@@ -6,6 +6,7 @@
   "main": "index.mjs",
   "exports": {
     ".": "./index.mjs",
+    "./paths": "./paths.mjs",
     "./lib/*": "./lib/*",
     "./public/*": "./public/*",
     "./package.json": "./package.json"
