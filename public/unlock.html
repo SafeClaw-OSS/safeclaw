@@ -1,0 +1,395 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SafeClaw — Unlock</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🔒</text></svg>">
+  <style>
+    :root {
+      --bg: #0f0e17;
+      --surface: #1e1c2e;
+      --surface2: #2a2840;
+      --accent: #7c6af7;
+      --accent-hover: #9b8dff;
+      --text: #f0eeff;
+      --muted: #8f8db8;
+      --success: #4ade80;
+      --error: #f87171;
+      --border: rgba(255,255,255,0.07);
+      --radius: 12px;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 24px 16px;
+    }
+
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 40px 36px;
+      width: 100%;
+      max-width: 380px;
+      text-align: center;
+    }
+
+    .lock-icon {
+      font-size: 3.5rem;
+      margin-bottom: 20px;
+      display: block;
+      transition: all 0.5s cubic-bezier(0.34, 1.56, 0.64, 1);
+    }
+    .lock-icon.unlocked { transform: rotate(-20deg) scale(1.15); }
+
+    h1 { font-size: 1.375rem; font-weight: 700; letter-spacing: -0.02em; margin-bottom: 8px; }
+    .subtitle { color: var(--muted); font-size: 0.875rem; line-height: 1.5; margin-bottom: 32px; }
+
+    .btn {
+      display: flex; align-items: center; justify-content: center; gap: 8px;
+      width: 100%; padding: 14px 20px;
+      border-radius: 8px; border: none;
+      font-size: 0.95rem; font-weight: 600;
+      cursor: pointer; transition: all 0.2s;
+    }
+    .btn-primary { background: var(--accent); color: #fff; }
+    .btn-primary:hover:not(:disabled) {
+      background: var(--accent-hover);
+      transform: translateY(-1px);
+      box-shadow: 0 6px 20px rgba(124,106,247,0.35);
+    }
+    .btn-primary:disabled { opacity: 0.45; cursor: not-allowed; transform: none; box-shadow: none; }
+
+    .btn-ghost {
+      background: transparent; border: 1px solid var(--border);
+      color: var(--muted); margin-top: 10px; font-size: 0.85rem; padding: 10px;
+    }
+    .btn-ghost:hover { border-color: var(--accent); color: var(--accent); }
+
+    /* Spinner */
+    .spinner {
+      width: 20px; height: 20px;
+      border: 2px solid rgba(255,255,255,0.25);
+      border-top-color: #fff;
+      border-radius: 50%;
+      animation: spin 0.7s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* Alert */
+    .alert {
+      padding: 12px 14px; border-radius: 8px;
+      font-size: 0.85rem; line-height: 1.5;
+      margin-top: 16px; text-align: left;
+    }
+    .alert-error { background: rgba(248,113,113,0.1); color: var(--error); border: 1px solid rgba(248,113,113,0.2); }
+    .alert-success { background: rgba(74,222,128,0.1); color: var(--success); border: 1px solid rgba(74,222,128,0.2); }
+    .alert-info { background: rgba(124,106,247,0.1); color: #a89ef9; border: 1px solid rgba(124,106,247,0.2); }
+
+    /* Success state */
+    .success-content { display: none; }
+    body.unlocked .lock-content { display: none; }
+    body.unlocked .success-content { display: block; }
+
+    .checkmark {
+      width: 56px; height: 56px;
+      background: rgba(74,222,128,0.15);
+      border-radius: 50%;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 1.75rem;
+      margin: 0 auto 20px;
+      border: 2px solid rgba(74,222,128,0.3);
+    }
+    .success-title { font-size: 1.25rem; font-weight: 700; color: var(--success); margin-bottom: 8px; }
+    .success-desc { color: var(--muted); font-size: 0.85rem; line-height: 1.6; }
+    .countdown { color: var(--muted); font-size: 0.75rem; margin-top: 16px; }
+
+    .divider {
+      display: flex; align-items: center; gap: 12px;
+      margin: 20px 0; color: var(--muted); font-size: 0.75rem;
+    }
+    .divider::before, .divider::after {
+      content: ''; flex: 1; height: 1px; background: var(--border);
+    }
+
+    /* Nav */
+    .nav {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 0 24px; height: 56px;
+      display: flex; align-items: center; justify-content: space-between;
+      position: fixed; top: 0; left: 0; right: 0; z-index: 50;
+    }
+    .nav-left { display: flex; align-items: center; gap: 10px; }
+    .nav-logo { font-size: 1.25rem; }
+    .nav h1 { font-size: 1rem; font-weight: 700; }
+    .nav h1 a { color: var(--text); text-decoration: none; }
+    .nav-links { display: flex; align-items: center; gap: 6px; }
+    .nav-links a {
+      color: var(--muted); text-decoration: none;
+      font-size: 0.8rem; font-weight: 500;
+      padding: 6px 12px; border-radius: 6px; transition: all 0.2s;
+    }
+    .nav-links a:hover { color: var(--text); background: var(--surface2); }
+    .nav-links a.active { color: var(--accent); background: rgba(124,106,247,0.1); }
+
+    .branding {
+      position: fixed; bottom: 20px; left: 0; right: 0;
+      text-align: center; font-size: 0.7rem; color: var(--muted); opacity: 0.5;
+    }
+
+    @media (max-width: 420px) {
+      .card { padding: 28px 20px; }
+    }
+  </style>
+</head>
+<body>
+
+<nav class="nav">
+  <div class="nav-left">
+    <span class="nav-logo">🔒</span>
+    <h1><a href="/">SafeClaw</a></h1>
+  </div>
+  <div class="nav-links">
+    <a href="/">Home</a>
+    <a href="/admin.html">Dashboard</a>
+    <a href="/setup.html">Setup</a>
+    <a href="/unlock.html" class="active">Unlock</a>
+  </div>
+</nav>
+
+<div class="card">
+  <!-- Locked state -->
+  <div class="lock-content">
+    <span class="lock-icon" id="lock-icon">🔒</span>
+    <h1>Vault Locked</h1>
+    <p class="subtitle">SafeClaw needs your passkey to decrypt and load your API credentials.</p>
+
+    <button class="btn btn-primary" id="unlock-btn" onclick="startUnlock()">
+      🔑 Unlock with Passkey
+    </button>
+
+    <div id="status"></div>
+
+    <div class="divider">or</div>
+    <a href="/admin.html" class="btn btn-ghost" style="text-decoration:none;">View Dashboard</a>
+  </div>
+
+  <!-- Success state -->
+  <div class="success-content">
+    <div class="checkmark">✓</div>
+    <div class="success-title">Vault Unlocked!</div>
+    <div class="success-desc">
+      Your API credentials have been decrypted and loaded. The proxy is now accepting requests.
+    </div>
+    <div class="countdown" id="countdown"></div>
+  </div>
+</div>
+
+<div class="branding">🔒 SafeClaw — Secure API Proxy</div>
+
+<script>
+'use strict';
+
+
+// ── Utilities ────────────────────────────────────────────────────────────────
+
+function toBase64(u8) {
+  let s = '';
+  for (let i = 0; i < u8.byteLength; i++) s += String.fromCharCode(u8[i]);
+  return btoa(s);
+}
+
+// ── WebCrypto E2E Encrypt (P-256 ECDH + HKDF + AES-256-GCM) ─────────────────
+
+async function e2eEncryptBrowser(plaintext, vmPkJwk) {
+  const ephemeral = await crypto.subtle.generateKey(
+    { name: 'ECDH', namedCurve: 'P-256' },
+    true,
+    ['deriveBits']
+  );
+  const serverPub = await crypto.subtle.importKey(
+    'jwk', vmPkJwk, { name: 'ECDH', namedCurve: 'P-256' }, false, []
+  );
+  const sharedBits = await crypto.subtle.deriveBits(
+    { name: 'ECDH', public: serverPub },
+    ephemeral.privateKey,
+    256
+  );
+  const hkdfKey = await crypto.subtle.importKey(
+    'raw', sharedBits, 'HKDF', false, ['deriveBits']
+  );
+  const aesKeyBits = await crypto.subtle.deriveBits(
+    {
+      name: 'HKDF',
+      hash: 'SHA-256',
+      salt: new Uint8Array(32),
+      info: new TextEncoder().encode('safeclaw-e2e'),
+    },
+    hkdfKey,
+    256
+  );
+  const aesKey = await crypto.subtle.importKey(
+    'raw', aesKeyBits, { name: 'AES-GCM' }, false, ['encrypt']
+  );
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = await crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv },
+    aesKey,
+    plaintext
+  );
+  const epk = await crypto.subtle.exportKey('jwk', ephemeral.publicKey);
+  const wire = JSON.stringify({
+    epk,
+    iv: toBase64(iv),
+    ct: toBase64(new Uint8Array(ct)),
+  });
+  return new TextEncoder().encode(wire);
+}
+
+async function getPrfSalt() {
+  const raw = new TextEncoder().encode('safeclaw-vault-v1');
+  const hash = await crypto.subtle.digest('SHA-256', raw);
+  return new Uint8Array(hash);
+}
+
+function setStatus(html, type) {
+  const el = document.getElementById('status');
+  el.innerHTML = html ? `<div class="alert alert-${type}">${html}</div>` : '';
+}
+
+function setBtn(html, disabled) {
+  const btn = document.getElementById('unlock-btn');
+  btn.innerHTML = html;
+  btn.disabled = disabled;
+}
+
+// ── Init ─────────────────────────────────────────────────────────────────────
+
+(async function init() {
+  if (!window.PublicKeyCredential) {
+    setStatus(
+      '⚠️ WebAuthn is not supported in this browser. ' +
+      'Please use Chrome 108+, Safari 16+, or Edge 108+.',
+      'error'
+    );
+    setBtn('🔑 Unlock with Passkey', true);
+  }
+})();
+
+// ── Unlock Flow ───────────────────────────────────────────────────────────────
+
+async function startUnlock() {
+  setBtn('<div class="spinner"></div> Contacting server…', true);
+  setStatus('', '');
+
+  let vmPk;
+
+  try {
+    // Fetch server public key
+    const res = await fetch('/vmPk');
+    if (!res.ok) throw new Error(`Server returned ${res.status}`);
+    const data = await res.json();
+    vmPk = data.vmPk;  // JWK object
+  } catch (e) {
+    setStatus(`❌ Could not reach server: ${e.message}`, 'error');
+    setBtn('🔑 Unlock with Passkey', false);
+    return;
+  }
+
+  try {
+    setBtn('<div class="spinner"></div> Waiting for authenticator…', true);
+
+    const prfSalt = await getPrfSalt();
+    const webauthnChallenge = crypto.getRandomValues(new Uint8Array(32));
+
+    // No allowCredentials — let browser show any registered passkey for this RP
+    const assertion = await navigator.credentials.get({
+      publicKey: {
+        challenge: webauthnChallenge,
+        userVerification: 'required',
+        extensions: { prf: { eval: { first: prfSalt } } },
+      },
+    });
+
+    const prfFirst = assertion.getClientExtensionResults()?.prf?.results?.first;
+    if (!prfFirst) {
+      setStatus(
+        "❌ Your browser/device doesn't support PRF. Please use Chrome 116+ or Safari 18+.",
+        'error'
+      );
+      setBtn('🔑 Unlock with Passkey', false);
+      return;
+    }
+
+    setBtn('<div class="spinner"></div> Encrypting…', true);
+
+    const userKey = new Uint8Array(prfFirst);
+    const credentialId = assertion.id;  // base64url string
+
+    // Capture assertion data (public, goes in request body top-level)
+    const assertionData = {
+      authenticatorData: toBase64(new Uint8Array(assertion.response.authenticatorData)),
+      clientDataJSON: toBase64(new Uint8Array(assertion.response.clientDataJSON)),
+      signature: toBase64(new Uint8Array(assertion.response.signature)),
+    };
+
+    const nonce = toBase64(crypto.getRandomValues(new Uint8Array(32)));
+    const payload = { userKey: toBase64(userKey), nonce };
+    const plaintext = new TextEncoder().encode(JSON.stringify(payload));
+    const sealed = await e2eEncryptBrowser(plaintext, vmPk);
+    const payloadB64 = toBase64(sealed);
+
+    // Zeroize key material
+    userKey.fill(0);
+
+    setBtn('<div class="spinner"></div> Unlocking vault…', true);
+
+    const res = await fetch('/unlock', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ payload: payloadB64, credentialId, assertion: assertionData }),
+    });
+
+    if (!res.ok) {
+      const errData = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
+      throw new Error(errData.error || `HTTP ${res.status}`);
+    }
+
+    // Animate lock icon and show success
+    document.getElementById('lock-icon').classList.add('unlocked');
+    setTimeout(() => {
+      document.body.classList.add('unlocked');
+      startCountdown();
+    }, 500);
+
+  } catch (e) {
+    const msg = e.name === 'NotAllowedError'
+      ? '❌ Authentication cancelled or timed out. Please try again.'
+      : `❌ ${e.message}`;
+    setStatus(msg, 'error');
+    setBtn('🔑 Unlock with Passkey', false);
+  }
+}
+
+function startCountdown() {
+  let t = 5;
+  const el = document.getElementById('countdown');
+  const tick = () => {
+    el.textContent = `Closing in ${t}s…`;
+    if (t-- > 0) setTimeout(tick, 1000);
+    else window.close();
+  };
+  tick();
+}
+</script>
+</body>
+</html>

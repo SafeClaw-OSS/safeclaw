@@ -1,0 +1,987 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SafeClaw — Setup</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🔒</text></svg>">
+  <style>
+    :root {
+      --bg: #0f0e17;
+      --surface: #1e1c2e;
+      --surface2: #2a2840;
+      --accent: #7c6af7;
+      --accent-hover: #9b8dff;
+      --text: #f0eeff;
+      --muted: #8f8db8;
+      --success: #4ade80;
+      --error: #f87171;
+      --border: rgba(255,255,255,0.07);
+      --radius: 12px;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 32px 16px 64px;
+    }
+    .header { text-align: center; margin-bottom: 28px; }
+    .header .logo { font-size: 2.5rem; margin-bottom: 10px; }
+    .header h1 { font-size: 1.5rem; font-weight: 700; letter-spacing: -0.02em; }
+    .header p { color: var(--muted); font-size: 0.875rem; margin-top: 6px; }
+
+    /* Stepper */
+    .stepper {
+      display: flex;
+      align-items: flex-start;
+      margin-bottom: 24px;
+      width: 100%;
+      max-width: 460px;
+    }
+    .step-item { display: flex; flex-direction: column; align-items: center; flex: 1; }
+    .step-circle {
+      width: 32px; height: 32px;
+      border-radius: 50%;
+      background: var(--surface);
+      border: 2px solid var(--border);
+      display: flex; align-items: center; justify-content: center;
+      font-size: 0.75rem; font-weight: 700;
+      color: var(--muted);
+      transition: all 0.3s;
+      position: relative; z-index: 1;
+    }
+    .step-item.active .step-circle { background: var(--accent); border-color: var(--accent); color: #fff; box-shadow: 0 0 0 4px rgba(124,106,247,0.2); }
+    .step-item.done .step-circle { background: var(--success); border-color: var(--success); color: #fff; }
+    .step-label { font-size: 0.65rem; color: var(--muted); margin-top: 6px; text-align: center; white-space: nowrap; }
+    .step-item.active .step-label, .step-item.done .step-label { color: var(--text); }
+    .step-connector { flex: 1; height: 2px; background: var(--border); margin: 15px 4px 0; transition: background 0.3s; }
+    .step-connector.done { background: var(--success); }
+
+    /* Card */
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 32px;
+      width: 100%;
+      max-width: 460px;
+    }
+    .step-title { font-size: 1.1rem; font-weight: 700; margin-bottom: 8px; }
+    .step-desc { color: var(--muted); font-size: 0.85rem; line-height: 1.6; margin-bottom: 24px; }
+
+    /* Form */
+    .form-group { margin-bottom: 16px; }
+    label { display: block; font-size: 0.8rem; font-weight: 600; color: var(--muted); margin-bottom: 6px; text-transform: uppercase; letter-spacing: 0.04em; }
+    input[type=text], input[type=password] {
+      width: 100%;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      color: var(--text);
+      font-size: 0.9rem;
+      padding: 10px 14px;
+      outline: none;
+      transition: border-color 0.2s, box-shadow 0.2s;
+    }
+    input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(124,106,247,0.15); }
+    input::placeholder { color: var(--muted); opacity: 0.6; }
+
+    /* Buttons */
+    .btn {
+      display: flex; align-items: center; justify-content: center; gap: 8px;
+      width: 100%; padding: 12px 20px;
+      border-radius: 8px; border: none;
+      font-size: 0.9rem; font-weight: 600;
+      cursor: pointer; transition: all 0.2s;
+    }
+    .btn-primary { background: var(--accent); color: #fff; }
+    .btn-primary:hover:not(:disabled) { background: var(--accent-hover); transform: translateY(-1px); box-shadow: 0 4px 16px rgba(124,106,247,0.3); }
+    .btn-primary:disabled { opacity: 0.45; cursor: not-allowed; transform: none; box-shadow: none; }
+    .btn-outline { background: transparent; border: 1px solid var(--border); color: var(--muted); }
+    .btn-outline:hover { border-color: var(--accent); color: var(--accent); }
+    a.btn { text-decoration: none; }
+
+    /* Passkey status row */
+    .pk-row {
+      display: flex; align-items: center; gap: 12px;
+      background: var(--surface2); border-radius: 8px;
+      padding: 12px 14px; margin-bottom: 16px;
+      border: 1px solid var(--border);
+    }
+    .pk-row .pk-icon { font-size: 1.5rem; flex-shrink: 0; }
+    .pk-row .pk-info { flex: 1; min-width: 0; }
+    .pk-row .pk-name { font-weight: 600; font-size: 0.875rem; }
+    .pk-row .pk-sub { color: var(--muted); font-size: 0.75rem; margin-top: 2px; }
+    .pk-row .pk-badge {
+      font-size: 0.7rem; font-weight: 700; padding: 3px 8px; border-radius: 20px;
+      background: rgba(74,222,128,0.15); color: var(--success); white-space: nowrap;
+    }
+    .pk-row .pk-badge.pending { background: rgba(124,106,247,0.15); color: var(--accent); }
+
+    /* Alert */
+    .alert {
+      padding: 12px 14px; border-radius: 8px;
+      font-size: 0.85rem; line-height: 1.5; margin-top: 14px;
+    }
+    .alert-error { background: rgba(248,113,113,0.1); color: var(--error); border: 1px solid rgba(248,113,113,0.2); }
+    .alert-info { background: rgba(124,106,247,0.1); color: #a89ef9; border: 1px solid rgba(124,106,247,0.2); }
+    .alert-success { background: rgba(74,222,128,0.1); color: var(--success); border: 1px solid rgba(74,222,128,0.2); }
+    .alert-info { background: rgba(124,106,247,0.1); color: #a89ef9; border: 1px solid rgba(124,106,247,0.2); }
+
+    /* Spinner */
+    .spinner {
+      width: 18px; height: 18px;
+      border: 2px solid rgba(255,255,255,0.25);
+      border-top-color: #fff;
+      border-radius: 50%;
+      animation: spin 0.7s linear infinite;
+      flex-shrink: 0;
+    }
+    .spinner.lg { width: 40px; height: 40px; border-width: 3px; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* Loading center */
+    .loading-center { display: flex; flex-direction: column; align-items: center; gap: 16px; padding: 40px 0; }
+    .loading-center p { color: var(--muted); font-size: 0.875rem; }
+
+    /* Success */
+    .success-wrap { text-align: center; padding: 16px 0; }
+    .success-icon { font-size: 3rem; margin-bottom: 16px; }
+    .success-title { font-size: 1.25rem; font-weight: 700; margin-bottom: 8px; }
+    .success-desc { color: var(--muted); font-size: 0.875rem; line-height: 1.6; margin-bottom: 28px; }
+
+    /* Divider */
+    .divider { border: none; border-top: 1px solid var(--border); margin: 20px 0; }
+
+    /* Custom service fields */
+    .custom-row { display: grid; grid-template-columns: 1fr 1.5fr 1.5fr auto; gap: 8px; margin-bottom: 10px; align-items: center; }
+    .custom-row input { margin-bottom: 0; }
+    /* Service cards */
+    .svc-grid { display: flex; flex-direction: column; gap: 8px; }
+    .svc-card {
+      background: var(--surface2); border: 1px solid var(--border);
+      border-radius: 10px; overflow: hidden; transition: all 0.2s;
+    }
+    .svc-card.active { border-color: rgba(124,106,247,0.3); }
+    .svc-header {
+      display: flex; align-items: center; gap: 10px;
+      padding: 12px 14px; cursor: pointer; user-select: none;
+    }
+    .svc-icon { font-size: 1.2rem; width: 28px; text-align: center; flex-shrink: 0; }
+    .svc-name { font-weight: 600; font-size: 0.9rem; flex: 1; }
+    .svc-toggle {
+      width: 38px; height: 20px; border-radius: 10px;
+      background: rgba(255,255,255,0.1); position: relative;
+      transition: background 0.2s; flex-shrink: 0;
+    }
+    .svc-toggle::after {
+      content: ''; position: absolute; top: 2px; left: 2px;
+      width: 16px; height: 16px; border-radius: 50%;
+      background: var(--muted); transition: all 0.2s;
+    }
+    .svc-card.active .svc-toggle { background: var(--accent); }
+    .svc-card.active .svc-toggle::after { left: 20px; background: #fff; }
+    .svc-body { padding: 0 14px 14px; display: none; }
+    .svc-card.active .svc-body { display: block; }
+    .svc-body .input-wrap { margin-top: 4px; }
+
+    .input-wrap { position: relative; }
+    .input-wrap input { width: 100%; padding-right: 36px; }
+    .input-wrap .toggle-vis {
+      position: absolute; right: 8px; top: 50%; transform: translateY(-50%);
+      background: none; border: none; cursor: pointer; font-size: 1rem;
+      color: var(--muted); padding: 2px; line-height: 1;
+    }
+    .input-wrap .toggle-vis:hover { color: var(--text); }
+    .btn-rm {
+      background: none; border: 1px solid var(--border);
+      color: var(--muted); border-radius: 8px;
+      padding: 0 10px; height: 40px; cursor: pointer; font-size: 1rem; line-height: 1;
+      transition: all 0.2s;
+    }
+    .btn-rm:hover { color: var(--error); border-color: rgba(248,113,113,0.4); }
+    .btn-add-service {
+      background: none; border: 1px dashed var(--border);
+      color: var(--muted); border-radius: 8px;
+      padding: 8px; cursor: pointer; width: 100%;
+      font-size: 0.8rem; margin-top: 4px; transition: all 0.2s;
+    }
+    .btn-add-service:hover { border-color: var(--accent); color: var(--accent); }
+
+    .hidden { display: none !important; }
+
+    /* Nav */
+    .nav {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 0 24px; height: 56px;
+      display: flex; align-items: center; justify-content: space-between;
+      position: sticky; top: 0; z-index: 50;
+    }
+    .nav-left { display: flex; align-items: center; gap: 10px; }
+    .nav-logo { font-size: 1.25rem; }
+    .nav h1 { font-size: 1rem; font-weight: 700; }
+    .nav h1 a { color: var(--text); text-decoration: none; }
+    .nav-links { display: flex; align-items: center; gap: 6px; }
+    .nav-links a {
+      color: var(--muted); text-decoration: none;
+      font-size: 0.8rem; font-weight: 500;
+      padding: 6px 12px; border-radius: 6px; transition: all 0.2s;
+    }
+    .nav-links a:hover { color: var(--text); background: var(--surface2); }
+    .nav-links a.active { color: var(--accent); background: rgba(124,106,247,0.1); }
+
+    @media (max-width: 500px) {
+      .card { padding: 20px 16px; }
+      .step-label { display: none; }
+      .custom-row { grid-template-columns: 1fr 1fr auto; }
+    }
+  </style>
+</head>
+<body data-1p-ignore data-lpignore="true">
+
+<nav class="nav">
+  <div class="nav-left">
+    <span class="nav-logo">🔒</span>
+    <h1><a href="/">SafeClaw</a></h1>
+  </div>
+  <div class="nav-links">
+    <a href="/">Home</a>
+    <a href="/admin.html">Dashboard</a>
+    <a href="/setup.html" class="active">Setup</a>
+    <a href="/unlock.html">Unlock</a>
+  </div>
+</nav>
+
+<div class="header" style="margin-top:24px;">
+  <div class="logo">⚙️</div>
+  <h1>SafeClaw Setup</h1>
+  <p>Protect your API keys with passkey-based encryption</p>
+</div>
+
+<!-- Stepper -->
+<div class="stepper" id="stepper">
+  <div class="step-item active" id="si-1">
+    <div class="step-circle">1</div>
+    <div class="step-label">Primary Key</div>
+  </div>
+  <div class="step-connector" id="sc-1"></div>
+  <div class="step-item" id="si-2">
+    <div class="step-circle">2</div>
+    <div class="step-label">Backup Key</div>
+  </div>
+  <div class="step-connector" id="sc-2"></div>
+  <div class="step-item" id="si-3">
+    <div class="step-circle">3</div>
+    <div class="step-label">API Keys</div>
+  </div>
+  <div class="step-connector" id="sc-3"></div>
+  <div class="step-item" id="si-4">
+    <div class="step-circle">4</div>
+    <div class="step-label">Finish</div>
+  </div>
+</div>
+
+<div class="card" id="main-card">
+
+  <!-- Step 1: Register Primary Passkey -->
+  <div id="pane-1">
+    <div class="step-title">Set Up Primary Passkey</div>
+    <div class="step-desc">
+      Create a passkey using your device's built-in authenticator — Touch ID, Face ID, Windows Hello, or a hardware security key. Your API keys will be encrypted with a key derived from this passkey.
+    </div>
+    <div class="form-group">
+      <label for="name1">Device Name <span style="font-weight:400;text-transform:none;color:var(--muted)">(optional)</span></label>
+      <input type="text" id="name1" placeholder="e.g. MacBook Touch ID" maxlength="64" autocomplete="off">
+    </div>
+    <button class="btn btn-primary" id="btn1" onclick="registerPasskey(1)">
+      🔑 Set Up Primary Passkey
+    </button>
+    <div id="status1"></div>
+  </div>
+
+  <!-- Step 2: Register Backup Passkey -->
+  <div id="pane-2" class="hidden">
+    <div class="pk-row">
+      <div class="pk-icon">✅</div>
+      <div class="pk-info">
+        <div class="pk-name" id="pk1-name">—</div>
+        <div class="pk-sub">Primary passkey</div>
+      </div>
+      <div class="pk-badge">Registered</div>
+    </div>
+    <div class="step-title">Set Up Backup Passkey</div>
+    <div class="step-desc">
+      Add a second passkey on a different device. If you lose access to your primary authenticator, you can still unlock your vault with this backup.
+    </div>
+    <div class="form-group">
+      <label for="name2">Device Name <span style="font-weight:400;text-transform:none;color:var(--muted)">(optional)</span></label>
+      <input type="text" id="name2" placeholder="e.g. iPhone Face ID" maxlength="64" autocomplete="off">
+    </div>
+    <button class="btn btn-primary" id="btn2" onclick="registerPasskey(2)">
+      🔑 Set Up Backup Passkey
+    </button>
+    <div id="status2"></div>
+  </div>
+
+  <!-- Step 3: API Keys -->
+  <div id="pane-3" class="hidden" data-1p-ignore data-lpignore="true" data-protonpass-ignore>
+    <div style="display:flex;gap:10px;margin-bottom:20px;">
+      <div class="pk-row" style="flex:1;margin:0;">
+        <div class="pk-icon">🔑</div>
+        <div class="pk-info">
+          <div class="pk-name" id="pk1-name-3">—</div>
+          <div class="pk-sub">Primary</div>
+        </div>
+        <div class="pk-badge">✓</div>
+      </div>
+      <div class="pk-row" style="flex:1;margin:0;">
+        <div class="pk-icon">🔑</div>
+        <div class="pk-info">
+          <div class="pk-name" id="pk2-name-3">—</div>
+          <div class="pk-sub">Backup</div>
+        </div>
+        <div class="pk-badge">✓</div>
+      </div>
+    </div>
+    <div class="step-title">Configure API Keys</div>
+    <div class="step-desc">
+      Toggle services on and paste your API keys. Everything is encrypted end-to-end — never stored in plaintext.
+    </div>
+
+    <div class="svc-grid" id="svc-grid"></div>
+
+    <hr class="divider">
+    <div style="font-size:0.8rem;font-weight:600;text-transform:uppercase;letter-spacing:0.04em;color:var(--muted);margin-bottom:10px;">Other Services</div>
+    <div id="custom-fields"></div>
+    <button class="btn-add-service" onclick="addCustom()">+ Add Custom Service</button>
+    <div style="margin-top:24px;">
+      <button class="btn btn-primary" onclick="goToSubmit()">Encrypt &amp; Save →</button>
+    </div>
+    <div id="status3"></div>
+  </div>
+
+  <!-- Step 4: Encrypting -->
+  <div id="pane-4" class="hidden">
+    <div class="loading-center">
+      <div class="spinner lg"></div>
+      <p id="submit-msg">Building encrypted payload…</p>
+    </div>
+  </div>
+
+  <!-- Success -->
+  <div id="pane-success" class="hidden">
+    <div class="success-wrap">
+      <div class="success-icon">🎉</div>
+      <div class="success-title">SafeClaw is Ready!</div>
+      <div class="success-desc">
+        Your API vault is encrypted and stored securely. Agents accessing this proxy will need your passkey to unlock the vault. You can close this tab.
+      </div>
+      <div style="display:flex;gap:10px;justify-content:center;flex-wrap:wrap;">
+        <a href="/admin.html" class="btn btn-primary" style="display:inline-flex;width:auto;">
+          📊 View Dashboard
+        </a>
+        <a href="/unlock.html" class="btn btn-outline" style="display:inline-flex;width:auto;">
+          🔓 Unlock Vault
+        </a>
+      </div>
+    </div>
+    <div id="openclaw-config-wrap" class="hidden" style="margin-top:24px;text-align:left;">
+      <hr class="divider">
+      <div style="font-size:0.875rem;font-weight:600;margin-bottom:8px;">OpenClaw Config Snippet</div>
+      <pre id="openclaw-config-pre" style="background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:14px;font-size:0.75rem;line-height:1.5;overflow-x:auto;white-space:pre;color:var(--text);margin-bottom:10px;font-family:ui-monospace,'SFMono-Regular',Consolas,monospace;"></pre>
+      <button class="btn btn-outline" id="btn-copy-config" onclick="copyOpenClawConfig()" style="width:auto;padding:8px 16px;">📋 Copy to clipboard</button>
+      <div style="font-size:0.78rem;color:var(--muted);margin-top:10px;line-height:1.6;">
+        Paste this into your openclaw.json providers section. The dummy API keys are intentional — SafeClaw injects the real keys at proxy level.
+      </div>
+    </div>
+  </div>
+
+</div><!-- /card -->
+
+<script>
+'use strict';
+
+
+const state = {
+  vmPk: null,       // JWK object (P-256 public key)
+  passkeys: [],     // [{credentialId, deviceName, prfKey: Uint8Array(32), x, y, assertion}]
+  configuredServiceIds: [],  // service slugs configured in step 3
+};
+
+// ── Utilities ────────────────────────────────────────────────────────────────
+
+function toBase64(u8) {
+  let s = '';
+  for (let i = 0; i < u8.byteLength; i++) s += String.fromCharCode(u8[i]);
+  return btoa(s);
+}
+
+// ── WebCrypto E2E Encrypt (P-256 ECDH + HKDF + AES-256-GCM) ─────────────────
+
+async function e2eEncryptBrowser(plaintext, vmPkJwk) {
+  // Generate ephemeral P-256 keypair
+  const ephemeral = await crypto.subtle.generateKey(
+    { name: 'ECDH', namedCurve: 'P-256' },
+    true,
+    ['deriveBits']
+  );
+
+  // Import server public key
+  const serverPub = await crypto.subtle.importKey(
+    'jwk', vmPkJwk, { name: 'ECDH', namedCurve: 'P-256' }, false, []
+  );
+
+  // ECDH → shared secret
+  const sharedBits = await crypto.subtle.deriveBits(
+    { name: 'ECDH', public: serverPub },
+    ephemeral.privateKey,
+    256
+  );
+
+  // HKDF → AES key
+  const hkdfKey = await crypto.subtle.importKey(
+    'raw', sharedBits, 'HKDF', false, ['deriveBits']
+  );
+  const aesKeyBits = await crypto.subtle.deriveBits(
+    {
+      name: 'HKDF',
+      hash: 'SHA-256',
+      salt: new Uint8Array(32),
+      info: new TextEncoder().encode('safeclaw-e2e'),
+    },
+    hkdfKey,
+    256
+  );
+  const aesKey = await crypto.subtle.importKey(
+    'raw', aesKeyBits, { name: 'AES-GCM' }, false, ['encrypt']
+  );
+
+  // Encrypt
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = await crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv },
+    aesKey,
+    plaintext
+  );
+
+  // Export ephemeral public key as JWK
+  const epk = await crypto.subtle.exportKey('jwk', ephemeral.publicKey);
+
+  // Wire format: JSON string
+  const wire = JSON.stringify({
+    epk,
+    iv: toBase64(iv),
+    ct: toBase64(new Uint8Array(ct)),
+  });
+  return new TextEncoder().encode(wire);
+}
+
+async function getPrfSalt() {
+  // SHA-256 of 'safeclaw-vault-v1' → 32 bytes required by WebAuthn PRF spec
+  const raw = new TextEncoder().encode('safeclaw-vault-v1');
+  const hash = await crypto.subtle.digest('SHA-256', raw);
+  return new Uint8Array(hash);
+}
+
+function setStatus(id, html, type) {
+  const el = document.getElementById(id);
+  el.innerHTML = html ? `<div class="alert alert-${type}">${html}</div>` : '';
+}
+
+function setStepDone(n) {
+  const si = document.getElementById('si-' + n);
+  si.className = 'step-item done';
+  si.querySelector('.step-circle').textContent = '✓';
+  if (n < 4) document.getElementById('sc-' + n).classList.add('done');
+}
+
+function setStepActive(n) {
+  const si = document.getElementById('si-' + n);
+  si.className = 'step-item active';
+}
+
+function showPane(n) {
+  ['1','2','3','4','success'].forEach(id => {
+    const el = document.getElementById('pane-' + id);
+    if (el) el.classList.toggle('hidden', id !== String(n));
+  });
+}
+
+// ── Init ─────────────────────────────────────────────────────────────────────
+
+(async function init() {
+  if (!window.PublicKeyCredential) {
+    setStatus('status1', '⚠️ WebAuthn is not supported in this browser. Use Chrome 108+, Safari 16+, or Edge 108+ with a built-in authenticator.', 'error');
+    document.getElementById('btn1').disabled = true;
+    return;
+  }
+
+  if (!crypto.subtle) {
+    setStatus('status1', '❌ WebCrypto is not available. Please use HTTPS or localhost.', 'error');
+    document.getElementById('btn1').disabled = true;
+    return;
+  }
+
+  try {
+    const res = await fetch('/vmPk');
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    state.vmPk = data.vmPk;  // JWK object
+  } catch (e) {
+    setStatus('status1', `❌ Could not reach server: ${e.message}`, 'error');
+    document.getElementById('btn1').disabled = true;
+  }
+
+  renderServiceGrid();
+
+  // Warn before leaving if setup is in progress
+  window.addEventListener('beforeunload', e => {
+    if (state.passkeys.some(p => p)) {
+      e.preventDefault();
+    }
+  });
+})();
+
+// ── Passkey Registration ──────────────────────────────────────────────────────
+
+async function registerPasskey(num) {
+  const btn = document.getElementById('btn' + num);
+  const statusId = 'status' + num;
+  const rawName = document.getElementById('name' + num).value.trim();
+  const deviceName = rawName || `Passkey ${num}`;
+  const label = num === 1 ? 'Primary' : 'Backup';
+
+  btn.disabled = true;
+  btn.innerHTML = '<div class="spinner"></div> Waiting for authenticator…';
+  setStatus(statusId, '', '');
+
+  try {
+    // Strategy: try get() first (reuse existing passkey), fallback to create() + get()
+    let prfFirst = null;
+    let credentialId = null;
+
+    let assertionData = null;
+    let publicKeyXY = { x: null, y: null };
+
+    // 1. Try using an existing passkey (get with PRF, no allowCredentials filter)
+    try {
+      const result = await derivePRFDiscoverable();
+      if (result) {
+        prfFirst = result.prf;
+        credentialId = result.credentialId;
+        assertionData = result.assertionData;
+      }
+    } catch (existingErr) {
+      if (existingErr.name !== 'NotAllowedError') throw existingErr;
+      // User cancelled or no existing passkey — fall through to create
+    }
+
+    // 2. No existing passkey used — create a new one
+    if (!prfFirst) {
+      setStatus(statusId, 'Creating new passkey…', 'info');
+      btn.innerHTML = '<div class="spinner"></div> Creating passkey…';
+
+      const credential = await navigator.credentials.create({
+        publicKey: {
+          challenge: crypto.getRandomValues(new Uint8Array(32)),
+          rp: { name: 'SafeClaw', id: window.location.hostname },
+          user: {
+            id: crypto.getRandomValues(new Uint8Array(16)),
+            name: `sc-${deviceName.toLowerCase().replace(/[^a-z0-9]/g, '')}-${Array.from(crypto.getRandomValues(new Uint8Array(2))).map(b => b.toString(36)).join('').slice(0,4)}`,
+            displayName: `SafeClaw · ${deviceName}`,
+          },
+          pubKeyCredParams: [
+            { alg: -7, type: 'public-key' },
+            { alg: -257, type: 'public-key' },
+          ],
+          authenticatorSelection: {
+            userVerification: 'required',
+            requireResidentKey: false,
+          },
+          extensions: { prf: {} },
+        },
+      });
+
+      credentialId = credential.id;
+
+      // Extract P-256 public key (x, y) from the new credential
+      const spki = credential.response.getPublicKey?.();
+      if (spki) {
+        const spkiBuf = new Uint8Array(spki);
+        // P-256 SPKI last 64 bytes = x(32) || y(32) (uncompressed EC point without 04 prefix)
+        publicKeyXY.x = toBase64(spkiBuf.slice(spkiBuf.length - 64, spkiBuf.length - 32));
+        publicKeyXY.y = toBase64(spkiBuf.slice(spkiBuf.length - 32));
+      }
+
+      // Derive PRF from the new credential
+      const createExt = credential.getClientExtensionResults();
+      const prfReported = createExt.prf?.enabled;
+
+      setStatus(statusId, '✓ Passkey created — deriving encryption key…', 'info');
+      btn.innerHTML = '<div class="spinner"></div> Deriving encryption key…';
+
+      if (!prfReported) {
+        await new Promise(r => setTimeout(r, 1000));
+      }
+
+      try {
+        const result = await derivePRF(credential);
+        if (result) {
+          prfFirst = result.prf;
+          assertionData = result.assertionData;
+        }
+      } catch (deriveErr) {
+        if (deriveErr.name === 'NotAllowedError') {
+          // iOS rate-limit fallback — manual button
+          setStatus(statusId, '✓ Passkey created. Tap below to derive encryption key.', 'info');
+          btn.innerHTML = '🔐 Derive Encryption Key';
+          btn.disabled = false;
+          btn.onclick = async () => {
+            btn.disabled = true;
+            btn.innerHTML = '<div class="spinner"></div> Verifying…';
+            setStatus(statusId, '', '');
+            try {
+              const result = await derivePRF(credential);
+              if (result) finishRegistration(num, credential.id, deviceName, result.prf, publicKeyXY, result.assertionData);
+              else showPRFError(statusId, btn, num);
+            } catch (e2) {
+              setStatus(statusId, e2.name === 'NotAllowedError'
+                ? '❌ Verification cancelled. Please try again.' : `❌ ${e2.message}`, 'error');
+              btn.disabled = false;
+              btn.innerHTML = '🔐 Derive Encryption Key';
+            }
+          };
+          return;
+        }
+        throw deriveErr;
+      }
+
+      if (!prfFirst) {
+        showPRFError(statusId, btn, num);
+        return;
+      }
+    }
+
+    finishRegistration(num, credentialId, deviceName, prfFirst, publicKeyXY, assertionData);
+
+  } catch (e) {
+    const msg = e.name === 'NotAllowedError'
+      ? '❌ Cancelled or timed out. Please try again.'
+      : `❌ ${e.message}`;
+    setStatus(statusId, msg, 'error');
+    btn.disabled = false;
+    btn.innerHTML = `🔑 Set Up ${label} Passkey`;
+  }
+}
+
+// ── PRF Helpers ───────────────────────────────────────────────────────────────
+
+function assertionToData(assertion) {
+  return {
+    authenticatorData: toBase64(new Uint8Array(assertion.response.authenticatorData)),
+    clientDataJSON: toBase64(new Uint8Array(assertion.response.clientDataJSON)),
+    signature: toBase64(new Uint8Array(assertion.response.signature)),
+  };
+}
+
+async function derivePRF(credential) {
+  const prfSalt = await getPrfSalt();
+  const assertion = await navigator.credentials.get({
+    publicKey: {
+      challenge: crypto.getRandomValues(new Uint8Array(32)),
+      allowCredentials: [{ type: 'public-key', id: credential.rawId }],
+      userVerification: 'required',
+      extensions: { prf: { eval: { first: prfSalt } } },
+    },
+  });
+  const getExt = assertion.getClientExtensionResults();
+  const prf = getExt?.prf?.results?.first || null;
+  if (!prf) return null;
+  return { prf, assertionData: assertionToData(assertion) };
+}
+
+// Discoverable get() — no allowCredentials, user picks from authenticator
+async function derivePRFDiscoverable() {
+  const prfSalt = await getPrfSalt();
+  const assertion = await navigator.credentials.get({
+    publicKey: {
+      challenge: crypto.getRandomValues(new Uint8Array(32)),
+      rpId: window.location.hostname,
+      userVerification: 'required',
+      extensions: { prf: { eval: { first: prfSalt } } },
+    },
+  });
+  const getExt = assertion.getClientExtensionResults();
+  const prf = getExt?.prf?.results?.first || null;
+  if (!prf) return null;
+  return { prf, credentialId: assertion.id, assertionData: assertionToData(assertion) };
+}
+
+function showPRFError(statusId, btn, num) {
+  setStatus(statusId,
+    "❌ Your browser/device doesn't support PRF. Please use Chrome 116+ or Safari 18+.",
+    'error');
+  btn.disabled = false;
+  btn.innerHTML = `🔑 Set Up ${num === 1 ? 'Primary' : 'Backup'} Passkey`;
+}
+
+function finishRegistration(num, credentialId, deviceName, prfFirst, publicKeyXY, assertionData) {
+  const statusId = 'status' + num;
+  const btn = document.getElementById('btn' + num);
+  const prfKey = new Uint8Array(prfFirst);
+
+  state.passkeys[num - 1] = {
+    credentialId,
+    deviceName,
+    prfKey,
+    x: publicKeyXY?.x || null,
+    y: publicKeyXY?.y || null,
+    assertion: assertionData || null,
+  };
+
+  setStatus(statusId, `✓ "${deviceName}" registered and encryption key derived.`, 'success');
+  btn.innerHTML = '✓ Registered';
+  btn.disabled = true;
+  btn.onclick = null;
+
+  setStepDone(num);
+  setStepActive(num + 1);
+  setTimeout(() => {
+    if (num === 1) {
+      document.getElementById('pk1-name').textContent = deviceName;
+      showPane(2);
+    } else {
+      document.getElementById('pk1-name-3').textContent = state.passkeys[0].deviceName;
+      document.getElementById('pk2-name-3').textContent = deviceName;
+      showPane(3);
+    }
+  }, 2000);
+}
+
+// ── Custom Services ───────────────────────────────────────────────────────────
+
+// ── Built-in services ─────────────────────────────────────────────────────────
+
+const BUILTIN_SERVICES = [
+  { id: 'anthropic', name: 'Anthropic', sub: 'Claude', icon: '🤖', placeholder: 'sk-ant-api03-...', upstream: 'https://api.anthropic.com', auth: { type: 'header', name: 'x-api-key' } },
+  { id: 'openai', name: 'OpenAI', sub: 'GPT / DALL·E', icon: '🧠', placeholder: 'sk-...', upstream: 'https://api.openai.com', auth: { type: 'header', name: 'Authorization', prefix: 'Bearer' } },
+  { id: 'google', name: 'Google AI', sub: 'Gemini', icon: '💎', placeholder: 'AIza...', upstream: 'https://generativelanguage.googleapis.com', auth: { type: 'query', name: 'key' } },
+  { id: 'brave', name: 'Brave Search', sub: 'Web search API', icon: '🦁', placeholder: 'BSA...', upstream: 'https://api.search.brave.com', auth: { type: 'header', name: 'X-Subscription-Token' } },
+  { id: 'groq', name: 'Groq', sub: 'Fast inference', icon: '⚡', placeholder: 'gsk_...', upstream: 'https://api.groq.com', auth: { type: 'header', name: 'Authorization', prefix: 'Bearer' } },
+  { id: 'deepseek', name: 'DeepSeek', sub: 'DeepSeek API', icon: '🐋', placeholder: 'sk-...', upstream: 'https://api.deepseek.com', auth: { type: 'header', name: 'Authorization', prefix: 'Bearer' } },
+];
+
+function renderServiceGrid() {
+  const grid = document.getElementById('svc-grid');
+  grid.innerHTML = BUILTIN_SERVICES.map(svc => `
+    <div class="svc-card" id="svc-${svc.id}" data-svc-id="${svc.id}">
+      <div class="svc-header" onclick="toggleService('${svc.id}')">
+        <span class="svc-icon">${svc.icon}</span>
+        <span class="svc-name">${svc.name} <span style="font-weight:400;color:var(--muted);font-size:0.8rem;">${svc.sub}</span></span>
+        <div class="svc-toggle"></div>
+      </div>
+      <div class="svc-body">
+        <div class="input-wrap">
+          <input type="text" id="key-${svc.id}" placeholder="${svc.placeholder}"
+            autocomplete="off" data-1p-ignore data-lpignore="true" data-form-type="other"
+            style="-webkit-text-security:disc;">
+          <button type="button" class="toggle-vis" onclick="toggleKey(this)">👁</button>
+        </div>
+      </div>
+    </div>
+  `).join('');
+}
+
+function toggleService(id) {
+  const card = document.getElementById('svc-' + id);
+  card.classList.toggle('active');
+  if (card.classList.contains('active')) {
+    setTimeout(() => card.querySelector('input')?.focus(), 100);
+  }
+}
+
+function toggleKey(btn) {
+  const input = btn.previousElementSibling;
+  if (input.style.webkitTextSecurity === 'disc' || input.type === 'password') {
+    input.style.webkitTextSecurity = 'none';
+    input.type = 'text';
+    btn.textContent = '🙈';
+  } else {
+    input.style.webkitTextSecurity = 'disc';
+    input.type = 'text'; // keep as text to avoid 1P interference
+    btn.textContent = '👁';
+  }
+}
+
+let _cid = 0;
+function addCustom() {
+  const id = ++_cid;
+  const row = document.createElement('div');
+  row.className = 'custom-row';
+  row.id = 'cr-' + id;
+  row.innerHTML = `
+    <input type="text"     id="cn-${id}" placeholder="Service name" autocomplete="off" data-1p-ignore data-lpignore="true">
+    <input type="text"     id="cu-${id}" placeholder="https://api.example.com" autocomplete="off" data-1p-ignore data-lpignore="true">
+    <div class="input-wrap"><input type="text" id="ck-${id}" placeholder="API key" autocomplete="off" data-1p-ignore data-lpignore="true" data-form-type="other" style="-webkit-text-security:disc;"><button type="button" class="toggle-vis" onclick="toggleKey(this)">👁</button></div>
+    <button class="btn-rm" onclick="document.getElementById('cr-${id}').remove()">✕</button>
+  `;
+  document.getElementById('custom-fields').appendChild(row);
+}
+
+function buildSecrets() {
+  const services = {};
+  state.configuredServiceIds = [];
+
+  // Built-in services
+  for (const svc of BUILTIN_SERVICES) {
+    const card = document.getElementById('svc-' + svc.id);
+    if (!card?.classList.contains('active')) continue;
+    const key = document.getElementById('key-' + svc.id)?.value?.trim();
+    if (!key) continue;
+    services[svc.id] = {
+      upstream: svc.upstream,
+      auth: { ...svc.auth, value: key },
+    };
+    state.configuredServiceIds.push(svc.id);
+  }
+
+  // Custom rows
+  for (let i = 1; i <= _cid; i++) {
+    const nameEl = document.getElementById('cn-' + i);
+    const urlEl  = document.getElementById('cu-' + i);
+    const keyEl  = document.getElementById('ck-' + i);
+    if (!nameEl || !keyEl || !urlEl) continue;
+    const name = nameEl.value.trim();
+    const url  = urlEl.value.trim();
+    const key  = keyEl.value.trim();
+    if (name && key) {
+      const slug = name.toLowerCase().replace(/[^a-z0-9]/g, '_');
+      services[slug] = {
+        upstream: url || '',
+        auth: { type: 'header', name: 'Authorization', prefix: 'Bearer ', value: key },
+      };
+      state.configuredServiceIds.push(slug);
+    }
+  }
+
+  return { version: 1, services };
+}
+
+function renderOpenClawConfig() {
+  const PORT = 9999;
+  const providers = {};
+  for (const id of state.configuredServiceIds) {
+    const svc = BUILTIN_SERVICES.find(s => s.id === id);
+    const dummyKey = svc?.placeholder?.startsWith('sk-') ? 'sk-dummy-safeclaw-protected' : 'dummy-safeclaw-protected';
+    providers[id] = {
+      apiKey: dummyKey,
+      baseUrl: `http://127.0.0.1:${PORT}/${id}`,
+    };
+  }
+  const config = JSON.stringify({ providers }, null, 2);
+  document.getElementById('openclaw-config-pre').textContent = config;
+  if (state.configuredServiceIds.length > 0) {
+    document.getElementById('openclaw-config-wrap').classList.remove('hidden');
+  }
+}
+
+async function copyOpenClawConfig() {
+  const text = document.getElementById('openclaw-config-pre').textContent;
+  const btn = document.getElementById('btn-copy-config');
+  try {
+    await navigator.clipboard.writeText(text);
+    btn.textContent = '✓ Copied!';
+    setTimeout(() => { btn.textContent = '📋 Copy to clipboard'; }, 2000);
+  } catch {
+    btn.textContent = '❌ Copy failed';
+    setTimeout(() => { btn.textContent = '📋 Copy to clipboard'; }, 2000);
+  }
+}
+
+// ── Submit ────────────────────────────────────────────────────────────────────
+
+async function goToSubmit() {
+  if (!state.passkeys[0] || !state.passkeys[1]) {
+    setStatus('status3', '❌ Both passkeys must be registered before continuing.', 'error');
+    return;
+  }
+  setStepDone(3);
+  setStepActive(4);
+  showPane(4);
+  await doSubmit();
+}
+
+async function doSubmit() {
+  const msg = document.getElementById('submit-msg');
+  try {
+    msg.textContent = 'Fetching server public key…';
+    const vmPkRes = await fetch('/vmPk');
+    if (!vmPkRes.ok) throw new Error(`vmPk fetch failed: HTTP ${vmPkRes.status}`);
+    const { vmPk } = await vmPkRes.json();
+    state.vmPk = vmPk;
+
+    msg.textContent = 'Building encrypted payload…';
+    const nonce = toBase64(crypto.getRandomValues(new Uint8Array(32)));
+    const secrets = buildSecrets();
+    const payload = {
+      nonce,
+      passkeys: state.passkeys.map(pk => ({
+        credentialId: pk.credentialId,
+        deviceName: pk.deviceName,
+        x: pk.x,
+        y: pk.y,
+      })),
+      userKeys: state.passkeys.map(pk => toBase64(pk.prfKey)),
+      secrets,
+    };
+
+    msg.textContent = 'Encrypting with server public key…';
+    const plaintext = new TextEncoder().encode(JSON.stringify(payload));
+    const sealed = await e2eEncryptBrowser(plaintext, state.vmPk);
+    const payloadB64 = toBase64(sealed);
+
+    msg.textContent = 'Uploading to server…';
+    const res = await fetch('/setup', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        payload: payloadB64,
+        assertions: state.passkeys.map(pk => pk.assertion),
+      }),
+    });
+
+    if (!res.ok) {
+      const errData = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
+      throw new Error(errData.error || `HTTP ${res.status}`);
+    }
+
+    // Zeroize sensitive data
+    state.passkeys.forEach(pk => pk.prfKey.fill(0));
+    state.passkeys = [];
+
+    setStepDone(4);
+    renderOpenClawConfig();
+    showPane('success');
+
+  } catch (e) {
+    document.getElementById('submit-msg').textContent = '';
+    document.getElementById('pane-4').insertAdjacentHTML('beforeend', `
+      <div class="alert alert-error" style="margin-top:12px;" id="submit-error">
+        ❌ Setup failed: ${e.message}
+      </div>
+      <div style="margin-top:16px;display:flex;gap:10px;">
+        <button class="btn btn-primary" onclick="document.getElementById('submit-error')?.remove();this.parentElement.remove();doSubmit();">Retry</button>
+        <button class="btn btn-outline" onclick="showPane(3);setStepActive(3);">Back to API Keys</button>
+      </div>
+    `);
+  }
+}
+</script>
+</body>
+</html>

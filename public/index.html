@@ -1,0 +1,291 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SafeClaw — Secure API Proxy</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🔒</text></svg>">
+  <style>
+    :root {
+      --bg: #0f0e17;
+      --surface: #1e1c2e;
+      --surface2: #2a2840;
+      --accent: #7c6af7;
+      --accent-hover: #9b8dff;
+      --text: #f0eeff;
+      --muted: #8f8db8;
+      --success: #4ade80;
+      --error: #f87171;
+      --border: rgba(255,255,255,0.07);
+      --radius: 12px;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+    }
+
+    /* Nav */
+    .nav {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 0 24px;
+      height: 56px;
+      display: flex; align-items: center; justify-content: space-between;
+      position: sticky; top: 0; z-index: 50;
+    }
+    .nav-left { display: flex; align-items: center; gap: 10px; }
+    .nav-logo { font-size: 1.25rem; text-decoration: none; }
+    .nav h1 { font-size: 1rem; font-weight: 700; }
+    .nav h1 a { color: var(--text); text-decoration: none; }
+    .nav-links { display: flex; align-items: center; gap: 6px; }
+    .nav-links a {
+      color: var(--muted); text-decoration: none;
+      font-size: 0.8rem; font-weight: 500;
+      padding: 6px 12px; border-radius: 6px;
+      transition: all 0.2s;
+    }
+    .nav-links a:hover { color: var(--text); background: var(--surface2); }
+    .nav-links a.active { color: var(--accent); background: rgba(124,106,247,0.1); }
+    .badge-sm {
+      display: inline-flex; align-items: center; gap: 4px;
+      padding: 3px 8px; border-radius: 12px;
+      font-size: 0.7rem; font-weight: 700; margin-left: 8px;
+    }
+    .badge-locked { background: rgba(248,113,113,0.15); color: var(--error); }
+    .badge-unlocked { background: rgba(74,222,128,0.15); color: var(--success); }
+
+    /* Hero */
+    .hero {
+      display: flex; flex-direction: column; align-items: center;
+      text-align: center; padding: 80px 24px 60px;
+    }
+    .hero-icon { font-size: 4rem; margin-bottom: 24px; }
+    .hero h2 {
+      font-size: 2rem; font-weight: 800;
+      letter-spacing: -0.03em; line-height: 1.2;
+      margin-bottom: 12px;
+    }
+    .hero .tagline {
+      color: var(--muted); font-size: 1rem; line-height: 1.6;
+      max-width: 480px; margin-bottom: 40px;
+    }
+    .hero-actions { display: flex; gap: 12px; flex-wrap: wrap; justify-content: center; }
+
+    .btn {
+      display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+      padding: 13px 28px; border-radius: 8px; border: none;
+      font-size: 0.95rem; font-weight: 600;
+      cursor: pointer; transition: all 0.2s; text-decoration: none;
+    }
+    .btn-primary { background: var(--accent); color: #fff; }
+    .btn-primary:hover { background: var(--accent-hover); transform: translateY(-1px); box-shadow: 0 6px 20px rgba(124,106,247,0.3); }
+    .btn-ghost { background: transparent; border: 1px solid var(--border); color: var(--muted); }
+    .btn-ghost:hover { border-color: var(--accent); color: var(--accent); }
+
+    /* Features */
+    .features {
+      max-width: 800px; margin: 0 auto;
+      padding: 0 24px 80px;
+      display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 16px;
+    }
+    .feature-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 24px;
+    }
+    .feature-icon { font-size: 1.5rem; margin-bottom: 12px; }
+    .feature-card h3 { font-size: 0.95rem; font-weight: 700; margin-bottom: 6px; }
+    .feature-card p { color: var(--muted); font-size: 0.825rem; line-height: 1.6; }
+
+    /* Status bar */
+    .status-bar {
+      max-width: 800px; margin: 0 auto 40px;
+      padding: 0 24px;
+    }
+    .status-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 20px 24px;
+      display: flex; align-items: center; gap: 16px;
+    }
+    .status-icon { font-size: 2rem; }
+    .status-info { flex: 1; }
+    .status-title { font-weight: 700; font-size: 0.95rem; }
+    .status-desc { color: var(--muted); font-size: 0.8rem; margin-top: 2px; }
+    .status-actions { display: flex; gap: 8px; }
+    .btn-sm {
+      padding: 8px 16px; border-radius: 7px; border: none;
+      font-size: 0.8rem; font-weight: 600;
+      cursor: pointer; transition: all 0.2s; text-decoration: none;
+      display: inline-flex; align-items: center; gap: 6px;
+    }
+    .btn-sm.accent { background: var(--accent); color: #fff; }
+    .btn-sm.accent:hover { background: var(--accent-hover); }
+    .btn-sm.ghost { background: transparent; border: 1px solid var(--border); color: var(--muted); }
+    .btn-sm.ghost:hover { border-color: var(--accent); color: var(--accent); }
+
+    .footer {
+      text-align: center; padding: 40px 24px;
+      color: var(--muted); font-size: 0.75rem;
+      border-top: 1px solid var(--border);
+    }
+    .footer a { color: var(--accent); text-decoration: none; }
+
+    @media (max-width: 500px) {
+      .hero { padding: 48px 16px 40px; }
+      .hero h2 { font-size: 1.5rem; }
+      .hero-actions { flex-direction: column; width: 100%; }
+      .btn { width: 100%; }
+    }
+  </style>
+</head>
+<body>
+
+<nav class="nav">
+  <div class="nav-left">
+    <span class="nav-logo">🔒</span>
+    <h1><a href="/">SafeClaw</a></h1>
+    <span class="badge-sm badge-locked" id="nav-badge" style="display:none;"></span>
+  </div>
+  <div class="nav-links">
+    <a href="/" class="active">Home</a>
+    <a href="/admin.html">Dashboard</a>
+    <a href="/setup.html">Setup</a>
+    <a href="/unlock.html">Unlock</a>
+  </div>
+</nav>
+
+<section class="hero">
+  <div class="hero-icon">🛡️</div>
+  <h2>Your API Keys,<br>Your Rules</h2>
+  <p class="tagline">
+    SafeClaw is a passkey-secured proxy that keeps your API credentials encrypted at rest
+    and invisible to the agents that use them. Zero plaintext. Zero trust required.
+  </p>
+  <div class="hero-actions" id="hero-actions">
+    <a href="/setup.html" class="btn btn-primary">⚙️ Get Started</a>
+    <a href="/admin.html" class="btn btn-ghost">📊 Dashboard</a>
+  </div>
+</section>
+
+<div class="status-bar" id="status-bar" style="display:none;">
+  <div class="status-card" id="status-card"></div>
+</div>
+
+<section class="features">
+  <div class="feature-card">
+    <div class="feature-icon">🔑</div>
+    <h3>Passkey Encryption</h3>
+    <p>Your vault is sealed with WebAuthn PRF — only your biometric can unlock it. No passwords, no master keys.</p>
+  </div>
+  <div class="feature-card">
+    <div class="feature-icon">🔐</div>
+    <h3>End-to-End Encrypted</h3>
+    <p>Credentials are encrypted in your browser before transmission. The server never sees plaintext keys.</p>
+  </div>
+  <div class="feature-card">
+    <div class="feature-icon">🤖</div>
+    <h3>Agent-Invisible</h3>
+    <p>Agents route through the proxy and get responses — but never see, store, or log your actual API keys.</p>
+  </div>
+  <div class="feature-card">
+    <div class="feature-icon">🧊</div>
+    <h3>Lock Anytime</h3>
+    <p>One tap to lock the vault. Secrets are wiped from memory and the proxy returns safe placeholder responses.</p>
+  </div>
+  <div class="feature-card">
+    <div class="feature-icon">🔄</div>
+    <h3>Dual Passkey Backup</h3>
+    <p>Register two passkeys on different devices. Lose one, unlock with the other — no lockout risk.</p>
+  </div>
+  <div class="feature-card">
+    <div class="feature-icon">⚡</div>
+    <h3>Transparent Proxy</h3>
+    <p>SSE streaming, all HTTP methods, auth injection — your tools work exactly the same, just more secure.</p>
+  </div>
+</section>
+
+<footer class="footer">
+  🔒 SafeClaw — Secure API Proxy for OpenClaw<br>
+  <a href="https://github.com/xhyumiracle/safeclaw" target="_blank">GitHub</a>
+</footer>
+
+<script>
+'use strict';
+(async function() {
+  try {
+    const res = await fetch('/admin/status');
+    if (!res.ok) return;
+    const data = await res.json();
+    
+    // Update nav badge
+    const badge = document.getElementById('nav-badge');
+    badge.style.display = 'inline-flex';
+    if (data.locked) {
+      badge.className = 'badge-sm badge-locked';
+      badge.innerHTML = '<span style="width:5px;height:5px;border-radius:50%;background:currentColor;"></span> Locked';
+    } else {
+      badge.className = 'badge-sm badge-unlocked';
+      badge.innerHTML = '<span style="width:5px;height:5px;border-radius:50%;background:currentColor;"></span> Unlocked';
+    }
+
+    // Show status bar
+    const bar = document.getElementById('status-bar');
+    const card = document.getElementById('status-card');
+    bar.style.display = 'block';
+
+    const hasVault = data.passkeys && data.passkeys.length > 0;
+    
+    if (!hasVault) {
+      card.innerHTML = `
+        <span class="status-icon">📦</span>
+        <div class="status-info">
+          <div class="status-title">No Vault Configured</div>
+          <div class="status-desc">Register your passkeys and add API credentials to get started.</div>
+        </div>
+        <div class="status-actions">
+          <a href="/setup.html" class="btn-sm accent">⚙️ Setup</a>
+        </div>
+      `;
+    } else if (data.locked) {
+      card.innerHTML = `
+        <span class="status-icon">🔒</span>
+        <div class="status-info">
+          <div class="status-title">Vault Locked</div>
+          <div class="status-desc">${data.services.length || 0} service(s) configured · ${data.passkeys.length} passkey(s) registered</div>
+        </div>
+        <div class="status-actions">
+          <a href="/unlock.html" class="btn-sm accent">🔓 Unlock</a>
+          <a href="/admin.html" class="btn-sm ghost">Dashboard</a>
+        </div>
+      `;
+    } else {
+      card.innerHTML = `
+        <span class="status-icon">🟢</span>
+        <div class="status-info">
+          <div class="status-title">Proxy Active</div>
+          <div class="status-desc">${data.services.length} service(s) proxying · Uptime ${formatUptime(data.uptime)}</div>
+        </div>
+        <div class="status-actions">
+          <a href="/admin.html" class="btn-sm accent">📊 Dashboard</a>
+        </div>
+      `;
+    }
+  } catch {}
+
+  function formatUptime(s) {
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    if (h > 0) return h + 'h ' + m + 'm';
+    return m + 'm';
+  }
+})();
+</script>
+</body>
+</html>
