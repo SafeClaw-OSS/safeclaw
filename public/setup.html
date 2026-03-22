@@ -404,6 +404,7 @@
 
 </div><!-- /card -->
 
+<script src="safeclaw-client.js"></script>
 <script>
 'use strict';
 
@@ -414,80 +415,6 @@ const state = {
   configuredServiceIds: [],  // service slugs configured in step 3
 };
 
-// ── Utilities ────────────────────────────────────────────────────────────────
-
-function toBase64(u8) {
-  let s = '';
-  for (let i = 0; i < u8.byteLength; i++) s += String.fromCharCode(u8[i]);
-  return btoa(s);
-}
-
-// ── WebCrypto E2E Encrypt (P-256 ECDH + HKDF + AES-256-GCM) ─────────────────
-
-async function e2eEncryptBrowser(plaintext, vmPkJwk) {
-  // Generate ephemeral P-256 keypair
-  const ephemeral = await crypto.subtle.generateKey(
-    { name: 'ECDH', namedCurve: 'P-256' },
-    true,
-    ['deriveBits']
-  );
-
-  // Import server public key
-  const serverPub = await crypto.subtle.importKey(
-    'jwk', vmPkJwk, { name: 'ECDH', namedCurve: 'P-256' }, false, []
-  );
-
-  // ECDH → shared secret
-  const sharedBits = await crypto.subtle.deriveBits(
-    { name: 'ECDH', public: serverPub },
-    ephemeral.privateKey,
-    256
-  );
-
-  // HKDF → AES key
-  const hkdfKey = await crypto.subtle.importKey(
-    'raw', sharedBits, 'HKDF', false, ['deriveBits']
-  );
-  const aesKeyBits = await crypto.subtle.deriveBits(
-    {
-      name: 'HKDF',
-      hash: 'SHA-256',
-      salt: new Uint8Array(32),
-      info: new TextEncoder().encode('safeclaw-e2e'),
-    },
-    hkdfKey,
-    256
-  );
-  const aesKey = await crypto.subtle.importKey(
-    'raw', aesKeyBits, { name: 'AES-GCM' }, false, ['encrypt']
-  );
-
-  // Encrypt
-  const iv = crypto.getRandomValues(new Uint8Array(12));
-  const ct = await crypto.subtle.encrypt(
-    { name: 'AES-GCM', iv },
-    aesKey,
-    plaintext
-  );
-
-  // Export ephemeral public key as JWK
-  const epk = await crypto.subtle.exportKey('jwk', ephemeral.publicKey);
-
-  // Wire format: JSON string
-  const wire = JSON.stringify({
-    epk,
-    iv: toBase64(iv),
-    ct: toBase64(new Uint8Array(ct)),
-  });
-  return new TextEncoder().encode(wire);
-}
-
-async function getPrfSalt() {
-  // SHA-256 of 'safeclaw-vault-v1' → 32 bytes required by WebAuthn PRF spec
-  const raw = new TextEncoder().encode('safeclaw-vault-v1');
-  const hash = await crypto.subtle.digest('SHA-256', raw);
-  return new Uint8Array(hash);
-}
 
 function setStatus(id, html, type) {
   const el = document.getElementById(id);
@@ -571,11 +498,11 @@ async function registerPasskey(num) {
 
     // 1. Try using an existing passkey (get with PRF, no allowCredentials filter)
     try {
-      const result = await derivePRFDiscoverable();
+      const result = await SafeClaw.derivePRFDiscoverable();
       if (result) {
-        prfFirst = result.prf;
+        prfFirst = result.userKey;
         credentialId = result.credentialId;
-        assertionData = result.assertionData;
+        assertionData = result.assertion;
       }
     } catch (existingErr) {
       if (existingErr.name !== 'NotAllowedError') throw existingErr;
@@ -615,8 +542,8 @@ async function registerPasskey(num) {
       if (spki) {
         const spkiBuf = new Uint8Array(spki);
         // P-256 SPKI last 64 bytes = x(32) || y(32) (uncompressed EC point without 04 prefix)
-        publicKeyXY.x = toBase64(spkiBuf.slice(spkiBuf.length - 64, spkiBuf.length - 32));
-        publicKeyXY.y = toBase64(spkiBuf.slice(spkiBuf.length - 32));
+        publicKeyXY.x = SafeClaw.toBase64(spkiBuf.slice(spkiBuf.length - 64, spkiBuf.length - 32));
+        publicKeyXY.y = SafeClaw.toBase64(spkiBuf.slice(spkiBuf.length - 32));
       }
 
       // Derive PRF from the new credential
@@ -682,16 +609,8 @@ async function registerPasskey(num) {
 
 // ── PRF Helpers ───────────────────────────────────────────────────────────────
 
-function assertionToData(assertion) {
-  return {
-    authenticatorData: toBase64(new Uint8Array(assertion.response.authenticatorData)),
-    clientDataJSON: toBase64(new Uint8Array(assertion.response.clientDataJSON)),
-    signature: toBase64(new Uint8Array(assertion.response.signature)),
-  };
-}
-
 async function derivePRF(credential) {
-  const prfSalt = await getPrfSalt();
+  const prfSalt = SafeClaw.getPrfSalt();
   const assertion = await navigator.credentials.get({
     publicKey: {
       challenge: crypto.getRandomValues(new Uint8Array(32)),
@@ -703,24 +622,7 @@ async function derivePRF(credential) {
   const getExt = assertion.getClientExtensionResults();
   const prf = getExt?.prf?.results?.first || null;
   if (!prf) return null;
-  return { prf, assertionData: assertionToData(assertion) };
-}
-
-// Discoverable get() — no allowCredentials, user picks from authenticator
-async function derivePRFDiscoverable() {
-  const prfSalt = await getPrfSalt();
-  const assertion = await navigator.credentials.get({
-    publicKey: {
-      challenge: crypto.getRandomValues(new Uint8Array(32)),
-      rpId: window.location.hostname,
-      userVerification: 'required',
-      extensions: { prf: { eval: { first: prfSalt } } },
-    },
-  });
-  const getExt = assertion.getClientExtensionResults();
-  const prf = getExt?.prf?.results?.first || null;
-  if (!prf) return null;
-  return { prf, credentialId: assertion.id, assertionData: assertionToData(assertion) };
+  return { prf, assertionData: SafeClaw.assertionToData(assertion) };
 }
 
 function showPRFError(statusId, btn, num) {
@@ -927,7 +829,7 @@ async function doSubmit() {
     state.vmPk = vmPk;
 
     msg.textContent = 'Building encrypted payload…';
-    const nonce = toBase64(crypto.getRandomValues(new Uint8Array(32)));
+    const nonce = SafeClaw.toBase64(crypto.getRandomValues(new Uint8Array(32)));
     const secrets = buildSecrets();
     const payload = {
       nonce,
@@ -937,14 +839,14 @@ async function doSubmit() {
         x: pk.x,
         y: pk.y,
       })),
-      userKeys: state.passkeys.map(pk => toBase64(pk.prfKey)),
+      userKeys: state.passkeys.map(pk => SafeClaw.toBase64(pk.prfKey)),
       secrets,
     };
 
     msg.textContent = 'Encrypting with server public key…';
     const plaintext = new TextEncoder().encode(JSON.stringify(payload));
-    const sealed = await e2eEncryptBrowser(plaintext, state.vmPk);
-    const payloadB64 = toBase64(sealed);
+    const sealed = await SafeClaw.e2eEncrypt(plaintext, state.vmPk);
+    const payloadB64 = SafeClaw.toBase64(sealed);
 
     msg.textContent = 'Uploading to server…';
     const res = await fetch('/setup', {

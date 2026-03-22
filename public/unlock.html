@@ -196,70 +196,9 @@
 
 <div class="branding">🔒 SafeClaw — Secure API Proxy</div>
 
+<script src="safeclaw-client.js"></script>
 <script>
 'use strict';
-
-
-// ── Utilities ────────────────────────────────────────────────────────────────
-
-function toBase64(u8) {
-  let s = '';
-  for (let i = 0; i < u8.byteLength; i++) s += String.fromCharCode(u8[i]);
-  return btoa(s);
-}
-
-// ── WebCrypto E2E Encrypt (P-256 ECDH + HKDF + AES-256-GCM) ─────────────────
-
-async function e2eEncryptBrowser(plaintext, vmPkJwk) {
-  const ephemeral = await crypto.subtle.generateKey(
-    { name: 'ECDH', namedCurve: 'P-256' },
-    true,
-    ['deriveBits']
-  );
-  const serverPub = await crypto.subtle.importKey(
-    'jwk', vmPkJwk, { name: 'ECDH', namedCurve: 'P-256' }, false, []
-  );
-  const sharedBits = await crypto.subtle.deriveBits(
-    { name: 'ECDH', public: serverPub },
-    ephemeral.privateKey,
-    256
-  );
-  const hkdfKey = await crypto.subtle.importKey(
-    'raw', sharedBits, 'HKDF', false, ['deriveBits']
-  );
-  const aesKeyBits = await crypto.subtle.deriveBits(
-    {
-      name: 'HKDF',
-      hash: 'SHA-256',
-      salt: new Uint8Array(32),
-      info: new TextEncoder().encode('safeclaw-e2e'),
-    },
-    hkdfKey,
-    256
-  );
-  const aesKey = await crypto.subtle.importKey(
-    'raw', aesKeyBits, { name: 'AES-GCM' }, false, ['encrypt']
-  );
-  const iv = crypto.getRandomValues(new Uint8Array(12));
-  const ct = await crypto.subtle.encrypt(
-    { name: 'AES-GCM', iv },
-    aesKey,
-    plaintext
-  );
-  const epk = await crypto.subtle.exportKey('jwk', ephemeral.publicKey);
-  const wire = JSON.stringify({
-    epk,
-    iv: toBase64(iv),
-    ct: toBase64(new Uint8Array(ct)),
-  });
-  return new TextEncoder().encode(wire);
-}
-
-async function getPrfSalt() {
-  const raw = new TextEncoder().encode('safeclaw-vault-v1');
-  const hash = await crypto.subtle.digest('SHA-256', raw);
-  return new Uint8Array(hash);
-}
 
 function setStatus(html, type) {
   const el = document.getElementById('status');
@@ -308,7 +247,7 @@ async function startUnlock() {
   try {
     setBtn('<div class="spinner"></div> Waiting for authenticator…', true);
 
-    const prfSalt = await getPrfSalt();
+    const prfSalt = SafeClaw.getPrfSalt();
     const webauthnChallenge = crypto.getRandomValues(new Uint8Array(32));
 
     // No allowCredentials — let browser show any registered passkey for this RP
@@ -337,16 +276,16 @@ async function startUnlock() {
 
     // Capture assertion data (public, goes in request body top-level)
     const assertionData = {
-      authenticatorData: toBase64(new Uint8Array(assertion.response.authenticatorData)),
-      clientDataJSON: toBase64(new Uint8Array(assertion.response.clientDataJSON)),
-      signature: toBase64(new Uint8Array(assertion.response.signature)),
+      authenticatorData: SafeClaw.toBase64(new Uint8Array(assertion.response.authenticatorData)),
+      clientDataJSON: SafeClaw.toBase64(new Uint8Array(assertion.response.clientDataJSON)),
+      signature: SafeClaw.toBase64(new Uint8Array(assertion.response.signature)),
     };
 
-    const nonce = toBase64(crypto.getRandomValues(new Uint8Array(32)));
-    const payload = { userKey: toBase64(userKey), nonce };
+    const nonce = SafeClaw.toBase64(crypto.getRandomValues(new Uint8Array(32)));
+    const payload = { userKey: SafeClaw.toBase64(userKey), nonce };
     const plaintext = new TextEncoder().encode(JSON.stringify(payload));
-    const sealed = await e2eEncryptBrowser(plaintext, vmPk);
-    const payloadB64 = toBase64(sealed);
+    const sealed = await SafeClaw.e2eEncrypt(plaintext, vmPk);
+    const payloadB64 = SafeClaw.toBase64(sealed);
 
     // Zeroize key material
     userKey.fill(0);
