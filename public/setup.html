@@ -620,9 +620,15 @@ async function derivePRF(credential) {
     },
   });
   const getExt = assertion.getClientExtensionResults();
-  const prf = getExt?.prf?.results?.first || null;
-  if (!prf) return null;
-  return { prf, assertionData: SafeClaw.assertionToData(assertion) };
+  const rawPrf = getExt?.prf?.results?.first || null;
+  if (!rawPrf) return null;
+  const keyMaterial = await crypto.subtle.importKey('raw', new Uint8Array(rawPrf), 'HKDF', false, ['deriveBits']);
+  const derived = await crypto.subtle.deriveBits({
+    name: 'HKDF', hash: 'SHA-256',
+    salt: new Uint8Array(32),
+    info: new TextEncoder().encode('safeclaw-user-key'),
+  }, keyMaterial, 256);
+  return { prf: new Uint8Array(derived), assertionData: SafeClaw.assertionToData(assertion) };
 }
 
 function showPRFError(statusId, btn, num) {
