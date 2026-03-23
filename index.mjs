@@ -7,8 +7,8 @@ import { createProxy } from './lib/proxy.mjs'
 import { loadOrCreateVmKeypair } from './lib/crypto.mjs'
 
 const DATA_DIR = process.env.SAFECLAW_DATA || './data'
-const SERVER_PORT = parseInt(process.env.SAFECLAW_PORT || '8443')
-const PROXY_PORT = parseInt(process.env.SAFECLAW_PROXY_PORT || '9999')
+const SERVER_PORT = parseInt(process.env.SAFECLAW_PORT || '23294')  // 0x5AFE = "SAFE"
+const PROXY_PORT = parseInt(process.env.SAFECLAW_PROXY_PORT || '23295')  // 0x5AFF = "SAFE+1"
 
 async function main() {
   console.log('[safeclaw] starting...')
