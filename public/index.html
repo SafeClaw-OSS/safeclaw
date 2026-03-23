@@ -155,9 +155,9 @@
   </div>
   <div class="nav-links">
     <a href="/" class="active">Home</a>
-    <a href="/admin.html">Dashboard</a>
-    <a href="/setup.html">Setup</a>
-    <a href="/unlock.html">Unlock</a>
+    <a href="/admin">Dashboard</a>
+    <a href="/setup">Setup</a>
+    <a href="/unlock">Unlock</a>
   </div>
 </nav>
 
@@ -169,8 +169,8 @@
     and invisible to the agents that use them. Zero plaintext. Zero trust required.
   </p>
   <div class="hero-actions" id="hero-actions">
-    <a href="/setup.html" class="btn btn-primary">⚙️ Get Started</a>
-    <a href="/admin.html" class="btn btn-ghost">📊 Dashboard</a>
+    <a href="/setup" class="btn btn-primary">⚙️ Get Started</a>
+    <a href="/admin" class="btn btn-ghost">📊 Dashboard</a>
   </div>
 </section>
 
@@ -250,7 +250,7 @@
           <div class="status-desc">Register your passkeys and add API credentials to get started.</div>
         </div>
         <div class="status-actions">
-          <a href="/setup.html" class="btn-sm accent">⚙️ Setup</a>
+          <a href="/setup" class="btn-sm accent">⚙️ Setup</a>
         </div>
       `;
     } else if (data.locked) {
@@ -261,8 +261,8 @@
           <div class="status-desc">${data.services.length || 0} service(s) configured · ${data.passkeys.length} passkey(s) registered</div>
         </div>
         <div class="status-actions">
-          <a href="/unlock.html" class="btn-sm accent">🔓 Unlock</a>
-          <a href="/admin.html" class="btn-sm ghost">Dashboard</a>
+          <a href="/unlock" class="btn-sm accent">🔓 Unlock</a>
+          <a href="/admin" class="btn-sm ghost">Dashboard</a>
         </div>
       `;
     } else {
@@ -273,7 +273,7 @@
           <div class="status-desc">${data.services.length} service(s) proxying · Uptime ${formatUptime(data.uptime)}</div>
         </div>
         <div class="status-actions">
-          <a href="/admin.html" class="btn-sm accent">📊 Dashboard</a>
+          <a href="/admin" class="btn-sm accent">📊 Dashboard</a>
         </div>
       `;
     }
