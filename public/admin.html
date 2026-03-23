@@ -771,36 +771,6 @@ function cancelEdit(svc) {
   }
 }
 
-// ── Seal SSH ──────────────────────────────────────────────────────────────────
-
-;
-    const plaintext = new TextEncoder().encode(JSON.stringify(payload));
-    const sealed = await SafeClaw.e2eEncrypt(plaintext, vmPk);
-
-    userKey.fill(0);
-    nonce.fill(0);
-
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ payload: SafeClaw.toBase64(sealed), assertion }),
-    });
-
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
-      throw new Error(err.error || `HTTP ${res.status}`);
-    }
-
-    btn.querySelector('.ab-icon').textContent = '✅';
-  } catch (e) {
-    btn.disabled = false;
-    btn.querySelector('.ab-icon').textContent = '🔐';
-    const msg = e.name === 'NotAllowedError'
-      ? 'Authentication cancelled or timed out.'
-      : e.message;
-    showToast(`❌ ${msg}`, 'error');
-  }
-}
-
 async function submitEdit(svc) {
   const input = document.getElementById(`edit-input-${svc}`);
   const saveBtn = document.getElementById(`edit-save-${svc}`);
