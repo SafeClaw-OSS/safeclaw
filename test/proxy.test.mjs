@@ -106,7 +106,7 @@ describe('proxy', () => {
   let proxy;
 
   before(async () => {
-    proxy = await createProxy({ port: 0, dataDir: '/tmp', serverPort: 8443 });
+    proxy = await createProxy({ port: 0, dataDir: '/tmp', serverPort: 23294 });
   });
 
   after(async () => {

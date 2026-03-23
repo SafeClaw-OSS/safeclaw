@@ -782,7 +782,7 @@ function buildSecrets() {
 }
 
 function renderOpenClawConfig() {
-  const PORT = 9999;
+  const PORT = 23295;  // 0x5AFF = "SAFE+1"
   const providers = {};
   for (const id of state.configuredServiceIds) {
     const svc = BUILTIN_SERVICES.find(s => s.id === id);
