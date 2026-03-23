@@ -10,7 +10,9 @@ window.SafeClaw = (() => {
   }
 
   function fromBase64(b64) {
-    const s = atob(b64);
+    // Accept both standard base64 and base64url
+    const std = b64.replace(/-/g, '+').replace(/_/g, '/');
+    const s = atob(std);
     const u8 = new Uint8Array(s.length);
     for (let i = 0; i < s.length; i++) u8[i] = s.charCodeAt(i);
     return u8;
