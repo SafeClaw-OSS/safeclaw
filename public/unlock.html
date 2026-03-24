@@ -290,7 +290,7 @@ async function startUnlock() {
     };
 
     const nonce = SafeClaw.toBase64(crypto.getRandomValues(new Uint8Array(32)));
-    const payload = { userKey: SafeClaw.toBase64(userKey), nonce };
+    const payload = { userKey: SafeClaw.toBase64(userKey), nonce, credentialId, assertion: assertionData };
     const plaintext = new TextEncoder().encode(JSON.stringify(payload));
     const sealed = await SafeClaw.e2eEncrypt(plaintext, vmPk);
     const payloadB64 = SafeClaw.toBase64(sealed);
@@ -303,7 +303,7 @@ async function startUnlock() {
     const res = await fetch('/unlock', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ payload: payloadB64, credentialId, assertion: assertionData }),
+      body: JSON.stringify({ payload: payloadB64 }),
     });
 
     if (!res.ok) {

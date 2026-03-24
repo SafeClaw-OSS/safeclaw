@@ -694,6 +694,7 @@ async function viewCredentials() {
       userKey: SafeClaw.toBase64(userKey),
       nonce: SafeClaw.toBase64(nonce),
       credentialId,
+      assertion,
     };
     const plaintext = new TextEncoder().encode(JSON.stringify(payload));
     const sealed = await SafeClaw.e2eEncrypt(plaintext, vmPk);
@@ -702,7 +703,7 @@ async function viewCredentials() {
     const res = await fetch('/admin/credentials', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ payload: SafeClaw.toBase64(sealed), assertion }),
+      body: JSON.stringify({ payload: SafeClaw.toBase64(sealed) }),
     });
 
     if (!res.ok) {
@@ -826,6 +827,7 @@ async function submitEdit(svc) {
       userKey: SafeClaw.toBase64(userKey),
       nonce: SafeClaw.toBase64(nonce),
       credentialId,
+      assertion,
       newSecrets,
     };
     const plaintext = new TextEncoder().encode(JSON.stringify(payload));
@@ -835,7 +837,7 @@ async function submitEdit(svc) {
     const res = await fetch('/admin/update-secrets', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ payload: SafeClaw.toBase64(sealed), assertion }),
+      body: JSON.stringify({ payload: SafeClaw.toBase64(sealed) }),
     });
 
     userKey.fill(0);
