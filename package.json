@@ -1,5 +1,5 @@
 {
-  "name": "safeclaw",
+  "name": "@xhyumiracle/safeclaw",
   "version": "0.1.0",
   "description": "Security proxy layer for OpenClaw — keeps API keys away from agents",
   "type": "module",

@@ -1,0 +1,6 @@
+test/
+.env
+data/
+*.enc
+*.bin
+node_modules/
