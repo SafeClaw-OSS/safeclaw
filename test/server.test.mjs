@@ -8,7 +8,7 @@ import { join } from 'node:path'
 import { generateDEK, e2eEncrypt, deriveResponseKey, decrypt } from '../lib/crypto.mjs'
 import { createServer } from '../lib/server.mjs'
 import {
-  TEST_HMAC_SECRET, SAMPLE_SECRETS,
+  SAMPLE_SECRETS,
   makeP256Credential, makeAssertion, httpRequest,
   createMockProxy, getFreePort, makeNonce,
 } from './helpers.mjs'
@@ -19,7 +19,7 @@ test('GET /health returns ok', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'sc-srv-test-'))
   const proxy = createMockProxy()
   const port = await getFreePort()
-  const server = await createServer({ port, dataDir: dir, proxy, hmacSecret: TEST_HMAC_SECRET })
+  const server = await createServer({ port, dataDir: dir, proxy })
   t.after(() => { server.close(); rmSync(dir, { recursive: true }) })
 
   const { status, body } = await httpRequest(port, 'GET', '/health')
@@ -33,7 +33,7 @@ test('POST /setup creates vault.enc, wrapped DEK, passkeys.json and unlocks prox
   const dir = mkdtempSync(join(tmpdir(), 'sc-srv-test-'))
   const proxy = createMockProxy()
   const port = await getFreePort()
-  const server = await createServer({ port, dataDir: dir, proxy, hmacSecret: TEST_HMAC_SECRET })
+  const server = await createServer({ port, dataDir: dir, proxy })
   t.after(() => { server.close(); rmSync(dir, { recursive: true }) })
 
   const { body: { vmPk } } = await httpRequest(port, 'GET', '/vmPk')
@@ -69,7 +69,7 @@ test('POST /unlock decrypts vault and unlocks proxy', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'sc-srv-test-'))
   const proxy = createMockProxy()
   const port = await getFreePort()
-  const server = await createServer({ port, dataDir: dir, proxy, hmacSecret: TEST_HMAC_SECRET })
+  const server = await createServer({ port, dataDir: dir, proxy })
   t.after(() => { server.close(); rmSync(dir, { recursive: true }) })
 
   const { body: { vmPk } } = await httpRequest(port, 'GET', '/vmPk')
@@ -112,7 +112,7 @@ test('POST /admin/status returns status without auth when no vault exists', asyn
   const dir = mkdtempSync(join(tmpdir(), 'sc-srv-test-'))
   const proxy = createMockProxy()
   const port = await getFreePort()
-  const server = await createServer({ port, dataDir: dir, proxy, hmacSecret: TEST_HMAC_SECRET })
+  const server = await createServer({ port, dataDir: dir, proxy })
   t.after(() => { server.close(); rmSync(dir, { recursive: true }) })
 
   const { status, body } = await httpRequest(port, 'POST', '/admin/status', {})
@@ -126,7 +126,7 @@ test('POST /admin/status requires passkey auth after setup', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'sc-srv-test-'))
   const proxy = createMockProxy()
   const port = await getFreePort()
-  const server = await createServer({ port, dataDir: dir, proxy, hmacSecret: TEST_HMAC_SECRET })
+  const server = await createServer({ port, dataDir: dir, proxy })
   t.after(() => { server.close(); rmSync(dir, { recursive: true }) })
 
   const { body: { vmPk } } = await httpRequest(port, 'GET', '/vmPk')
@@ -165,7 +165,7 @@ test('POST /setup rejects replayed nonce', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'sc-srv-test-'))
   const proxy = createMockProxy()
   const port = await getFreePort()
-  const server = await createServer({ port, dataDir: dir, proxy, hmacSecret: TEST_HMAC_SECRET })
+  const server = await createServer({ port, dataDir: dir, proxy })
   t.after(() => { server.close(); rmSync(dir, { recursive: true }) })
 
   const { body: { vmPk } } = await httpRequest(port, 'GET', '/vmPk')
@@ -213,7 +213,7 @@ test('POST /unlock rejects replayed nonce', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'sc-srv-test-'))
   const proxy = createMockProxy()
   const port = await getFreePort()
-  const server = await createServer({ port, dataDir: dir, proxy, hmacSecret: TEST_HMAC_SECRET })
+  const server = await createServer({ port, dataDir: dir, proxy })
   t.after(() => { server.close(); rmSync(dir, { recursive: true }) })
 
   const { body: { vmPk } } = await httpRequest(port, 'GET', '/vmPk')
@@ -260,7 +260,7 @@ test('POST /admin/credentials returns response-key-encrypted vault contents', as
   const dir = mkdtempSync(join(tmpdir(), 'sc-srv-test-'))
   const proxy = createMockProxy()
   const port = await getFreePort()
-  const server = await createServer({ port, dataDir: dir, proxy, hmacSecret: TEST_HMAC_SECRET })
+  const server = await createServer({ port, dataDir: dir, proxy })
   t.after(() => { server.close(); rmSync(dir, { recursive: true }) })
 
   const { body: { vmPk } } = await httpRequest(port, 'GET', '/vmPk')
@@ -304,7 +304,7 @@ test('POST /admin/credentials rejects replayed nonce', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'sc-srv-test-'))
   const proxy = createMockProxy()
   const port = await getFreePort()
-  const server = await createServer({ port, dataDir: dir, proxy, hmacSecret: TEST_HMAC_SECRET })
+  const server = await createServer({ port, dataDir: dir, proxy })
   t.after(() => { server.close(); rmSync(dir, { recursive: true }) })
 
   const { body: { vmPk } } = await httpRequest(port, 'GET', '/vmPk')
@@ -349,7 +349,7 @@ test('POST /admin/update-secrets re-encrypts vault with new secrets', async (t) 
   const dir = mkdtempSync(join(tmpdir(), 'sc-srv-test-'))
   const proxy = createMockProxy()
   const port = await getFreePort()
-  const server = await createServer({ port, dataDir: dir, proxy, hmacSecret: TEST_HMAC_SECRET })
+  const server = await createServer({ port, dataDir: dir, proxy })
   t.after(() => { server.close(); rmSync(dir, { recursive: true }) })
 
   const { body: { vmPk } } = await httpRequest(port, 'GET', '/vmPk')

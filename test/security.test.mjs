@@ -8,7 +8,7 @@ import { join } from 'node:path'
 import { generateDEK, e2eEncrypt } from '../lib/crypto.mjs'
 import { createServer } from '../lib/server.mjs'
 import {
-  TEST_HMAC_SECRET, SAMPLE_SECRETS,
+  SAMPLE_SECRETS,
   makeP256Credential, makeAssertion, httpRequest,
   createMockProxy, getFreePort, makeNonce,
 } from './helpers.mjs'
@@ -36,47 +36,40 @@ async function doSetup(port) {
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// 🔴-1: HMAC Relay Verification
+// Rate Limit
 // ══════════════════════════════════════════════════════════════════════════════
 
-test('🔴-1: createServer throws if hmacSecret not provided', async () => {
+test('Rate limit: rejects excessive POST requests from same IP', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'sc-sec-'))
   const proxy = createMockProxy()
   const port = await getFreePort()
-  try {
-    await assert.rejects(
-      () => createServer({ port, dataDir: dir, proxy }),
-      { message: 'hmacSecret is required' }
-    )
-  } finally { rmSync(dir, { recursive: true }) }
-})
-
-test('🔴-1: POST without X-Relay-Sig is rejected', async (t) => {
-  const dir = mkdtempSync(join(tmpdir(), 'sc-sec-'))
-  const proxy = createMockProxy()
-  const port = await getFreePort()
-  const server = await createServer({ port, dataDir: dir, proxy, hmacSecret: TEST_HMAC_SECRET })
+  const server = await createServer({ port, dataDir: dir, proxy, rateLimit: 3 })
   t.after(() => { server.close(); rmSync(dir, { recursive: true }) })
 
-  const { status, body } = await httpRequest(port, 'POST', '/setup', { test: 'data' }, { skipHmac: true })
-  assert.strictEqual(status, 401)
-  assert.ok(body.error.includes('Missing relay signature'))
+  // First 3 requests should not be rate limited
+  for (let i = 0; i < 3; i++) {
+    const { status } = await httpRequest(port, 'POST', '/admin/status', {})
+    assert.notStrictEqual(status, 429, `request ${i + 1} should not be rate limited`)
+  }
+  // 4th request should be rate limited
+  const { status, body } = await httpRequest(port, 'POST', '/admin/status', {})
+  assert.strictEqual(status, 429)
+  assert.ok(body.error.includes('Rate limit'))
 })
 
-test('🔴-1: POST with wrong HMAC is rejected', async (t) => {
+test('Rate limit: disabled when rateLimit=0', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'sc-sec-'))
   const proxy = createMockProxy()
   const port = await getFreePort()
-  const server = await createServer({ port, dataDir: dir, proxy, hmacSecret: TEST_HMAC_SECRET })
+  const server = await createServer({ port, dataDir: dir, proxy, rateLimit: 0 })
   t.after(() => { server.close(); rmSync(dir, { recursive: true }) })
 
-  const { status, body } = await httpRequest(port, 'POST', '/setup', { test: 'data' }, { hmacSecret: 'wrong-secret' })
-  assert.strictEqual(status, 403)
-  assert.ok(body.error.includes('Invalid relay signature'))
+  // Should never get 429
+  for (let i = 0; i < 5; i++) {
+    const { status } = await httpRequest(port, 'POST', '/admin/status', {})
+    assert.notStrictEqual(status, 429)
+  }
 })
-
-// GET bypass + correct HMAC acceptance: implicitly covered by every test that
-// calls doSetup() (GET /vmPk) and every successful POST (correct HMAC)
 
 // ══════════════════════════════════════════════════════════════════════════════
 // 🔴-2: Admin Endpoint Auth
@@ -86,7 +79,7 @@ test('🔴-2: /admin/lock requires passkey assertion', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'sc-sec-'))
   const proxy = createMockProxy()
   const port = await getFreePort()
-  const server = await createServer({ port, dataDir: dir, proxy, hmacSecret: TEST_HMAC_SECRET })
+  const server = await createServer({ port, dataDir: dir, proxy })
   t.after(() => { server.close(); rmSync(dir, { recursive: true }) })
 
   const { credentialId, cred, vmPk } = await doSetup(port)
@@ -110,7 +103,7 @@ test('🔴-2: /admin/status rejects unauthenticated request after setup', async 
   const dir = mkdtempSync(join(tmpdir(), 'sc-sec-'))
   const proxy = createMockProxy()
   const port = await getFreePort()
-  const server = await createServer({ port, dataDir: dir, proxy, hmacSecret: TEST_HMAC_SECRET })
+  const server = await createServer({ port, dataDir: dir, proxy })
   t.after(() => { server.close(); rmSync(dir, { recursive: true }) })
 
   await doSetup(port)
@@ -127,7 +120,7 @@ test('🔴-3: null x/y passkey is rejected', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'sc-sec-'))
   const proxy = createMockProxy()
   const port = await getFreePort()
-  const server = await createServer({ port, dataDir: dir, proxy, hmacSecret: TEST_HMAC_SECRET })
+  const server = await createServer({ port, dataDir: dir, proxy })
   t.after(() => { server.close(); rmSync(dir, { recursive: true }) })
 
   const { body: { vmPk } } = await httpRequest(port, 'GET', '/vmPk')
@@ -158,7 +151,7 @@ test('🔴-4: wrong origin rejected', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'sc-sec-'))
   const proxy = createMockProxy()
   const port = await getFreePort()
-  const server = await createServer({ port, dataDir: dir, proxy, hmacSecret: TEST_HMAC_SECRET })
+  const server = await createServer({ port, dataDir: dir, proxy })
   t.after(() => { server.close(); rmSync(dir, { recursive: true }) })
 
   const { credentialId, cred, vmPk, userKey } = await doSetup(port)
@@ -178,7 +171,7 @@ test('🔴-4: wrong rpId rejected', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'sc-sec-'))
   const proxy = createMockProxy()
   const port = await getFreePort()
-  const server = await createServer({ port, dataDir: dir, proxy, hmacSecret: TEST_HMAC_SECRET })
+  const server = await createServer({ port, dataDir: dir, proxy })
   t.after(() => { server.close(); rmSync(dir, { recursive: true }) })
 
   const { credentialId, cred, vmPk, userKey } = await doSetup(port)
@@ -198,7 +191,7 @@ test('🔴-4: wrong type (webauthn.create) rejected', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'sc-sec-'))
   const proxy = createMockProxy()
   const port = await getFreePort()
-  const server = await createServer({ port, dataDir: dir, proxy, hmacSecret: TEST_HMAC_SECRET })
+  const server = await createServer({ port, dataDir: dir, proxy })
   t.after(() => { server.close(); rmSync(dir, { recursive: true }) })
 
   const { credentialId, cred, vmPk, userKey } = await doSetup(port)
@@ -218,7 +211,7 @@ test('🔴-4: missing UP flag rejected', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'sc-sec-'))
   const proxy = createMockProxy()
   const port = await getFreePort()
-  const server = await createServer({ port, dataDir: dir, proxy, hmacSecret: TEST_HMAC_SECRET })
+  const server = await createServer({ port, dataDir: dir, proxy })
   t.after(() => { server.close(); rmSync(dir, { recursive: true }) })
 
   const { credentialId, cred, vmPk, userKey } = await doSetup(port)
@@ -242,7 +235,7 @@ test('🔵-3: setup with existing vault requires existing passkey auth', async (
   const dir = mkdtempSync(join(tmpdir(), 'sc-sec-'))
   const proxy = createMockProxy()
   const port = await getFreePort()
-  const server = await createServer({ port, dataDir: dir, proxy, hmacSecret: TEST_HMAC_SECRET })
+  const server = await createServer({ port, dataDir: dir, proxy })
   t.after(() => { server.close(); rmSync(dir, { recursive: true }) })
 
   const { credentialId, cred, vmPk } = await doSetup(port)
@@ -287,7 +280,7 @@ test('🟡-1: add-passkey adds a new credential', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'sc-sec-'))
   const proxy = createMockProxy()
   const port = await getFreePort()
-  const server = await createServer({ port, dataDir: dir, proxy, hmacSecret: TEST_HMAC_SECRET })
+  const server = await createServer({ port, dataDir: dir, proxy })
   t.after(() => { server.close(); rmSync(dir, { recursive: true }) })
 
   const { credentialId, userKey, cred, vmPk } = await doSetup(port)
@@ -315,7 +308,7 @@ test('🟡-1: remove-passkey removes a credential', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'sc-sec-'))
   const proxy = createMockProxy()
   const port = await getFreePort()
-  const server = await createServer({ port, dataDir: dir, proxy, hmacSecret: TEST_HMAC_SECRET })
+  const server = await createServer({ port, dataDir: dir, proxy })
   t.after(() => { server.close(); rmSync(dir, { recursive: true }) })
 
   const { credentialId, userKey, cred, vmPk } = await doSetup(port)
@@ -355,7 +348,7 @@ test('🟡-1: cannot remove the last passkey', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'sc-sec-'))
   const proxy = createMockProxy()
   const port = await getFreePort()
-  const server = await createServer({ port, dataDir: dir, proxy, hmacSecret: TEST_HMAC_SECRET })
+  const server = await createServer({ port, dataDir: dir, proxy })
   t.after(() => { server.close(); rmSync(dir, { recursive: true }) })
 
   const { credentialId, cred, vmPk } = await doSetup(port)
@@ -384,7 +377,7 @@ test('🟡-2: /admin/restart locks proxy and exits with 0', async (t) => {
   const port = await getFreePort()
   let exitCode = null
   const server = await createServer({
-    port, dataDir: dir, proxy, hmacSecret: TEST_HMAC_SECRET,
+    port, dataDir: dir, proxy,
     exitFn: (code) => { exitCode = code },
   })
   t.after(() => { server.close(); rmSync(dir, { recursive: true }) })
@@ -408,7 +401,7 @@ test('🟡-2: /admin/shutdown locks proxy and exits with 1', async (t) => {
   const port = await getFreePort()
   let exitCode = null
   const server = await createServer({
-    port, dataDir: dir, proxy, hmacSecret: TEST_HMAC_SECRET,
+    port, dataDir: dir, proxy,
     exitFn: (code) => { exitCode = code },
   })
   t.after(() => { server.close(); rmSync(dir, { recursive: true }) })

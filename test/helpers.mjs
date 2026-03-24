@@ -3,8 +3,6 @@ import http from 'node:http'
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-export const TEST_HMAC_SECRET = 'test-hmac-secret-for-unit-tests'
-
 export const SAMPLE_SECRETS = {
   version: 1,
   services: {
@@ -73,15 +71,12 @@ export async function makeAssertion(privateKey, { rpId = 'localhost', origin = '
 
 // ── HTTP helpers ──────────────────────────────────────────────────────────────
 
-export function httpRequest(port, method, path, body, { hmacSecret = TEST_HMAC_SECRET, skipHmac = false } = {}) {
+export function httpRequest(port, method, path, body) {
   return new Promise((resolve, reject) => {
     const bodyStr = body ? JSON.stringify(body) : null
     const headers = {
       'Content-Type': 'application/json',
       ...(bodyStr ? { 'Content-Length': Buffer.byteLength(bodyStr) } : {}),
-    }
-    if (method === 'POST' && bodyStr && hmacSecret && !skipHmac) {
-      headers['x-relay-sig'] = crypto.createHmac('sha256', hmacSecret).update(bodyStr).digest('hex')
     }
     const req = http.request(
       { hostname: '127.0.0.1', port, path, method, headers },
