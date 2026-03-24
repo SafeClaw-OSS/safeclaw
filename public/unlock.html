@@ -271,7 +271,15 @@ async function startUnlock() {
 
     setBtn('<div class="spinner"></div> Encrypting…', true);
 
-    const userKey = new Uint8Array(prfFirst);
+    // HKDF-normalize PRF output — must match setup.html / safeclaw-client.js:derivePRF()
+    const rawKey = new Uint8Array(prfFirst);
+    const keyMaterial = await crypto.subtle.importKey('raw', rawKey, 'HKDF', false, ['deriveBits']);
+    const userKeyBits = await crypto.subtle.deriveBits(
+      { name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(32), info: new TextEncoder().encode('safeclaw-user-key') },
+      keyMaterial, 256
+    );
+    const userKey = new Uint8Array(userKeyBits);
+    rawKey.fill(0);
     const credentialId = assertion.id;  // base64url string
 
     // Capture assertion data (public, goes in request body top-level)

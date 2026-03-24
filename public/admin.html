@@ -415,6 +415,8 @@ const SERVICE_META = {
   openai:    { icon: '🟢', label: 'OpenAI',               url: 'api.openai.com' },
   google:    { icon: '🔵', label: 'Google AI (Gemini)',    url: 'generativelanguage.googleapis.com' },
   brave:     { icon: '🦁', label: 'Brave Search',          url: 'api.search.brave.com' },
+  groq:      { icon: '⚡', label: 'Groq',                  url: 'api.groq.com' },
+  deepseek:  { icon: '🐋', label: 'DeepSeek',              url: 'api.deepseek.com' },
 };
 
 let lastStatus = null;
@@ -628,6 +630,7 @@ async function getVmPk() {
 }
 
 // Trigger passkey PRF and return { userKey, credentialId, nonce, assertion }
+// userKey is HKDF-normalized to match setup.html / safeclaw-client.js:derivePRF()
 async function passkeyPRF() {
   const prfSalt = SafeClaw.getPrfSalt();
   const webauthnChallenge = crypto.getRandomValues(new Uint8Array(32));
@@ -640,8 +643,18 @@ async function passkeyPRF() {
   });
   const prfFirst = assertion.getClientExtensionResults()?.prf?.results?.first;
   if (!prfFirst) throw new Error("Your browser/device doesn't support PRF. Please use Chrome 116+ or Safari 18+.");
+
+  // HKDF-normalize PRF output (must match setup flow)
+  const rawKey = new Uint8Array(prfFirst);
+  const keyMaterial = await crypto.subtle.importKey('raw', rawKey, 'HKDF', false, ['deriveBits']);
+  const userKeyBits = await crypto.subtle.deriveBits(
+    { name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(32), info: new TextEncoder().encode('safeclaw-user-key') },
+    keyMaterial, 256
+  );
+  rawKey.fill(0);
+
   return {
-    userKey: new Uint8Array(prfFirst),
+    userKey: new Uint8Array(userKeyBits),
     credentialId: assertion.id,
     nonce: crypto.getRandomValues(new Uint8Array(32)),
     assertion: {
@@ -651,6 +664,9 @@ async function passkeyPRF() {
     },
   };
 }
+
+// Cached PRF result from viewCredentials — reused by submitEdit for 1-tap edit flow
+let cachedPRF = null;
 
 // ── Credential masking ────────────────────────────────────────────────────────
 
@@ -699,7 +715,10 @@ async function viewCredentials() {
     const secretsJson = await SafeClaw.aesDecrypt(responseKey, sealedResponse);
     currentSecrets = JSON.parse(secretsJson);
 
-    // Zeroize sensitive buffers
+    // Cache PRF result for 1-tap edit flow (reuse userKey + credentialId + assertion)
+    cachedPRF = { userKey: new Uint8Array(userKey), credentialId, assertion };
+
+    // Zeroize local copy (cachedPRF holds its own copy)
     userKey.fill(0);
     nonce.fill(0);
     new Uint8Array(responseKey).fill(0);
@@ -781,18 +800,20 @@ async function submitEdit(svc) {
     return;
   }
 
-  // We need the full secrets to update. Fetch them first if not cached.
+  // We need the full secrets and cached PRF to update. viewCredentials must be called first.
   let secrets = currentSecrets;
-  if (!secrets) {
+  if (!secrets || !cachedPRF) {
     showToast('View credentials first to load current vault state', 'error');
     return;
   }
 
   saveBtn.disabled = true;
-  saveBtn.textContent = 'Authenticating…';
+  saveBtn.textContent = 'Saving…';
 
   try {
-    const { userKey, credentialId, nonce, assertion } = await passkeyPRF();
+    // Reuse cached PRF from viewCredentials — 1-tap edit flow (no 2nd passkey prompt)
+    const { userKey, credentialId, assertion } = cachedPRF;
+    const nonce = crypto.getRandomValues(new Uint8Array(32));
     const vmPk = await getVmPk();
 
     // Build updated secrets

@@ -772,7 +772,7 @@ function buildSecrets() {
       const slug = name.toLowerCase().replace(/[^a-z0-9]/g, '_');
       services[slug] = {
         upstream: url || '',
-        auth: { type: 'header', name: 'Authorization', prefix: 'Bearer ', value: key },
+        auth: { type: 'header', name: 'Authorization', prefix: 'Bearer', value: key },
       };
       state.configuredServiceIds.push(slug);
     }
