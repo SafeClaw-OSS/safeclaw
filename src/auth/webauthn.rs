@@ -64,12 +64,14 @@ fn der_to_raw_rs(der: &[u8]) -> Result<[u8; 64]> {
 
     // Right-align r and s into 32-byte arrays (strip leading zeros, pad on left)
     let mut result = [0u8; 64];
-    let r_src_start = if r.len() > 32 { r.len() - 32 } else { 0 };
-    let r_dst_start = 32usize.saturating_sub(r.len().min(32));
+    let r_take = r.len().min(32);
+    let r_src_start = r.len() - r_take;
+    let r_dst_start = 32 - r_take;
     result[r_dst_start..32].copy_from_slice(&r[r_src_start..]);
 
-    let s_src_start = if s.len() > 32 { s.len() - 32 } else { 0 };
-    let s_dst_start = 64usize.saturating_sub(s.len().min(32)) + 32;
+    let s_take = s.len().min(32);
+    let s_src_start = s.len() - s_take;
+    let s_dst_start = 32 + (32 - s_take);
     result[s_dst_start..64].copy_from_slice(&s[s_src_start..]);
 
     Ok(result)

@@ -27,7 +27,7 @@ pub struct ProxyState {
 pub fn build_proxy_router(state: Arc<ProxyState>) -> Router {
     Router::new()
         .route("/health", any(proxy_health))
-        .route("/*path", any(proxy_handler))
+        .route("/{*path}", any(proxy_handler))
         .with_state(state)
 }
 

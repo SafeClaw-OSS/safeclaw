@@ -157,16 +157,17 @@ pub fn secret_key_from_bytes(bytes: &[u8; 32]) -> Result<SecretKey> {
 /// Sanitize a credential ID string for use as a filename component.
 /// Replaces base64 special chars with filesystem-safe equivalents.
 pub fn credential_id_to_filename(cred_id: &str) -> Result<String> {
-    // Reject obviously dangerous patterns
-    if cred_id.contains("..") || cred_id.contains('/') || cred_id.contains('\\') {
+    // Reject path traversal
+    if cred_id.contains("..") || cred_id.contains('\\') {
         return Err(AppError::BadRequest("Invalid credential ID".into()));
     }
     // Replace base64 standard chars that aren't filename-safe
+    // (credential IDs from WebAuthn are standard base64 and may contain +, /, =)
     let sanitized = cred_id
         .replace('+', "-")
         .replace('/', "_")
         .replace('=', "");
-    // Allow only base64 characters + our replacements
+    // Allow only base64url characters after replacement
     if sanitized.chars().any(|c| !c.is_alphanumeric() && c != '-' && c != '_') {
         return Err(AppError::BadRequest("Credential ID contains invalid characters".into()));
     }
