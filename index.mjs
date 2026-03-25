@@ -25,7 +25,12 @@ async function main() {
   await loadOrCreateVmKeypair(DATA_DIR)
 
   const proxy = await createProxy({ port: PROXY_PORT, dataDir: DATA_DIR, serverPort: SERVER_PORT })
-  const server = await createServer({ port: SERVER_PORT, dataDir: DATA_DIR, proxy, rateLimit: RATE_LIMIT })
+  const expectedOrigin = process.env.SAFECLAW_ORIGIN || undefined
+  const rpId = process.env.SAFECLAW_RP_ID || undefined
+  if (expectedOrigin) console.log(`[safeclaw] origin: ${expectedOrigin}`)
+  if (rpId) console.log(`[safeclaw] rpId: ${rpId}`)
+
+  const server = await createServer({ port: SERVER_PORT, dataDir: DATA_DIR, proxy, expectedOrigin, rpId, rateLimit: RATE_LIMIT })
 
   console.log(`[safeclaw] proxy listening on 127.0.0.1:${PROXY_PORT}`)
   console.log(`[safeclaw] server listening on 0.0.0.0:${SERVER_PORT}`)
