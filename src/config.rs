@@ -32,6 +32,11 @@ struct CliArgs {
     /// Rate limit: requests per minute per IP (0 = disabled)
     #[arg(long)]
     rate_limit: Option<u32>,
+    /// Webhook URL called after successful setup with the `config` portion of the payload.
+    /// Only non-secret data (the "config" field) is sent; secrets never leave the vault.
+    /// [env: SAFECLAW_ON_SETUP_HOOK]
+    #[arg(long)]
+    on_setup_hook: Option<String>,
 }
 
 /// Resolved configuration from CLI args + environment variables.
@@ -47,6 +52,7 @@ pub struct Config {
     pub admin_url: Option<String>,
     pub instance_id: Option<String>,
     pub rate_limit: u32,
+    pub on_setup_hook: Option<String>,
 }
 
 fn env_str(key: &str) -> Option<String> {
@@ -82,7 +88,9 @@ impl Config {
             .or_else(|| env_str("SAFECLAW_RATE_LIMIT").and_then(|s| s.parse().ok()))
             .unwrap_or(20);
 
-        Self { data_dir, port, proxy_port, proxy_bind, origin, rp_id, admin_url, instance_id, rate_limit }
+        let on_setup_hook = cli.on_setup_hook.or_else(|| env_str("SAFECLAW_ON_SETUP_HOOK"));
+
+        Self { data_dir, port, proxy_port, proxy_bind, origin, rp_id, admin_url, instance_id, rate_limit, on_setup_hook }
     }
 
     pub fn effective_origin(&self) -> String {

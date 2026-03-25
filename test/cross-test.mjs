@@ -4,6 +4,7 @@
 
 import { execSync, spawn } from 'node:child_process'
 import { readFileSync, existsSync, rmSync, mkdirSync } from 'node:fs'
+import { createServer as createHttpServer } from 'node:http'
 import { join } from 'node:path'
 import crypto from 'node:crypto'
 import { strict as assert } from 'node:assert'
@@ -12,6 +13,7 @@ const RUST_BIN = join(import.meta.dirname, '..', 'target', 'release', 'safeclaw'
 const DATA_DIR = join(import.meta.dirname, '..', '.cross-test-data')
 const SERVER_PORT = 23394
 const PROXY_PORT = 23395
+const HOOK_PORT = 23396
 const ORIGIN = 'https://test.safeclaw.dev'
 const RP_ID = 'test.safeclaw.dev'
 
@@ -185,6 +187,19 @@ async function main() {
   if (existsSync(DATA_DIR)) rmSync(DATA_DIR, { recursive: true })
   mkdirSync(DATA_DIR, { recursive: true })
 
+  // Start webhook receiver to capture on-setup hook calls
+  const hookPayloads = []
+  const hookServer = createHttpServer((req, res) => {
+    let body = ''
+    req.on('data', c => { body += c })
+    req.on('end', () => {
+      try { hookPayloads.push(JSON.parse(body)) } catch { hookPayloads.push(body) }
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end('{"ok":true}')
+    })
+  })
+  await new Promise(resolve => hookServer.listen(HOOK_PORT, '127.0.0.1', resolve))
+
   // Start Rust server
   console.log('Starting Rust server...')
   rustProcess = spawn(RUST_BIN, ['--rate-limit', '0'], {
@@ -196,6 +211,7 @@ async function main() {
       SAFECLAW_ORIGIN: ORIGIN,
       SAFECLAW_RP_ID: RP_ID,
       SAFECLAW_PROXY_BIND: '127.0.0.1',
+      SAFECLAW_ON_SETUP_HOOK: `http://127.0.0.1:${HOOK_PORT}/on-setup`,
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   })
@@ -266,9 +282,16 @@ async function main() {
       }
     }
 
+    // config: non-secret data, should be forwarded to webhook (never stored in vault)
+    const config = {
+      channels: { telegram: { token: 'bot123:fake', ownerId: '12345' } },
+      defaultModel: 'anthropic/claude-sonnet-4-20250514',
+    }
+
     const innerPayload = {
       passkeys: [{ credentialId: passkey.credentialId, x: passkey.x, y: passkey.y, deviceName: 'CrossTest' }],
       secrets,
+      config,
       userKeys: [toBase64(userKey)],
       nonce,
       assertions: [assertion],
@@ -290,6 +313,21 @@ async function main() {
     // Store for later tests
     globalThis._crossTestPasskey = passkey
     globalThis._crossTestUserKey = userKey
+  })
+
+  await test('on-setup webhook receives config (not secrets)', async () => {
+    // Give webhook a moment to arrive (fire-and-forget in Rust)
+    await new Promise(r => setTimeout(r, 500))
+    assert.equal(hookPayloads.length, 1, `Expected 1 webhook call, got ${hookPayloads.length}`)
+    const hookData = hookPayloads[0]
+    // Config fields should be present
+    assert.ok(hookData.channels, 'Missing channels in webhook')
+    assert.equal(hookData.channels.telegram.ownerId, '12345')
+    assert.equal(hookData.defaultModel, 'anthropic/claude-sonnet-4-20250514')
+    // Secrets must NOT be in webhook payload
+    assert.equal(hookData.services, undefined, 'SECURITY: secrets leaked to webhook!')
+    assert.equal(hookData.userKeys, undefined, 'SECURITY: userKeys leaked to webhook!')
+    assert.equal(hookData.passkeys, undefined, 'SECURITY: passkeys leaked to webhook!')
   })
 
   await test('GET /health shows unlocked after setup', async () => {
@@ -544,4 +582,4 @@ async function main() {
 
 main()
   .catch(err => { console.error('Fatal:', err); process.exit(1) })
-  .finally(() => { if (rustProcess) rustProcess.kill() })
+  .finally(() => { if (rustProcess) rustProcess.kill(); if (typeof hookServer !== 'undefined') hookServer.close() })

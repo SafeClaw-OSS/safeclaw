@@ -291,6 +291,7 @@ mod tests {
                 admin_url: None,
                 instance_id: None,
                 rate_limit: 0,
+                on_setup_hook: None,
             };
             let vm_keypair = generate_keypair().expect("generate_keypair failed");
             let vault = Arc::new(VaultState::new());

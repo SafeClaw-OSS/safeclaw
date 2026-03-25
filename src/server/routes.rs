@@ -146,9 +146,12 @@ pub async fn setup(
         .and_then(|v| v.as_array())
         .ok_or_else(|| AppError::BadRequest("Missing userKeys array".into()))?;
 
+    // Extract secrets (encrypted vault storage) and config (webhook-only, never stored)
     let secrets = parsed.get("secrets")
         .cloned()
         .ok_or_else(|| AppError::BadRequest("Missing secrets".into()))?;
+
+    let setup_config = parsed.get("config").cloned();
 
     // If vault already exists, require existing passkey auth before overwrite
     let passkeys_path = state.config.data_dir.join("passkeys.json");
@@ -260,6 +263,32 @@ pub async fn setup(
 
     // Unlock proxy immediately after setup
     state.vault.set_secrets(secrets);
+
+    // Fire on-setup webhook with config data (never secrets)
+    if let Some(ref hook_url) = state.config.on_setup_hook {
+        if let Some(ref config_data) = setup_config {
+            let hook_url = hook_url.clone();
+            let config_json = config_data.clone();
+            // Fire-and-forget in background — don't block setup response
+            tokio::spawn(async move {
+                let client = reqwest::Client::new();
+                match client
+                    .post(&hook_url)
+                    .json(&config_json)
+                    .timeout(std::time::Duration::from_secs(10))
+                    .send()
+                    .await
+                {
+                    Ok(resp) => {
+                        tracing::info!("on-setup hook responded: {}", resp.status());
+                    }
+                    Err(e) => {
+                        tracing::warn!("on-setup hook failed: {}", e);
+                    }
+                }
+            });
+        }
+    }
 
     Ok(Json(json!({ "ok": true })))
 }
