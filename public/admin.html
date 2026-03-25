@@ -575,11 +575,11 @@ async function lockProxy() {
 
   try {
     const { credentialId, nonce, assertion } = await passkeyPRF();
-    const vmPk = await getVmPk();
+    const serverPk = await getServerPk();
 
     const payload = { nonce: SafeClaw.toBase64(nonce), credentialId, assertion };
     const plaintext = new TextEncoder().encode(JSON.stringify(payload));
-    const sealed = await SafeClaw.e2eEncrypt(plaintext, vmPk);
+    const sealed = await SafeClaw.e2eEncrypt(plaintext, serverPk);
 
     const res = await fetch('/vault/lock', {
       method: 'POST',
@@ -626,11 +626,11 @@ function escapeAttr(s) {
   return String(s).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/'/g, '&#39;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
-async function getVmPk() {
+async function getServerPk() {
   const res = await fetch('/pk');
   if (!res.ok) throw new Error(`Could not fetch pk: ${res.status}`);
   const data = await res.json();
-  return data.vmPk;
+  return data.pk;
 }
 
 // Trigger passkey PRF and return { userKey, credentialId, nonce, assertion }
@@ -692,7 +692,7 @@ async function viewCredentials() {
 
   try {
     const { userKey, credentialId, nonce, assertion } = await passkeyPRF();
-    const vmPk = await getVmPk();
+    const serverPk = await getServerPk();
 
     const payload = {
       userKey: SafeClaw.toBase64(userKey),
@@ -701,7 +701,7 @@ async function viewCredentials() {
       assertion,
     };
     const plaintext = new TextEncoder().encode(JSON.stringify(payload));
-    const sealed = await SafeClaw.e2eEncrypt(plaintext, vmPk);
+    const sealed = await SafeClaw.e2eEncrypt(plaintext, serverPk);
 
     btn.textContent = 'Decrypting…';
     const res = await fetch('/vault/credentials', {
@@ -819,7 +819,7 @@ async function submitEdit(svc) {
     // Reuse cached PRF from viewCredentials — 1-tap edit flow (no 2nd passkey prompt)
     const { userKey, credentialId, assertion } = cachedPRF;
     const nonce = crypto.getRandomValues(new Uint8Array(32));
-    const vmPk = await getVmPk();
+    const serverPk = await getServerPk();
 
     // Build updated secrets
     const newSecrets = JSON.parse(JSON.stringify(secrets));  // deep clone
@@ -835,7 +835,7 @@ async function submitEdit(svc) {
       newSecrets,
     };
     const plaintext = new TextEncoder().encode(JSON.stringify(payload));
-    const sealed = await SafeClaw.e2eEncrypt(plaintext, vmPk);
+    const sealed = await SafeClaw.e2eEncrypt(plaintext, serverPk);
 
     saveBtn.textContent = 'Saving…';
     const res = await fetch('/vault/update', {

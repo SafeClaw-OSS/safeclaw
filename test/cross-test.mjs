@@ -27,12 +27,12 @@ function toBase64url(buf) {
   return Buffer.from(buf).toString('base64url')
 }
 
-async function e2eEncrypt(plaintext, vmPkJwk) {
+async function e2eEncrypt(plaintext, serverPkJwk) {
   const ephemeral = await crypto.subtle.generateKey(
     { name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveBits']
   )
   const serverPub = await crypto.subtle.importKey(
-    'jwk', vmPkJwk, { name: 'ECDH', namedCurve: 'P-256' }, false, []
+    'jwk', serverPkJwk, { name: 'ECDH', namedCurve: 'P-256' }, false, []
   )
   const sharedBits = await crypto.subtle.deriveBits(
     { name: 'ECDH', public: serverPub }, ephemeral.privateKey, 256
@@ -139,9 +139,9 @@ async function createFakeAssertion(privateKey, origin, rpId) {
   }
 }
 
-async function makeAuthPayload(vmPk, innerPayload) {
+async function makeAuthPayload(serverPk, innerPayload) {
   const plaintext = Buffer.from(JSON.stringify(innerPayload))
-  const encrypted = await e2eEncrypt(plaintext, vmPk)
+  const encrypted = await e2eEncrypt(plaintext, serverPk)
   const payloadB64 = toBase64(encrypted)
   return JSON.stringify({ payload: payloadB64 })
 }
@@ -244,7 +244,7 @@ async function main() {
 
   // ── Tests ───────────────────────────────────────────────────────────────
 
-  let vmPk
+  let serverPk
 
   await test('GET /health returns correct fields', async () => {
     const { status, json } = await get('/health')
@@ -258,13 +258,13 @@ async function main() {
   await test('GET /pk returns JWK public key', async () => {
     const { status, json } = await get('/pk')
     assert.equal(status, 200)
-    assert.ok(json.vmPk)
-    assert.equal(json.vmPk.kty, 'EC')
-    assert.equal(json.vmPk.crv, 'P-256')
-    assert.ok(json.vmPk.x)
-    assert.ok(json.vmPk.y)
-    assert.equal(json.vmPk.d, undefined) // no private key leaked
-    vmPk = json.vmPk
+    assert.ok(json.pk)
+    assert.equal(json.pk.kty, 'EC')
+    assert.equal(json.pk.crv, 'P-256')
+    assert.ok(json.pk.x)
+    assert.ok(json.pk.y)
+    assert.equal(json.pk.d, undefined) // no private key leaked
+    serverPk = json.pk
   })
 
   await test('E2E encrypt (JS) → decrypt (Rust) via /setup', async () => {
@@ -297,7 +297,7 @@ async function main() {
       assertions: [assertion],
     }
 
-    const body = await makeAuthPayload(vmPk, innerPayload)
+    const body = await makeAuthPayload(serverPk, innerPayload)
     let res
     try {
       res = await post('/admin/setup', body)
@@ -342,7 +342,7 @@ async function main() {
     const nonce1 = toBase64(crypto.randomBytes(32))
     const assertion1 = await createFakeAssertion(passkey.keyPair.privateKey, ORIGIN, RP_ID)
 
-    const lockBody = await makeAuthPayload(vmPk, {
+    const lockBody = await makeAuthPayload(serverPk, {
       nonce: nonce1, credentialId: passkey.credentialId, assertion: assertion1,
     })
     const lockRes = await post('/vault/lock', lockBody)
@@ -356,7 +356,7 @@ async function main() {
     const nonce2 = toBase64(crypto.randomBytes(32))
     const assertion2 = await createFakeAssertion(passkey.keyPair.privateKey, ORIGIN, RP_ID)
 
-    const unlockBody = await makeAuthPayload(vmPk, {
+    const unlockBody = await makeAuthPayload(serverPk, {
       userKey: toBase64(userKey),
       nonce: nonce2,
       credentialId: passkey.credentialId,
@@ -377,7 +377,7 @@ async function main() {
     const nonce = toBase64(crypto.randomBytes(32))
     const assertion = await createFakeAssertion(passkey.keyPair.privateKey, ORIGIN, RP_ID)
 
-    const body = await makeAuthPayload(vmPk, {
+    const body = await makeAuthPayload(serverPk, {
       userKey: toBase64(userKey),
       nonce,
       credentialId: passkey.credentialId,
@@ -415,7 +415,7 @@ async function main() {
     const nonce = toBase64(crypto.randomBytes(32))
     const assertion1 = await createFakeAssertion(passkey.keyPair.privateKey, ORIGIN, RP_ID)
 
-    const body1 = await makeAuthPayload(vmPk, {
+    const body1 = await makeAuthPayload(serverPk, {
       userKey: toBase64(userKey), nonce,
       credentialId: passkey.credentialId, assertion: assertion1,
     })
@@ -424,7 +424,7 @@ async function main() {
 
     // Same nonce, new assertion — should fail
     const assertion2 = await createFakeAssertion(passkey.keyPair.privateKey, ORIGIN, RP_ID)
-    const body2 = await makeAuthPayload(vmPk, {
+    const body2 = await makeAuthPayload(serverPk, {
       userKey: toBase64(userKey), nonce,
       credentialId: passkey.credentialId, assertion: assertion2,
     })
@@ -440,7 +440,7 @@ async function main() {
     // Sign with wrong origin
     const assertion = await createFakeAssertion(passkey.keyPair.privateKey, 'https://evil.com', RP_ID)
 
-    const body = await makeAuthPayload(vmPk, {
+    const body = await makeAuthPayload(serverPk, {
       userKey: toBase64(userKey), nonce,
       credentialId: passkey.credentialId, assertion,
     })
@@ -454,7 +454,7 @@ async function main() {
     const nonce = toBase64(crypto.randomBytes(32))
     const assertion = await createFakeAssertion(passkey.keyPair.privateKey, ORIGIN, 'evil.com')
 
-    const body = await makeAuthPayload(vmPk, {
+    const body = await makeAuthPayload(serverPk, {
       userKey: toBase64(userKey), nonce,
       credentialId: passkey.credentialId, assertion,
     })
@@ -467,7 +467,7 @@ async function main() {
     const passkey = globalThis._crossTestPasskey
     const nonce = toBase64(crypto.randomBytes(32))
     const assertion = await createFakeAssertion(passkey.keyPair.privateKey, ORIGIN, RP_ID)
-    const lockBody = await makeAuthPayload(vmPk, {
+    const lockBody = await makeAuthPayload(serverPk, {
       nonce, credentialId: passkey.credentialId, assertion,
     })
     await post('/vault/lock', lockBody)
@@ -490,7 +490,7 @@ async function main() {
     const userKey = globalThis._crossTestUserKey
     const nonce1 = toBase64(crypto.randomBytes(32))
     const assertion1 = await createFakeAssertion(passkey.keyPair.privateKey, ORIGIN, RP_ID)
-    await post('/admin/unlock', await makeAuthPayload(vmPk, {
+    await post('/admin/unlock', await makeAuthPayload(serverPk, {
       userKey: toBase64(userKey), nonce: nonce1,
       credentialId: passkey.credentialId, assertion: assertion1,
     }))
@@ -501,7 +501,7 @@ async function main() {
     const nonce2 = toBase64(crypto.randomBytes(32))
     const assertion2 = await createFakeAssertion(passkey.keyPair.privateKey, ORIGIN, RP_ID)
 
-    const body = await makeAuthPayload(vmPk, {
+    const body = await makeAuthPayload(serverPk, {
       userKey: toBase64(userKey),
       nonce: nonce2,
       credentialId: passkey.credentialId,
@@ -515,13 +515,13 @@ async function main() {
     // Verify we can unlock with the new passkey
     const nonce3 = toBase64(crypto.randomBytes(32))
     const assertion3 = await createFakeAssertion(passkey.keyPair.privateKey, ORIGIN, RP_ID)
-    await post('/vault/lock', await makeAuthPayload(vmPk, {
+    await post('/vault/lock', await makeAuthPayload(serverPk, {
       nonce: nonce3, credentialId: passkey.credentialId, assertion: assertion3,
     }))
 
     const nonce4 = toBase64(crypto.randomBytes(32))
     const assertion4 = await createFakeAssertion(passkey2.keyPair.privateKey, ORIGIN, RP_ID)
-    const unlockRes = await post('/admin/unlock', await makeAuthPayload(vmPk, {
+    const unlockRes = await post('/admin/unlock', await makeAuthPayload(serverPk, {
       userKey: toBase64(userKey2), nonce: nonce4,
       credentialId: passkey2.credentialId, assertion: assertion4,
     }))
@@ -534,7 +534,7 @@ async function main() {
     const nonce = toBase64(crypto.randomBytes(32))
     const assertion = await createFakeAssertion(passkey.keyPair.privateKey, ORIGIN, RP_ID)
 
-    const body = await makeAuthPayload(vmPk, {
+    const body = await makeAuthPayload(serverPk, {
       userKey: toBase64(userKey), nonce,
       credentialId: passkey.credentialId, assertion,
       newSecrets: { services: { anthropic: { upstream: 'https://api.anthropic.com', auth: { type: 'header', name: 'x-api-key', value: 'sk-ant-test' } } } },
@@ -545,7 +545,7 @@ async function main() {
     // Verify updated secrets
     const nonce2 = toBase64(crypto.randomBytes(32))
     const assertion2 = await createFakeAssertion(passkey.keyPair.privateKey, ORIGIN, RP_ID)
-    const credRes = await post('/vault/credentials', await makeAuthPayload(vmPk, {
+    const credRes = await post('/vault/credentials', await makeAuthPayload(serverPk, {
       userKey: toBase64(userKey), nonce: nonce2,
       credentialId: passkey.credentialId, assertion: assertion2,
     }))

@@ -3,9 +3,9 @@ use sha2::Sha256;
 
 use crate::error::{AppError, Result};
 
-/// HKDF-SHA256(ikm=user_key, salt=vm_sk_d, info="safeclaw-kek-v1") → 32-byte KEK
-pub fn derive_kek(user_key: &[u8], vm_sk_d: &[u8]) -> Result<[u8; 32]> {
-    let hkdf = Hkdf::<Sha256>::new(Some(vm_sk_d), user_key);
+/// HKDF-SHA256(ikm=user_key, salt=sk_d, info="safeclaw-kek-v1") → 32-byte KEK
+pub fn derive_kek(user_key: &[u8], sk_d: &[u8]) -> Result<[u8; 32]> {
+    let hkdf = Hkdf::<Sha256>::new(Some(sk_d), user_key);
     let mut okm = [0u8; 32];
     hkdf.expand(b"safeclaw-kek-v1", &mut okm)
         .map_err(|e| AppError::Internal(format!("HKDF expand (KEK) failed: {}", e)))?;

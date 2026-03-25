@@ -3,12 +3,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crate::config::Config;
-use crate::crypto::keys::VmKeypair;
+use crate::crypto::keys::ServerKeypair;
 
 /// Shared application state (Arc-wrapped)
 pub struct AppState {
     pub config: Config,
-    pub vm_keypair: VmKeypair,
+    pub keypair: ServerKeypair,
     pub vault: Arc<VaultState>,
     pub nonces: Arc<Mutex<crate::auth::nonce::NonceStore>>,
     pub start_time: Instant,

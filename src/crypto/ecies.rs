@@ -43,7 +43,7 @@ pub struct EpkJwk {
 /// Decrypt an E2E-encrypted payload using the server's VM private key.
 ///
 /// `wire_bytes` is the JSON wire format (not base64-encoded, already decoded).
-pub fn e2e_decrypt(wire_bytes: &[u8], vm_sk_d: &[u8; 32]) -> Result<Vec<u8>> {
+pub fn e2e_decrypt(wire_bytes: &[u8], sk_d: &[u8; 32]) -> Result<Vec<u8>> {
     // Parse wire JSON
     let wire: E2eWire = serde_json::from_slice(wire_bytes)
         .map_err(|e| AppError::BadRequest(format!("Invalid E2E wire format: {}", e)))?;
@@ -75,7 +75,7 @@ pub fn e2e_decrypt(wire_bytes: &[u8], vm_sk_d: &[u8; 32]) -> Result<Vec<u8>> {
     let epk = jwk_pk_to_public_key(&epk_jwk_pub)?;
 
     // ECDH: server_sk × epk → shared_secret
-    let server_sk = secret_key_from_bytes(vm_sk_d)?;
+    let server_sk = secret_key_from_bytes(sk_d)?;
     let nz_scalar = server_sk.to_nonzero_scalar();
     let shared_secret = diffie_hellman(&nz_scalar, epk.as_affine());
 

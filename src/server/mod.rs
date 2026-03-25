@@ -52,7 +52,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         // ── Public ──────────────────────────────────────────────────────────
         .route("/health", get(health))
-        .route("/pk", get(vm_pk))
+        .route("/pk", get(server_pk))
 
         // ── Admin (instance management) ─────────────────────────────────────
         .route("/admin/setup", get(serve_setup).post(setup))

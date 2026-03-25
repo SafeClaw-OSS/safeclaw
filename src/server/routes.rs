@@ -37,8 +37,8 @@ pub async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 
 // ── VM Public Key ─────────────────────────────────────────────────────────────
 
-pub async fn vm_pk(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    Json(json!({ "vmPk": state.vm_keypair.pk }))
+pub async fn server_pk(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    Json(json!({ "pk": state.keypair.pk }))
 }
 
 // (status endpoints removed — dashboard uses /health + /vault/credentials)
@@ -63,8 +63,8 @@ pub async fn setup(
         .decode(&body.payload)
         .map_err(|e| AppError::BadRequest(format!("Invalid payload base64: {}", e)))?;
 
-    let vm_sk_d = jwk_sk_d_bytes(&state.vm_keypair.sk)?;
-    let plaintext = crate::crypto::ecies::e2e_decrypt(&wire_bytes, &vm_sk_d)?;
+    let sk_d = jwk_sk_d_bytes(&state.keypair.sk)?;
+    let plaintext = crate::crypto::ecies::e2e_decrypt(&wire_bytes, &sk_d)?;
 
     let parsed: Value = serde_json::from_slice(&plaintext)
         .map_err(|_| AppError::BadRequest("Decrypted payload is not valid JSON".into()))?;
@@ -192,8 +192,8 @@ pub async fn setup(
         let user_key_bytes = STANDARD.decode(user_key_b64)
             .map_err(|e| AppError::BadRequest(format!("Invalid userKey: {}", e)))?;
 
-        let vm_sk_d_local = jwk_sk_d_bytes(&state.vm_keypair.sk)?;
-        let mut kek = derive_kek(&user_key_bytes, &vm_sk_d_local)?;
+        let sk_d_local = jwk_sk_d_bytes(&state.keypair.sk)?;
+        let mut kek = derive_kek(&user_key_bytes, &sk_d_local)?;
         let wrapped = wrap_dek(&dek, &kek)?;
         kek.zeroize();
 
@@ -255,8 +255,8 @@ pub async fn vault_unlock(
         return Err(AppError::Unauthorized("No wrapped DEK for this credential".into()));
     }
 
-    let vm_sk_d = jwk_sk_d_bytes(&state.vm_keypair.sk)?;
-    let mut kek = derive_kek(&user_key, &vm_sk_d)?;
+    let sk_d = jwk_sk_d_bytes(&state.keypair.sk)?;
+    let mut kek = derive_kek(&user_key, &sk_d)?;
     let wrapped = fs::read(&wrapped_path)?;
     let mut dek = unwrap_dek(&wrapped, &kek)?;
     kek.zeroize();
@@ -311,8 +311,8 @@ pub async fn vault_credentials(
         return Err(AppError::Unauthorized("No wrapped DEK for this credential".into()));
     }
 
-    let vm_sk_d = jwk_sk_d_bytes(&state.vm_keypair.sk)?;
-    let mut kek = derive_kek(&user_key, &vm_sk_d)?;
+    let sk_d = jwk_sk_d_bytes(&state.keypair.sk)?;
+    let mut kek = derive_kek(&user_key, &sk_d)?;
     let wrapped = fs::read(&wrapped_path)?;
     let mut dek = unwrap_dek(&wrapped, &kek)?;
     kek.zeroize();
@@ -349,8 +349,8 @@ pub async fn vault_update(
         return Err(AppError::Unauthorized("No wrapped DEK for this credential".into()));
     }
 
-    let vm_sk_d = jwk_sk_d_bytes(&state.vm_keypair.sk)?;
-    let mut kek = derive_kek(&user_key, &vm_sk_d)?;
+    let sk_d = jwk_sk_d_bytes(&state.keypair.sk)?;
+    let mut kek = derive_kek(&user_key, &sk_d)?;
     let wrapped = fs::read(&wrapped_path)?;
     let mut dek = unwrap_dek(&wrapped, &kek)?;
     kek.zeroize();
@@ -391,8 +391,8 @@ pub async fn identity_add_passkey(
         return Err(AppError::Unauthorized("No wrapped DEK for this credential".into()));
     }
 
-    let vm_sk_d = jwk_sk_d_bytes(&state.vm_keypair.sk)?;
-    let mut kek = derive_kek(&user_key, &vm_sk_d)?;
+    let sk_d = jwk_sk_d_bytes(&state.keypair.sk)?;
+    let mut kek = derive_kek(&user_key, &sk_d)?;
     let wrapped = fs::read(&wrapped_path)?;
     let mut dek = unwrap_dek(&wrapped, &kek)?;
     kek.zeroize();
@@ -400,7 +400,7 @@ pub async fn identity_add_passkey(
     // Wrap DEK for new passkey
     let new_user_key = STANDARD.decode(new_user_key_b64)
         .map_err(|e| AppError::BadRequest(format!("Invalid newUserKey: {}", e)))?;
-    let mut new_kek = derive_kek(&new_user_key, &vm_sk_d)?;
+    let mut new_kek = derive_kek(&new_user_key, &sk_d)?;
     let new_wrapped = wrap_dek(&dek, &new_kek)?;
     dek.zeroize();
     new_kek.zeroize();

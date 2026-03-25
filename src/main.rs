@@ -43,16 +43,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         warn!("SAFECLAW_RP_ID not set — defaulting to 'localhost'. Set this for production.");
     }
 
-    // Load or create VM keypair
-    let vm_keypair = load_or_create_keypair(&config.data_dir)?;
-    info!("VM keypair loaded (pk.x={}...)", &vm_keypair.pk.x[..8.min(vm_keypair.pk.x.len())]);
+    // Load or create server keypair
+    let keypair = load_or_create_keypair(&config.data_dir)?;
+    info!("Server keypair loaded (pk.x={}...)", &keypair.pk.x[..8.min(keypair.pk.x.len())]);
+
+    // --init: generate keypair and exit (for deployment scripts)
+    if config.init {
+        info!("--init: keypair ready at {}/pk.jwk, exiting", config.data_dir.display());
+        return Ok(());
+    }
 
     // Build shared vault state
     let vault = Arc::new(VaultState::new());
 
     // Build app state
     let state = Arc::new(AppState {
-        vm_keypair,
+        keypair,
         vault: vault.clone(),
         nonces: Arc::new(Mutex::new(auth::nonce::NonceStore::new())),
         start_time: Instant::now(),

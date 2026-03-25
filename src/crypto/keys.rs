@@ -38,20 +38,20 @@ pub struct JwkPrivateKey {
     pub ext: Option<bool>,
 }
 
-/// VM keypair stored as JWK
+/// Server keypair stored as JWK
 #[derive(Clone)]
-pub struct VmKeypair {
+pub struct ServerKeypair {
     pub pk: JwkPublicKey,
     pub sk: JwkPrivateKey,
 }
 
 /// Generate a fresh P-256 keypair
-pub fn generate_keypair() -> Result<VmKeypair> {
+pub fn generate_keypair() -> Result<ServerKeypair> {
     let sk = SecretKey::random(&mut rand::rngs::OsRng);
     keypair_from_secret(sk)
 }
 
-fn keypair_from_secret(sk: SecretKey) -> Result<VmKeypair> {
+fn keypair_from_secret(sk: SecretKey) -> Result<ServerKeypair> {
     let pk = sk.public_key();
     let ep = pk.to_encoded_point(false); // uncompressed: 0x04 || x || y
 
@@ -81,20 +81,20 @@ fn keypair_from_secret(sk: SecretKey) -> Result<VmKeypair> {
         ext: None,
     };
 
-    Ok(VmKeypair { pk: jwk_pk, sk: jwk_sk })
+    Ok(ServerKeypair { pk: jwk_pk, sk: jwk_sk })
 }
 
 /// Load keypair from data directory, or generate and save a new one
-pub fn load_or_create_keypair(data_dir: &Path) -> Result<VmKeypair> {
-    let pk_path = data_dir.join("vm_pk.jwk");
-    let sk_path = data_dir.join("vm_sk.jwk");
+pub fn load_or_create_keypair(data_dir: &Path) -> Result<ServerKeypair> {
+    let pk_path = data_dir.join("pk.jwk");
+    let sk_path = data_dir.join("sk.jwk");
 
     if pk_path.exists() && sk_path.exists() {
         let pk: JwkPublicKey = serde_json::from_str(&fs::read_to_string(&pk_path)?)
-            .map_err(|e| AppError::Internal(format!("Failed to parse vm_pk.jwk: {}", e)))?;
+            .map_err(|e| AppError::Internal(format!("Failed to parse pk.jwk: {}", e)))?;
         let sk: JwkPrivateKey = serde_json::from_str(&fs::read_to_string(&sk_path)?)
-            .map_err(|e| AppError::Internal(format!("Failed to parse vm_sk.jwk: {}", e)))?;
-        return Ok(VmKeypair { pk, sk });
+            .map_err(|e| AppError::Internal(format!("Failed to parse sk.jwk: {}", e)))?;
+        return Ok(ServerKeypair { pk, sk });
     }
 
     fs::create_dir_all(data_dir)?;

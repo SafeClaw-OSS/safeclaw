@@ -19,12 +19,12 @@ window.SafeClaw = (() => {
   }
 
   // ECIES encrypt: P-256 ECDH → HKDF → AES-256-GCM
-  async function e2eEncrypt(plaintext, vmPkJwk) {
+  async function e2eEncrypt(plaintext, serverPkJwk) {
     const ephemeral = await crypto.subtle.generateKey(
       { name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveBits']
     );
     const serverPub = await crypto.subtle.importKey(
-      'jwk', vmPkJwk, { name: 'ECDH', namedCurve: 'P-256' }, false, []
+      'jwk', serverPkJwk, { name: 'ECDH', namedCurve: 'P-256' }, false, []
     );
     const sharedBits = await crypto.subtle.deriveBits(
       { name: 'ECDH', public: serverPub }, ephemeral.privateKey, 256

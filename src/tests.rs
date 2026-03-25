@@ -110,22 +110,22 @@ mod tests {
         #[test]
         fn derive_kek_is_deterministic() {
             let user_key = [0x01u8; 32];
-            let vm_sk_d = [0x02u8; 32];
+            let sk_d = [0x02u8; 32];
 
-            let kek1 = derive_kek(&user_key, &vm_sk_d).expect("derive_kek failed");
-            let kek2 = derive_kek(&user_key, &vm_sk_d).expect("derive_kek failed again");
+            let kek1 = derive_kek(&user_key, &sk_d).expect("derive_kek failed");
+            let kek2 = derive_kek(&user_key, &sk_d).expect("derive_kek failed again");
             assert_eq!(kek1, kek2, "KEK must be deterministic");
         }
 
         #[test]
         fn derive_kek_changes_with_different_salt() {
             let user_key = [0x01u8; 32];
-            let vm_sk_d_a = [0x02u8; 32];
-            let vm_sk_d_b = [0x03u8; 32];
+            let sk_d_a = [0x02u8; 32];
+            let sk_d_b = [0x03u8; 32];
 
-            let kek_a = derive_kek(&user_key, &vm_sk_d_a).expect("derive_kek_a failed");
-            let kek_b = derive_kek(&user_key, &vm_sk_d_b).expect("derive_kek_b failed");
-            assert_ne!(kek_a, kek_b, "different vm_sk_d must produce different KEKs");
+            let kek_a = derive_kek(&user_key, &sk_d_a).expect("derive_kek_a failed");
+            let kek_b = derive_kek(&user_key, &sk_d_b).expect("derive_kek_b failed");
+            assert_ne!(kek_a, kek_b, "different sk_d must produce different KEKs");
         }
 
         #[test]
@@ -180,9 +180,9 @@ mod tests {
         #[test]
         fn derive_kek_known_answer() {
             let user_key = [0x01u8; 32];
-            let vm_sk_d = [0x02u8; 32];
+            let sk_d = [0x02u8; 32];
 
-            let kek = derive_kek(&user_key, &vm_sk_d).expect("derive_kek failed");
+            let kek = derive_kek(&user_key, &sk_d).expect("derive_kek failed");
 
             let expected = hex_to_bytes(
                 "544091d91d21f0eb3f9be13acdd597714cccdbdd13d8d9cea0bc0207f3cd88bd",
@@ -292,13 +292,14 @@ mod tests {
                 instance_id: None,
                 rate_limit: 0,
                 on_setup_hook: None,
+                init: false,
             };
-            let vm_keypair = generate_keypair().expect("generate_keypair failed");
+            let keypair = generate_keypair().expect("generate_keypair failed");
             let vault = Arc::new(VaultState::new());
 
             Arc::new(AppState {
                 config,
-                vm_keypair,
+                keypair,
                 vault,
                 nonces: Arc::new(Mutex::new(NonceStore::new())),
                 start_time: Instant::now(),
@@ -324,23 +325,23 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn vm_pk_returns_jwk_public_key() {
+        async fn server_pk_returns_jwk_public_key() {
             let state = make_test_state();
-            let response = crate::server::routes::vm_pk(State(state)).await.into_response();
+            let response = crate::server::routes::server_pk(State(state)).await.into_response();
 
             assert_eq!(response.status(), StatusCode::OK);
 
             let body = to_bytes(response.into_body(), 4096).await.unwrap();
             let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
-            let vm_pk = &json["vmPk"];
-            assert_eq!(vm_pk["kty"], "EC");
-            assert_eq!(vm_pk["crv"], "P-256");
-            assert!(vm_pk["x"].is_string(), "x coordinate must be present");
-            assert!(vm_pk["y"].is_string(), "y coordinate must be present");
+            let pk = &json["pk"];
+            assert_eq!(pk["kty"], "EC");
+            assert_eq!(pk["crv"], "P-256");
+            assert!(pk["x"].is_string(), "x coordinate must be present");
+            assert!(pk["y"].is_string(), "y coordinate must be present");
             // 32 bytes base64url-no-pad = 43 characters
-            assert_eq!(vm_pk["x"].as_str().unwrap().len(), 43);
-            assert_eq!(vm_pk["y"].as_str().unwrap().len(), 43);
+            assert_eq!(pk["x"].as_str().unwrap().len(), 43);
+            assert_eq!(pk["y"].as_str().unwrap().len(), 43);
         }
 
         #[tokio::test]
