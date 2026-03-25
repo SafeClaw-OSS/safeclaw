@@ -58,7 +58,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 
         // ── Vault (authenticated) ───────────────────────────────────────────
         .route("/vault/unlock", post(vault_unlock))
-        .route("/vault/lock", post(vault_lock_noauth))
+        .route("/vault/lock", post(vault_lock))
         .route("/vault/credentials", post(vault_credentials))
         .route("/vault/update", post(vault_update))
 

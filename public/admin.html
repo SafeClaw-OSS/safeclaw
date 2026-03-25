@@ -581,7 +581,18 @@ async function lockProxy() {
   statusEl.innerHTML = '';
 
   try {
-    const res = await fetch('/vault/lock', { method: 'POST' });
+    const { credentialId, nonce, assertion } = await passkeyPRF();
+    const vmPk = await getVmPk();
+
+    const payload = { nonce: SafeClaw.toBase64(nonce), credentialId, assertion };
+    const plaintext = new TextEncoder().encode(JSON.stringify(payload));
+    const sealed = await SafeClaw.e2eEncrypt(plaintext, vmPk);
+
+    const res = await fetch('/vault/lock', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ payload: SafeClaw.toBase64(sealed) }),
+    });
     if (!res.ok) {
       const err = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
       throw new Error(err.error || `HTTP ${res.status}`);
