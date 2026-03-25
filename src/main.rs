@@ -49,7 +49,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // --init: generate keypair and exit (for deployment scripts)
     if config.init {
-        info!("--init: keypair ready at {}/pk.jwk, exiting", config.data_dir.display());
+        info!("--init: keypair ready at {}/sc_pk.jwk, exiting", config.data_dir.display());
         return Ok(());
     }
 
