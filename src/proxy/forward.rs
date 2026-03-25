@@ -1,19 +1,19 @@
-/// Upstream request forwarding.
-///
-/// For HTTP upstreams: forwards the request using hyper's HTTP connector.
-/// For HTTPS upstreams: returns 502 (TLS support requires adding a TLS connector crate).
+/// Upstream request forwarding via reqwest (supports HTTP and HTTPS).
 use axum::{
     body::Body,
-    http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri},
+    http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Response},
 };
-use http_body_util::{BodyExt, Full};
-use hyper::body::Bytes;
-use hyper_util::client::legacy::Client;
-use hyper_util::client::legacy::connect::HttpConnector;
-use hyper_util::rt::TokioExecutor;
+use axum::body::Bytes;
+use once_cell::sync::Lazy;
 use std::str::FromStr;
 
+static HTTP_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("failed to build HTTP client")
+});
 
 /// Service configuration extracted from vault secrets
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -40,7 +40,6 @@ pub fn parse_route(req_path: &str) -> Option<(String, String, String)> {
     };
 
     let parts: Vec<&str> = path_part.splitn(3, '/').collect();
-    // parts[0] = "" (before first /), parts[1] = service, parts[2] = rest
     if parts.len() < 2 || parts[1].is_empty() {
         return None;
     }
@@ -63,21 +62,9 @@ pub async fn forward_request(
     service_config: &ServiceConfig,
 ) -> Response {
     let upstream_url = &service_config.upstream;
-    let is_https = upstream_url.starts_with("https://");
 
-    if is_https {
-        // TLS not supported without adding hyper-tls / tokio-rustls to Cargo.toml
-        return (
-            StatusCode::BAD_GATEWAY,
-            axum::Json(serde_json::json!({
-                "error": "HTTPS upstream forwarding requires TLS support (add hyper-tls to Cargo.toml)"
-            })),
-        )
-            .into_response();
-    }
-
-    // Parse upstream base URL
-    let parsed_upstream = match upstream_url.parse::<Uri>() {
+    // Parse upstream base URL for host header
+    let parsed_upstream = match upstream_url.parse::<url::Url>() {
         Ok(u) => u,
         Err(e) => {
             return (
@@ -88,7 +75,7 @@ pub async fn forward_request(
         }
     };
 
-    let host = match parsed_upstream.host() {
+    let host = match parsed_upstream.host_str() {
         Some(h) => h.to_string(),
         None => {
             return (
@@ -98,7 +85,6 @@ pub async fn forward_request(
                 .into_response();
         }
     };
-    let port = parsed_upstream.port_u16().unwrap_or(80);
 
     // Build the upstream path + query
     let (_service_name, rest_path, query) = match parse_route(uri_path) {
@@ -114,7 +100,7 @@ pub async fn forward_request(
 
     let auth = service_config.auth.as_ref();
 
-    // Handle path-type auth injection
+    // Handle path-type auth injection (e.g. Google API key in path)
     let upstream_path = if let Some(a) = auth {
         if a.auth_type == "path" {
             format!("/{}{}", a.value, rest_path)
@@ -141,33 +127,24 @@ pub async fn forward_request(
         query.clone()
     };
 
-    let full_path = format!("{}{}", upstream_path, upstream_query);
-    let full_uri = format!("http://{}:{}{}", host, port, full_path);
+    let full_url = format!("{}{}{}", upstream_url.trim_end_matches('/'), upstream_path, upstream_query);
 
-    let upstream_uri = match full_uri.parse::<Uri>() {
-        Ok(u) => u,
-        Err(e) => {
-            return (
-                StatusCode::BAD_GATEWAY,
-                axum::Json(serde_json::json!({ "error": format!("Failed to build upstream URI: {}", e) })),
-            )
-                .into_response();
-        }
-    };
-
-    // Build forwarded headers (drop Host, add auth header if needed)
-    let mut fwd_headers = HeaderMap::new();
+    // Build forwarded headers
+    let mut fwd_headers = reqwest::header::HeaderMap::new();
     for (k, v) in headers.iter() {
         let key = k.as_str().to_lowercase();
-        if key == "host" {
+        if key == "host" || key == "content-length" || key == "transfer-encoding" {
             continue;
         }
-        fwd_headers.insert(k.clone(), v.clone());
+        if let Ok(rk) = reqwest::header::HeaderName::from_str(k.as_str()) {
+            if let Ok(rv) = reqwest::header::HeaderValue::from_bytes(v.as_bytes()) {
+                fwd_headers.insert(rk, rv);
+            }
+        }
     }
-    fwd_headers.insert(
-        HeaderName::from_static("host"),
-        HeaderValue::from_str(&format!("{}:{}", host, port)).unwrap_or_else(|_| HeaderValue::from_static("localhost")),
-    );
+    if let Ok(hv) = reqwest::header::HeaderValue::from_str(&host) {
+        fwd_headers.insert(reqwest::header::HOST, hv);
+    }
 
     // Handle header-type auth injection
     if let Some(a) = auth {
@@ -183,39 +160,43 @@ pub async fn forward_request(
                 a.value.clone()
             };
             if let (Ok(hn), Ok(hv)) = (
-                HeaderName::from_str(&header_name),
-                HeaderValue::from_str(&header_val),
+                reqwest::header::HeaderName::from_str(&header_name),
+                reqwest::header::HeaderValue::from_str(&header_val),
             ) {
                 fwd_headers.insert(hn, hv);
             }
         }
     }
 
-    // Build the request
-    let mut req_builder = hyper::Request::builder()
-        .method(method)
-        .uri(upstream_uri);
-    let req_headers = req_builder.headers_mut().unwrap();
-    for (k, v) in &fwd_headers {
-        req_headers.insert(k, v.clone());
-    }
-
-    let upstream_req = match req_builder.body(Full::new(body_bytes)) {
-        Ok(r) => r,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                axum::Json(serde_json::json!({ "error": format!("Failed to build upstream request: {}", e) })),
-            )
-                .into_response();
-        }
+    // Convert method
+    let reqwest_method = match method.as_str() {
+        "GET" => reqwest::Method::GET,
+        "POST" => reqwest::Method::POST,
+        "PUT" => reqwest::Method::PUT,
+        "DELETE" => reqwest::Method::DELETE,
+        "PATCH" => reqwest::Method::PATCH,
+        "HEAD" => reqwest::Method::HEAD,
+        "OPTIONS" => reqwest::Method::OPTIONS,
+        other => match reqwest::Method::from_bytes(other.as_bytes()) {
+            Ok(m) => m,
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    axum::Json(serde_json::json!({ "error": format!("Unsupported method: {}", other) })),
+                )
+                    .into_response();
+            }
+        },
     };
 
     // Send request
-    let connector = HttpConnector::new();
-    let client: Client<HttpConnector, Full<Bytes>> = Client::builder(TokioExecutor::new()).build(connector);
-
-    let upstream_resp = match client.request(upstream_req).await {
+    let upstream_resp = match HTTP_CLIENT
+        .request(reqwest_method, &full_url)
+        .headers(fwd_headers)
+        .body(body_bytes.to_vec())
+        .send()
+        .await
+    {
         Ok(r) => r,
         Err(e) => {
             return (
@@ -227,10 +208,12 @@ pub async fn forward_request(
     };
 
     // Convert upstream response
-    let status = upstream_resp.status();
+    let status = StatusCode::from_u16(upstream_resp.status().as_u16())
+        .unwrap_or(StatusCode::BAD_GATEWAY);
     let resp_headers = upstream_resp.headers().clone();
-    let body_bytes = match upstream_resp.into_body().collect().await {
-        Ok(b) => b.to_bytes(),
+
+    let body_bytes = match upstream_resp.bytes().await {
+        Ok(b) => b,
         Err(e) => {
             return (
                 StatusCode::BAD_GATEWAY,
@@ -243,13 +226,17 @@ pub async fn forward_request(
     let mut response = Response::new(Body::from(body_bytes));
     *response.status_mut() = status;
     for (k, v) in &resp_headers {
-        response.headers_mut().insert(k, v.clone());
+        if let (Ok(ak), Ok(av)) = (
+            HeaderName::from_str(k.as_str()),
+            HeaderValue::from_bytes(v.as_bytes()),
+        ) {
+            response.headers_mut().insert(ak, av);
+        }
     }
     response
 }
 
 fn urlencoding_encode(s: &str) -> String {
-    // Simple percent-encoding for query parameter values
     let mut encoded = String::new();
     for c in s.chars() {
         match c {

@@ -1339,6 +1339,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "mime_guess",
+ "once_cell",
  "p256",
  "rand 0.8.5",
  "reqwest",
@@ -1349,6 +1350,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "url",
  "zeroize",
 ]
 
