@@ -160,9 +160,9 @@
   </div>
   <div class="nav-links">
     <a href="/">Home</a>
-    <a href="/admin.html">Dashboard</a>
-    <a href="/setup.html">Setup</a>
-    <a href="/unlock.html" class="active">Unlock</a>
+    <a href="/admin">Dashboard</a>
+    <a href="/setup">Setup</a>
+    <a href="/unlock" class="active">Unlock</a>
   </div>
 </nav>
 
@@ -180,7 +180,7 @@
     <div id="status"></div>
 
     <div class="divider">or</div>
-    <a href="/admin.html" class="btn btn-ghost" style="text-decoration:none;">View Dashboard</a>
+    <a href="/admin" class="btn btn-ghost" style="text-decoration:none;">View Dashboard</a>
   </div>
 
   <!-- Success state -->
@@ -234,7 +234,7 @@ async function startUnlock() {
 
   try {
     // Fetch server public key
-    const res = await fetch('/vmPk');
+    const res = await fetch('/pk');
     if (!res.ok) throw new Error(`Server returned ${res.status}`);
     const data = await res.json();
     vmPk = data.vmPk;  // JWK object
@@ -300,7 +300,7 @@ async function startUnlock() {
 
     setBtn('<div class="spinner"></div> Unlocking vault…', true);
 
-    const res = await fetch('/unlock', {
+    const res = await fetch('/vault/unlock', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ payload: payloadB64 }),

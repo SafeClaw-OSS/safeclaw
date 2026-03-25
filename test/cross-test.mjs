@@ -240,7 +240,7 @@ async function main() {
   })
 
   await test('GET /vm-pk returns JWK public key', async () => {
-    const { status, json } = await get('/vm-pk')
+    const { status, json } = await get('/pk')
     assert.equal(status, 200)
     assert.ok(json.vmPk)
     assert.equal(json.vmPk.kty, 'EC')
@@ -471,7 +471,7 @@ async function main() {
       newPasskey: { credentialId: passkey2.credentialId, x: passkey2.x, y: passkey2.y, deviceName: 'CrossTest2' },
       newUserKey: toBase64(userKey2),
     })
-    const res = await post('/identity/add-passkey', body)
+    const res = await post('/passkeys/add', body)
     assert.equal(res.status, 200, `Add passkey failed: ${JSON.stringify(res.json)}`)
 
     // Verify we can unlock with the new passkey

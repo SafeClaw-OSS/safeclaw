@@ -252,9 +252,9 @@
   </div>
   <div class="nav-links">
     <a href="/">Home</a>
-    <a href="/admin.html">Dashboard</a>
-    <a href="/setup.html" class="active">Setup</a>
-    <a href="/unlock.html">Unlock</a>
+    <a href="/admin">Dashboard</a>
+    <a href="/setup" class="active">Setup</a>
+    <a href="/unlock">Unlock</a>
   </div>
 </nav>
 
@@ -383,10 +383,10 @@
         Your API vault is encrypted and stored securely. Agents accessing this proxy will need your passkey to unlock the vault. You can close this tab.
       </div>
       <div style="display:flex;gap:10px;justify-content:center;flex-wrap:wrap;">
-        <a href="/admin.html" class="btn btn-primary" style="display:inline-flex;width:auto;">
+        <a href="/admin" class="btn btn-primary" style="display:inline-flex;width:auto;">
           📊 View Dashboard
         </a>
-        <a href="/unlock.html" class="btn btn-outline" style="display:inline-flex;width:auto;">
+        <a href="/unlock" class="btn btn-outline" style="display:inline-flex;width:auto;">
           🔓 Unlock Vault
         </a>
       </div>
@@ -456,7 +456,7 @@ function showPane(n) {
   }
 
   try {
-    const res = await fetch('/vmPk');
+    const res = await fetch('/pk');
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
     state.vmPk = data.vmPk;  // JWK object
@@ -829,8 +829,8 @@ async function doSubmit() {
   const msg = document.getElementById('submit-msg');
   try {
     msg.textContent = 'Fetching server public key…';
-    const vmPkRes = await fetch('/vmPk');
-    if (!vmPkRes.ok) throw new Error(`vmPk fetch failed: HTTP ${vmPkRes.status}`);
+    const vmPkRes = await fetch('/pk');
+    if (!vmPkRes.ok) throw new Error(`pk fetch failed: HTTP ${vmPkRes.status}`);
     const { vmPk } = await vmPkRes.json();
     state.vmPk = vmPk;
 

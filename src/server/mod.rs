@@ -50,66 +50,29 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .allow_headers(Any);
 
     Router::new()
-        // ── Health ──────────────────────────────────────────────────────────
+        // ── Public ──────────────────────────────────────────────────────────
         .route("/health", get(health))
+        .route("/pk", get(vm_pk))
+        .route("/setup", get(serve_setup).post(setup))
+        .route("/status", get(status_basic).post(status_authenticated))
 
-        // ── VM Public Key ────────────────────────────────────────────────────
-        // Old path (used by HTML)
-        .route("/vmPk", get(vm_pk))
-        // New path
-        .route("/vm-pk", get(vm_pk))
-
-        // ── Status ───────────────────────────────────────────────────────────
-        // Old path: GET for unauthenticated basic status (used by admin.html)
-        .route("/admin/status", get(status_basic).post(status_authenticated))
-        // New path
-        .route("/system/status", get(status_basic).post(status_authenticated))
-
-        // ── Setup ─────────────────────────────────────────────────────────────
-        .route("/setup", post(setup))
-
-        // ── Vault: Unlock ─────────────────────────────────────────────────────
-        // Old paths (used by HTML)
-        .route("/unlock", post(vault_unlock))
-        .route("/admin/unlock", post(vault_unlock))
-        // New path
+        // ── Vault (authenticated) ───────────────────────────────────────────
         .route("/vault/unlock", post(vault_unlock))
-
-        // ── Vault: Lock ───────────────────────────────────────────────────────
-        // Old path (no auth — HTML sends no auth for lock)
-        .route("/admin/lock", post(vault_lock_noauth))
-        // New path (with auth)
-        .route("/vault/lock", post(vault_lock))
-
-        // ── Vault: Credentials ────────────────────────────────────────────────
-        .route("/admin/credentials", post(vault_credentials))
+        .route("/vault/lock", post(vault_lock_noauth))
         .route("/vault/credentials", post(vault_credentials))
-
-        // ── Vault: Update ─────────────────────────────────────────────────────
-        .route("/admin/update-secrets", post(vault_update))
         .route("/vault/update", post(vault_update))
 
-        // ── Identity ──────────────────────────────────────────────────────────
-        .route("/admin/add-passkey", post(identity_add_passkey))
-        .route("/identity/add-passkey", post(identity_add_passkey))
-        .route("/admin/remove-passkey", post(identity_remove_passkey))
-        .route("/identity/remove-passkey", post(identity_remove_passkey))
+        // ── Passkeys (authenticated) ────────────────────────────────────────
+        .route("/passkeys/add", post(identity_add_passkey))
+        .route("/passkeys/remove", post(identity_remove_passkey))
 
-        // ── System ────────────────────────────────────────────────────────────
-        .route("/admin/restart", post(system_restart))
-        .route("/system/restart", post(system_restart))
-        .route("/admin/shutdown", post(system_shutdown))
-        .route("/system/shutdown", post(system_shutdown))
+        // ── Process control (authenticated) ─────────────────────────────────
+        .route("/restart", post(system_restart))
+        .route("/shutdown", post(system_shutdown))
 
-        // ── Static Pages ──────────────────────────────────────────────────────
+        // ── Static pages ────────────────────────────────────────────────────
         .route("/", get(serve_index))
-        .route("/index.html", get(serve_index))
-        .route("/setup.html", get(serve_setup))
-        .route("/setup", get(serve_setup))
-        .route("/unlock.html", get(serve_unlock))
         .route("/unlock", get(serve_unlock))
-        .route("/admin/unlock", get(serve_unlock))
-        .route("/admin.html", get(serve_admin))
         .route("/admin", get(serve_admin))
         .route("/safeclaw-client.js", get(serve_client_js))
 

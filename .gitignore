@@ -8,3 +8,4 @@ data/
 # Added by cargo
 
 /target
+.cross-test-data/
