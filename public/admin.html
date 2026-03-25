@@ -280,8 +280,8 @@
   <div class="nav-links">
     <a href="/">Home</a>
     <a href="/admin" class="active">Dashboard</a>
-    <a href="/setup">Setup</a>
-    <a href="/unlock">Unlock</a>
+    <a href="/admin/setup">Setup</a>
+    <a href="/admin/unlock">Unlock</a>
   </div>
 </nav>
 
@@ -377,14 +377,14 @@
         <span class="card-title">Quick Actions</span>
       </div>
       <div class="action-row">
-        <a href="/unlock" class="action-btn">
+        <a href="/admin/unlock" class="action-btn">
           <span class="ab-icon">🔓</span>
           <div class="ab-text">
             <div>Unlock Vault</div>
             <div class="ab-desc">Authenticate with passkey to restore proxy access</div>
           </div>
         </a>
-        <a href="/setup" class="action-btn">
+        <a href="/admin/setup" class="action-btn">
           <span class="ab-icon">⚙️</span>
           <div class="ab-text">
             <div>Re-run Setup</div>
@@ -432,7 +432,7 @@ async function refreshStatus() {
   errBanner.style.display = 'none';
 
   try {
-    const res = await fetch('/status');
+    const res = await fetch('/health');
     if (!res.ok) throw new Error(`Server returned ${res.status}`);
     const data = await res.json();
 
@@ -454,7 +454,7 @@ async function refreshStatus() {
 // ── Render ────────────────────────────────────────────────────────────────────
 
 function renderStatus(data) {
-  const { locked, uptime, services, passkeys } = data;
+  const { locked, uptime, version } = data;
 
   // Topbar badge
   const badge = document.getElementById('topbar-badge');
@@ -491,11 +491,10 @@ function renderStatus(data) {
   // Uptime
   renderUptime(uptime);
 
-  // Services
+  // Services — show from cached credentials if available, otherwise prompt to view
   const svcEl = document.getElementById('services-content');
-  if (!services || services.length === 0) {
-    svcEl.innerHTML = '<div class="list-empty">No services configured. <a href="/setup">Run setup</a></div>';
-  } else {
+  if (currentSecrets && currentSecrets.services) {
+    const services = Object.keys(currentSecrets.services);
     svcEl.innerHTML = services.map(svc => {
       const meta = SERVICE_META[svc] || { icon: '🔌', label: svc, url: '' };
       return `
@@ -520,24 +519,18 @@ function renderStatus(data) {
         </div>
       `;
     }).join('');
+  } else if (locked) {
+    svcEl.innerHTML = '<div class="list-empty">Unlock vault to view services.</div>';
+  } else {
+    svcEl.innerHTML = '<div class="list-empty">Click "View Credentials" to see configured services.</div>';
   }
 
-  // Passkeys
+  // Passkeys — only visible after viewing credentials
   const pkEl = document.getElementById('passkeys-content');
-  if (!passkeys || passkeys.length === 0) {
-    pkEl.innerHTML = '<div class="list-empty">No passkeys registered. <a href="/setup">Run setup</a></div>';
-  } else {
-    pkEl.innerHTML = passkeys.map((pk, i) => {
-      const short = pk.length > 16 ? pk.slice(0, 8) + '…' + pk.slice(-6) : pk;
-      return `
-        <div class="list-item">
-          <span class="li-icon">🔑</span>
-          <div class="li-text">
-            <div class="li-name">Passkey ${i + 1}</div>
-            <div class="li-sub" title="${pk}">${short}</div>
-          </div>
-        </div>
-      `;
+  if (!locked && !currentSecrets) {
+    pkEl.innerHTML = '<div class="list-empty">Click "View Credentials" to see passkey info.</div>';
+  } else if (locked) {
+    pkEl.innerHTML = '<div class="list-empty">Unlock vault to view passkeys.</div>';
     }).join('');
   }
 }

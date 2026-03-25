@@ -53,11 +53,15 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // ── Public ──────────────────────────────────────────────────────────
         .route("/health", get(health))
         .route("/pk", get(vm_pk))
-        .route("/setup", get(serve_setup).post(setup))
-        .route("/status", get(status_basic).post(status_authenticated))
+
+        // ── Admin (instance management) ─────────────────────────────────────
+        .route("/admin/setup", get(serve_setup).post(setup))
+        .route("/admin/unlock", get(serve_unlock).post(vault_unlock))
+        .route("/admin", get(serve_admin))
+        .route("/admin/restart", post(system_restart))
+        .route("/admin/shutdown", post(system_shutdown))
 
         // ── Vault (authenticated) ───────────────────────────────────────────
-        .route("/vault/unlock", post(vault_unlock))
         .route("/vault/lock", post(vault_lock))
         .route("/vault/credentials", post(vault_credentials))
         .route("/vault/update", post(vault_update))
@@ -66,14 +70,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/passkeys/add", post(identity_add_passkey))
         .route("/passkeys/remove", post(identity_remove_passkey))
 
-        // ── Process control (authenticated) ─────────────────────────────────
-        .route("/restart", post(system_restart))
-        .route("/shutdown", post(system_shutdown))
-
-        // ── Static pages ────────────────────────────────────────────────────
+        // ── Static ──────────────────────────────────────────────────────────
         .route("/", get(serve_index))
-        .route("/unlock", get(serve_unlock))
-        .route("/admin", get(serve_admin))
         .route("/safeclaw-client.js", get(serve_client_js))
 
         // ── Middleware ────────────────────────────────────────────────────────

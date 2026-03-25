@@ -253,8 +253,8 @@
   <div class="nav-links">
     <a href="/">Home</a>
     <a href="/admin">Dashboard</a>
-    <a href="/setup" class="active">Setup</a>
-    <a href="/unlock">Unlock</a>
+    <a href="/admin/setup" class="active">Setup</a>
+    <a href="/admin/unlock">Unlock</a>
   </div>
 </nav>
 
@@ -386,7 +386,7 @@
         <a href="/admin" class="btn btn-primary" style="display:inline-flex;width:auto;">
           📊 View Dashboard
         </a>
-        <a href="/unlock" class="btn btn-outline" style="display:inline-flex;width:auto;">
+        <a href="/admin/unlock" class="btn btn-outline" style="display:inline-flex;width:auto;">
           🔓 Unlock Vault
         </a>
       </div>
@@ -855,7 +855,7 @@ async function doSubmit() {
     const payloadB64 = SafeClaw.toBase64(sealed);
 
     msg.textContent = 'Uploading to server…';
-    const res = await fetch('/setup', {
+    const res = await fetch('/admin/setup', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({

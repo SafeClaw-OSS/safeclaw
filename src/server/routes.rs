@@ -41,61 +41,7 @@ pub async fn vm_pk(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     Json(json!({ "vmPk": state.vm_keypair.pk }))
 }
 
-// ── Status (unauthenticated basic / authenticated full) ───────────────────────
-
-pub async fn status_basic(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let passkeys_path = state.config.data_dir.join("passkeys.json");
-    let passkeys_info: Vec<Value> = if passkeys_path.exists() {
-        let data: HashMap<String, PasskeyEntry> =
-            serde_json::from_str(&fs::read_to_string(&passkeys_path).unwrap_or_default())
-                .unwrap_or_default();
-        data.iter()
-            .map(|(id, e)| json!({ "id": id, "deviceName": e.device_name }))
-            .collect()
-    } else {
-        vec![]
-    };
-
-    Json(json!({
-        "locked": state.vault.is_locked(),
-        "uptime": state.start_time.elapsed().as_secs_f64(),
-        "services": state.vault.service_names(),
-        "passkeys": passkeys_info,
-    }))
-}
-
-pub async fn status_authenticated(
-    State(state): State<Arc<AppState>>,
-    bytes: Bytes,
-) -> Result<impl IntoResponse> {
-    // If body is empty / trivial, return basic status (compat with admin.html's GET-style call)
-    let trimmed = bytes.trim_ascii();
-    if trimmed.is_empty() || trimmed == b"{}" {
-        let passkeys_path = state.config.data_dir.join("passkeys.json");
-        let passkeys: HashMap<String, PasskeyEntry> = if passkeys_path.exists() {
-            serde_json::from_str(&fs::read_to_string(&passkeys_path).unwrap_or_default())
-                .unwrap_or_default()
-        } else {
-            HashMap::new()
-        };
-        return Ok(Json(json!({
-            "locked": state.vault.is_locked(),
-            "uptime": state.start_time.elapsed().as_secs_f64(),
-            "services": state.vault.service_names(),
-            "passkeys": passkeys.keys().collect::<Vec<_>>(),
-        })));
-    }
-
-    let auth = authenticate_bytes(&bytes, &state)?;
-    let passkeys = &auth.passkeys;
-
-    Ok(Json(json!({
-        "locked": state.vault.is_locked(),
-        "uptime": state.start_time.elapsed().as_secs_f64(),
-        "services": state.vault.service_names(),
-        "passkeys": passkeys.keys().collect::<Vec<_>>(),
-    })))
-}
+// (status endpoints removed — dashboard uses /health + /vault/credentials)
 
 // ── Setup ─────────────────────────────────────────────────────────────────────
 
