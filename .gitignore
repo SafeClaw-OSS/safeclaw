@@ -3,3 +3,8 @@ data/
 *.enc
 *.bin
 .env
+
+
+# Added by cargo
+
+/target

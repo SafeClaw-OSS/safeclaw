@@ -1,0 +1,106 @@
+mod auth;
+mod config;
+mod crypto;
+mod error;
+mod proxy;
+mod server;
+mod state;
+#[cfg(test)]
+mod tests;
+
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
+use axum::serve;
+use tokio::net::TcpListener;
+use tracing::{info, warn};
+
+use config::Config;
+use crypto::keys::load_or_create_keypair;
+use state::{AppState, RateLimiter, VaultState};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Initialize tracing subscriber
+    tracing_subscriber::fmt::init();
+
+    let config = Config::parse();
+
+    info!(
+        "SafeClaw v{} starting — data_dir={} port={} proxy_port={}",
+        env!("CARGO_PKG_VERSION"),
+        config.data_dir.display(),
+        config.port,
+        config.proxy_port,
+    );
+
+    // Warn if SAFECLAW_ORIGIN/SAFECLAW_RP_ID are not set
+    if config.origin.is_none() {
+        warn!("SAFECLAW_ORIGIN not set — defaulting to http://localhost:{}. Set this for production.", config.port);
+    }
+    if config.rp_id.is_none() {
+        warn!("SAFECLAW_RP_ID not set — defaulting to 'localhost'. Set this for production.");
+    }
+
+    // Load or create VM keypair
+    let vm_keypair = load_or_create_keypair(&config.data_dir)?;
+    info!("VM keypair loaded (pk.x={}...)", &vm_keypair.pk.x[..8.min(vm_keypair.pk.x.len())]);
+
+    // Build shared vault state
+    let vault = Arc::new(VaultState::new());
+
+    // Build app state
+    let state = Arc::new(AppState {
+        vm_keypair,
+        vault: vault.clone(),
+        nonces: Arc::new(Mutex::new(auth::nonce::NonceStore::new())),
+        start_time: Instant::now(),
+        rate_limiter: Arc::new(Mutex::new(RateLimiter::new(config.rate_limit))),
+        config: config.clone(),
+    });
+
+    // Periodic rate-limiter cleanup
+    {
+        let state_clone = state.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
+            loop {
+                interval.tick().await;
+                state_clone.rate_limiter.lock().unwrap().cleanup();
+            }
+        });
+    }
+
+    // Build proxy state and router
+    let proxy_state = Arc::new(proxy::ProxyState {
+        vault: vault.clone(),
+        config: config.clone(),
+    });
+    let proxy_router = proxy::build_proxy_router(proxy_state);
+
+    // Bind proxy first (127.0.0.1)
+    let proxy_addr: SocketAddr = format!("{}:{}", config.proxy_bind, config.proxy_port)
+        .parse()
+        .map_err(|e| format!("Invalid proxy bind address: {}", e))?;
+    let proxy_listener = TcpListener::bind(proxy_addr).await?;
+    info!("Proxy listening on http://{}", proxy_addr);
+
+    // Bind server (0.0.0.0)
+    let server_addr: SocketAddr = format!("0.0.0.0:{}", config.port)
+        .parse()
+        .map_err(|e| format!("Invalid server address: {}", e))?;
+    let server_listener = TcpListener::bind(server_addr).await?;
+    info!("Server listening on http://{}", server_addr);
+
+    // Build server router
+    let server_router = server::build_router(state);
+
+    // Run both servers concurrently
+    tokio::try_join!(
+        serve(server_listener, server_router.into_make_service_with_connect_info::<SocketAddr>()),
+        serve(proxy_listener, proxy_router.into_make_service()),
+    )?;
+
+    Ok(())
+}
