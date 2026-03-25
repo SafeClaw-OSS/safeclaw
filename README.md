@@ -70,6 +70,7 @@ providers:
 | `--admin-url` | `SAFECLAW_ADMIN_URL` | `http://localhost:{port}` | URL shown in locked responses |
 | `--rate-limit` | `SAFECLAW_RATE_LIMIT` | `20` | Requests/min per IP (0 = off) |
 | `--on-setup-hook` | `SAFECLAW_ON_SETUP_HOOK` | — | Webhook URL for setup `config` data |
+| `--init` | — | — | Generate keypair and exit (for deploy scripts) |
 
 ## API
 
@@ -78,7 +79,7 @@ providers:
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/health` | Health check (`{ status, locked, uptime, version }`) |
-| GET | `/pk` | Server P-256 public key (JWK) for E2E encryption |
+| GET | `/pk` | Server P-256 public key (JWK `{ pk: {...} }`) for E2E encryption |
 
 ### Admin (instance management)
 
