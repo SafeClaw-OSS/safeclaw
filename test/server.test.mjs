@@ -19,7 +19,7 @@ test('GET /health returns ok', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'sc-srv-test-'))
   const proxy = createMockProxy()
   const port = await getFreePort()
-  const server = await createServer({ port, dataDir: dir, proxy })
+  const server = await createServer({ port, dataDir: dir, proxy, expectedOrigin: "http://localhost", rpId: "localhost" })
   t.after(() => { server.close(); rmSync(dir, { recursive: true }) })
 
   const { status, body } = await httpRequest(port, 'GET', '/health')
@@ -33,7 +33,7 @@ test('POST /setup creates vault.enc, wrapped DEK, passkeys.json and unlocks prox
   const dir = mkdtempSync(join(tmpdir(), 'sc-srv-test-'))
   const proxy = createMockProxy()
   const port = await getFreePort()
-  const server = await createServer({ port, dataDir: dir, proxy })
+  const server = await createServer({ port, dataDir: dir, proxy, expectedOrigin: "http://localhost", rpId: "localhost" })
   t.after(() => { server.close(); rmSync(dir, { recursive: true }) })
 
   const { body: { vmPk } } = await httpRequest(port, 'GET', '/vmPk')
@@ -69,7 +69,7 @@ test('POST /unlock decrypts vault and unlocks proxy', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'sc-srv-test-'))
   const proxy = createMockProxy()
   const port = await getFreePort()
-  const server = await createServer({ port, dataDir: dir, proxy })
+  const server = await createServer({ port, dataDir: dir, proxy, expectedOrigin: "http://localhost", rpId: "localhost" })
   t.after(() => { server.close(); rmSync(dir, { recursive: true }) })
 
   const { body: { vmPk } } = await httpRequest(port, 'GET', '/vmPk')
@@ -112,7 +112,7 @@ test('POST /admin/status returns status without auth when no vault exists', asyn
   const dir = mkdtempSync(join(tmpdir(), 'sc-srv-test-'))
   const proxy = createMockProxy()
   const port = await getFreePort()
-  const server = await createServer({ port, dataDir: dir, proxy })
+  const server = await createServer({ port, dataDir: dir, proxy, expectedOrigin: "http://localhost", rpId: "localhost" })
   t.after(() => { server.close(); rmSync(dir, { recursive: true }) })
 
   const { status, body } = await httpRequest(port, 'POST', '/admin/status', {})
@@ -126,7 +126,7 @@ test('POST /admin/status requires passkey auth after setup', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'sc-srv-test-'))
   const proxy = createMockProxy()
   const port = await getFreePort()
-  const server = await createServer({ port, dataDir: dir, proxy })
+  const server = await createServer({ port, dataDir: dir, proxy, expectedOrigin: "http://localhost", rpId: "localhost" })
   t.after(() => { server.close(); rmSync(dir, { recursive: true }) })
 
   const { body: { vmPk } } = await httpRequest(port, 'GET', '/vmPk')
@@ -165,7 +165,7 @@ test('POST /setup rejects replayed nonce', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'sc-srv-test-'))
   const proxy = createMockProxy()
   const port = await getFreePort()
-  const server = await createServer({ port, dataDir: dir, proxy })
+  const server = await createServer({ port, dataDir: dir, proxy, expectedOrigin: "http://localhost", rpId: "localhost" })
   t.after(() => { server.close(); rmSync(dir, { recursive: true }) })
 
   const { body: { vmPk } } = await httpRequest(port, 'GET', '/vmPk')
@@ -213,7 +213,7 @@ test('POST /unlock rejects replayed nonce', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'sc-srv-test-'))
   const proxy = createMockProxy()
   const port = await getFreePort()
-  const server = await createServer({ port, dataDir: dir, proxy })
+  const server = await createServer({ port, dataDir: dir, proxy, expectedOrigin: "http://localhost", rpId: "localhost" })
   t.after(() => { server.close(); rmSync(dir, { recursive: true }) })
 
   const { body: { vmPk } } = await httpRequest(port, 'GET', '/vmPk')
@@ -260,7 +260,7 @@ test('POST /admin/credentials returns response-key-encrypted vault contents', as
   const dir = mkdtempSync(join(tmpdir(), 'sc-srv-test-'))
   const proxy = createMockProxy()
   const port = await getFreePort()
-  const server = await createServer({ port, dataDir: dir, proxy })
+  const server = await createServer({ port, dataDir: dir, proxy, expectedOrigin: "http://localhost", rpId: "localhost" })
   t.after(() => { server.close(); rmSync(dir, { recursive: true }) })
 
   const { body: { vmPk } } = await httpRequest(port, 'GET', '/vmPk')
@@ -304,7 +304,7 @@ test('POST /admin/credentials rejects replayed nonce', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'sc-srv-test-'))
   const proxy = createMockProxy()
   const port = await getFreePort()
-  const server = await createServer({ port, dataDir: dir, proxy })
+  const server = await createServer({ port, dataDir: dir, proxy, expectedOrigin: "http://localhost", rpId: "localhost" })
   t.after(() => { server.close(); rmSync(dir, { recursive: true }) })
 
   const { body: { vmPk } } = await httpRequest(port, 'GET', '/vmPk')
@@ -349,7 +349,7 @@ test('POST /admin/update-secrets re-encrypts vault with new secrets', async (t) 
   const dir = mkdtempSync(join(tmpdir(), 'sc-srv-test-'))
   const proxy = createMockProxy()
   const port = await getFreePort()
-  const server = await createServer({ port, dataDir: dir, proxy })
+  const server = await createServer({ port, dataDir: dir, proxy, expectedOrigin: "http://localhost", rpId: "localhost" })
   t.after(() => { server.close(); rmSync(dir, { recursive: true }) })
 
   const { body: { vmPk } } = await httpRequest(port, 'GET', '/vmPk')
@@ -406,4 +406,65 @@ test('POST /admin/update-secrets re-encrypts vault with new secrets', async (t) 
   })
   assert.strictEqual(unlockRes.status, 200)
   assert.strictEqual(proxy.getSecrets().services.anthropic.auth.value, 'sk-ant-updated')
+})
+
+// ── onSetup hook ──────────────────────────────────────────────────────────────
+
+test('onSetup hook can transform secrets before vault write', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'sc-srv-test-'))
+  const proxy = createMockProxy()
+  const port = await getFreePort()
+  let hookCalled = false
+  const server = await createServer({
+    port, dataDir: dir, proxy,
+    expectedOrigin: 'http://localhost', rpId: 'localhost',
+    onSetup: async ({ payload, secrets }) => {
+      hookCalled = true
+      // Strip extra fields, only keep services
+      const { extra, ...clean } = secrets
+      return { secrets: clean }
+    },
+  })
+  t.after(() => { server.close(); rmSync(dir, { recursive: true }) })
+
+  const { body: { vmPk } } = await httpRequest(port, 'GET', '/vmPk')
+
+  const credentialId = 'cred-hook-001'
+  const userKey = generateDEK()
+  const cred = await makeP256Credential()
+  const assertion = await makeAssertion(cred.privateKey)
+
+  const secretsWithExtra = { ...SAMPLE_SECRETS, extra: 'should-be-stripped' }
+  const setupEnc = await e2eEncrypt(Buffer.from(JSON.stringify({
+    passkeys: [{ credentialId, x: cred.x, y: cred.y, deviceName: 'HookTest' }],
+    secrets: secretsWithExtra,
+    userKeys: [userKey.toString('base64')],
+    nonce: makeNonce(),
+    assertions: [assertion],
+  })), vmPk)
+  const { status, body } = await httpRequest(port, 'POST', '/setup', {
+    payload: setupEnc.toString('base64'),
+  })
+
+  assert.strictEqual(status, 200)
+  assert.strictEqual(body.ok, true)
+  assert.strictEqual(hookCalled, true)
+
+  // Verify stored secrets don't have 'extra' — unlock and check proxy
+  assert.strictEqual(proxy.getSecrets().extra, undefined)
+  assert.strictEqual(proxy.getSecrets().services.anthropic.auth.value, 'sk-ant-test')
+})
+
+// ── createServer rejects missing origin/rpId ──────────────────────────────────
+
+test('createServer throws without expectedOrigin and rpId', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'sc-srv-test-'))
+  const proxy = createMockProxy()
+  const port = await getFreePort()
+  t.after(() => { rmSync(dir, { recursive: true }) })
+
+  await assert.rejects(
+    () => createServer({ port, dataDir: dir, proxy }),
+    { message: /expectedOrigin and rpId are required/ }
+  )
 })

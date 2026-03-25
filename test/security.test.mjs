@@ -43,7 +43,7 @@ test('Rate limit: rejects excessive POST requests from same IP', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'sc-sec-'))
   const proxy = createMockProxy()
   const port = await getFreePort()
-  const server = await createServer({ port, dataDir: dir, proxy, rateLimit: 3 })
+  const server = await createServer({ port, dataDir: dir, proxy, rateLimit: 3, expectedOrigin: "http://localhost", rpId: "localhost" })
   t.after(() => { server.close(); rmSync(dir, { recursive: true }) })
 
   // First 3 requests should not be rate limited
@@ -61,7 +61,7 @@ test('Rate limit: disabled when rateLimit=0', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'sc-sec-'))
   const proxy = createMockProxy()
   const port = await getFreePort()
-  const server = await createServer({ port, dataDir: dir, proxy, rateLimit: 0 })
+  const server = await createServer({ port, dataDir: dir, proxy, rateLimit: 0, expectedOrigin: "http://localhost", rpId: "localhost" })
   t.after(() => { server.close(); rmSync(dir, { recursive: true }) })
 
   // Should never get 429
@@ -79,7 +79,7 @@ test('🔴-2: /admin/lock requires passkey assertion', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'sc-sec-'))
   const proxy = createMockProxy()
   const port = await getFreePort()
-  const server = await createServer({ port, dataDir: dir, proxy })
+  const server = await createServer({ port, dataDir: dir, proxy, expectedOrigin: "http://localhost", rpId: "localhost" })
   t.after(() => { server.close(); rmSync(dir, { recursive: true }) })
 
   const { credentialId, cred, vmPk } = await doSetup(port)
@@ -103,7 +103,7 @@ test('🔴-2: /admin/status rejects unauthenticated request after setup', async 
   const dir = mkdtempSync(join(tmpdir(), 'sc-sec-'))
   const proxy = createMockProxy()
   const port = await getFreePort()
-  const server = await createServer({ port, dataDir: dir, proxy })
+  const server = await createServer({ port, dataDir: dir, proxy, expectedOrigin: "http://localhost", rpId: "localhost" })
   t.after(() => { server.close(); rmSync(dir, { recursive: true }) })
 
   await doSetup(port)
@@ -120,7 +120,7 @@ test('🔴-3: null x/y passkey is rejected', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'sc-sec-'))
   const proxy = createMockProxy()
   const port = await getFreePort()
-  const server = await createServer({ port, dataDir: dir, proxy })
+  const server = await createServer({ port, dataDir: dir, proxy, expectedOrigin: "http://localhost", rpId: "localhost" })
   t.after(() => { server.close(); rmSync(dir, { recursive: true }) })
 
   const { body: { vmPk } } = await httpRequest(port, 'GET', '/vmPk')
@@ -151,7 +151,7 @@ test('🔴-4: wrong origin rejected', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'sc-sec-'))
   const proxy = createMockProxy()
   const port = await getFreePort()
-  const server = await createServer({ port, dataDir: dir, proxy })
+  const server = await createServer({ port, dataDir: dir, proxy, expectedOrigin: "http://localhost", rpId: "localhost" })
   t.after(() => { server.close(); rmSync(dir, { recursive: true }) })
 
   const { credentialId, cred, vmPk, userKey } = await doSetup(port)
@@ -171,7 +171,7 @@ test('🔴-4: wrong rpId rejected', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'sc-sec-'))
   const proxy = createMockProxy()
   const port = await getFreePort()
-  const server = await createServer({ port, dataDir: dir, proxy })
+  const server = await createServer({ port, dataDir: dir, proxy, expectedOrigin: "http://localhost", rpId: "localhost" })
   t.after(() => { server.close(); rmSync(dir, { recursive: true }) })
 
   const { credentialId, cred, vmPk, userKey } = await doSetup(port)
@@ -191,7 +191,7 @@ test('🔴-4: wrong type (webauthn.create) rejected', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'sc-sec-'))
   const proxy = createMockProxy()
   const port = await getFreePort()
-  const server = await createServer({ port, dataDir: dir, proxy })
+  const server = await createServer({ port, dataDir: dir, proxy, expectedOrigin: "http://localhost", rpId: "localhost" })
   t.after(() => { server.close(); rmSync(dir, { recursive: true }) })
 
   const { credentialId, cred, vmPk, userKey } = await doSetup(port)
@@ -211,7 +211,7 @@ test('🔴-4: missing UP flag rejected', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'sc-sec-'))
   const proxy = createMockProxy()
   const port = await getFreePort()
-  const server = await createServer({ port, dataDir: dir, proxy })
+  const server = await createServer({ port, dataDir: dir, proxy, expectedOrigin: "http://localhost", rpId: "localhost" })
   t.after(() => { server.close(); rmSync(dir, { recursive: true }) })
 
   const { credentialId, cred, vmPk, userKey } = await doSetup(port)
@@ -235,7 +235,7 @@ test('🔵-3: setup with existing vault requires existing passkey auth', async (
   const dir = mkdtempSync(join(tmpdir(), 'sc-sec-'))
   const proxy = createMockProxy()
   const port = await getFreePort()
-  const server = await createServer({ port, dataDir: dir, proxy })
+  const server = await createServer({ port, dataDir: dir, proxy, expectedOrigin: "http://localhost", rpId: "localhost" })
   t.after(() => { server.close(); rmSync(dir, { recursive: true }) })
 
   const { credentialId, cred, vmPk } = await doSetup(port)
@@ -280,7 +280,7 @@ test('🟡-1: add-passkey adds a new credential', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'sc-sec-'))
   const proxy = createMockProxy()
   const port = await getFreePort()
-  const server = await createServer({ port, dataDir: dir, proxy })
+  const server = await createServer({ port, dataDir: dir, proxy, expectedOrigin: "http://localhost", rpId: "localhost" })
   t.after(() => { server.close(); rmSync(dir, { recursive: true }) })
 
   const { credentialId, userKey, cred, vmPk } = await doSetup(port)
@@ -308,7 +308,7 @@ test('🟡-1: remove-passkey removes a credential', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'sc-sec-'))
   const proxy = createMockProxy()
   const port = await getFreePort()
-  const server = await createServer({ port, dataDir: dir, proxy })
+  const server = await createServer({ port, dataDir: dir, proxy, expectedOrigin: "http://localhost", rpId: "localhost" })
   t.after(() => { server.close(); rmSync(dir, { recursive: true }) })
 
   const { credentialId, userKey, cred, vmPk } = await doSetup(port)
@@ -348,7 +348,7 @@ test('🟡-1: cannot remove the last passkey', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'sc-sec-'))
   const proxy = createMockProxy()
   const port = await getFreePort()
-  const server = await createServer({ port, dataDir: dir, proxy })
+  const server = await createServer({ port, dataDir: dir, proxy, expectedOrigin: "http://localhost", rpId: "localhost" })
   t.after(() => { server.close(); rmSync(dir, { recursive: true }) })
 
   const { credentialId, cred, vmPk } = await doSetup(port)
@@ -378,6 +378,7 @@ test('🟡-2: /admin/restart locks proxy and exits with 0', async (t) => {
   let exitCode = null
   const server = await createServer({
     port, dataDir: dir, proxy,
+    expectedOrigin: 'http://localhost', rpId: 'localhost',
     exitFn: (code) => { exitCode = code },
   })
   t.after(() => { server.close(); rmSync(dir, { recursive: true }) })
@@ -402,6 +403,7 @@ test('🟡-2: /admin/shutdown locks proxy and exits with 1', async (t) => {
   let exitCode = null
   const server = await createServer({
     port, dataDir: dir, proxy,
+    expectedOrigin: 'http://localhost', rpId: 'localhost',
     exitFn: (code) => { exitCode = code },
   })
   t.after(() => { server.close(); rmSync(dir, { recursive: true }) })

@@ -25,10 +25,15 @@ async function main() {
   await loadOrCreateVmKeypair(DATA_DIR)
 
   const proxy = await createProxy({ port: PROXY_PORT, dataDir: DATA_DIR, serverPort: SERVER_PORT })
-  const expectedOrigin = process.env.SAFECLAW_ORIGIN || undefined
-  const rpId = process.env.SAFECLAW_RP_ID || undefined
-  if (expectedOrigin) console.log(`[safeclaw] origin: ${expectedOrigin}`)
-  if (rpId) console.log(`[safeclaw] rpId: ${rpId}`)
+  const expectedOrigin = process.env.SAFECLAW_ORIGIN
+  const rpId = process.env.SAFECLAW_RP_ID
+  if (!expectedOrigin || !rpId) {
+    console.error('[safeclaw] SAFECLAW_ORIGIN and SAFECLAW_RP_ID must be set.')
+    console.error('[safeclaw] Example: SAFECLAW_ORIGIN=https://example.com SAFECLAW_RP_ID=example.com')
+    process.exit(1)
+  }
+  console.log(`[safeclaw] origin: ${expectedOrigin}`)
+  console.log(`[safeclaw] rpId: ${rpId}`)
 
   const server = await createServer({ port: SERVER_PORT, dataDir: DATA_DIR, proxy, expectedOrigin, rpId, rateLimit: RATE_LIMIT })
 
