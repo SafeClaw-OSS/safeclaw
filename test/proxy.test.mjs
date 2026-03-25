@@ -166,7 +166,7 @@ describe('proxy', () => {
     // Parse the first data chunk
     const firstLine = res.body.split('\n').find(l => l.startsWith('data: ') && !l.includes('[DONE]'));
     const chunk = JSON.parse(firstLine.slice(6));
-    assert.ok(chunk.choices[0].message.content.includes('locked'));
+    assert.ok(chunk.choices[0].delta.content.includes('locked'));
   });
 
   test('locked: non-JSON body still returns locked JSON response', async () => {
