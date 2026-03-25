@@ -44,7 +44,7 @@ cargo build --release
 ./safeclaw
 
 # Open browser to setup
-open http://localhost:23294/setup
+open http://localhost:23294/admin/setup
 ```
 
 Register your passkey, add API keys, done. Then configure your agent:
@@ -70,6 +70,7 @@ providers:
 | `--admin-url` | `SAFECLAW_ADMIN_URL` | `http://localhost:{port}` | URL shown in locked responses |
 | `--rate-limit` | `SAFECLAW_RATE_LIMIT` | `20` | Requests/min per IP (0 = off) |
 | `--on-setup-hook` | `SAFECLAW_ON_SETUP_HOOK` | — | Webhook URL for setup `config` data |
+| `--init` | — | — | Generate keypair and exit (for deploy scripts) |
 
 ## API
 
@@ -77,16 +78,23 @@ providers:
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/health` | Health check (status, locked, uptime, version) |
-| GET | `/pk` | Server P-256 public key (JWK) for E2E encryption |
-| GET/POST | `/setup` | GET: setup page. POST: create vault + register passkeys |
-| GET/POST | `/status` | GET: basic status. POST: authenticated detailed status |
+| GET | `/health` | Health check (`{ status, locked, uptime, version }`) |
+| GET | `/pk` | Server P-256 public key (JWK `{ pk: {...} }`) for E2E encryption |
+
+### Admin (instance management)
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET/POST | `/admin/setup` | GET: setup page. POST: create vault + register passkeys |
+| GET/POST | `/admin/unlock` | GET: unlock page. POST: decrypt vault → activate proxy |
+| GET | `/admin` | Dashboard page |
+| POST | `/admin/restart` | Lock vault + exit 0 (for systemd restart) |
+| POST | `/admin/shutdown` | Lock vault + exit 1 |
 
 ### Vault (authenticated)
 
 | Method | Path | Description |
 |--------|------|-------------|
-| POST | `/vault/unlock` | Decrypt vault → activate proxy |
 | POST | `/vault/lock` | Wipe keys from memory → deactivate proxy |
 | POST | `/vault/credentials` | Read vault contents (encrypted response) |
 | POST | `/vault/update` | Update stored secrets |
@@ -97,13 +105,6 @@ providers:
 |--------|------|-------------|
 | POST | `/passkeys/add` | Register a new passkey device |
 | POST | `/passkeys/remove` | Remove a passkey device |
-
-### Process control (authenticated)
-
-| Method | Path | Description |
-|--------|------|-------------|
-| POST | `/restart` | Lock vault + exit 0 (for systemd restart) |
-| POST | `/shutdown` | Lock vault + exit 1 |
 
 ### Proxy
 

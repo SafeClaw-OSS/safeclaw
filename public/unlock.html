@@ -161,8 +161,8 @@
   <div class="nav-links">
     <a href="/">Home</a>
     <a href="/admin">Dashboard</a>
-    <a href="/setup">Setup</a>
-    <a href="/unlock" class="active">Unlock</a>
+    <a href="/admin/setup">Setup</a>
+    <a href="/admin/unlock" class="active">Unlock</a>
   </div>
 </nav>
 
@@ -230,14 +230,14 @@ async function startUnlock() {
   setBtn('<div class="spinner"></div> Contacting server…', true);
   setStatus('', '');
 
-  let vmPk;
+  let serverPk;
 
   try {
     // Fetch server public key
     const res = await fetch('/pk');
     if (!res.ok) throw new Error(`Server returned ${res.status}`);
     const data = await res.json();
-    vmPk = data.vmPk;  // JWK object
+    serverPk = data.pk;  // JWK object
   } catch (e) {
     setStatus(`❌ Could not reach server: ${e.message}`, 'error');
     setBtn('🔑 Unlock with Passkey', false);
@@ -292,7 +292,7 @@ async function startUnlock() {
     const nonce = SafeClaw.toBase64(crypto.getRandomValues(new Uint8Array(32)));
     const payload = { userKey: SafeClaw.toBase64(userKey), nonce, credentialId, assertion: assertionData };
     const plaintext = new TextEncoder().encode(JSON.stringify(payload));
-    const sealed = await SafeClaw.e2eEncrypt(plaintext, vmPk);
+    const sealed = await SafeClaw.e2eEncrypt(plaintext, serverPk);
     const payloadB64 = SafeClaw.toBase64(sealed);
 
     // Zeroize key material

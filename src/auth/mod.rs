@@ -88,8 +88,8 @@ pub fn authenticate_bytes(bytes: &[u8], state: &Arc<AppState>) -> Result<Authent
         .map_err(|e| AppError::BadRequest(format!("Invalid payload base64: {}", e)))?;
 
     // E2E decrypt
-    let vm_sk_d = jwk_sk_d_bytes(&state.vm_keypair.sk)?;
-    let plaintext = e2e_decrypt(&wire_bytes, &vm_sk_d)?;
+    let sk_d = jwk_sk_d_bytes(&state.keypair.sk)?;
+    let plaintext = e2e_decrypt(&wire_bytes, &sk_d)?;
 
     // Parse inner payload
     let inner: Value = serde_json::from_slice(&plaintext)

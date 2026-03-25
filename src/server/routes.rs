@@ -37,65 +37,11 @@ pub async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 
 // ── VM Public Key ─────────────────────────────────────────────────────────────
 
-pub async fn vm_pk(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    Json(json!({ "vmPk": state.vm_keypair.pk }))
+pub async fn server_pk(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    Json(json!({ "pk": state.keypair.pk }))
 }
 
-// ── Status (unauthenticated basic / authenticated full) ───────────────────────
-
-pub async fn status_basic(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let passkeys_path = state.config.data_dir.join("passkeys.json");
-    let passkeys_info: Vec<Value> = if passkeys_path.exists() {
-        let data: HashMap<String, PasskeyEntry> =
-            serde_json::from_str(&fs::read_to_string(&passkeys_path).unwrap_or_default())
-                .unwrap_or_default();
-        data.iter()
-            .map(|(id, e)| json!({ "id": id, "deviceName": e.device_name }))
-            .collect()
-    } else {
-        vec![]
-    };
-
-    Json(json!({
-        "locked": state.vault.is_locked(),
-        "uptime": state.start_time.elapsed().as_secs_f64(),
-        "services": state.vault.service_names(),
-        "passkeys": passkeys_info,
-    }))
-}
-
-pub async fn status_authenticated(
-    State(state): State<Arc<AppState>>,
-    bytes: Bytes,
-) -> Result<impl IntoResponse> {
-    // If body is empty / trivial, return basic status (compat with admin.html's GET-style call)
-    let trimmed = bytes.trim_ascii();
-    if trimmed.is_empty() || trimmed == b"{}" {
-        let passkeys_path = state.config.data_dir.join("passkeys.json");
-        let passkeys: HashMap<String, PasskeyEntry> = if passkeys_path.exists() {
-            serde_json::from_str(&fs::read_to_string(&passkeys_path).unwrap_or_default())
-                .unwrap_or_default()
-        } else {
-            HashMap::new()
-        };
-        return Ok(Json(json!({
-            "locked": state.vault.is_locked(),
-            "uptime": state.start_time.elapsed().as_secs_f64(),
-            "services": state.vault.service_names(),
-            "passkeys": passkeys.keys().collect::<Vec<_>>(),
-        })));
-    }
-
-    let auth = authenticate_bytes(&bytes, &state)?;
-    let passkeys = &auth.passkeys;
-
-    Ok(Json(json!({
-        "locked": state.vault.is_locked(),
-        "uptime": state.start_time.elapsed().as_secs_f64(),
-        "services": state.vault.service_names(),
-        "passkeys": passkeys.keys().collect::<Vec<_>>(),
-    })))
-}
+// (status endpoints removed — dashboard uses /health + /vault/credentials)
 
 // ── Setup ─────────────────────────────────────────────────────────────────────
 
@@ -117,8 +63,8 @@ pub async fn setup(
         .decode(&body.payload)
         .map_err(|e| AppError::BadRequest(format!("Invalid payload base64: {}", e)))?;
 
-    let vm_sk_d = jwk_sk_d_bytes(&state.vm_keypair.sk)?;
-    let plaintext = crate::crypto::ecies::e2e_decrypt(&wire_bytes, &vm_sk_d)?;
+    let sk_d = jwk_sk_d_bytes(&state.keypair.sk)?;
+    let plaintext = crate::crypto::ecies::e2e_decrypt(&wire_bytes, &sk_d)?;
 
     let parsed: Value = serde_json::from_slice(&plaintext)
         .map_err(|_| AppError::BadRequest("Decrypted payload is not valid JSON".into()))?;
@@ -246,8 +192,8 @@ pub async fn setup(
         let user_key_bytes = STANDARD.decode(user_key_b64)
             .map_err(|e| AppError::BadRequest(format!("Invalid userKey: {}", e)))?;
 
-        let vm_sk_d_local = jwk_sk_d_bytes(&state.vm_keypair.sk)?;
-        let mut kek = derive_kek(&user_key_bytes, &vm_sk_d_local)?;
+        let sk_d_local = jwk_sk_d_bytes(&state.keypair.sk)?;
+        let mut kek = derive_kek(&user_key_bytes, &sk_d_local)?;
         let wrapped = wrap_dek(&dek, &kek)?;
         kek.zeroize();
 
@@ -309,8 +255,8 @@ pub async fn vault_unlock(
         return Err(AppError::Unauthorized("No wrapped DEK for this credential".into()));
     }
 
-    let vm_sk_d = jwk_sk_d_bytes(&state.vm_keypair.sk)?;
-    let mut kek = derive_kek(&user_key, &vm_sk_d)?;
+    let sk_d = jwk_sk_d_bytes(&state.keypair.sk)?;
+    let mut kek = derive_kek(&user_key, &sk_d)?;
     let wrapped = fs::read(&wrapped_path)?;
     let mut dek = unwrap_dek(&wrapped, &kek)?;
     kek.zeroize();
@@ -365,8 +311,8 @@ pub async fn vault_credentials(
         return Err(AppError::Unauthorized("No wrapped DEK for this credential".into()));
     }
 
-    let vm_sk_d = jwk_sk_d_bytes(&state.vm_keypair.sk)?;
-    let mut kek = derive_kek(&user_key, &vm_sk_d)?;
+    let sk_d = jwk_sk_d_bytes(&state.keypair.sk)?;
+    let mut kek = derive_kek(&user_key, &sk_d)?;
     let wrapped = fs::read(&wrapped_path)?;
     let mut dek = unwrap_dek(&wrapped, &kek)?;
     kek.zeroize();
@@ -403,8 +349,8 @@ pub async fn vault_update(
         return Err(AppError::Unauthorized("No wrapped DEK for this credential".into()));
     }
 
-    let vm_sk_d = jwk_sk_d_bytes(&state.vm_keypair.sk)?;
-    let mut kek = derive_kek(&user_key, &vm_sk_d)?;
+    let sk_d = jwk_sk_d_bytes(&state.keypair.sk)?;
+    let mut kek = derive_kek(&user_key, &sk_d)?;
     let wrapped = fs::read(&wrapped_path)?;
     let mut dek = unwrap_dek(&wrapped, &kek)?;
     kek.zeroize();
@@ -445,8 +391,8 @@ pub async fn identity_add_passkey(
         return Err(AppError::Unauthorized("No wrapped DEK for this credential".into()));
     }
 
-    let vm_sk_d = jwk_sk_d_bytes(&state.vm_keypair.sk)?;
-    let mut kek = derive_kek(&user_key, &vm_sk_d)?;
+    let sk_d = jwk_sk_d_bytes(&state.keypair.sk)?;
+    let mut kek = derive_kek(&user_key, &sk_d)?;
     let wrapped = fs::read(&wrapped_path)?;
     let mut dek = unwrap_dek(&wrapped, &kek)?;
     kek.zeroize();
@@ -454,7 +400,7 @@ pub async fn identity_add_passkey(
     // Wrap DEK for new passkey
     let new_user_key = STANDARD.decode(new_user_key_b64)
         .map_err(|e| AppError::BadRequest(format!("Invalid newUserKey: {}", e)))?;
-    let mut new_kek = derive_kek(&new_user_key, &vm_sk_d)?;
+    let mut new_kek = derive_kek(&new_user_key, &sk_d)?;
     let new_wrapped = wrap_dek(&dek, &new_kek)?;
     dek.zeroize();
     new_kek.zeroize();

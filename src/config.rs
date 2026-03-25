@@ -37,6 +37,10 @@ struct CliArgs {
     /// [env: SAFECLAW_ON_SETUP_HOOK]
     #[arg(long)]
     on_setup_hook: Option<String>,
+    /// Generate server keypair and exit. Use for deployment scripts that need
+    /// the public key before starting the server.
+    #[arg(long)]
+    init: bool,
 }
 
 /// Resolved configuration from CLI args + environment variables.
@@ -53,6 +57,7 @@ pub struct Config {
     pub instance_id: Option<String>,
     pub rate_limit: u32,
     pub on_setup_hook: Option<String>,
+    pub init: bool,
 }
 
 fn env_str(key: &str) -> Option<String> {
@@ -89,8 +94,9 @@ impl Config {
             .unwrap_or(20);
 
         let on_setup_hook = cli.on_setup_hook.or_else(|| env_str("SAFECLAW_ON_SETUP_HOOK"));
+        let init = cli.init;
 
-        Self { data_dir, port, proxy_port, proxy_bind, origin, rp_id, admin_url, instance_id, rate_limit, on_setup_hook }
+        Self { data_dir, port, proxy_port, proxy_bind, origin, rp_id, admin_url, instance_id, rate_limit, on_setup_hook, init }
     }
 
     pub fn effective_origin(&self) -> String {

@@ -253,8 +253,8 @@
   <div class="nav-links">
     <a href="/">Home</a>
     <a href="/admin">Dashboard</a>
-    <a href="/setup" class="active">Setup</a>
-    <a href="/unlock">Unlock</a>
+    <a href="/admin/setup" class="active">Setup</a>
+    <a href="/admin/unlock">Unlock</a>
   </div>
 </nav>
 
@@ -386,7 +386,7 @@
         <a href="/admin" class="btn btn-primary" style="display:inline-flex;width:auto;">
           📊 View Dashboard
         </a>
-        <a href="/unlock" class="btn btn-outline" style="display:inline-flex;width:auto;">
+        <a href="/admin/unlock" class="btn btn-outline" style="display:inline-flex;width:auto;">
           🔓 Unlock Vault
         </a>
       </div>
@@ -410,7 +410,7 @@
 
 
 const state = {
-  vmPk: null,       // JWK object (P-256 public key)
+  serverPk: null,       // JWK object (P-256 public key)
   passkeys: [],     // [{credentialId, deviceName, prfKey: Uint8Array(32), x, y, assertion}]
   configuredServiceIds: [],  // service slugs configured in step 3
 };
@@ -459,7 +459,7 @@ function showPane(n) {
     const res = await fetch('/pk');
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
-    state.vmPk = data.vmPk;  // JWK object
+    state.serverPk = data.pk;  // JWK object
   } catch (e) {
     setStatus('status1', `❌ Could not reach server: ${e.message}`, 'error');
     document.getElementById('btn1').disabled = true;
@@ -829,10 +829,10 @@ async function doSubmit() {
   const msg = document.getElementById('submit-msg');
   try {
     msg.textContent = 'Fetching server public key…';
-    const vmPkRes = await fetch('/pk');
-    if (!vmPkRes.ok) throw new Error(`pk fetch failed: HTTP ${vmPkRes.status}`);
-    const { vmPk } = await vmPkRes.json();
-    state.vmPk = vmPk;
+    const pkRes = await fetch('/pk');
+    if (!pkRes.ok) throw new Error(`pk fetch failed: HTTP ${pkRes.status}`);
+    const { pk } = await pkRes.json();
+    state.serverPk = pk;
 
     msg.textContent = 'Building encrypted payload…';
     const nonce = SafeClaw.toBase64(crypto.getRandomValues(new Uint8Array(32)));
@@ -851,11 +851,11 @@ async function doSubmit() {
 
     msg.textContent = 'Encrypting with server public key…';
     const plaintext = new TextEncoder().encode(JSON.stringify(payload));
-    const sealed = await SafeClaw.e2eEncrypt(plaintext, state.vmPk);
+    const sealed = await SafeClaw.e2eEncrypt(plaintext, state.serverPk);
     const payloadB64 = SafeClaw.toBase64(sealed);
 
     msg.textContent = 'Uploading to server…';
-    const res = await fetch('/setup', {
+    const res = await fetch('/admin/setup', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
