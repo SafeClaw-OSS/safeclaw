@@ -92,11 +92,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 
         // ── Approval Endpoints ───────────────────────────────────────────────
         .route("/approve/pending", get(approval_list_pending))
-        .route("/approve/:id", get(approval_get))
-        .route("/approve/:id/status", get(approval_status))
-        .route("/approve/:id/details", post(approval_details))
-        .route("/approve/:id/confirm", post(approval_confirm))
-        .route("/approve/:id/reject", post(approval_reject))
+        .route("/approve/{id}", get(approval_get))
+        .route("/approve/{id}/status", get(approval_status))
+        .route("/approve/{id}/details", post(approval_details))
+        .route("/approve/{id}/confirm", post(approval_confirm))
+        .route("/approve/{id}/reject", post(approval_reject))
 
         // ── Passkeys (authenticated) ────────────────────────────────────────
         .route("/passkeys/add", post(identity_add_passkey))
