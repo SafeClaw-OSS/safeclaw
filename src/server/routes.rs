@@ -377,7 +377,17 @@ pub async fn setup(
     if let Some(ref hook_url) = state.config.on_setup_hook {
         if let Some(ref config_data) = setup_config {
             let hook_url = hook_url.clone();
-            let config_json = config_data.clone();
+            // Enrich config with agentName from passkeys (provisioner needs it for OpenClaw agent.name)
+            let mut config_json = config_data.clone();
+            if let Some(agent_name) = parsed.get("passkeys")
+                .and_then(|p| p.as_array())
+                .and_then(|a| a.first())
+                .and_then(|pk| pk.get("agentName"))
+                .and_then(|v| v.as_str())
+            {
+                config_json.as_object_mut()
+                    .map(|m| m.insert("agentName".into(), serde_json::Value::String(agent_name.to_string())));
+            }
             tokio::spawn(async move {
                 let client = reqwest::Client::new();
                 match client
