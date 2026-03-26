@@ -92,8 +92,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let proxy_listener = TcpListener::bind(proxy_addr).await?;
     info!("Proxy listening on http://{}", proxy_addr);
 
-    // Bind server (0.0.0.0)
-    let server_addr: SocketAddr = format!("0.0.0.0:{}", config.port)
+    // Bind server
+    let server_addr: SocketAddr = format!("{}:{}", config.bind, config.port)
         .parse()
         .map_err(|e| format!("Invalid server address: {}", e))?;
     let server_listener = TcpListener::bind(server_addr).await?;

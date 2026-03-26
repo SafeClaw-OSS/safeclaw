@@ -142,17 +142,17 @@ pub fn authenticate_bytes(bytes: &[u8], state: &Arc<AppState>) -> Result<Authent
     )
     .map_err(|e| AppError::BadRequest(format!("Invalid assertion format: {}", e)))?;
 
-    // Verify assertion (skip if x/y are null — this happens for discoverable credentials
-    // where the client didn't extract the public key SPKI)
-    if !entry.x.is_empty() && !entry.y.is_empty() {
-        verify_assertion(
-            &assertion,
-            &entry.x,
-            &entry.y,
-            &state.config.effective_origin(),
-            &state.config.effective_rp_id(),
-        )?;
+    // Verify assertion — x and y coordinates are required for signature verification
+    if entry.x.is_empty() || entry.y.is_empty() {
+        return Err(AppError::Unauthorized("Passkey has missing coordinates — cannot verify".into()));
     }
+    verify_assertion(
+        &assertion,
+        &entry.x,
+        &entry.y,
+        &state.config.effective_origin(),
+        &state.config.effective_rp_id(),
+    )?;
 
     Ok(AuthenticatedRequest {
         payload: inner,

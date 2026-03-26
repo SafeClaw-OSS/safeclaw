@@ -5,6 +5,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use axum::body::Bytes;
+use futures_util::StreamExt;
 use once_cell::sync::Lazy;
 use std::str::FromStr;
 
@@ -207,23 +208,20 @@ pub async fn forward_request(
         }
     };
 
-    // Convert upstream response
+    // Convert upstream response — stream body through without buffering
     let status = StatusCode::from_u16(upstream_resp.status().as_u16())
         .unwrap_or(StatusCode::BAD_GATEWAY);
     let resp_headers = upstream_resp.headers().clone();
 
-    let body_bytes = match upstream_resp.bytes().await {
-        Ok(b) => b,
-        Err(e) => {
-            return (
-                StatusCode::BAD_GATEWAY,
-                axum::Json(serde_json::json!({ "error": format!("Failed to read upstream body: {}", e) })),
-            )
-                .into_response();
-        }
-    };
+    // Stream the response body as chunks arrive from upstream
+    let byte_stream = upstream_resp.bytes_stream().map(|result| {
+        result.map_err(|e| {
+            axum::Error::new(std::io::Error::new(std::io::ErrorKind::Other, e))
+        })
+    });
+    let body = Body::from_stream(byte_stream);
 
-    let mut response = Response::new(Body::from(body_bytes));
+    let mut response = Response::new(body);
     *response.status_mut() = status;
     for (k, v) in &resp_headers {
         if let (Ok(ak), Ok(av)) = (

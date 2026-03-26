@@ -119,15 +119,16 @@ pub async fn setup(
             existing_assertion_val.ok_or_else(|| AppError::Unauthorized("Missing existing assertion".into()))?,
         ).map_err(|e| AppError::BadRequest(format!("Invalid existing assertion: {}", e)))?;
 
-        if !entry.x.is_empty() && !entry.y.is_empty() {
-            verify_assertion(
-                &existing_assertion,
-                &entry.x,
-                &entry.y,
-                &state.config.effective_origin(),
-                &state.config.effective_rp_id(),
-            )?;
+        if entry.x.is_empty() || entry.y.is_empty() {
+            return Err(AppError::Unauthorized("Existing passkey has missing coordinates".into()));
         }
+        verify_assertion(
+            &existing_assertion,
+            &entry.x,
+            &entry.y,
+            &state.config.effective_origin(),
+            &state.config.effective_rp_id(),
+        )?;
     }
 
     // Verify each new passkey's assertion (from outer body.assertions OR inner parsed.assertions)
@@ -140,22 +141,27 @@ pub async fn setup(
         let x = pk_val.get("x").and_then(|v| v.as_str()).unwrap_or("");
         let y = pk_val.get("y").and_then(|v| v.as_str()).unwrap_or("");
 
-        // Only verify if we have both the assertion and the public key coords
-        if !x.is_empty() && !y.is_empty() {
-            if let Some(ref assertions) = assertions_src {
-                if let Some(assertion_val) = assertions.get(i) {
-                    if let Ok(assertion) = serde_json::from_value::<AssertionData>(assertion_val.clone()) {
-                        verify_assertion(
-                            &assertion,
-                            x,
-                            y,
-                            &state.config.effective_origin(),
-                            &state.config.effective_rp_id(),
-                        )?;
-                    }
-                }
-            }
+        // Reject passkeys with missing coordinates
+        if x.is_empty() || y.is_empty() {
+            return Err(AppError::BadRequest(format!(
+                "Passkey {} has missing x/y coordinates", i
+            )));
         }
+
+        // Require assertion for each passkey
+        let assertions = assertions_src.as_ref()
+            .ok_or_else(|| AppError::BadRequest("Missing assertions array".into()))?;
+        let assertion_val = assertions.get(i)
+            .ok_or_else(|| AppError::BadRequest(format!("Missing assertion for passkey {}", i)))?;
+        let assertion: AssertionData = serde_json::from_value(assertion_val.clone())
+            .map_err(|e| AppError::BadRequest(format!("Invalid assertion for passkey {}: {}", i, e)))?;
+        verify_assertion(
+            &assertion,
+            x,
+            y,
+            &state.config.effective_origin(),
+            &state.config.effective_rp_id(),
+        )?;
     }
 
     // Generate DEK and encrypt vault
@@ -176,6 +182,11 @@ pub async fn setup(
             .ok_or_else(|| AppError::BadRequest(format!("Missing credentialId for passkey {}", i)))?;
         let x = pk_val.get("x").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let y = pk_val.get("y").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if x.is_empty() || y.is_empty() {
+            return Err(AppError::BadRequest(format!(
+                "Passkey {} has missing x/y coordinates", i
+            )));
+        }
         let device_name = pk_val.get("deviceName").and_then(|v| v.as_str()).unwrap_or("").to_string();
 
         passkeys_map.insert(cred_id.to_string(), PasskeyEntry {
@@ -275,13 +286,7 @@ pub async fn vault_unlock(
 
 // ── Vault Lock ────────────────────────────────────────────────────────────────
 
-/// Lock the vault (no auth required — locking is safe and unauthenticated in the HTML flow)
-pub async fn vault_lock_noauth(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    state.vault.lock();
-    Json(json!({ "ok": true }))
-}
-
-/// Lock the vault (auth required — new API path)
+/// Lock the vault (auth required)
 pub async fn vault_lock(
     State(state): State<Arc<AppState>>,
     auth: AuthenticatedRequest,
@@ -415,9 +420,14 @@ pub async fn identity_add_passkey(
     let passkeys_path = state.config.data_dir.join("passkeys.json");
     let mut passkeys = auth.passkeys.clone();
     let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+    let new_x = new_passkey.get("x").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let new_y = new_passkey.get("y").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    if new_x.is_empty() || new_y.is_empty() {
+        return Err(AppError::BadRequest("New passkey has missing x/y coordinates".into()));
+    }
     passkeys.insert(new_cred_id.to_string(), PasskeyEntry {
-        x: new_passkey.get("x").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-        y: new_passkey.get("y").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        x: new_x,
+        y: new_y,
         device_name: new_passkey.get("deviceName").and_then(|v| v.as_str()).unwrap_or("").to_string(),
         created_at: now_ms,
     });
@@ -488,7 +498,7 @@ pub async fn system_shutdown(
     let resp = Json(json!({ "ok": true })).into_response();
     tokio::spawn(async {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        std::process::exit(1);
+        std::process::exit(0);
     });
     Ok(resp)
 }

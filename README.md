@@ -101,6 +101,7 @@ data/
 |------|---------|---------|-------------|
 | `--data-dir` | `SAFECLAW_DATA` | `./data` | Where vault data is stored |
 | `--port` | `SAFECLAW_PORT` | `23294` | Admin UI port |
+| `--bind` | `SAFECLAW_BIND` | `0.0.0.0` | Admin server bind address |
 | `--proxy-port` | `SAFECLAW_PROXY_PORT` | `23295` | Proxy port (point your agent here) |
 | `--proxy-bind` | `SAFECLAW_PROXY_BIND` | `127.0.0.1` | Proxy bind address |
 | `--origin` | `SAFECLAW_ORIGIN` | `http://localhost:{port}` | WebAuthn origin (must match browser URL) |
@@ -151,6 +152,13 @@ cargo build --release
 | POST | `/vault/credentials` | Read vault contents |
 | POST | `/vault/update` | Update stored secrets |
 
+### Proxy
+
+| Method | Path | Description |
+|--------|------|-------------|
+| ANY | `/health` | Proxy health check (`{ status, locked, version }`) |
+| ANY | `/{service}/{*path}` | Forward to upstream (requires unlocked vault) |
+
 ### Passkeys (authenticated)
 
 | Method | Path | Description |
@@ -181,6 +189,7 @@ cargo build --release
 
 | Derivation | Info |
 |------------|------|
+| PRF normalization (client) | `safeclaw-user-key` |
 | KEK | `safeclaw-kek-v1` |
 | E2E request | `safeclaw-e2e` |
 | E2E response | `safeclaw-response-v1` |

@@ -284,6 +284,7 @@ mod tests {
             let config = Config {
                 data_dir: std::path::PathBuf::from("/tmp/safeclaw-test"),
                 port: 23294,
+                bind: "127.0.0.1".to_string(),
                 proxy_port: 23295,
                 proxy_bind: "127.0.0.1".to_string(),
                 origin: None,

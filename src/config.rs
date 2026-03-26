@@ -14,6 +14,9 @@ struct CliArgs {
     /// Proxy port [env: SAFECLAW_PROXY_PORT]
     #[arg(long)]
     proxy_port: Option<u16>,
+    /// Server bind address [env: SAFECLAW_BIND]
+    #[arg(long)]
+    bind: Option<String>,
     /// Proxy bind address [env: SAFECLAW_PROXY_BIND]
     #[arg(long)]
     proxy_bind: Option<String>,
@@ -49,6 +52,7 @@ struct CliArgs {
 pub struct Config {
     pub data_dir: PathBuf,
     pub port: u16,
+    pub bind: String,
     pub proxy_port: u16,
     pub proxy_bind: String,
     pub origin: Option<String>,
@@ -80,6 +84,10 @@ impl Config {
             .or_else(|| env_str("SAFECLAW_PROXY_PORT").and_then(|s| s.parse().ok()))
             .unwrap_or(23295);
 
+        let bind = cli.bind
+            .or_else(|| env_str("SAFECLAW_BIND"))
+            .unwrap_or_else(|| "0.0.0.0".to_string());
+
         let proxy_bind = cli.proxy_bind
             .or_else(|| env_str("SAFECLAW_PROXY_BIND"))
             .unwrap_or_else(|| "127.0.0.1".to_string());
@@ -96,7 +104,7 @@ impl Config {
         let on_setup_hook = cli.on_setup_hook.or_else(|| env_str("SAFECLAW_ON_SETUP_HOOK"));
         let init = cli.init;
 
-        Self { data_dir, port, proxy_port, proxy_bind, origin, rp_id, admin_url, instance_id, rate_limit, on_setup_hook, init }
+        Self { data_dir, port, bind, proxy_port, proxy_bind, origin, rp_id, admin_url, instance_id, rate_limit, on_setup_hook, init }
     }
 
     pub fn effective_origin(&self) -> String {
