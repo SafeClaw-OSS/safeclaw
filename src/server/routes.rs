@@ -550,6 +550,29 @@ pub async fn vault_update(
     Ok(Json(json!({ "ok": true })))
 }
 
+// ── Provisioner Push ───────────────────────────────────────────────────────────
+
+/// Spawn a background task that pushes updated safeclaw.md and AGENTS.md to the
+/// local provisioner after a service add/update/remove. Failures are silently
+/// discarded — the vault operation has already succeeded.
+fn push_to_provisioner(secrets: serde_json::Value, proxy_port: u16) {
+    tokio::spawn(async move {
+        let md = crate::generate::generate_safeclaw_md(&secrets, false, proxy_port);
+        let snippet = crate::generate::generate_agents_md_snippet(&secrets, proxy_port);
+        let _ = reqwest::Client::new()
+            .post("http://localhost:23296/apply")
+            .json(&serde_json::json!({
+                "ops": [
+                    { "type": "workspace", "file": "safeclaw.md", "content": md },
+                    { "type": "workspace", "file": "AGENTS.md", "content": snippet }
+                ],
+                "restart": false
+            }))
+            .send()
+            .await;
+    });
+}
+
 // ── Vault Service CRUD ─────────────────────────────────────────────────────────
 
 /// GET /vault/services — list service names (no passkey required)
@@ -591,6 +614,12 @@ pub async fn vault_services_add(
         Ok(())
     })?;
 
+    // Push updated workspace files to provisioner
+    let proxy_port = state.config.proxy_port;
+    if let Some(secrets) = state.vault.secrets.lock().unwrap().clone() {
+        push_to_provisioner(secrets, proxy_port);
+    }
+
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -624,6 +653,12 @@ pub async fn vault_services_update(
         Ok(())
     })?;
 
+    // Push updated workspace files to provisioner
+    let proxy_port = state.config.proxy_port;
+    if let Some(secrets) = state.vault.secrets.lock().unwrap().clone() {
+        push_to_provisioner(secrets, proxy_port);
+    }
+
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -647,6 +682,12 @@ pub async fn vault_services_remove(
         services.remove(&name);
         Ok(())
     })?;
+
+    // Push updated workspace files to provisioner
+    let proxy_port = state.config.proxy_port;
+    if let Some(secrets) = state.vault.secrets.lock().unwrap().clone() {
+        push_to_provisioner(secrets, proxy_port);
+    }
 
     Ok(Json(json!({ "ok": true })))
 }
@@ -1023,11 +1064,31 @@ pub async fn approval_confirm(
     Path(id): Path<String>,
     auth: AuthenticatedRequest,
 ) -> Result<impl IntoResponse> {
-    let _ = auth; // passkey verified by extractor
+    // Get service name from the pending approval (needed to extract its auth config)
+    let service_name = {
+        let pending = state.approval_manager.pending.lock().unwrap();
+        pending.get(&id).map(|a| a.service.clone())
+    };
+
+    let service_name = match service_name {
+        Some(s) => s,
+        None => return Err(AppError::NotFound),
+    };
+
+    // Decrypt vault and extract the service's auth config to pass through the channel
+    let auth_json = decrypt_vault_json(&state, &auth)
+        .ok()
+        .and_then(|secrets| {
+            secrets
+                .get("services")
+                .and_then(|s| s.get(&service_name))
+                .and_then(|svc| svc.get("auth"))
+                .cloned()
+        });
 
     if state
         .approval_manager
-        .resolve(&id, ApprovalDecision::Approved)
+        .resolve(&id, ApprovalDecision::Approved(auth_json))
     {
         Ok(Json(json!({ "ok": true })))
     } else {

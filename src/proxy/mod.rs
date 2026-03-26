@@ -128,7 +128,7 @@ async fn proxy_handler(
     };
 
     // Look up service config from vault secrets
-    let service_config = {
+    let mut service_config = {
         let secrets_guard = state.vault.secrets.lock().unwrap();
         let secrets = match secrets_guard.as_ref() {
             Some(s) => s.clone(),
@@ -201,14 +201,21 @@ async fn proxy_handler(
 
     // ── Approval gate ──────────────────────────────────────────────────────────
 
+    // For elevated services, check if there is a cached session with credentials.
+    let cached_auth = if access_level == AccessLevel::Elevated {
+        state.vault.check_elevated_session(&route_service)
+    } else {
+        None
+    };
+
     let needs_approval = match &access_level {
         AccessLevel::Standard => false,
-        AccessLevel::Elevated => {
-            // Skip approval if a valid elevated session exists
-            !state.vault.check_elevated_session(&route_service)
-        }
+        AccessLevel::Elevated => cached_auth.is_none(), // skip if valid cache exists
         AccessLevel::Critical => true, // always require approval
     };
+
+    // auth_from_approval is populated when we receive Approved(Some(...)) from the channel.
+    let mut auth_from_approval: Option<serde_json::Value> = None;
 
     let approval_id: Option<String> = if needs_approval {
         let timeout = policy_defaults.timeout.unwrap_or(300);
@@ -279,19 +286,20 @@ async fn proxy_handler(
         .await;
 
         match decision {
-            Ok(Ok(ApprovalDecision::Approved)) => {
+            Ok(Ok(ApprovalDecision::Approved(auth_json))) => {
                 tracing::info!("proxy: approval id={} approved", id);
-                // Cache elevated session with TTL
+                // Cache elevated session with TTL and store the auth credentials
                 if access_level == AccessLevel::Elevated {
-                    // Find TTL from matching rule, or default 3600s
                     let ttl = find_rule_ttl(
                         service_config.rules.as_ref(),
                         method.as_str(),
                         &route_path,
                     )
                     .unwrap_or(3600);
-                    state.vault.set_elevated_session(&route_service, ttl);
+                    let cache_val = auth_json.clone().unwrap_or(serde_json::Value::Null);
+                    state.vault.set_elevated_session(&route_service, cache_val, ttl);
                 }
+                auth_from_approval = auth_json;
                 Some(id)
             }
             Ok(Ok(ApprovalDecision::Rejected)) => {
@@ -334,6 +342,17 @@ async fn proxy_handler(
     } else {
         None
     };
+
+    // ── Inject effective auth for elevated/critical services ───────────────────
+    // For standard services, auth is already in service_config.auth (unchanged).
+    // For elevated/critical, auth was stripped from memory at unlock; we restore it
+    // here from the approval payload or the elevated session cache.
+    if service_config.auth.is_none() {
+        let effective_auth_json = auth_from_approval.or(cached_auth);
+        if let Some(aj) = effective_auth_json {
+            service_config.auth = serde_json::from_value::<forward::AuthConfig>(aj).ok();
+        }
+    }
 
     // ── OAuth2 token refresh ───────────────────────────────────────────────────
 

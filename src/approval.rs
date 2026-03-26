@@ -18,7 +18,8 @@ use crate::audit::AuditLog;
 /// Decision sent through the oneshot channel.
 #[derive(Debug)]
 pub enum ApprovalDecision {
-    Approved,
+    /// Approved; carries the decrypted auth config for the service (None for standard services).
+    Approved(Option<serde_json::Value>),
     Rejected,
 }
 
@@ -93,7 +94,7 @@ impl ApprovalManager {
         let mut pending = self.pending.lock().unwrap();
         if let Some(approval) = pending.remove(id) {
             let status = match &decision {
-                ApprovalDecision::Approved => "approved",
+                ApprovalDecision::Approved(_) => "approved",
                 ApprovalDecision::Rejected => "rejected",
             };
             let _ = self.audit.update_approval(id, status);

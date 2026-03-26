@@ -10,6 +10,8 @@ use crate::policy::{PolicyDefaults, PushSubscription};
 
 /// Elevated session: credential access is cached after approval until TTL expires.
 pub struct ElevatedSession {
+    /// Decrypted auth config for this service (stored as JSON to avoid circular imports).
+    pub auth: serde_json::Value,
     /// Unix timestamp when this session expires
     pub expires_at: Instant,
 }
@@ -30,6 +32,29 @@ pub struct VaultState {
     pub oauth2_tokens: Mutex<HashMap<String, (String, u64)>>,
 }
 
+/// Returns true if the service JSON has any elevated or critical access levels,
+/// meaning its auth credentials must not be kept in memory at unlock.
+fn service_needs_auth_stripped(svc: &serde_json::Value) -> bool {
+    let is_sensitive = |s: &str| s == "elevated" || s == "critical";
+
+    if let Some(levels) = svc.get("levels") {
+        if levels.get("write").and_then(|v| v.as_str()).map(is_sensitive).unwrap_or(false) {
+            return true;
+        }
+        if levels.get("read").and_then(|v| v.as_str()).map(is_sensitive).unwrap_or(false) {
+            return true;
+        }
+    }
+    if let Some(rules) = svc.get("rules").and_then(|r| r.as_array()) {
+        for rule in rules {
+            if rule.get("level").and_then(|v| v.as_str()).map(is_sensitive).unwrap_or(false) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 impl VaultState {
     pub fn new() -> Self {
         Self {
@@ -48,7 +73,18 @@ impl VaultState {
 
     /// Load decrypted vault JSON into memory.
     /// Parses service names, policy defaults, and push subscriptions.
-    pub fn set_secrets(&self, secrets: serde_json::Value) {
+    /// Auth is stripped from services whose access level includes elevated or critical —
+    /// credentials for those services are only available transiently via approval.
+    pub fn set_secrets(&self, mut secrets: serde_json::Value) {
+        // Strip auth from elevated/critical services
+        if let Some(services) = secrets.get_mut("services").and_then(|s| s.as_object_mut()) {
+            for svc in services.values_mut() {
+                if service_needs_auth_stripped(svc) {
+                    svc.as_object_mut().map(|m| m.remove("auth"));
+                }
+            }
+        }
+
         // Extract service names
         let names: Vec<String> = secrets
             .get("services")
@@ -89,21 +125,24 @@ impl VaultState {
     }
 
     /// Check if an elevated session is still valid for the given service.
-    pub fn check_elevated_session(&self, service: &str) -> bool {
+    /// Returns the cached auth config if valid, or None if expired/absent.
+    pub fn check_elevated_session(&self, service: &str) -> Option<serde_json::Value> {
         let cache = self.elevated_cache.lock().unwrap();
         if let Some(session) = cache.get(service) {
-            session.expires_at > Instant::now()
-        } else {
-            false
+            if session.expires_at > Instant::now() {
+                return Some(session.auth.clone());
+            }
         }
+        None
     }
 
     /// Store an elevated session for a service with the given TTL (seconds).
-    pub fn set_elevated_session(&self, service: &str, ttl_secs: u64) {
+    pub fn set_elevated_session(&self, service: &str, auth: serde_json::Value, ttl_secs: u64) {
         let mut cache = self.elevated_cache.lock().unwrap();
         cache.insert(
             service.to_string(),
             ElevatedSession {
+                auth,
                 expires_at: Instant::now() + std::time::Duration::from_secs(ttl_secs),
             },
         );

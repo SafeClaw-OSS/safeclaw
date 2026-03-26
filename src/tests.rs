@@ -484,9 +484,25 @@ mod tests {
             let (id, rx) = mgr.create_approval(
                 "svc".to_string(), "POST".to_string(), "/api".to_string(), 60, None,
             );
-            assert!(mgr.resolve(&id, ApprovalDecision::Approved));
+            assert!(mgr.resolve(&id, ApprovalDecision::Approved(None)));
             let decision = rx.await.expect("channel closed");
-            assert!(matches!(decision, ApprovalDecision::Approved));
+            assert!(matches!(decision, ApprovalDecision::Approved(_)));
+        }
+
+        #[tokio::test]
+        async fn approve_carries_auth_payload() {
+            let mgr = make_manager();
+            let (id, rx) = mgr.create_approval(
+                "svc".to_string(), "POST".to_string(), "/api".to_string(), 60, None,
+            );
+            let auth_json = serde_json::json!({"type": "bearer", "secret": "tok"});
+            mgr.resolve(&id, ApprovalDecision::Approved(Some(auth_json.clone())));
+            let decision = rx.await.expect("channel closed");
+            if let ApprovalDecision::Approved(Some(payload)) = decision {
+                assert_eq!(payload["type"], "bearer");
+            } else {
+                panic!("expected Approved with auth payload");
+            }
         }
 
         #[tokio::test]
@@ -512,32 +528,44 @@ mod tests {
     mod vault_elevated_cache {
         use crate::state::VaultState;
 
+        fn dummy_auth() -> serde_json::Value {
+            serde_json::json!({"type": "bearer", "secret": "tok"})
+        }
+
         #[test]
         fn no_session_initially() {
             let vs = VaultState::new();
-            assert!(!vs.check_elevated_session("github"));
+            assert!(vs.check_elevated_session("github").is_none());
         }
 
         #[test]
         fn long_ttl_session_is_valid() {
             let vs = VaultState::new();
-            vs.set_elevated_session("github", 3600);
-            assert!(vs.check_elevated_session("github"));
+            vs.set_elevated_session("github", dummy_auth(), 3600);
+            assert!(vs.check_elevated_session("github").is_some());
+        }
+
+        #[test]
+        fn cached_auth_is_returned() {
+            let vs = VaultState::new();
+            vs.set_elevated_session("github", dummy_auth(), 3600);
+            let auth = vs.check_elevated_session("github").expect("should be present");
+            assert_eq!(auth["type"], "bearer");
         }
 
         #[test]
         fn zero_ttl_session_is_expired() {
             let vs = VaultState::new();
-            vs.set_elevated_session("github", 0);
-            assert!(!vs.check_elevated_session("github"));
+            vs.set_elevated_session("github", dummy_auth(), 0);
+            assert!(vs.check_elevated_session("github").is_none());
         }
 
         #[test]
         fn lock_clears_cache() {
             let vs = VaultState::new();
-            vs.set_elevated_session("github", 3600);
+            vs.set_elevated_session("github", dummy_auth(), 3600);
             vs.lock();
-            assert!(!vs.check_elevated_session("github"));
+            assert!(vs.check_elevated_session("github").is_none());
         }
     }
 
