@@ -316,7 +316,7 @@ async fn proxy_handler(
                 );
                 return (
                     StatusCode::FORBIDDEN,
-                    Json(serde_json::json!({ "error": "request rejected by vault owner" })),
+                    Json(serde_json::json!({ "error": "request rejected by vault owner", "code": "USER_REJECTED" })),
                 )
                     .into_response();
             }
@@ -334,7 +334,7 @@ async fn proxy_handler(
                 );
                 return (
                     StatusCode::REQUEST_TIMEOUT,
-                    Json(serde_json::json!({ "error": "approval timed out" })),
+                    Json(serde_json::json!({ "error": "approval timed out", "code": "APPROVAL_TIMEOUT" })),
                 )
                     .into_response();
             }

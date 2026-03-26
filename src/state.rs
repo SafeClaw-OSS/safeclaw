@@ -148,6 +148,13 @@ impl VaultState {
         );
     }
 
+    /// Remove expired elevated sessions from cache (zeroize credentials).
+    pub fn cleanup_expired_sessions(&self) {
+        let mut cache = self.elevated_cache.lock().unwrap();
+        let now = Instant::now();
+        cache.retain(|_, session| session.expires_at > now);
+    }
+
     /// Get the policy defaults currently in memory.
     pub fn get_policy_defaults(&self) -> PolicyDefaults {
         self.policy_defaults.lock().unwrap().clone()

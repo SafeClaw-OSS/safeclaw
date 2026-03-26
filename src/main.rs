@@ -100,14 +100,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         notifications: notifications.clone(),
     });
 
-    // Periodic rate-limiter cleanup
+    // Periodic cleanup: rate limiter + expired elevated sessions
     {
         let state_clone = state.clone();
+        let vault_clone = vault.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
             loop {
                 interval.tick().await;
                 state_clone.rate_limiter.lock().unwrap().cleanup();
+                // Zeroize expired elevated credentials from cache
+                vault_clone.cleanup_expired_sessions();
             }
         });
     }
