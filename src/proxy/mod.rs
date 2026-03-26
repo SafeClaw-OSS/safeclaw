@@ -220,7 +220,7 @@ async fn proxy_handler(
                 d.insert("content_type".to_string(), serde_json::Value::String(ct.to_string()));
             }
             if !body_bytes.is_empty() {
-                let preview = String::from_utf8_lossy(&body_bytes[..body_bytes.len().min(500)]);
+                let preview = String::from_utf8_lossy(&body_bytes[..body_bytes.len().min(2048)]);
                 d.insert("body_preview".to_string(), serde_json::Value::String(preview.into_owned()));
             }
             Some(serde_json::Value::Object(d))
