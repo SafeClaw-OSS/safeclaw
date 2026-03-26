@@ -1,0 +1,225 @@
+/// Policy engine: access levels, rules, and evaluation logic.
+use serde::{Deserialize, Serialize};
+
+// ── Access Level ───────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AccessLevel {
+    Standard,
+    Elevated,
+    Critical,
+}
+
+impl std::fmt::Display for AccessLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AccessLevel::Standard => write!(f, "standard"),
+            AccessLevel::Elevated => write!(f, "elevated"),
+            AccessLevel::Critical => write!(f, "critical"),
+        }
+    }
+}
+
+// ── Policy Types ───────────────────────────────────────────────────────────────
+
+/// Per-request rule override for specific method/path patterns
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PolicyRule {
+    pub method: Option<String>,
+    #[serde(rename = "pathSuffix")]
+    pub path_suffix: Option<String>,
+    pub level: AccessLevel,
+    /// Session TTL in seconds (for elevated; cached after first approval)
+    #[serde(rename = "sessionTTL")]
+    pub session_ttl: Option<u64>,
+}
+
+/// Per-service read/write access levels
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServiceLevels {
+    pub write: Option<AccessLevel>,
+    pub read: Option<AccessLevel>,
+}
+
+/// Global policy defaults (stored in vault.enc under "policy_defaults")
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PolicyDefaults {
+    /// "block" (default) or "allow"
+    pub unknown_domain: Option<String>,
+    /// Approval timeout in seconds (default 300)
+    pub timeout: Option<u64>,
+    pub levels: Option<ServiceLevels>,
+}
+
+impl Default for PolicyDefaults {
+    fn default() -> Self {
+        Self {
+            unknown_domain: Some("block".to_string()),
+            timeout: Some(300),
+            levels: None,
+        }
+    }
+}
+
+// ── Push Notification Types ────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PushSubscription {
+    pub endpoint: String,
+    pub keys: PushKeys,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PushKeys {
+    pub p256dh: String,
+    pub auth: String,
+}
+
+// ── Policy Evaluation ──────────────────────────────────────────────────────────
+
+/// Determine the access level for a given request.
+/// Priority: service rules > service levels > global defaults > standard
+pub fn evaluate_policy(
+    method: &str,
+    path: &str,
+    rules: Option<&Vec<PolicyRule>>,
+    service_levels: Option<&ServiceLevels>,
+    defaults: &PolicyDefaults,
+) -> AccessLevel {
+    // 1. Check service rules (most specific)
+    if let Some(rules) = rules {
+        for rule in rules {
+            if matches_rule(rule, method, path) {
+                return rule.level.clone();
+            }
+        }
+    }
+
+    // 2. Check service-level access levels
+    if let Some(levels) = service_levels {
+        let level = if is_write_method(method) {
+            &levels.write
+        } else {
+            &levels.read
+        };
+        if let Some(l) = level {
+            return l.clone();
+        }
+    }
+
+    // 3. Fall back to policy defaults
+    if let Some(ref def_levels) = defaults.levels {
+        let level = if is_write_method(method) {
+            &def_levels.write
+        } else {
+            &def_levels.read
+        };
+        if let Some(l) = level {
+            return l.clone();
+        }
+    }
+
+    // 4. Default: standard
+    AccessLevel::Standard
+}
+
+fn is_write_method(method: &str) -> bool {
+    matches!(method, "POST" | "PUT" | "PATCH" | "DELETE")
+}
+
+fn matches_rule(rule: &PolicyRule, method: &str, path: &str) -> bool {
+    if let Some(ref m) = rule.method {
+        if m != method {
+            return false;
+        }
+    }
+    if let Some(ref suffix) = rule.path_suffix {
+        if !path.contains(suffix.as_str()) {
+            return false;
+        }
+    }
+    true
+}
+
+// ── Unit Tests ─────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn defaults() -> PolicyDefaults {
+        PolicyDefaults::default()
+    }
+
+    #[test]
+    fn default_is_standard() {
+        let level = evaluate_policy("GET", "/foo", None, None, &defaults());
+        assert_eq!(level, AccessLevel::Standard);
+    }
+
+    #[test]
+    fn write_method_elevated_via_service_levels() {
+        let levels = ServiceLevels {
+            write: Some(AccessLevel::Elevated),
+            read: Some(AccessLevel::Standard),
+        };
+        let level = evaluate_policy("POST", "/create", None, Some(&levels), &defaults());
+        assert_eq!(level, AccessLevel::Elevated);
+    }
+
+    #[test]
+    fn read_method_stays_standard_when_only_write_elevated() {
+        let levels = ServiceLevels {
+            write: Some(AccessLevel::Elevated),
+            read: None,
+        };
+        let level = evaluate_policy("GET", "/read", None, Some(&levels), &defaults());
+        assert_eq!(level, AccessLevel::Standard);
+    }
+
+    #[test]
+    fn rule_takes_priority_over_service_levels() {
+        let rules = vec![PolicyRule {
+            method: Some("DELETE".to_string()),
+            path_suffix: Some("/admin".to_string()),
+            level: AccessLevel::Critical,
+            session_ttl: None,
+        }];
+        let levels = ServiceLevels {
+            write: Some(AccessLevel::Elevated),
+            read: None,
+        };
+        let level = evaluate_policy(
+            "DELETE",
+            "/api/admin",
+            Some(&rules),
+            Some(&levels),
+            &defaults(),
+        );
+        assert_eq!(level, AccessLevel::Critical);
+    }
+
+    #[test]
+    fn rule_method_mismatch_falls_through() {
+        let rules = vec![PolicyRule {
+            method: Some("DELETE".to_string()),
+            path_suffix: None,
+            level: AccessLevel::Critical,
+            session_ttl: None,
+        }];
+        let level = evaluate_policy("GET", "/foo", Some(&rules), None, &defaults());
+        assert_eq!(level, AccessLevel::Standard);
+    }
+
+    #[test]
+    fn global_defaults_apply_when_no_service_levels() {
+        let mut def = defaults();
+        def.levels = Some(ServiceLevels {
+            write: Some(AccessLevel::Elevated),
+            read: None,
+        });
+        let level = evaluate_policy("POST", "/x", None, None, &def);
+        assert_eq!(level, AccessLevel::Elevated);
+    }
+}

@@ -60,11 +60,39 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/admin", get(serve_admin))
         .route("/admin/restart", post(system_restart))
         .route("/admin/shutdown", post(system_shutdown))
+        .route("/admin/safeclaw.md", get(admin_safeclaw_md))
+        .route("/admin/agents-snippet", get(admin_agents_snippet))
 
         // ── Vault (authenticated) ───────────────────────────────────────────
         .route("/vault/lock", post(vault_lock))
         .route("/vault/credentials", post(vault_credentials))
         .route("/vault/update", post(vault_update))
+
+        // ── Vault Service CRUD ───────────────────────────────────────────────
+        .route("/vault/services", get(vault_services_list))
+        .route("/vault/services/add", post(vault_services_add))
+        .route("/vault/services/update", post(vault_services_update))
+        .route("/vault/services/remove", post(vault_services_remove))
+
+        // ── Policy Defaults ──────────────────────────────────────────────────
+        .route("/vault/policy", get(vault_policy_get))
+        .route("/vault/policy/update", post(vault_policy_update))
+
+        // ── Files ────────────────────────────────────────────────────────────
+        .route("/vault/files", get(vault_files_list))
+        .route("/vault/files/upload", post(vault_files_upload))
+        .route("/vault/files/read", post(vault_files_read))
+        .route("/vault/files/remove", post(vault_files_remove))
+
+        // ── Push Notifications ───────────────────────────────────────────────
+        .route("/vault/notifications/subscribe", post(vault_notifications_subscribe))
+
+        // ── Approval Endpoints ───────────────────────────────────────────────
+        .route("/approve/pending", get(approval_list_pending))
+        .route("/approve/:id", get(approval_get))
+        .route("/approve/:id/status", get(approval_status))
+        .route("/approve/:id/confirm", post(approval_confirm))
+        .route("/approve/:id/reject", post(approval_reject))
 
         // ── Passkeys (authenticated) ────────────────────────────────────────
         .route("/passkeys/add", post(identity_add_passkey))

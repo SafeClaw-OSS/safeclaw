@@ -1,7 +1,11 @@
+mod approval;
+mod audit;
 mod auth;
 mod config;
 mod crypto;
 mod error;
+mod generate;
+mod policy;
 mod proxy;
 mod server;
 mod state;
@@ -16,6 +20,8 @@ use axum::serve;
 use tokio::net::TcpListener;
 use tracing::{info, warn};
 
+use approval::ApprovalManager;
+use audit::AuditLog;
 use config::Config;
 use crypto::keys::load_or_create_keypair;
 use state::{AppState, RateLimiter, VaultState};
@@ -37,7 +43,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Warn if SAFECLAW_ORIGIN/SAFECLAW_RP_ID are not set
     if config.origin.is_none() {
-        warn!("SAFECLAW_ORIGIN not set — defaulting to http://localhost:{}. Set this for production.", config.port);
+        warn!(
+            "SAFECLAW_ORIGIN not set — defaulting to http://localhost:{}. Set this for production.",
+            config.port
+        );
     }
     if config.rp_id.is_none() {
         warn!("SAFECLAW_RP_ID not set — defaulting to 'localhost'. Set this for production.");
@@ -45,13 +54,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Load or create server keypair
     let keypair = load_or_create_keypair(&config.data_dir)?;
-    info!("Server keypair loaded (pk.x={}...)", &keypair.pk.x[..8.min(keypair.pk.x.len())]);
+    info!(
+        "Server keypair loaded (pk.x={}...)",
+        &keypair.pk.x[..8.min(keypair.pk.x.len())]
+    );
 
     // --init: generate keypair and exit (for deployment scripts)
     if config.init {
-        info!("--init: keypair ready at {}/sc_pk.jwk, exiting", config.data_dir.display());
+        info!(
+            "--init: keypair ready at {}/sc_pk.jwk, exiting",
+            config.data_dir.display()
+        );
         return Ok(());
     }
+
+    // Ensure data directory exists
+    std::fs::create_dir_all(&config.data_dir)?;
+
+    // Initialize audit log (SQLite)
+    let audit_log = Arc::new(
+        AuditLog::open(&config.data_dir.join("audit.db"))
+            .map_err(|e| format!("Failed to open audit log: {}", e))?,
+    );
+    info!("Audit log open: {}", config.data_dir.join("audit.db").display());
+
+    // Initialize approval manager
+    let approval_manager = Arc::new(ApprovalManager::new(audit_log.clone()));
 
     // Build shared vault state
     let vault = Arc::new(VaultState::new());
@@ -64,6 +92,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         start_time: Instant::now(),
         rate_limiter: Arc::new(Mutex::new(RateLimiter::new(config.rate_limit))),
         config: config.clone(),
+        approval_manager: approval_manager.clone(),
+        audit_log: audit_log.clone(),
     });
 
     // Periodic rate-limiter cleanup
@@ -82,6 +112,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let proxy_state = Arc::new(proxy::ProxyState {
         vault: vault.clone(),
         config: config.clone(),
+        approval_manager: approval_manager.clone(),
+        audit_log: audit_log.clone(),
     });
     let proxy_router = proxy::build_proxy_router(proxy_state);
 
@@ -104,7 +136,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Run both servers concurrently
     tokio::try_join!(
-        serve(server_listener, server_router.into_make_service_with_connect_info::<SocketAddr>()),
+        serve(
+            server_listener,
+            server_router.into_make_service_with_connect_info::<SocketAddr>()
+        ),
         serve(proxy_listener, proxy_router.into_make_service()),
     )?;
 

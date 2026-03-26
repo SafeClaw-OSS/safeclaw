@@ -275,6 +275,8 @@ mod tests {
         use axum::http::StatusCode;
         use axum::response::IntoResponse;
 
+        use crate::approval::ApprovalManager;
+        use crate::audit::AuditLog;
         use crate::auth::nonce::NonceStore;
         use crate::config::Config;
         use crate::crypto::keys::generate_keypair;
@@ -297,6 +299,10 @@ mod tests {
             };
             let keypair = generate_keypair().expect("generate_keypair failed");
             let vault = Arc::new(VaultState::new());
+            let audit_log = Arc::new(
+                AuditLog::open_in_memory().expect("audit log failed"),
+            );
+            let approval_manager = Arc::new(ApprovalManager::new(audit_log.clone()));
 
             Arc::new(AppState {
                 config,
@@ -305,6 +311,8 @@ mod tests {
                 nonces: Arc::new(Mutex::new(NonceStore::new())),
                 start_time: Instant::now(),
                 rate_limiter: Arc::new(Mutex::new(RateLimiter::new(0))),
+                approval_manager,
+                audit_log,
             })
         }
 
@@ -358,6 +366,213 @@ mod tests {
                 env!("CARGO_PKG_VERSION"),
                 "version must match Cargo.toml"
             );
+        }
+    }
+
+    // ── Policy evaluation ─────────────────────────────────────────────────────────
+
+    mod policy_tests {
+        use crate::policy::{
+            evaluate_policy, AccessLevel, PolicyDefaults, PolicyRule, ServiceLevels,
+        };
+
+        fn defaults() -> PolicyDefaults {
+            PolicyDefaults::default()
+        }
+
+        #[test]
+        fn default_policy_is_standard() {
+            let level = evaluate_policy("GET", "/foo", None, None, &defaults());
+            assert_eq!(level, AccessLevel::Standard);
+        }
+
+        #[test]
+        fn post_with_elevated_write_returns_elevated() {
+            let levels = ServiceLevels {
+                write: Some(AccessLevel::Elevated),
+                read: None,
+            };
+            let level = evaluate_policy("POST", "/data", None, Some(&levels), &defaults());
+            assert_eq!(level, AccessLevel::Elevated);
+        }
+
+        #[test]
+        fn critical_rule_overrides_service_levels() {
+            let rules = vec![PolicyRule {
+                method: Some("DELETE".to_string()),
+                path_suffix: Some("/admin".to_string()),
+                level: AccessLevel::Critical,
+                session_ttl: None,
+            }];
+            let levels = ServiceLevels {
+                write: Some(AccessLevel::Elevated),
+                read: None,
+            };
+            let level = evaluate_policy(
+                "DELETE",
+                "/api/admin",
+                Some(&rules),
+                Some(&levels),
+                &defaults(),
+            );
+            assert_eq!(level, AccessLevel::Critical);
+        }
+
+        #[test]
+        fn get_not_elevated_when_only_write_elevated() {
+            let levels = ServiceLevels {
+                write: Some(AccessLevel::Elevated),
+                read: None,
+            };
+            let level = evaluate_policy("GET", "/data", None, Some(&levels), &defaults());
+            assert_eq!(level, AccessLevel::Standard);
+        }
+    }
+
+    // ── Audit log ─────────────────────────────────────────────────────────────────
+
+    mod audit_tests {
+        use crate::audit::AuditLog;
+
+        #[test]
+        fn create_and_retrieve_approval() {
+            let log = AuditLog::open_in_memory().expect("open failed");
+            log.create_approval("id1", "svc", "POST", "/api", "2099-01-01")
+                .expect("create failed");
+            let rec = log.get_approval("id1").unwrap().expect("not found");
+            assert_eq!(rec.id, "id1");
+            assert_eq!(rec.status, "pending");
+        }
+
+        #[test]
+        fn update_approval_status() {
+            let log = AuditLog::open_in_memory().expect("open failed");
+            log.create_approval("id2", "svc", "GET", "/x", "2099-01-01").unwrap();
+            log.update_approval("id2", "approved").unwrap();
+            let rec = log.get_approval("id2").unwrap().unwrap();
+            assert_eq!(rec.status, "approved");
+        }
+
+        #[test]
+        fn list_pending_filters_correctly() {
+            let log = AuditLog::open_in_memory().expect("open failed");
+            log.create_approval("a", "s1", "GET", "/1", "2099-01-01").unwrap();
+            log.create_approval("b", "s2", "POST", "/2", "2099-01-01").unwrap();
+            log.update_approval("b", "rejected").unwrap();
+            let pending = log.list_pending_approvals().unwrap();
+            assert_eq!(pending.len(), 1);
+            assert_eq!(pending[0].id, "a");
+        }
+    }
+
+    // ── Approval manager ──────────────────────────────────────────────────────────
+
+    mod approval_tests {
+        use std::sync::Arc;
+        use crate::approval::{ApprovalDecision, ApprovalManager};
+        use crate::audit::AuditLog;
+
+        fn make_manager() -> Arc<ApprovalManager> {
+            let audit = Arc::new(AuditLog::open_in_memory().expect("audit log failed"));
+            Arc::new(ApprovalManager::new(audit))
+        }
+
+        #[tokio::test]
+        async fn approve_resolves_receiver() {
+            let mgr = make_manager();
+            let (id, rx) = mgr.create_approval(
+                "svc".to_string(), "POST".to_string(), "/api".to_string(), 60,
+            );
+            assert!(mgr.resolve(&id, ApprovalDecision::Approved));
+            let decision = rx.await.expect("channel closed");
+            assert!(matches!(decision, ApprovalDecision::Approved));
+        }
+
+        #[tokio::test]
+        async fn reject_resolves_receiver() {
+            let mgr = make_manager();
+            let (id, rx) = mgr.create_approval(
+                "svc".to_string(), "DELETE".to_string(), "/secret".to_string(), 60,
+            );
+            mgr.resolve(&id, ApprovalDecision::Rejected);
+            let decision = rx.await.expect("channel closed");
+            assert!(matches!(decision, ApprovalDecision::Rejected));
+        }
+
+        #[test]
+        fn resolve_unknown_returns_false() {
+            let mgr = make_manager();
+            assert!(!mgr.resolve("nonexistent", ApprovalDecision::Rejected));
+        }
+    }
+
+    // ── VaultState elevated session cache ─────────────────────────────────────────
+
+    mod vault_elevated_cache {
+        use crate::state::VaultState;
+
+        #[test]
+        fn no_session_initially() {
+            let vs = VaultState::new();
+            assert!(!vs.check_elevated_session("github"));
+        }
+
+        #[test]
+        fn long_ttl_session_is_valid() {
+            let vs = VaultState::new();
+            vs.set_elevated_session("github", 3600);
+            assert!(vs.check_elevated_session("github"));
+        }
+
+        #[test]
+        fn zero_ttl_session_is_expired() {
+            let vs = VaultState::new();
+            vs.set_elevated_session("github", 0);
+            assert!(!vs.check_elevated_session("github"));
+        }
+
+        #[test]
+        fn lock_clears_cache() {
+            let vs = VaultState::new();
+            vs.set_elevated_session("github", 3600);
+            vs.lock();
+            assert!(!vs.check_elevated_session("github"));
+        }
+    }
+
+    // ── Auth config backward compatibility ────────────────────────────────────────
+
+    mod auth_config_compat {
+        use crate::proxy::forward::AuthConfig;
+
+        #[test]
+        fn legacy_value_field_works() {
+            let json = r#"{"type":"bearer","value":"tok123"}"#;
+            let cfg: AuthConfig = serde_json::from_str(json).unwrap();
+            assert_eq!(cfg.secret.as_deref(), Some("tok123"));
+        }
+
+        #[test]
+        fn new_secret_field_works() {
+            let json = r#"{"type":"header","name":"x-api-key","secret":"key456"}"#;
+            let cfg: AuthConfig = serde_json::from_str(json).unwrap();
+            assert_eq!(cfg.secret.as_deref(), Some("key456"));
+        }
+
+        #[test]
+        fn basic_auth_type_deserializes() {
+            let json = r#"{"type":"basic","username":"u","password":"p"}"#;
+            let cfg: AuthConfig = serde_json::from_str(json).unwrap();
+            assert_eq!(cfg.username.as_deref(), Some("u"));
+            assert_eq!(cfg.password.as_deref(), Some("p"));
+        }
+
+        #[test]
+        fn oauth2_config_deserializes() {
+            let json = r#"{"type":"oauth2","token_url":"https://t.example.com/token","client_id":"cid","client_secret":"cs","refresh_token":"rt"}"#;
+            let cfg: AuthConfig = serde_json::from_str(json).unwrap();
+            assert_eq!(cfg.auth_type, "oauth2");
+            assert_eq!(cfg.token_url.as_deref(), Some("https://t.example.com/token"));
         }
     }
 }
