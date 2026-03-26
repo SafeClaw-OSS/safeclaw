@@ -888,6 +888,17 @@ pub async fn vault_notifications_subscribe(
     Ok(Json(json!({ "ok": true })))
 }
 
+// ── Notifications ──────────────────────────────────────────────────────────────
+
+/// GET /notifications — return and clear pending in-memory notifications (no passkey required).
+/// Web Push (RFC 8030) is a future enhancement; the admin page polls this endpoint instead.
+pub async fn notifications_get(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let mut notifs = state.notifications.lock().unwrap();
+    let result = notifs.clone();
+    notifs.clear();
+    Json(json!({ "notifications": result }))
+}
+
 // ── Approval Endpoints ─────────────────────────────────────────────────────────
 
 /// GET /approve/:id — get approval info (no passkey required)
@@ -959,6 +970,41 @@ pub async fn approval_list_pending(
         )
             .into_response(),
     }
+}
+
+/// POST /approve/:id/details — return E2E-encrypted request details (passkey required).
+/// Details are in-memory only; cleared automatically when the approval is resolved/timed-out.
+pub async fn approval_details(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    auth: AuthenticatedRequest,
+) -> Result<impl IntoResponse> {
+    let nonce_b64 = auth.get_str("nonce")?;
+    let nonce_bytes = STANDARD
+        .decode(nonce_b64)
+        .map_err(|e| AppError::BadRequest(format!("Invalid nonce: {}", e)))?;
+
+    let user_key_b64 = auth.get_str("userKey")?;
+    let user_key = STANDARD
+        .decode(user_key_b64)
+        .map_err(|e| AppError::BadRequest(format!("Invalid userKey: {}", e)))?;
+
+    let details: serde_json::Value = {
+        let pending = state.approval_manager.pending.lock().unwrap();
+        pending
+            .get(&id)
+            .map(|a| a.details.clone().unwrap_or(serde_json::Value::Null))
+            .ok_or(AppError::NotFound)?
+    };
+
+    let details_bytes = serde_json::to_vec(&details)
+        .map_err(|e| AppError::Internal(format!("Failed to serialize details: {}", e)))?;
+
+    let mut response_key = derive_response_key(&user_key, &nonce_bytes)?;
+    let sealed = aes_encrypt(&response_key, &details_bytes)?;
+    response_key.zeroize();
+
+    Ok(Json(json!({ "sealed": STANDARD.encode(&sealed) })))
 }
 
 /// POST /approve/:id/confirm — approve a pending request (passkey required)

@@ -127,6 +127,9 @@ pub struct AppState {
     pub rate_limiter: Arc<Mutex<RateLimiter>>,
     pub approval_manager: Arc<ApprovalManager>,
     pub audit_log: Arc<AuditLog>,
+    /// In-memory notification queue — polled by GET /notifications.
+    /// Web Push (RFC 8030) is a future enhancement.
+    pub notifications: Arc<Mutex<Vec<serde_json::Value>>>,
 }
 
 // ── Rate Limiter ───────────────────────────────────────────────────────────────

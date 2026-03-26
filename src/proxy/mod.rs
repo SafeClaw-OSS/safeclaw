@@ -28,6 +28,7 @@ pub struct ProxyState {
     pub config: Config,
     pub approval_manager: Arc<ApprovalManager>,
     pub audit_log: Arc<AuditLog>,
+    pub notifications: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
 }
 
 pub fn build_proxy_router(state: Arc<ProxyState>) -> Router {
@@ -158,11 +159,22 @@ async fn proxy_handler(
                 }
             },
             None => {
+                state.audit_log.log_request(
+                    &route_service,
+                    method.as_str(),
+                    &route_path,
+                    "standard",
+                    "blocked",
+                    None,
+                    None,
+                    None,
+                );
                 return (
-                    StatusCode::BAD_GATEWAY,
-                    Json(
-                        serde_json::json!({ "error": format!("unknown service: {}", route_service) }),
-                    ),
+                    StatusCode::FORBIDDEN,
+                    Json(serde_json::json!({
+                        "error": "service not configured",
+                        "code": "UNKNOWN_SERVICE"
+                    })),
                 )
                     .into_response();
             }
@@ -200,11 +212,26 @@ async fn proxy_handler(
 
     let approval_id: Option<String> = if needs_approval {
         let timeout = policy_defaults.timeout.unwrap_or(300);
+
+        // Capture sanitised request details (no sensitive values)
+        let details = {
+            let mut d = serde_json::Map::new();
+            if let Some(ct) = headers.get("content-type").and_then(|v| v.to_str().ok()) {
+                d.insert("content_type".to_string(), serde_json::Value::String(ct.to_string()));
+            }
+            if !body_bytes.is_empty() {
+                let preview = String::from_utf8_lossy(&body_bytes[..body_bytes.len().min(500)]);
+                d.insert("body_preview".to_string(), serde_json::Value::String(preview.into_owned()));
+            }
+            Some(serde_json::Value::Object(d))
+        };
+
         let (id, rx) = state.approval_manager.create_approval(
             route_service.clone(),
             method.to_string(),
             route_path.clone(),
             timeout,
+            details,
         );
 
         tracing::info!(
@@ -215,7 +242,17 @@ async fn proxy_handler(
             route_path
         );
 
-        // TODO: send push notification to registered devices
+        // Push lightweight in-memory notification (Web Push / RFC 8030 is a future enhancement)
+        {
+            let notif = serde_json::json!({
+                "type": "approval",
+                "id": id,
+                "service": route_service,
+                "method": method.to_string(),
+                "level": access_level.to_string(),
+            });
+            state.notifications.lock().unwrap().push(notif);
+        }
 
         // Spawn cleanup task for timeout
         {

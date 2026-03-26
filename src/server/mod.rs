@@ -87,10 +87,14 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // ── Push Notifications ───────────────────────────────────────────────
         .route("/vault/notifications/subscribe", post(vault_notifications_subscribe))
 
+        // ── Notifications (poll queue) ───────────────────────────────────────
+        .route("/notifications", get(notifications_get))
+
         // ── Approval Endpoints ───────────────────────────────────────────────
         .route("/approve/pending", get(approval_list_pending))
         .route("/approve/:id", get(approval_get))
         .route("/approve/:id/status", get(approval_status))
+        .route("/approve/:id/details", post(approval_details))
         .route("/approve/:id/confirm", post(approval_confirm))
         .route("/approve/:id/reject", post(approval_reject))
 

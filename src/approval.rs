@@ -31,6 +31,8 @@ pub struct PendingApproval {
     pub tx: oneshot::Sender<ApprovalDecision>,
     pub created_at: Instant,
     pub expires_at: Instant,
+    /// Sanitised request details (headers + body preview) — in-memory only.
+    pub details: Option<serde_json::Value>,
 }
 
 // ── Manager ────────────────────────────────────────────────────────────────────
@@ -56,36 +58,17 @@ impl ApprovalManager {
         method: String,
         path: String,
         timeout_secs: u64,
+        details: Option<serde_json::Value>,
     ) -> (String, oneshot::Receiver<ApprovalDecision>) {
         let id = uuid::Uuid::new_v4().to_string();
         let (tx, rx) = oneshot::channel();
         let now = Instant::now();
         let expires_at = now + std::time::Duration::from_secs(timeout_secs);
 
-        // Human-readable expires_at for SQLite
-        let expires_str = {
-            use std::time::{SystemTime, UNIX_EPOCH};
-            let unix = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs()
-                + timeout_secs;
-            // Format as "YYYY-MM-DD HH:MM:SS" (UTC) — SQLite datetime format
-            let secs = unix % 60;
-            let mins = (unix / 60) % 60;
-            let hours = (unix / 3600) % 24;
-            let days = unix / 86400;
-            // Simple approximation from epoch (good enough for audit display)
-            let year = 1970 + (days / 365);
-            format!(
-                "{}-01-01 {:02}:{:02}:{:02} (+{}d)",
-                year, hours, mins, secs, days % 365
-            )
-        };
-
+        // SQLite computes expires_at via datetime('now', '+N seconds')
         let _ = self
             .audit
-            .create_approval(&id, &service, &method, &path, &expires_str);
+            .create_approval(&id, &service, &method, &path, timeout_secs);
 
         self.pending.lock().unwrap().insert(
             id.clone(),
@@ -97,6 +80,7 @@ impl ApprovalManager {
                 tx,
                 created_at: now,
                 expires_at,
+                details,
             },
         );
 

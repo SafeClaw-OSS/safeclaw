@@ -99,19 +99,20 @@ impl AuditLog {
     }
 
     /// Insert a new pending approval record.
+    /// `timeout_secs` is added to the current time via SQLite's datetime() function.
     pub fn create_approval(
         &self,
         id: &str,
         service: &str,
         method: &str,
         path: &str,
-        expires_at: &str,
+        timeout_secs: u64,
     ) -> Result<(), rusqlite::Error> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO approvals (id, service, method, path, expires_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![id, service, method, path, expires_at],
+             VALUES (?1, ?2, ?3, ?4, datetime('now', '+' || ?5 || ' seconds'))",
+            params![id, service, method, path, timeout_secs as i64],
         )?;
         Ok(())
     }
@@ -185,7 +186,7 @@ mod tests {
     fn approval_lifecycle() {
         let log = open();
         let id = "test-id-1";
-        log.create_approval(id, "svc", "POST", "/api", "2099-01-01 00:00:00")
+        log.create_approval(id, "svc", "POST", "/api", 3600)
             .expect("create failed");
 
         let rec = log.get_approval(id).expect("get failed").expect("not found");
@@ -201,8 +202,8 @@ mod tests {
     #[test]
     fn list_pending_only_returns_pending() {
         let log = open();
-        log.create_approval("a", "s1", "GET", "/1", "2099-01-01 00:00:00").unwrap();
-        log.create_approval("b", "s2", "POST", "/2", "2099-01-01 00:00:00").unwrap();
+        log.create_approval("a", "s1", "GET", "/1", 3600).unwrap();
+        log.create_approval("b", "s2", "POST", "/2", 3600).unwrap();
         log.update_approval("b", "approved").unwrap();
 
         let pending = log.list_pending_approvals().unwrap();

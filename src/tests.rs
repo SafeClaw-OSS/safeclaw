@@ -313,6 +313,7 @@ mod tests {
                 rate_limiter: Arc::new(Mutex::new(RateLimiter::new(0))),
                 approval_manager,
                 audit_log,
+                notifications: Arc::new(Mutex::new(Vec::new())),
             })
         }
 
@@ -437,7 +438,7 @@ mod tests {
         #[test]
         fn create_and_retrieve_approval() {
             let log = AuditLog::open_in_memory().expect("open failed");
-            log.create_approval("id1", "svc", "POST", "/api", "2099-01-01")
+            log.create_approval("id1", "svc", "POST", "/api", 3600)
                 .expect("create failed");
             let rec = log.get_approval("id1").unwrap().expect("not found");
             assert_eq!(rec.id, "id1");
@@ -447,7 +448,7 @@ mod tests {
         #[test]
         fn update_approval_status() {
             let log = AuditLog::open_in_memory().expect("open failed");
-            log.create_approval("id2", "svc", "GET", "/x", "2099-01-01").unwrap();
+            log.create_approval("id2", "svc", "GET", "/x", 3600).unwrap();
             log.update_approval("id2", "approved").unwrap();
             let rec = log.get_approval("id2").unwrap().unwrap();
             assert_eq!(rec.status, "approved");
@@ -456,8 +457,8 @@ mod tests {
         #[test]
         fn list_pending_filters_correctly() {
             let log = AuditLog::open_in_memory().expect("open failed");
-            log.create_approval("a", "s1", "GET", "/1", "2099-01-01").unwrap();
-            log.create_approval("b", "s2", "POST", "/2", "2099-01-01").unwrap();
+            log.create_approval("a", "s1", "GET", "/1", 3600).unwrap();
+            log.create_approval("b", "s2", "POST", "/2", 3600).unwrap();
             log.update_approval("b", "rejected").unwrap();
             let pending = log.list_pending_approvals().unwrap();
             assert_eq!(pending.len(), 1);
@@ -481,7 +482,7 @@ mod tests {
         async fn approve_resolves_receiver() {
             let mgr = make_manager();
             let (id, rx) = mgr.create_approval(
-                "svc".to_string(), "POST".to_string(), "/api".to_string(), 60,
+                "svc".to_string(), "POST".to_string(), "/api".to_string(), 60, None,
             );
             assert!(mgr.resolve(&id, ApprovalDecision::Approved));
             let decision = rx.await.expect("channel closed");
@@ -492,7 +493,7 @@ mod tests {
         async fn reject_resolves_receiver() {
             let mgr = make_manager();
             let (id, rx) = mgr.create_approval(
-                "svc".to_string(), "DELETE".to_string(), "/secret".to_string(), 60,
+                "svc".to_string(), "DELETE".to_string(), "/secret".to_string(), 60, None,
             );
             mgr.resolve(&id, ApprovalDecision::Rejected);
             let decision = rx.await.expect("channel closed");
