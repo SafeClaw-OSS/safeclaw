@@ -9,6 +9,10 @@ window.SafeClaw = (() => {
     return btoa(s);
   }
 
+  function toBase64url(u8) {
+    return toBase64(u8).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  }
+
   function fromBase64(b64) {
     // Accept both standard base64 and base64url
     const std = b64.replace(/-/g, '+').replace(/_/g, '/');
@@ -120,6 +124,7 @@ window.SafeClaw = (() => {
 
   return {
     toBase64,
+    toBase64url,
     fromBase64,
     e2eEncrypt,
     deriveResponseKey,
