@@ -29,11 +29,14 @@ Some operations require explicit human approval. You will receive HTTP 202 with:
 }
 ```
 
-### Step 1 — Notify the user
+### Step 1 — Notify the user immediately
 
-Tell them what you were trying to do and share the approval link:
+Tell the user what you were trying to do and share the approval link.
+If the channel supports inline buttons (e.g. Telegram), use a button — otherwise send the URL as text:
 
-> "I need approval to [describe the action — service + what you were doing]. Please review and approve: [safeclaw_approve_url]"
+> "I need approval to [describe the action — service + what you were doing]. Please review: **[Review & Approve]**(`safeclaw_approve_url`)"
+
+Then poll silently — no need to say "waiting…", the notification above is sufficient.
 
 ### Step 2 — Poll for result
 
@@ -46,12 +49,26 @@ GET http://localhost:23295/approve/<id>
 | Response | What to do |
 |---|---|
 | `{"status": "pending"}` | Keep polling |
-| `{"status": "approved", "response": {...}}` | Use `response` as the original call result, continue task |
+| `{"status": "approved", "response": {...}}` | Extract `response.body` as the upstream API response body; use `response.status` for the status code. Continue the task. |
 | `{"status": "rejected"}` | Tell user the action was blocked; ask how to proceed |
 | `{"status": "expired"}` | Tell user the approval window expired; ask if they want to retry |
 
+**Approved response structure:**
+```json
+{
+  "status": "approved",
+  "response": {
+    "status": 200,
+    "headers": { ... },
+    "body": { ...upstream API response... }
+  }
+}
+```
+Use `response.body` as the data, not the whole `response` object.
+
 ### Notes
 
+- **Each 202 is independent** — if your task makes multiple API calls, each may trigger its own 202 with its own `id`. Handle them separately; ids are never reused.
 - **Polling is always GET** regardless of your original request method (POST, PUT, etc.)
 - **Streaming requests**: if your original call used `stream: true`, the approved `response` will be a complete buffered JSON — handle it as a regular response
 - **Expiry**: `expires_at` is a unix timestamp (5 min window). If approaching, remind the user
