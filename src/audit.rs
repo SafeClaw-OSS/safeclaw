@@ -8,6 +8,20 @@ use std::sync::Mutex;
 // ── Record Types ───────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditEntry {
+    pub id: i64,
+    pub timestamp: String,
+    pub service: String,
+    pub method: String,
+    pub path: String,
+    pub level: String,
+    pub decision: String,
+    pub duration_ms: Option<i64>,
+    pub upstream_status: Option<u16>,
+    pub approval_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApprovalRecord {
     pub id: String,
     pub service: String,
@@ -141,6 +155,31 @@ impl AuditLog {
         }
     }
 
+    /// Return the most recent `limit` audit log entries, newest first.
+    pub fn list_recent(&self, limit: u32) -> Result<Vec<AuditEntry>, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, timestamp, service, method, path, level, decision, \
+             duration_ms, upstream_status, approval_id \
+             FROM audit_log ORDER BY id DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit], |row| {
+            Ok(AuditEntry {
+                id: row.get(0)?,
+                timestamp: row.get(1)?,
+                service: row.get(2)?,
+                method: row.get(3)?,
+                path: row.get(4)?,
+                level: row.get(5)?,
+                decision: row.get(6)?,
+                duration_ms: row.get(7)?,
+                upstream_status: row.get::<_, Option<i64>>(8)?.map(|v| v as u16),
+                approval_id: row.get(9)?,
+            })
+        })?;
+        rows.collect()
+    }
+
     /// List all approvals with status = 'pending'.
     pub fn list_pending_approvals(&self) -> Result<Vec<ApprovalRecord>, rusqlite::Error> {
         let conn = self.conn.lock().unwrap();
@@ -197,6 +236,23 @@ mod tests {
         let rec2 = log.get_approval(id).expect("get failed").expect("not found");
         assert_eq!(rec2.status, "approved");
         assert!(rec2.decided_at.is_some());
+    }
+
+    #[test]
+    fn list_recent_returns_entries() {
+        let log = open();
+        log.log_request("svc", "GET", "/a", "standard", "allowed", Some(10), Some(200), None);
+        log.log_request("svc", "POST", "/b", "elevated", "blocked", None, None, None);
+
+        let entries = log.list_recent(10).unwrap();
+        assert_eq!(entries.len(), 2);
+        // newest first
+        assert_eq!(entries[0].path, "/b");
+        assert_eq!(entries[1].path, "/a");
+
+        let limited = log.list_recent(1).unwrap();
+        assert_eq!(limited.len(), 1);
+        assert_eq!(limited[0].path, "/b");
     }
 
     #[test]

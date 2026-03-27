@@ -98,6 +98,9 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/approve/{id}/confirm", post(approval_confirm))
         .route("/approve/{id}/reject", post(approval_reject))
 
+        // ── Audit Log ────────────────────────────────────────────────────────
+        .route("/audit/log", get(audit_log_list))
+
         // ── Passkeys (authenticated) ────────────────────────────────────────
         .route("/passkeys/add", post(identity_add_passkey))
         .route("/passkeys/remove", post(identity_remove_passkey))

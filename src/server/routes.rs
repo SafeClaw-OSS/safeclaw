@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{
     body::Bytes,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     response::IntoResponse,
     Json,
 };
@@ -1336,4 +1336,18 @@ pub async fn system_shutdown(
         std::process::exit(0);
     });
     Ok(resp)
+}
+
+// ── Audit Log ──────────────────────────────────────────────────────────────────
+
+/// GET /audit/log?limit=50 — list recent audit entries (no auth required, contains zero sensitive data).
+pub async fn audit_log_list(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let limit = params.get("limit").and_then(|v| v.parse().ok()).unwrap_or(50u32).min(200);
+    match state.audit_log.list_recent(limit) {
+        Ok(entries) => Json(json!({ "entries": entries })).into_response(),
+        Err(e) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))).into_response(),
+    }
 }
