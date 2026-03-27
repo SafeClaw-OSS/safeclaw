@@ -77,10 +77,21 @@ fn read_index(state: &AppState) -> Value {
 }
 
 fn write_index(state: &AppState, secrets: &Value) -> std::io::Result<()> {
-    let services: Vec<String> = secrets
+    // Store lightweight service metadata (name + category) — no credentials.
+    let services: Vec<Value> = secrets
         .get("services")
         .and_then(|s| s.as_object())
-        .map(|obj| obj.keys().cloned().collect())
+        .map(|obj| {
+            obj.iter()
+                .map(|(name, cfg)| {
+                    let category = cfg
+                        .get("category")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("service");
+                    json!({ "name": name, "category": category })
+                })
+                .collect()
+        })
         .unwrap_or_default();
 
     let files: Vec<Value> = secrets
