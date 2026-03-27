@@ -552,7 +552,6 @@ pub async fn vault_lock(
 
 // ── Vault Credentials ──────────────────────────────────────────────────────────
 
-#[allow(dead_code)]
 pub async fn vault_credentials(
     State(state): State<Arc<AppState>>,
     auth: AuthenticatedRequest,

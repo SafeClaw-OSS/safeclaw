@@ -62,6 +62,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/pk", get(server_pk))
         .route("/challenge", get(issue_challenge))
         .route("/auth/verify", post(auth_verify))
+        .route("/vault/credentials", post(vault_credentials))
 
         // ── Admin (instance management) ─────────────────────────────────────
         .route("/admin/setup", get(serve_setup).post(setup))
