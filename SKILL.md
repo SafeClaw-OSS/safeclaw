@@ -36,24 +36,34 @@ If the channel supports inline buttons (e.g. Telegram), use a button — otherwi
 
 > "I need approval to [describe the action — service + what you were doing]. Please review: **[Review & Approve]**(`safeclaw_approve_url`)"
 
-Then poll silently — no need to say "waiting…", the notification above is sufficient.
+Then end your turn — no need to say "waiting…", the notification above is sufficient.
 
-### Step 2 — Poll for result
+### Step 2 — Set up a cron watcher
 
-`GET /approve/<id>` on the same proxy host, every 5 seconds:
+Immediately after notifying the user, create a recurring cron job to watch for the result.
+Use your runtime's cron tool (e.g. OpenClaw `cron.add`):
 
+```json
+{
+  "name": "safeclaw-approval-<id>",
+  "schedule": { "kind": "every", "everyMs": 3000 },
+  "sessionTarget": "isolated",
+  "payload": {
+    "kind": "agentTurn",
+    "message": "SafeClaw approval watcher.\nApproval id: <id>\nPoll URL: <proxy_base>/approve/<id>\nExpires at: <expires_at> (unix timestamp)\n\nInstructions:\n1. If current time > expires_at: tell user approval window expired, then remove this cron job (cron.list → find name=safeclaw-approval-<id> → cron.remove). Done.\n2. GET <proxy_base>/approve/<id>\n3. If status=pending: reply HEARTBEAT_OK (will check again in 3s)\n4. If status=approved: present response.body to the user. Remove cron job.\n5. If status=rejected: tell user the action was blocked, ask how to proceed. Remove cron job.\n6. If status=expired or 404: tell user approval window expired. Remove cron job."
+  },
+  "delivery": {
+    "mode": "announce",
+    "channel": "<current channel>",
+    "to": "<current chat/topic target>"
+  }
+}
 ```
-GET http://localhost:23295/approve/<id>
-```
 
-| Response | What to do |
-|---|---|
-| `{"status": "pending"}` | Keep polling |
-| `{"status": "approved", "response": {...}}` | Extract `response.body` as the upstream API response body; use `response.status` for the status code. Continue the task. |
-| `{"status": "rejected"}` | Tell user the action was blocked; ask how to proceed |
-| `{"status": "expired"}` | Tell user the approval window expired; ask if they want to retry |
+- Set `delivery.channel` and `delivery.to` to the current conversation (so the result reaches the user in the right place)
+- `HEARTBEAT_OK` responses are never delivered — safe to use for pending state
 
-**Approved response structure:**
+**Approved response structure** (when cron run calls GET /approve/\<id\>):
 ```json
 {
   "status": "approved",
@@ -68,8 +78,8 @@ Use `response.body` as the data, not the whole `response` object.
 
 ### Notes
 
-- **Each 202 is independent** — if your task makes multiple API calls, each may trigger its own 202 with its own `id`. Handle them separately; ids are never reused.
+- **Each 202 is independent** — if your task makes multiple API calls, each may trigger its own 202 with its own `id`. Create a separate cron watcher per id.
 - **Polling is always GET** regardless of your original request method (POST, PUT, etc.)
 - **Streaming requests**: if your original call used `stream: true`, the approved `response` will be a complete buffered JSON — handle it as a regular response
-- **Expiry**: `expires_at` is a unix timestamp (5 min window). If approaching, remind the user
-- **Not found (404)**: the approval ID doesn't exist — do not retry, inform the user
+- **Expiry**: `expires_at` is a unix timestamp (5 min window). Cron checks `expires_at` first each run — auto-stops at exact TTL boundary. Max ~100 ticks at 3s.
+- **Not found (404)**: treat same as expired — inform user, remove cron job
