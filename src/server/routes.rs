@@ -15,7 +15,7 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use serde_json::{json, Value};
 use zeroize::Zeroize;
 
-use crate::approval::ApprovalDecision;
+// ApprovalDecision removed (async 202 flow — no more oneshot channel)
 use crate::auth::{AuthenticatedRequest, PasskeyEntry};
 use crate::auth::webauthn::{verify_assertion, AssertionData};
 use crate::crypto::{
@@ -1091,33 +1091,7 @@ pub async fn approval_get(
     }
 }
 
-/// GET /approve/:id/status — poll approval status (no passkey required)
-pub async fn approval_status(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-) -> impl IntoResponse {
-    // Check in-memory pending first (faster)
-    let is_pending = state
-        .approval_manager
-        .pending
-        .lock()
-        .unwrap()
-        .contains_key(&id);
-
-    if is_pending {
-        return Json(json!({ "status": "pending" })).into_response();
-    }
-
-    match state.audit_log.get_approval(&id) {
-        Ok(Some(rec)) => Json(json!({ "status": rec.status })).into_response(),
-        Ok(None) => (
-            axum::http::StatusCode::NOT_FOUND,
-            Json(json!({ "error": "approval not found" })),
-        )
-            .into_response(),
-        Err(_) => Json(json!({ "status": "unknown" })).into_response(),
-    }
-}
+// GET /approve/:id/status removed — replaced by GET /approve/{id} on proxy port (async 202 flow).
 
 /// GET /approve/pending — list pending approvals (no passkey required)
 pub async fn approval_list_pending(
@@ -1185,7 +1159,7 @@ pub async fn approval_confirm(
         None => return Err(AppError::NotFound),
     };
 
-    // Decrypt vault and extract the service's auth config to pass through the channel
+    // Decrypt vault and extract the service's auth config for replay
     let auth_json = decrypt_vault_json(&state, &auth)
         .ok()
         .and_then(|secrets| {
@@ -1196,10 +1170,7 @@ pub async fn approval_confirm(
                 .cloned()
         });
 
-    if state
-        .approval_manager
-        .resolve(&id, ApprovalDecision::Approved(auth_json))
-    {
+    if state.approval_manager.confirm(&id, auth_json) {
         Ok(Json(json!({ "ok": true })))
     } else {
         Err(AppError::NotFound)
@@ -1214,10 +1185,7 @@ pub async fn approval_reject(
 ) -> Result<impl IntoResponse> {
     let _ = auth; // passkey verified by extractor
 
-    if state
-        .approval_manager
-        .resolve(&id, ApprovalDecision::Rejected)
-    {
+    if state.approval_manager.reject(&id) {
         Ok(Json(json!({ "ok": true })))
     } else {
         Err(AppError::NotFound)

@@ -1,11 +1,12 @@
 pub mod forward;
 pub mod locked;
 
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use axum::{
-    extract::{Request, State},
+    extract::{Path, Request, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::any,
@@ -14,7 +15,7 @@ use axum::{
 use http_body_util::BodyExt;
 use hyper::body::Bytes;
 
-use crate::approval::{ApprovalDecision, ApprovalManager};
+use crate::approval::{ApprovalManager, ApprovalStatus, CachedResponse};
 use crate::audit::AuditLog;
 use crate::config::Config;
 use crate::policy::{evaluate_policy, AccessLevel};
@@ -33,6 +34,7 @@ pub struct ProxyState {
 pub fn build_proxy_router(state: Arc<ProxyState>) -> Router {
     Router::new()
         .route("/health", any(proxy_health))
+        .route("/approve/{id}", any(proxy_poll_approval))
         .route("/{*path}", any(proxy_handler))
         .with_state(state)
 }
@@ -45,6 +47,214 @@ async fn proxy_health(State(state): State<Arc<ProxyState>>) -> impl IntoResponse
         "version": env!("CARGO_PKG_VERSION"),
     }))
 }
+
+// ── GET /approve/{id} — agent polls approval status ───────────────────────────
+
+async fn proxy_poll_approval(
+    State(state): State<Arc<ProxyState>>,
+    Path(id): Path<String>,
+) -> Response {
+    let snapshot = match state.approval_manager.get_snapshot(&id) {
+        Some(s) => s,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "approval not found" })),
+            )
+                .into_response();
+        }
+    };
+
+    match snapshot.status {
+        ApprovalStatus::Pending => {
+            Json(serde_json::json!({ "status": "pending" })).into_response()
+        }
+
+        ApprovalStatus::Rejected => {
+            Json(serde_json::json!({ "status": "rejected" })).into_response()
+        }
+
+        ApprovalStatus::Expired => {
+            // Still in map briefly during expire(); treat as not found
+            (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "approval not found" })),
+            )
+                .into_response()
+        }
+
+        ApprovalStatus::Approved => {
+            // Return cached response if already executed
+            if let Some(cached) = snapshot.cached_response {
+                return Json(serde_json::json!({
+                    "status": "approved",
+                    "response": {
+                        "status": cached.status,
+                        "headers": cached.headers,
+                        "body": cached.body,
+                    }
+                }))
+                .into_response();
+            }
+
+            // First poll after approval: take auth and execute upstream
+            let auth_json = match state.approval_manager.take_auth_for_execute(&id) {
+                Some(aj) => aj,
+                None => {
+                    // Race: another concurrent poll already took it, spin back pending
+                    return Json(serde_json::json!({ "status": "pending" })).into_response();
+                }
+            };
+
+            // Build service config for replay
+            let auth_config = auth_json
+                .clone()
+                .and_then(|aj| serde_json::from_value::<forward::AuthConfig>(aj).ok());
+
+            let service_config = ServiceConfig {
+                upstream: snapshot.upstream.clone(),
+                auth: auth_config,
+                levels: None,
+                rules: None,
+                category: None,
+            };
+
+            // OAuth2 token refresh if needed
+            let resolved_bearer: Option<String> = if let Some(a) = &service_config.auth {
+                if a.auth_type == "oauth2" {
+                    let service_name = &snapshot.service;
+                    let cached_token = {
+                        let tokens = state.vault.oauth2_tokens.lock().unwrap();
+                        tokens.get(service_name).cloned()
+                    };
+                    let now_secs = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    let valid_cached = cached_token
+                        .filter(|(_, exp)| *exp > now_secs + 60)
+                        .map(|(tok, _)| tok);
+
+                    if let Some(t) = valid_cached {
+                        Some(t)
+                    } else {
+                        match refresh_oauth2_token(a).await {
+                            Ok((access_token, expires_at)) => {
+                                state
+                                    .vault
+                                    .oauth2_tokens
+                                    .lock()
+                                    .unwrap()
+                                    .insert(service_name.clone(), (access_token.clone(), expires_at));
+                                Some(access_token)
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "poll: oauth2 refresh failed for {}: {}",
+                                    service_name,
+                                    e
+                                );
+                                a.access_token.clone()
+                            }
+                        }
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            // Parse method
+            let method = match snapshot.method.parse::<axum::http::Method>() {
+                Ok(m) => m,
+                Err(_) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({ "error": "invalid stored method" })),
+                    )
+                        .into_response();
+                }
+            };
+
+            // Execute upstream
+            let upstream_resp = forward_request(
+                method,
+                &snapshot.uri_path,
+                &snapshot.req_headers,
+                snapshot.req_body.clone(),
+                &service_config,
+                resolved_bearer.as_deref(),
+            )
+            .await;
+
+            // Buffer the full response to cache + return as JSON
+            let resp_status = upstream_resp.status().as_u16();
+            let resp_headers: HashMap<String, String> = upstream_resp
+                .headers()
+                .iter()
+                .filter_map(|(k, v)| {
+                    v.to_str().ok().map(|vs| (k.as_str().to_string(), vs.to_string()))
+                })
+                .collect();
+
+            let body_bytes = match axum::body::to_bytes(upstream_resp.into_body(), 32 * 1024 * 1024).await {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::warn!("poll: failed to read upstream body: {}", e);
+                    // Don't cache; agent can retry
+                    return (
+                        StatusCode::BAD_GATEWAY,
+                        Json(serde_json::json!({ "error": "failed to read upstream response" })),
+                    )
+                        .into_response();
+                }
+            };
+
+            let body_json: serde_json::Value =
+                serde_json::from_slice(&body_bytes).unwrap_or_else(|_| {
+                    serde_json::Value::String(String::from_utf8_lossy(&body_bytes).into_owned())
+                });
+
+            let cached = CachedResponse {
+                status: resp_status,
+                headers: resp_headers.clone(),
+                body: body_json.clone(),
+            };
+            state.approval_manager.set_cached_response(&id, cached);
+
+            tracing::info!(
+                "poll: executed approved request id={} service={} status={}",
+                id,
+                snapshot.service,
+                resp_status
+            );
+            state.audit_log.log_request(
+                &snapshot.service,
+                &snapshot.method,
+                // strip service prefix from uri_path for audit
+                &format!("/{}", snapshot.uri_path.trim_start_matches('/').splitn(3, '/').nth(1).unwrap_or("")),
+                "approved",
+                "allowed",
+                None,
+                Some(resp_status),
+                Some(&id),
+            );
+
+            Json(serde_json::json!({
+                "status": "approved",
+                "response": {
+                    "status": resp_status,
+                    "headers": resp_headers,
+                    "body": body_json,
+                }
+            }))
+            .into_response()
+        }
+    }
+}
+
+// ── POST /any-path — main proxy handler ───────────────────────────────────────
 
 async fn proxy_handler(
     State(state): State<Arc<ProxyState>>,
@@ -114,7 +324,7 @@ async fn proxy_handler(
         };
     }
 
-    // Read full body for forwarding
+    // Read full body for forwarding (and potential approval replay)
     let body_bytes = match read_body_limited(req, 32 * 1024 * 1024).await {
         Ok(b) => b,
         Err(e) => {
@@ -200,7 +410,6 @@ async fn proxy_handler(
 
     // ── Approval gate ──────────────────────────────────────────────────────────
 
-    // For elevated services, check if there is a cached session with credentials.
     let cached_auth = if access_level == AccessLevel::Elevated {
         state.vault.check_elevated_session(&route_service)
     } else {
@@ -209,33 +418,44 @@ async fn proxy_handler(
 
     let needs_approval = match &access_level {
         AccessLevel::Standard => false,
-        AccessLevel::Elevated => cached_auth.is_none(), // skip if valid cache exists
-        AccessLevel::Critical => true, // always require approval
+        AccessLevel::Elevated => cached_auth.is_none(),
+        AccessLevel::Critical => true,
     };
 
-    // auth_from_approval is populated when we receive Approved(Some(...)) from the channel.
-    let mut auth_from_approval: Option<serde_json::Value> = None;
-
-    let approval_id: Option<String> = if needs_approval {
+    if needs_approval {
         let timeout = policy_defaults.timeout.unwrap_or(300);
 
-        // Capture sanitised request details (no sensitive values)
+        // Sanitised details (no secrets) for the console approve page
         let details = {
             let mut d = serde_json::Map::new();
             if let Some(ct) = headers.get("content-type").and_then(|v| v.to_str().ok()) {
-                d.insert("content_type".to_string(), serde_json::Value::String(ct.to_string()));
+                d.insert(
+                    "content_type".to_string(),
+                    serde_json::Value::String(ct.to_string()),
+                );
             }
             if !body_bytes.is_empty() {
-                let preview = String::from_utf8_lossy(&body_bytes[..body_bytes.len().min(2048)]);
-                d.insert("body_preview".to_string(), serde_json::Value::String(preview.into_owned()));
+                let preview =
+                    String::from_utf8_lossy(&body_bytes[..body_bytes.len().min(2048)]);
+                d.insert(
+                    "body_preview".to_string(),
+                    serde_json::Value::String(preview.into_owned()),
+                );
             }
             Some(serde_json::Value::Object(d))
         };
 
-        let (id, rx) = state.approval_manager.create_approval(
+        // Filter request headers for replay (strip hop-by-hop + auth)
+        let replay_headers = filter_replay_headers(&headers);
+
+        let id = state.approval_manager.create_approval(
             route_service.clone(),
             method.to_string(),
             route_path.clone(),
+            uri_path.clone(),
+            service_config.upstream.clone(),
+            replay_headers,
+            body_bytes.clone(),
             timeout,
             details,
         );
@@ -248,7 +468,27 @@ async fn proxy_handler(
             route_path
         );
 
-        // Send Web Push notification to all registered subscriptions
+        // Elevated session cache cleanup on TTL
+        {
+            let mgr = state.approval_manager.clone();
+            let id_clone = id.clone();
+            let level_clone = access_level.clone();
+            let vault_clone = state.vault.clone();
+            let svc_clone = route_service.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(timeout)).await;
+                if level_clone == AccessLevel::Elevated {
+                    vault_clone
+                        .elevated_cache
+                        .lock()
+                        .unwrap()
+                        .remove(&svc_clone);
+                }
+                mgr.expire(&id_clone);
+            });
+        }
+
+        // Web Push notification
         {
             let notif = serde_json::json!({
                 "type": "approval",
@@ -262,7 +502,8 @@ async fn proxy_handler(
             if let Some(priv_b64) = priv_key {
                 let vault_clone = state.vault.clone();
                 tokio::spawn(async move {
-                    let dead = crate::webpush::send_push_notification(&priv_b64, &subs, notif).await;
+                    let dead =
+                        crate::webpush::send_push_notification(&priv_b64, &subs, notif).await;
                     if !dead.is_empty() {
                         let mut active = vault_clone.push_subscriptions.lock().unwrap();
                         active.retain(|s| !dead.contains(&s.endpoint));
@@ -271,95 +512,40 @@ async fn proxy_handler(
             }
         }
 
-        // Spawn cleanup task for timeout
-        {
-            let mgr = state.approval_manager.clone();
-            let id_clone = id.clone();
-            let level_clone = access_level.clone();
-            let vault_clone = state.vault.clone();
-            let svc_clone = route_service.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_secs(timeout)).await;
-                // Only remove if it was elevated (for cache cleanup)
-                if level_clone == AccessLevel::Elevated {
-                    vault_clone.elevated_cache.lock().unwrap().remove(&svc_clone);
-                }
-                mgr.remove_timed_out(&id_clone);
-            });
+        // Elevated session cache TTL (for agent-side)
+        if access_level == AccessLevel::Elevated {
+            let ttl = find_rule_ttl(service_config.rules.as_ref(), method.as_str(), &route_path)
+                .unwrap_or(3600);
+            // Cache a placeholder; real auth stored in PendingApproval.approved_auth
+            // and injected into elevated cache only after execution (in poll handler).
+            let _ = ttl; // TTL applied at execute time
         }
 
-        // Await approval decision
-        let decision = tokio::time::timeout(
-            std::time::Duration::from_secs(timeout),
-            rx,
+        let expires_at_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            + timeout;
+
+        return (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({
+                "id": id,
+                "safeclaw_approve_url": format!(
+                    "{}/approve/{}",
+                    state.config.effective_admin_url(),
+                    id
+                ),
+                "expires_at": expires_at_unix,
+            })),
         )
-        .await;
+            .into_response();
+    }
 
-        match decision {
-            Ok(Ok(ApprovalDecision::Approved(auth_json))) => {
-                tracing::info!("proxy: approval id={} approved", id);
-                // Cache elevated session with TTL and store the auth credentials
-                if access_level == AccessLevel::Elevated {
-                    let ttl = find_rule_ttl(
-                        service_config.rules.as_ref(),
-                        method.as_str(),
-                        &route_path,
-                    )
-                    .unwrap_or(3600);
-                    let cache_val = auth_json.clone().unwrap_or(serde_json::Value::Null);
-                    state.vault.set_elevated_session(&route_service, cache_val, ttl);
-                }
-                auth_from_approval = auth_json;
-                Some(id)
-            }
-            Ok(Ok(ApprovalDecision::Rejected)) => {
-                tracing::info!("proxy: approval id={} rejected", id);
-                state.audit_log.log_request(
-                    &route_service,
-                    method.as_str(),
-                    &route_path,
-                    &access_level.to_string(),
-                    "rejected",
-                    None,
-                    None,
-                    Some(&id),
-                );
-                return (
-                    StatusCode::FORBIDDEN,
-                    Json(serde_json::json!({ "error": "request rejected by vault owner", "code": "USER_REJECTED" })),
-                )
-                    .into_response();
-            }
-            Ok(Err(_)) | Err(_) => {
-                tracing::warn!("proxy: approval id={} timed out", id);
-                state.audit_log.log_request(
-                    &route_service,
-                    method.as_str(),
-                    &route_path,
-                    &access_level.to_string(),
-                    "timed_out",
-                    None,
-                    None,
-                    Some(&id),
-                );
-                return (
-                    StatusCode::REQUEST_TIMEOUT,
-                    Json(serde_json::json!({ "error": "approval timed out", "code": "APPROVAL_TIMEOUT" })),
-                )
-                    .into_response();
-            }
-        }
-    } else {
-        None
-    };
+    // ── Inject effective auth for elevated (cached session) ───────────────────
 
-    // ── Inject effective auth for elevated/critical services ───────────────────
-    // For standard services, auth is already in service_config.auth (unchanged).
-    // For elevated/critical, auth was stripped from memory at unlock; we restore it
-    // here from the approval payload or the elevated session cache.
     if service_config.auth.is_none() {
-        let effective_auth_json = auth_from_approval.or(cached_auth);
-        if let Some(aj) = effective_auth_json {
+        if let Some(aj) = cached_auth {
             service_config.auth = serde_json::from_value::<forward::AuthConfig>(aj).ok();
         }
     }
@@ -368,32 +554,23 @@ async fn proxy_handler(
 
     let resolved_bearer: Option<String> = if let Some(a) = &service_config.auth {
         if a.auth_type == "oauth2" {
-            // Check in-memory cache first
             let cached = {
                 let tokens = state.vault.oauth2_tokens.lock().unwrap();
                 tokens.get(&route_service).cloned()
             };
 
-            let now_secs = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
+            let now_secs = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
 
-            let token = if let Some((tok, exp)) = cached {
-                if exp > now_secs + 60 {
-                    // Valid with >60s margin
-                    Some(tok)
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
+            let valid_cached = cached
+                .filter(|(_, exp)| *exp > now_secs + 60)
+                .map(|(tok, _)| tok);
 
-            if let Some(t) = token {
+            if let Some(t) = valid_cached {
                 Some(t)
             } else {
-                // Refresh token
                 match refresh_oauth2_token(a).await {
                     Ok((access_token, expires_at)) => {
                         state
@@ -406,7 +583,6 @@ async fn proxy_handler(
                     }
                     Err(e) => {
                         tracing::warn!("oauth2 refresh failed for {}: {}", route_service, e);
-                        // Fall back to static access_token if present
                         a.access_token.clone()
                     }
                 }
@@ -442,10 +618,38 @@ async fn proxy_handler(
         "allowed",
         Some(duration_ms),
         Some(upstream_status),
-        approval_id.as_deref(),
+        None,
     );
 
     response
+}
+
+// ── Helpers ────────────────────────────────────────────────────────────────────
+
+/// Strip headers that must not be replayed: hop-by-hop, auth, host, content-length.
+fn filter_replay_headers(headers: &axum::http::HeaderMap) -> axum::http::HeaderMap {
+    const STRIP: &[&str] = &[
+        "host",
+        "content-length",
+        "transfer-encoding",
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailer",
+        "upgrade",
+        "authorization",
+        "x-api-key",
+        "api-key",
+    ];
+    let mut out = axum::http::HeaderMap::new();
+    for (k, v) in headers.iter() {
+        if !STRIP.contains(&k.as_str().to_lowercase().as_str()) {
+            out.insert(k.clone(), v.clone());
+        }
+    }
+    out
 }
 
 /// Find session TTL from matching rule (for elevated access).

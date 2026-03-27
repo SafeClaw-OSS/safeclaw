@@ -99,7 +99,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // ── Approval Endpoints ───────────────────────────────────────────────
         .route("/approve/pending", get(approval_list_pending))
         .route("/approve/{id}", get(approval_get))
-        .route("/approve/{id}/status", get(approval_status))
+        // /approve/{id}/status removed — polling moved to proxy port GET /approve/{id}
         .route("/approve/{id}/details", post(approval_details))
         .route("/approve/{id}/confirm", post(approval_confirm))
         .route("/approve/{id}/reject", post(approval_reject))

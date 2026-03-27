@@ -473,7 +473,9 @@ mod tests {
 
     mod approval_tests {
         use std::sync::Arc;
-        use crate::approval::{ApprovalDecision, ApprovalManager};
+        use axum::http::HeaderMap;
+        use hyper::body::Bytes;
+        use crate::approval::{ApprovalStatus, ApprovalManager};
         use crate::audit::AuditLog;
 
         fn make_manager() -> Arc<ApprovalManager> {
@@ -481,48 +483,69 @@ mod tests {
             Arc::new(ApprovalManager::new(audit))
         }
 
-        #[tokio::test]
-        async fn approve_resolves_receiver() {
-            let mgr = make_manager();
-            let (id, rx) = mgr.create_approval(
-                "svc".to_string(), "POST".to_string(), "/api".to_string(), 60, None,
-            );
-            assert!(mgr.resolve(&id, ApprovalDecision::Approved(None)));
-            let decision = rx.await.expect("channel closed");
-            assert!(matches!(decision, ApprovalDecision::Approved(_)));
-        }
-
-        #[tokio::test]
-        async fn approve_carries_auth_payload() {
-            let mgr = make_manager();
-            let (id, rx) = mgr.create_approval(
-                "svc".to_string(), "POST".to_string(), "/api".to_string(), 60, None,
-            );
-            let auth_json = serde_json::json!({"type": "bearer", "secret": "tok"});
-            mgr.resolve(&id, ApprovalDecision::Approved(Some(auth_json.clone())));
-            let decision = rx.await.expect("channel closed");
-            if let ApprovalDecision::Approved(Some(payload)) = decision {
-                assert_eq!(payload["type"], "bearer");
-            } else {
-                panic!("expected Approved with auth payload");
-            }
-        }
-
-        #[tokio::test]
-        async fn reject_resolves_receiver() {
-            let mgr = make_manager();
-            let (id, rx) = mgr.create_approval(
-                "svc".to_string(), "DELETE".to_string(), "/secret".to_string(), 60, None,
-            );
-            mgr.resolve(&id, ApprovalDecision::Rejected);
-            let decision = rx.await.expect("channel closed");
-            assert!(matches!(decision, ApprovalDecision::Rejected));
+        fn make_approval(mgr: &Arc<ApprovalManager>) -> String {
+            mgr.create_approval(
+                "svc".to_string(),
+                "POST".to_string(),
+                "/api".to_string(),
+                "/svc/api".to_string(),
+                "https://api.example.com".to_string(),
+                HeaderMap::new(),
+                Bytes::new(),
+                60,
+                None,
+            )
         }
 
         #[test]
-        fn resolve_unknown_returns_false() {
+        fn confirm_sets_approved_status() {
             let mgr = make_manager();
-            assert!(!mgr.resolve("nonexistent", ApprovalDecision::Rejected));
+            let id = make_approval(&mgr);
+            assert!(mgr.confirm(&id, None));
+            let snap = mgr.get_snapshot(&id).expect("not found");
+            assert_eq!(snap.status, ApprovalStatus::Approved);
+        }
+
+        #[test]
+        fn confirm_carries_auth_payload() {
+            let mgr = make_manager();
+            let id = make_approval(&mgr);
+            let auth_json = serde_json::json!({"type": "bearer", "secret": "tok"});
+            mgr.confirm(&id, Some(auth_json.clone()));
+            let auth = mgr.take_auth_for_execute(&id).expect("should be approved");
+            assert_eq!(auth.unwrap()["type"], "bearer");
+        }
+
+        #[test]
+        fn take_auth_idempotent() {
+            let mgr = make_manager();
+            let id = make_approval(&mgr);
+            mgr.confirm(&id, None);
+            // First take succeeds
+            assert!(mgr.take_auth_for_execute(&id).is_some());
+            // Second take returns None (already taken / cached)
+            assert!(mgr.take_auth_for_execute(&id).is_none());
+        }
+
+        #[test]
+        fn reject_sets_rejected_status() {
+            let mgr = make_manager();
+            let id = make_approval(&mgr);
+            assert!(mgr.reject(&id));
+            let snap = mgr.get_snapshot(&id).expect("not found");
+            assert_eq!(snap.status, ApprovalStatus::Rejected);
+        }
+
+        #[test]
+        fn confirm_unknown_returns_false() {
+            let mgr = make_manager();
+            assert!(!mgr.confirm("nonexistent", None));
+        }
+
+        #[test]
+        fn reject_unknown_returns_false() {
+            let mgr = make_manager();
+            assert!(!mgr.reject("nonexistent"));
         }
     }
 
