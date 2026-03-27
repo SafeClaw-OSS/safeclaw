@@ -81,5 +81,5 @@ Use `response.body` as the data, not the whole `response` object.
 - **Each 202 is independent** — if your task makes multiple API calls, each may trigger its own 202 with its own `id`. Create a separate cron watcher per id.
 - **Polling is always GET** regardless of your original request method (POST, PUT, etc.)
 - **Streaming requests**: if your original call used `stream: true`, the approved `response` will be a complete buffered JSON — handle it as a regular response
-- **Expiry**: `expires_at` is a unix timestamp (5 min window). Cron checks `expires_at` first each run — auto-stops at exact TTL boundary. Max ~100 ticks at 3s.
+- **Expiry**: `expires_at` is a unix timestamp set by the server. Cron checks it first each run — auto-stops at the exact TTL boundary, however long that is.
 - **Not found (404)**: treat same as expired — inform user, remove cron job
