@@ -309,6 +309,7 @@ mod tests {
                 keypair,
                 vault,
                 nonces: Arc::new(Mutex::new(NonceStore::new())),
+                challenges: Arc::new(Mutex::new(crate::auth::challenge::ChallengeStore::new())),
                 start_time: Instant::now(),
                 rate_limiter: Arc::new(Mutex::new(RateLimiter::new(0))),
                 approval_manager,

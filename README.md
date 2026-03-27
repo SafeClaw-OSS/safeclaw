@@ -134,6 +134,7 @@ cargo build --release
 |--------|------|-------------|
 | GET | `/health` | `{ status, locked, uptime, version }` |
 | GET | `/pk` | Server P-256 public key (JWK) |
+| GET | `/challenge` | Issue replay-protection challenge (TTL 5min, single-use, 60/min/IP) |
 
 ### Admin
 

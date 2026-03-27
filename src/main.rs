@@ -92,6 +92,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         keypair,
         vault: vault.clone(),
         nonces: Arc::new(Mutex::new(auth::nonce::NonceStore::new())),
+        challenges: Arc::new(Mutex::new(auth::challenge::ChallengeStore::new())),
         start_time: Instant::now(),
         rate_limiter: Arc::new(Mutex::new(RateLimiter::new(config.rate_limit))),
         config: config.clone(),
@@ -109,6 +110,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             loop {
                 interval.tick().await;
                 state_clone.rate_limiter.lock().unwrap().cleanup();
+                state_clone.challenges.lock().unwrap().cleanup();
                 // Zeroize expired elevated credentials from cache
                 vault_clone.cleanup_expired_sessions();
             }

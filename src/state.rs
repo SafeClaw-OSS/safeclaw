@@ -171,6 +171,7 @@ pub struct AppState {
     pub keypair: ServerKeypair,
     pub vault: Arc<VaultState>,
     pub nonces: Arc<Mutex<crate::auth::nonce::NonceStore>>,
+    pub challenges: Arc<Mutex<crate::auth::challenge::ChallengeStore>>,
     pub start_time: Instant,
     pub rate_limiter: Arc<Mutex<RateLimiter>>,
     pub approval_manager: Arc<ApprovalManager>,

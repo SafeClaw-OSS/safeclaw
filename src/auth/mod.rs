@@ -1,3 +1,4 @@
+pub mod challenge;
 pub mod nonce;
 pub mod webauthn;
 
@@ -48,6 +49,16 @@ impl AuthenticatedRequest {
             .and_then(|v| v.as_str())
             .ok_or_else(|| AppError::BadRequest(format!("Missing field '{}' in payload", key)))
     }
+
+    /// Get the replay-protection value (challenge or nonce) as base64 string.
+    /// Used as salt for response_key derivation.
+    pub fn replay_token_b64(&self) -> Result<&str> {
+        self.payload
+            .get("challenge")
+            .or_else(|| self.payload.get("nonce"))
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| AppError::BadRequest("Missing 'challenge' or 'nonce' in payload".into()))
+    }
 }
 
 /// Axum extractor that performs the full auth flow:
@@ -96,33 +107,47 @@ pub fn authenticate_bytes(bytes: &[u8], state: &Arc<AppState>) -> Result<Authent
         .map_err(|_| AppError::BadRequest("Decrypted payload is not valid JSON".into()))?;
 
     // Extract required fields
-    let nonce_b64 = inner
-        .get("nonce")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| AppError::BadRequest("Missing 'nonce' in decrypted payload".into()))?;
     let credential_id = inner
         .get("credentialId")
         .and_then(|v| v.as_str())
         .ok_or_else(|| AppError::BadRequest("Missing 'credentialId' in decrypted payload".into()))?
         .to_string();
 
-    // Decode nonce from base64
-    let nonce_bytes = STANDARD
-        .decode(nonce_b64)
-        .map_err(|e| AppError::BadRequest(format!("Invalid nonce base64: {}", e)))?;
+    // Dual-track replay protection:
+    //   "challenge" → server-issued (daily ops: unlock, vault, approve, etc.)
+    //   "nonce"     → client-generated (setup only, append-only file on disk)
+    let challenge_b64 = inner.get("challenge").and_then(|v| v.as_str());
+    let nonce_b64 = inner.get("nonce").and_then(|v| v.as_str());
 
-    // Minimum nonce length: 16 bytes (128 bits) to ensure sufficient entropy
-    if nonce_bytes.len() < 16 {
-        return Err(AppError::BadRequest(format!(
-            "Nonce too short: {} bytes (minimum 16)", nonce_bytes.len()
-        )));
-    }
+    match (challenge_b64, nonce_b64) {
+        (Some(c), _) => {
+            // Server challenge path: verify against issued challenges
+            let mut store = state.challenges.lock().unwrap();
+            if !store.verify(c) {
+                return Err(AppError::BadRequest("Invalid or expired challenge".into()));
+            }
+        }
+        (None, Some(n)) => {
+            // Client nonce path (setup): verify via in-memory nonce store
+            let nonce_bytes = STANDARD
+                .decode(n)
+                .map_err(|e| AppError::BadRequest(format!("Invalid nonce base64: {}", e)))?;
 
-    // Check nonce
-    {
-        let mut nonce_store = state.nonces.lock().unwrap();
-        if !nonce_store.check_and_insert(&nonce_bytes) {
-            return Err(AppError::BadRequest("Nonce already used".into()));
+            if nonce_bytes.len() < 16 {
+                return Err(AppError::BadRequest(format!(
+                    "Nonce too short: {} bytes (minimum 16)", nonce_bytes.len()
+                )));
+            }
+
+            let mut nonce_store = state.nonces.lock().unwrap();
+            if !nonce_store.check_and_insert(&nonce_bytes) {
+                return Err(AppError::BadRequest("Nonce already used".into()));
+            }
+        }
+        (None, None) => {
+            return Err(AppError::BadRequest(
+                "Missing 'challenge' or 'nonce' in decrypted payload".into(),
+            ));
         }
     }
 

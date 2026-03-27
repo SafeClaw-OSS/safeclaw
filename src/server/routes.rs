@@ -1,11 +1,13 @@
 use std::collections::HashMap;
 use std::fs;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{
     body::Bytes,
-    extract::{Path, Query, State},
+    extract::{ConnectInfo, Path, Query, State},
+    http::StatusCode,
     response::IntoResponse,
     Json,
 };
@@ -41,6 +43,26 @@ pub async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 
 pub async fn server_pk(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     Json(json!({ "pk": state.keypair.pk }))
+}
+
+/// GET /challenge — issue a server challenge for replay protection.
+/// Returns { challenge: base64 }. TTL 5min, single-use, 60/min/IP.
+pub async fn issue_challenge(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+) -> impl IntoResponse {
+    let ip = addr.ip();
+    let mut store = state.challenges.lock().unwrap();
+    match store.issue(ip) {
+        Some(challenge) => (
+            StatusCode::OK,
+            Json(json!({ "challenge": challenge })),
+        ).into_response(),
+        None => (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({ "error": "Challenge rate limit exceeded" })),
+        ).into_response(),
+    }
 }
 
 // ── Vault Index Helpers ────────────────────────────────────────────────────────
@@ -470,7 +492,7 @@ pub async fn vault_credentials(
     auth: AuthenticatedRequest,
 ) -> Result<impl IntoResponse> {
     let user_key_b64 = auth.get_str("userKey")?;
-    let nonce_b64 = auth.get_str("nonce")?;
+    let nonce_b64 = auth.replay_token_b64()?;
 
     let user_key = STANDARD
         .decode(user_key_b64)
@@ -820,7 +842,7 @@ pub async fn vault_files_read(
         .ok_or_else(|| AppError::BadRequest("Missing file id".into()))?
         .to_string();
 
-    let nonce_b64 = auth.get_str("nonce")?;
+    let nonce_b64 = auth.replay_token_b64()?;
     let nonce_bytes = STANDARD
         .decode(nonce_b64)
         .map_err(|e| AppError::BadRequest(format!("Invalid nonce: {}", e)))?;
@@ -1035,7 +1057,7 @@ pub async fn approval_details(
     Path(id): Path<String>,
     auth: AuthenticatedRequest,
 ) -> Result<impl IntoResponse> {
-    let nonce_b64 = auth.get_str("nonce")?;
+    let nonce_b64 = auth.replay_token_b64()?;
     let nonce_bytes = STANDARD
         .decode(nonce_b64)
         .map_err(|e| AppError::BadRequest(format!("Invalid nonce: {}", e)))?;
