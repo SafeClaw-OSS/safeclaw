@@ -315,7 +315,7 @@ mod tests {
                 rate_limiter: Arc::new(Mutex::new(RateLimiter::new(0))),
                 approval_manager,
                 audit_log,
-                notifications: Arc::new(Mutex::new(Vec::new())),
+
             })
         }
 

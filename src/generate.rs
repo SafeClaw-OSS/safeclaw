@@ -10,17 +10,30 @@ pub fn generate_safeclaw_md(secrets: &serde_json::Value, locked: bool, proxy_por
     let mut lines = vec![
         "# SafeClaw Services".to_string(),
         format!(
-            "The following services are available through SafeClaw proxy at {}:",
+            "Route API calls through the SafeClaw proxy at `{}`. Do NOT call upstream APIs directly.",
             proxy_base
         ),
         String::new(),
-        "| Service | Proxy URL | Auth | Level |".to_string(),
-        "|---------|-----------|------|-------|".to_string(),
+        "## Usage".to_string(),
+        "Replace the upstream base URL with the proxy URL. Do NOT add Authorization headers.".to_string(),
+        "SafeClaw auto-injects credentials (API key / OAuth2 token) before forwarding.".to_string(),
+        String::new(),
+        "## Service Table".to_string(),
+        "| Service | Upstream | Proxy URL | Auth | Approval Level |".to_string(),
+        "|---------|----------|-----------|------|----------------|".to_string(),
     ];
 
     if let Some(services) = secrets.get("services").and_then(|s| s.as_object()) {
         for (name, svc) in services {
             let proxy_url = format!("{}/{}/", proxy_base, name);
+            let upstream = if locked || svc.is_null() {
+                "-".to_string()
+            } else {
+                svc.get("upstream")
+                    .and_then(|u| u.as_str())
+                    .unwrap_or("-")
+                    .to_string()
+            };
             let auth = if locked || svc.is_null() {
                 "-".to_string()
             } else {
@@ -31,10 +44,15 @@ pub fn generate_safeclaw_md(secrets: &serde_json::Value, locked: bool, proxy_por
             } else {
                 level_display(svc)
             };
-            lines.push(format!("| {} | {} | {} | {} |", name, proxy_url, auth, level));
+            lines.push(format!("| {} | {} | {} | {} | {} |", name, upstream, proxy_url, auth, level));
         }
     }
 
+    lines.push(String::new());
+    lines.push("## Example".to_string());
+    lines.push(format!(
+        "```\n# Call OpenAI via proxy (no Authorization header needed):\ncurl -X POST {proxy_base}/openai/v1/chat/completions \\\n  -H 'Content-Type: application/json' \\\n  -d '{{\"model\":\"gpt-4o\",\"messages\":[...]}}'\n\n# Call Gmail via proxy:\ncurl {proxy_base}/gmail/gmail/v1/users/me/messages\n```"
+    ));
     lines.push(String::new());
     lines.push(format!(
         "Vault status: {}",
@@ -62,21 +80,36 @@ pub fn generate_agents_md_snippet(secrets: &serde_json::Value, proxy_port: u16) 
                 .unwrap_or("");
             let domain = extract_domain(upstream);
             if !domain.is_empty() {
+                // Strip trailing slash for clean URL example
+                let upstream_clean = upstream.trim_end_matches('/');
                 entries.push(format!(
-                    "- {} → {}/{}/{{原始路径}}",
-                    domain, proxy_base, name
+                    "- **{name}**: replace `{upstream_clean}` with `{proxy_base}/{name}` — e.g. `{proxy_base}/{name}/some/api/path`"
                 ));
             }
         }
     }
 
     let mut lines = vec![
-        "## SafeClaw（安全规则，必须遵守）".to_string(),
-        "以下域名的 HTTP 请求禁止直连，必须走 SafeClaw proxy：".to_string(),
+        "## SafeClaw Proxy (MANDATORY security rules)".to_string(),
+        String::new(),
+        "All HTTP requests to the following services MUST go through the SafeClaw proxy.".to_string(),
+        "Direct calls to these APIs are forbidden.".to_string(),
+        String::new(),
+        "### How to use".to_string(),
+        "1. Replace the upstream base URL with the proxy URL shown below.".to_string(),
+        "2. Do NOT add an Authorization header — SafeClaw injects credentials automatically.".to_string(),
+        "3. Keep the original API path and query parameters unchanged.".to_string(),
+        String::new(),
+        "### Services".to_string(),
     ];
     lines.extend(entries);
-    lines.push("不需要加 Authorization header，SafeClaw 自动注入。".to_string());
-    lines.push("违反此规则 = 安全事故。".to_string());
+    lines.push(String::new());
+    lines.push("### Example".to_string());
+    lines.push(format!(
+        "```\n# Wrong (direct call — FORBIDDEN):\ncurl https://api.openai.com/v1/chat/completions ...\n\n# Correct (via SafeClaw proxy):\ncurl {proxy_base}/openai/v1/chat/completions ...\n# (no Authorization header needed)\n```"
+    ));
+    lines.push(String::new());
+    lines.push("Violating these rules is a security incident.".to_string());
 
     lines.join("\n")
 }
@@ -179,7 +212,7 @@ mod tests {
         let s = generate_safeclaw_md(&names, true, 23295);
         assert!(s.contains("anthropic"));
         assert!(s.contains("gmail"));
-        assert!(!s.contains("header"));
+        assert!(!s.contains("header ("));
         assert!(s.contains("Vault status: locked"));
     }
 
