@@ -754,11 +754,8 @@ pub async fn vault_files_upload(
     let file_size = file_bytes.len();
     let file_id = uuid::Uuid::new_v4().to_string();
 
-    // Decrypt vault to get DEK context
-    let vault_val = decrypt_vault_json(&state, &auth)?;
-    let _ = vault_val; // We just needed to verify auth; DEK is already zeroized inside
-
-    // We need the DEK to encrypt the file — redo decrypt to get DEK
+    // Auth already verified by AuthenticatedRequest extractor.
+    // Derive DEK directly from user key + wrapped DEK on disk.
     let user_key_b64 = auth.get_str("userKey")?;
     let user_key = STANDARD
         .decode(user_key_b64)
