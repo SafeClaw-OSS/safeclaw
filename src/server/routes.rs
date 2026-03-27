@@ -514,6 +514,13 @@ pub async fn vault_unlock(
 
     state.vault.set_secrets(secrets);
 
+    // Push AGENTS.md + safeclaw.md to provisioner on unlock, so workspace is
+    // always up-to-date even if services were added while the vault was locked.
+    let proxy_port = state.config.proxy_port;
+    if let Some(unlocked_secrets) = state.vault.secrets.lock().unwrap().clone() {
+        push_to_provisioner(unlocked_secrets, proxy_port);
+    }
+
     Ok(Json(json!({ "ok": true })))
 }
 
