@@ -9,6 +9,7 @@ mod policy;
 mod proxy;
 mod server;
 mod state;
+mod webpush;
 #[cfg(test)]
 mod tests;
 
@@ -84,9 +85,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Build shared vault state
     let vault = Arc::new(VaultState::new());
 
-    // Shared in-memory notification queue (polled by GET /notifications)
-    let notifications: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
-
     // Build app state
     let state = Arc::new(AppState {
         keypair,
@@ -98,7 +96,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config: config.clone(),
         approval_manager: approval_manager.clone(),
         audit_log: audit_log.clone(),
-        notifications: notifications.clone(),
     });
 
     // Periodic cleanup: rate limiter + expired elevated sessions
@@ -123,7 +120,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config: config.clone(),
         approval_manager: approval_manager.clone(),
         audit_log: audit_log.clone(),
-        notifications: notifications.clone(),
     });
     let proxy_router = proxy::build_proxy_router(proxy_state);
 

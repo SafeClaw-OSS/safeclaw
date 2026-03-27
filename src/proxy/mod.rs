@@ -28,7 +28,6 @@ pub struct ProxyState {
     pub config: Config,
     pub approval_manager: Arc<ApprovalManager>,
     pub audit_log: Arc<AuditLog>,
-    pub notifications: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
 }
 
 pub fn build_proxy_router(state: Arc<ProxyState>) -> Router {
@@ -249,7 +248,7 @@ async fn proxy_handler(
             route_path
         );
 
-        // Push lightweight in-memory notification (Web Push / RFC 8030 is a future enhancement)
+        // Send Web Push notification to all registered subscriptions
         {
             let notif = serde_json::json!({
                 "type": "approval",
@@ -258,7 +257,13 @@ async fn proxy_handler(
                 "method": method.to_string(),
                 "level": access_level.to_string(),
             });
-            state.notifications.lock().unwrap().push(notif);
+            let subs = state.vault.push_subscriptions.lock().unwrap().clone();
+            let priv_key = state.vault.vapid_private_key.lock().unwrap().clone();
+            if let Some(priv_b64) = priv_key {
+                tokio::spawn(async move {
+                    crate::webpush::send_push_notification(&priv_b64, &subs, notif).await;
+                });
+            }
         }
 
         // Spawn cleanup task for timeout
