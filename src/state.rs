@@ -192,6 +192,7 @@ pub struct AppState {
     pub nonces: Arc<Mutex<crate::auth::nonce::NonceStore>>,
     pub challenges: Arc<Mutex<crate::auth::challenge::ChallengeStore>>,
     pub start_time: Instant,
+    pub started_at_ms: u64,  // Unix ms timestamp at startup (for client-side uptime calc)
     pub rate_limiter: Arc<Mutex<RateLimiter>>,
     pub approval_manager: Arc<ApprovalManager>,
     pub audit_log: Arc<AuditLog>,

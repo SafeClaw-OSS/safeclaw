@@ -312,6 +312,7 @@ mod tests {
                 nonces: Arc::new(Mutex::new(NonceStore::new())),
                 challenges: Arc::new(Mutex::new(crate::auth::challenge::ChallengeStore::new())),
                 start_time: Instant::now(),
+                started_at_ms: 0,
                 rate_limiter: Arc::new(Mutex::new(RateLimiter::new(0))),
                 approval_manager,
                 audit_log,
@@ -331,7 +332,7 @@ mod tests {
 
             assert_eq!(json["status"], "ok", "status field must be 'ok'");
             assert!(json["locked"].is_boolean(), "locked must be a boolean");
-            assert!(json["uptime"].is_number(), "uptime must be a number");
+            assert!(json["started_at"].is_number(), "started_at must be a number");
             assert!(json["version"].is_string(), "version must be a string");
             assert_eq!(json["locked"], true, "vault must start locked");
         }

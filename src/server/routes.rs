@@ -30,12 +30,15 @@ use crate::state::AppState;
 // ── Health ─────────────────────────────────────────────────────────────────────
 
 pub async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let uptime = state.start_time.elapsed().as_secs();
     let vapid_public_key = state.vault.vapid_public_key.lock().unwrap().clone();
+    // started_at: Unix ms timestamp of when the process started.
+    // Clients compute uptime = Date.now() - started_at, so the counter
+    // keeps ticking even if the health endpoint becomes temporarily unreachable.
+    let started_at = state.started_at_ms;
     Json(json!({
         "status": "ok",
         "locked": state.vault.is_locked(),
-        "uptime": uptime,
+        "started_at": started_at,
         "version": env!("CARGO_PKG_VERSION"),
         "vapidPublicKey": vapid_public_key,
     }))

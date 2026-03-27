@@ -92,6 +92,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         nonces: Arc::new(Mutex::new(auth::nonce::NonceStore::new())),
         challenges: Arc::new(Mutex::new(auth::challenge::ChallengeStore::new())),
         start_time: Instant::now(),
+        started_at_ms: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64,
         rate_limiter: Arc::new(Mutex::new(RateLimiter::new(config.rate_limit))),
         config: config.clone(),
         approval_manager: approval_manager.clone(),
