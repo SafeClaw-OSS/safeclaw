@@ -29,6 +29,19 @@ use crate::state::AppState;
 
 // ── Health ─────────────────────────────────────────────────────────────────────
 
+/// POST /auth/verify — verify passkey identity without unlocking vault.
+/// Returns 200 {ok: true, credential_id} if the passkey is registered on this instance.
+/// Returns 401 if challenge invalid, signature wrong, or credential not registered.
+/// Used by the console gate to block unauthorized access to the UI.
+pub async fn auth_verify(
+    _state: State<Arc<AppState>>,
+    auth: AuthenticatedRequest,
+) -> Result<impl IntoResponse> {
+    // AuthenticatedRequest extractor already verified: challenge, credentialId, signature.
+    // If we get here, the passkey is valid and registered on this instance.
+    Ok(Json(json!({ "ok": true, "credential_id": auth.credential_id })))
+}
+
 pub async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let vapid_public_key = state.vault.vapid_public_key.lock().unwrap().clone();
     // started_at: Unix ms timestamp of when the process started.

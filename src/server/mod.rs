@@ -61,6 +61,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/health", get(health))
         .route("/pk", get(server_pk))
         .route("/challenge", get(issue_challenge))
+        .route("/auth/verify", post(auth_verify))
 
         // ── Admin (instance management) ─────────────────────────────────────
         .route("/admin/setup", get(serve_setup).post(setup))
