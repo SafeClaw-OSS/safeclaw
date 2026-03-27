@@ -35,6 +35,10 @@ struct CliArgs {
     /// Rate limit: requests per minute per IP (0 = disabled)
     #[arg(long)]
     rate_limit: Option<u32>,
+    /// Comma-separated path prefixes exempt from rate limiting (e.g. /health,/notifications,/approve/)
+    /// [env: SAFECLAW_RATE_LIMIT_EXEMPT]
+    #[arg(long)]
+    rate_limit_exempt: Option<String>,
     /// Webhook URL called after successful setup with the `config` portion of the payload.
     /// Only non-secret data (the "config" field) is sent; secrets never leave the vault.
     /// [env: SAFECLAW_ON_SETUP_HOOK]
@@ -60,6 +64,8 @@ pub struct Config {
     pub admin_url: Option<String>,
     pub instance_id: Option<String>,
     pub rate_limit: u32,
+    /// Path prefixes exempt from rate limiting. Prefix match: /health matches /health and /health/foo.
+    pub rate_limit_exempt: Vec<String>,
     pub on_setup_hook: Option<String>,
     pub init: bool,
 }
@@ -99,12 +105,21 @@ impl Config {
 
         let rate_limit = cli.rate_limit
             .or_else(|| env_str("SAFECLAW_RATE_LIMIT").and_then(|s| s.parse().ok()))
-            .unwrap_or(20);
+            .unwrap_or(300);
+
+        // Default exempt: polling endpoints that have no security value in rate limiting
+        let rate_limit_exempt = cli.rate_limit_exempt
+            .or_else(|| env_str("SAFECLAW_RATE_LIMIT_EXEMPT"))
+            .unwrap_or_else(|| "/health,/notifications,/pk,/approve/".to_string())
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
 
         let on_setup_hook = cli.on_setup_hook.or_else(|| env_str("SAFECLAW_ON_SETUP_HOOK"));
         let init = cli.init;
 
-        Self { data_dir, port, bind, proxy_port, proxy_bind, origin, rp_id, admin_url, instance_id, rate_limit, on_setup_hook, init }
+        Self { data_dir, port, bind, proxy_port, proxy_bind, origin, rp_id, admin_url, instance_id, rate_limit, rate_limit_exempt, on_setup_hook, init }
     }
 
     pub fn effective_origin(&self) -> String {

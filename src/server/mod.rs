@@ -27,6 +27,13 @@ async fn rate_limit_middleware(
     req: Request,
     next: Next,
 ) -> Response {
+    // Check exempt prefixes before applying rate limit
+    let path = req.uri().path().to_string();
+    let exempt = state.config.rate_limit_exempt.iter().any(|prefix| path.starts_with(prefix.as_str()));
+    if exempt {
+        return next.run(req).await;
+    }
+
     let ip = addr.ip().to_string();
     let allowed = {
         let mut rl = state.rate_limiter.lock().unwrap();

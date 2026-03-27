@@ -294,6 +294,7 @@ mod tests {
                 admin_url: None,
                 instance_id: None,
                 rate_limit: 0,
+                rate_limit_exempt: vec![],
                 on_setup_hook: None,
                 init: false,
             };
