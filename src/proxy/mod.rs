@@ -260,8 +260,13 @@ async fn proxy_handler(
             let subs = state.vault.push_subscriptions.lock().unwrap().clone();
             let priv_key = state.vault.vapid_private_key.lock().unwrap().clone();
             if let Some(priv_b64) = priv_key {
+                let vault_clone = state.vault.clone();
                 tokio::spawn(async move {
-                    crate::webpush::send_push_notification(&priv_b64, &subs, notif).await;
+                    let dead = crate::webpush::send_push_notification(&priv_b64, &subs, notif).await;
+                    if !dead.is_empty() {
+                        let mut active = vault_clone.push_subscriptions.lock().unwrap();
+                        active.retain(|s| !dead.contains(&s.endpoint));
+                    }
                 });
             }
         }

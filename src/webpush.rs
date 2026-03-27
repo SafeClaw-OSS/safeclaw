@@ -154,14 +154,17 @@ fn ece_encrypt(
 // ── Public: send notifications ─────────────────────────────────────────────────
 
 /// Send a Web Push notification to all subscriptions.
-/// Fire-and-forget: logs warnings on failure, never panics.
+/// Returns a list of dead endpoint URLs (410 Gone / 404 Not Found) that should be
+/// removed from the vault by the caller. Never panics.
 pub async fn send_push_notification(
     priv_b64: &str,
     subs: &[PushSubscription],
     payload: serde_json::Value,
-) {
+) -> Vec<String> {
+    let mut dead_endpoints: Vec<String> = Vec::new();
+
     if subs.is_empty() {
-        return;
+        return dead_endpoints;
     }
     let body_str = payload.to_string();
     let client = reqwest::Client::new();
@@ -192,6 +195,10 @@ pub async fn send_push_notification(
             Ok(resp) if resp.status().is_success() || resp.status().as_u16() == 201 => {
                 info!("Web Push delivered to {}", sub.endpoint);
             }
+            Ok(resp) if resp.status().as_u16() == 410 || resp.status().as_u16() == 404 => {
+                warn!("Web Push subscription expired ({}): {}", resp.status(), sub.endpoint);
+                dead_endpoints.push(sub.endpoint.clone());
+            }
             Ok(resp) => {
                 warn!("Web Push HTTP {} for {}", resp.status(), sub.endpoint);
             }
@@ -200,4 +207,6 @@ pub async fn send_push_notification(
             }
         }
     }
+
+    dead_endpoints
 }

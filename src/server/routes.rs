@@ -626,8 +626,15 @@ fn push_to_provisioner(secrets: serde_json::Value, proxy_port: u16) {
     tokio::spawn(async move {
         let md = crate::generate::generate_safeclaw_md(&secrets, false, proxy_port);
         let snippet = crate::generate::generate_agents_md_snippet(&secrets, proxy_port);
+        // Use host.docker.internal when running inside Docker (host-gateway mapping).
+        // Falls back to localhost for non-Docker environments.
+        let provisioner_host = if std::path::Path::new("/.dockerenv").exists() {
+            "host.docker.internal"
+        } else {
+            "localhost"
+        };
         let _ = reqwest::Client::new()
-            .post("http://localhost:23296/apply")
+            .post(format!("http://{}:23296/apply", provisioner_host))
             .json(&serde_json::json!({
                 "ops": [
                     { "type": "workspace", "file": "safeclaw.md", "content": md },
