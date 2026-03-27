@@ -59,7 +59,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/admin/setup", get(serve_setup).post(setup))
         .route("/admin/unlock", get(serve_unlock).post(vault_unlock))
         .route("/admin", get(serve_admin))
-        .route("/admin/shutdown", post(system_shutdown))
+        // /admin/shutdown removed — process lifecycle is the supervisor's job
         .route("/admin/safeclaw.md", get(admin_safeclaw_md))
         .route("/admin/agents-snippet", get(admin_agents_snippet))
 

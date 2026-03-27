@@ -1337,6 +1337,7 @@ pub async fn admin_agents_snippet(State(state): State<Arc<AppState>>) -> impl In
 
 // ── System: Restart / Shutdown ─────────────────────────────────────────────────
 
+#[allow(dead_code)]
 pub async fn system_shutdown(
     State(state): State<Arc<AppState>>,
     auth: AuthenticatedRequest,

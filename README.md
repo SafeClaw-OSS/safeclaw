@@ -143,16 +143,16 @@ cargo build --release
 | GET/POST | `/admin/setup` | Setup page / create vault |
 | GET/POST | `/admin/unlock` | Unlock page / decrypt vault |
 | GET | `/admin` | Dashboard |
-| POST | `/admin/shutdown` | Lock vault + exit (process manager handles restart) |
 | GET | `/admin/safeclaw.md` | Generated workspace doc listing proxy URLs |
 | GET | `/admin/agents-snippet` | AGENTS.md snippet with URL rewrite rules |
+
+> `/admin/shutdown` removed — process lifecycle is your supervisor's job (systemd, Docker, etc.)
 
 ### Vault (authenticated via passkey + ECIES)
 
 | Method | Path | Description |
 |--------|------|-------------|
 | POST | `/vault/lock` | Wipe keys from memory |
-| POST | `/vault/credentials` | Read vault contents |
 | POST | `/vault/update` | Update stored secrets |
 
 ### Services (authenticated)
