@@ -43,10 +43,13 @@ pub struct ServiceLevels {
 }
 
 /// Global policy defaults (stored in vault.enc under "policy_defaults")
+///
+/// Note: `unknown_domain` was removed. The proxy enforces domain allowlisting
+/// by construction — upstream URLs are derived from `service_config.upstream`,
+/// and unconfigured services return 403 UNKNOWN_SERVICE. Agents cannot target
+/// arbitrary domains through the proxy.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PolicyDefaults {
-    /// "block" (default) or "allow"
-    pub unknown_domain: Option<String>,
     /// Approval timeout in seconds (default 300)
     pub timeout: Option<u64>,
     pub levels: Option<ServiceLevels>,
@@ -55,7 +58,6 @@ pub struct PolicyDefaults {
 impl Default for PolicyDefaults {
     fn default() -> Self {
         Self {
-            unknown_domain: Some("block".to_string()),
             timeout: Some(300),
             levels: None,
         }

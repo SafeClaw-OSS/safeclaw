@@ -464,6 +464,7 @@ pub async fn vault_lock(
 
 // ── Vault Credentials ──────────────────────────────────────────────────────────
 
+#[allow(dead_code)]
 pub async fn vault_credentials(
     State(state): State<Arc<AppState>>,
     auth: AuthenticatedRequest,
@@ -924,10 +925,17 @@ pub async fn vault_notifications_subscribe(
         .map_err(|e| AppError::BadRequest(format!("Invalid subscription: {}", e)))?;
 
     with_vault_mut(&state, &auth, move |secrets| {
-        if secrets.get("push_subscriptions").is_none() {
-            secrets["push_subscriptions"] = json!([]);
+        // Migrate flat key to nested structure if needed
+        if let Some(old) = secrets.get("push_subscriptions").cloned() {
+            if secrets.get("notifications").is_none() {
+                secrets["notifications"] = json!({ "subscriptions": old });
+            }
+            secrets.as_object_mut().map(|m| m.remove("push_subscriptions"));
         }
-        if let Some(arr) = secrets["push_subscriptions"].as_array_mut() {
+        if secrets.get("notifications").is_none() {
+            secrets["notifications"] = json!({ "subscriptions": [] });
+        }
+        if let Some(arr) = secrets["notifications"]["subscriptions"].as_array_mut() {
             arr.push(sub);
         }
         Ok(())

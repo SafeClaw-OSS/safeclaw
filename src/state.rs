@@ -98,9 +98,11 @@ impl VaultState {
             .and_then(|v| serde_json::from_value::<PolicyDefaults>(v.clone()).ok())
             .unwrap_or_default();
 
-        // Extract push subscriptions
+        // Extract push subscriptions (support both nested and flat key for compat)
         let push_subs = secrets
-            .get("push_subscriptions")
+            .get("notifications")
+            .and_then(|n| n.get("subscriptions"))
+            .or_else(|| secrets.get("push_subscriptions"))
             .and_then(|v| serde_json::from_value::<Vec<PushSubscription>>(v.clone()).ok())
             .unwrap_or_default();
 
