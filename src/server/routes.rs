@@ -1004,6 +1004,16 @@ pub async fn vault_notifications_subscribe(
     let _: PushSubscription = serde_json::from_value(sub.clone())
         .map_err(|e| AppError::BadRequest(format!("Invalid subscription: {}", e)))?;
 
+    // Snapshot current in-memory dead endpoints (removed since last vault write)
+    let live_endpoints: std::collections::HashSet<String> = state
+        .vault
+        .push_subscriptions
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|s| s.endpoint.clone())
+        .collect();
+
     with_vault_mut(&state, &auth, move |secrets| {
         // Migrate flat key to nested structure if needed
         if let Some(old) = secrets.get("push_subscriptions").cloned() {
@@ -1016,6 +1026,16 @@ pub async fn vault_notifications_subscribe(
             secrets["notifications"] = json!({ "subscriptions": [] });
         }
         if let Some(arr) = secrets["notifications"]["subscriptions"].as_array_mut() {
+            // Prune dead subscriptions (410/404 since last vault write)
+            arr.retain(|s| {
+                s.get("endpoint")
+                    .and_then(|e| e.as_str())
+                    .map(|e| live_endpoints.contains(e))
+                    .unwrap_or(true)
+            });
+            // Deduplicate by endpoint before adding new
+            let new_endpoint = sub.get("endpoint").and_then(|e| e.as_str()).unwrap_or("");
+            arr.retain(|s| s.get("endpoint").and_then(|e| e.as_str()) != Some(new_endpoint));
             arr.push(sub);
         }
         Ok(())
