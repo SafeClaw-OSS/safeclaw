@@ -81,6 +81,9 @@ fn der_to_raw_rs(der: &[u8]) -> Result<[u8; 64]> {
 ///
 /// `x` and `y` are the passkey public key coordinates as standard base64.
 /// Returns Ok(()) if valid, Err if invalid.
+///
+/// Note: challenge is not server-issued. The E2E envelope nonce serves as
+/// equivalent replay protection (server-generated, single-use, verified on decrypt).
 pub fn verify_assertion(
     assertion: &AssertionData,
     x_b64: &str,

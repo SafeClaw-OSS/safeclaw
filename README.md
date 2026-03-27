@@ -142,16 +142,66 @@ cargo build --release
 | GET/POST | `/admin/setup` | Setup page / create vault |
 | GET/POST | `/admin/unlock` | Unlock page / decrypt vault |
 | GET | `/admin` | Dashboard |
-| POST | `/admin/restart` | Lock + restart |
-| POST | `/admin/shutdown` | Lock + shutdown |
+| POST | `/admin/shutdown` | Lock vault + exit (process manager handles restart) |
+| GET | `/admin/safeclaw.md` | Generated workspace doc listing proxy URLs |
+| GET | `/admin/agents-snippet` | AGENTS.md snippet with URL rewrite rules |
 
-### Vault (all authenticated via passkey)
+### Vault (authenticated via passkey + ECIES)
 
 | Method | Path | Description |
 |--------|------|-------------|
 | POST | `/vault/lock` | Wipe keys from memory |
 | POST | `/vault/credentials` | Read vault contents |
 | POST | `/vault/update` | Update stored secrets |
+
+### Services (authenticated)
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/vault/services` | List configured services (names only) |
+| POST | `/vault/services/add` | Add a service (name, upstream, auth config) |
+| POST | `/vault/services/update` | Update service config |
+| POST | `/vault/services/remove` | Remove a service |
+
+### Policy
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/vault/policy` | Get policy defaults (no auth) |
+| POST | `/vault/policy/update` | Update policy defaults (authenticated) |
+
+### Files (authenticated)
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/vault/files` | List stored files (names + metadata, no auth) |
+| POST | `/vault/files/upload` | Encrypt and store a file |
+| POST | `/vault/files/read` | Decrypt and download a file |
+| POST | `/vault/files/remove` | Delete a file |
+
+### Notifications
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/vault/notifications/subscribe` | Store push subscription (authenticated) |
+| GET | `/notifications` | Poll + clear pending notifications (no auth) |
+
+### Approvals
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/approve/pending` | List pending approval requests (no auth) |
+| GET | `/approve/{id}` | Get approval info (no auth) |
+| GET | `/approve/{id}/status` | Get approval status (no auth) |
+| POST | `/approve/{id}/details` | Decrypt request details (authenticated) |
+| POST | `/approve/{id}/confirm` | Approve request (authenticated) |
+| POST | `/approve/{id}/reject` | Reject request (authenticated) |
+
+### Audit
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/audit/log?limit=50` | Recent audit entries (no auth, zero sensitive data) |
 
 ### Proxy
 
@@ -166,6 +216,10 @@ cargo build --release
 |--------|------|-------------|
 | POST | `/passkeys/add` | Add a passkey device |
 | POST | `/passkeys/remove` | Remove a passkey device |
+
+> **Note:** "authenticated" endpoints require ECIES-encrypted payloads with passkey assertion.
+> "no auth" endpoints expose only non-sensitive metadata.
+> Process lifecycle (restart/stop) is managed by your process supervisor (systemd, Docker, etc.).
 
 </details>
 

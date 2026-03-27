@@ -1310,20 +1310,6 @@ pub async fn admin_agents_snippet(State(state): State<Arc<AppState>>) -> impl In
 
 // ── System: Restart / Shutdown ─────────────────────────────────────────────────
 
-pub async fn system_restart(
-    State(state): State<Arc<AppState>>,
-    auth: AuthenticatedRequest,
-) -> Result<impl IntoResponse> {
-    let _ = auth;
-    state.vault.lock();
-    let resp = Json(json!({ "ok": true })).into_response();
-    tokio::spawn(async {
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        std::process::exit(0);
-    });
-    Ok(resp)
-}
-
 pub async fn system_shutdown(
     State(state): State<Arc<AppState>>,
     auth: AuthenticatedRequest,
