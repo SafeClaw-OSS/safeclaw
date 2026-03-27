@@ -107,6 +107,7 @@ data/
 | `--origin` | `SAFECLAW_ORIGIN` | `http://localhost:{port}` | WebAuthn origin (must match browser URL) |
 | `--rp-id` | `SAFECLAW_RP_ID` | `localhost` | WebAuthn relying party ID (hostname only) |
 | `--admin-url` | `SAFECLAW_ADMIN_URL` | `http://localhost:{port}` | URL shown in "vault locked" responses |
+| `--instance-id` | `SAFECLAW_INSTANCE_ID` | — | Optional instance identifier (included in health/webhook responses) |
 | `--rate-limit` | `SAFECLAW_RATE_LIMIT` | `20` | Max requests/min per IP (0 = unlimited) |
 | `--on-setup-hook` | `SAFECLAW_ON_SETUP_HOOK` | — | Webhook URL for non-secret setup data |
 | `--init` | — | — | Generate server keypair and exit |

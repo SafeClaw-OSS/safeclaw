@@ -111,6 +111,13 @@ pub fn authenticate_bytes(bytes: &[u8], state: &Arc<AppState>) -> Result<Authent
         .decode(nonce_b64)
         .map_err(|e| AppError::BadRequest(format!("Invalid nonce base64: {}", e)))?;
 
+    // Minimum nonce length: 16 bytes (128 bits) to ensure sufficient entropy
+    if nonce_bytes.len() < 16 {
+        return Err(AppError::BadRequest(format!(
+            "Nonce too short: {} bytes (minimum 16)", nonce_bytes.len()
+        )));
+    }
+
     // Check nonce
     {
         let mut nonce_store = state.nonces.lock().unwrap();
