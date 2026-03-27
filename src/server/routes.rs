@@ -530,14 +530,33 @@ pub async fn vault_unlock(
 
     state.vault.set_secrets(secrets);
 
-    // Push AGENTS.md + safeclaw.md to provisioner on unlock, so workspace is
-    // always up-to-date even if services were added while the vault was locked.
+    // Push AGENTS.md + safeclaw.md to provisioner on unlock
     let proxy_port = state.config.proxy_port;
     if let Some(unlocked_secrets) = state.vault.secrets.lock().unwrap().clone() {
         push_to_provisioner(unlocked_secrets, proxy_port);
     }
 
-    Ok(Json(json!({ "ok": true })))
+    // Return encrypted services snapshot so the console can populate
+    // API key values immediately without a separate /vault/credentials call.
+    // Encrypted with AES-GCM using derive_response_key(userKey, challenge).
+    let nonce_b64 = auth.replay_token_b64()?;
+    let nonce_bytes = STANDARD
+        .decode(nonce_b64)
+        .map_err(|e| AppError::BadRequest(format!("Invalid nonce: {}", e)))?;
+    let user_key_b64 = auth.get_str("userKey")?;
+    let user_key_bytes = STANDARD
+        .decode(user_key_b64)
+        .map_err(|e| AppError::BadRequest(format!("Invalid userKey: {}", e)))?;
+
+    let snapshot = state.vault.secrets.lock().unwrap().clone()
+        .unwrap_or(serde_json::Value::Object(Default::default()));
+    let snapshot_bytes = serde_json::to_vec(&snapshot)
+        .map_err(|e| AppError::Internal(format!("Serialize error: {}", e)))?;
+    let mut response_key = derive_response_key(&user_key_bytes, &nonce_bytes)?;
+    let sealed = aes_encrypt(&response_key, &snapshot_bytes)?;
+    response_key.zeroize();
+
+    Ok(Json(json!({ "ok": true, "sealed": STANDARD.encode(&sealed) })))
 }
 
 // ── Vault Lock ─────────────────────────────────────────────────────────────────
