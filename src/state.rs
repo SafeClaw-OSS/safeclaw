@@ -30,6 +30,10 @@ pub struct VaultState {
     pub policy_defaults: Mutex<PolicyDefaults>,
     /// OAuth2 token cache: service_name → (access_token, expires_at_unix_secs)
     pub oauth2_tokens: Mutex<HashMap<String, (String, u64)>>,
+    /// VAPID private key (base64url) for Web Push — loaded at unlock, cleared at lock
+    pub vapid_private_key: Mutex<Option<String>>,
+    /// VAPID public key (base64url) — derived from private key at unlock
+    pub vapid_public_key: Mutex<Option<String>>,
 }
 
 /// Returns true if the service JSON has any elevated or critical access levels,
@@ -64,6 +68,8 @@ impl VaultState {
             push_subscriptions: Mutex::new(Vec::new()),
             policy_defaults: Mutex::new(PolicyDefaults::default()),
             oauth2_tokens: Mutex::new(HashMap::new()),
+            vapid_private_key: Mutex::new(None),
+            vapid_public_key: Mutex::new(None),
         }
     }
 
@@ -106,6 +112,17 @@ impl VaultState {
             .and_then(|v| serde_json::from_value::<Vec<PushSubscription>>(v.clone()).ok())
             .unwrap_or_default();
 
+        // Load VAPID private key and derive public key
+        let vapid_priv = secrets
+            .get("vapid_private_key")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_owned());
+        let vapid_pub = vapid_priv.as_deref().and_then(|priv_b64| {
+            crate::webpush::vapid_public_key(priv_b64).ok()
+        });
+        *self.vapid_private_key.lock().unwrap() = vapid_priv;
+        *self.vapid_public_key.lock().unwrap() = vapid_pub;
+
         *self.service_names.lock().unwrap() = names;
         *self.policy_defaults.lock().unwrap() = policy_defaults;
         *self.push_subscriptions.lock().unwrap() = push_subs;
@@ -120,6 +137,8 @@ impl VaultState {
         *self.push_subscriptions.lock().unwrap() = Vec::new();
         *self.policy_defaults.lock().unwrap() = PolicyDefaults::default();
         *self.oauth2_tokens.lock().unwrap() = HashMap::new();
+        *self.vapid_private_key.lock().unwrap() = None;
+        *self.vapid_public_key.lock().unwrap() = None;
     }
 
     pub fn service_names(&self) -> Vec<String> {
@@ -176,9 +195,7 @@ pub struct AppState {
     pub rate_limiter: Arc<Mutex<RateLimiter>>,
     pub approval_manager: Arc<ApprovalManager>,
     pub audit_log: Arc<AuditLog>,
-    /// In-memory notification queue — polled by GET /notifications.
-    /// Web Push (RFC 8030) is a future enhancement.
-    pub notifications: Arc<Mutex<Vec<serde_json::Value>>>,
+    // notifications field removed — Web Push replaces polling
 }
 
 // ── Rate Limiter ───────────────────────────────────────────────────────────────

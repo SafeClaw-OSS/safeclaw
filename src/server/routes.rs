@@ -31,11 +31,13 @@ use crate::state::AppState;
 
 pub async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let uptime = state.start_time.elapsed().as_secs();
+    let vapid_public_key = state.vault.vapid_public_key.lock().unwrap().clone();
     Json(json!({
         "status": "ok",
         "locked": state.vault.is_locked(),
         "uptime": uptime,
         "version": env!("CARGO_PKG_VERSION"),
+        "vapidPublicKey": vapid_public_key,
     }))
 }
 
@@ -240,10 +242,24 @@ pub async fn setup(
         .and_then(|v| v.as_array())
         .ok_or_else(|| AppError::BadRequest("Missing userKeys array".into()))?;
 
-    let secrets = parsed
+    let mut secrets = parsed
         .get("secrets")
         .cloned()
         .ok_or_else(|| AppError::BadRequest("Missing secrets".into()))?;
+
+    // Inject VAPID key pair if not already present (fresh setup or migration)
+    if secrets.get("vapid_private_key").is_none() {
+        match crate::webpush::generate_vapid_keypair() {
+            Ok((priv_b64, _pub_b64)) => {
+                secrets.as_object_mut().map(|m| m.insert(
+                    "vapid_private_key".into(),
+                    serde_json::Value::String(priv_b64),
+                ));
+                tracing::info!("Generated VAPID key pair for vault");
+            }
+            Err(e) => tracing::warn!("Failed to generate VAPID keypair: {e}"),
+        }
+    }
 
     let setup_config = parsed.get("config").cloned();
 
@@ -474,10 +490,27 @@ pub async fn vault_unlock(
 
     let vault_enc = fs::read(state.config.data_dir.join("vault.enc"))?;
     let secrets_bytes = decrypt_vault(&dek, &vault_enc)?;
-    dek.zeroize();
 
-    let secrets: Value = serde_json::from_slice(&secrets_bytes)
+    let mut secrets: Value = serde_json::from_slice(&secrets_bytes)
         .map_err(|e| AppError::Internal(format!("Failed to parse vault: {}", e)))?;
+
+    // Migration: generate VAPID key pair if not present (existing vaults pre-dating Web Push)
+    if secrets.get("vapid_private_key").is_none() {
+        match crate::webpush::generate_vapid_keypair() {
+            Ok((priv_b64, _)) => {
+                secrets.as_object_mut().map(|m| m.insert(
+                    "vapid_private_key".into(),
+                    serde_json::Value::String(priv_b64),
+                ));
+                // Re-encrypt and persist migrated vault
+                let new_enc = encrypt_vault(&dek, serde_json::to_string(&secrets)?.as_bytes())?;
+                fs::write(state.config.data_dir.join("vault.enc"), &new_enc)?;
+                tracing::info!("Migrated vault: generated VAPID key pair");
+            }
+            Err(e) => tracing::warn!("VAPID migration failed: {e}"),
+        }
+    }
+    dek.zeroize();
 
     state.vault.set_secrets(secrets);
 
@@ -977,16 +1010,7 @@ pub async fn vault_notifications_subscribe(
     Ok(Json(json!({ "ok": true })))
 }
 
-// ── Notifications ──────────────────────────────────────────────────────────────
-
-/// GET /notifications — return and clear pending in-memory notifications (no passkey required).
-/// Web Push (RFC 8030) is a future enhancement; the admin page polls this endpoint instead.
-pub async fn notifications_get(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let mut notifs = state.notifications.lock().unwrap();
-    let result = notifs.clone();
-    notifs.clear();
-    Json(json!({ "notifications": result }))
-}
+// GET /notifications removed — replaced by Web Push (RFC 8030).
 
 // ── Approval Endpoints ─────────────────────────────────────────────────────────
 
