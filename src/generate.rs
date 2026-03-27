@@ -110,6 +110,23 @@ pub fn generate_agents_md_snippet(secrets: &serde_json::Value, proxy_port: u16) 
     ));
     lines.push(String::new());
     lines.push("Violating these rules is a security incident.".to_string());
+    lines.push(String::new());
+    lines.push("### Approval Required (HTTP 202)".to_string());
+    lines.push(String::new());
+    lines.push("Some operations require human approval. When the proxy returns HTTP 202:".to_string());
+    lines.push(String::new());
+    lines.push("```json".to_string());
+    lines.push(r#"{"id":"<uuid>","safeclaw_approve_url":"https://...","expires_at":1711548300}"#.to_string());
+    lines.push("```".to_string());
+    lines.push(String::new());
+    lines.push("**Do this:**".to_string());
+    lines.push("1. Tell the user what you were doing and share the approval URL (use inline button if supported).".to_string());
+    lines.push("2. Poll `GET <proxy>/approve/<id>` every 5 seconds.".to_string());
+    lines.push("3. On `{\"status\":\"approved\",\"response\":{...}}` — use `response.body` as the upstream API result and continue.".to_string());
+    lines.push("4. On `{\"status\":\"rejected\"}` — tell the user the action was blocked.".to_string());
+    lines.push("5. On `{\"status\":\"expired\"}` or 404 — tell the user the window expired, ask to retry.".to_string());
+    lines.push(String::new());
+    lines.push(format!("Poll URL: `{proxy_base}/approve/<id>`"));
 
     lines.join("\n")
 }

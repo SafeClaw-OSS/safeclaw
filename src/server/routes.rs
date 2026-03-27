@@ -647,6 +647,33 @@ fn push_to_provisioner(secrets: serde_json::Value, proxy_port: u16) {
     tokio::spawn(async move {
         let md = crate::generate::generate_safeclaw_md(&secrets, false, proxy_port);
         let snippet = crate::generate::generate_agents_md_snippet(&secrets, proxy_port);
+
+        // Extract channel tokens that need to be written into OpenClaw config.
+        // Telegram: stored as services.telegram.auth.secret (path auth type).
+        let telegram_token = secrets
+            .get("services")
+            .and_then(|s| s.get("telegram"))
+            .and_then(|t| t.get("auth"))
+            .and_then(|a| a.get("secret"))
+            .and_then(|s| s.as_str())
+            .map(|s| s.to_owned());
+
+        let mut ops = vec![
+            serde_json::json!({ "type": "workspace", "file": "safeclaw.md", "content": md }),
+            serde_json::json!({ "type": "workspace", "file": "AGENTS.md", "content": snippet }),
+        ];
+
+        // Push telegram token as a config op so the provisioner writes it into
+        // the OpenClaw config (channels.telegram.token).
+        let mut needs_restart = false;
+        if let Some(token) = telegram_token {
+            ops.push(serde_json::json!({
+                "type": "config",
+                "patch": { "channels": { "telegram": { "token": token } } }
+            }));
+            needs_restart = true;
+        }
+
         // Use host.docker.internal when running inside Docker (host-gateway mapping).
         // Falls back to localhost for non-Docker environments.
         let provisioner_host = if std::path::Path::new("/.dockerenv").exists() {
@@ -657,11 +684,8 @@ fn push_to_provisioner(secrets: serde_json::Value, proxy_port: u16) {
         let _ = reqwest::Client::new()
             .post(format!("http://{}:23296/apply", provisioner_host))
             .json(&serde_json::json!({
-                "ops": [
-                    { "type": "workspace", "file": "safeclaw.md", "content": md },
-                    { "type": "workspace", "file": "AGENTS.md", "content": snippet }
-                ],
-                "restart": false
+                "ops": ops,
+                "restart": needs_restart
             }))
             .send()
             .await;
