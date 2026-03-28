@@ -39,7 +39,7 @@ pub struct VaultState {
 /// Returns true if the service JSON has any approval-required access levels,
 /// meaning its auth credentials must not be kept in memory at unlock.
 fn service_needs_auth_stripped(svc: &serde_json::Value) -> bool {
-    let is_sensitive = |s: &str| s == "ask" || s == "ask-always";
+    let is_sensitive = |s: &str| matches!(s, "ask" | "ask-always" | "elevated" | "critical");
 
     if let Some(levels) = svc.get("levels") {
         if levels.get("write").and_then(|v| v.as_str()).map(is_sensitive).unwrap_or(false) {

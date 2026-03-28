@@ -12,8 +12,11 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum AccessLevel {
+    #[serde(alias = "standard")]
     Allow,
+    #[serde(alias = "elevated")]
     Ask,
+    #[serde(alias = "critical")]
     AskAlways,
     Deny,
 }
