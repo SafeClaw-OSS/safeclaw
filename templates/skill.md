@@ -40,11 +40,9 @@ Then end your turn — no need to say "waiting…", the notification above is su
 
 ### Step 2 — Set up a cron watcher (required)
 
-Immediately after notifying the user, you MUST create a cron job to poll for the approval result.
-This is NOT optional — the user expects real-time feedback when they approve.
+Immediately after notifying the user, you MUST create a background polling job so the user gets real-time feedback when they approve.
 
-Call the `cron` tool with `action: "add"` and the following `job` parameter:
-
+**Option A** — If you have a `cron` tool, call it with `action: "add"`:
 ```json
 {
   "action": "add",
@@ -54,21 +52,29 @@ Call the `cron` tool with `action: "add"` and the following `job` parameter:
     "sessionTarget": "isolated",
     "payload": {
       "kind": "agentTurn",
-      "message": "SafeClaw approval watcher.\nApproval id: <id>\nPoll URL: http://localhost:23295/approve/<id>\nExpires at: <expires_at> (unix timestamp)\n\nInstructions:\n1. If current time > expires_at: tell user approval expired, then call cron tool with action=remove and jobId=<this job id>. Done.\n2. Call the exec tool: curl -sf http://localhost:23295/approve/<id>\n3. If status=pending: reply HEARTBEAT_OK (will check again next interval)\n4. If status=approved: present response.body to the user. Remove this cron job.\n5. If status=rejected: tell user denied. Remove this cron job.\n6. If 404 or error: tell user expired. Remove this cron job."
+      "message": "Poll http://localhost:23295/approve/<id>. If pending→HEARTBEAT_OK. If approved→announce response.body, remove this job. If rejected/expired/404→announce, remove job."
     },
-    "delivery": {
-      "mode": "announce"
-    }
+    "delivery": { "mode": "announce" }
   }
 }
 ```
 
-- `everyMs: 1000` = poll every 1 second for responsive UX
-- The cron job auto-stops when the watcher removes itself (on approved/rejected/expired)
-- `HEARTBEAT_OK` responses are silently discarded — safe for pending state
-- The `cron` tool is a built-in tool in your runtime — use it directly (do not ask the user to run commands)
+**Option B** — If you do NOT have a `cron` tool but have `exec`, use the CLI:
+```bash
+openclaw cron add --name "safeclaw-approval-<id>" \
+  --every 1000 \
+  --isolated \
+  --message "Poll http://localhost:23295/approve/<id>. If pending→HEARTBEAT_OK. If approved→announce response.body and remove this job via: openclaw cron remove <jobId>. If rejected/expired/404→announce and remove job." \
+  --announce
+```
 
-**Approved response structure** (when cron run calls GET /approve/\<id\>):
+**Option C** — If neither cron tool nor CLI is available, tell the user "Let me know when you've approved" and poll once on their reply.
+
+- `everyMs: 1000` = poll every 1 second for responsive UX
+- The cron job auto-stops when the isolated agent removes it (on approved/rejected/expired)
+- `HEARTBEAT_OK` responses are silently discarded — safe for pending state
+
+**Approved response structure** (when the watcher polls GET /approve/\<id\>):
 ```json
 {
   "status": "approved",
@@ -80,12 +86,6 @@ Call the `cron` tool with `action: "add"` and the following `job` parameter:
 }
 ```
 Use `response.body` as the data, not the whole `response` object.
-
-### Fallback (cron tool genuinely unavailable)
-
-Only if the cron tool call fails with an error (not if you're unsure — try it first):
-- Tell the user: "Let me know when you've approved it and I'll continue."
-- When the user confirms, `curl -sf http://localhost:23295/approve/<id>` and proceed based on the status.
 
 ### Notes
 
