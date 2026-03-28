@@ -9,4 +9,4 @@ Services listed above are routed through SafeClaw. Use the proxy URL — do NOT 
 
 Services NOT listed here are not managed by SafeClaw — call them normally.
 
-Before using any service above, load the `safeclaw` skill for protocol details (vault locked handling, approval flows, etc.).
+Before using any service listed here, load the `safeclaw` skill — it covers vault-locked handling, approval flows, and proxy protocol details.
