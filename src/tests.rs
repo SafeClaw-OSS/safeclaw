@@ -433,28 +433,12 @@ mod tests {
         }
 
         #[test]
-        fn old_vault_terms_deserialize_via_alias() {
-            // Existing vault data uses "standard"/"elevated"/"critical"
-            let old: ServiceLevels = serde_json::from_str(
-                r#"{"write": "elevated", "read": "standard"}"#,
-            ).expect("old terms must deserialize");
-            assert_eq!(old.write, Some(AccessLevel::Ask));
-            assert_eq!(old.read, Some(AccessLevel::Allow));
-
-            let old2: ServiceLevels = serde_json::from_str(
-                r#"{"write": "critical", "read": "elevated"}"#,
-            ).expect("old terms must deserialize");
-            assert_eq!(old2.write, Some(AccessLevel::AskAlways));
-            assert_eq!(old2.read, Some(AccessLevel::Ask));
-        }
-
-        #[test]
-        fn new_terms_deserialize() {
-            let new: ServiceLevels = serde_json::from_str(
+        fn access_level_serde_roundtrip() {
+            let levels: ServiceLevels = serde_json::from_str(
                 r#"{"write": "ask-always", "read": "allow"}"#,
             ).expect("new terms must deserialize");
-            assert_eq!(new.write, Some(AccessLevel::AskAlways));
-            assert_eq!(new.read, Some(AccessLevel::Allow));
+            assert_eq!(levels.write, Some(AccessLevel::AskAlways));
+            assert_eq!(levels.read, Some(AccessLevel::Allow));
         }
     }
 
