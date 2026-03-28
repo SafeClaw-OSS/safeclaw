@@ -19,3 +19,9 @@ Configure your API clients to use those base URLs instead of calling upstream se
 2. **On vault locked** — stop the current task, notify the user, wait. Do not retry in a loop.
 3. **On approval required (202)** — notify the user with the approve URL, poll for result. See SKILL.md.
 4. **On approval rejected/expired** — do not silently retry. Ask the user how to proceed.
+
+---
+
+> **Implementation note:** When deployed to a VM, the AGENTS.md in the agent's workspace
+> receives a managed block generated from `templates/agents-snippet.md` with dynamic
+> service routing. See `templates/` for the source of truth.

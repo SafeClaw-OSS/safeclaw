@@ -5,83 +5,49 @@
 /// When `locked` is true, auth/level details are omitted (only names shown).
 /// `secrets` should be the full vault JSON when unlocked, or a minimal
 /// `{"services": {"name": null, ...}}` when locked.
+const SAFECLAW_MD_TEMPLATE: &str = include_str!("../templates/safeclaw.md");
+
 pub fn generate_safeclaw_md(secrets: &serde_json::Value, locked: bool, proxy_port: u16) -> String {
     let proxy_base = format!("http://localhost:{}", proxy_port);
-    let mut lines = vec![
-        "<!-- SAFECLAW:GENERATED FILE - DO NOT EDIT. Changes may be overwritten by SafeClaw sync. -->".to_string(),
-        "# SafeClaw Services".to_string(),
-        format!(
-            "Route API calls through the SafeClaw proxy at `{}`. Do NOT call upstream APIs directly.",
-            proxy_base
-        ),
-        String::new(),
-        "## Usage".to_string(),
-        "Replace the upstream base URL with the proxy URL. Do NOT add Authorization headers.".to_string(),
-        "SafeClaw auto-injects credentials (API key / OAuth2 token) before forwarding.".to_string(),
-        String::new(),
-        "## Service Table".to_string(),
+
+    // Build service table rows
+    let mut rows = vec![
         "| Service | Upstream | Proxy URL | Auth | Approval Level |".to_string(),
         "|---------|----------|-----------|------|----------------|".to_string(),
     ];
-
     if let Some(services) = secrets.get("services").and_then(|s| s.as_object()) {
         for (name, svc) in services {
             let proxy_url = format!("{}/{}/", proxy_base, name);
-            let upstream = if locked || svc.is_null() {
-                "-".to_string()
-            } else {
-                svc.get("upstream")
-                    .and_then(|u| u.as_str())
-                    .unwrap_or("-")
-                    .to_string()
+            let upstream = if locked || svc.is_null() { "-".to_string() } else {
+                svc.get("upstream").and_then(|u| u.as_str()).unwrap_or("-").to_string()
             };
-            let auth = if locked || svc.is_null() {
-                "-".to_string()
-            } else {
-                auth_display(svc)
-            };
-            let level = if locked || svc.is_null() {
-                "-".to_string()
-            } else {
-                level_display(svc)
-            };
-            lines.push(format!("| {} | {} | {} | {} | {} |", name, upstream, proxy_url, auth, level));
+            let auth = if locked || svc.is_null() { "-".to_string() } else { auth_display(svc) };
+            let level = if locked || svc.is_null() { "-".to_string() } else { level_display(svc) };
+            rows.push(format!("| {} | {} | {} | {} | {} |", name, upstream, proxy_url, auth, level));
         }
     }
 
-    lines.push(String::new());
-    lines.push("## Example".to_string());
-    lines.push(format!(
-        "```\n# Call OpenAI via proxy (no Authorization header needed):\ncurl -X POST {proxy_base}/openai/v1/chat/completions \\\n  -H 'Content-Type: application/json' \\\n  -d '{{\"model\":\"gpt-4o\",\"messages\":[...]}}'\n\n# Call Gmail via proxy:\ncurl {proxy_base}/gmail/gmail/v1/users/me/messages\n```"
-    ));
-    lines.push(String::new());
-    lines.push(format!(
-        "Vault status: {}",
-        if locked { "locked" } else { "unlocked" }
-    ));
-
-    lines.join("\n")
+    SAFECLAW_MD_TEMPLATE
+        .replace("{{PROXY_BASE}}", &proxy_base)
+        .replace("{{SERVICE_TABLE}}", &rows.join("\n"))
+        .replace("{{VAULT_STATUS}}", if locked { "locked" } else { "unlocked" })
 }
 
 /// Generate AGENTS.md snippet instructing agents to route requests through SafeClaw.
 ///
 /// When vault is locked or upstream URLs are unavailable, entries are omitted.
+const AGENTS_SNIPPET_TEMPLATE: &str = include_str!("../templates/agents-snippet.md");
+
 pub fn generate_agents_md_snippet(secrets: &serde_json::Value, proxy_port: u16) -> String {
     let proxy_base = format!("http://localhost:{}", proxy_port);
     let mut entries: Vec<String> = Vec::new();
 
     if let Some(services) = secrets.get("services").and_then(|s| s.as_object()) {
         for (name, svc) in services {
-            if svc.is_null() {
-                continue;
-            }
-            let upstream = svc
-                .get("upstream")
-                .and_then(|u| u.as_str())
-                .unwrap_or("");
+            if svc.is_null() { continue; }
+            let upstream = svc.get("upstream").and_then(|u| u.as_str()).unwrap_or("");
             let domain = extract_domain(upstream);
             if !domain.is_empty() {
-                // Strip trailing slash for clean URL example
                 let upstream_clean = upstream.trim_end_matches('/');
                 entries.push(format!(
                     "- **{name}**: replace `{upstream_clean}` with `{proxy_base}/{name}` — e.g. `{proxy_base}/{name}/some/api/path`"
@@ -90,52 +56,15 @@ pub fn generate_agents_md_snippet(secrets: &serde_json::Value, proxy_port: u16) 
         }
     }
 
-    let mut lines = vec![
-        "<!-- SAFECLAW:BEGIN - managed block. Changes inside this block may be overwritten by SafeClaw sync. -->".to_string(),
-        "## SafeClaw Proxy (MANDATORY security rules)".to_string(),
-        String::new(),
-        "**Required:** Load the `safeclaw` skill (SKILL.md) before making any API calls through SafeClaw.".to_string(),
-        "It defines how to handle vault-locked responses and approval flows.".to_string(),
-        String::new(),
-        "All HTTP requests to the following services MUST go through the SafeClaw proxy.".to_string(),
-        "Direct calls to these APIs are forbidden.".to_string(),
-        String::new(),
-        "### How to use".to_string(),
-        "1. Replace the upstream base URL with the proxy URL shown below.".to_string(),
-        "2. Do NOT add an Authorization header — SafeClaw injects credentials automatically.".to_string(),
-        "3. Keep the original API path and query parameters unchanged.".to_string(),
-        String::new(),
-        "### Services".to_string(),
-    ];
-    lines.extend(entries);
-    lines.push(String::new());
-    lines.push("### Example".to_string());
-    lines.push(format!(
-        "```\n# Wrong (direct call — FORBIDDEN):\ncurl https://api.openai.com/v1/chat/completions ...\n\n# Correct (via SafeClaw proxy):\ncurl {proxy_base}/openai/v1/chat/completions ...\n# (no Authorization header needed)\n```"
-    ));
-    lines.push(String::new());
-    lines.push("Violating these rules is a security incident.".to_string());
-    lines.push(String::new());
-    lines.push("### Approval Required (HTTP 202)".to_string());
-    lines.push(String::new());
-    lines.push("Some operations require human approval. When the proxy returns HTTP 202:".to_string());
-    lines.push(String::new());
-    lines.push("```json".to_string());
-    lines.push(r#"{"id":"<uuid>","safeclaw_approve_url":"https://...","expires_at":1711548300}"#.to_string());
-    lines.push("```".to_string());
-    lines.push(String::new());
-    lines.push("**Do this:**".to_string());
-    lines.push("1. Tell the user what you were doing and share the approval URL (use inline button if supported).".to_string());
-    lines.push("2. Poll `GET <proxy>/approve/<id>` every 5 seconds.".to_string());
-    lines.push("3. On `{\"status\":\"approved\",\"response\":{...}}` — use `response.body` as the upstream API result and continue.".to_string());
-    lines.push("4. On `{\"status\":\"rejected\"}` — tell the user the action was blocked.".to_string());
-    lines.push("5. On `{\"status\":\"expired\"}` or 404 — tell the user the window expired, ask to retry.".to_string());
-    lines.push(String::new());
-    lines.push(format!("Poll URL: `{proxy_base}/approve/<id>`"));
-    lines.push(String::new());
-    lines.push("<!-- SAFECLAW:END -->".to_string());
+    let services_block = if entries.is_empty() {
+        "(no services configured)".to_string()
+    } else {
+        entries.join("\n")
+    };
 
-    lines.join("\n")
+    AGENTS_SNIPPET_TEMPLATE
+        .replace("{{SERVICES}}", &services_block)
+        .replace("{{PROXY_BASE}}", &proxy_base)
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
