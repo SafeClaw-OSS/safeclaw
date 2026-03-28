@@ -70,17 +70,8 @@ async fn proxy_poll_approval(
             Json(serde_json::json!({ "status": "pending" })).into_response()
         }
 
-        ApprovalStatus::Rejected => {
+        ApprovalStatus::Rejected | ApprovalStatus::Expired => {
             Json(serde_json::json!({ "status": "rejected" })).into_response()
-        }
-
-        ApprovalStatus::Expired => {
-            // Still in map briefly during expire(); treat as not found
-            (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "error": "approval not found" })),
-            )
-                .into_response()
         }
 
         ApprovalStatus::Approved => {
@@ -222,6 +213,11 @@ async fn proxy_poll_approval(
                 body: body_json.clone(),
             };
             state.approval_manager.set_cached_response(&id, cached);
+
+            // Cache elevated session so subsequent requests skip approval
+            if let Some(auth) = auth_json {
+                state.vault.set_elevated_session(&snapshot.service, auth, 3600);
+            }
 
             tracing::info!(
                 "poll: executed approved request id={} service={} status={}",
