@@ -234,8 +234,8 @@ async fn proxy_poll_approval(
                 &snapshot.method,
                 // strip service prefix from uri_path for audit
                 &format!("/{}", snapshot.uri_path.trim_start_matches('/').splitn(3, '/').nth(1).unwrap_or("")),
+                "elevated",
                 "approved",
-                "allowed",
                 None,
                 Some(resp_status),
                 Some(&id),

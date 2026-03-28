@@ -1209,7 +1209,22 @@ pub async fn approval_reject(
 ) -> Result<impl IntoResponse> {
     let _ = auth; // passkey verified by extractor
 
+    // Fetch approval info before rejecting so we can write the audit entry
+    let approval_info = state.audit_log.get_approval(&id).ok().flatten();
+
     if state.approval_manager.reject(&id) {
+        if let Some(rec) = approval_info {
+            state.audit_log.log_request(
+                &rec.service,
+                &rec.method,
+                &rec.path,
+                "elevated",
+                "rejected",
+                None,
+                None,
+                Some(&id),
+            );
+        }
         Ok(Json(json!({ "ok": true })))
     } else {
         Err(AppError::NotFound)
@@ -1429,13 +1444,17 @@ pub async fn system_shutdown(
 
 // ── Audit Log ──────────────────────────────────────────────────────────────────
 
-/// GET /audit/log?limit=50 — list recent audit entries (no auth required, contains zero sensitive data).
+/// GET /audit/log?limit=50&service=openai&decision=blocked&since=2024-01-01T00:00:00
+/// List audit entries. No auth required — contains operational metadata only, no secrets.
 pub async fn audit_log_list(
     State(state): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
-    let limit = params.get("limit").and_then(|v| v.parse().ok()).unwrap_or(50u32).min(200);
-    match state.audit_log.list_recent(limit) {
+    let limit    = params.get("limit").and_then(|v| v.parse().ok()).unwrap_or(50u32).min(500);
+    let service  = params.get("service").map(|s| s.as_str());
+    let decision = params.get("decision").map(|s| s.as_str());
+    let since    = params.get("since").map(|s| s.as_str());
+    match state.audit_log.list_entries(limit, service, decision, since) {
         Ok(entries) => Json(json!({ "entries": entries })).into_response(),
         Err(e) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))).into_response(),
     }

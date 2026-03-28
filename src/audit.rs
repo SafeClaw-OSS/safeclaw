@@ -155,15 +155,25 @@ impl AuditLog {
         }
     }
 
-    /// Return the most recent `limit` audit log entries, newest first.
-    pub fn list_recent(&self, limit: u32) -> Result<Vec<AuditEntry>, rusqlite::Error> {
+    /// Return audit log entries with optional filters, newest first.
+    pub fn list_entries(
+        &self,
+        limit: u32,
+        service: Option<&str>,
+        decision: Option<&str>,
+        since: Option<&str>,
+    ) -> Result<Vec<AuditEntry>, rusqlite::Error> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id, timestamp, service, method, path, level, decision, \
+        let mut sql = "SELECT id, timestamp, service, method, path, level, decision, \
              duration_ms, upstream_status, approval_id \
-             FROM audit_log ORDER BY id DESC LIMIT ?1",
-        )?;
-        let rows = stmt.query_map(params![limit], |row| {
+             FROM audit_log WHERE 1=1".to_string();
+        if service.is_some()  { sql.push_str(" AND service = ?2");   }
+        if decision.is_some() { sql.push_str(" AND decision = ?3");  }
+        if since.is_some()    { sql.push_str(" AND timestamp > ?4"); }
+        sql.push_str(" ORDER BY id DESC LIMIT ?1");
+
+        let mut stmt = conn.prepare(&sql)?;
+        let map_row = |row: &rusqlite::Row<'_>| {
             Ok(AuditEntry {
                 id: row.get(0)?,
                 timestamp: row.get(1)?,
@@ -176,8 +186,23 @@ impl AuditLog {
                 upstream_status: row.get::<_, Option<i64>>(8)?.map(|v| v as u16),
                 approval_id: row.get(9)?,
             })
-        })?;
+        };
+        let rows = match (service, decision, since) {
+            (Some(s), Some(d), Some(t)) => stmt.query_map(params![limit, s, d, t], map_row)?,
+            (Some(s), Some(d), None)    => stmt.query_map(params![limit, s, d], map_row)?,
+            (Some(s), None,    Some(t)) => stmt.query_map(params![limit, s, t], map_row)?,
+            (None,    Some(d), Some(t)) => stmt.query_map(params![limit, d, t], map_row)?,
+            (Some(s), None,    None)    => stmt.query_map(params![limit, s], map_row)?,
+            (None,    Some(d), None)    => stmt.query_map(params![limit, d], map_row)?,
+            (None,    None,    Some(t)) => stmt.query_map(params![limit, t], map_row)?,
+            (None,    None,    None)    => stmt.query_map(params![limit], map_row)?,
+        };
         rows.collect()
+    }
+
+    /// Convenience wrapper with no filters (used by tests).
+    pub fn list_recent(&self, limit: u32) -> Result<Vec<AuditEntry>, rusqlite::Error> {
+        self.list_entries(limit, None, None, None)
     }
 
     /// List all approvals with status = 'pending'.
