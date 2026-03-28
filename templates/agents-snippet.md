@@ -1,47 +1,25 @@
-<!-- SAFECLAW:BEGIN - managed block. Changes inside this block may be overwritten by SafeClaw sync. -->
-## SafeClaw Proxy (MANDATORY security rules)
+<!-- SAFECLAW:BEGIN — managed by SafeClaw. Do not edit inside this block; changes will be overwritten on next sync. -->
+## SafeClaw Proxy
 
-**Required:** Load the `safeclaw` skill (SKILL.md) before making any API calls through SafeClaw.
-It defines how to handle vault-locked responses and approval flows.
+**Required:** Before making API calls, load the `safeclaw` skill. It covers vault-locked handling and approval flows.
 
-All HTTP requests to the following services MUST go through the SafeClaw proxy.
-Direct calls to these APIs are forbidden.
-
-### How to use
-1. Replace the upstream base URL with the proxy URL shown below.
-2. Do NOT add an Authorization header — SafeClaw injects credentials automatically.
-3. Keep the original API path and query parameters unchanged.
+### Rules
+1. All HTTP requests to configured services MUST go through the SafeClaw proxy. Direct upstream calls are forbidden.
+2. Do NOT add Authorization headers — SafeClaw injects credentials automatically.
+3. Never expose or log the placeholder API key in your config (e.g. `sk-dummy`). It is not real.
+4. On vault locked — stop, notify the user, wait. Do not retry in a loop.
+5. On approval required (HTTP 202) — follow the protocol in SKILL.md.
+6. On approval rejected/expired — do not silently retry. Ask the user.
 
 ### Services
 {{SERVICES}}
 
-### Example
+### Quick Reference
 ```
-# Wrong (direct call — FORBIDDEN):
+# Wrong — direct call (FORBIDDEN):
 curl https://api.openai.com/v1/chat/completions ...
 
-# Correct (via SafeClaw proxy):
+# Correct — via SafeClaw proxy (no auth header needed):
 curl {{PROXY_BASE}}/openai/v1/chat/completions ...
-# (no Authorization header needed)
 ```
-
-Violating these rules is a security incident.
-
-### Approval Required (HTTP 202)
-
-Some operations require human approval. When the proxy returns HTTP 202:
-
-```json
-{"id":"<uuid>","safeclaw_approve_url":"https://...","expires_at":1711548300}
-```
-
-**Do this:**
-1. Tell the user what you were doing and share the approval URL (use inline button if supported).
-2. Poll `GET <proxy>/approve/<id>` every 5 seconds.
-3. On `{"status":"approved","response":{...}}` — use `response.body` as the upstream API result and continue.
-4. On `{"status":"rejected"}` — tell the user the action was blocked.
-5. On `{"status":"expired"}` or 404 — tell the user the window expired, ask to retry.
-
-Poll URL: `{{PROXY_BASE}}/approve/<id>`
-
 <!-- SAFECLAW:END -->
