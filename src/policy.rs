@@ -3,20 +3,28 @@ use serde::{Deserialize, Serialize};
 
 // ── Access Level ───────────────────────────────────────────────────────────────
 
+/// Controls whether a proxy request requires human approval.
+///
+/// - `Allow`: pass through immediately, no approval needed
+/// - `Ask`: require human approval once, then cache the session (TTL-based)
+/// - `AskAlways`: require human approval for every request, never cache
+/// - `Deny`: block unconditionally (used as default for unconfigured services)
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "kebab-case")]
 pub enum AccessLevel {
-    Standard,
-    Elevated,
-    Critical,
+    Allow,
+    Ask,
+    AskAlways,
+    Deny,
 }
 
 impl std::fmt::Display for AccessLevel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            AccessLevel::Standard => write!(f, "standard"),
-            AccessLevel::Elevated => write!(f, "elevated"),
-            AccessLevel::Critical => write!(f, "critical"),
+            AccessLevel::Allow => write!(f, "allow"),
+            AccessLevel::Ask => write!(f, "ask"),
+            AccessLevel::AskAlways => write!(f, "ask-always"),
+            AccessLevel::Deny => write!(f, "deny"),
         }
     }
 }
@@ -30,7 +38,7 @@ pub struct PolicyRule {
     #[serde(rename = "pathSuffix")]
     pub path_suffix: Option<String>,
     pub level: AccessLevel,
-    /// Session TTL in seconds (for elevated; cached after first approval)
+    /// Session TTL in seconds (for `ask` level; cached after first approval)
     #[serde(rename = "sessionTTL")]
     pub session_ttl: Option<u64>,
 }
@@ -122,8 +130,8 @@ pub fn evaluate_policy(
         }
     }
 
-    // 4. Default: standard
-    AccessLevel::Standard
+    // 4. Default: allow
+    AccessLevel::Allow
 }
 
 fn is_write_method(method: &str) -> bool {
@@ -155,29 +163,29 @@ mod tests {
     }
 
     #[test]
-    fn default_is_standard() {
+    fn default_is_allow() {
         let level = evaluate_policy("GET", "/foo", None, None, &defaults());
-        assert_eq!(level, AccessLevel::Standard);
+        assert_eq!(level, AccessLevel::Allow);
     }
 
     #[test]
-    fn write_method_elevated_via_service_levels() {
+    fn write_method_ask_via_service_levels() {
         let levels = ServiceLevels {
-            write: Some(AccessLevel::Elevated),
-            read: Some(AccessLevel::Standard),
+            write: Some(AccessLevel::Ask),
+            read: Some(AccessLevel::Allow),
         };
         let level = evaluate_policy("POST", "/create", None, Some(&levels), &defaults());
-        assert_eq!(level, AccessLevel::Elevated);
+        assert_eq!(level, AccessLevel::Ask);
     }
 
     #[test]
-    fn read_method_stays_standard_when_only_write_elevated() {
+    fn read_method_stays_allow_when_only_write_ask() {
         let levels = ServiceLevels {
-            write: Some(AccessLevel::Elevated),
+            write: Some(AccessLevel::Ask),
             read: None,
         };
         let level = evaluate_policy("GET", "/read", None, Some(&levels), &defaults());
-        assert_eq!(level, AccessLevel::Standard);
+        assert_eq!(level, AccessLevel::Allow);
     }
 
     #[test]
@@ -185,11 +193,11 @@ mod tests {
         let rules = vec![PolicyRule {
             method: Some("DELETE".to_string()),
             path_suffix: Some("/admin".to_string()),
-            level: AccessLevel::Critical,
+            level: AccessLevel::AskAlways,
             session_ttl: None,
         }];
         let levels = ServiceLevels {
-            write: Some(AccessLevel::Elevated),
+            write: Some(AccessLevel::Ask),
             read: None,
         };
         let level = evaluate_policy(
@@ -199,7 +207,7 @@ mod tests {
             Some(&levels),
             &defaults(),
         );
-        assert_eq!(level, AccessLevel::Critical);
+        assert_eq!(level, AccessLevel::AskAlways);
     }
 
     #[test]
@@ -207,21 +215,21 @@ mod tests {
         let rules = vec![PolicyRule {
             method: Some("DELETE".to_string()),
             path_suffix: None,
-            level: AccessLevel::Critical,
+            level: AccessLevel::AskAlways,
             session_ttl: None,
         }];
         let level = evaluate_policy("GET", "/foo", Some(&rules), None, &defaults());
-        assert_eq!(level, AccessLevel::Standard);
+        assert_eq!(level, AccessLevel::Allow);
     }
 
     #[test]
     fn global_defaults_apply_when_no_service_levels() {
         let mut def = defaults();
         def.levels = Some(ServiceLevels {
-            write: Some(AccessLevel::Elevated),
+            write: Some(AccessLevel::Ask),
             read: None,
         });
         let level = evaluate_policy("POST", "/x", None, None, &def);
-        assert_eq!(level, AccessLevel::Elevated);
+        assert_eq!(level, AccessLevel::Ask);
     }
 }

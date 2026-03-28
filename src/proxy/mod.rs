@@ -214,9 +214,9 @@ async fn proxy_poll_approval(
             };
             state.approval_manager.set_cached_response(&id, cached);
 
-            // Cache elevated session so subsequent requests skip approval
+            // Cache approval session so subsequent requests skip approval
             if let Some(auth) = auth_json {
-                state.vault.set_elevated_session(&snapshot.service, auth, 3600);
+                state.vault.set_approval_session(&snapshot.service, auth, 3600);
             }
 
             tracing::info!(
@@ -230,7 +230,7 @@ async fn proxy_poll_approval(
                 &snapshot.method,
                 // strip service prefix from uri_path for audit
                 &format!("/{}", snapshot.uri_path.trim_start_matches('/').splitn(3, '/').nth(1).unwrap_or("")),
-                "elevated",
+                "ask",
                 "approved",
                 None,
                 Some(resp_status),
@@ -368,8 +368,8 @@ async fn proxy_handler(
                     &route_service,
                     method.as_str(),
                     &route_path,
-                    "standard",
-                    "blocked",
+                    "allow",
+                    "denied",
                     None,
                     None,
                     None,
@@ -406,16 +406,36 @@ async fn proxy_handler(
 
     // ── Approval gate ──────────────────────────────────────────────────────────
 
-    let cached_auth = if access_level == AccessLevel::Elevated {
-        state.vault.check_elevated_session(&route_service)
+    let cached_auth = if access_level == AccessLevel::Ask {
+        state.vault.check_approval_session(&route_service)
     } else {
         None
     };
 
     let needs_approval = match &access_level {
-        AccessLevel::Standard => false,
-        AccessLevel::Elevated => cached_auth.is_none(),
-        AccessLevel::Critical => true,
+        AccessLevel::Allow => false,
+        AccessLevel::Ask => cached_auth.is_none(),
+        AccessLevel::AskAlways => true,
+        AccessLevel::Deny => {
+            state.audit_log.log_request(
+                &route_service,
+                method.as_str(),
+                &route_path,
+                "deny",
+                "denied",
+                None,
+                None,
+                None,
+            );
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "error": "access denied by policy",
+                    "code": "DENIED"
+                })),
+            )
+                .into_response();
+        }
     };
 
     if needs_approval {
@@ -464,7 +484,7 @@ async fn proxy_handler(
             route_path
         );
 
-        // Elevated session cache cleanup on TTL
+        // Approval session cache cleanup on TTL
         {
             let mgr = state.approval_manager.clone();
             let id_clone = id.clone();
@@ -473,9 +493,9 @@ async fn proxy_handler(
             let svc_clone = route_service.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_secs(timeout)).await;
-                if level_clone == AccessLevel::Elevated {
+                if level_clone == AccessLevel::Ask {
                     vault_clone
-                        .elevated_cache
+                        .approval_cache
                         .lock()
                         .unwrap()
                         .remove(&svc_clone);
@@ -508,12 +528,12 @@ async fn proxy_handler(
             }
         }
 
-        // Elevated session cache TTL (for agent-side)
-        if access_level == AccessLevel::Elevated {
+        // Approval session cache TTL (for agent-side)
+        if access_level == AccessLevel::Ask {
             let ttl = find_rule_ttl(service_config.rules.as_ref(), method.as_str(), &route_path)
                 .unwrap_or(3600);
             // Cache a placeholder; real auth stored in PendingApproval.approved_auth
-            // and injected into elevated cache only after execution (in poll handler).
+            // and injected into approval cache only after execution (in poll handler).
             let _ = ttl; // TTL applied at execute time
         }
 
@@ -538,7 +558,7 @@ async fn proxy_handler(
             .into_response();
     }
 
-    // ── Inject effective auth for elevated (cached session) ───────────────────
+    // ── Inject effective auth for approval-cached session ─────────────────────
 
     if service_config.auth.is_none() {
         if let Some(aj) = cached_auth {
@@ -648,7 +668,7 @@ fn filter_replay_headers(headers: &axum::http::HeaderMap) -> axum::http::HeaderM
     out
 }
 
-/// Find session TTL from matching rule (for elevated access).
+/// Find session TTL from matching rule (for `ask` access level).
 fn find_rule_ttl(
     rules: Option<&Vec<crate::policy::PolicyRule>>,
     method: &str,

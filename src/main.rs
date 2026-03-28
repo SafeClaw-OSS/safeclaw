@@ -102,7 +102,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         audit_log: audit_log.clone(),
     });
 
-    // Periodic cleanup: rate limiter + expired elevated sessions
+    // Periodic cleanup: rate limiter + expired approval sessions
     {
         let state_clone = state.clone();
         let vault_clone = vault.clone();
@@ -112,7 +112,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 interval.tick().await;
                 state_clone.rate_limiter.lock().unwrap().cleanup();
                 state_clone.challenges.lock().unwrap().cleanup();
-                // Zeroize expired elevated credentials from cache
+                // Zeroize expired approval credentials from cache
                 vault_clone.cleanup_expired_sessions();
             }
         });

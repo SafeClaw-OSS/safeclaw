@@ -12,8 +12,8 @@ pub fn generate_safeclaw_md(secrets: &serde_json::Value, locked: bool, proxy_por
 
     // Build service table rows
     let mut rows = vec![
-        "| Service | Upstream | Proxy URL | Auth | Approval Level |".to_string(),
-        "|---------|----------|-----------|------|----------------|".to_string(),
+        "| Service | Upstream | Proxy URL | Auth | Approval |".to_string(),
+        "|---------|----------|-----------|------|----------|".to_string(),
     ];
     if let Some(services) = secrets.get("services").and_then(|s| s.as_object()) {
         for (name, svc) in services {
@@ -72,7 +72,7 @@ fn auth_display(svc: &serde_json::Value) -> String {
 fn level_display(svc: &serde_json::Value) -> String {
     let levels = match svc.get("levels") {
         Some(l) if !l.is_null() => l,
-        _ => return "standard".to_string(),
+        _ => return "allow".to_string(),
     };
     let write = levels.get("write").and_then(|l| l.as_str());
     let read = levels.get("read").and_then(|l| l.as_str());
@@ -81,7 +81,7 @@ fn level_display(svc: &serde_json::Value) -> String {
         (Some(w), Some(r)) => format!("write:{}, read:{}", w, r),
         (Some(w), None) => format!("write:{}", w),
         (None, Some(r)) => format!("read:{}", r),
-        (None, None) => "standard".to_string(),
+        (None, None) => "allow".to_string(),
     }
 }
 
@@ -98,12 +98,12 @@ mod tests {
                 "anthropic": {
                     "upstream": "https://api.anthropic.com",
                     "auth": { "type": "header", "name": "x-api-key", "secret": "sk-test" },
-                    "levels": { "write": "standard", "read": "standard" }
+                    "levels": { "write": "allow", "read": "allow" }
                 },
                 "gmail": {
                     "upstream": "https://gmail.googleapis.com",
                     "auth": { "type": "oauth2" },
-                    "levels": { "write": "critical", "read": "elevated" }
+                    "levels": { "write": "ask-always", "read": "ask" }
                 }
             }
         })
@@ -130,15 +130,15 @@ mod tests {
     #[test]
     fn safeclaw_md_level_display_mixed() {
         let s = generate_safeclaw_md(&two_service_secrets(), false, 23295);
-        // gmail has write:critical, read:elevated
-        assert!(s.contains("write:critical, read:elevated"));
+        // gmail has write:ask-always, read:ask
+        assert!(s.contains("write:ask-always, read:ask"));
     }
 
     #[test]
     fn safeclaw_md_level_display_same() {
         let s = generate_safeclaw_md(&two_service_secrets(), false, 23295);
-        // anthropic has write:standard, read:standard → just "standard"
-        assert!(s.contains("standard"));
+        // anthropic has write:allow, read:allow → just "allow"
+        assert!(s.contains("allow"));
     }
 
     #[test]

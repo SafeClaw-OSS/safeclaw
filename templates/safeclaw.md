@@ -7,6 +7,11 @@ Proxy: `{{PROXY_BASE}}`
 
 Services listed above are routed through SafeClaw. Use the proxy URL — do NOT call upstream directly, and do NOT add Authorization headers (SafeClaw injects credentials automatically).
 
-Services NOT listed here are not managed by SafeClaw — call them normally.
+**Default policy: deny.** Services NOT listed here cannot be accessed through the proxy (403 UNKNOWN_SERVICE). Only registered services are routed.
+
+**Approval levels:**
+- `allow` — request passes through automatically
+- `ask` — requires human approval once, then cached for the session
+- `ask-always` — requires human approval for every request
 
 Before using any service listed here, load the `safeclaw` skill — it covers vault-locked handling, approval flows, and proxy protocol details.

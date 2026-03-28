@@ -243,7 +243,7 @@ mod tests {
     #[test]
     fn log_request_does_not_panic() {
         let log = open();
-        log.log_request("svc", "GET", "/foo", "standard", "allowed", Some(42), Some(200), None);
+        log.log_request("svc", "GET", "/foo", "allow", "allowed", Some(42), Some(200), None);
     }
 
     #[test]
@@ -266,8 +266,8 @@ mod tests {
     #[test]
     fn list_recent_returns_entries() {
         let log = open();
-        log.log_request("svc", "GET", "/a", "standard", "allowed", Some(10), Some(200), None);
-        log.log_request("svc", "POST", "/b", "elevated", "blocked", None, None, None);
+        log.log_request("svc", "GET", "/a", "allow", "allowed", Some(10), Some(200), None);
+        log.log_request("svc", "POST", "/b", "ask", "denied", None, None, None);
 
         let entries = log.list_recent(10).unwrap();
         assert_eq!(entries.len(), 2);

@@ -385,31 +385,31 @@ mod tests {
         }
 
         #[test]
-        fn default_policy_is_standard() {
+        fn default_policy_is_allow() {
             let level = evaluate_policy("GET", "/foo", None, None, &defaults());
-            assert_eq!(level, AccessLevel::Standard);
+            assert_eq!(level, AccessLevel::Allow);
         }
 
         #[test]
-        fn post_with_elevated_write_returns_elevated() {
+        fn post_with_ask_write_returns_ask() {
             let levels = ServiceLevels {
-                write: Some(AccessLevel::Elevated),
+                write: Some(AccessLevel::Ask),
                 read: None,
             };
             let level = evaluate_policy("POST", "/data", None, Some(&levels), &defaults());
-            assert_eq!(level, AccessLevel::Elevated);
+            assert_eq!(level, AccessLevel::Ask);
         }
 
         #[test]
-        fn critical_rule_overrides_service_levels() {
+        fn ask_always_rule_overrides_service_levels() {
             let rules = vec![PolicyRule {
                 method: Some("DELETE".to_string()),
                 path_suffix: Some("/admin".to_string()),
-                level: AccessLevel::Critical,
+                level: AccessLevel::AskAlways,
                 session_ttl: None,
             }];
             let levels = ServiceLevels {
-                write: Some(AccessLevel::Elevated),
+                write: Some(AccessLevel::Ask),
                 read: None,
             };
             let level = evaluate_policy(
@@ -419,17 +419,17 @@ mod tests {
                 Some(&levels),
                 &defaults(),
             );
-            assert_eq!(level, AccessLevel::Critical);
+            assert_eq!(level, AccessLevel::AskAlways);
         }
 
         #[test]
-        fn get_not_elevated_when_only_write_elevated() {
+        fn get_not_ask_when_only_write_ask() {
             let levels = ServiceLevels {
-                write: Some(AccessLevel::Elevated),
+                write: Some(AccessLevel::Ask),
                 read: None,
             };
             let level = evaluate_policy("GET", "/data", None, Some(&levels), &defaults());
-            assert_eq!(level, AccessLevel::Standard);
+            assert_eq!(level, AccessLevel::Allow);
         }
     }
 
@@ -549,9 +549,9 @@ mod tests {
         }
     }
 
-    // ── VaultState elevated session cache ─────────────────────────────────────────
+    // ── VaultState approval session cache ────────────────────────────────────────
 
-    mod vault_elevated_cache {
+    mod vault_approval_cache {
         use crate::state::VaultState;
 
         fn dummy_auth() -> serde_json::Value {
@@ -561,37 +561,37 @@ mod tests {
         #[test]
         fn no_session_initially() {
             let vs = VaultState::new();
-            assert!(vs.check_elevated_session("github").is_none());
+            assert!(vs.check_approval_session("github").is_none());
         }
 
         #[test]
         fn long_ttl_session_is_valid() {
             let vs = VaultState::new();
-            vs.set_elevated_session("github", dummy_auth(), 3600);
-            assert!(vs.check_elevated_session("github").is_some());
+            vs.set_approval_session("github", dummy_auth(), 3600);
+            assert!(vs.check_approval_session("github").is_some());
         }
 
         #[test]
         fn cached_auth_is_returned() {
             let vs = VaultState::new();
-            vs.set_elevated_session("github", dummy_auth(), 3600);
-            let auth = vs.check_elevated_session("github").expect("should be present");
+            vs.set_approval_session("github", dummy_auth(), 3600);
+            let auth = vs.check_approval_session("github").expect("should be present");
             assert_eq!(auth["type"], "bearer");
         }
 
         #[test]
         fn zero_ttl_session_is_expired() {
             let vs = VaultState::new();
-            vs.set_elevated_session("github", dummy_auth(), 0);
-            assert!(vs.check_elevated_session("github").is_none());
+            vs.set_approval_session("github", dummy_auth(), 0);
+            assert!(vs.check_approval_session("github").is_none());
         }
 
         #[test]
         fn lock_clears_cache() {
             let vs = VaultState::new();
-            vs.set_elevated_session("github", dummy_auth(), 3600);
+            vs.set_approval_session("github", dummy_auth(), 3600);
             vs.lock();
-            assert!(vs.check_elevated_session("github").is_none());
+            assert!(vs.check_approval_session("github").is_none());
         }
     }
 

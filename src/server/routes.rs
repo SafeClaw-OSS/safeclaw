@@ -1231,7 +1231,7 @@ pub async fn approval_reject(
                 &rec.service,
                 &rec.method,
                 &rec.path,
-                "elevated",
+                "ask",
                 "rejected",
                 None,
                 None,
@@ -1457,7 +1457,7 @@ pub async fn system_shutdown(
 
 // ── Audit Log ──────────────────────────────────────────────────────────────────
 
-/// GET /audit/log?limit=50&service=openai&decision=blocked&since=2024-01-01T00:00:00
+/// GET /audit/log?limit=50&service=openai&decision=denied&since=2024-01-01T00:00:00
 /// List audit entries. No auth required — contains operational metadata only, no secrets.
 pub async fn audit_log_list(
     State(state): State<Arc<AppState>>,

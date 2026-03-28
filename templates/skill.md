@@ -50,7 +50,7 @@ Use your runtime's cron tool (e.g. OpenClaw `cron.add`):
   "sessionTarget": "isolated",
   "payload": {
     "kind": "agentTurn",
-    "message": "SafeClaw approval watcher.\nApproval id: <id>\nPoll URL: <proxy_base>/approve/<id>\nExpires at: <expires_at> (unix timestamp)\n\nInstructions:\n1. If current time > expires_at: tell user approval window expired, then remove this cron job (cron.list → find name=safeclaw-approval-<id> → cron.remove). Done.\n2. GET <proxy_base>/approve/<id>\n3. If status=pending: reply HEARTBEAT_OK (will check again in 3s)\n4. If status=approved: present response.body to the user. Remove cron job.\n5. If status=rejected: tell user the action was blocked, ask how to proceed. Remove cron job.\n6. If status=expired or 404: tell user approval window expired. Remove cron job."
+    "message": "SafeClaw approval watcher.\nApproval id: <id>\nPoll URL: <proxy_base>/approve/<id>\nExpires at: <expires_at> (unix timestamp)\n\nInstructions:\n1. If current time > expires_at: tell user approval window expired, then remove this cron job (cron.list → find name=safeclaw-approval-<id> → cron.remove). Done.\n2. GET <proxy_base>/approve/<id>\n3. If status=pending: reply HEARTBEAT_OK (will check again in 3s)\n4. If status=approved: present response.body to the user. Remove cron job.\n5. If status=rejected: tell user the action was denied, ask how to proceed. Remove cron job.\n6. If status=expired or 404: tell user approval window expired. Remove cron job."
   },
   "delivery": {
     "mode": "announce",
