@@ -30,41 +30,13 @@ pub fn generate_safeclaw_md(secrets: &serde_json::Value, locked: bool, proxy_por
     SAFECLAW_MD_TEMPLATE
         .replace("{{PROXY_BASE}}", &proxy_base)
         .replace("{{SERVICE_TABLE}}", &rows.join("\n"))
-        .replace("{{VAULT_STATUS}}", if locked { "locked" } else { "unlocked" })
 }
 
-/// Generate AGENTS.md snippet instructing agents to route requests through SafeClaw.
+/// Return the static AGENTS.md snippet (managed block).
 ///
-/// When vault is locked or upstream URLs are unavailable, entries are omitted.
-const AGENTS_SNIPPET_TEMPLATE: &str = include_str!("../templates/agents-snippet.md");
-
-pub fn generate_agents_md_snippet(secrets: &serde_json::Value, proxy_port: u16) -> String {
-    let proxy_base = format!("http://localhost:{}", proxy_port);
-    let mut entries: Vec<String> = Vec::new();
-
-    if let Some(services) = secrets.get("services").and_then(|s| s.as_object()) {
-        for (name, svc) in services {
-            if svc.is_null() { continue; }
-            let upstream = svc.get("upstream").and_then(|u| u.as_str()).unwrap_or("");
-            let domain = extract_domain(upstream);
-            if !domain.is_empty() {
-                let upstream_clean = upstream.trim_end_matches('/');
-                entries.push(format!(
-                    "- **{name}**: replace `{upstream_clean}` with `{proxy_base}/{name}` — e.g. `{proxy_base}/{name}/some/api/path`"
-                ));
-            }
-        }
-    }
-
-    let services_block = if entries.is_empty() {
-        "(no services configured)".to_string()
-    } else {
-        entries.join("\n")
-    };
-
-    AGENTS_SNIPPET_TEMPLATE
-        .replace("{{SERVICES}}", &services_block)
-        .replace("{{PROXY_BASE}}", &proxy_base)
+/// This is now fully static — dynamic service info lives in safeclaw.md.
+pub fn generate_agents_md_snippet(_secrets: &serde_json::Value, _proxy_port: u16) -> String {
+    include_str!("../templates/agents-snippet.md").to_string()
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
@@ -113,18 +85,6 @@ fn level_display(svc: &serde_json::Value) -> String {
     }
 }
 
-fn extract_domain(upstream: &str) -> String {
-    if let Ok(url) = url::Url::parse(upstream) {
-        if let Some(host) = url.host_str() {
-            return match url.port() {
-                Some(p) => format!("{}:{}", host, p),
-                None => host.to_string(),
-            };
-        }
-    }
-    String::new()
-}
-
 // ── Unit Tests ─────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -156,7 +116,6 @@ mod tests {
         assert!(s.contains("gmail"));
         assert!(s.contains("header (x-api-key)"));
         assert!(s.contains("oauth2"));
-        assert!(s.contains("Vault status: unlocked"));
     }
 
     #[test]
@@ -166,7 +125,6 @@ mod tests {
         assert!(s.contains("anthropic"));
         assert!(s.contains("gmail"));
         assert!(!s.contains("header ("));
-        assert!(s.contains("Vault status: locked"));
     }
 
     #[test]
@@ -184,30 +142,14 @@ mod tests {
     }
 
     #[test]
-    fn agents_snippet_contains_domains() {
-        let s = generate_agents_md_snippet(&two_service_secrets(), 23295);
-        assert!(s.contains("api.anthropic.com"));
-        assert!(s.contains("gmail.googleapis.com"));
-        assert!(s.contains("http://localhost:23295/anthropic/"));
-        assert!(s.contains("SafeClaw"));
-    }
-
-    #[test]
-    fn agents_snippet_locked_shows_no_domains() {
+    fn agents_snippet_is_static() {
+        let s1 = generate_agents_md_snippet(&two_service_secrets(), 23295);
         let names = json!({ "services": { "anthropic": null } });
-        let s = generate_agents_md_snippet(&names, 23295);
-        // No upstream → no domain entries, but header/footer still present
-        assert!(s.contains("SafeClaw"));
-        assert!(!s.contains("api.anthropic.com"));
-    }
-
-    #[test]
-    fn extract_domain_strips_path() {
-        assert_eq!(extract_domain("https://api.openai.com/v1"), "api.openai.com");
-        assert_eq!(
-            extract_domain("https://example.com:8443/path"),
-            "example.com:8443"
-        );
-        assert_eq!(extract_domain("not-a-url"), "");
+        let s2 = generate_agents_md_snippet(&names, 23295);
+        // Snippet is now fully static — same output regardless of input
+        assert_eq!(s1, s2);
+        assert!(s1.contains("SafeClaw"));
+        assert!(s1.contains("safeclaw.md"));
+        assert!(s1.contains("SAFECLAW:BEGIN"));
     }
 }

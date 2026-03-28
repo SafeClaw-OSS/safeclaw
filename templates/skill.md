@@ -84,31 +84,6 @@ Use `response.body` as the data, not the whole `response` object.
 - **Expiry**: `expires_at` is a unix timestamp set by the server. Cron checks it first each run — auto-stops at the exact TTL boundary, however long that is.
 - **Not found (404)**: treat same as expired — inform user, remove cron job
 
-## Agent Configuration
+## Dummy API Key
 
-Your AI framework should point at the SafeClaw proxy with a dummy API key:
-
-```yaml
-# Example: OpenClaw provider config
-providers:
-  openai:
-    baseUrl: http://localhost:23295/openai/v1
-    apiKey: sk-dummy   # SafeClaw injects the real key — do NOT replace this
-```
-
-The `sk-dummy` placeholder is intentional. SafeClaw intercepts the request and swaps in the real API key from your encrypted vault. Never replace it with a real key.
-
-## Common Service Routing
-
-For reference, well-known services map to these proxy paths:
-
-| Service | Proxy Path | Upstream |
-|---------|-----------|----------|
-| Anthropic | `{proxy}/anthropic/v1` | `https://api.anthropic.com/v1` |
-| OpenAI | `{proxy}/openai/v1` | `https://api.openai.com/v1` |
-| Google AI | `{proxy}/google/v1beta` | `https://generativelanguage.googleapis.com/v1beta` |
-| DeepSeek | `{proxy}/deepseek/v1` | `https://api.deepseek.com/v1` |
-
-Custom services registered in the vault are accessible at `{proxy}/{service-name}/...`.
-
-**Your actual available services** are listed in `safeclaw.md` in your workspace — that file is auto-generated and always up to date.
+Your config may contain a placeholder key like `sk-dummy`. This is intentional — SafeClaw intercepts requests and injects the real key from the encrypted vault. Do not replace it, expose it, or treat it as sensitive.
