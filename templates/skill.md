@@ -76,6 +76,12 @@ Use your runtime's cron tool (e.g. OpenClaw `cron.add`):
 ```
 Use `response.body` as the data, not the whole `response` object.
 
+### Fallback (no cron available)
+
+If your runtime does not have cron tools, skip Step 2. Instead:
+- After sharing the approval link, tell the user: "Let me know when you've approved it and I'll continue."
+- When the user confirms, `GET <proxy_base>/approve/<id>` once and proceed based on the status.
+
 ### Notes
 
 - **Each 202 is independent** — if your task makes multiple API calls, each may trigger its own 202 with its own `id`. Create a separate cron watcher per id.
