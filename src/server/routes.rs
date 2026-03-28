@@ -633,7 +633,10 @@ pub async fn vault_update(
     fs::write(state.config.data_dir.join("vault.enc"), &vault_enc)?;
 
     let _ = write_index(&state, &new_secrets);
-    state.vault.set_secrets(new_secrets);
+    state.vault.set_secrets(new_secrets.clone());
+
+    // Keep VM-side SafeClaw guidance in sync with the latest vault config.
+    push_to_provisioner(new_secrets, state.config.proxy_port);
 
     Ok(Json(json!({ "ok": true })))
 }
@@ -661,11 +664,21 @@ fn push_to_provisioner(secrets: serde_json::Value, proxy_port: u16) {
         let mut ops = vec![
             serde_json::json!({ "type": "workspace", "file": "safeclaw.md", "content": md }),
             serde_json::json!({ "type": "workspace", "file": "AGENTS.md", "content": snippet }),
+            serde_json::json!({
+                "type": "skill",
+                "dir": "safeclaw",
+                "file": "SKILL.md",
+                "content": include_str!("../../SKILL.md")
+            }),
         ];
+
+        // Restart OpenClaw after guidance sync so newly written skills/docs are
+        // picked up immediately. This keeps fresh VMs and post-update sessions
+        // on the latest SafeClaw protocol without relying on hot reload.
+        let mut needs_restart = true;
 
         // Push telegram token as a config op so the provisioner writes it into
         // the OpenClaw config (channels.telegram.token).
-        let mut needs_restart = false;
         if let Some(token) = telegram_token {
             ops.push(serde_json::json!({
                 "type": "config",

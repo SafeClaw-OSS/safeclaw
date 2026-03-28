@@ -8,6 +8,7 @@
 pub fn generate_safeclaw_md(secrets: &serde_json::Value, locked: bool, proxy_port: u16) -> String {
     let proxy_base = format!("http://localhost:{}", proxy_port);
     let mut lines = vec![
+        "<!-- SAFECLAW:GENERATED FILE - DO NOT EDIT. Changes may be overwritten by SafeClaw sync. -->".to_string(),
         "# SafeClaw Services".to_string(),
         format!(
             "Route API calls through the SafeClaw proxy at `{}`. Do NOT call upstream APIs directly.",
@@ -90,6 +91,7 @@ pub fn generate_agents_md_snippet(secrets: &serde_json::Value, proxy_port: u16) 
     }
 
     let mut lines = vec![
+        "<!-- SAFECLAW:BEGIN - managed block. Changes inside this block may be overwritten by SafeClaw sync. -->".to_string(),
         "## SafeClaw Proxy (MANDATORY security rules)".to_string(),
         String::new(),
         "All HTTP requests to the following services MUST go through the SafeClaw proxy.".to_string(),
@@ -127,6 +129,8 @@ pub fn generate_agents_md_snippet(secrets: &serde_json::Value, proxy_port: u16) 
     lines.push("5. On `{\"status\":\"expired\"}` or 404 — tell the user the window expired, ask to retry.".to_string());
     lines.push(String::new());
     lines.push(format!("Poll URL: `{proxy_base}/approve/<id>`"));
+    lines.push(String::new());
+    lines.push("<!-- SAFECLAW:END -->".to_string());
 
     lines.join("\n")
 }
