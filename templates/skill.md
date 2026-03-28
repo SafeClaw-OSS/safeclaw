@@ -38,30 +38,35 @@ If the channel supports inline buttons (e.g. Telegram), use a button — otherwi
 
 Then end your turn — no need to say "waiting…", the notification above is sufficient.
 
-### Step 2 — Set up a cron watcher
+### Step 2 — Set up a cron watcher (required)
 
-Immediately after notifying the user, create a recurring cron job to watch for the result.
-Use your runtime's cron tool (e.g. OpenClaw `cron.add`):
+Immediately after notifying the user, you MUST create a cron job to poll for the approval result.
+This is NOT optional — the user expects real-time feedback when they approve.
+
+Call the `cron` tool with `action: "add"` and the following `job` parameter:
 
 ```json
 {
-  "name": "safeclaw-approval-<id>",
-  "schedule": { "kind": "every", "everyMs": 3000 },
-  "sessionTarget": "isolated",
-  "payload": {
-    "kind": "agentTurn",
-    "message": "SafeClaw approval watcher.\nApproval id: <id>\nPoll URL: <proxy_base>/approve/<id>\nExpires at: <expires_at> (unix timestamp)\n\nInstructions:\n1. If current time > expires_at: tell user approval window expired, then remove this cron job (cron.list → find name=safeclaw-approval-<id> → cron.remove). Done.\n2. GET <proxy_base>/approve/<id>\n3. If status=pending: reply HEARTBEAT_OK (will check again in 3s)\n4. If status=approved: present response.body to the user. Remove cron job.\n5. If status=rejected: tell user the action was denied, ask how to proceed. Remove cron job.\n6. If status=expired or 404: tell user approval window expired. Remove cron job."
-  },
-  "delivery": {
-    "mode": "announce",
-    "channel": "<current channel>",
-    "to": "<current chat/topic target>"
+  "action": "add",
+  "job": {
+    "name": "safeclaw-approval-<id>",
+    "schedule": { "kind": "every", "everyMs": 1000 },
+    "sessionTarget": "isolated",
+    "payload": {
+      "kind": "agentTurn",
+      "message": "SafeClaw approval watcher.\nApproval id: <id>\nPoll URL: http://localhost:23295/approve/<id>\nExpires at: <expires_at> (unix timestamp)\n\nInstructions:\n1. If current time > expires_at: tell user approval expired, then call cron tool with action=remove and jobId=<this job id>. Done.\n2. Call the exec tool: curl -sf http://localhost:23295/approve/<id>\n3. If status=pending: reply HEARTBEAT_OK (will check again next interval)\n4. If status=approved: present response.body to the user. Remove this cron job.\n5. If status=rejected: tell user denied. Remove this cron job.\n6. If 404 or error: tell user expired. Remove this cron job."
+    },
+    "delivery": {
+      "mode": "announce"
+    }
   }
 }
 ```
 
-- Set `delivery.channel` and `delivery.to` to the current conversation (so the result reaches the user in the right place)
-- `HEARTBEAT_OK` responses are never delivered — safe to use for pending state
+- `everyMs: 1000` = poll every 1 second for responsive UX
+- The cron job auto-stops when the watcher removes itself (on approved/rejected/expired)
+- `HEARTBEAT_OK` responses are silently discarded — safe for pending state
+- The `cron` tool is a built-in tool in your runtime — use it directly (do not ask the user to run commands)
 
 **Approved response structure** (when cron run calls GET /approve/\<id\>):
 ```json
@@ -76,11 +81,11 @@ Use your runtime's cron tool (e.g. OpenClaw `cron.add`):
 ```
 Use `response.body` as the data, not the whole `response` object.
 
-### Fallback (no cron available)
+### Fallback (cron tool genuinely unavailable)
 
-If your runtime does not have cron tools, skip Step 2. Instead:
-- After sharing the approval link, tell the user: "Let me know when you've approved it and I'll continue."
-- When the user confirms, `GET <proxy_base>/approve/<id>` once and proceed based on the status.
+Only if the cron tool call fails with an error (not if you're unsure — try it first):
+- Tell the user: "Let me know when you've approved it and I'll continue."
+- When the user confirms, `curl -sf http://localhost:23295/approve/<id>` and proceed based on the status.
 
 ### Notes
 
