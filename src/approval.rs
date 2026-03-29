@@ -154,16 +154,16 @@ impl ApprovalManager {
         false
     }
 
-    /// Called by TTL cleanup task. Marks as expired and removes from map.
+    /// Called by TTL cleanup task. Marks as expired — does NOT remove from map.
+    /// Agent can still poll and receive {status:"expired"} (consistent with reject behavior).
     pub fn expire(&self, id: &str) {
         let mut pending = self.pending.lock().unwrap();
         if let Some(approval) = pending.get_mut(id) {
             if approval.approval_status == ApprovalStatus::Pending {
                 approval.approval_status = ApprovalStatus::Expired;
+                let _ = self.audit.update_approval(id, "expired");
             }
         }
-        pending.remove(id);
-        let _ = self.audit.update_approval(id, "expired");
     }
 
     /// For poll handler: take the approved_auth to execute upstream.
