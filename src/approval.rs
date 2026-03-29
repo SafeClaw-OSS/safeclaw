@@ -163,7 +163,7 @@ impl ApprovalManager {
             }
         }
         pending.remove(id);
-        let _ = self.audit.update_approval(id, "timed_out");
+        let _ = self.audit.update_approval(id, "expired");
     }
 
     /// For poll handler: take the approved_auth to execute upstream.

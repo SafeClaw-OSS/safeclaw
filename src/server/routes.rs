@@ -320,12 +320,12 @@ pub async fn setup(
         )?;
     }
 
-    let inner_assertions = parsed
+    // D31: assertions MUST come from inside the ECIES envelope (integrity-protected).
+    // Never fall back to outer (unencrypted) body — that would bypass AEAD protection.
+    let assertions_src = parsed
         .get("assertions")
         .and_then(|v| v.as_array())
         .cloned();
-    let outer_assertions = body.assertions.clone();
-    let assertions_src = inner_assertions.or(outer_assertions);
 
     for (i, pk_val) in passkeys_arr.iter().enumerate() {
         let x = pk_val.get("x").and_then(|v| v.as_str()).unwrap_or("");

@@ -70,8 +70,12 @@ async fn proxy_poll_approval(
             Json(serde_json::json!({ "status": "pending" })).into_response()
         }
 
-        ApprovalStatus::Rejected | ApprovalStatus::Expired => {
+        ApprovalStatus::Rejected => {
             Json(serde_json::json!({ "status": "rejected" })).into_response()
+        }
+
+        ApprovalStatus::Expired => {
+            Json(serde_json::json!({ "status": "expired" })).into_response()
         }
 
         ApprovalStatus::Approved => {
