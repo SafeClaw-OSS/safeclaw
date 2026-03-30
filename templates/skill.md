@@ -59,7 +59,7 @@ Create the watcher cron:
     "sessionTarget": "isolated",
     "payload": {
       "kind": "agentTurn",
-      "message": "SafeClaw approval watcher.\nApproval id: <id>\nPoll URL: http://localhost:23295/approve/<id>\nExpires at: <expires_at>\nOriginal task: <one-line description of what the user asked>\n\nInstructions:\n1. Check current time vs expires_at. If expired: send expiry notification via CLI (see step 5), then remove this job.\n2. Run: curl -sf http://localhost:23295/approve/<id>\n3. If status=pending: reply HEARTBEAT_OK\n4. If status=approved: Send resume signal via CLI (see step 5), then remove this watcher job.\n5. If status=rejected or 404: Send rejection notification via CLI (see step 5), then remove this job.\n\nStep 5 — Sending the resume signal:\nIMPORTANT: Do NOT use the cron tool to create a systemEvent. Instead, use the exec tool to run this CLI command:\n\nFor approved:\nexec: openclaw cron add --name safeclaw-resume-<id> --every 1s --delete-after-run --system-event \"SafeClaw approval <id> APPROVED. Original task: <task>. API response: <format response.body as clean readable text, not raw JSON dump>. Continue executing the original task using this data.\"\n\nFor rejected:\nexec: openclaw cron add --name safeclaw-resume-<id> --every 1s --delete-after-run --system-event \"SafeClaw approval <id> REJECTED. Original task: <task>. The user denied this request.\"\n\nFor expired:\nexec: openclaw cron add --name safeclaw-resume-<id> --every 1s --delete-after-run --system-event \"SafeClaw approval <id> EXPIRED. Original task: <task>. The approval timed out.\"\n\nThe CLI command creates a gateway-level systemEvent that reaches the real main session (unlike cron tool calls from isolated sessions which are scoped)."
+      "message": "SafeClaw approval watcher.\nApproval id: <id>\nPoll URL: http://localhost:23295/approve/<id>\nExpires at: <expires_at>\nOriginal task: <one-line description of what the user asked>\n\nInstructions:\n1. Check current time vs expires_at. If expired: send expiry notification via CLI (see step 5), then self-disable (see step 6).\n2. Run: curl -sf http://localhost:23295/approve/<id>\n3. If status=pending: reply HEARTBEAT_OK (this is a no-op, costs nothing)\n4. If status=approved: Send resume signal via CLI (see step 5), then self-disable (see step 6).\n5. If status=rejected or 404: Send rejection/expiry notification via CLI (see step 5), then self-disable (see step 6).\n\nStep 5 — Sending the resume signal:\nIMPORTANT: Do NOT use the cron tool to create a systemEvent. Instead, use the exec tool to run this CLI command:\n\nFor approved:\nexec: openclaw cron add --name safeclaw-resume-<id> --every 1s --delete-after-run --system-event \"SafeClaw approval <id> APPROVED. Original task: <task>. API response: <format response.body as clean readable text, not raw JSON dump>. Continue executing the original task using this data.\"\n\nFor rejected:\nexec: openclaw cron add --name safeclaw-resume-<id> --every 1s --delete-after-run --system-event \"SafeClaw approval <id> REJECTED. Original task: <task>. The user denied this request.\"\n\nFor expired:\nexec: openclaw cron add --name safeclaw-resume-<id> --every 1s --delete-after-run --system-event \"SafeClaw approval <id> EXPIRED. Original task: <task>. The approval timed out.\"\n\nThe CLI command creates a gateway-level systemEvent that reaches the real main session (unlike cron tool calls from isolated sessions which are scoped).\n\nStep 6 — Self-cleanup (CRITICAL — must run after step 5):\nTo prevent this watcher from running again, remove it immediately using the cron tool:\n{\"action\": \"remove\", \"name\": \"safeclaw-approval-<id>\"}\nThis is the one case where using the cron tool (not CLI) from the isolated session is correct — removing a job works from any session."
     },
     "delivery": { "mode": "none" }
   }
@@ -100,7 +100,15 @@ When you receive a systemEvent containing "SafeClaw approval ... APPROVED", this
 - The formatted API response
 
 1. **First**, send a brief acknowledgment to the user (e.g. "Approved — processing now.") so they know it went through.
-2. **Then** continue the original task with the data. Do not ask the user for further confirmation — just proceed.
+2. **Clean up** any leftover watcher/resume cron jobs for this approval ID:
+   ```
+   exec: openclaw cron list --json
+   ```
+   Find any jobs with names starting with `safeclaw-approval-` or `safeclaw-resume-` and remove them by ID:
+   ```
+   exec: openclaw cron rm <uuid>
+   ```
+3. **Then** continue the original task with the data. Do not ask the user for further confirmation — just proceed.
 
 ### Notes
 
