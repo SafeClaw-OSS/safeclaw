@@ -67,7 +67,12 @@ Create the watcher cron:
 }
 ```
 
-If you do not have a `cron` tool, use `exec` to run `openclaw cron add` for the watcher too.
+If you do not have a `cron` tool, use `exec` to run `openclaw cron add` CLI instead:
+
+```
+openclaw cron add --name safeclaw-approval-<id> --every 1s --session isolated --no-deliver --message "SafeClaw approval watcher. Approval id: <id>. Poll URL: http://localhost:23295/approve/<id>. Expires at: <expires_at>. Original task: <task>. Instructions: 1. Check time vs expires_at, if expired send expiry via CLI then remove job. 2. Run curl -sf http://localhost:23295/approve/<id>. 3. If pending: reply HEARTBEAT_OK. 4. If approved: send resume signal via CLI then remove job. 5. If rejected/404: send rejection via CLI then remove job."
+```
+
 If neither works, tell the user "I couldn't create the approval watcher, so I'll need you to tell me after approving." and poll once on their reply.
 
 **Key design points:**
