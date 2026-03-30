@@ -99,7 +99,8 @@ When you receive a systemEvent containing "SafeClaw approval ... APPROVED", this
 - The original task description
 - The formatted API response
 
-**Continue the original task immediately.** Do not ask the user — just proceed with the data.
+1. **First**, send a brief acknowledgment to the user (e.g. "Approved — processing now.") so they know it went through.
+2. **Then** continue the original task with the data. Do not ask the user for further confirmation — just proceed.
 
 ### Notes
 
