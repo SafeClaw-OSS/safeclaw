@@ -36,9 +36,16 @@ If the channel supports inline buttons (e.g. Telegram), use a button — otherwi
 
 > "I need approval to [describe the action — service + what you were doing]. Please review: **[Review & Approve]**(`safeclaw_approve_url`)"
 
-Then proceed to Step 2 immediately (do not wait for user reply).
+Then proceed to Step 2 **immediately** — do not wait for user reply, not even a fast one.
 
 ### Step 2 — Set up an approval watcher (required)
+
+**Before continuing, verify:**
+- [ ] I told the user what needs approval and shared the link
+- [ ] I am creating the watcher **right now**, not waiting for user input
+- [ ] I will not ask "let me know when you've approved" unless watcher creation fails
+
+Manual polling after a user reply is **only** allowed if watcher creation explicitly failed. In that case, tell the user: "I couldn't create the approval watcher, so I'll need you to tell me after approving."
 
 You MUST create an isolated cron job that polls the approval endpoint every second. When approved, the watcher sends a resume signal to your main session via CLI so you can continue automatically.
 
@@ -61,7 +68,7 @@ Create the watcher cron:
 ```
 
 If you do not have a `cron` tool, use `exec` to run `openclaw cron add` for the watcher too.
-If neither works, tell the user "Let me know when you've approved" and poll once on their reply.
+If neither works, tell the user "I couldn't create the approval watcher, so I'll need you to tell me after approving." and poll once on their reply.
 
 **Key design points:**
 - The isolated watcher polls cheaply (HEARTBEAT_OK = zero cost when pending)
