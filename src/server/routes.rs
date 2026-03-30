@@ -526,6 +526,8 @@ pub async fn vault_unlock(
             Err(e) => tracing::warn!("VAPID migration failed: {e}"),
         }
     }
+    // Cache DEK for agent file reads (zeroized on lock)
+    *state.vault.cached_dek.lock().unwrap() = Some(dek);
     dek.zeroize();
 
     state.vault.set_secrets(secrets);
@@ -903,6 +905,53 @@ pub async fn vault_files_list(State(state): State<Arc<AppState>>) -> impl IntoRe
     let index = read_index(&state);
     let files = index.get("files").cloned().unwrap_or_else(|| json!([]));
     Json(json!({ "files": files }))
+}
+
+/// GET /vault/files/:id — read a file using cached DEK (no passkey, vault must be unlocked)
+/// Used by the proxy "files" service so the agent can read files via approval flow.
+pub async fn vault_files_read_plain(
+    State(state): State<Arc<AppState>>,
+    Path(file_id): Path<String>,
+) -> Result<impl IntoResponse> {
+    // Sanitize
+    if !file_id.chars().all(|c| c.is_alphanumeric() || c == '-') || file_id.len() > 40 {
+        return Err(AppError::BadRequest("Invalid file id".into()));
+    }
+
+    let dek = state.vault.cached_dek.lock().unwrap()
+        .ok_or_else(|| AppError::Unauthorized("Vault is locked".into()))?;
+
+    let enc_path = state.config.data_dir.join(format!("files/{}.enc", file_id));
+    if !enc_path.exists() {
+        return Err(AppError::NotFound);
+    }
+
+    let enc_data = fs::read(&enc_path)?;
+    let plaintext = crate::crypto::aes_decrypt(&dek, &enc_data)?;
+
+    // Look up filename from index
+    let index = read_index(&state);
+    let filename = index.get("files")
+        .and_then(|f| f.as_array())
+        .and_then(|arr| arr.iter().find(|f| f.get("id").and_then(|v| v.as_str()) == Some(&file_id)))
+        .and_then(|f| f.get("name").and_then(|v| v.as_str()))
+        .unwrap_or("file");
+
+    // Detect content type from extension
+    let content_type = if filename.ends_with(".json") { "application/json".to_string() }
+        else if filename.ends_with(".txt") || filename.ends_with(".md") || filename.ends_with(".csv") { "text/plain; charset=utf-8".to_string() }
+        else if filename.ends_with(".pdf") { "application/pdf".to_string() }
+        else { "application/octet-stream".to_string() };
+    let disposition = format!("inline; filename=\"{}\"", filename);
+
+    Ok((
+        axum::http::StatusCode::OK,
+        [
+            ("content-type".to_string(), content_type),
+            ("content-disposition".to_string(), disposition),
+        ],
+        plaintext,
+    ))
 }
 
 /// POST /vault/files/upload — encrypt and store a file (passkey required)

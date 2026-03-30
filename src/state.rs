@@ -34,6 +34,9 @@ pub struct VaultState {
     pub vapid_private_key: Mutex<Option<String>>,
     /// VAPID public key (base64url) — derived from private key at unlock
     pub vapid_public_key: Mutex<Option<String>>,
+    /// Cached DEK (Data Encryption Key) — set at unlock, zeroized at lock.
+    /// Used for agent file reads via proxy without passkey.
+    pub cached_dek: Mutex<Option<[u8; 32]>>,
 }
 
 /// Returns true if the service JSON has any approval-required access levels,
@@ -70,6 +73,7 @@ impl VaultState {
             oauth2_tokens: Mutex::new(HashMap::new()),
             vapid_private_key: Mutex::new(None),
             vapid_public_key: Mutex::new(None),
+            cached_dek: Mutex::new(None),
         }
     }
 
@@ -82,6 +86,17 @@ impl VaultState {
     /// Auth is stripped from services whose access level requires approval (ask / ask-always) —
     /// credentials for those services are only available transiently via approval.
     pub fn set_secrets(&self, mut secrets: serde_json::Value) {
+        // Auto-inject built-in "files" service (vault file storage, accessed via proxy)
+        if let Some(services) = secrets.get_mut("services").and_then(|s| s.as_object_mut()) {
+            if !services.contains_key("files") {
+                services.insert("files".into(), serde_json::json!({
+                    "upstream": "http://localhost:23294/vault/files",
+                    "category": "service",
+                    "levels": { "read": "ask", "write": "ask" }
+                }));
+            }
+        }
+
         // Strip auth from approval-required services
         if let Some(services) = secrets.get_mut("services").and_then(|s| s.as_object_mut()) {
             for svc in services.values_mut() {
@@ -139,6 +154,11 @@ impl VaultState {
         *self.oauth2_tokens.lock().unwrap() = HashMap::new();
         *self.vapid_private_key.lock().unwrap() = None;
         *self.vapid_public_key.lock().unwrap() = None;
+        if let Some(ref mut dek) = *self.cached_dek.lock().unwrap() {
+            use zeroize::Zeroize;
+            dek.zeroize();
+        }
+        *self.cached_dek.lock().unwrap() = None;
     }
 
     pub fn service_names(&self) -> Vec<String> {
