@@ -172,10 +172,18 @@ async fn proxy_poll_approval(
                 }
             };
 
+            // For files service: inject approval ID so the vault endpoint can find the DEK
+            let replay_uri = if snapshot.service == "files" {
+                let sep = if snapshot.uri_path.contains('?') { "&" } else { "?" };
+                format!("{}{}approval={}", snapshot.uri_path, sep, id)
+            } else {
+                snapshot.uri_path.clone()
+            };
+
             // Execute upstream
             let upstream_resp = forward_request(
                 method,
-                &snapshot.uri_path,
+                &replay_uri,
                 &snapshot.req_headers,
                 snapshot.req_body.clone(),
                 &service_config,

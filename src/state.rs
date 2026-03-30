@@ -34,9 +34,9 @@ pub struct VaultState {
     pub vapid_private_key: Mutex<Option<String>>,
     /// VAPID public key (base64url) — derived from private key at unlock
     pub vapid_public_key: Mutex<Option<String>>,
-    /// Cached DEK (Data Encryption Key) — set at unlock, zeroized at lock.
-    /// Used for agent file reads via proxy without passkey.
-    pub cached_dek: Mutex<Option<[u8; 32]>>,
+    /// Short-lived DEK cache for approved file reads: approval_id → DEK.
+    /// Written at approval_confirm, consumed (and zeroized) at file read time.
+    pub pending_deks: Mutex<HashMap<String, [u8; 32]>>,
 }
 
 /// Returns true if the service JSON has any approval-required access levels,
@@ -73,7 +73,7 @@ impl VaultState {
             oauth2_tokens: Mutex::new(HashMap::new()),
             vapid_private_key: Mutex::new(None),
             vapid_public_key: Mutex::new(None),
-            cached_dek: Mutex::new(None),
+            pending_deks: Mutex::new(HashMap::new()),
         }
     }
 
@@ -154,11 +154,12 @@ impl VaultState {
         *self.oauth2_tokens.lock().unwrap() = HashMap::new();
         *self.vapid_private_key.lock().unwrap() = None;
         *self.vapid_public_key.lock().unwrap() = None;
-        if let Some(ref mut dek) = *self.cached_dek.lock().unwrap() {
+        {
             use zeroize::Zeroize;
-            dek.zeroize();
+            let mut deks = self.pending_deks.lock().unwrap();
+            for dek in deks.values_mut() { dek.zeroize(); }
+            deks.clear();
         }
-        *self.cached_dek.lock().unwrap() = None;
     }
 
     pub fn service_names(&self) -> Vec<String> {

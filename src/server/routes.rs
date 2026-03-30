@@ -526,8 +526,6 @@ pub async fn vault_unlock(
             Err(e) => tracing::warn!("VAPID migration failed: {e}"),
         }
     }
-    // Cache DEK for agent file reads (zeroized on lock)
-    *state.vault.cached_dek.lock().unwrap() = Some(dek);
     dek.zeroize();
 
     state.vault.set_secrets(secrets);
@@ -907,29 +905,44 @@ pub async fn vault_files_list(State(state): State<Arc<AppState>>) -> impl IntoRe
     Json(json!({ "files": files }))
 }
 
-/// GET /vault/files/:id — read a file using cached DEK (no passkey, vault must be unlocked)
-/// Used by the proxy "files" service so the agent can read files via approval flow.
-pub async fn vault_files_read_plain(
+/// GET /vault/files/:id?approval=:approval_id — read file using short-lived DEK from approval.
+/// The DEK was stashed by approval_confirm and is consumed (zeroized) after this read.
+pub async fn vault_files_read_approved(
     State(state): State<Arc<AppState>>,
     Path(file_id): Path<String>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<impl IntoResponse> {
-    // Sanitize
+    // Sanitize file_id
     if !file_id.chars().all(|c| c.is_alphanumeric() || c == '-') || file_id.len() > 40 {
         return Err(AppError::BadRequest("Invalid file id".into()));
     }
 
-    let dek = state.vault.cached_dek.lock().unwrap()
-        .ok_or_else(|| AppError::Unauthorized("Vault is locked".into()))?;
+    let approval_id = params.get("approval").ok_or_else(|| {
+        AppError::BadRequest("Missing approval parameter".into())
+    })?;
+
+    // Take DEK from pending_deks (one-time use)
+    let mut dek = {
+        let mut deks = state.vault.pending_deks.lock().unwrap();
+        deks.remove(approval_id).ok_or_else(|| {
+            AppError::Unauthorized("No DEK available — approval may have expired".into())
+        })?
+    };
 
     let enc_path = state.config.data_dir.join(format!("files/{}.enc", file_id));
     if !enc_path.exists() {
+        dek.zeroize();
         return Err(AppError::NotFound);
     }
 
+    // Decrypt
     let enc_data = fs::read(&enc_path)?;
-    let plaintext = crate::crypto::aes_decrypt(&dek, &enc_data)?;
+    let plaintext = crate::crypto::aes_decrypt(&dek, &enc_data);
+    dek.zeroize(); // DEK gone immediately
 
-    // Look up filename from index
+    let plaintext = plaintext?;
+
+    // Look up filename from index for content-type
     let index = read_index(&state);
     let filename = index.get("files")
         .and_then(|f| f.as_array())
@@ -937,18 +950,15 @@ pub async fn vault_files_read_plain(
         .and_then(|f| f.get("name").and_then(|v| v.as_str()))
         .unwrap_or("file");
 
-    // Detect content type from extension
-    let content_type = if filename.ends_with(".json") { "application/json".to_string() }
-        else if filename.ends_with(".txt") || filename.ends_with(".md") || filename.ends_with(".csv") { "text/plain; charset=utf-8".to_string() }
-        else if filename.ends_with(".pdf") { "application/pdf".to_string() }
-        else { "application/octet-stream".to_string() };
-    let disposition = format!("inline; filename=\"{}\"", filename);
+    let content_type = if filename.ends_with(".json") { "application/json" }
+        else if filename.ends_with(".txt") || filename.ends_with(".md") || filename.ends_with(".csv") { "text/plain; charset=utf-8" }
+        else if filename.ends_with(".pdf") { "application/pdf" }
+        else { "application/octet-stream" };
 
     Ok((
         axum::http::StatusCode::OK,
         [
-            ("content-type".to_string(), content_type),
-            ("content-disposition".to_string(), disposition),
+            ("content-type", content_type),
         ],
         plaintext,
     ))
@@ -1279,7 +1289,7 @@ pub async fn approval_confirm(
     Path(id): Path<String>,
     auth: AuthenticatedRequest,
 ) -> Result<impl IntoResponse> {
-    // Get service name from the pending approval (needed to extract its auth config)
+    // Get service name from the pending approval
     let service_name = {
         let pending = state.approval_manager.pending.lock().unwrap();
         pending.get(&id).map(|a| a.service.clone())
@@ -1290,21 +1300,47 @@ pub async fn approval_confirm(
         None => return Err(AppError::NotFound),
     };
 
-    // Decrypt vault and extract the service's auth config for replay
-    let auth_json = decrypt_vault_json(&state, &auth)
-        .ok()
-        .and_then(|secrets| {
-            secrets
-                .get("services")
-                .and_then(|s| s.get(&service_name))
-                .and_then(|svc| svc.get("auth"))
-                .cloned()
-        });
+    // For "files" service: derive DEK and stash it for the upcoming replay request
+    if service_name == "files" {
+        let user_key_b64 = auth.get_str("userKey")?;
+        let user_key = STANDARD.decode(user_key_b64)
+            .map_err(|e| AppError::BadRequest(format!("Invalid userKey: {}", e)))?;
+        let fname = credential_id_to_filename(&auth.credential_id)?;
+        let wrapped_path = state.config.data_dir.join(format!("wrapped_dek_{}.bin", fname));
+        let sk_d = jwk_sk_d_bytes(&state.keypair.sk)?;
+        let mut kek = derive_kek(&user_key, &sk_d)?;
+        let wrapped = fs::read(&wrapped_path)?;
+        let dek = unwrap_dek(&wrapped, &kek)?;
+        kek.zeroize();
 
-    if state.approval_manager.confirm(&id, auth_json) {
-        Ok(Json(json!({ "ok": true })))
+        // Store DEK keyed by approval ID — consumed and zeroized at file read time
+        state.vault.pending_deks.lock().unwrap().insert(id.clone(), dek);
+
+        if state.approval_manager.confirm(&id, None) {
+            Ok(Json(json!({ "ok": true })))
+        } else {
+            // Clean up if confirm failed
+            use zeroize::Zeroize;
+            if let Some(mut d) = state.vault.pending_deks.lock().unwrap().remove(&id) { d.zeroize(); }
+            Err(AppError::NotFound)
+        }
     } else {
-        Err(AppError::NotFound)
+        // Normal service: decrypt vault and extract auth config for replay
+        let auth_json = decrypt_vault_json(&state, &auth)
+            .ok()
+            .and_then(|secrets| {
+                secrets
+                    .get("services")
+                    .and_then(|s| s.get(&service_name))
+                    .and_then(|svc| svc.get("auth"))
+                    .cloned()
+            });
+
+        if state.approval_manager.confirm(&id, auth_json) {
+            Ok(Json(json!({ "ok": true })))
+        } else {
+            Err(AppError::NotFound)
+        }
     }
 }
 
