@@ -392,6 +392,11 @@ async fn proxy_handler(
 
     // ── Policy evaluation ──────────────────────────────────────────────────────
 
+    // Infer category for known LLM providers if not explicitly set
+    const LLM_PROVIDERS: &[&str] = &["openai", "anthropic", "google", "deepseek", "groq"];
+    let category = service_config.category.as_deref()
+        .or_else(|| if LLM_PROVIDERS.contains(&route_service.as_str()) { Some("llm") } else { None });
+
     let policy_defaults = state.vault.get_policy_defaults();
     let access_level = evaluate_policy(
         method.as_str(),
@@ -399,6 +404,7 @@ async fn proxy_handler(
         service_config.rules.as_ref(),
         service_config.levels.as_ref(),
         &policy_defaults,
+        category,
     );
 
     tracing::debug!(

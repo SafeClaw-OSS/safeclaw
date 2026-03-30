@@ -61,13 +61,26 @@ pub struct PolicyDefaults {
     /// Approval timeout in seconds (default 300)
     pub timeout: Option<u64>,
     pub levels: Option<ServiceLevels>,
+    /// Per-category defaults (e.g. "llm", "service", "channel").
+    /// Takes priority over `levels` when the service's category matches.
+    #[serde(default)]
+    pub type_levels: Option<std::collections::HashMap<String, ServiceLevels>>,
 }
 
 impl Default for PolicyDefaults {
     fn default() -> Self {
+        let mut type_levels = std::collections::HashMap::new();
+        type_levels.insert("llm".into(), ServiceLevels {
+            write: Some(AccessLevel::Allow),
+            read: Some(AccessLevel::Allow),
+        });
         Self {
             timeout: Some(300),
-            levels: None,
+            levels: Some(ServiceLevels {
+                write: Some(AccessLevel::AskAlways),
+                read: Some(AccessLevel::AskAlways),
+            }),
+            type_levels: Some(type_levels),
         }
     }
 }
@@ -89,13 +102,14 @@ pub struct PushKeys {
 // ── Policy Evaluation ──────────────────────────────────────────────────────────
 
 /// Determine the access level for a given request.
-/// Priority: service rules > service levels > global defaults > standard
+/// Priority: service rules > service levels > type defaults > global defaults > fallback
 pub fn evaluate_policy(
     method: &str,
     path: &str,
     rules: Option<&Vec<PolicyRule>>,
     service_levels: Option<&ServiceLevels>,
     defaults: &PolicyDefaults,
+    service_category: Option<&str>,
 ) -> AccessLevel {
     // 1. Check service rules (most specific)
     if let Some(rules) = rules {
@@ -118,7 +132,21 @@ pub fn evaluate_policy(
         }
     }
 
-    // 3. Fall back to policy defaults
+    // 3. Check type-level defaults (e.g. "llm" → allow)
+    if let (Some(cat), Some(ref type_levels)) = (service_category, &defaults.type_levels) {
+        if let Some(type_def) = type_levels.get(cat) {
+            let level = if is_write_method(method) {
+                &type_def.write
+            } else {
+                &type_def.read
+            };
+            if let Some(l) = level {
+                return l.clone();
+            }
+        }
+    }
+
+    // 4. Fall back to global policy defaults
     if let Some(ref def_levels) = defaults.levels {
         let level = if is_write_method(method) {
             &def_levels.write
@@ -130,8 +158,8 @@ pub fn evaluate_policy(
         }
     }
 
-    // 4. Default: allow
-    AccessLevel::Allow
+    // 5. Default: ask-always (safe default — require approval for every request)
+    AccessLevel::AskAlways
 }
 
 fn is_write_method(method: &str) -> bool {
@@ -163,8 +191,14 @@ mod tests {
     }
 
     #[test]
-    fn default_is_allow() {
-        let level = evaluate_policy("GET", "/foo", None, None, &defaults());
+    fn default_no_category_is_ask_always() {
+        let level = evaluate_policy("GET", "/foo", None, None, &defaults(), None);
+        assert_eq!(level, AccessLevel::AskAlways);
+    }
+
+    #[test]
+    fn llm_category_is_allow() {
+        let level = evaluate_policy("POST", "/v1/chat/completions", None, None, &defaults(), Some("llm"));
         assert_eq!(level, AccessLevel::Allow);
     }
 
@@ -174,18 +208,19 @@ mod tests {
             write: Some(AccessLevel::Ask),
             read: Some(AccessLevel::Allow),
         };
-        let level = evaluate_policy("POST", "/create", None, Some(&levels), &defaults());
+        let level = evaluate_policy("POST", "/create", None, Some(&levels), &defaults(), None);
         assert_eq!(level, AccessLevel::Ask);
     }
 
     #[test]
-    fn read_method_stays_allow_when_only_write_ask() {
+    fn service_levels_override_type_defaults() {
         let levels = ServiceLevels {
-            write: Some(AccessLevel::Ask),
+            write: Some(AccessLevel::AskAlways),
             read: None,
         };
-        let level = evaluate_policy("GET", "/read", None, Some(&levels), &defaults());
-        assert_eq!(level, AccessLevel::Allow);
+        // Even though category is "llm" (default allow), service-level override wins
+        let level = evaluate_policy("POST", "/foo", None, Some(&levels), &defaults(), Some("llm"));
+        assert_eq!(level, AccessLevel::AskAlways);
     }
 
     #[test]
@@ -206,6 +241,7 @@ mod tests {
             Some(&rules),
             Some(&levels),
             &defaults(),
+            None,
         );
         assert_eq!(level, AccessLevel::AskAlways);
     }
@@ -218,8 +254,8 @@ mod tests {
             level: AccessLevel::AskAlways,
             session_ttl: None,
         }];
-        let level = evaluate_policy("GET", "/foo", Some(&rules), None, &defaults());
-        assert_eq!(level, AccessLevel::Allow);
+        let level = evaluate_policy("GET", "/foo", Some(&rules), None, &defaults(), None);
+        assert_eq!(level, AccessLevel::AskAlways);
     }
 
     #[test]
@@ -229,7 +265,7 @@ mod tests {
             write: Some(AccessLevel::Ask),
             read: None,
         });
-        let level = evaluate_policy("POST", "/x", None, None, &def);
+        let level = evaluate_policy("POST", "/x", None, None, &def, None);
         assert_eq!(level, AccessLevel::Ask);
     }
 }

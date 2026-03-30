@@ -677,12 +677,57 @@ fn push_to_provisioner(secrets: serde_json::Value, proxy_port: u16) {
         // on the latest SafeClaw protocol without relying on hot reload.
         let mut needs_restart = true;
 
-        // Push telegram token as a config op so the provisioner writes it into
-        // the OpenClaw config (channels.telegram.token).
+        // Build config patch from vault secrets.
+        let mut config_patch = serde_json::json!({});
+
+        // Telegram: token + ownerId for OpenClaw channel config.
         if let Some(token) = telegram_token {
+            let mut tg_patch = serde_json::json!({ "token": token });
+            // Extract ownerId if present (stored alongside token in vault config).
+            if let Some(owner_id) = secrets
+                .get("services").and_then(|s| s.get("telegram"))
+                .and_then(|t| t.get("owner_id").or_else(|| t.get("ownerId")))
+                .and_then(|o| o.as_str())
+            {
+                tg_patch["ownerId"] = serde_json::json!(owner_id);
+            }
+            config_patch["channels"] = serde_json::json!({ "telegram": tg_patch });
+        }
+
+        // Model config (primary + fallback).
+        if let Some(model) = secrets.get("model") {
+            config_patch["model"] = model.clone();
+        }
+
+        // Pass service names so provisioner knows which providers to register.
+        if let Some(svcs) = secrets.get("services").and_then(|s| s.as_object()) {
+            let svc_keys: serde_json::Value = svcs.keys()
+                .map(|k| serde_json::Value::String(k.clone()))
+                .collect::<Vec<_>>()
+                .into();
+            config_patch["services"] = serde_json::json!({});
+            for k in svcs.keys() {
+                config_patch["services"][k] = serde_json::json!(true);
+            }
+        }
+
+        if config_patch.as_object().map_or(false, |o| !o.is_empty()) {
             ops.push(serde_json::json!({
                 "type": "config",
-                "patch": { "channels": { "telegram": { "token": token } } }
+                "patch": config_patch
+            }));
+            needs_restart = true;
+        }
+
+        // WeChat: push channel op if wechat service exists in vault.
+        let has_wechat = secrets
+            .get("services")
+            .and_then(|s| s.get("wechat"))
+            .is_some();
+        if has_wechat {
+            ops.push(serde_json::json!({
+                "type": "channel",
+                "patch": { "wechat": true }
             }));
             needs_restart = true;
         }

@@ -385,8 +385,14 @@ mod tests {
         }
 
         #[test]
-        fn default_policy_is_allow() {
-            let level = evaluate_policy("GET", "/foo", None, None, &defaults());
+        fn default_policy_is_ask_always() {
+            let level = evaluate_policy("GET", "/foo", None, None, &defaults(), None);
+            assert_eq!(level, AccessLevel::AskAlways);
+        }
+
+        #[test]
+        fn llm_category_is_allow() {
+            let level = evaluate_policy("POST", "/v1/chat", None, None, &defaults(), Some("llm"));
             assert_eq!(level, AccessLevel::Allow);
         }
 
@@ -396,7 +402,7 @@ mod tests {
                 write: Some(AccessLevel::Ask),
                 read: None,
             };
-            let level = evaluate_policy("POST", "/data", None, Some(&levels), &defaults());
+            let level = evaluate_policy("POST", "/data", None, Some(&levels), &defaults(), None);
             assert_eq!(level, AccessLevel::Ask);
         }
 
@@ -418,18 +424,20 @@ mod tests {
                 Some(&rules),
                 Some(&levels),
                 &defaults(),
+                None,
             );
             assert_eq!(level, AccessLevel::AskAlways);
         }
 
         #[test]
-        fn get_not_ask_when_only_write_ask() {
+        fn get_falls_to_global_default_when_only_write_set() {
             let levels = ServiceLevels {
                 write: Some(AccessLevel::Ask),
                 read: None,
             };
-            let level = evaluate_policy("GET", "/data", None, Some(&levels), &defaults());
-            assert_eq!(level, AccessLevel::Allow);
+            // No read at service level, no category → falls to global default (ask-always)
+            let level = evaluate_policy("GET", "/data", None, Some(&levels), &defaults(), None);
+            assert_eq!(level, AccessLevel::AskAlways);
         }
 
         #[test]

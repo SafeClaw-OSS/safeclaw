@@ -72,7 +72,7 @@ fn auth_display(svc: &serde_json::Value) -> String {
 fn level_display(svc: &serde_json::Value) -> String {
     let levels = match svc.get("levels") {
         Some(l) if !l.is_null() => l,
-        _ => return "allow".to_string(),
+        _ => return "ask-always".to_string(),
     };
     let write = levels.get("write").and_then(|l| l.as_str());
     let read = levels.get("read").and_then(|l| l.as_str());
@@ -81,7 +81,7 @@ fn level_display(svc: &serde_json::Value) -> String {
         (Some(w), Some(r)) => format!("write:{}, read:{}", w, r),
         (Some(w), None) => format!("write:{}", w),
         (None, Some(r)) => format!("read:{}", r),
-        (None, None) => "allow".to_string(),
+        (None, None) => "ask-always".to_string(),
     }
 }
 
@@ -138,7 +138,7 @@ mod tests {
     fn safeclaw_md_level_display_same() {
         let s = generate_safeclaw_md(&two_service_secrets(), false, 23295);
         // anthropic has write:allow, read:allow → just "allow"
-        assert!(s.contains("allow"));
+        assert!(s.contains("| allow |"));
     }
 
     #[test]
