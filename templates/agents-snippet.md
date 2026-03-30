@@ -4,5 +4,5 @@
   overwrite this block on each vault sync. Do not remove the markers.
 -->
 <!-- SAFECLAW:BEGIN — managed by SafeClaw. Do not edit inside this block; changes will be overwritten on next sync. -->
-This agent's API credentials are managed by [SafeClaw](https://github.com/xhyumiracle/safeclaw). See `safeclaw.md` for registered services and proxy URLs.
+**IMPORTANT: This agent has external services (email, calendar, search, etc.) available via SafeClaw proxy.** Before telling the user you cannot access an external service, **always read `safeclaw.md` first** — it lists all registered services and how to call them. If the user asks about email, calendar, files, or any web service, read `safeclaw.md` immediately.
 <!-- SAFECLAW:END -->
