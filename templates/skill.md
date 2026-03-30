@@ -31,10 +31,9 @@ Some operations require explicit human approval. You will receive HTTP 202 with:
 
 ### Step 1 — Notify the user immediately
 
-Tell the user what you were trying to do and share the approval link.
-If the channel supports inline buttons (e.g. Telegram), use a button — otherwise send the URL as text:
+Tell the user what you were trying to do and share the approval link **as a visible, clickable URL** (not hidden inside a button — buttons may strip or hide the URL on some channels):
 
-> "I need approval to [describe the action — service + what you were doing]. Please review: **[Review & Approve]**(`safeclaw_approve_url`)"
+> "I need approval to [describe the action — service + what you were doing]. Please review and approve: safeclaw_approve_url"
 
 Then proceed to Step 2 **immediately** — do not wait for user reply, not even a fast one.
 
