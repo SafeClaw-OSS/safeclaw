@@ -130,7 +130,7 @@ fn write_index(state: &AppState, secrets: &Value) -> std::io::Result<()> {
 /// Decrypt vault.enc into a JSON Value using passkey auth credentials.
 fn decrypt_vault_json(state: &AppState, auth: &AuthenticatedRequest) -> Result<Value> {
     let user_key_b64 = auth.get_str("userKey")?;
-    let user_key = STANDARD
+    let mut user_key = STANDARD
         .decode(user_key_b64)
         .map_err(|e| AppError::BadRequest(format!("Invalid userKey: {}", e)))?;
 
@@ -140,6 +140,7 @@ fn decrypt_vault_json(state: &AppState, auth: &AuthenticatedRequest) -> Result<V
         .data_dir
         .join(format!("wrapped_dek_{}.bin", fname));
     if !wrapped_path.exists() {
+        user_key.zeroize();
         return Err(AppError::Unauthorized(
             "No wrapped DEK for this credential".into(),
         ));
@@ -147,6 +148,7 @@ fn decrypt_vault_json(state: &AppState, auth: &AuthenticatedRequest) -> Result<V
 
     let sk_d = jwk_sk_d_bytes(&state.keypair.sk)?;
     let mut kek = derive_kek(&user_key, &sk_d)?;
+    user_key.zeroize();
     let wrapped = fs::read(&wrapped_path)?;
     let mut dek = unwrap_dek(&wrapped, &kek)?;
     kek.zeroize();
@@ -920,6 +922,9 @@ pub async fn vault_files_read_approved(
     let approval_id = params.get("approval").ok_or_else(|| {
         AppError::BadRequest("Missing approval parameter".into())
     })?;
+    if approval_id.len() > 64 {
+        return Err(AppError::BadRequest("Invalid approval id".into()));
+    }
 
     // Take DEK from pending_deks (one-time use)
     let mut dek = {

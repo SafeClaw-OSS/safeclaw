@@ -457,7 +457,7 @@ async fn proxy_handler(
     };
 
     if needs_approval {
-        let timeout = policy_defaults.timeout.unwrap_or(300);
+        let timeout = policy_defaults.timeout.unwrap_or(300).max(10).min(3600);
 
         // Sanitised details (no secrets) for the console approve page
         let details = {

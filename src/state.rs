@@ -190,10 +190,16 @@ impl VaultState {
         );
     }
 
-    /// Remove expired approval sessions from cache (zeroize credentials).
+    /// Remove expired approval sessions from cache (overwrite credentials before dropping).
     pub fn cleanup_expired_sessions(&self) {
         let mut cache = self.approval_cache.lock().unwrap();
         let now = Instant::now();
+        // Overwrite auth values before dropping expired sessions
+        for session in cache.values_mut() {
+            if session.expires_at <= now {
+                session.auth = serde_json::Value::Null;
+            }
+        }
         cache.retain(|_, session| session.expires_at > now);
     }
 
