@@ -141,18 +141,30 @@ impl VaultState {
         *self.service_names.lock().unwrap() = names;
         *self.policy_defaults.lock().unwrap() = policy_defaults;
         *self.push_subscriptions.lock().unwrap() = push_subs;
-        *self.secrets.lock().unwrap() = Some(secrets);
+        // Zeroize old secrets before replacing
+        {
+            let mut guard = self.secrets.lock().unwrap();
+            crate::secret_json::zeroize_json_option(&mut *guard);
+            *guard = Some(secrets);
+        }
     }
 
-    /// Lock the vault — clear all in-memory secrets.
+    /// Lock the vault — zeroize and clear all in-memory secrets.
     pub fn lock(&self) {
-        *self.secrets.lock().unwrap() = None;
+        // Zeroize vault secrets (API keys, OAuth tokens, etc.) before drop
+        crate::secret_json::zeroize_json_option(&mut *self.secrets.lock().unwrap());
         *self.service_names.lock().unwrap() = Vec::new();
         *self.approval_cache.lock().unwrap() = HashMap::new();
         *self.push_subscriptions.lock().unwrap() = Vec::new();
         *self.policy_defaults.lock().unwrap() = PolicyDefaults::default();
         *self.oauth2_tokens.lock().unwrap() = HashMap::new();
-        *self.vapid_private_key.lock().unwrap() = None;
+        // Zeroize VAPID private key string
+        {
+            use zeroize::Zeroize;
+            let mut vpk = self.vapid_private_key.lock().unwrap();
+            if let Some(ref mut s) = *vpk { s.zeroize(); }
+            *vpk = None;
+        }
         *self.vapid_public_key.lock().unwrap() = None;
         {
             use zeroize::Zeroize;

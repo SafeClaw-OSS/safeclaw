@@ -7,6 +7,7 @@ mod error;
 mod generate;
 mod policy;
 mod proxy;
+mod secret_json;
 mod server;
 mod state;
 mod update;
