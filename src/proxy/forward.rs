@@ -64,6 +64,9 @@ pub struct AuthConfig {
     /// Cached access token (in-memory only; never written back to vault)
     pub access_token: Option<String>,
     pub expires_at: Option<u64>,
+
+    // For OpenAI Codex OAuth (chatgpt.com/backend-api)
+    pub account_id: Option<String>,
 }
 
 // ── Routing ────────────────────────────────────────────────────────────────────
@@ -113,6 +116,7 @@ pub async fn refresh_oauth2_token(
 
     // Anthropic requires JSON body for token refresh; others use form-urlencoded
     let is_anthropic = token_url.contains("anthropic.com") || token_url.contains("platform.claude.com");
+    tracing::info!("oauth2 refresh: token_url={} is_anthropic={}", token_url, is_anthropic);
 
     let resp = if is_anthropic {
         // JSON body with scope (matches Claude Code CLI refresh)
@@ -148,7 +152,10 @@ pub async fn refresh_oauth2_token(
     };
 
     if !resp.status().is_success() {
-        return Err(format!("oauth2 refresh returned HTTP {}", resp.status()));
+        let status = resp.status();
+        let body_text = resp.text().await.unwrap_or_else(|_| "<no body>".to_string());
+        tracing::warn!("oauth2 refresh error body: {}", body_text);
+        return Err(format!("oauth2 refresh returned HTTP {} — {}", status, body_text));
     }
 
     let body: serde_json::Value = resp
@@ -361,10 +368,38 @@ pub async fn forward_request(
                         fwd_headers.insert(
                             reqwest::header::USER_AGENT,
                             reqwest::header::HeaderValue::from_static(
-                                "claude-cli/2.1.2 (external, cli)",
+                                "claude-cli/2.1.87 (external, cli)",
                             ),
                         );
+                        // Claude Code also sends a session ID header
+                        let session_id = uuid::Uuid::new_v4().to_string();
+                        if let Ok(hv) = reqwest::header::HeaderValue::from_str(&session_id) {
+                            fwd_headers.insert(
+                                reqwest::header::HeaderName::from_static("x-claude-code-session-id"),
+                                hv,
+                            );
+                        }
                     }
+                }
+            }
+        }
+    }
+
+    // OpenAI Codex OAuth (chatgpt.com/backend-api) requires account ID and beta header
+    if resolved_bearer.is_some() {
+        if let Some(a) = auth {
+            if a.auth_type == "oauth2" {
+                if let Some(account_id) = &a.account_id {
+                    if let Ok(hv) = reqwest::header::HeaderValue::from_str(account_id) {
+                        fwd_headers.insert(
+                            reqwest::header::HeaderName::from_static("chatgpt-account-id"),
+                            hv,
+                        );
+                    }
+                    fwd_headers.insert(
+                        reqwest::header::HeaderName::from_static("openai-beta"),
+                        reqwest::header::HeaderValue::from_static("responses=experimental"),
+                    );
                 }
             }
         }
