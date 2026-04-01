@@ -210,7 +210,7 @@ impl AuditLog {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, service, method, path, status, created_at, expires_at, decided_at \
-             FROM approvals WHERE status = 'pending' ORDER BY created_at DESC",
+             FROM approvals WHERE status = 'pending' AND expires_at > datetime('now') ORDER BY created_at DESC",
         )?;
         let rows = stmt.query_map(params![], row_to_approval)?;
         rows.collect()
