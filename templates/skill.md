@@ -3,19 +3,19 @@ name: safeclaw
 description: 'SafeClaw proxy protocol handler. Load when your API calls are routed through SafeClaw (localhost:23295 or remote proxy). Teaches you how to handle vault-locked responses and approval-required flows.'
 ---
 
-# SafeClaw Proxy
+# SafeClaw Proxy Protocol
 
 SafeClaw is a local API key vault and proxy. Your calls to the proxy are forwarded to upstream services with credentials injected automatically.
 
-## Vault Locked
+## 1. Vault locked
 
 If the proxy response contains `safeclaw_unlock_url`, the vault is locked.
 
-**Do not retry automatically.** Tell the user the vault is locked and provide the unlock URL. Create an inline button labeled "🔓 Unlock" linking to the URL. Then stop and wait for the user to confirm they've unlocked before retrying.
+**Action:** Tell the user the vault is locked, provide the unlock URL as a clickable link, and create an inline button labeled "🔓 Unlock" linking to the URL. Then **stop and wait** — do not retry until the user confirms they have unlocked.
 
-## Approval Required (HTTP 202)
+## 2. Approval required (HTTP 202)
 
-Some operations require explicit human approval. You will receive HTTP 202 with:
+Some operations require human approval. When you receive HTTP 202, the response body looks like:
 
 ```json
 {
@@ -25,62 +25,57 @@ Some operations require explicit human approval. You will receive HTTP 202 with:
 }
 ```
 
-**RULE: After receiving 202, you must NEVER call the same API endpoint again for this task.** The approved result is retrieved via `GET http://localhost:23295/approve/<approval-id>` — not by re-sending the original request. Re-sending creates an infinite approval loop.
+### The one rule
 
-### Step 1 — Notify the user and wait
+**After receiving 202, NEVER call the original API endpoint again for this task.** The result is retrieved via the approval ID — not by re-sending the request. Re-sending creates a new approval each time, causing an infinite loop where the user's approvals never match your requests.
+
+### Step 1 — Ask the user to approve
 
 Send a message with:
 1. What you were trying to do (service + action)
-2. The approval URL as visible clickable text
-3. Create an inline button labeled "✅ Done" — when tapped, it should send a message like "Done" back to the chat so you know the user has approved
+2. The `safeclaw_approve_url` as clickable text
+3. An inline button labeled "✅ Done" that sends "Done" back to the chat
 
-Example message:
-
-> I need approval to read your Gmail inbox.
-> Please review and approve: safeclaw_approve_url
-> Tap ✅ Done after you've approved.
-
-Then **stop and wait** — do nothing until the user taps the Done button or replies.
-
-**CRITICAL: Do NOT re-send the original API call after the user responds.** That creates a new approval request (infinite loop). Always retrieve the result by polling the approval ID (Step 2).
+Then **stop and wait** for the user to tap Done or reply.
 
 ### Step 2 — Retrieve the result
 
-When the user taps Done or replies, make a **GET request** to retrieve the result:
+When the user confirms, make a **GET** request to:
 
 ```
 GET http://localhost:23295/approve/<approval-id>
 ```
 
-Use whatever HTTP tool you have (fetch, curl, http request, etc.) to make this GET request. This is the **only** way to get the result. Do NOT call the original API again.
+This is the **only** way to get the result. Do NOT call the original API again.
 
-**Response when approved:**
+**Response statuses:**
+
+| Status | Meaning | Action |
+|--------|---------|--------|
+| `"approved"` | User approved | Use `response.body` — it contains the full upstream API response |
+| `"pending"` | User hasn't acted yet | Ask them to complete the approval |
+| `"rejected"` | User denied | Tell the user the request was denied |
+| 404 | Expired or not found | Tell the user it expired; start over if needed |
+
+**Approved response format:**
 ```json
 {
   "status": "approved",
   "response": {
     "status": 200,
-    "headers": { ... },
-    "body": { ...the actual API response data... }
+    "headers": { "..." },
+    "body": { "...the actual API response data..." }
   }
 }
 ```
 
-Use `response.body` — it contains the complete API result (e.g. the email data, calendar events, etc.). Continue your original task with this data.
+### Important notes
 
-**Other statuses:**
-- `"rejected"` — tell the user the request was denied.
-- `"pending"` — the user hasn't acted yet. Ask them to complete the approval first.
-- 404 — the approval expired.
+- Each 202 is independent — multiple API calls in one task may each trigger their own 202.
+- Polling is always **GET** regardless of the original method (POST, PUT, etc.).
+- `expires_at` is a unix timestamp. After expiry the approval is gone.
+- Streaming requests: the approved `response` is complete buffered JSON.
 
-### Notes
+## 3. Dummy API key
 
-- **Each 202 is independent** — if your task makes multiple API calls, each may trigger its own 202.
-- **Polling is always GET** regardless of original method (POST, PUT, etc.)
-- **Streaming requests**: approved `response` will be complete buffered JSON
-- **Expiry**: `expires_at` is a unix timestamp.
-- **Not found (404)**: treat same as expired
-
-## Dummy API Key
-
-Your config may contain a placeholder key like `sk-dummy`. This is intentional — SafeClaw intercepts requests and injects the real key from the encrypted vault. Do not replace it, expose it, or treat it as sensitive.
+Your config may contain a placeholder key like `sk-dummy` or `sk-safeclaw-proxy`. This is intentional — SafeClaw intercepts requests and injects the real key from the encrypted vault. Do not replace it, expose it, or treat it as sensitive.

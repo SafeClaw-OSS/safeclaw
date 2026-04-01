@@ -701,15 +701,13 @@ fn push_to_provisioner(secrets: serde_json::Value, proxy_port: u16) {
             config_patch["model"] = model.clone();
         }
 
-        // Pass service names so provisioner knows which providers to register.
+        // Pass full service data so provisioner can extract auth tokens (e.g. access_token
+        // for openai-codex OAuth). Previously only passed `true` as a presence marker,
+        // which caused extractAccountId to always fail with "sk-safeclaw-proxy" as apiKey.
         if let Some(svcs) = secrets.get("services").and_then(|s| s.as_object()) {
-            let svc_keys: serde_json::Value = svcs.keys()
-                .map(|k| serde_json::Value::String(k.clone()))
-                .collect::<Vec<_>>()
-                .into();
             config_patch["services"] = serde_json::json!({});
-            for k in svcs.keys() {
-                config_patch["services"][k] = serde_json::json!(true);
+            for (k, v) in svcs {
+                config_patch["services"][k] = v.clone();
             }
         }
 

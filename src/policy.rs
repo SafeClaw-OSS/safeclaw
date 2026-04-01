@@ -77,6 +77,10 @@ impl Default for PolicyDefaults {
             write: Some(AccessLevel::Allow),
             read: Some(AccessLevel::Allow),
         });
+        type_levels.insert("channel".into(), ServiceLevels {
+            write: Some(AccessLevel::Allow),
+            read: Some(AccessLevel::Allow),
+        });
         Self {
             timeout: Some(300),
             levels: Some(ServiceLevels {
