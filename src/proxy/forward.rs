@@ -111,23 +111,41 @@ pub async fn refresh_oauth2_token(
         .as_ref()
         .ok_or("oauth2: missing refresh_token")?;
 
-    // Build form params — client_secret is optional (public clients use PKCE without it)
-    let mut form_params = vec![
-        ("grant_type", "refresh_token"),
-        ("client_id", client_id.as_str()),
-        ("refresh_token", refresh_token.as_str()),
-    ];
-    let client_secret = auth.client_secret.as_deref();
-    if let Some(secret) = client_secret {
-        form_params.push(("client_secret", secret));
-    }
+    // Anthropic requires JSON body for token refresh; others use form-urlencoded
+    let is_anthropic = token_url.contains("anthropic.com") || token_url.contains("platform.claude.com");
 
-    let resp = HTTP_CLIENT
-        .post(token_url)
-        .form(&form_params)
-        .send()
-        .await
-        .map_err(|e| format!("oauth2 refresh request failed: {}", e))?;
+    let resp = if is_anthropic {
+        // JSON body with scope (matches Claude Code CLI refresh)
+        let body = serde_json::json!({
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "client_id": client_id,
+        });
+        HTTP_CLIENT
+            .post(token_url)
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("oauth2 refresh request failed: {}", e))?
+    } else {
+        // Standard form-urlencoded (OpenAI, Google, etc.)
+        let mut form_params = vec![
+            ("grant_type", "refresh_token"),
+            ("client_id", client_id.as_str()),
+            ("refresh_token", refresh_token.as_str()),
+        ];
+        let client_secret = auth.client_secret.as_deref();
+        if let Some(secret) = client_secret {
+            form_params.push(("client_secret", secret));
+        }
+        HTTP_CLIENT
+            .post(token_url)
+            .form(&form_params)
+            .send()
+            .await
+            .map_err(|e| format!("oauth2 refresh request failed: {}", e))?
+    };
 
     if !resp.status().is_success() {
         return Err(format!("oauth2 refresh returned HTTP {}", resp.status()));
@@ -350,6 +368,17 @@ pub async fn forward_request(
                 }
             }
         }
+    }
+
+    // Debug: log outgoing headers for OAuth requests
+    if resolved_bearer.is_some() {
+        let has_beta = fwd_headers.contains_key("anthropic-beta");
+        let ua = fwd_headers.get(reqwest::header::USER_AGENT).map(|v| v.to_str().unwrap_or("?").to_string());
+        let has_xapi = fwd_headers.contains_key("x-api-key");
+        tracing::info!(
+            "oauth2 forward: url={} has_anthropic_beta={} user_agent={:?} has_x_api_key={}",
+            full_url, has_beta, ua, has_xapi
+        );
     }
 
     // Convert method
