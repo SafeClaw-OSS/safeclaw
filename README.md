@@ -112,6 +112,21 @@ data/
 | `--on-setup-hook` | `SAFECLAW_ON_SETUP_HOOK` | — | Webhook URL for non-secret setup data |
 | `--init` | — | — | Generate server keypair and exit |
 
+## Update
+
+```bash
+# Check for new version
+./safeclaw update --check
+
+# Update templates only (hot reload, no restart needed)
+./safeclaw update --templates
+
+# Full update (binary + templates, restart required)
+./safeclaw update
+```
+
+Templates (skill.md, safeclaw.md, agents-snippet.md) are stored in `$SAFECLAW_DATA/templates/` and read at runtime. Template updates take effect immediately without restarting SafeClaw.
+
 ## Build from source
 
 ```bash
@@ -154,6 +169,7 @@ cargo build --release
 |--------|------|-------------|
 | POST | `/vault/lock` | Wipe keys from memory |
 | POST | `/vault/update` | Update stored secrets |
+| POST | `/admin/upgrade` | Trigger self-update (downloads latest templates/binary) |
 
 ### Services (authenticated)
 
@@ -269,4 +285,4 @@ The setup payload has two categories:
 
 ## License
 
-MIT — see [LICENSE](LICENSE)
+Apache 2.0 — see [LICENSE](LICENSE)

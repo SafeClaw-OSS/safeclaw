@@ -64,14 +64,13 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Resolve where templates should be written.
-/// Priority: $SAFECLAW_DATA/templates → ./templates
-/// Unlike read_template (which also checks ./templates at cwd), this always
-/// prefers the data dir so updates persist across container restarts.
+/// Always uses $SAFECLAW_DATA/templates/ (matches read_template() source).
 fn resolve_templates_dir() -> PathBuf {
     if let Ok(data) = std::env::var("SAFECLAW_DATA") {
         return PathBuf::from(&data).join("templates");
     }
-    PathBuf::from("templates")
+    // Fallback for bare-metal users without SAFECLAW_DATA set
+    PathBuf::from("./data/templates")
 }
 
 /// Fetch latest release info from GitHub API.

@@ -1,19 +1,12 @@
 /// Workspace file generation: safeclaw.md and AGENTS.md snippets.
 
-/// Read a template file at runtime, with compile-time fallback.
+/// Read a template file at runtime from `$SAFECLAW_DATA/templates/`.
+/// Falls back to the compile-time embedded version if the file isn't found.
 pub fn read_template(name: &str, fallback: &str) -> String {
-    // Try: ./templates/{name}, then $SAFECLAW_DATA/templates/{name}
-    let paths = [
-        format!("templates/{}", name),
-        std::env::var("SAFECLAW_DATA")
-            .map(|d| format!("{}/templates/{}", d, name))
-            .unwrap_or_default(),
-    ];
-    for p in &paths {
-        if !p.is_empty() {
-            if let Ok(content) = std::fs::read_to_string(p) {
-                return content;
-            }
+    if let Ok(data) = std::env::var("SAFECLAW_DATA") {
+        let path = format!("{}/templates/{}", data, name);
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            return content;
         }
     }
     fallback.to_string()
