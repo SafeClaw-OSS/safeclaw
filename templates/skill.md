@@ -29,6 +29,8 @@ Some operations require explicit human approval. You will receive HTTP 202 with:
 }
 ```
 
+**RULE: After receiving 202, you must NEVER call the same API endpoint again for this task.** The approved result is retrieved via `GET http://localhost:23295/approve/<id>` — not by re-sending the original request. Re-sending creates an infinite approval loop.
+
 ### Step 1 — Notify the user and wait
 
 Send a message with:
@@ -48,28 +50,32 @@ Then **stop and wait** for the user to click Done or reply.
 
 ### Step 2 — Retrieve the result
 
-When the user clicks Done or tells you they've approved/rejected, poll the approval endpoint:
+When the user clicks Done or tells you they've approved/rejected, make a **GET request** to retrieve the result:
 
 ```
-curl -sf http://localhost:23295/approve/<id>
+GET http://localhost:23295/approve/<id>
 ```
 
-**Approved response:**
+Use whatever HTTP tool you have (fetch, curl, http request, etc.) to make this GET request. This is the **only** way to get the result. Do NOT call the original API again.
+
+**Response when approved:**
 ```json
 {
   "status": "approved",
   "response": {
     "status": 200,
     "headers": { ... },
-    "body": { ...upstream API response... }
+    "body": { ...the actual API response data... }
   }
 }
 ```
 
-- If `status` is `"approved"`: use `response.body` as the API result. Continue the original task.
-- If `status` is `"rejected"`: tell the user the request was denied.
-- If `status` is `"pending"`: the user hasn't acted yet. Ask them to complete the approval first.
-- If 404: the approval expired.
+Use `response.body` — it contains the complete API result (e.g. the email data, calendar events, etc.). Continue your original task with this data.
+
+**Other statuses:**
+- `"rejected"` — tell the user the request was denied.
+- `"pending"` — the user hasn't acted yet. Ask them to complete the approval first.
+- 404 — the approval expired.
 
 ### Notes
 
