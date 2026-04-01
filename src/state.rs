@@ -144,7 +144,7 @@ impl VaultState {
         // Zeroize old secrets before replacing
         {
             let mut guard = self.secrets.lock().unwrap();
-            crate::secret_json::zeroize_json_option(&mut *guard);
+            crate::zeroize_json::zeroize_json_option(&mut *guard);
             *guard = Some(secrets);
         }
     }
@@ -152,7 +152,7 @@ impl VaultState {
     /// Lock the vault — zeroize and clear all in-memory secrets.
     pub fn lock(&self) {
         // Zeroize vault secrets (API keys, OAuth tokens, etc.) before drop
-        crate::secret_json::zeroize_json_option(&mut *self.secrets.lock().unwrap());
+        crate::zeroize_json::zeroize_json_option(&mut *self.secrets.lock().unwrap());
         *self.service_names.lock().unwrap() = Vec::new();
         *self.approval_cache.lock().unwrap() = HashMap::new();
         *self.push_subscriptions.lock().unwrap() = Vec::new();
