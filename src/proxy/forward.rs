@@ -321,6 +321,30 @@ pub async fn forward_request(
         }
     }
 
+    // Anthropic OAuth requires special beta header and user-agent to work
+    if resolved_bearer.is_some() {
+        if let Some(a) = auth {
+            if a.auth_type == "oauth2" {
+                if let Some(token_url) = &a.token_url {
+                    if token_url.contains("anthropic.com") {
+                        fwd_headers.insert(
+                            reqwest::header::HeaderName::from_static("anthropic-beta"),
+                            reqwest::header::HeaderValue::from_static(
+                                "oauth-2025-04-20,interleaved-thinking-2025-05-14",
+                            ),
+                        );
+                        fwd_headers.insert(
+                            reqwest::header::USER_AGENT,
+                            reqwest::header::HeaderValue::from_static(
+                                "claude-cli/2.1.2 (external, cli)",
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     // Convert method
     let reqwest_method = match method.as_str() {
         "GET" => reqwest::Method::GET,
