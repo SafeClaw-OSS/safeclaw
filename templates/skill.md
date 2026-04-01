@@ -29,59 +29,32 @@ Some operations require explicit human approval. You will receive HTTP 202 with:
 }
 ```
 
-### Step 1 — Notify the user immediately
+### Step 1 — Notify the user and wait
 
-Tell the user what you were trying to do and share the approval link **as a visible, clickable URL** (not hidden inside a button — buttons may strip or hide the URL on some channels):
+Send a message with:
+1. What you were trying to do (service + action)
+2. The approval URL as visible clickable text
+3. An inline button labeled "Done" that the user clicks after approving on the web
 
-> "I need approval to [describe the action — service + what you were doing]. Please review and approve: safeclaw_approve_url"
+Example message:
 
-Then proceed to Step 2 **immediately** — do not wait for user reply, not even a fast one.
+> I need approval to read your Gmail inbox.
+> Please review and approve: safeclaw_approve_url
+> Tap **Done** below after you've approved or rejected.
 
-### Step 2 — Set up an approval watcher (required)
+Then **stop and wait** for the user to click Done or reply.
 
-**Before continuing, verify:**
-- [ ] I told the user what needs approval and shared the link
-- [ ] I am creating the watcher **right now**, not waiting for user input
-- [ ] I will not ask "let me know when you've approved" unless watcher creation fails
+**CRITICAL: Do NOT re-send the original API call after the user responds.** That creates a new approval request (infinite loop). Always retrieve the result by polling the approval ID (Step 2).
 
-Manual polling after a user reply is **only** allowed if watcher creation explicitly failed. In that case, tell the user: "I couldn't create the approval watcher, so I'll need you to tell me after approving."
+### Step 2 — Retrieve the result
 
-You MUST create an isolated cron job that polls the approval endpoint every second. When approved, the watcher sends a resume signal to your main session via CLI so you can continue automatically.
-
-Create the watcher cron:
-
-```json
-{
-  "action": "add",
-  "job": {
-    "name": "safeclaw-approval-<id>",
-    "schedule": { "kind": "every", "everyMs": 1000 },
-    "sessionTarget": "isolated",
-    "payload": {
-      "kind": "agentTurn",
-      "message": "SafeClaw approval watcher.\nApproval id: <id>\nPoll URL: http://localhost:23295/approve/<id>\nExpires at: <expires_at>\nOriginal task: <one-line description of what the user asked>\n\nInstructions:\n1. Check current time vs expires_at. If expired: send expiry notification via CLI (see step 5), then self-disable (see step 6).\n2. Run: curl -sf http://localhost:23295/approve/<id>\n3. If status=pending: reply HEARTBEAT_OK (this is a no-op, costs nothing)\n4. If status=approved: Send resume signal via CLI (see step 5), then self-disable (see step 6).\n5. If status=rejected or 404: Send rejection/expiry notification via CLI (see step 5), then self-disable (see step 6).\n\nStep 5 — Sending the resume signal:\nIMPORTANT: Do NOT use the cron tool to create a systemEvent. Instead, use the exec tool to run this CLI command:\n\nFor approved:\nexec: openclaw cron add --name safeclaw-resume-<id> --every 1s --delete-after-run --system-event \"SafeClaw approval <id> APPROVED. Original task: <task>. API response: <format response.body as clean readable text, not raw JSON dump>. Continue executing the original task using this data.\"\n\nFor rejected:\nexec: openclaw cron add --name safeclaw-resume-<id> --every 1s --delete-after-run --system-event \"SafeClaw approval <id> REJECTED. Original task: <task>. The user denied this request.\"\n\nFor expired:\nexec: openclaw cron add --name safeclaw-resume-<id> --every 1s --delete-after-run --system-event \"SafeClaw approval <id> EXPIRED. Original task: <task>. The approval timed out.\"\n\nThe CLI command creates a gateway-level systemEvent that reaches the real main session (unlike cron tool calls from isolated sessions which are scoped).\n\nStep 6 — Self-cleanup (CRITICAL — must run after step 5):\nTo prevent this watcher from running again, find your own UUID and remove:\nexec: openclaw cron list --json\nParse the JSON output, find the job where name equals \"safeclaw-approval-<id>\", extract its \"id\" (UUID), then:\nexec: openclaw cron rm <UUID>"
-    },
-    "delivery": { "mode": "none" }
-  }
-}
-```
-
-If you do not have a `cron` tool, use `exec` to run `openclaw cron add` CLI instead:
+When the user clicks Done or tells you they've approved/rejected, poll the approval endpoint:
 
 ```
-openclaw cron add --name safeclaw-approval-<id> --every 1s --session isolated --no-deliver --message "SafeClaw approval watcher. Approval id: <id>. Poll URL: http://localhost:23295/approve/<id>. Expires at: <expires_at>. Original task: <task>. Instructions: 1. Check time vs expires_at, if expired send expiry via CLI then remove job. 2. Run curl -sf http://localhost:23295/approve/<id>. 3. If pending: reply HEARTBEAT_OK. 4. If approved: send resume signal via CLI then remove job. 5. If rejected/404: send rejection via CLI then remove job."
+curl -sf http://localhost:23295/approve/<id>
 ```
 
-If neither works, tell the user "I couldn't create the approval watcher, so I'll need you to tell me after approving." and poll once on their reply.
-
-**Key design points:**
-- The isolated watcher polls cheaply (HEARTBEAT_OK = zero cost when pending)
-- On approval, it uses `exec` + `openclaw cron add --system-event` CLI to create a gateway-level systemEvent
-- This bypasses session scoping — the CLI creates the event at gateway level, reaching your real main session
-- Your main session receives the systemEvent with full task context and continues automatically
-- The watcher formats `response.body` as clean readable text (not raw JSON dump)
-
-**Approved response structure** (from GET /approve/\<id\>):
+**Approved response:**
 ```json
 {
   "status": "approved",
@@ -93,38 +66,17 @@ If neither works, tell the user "I couldn't create the approval watcher, so I'll
 }
 ```
 
-### Step 3 — Get the result after approval
-
-The result is **always** retrieved the same way — poll the approval endpoint:
-```
-curl -sf http://localhost:23295/approve/<id>
-```
-When `status` is `"approved"`, `response.body` contains the full API result. **Never re-send the original API call** — that creates a new approval (infinite loop).
-
-The watcher from Step 2 handles this automatically. But if the user tells you "I approved it" before the watcher fires, you must poll manually:
-
-**Priority: automatic watcher is always preferred.** Manual poll is a fallback only when:
-- The user explicitly says they approved and the watcher hasn't fired yet
-- The watcher failed to start
-
-**After getting the result (via either path):**
-1. Send a brief acknowledgment (e.g. "Approved — processing now.")
-2. **Always clean up the watcher cron job** — even if you got the result manually:
-   ```
-   exec: openclaw cron list --json
-   ```
-   Find jobs with names starting with `safeclaw-approval-<id>` or `safeclaw-resume-<id>` and remove by UUID:
-   ```
-   exec: openclaw cron rm <uuid>
-   ```
-3. Continue the original task with the data.
+- If `status` is `"approved"`: use `response.body` as the API result. Continue the original task.
+- If `status` is `"rejected"`: tell the user the request was denied.
+- If `status` is `"pending"`: the user hasn't acted yet. Ask them to complete the approval first.
+- If 404: the approval expired.
 
 ### Notes
 
-- **Each 202 is independent** — if your task makes multiple API calls, each may trigger its own 202. Create a separate watcher per id.
+- **Each 202 is independent** — if your task makes multiple API calls, each may trigger its own 202.
 - **Polling is always GET** regardless of original method (POST, PUT, etc.)
 - **Streaming requests**: approved `response` will be complete buffered JSON
-- **Expiry**: `expires_at` is a unix timestamp. Watcher checks it each run.
+- **Expiry**: `expires_at` is a unix timestamp.
 - **Not found (404)**: treat same as expired
 
 ## Dummy API Key
