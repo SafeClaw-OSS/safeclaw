@@ -16,13 +16,14 @@ Your AI Agent → SafeClaw Proxy (localhost:23295) → OpenAI / Anthropic / Goog
 - **No plaintext keys** — API keys are encrypted at rest with your biometric
 - **No passwords to remember** — unlock with Touch ID, Windows Hello, or a security key
 - **No code changes** — point your agent at `localhost:23295` instead of the API directly
-- **Single binary** — ~4MB, no runtime dependencies, runs anywhere
+- **Single binary** — ~5MB, no runtime dependencies, runs anywhere
 
 ## Quick start
 
 ```bash
-# Download (or build from source: cargo build --release)
-curl -fsSL https://github.com/xhyumiracle/safeclaw/releases/latest/download/safeclaw-linux-x86_64 -o safeclaw
+# Download
+curl -fsSL https://github.com/xhyumiracle/safeclaw/releases/latest/download/safeclaw-linux-x86_64.tar.gz \
+  | tar xz
 chmod +x safeclaw
 
 # Start
@@ -30,6 +31,15 @@ chmod +x safeclaw
 
 # Open http://localhost:23294/admin/setup in your browser
 # Register your passkey, paste your API keys, done.
+```
+
+Or build from source:
+
+```bash
+git clone https://github.com/xhyumiracle/safeclaw.git
+cd safeclaw
+cargo build --release
+./target/release/safeclaw
 ```
 
 Then point your agent at the proxy:
@@ -64,6 +74,8 @@ The proxy routes requests by path prefix and injects the appropriate auth:
 | `localhost:23295/anthropic/v1/...` | `api.anthropic.com/v1/...` | `x-api-key` |
 | `localhost:23295/google/v1beta/...` | `generativelanguage.googleapis.com/...` | `x-goog-api-key` |
 
+Any service can be added via the admin UI — just provide the upstream URL and auth config.
+
 When locked, the proxy returns a friendly API-compatible error (works with OpenAI/Anthropic SDKs) with a link to unlock.
 
 ## Remote deployment
@@ -77,7 +89,7 @@ If you run SafeClaw on a remote server (not localhost), WebAuthn requires **HTTP
   --rp-id safeclaw.example.com
 ```
 
-> ⚠️ `--origin` must exactly match the URL in your browser (e.g. `https://safeclaw.example.com`). `--rp-id` is just the hostname. If these are wrong, passkey auth will silently fail.
+> `--origin` must exactly match the URL in your browser (e.g. `https://safeclaw.example.com`). `--rp-id` is just the hostname. If these are wrong, passkey auth will silently fail.
 
 ## Data & backup
 
@@ -89,6 +101,8 @@ data/
   sc_sk.jwk          # Server private key (keep secret!)
   vault.enc          # Encrypted API keys
   passkeys.json      # Registered passkey metadata
+  audit.db           # Audit log (SQLite)
+  templates/         # Agent templates (safeclaw.md, skill.md, etc.)
 ```
 
 **Backup**: Copy the entire `data/` directory. Your passkeys are tied to your device (biometric), but as long as you have the same passkey device, you can unlock the vault on any machine with the same `data/` directory.
@@ -106,9 +120,8 @@ data/
 | `--proxy-bind` | `SAFECLAW_PROXY_BIND` | `127.0.0.1` | Proxy bind address |
 | `--origin` | `SAFECLAW_ORIGIN` | `http://localhost:{port}` | WebAuthn origin (must match browser URL) |
 | `--rp-id` | `SAFECLAW_RP_ID` | `localhost` | WebAuthn relying party ID (hostname only) |
-| `--admin-url` | `SAFECLAW_ADMIN_URL` | `http://localhost:{port}` | URL shown in "vault locked" responses |
-| `--instance-id` | `SAFECLAW_INSTANCE_ID` | — | Optional instance identifier (included in health/webhook responses) |
-| `--rate-limit` | `SAFECLAW_RATE_LIMIT` | `20` | Max requests/min per IP (0 = unlimited) |
+| `--admin-url` | `SAFECLAW_ADMIN_URL` | `http://localhost:{port}` | URL shown in "vault locked" and approval responses |
+| `--rate-limit` | `SAFECLAW_RATE_LIMIT` | `300` | Max requests/min per IP (0 = unlimited) |
 | `--on-setup-hook` | `SAFECLAW_ON_SETUP_HOOK` | — | Webhook URL for non-secret setup data |
 | `--init` | — | — | Generate server keypair and exit |
 
@@ -127,15 +140,6 @@ data/
 
 Templates (skill.md, safeclaw.md, agents-snippet.md) are stored in `$SAFECLAW_DATA/templates/` and read at runtime. Template updates take effect immediately without restarting SafeClaw.
 
-## Build from source
-
-```bash
-git clone https://github.com/xhyumiracle/safeclaw.git
-cd safeclaw
-cargo build --release
-# Binary at target/release/safeclaw
-```
-
 ---
 
 ## Technical details
@@ -149,7 +153,7 @@ cargo build --release
 |--------|------|-------------|
 | GET | `/health` | `{ status, locked, uptime, version }` |
 | GET | `/pk` | Server P-256 public key (JWK) |
-| GET | `/challenge` | Issue replay-protection challenge (TTL 5min, single-use, 60/min/IP) |
+| GET | `/challenge` | Issue replay-protection challenge (TTL 5min, single-use) |
 
 ### Admin
 
@@ -159,9 +163,8 @@ cargo build --release
 | GET/POST | `/admin/unlock` | Unlock page / decrypt vault |
 | GET | `/admin` | Dashboard |
 | GET | `/admin/safeclaw.md` | Generated workspace doc listing proxy URLs |
-| GET | `/admin/agents-snippet` | AGENTS.md snippet with URL rewrite rules |
-
-> `/admin/shutdown` removed — process lifecycle is your supervisor's job (systemd, Docker, etc.)
+| GET | `/admin/agents-snippet` | AGENTS.md snippet for agent workspace |
+| POST | `/admin/upgrade` | Trigger self-update via provisioner (authenticated) |
 
 ### Vault (authenticated via passkey + ECIES)
 
@@ -169,13 +172,13 @@ cargo build --release
 |--------|------|-------------|
 | POST | `/vault/lock` | Wipe keys from memory |
 | POST | `/vault/update` | Update stored secrets |
-| POST | `/admin/upgrade` | Trigger self-update (downloads latest templates/binary) |
+| POST | `/vault/credentials` | Get encrypted credential for a passkey |
 
 ### Services (authenticated)
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/vault/services` | List configured services (names only) |
+| GET | `/vault/services` | List configured services (names only, no auth) |
 | POST | `/vault/services/add` | Add a service (name, upstream, auth config) |
 | POST | `/vault/services/update` | Update service config |
 | POST | `/vault/services/remove` | Remove a service |
@@ -192,6 +195,7 @@ cargo build --release
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/vault/files` | List stored files (names + metadata, no auth) |
+| GET | `/vault/files/{id}?approval={id}` | Read file with approved DEK |
 | POST | `/vault/files/upload` | Encrypt and store a file |
 | POST | `/vault/files/read` | Decrypt and download a file |
 | POST | `/vault/files/remove` | Delete a file |
@@ -201,15 +205,13 @@ cargo build --release
 | Method | Path | Description |
 |--------|------|-------------|
 | POST | `/vault/notifications/subscribe` | Store push subscription (authenticated) |
-| GET | `/notifications` | Poll + clear pending notifications (no auth) |
 
 ### Approvals
 
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/approve/pending` | List pending approval requests (no auth) |
-| GET | `/approve/{id}` | Get approval info (no auth) |
-| GET | `/approve/{id}/status` | Get approval status (no auth) |
+| GET | `/approve/{id}` | Get approval info / poll result (no auth) |
 | POST | `/approve/{id}/details` | Decrypt request details (authenticated) |
 | POST | `/approve/{id}/confirm` | Approve request (authenticated) |
 | POST | `/approve/{id}/reject` | Reject request (authenticated) |
@@ -220,11 +222,11 @@ cargo build --release
 |--------|------|-------------|
 | GET | `/audit/log?limit=50` | Recent audit entries (no auth, zero sensitive data) |
 
-### Proxy
+### Proxy (port 23295)
 
 | Method | Path | Description |
 |--------|------|-------------|
-| ANY | `/health` | Proxy health check (`{ status, locked, version }`) |
+| ANY | `/health` | Proxy health check |
 | ANY | `/{service}/{*path}` | Forward to upstream (requires unlocked vault) |
 
 ### Passkeys (authenticated)
@@ -236,7 +238,6 @@ cargo build --release
 
 > **Note:** "authenticated" endpoints require ECIES-encrypted payloads with passkey assertion.
 > "no auth" endpoints expose only non-sensitive metadata.
-> Process lifecycle (restart/stop) is managed by your process supervisor (systemd, Docker, etc.).
 
 </details>
 

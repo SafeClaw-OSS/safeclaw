@@ -69,7 +69,7 @@ fn vapid_auth_header(priv_b64: &str, endpoint: &str) -> Result<String, String> {
         sub: String,
     }
     let claims = Claims::with_custom_claims(
-        VapidClaims { sub: "mailto:noreply@safeclaw.vip".to_string() },
+        VapidClaims { sub: "mailto:safeclaw@localhost".to_string() },
         Duration::from_hours(12),
     ).with_audience(aud);
 
