@@ -670,7 +670,7 @@ fn push_to_provisioner(secrets: serde_json::Value, proxy_port: u16) {
                 "type": "skill",
                 "dir": "safeclaw",
                 "file": "SKILL.md",
-                "content": include_str!("../../templates/skill.md")
+                "content": crate::generate::read_template("skill.md", include_str!("../../templates/skill.md"))
             }),
         ];
 

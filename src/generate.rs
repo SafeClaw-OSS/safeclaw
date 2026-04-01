@@ -1,13 +1,33 @@
 /// Workspace file generation: safeclaw.md and AGENTS.md snippets.
+use std::path::Path;
+
+/// Read a template file at runtime, with compile-time fallback.
+pub fn read_template(name: &str, fallback: &str) -> String {
+    // Try: ./templates/{name}, then $SAFECLAW_DATA/templates/{name}
+    let paths = [
+        format!("templates/{}", name),
+        std::env::var("SAFECLAW_DATA")
+            .map(|d| format!("{}/templates/{}", d, name))
+            .unwrap_or_default(),
+    ];
+    for p in &paths {
+        if !p.is_empty() {
+            if let Ok(content) = std::fs::read_to_string(p) {
+                return content;
+            }
+        }
+    }
+    fallback.to_string()
+}
 
 /// Generate safeclaw.md content describing all services and their proxy URLs.
 ///
 /// When `locked` is true, auth/level details are omitted (only names shown).
 /// `secrets` should be the full vault JSON when unlocked, or a minimal
 /// `{"services": {"name": null, ...}}` when locked.
-const SAFECLAW_MD_TEMPLATE: &str = include_str!("../templates/safeclaw.md");
 
 pub fn generate_safeclaw_md(secrets: &serde_json::Value, locked: bool, proxy_port: u16) -> String {
+    let template = read_template("safeclaw.md", include_str!("../templates/safeclaw.md"));
     let proxy_base = format!("http://localhost:{}", proxy_port);
 
     // Build service table rows
@@ -27,7 +47,7 @@ pub fn generate_safeclaw_md(secrets: &serde_json::Value, locked: bool, proxy_por
         }
     }
 
-    SAFECLAW_MD_TEMPLATE
+    template
         .replace("{{PROXY_BASE}}", &proxy_base)
         .replace("{{SERVICE_TABLE}}", &rows.join("\n"))
 }
@@ -36,7 +56,7 @@ pub fn generate_safeclaw_md(secrets: &serde_json::Value, locked: bool, proxy_por
 ///
 /// This is now fully static — dynamic service info lives in safeclaw.md.
 pub fn generate_agents_md_snippet(_secrets: &serde_json::Value, _proxy_port: u16) -> String {
-    include_str!("../templates/agents-snippet.md").to_string()
+    read_template("agents-snippet.md", include_str!("../templates/agents-snippet.md"))
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
