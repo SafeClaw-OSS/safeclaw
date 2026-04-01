@@ -438,7 +438,10 @@ pub async fn setup(
     let _ = write_index(&state, &secrets);
 
     // Unlock proxy immediately after setup
-    state.vault.set_secrets(secrets);
+    state.vault.set_secrets(secrets.clone());
+
+    // Push full secrets (including services with auth tokens) to provisioner
+    push_to_provisioner(secrets, state.config.proxy_port);
 
     // Fire on-setup webhook
     if let Some(ref hook_url) = state.config.on_setup_hook {
