@@ -63,14 +63,13 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Resolve where templates live.
+/// Resolve where templates should be written.
 /// Priority: $SAFECLAW_DATA/templates → ./templates
+/// Unlike read_template (which also checks ./templates at cwd), this always
+/// prefers the data dir so updates persist across container restarts.
 fn resolve_templates_dir() -> PathBuf {
     if let Ok(data) = std::env::var("SAFECLAW_DATA") {
-        let p = PathBuf::from(&data).join("templates");
-        if p.exists() {
-            return p;
-        }
+        return PathBuf::from(&data).join("templates");
     }
     PathBuf::from("templates")
 }
