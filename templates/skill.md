@@ -93,22 +93,26 @@ If neither works, tell the user "I couldn't create the approval watcher, so I'll
 }
 ```
 
-### Step 3 — Continue on resume
+### Step 3 — Get the result after approval
 
-When you receive a systemEvent containing "SafeClaw approval ... APPROVED", this is the resume signal from your watcher. It contains:
-- The original task description
-- The formatted API response
+There are two ways to get the result. Use whichever fires first:
 
-1. **First**, send a brief acknowledgment to the user (e.g. "Approved — processing now.") so they know it went through.
-2. **Clean up** any leftover watcher/resume cron jobs for this approval ID:
-   ```
-   exec: openclaw cron list --json
-   ```
-   Find any jobs with names starting with `safeclaw-approval-` or `safeclaw-resume-` and remove them by ID:
-   ```
-   exec: openclaw cron rm <uuid>
-   ```
-3. **Then** continue the original task with the data. Do not ask the user for further confirmation — just proceed.
+**A. Automatic (via watcher systemEvent):**
+When you receive a systemEvent containing "SafeClaw approval ... APPROVED", it contains the original task + API response. Continue immediately.
+
+**B. Manual (when user says "I approved it" or watcher didn't fire):**
+Poll the approval endpoint directly — **do NOT re-make the original API call**:
+```
+curl -sf http://localhost:23295/approve/<id>
+```
+If `status` is `"approved"`, the response contains `response.body` with the full API result. Use it.
+
+**CRITICAL: Never re-send the original API call after the user approves.** That creates a new approval request (infinite loop). Always poll `GET /approve/<id>` to retrieve the result of the already-approved request.
+
+After getting the result (either way):
+1. Send a brief acknowledgment (e.g. "Got it — processing now.")
+2. Clean up leftover cron jobs: `openclaw cron list --json` → find `safeclaw-approval-*` / `safeclaw-resume-*` → `openclaw cron rm <uuid>`
+3. Continue the original task with the data.
 
 ### Notes
 
@@ -117,6 +121,7 @@ When you receive a systemEvent containing "SafeClaw approval ... APPROVED", this
 - **Streaming requests**: approved `response` will be complete buffered JSON
 - **Expiry**: `expires_at` is a unix timestamp. Watcher checks it each run.
 - **Not found (404)**: treat same as expired
+- **Remember the approval ID** — you need it to poll. Save it when you get the 202.
 
 ## Dummy API Key
 
