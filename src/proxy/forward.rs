@@ -261,6 +261,13 @@ pub async fn forward_request(
         if key == "host" || key == "content-length" || key == "transfer-encoding" {
             continue;
         }
+        // When proxy injects auth (oauth2 or key), strip incoming auth headers
+        // to prevent conflicts (e.g. agent sends x-api-key, but we need Bearer)
+        if (resolved_bearer.is_some() || auth.is_some())
+            && (key == "authorization" || key == "x-api-key")
+        {
+            continue;
+        }
         if let Ok(rk) = reqwest::header::HeaderName::from_str(k.as_str()) {
             if let Ok(rv) = reqwest::header::HeaderValue::from_bytes(v.as_bytes()) {
                 fwd_headers.insert(rk, rv);
