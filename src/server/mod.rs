@@ -104,6 +104,9 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/approve/{id}/confirm", post(approval_confirm))
         .route("/approve/{id}/reject", post(approval_reject))
 
+        // ── Admin Operations ─────────────────────────────────────────────────
+        .route("/admin/upgrade", post(admin_upgrade))
+
         // ── Audit Log ────────────────────────────────────────────────────────
         .route("/audit/log", get(audit_log_list))
 

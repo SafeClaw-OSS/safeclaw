@@ -1,5 +1,4 @@
 /// Workspace file generation: safeclaw.md and AGENTS.md snippets.
-use std::path::Path;
 
 /// Read a template file at runtime, with compile-time fallback.
 pub fn read_template(name: &str, fallback: &str) -> String {

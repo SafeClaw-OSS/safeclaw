@@ -9,13 +9,9 @@ SafeClaw is a local API key vault and proxy. Your calls to the proxy are forward
 
 ## Vault Locked
 
-If the proxy response contains `safeclaw_unlock_url` (or `safeclaw_buttons` with an unlock action), the vault is locked.
+If the proxy response contains `safeclaw_unlock_url`, the vault is locked.
 
-**Do not retry automatically.** Tell the user:
-
-> "SafeClaw is locked — your API keys are unavailable. Please unlock: [safeclaw_unlock_url]"
-
-Wait for the user to confirm they've unlocked before retrying.
+**Do not retry automatically.** Tell the user the vault is locked and provide the unlock URL. Create an inline button labeled "🔓 Unlock" linking to the URL. Then stop and wait for the user to confirm they've unlocked before retrying.
 
 ## Approval Required (HTTP 202)
 
@@ -29,22 +25,22 @@ Some operations require explicit human approval. You will receive HTTP 202 with:
 }
 ```
 
-**RULE: After receiving 202, you must NEVER call the same API endpoint again for this task.** The approved result is retrieved via `GET http://localhost:23295/approve/<id>` — not by re-sending the original request. Re-sending creates an infinite approval loop.
+**RULE: After receiving 202, you must NEVER call the same API endpoint again for this task.** The approved result is retrieved via `GET http://localhost:23295/approve/<approval-id>` — not by re-sending the original request. Re-sending creates an infinite approval loop.
 
 ### Step 1 — Notify the user and wait
 
 Send a message with:
 1. What you were trying to do (service + action)
 2. The approval URL as visible clickable text
-3. An inline button labeled "Done" for the user to tap after approving
+3. Create an inline button labeled "✅ Done" — when tapped, it should send a message like "Done" back to the chat so you know the user has approved
 
 Example message:
 
 > I need approval to read your Gmail inbox.
 > Please review and approve: safeclaw_approve_url
-> Tap Done after you've approved or rejected.
+> Tap ✅ Done after you've approved.
 
-Then **stop and wait** for the user to tap Done or reply.
+Then **stop and wait** — do nothing until the user taps the Done button or replies.
 
 **CRITICAL: Do NOT re-send the original API call after the user responds.** That creates a new approval request (infinite loop). Always retrieve the result by polling the approval ID (Step 2).
 
@@ -53,7 +49,7 @@ Then **stop and wait** for the user to tap Done or reply.
 When the user taps Done or replies, make a **GET request** to retrieve the result:
 
 ```
-GET http://localhost:23295/approve/<id>
+GET http://localhost:23295/approve/<approval-id>
 ```
 
 Use whatever HTTP tool you have (fetch, curl, http request, etc.) to make this GET request. This is the **only** way to get the result. Do NOT call the original API again.

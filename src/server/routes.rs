@@ -1590,6 +1590,67 @@ pub async fn system_shutdown(
     Ok(resp)
 }
 
+// ── Admin Upgrade ─────────────────────────────────────────────────────────────
+
+/// POST /admin/upgrade — passkey-protected software update.
+///
+/// Triggers a self-update by calling the local provisioner's /update endpoint.
+/// The provisioner runs `safeclaw update` inside the container (or on host).
+///
+/// Payload: { scope?: "all" | "templates" }
+///   - "all" (default): update binary + templates, restarts safeclaw
+///   - "templates": update templates only, no restart needed
+pub async fn admin_upgrade(
+    State(state): State<Arc<AppState>>,
+    _auth: AuthenticatedRequest,
+) -> Result<impl IntoResponse> {
+    let scope = _auth
+        .payload
+        .get("scope")
+        .and_then(|s| s.as_str())
+        .unwrap_or("all")
+        .to_string();
+
+    if scope != "all" && scope != "templates" {
+        return Err(AppError::BadRequest(format!("Invalid scope: {scope}. Use 'all' or 'templates'.")));
+    }
+
+    // Call provisioner /update endpoint
+    let provisioner_host = if std::path::Path::new("/.dockerenv").exists() {
+        "host.docker.internal"
+    } else {
+        "localhost"
+    };
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .unwrap_or_default();
+
+    let resp = client
+        .post(format!("http://{}:23296/update", provisioner_host))
+        .json(&json!({ "scope": scope }))
+        .send()
+        .await
+        .map_err(|e| AppError::Internal(format!("Provisioner unreachable: {e}")))?;
+
+    if !resp.status().is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(AppError::Internal(format!("Provisioner error: {body}")));
+    }
+
+    let result: serde_json::Value = resp
+        .json()
+        .await
+        .unwrap_or_else(|_| json!({ "ok": true }));
+
+    Ok(Json(json!({
+        "ok": true,
+        "scope": scope,
+        "result": result
+    })))
+}
+
 // ── Audit Log ──────────────────────────────────────────────────────────────────
 
 /// GET /audit/log?limit=50&service=openai&decision=denied&since=2024-01-01T00:00:00

@@ -9,6 +9,7 @@ mod policy;
 mod proxy;
 mod server;
 mod state;
+mod update;
 mod webpush;
 #[cfg(test)]
 mod tests;
@@ -29,6 +30,12 @@ use state::{AppState, RateLimiter, VaultState};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Handle `safeclaw update` subcommand before anything else
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() >= 2 && args[1] == "update" {
+        return update::run(&args[2..]).map_err(Into::into);
+    }
+
     // Initialize tracing subscriber
     tracing_subscriber::fmt::init();
 
