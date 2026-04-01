@@ -36,21 +36,21 @@ Some operations require explicit human approval. You will receive HTTP 202 with:
 Send a message with:
 1. What you were trying to do (service + action)
 2. The approval URL as visible clickable text
-3. Ask the user to reply when done (e.g. "reply 'done' after approving")
+3. An inline button labeled "Done" for the user to tap after approving
 
 Example message:
 
 > I need approval to read your Gmail inbox.
 > Please review and approve: safeclaw_approve_url
-> Reply "done" after you've approved or rejected.
+> Tap Done after you've approved or rejected.
 
-Then **stop and wait** for the user to reply.
+Then **stop and wait** for the user to tap Done or reply.
 
 **CRITICAL: Do NOT re-send the original API call after the user responds.** That creates a new approval request (infinite loop). Always retrieve the result by polling the approval ID (Step 2).
 
 ### Step 2 — Retrieve the result
 
-When the user replies (e.g. "done", "approved", "好了", or any confirmation), make a **GET request** to retrieve the result:
+When the user taps Done or replies, make a **GET request** to retrieve the result:
 
 ```
 GET http://localhost:23295/approve/<id>
