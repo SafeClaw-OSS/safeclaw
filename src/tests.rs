@@ -411,6 +411,7 @@ mod tests {
             let rules = vec![PolicyRule {
                 method: Some("DELETE".to_string()),
                 path_suffix: Some("/admin".to_string()),
+                path_exact: None,
                 level: AccessLevel::AskAlways,
                 session_ttl: None,
             }];

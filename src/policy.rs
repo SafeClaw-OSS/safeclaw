@@ -37,6 +37,9 @@ pub struct PolicyRule {
     pub method: Option<String>,
     #[serde(rename = "pathSuffix")]
     pub path_suffix: Option<String>,
+    /// Exact path match (query string stripped before comparison)
+    #[serde(rename = "pathExact")]
+    pub path_exact: Option<String>,
     pub level: AccessLevel,
     /// Session TTL in seconds (for `ask` level; cached after first approval)
     #[serde(rename = "sessionTTL")]
@@ -172,6 +175,13 @@ fn matches_rule(rule: &PolicyRule, method: &str, path: &str) -> bool {
             return false;
         }
     }
+    if let Some(ref exact) = rule.path_exact {
+        let path_no_query = path.split('?').next().unwrap_or(path).trim_end_matches('/');
+        let exact_trimmed = exact.trim_end_matches('/');
+        if path_no_query != exact_trimmed {
+            return false;
+        }
+    }
     if let Some(ref suffix) = rule.path_suffix {
         if !path.contains(suffix.as_str()) {
             return false;
@@ -228,6 +238,7 @@ mod tests {
         let rules = vec![PolicyRule {
             method: Some("DELETE".to_string()),
             path_suffix: Some("/admin".to_string()),
+            path_exact: None,
             level: AccessLevel::AskAlways,
             session_ttl: None,
         }];
@@ -251,6 +262,7 @@ mod tests {
         let rules = vec![PolicyRule {
             method: Some("DELETE".to_string()),
             path_suffix: None,
+            path_exact: None,
             level: AccessLevel::AskAlways,
             session_ttl: None,
         }];
