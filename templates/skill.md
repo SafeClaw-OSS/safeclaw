@@ -126,7 +126,6 @@ The watcher from Step 2 handles this automatically. But if the user tells you "I
 - **Streaming requests**: approved `response` will be complete buffered JSON
 - **Expiry**: `expires_at` is a unix timestamp. Watcher checks it each run.
 - **Not found (404)**: treat same as expired
-- **Remember the approval ID** — you need it to poll. Save it when you get the 202.
 
 ## Dummy API Key
 
