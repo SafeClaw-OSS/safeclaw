@@ -94,6 +94,7 @@ pub fn parse_route(req_path: &str) -> Option<(String, String, String)> {
 
 /// Attempt to refresh an OAuth2 access token using the refresh_token grant.
 /// Returns (access_token, expires_at_unix_secs) on success.
+/// Supports both confidential clients (with client_secret) and public clients (PKCE, no secret).
 pub async fn refresh_oauth2_token(
     auth: &AuthConfig,
 ) -> Result<(String, u64), String> {
@@ -105,23 +106,25 @@ pub async fn refresh_oauth2_token(
         .client_id
         .as_ref()
         .ok_or("oauth2: missing client_id")?;
-    let client_secret = auth
-        .client_secret
-        .as_ref()
-        .ok_or("oauth2: missing client_secret")?;
     let refresh_token = auth
         .refresh_token
         .as_ref()
         .ok_or("oauth2: missing refresh_token")?;
 
+    // Build form params — client_secret is optional (public clients use PKCE without it)
+    let mut form_params = vec![
+        ("grant_type", "refresh_token"),
+        ("client_id", client_id.as_str()),
+        ("refresh_token", refresh_token.as_str()),
+    ];
+    let client_secret = auth.client_secret.as_deref();
+    if let Some(secret) = client_secret {
+        form_params.push(("client_secret", secret));
+    }
+
     let resp = HTTP_CLIENT
         .post(token_url)
-        .form(&[
-            ("grant_type", "refresh_token"),
-            ("client_id", client_id.as_str()),
-            ("client_secret", client_secret.as_str()),
-            ("refresh_token", refresh_token.as_str()),
-        ])
+        .form(&form_params)
         .send()
         .await
         .map_err(|e| format!("oauth2 refresh request failed: {}", e))?;
