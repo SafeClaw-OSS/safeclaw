@@ -95,23 +95,28 @@ If neither works, tell the user "I couldn't create the approval watcher, so I'll
 
 ### Step 3 — Get the result after approval
 
-There are two ways to get the result. Use whichever fires first:
-
-**A. Automatic (via watcher systemEvent):**
-When you receive a systemEvent containing "SafeClaw approval ... APPROVED", it contains the original task + API response. Continue immediately.
-
-**B. Manual (when user says "I approved it" or watcher didn't fire):**
-Poll the approval endpoint directly — **do NOT re-make the original API call**:
+The result is **always** retrieved the same way — poll the approval endpoint:
 ```
 curl -sf http://localhost:23295/approve/<id>
 ```
-If `status` is `"approved"`, the response contains `response.body` with the full API result. Use it.
+When `status` is `"approved"`, `response.body` contains the full API result. **Never re-send the original API call** — that creates a new approval (infinite loop).
 
-**CRITICAL: Never re-send the original API call after the user approves.** That creates a new approval request (infinite loop). Always poll `GET /approve/<id>` to retrieve the result of the already-approved request.
+The watcher from Step 2 handles this automatically. But if the user tells you "I approved it" before the watcher fires, you must poll manually:
 
-After getting the result (either way):
-1. Send a brief acknowledgment (e.g. "Got it — processing now.")
-2. Clean up leftover cron jobs: `openclaw cron list --json` → find `safeclaw-approval-*` / `safeclaw-resume-*` → `openclaw cron rm <uuid>`
+**Priority: automatic watcher is always preferred.** Manual poll is a fallback only when:
+- The user explicitly says they approved and the watcher hasn't fired yet
+- The watcher failed to start
+
+**After getting the result (via either path):**
+1. Send a brief acknowledgment (e.g. "Approved — processing now.")
+2. **Always clean up the watcher cron job** — even if you got the result manually:
+   ```
+   exec: openclaw cron list --json
+   ```
+   Find jobs with names starting with `safeclaw-approval-<id>` or `safeclaw-resume-<id>` and remove by UUID:
+   ```
+   exec: openclaw cron rm <uuid>
+   ```
 3. Continue the original task with the data.
 
 ### Notes
