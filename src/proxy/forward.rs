@@ -326,7 +326,7 @@ pub async fn forward_request(
         if let Some(a) = auth {
             if a.auth_type == "oauth2" {
                 if let Some(token_url) = &a.token_url {
-                    if token_url.contains("anthropic.com") {
+                    if token_url.contains("anthropic.com") || token_url.contains("platform.claude.com") {
                         fwd_headers.insert(
                             reqwest::header::HeaderName::from_static("anthropic-beta"),
                             reqwest::header::HeaderValue::from_static(
