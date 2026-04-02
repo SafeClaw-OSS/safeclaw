@@ -201,7 +201,7 @@ mod tests {
     // ── Nonce store ─────────────────────────────────────────────────────────────
 
     mod nonce_store {
-        use crate::auth::nonce::NonceStore;
+        use crate::passkey::nonce::NonceStore;
 
         #[test]
         fn fresh_nonce_is_accepted() {
@@ -275,9 +275,9 @@ mod tests {
         use axum::http::StatusCode;
         use axum::response::IntoResponse;
 
-        use crate::approval::ApprovalManager;
-        use crate::audit::AuditLog;
-        use crate::auth::nonce::NonceStore;
+        use crate::core::approval::ApprovalManager;
+        use crate::core::audit::AuditLog;
+        use crate::passkey::nonce::NonceStore;
         use crate::config::Config;
         use crate::crypto::keys::generate_keypair;
         use crate::state::{AppState, RateLimiter, VaultState};
@@ -310,7 +310,7 @@ mod tests {
                 keypair,
                 vault,
                 nonces: Arc::new(Mutex::new(NonceStore::new())),
-                challenges: Arc::new(Mutex::new(crate::auth::challenge::ChallengeStore::new())),
+                challenges: Arc::new(Mutex::new(crate::passkey::challenge::ChallengeStore::new())),
                 start_time: Instant::now(),
                 started_at_ms: 0,
                 rate_limiter: Arc::new(Mutex::new(RateLimiter::new(0))),
@@ -376,7 +376,7 @@ mod tests {
     // ── Policy evaluation ─────────────────────────────────────────────────────────
 
     mod policy_tests {
-        use crate::policy::{
+        use crate::core::policy::{
             evaluate_policy, AccessLevel, PolicyDefaults, PolicyRule, ServiceLevels,
         };
 
@@ -454,7 +454,7 @@ mod tests {
     // ── Audit log ─────────────────────────────────────────────────────────────────
 
     mod audit_tests {
-        use crate::audit::AuditLog;
+        use crate::core::audit::AuditLog;
 
         #[test]
         fn create_and_retrieve_approval() {
@@ -493,8 +493,8 @@ mod tests {
         use std::sync::Arc;
         use axum::http::HeaderMap;
         use hyper::body::Bytes;
-        use crate::approval::{ApprovalStatus, ApprovalManager};
-        use crate::audit::AuditLog;
+        use crate::core::approval::{ApprovalStatus, ApprovalManager};
+        use crate::core::audit::AuditLog;
 
         fn make_manager() -> Arc<ApprovalManager> {
             let audit = Arc::new(AuditLog::open_in_memory().expect("audit log failed"));
@@ -616,7 +616,7 @@ mod tests {
     // ── Auth config backward compatibility ────────────────────────────────────────
 
     mod auth_config_compat {
-        use crate::proxy::forward::AuthConfig;
+        use crate::auth::AuthConfig;
 
         #[test]
         fn legacy_value_field_works() {

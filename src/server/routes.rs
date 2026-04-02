@@ -16,15 +16,15 @@ use serde_json::{json, Value};
 use zeroize::Zeroize;
 
 // ApprovalDecision removed (async 202 flow — no more oneshot channel)
-use crate::auth::{AuthenticatedRequest, PasskeyEntry};
-use crate::auth::webauthn::{verify_assertion, AssertionData};
+use crate::passkey::{AuthenticatedRequest, PasskeyEntry};
+use crate::passkey::webauthn::{verify_assertion, AssertionData};
 use crate::crypto::{
     aes_encrypt, decrypt_vault, derive_kek, derive_response_key, encrypt_vault,
     generate_dek, jwk_sk_d_bytes, unwrap_dek, wrap_dek,
 };
 use crate::crypto::keys::credential_id_to_filename;
 use crate::error::{AppError, Result};
-use crate::policy::PushSubscription;
+use crate::notify::PushSubscription;
 use crate::state::AppState;
 
 // ── Health ─────────────────────────────────────────────────────────────────────
@@ -267,7 +267,7 @@ pub async fn setup(
 
     // Inject VAPID key pair if not already present (fresh setup or migration)
     if secrets.get("vapid_private_key").is_none() {
-        match crate::webpush::generate_vapid_keypair() {
+        match crate::notify::webpush::generate_vapid_keypair() {
             Ok((priv_b64, _pub_b64)) => {
                 secrets.as_object_mut().map(|m| m.insert(
                     "vapid_private_key".into(),
@@ -517,7 +517,7 @@ pub async fn vault_unlock(
 
     // Migration: generate VAPID key pair if not present (existing vaults pre-dating Web Push)
     if secrets.get("vapid_private_key").is_none() {
-        match crate::webpush::generate_vapid_keypair() {
+        match crate::notify::webpush::generate_vapid_keypair() {
             Ok((priv_b64, _)) => {
                 secrets.as_object_mut().map(|m| m.insert(
                     "vapid_private_key".into(),
@@ -653,8 +653,8 @@ pub async fn vault_update(
 /// discarded — the vault operation has already succeeded.
 fn push_to_provisioner(secrets: serde_json::Value, proxy_port: u16) {
     tokio::spawn(async move {
-        let md = crate::generate::generate_safeclaw_md(&secrets, false, proxy_port);
-        let snippet = crate::generate::generate_agents_md_snippet(&secrets, proxy_port);
+        let md = crate::cli::generate::generate_safeclaw_md(&secrets, false, proxy_port);
+        let snippet = crate::cli::generate::generate_agents_md_snippet(&secrets, proxy_port);
 
         // Extract channel tokens that need to be written into OpenClaw config.
         // Telegram: stored as services.telegram.auth.secret (path auth type).
@@ -673,7 +673,7 @@ fn push_to_provisioner(secrets: serde_json::Value, proxy_port: u16) {
                 "type": "skill",
                 "dir": "safeclaw",
                 "file": "SKILL.md",
-                "content": crate::generate::read_template("skill.md", include_str!("../../templates/skill.md"))
+                "content": crate::cli::generate::read_template("skill.md", include_str!("../../templates/skill.md"))
             }),
         ];
 
@@ -1529,14 +1529,14 @@ pub async fn admin_safeclaw_md(State(state): State<Arc<AppState>>) -> impl IntoR
     let content = {
         let secrets_guard = state.vault.secrets.lock().unwrap();
         if let Some(ref s) = *secrets_guard {
-            crate::generate::generate_safeclaw_md(s, false, state.config.proxy_port)
+            crate::cli::generate::generate_safeclaw_md(s, false, state.config.proxy_port)
         } else {
             drop(secrets_guard);
             let names = state.vault.service_names.lock().unwrap().clone();
             let services: serde_json::Map<String, Value> =
                 names.into_iter().map(|n| (n, Value::Null)).collect();
             let minimal = json!({ "services": services });
-            crate::generate::generate_safeclaw_md(&minimal, locked, state.config.proxy_port)
+            crate::cli::generate::generate_safeclaw_md(&minimal, locked, state.config.proxy_port)
         }
     };
     (
@@ -1554,14 +1554,14 @@ pub async fn admin_agents_snippet(State(state): State<Arc<AppState>>) -> impl In
     let content = {
         let secrets_guard = state.vault.secrets.lock().unwrap();
         if let Some(ref s) = *secrets_guard {
-            crate::generate::generate_agents_md_snippet(s, state.config.proxy_port)
+            crate::cli::generate::generate_agents_md_snippet(s, state.config.proxy_port)
         } else {
             drop(secrets_guard);
             let names = state.vault.service_names.lock().unwrap().clone();
             let services: serde_json::Map<String, Value> =
                 names.into_iter().map(|n| (n, Value::Null)).collect();
             let minimal = json!({ "services": services });
-            crate::generate::generate_agents_md_snippet(&minimal, state.config.proxy_port)
+            crate::cli::generate::generate_agents_md_snippet(&minimal, state.config.proxy_port)
         }
     };
     (

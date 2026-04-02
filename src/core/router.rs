@@ -1,6 +1,3 @@
-pub mod forward;
-pub mod locked;
-
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -15,13 +12,16 @@ use axum::{
 use http_body_util::BodyExt;
 use hyper::body::Bytes;
 
-use crate::approval::{ApprovalManager, ApprovalStatus, CachedResponse};
-use crate::audit::AuditLog;
+use super::approval::{ApprovalManager, ApprovalStatus, CachedResponse};
+use super::audit::AuditLog;
 use crate::config::Config;
-use crate::policy::{evaluate_policy, AccessLevel};
+use super::policy::{evaluate_policy, AccessLevel};
 use crate::state::VaultState;
-use forward::{forward_request, parse_route, refresh_oauth2_token, ServiceConfig};
-use locked::{anthropic_locked, gemini_locked, openai_locked, openai_responses_locked};
+use super::forward::{forward_request, parse_route};
+use super::locked::openai_locked;
+use crate::auth::{AuthConfig, ServiceConfig};
+use crate::auth::oauth2::refresh_token as refresh_oauth2_token;
+use crate::provider::ProviderRegistry;
 
 /// Shared state for the proxy server
 pub struct ProxyState {
@@ -29,6 +29,7 @@ pub struct ProxyState {
     pub config: Config,
     pub approval_manager: Arc<ApprovalManager>,
     pub audit_log: Arc<AuditLog>,
+    pub providers: ProviderRegistry,
 }
 
 pub fn build_proxy_router(state: Arc<ProxyState>) -> Router {
@@ -104,7 +105,7 @@ async fn proxy_poll_approval(
             // Build service config for replay
             let auth_config = auth_json
                 .clone()
-                .and_then(|aj| serde_json::from_value::<forward::AuthConfig>(aj).ok());
+                .and_then(|aj| serde_json::from_value::<AuthConfig>(aj).ok());
 
             let service_config = ServiceConfig {
                 upstream: snapshot.upstream.clone(),
@@ -320,16 +321,10 @@ async fn proxy_handler(
         }
 
         let admin_url = &state.config.effective_admin_url();
+        let provider = state.providers.resolve(&route_service);
 
-        return if route_path.contains("/responses") {
-            openai_responses_locked(is_stream, admin_url)
-        } else if route_service == "anthropic" || route_path.contains("/messages") {
-            anthropic_locked(is_stream, admin_url)
-        } else if route_service == "google" || route_path.contains("generateContent") {
-            gemini_locked(admin_url)
-        } else {
-            openai_locked(is_stream, admin_url)
-        };
+        return provider.locked_response(is_stream, admin_url, &route_path)
+            .unwrap_or_else(|| openai_locked(is_stream, admin_url));
     }
 
     // Read full body for forwarding (and potential approval replay)
@@ -400,10 +395,10 @@ async fn proxy_handler(
 
     // ── Policy evaluation ──────────────────────────────────────────────────────
 
-    // Infer category for known LLM providers if not explicitly set
-    const LLM_PROVIDERS: &[&str] = &["openai", "anthropic", "google", "deepseek", "groq"];
+    // Infer category from provider if not explicitly set in vault config
+    let provider = state.providers.resolve(&route_service);
     let category = service_config.category.as_deref()
-        .or_else(|| if LLM_PROVIDERS.contains(&route_service.as_str()) { Some("llm") } else { None });
+        .unwrap_or(provider.default_category());
 
     let policy_defaults = state.vault.get_policy_defaults();
     let access_level = evaluate_policy(
@@ -412,7 +407,7 @@ async fn proxy_handler(
         service_config.rules.as_ref(),
         service_config.levels.as_ref(),
         &policy_defaults,
-        category,
+        Some(category),
     );
 
     tracing::debug!(
@@ -537,7 +532,7 @@ async fn proxy_handler(
                 let vault_clone = state.vault.clone();
                 tokio::spawn(async move {
                     let dead =
-                        crate::webpush::send_push_notification(&priv_b64, &subs, notif).await;
+                        crate::notify::webpush::send_push_notification(&priv_b64, &subs, notif).await;
                     if !dead.is_empty() {
                         let mut active = vault_clone.push_subscriptions.lock().unwrap();
                         active.retain(|s| !dead.contains(&s.endpoint));
@@ -580,7 +575,7 @@ async fn proxy_handler(
 
     if service_config.auth.is_none() {
         if let Some(aj) = cached_auth {
-            service_config.auth = serde_json::from_value::<forward::AuthConfig>(aj).ok();
+            service_config.auth = serde_json::from_value::<AuthConfig>(aj).ok();
         }
     }
 
@@ -688,7 +683,7 @@ fn filter_replay_headers(headers: &axum::http::HeaderMap) -> axum::http::HeaderM
 
 /// Find session TTL from matching rule (for `ask` access level).
 fn find_rule_ttl(
-    rules: Option<&Vec<crate::policy::PolicyRule>>,
+    rules: Option<&Vec<super::policy::PolicyRule>>,
     method: &str,
     path: &str,
 ) -> Option<u64> {

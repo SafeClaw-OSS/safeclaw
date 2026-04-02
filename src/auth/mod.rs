@@ -1,194 +1,101 @@
-pub mod challenge;
-pub mod nonce;
-pub mod webauthn;
+/// Service authentication: credential injection for upstream requests.
+///
+/// Each auth type (bearer, basic, header, query, path, oauth2) has its own
+/// submodule. The `inject_auth()` function dispatches to the correct one.
+pub mod bearer;
+pub mod basic;
+pub mod header;
+pub mod query;
+pub mod path;
+pub mod oauth2;
 
-use std::collections::HashMap;
-use std::fs;
-use std::sync::Arc;
+use crate::core::policy::{PolicyRule, ServiceLevels};
 
-use axum::{
-    extract::{FromRequest, Request},
-    body::Bytes,
-};
-use base64::{engine::general_purpose::STANDARD, Engine};
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
+// ── Config Types ───────────────────────────────────────────────────────────────
 
-use crate::crypto::ecies::e2e_decrypt;
-use crate::crypto::keys::jwk_sk_d_bytes;
-use crate::error::{AppError, Result};
-use crate::state::AppState;
-use self::webauthn::{verify_assertion, AssertionData};
-
-/// Passkey entry as stored in passkeys.json
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PasskeyEntry {
-    pub x: String, // standard base64
-    pub y: String, // standard base64
-    #[serde(rename = "deviceName", default)]
-    pub device_name: String,
-    #[serde(rename = "createdAt", default)]
-    pub created_at: u64,
+/// Service configuration extracted from vault secrets
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ServiceConfig {
+    pub upstream: String,
+    pub auth: Option<AuthConfig>,
+    /// Per-service access levels (optional; falls back to policy defaults)
+    pub levels: Option<ServiceLevels>,
+    /// Per-request rule overrides (optional; most specific match wins)
+    pub rules: Option<Vec<PolicyRule>>,
+    /// UI display category — "llm" | "channel" | "service" (default: "service").
+    /// Pure metadata; not used by proxy routing or auth logic.
+    #[serde(default)]
+    pub category: Option<String>,
 }
 
-/// Result of a successful authenticated request
-pub struct AuthenticatedRequest {
-    /// Decrypted inner payload as JSON
-    pub payload: Value,
-    /// Credential ID of the authenticating passkey
-    pub credential_id: String,
-    /// Full passkeys map from passkeys.json
-    pub passkeys: HashMap<String, PasskeyEntry>,
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct AuthConfig {
+    #[serde(rename = "type")]
+    pub auth_type: String,
+
+    // For header / bearer / query / path
+    pub name: Option<String>,
+    /// The credential secret.  Accepts both "secret" (new) and "value" (legacy).
+    #[serde(alias = "value")]
+    pub secret: Option<String>,
+    pub prefix: Option<String>,
+
+    // For path type
+    #[serde(rename = "pathTemplate")]
+    pub path_template: Option<String>,
+
+    // For basic auth
+    pub username: Option<String>,
+    pub password: Option<String>,
+
+    // For oauth2
+    pub token_url: Option<String>,
+    pub client_id: Option<String>,
+    pub client_secret: Option<String>,
+    pub refresh_token: Option<String>,
+    /// Cached access token (in-memory only; never written back to vault)
+    pub access_token: Option<String>,
+    pub expires_at: Option<u64>,
+
+    // For OpenAI Codex OAuth (chatgpt.com/backend-api)
+    pub account_id: Option<String>,
 }
 
-impl AuthenticatedRequest {
-    /// Get a field from the inner payload
-    pub fn get_str(&self, key: &str) -> Result<&str> {
-        self.payload
-            .get(key)
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| AppError::BadRequest(format!("Missing field '{}' in payload", key)))
+// ── Auth injection dispatcher ──────────────────────────────────────────────────
+
+/// Inject authentication credentials into the request headers.
+/// Handles bearer, basic, and custom header types.
+/// Query and path types are handled at the URL level by `transform_url()`.
+pub fn inject_auth(
+    auth: &AuthConfig,
+    resolved_bearer: Option<&str>,
+    headers: &mut reqwest::header::HeaderMap,
+) {
+    // Pre-resolved bearer (from oauth2 refresh) takes priority
+    if let Some(bearer_token) = resolved_bearer {
+        bearer::inject_resolved(bearer_token, headers);
+        return;
     }
 
-    /// Get the replay-protection value (challenge or nonce) as base64 string.
-    /// Used as salt for response_key derivation.
-    pub fn replay_token_b64(&self) -> Result<&str> {
-        self.payload
-            .get("challenge")
-            .or_else(|| self.payload.get("nonce"))
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| AppError::BadRequest("Missing 'challenge' or 'nonce' in payload".into()))
-    }
-}
-
-/// Axum extractor that performs the full auth flow:
-///   1. Read body → parse { payload: base64 }
-///   2. Base64-decode payload → JSON bytes (E2E wire format)
-///   3. E2E decrypt using VM private key
-///   4. Parse inner JSON → extract { nonce, credentialId, assertion }
-///   5. Check nonce (in-memory HashSet)
-///   6. Load passkey (x, y) from passkeys.json
-///   7. Verify WebAuthn P-256 assertion
-impl FromRequest<Arc<AppState>> for AuthenticatedRequest {
-    type Rejection = AppError;
-
-    async fn from_request(req: Request, state: &Arc<AppState>) -> std::result::Result<Self, Self::Rejection> {
-        // Read body bytes
-        let bytes = Bytes::from_request(req, state)
-            .await
-            .map_err(|_| AppError::BadRequest("Failed to read request body".into()))?;
-
-        authenticate_bytes(&bytes, state)
+    match auth.auth_type.as_str() {
+        "bearer" => bearer::inject(auth, headers),
+        "basic" => basic::inject(auth, headers),
+        "header" => header::inject(auth, headers),
+        // query and path are handled at URL level, not header level
+        _ => {}
     }
 }
 
-/// Core authentication logic, extracted so routes can call it with pre-read body bytes too
-pub fn authenticate_bytes(bytes: &[u8], state: &Arc<AppState>) -> Result<AuthenticatedRequest> {
-    // Parse outer body: { payload: base64 }
-    let outer: serde_json::Value = serde_json::from_slice(bytes)
-        .map_err(|_| AppError::BadRequest("Invalid JSON body".into()))?;
-
-    let payload_b64 = outer
-        .get("payload")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| AppError::BadRequest("Missing 'payload' field in body".into()))?;
-
-    // Decode base64 → E2E wire bytes
-    let wire_bytes = STANDARD
-        .decode(payload_b64)
-        .map_err(|e| AppError::BadRequest(format!("Invalid payload base64: {}", e)))?;
-
-    // E2E decrypt
-    let sk_d = jwk_sk_d_bytes(&state.keypair.sk)?;
-    let plaintext = e2e_decrypt(&wire_bytes, &sk_d)?;
-
-    // Parse inner payload
-    let inner: Value = serde_json::from_slice(&plaintext)
-        .map_err(|_| AppError::BadRequest("Decrypted payload is not valid JSON".into()))?;
-
-    // Extract required fields
-    let credential_id = inner
-        .get("credentialId")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| AppError::BadRequest("Missing 'credentialId' in decrypted payload".into()))?
-        .to_string();
-
-    // Dual-track replay protection:
-    //   "challenge" → server-issued (daily ops: unlock, vault, approve, etc.)
-    //   "nonce"     → client-generated (setup only, append-only file on disk)
-    let challenge_b64 = inner.get("challenge").and_then(|v| v.as_str());
-    let nonce_b64 = inner.get("nonce").and_then(|v| v.as_str());
-
-    match (challenge_b64, nonce_b64) {
-        (Some(c), _) => {
-            // Server challenge path: verify against issued challenges
-            let mut store = state.challenges.lock().unwrap();
-            if !store.verify(c) {
-                return Err(AppError::BadRequest("Invalid or expired challenge".into()));
-            }
-        }
-        (None, Some(n)) => {
-            // Client nonce path (setup): verify via in-memory nonce store
-            let nonce_bytes = STANDARD
-                .decode(n)
-                .map_err(|e| AppError::BadRequest(format!("Invalid nonce base64: {}", e)))?;
-
-            if nonce_bytes.len() < 16 {
-                return Err(AppError::BadRequest(format!(
-                    "Nonce too short: {} bytes (minimum 16)", nonce_bytes.len()
-                )));
-            }
-
-            let mut nonce_store = state.nonces.lock().unwrap();
-            if !nonce_store.check_and_insert(&nonce_bytes) {
-                return Err(AppError::BadRequest("Nonce already used".into()));
-            }
-        }
-        (None, None) => {
-            return Err(AppError::BadRequest(
-                "Missing 'challenge' or 'nonce' in decrypted payload".into(),
-            ));
-        }
+/// Transform the upstream URL for auth types that modify the URL (query, path).
+/// Returns (modified_path, modified_query).
+pub fn transform_url(
+    auth: &AuthConfig,
+    rest_path: &str,
+    original_query: &str,
+) -> (String, String) {
+    match auth.auth_type.as_str() {
+        "path" => (path::transform(auth, rest_path), original_query.to_string()),
+        "query" => (rest_path.to_string(), query::transform(auth, original_query)),
+        _ => (rest_path.to_string(), original_query.to_string()),
     }
-
-    // Load passkeys.json
-    let passkeys_path = state.config.data_dir.join("passkeys.json");
-    if !passkeys_path.exists() {
-        return Err(AppError::Unauthorized("Not set up — no passkeys registered".into()));
-    }
-    let passkeys: HashMap<String, PasskeyEntry> =
-        serde_json::from_str(&fs::read_to_string(&passkeys_path)?)
-            .map_err(|e| AppError::Internal(format!("Failed to parse passkeys.json: {}", e)))?;
-
-    // Look up the credential
-    let entry = passkeys
-        .get(&credential_id)
-        .ok_or_else(|| AppError::Unauthorized("Unknown credential ID".into()))?;
-
-    // Extract assertion from inner payload
-    let assertion: AssertionData = serde_json::from_value(
-        inner
-            .get("assertion")
-            .cloned()
-            .ok_or_else(|| AppError::BadRequest("Missing 'assertion' in decrypted payload".into()))?,
-    )
-    .map_err(|e| AppError::BadRequest(format!("Invalid assertion format: {}", e)))?;
-
-    // Verify assertion — x and y coordinates are required for signature verification
-    if entry.x.is_empty() || entry.y.is_empty() {
-        return Err(AppError::Unauthorized("Passkey has missing coordinates — cannot verify".into()));
-    }
-    verify_assertion(
-        &assertion,
-        &entry.x,
-        &entry.y,
-        &state.config.effective_origin(),
-        &state.config.effective_rp_id(),
-    )?;
-
-    Ok(AuthenticatedRequest {
-        payload: inner,
-        credential_id,
-        passkeys,
-    })
 }

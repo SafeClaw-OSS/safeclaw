@@ -1,17 +1,14 @@
-mod approval;
-mod audit;
 mod auth;
+mod cli;
 mod config;
+mod core;
 mod crypto;
 mod error;
-mod generate;
-mod policy;
-mod proxy;
-mod zeroize_json;
+mod notify;
+mod passkey;
+mod provider;
 mod server;
 mod state;
-mod update;
-mod webpush;
 #[cfg(test)]
 mod tests;
 
@@ -23,8 +20,8 @@ use axum::serve;
 use tokio::net::TcpListener;
 use tracing::{info, warn};
 
-use approval::ApprovalManager;
-use audit::AuditLog;
+use core::approval::ApprovalManager;
+use core::audit::AuditLog;
 use config::Config;
 use crypto::keys::load_or_create_keypair;
 use state::{AppState, RateLimiter, VaultState};
@@ -34,7 +31,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Handle `safeclaw update` subcommand before anything else
     let args: Vec<String> = std::env::args().collect();
     if args.len() >= 2 && args[1] == "update" {
-        return update::run(&args[2..]).map_err(Into::into);
+        return cli::update::run(&args[2..]).map_err(Into::into);
     }
 
     // Initialize tracing subscriber
@@ -97,8 +94,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = Arc::new(AppState {
         keypair,
         vault: vault.clone(),
-        nonces: Arc::new(Mutex::new(auth::nonce::NonceStore::new())),
-        challenges: Arc::new(Mutex::new(auth::challenge::ChallengeStore::new())),
+        nonces: Arc::new(Mutex::new(passkey::nonce::NonceStore::new())),
+        challenges: Arc::new(Mutex::new(passkey::challenge::ChallengeStore::new())),
         start_time: Instant::now(),
         started_at_ms: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -127,13 +124,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Build proxy state and router
-    let proxy_state = Arc::new(proxy::ProxyState {
+    let proxy_state = Arc::new(core::router::ProxyState {
         vault: vault.clone(),
         config: config.clone(),
         approval_manager: approval_manager.clone(),
         audit_log: audit_log.clone(),
+        providers: provider::ProviderRegistry::new(),
     });
-    let proxy_router = proxy::build_proxy_router(proxy_state);
+    let proxy_router = core::router::build_proxy_router(proxy_state);
 
     // Bind proxy first (127.0.0.1)
     let proxy_addr: SocketAddr = format!("{}:{}", config.proxy_bind, config.proxy_port)

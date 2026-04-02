@@ -13,7 +13,7 @@ use std::time::Instant;
 use axum::http::HeaderMap;
 use hyper::body::Bytes;
 
-use crate::audit::AuditLog;
+use super::audit::AuditLog;
 
 // ── Status ─────────────────────────────────────────────────────────────────────
 

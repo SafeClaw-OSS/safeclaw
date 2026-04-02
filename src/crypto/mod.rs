@@ -3,6 +3,7 @@ pub mod ecies;
 pub mod envelope;
 pub mod kdf;
 pub mod keys;
+pub mod zeroize;
 
 // Re-export commonly used items
 pub use aes::{aes_decrypt, aes_encrypt};

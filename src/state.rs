@@ -2,11 +2,12 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use crate::approval::ApprovalManager;
-use crate::audit::AuditLog;
+use crate::core::approval::ApprovalManager;
+use crate::core::audit::AuditLog;
 use crate::config::Config;
 use crate::crypto::keys::ServerKeypair;
-use crate::policy::{PolicyDefaults, PushSubscription};
+use crate::core::policy::PolicyDefaults;
+use crate::notify::PushSubscription;
 
 /// Approval session: credential access is cached after human approval until TTL expires.
 pub struct ApprovalSession {
@@ -133,7 +134,7 @@ impl VaultState {
             .and_then(|v| v.as_str())
             .map(|s| s.to_owned());
         let vapid_pub = vapid_priv.as_deref().and_then(|priv_b64| {
-            crate::webpush::vapid_public_key(priv_b64).ok()
+            crate::notify::webpush::vapid_public_key(priv_b64).ok()
         });
         *self.vapid_private_key.lock().unwrap() = vapid_priv;
         *self.vapid_public_key.lock().unwrap() = vapid_pub;
@@ -144,7 +145,7 @@ impl VaultState {
         // Zeroize old secrets before replacing
         {
             let mut guard = self.secrets.lock().unwrap();
-            crate::zeroize_json::zeroize_json_option(&mut *guard);
+            crate::crypto::zeroize::zeroize_json_option(&mut *guard);
             *guard = Some(secrets);
         }
     }
@@ -152,7 +153,7 @@ impl VaultState {
     /// Lock the vault — zeroize and clear all in-memory secrets.
     pub fn lock(&self) {
         // Zeroize vault secrets (API keys, OAuth tokens, etc.) before drop
-        crate::zeroize_json::zeroize_json_option(&mut *self.secrets.lock().unwrap());
+        crate::crypto::zeroize::zeroize_json_option(&mut *self.secrets.lock().unwrap());
         *self.service_names.lock().unwrap() = Vec::new();
         *self.approval_cache.lock().unwrap() = HashMap::new();
         *self.push_subscriptions.lock().unwrap() = Vec::new();
@@ -228,8 +229,8 @@ pub struct AppState {
     pub config: Config,
     pub keypair: ServerKeypair,
     pub vault: Arc<VaultState>,
-    pub nonces: Arc<Mutex<crate::auth::nonce::NonceStore>>,
-    pub challenges: Arc<Mutex<crate::auth::challenge::ChallengeStore>>,
+    pub nonces: Arc<Mutex<crate::passkey::nonce::NonceStore>>,
+    pub challenges: Arc<Mutex<crate::passkey::challenge::ChallengeStore>>,
     pub start_time: Instant,
     pub started_at_ms: u64,  // Unix ms timestamp at startup (for client-side uptime calc)
     pub rate_limiter: Arc<Mutex<RateLimiter>>,

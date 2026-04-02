@@ -18,7 +18,7 @@ use rand::RngCore;
 use sha2::Sha256;
 use tracing::{info, warn};
 
-use crate::policy::PushSubscription;
+use super::PushSubscription;
 
 // ── VAPID key management ───────────────────────────────────────────────────────
 

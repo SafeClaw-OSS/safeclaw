@@ -19,7 +19,7 @@ pub fn read_template(name: &str, fallback: &str) -> String {
 /// `{"services": {"name": null, ...}}` when locked.
 
 pub fn generate_safeclaw_md(secrets: &serde_json::Value, locked: bool, proxy_port: u16) -> String {
-    let template = read_template("safeclaw.md", include_str!("../templates/safeclaw.md"));
+    let template = read_template("safeclaw.md", include_str!("../../templates/safeclaw.md"));
     let proxy_base = format!("http://localhost:{}", proxy_port);
 
     // Build service table rows
@@ -48,7 +48,7 @@ pub fn generate_safeclaw_md(secrets: &serde_json::Value, locked: bool, proxy_por
 ///
 /// This is now fully static — dynamic service info lives in safeclaw.md.
 pub fn generate_agents_md_snippet(_secrets: &serde_json::Value, _proxy_port: u16) -> String {
-    read_template("agents-snippet.md", include_str!("../templates/agents-snippet.md"))
+    read_template("agents-snippet.md", include_str!("../../templates/agents-snippet.md"))
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
