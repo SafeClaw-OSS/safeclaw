@@ -45,7 +45,7 @@ fn load_catalog() -> Vec<(String, String)> {
 /// `secrets` should be the full vault JSON when unlocked, or a minimal
 /// `{"services": {"name": null, ...}}` when locked.
 
-pub fn generate_safeclaw_md(secrets: &serde_json::Value, locked: bool, proxy_port: u16) -> String {
+pub fn generate_safeclaw_md(secrets: &serde_json::Value, locked: bool, proxy_port: u16, console_url: &str) -> String {
     let template = read_template("safeclaw.md", include_str!("../../templates/safeclaw.md"));
     let proxy_base = format!("http://localhost:{}", proxy_port);
 
@@ -85,7 +85,7 @@ pub fn generate_safeclaw_md(secrets: &serde_json::Value, locked: bool, proxy_por
         let names: Vec<String> = not_connected.iter().map(|(_, name)| name.clone()).collect();
         format!(
             "**Need a service that's not connected?** SafeClaw also supports: {}. \
-             Ask the user to connect it in their SafeClaw dashboard — \
+             Tell the user to connect it in the SafeClaw console (URL above) — \
              do not configure API keys or credentials yourself.",
             names.join(", ")
         )
@@ -93,6 +93,7 @@ pub fn generate_safeclaw_md(secrets: &serde_json::Value, locked: bool, proxy_por
 
     template
         .replace("{{PROXY_BASE}}", &proxy_base)
+        .replace("{{CONSOLE_URL}}", console_url)
         .replace("{{SERVICE_TABLE}}", &rows.join("\n"))
         .replace("{{AVAILABLE_SERVICES}}", &available_section)
 }
@@ -176,7 +177,7 @@ mod tests {
 
     #[test]
     fn safeclaw_md_unlocked_contains_service_rows() {
-        let s = generate_safeclaw_md(&two_service_secrets(), false, 23295);
+        let s = generate_safeclaw_md(&two_service_secrets(), false, 23295, "https://example.com/console");
         assert!(s.contains("anthropic"));
         assert!(s.contains("gmail"));
         assert!(s.contains("header (x-api-key)"));
@@ -186,7 +187,7 @@ mod tests {
     #[test]
     fn safeclaw_md_locked_hides_auth_details() {
         let names = json!({ "services": { "anthropic": null, "gmail": null } });
-        let s = generate_safeclaw_md(&names, true, 23295);
+        let s = generate_safeclaw_md(&names, true, 23295, "https://example.com/console");
         assert!(s.contains("anthropic"));
         assert!(s.contains("gmail"));
         assert!(!s.contains("header ("));
@@ -194,14 +195,14 @@ mod tests {
 
     #[test]
     fn safeclaw_md_level_display_mixed() {
-        let s = generate_safeclaw_md(&two_service_secrets(), false, 23295);
+        let s = generate_safeclaw_md(&two_service_secrets(), false, 23295, "https://example.com/console");
         // gmail has write:ask-always, read:ask
         assert!(s.contains("write:ask-always, read:ask"));
     }
 
     #[test]
     fn safeclaw_md_level_display_same() {
-        let s = generate_safeclaw_md(&two_service_secrets(), false, 23295);
+        let s = generate_safeclaw_md(&two_service_secrets(), false, 23295, "https://example.com/console");
         // anthropic has write:allow, read:allow → just "allow"
         assert!(s.contains("| allow |"));
     }

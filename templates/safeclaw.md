@@ -14,19 +14,29 @@ SafeClaw is the API proxy on this machine. It holds encrypted credentials and fo
 - Only services listed above are accessible. Anything else returns 403 `UNKNOWN_SERVICE`.
 - Do **not** add API keys or Authorization headers — SafeClaw injects them automatically.
 
+## Console
+
+`{{CONSOLE_URL}}`
+
+Send this URL to the user when they need to connect services or configure their vault.
+
 {{AVAILABLE_SERVICES}}
 
-## Protocol
+## How to use
 
-### Vault locked
+**Always make the HTTP request to the proxy first. Do not predict or assume the outcome — handle the actual response you receive.**
 
-If a response contains `safeclaw_unlock_url`, the vault is locked.
+### Normal response (2xx, 4xx, 5xx)
 
-**Action:** Tell the user the vault is locked, provide the unlock URL as a clickable link, and create an inline button labeled "Unlock" linking to the URL. Then **stop and wait** — do not retry until the user confirms they have unlocked.
+Use it directly — this is the upstream API response.
+
+### Vault locked (response contains `safeclaw_unlock_url`)
+
+The vault is locked. Tell the user, provide the unlock URL as a clickable link, and create an inline button labeled "Unlock" linking to the URL. Then **stop and wait** — do not retry until the user confirms they have unlocked.
 
 ### Approval required (HTTP 202)
 
-Some requests require human approval. When you receive HTTP 202, the response body looks like:
+Some requests need human approval. When you receive HTTP 202, the response body looks like:
 
 ```json
 {
@@ -42,10 +52,10 @@ Some requests require human approval. When you receive HTTP 202, the response bo
 
 Send a message with:
 1. What you were trying to do (service + action)
-2. The `safeclaw_approve_url` as clickable text
-3. An inline button labeled "Done" that sends "Done" back to the chat
+2. The `safeclaw_approve_url` **from the actual 202 response** as clickable text
+3. An inline button: `[{"text": "✅ Done", "callback_data": "done"}]` — the user taps this button after approving, you must render it as an actual inline button, not as text
 
-Then **stop and wait** for the user to tap Done or reply.
+Then **stop and wait** for the user to tap the button or reply.
 
 #### Step 2 — Retrieve the result
 
@@ -84,7 +94,7 @@ This is the **only** way to get the result. Do NOT call the original API again.
 - `expires_at` is a unix timestamp. After expiry the approval is gone.
 - Streaming requests: the approved `response` is complete buffered JSON.
 
-### Approval policy
+### Approval levels
 
 | Level | Behavior |
 |-------|----------|

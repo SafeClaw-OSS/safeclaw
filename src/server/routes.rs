@@ -441,7 +441,7 @@ pub async fn setup(
     state.vault.set_secrets(secrets.clone());
 
     // Push full secrets (including services with auth tokens) to provisioner
-    push_to_provisioner(secrets, state.config.proxy_port);
+    push_to_provisioner(secrets, state.config.proxy_port, state.config.effective_admin_url());
 
     // Fire on-setup webhook
     if let Some(ref hook_url) = state.config.on_setup_hook {
@@ -537,8 +537,9 @@ pub async fn vault_unlock(
 
     // Push AGENTS.md + safeclaw.md to provisioner on unlock
     let proxy_port = state.config.proxy_port;
+    let console_url = state.config.effective_admin_url();
     if let Some(unlocked_secrets) = state.vault.secrets.lock().unwrap().clone() {
-        push_to_provisioner(unlocked_secrets, proxy_port);
+        push_to_provisioner(unlocked_secrets, proxy_port, console_url);
     }
 
     Ok(Json(json!({ "ok": true })))
@@ -641,7 +642,7 @@ pub async fn vault_update(
     state.vault.set_secrets(new_secrets.clone());
 
     // Keep VM-side SafeClaw guidance in sync with the latest vault config.
-    push_to_provisioner(new_secrets, state.config.proxy_port);
+    push_to_provisioner(new_secrets, state.config.proxy_port, state.config.effective_admin_url());
 
     Ok(Json(json!({ "ok": true })))
 }
@@ -651,9 +652,9 @@ pub async fn vault_update(
 /// Spawn a background task that pushes updated safeclaw.md and AGENTS.md to the
 /// local provisioner after a service add/update/remove. Failures are silently
 /// discarded — the vault operation has already succeeded.
-fn push_to_provisioner(secrets: serde_json::Value, proxy_port: u16) {
+fn push_to_provisioner(secrets: serde_json::Value, proxy_port: u16, console_url: String) {
     tokio::spawn(async move {
-        let md = crate::cli::generate::generate_safeclaw_md(&secrets, false, proxy_port);
+        let md = crate::cli::generate::generate_safeclaw_md(&secrets, false, proxy_port, &console_url);
         let snippet = crate::cli::generate::generate_agents_md_snippet(&secrets, proxy_port);
 
         // Extract channel tokens that need to be written into OpenClaw config.
@@ -790,8 +791,9 @@ pub async fn vault_services_add(
 
     // Push updated workspace files to provisioner
     let proxy_port = state.config.proxy_port;
+    let console_url = state.config.effective_admin_url();
     if let Some(secrets) = state.vault.secrets.lock().unwrap().clone() {
-        push_to_provisioner(secrets, proxy_port);
+        push_to_provisioner(secrets, proxy_port, console_url);
     }
 
     Ok(Json(json!({ "ok": true })))
@@ -829,8 +831,9 @@ pub async fn vault_services_update(
 
     // Push updated workspace files to provisioner
     let proxy_port = state.config.proxy_port;
+    let console_url = state.config.effective_admin_url();
     if let Some(secrets) = state.vault.secrets.lock().unwrap().clone() {
-        push_to_provisioner(secrets, proxy_port);
+        push_to_provisioner(secrets, proxy_port, console_url);
     }
 
     Ok(Json(json!({ "ok": true })))
@@ -859,8 +862,9 @@ pub async fn vault_services_remove(
 
     // Push updated workspace files to provisioner
     let proxy_port = state.config.proxy_port;
+    let console_url = state.config.effective_admin_url();
     if let Some(secrets) = state.vault.secrets.lock().unwrap().clone() {
-        push_to_provisioner(secrets, proxy_port);
+        push_to_provisioner(secrets, proxy_port, console_url);
     }
 
     Ok(Json(json!({ "ok": true })))
@@ -1520,17 +1524,18 @@ pub async fn identity_remove_passkey(
 /// GET /admin/safeclaw.md — returns a Markdown service table (no passkey required)
 pub async fn admin_safeclaw_md(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let locked = state.vault.is_locked();
+    let console_url = state.config.effective_admin_url();
     let content = {
         let secrets_guard = state.vault.secrets.lock().unwrap();
         if let Some(ref s) = *secrets_guard {
-            crate::cli::generate::generate_safeclaw_md(s, false, state.config.proxy_port)
+            crate::cli::generate::generate_safeclaw_md(s, false, state.config.proxy_port, &console_url)
         } else {
             drop(secrets_guard);
             let names = state.vault.service_names.lock().unwrap().clone();
             let services: serde_json::Map<String, Value> =
                 names.into_iter().map(|n| (n, Value::Null)).collect();
             let minimal = json!({ "services": services });
-            crate::cli::generate::generate_safeclaw_md(&minimal, locked, state.config.proxy_port)
+            crate::cli::generate::generate_safeclaw_md(&minimal, locked, state.config.proxy_port, &console_url)
         }
     };
     (
