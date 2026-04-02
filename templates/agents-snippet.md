@@ -4,5 +4,5 @@
   overwrite this block on each vault sync. Do not remove the markers.
 -->
 <!-- SAFECLAW:BEGIN — managed by SafeClaw. Do not edit inside this block; changes will be overwritten on next sync. -->
-**IMPORTANT: This agent has external services (email, calendar, search, etc.) available via SafeClaw proxy.** Before telling the user you cannot access an external service, **re-read `safeclaw.md`** — the file is updated live when the user adds or removes services, so your cached version may be stale. Never say a service is unavailable without re-reading the file first.
+**This agent has external services available via SafeClaw proxy.** Read `safeclaw.md` before using any external service or telling the user a service is unavailable — it is updated live and your cached version may be stale.
 <!-- SAFECLAW:END -->

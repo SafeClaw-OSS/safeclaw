@@ -669,12 +669,6 @@ fn push_to_provisioner(secrets: serde_json::Value, proxy_port: u16) {
         let mut ops = vec![
             serde_json::json!({ "type": "workspace", "file": "safeclaw.md", "content": md }),
             serde_json::json!({ "type": "workspace", "file": "AGENTS.md", "content": snippet }),
-            serde_json::json!({
-                "type": "skill",
-                "dir": "safeclaw",
-                "file": "SKILL.md",
-                "content": crate::cli::generate::read_template("skill.md", include_str!("../../templates/skill.md"))
-            }),
         ];
 
         // Restart OpenClaw after guidance sync so newly written skills/docs are

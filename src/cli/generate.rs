@@ -12,6 +12,33 @@ pub fn read_template(name: &str, fallback: &str) -> String {
     fallback.to_string()
 }
 
+/// Load the service catalog (services.json) at runtime.
+/// Returns the set of known service IDs and their display names.
+fn load_catalog() -> Vec<(String, String)> {
+    let catalog_str = if let Ok(data) = std::env::var("SAFECLAW_DATA") {
+        let path = format!("{}/catalog/services.json", data);
+        std::fs::read_to_string(&path).ok()
+    } else {
+        None
+    };
+    // Fall back to compiled-in catalog
+    let catalog_str = catalog_str.unwrap_or_else(|| {
+        include_str!("../../catalog/services.json").to_string()
+    });
+    let catalog: serde_json::Value = match serde_json::from_str(&catalog_str) {
+        Ok(v) => v,
+        Err(_) => return vec![],
+    };
+    let mut out = vec![];
+    if let Some(services) = catalog.get("services").and_then(|s| s.as_object()) {
+        for (id, svc) in services {
+            let name = svc.get("name").and_then(|n| n.as_str()).unwrap_or(id).to_string();
+            out.push((id.clone(), name));
+        }
+    }
+    out
+}
+
 /// Generate safeclaw.md content describing all services and their proxy URLs.
 ///
 /// When `locked` is true, auth/level details are omitted (only names shown).
@@ -21,6 +48,13 @@ pub fn read_template(name: &str, fallback: &str) -> String {
 pub fn generate_safeclaw_md(secrets: &serde_json::Value, locked: bool, proxy_port: u16) -> String {
     let template = read_template("safeclaw.md", include_str!("../../templates/safeclaw.md"));
     let proxy_base = format!("http://localhost:{}", proxy_port);
+
+    // Collect connected service IDs
+    let connected: std::collections::HashSet<String> = secrets
+        .get("services")
+        .and_then(|s| s.as_object())
+        .map(|m| m.keys().cloned().collect())
+        .unwrap_or_default();
 
     // Build service table rows
     let mut rows = vec![
@@ -39,9 +73,28 @@ pub fn generate_safeclaw_md(secrets: &serde_json::Value, locked: bool, proxy_por
         }
     }
 
+    // Build available-but-not-connected guidance from catalog
+    let catalog = load_catalog();
+    let not_connected: Vec<&(String, String)> = catalog
+        .iter()
+        .filter(|(id, _)| !connected.contains(id))
+        .collect();
+    let available_section = if not_connected.is_empty() {
+        String::new()
+    } else {
+        let names: Vec<String> = not_connected.iter().map(|(_, name)| name.clone()).collect();
+        format!(
+            "**Need a service that's not connected?** SafeClaw also supports: {}. \
+             Ask the user to connect it in their SafeClaw dashboard — \
+             do not configure API keys or credentials yourself.",
+            names.join(", ")
+        )
+    };
+
     template
         .replace("{{PROXY_BASE}}", &proxy_base)
         .replace("{{SERVICE_TABLE}}", &rows.join("\n"))
+        .replace("{{AVAILABLE_SERVICES}}", &available_section)
 }
 
 /// Return the static AGENTS.md snippet (managed block).
