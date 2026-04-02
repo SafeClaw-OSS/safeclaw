@@ -45,8 +45,8 @@ cargo build --release
 Then point your agent at the proxy:
 
 ```yaml
-# Example: OpenClaw config
-providers:
+# Example: agent config
+services:
   openai:
     baseUrl: http://localhost:23295/openai/v1
     apiKey: sk-dummy  # SafeClaw injects the real key
@@ -141,6 +141,74 @@ data/
 Templates (skill.md, safeclaw.md, agents-snippet.md) are stored in `$SAFECLAW_DATA/templates/` and read at runtime. Template updates take effect immediately without restarting SafeClaw.
 
 ---
+
+## Architecture
+
+```
+src/
+├── main.rs              # Entry point: starts admin server + proxy server
+├── config.rs            # CLI flags & env var parsing
+├── state.rs             # Shared application state (AppState, VaultState)
+├── error.rs             # Error types
+│
+├── core/                # Core proxy engine
+│   ├── router.rs        # Proxy request handler + routing
+│   ├── forward.rs       # Upstream HTTP forwarding (reqwest)
+│   ├── policy.rs        # Access policy evaluation (allow/deny/approve)
+│   ├── approval.rs      # Human-in-the-loop approval flow
+│   ├── audit.rs         # SQLite audit log
+│   └── locked.rs        # Locked-vault response formatting
+│
+├── service/             # Service plugin system
+│   ├── mod.rs           # Service trait + ServiceRegistry
+│   ├── anthropic.rs     # Anthropic (Claude) — OAuth, x-api-key, locked response
+│   ├── openai.rs        # OpenAI / Codex — account headers, locked response
+│   ├── google.rs        # Google Gemini — locked response
+│   └── default.rs       # Default no-op + GenericLlm (DeepSeek, Groq, etc.)
+│
+├── auth/                # Service auth (upstream credential injection)
+│   ├── mod.rs           # AuthConfig, ServiceConfig, inject_auth(), transform_url()
+│   ├── bearer.rs        # Bearer token injection
+│   ├── basic.rs         # HTTP Basic auth
+│   ├── header.rs        # Custom header (x-api-key, etc.)
+│   ├── query.rs         # Query parameter injection
+│   ├── path.rs          # URL path injection
+│   └── oauth2.rs        # OAuth2 token refresh (form + JSON styles)
+│
+├── passkey/             # User auth (WebAuthn passkey verification)
+│   ├── mod.rs           # AuthenticatedRequest extractor, PasskeyEntry
+│   ├── webauthn.rs      # ECDSA P-256 assertion verification
+│   ├── challenge.rs     # Challenge store (TTL, single-use)
+│   └── nonce.rs         # Replay-protection nonce store
+│
+├── crypto/              # Cryptographic primitives
+│   ├── keys.rs          # P-256 keypair management (JWK)
+│   ├── ecies.rs         # ECIES encrypt/decrypt (ECDH + AES-GCM)
+│   ├── aes.rs           # AES-256-GCM
+│   ├── kdf.rs           # HKDF-SHA256
+│   ├── envelope.rs      # Sealed envelope format
+│   └── zeroize.rs       # Zeroize-on-drop JSON values
+│
+├── server/              # Admin HTTP server
+│   ├── routes.rs        # All admin/vault/passkey endpoints
+│   └── static_files.rs  # Embedded static assets
+│
+├── notify/              # Push notifications
+│   ├── mod.rs           # PushSubscription, PushKeys types
+│   └── webpush.rs       # VAPID + ECE + WebPush delivery
+│
+└── cli/                 # CLI subcommands
+    ├── generate.rs      # Workspace file generation (safeclaw.md, etc.)
+    └── update.rs        # Self-update from GitHub releases
+```
+
+### Adding a new service
+
+1. Create `src/service/myservice.rs` implementing the `Service` trait
+2. Register it in `ServiceRegistry::new()` in `src/service/mod.rs`
+3. That's it — the core proxy handles routing, auth injection, and policy automatically
+
+Most `Service` trait methods have default no-op implementations. Only override what your service needs (custom headers, OAuth style, locked response format).
 
 ## Technical details
 
