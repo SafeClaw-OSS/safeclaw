@@ -10,7 +10,7 @@ pub fn inject(auth: &AuthConfig, headers: &mut reqwest::header::HeaderMap) {
         if prefix.is_empty() {
             secret.to_string()
         } else {
-            format!("{} {}", prefix, secret)
+            format!("{} {}", prefix.trim_end(), secret)
         }
     } else {
         secret.to_string()
