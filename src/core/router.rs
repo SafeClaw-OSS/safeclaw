@@ -21,7 +21,7 @@ use super::forward::{forward_request, parse_route};
 use super::locked::openai_locked;
 use crate::auth::{AuthConfig, ServiceConfig};
 use crate::auth::oauth2::refresh_token as refresh_oauth2_token;
-use crate::provider::ProviderRegistry;
+use crate::service::ServiceRegistry;
 
 /// Shared state for the proxy server
 pub struct ProxyState {
@@ -29,7 +29,7 @@ pub struct ProxyState {
     pub config: Config,
     pub approval_manager: Arc<ApprovalManager>,
     pub audit_log: Arc<AuditLog>,
-    pub providers: ProviderRegistry,
+    pub services: ServiceRegistry,
 }
 
 pub fn build_proxy_router(state: Arc<ProxyState>) -> Router {
@@ -321,9 +321,9 @@ async fn proxy_handler(
         }
 
         let admin_url = &state.config.effective_admin_url();
-        let provider = state.providers.resolve(&route_service);
+        let svc = state.services.resolve(&route_service);
 
-        return provider.locked_response(is_stream, admin_url, &route_path)
+        return svc.locked_response(is_stream, admin_url, &route_path)
             .unwrap_or_else(|| openai_locked(is_stream, admin_url));
     }
 
@@ -395,10 +395,10 @@ async fn proxy_handler(
 
     // ── Policy evaluation ──────────────────────────────────────────────────────
 
-    // Infer category from provider if not explicitly set in vault config
-    let provider = state.providers.resolve(&route_service);
+    // Infer category from service if not explicitly set in vault config
+    let svc = state.services.resolve(&route_service);
     let category = service_config.category.as_deref()
-        .unwrap_or(provider.default_category());
+        .unwrap_or(svc.default_category());
 
     let policy_defaults = state.vault.get_policy_defaults();
     let access_level = evaluate_policy(

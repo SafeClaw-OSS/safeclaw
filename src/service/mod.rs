@@ -1,8 +1,8 @@
-/// Service provider plugin system.
+/// Service plugin system.
 ///
 /// Each upstream service can optionally implement the `Service` trait
 /// to customize headers, locked responses, OAuth refresh, etc.
-/// Services without a provider implementation use `DefaultProvider` (pure config).
+/// Services without a custom implementation use `Default` (pure config).
 pub mod default;
 pub mod anthropic;
 pub mod openai;
@@ -14,14 +14,14 @@ use crate::auth::oauth2::OAuthStyle;
 
 // ── Service Trait ───────────────────────────────────────────────────────
 
-/// Trait for provider-specific behavior.
+/// Trait for service-specific behavior.
 ///
-/// Most methods have default implementations (no-op), so providers only need
-/// to override what they customize. Adding a new provider requires:
-/// 1. Create a file in `provider/` implementing this trait
-/// 2. Register it in `build_registry()` below
+/// Most methods have default implementations (no-op), so services only need
+/// to override what they customize. Adding a new service requires:
+/// 1. Create a file in `service/` implementing this trait
+/// 2. Register it in `ServiceRegistry::new()` below
 pub trait Service: Send + Sync {
-    /// Service name(s) this provider matches.
+    /// Service name(s) this implementation matches.
     fn names(&self) -> &[&str];
 
     /// Default category if not set in vault config.
@@ -39,7 +39,7 @@ pub trait Service: Send + Sync {
     /// Custom OAuth2 refresh style. Return None to use the default form-urlencoded.
     fn oauth_style(&self) -> Option<OAuthStyle> { None }
 
-    /// Locked vault response in this provider's API format.
+    /// Locked vault response in this service's API format.
     /// Return None to use a generic JSON error.
     fn locked_response(
         &self,
@@ -49,17 +49,17 @@ pub trait Service: Send + Sync {
     ) -> Option<Response> { None }
 }
 
-// ── Provider Registry ──────────────────────────────────────────────────────────
+// ── Service Registry ─────────────────────────────────────────────────────────
 
-pub struct ProviderRegistry {
-    providers: Vec<Box<dyn Service>>,
+pub struct ServiceRegistry {
+    services: Vec<Box<dyn Service>>,
 }
 
-impl ProviderRegistry {
-    /// Build the registry with all built-in providers.
+impl ServiceRegistry {
+    /// Build the registry with all built-in services.
     pub fn new() -> Self {
         Self {
-            providers: vec![
+            services: vec![
                 Box::new(anthropic::Anthropic),
                 Box::new(openai::OpenAI),
                 Box::new(google::Google),
@@ -68,21 +68,21 @@ impl ProviderRegistry {
         }
     }
 
-    /// Resolve a provider by service name. Returns the DefaultProvider if none matches.
+    /// Resolve a service by name. Returns Default if none matches.
     pub fn resolve(&self, service_name: &str) -> &dyn Service {
-        for p in &self.providers {
-            if p.names().contains(&service_name) {
-                return p.as_ref();
+        for s in &self.services {
+            if s.names().contains(&service_name) {
+                return s.as_ref();
             }
         }
         &default::Default
     }
 }
 
-// ── Convenience: apply_provider_headers (used by forward.rs) ────────────────────
+// ── Convenience: apply_service_headers (used by forward.rs) ─────────────────
 
-/// Inject provider-specific headers. Called from core/forward.rs after auth injection.
-pub fn apply_provider_headers(
+/// Inject service-specific headers. Called from core/forward.rs after auth injection.
+pub fn apply_service_headers(
     auth: &AuthConfig,
     resolved_bearer: Option<&str>,
     headers: &mut reqwest::header::HeaderMap,

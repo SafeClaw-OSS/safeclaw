@@ -1,4 +1,4 @@
-// Google Gemini provider.
+// Google Gemini service.
 
 use axum::response::Response;
 use crate::auth::AuthConfig;

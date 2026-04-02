@@ -138,7 +138,7 @@ pub async fn forward_request(
 
     // ── Provider-specific header injection ──────────────────────────────────
     if let Some(a) = auth_cfg {
-        crate::provider::apply_provider_headers(a, resolved_bearer, &mut fwd_headers);
+        crate::service::apply_service_headers(a, resolved_bearer, &mut fwd_headers);
     }
 
     // ── Request logging (all auth types) ─────────────────────────────────────

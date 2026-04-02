@@ -6,7 +6,7 @@ mod crypto;
 mod error;
 mod notify;
 mod passkey;
-mod provider;
+mod service;
 mod server;
 mod state;
 #[cfg(test)]
@@ -129,7 +129,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config: config.clone(),
         approval_manager: approval_manager.clone(),
         audit_log: audit_log.clone(),
-        providers: provider::ProviderRegistry::new(),
+        services: service::ServiceRegistry::new(),
     });
     let proxy_router = core::router::build_proxy_router(proxy_state);
 

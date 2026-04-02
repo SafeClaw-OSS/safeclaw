@@ -1,4 +1,4 @@
-// Anthropic Claude API provider.
+// Anthropic Claude API service.
 
 use std::str::FromStr;
 use axum::response::Response;

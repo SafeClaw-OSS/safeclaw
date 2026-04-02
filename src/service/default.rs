@@ -1,8 +1,8 @@
-// Default provider: pure vault-config-driven, no provider-specific behavior.
+// Default service: pure vault-config-driven, no service-specific behavior.
 
 use super::Service;
 
-/// Fallback provider for services with no custom behavior.
+/// Fallback service for services with no custom behavior.
 /// All methods use the default (no-op) implementations.
 pub struct Default;
 
@@ -10,8 +10,8 @@ impl Service for Default {
     fn names(&self) -> &[&str] { &[] }
 }
 
-/// Generic LLM provider: no custom headers/locked responses, just category = "llm".
-/// Used for providers that are OpenAI-compatible (deepseek, groq, etc.)
+/// Generic LLM service: no custom headers/locked responses, just category = "llm".
+/// Used for services that are OpenAI-compatible (deepseek, groq, etc.)
 pub struct GenericLlm {
     pub names: &'static [&'static str],
 }

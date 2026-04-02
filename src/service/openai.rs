@@ -1,4 +1,4 @@
-// OpenAI provider (Chat Completions + Responses API + Codex).
+// OpenAI service (Chat Completions + Responses API + Codex).
 
 use std::str::FromStr;
 use axum::response::Response;
