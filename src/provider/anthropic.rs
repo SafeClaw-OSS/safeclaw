@@ -4,12 +4,12 @@ use std::str::FromStr;
 use axum::response::Response;
 use crate::auth::AuthConfig;
 use crate::auth::oauth2::OAuthStyle;
-use super::ServiceProvider;
+use super::Service;
 use crate::core::locked::anthropic_locked;
 
 pub struct Anthropic;
 
-impl ServiceProvider for Anthropic {
+impl Service for Anthropic {
     fn names(&self) -> &[&str] { &["anthropic"] }
 
     fn default_category(&self) -> &str { "llm" }

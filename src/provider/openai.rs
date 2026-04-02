@@ -3,12 +3,12 @@
 use std::str::FromStr;
 use axum::response::Response;
 use crate::auth::AuthConfig;
-use super::ServiceProvider;
+use super::Service;
 use crate::core::locked::{openai_locked, openai_responses_locked};
 
 pub struct OpenAI;
 
-impl ServiceProvider for OpenAI {
+impl Service for OpenAI {
     fn names(&self) -> &[&str] { &["openai"] }
 
     fn default_category(&self) -> &str { "llm" }

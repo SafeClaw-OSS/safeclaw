@@ -2,12 +2,12 @@
 
 use axum::response::Response;
 use crate::auth::AuthConfig;
-use super::ServiceProvider;
+use super::Service;
 use crate::core::locked::gemini_locked;
 
 pub struct Google;
 
-impl ServiceProvider for Google {
+impl Service for Google {
     fn names(&self) -> &[&str] { &["google"] }
 
     fn default_category(&self) -> &str { "llm" }

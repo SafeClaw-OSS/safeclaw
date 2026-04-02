@@ -1,6 +1,6 @@
 /// Service provider plugin system.
 ///
-/// Each upstream service can optionally implement the `ServiceProvider` trait
+/// Each upstream service can optionally implement the `Service` trait
 /// to customize headers, locked responses, OAuth refresh, etc.
 /// Services without a provider implementation use `DefaultProvider` (pure config).
 pub mod default;
@@ -12,7 +12,7 @@ use axum::response::Response;
 use crate::auth::AuthConfig;
 use crate::auth::oauth2::OAuthStyle;
 
-// ── ServiceProvider Trait ───────────────────────────────────────────────────────
+// ── Service Trait ───────────────────────────────────────────────────────
 
 /// Trait for provider-specific behavior.
 ///
@@ -20,7 +20,7 @@ use crate::auth::oauth2::OAuthStyle;
 /// to override what they customize. Adding a new provider requires:
 /// 1. Create a file in `provider/` implementing this trait
 /// 2. Register it in `build_registry()` below
-pub trait ServiceProvider: Send + Sync {
+pub trait Service: Send + Sync {
     /// Service name(s) this provider matches.
     fn names(&self) -> &[&str];
 
@@ -52,7 +52,7 @@ pub trait ServiceProvider: Send + Sync {
 // ── Provider Registry ──────────────────────────────────────────────────────────
 
 pub struct ProviderRegistry {
-    providers: Vec<Box<dyn ServiceProvider>>,
+    providers: Vec<Box<dyn Service>>,
 }
 
 impl ProviderRegistry {
@@ -69,7 +69,7 @@ impl ProviderRegistry {
     }
 
     /// Resolve a provider by service name. Returns the DefaultProvider if none matches.
-    pub fn resolve(&self, service_name: &str) -> &dyn ServiceProvider {
+    pub fn resolve(&self, service_name: &str) -> &dyn Service {
         for p in &self.providers {
             if p.names().contains(&service_name) {
                 return p.as_ref();

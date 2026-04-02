@@ -1,12 +1,12 @@
 // Default provider: pure vault-config-driven, no provider-specific behavior.
 
-use super::ServiceProvider;
+use super::Service;
 
 /// Fallback provider for services with no custom behavior.
 /// All methods use the default (no-op) implementations.
 pub struct Default;
 
-impl ServiceProvider for Default {
+impl Service for Default {
     fn names(&self) -> &[&str] { &[] }
 }
 
@@ -16,7 +16,7 @@ pub struct GenericLlm {
     pub names: &'static [&'static str],
 }
 
-impl ServiceProvider for GenericLlm {
+impl Service for GenericLlm {
     fn names(&self) -> &[&str] { self.names }
     fn default_category(&self) -> &str { "llm" }
 }
