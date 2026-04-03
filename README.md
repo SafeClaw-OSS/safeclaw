@@ -72,8 +72,8 @@ SafeClaw uses a **declarative service protocol**. Services are organized by cate
 services/
   llm/                          # LLM providers
     anthropic/
-      service.toml              # Vault proxy definition (auth, upstream, headers)
-      recipe.toml               # Runtime setup instructions for OpenClaw
+      service.toml              # Runtime interface (upstream, auth, policy)
+      recipe.toml               # First-time installation instructions
     claude-code/                # Claude Code OAuth variant
     openai/
     openai-codex/               # Codex OAuth variant
@@ -87,35 +87,36 @@ services/
     github/
     brave/
     gmail/
-    nodpay/                     # Recipe only (no credential proxy)
+    nodpay/                     # Local CLI bridge (type = "local")
     openclaw-dashboard/         # OpenClaw native dashboard
     ...
 ```
 
-### service.toml — vault proxy definition
+### service.toml — runtime interface definition
 
 ```toml
 [service]
 id = "anthropic"
 name = "Anthropic"
-description = "Claude AI models via API key"
+sub = "API Key"
 category = "llm"
 
 [upstream]
 url = "https://api.anthropic.com"
 
-[auth]
+[upstream.auth]
 type = "header"
 header = "x-api-key"
 
-[defaults]
-levels = { read = "allow", write = "allow" }
-
-[locked_response]
+[upstream.locked]
 template = "anthropic"
+
+[policy.levels]
+read = "allow"
+write = "allow"
 ```
 
-### recipe.toml — runtime setup instructions
+### recipe.toml — first-time installation instructions
 
 ```toml
 [openclaw]
@@ -124,14 +125,17 @@ api = "anthropic-messages"
 env_key = "ANTHROPIC_API_KEY"
 env_base_url = "ANTHROPIC_BASE_URL"
 proxy_path = "/anthropic/v1"
-models = ["claude-sonnet-4-20250514", "claude-opus-4-20250514"]
+
+[[openclaw.models]]
+id = "claude-sonnet-4-20250514"
+name = "Claude Sonnet 4"
 ```
 
 ### Adding a new service
 
 Create a folder in `services/` with a `service.toml`. No Rust code needed — the registry loads all definitions at startup.
 
-For services that need runtime installation (plugins, env vars, config patches), add a `recipe.toml`.
+For services that need installation steps (plugins, env vars, config patches), add a `recipe.toml`. Each step declares `target = "safeclaw"` or `target = "openclaw"` to specify which environment executes it.
 
 ### Connect a service (open-source)
 
@@ -148,7 +152,7 @@ The `connect` command reads the service's `recipe.toml` and prints human-readabl
 
 ### Service protocol
 
-See [PROTOCOL.md](PROTOCOL.md) for the full service.toml and recipe.toml specification, including auth types, header templates, policy rules, and local service handlers.
+See [PROTOCOL.md](PROTOCOL.md) for the full service.toml and recipe.toml specification, including auth types, header templates, policy rules, local service handlers, and step targets.
 
 ## Remote deployment
 
