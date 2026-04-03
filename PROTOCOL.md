@@ -19,8 +19,8 @@ services/
   integration/                  # Apps, tools, CLI services
     github/
     nodpay/
-      recipe.toml               # Recipe-only (no proxy)
-      [custom code/binary]      # Optional: service-specific bridge
+      service.toml              # Local CLI bridge (type = "local")
+      recipe.toml               # Install steps (target = "safeclaw")
     ...
 ```
 
