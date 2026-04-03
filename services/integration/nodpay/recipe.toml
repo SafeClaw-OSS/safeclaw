@@ -22,3 +22,15 @@ target = "safeclaw"
 title = "Enable passkey sharing"
 description = "Allows NodPay to create wallets using the same biometric passkey"
 target = "safeclaw"
+
+[[steps]]
+title = "Install NodPay CLI"
+run = "npm install -g nodpay"
+target = "openclaw"
+
+[[steps]]
+title = "Configure remote wallet"
+files = [
+    { path = "~/.nodpay/config.json", content = '{"remote_wallet": "http://localhost:{{proxy_port}}/nodpay"}' },
+]
+target = "openclaw"

@@ -8,14 +8,19 @@ category = "integration"
 type = "local"
 
 [[upstream.apis]]
-method = "POST"
-path = "/sign"
-command = "npx nodpay sign"
+method = "GET"
+path = "/wallets"
+command = "npx nodpay wallets --json"
 
 [[upstream.apis]]
 method = "GET"
 path = "/address"
 command = "npx nodpay address"
+
+[[upstream.apis]]
+method = "POST"
+path = "/sign"
+command = "npx nodpay sign"
 
 [policy.levels]
 read = "allow"
