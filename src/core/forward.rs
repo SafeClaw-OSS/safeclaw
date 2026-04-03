@@ -57,7 +57,16 @@ pub async fn forward_request(
     registry: &ServiceRegistry,
     service_name: &str,
 ) -> Response {
-    let upstream_url = &service_config.upstream;
+    let upstream_url = match &service_config.upstream {
+        Some(u) => u,
+        None => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                axum::Json(serde_json::json!({ "error": "No upstream URL configured (local service?)" })),
+            )
+                .into_response();
+        }
+    };
 
     // Parse upstream base URL for host header
     let parsed_upstream = match upstream_url.parse::<url::Url>() {

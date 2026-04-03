@@ -16,7 +16,9 @@ use crate::core::policy::{PolicyRule, ServiceLevels};
 /// Service configuration extracted from vault secrets
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct ServiceConfig {
-    pub upstream: String,
+    /// Upstream base URL. Required for proxy services; absent for local services.
+    #[serde(default)]
+    pub upstream: Option<String>,
     pub auth: Option<AuthConfig>,
     /// Per-service access levels (optional; falls back to policy defaults)
     pub levels: Option<ServiceLevels>,
