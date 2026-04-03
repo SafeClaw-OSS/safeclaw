@@ -146,17 +146,9 @@ safeclaw connect nodpay
 
 The `connect` command reads the service's `recipe.toml` and prints human-readable instructions for manual setup.
 
-### Header templates
+### Service protocol
 
-Service definitions support template variables in custom headers:
-
-```toml
-[headers]
-"x-session-id" = "{{uuid_v4}}"           # Generated per-request
-"chatgpt-account-id" = "{{auth.account_id}}"  # From auth config
-```
-
-Supported variables: `{{uuid_v4}}`, `{{auth.<field>}}`.
+See [PROTOCOL.md](PROTOCOL.md) for the full service.toml and recipe.toml specification, including auth types, header templates, policy rules, and local service handlers.
 
 ## Remote deployment
 
