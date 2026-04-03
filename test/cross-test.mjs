@@ -3,7 +3,7 @@
 // Verifies wire compatibility between safeclaw-client.js crypto and Rust backend.
 
 import { execSync, spawn } from 'node:child_process'
-import { readFileSync, existsSync, rmSync, mkdirSync } from 'node:fs'
+import { readFileSync, writeFileSync, existsSync, rmSync, mkdirSync, chmodSync } from 'node:fs'
 import { createServer as createHttpServer } from 'node:http'
 import { join } from 'node:path'
 import crypto from 'node:crypto'
@@ -187,6 +187,51 @@ async function main() {
   if (existsSync(DATA_DIR)) rmSync(DATA_DIR, { recursive: true })
   mkdirSync(DATA_DIR, { recursive: true })
 
+  // ── Set up a local service for testing CLI bridge ──────────────────────
+  const localSvcDir = join(DATA_DIR, 'services', 'testlocal')
+  mkdirSync(localSvcDir, { recursive: true })
+
+  // service.toml: local type with mock commands
+  const echoScript = join(localSvcDir, 'echo.sh')
+  const signScript = join(localSvcDir, 'sign.sh')
+  writeFileSync(join(localSvcDir, 'service.toml'), `
+[service]
+id = "testlocal"
+name = "Test Local"
+sub = "Local bridge test"
+category = "integration"
+
+[upstream]
+type = "local"
+
+[[upstream.apis]]
+method = "GET"
+path = "/echo"
+command = "${echoScript}"
+
+[[upstream.apis]]
+method = "POST"
+path = "/sign"
+command = "${signScript}"
+
+[policy.levels]
+read = "allow"
+write = "allow"
+`)
+
+  // GET /echo: returns static JSON
+  writeFileSync(echoScript, `#!/bin/sh
+echo '{"address":"0xDEAD","ok":true}'
+`)
+  chmodSync(echoScript, '755')
+
+  // POST /sign: reads stdin body and wraps it
+  writeFileSync(signScript, `#!/bin/sh
+BODY=$(cat)
+echo "{\\"signed\\":true,\\"input\\":$BODY}"
+`)
+  chmodSync(signScript, '755')
+
   // Start webhook receiver to capture on-setup hook calls
   const hookPayloads = []
   const hookServer = createHttpServer((req, res) => {
@@ -278,7 +323,13 @@ async function main() {
         openai: {
           upstream: 'https://api.openai.com',
           auth: { type: 'header', name: 'authorization', prefix: 'Bearer', value: 'sk-test-key' },
-        }
+        },
+        testlocal: {
+          // No upstream — local service (CLI bridge)
+          auth: { type: 'key', secret: '0xdeadbeef' },
+          category: 'integration',
+          levels: { read: 'allow', write: 'allow' },
+        },
       }
     }
 
@@ -527,6 +578,76 @@ async function main() {
     }))
     assert.equal(unlockRes.status, 200, `Unlock with new passkey failed: ${JSON.stringify(unlockRes.json)}`)
   })
+
+  // ── NodPay integration: webauthn, passkey export, local service ──────
+
+  await test('GET /.well-known/webauthn returns origins', async () => {
+    const { status, json } = await get('/.well-known/webauthn')
+    assert.equal(status, 200)
+    assert.ok(Array.isArray(json.origins))
+    assert.ok(json.origins.includes('https://nodpay.ai'))
+  })
+
+  await test('GET /passkeys/public returns hex coordinates', async () => {
+    const { status, json } = await get('/passkeys/public')
+    assert.equal(status, 200)
+    assert.ok(Array.isArray(json.passkeys))
+    assert.ok(json.passkeys.length >= 1, 'Expected at least 1 passkey')
+    // Find any passkey with valid coordinates (order is non-deterministic)
+    const pk = json.passkeys.find(p => p.deviceName === 'CrossTest') || json.passkeys[0]
+    assert.ok(pk.x.startsWith('0x'), 'x should be 0x-prefixed hex')
+    assert.ok(pk.y.startsWith('0x'), 'y should be 0x-prefixed hex')
+    assert.equal(pk.x.length, 66, 'x should be 32 bytes = 64 hex chars + 0x prefix')
+    assert.equal(pk.y.length, 66, 'y should be 32 bytes = 64 hex chars + 0x prefix')
+    assert.ok(pk.credentialId)
+  })
+
+  await test('Local service: GET /echo via proxy', async () => {
+    // Ensure vault is unlocked
+    const passkey = globalThis._crossTestPasskey
+    const userKey = globalThis._crossTestUserKey
+
+    // Check health first to see if unlocked
+    const { json: health } = await get('/health')
+    if (health.locked) {
+      const nonce = toBase64(crypto.randomBytes(32))
+      const assertion = await createFakeAssertion(passkey.keyPair.privateKey, ORIGIN, RP_ID)
+      await post('/admin/unlock', await makeAuthPayload(serverPk, {
+        userKey: toBase64(userKey), nonce,
+        credentialId: passkey.credentialId, assertion,
+      }))
+    }
+
+    const res = await fetch(`http://127.0.0.1:${PROXY_PORT}/testlocal/echo`, {
+      method: 'GET',
+    })
+    assert.equal(res.status, 200, `Local GET failed: ${res.status}`)
+    const body = await res.json()
+    assert.equal(body.ok, true)
+    assert.equal(body.address, '0xDEAD')
+  })
+
+  await test('Local service: POST /sign via proxy', async () => {
+    const payload = { data: '0x1234', to: '0xABCD' }
+    const res = await fetch(`http://127.0.0.1:${PROXY_PORT}/testlocal/sign`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
+    assert.equal(res.status, 200, `Local POST failed: ${res.status}`)
+    const body = await res.json()
+    assert.equal(body.signed, true)
+    assert.deepStrictEqual(body.input, payload)
+  })
+
+  await test('Local service: unknown path returns 404', async () => {
+    const res = await fetch(`http://127.0.0.1:${PROXY_PORT}/testlocal/unknown`, {
+      method: 'GET',
+    })
+    assert.equal(res.status, 404)
+  })
+
+  // ── Vault update (destructive — runs last as it replaces all secrets) ──
 
   await test('Update vault secrets', async () => {
     const passkey = globalThis._crossTestPasskey

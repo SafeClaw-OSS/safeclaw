@@ -17,6 +17,11 @@ method = "GET"
 path = "/address"
 command = "npx nodpay address"
 
+[[upstream.apis]]
+method = "GET"
+path = "/wallets"
+command = "npx nodpay wallets --json"
+
 [policy.levels]
 read = "allow"
 write = "allow"

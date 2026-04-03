@@ -107,7 +107,7 @@ async fn proxy_poll_approval(
                 .and_then(|aj| serde_json::from_value::<AuthConfig>(aj).ok());
 
             let service_config = ServiceConfig {
-                upstream: snapshot.upstream.clone(),
+                upstream: if snapshot.upstream.is_empty() { None } else { Some(snapshot.upstream.clone()) },
                 auth: auth_config,
                 levels: None,
                 rules: None,
@@ -181,18 +181,30 @@ async fn proxy_poll_approval(
                 snapshot.uri_path.clone()
             };
 
-            // Execute upstream
-            let upstream_resp = forward_request(
-                method,
-                &replay_uri,
-                &snapshot.req_headers,
-                snapshot.req_body.clone(),
-                &service_config,
-                resolved_bearer.as_deref(),
-                &state.services,
-                &snapshot.service,
-            )
-            .await;
+            // Execute upstream (local CLI bridge or HTTP proxy)
+            let upstream_resp = if state.services.is_local(&snapshot.service) {
+                let (_, rest_path, _) = parse_route(&replay_uri)
+                    .unwrap_or_default();
+                handle_local_service(
+                    &state.services,
+                    &snapshot.service,
+                    method.as_str(),
+                    &rest_path,
+                    snapshot.req_body.clone(),
+                ).await
+            } else {
+                forward_request(
+                    method,
+                    &replay_uri,
+                    &snapshot.req_headers,
+                    snapshot.req_body.clone(),
+                    &service_config,
+                    resolved_bearer.as_deref(),
+                    &state.services,
+                    &snapshot.service,
+                )
+                .await
+            };
 
             // Buffer the full response to cache + return as JSON
             let resp_status = upstream_resp.status().as_u16();
@@ -483,7 +495,7 @@ async fn proxy_handler(
             method.to_string(),
             route_path.clone(),
             uri_path.clone(),
-            service_config.upstream.clone(),
+            service_config.upstream.clone().unwrap_or_default(),
             replay_headers,
             body_bytes.clone(),
             timeout,

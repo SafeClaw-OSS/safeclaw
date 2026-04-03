@@ -7,15 +7,31 @@ requires_credential = false
 enabled = true
 origins = ["https://nodpay.ai"]
 
+# ── SafeClaw vault side ──────────────────────────────────────────────────
+
+[[steps]]
+title = "Install NodPay CLI on vault"
+run = "npm install -g nodpay"
+target = "safeclaw"
+note = "Required for local signing oracle (npx nodpay sign/address/wallets)"
+
+# ── OpenClaw agent side ──────────────────────────────────────────────────
+
 [[steps]]
 title = "Install NodPay CLI"
 run = "npm install -g nodpay"
+target = "openclaw"
 
 [[steps]]
-title = "Generate agent keypair"
-run = "npx nodpay keygen"
-note = "Reuses existing key if already generated"
+title = "Configure remote wallet"
+files = [
+    { path = ".nodpay/config.json", content = '{"remote_wallet":"http://localhost:{{proxy_port}}/nodpay"}' },
+]
+target = "openclaw"
+note = "CLI reads remote_wallet to delegate sign/address/wallets to SafeClaw vault"
 
 [[steps]]
-title = "Enable passkey sharing"
-description = "Allows NodPay to create wallets using the same biometric passkey"
+title = "Load NodPay skill"
+run = "openclaw skill load nodpay"
+target = "openclaw"
+note = "Enables agent to use NodPay propose/approve via SKILL.md"
