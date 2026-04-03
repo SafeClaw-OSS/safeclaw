@@ -292,11 +292,11 @@ Recipe steps are translated into cook ops sent to the cooker:
 
 | Recipe field | Cook op type | Description |
 |--------------|-------------|-------------|
-| `files` | `file` | Write file at `path` (relative to `~/.openclaw/`) with `content` |
+| `files` | `file` | Write file at `path` (relative to `~`) with `content` |
 | `config_patches` | `config` | Deep-merge patch into `openclaw.json` |
 | `run` | `exec` | Execute shell command in openclaw environment |
 
-File paths in cook ops are relative to the openclaw home directory (`~/.openclaw/`). The cooker resolves them to host-side paths.
+File paths in cook ops are relative to the user's home directory (`~`). Paths typically start with `.openclaw/` (e.g. `.openclaw/workspace/IDENTITY.md`) but can target any home-relative location (e.g. `.nodpay/config.json`). The cooker resolves them to host-side absolute paths.
 
 ## Adding a new service
 

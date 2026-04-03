@@ -163,7 +163,16 @@ fn write_index(state: &AppState, secrets: &Value) -> std::io::Result<()> {
                         .get("category")
                         .and_then(|v| v.as_str())
                         .unwrap_or("service");
-                    json!({ "name": name, "category": category })
+                    let mut entry = json!({ "name": name, "category": category });
+                    // Expose wallet metadata (safe address, chains) for integration services
+                    if let Some(wallet) = cfg.get("wallet") {
+                        let mut meta = serde_json::Map::new();
+                        if let Some(safe) = wallet.get("safe") { meta.insert("safe".into(), safe.clone()); }
+                        if let Some(chains) = wallet.get("chains") { meta.insert("chains".into(), chains.clone()); }
+                        if let Some(rpid) = wallet.get("rpId") { meta.insert("rpId".into(), rpid.clone()); }
+                        entry["wallet"] = Value::Object(meta);
+                    }
+                    entry
                 })
                 .collect()
         })
@@ -680,8 +689,8 @@ fn dispatch_cook(secrets: serde_json::Value, proxy_port: u16, console_url: Strin
         let snippet = crate::cli::generate::generate_agents_md_snippet(&secrets, proxy_port);
 
         let mut ops = vec![
-            serde_json::json!({ "type": "file", "path": "workspace/safeclaw.md", "content": md }),
-            serde_json::json!({ "type": "file", "path": "workspace/AGENTS.md", "content": snippet, "upsert_block": "SAFECLAW" }),
+            serde_json::json!({ "type": "file", "path": ".openclaw/workspace/safeclaw.md", "content": md }),
+            serde_json::json!({ "type": "file", "path": ".openclaw/workspace/AGENTS.md", "content": snippet, "upsert_block": "SAFECLAW" }),
         ];
 
         let mut needs_restart = true;
