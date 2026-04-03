@@ -11,11 +11,11 @@ pub mod oauth2;
 
 use crate::core::policy::{PolicyRule, ServiceLevels};
 
-// ── Config Types ───────────────────────────────────────────────────────────────
+// ── Vault Types ──────────────────────────────────────────────────────────────
 
-/// Service configuration extracted from vault secrets
+/// Per-service data stored in vault.enc (secrets + runtime auth state)
 #[derive(Debug, Clone, serde::Deserialize)]
-pub struct ServiceConfig {
+pub struct ServiceVault {
     /// Upstream base URL. Required for proxy services; absent for local services.
     #[serde(default)]
     pub upstream: Option<String>,

@@ -18,7 +18,7 @@ use crate::config::Config;
 use super::policy::{evaluate_policy, AccessLevel};
 use crate::state::VaultState;
 use super::forward::{forward_request, parse_route};
-use crate::auth::{AuthConfig, ServiceConfig};
+use crate::auth::{AuthConfig, ServiceVault};
 use crate::auth::oauth2::refresh_token as refresh_oauth2_token;
 use crate::service::ServiceRegistry;
 
@@ -106,7 +106,7 @@ async fn proxy_poll_approval(
                 .clone()
                 .and_then(|aj| serde_json::from_value::<AuthConfig>(aj).ok());
 
-            let service_config = ServiceConfig {
+            let service_vault = ServiceVault {
                 upstream: if snapshot.upstream.is_empty() { None } else { Some(snapshot.upstream.clone()) },
                 auth: auth_config,
                 levels: None,
@@ -115,7 +115,7 @@ async fn proxy_poll_approval(
             };
 
             // OAuth2 token refresh if needed
-            let resolved_bearer: Option<String> = if let Some(a) = &service_config.auth {
+            let resolved_bearer: Option<String> = if let Some(a) = &service_vault.auth {
                 if a.auth_type == "oauth2" {
                     let service_name = &snapshot.service;
                     let cached_token = {
@@ -198,7 +198,7 @@ async fn proxy_poll_approval(
                     &replay_uri,
                     &snapshot.req_headers,
                     snapshot.req_body.clone(),
-                    &service_config,
+                    &service_vault,
                     resolved_bearer.as_deref(),
                     &state.services,
                     &snapshot.service,
@@ -354,7 +354,7 @@ async fn proxy_handler(
     };
 
     // Look up service config from vault secrets
-    let mut service_config = {
+    let mut service_vault = {
         let secrets_guard = state.vault.secrets.lock().unwrap();
         let secrets = match secrets_guard.as_ref() {
             Some(s) => s.clone(),
@@ -374,12 +374,12 @@ async fn proxy_handler(
             .cloned();
 
         match svc_val {
-            Some(v) => match serde_json::from_value::<ServiceConfig>(v) {
+            Some(v) => match serde_json::from_value::<ServiceVault>(v) {
                 Ok(cfg) => cfg,
                 Err(e) => {
                     return (
                         StatusCode::BAD_GATEWAY,
-                        Json(serde_json::json!({ "error": format!("Invalid service config: {}", e) })),
+                        Json(serde_json::json!({ "error": format!("Invalid service vault data: {}", e) })),
                     )
                         .into_response();
                 }
@@ -410,15 +410,15 @@ async fn proxy_handler(
     // ── Policy evaluation ──────────────────────────────────────────────────────
 
     // Infer category from service if not explicitly set in vault config
-    let category = service_config.category.as_deref()
+    let category = service_vault.category.as_deref()
         .unwrap_or_else(|| state.services.default_category(&route_service));
 
     let policy_defaults = state.vault.get_policy_defaults();
     let access_level = evaluate_policy(
         method.as_str(),
         &route_path,
-        service_config.rules.as_ref(),
-        service_config.levels.as_ref(),
+        service_vault.rules.as_ref(),
+        service_vault.levels.as_ref(),
         &policy_defaults,
         Some(category),
     );
@@ -495,7 +495,7 @@ async fn proxy_handler(
             method.to_string(),
             route_path.clone(),
             uri_path.clone(),
-            service_config.upstream.clone().unwrap_or_default(),
+            service_vault.upstream.clone().unwrap_or_default(),
             replay_headers,
             body_bytes.clone(),
             timeout,
@@ -556,7 +556,7 @@ async fn proxy_handler(
 
         // Approval session cache TTL (for agent-side)
         if access_level == AccessLevel::Ask {
-            let ttl = find_rule_ttl(service_config.rules.as_ref(), method.as_str(), &route_path)
+            let ttl = find_rule_ttl(service_vault.rules.as_ref(), method.as_str(), &route_path)
                 .unwrap_or(3600);
             // Cache a placeholder; real auth stored in PendingApproval.approved_auth
             // and injected into approval cache only after execution (in poll handler).
@@ -586,15 +586,15 @@ async fn proxy_handler(
 
     // ── Inject effective auth for approval-cached session ─────────────────────
 
-    if service_config.auth.is_none() {
+    if service_vault.auth.is_none() {
         if let Some(aj) = cached_auth {
-            service_config.auth = serde_json::from_value::<AuthConfig>(aj).ok();
+            service_vault.auth = serde_json::from_value::<AuthConfig>(aj).ok();
         }
     }
 
     // ── OAuth2 token refresh ───────────────────────────────────────────────────
 
-    let resolved_bearer: Option<String> = if let Some(a) = &service_config.auth {
+    let resolved_bearer: Option<String> = if let Some(a) = &service_vault.auth {
         if a.auth_type == "oauth2" {
             let cached = {
                 let tokens = state.vault.oauth2_tokens.lock().unwrap();
@@ -671,7 +671,7 @@ async fn proxy_handler(
         &uri_path,
         &headers,
         body_bytes,
-        &service_config,
+        &service_vault,
         resolved_bearer.as_deref(),
         &state.services,
         &route_service,

@@ -9,7 +9,7 @@ use futures_util::StreamExt;
 use once_cell::sync::Lazy;
 use std::str::FromStr;
 
-use crate::auth::{self, ServiceConfig};
+use crate::auth::{self, ServiceVault};
 use crate::service::ServiceRegistry;
 
 pub static HTTP_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
@@ -52,12 +52,12 @@ pub async fn forward_request(
     uri_path: &str,
     headers: &HeaderMap,
     body_bytes: Bytes,
-    service_config: &ServiceConfig,
+    service_vault: &ServiceVault,
     resolved_bearer: Option<&str>,
     registry: &ServiceRegistry,
     service_name: &str,
 ) -> Response {
-    let upstream_url = match &service_config.upstream {
+    let upstream_url = match &service_vault.upstream {
         Some(u) => u,
         None => {
             return (
@@ -103,7 +103,7 @@ pub async fn forward_request(
         }
     };
 
-    let auth_cfg = service_config.auth.as_ref();
+    let auth_cfg = service_vault.auth.as_ref();
 
     // Transform URL for auth types that modify it (path, query)
     let (upstream_path, upstream_query) = if let Some(a) = auth_cfg {
