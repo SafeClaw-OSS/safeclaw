@@ -1,9 +1,11 @@
 mod auth;
 mod cli;
 mod config;
+mod cooker;
 mod core;
 mod crypto;
 mod error;
+mod generated_services;
 mod notify;
 mod passkey;
 mod service;

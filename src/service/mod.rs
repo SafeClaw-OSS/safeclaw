@@ -182,27 +182,9 @@ impl ServiceRegistry {
     }
 
     /// Compiled-in service definitions for when filesystem discovery fails.
+    /// Uses the auto-generated registry from build.rs.
     fn load_compiled_defaults(services: &mut HashMap<String, ServiceDef>) {
-        let defaults: &[(&str, &str)] = &[
-            // llm
-            ("anthropic", include_str!("../../services/llm/anthropic/service.toml")),
-            ("claude-code", include_str!("../../services/llm/claude-code/service.toml")),
-            ("openai", include_str!("../../services/llm/openai/service.toml")),
-            ("openai-codex", include_str!("../../services/llm/openai-codex/service.toml")),
-            ("google", include_str!("../../services/llm/google/service.toml")),
-            ("deepseek", include_str!("../../services/llm/deepseek/service.toml")),
-            ("groq", include_str!("../../services/llm/groq/service.toml")),
-            // channel
-            ("telegram", include_str!("../../services/channel/telegram/service.toml")),
-            ("weixin", include_str!("../../services/channel/weixin/service.toml")),
-            // integration
-            ("brave", include_str!("../../services/integration/brave/service.toml")),
-            ("github", include_str!("../../services/integration/github/service.toml")),
-            ("gmail", include_str!("../../services/integration/gmail/service.toml")),
-            ("gdrive", include_str!("../../services/integration/gdrive/service.toml")),
-            ("gcalendar", include_str!("../../services/integration/gcalendar/service.toml")),
-            ("twilio", include_str!("../../services/integration/twilio/service.toml")),
-        ];
+        let defaults = crate::generated_services::compiled_service_tomls();
         for (id, toml_str) in defaults {
             if let Ok(def) = toml::from_str::<ServiceDef>(toml_str) {
                 services.insert(id.to_string(), def);
