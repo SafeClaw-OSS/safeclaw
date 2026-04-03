@@ -9,6 +9,7 @@ description = "OpenClaw includes a web dashboard for monitoring agents, conversa
 config_patches = [
     { path = "gateway.dashboard.enabled", value = true },
 ]
+target = "openclaw"
 
 [[steps]]
 title = "Set dashboard port (optional)"
@@ -17,8 +18,10 @@ config_patches = [
     { path = "gateway.dashboard.port", value = 3000 },
 ]
 note = "If you change the port, make sure it's accessible from your browser."
+target = "openclaw"
 
 [[steps]]
 title = "Restart OpenClaw"
 note = "Restart to apply dashboard configuration"
 restart = true
+target = "openclaw"
