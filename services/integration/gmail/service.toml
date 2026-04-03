@@ -1,0 +1,17 @@
+[service]
+id = "gmail"
+name = "Gmail"
+description = "Google Gmail API"
+category = "integration"
+color = "#ea4335"
+docs = "https://developers.google.com/gmail/api"
+
+[upstream]
+url = "https://gmail.googleapis.com"
+
+[auth]
+type = "oauth2"
+provider = "google"
+
+[defaults]
+levels = { read = "ask", write = "ask-always" }

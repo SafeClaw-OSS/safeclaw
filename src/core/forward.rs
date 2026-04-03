@@ -9,7 +9,8 @@ use futures_util::StreamExt;
 use once_cell::sync::Lazy;
 use std::str::FromStr;
 
-use crate::auth::{self, AuthConfig, ServiceConfig};
+use crate::auth::{self, ServiceConfig};
+use crate::service::ServiceRegistry;
 
 pub static HTTP_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
     reqwest::Client::builder()
@@ -53,6 +54,8 @@ pub async fn forward_request(
     body_bytes: Bytes,
     service_config: &ServiceConfig,
     resolved_bearer: Option<&str>,
+    registry: &ServiceRegistry,
+    service_name: &str,
 ) -> Response {
     let upstream_url = &service_config.upstream;
 
@@ -136,9 +139,9 @@ pub async fn forward_request(
         auth::inject_auth(a, resolved_bearer, &mut fwd_headers);
     }
 
-    // ── Provider-specific header injection ──────────────────────────────────
+    // ── Provider-specific header injection (from service.toml [headers]) ────
     if let Some(a) = auth_cfg {
-        crate::service::apply_service_headers(a, resolved_bearer, &mut fwd_headers);
+        crate::service::apply_service_headers(a, resolved_bearer, &mut fwd_headers, registry, service_name);
     }
 
     // ── Request logging (all auth types) ─────────────────────────────────────
@@ -237,6 +240,7 @@ pub fn urlencoding_encode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::AuthConfig;
 
     #[test]
     fn parse_route_basic() {

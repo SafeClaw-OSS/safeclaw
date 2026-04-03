@@ -1,0 +1,23 @@
+[service]
+id = "openai"
+name = "OpenAI"
+description = "GPT and o-series models via API key"
+category = "llm"
+color = "#10a37f"
+docs = "https://platform.openai.com/docs"
+
+[upstream]
+url = "https://api.openai.com"
+
+[auth]
+type = "bearer"
+key_placeholder = "sk-..."
+
+[defaults]
+levels = { read = "allow", write = "allow" }
+
+[locked_response]
+template = "openai"
+
+[locked_response.routes]
+"/responses" = "openai-responses"

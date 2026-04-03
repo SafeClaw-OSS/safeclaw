@@ -1,0 +1,17 @@
+[openclaw]
+plugin = "openai"
+api = "openai-codex-responses"
+env_key = "OPENAI_CODEX_API_KEY"
+env_base_url = "OPENAI_CODEX_BASE_URL"
+proxy_path = "/openai-codex"
+models = [
+    "gpt-5.3-codex",
+    "gpt-5.4",
+    "gpt-5.3-codex-spark",
+    "gpt-5.2-codex",
+    "gpt-5.2",
+    "gpt-5.1-codex-max",
+    "gpt-5.1-codex-mini",
+    "gpt-5.1",
+    "gpt-5.4-mini",
+]

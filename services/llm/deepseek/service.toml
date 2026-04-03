@@ -1,0 +1,20 @@
+[service]
+id = "deepseek"
+name = "DeepSeek"
+description = "DeepSeek Chat and reasoning models"
+category = "llm"
+color = "#5b5de5"
+docs = "https://platform.deepseek.com/api-docs"
+
+[upstream]
+url = "https://api.deepseek.com"
+
+[auth]
+type = "bearer"
+key_placeholder = "sk-..."
+
+[defaults]
+levels = { read = "allow", write = "allow" }
+
+[locked_response]
+template = "openai"

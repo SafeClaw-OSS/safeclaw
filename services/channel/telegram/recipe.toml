@@ -1,0 +1,15 @@
+[openclaw]
+plugin = "telegram"
+essential = true
+
+[[steps]]
+title = "Configure Telegram bot token"
+description = "Add your Telegram bot token to the vault"
+vault_credential = true
+
+[[steps]]
+title = "Set owner allowlist"
+description = "Configure which Telegram user IDs can interact with the bot"
+config_patches = [
+    { path = "channels.telegram.enabled", value = true },
+]

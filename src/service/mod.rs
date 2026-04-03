@@ -1,105 +1,333 @@
-/// Service plugin system.
+/// TOML-driven service registry.
 ///
-/// Each upstream service can optionally implement the `Service` trait
-/// to customize headers, locked responses, OAuth refresh, etc.
-/// Services without a custom implementation use `Default` (pure config).
-pub mod default;
-pub mod anthropic;
-pub mod openai;
-pub mod google;
+/// Each service is defined by a `service.toml` in `services/{id}/`.
+/// No Rust code is needed per service — headers, locked responses, and
+/// categories are all declarative.
 
+pub mod locked;
+
+use std::collections::HashMap;
 use axum::response::Response;
 use crate::auth::AuthConfig;
 use crate::auth::oauth2::OAuthStyle;
 
-// ── Service Trait ───────────────────────────────────────────────────────
+// ── ServiceDef: parsed from service.toml ──────────────────────────────────────
 
-/// Trait for service-specific behavior.
-///
-/// Most methods have default implementations (no-op), so services only need
-/// to override what they customize. Adding a new service requires:
-/// 1. Create a file in `service/` implementing this trait
-/// 2. Register it in `ServiceRegistry::new()` below
-pub trait Service: Send + Sync {
-    /// Service name(s) this implementation matches.
-    fn names(&self) -> &[&str];
-
-    /// Default category if not set in vault config.
-    fn default_category(&self) -> &str { "service" }
-
-    /// Extra headers beyond standard auth injection.
-    /// Called after generic auth (bearer/basic/header) is already applied.
-    fn apply_headers(
-        &self,
-        _auth: &AuthConfig,
-        _resolved_bearer: Option<&str>,
-        _headers: &mut reqwest::header::HeaderMap,
-    ) {}
-
-    /// Custom OAuth2 refresh style. Return None to use the default form-urlencoded.
-    fn oauth_style(&self) -> Option<OAuthStyle> { None }
-
-    /// Locked vault response in this service's API format.
-    /// Return None to use a generic JSON error.
-    fn locked_response(
-        &self,
-        _is_stream: bool,
-        _admin_url: &str,
-        _path: &str,
-    ) -> Option<Response> { None }
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ServiceDef {
+    pub service: ServiceMeta,
+    pub upstream: Option<UpstreamDef>,
+    pub auth: Option<AuthDef>,
+    pub defaults: Option<DefaultsDef>,
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+    pub locked_response: Option<LockedResponseDef>,
 }
 
-// ── Service Registry ─────────────────────────────────────────────────────────
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ServiceMeta {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    #[serde(default = "default_category")]
+    pub category: String,
+    #[serde(default)]
+    pub color: Option<String>,
+    #[serde(default)]
+    pub docs: Option<String>,
+}
+
+fn default_category() -> String { "integration".to_string() }
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct UpstreamDef {
+    pub url: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct AuthDef {
+    #[serde(rename = "type")]
+    pub auth_type: String,
+    #[serde(default)]
+    pub header: Option<String>,
+    #[serde(default)]
+    pub param: Option<String>,
+    #[serde(default)]
+    pub key_placeholder: Option<String>,
+    #[serde(default)]
+    pub oauth_style: Option<String>,
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub username_label: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct DefaultsDef {
+    pub levels: Option<HashMap<String, String>>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct LockedResponseDef {
+    pub template: Option<String>,
+    #[serde(default)]
+    pub routes: HashMap<String, String>,
+}
+
+// ── ServiceRegistry ───────────────────────────────────────────────────────────
 
 pub struct ServiceRegistry {
-    services: Vec<Box<dyn Service>>,
+    services: HashMap<String, ServiceDef>,
 }
 
 impl ServiceRegistry {
-    /// Build the registry with all built-in services.
-    pub fn new() -> Self {
-        Self {
-            services: vec![
-                Box::new(anthropic::Anthropic),
-                Box::new(openai::OpenAI),
-                Box::new(google::Google),
-                Box::new(default::GenericLlm { names: &["deepseek", "groq"] }),
-            ],
+    /// Load all service definitions from `services/*/service.toml`.
+    /// Falls back to compiled-in definitions if the directory is not found.
+    pub fn load() -> Self {
+        let mut services = HashMap::new();
+
+        // Try runtime path first ($SAFECLAW_DATA/services/), then compiled-in
+        let dirs = Self::discover_service_dirs();
+        for (id, toml_str) in dirs {
+            match toml::from_str::<ServiceDef>(&toml_str) {
+                Ok(def) => { services.insert(id, def); }
+                Err(e) => {
+                    tracing::warn!("Failed to parse service.toml for {}: {}", id, e);
+                }
+            }
+        }
+
+        if services.is_empty() {
+            tracing::warn!("No service definitions found, loading compiled-in defaults");
+            Self::load_compiled_defaults(&mut services);
+        }
+
+        tracing::info!("Loaded {} service definitions", services.len());
+        Self { services }
+    }
+
+    fn discover_service_dirs() -> Vec<(String, String)> {
+        let mut results = vec![];
+
+        // Check $SAFECLAW_DATA/services/ first (runtime override)
+        if let Ok(data) = std::env::var("SAFECLAW_DATA") {
+            let dir = std::path::Path::new(&data).join("services");
+            if dir.is_dir() {
+                Self::scan_dir(&dir, &mut results);
+                if !results.is_empty() {
+                    return results;
+                }
+            }
+        }
+
+        // Fallback: relative to binary (for dev / standalone installs)
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(parent) = exe.parent() {
+                let dir = parent.join("services");
+                if dir.is_dir() {
+                    Self::scan_dir(&dir, &mut results);
+                    if !results.is_empty() {
+                        return results;
+                    }
+                }
+            }
+        }
+
+        results
+    }
+
+    /// Scan for service.toml files. Supports both flat and nested layouts:
+    ///   services/anthropic/service.toml          (flat)
+    ///   services/llm/anthropic/service.toml      (nested by category)
+    fn scan_dir(base: &std::path::Path, results: &mut Vec<(String, String)>) {
+        let Ok(entries) = std::fs::read_dir(base) else { return };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() { continue; }
+
+            // Check if this directory itself has service.toml (flat layout)
+            let toml_path = path.join("service.toml");
+            if toml_path.exists() {
+                if let Ok(content) = std::fs::read_to_string(&toml_path) {
+                    let id = path.file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if !id.is_empty() {
+                        results.push((id, content));
+                    }
+                }
+                continue;
+            }
+
+            // Otherwise, scan one level deeper (category subfolder: llm/, channel/, integration/)
+            let Ok(sub_entries) = std::fs::read_dir(&path) else { continue };
+            for sub_entry in sub_entries.flatten() {
+                let sub_path = sub_entry.path();
+                if !sub_path.is_dir() { continue; }
+                let sub_toml = sub_path.join("service.toml");
+                if sub_toml.exists() {
+                    if let Ok(content) = std::fs::read_to_string(&sub_toml) {
+                        let id = sub_path.file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("")
+                            .to_string();
+                        if !id.is_empty() {
+                            results.push((id, content));
+                        }
+                    }
+                }
+            }
         }
     }
 
-    /// Resolve a service by name. Returns Default if none matches.
-    pub fn resolve(&self, service_name: &str) -> &dyn Service {
-        for s in &self.services {
-            if s.names().contains(&service_name) {
-                return s.as_ref();
+    /// Compiled-in service definitions for when filesystem discovery fails.
+    fn load_compiled_defaults(services: &mut HashMap<String, ServiceDef>) {
+        let defaults: &[(&str, &str)] = &[
+            // llm
+            ("anthropic", include_str!("../../services/llm/anthropic/service.toml")),
+            ("claude-code", include_str!("../../services/llm/claude-code/service.toml")),
+            ("openai", include_str!("../../services/llm/openai/service.toml")),
+            ("openai-codex", include_str!("../../services/llm/openai-codex/service.toml")),
+            ("google", include_str!("../../services/llm/google/service.toml")),
+            ("deepseek", include_str!("../../services/llm/deepseek/service.toml")),
+            ("groq", include_str!("../../services/llm/groq/service.toml")),
+            // channel
+            ("telegram", include_str!("../../services/channel/telegram/service.toml")),
+            ("weixin", include_str!("../../services/channel/weixin/service.toml")),
+            // integration
+            ("brave", include_str!("../../services/integration/brave/service.toml")),
+            ("github", include_str!("../../services/integration/github/service.toml")),
+            ("gmail", include_str!("../../services/integration/gmail/service.toml")),
+            ("gdrive", include_str!("../../services/integration/gdrive/service.toml")),
+            ("gcalendar", include_str!("../../services/integration/gcalendar/service.toml")),
+            ("twilio", include_str!("../../services/integration/twilio/service.toml")),
+        ];
+        for (id, toml_str) in defaults {
+            if let Ok(def) = toml::from_str::<ServiceDef>(toml_str) {
+                services.insert(id.to_string(), def);
             }
         }
-        &default::Default
+    }
+
+    /// Resolve a service by name. Returns None if not found.
+    pub fn get(&self, service_name: &str) -> Option<&ServiceDef> {
+        self.services.get(service_name)
+    }
+
+    /// Get default category for a service, falling back to "service".
+    pub fn default_category(&self, service_name: &str) -> &str {
+        self.services.get(service_name)
+            .map(|d| d.service.category.as_str())
+            .unwrap_or("service")
+    }
+
+    /// Get OAuth style for a service (if oauth2 with custom style).
+    pub fn oauth_style(&self, service_name: &str) -> Option<OAuthStyle> {
+        let def = self.services.get(service_name)?;
+        let auth = def.auth.as_ref()?;
+        match auth.oauth_style.as_deref() {
+            Some("json") => Some(OAuthStyle::Json),
+            _ => None,
+        }
+    }
+
+    /// Generate locked response for a service when vault is locked.
+    pub fn locked_response(
+        &self,
+        service_name: &str,
+        is_stream: bool,
+        admin_url: &str,
+        path: &str,
+    ) -> Option<Response> {
+        let def = self.services.get(service_name)?;
+        let lr = def.locked_response.as_ref()?;
+
+        // Check path-specific routes first
+        for (route_prefix, template_name) in &lr.routes {
+            if path.contains(route_prefix) {
+                return locked::render(template_name, is_stream, admin_url);
+            }
+        }
+
+        // Fall back to default template
+        lr.template.as_ref()
+            .and_then(|t| locked::render(t, is_stream, admin_url))
+    }
+
+    /// Return all service definitions (for catalog/UI use).
+    pub fn all(&self) -> &HashMap<String, ServiceDef> {
+        &self.services
     }
 }
 
-// ── Convenience: apply_service_headers (used by forward.rs) ─────────────────
+// ── Header micro-resolver ─────────────────────────────────────────────────────
 
-/// Inject service-specific headers. Called from core/forward.rs after auth injection.
+/// Context for resolving header template variables.
+pub struct HeaderContext<'a> {
+    pub auth: &'a AuthConfig,
+    pub resolved_bearer: Option<&'a str>,
+}
+
+/// Resolve template variables in a header value string.
+/// Supports: {{uuid_v4}}, {{auth.<field>}}, static strings.
+fn resolve_header_value(template: &str, ctx: &HeaderContext) -> Option<String> {
+    if !template.contains("{{") {
+        // Static value, return as-is
+        return Some(template.to_string());
+    }
+
+    match template.trim() {
+        "{{uuid_v4}}" => Some(uuid::Uuid::new_v4().to_string()),
+        s if s.starts_with("{{auth.") && s.ends_with("}}") => {
+            let field = &s[7..s.len() - 2];
+            match field {
+                "account_id" => ctx.auth.account_id.clone(),
+                "client_id" => ctx.auth.client_id.clone(),
+                "secret" => ctx.auth.secret.clone(),
+                _ => None,
+            }
+        }
+        _ => {
+            // Unknown template, skip this header
+            tracing::debug!("Unknown header template: {}", template);
+            None
+        }
+    }
+}
+
+/// Apply service-specific headers from TOML definitions.
+/// Called from core/forward.rs after standard auth injection.
 pub fn apply_service_headers(
     auth: &AuthConfig,
     resolved_bearer: Option<&str>,
     headers: &mut reqwest::header::HeaderMap,
+    registry: &ServiceRegistry,
+    service_name: &str,
 ) {
-    if auth.auth_type != "oauth2" || resolved_bearer.is_none() {
+    let def = match registry.get(service_name) {
+        Some(d) => d,
+        None => return,
+    };
+
+    if def.headers.is_empty() {
         return;
     }
 
-    // Anthropic OAuth
-    if let Some(token_url) = &auth.token_url {
-        if token_url.contains("anthropic.com") || token_url.contains("platform.claude.com") {
-            anthropic::Anthropic.apply_headers(auth, resolved_bearer, headers);
-        }
-    }
+    // Only apply custom headers for oauth2 services with a resolved token
+    // (API-key services don't need extra headers — their auth is fully declarative)
+    if auth.auth_type == "oauth2" && resolved_bearer.is_some() {
+        let ctx = HeaderContext { auth, resolved_bearer };
 
-    // OpenAI Codex OAuth
-    if auth.account_id.is_some() {
-        openai::OpenAI.apply_headers(auth, resolved_bearer, headers);
+        for (name, template) in &def.headers {
+            if let Some(value) = resolve_header_value(template, &ctx) {
+                if let (Ok(header_name), Ok(header_value)) = (
+                    reqwest::header::HeaderName::from_bytes(name.as_bytes()),
+                    reqwest::header::HeaderValue::from_str(&value),
+                ) {
+                    headers.insert(header_name, header_value);
+                }
+            }
+        }
     }
 }

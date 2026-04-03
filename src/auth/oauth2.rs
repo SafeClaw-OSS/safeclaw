@@ -13,8 +13,9 @@ pub enum OAuthStyle {
 }
 
 /// Determine the OAuth2 refresh style from the auth config.
-/// Default: form-urlencoded. Anthropic uses JSON.
-pub fn detect_style(auth: &AuthConfig) -> OAuthStyle {
+/// Fallback heuristic: checks token_url for known providers.
+/// Prefer passing `style_override` from service.toml instead.
+fn detect_style(auth: &AuthConfig) -> OAuthStyle {
     if let Some(token_url) = &auth.token_url {
         if token_url.contains("anthropic.com") || token_url.contains("platform.claude.com") {
             return OAuthStyle::Json;
@@ -24,9 +25,12 @@ pub fn detect_style(auth: &AuthConfig) -> OAuthStyle {
 }
 
 /// Attempt to refresh an OAuth2 access token using the refresh_token grant.
+/// `style_override` comes from service.toml [auth] oauth_style; falls back to
+/// URL-based heuristic if None.
 /// Returns (access_token, expires_at_unix_secs) on success.
 pub async fn refresh_token(
     auth: &AuthConfig,
+    style_override: Option<OAuthStyle>,
 ) -> Result<(String, u64), String> {
     let token_url = auth
         .token_url
@@ -41,7 +45,7 @@ pub async fn refresh_token(
         .as_ref()
         .ok_or("oauth2: missing refresh_token")?;
 
-    let style = detect_style(auth);
+    let style = style_override.unwrap_or_else(|| detect_style(auth));
     tracing::info!("oauth2 refresh: token_url={} style={}", token_url,
         match style { OAuthStyle::Json => "json", OAuthStyle::Form => "form" });
 

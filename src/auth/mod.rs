@@ -22,7 +22,7 @@ pub struct ServiceConfig {
     pub levels: Option<ServiceLevels>,
     /// Per-request rule overrides (optional; most specific match wins)
     pub rules: Option<Vec<PolicyRule>>,
-    /// UI display category — "llm" | "channel" | "service" (default: "service").
+    /// UI display category — "llm" | "channel" | "integration" (default: "integration").
     /// Pure metadata; not used by proxy routing or auth logic.
     #[serde(default)]
     pub category: Option<String>,

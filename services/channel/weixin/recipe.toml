@@ -1,0 +1,29 @@
+[openclaw]
+plugin = "openclaw-weixin"
+essential = true
+
+[[steps]]
+title = "Install WeChat iLink plugin"
+run = "npm install @tencent-weixin/openclaw-weixin@latest"
+cwd = "openclaw"
+
+[[steps]]
+title = "Create account config"
+files = [
+    { path = "openclaw-weixin/accounts.json", content = '["safeclaw"]' },
+    { path = "openclaw-weixin/accounts/safeclaw.json", template = "weixin-account" },
+]
+
+[[steps]]
+title = "Enable WeChat channel"
+config_patches = [
+    { path = "plugins.entries.openclaw-weixin.enabled", value = true },
+    { path = "channels.openclaw-weixin.enabled", value = true },
+    { path = "channels.openclaw-weixin.options.base_url", value = "http://localhost:{{proxy_port}}/wechat" },
+    { path = "channels.openclaw-weixin.options.token", value = "sk-dummy-safeclaw-wechat" },
+]
+
+[[steps]]
+title = "Restart OpenClaw"
+note = "Restart to load the new plugin"
+restart = true

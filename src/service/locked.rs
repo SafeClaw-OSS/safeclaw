@@ -1,9 +1,20 @@
-/// Locked proxy response generators.
+/// Locked proxy response generators (by template name).
 ///
-/// When the vault is locked, the proxy returns API-format-aware placeholder responses
-/// that include a link to the admin unlock page.
+/// When the vault is locked, the proxy returns API-format-aware placeholder
+/// responses. Template names come from service.toml `[locked_response]`.
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+
+/// Render a locked response by template name.
+pub fn render(template: &str, is_stream: bool, admin_url: &str) -> Option<Response> {
+    match template {
+        "anthropic" => Some(anthropic(is_stream, admin_url)),
+        "openai" => Some(openai(is_stream, admin_url)),
+        "openai-responses" => Some(openai_responses(is_stream, admin_url)),
+        "gemini" => Some(gemini(admin_url)),
+        _ => None,
+    }
+}
 
 fn locked_message(admin_url: &str) -> String {
     let display = admin_url
@@ -26,7 +37,7 @@ fn now_secs() -> u64 {
 }
 
 /// Anthropic Messages API locked response
-pub fn anthropic_locked(is_stream: bool, admin_url: &str) -> Response {
+fn anthropic(is_stream: bool, admin_url: &str) -> Response {
     let content = locked_message(admin_url);
     let id = msg_id();
 
@@ -105,7 +116,7 @@ pub fn anthropic_locked(is_stream: bool, admin_url: &str) -> Response {
 }
 
 /// OpenAI Chat Completions locked response
-pub fn openai_locked(is_stream: bool, admin_url: &str) -> Response {
+fn openai(is_stream: bool, admin_url: &str) -> Response {
     let content = locked_message(admin_url);
     let now = now_secs();
 
@@ -159,7 +170,7 @@ pub fn openai_locked(is_stream: bool, admin_url: &str) -> Response {
 }
 
 /// OpenAI Responses API locked response
-pub fn openai_responses_locked(is_stream: bool, admin_url: &str) -> Response {
+fn openai_responses(is_stream: bool, admin_url: &str) -> Response {
     let content = locked_message(admin_url);
     let now = now_secs();
     let resp_id = format!("resp_locked_{}", now);
@@ -199,7 +210,7 @@ pub fn openai_responses_locked(is_stream: bool, admin_url: &str) -> Response {
 }
 
 /// Google Gemini locked response
-pub fn gemini_locked(admin_url: &str) -> Response {
+fn gemini(admin_url: &str) -> Response {
     let content = locked_message(admin_url);
     let body = serde_json::to_string(&serde_json::json!({
         "candidates": [{

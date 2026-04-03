@@ -1,0 +1,24 @@
+[recipe]
+id = "openclaw-dashboard"
+display_name = "OpenClaw Dashboard"
+requires_credential = false
+
+[[steps]]
+title = "Enable the built-in dashboard"
+description = "OpenClaw includes a web dashboard for monitoring agents, conversations, and tasks."
+config_patches = [
+    { path = "gateway.dashboard.enabled", value = true },
+]
+
+[[steps]]
+title = "Set dashboard port (optional)"
+description = "By default the dashboard is served on the gateway port. You can customize it."
+config_patches = [
+    { path = "gateway.dashboard.port", value = 3000 },
+]
+note = "If you change the port, make sure it's accessible from your browser."
+
+[[steps]]
+title = "Restart OpenClaw"
+note = "Restart to apply dashboard configuration"
+restart = true

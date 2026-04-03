@@ -500,11 +500,11 @@ pub async fn setup(
     // Push full secrets (including services with auth tokens) to provisioner
     push_to_provisioner(secrets, state.config.proxy_port, state.config.effective_admin_url());
 
-    // Fire on-setup webhook
+    // Fire on-setup webhook (POST /cook with config op)
     if let Some(ref hook_url) = state.config.on_setup_hook {
         if let Some(ref config_data) = setup_config {
             let hook_url = hook_url.clone();
-            // Enrich config with agentName from passkeys (provisioner needs it for OpenClaw agent.name)
+            // Enrich config with agentName from passkeys (provisioner needs it for IDENTITY.md)
             let mut config_json = config_data.clone();
             if let Some(agent_name) = parsed.get("passkeys")
                 .and_then(|p| p.as_array())
@@ -515,12 +515,31 @@ pub async fn setup(
                 config_json.as_object_mut()
                     .map(|m| m.insert("agentName".into(), serde_json::Value::String(agent_name.to_string())));
             }
+            // Build /cook ops from config
+            let mut ops = vec![
+                serde_json::json!({"type": "config", "patch": &config_json}),
+            ];
+            // Add channel ops if wechat is configured
+            if config_json.get("channels").and_then(|c| c.get("wechat")).is_some() {
+                ops.push(serde_json::json!({"type": "channel", "patch": {"wechat": true}}));
+            }
+            // Add IDENTITY.md if agentName is present
+            if let Some(name) = config_json.get("agentName").and_then(|v| v.as_str()) {
+                if !name.is_empty() {
+                    ops.push(serde_json::json!({
+                        "type": "workspace",
+                        "file": "IDENTITY.md",
+                        "content": format!("# IDENTITY.md\n\n- **Name:** {name}\n")
+                    }));
+                }
+            }
+            let cook_body = serde_json::json!({"ops": ops, "restart": true});
             tokio::spawn(async move {
                 let client = reqwest::Client::new();
                 match client
                     .post(&hook_url)
-                    .json(&config_json)
-                    .timeout(std::time::Duration::from_secs(10))
+                    .json(&cook_body)
+                    .timeout(std::time::Duration::from_secs(30))
                     .send()
                     .await
                 {

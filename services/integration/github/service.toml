@@ -1,0 +1,17 @@
+[service]
+id = "github"
+name = "GitHub"
+description = "GitHub REST API"
+category = "integration"
+color = "#e6edf3"
+docs = "https://docs.github.com/en/rest"
+
+[upstream]
+url = "https://api.github.com"
+
+[auth]
+type = "bearer"
+key_placeholder = "ghp_..."
+
+[defaults]
+levels = { read = "allow", write = "ask" }

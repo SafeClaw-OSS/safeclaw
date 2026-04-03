@@ -1,0 +1,21 @@
+[recipe]
+id = "nodpay"
+display_name = "NodPay"
+requires_credential = false
+
+[passkey_sharing]
+enabled = true
+origins = ["https://nodpay.ai"]
+
+[[steps]]
+title = "Install NodPay CLI"
+run = "npm install -g nodpay"
+
+[[steps]]
+title = "Generate agent keypair"
+run = "npx nodpay keygen"
+note = "Reuses existing key if already generated"
+
+[[steps]]
+title = "Enable passkey sharing"
+description = "Allows NodPay to create wallets using the same biometric passkey"

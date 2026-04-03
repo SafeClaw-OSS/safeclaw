@@ -64,19 +64,99 @@ export OPENAI_BASE_URL=http://localhost:23295/openai/v1
 3. **Work** — your agent uses the proxy transparently
 4. **Lock** — tap again to wipe keys from memory (or just close SafeClaw)
 
-## Supported services
+## Services
 
-The proxy routes requests by path prefix and injects the appropriate auth:
+SafeClaw uses a **declarative service protocol**. Services are organized by category in `services/`:
 
-| Your agent calls | SafeClaw forwards to | Auth injected |
-|------------------|----------------------|---------------|
-| `localhost:23295/openai/v1/...` | `api.openai.com/v1/...` | `Authorization: Bearer` |
-| `localhost:23295/anthropic/v1/...` | `api.anthropic.com/v1/...` | `x-api-key` |
-| `localhost:23295/google/v1beta/...` | `generativelanguage.googleapis.com/...` | `x-goog-api-key` |
+```
+services/
+  llm/                          # LLM providers
+    anthropic/
+      service.toml              # Vault proxy definition (auth, upstream, headers)
+      recipe.toml               # Runtime setup instructions for OpenClaw
+    claude-code/                # Claude Code OAuth variant
+    openai/
+    openai-codex/               # Codex OAuth variant
+    google/
+    deepseek/
+    groq/
+  channel/                      # Messaging channels
+    telegram/
+    weixin/
+  integration/                  # Apps & tools
+    github/
+    brave/
+    gmail/
+    nodpay/                     # Recipe only (no credential proxy)
+    openclaw-dashboard/         # OpenClaw native dashboard
+    ...
+```
 
-Any service can be added via the admin UI — just provide the upstream URL and auth config.
+### service.toml — vault proxy definition
 
-When locked, the proxy returns a friendly API-compatible error (works with OpenAI/Anthropic SDKs) with a link to unlock.
+```toml
+[service]
+id = "anthropic"
+name = "Anthropic"
+description = "Claude AI models via API key"
+category = "llm"
+
+[upstream]
+url = "https://api.anthropic.com"
+
+[auth]
+type = "header"
+header = "x-api-key"
+
+[defaults]
+levels = { read = "allow", write = "allow" }
+
+[locked_response]
+template = "anthropic"
+```
+
+### recipe.toml — runtime setup instructions
+
+```toml
+[openclaw]
+plugin = "anthropic"
+api = "anthropic-messages"
+env_key = "ANTHROPIC_API_KEY"
+env_base_url = "ANTHROPIC_BASE_URL"
+proxy_path = "/anthropic/v1"
+models = ["claude-sonnet-4-20250514", "claude-opus-4-20250514"]
+```
+
+### Adding a new service
+
+Create a folder in `services/` with a `service.toml`. No Rust code needed — the registry loads all definitions at startup.
+
+For services that need runtime installation (plugins, env vars, config patches), add a `recipe.toml`.
+
+### Connect a service (open-source)
+
+```bash
+# List available services
+safeclaw connect
+
+# Get step-by-step setup instructions for a service
+safeclaw connect weixin
+safeclaw connect nodpay
+```
+
+The `connect` command reads the service's `recipe.toml` and prints human-readable instructions for manual setup.
+
+### Header templates
+
+Service definitions support template variables in custom headers:
+
+```toml
+[headers]
+"x-session-id" = "{{uuid_v4}}"           # Generated per-request
+"chatgpt-account-id" = "{{auth.account_id}}"  # From auth config
+```
+
+Supported variables: `{{uuid_v4}}`, `{{auth.<field>}}`.
 
 ## Remote deployment
 
@@ -122,23 +202,19 @@ data/
 | `--rp-id` | `SAFECLAW_RP_ID` | `localhost` | WebAuthn relying party ID (hostname only) |
 | `--admin-url` | `SAFECLAW_ADMIN_URL` | `http://localhost:{port}` | URL shown in "vault locked" and approval responses |
 | `--rate-limit` | `SAFECLAW_RATE_LIMIT` | `300` | Max requests/min per IP (0 = unlimited) |
-| `--on-setup-hook` | `SAFECLAW_ON_SETUP_HOOK` | — | Webhook URL for non-secret setup data |
+| `--on-setup-hook` | `SAFECLAW_ON_SETUP_HOOK` | — | Webhook URL called after setup (POST /cook format) |
 | `--init` | — | — | Generate server keypair and exit |
 
-## Update
+## CLI commands
 
 ```bash
-# Check for new version
-./safeclaw update --check
-
-# Update templates only (hot reload, no restart needed)
-./safeclaw update --templates
-
-# Full update (binary + templates, restart required)
-./safeclaw update
+safeclaw                    # Start the server
+safeclaw connect            # List available services with recipes
+safeclaw connect <service>  # Print setup instructions for a service
+safeclaw update             # Full self-update (binary + templates)
+safeclaw update --check     # Check for new version
+safeclaw update --templates # Update templates only (hot reload)
 ```
-
-Templates (skill.md, safeclaw.md, agents-snippet.md) are stored in `$SAFECLAW_DATA/templates/` and read at runtime. Template updates take effect immediately without restarting SafeClaw.
 
 ---
 
@@ -149,22 +225,17 @@ src/
 ├── main.rs              # Entry point: starts admin server + proxy server
 ├── config.rs            # CLI flags & env var parsing
 ├── state.rs             # Shared application state (AppState, VaultState)
-├── error.rs             # Error types
 │
 ├── core/                # Core proxy engine
 │   ├── router.rs        # Proxy request handler + routing
 │   ├── forward.rs       # Upstream HTTP forwarding (reqwest)
 │   ├── policy.rs        # Access policy evaluation (allow/deny/approve)
 │   ├── approval.rs      # Human-in-the-loop approval flow
-│   ├── audit.rs         # SQLite audit log
-│   └── locked.rs        # Locked-vault response formatting
+│   └── audit.rs         # SQLite audit log
 │
-├── service/             # Service plugin system
-│   ├── mod.rs           # Service trait + ServiceRegistry
-│   ├── anthropic.rs     # Anthropic (Claude) — OAuth, x-api-key, locked response
-│   ├── openai.rs        # OpenAI / Codex — account headers, locked response
-│   ├── google.rs        # Google Gemini — locked response
-│   └── default.rs       # Default no-op + GenericLlm (DeepSeek, Groq, etc.)
+├── service/             # TOML-driven service registry
+│   ├── mod.rs           # ServiceRegistry: loads services/*/service.toml
+│   └── locked.rs        # Locked-vault response templates (per API format)
 │
 ├── auth/                # Service auth (upstream credential injection)
 │   ├── mod.rs           # AuthConfig, ServiceConfig, inject_auth(), transform_url()
@@ -197,18 +268,28 @@ src/
 │   ├── mod.rs           # PushSubscription, PushKeys types
 │   └── webpush.rs       # VAPID + ECE + WebPush delivery
 │
-└── cli/                 # CLI subcommands
-    ├── generate.rs      # Workspace file generation (safeclaw.md, etc.)
-    └── update.rs        # Self-update from GitHub releases
+├── cli/                 # CLI subcommands
+│   ├── connect.rs       # NL-Cooker: safeclaw connect (setup instructions)
+│   ├── generate.rs      # Workspace file generation (safeclaw.md, etc.)
+│   └── update.rs        # Self-update from GitHub releases
+│
+└── services/            # Service protocol definitions (TOML)
+    ├── llm/             # LLM providers
+    │   ├── anthropic/   #   service.toml + recipe.toml
+    │   ├── claude-code/ #   Claude Code OAuth variant
+    │   ├── openai/
+    │   ├── openai-codex/
+    │   ├── google/
+    │   ├── deepseek/
+    │   └── groq/
+    ├── channel/         # Messaging channels
+    │   ├── telegram/
+    │   └── weixin/
+    └── integration/     # Apps & tools
+        ├── github/
+        ├── nodpay/      #   recipe.toml only
+        └── openclaw-dashboard/
 ```
-
-### Adding a new service
-
-1. Create `src/service/myservice.rs` implementing the `Service` trait
-2. Register it in `ServiceRegistry::new()` in `src/service/mod.rs`
-3. That's it — the core proxy handles routing, auth injection, and policy automatically
-
-Most `Service` trait methods have default no-op implementations. Only override what your service needs (custom headers, OAuth style, locked response format).
 
 ## Technical details
 
@@ -251,45 +332,6 @@ Most `Service` trait methods have default no-op implementations. Only override w
 | POST | `/vault/services/update` | Update service config |
 | POST | `/vault/services/remove` | Remove a service |
 
-### Policy
-
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | `/vault/policy` | Get policy defaults (no auth) |
-| POST | `/vault/policy/update` | Update policy defaults (authenticated) |
-
-### Files (authenticated)
-
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | `/vault/files` | List stored files (names + metadata, no auth) |
-| GET | `/vault/files/{id}?approval={id}` | Read file with approved DEK |
-| POST | `/vault/files/upload` | Encrypt and store a file |
-| POST | `/vault/files/read` | Decrypt and download a file |
-| POST | `/vault/files/remove` | Delete a file |
-
-### Notifications
-
-| Method | Path | Description |
-|--------|------|-------------|
-| POST | `/vault/notifications/subscribe` | Store push subscription (authenticated) |
-
-### Approvals
-
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | `/approve/pending` | List pending approval requests (no auth) |
-| GET | `/approve/{id}` | Get approval info / poll result (no auth) |
-| POST | `/approve/{id}/details` | Decrypt request details (authenticated) |
-| POST | `/approve/{id}/confirm` | Approve request (authenticated) |
-| POST | `/approve/{id}/reject` | Reject request (authenticated) |
-
-### Audit
-
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | `/audit/log?limit=50` | Recent audit entries (no auth, zero sensitive data) |
-
 ### Proxy (port 23295)
 
 | Method | Path | Description |
@@ -297,15 +339,17 @@ Most `Service` trait methods have default no-op implementations. Only override w
 | ANY | `/health` | Proxy health check |
 | ANY | `/{service}/{*path}` | Forward to upstream (requires unlocked vault) |
 
-### Passkeys (authenticated)
+### Approvals
 
 | Method | Path | Description |
 |--------|------|-------------|
-| POST | `/passkeys/add` | Add a passkey device |
-| POST | `/passkeys/remove` | Remove a passkey device |
+| GET | `/approve/pending` | List pending approval requests |
+| GET | `/approve/{id}` | Get approval info / poll result |
+| POST | `/approve/{id}/details` | Decrypt request details (authenticated) |
+| POST | `/approve/{id}/confirm` | Approve request (authenticated) |
+| POST | `/approve/{id}/reject` | Reject request (authenticated) |
 
 > **Note:** "authenticated" endpoints require ECIES-encrypted payloads with passkey assertion.
-> "no auth" endpoints expose only non-sensitive metadata.
 
 </details>
 
@@ -334,21 +378,6 @@ Most `Service` trait methods have default no-op implementations. Only override w
 | KEK | `safeclaw-kek-v1` |
 | E2E request | `safeclaw-e2e` |
 | E2E response | `safeclaw-response-v1` |
-
-</details>
-
-<details>
-<summary>Setup webhook</summary>
-
-For integration with external systems, SafeClaw can forward non-secret setup data via webhook:
-
-```bash
-./safeclaw --on-setup-hook http://localhost:8080/on-setup
-```
-
-The setup payload has two categories:
-- **`secrets`** — Encrypted in vault. **Never** sent to webhook.
-- **`config`** — Not stored in vault. Forwarded to the webhook URL.
 
 </details>
 

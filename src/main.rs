@@ -28,10 +28,13 @@ use state::{AppState, RateLimiter, VaultState};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Handle `safeclaw update` subcommand before anything else
+    // Handle subcommands before anything else
     let args: Vec<String> = std::env::args().collect();
     if args.len() >= 2 && args[1] == "update" {
         return cli::update::run(&args[2..]).map_err(Into::into);
+    }
+    if args.len() >= 2 && args[1] == "connect" {
+        return cli::connect::run(&args[2..]).map_err(Into::into);
     }
 
     // Initialize tracing subscriber
@@ -129,7 +132,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config: config.clone(),
         approval_manager: approval_manager.clone(),
         audit_log: audit_log.clone(),
-        services: service::ServiceRegistry::new(),
+        services: service::ServiceRegistry::load(),
     });
     let proxy_router = core::router::build_proxy_router(proxy_state);
 

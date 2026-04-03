@@ -1,0 +1,15 @@
+[openclaw]
+plugin = "anthropic"
+api = "anthropic-messages"
+env_key = "ANTHROPIC_API_KEY"
+env_base_url = "ANTHROPIC_BASE_URL"
+proxy_path = "/anthropic/v1"
+models = [
+    "claude-sonnet-4-20250514",
+    "claude-opus-4-20250514",
+    "claude-haiku-3-5-20241022",
+]
+
+# Claude Code OAuth also needs CLI credentials written
+[openclaw.claude_cli]
+credentials_path = "/root/.claude/.credentials.json"

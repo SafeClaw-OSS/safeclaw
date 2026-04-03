@@ -32,7 +32,13 @@ Use it directly — this is the upstream API response.
 
 ### Vault locked (response contains `safeclaw_unlock_url`)
 
-The vault is locked. Tell the user, provide the unlock URL as a clickable link, and create an inline button labeled "Unlock" linking to the URL. Then **stop and wait** — do not retry until the user confirms they have unlocked.
+Send **three separate messages**:
+
+1. Tell the user the vault is locked
+2. The `safeclaw_unlock_url` — the URL alone, nothing else
+3. An inline button: `[{"text": "🔓 Unlock", "callback_data": "unlock"}]`
+
+Then **stop and wait** — do not retry until the user confirms they have unlocked.
 
 ### Approval required (HTTP 202)
 
@@ -50,10 +56,11 @@ Some requests need human approval. When you receive HTTP 202, the response body 
 
 #### Step 1 — Ask the user to approve
 
-Send a message with:
+Send **three separate messages**, in order:
+
 1. What you were trying to do (service + action)
-2. The `safeclaw_approve_url` **from the actual 202 response** as clickable text
-3. An inline button: `[{"text": "✅ Done", "callback_data": "done"}]` — the user taps this button after approving, you must render it as an actual inline button, not as text
+2. The `safeclaw_approve_url` **from the actual 202 response** — the URL alone, nothing else
+3. An inline button: `[{"text": "✅ Done", "callback_data": "done"}]` — you must render it as an actual inline button, not as text. The user taps this after approving.
 
 Then **stop and wait** for the user to tap the button or reply.
 

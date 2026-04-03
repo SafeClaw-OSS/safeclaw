@@ -12,30 +12,15 @@ pub fn read_template(name: &str, fallback: &str) -> String {
     fallback.to_string()
 }
 
-/// Load the service catalog (services.json) at runtime.
+/// Load the service catalog from services/*/service.toml.
 /// Returns the set of known service IDs and their display names.
 fn load_catalog() -> Vec<(String, String)> {
-    let catalog_str = if let Ok(data) = std::env::var("SAFECLAW_DATA") {
-        let path = format!("{}/catalog/services.json", data);
-        std::fs::read_to_string(&path).ok()
-    } else {
-        None
-    };
-    // Fall back to compiled-in catalog
-    let catalog_str = catalog_str.unwrap_or_else(|| {
-        include_str!("../../catalog/services.json").to_string()
-    });
-    let catalog: serde_json::Value = match serde_json::from_str(&catalog_str) {
-        Ok(v) => v,
-        Err(_) => return vec![],
-    };
-    let mut out = vec![];
-    if let Some(services) = catalog.get("services").and_then(|s| s.as_object()) {
-        for (id, svc) in services {
-            let name = svc.get("name").and_then(|n| n.as_str()).unwrap_or(id).to_string();
-            out.push((id.clone(), name));
-        }
-    }
+    let registry = crate::service::ServiceRegistry::load();
+    let mut out: Vec<(String, String)> = registry.all()
+        .iter()
+        .map(|(id, def)| (id.clone(), def.service.name.clone()))
+        .collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
     out
 }
 

@@ -18,7 +18,6 @@ use crate::config::Config;
 use super::policy::{evaluate_policy, AccessLevel};
 use crate::state::VaultState;
 use super::forward::{forward_request, parse_route};
-use super::locked::openai_locked;
 use crate::auth::{AuthConfig, ServiceConfig};
 use crate::auth::oauth2::refresh_token as refresh_oauth2_token;
 use crate::service::ServiceRegistry;
@@ -134,7 +133,8 @@ async fn proxy_poll_approval(
                     if let Some(t) = valid_cached {
                         Some(t)
                     } else {
-                        match refresh_oauth2_token(a).await {
+                        let oauth_style = state.services.oauth_style(service_name);
+                        match refresh_oauth2_token(a, oauth_style).await {
                             Ok((access_token, expires_at)) => {
                                 state
                                     .vault
@@ -189,6 +189,8 @@ async fn proxy_poll_approval(
                 snapshot.req_body.clone(),
                 &service_config,
                 resolved_bearer.as_deref(),
+                &state.services,
+                &snapshot.service,
             )
             .await;
 
@@ -321,10 +323,10 @@ async fn proxy_handler(
         }
 
         let admin_url = &state.config.effective_admin_url();
-        let svc = state.services.resolve(&route_service);
 
-        return svc.locked_response(is_stream, admin_url, &route_path)
-            .unwrap_or_else(|| openai_locked(is_stream, admin_url));
+        return state.services.locked_response(&route_service, is_stream, admin_url, &route_path)
+            .unwrap_or_else(|| crate::service::locked::render("openai", is_stream, admin_url)
+                .unwrap_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "vault locked").into_response()));
     }
 
     // Read full body for forwarding (and potential approval replay)
@@ -396,9 +398,8 @@ async fn proxy_handler(
     // ── Policy evaluation ──────────────────────────────────────────────────────
 
     // Infer category from service if not explicitly set in vault config
-    let svc = state.services.resolve(&route_service);
     let category = service_config.category.as_deref()
-        .unwrap_or(svc.default_category());
+        .unwrap_or_else(|| state.services.default_category(&route_service));
 
     let policy_defaults = state.vault.get_policy_defaults();
     let access_level = evaluate_policy(
@@ -600,7 +601,8 @@ async fn proxy_handler(
             if let Some(t) = valid_cached {
                 Some(t)
             } else {
-                match refresh_oauth2_token(a).await {
+                let oauth_style = state.services.oauth_style(&route_service);
+                match refresh_oauth2_token(a, oauth_style).await {
                     Ok((access_token, expires_at)) => {
                         state
                             .vault
@@ -633,6 +635,8 @@ async fn proxy_handler(
         body_bytes,
         &service_config,
         resolved_bearer.as_deref(),
+        &state.services,
+        &route_service,
     )
     .await;
 

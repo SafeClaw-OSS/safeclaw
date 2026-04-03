@@ -1,0 +1,18 @@
+[service]
+id = "brave"
+name = "Brave Search"
+description = "Web search API"
+category = "integration"
+color = "#f55036"
+docs = "https://brave.com/search/api/"
+
+[upstream]
+url = "https://api.search.brave.com"
+
+[auth]
+type = "header"
+header = "X-Subscription-Token"
+key_placeholder = "BSA..."
+
+[defaults]
+levels = { read = "allow", write = "allow" }

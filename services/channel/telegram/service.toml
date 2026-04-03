@@ -1,0 +1,16 @@
+[service]
+id = "telegram"
+name = "Telegram"
+description = "Telegram Bot API"
+category = "channel"
+color = "#26a5e4"
+docs = "https://core.telegram.org/bots/api"
+
+[upstream]
+url = "https://api.telegram.org"
+
+[auth]
+type = "path"
+
+[defaults]
+levels = { read = "allow", write = "allow" }

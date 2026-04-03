@@ -1,0 +1,16 @@
+[service]
+id = "weixin"
+name = "WeChat iLink"
+description = "WeChat messaging via iLink plugin"
+category = "channel"
+color = "#07c160"
+docs = "https://weixin.qq.com"
+
+[upstream]
+url = "http://localhost:23295/wechat"
+
+[auth]
+type = "bearer"
+
+[defaults]
+levels = { read = "allow", write = "allow" }
