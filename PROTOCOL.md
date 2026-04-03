@@ -253,7 +253,50 @@ config_patches = [                      # Config changes (dot-path notation). Op
 | `{{admin_url}}` | SafeClaw admin URL (e.g., `http://localhost:23294`) |
 | `{{service_id}}` | Current service ID |
 
-Template variables can appear in `run`, `content`, `path`, and `config_patches` values. NL-Cooker prints them as-is (placeholders); the provisioner substitutes real values.
+Template variables can appear in `run`, `content`, `path`, and `config_patches` values. NL-Cooker prints them as-is (placeholders); `dispatch_cook` substitutes real values at execution time.
+
+## Enable flow
+
+Enabling a service (built-in or custom) follows a single unified path:
+
+```
+Frontend → POST /vault/services/add → vault stores secret
+         → dispatch_cook(secrets)
+           → builds ops from vault state + recipe steps
+           → POST /cook to cooker endpoint
+           → cooker executes ops (file write, config, exec, etc.)
+```
+
+**Built-in services**: `service.toml` and `recipe.toml` come from the compiled TOML registry. The frontend only sends the secret (API key, OAuth tokens, etc.).
+
+**Custom services**: The frontend sends the full definition inline:
+
+```json
+{
+  "name": "my-custom-service",
+  "service": { "upstream": { "url": "...", "auth": { "type": "bearer" } } },
+  "recipe": { "steps": [...] },
+  "secret": { "key": "sk-..." }
+}
+```
+
+Fields `service` and `recipe` are optional — omit for built-in services. The vault stores whatever the frontend sends; `dispatch_cook` merges built-in TOML with vault data.
+
+**Equivalences**:
+- `enable(service)` = `vault.store(service)` + `cook(recipe.steps)`
+- `setup` = batch enable all services = single `dispatch_cook` with merged ops
+
+### Cook ops
+
+Recipe steps are translated into cook ops sent to the cooker:
+
+| Recipe field | Cook op type | Description |
+|--------------|-------------|-------------|
+| `files` | `file` | Write file at `path` (relative to `~/.openclaw/`) with `content` |
+| `config_patches` | `config` | Deep-merge patch into `openclaw.json` |
+| `run` | `exec` | Execute shell command in openclaw environment |
+
+File paths in cook ops are relative to the openclaw home directory (`~/.openclaw/`). The cooker resolves them to host-side paths.
 
 ## Adding a new service
 
@@ -275,6 +318,8 @@ Template variables can appear in `run`, `content`, `path`, and `config_patches` 
 
 - **Declarative over imperative**: TOML definitions, not Rust code per service
 - **Single source of truth**: service.toml defines runtime behavior; recipe.toml defines installation
+- **Unified enable path**: built-in and custom services follow the same vault → dispatch_cook → cooker flow
+- **Vault stores only secrets**: auth type, upstream URL, and other static config live in service.toml, not vault
 - **No hidden protocols**: every field has one clear meaning; grouping is explicit via `group`
 - **Backward-compatible extension**: new fields can be added to any section without breaking existing definitions
 - **Separation of concerns**: `[service]` = identity, `[upstream]` = connection, `[policy]` = access control

@@ -336,8 +336,6 @@ pub async fn setup(
         }
     }
 
-    let setup_config = parsed.get("config").cloned();
-
     // If vault already exists, require existing passkey auth before overwrite
     let passkeys_path = state.config.data_dir.join("passkeys.json");
     if passkeys_path.exists() {
@@ -497,62 +495,9 @@ pub async fn setup(
     // Unlock proxy immediately after setup
     state.vault.set_secrets(secrets.clone());
 
-    // Push full secrets (including services with auth tokens) to provisioner
-    push_to_provisioner(secrets, state.config.proxy_port, state.config.effective_admin_url());
+    // Dispatch cook ops (workspace files, config, recipe steps)
+    dispatch_cook(secrets, state.config.proxy_port, state.config.effective_admin_url());
 
-    // Fire on-setup webhook (POST /cook with config op)
-    if let Some(ref hook_url) = state.config.on_setup_hook {
-        if let Some(ref config_data) = setup_config {
-            let hook_url = hook_url.clone();
-            // Enrich config with agentName from passkeys (provisioner needs it for IDENTITY.md)
-            let mut config_json = config_data.clone();
-            if let Some(agent_name) = parsed.get("passkeys")
-                .and_then(|p| p.as_array())
-                .and_then(|a| a.first())
-                .and_then(|pk| pk.get("agentName"))
-                .and_then(|v| v.as_str())
-            {
-                config_json.as_object_mut()
-                    .map(|m| m.insert("agentName".into(), serde_json::Value::String(agent_name.to_string())));
-            }
-            // Build /cook ops from config
-            let mut ops = vec![
-                serde_json::json!({"type": "config", "patch": &config_json}),
-            ];
-            // Add channel ops if wechat is configured
-            if config_json.get("channels").and_then(|c| c.get("wechat")).is_some() {
-                ops.push(serde_json::json!({"type": "channel", "patch": {"wechat": true}}));
-            }
-            // Add IDENTITY.md if agentName is present
-            if let Some(name) = config_json.get("agentName").and_then(|v| v.as_str()) {
-                if !name.is_empty() {
-                    ops.push(serde_json::json!({
-                        "type": "workspace",
-                        "file": "IDENTITY.md",
-                        "content": format!("# IDENTITY.md\n\n- **Name:** {name}\n")
-                    }));
-                }
-            }
-            let cook_body = serde_json::json!({"ops": ops, "restart": true});
-            tokio::spawn(async move {
-                let client = reqwest::Client::new();
-                match client
-                    .post(&hook_url)
-                    .json(&cook_body)
-                    .timeout(std::time::Duration::from_secs(30))
-                    .send()
-                    .await
-                {
-                    Ok(resp) => {
-                        tracing::info!("on-setup hook responded: {}", resp.status());
-                    }
-                    Err(e) => {
-                        tracing::warn!("on-setup hook failed: {}", e);
-                    }
-                }
-            });
-        }
-    }
 
     Ok(Json(json!({ "ok": true })))
 }
@@ -611,11 +556,11 @@ pub async fn vault_unlock(
 
     state.vault.set_secrets(secrets);
 
-    // Push AGENTS.md + safeclaw.md to provisioner on unlock
+    // Dispatch cook ops on unlock
     let proxy_port = state.config.proxy_port;
     let console_url = state.config.effective_admin_url();
     if let Some(unlocked_secrets) = state.vault.secrets.lock().unwrap().clone() {
-        push_to_provisioner(unlocked_secrets, proxy_port, console_url);
+        dispatch_cook(unlocked_secrets, proxy_port, console_url);
     }
 
     Ok(Json(json!({ "ok": true })))
@@ -718,48 +663,39 @@ pub async fn vault_update(
     state.vault.set_secrets(new_secrets.clone());
 
     // Keep VM-side SafeClaw guidance in sync with the latest vault config.
-    push_to_provisioner(new_secrets, state.config.proxy_port, state.config.effective_admin_url());
+    dispatch_cook(new_secrets, state.config.proxy_port, state.config.effective_admin_url());
 
     Ok(Json(json!({ "ok": true })))
 }
 
-// ── Provisioner Push ───────────────────────────────────────────────────────────
+// ── Cook Dispatch ─────────────────────────────────────────────────────────────
 
-/// Spawn a background task that pushes updated safeclaw.md and AGENTS.md to the
-/// local provisioner after a service add/update/remove. Failures are silently
-/// discarded — the vault operation has already succeeded.
-fn push_to_provisioner(secrets: serde_json::Value, proxy_port: u16, console_url: String) {
+/// Spawn a background task that dispatches cook ops to the local cooker endpoint
+/// after vault state changes (setup, unlock, service add/update/remove).
+/// Builds ops from vault secrets + service recipes, sends a single POST /cook.
+/// Failures are silently discarded — the vault operation has already succeeded.
+fn dispatch_cook(secrets: serde_json::Value, proxy_port: u16, console_url: String) {
     tokio::spawn(async move {
         let md = crate::cli::generate::generate_safeclaw_md(&secrets, false, proxy_port, &console_url);
         let snippet = crate::cli::generate::generate_agents_md_snippet(&secrets, proxy_port);
 
-        // Extract channel tokens that need to be written into OpenClaw config.
-        // Telegram: stored as services.telegram.auth.secret (path auth type).
-        let telegram_token = secrets
-            .get("services")
-            .and_then(|s| s.get("telegram"))
-            .and_then(|t| t.get("auth"))
-            .and_then(|a| a.get("secret"))
-            .and_then(|s| s.as_str())
-            .map(|s| s.to_owned());
-
         let mut ops = vec![
-            serde_json::json!({ "type": "workspace", "file": "safeclaw.md", "content": md }),
-            serde_json::json!({ "type": "workspace", "file": "AGENTS.md", "content": snippet }),
+            serde_json::json!({ "type": "file", "path": "workspace/safeclaw.md", "content": md }),
+            serde_json::json!({ "type": "file", "path": "workspace/AGENTS.md", "content": snippet, "upsert_block": "SAFECLAW" }),
         ];
 
-        // Restart OpenClaw after guidance sync so newly written skills/docs are
-        // picked up immediately. This keeps fresh VMs and post-update sessions
-        // on the latest SafeClaw protocol without relying on hot reload.
         let mut needs_restart = true;
 
         // Build config patch from vault secrets.
         let mut config_patch = serde_json::json!({});
 
         // Telegram: token + ownerId for OpenClaw channel config.
-        if let Some(token) = telegram_token {
+        if let Some(token) = secrets
+            .get("services").and_then(|s| s.get("telegram"))
+            .and_then(|t| t.get("auth")).and_then(|a| a.get("secret"))
+            .and_then(|s| s.as_str())
+        {
             let mut tg_patch = serde_json::json!({ "token": token });
-            // Extract ownerId if present (stored alongside token in vault config).
             if let Some(owner_id) = secrets
                 .get("services").and_then(|s| s.get("telegram"))
                 .and_then(|t| t.get("owner_id").or_else(|| t.get("ownerId")))
@@ -775,9 +711,8 @@ fn push_to_provisioner(secrets: serde_json::Value, proxy_port: u16, console_url:
             config_patch["model"] = model.clone();
         }
 
-        // Pass full service data so provisioner can extract auth tokens (e.g. access_token
-        // for openai-codex OAuth). Previously only passed `true` as a presence marker,
-        // which caused extractAccountId to always fail with "sk-safeclaw-proxy" as apiKey.
+        // Pass full service data so cooker can extract auth tokens (e.g. access_token
+        // for openai-codex OAuth).
         if let Some(svcs) = secrets.get("services").and_then(|s| s.as_object()) {
             config_patch["services"] = serde_json::json!({});
             for (k, v) in svcs {
@@ -790,31 +725,124 @@ fn push_to_provisioner(secrets: serde_json::Value, proxy_port: u16, console_url:
                 "type": "config",
                 "patch": config_patch
             }));
-            needs_restart = true;
         }
 
         // WeChat: push channel op if wechat service exists in vault.
-        let has_wechat = secrets
-            .get("services")
-            .and_then(|s| s.get("wechat"))
-            .is_some();
-        if has_wechat {
+        if secrets.get("services").and_then(|s| s.get("wechat")).is_some() {
             ops.push(serde_json::json!({
                 "type": "channel",
                 "patch": { "wechat": true }
             }));
-            needs_restart = true;
+        }
+
+        // Execute recipe steps for each enabled service.
+        // Recipe source: built-in TOML first, then vault blob's "recipe" field.
+        if let Some(svcs) = secrets.get("services").and_then(|s| s.as_object()) {
+            for (svc_id, svc_data) in svcs {
+                let recipe = crate::cooker::load_recipe(svc_id).or_else(|| {
+                    // Custom service: recipe stored in vault blob
+                    svc_data.get("recipe")
+                        .and_then(|r| serde_json::from_value::<crate::cooker::Recipe>(r.clone()).ok())
+                });
+                if let Some(recipe) = recipe {
+                    for step in &recipe.steps {
+                        // Only include openclaw-targeted steps (safeclaw steps run locally)
+                        if step.target != "openclaw" { continue; }
+
+                        // Translate recipe step files → file ops
+                        if let Some(files) = &step.files {
+                            for f in files {
+                                let path = f.get("path").and_then(|v| v.as_str());
+                                let content = f.get("content").and_then(|v| v.as_str());
+                                let template = f.get("template").and_then(|v| v.as_str());
+                                if let Some(path) = path {
+                                    // Resolve template variables
+                                    let resolve = |s: &str| -> String {
+                                        s.replace("{{proxy_port}}", &proxy_port.to_string())
+                                         .replace("{{admin_port}}", &console_url.split(':').last().unwrap_or("23294"))
+                                         .replace("{{admin_url}}", &console_url)
+                                         .replace("{{service_id}}", svc_id)
+                                    };
+                                    let resolved_content = if let Some(c) = content {
+                                        Some(resolve(c))
+                                    } else if let Some(_tmpl) = template {
+                                        // Template files are loaded by provisioner from service folder
+                                        // (not resolved here — provisioner has access to the files)
+                                        None
+                                    } else {
+                                        None
+                                    };
+                                    if let Some(content) = resolved_content {
+                                        ops.push(serde_json::json!({
+                                            "type": "file",
+                                            "path": resolve(path),
+                                            "content": content
+                                        }));
+                                    }
+                                }
+                            }
+                        }
+
+                        // Translate recipe step config_patches → config ops
+                        if let Some(patches) = &step.config_patches {
+                            let mut patch = serde_json::json!({});
+                            for p in patches {
+                                if let (Some(dot_path), Some(value)) = (
+                                    p.get("path").and_then(|v| v.as_str()),
+                                    p.get("value"),
+                                ) {
+                                    // Convert dot-path to nested JSON
+                                    let parts: Vec<&str> = dot_path.split('.').collect();
+                                    let mut target = &mut patch;
+                                    for (i, part) in parts.iter().enumerate() {
+                                        if i == parts.len() - 1 {
+                                            target[part] = value.clone();
+                                        } else {
+                                            if target.get(part).is_none() {
+                                                target[part] = serde_json::json!({});
+                                            }
+                                            target = &mut target[part];
+                                        }
+                                    }
+                                }
+                            }
+                            if patch.as_object().map_or(false, |o| !o.is_empty()) {
+                                ops.push(serde_json::json!({
+                                    "type": "config",
+                                    "patch": patch
+                                }));
+                            }
+                        }
+
+                        // Translate recipe step run → exec ops
+                        if let Some(run) = &step.run {
+                            let resolved_run = run
+                                .replace("{{proxy_port}}", &proxy_port.to_string())
+                                .replace("{{admin_url}}", &console_url)
+                                .replace("{{service_id}}", svc_id);
+                            let mut exec_op = serde_json::json!({
+                                "type": "exec",
+                                "command": resolved_run
+                            });
+                            if let Some(cwd) = &step.cwd {
+                                exec_op["cwd"] = serde_json::json!(cwd);
+                            }
+                            ops.push(exec_op);
+                        }
+                    }
+                }
+            }
         }
 
         // Use host.docker.internal when running inside Docker (host-gateway mapping).
-        // Falls back to localhost for non-Docker environments.
         let provisioner_host = if std::path::Path::new("/.dockerenv").exists() {
             "host.docker.internal"
         } else {
             "localhost"
         };
         let _ = reqwest::Client::new()
-            .post(format!("http://{}:23296/apply", provisioner_host))
+            .post(format!("http://{}:23296/cook", provisioner_host))
+            .timeout(std::time::Duration::from_secs(120))
             .json(&serde_json::json!({
                 "ops": ops,
                 "restart": needs_restart
@@ -865,11 +893,11 @@ pub async fn vault_services_add(
         Ok(())
     })?;
 
-    // Push updated workspace files to provisioner
+    // Dispatch cook ops for updated vault state
     let proxy_port = state.config.proxy_port;
     let console_url = state.config.effective_admin_url();
     if let Some(secrets) = state.vault.secrets.lock().unwrap().clone() {
-        push_to_provisioner(secrets, proxy_port, console_url);
+        dispatch_cook(secrets, proxy_port, console_url);
     }
 
     Ok(Json(json!({ "ok": true })))
@@ -905,11 +933,11 @@ pub async fn vault_services_update(
         Ok(())
     })?;
 
-    // Push updated workspace files to provisioner
+    // Dispatch cook ops for updated vault state
     let proxy_port = state.config.proxy_port;
     let console_url = state.config.effective_admin_url();
     if let Some(secrets) = state.vault.secrets.lock().unwrap().clone() {
-        push_to_provisioner(secrets, proxy_port, console_url);
+        dispatch_cook(secrets, proxy_port, console_url);
     }
 
     Ok(Json(json!({ "ok": true })))
@@ -936,11 +964,11 @@ pub async fn vault_services_remove(
         Ok(())
     })?;
 
-    // Push updated workspace files to provisioner
+    // Dispatch cook ops for updated vault state
     let proxy_port = state.config.proxy_port;
     let console_url = state.config.effective_admin_url();
     if let Some(secrets) = state.vault.secrets.lock().unwrap().clone() {
-        push_to_provisioner(secrets, proxy_port, console_url);
+        dispatch_cook(secrets, proxy_port, console_url);
     }
 
     Ok(Json(json!({ "ok": true })))

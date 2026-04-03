@@ -198,7 +198,6 @@ data/
 | `--rp-id` | `SAFECLAW_RP_ID` | `localhost` | WebAuthn relying party ID (hostname only) |
 | `--admin-url` | `SAFECLAW_ADMIN_URL` | `http://localhost:{port}` | URL shown in "vault locked" and approval responses |
 | `--rate-limit` | `SAFECLAW_RATE_LIMIT` | `300` | Max requests/min per IP (0 = unlimited) |
-| `--on-setup-hook` | `SAFECLAW_ON_SETUP_HOOK` | — | Webhook URL called after setup (POST /cook format) |
 | `--init` | — | — | Generate server keypair and exit |
 
 ## CLI commands
