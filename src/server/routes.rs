@@ -160,6 +160,10 @@ fn write_index(state: &AppState, secrets: &Value) -> std::io::Result<()> {
         .and_then(|s| s.as_object())
         .map(|obj| {
             obj.iter()
+                .filter(|(name, _)| {
+                    // Hide internal services (no service.toml = recipe-only, not user-facing)
+                    registry.get(name).is_some()
+                })
                 .map(|(name, cfg)| {
                     let svc_def = registry.get(name);
                     let category = svc_def
