@@ -27,6 +27,63 @@ use crate::error::{AppError, Result};
 use crate::notify::PushSubscription;
 use crate::state::AppState;
 
+// ── WebAuthn Related Origin Requests (ROR) ────────────────────────────────────
+
+/// GET /.well-known/webauthn — declare which origins may use this domain's passkeys.
+/// Required for cross-origin passkey sharing (e.g. NodPay using SafeClaw passkeys).
+pub async fn well_known_webauthn() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        Json(json!({ "origins": ["https://nodpay.ai"] })),
+    )
+}
+
+// ── Passkey Public Coordinates ────────────────────────────────────────────────
+
+/// GET /passkeys/public — return all registered passkey (x, y) coordinates as hex.
+/// Public key material — no auth required. Used by NodPay wallet creation.
+pub async fn passkeys_public(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let passkeys_path = state.config.data_dir.join("passkeys.json");
+    if !passkeys_path.exists() {
+        return Json(json!({ "passkeys": [] })).into_response();
+    }
+    let passkeys: HashMap<String, PasskeyEntry> = match fs::read_to_string(&passkeys_path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+    {
+        Some(p) => p,
+        None => return Json(json!({ "passkeys": [] })).into_response(),
+    };
+
+    let entries: Vec<Value> = passkeys
+        .iter()
+        .map(|(cred_id, entry)| {
+            let x_hex = base64_to_hex(&entry.x);
+            let y_hex = base64_to_hex(&entry.y);
+            json!({
+                "credentialId": cred_id,
+                "x": x_hex,
+                "y": y_hex,
+                "deviceName": entry.device_name,
+            })
+        })
+        .collect();
+
+    Json(json!({ "passkeys": entries })).into_response()
+}
+
+/// Convert standard base64 to 0x-prefixed hex string.
+fn base64_to_hex(b64: &str) -> String {
+    match STANDARD.decode(b64) {
+        Ok(bytes) => {
+            let hex: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
+            format!("0x{}", hex)
+        }
+        Err(_) => String::new(),
+    }
+}
+
 // ── Health ─────────────────────────────────────────────────────────────────────
 
 /// POST /auth/verify — verify passkey identity without unlocking vault.

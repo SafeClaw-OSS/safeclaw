@@ -57,6 +57,9 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .allow_headers(Any);
 
     Router::new()
+        // ── WebAuthn ROR (Related Origin Requests) ──────────────────────────
+        .route("/.well-known/webauthn", get(well_known_webauthn))
+
         // ── Public ──────────────────────────────────────────────────────────
         .route("/health", get(health))
         .route("/pk", get(server_pk))
@@ -113,6 +116,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // ── Passkeys (authenticated) ────────────────────────────────────────
         .route("/passkeys/add", post(identity_add_passkey))
         .route("/passkeys/remove", post(identity_remove_passkey))
+        .route("/passkeys/public", get(passkeys_public))
 
         // ── Static ──────────────────────────────────────────────────────────
         .route("/", get(serve_index))
