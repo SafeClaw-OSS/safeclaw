@@ -84,6 +84,7 @@ key_placeholder = "sk-..."     # Input hint for UI. Optional.
 
 # Type-specific fields:
 # header:  header = "x-api-key"
+#          prefix = "Bearer "       (optional, prepended to secret value)
 # query:   param = "key"
 # basic:   username_label = "Account SID"
 # oauth2:  oauth_style = "json" | "form" (default: form)

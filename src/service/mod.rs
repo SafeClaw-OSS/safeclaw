@@ -68,6 +68,8 @@ pub struct AuthDef {
     #[serde(default)]
     pub header: Option<String>,
     #[serde(default)]
+    pub prefix: Option<String>,
+    #[serde(default)]
     pub param: Option<String>,
     #[serde(default)]
     pub key_placeholder: Option<String>,
