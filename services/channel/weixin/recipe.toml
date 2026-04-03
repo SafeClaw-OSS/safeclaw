@@ -11,7 +11,7 @@ target = "openclaw"
 title = "Create account config"
 files = [
     { path = "openclaw-weixin/accounts.json", content = '["safeclaw"]' },
-    { path = "openclaw-weixin/accounts/safeclaw.json", template = "weixin-account" },
+    { path = "openclaw-weixin/accounts/safeclaw.json", template = "weixin-account.json" },
 ]
 target = "openclaw"
 

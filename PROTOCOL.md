@@ -168,9 +168,9 @@ Defines first-time installation instructions. Consumed by:
 [recipe]
 id = "weixin"
 display_name = "WeChat iLink"
-requires_credential = true      # Hint: user must add credentials to vault. Default: true.
-                                # Set false for services without vault secrets (e.g., nodpay).
 ```
+
+Whether a service needs vault credentials is derived from `service.toml` — if `[upstream.auth]` exists, credentials are required.
 
 ### `[openclaw]` — OpenClaw runtime integration
 
@@ -214,7 +214,7 @@ title = "Create account config"
 target = "openclaw"
 files = [                               # Files to create. Optional.
   { path = "accounts.json", content = '["safeclaw"]' },
-  { path = "accounts/safeclaw.json", template = "weixin-account" },
+  { path = "accounts/safeclaw.json", template = "weixin-account.json" },
 ]
 
 [[steps]]
@@ -238,7 +238,7 @@ config_patches = [                      # Config changes (dot-path notation). Op
 |-----------|-------------|
 | `path` | Destination file path. Required. |
 | `content` | Inline file content (string). Mutually exclusive with `template`. |
-| `template` | File name within the same service folder (e.g., `"weixin-account"` resolves to `services/channel/weixin/weixin-account.json`). Mutually exclusive with `content`. |
+| `template` | File name (with extension) within the same service folder (e.g., `"weixin-account.json"` resolves to `services/channel/weixin/weixin-account.json`). Mutually exclusive with `content`. |
 
 **`config_patches` field**: Applies key-value changes to the OpenClaw config file.
 

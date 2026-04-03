@@ -1,7 +1,6 @@
 [recipe]
 id = "openclaw-dashboard"
 display_name = "OpenClaw Dashboard"
-requires_credential = false
 
 [[steps]]
 title = "Enable the built-in dashboard"

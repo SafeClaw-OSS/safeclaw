@@ -1,6 +1,7 @@
 /// NL-Cooker: render a recipe as human-readable setup instructions.
 
 use super::Recipe;
+use crate::service::ServiceRegistry;
 
 /// Render a recipe into step-by-step instructions (printed to stderr).
 pub fn render(service_id: &str, recipe: &Recipe) {
@@ -9,17 +10,19 @@ pub fn render(service_id: &str, recipe: &Recipe) {
         .and_then(|r| r.display_name.as_deref())
         .unwrap_or(service_id);
 
-    let requires_cred = recipe.recipe
-        .as_ref()
-        .and_then(|r| r.requires_credential)
-        .unwrap_or(true);
+    // Derive credential requirement from service.toml [upstream.auth]
+    let registry = ServiceRegistry::load();
+    let requires_cred = registry.get(service_id)
+        .and_then(|d| d.upstream.as_ref())
+        .and_then(|u| u.auth.as_ref())
+        .is_some();
 
     eprintln!("Connect: {}\n", display_name);
     eprintln!("{}", "=".repeat(40));
 
     let mut step_num = 0;
 
-    // Credential step
+    // Credential step (auto-derived from service.toml having [upstream.auth])
     if requires_cred {
         step_num += 1;
         eprintln!("\nStep {}: Add credentials to SafeClaw vault", step_num);

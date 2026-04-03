@@ -23,8 +23,6 @@ pub struct RecipeMeta {
     pub id: Option<String>,
     #[serde(default)]
     pub display_name: Option<String>,
-    #[serde(default)]
-    pub requires_credential: Option<bool>,
 }
 
 #[derive(Debug, serde::Deserialize)]

@@ -1,7 +1,6 @@
 [recipe]
 id = "nodpay"
 display_name = "NodPay"
-requires_credential = false
 
 [passkey_sharing]
 enabled = true
