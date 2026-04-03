@@ -41,8 +41,6 @@ pub struct OpenClawDef {
     pub proxy_path: Option<String>,
     #[serde(default)]
     pub models: Vec<ModelDef>,
-    #[serde(default)]
-    pub essential: Option<bool>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -74,8 +72,6 @@ pub struct Step {
     pub config_patches: Option<Vec<serde_json::Value>>,
     #[serde(default)]
     pub files: Option<Vec<serde_json::Value>>,
-    #[serde(default)]
-    pub vault_credential: Option<bool>,
     #[serde(default)]
     pub restart: Option<bool>,
     /// Which environment executes this step: "safeclaw" or "openclaw" (default).

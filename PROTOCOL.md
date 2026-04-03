@@ -168,20 +168,21 @@ Defines first-time installation instructions. Consumed by:
 [recipe]
 id = "weixin"
 display_name = "WeChat iLink"
-requires_credential = true      # Whether vault credential is needed. Default: true.
+requires_credential = true      # Hint: user must add credentials to vault. Default: true.
+                                # Set false for services without vault secrets (e.g., nodpay).
 ```
 
 ### `[openclaw]` — OpenClaw runtime integration
 
 ```toml
 [openclaw]
-plugin = "anthropic"            # OpenClaw plugin name (for plugins.allow)
-api = "anthropic-messages"      # OpenClaw provider API type
-env_key = "ANTHROPIC_API_KEY"   # Environment variable for API key marker
-env_base_url = "ANTHROPIC_BASE_URL"
-proxy_path = "/anthropic/v1"    # SafeClaw proxy path
+plugin = "anthropic"            # OpenClaw plugin name (for plugins.allow). Optional.
+api = "anthropic-messages"      # OpenClaw provider API type. Optional.
+env_key = "ANTHROPIC_API_KEY"   # Environment variable for API key marker. Optional.
+env_base_url = "ANTHROPIC_BASE_URL"  # Environment variable for base URL. Optional.
+proxy_path = "/anthropic/v1"    # SafeClaw proxy path. Optional.
 
-[[openclaw.models]]             # Available models (id + display name)
+[[openclaw.models]]             # Available models (id + display name). Optional.
 id = "claude-sonnet-4-20250514"
 name = "Claude Sonnet 4"
 ```
@@ -203,13 +204,14 @@ Configures `/.well-known/webauthn` to allow external origins to use passkeys reg
 title = "Install WeChat plugin"         # Step title. Required.
 description = "Detailed explanation"    # Optional.
 run = "npm install @tencent-weixin/openclaw-weixin@latest"  # Shell command. Optional.
-cwd = "openclaw"                        # Working directory. Optional.
+cwd = "openclaw"                        # Working directory for `run`. Optional.
 note = "Requires Node.js 18+"          # Additional note. Optional.
 restart = true                          # Restart OpenClaw after this step. Optional.
-target = "openclaw"                     # openclaw | safeclaw. Default: openclaw.
+target = "openclaw"                     # openclaw | safeclaw. Required.
 
 [[steps]]
 title = "Create account config"
+target = "openclaw"
 files = [                               # Files to create. Optional.
   { path = "accounts.json", content = '["safeclaw"]' },
   { path = "accounts/safeclaw.json", template = "weixin-account" },
@@ -217,19 +219,41 @@ files = [                               # Files to create. Optional.
 
 [[steps]]
 title = "Enable channel"
-config_patches = [                      # OpenClaw config changes. Optional.
+target = "openclaw"
+config_patches = [                      # Config changes (dot-path notation). Optional.
   { path = "channels.openclaw-weixin.enabled", value = true },
 ]
 ```
 
-**`target` field**: Controls which environment executes the step.
+**`target` field** (required): Controls which environment executes the step.
 
 | Value | Description |
 |-------|-------------|
-| `openclaw` | Executed on the OpenClaw/agent side (default). Sent to provisioner via webhook. |
+| `openclaw` | Executed on the OpenClaw/agent side. Sent to provisioner via webhook. |
 | `safeclaw` | Executed on the SafeClaw vault machine locally. Used for local service dependencies (e.g., CLI tools). |
 
-Steps without `target` default to `openclaw` for backward compatibility. NL-Cooker (`safeclaw connect`) prints all steps with their target noted.
+**`files` field**: Creates files on the target environment.
+
+| Sub-field | Description |
+|-----------|-------------|
+| `path` | Destination file path. Required. |
+| `content` | Inline file content (string). Mutually exclusive with `template`. |
+| `template` | File name within the same service folder (e.g., `"weixin-account"` resolves to `services/channel/weixin/weixin-account.json`). Mutually exclusive with `content`. |
+
+**`config_patches` field**: Applies key-value changes to the OpenClaw config file.
+
+`path` uses **dot-separated notation** for nested JSON keys: `channels.openclaw-weixin.enabled` sets `config["channels"]["openclaw-weixin"]["enabled"]`. `value` can be any JSON-compatible type (bool, string, number, object).
+
+**Template variables** (resolved at execution time in string values):
+
+| Variable | Description |
+|----------|-------------|
+| `{{proxy_port}}` | SafeClaw proxy port (default: 23295) |
+| `{{admin_port}}` | SafeClaw admin port (default: 23294) |
+| `{{admin_url}}` | SafeClaw admin URL (e.g., `http://localhost:23294`) |
+| `{{service_id}}` | Current service ID |
+
+Template variables can appear in `run`, `content`, `path`, and `config_patches` values. NL-Cooker prints them as-is (placeholders); the provisioner substitutes real values.
 
 ## Adding a new service
 

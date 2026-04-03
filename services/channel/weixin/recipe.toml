@@ -1,6 +1,5 @@
 [openclaw]
 plugin = "openclaw-weixin"
-essential = true
 
 [[steps]]
 title = "Install WeChat iLink plugin"
