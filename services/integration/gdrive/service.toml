@@ -17,5 +17,5 @@ write = "ask-always"
 
 [[policy.rules]]
 method = "GET"
-pathExact = "/drive/v3/files"
+path_exact = "/drive/v3/files"
 level = "allow"

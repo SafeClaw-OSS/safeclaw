@@ -17,10 +17,10 @@ write = "ask-always"
 
 [[policy.rules]]
 method = "GET"
-pathExact = "/gmail/v1/users/me/messages"
+path_exact = "/gmail/v1/users/me/messages"
 level = "allow"
 
 [[policy.rules]]
 method = "GET"
-pathExact = "/gmail/v1/users/me/labels"
+path_exact = "/gmail/v1/users/me/labels"
 level = "allow"

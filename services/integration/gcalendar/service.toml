@@ -17,5 +17,5 @@ write = "ask"
 
 [[policy.rules]]
 method = "GET"
-pathExact = "/calendar/v3/calendars/primary/events"
+path_exact = "/calendar/v3/calendars/primary/events"
 level = "allow"

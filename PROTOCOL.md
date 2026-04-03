@@ -1,5 +1,7 @@
 # SafeClaw Service Protocol
 
+**Protocol version: 1** — Breaking changes require a version bump and migration notes.
+
 This document defines the declarative service protocol used by SafeClaw. Each service is a folder in `services/{category}/{id}/` containing TOML definition files.
 
 ## File structure
@@ -34,7 +36,7 @@ Defines how a service behaves at runtime: identity, upstream connection, and acc
 [service]
 id = "openai"                   # Machine identifier (vault key, proxy route). Required.
 name = "OpenAI"                 # Human-readable name. Required.
-sub = "API Key"                 # Short tagline (card subtitle, tab label). Required.
+sub = "API Key"                 # Short tagline (card subtitle, tab label). Optional.
 category = "llm"                # llm | channel | integration. Required.
 group = "openai"                # UI merge key. Services with the same group value
                                 # are displayed as one card with multiple auth tabs.
@@ -141,12 +143,12 @@ write = "allow"                 # Default write access level
 ```toml
 [[policy.rules]]
 method = "GET"                  # HTTP method to match. Optional (matches all if omitted).
-pathExact = "/v1/models"        # Exact path match. Mutually exclusive with pathSuffix.
+path_exact = "/v1/models"        # Exact path match. Mutually exclusive with path_suffix.
 level = "allow"
 
 [[policy.rules]]
 method = "DELETE"
-pathSuffix = "/admin"           # Suffix path match.
+path_suffix = "/admin"           # Suffix path match.
 level = "ask-always"
 ```
 

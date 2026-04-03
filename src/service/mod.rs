@@ -93,9 +93,9 @@ pub struct PolicyRule {
     #[serde(default)]
     pub method: Option<String>,
     #[serde(default)]
-    pub pathExact: Option<String>,
+    pub path_exact: Option<String>,
     #[serde(default)]
-    pub pathSuffix: Option<String>,
+    pub path_suffix: Option<String>,
     pub level: String,
 }
 

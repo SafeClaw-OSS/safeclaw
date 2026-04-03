@@ -3,6 +3,7 @@ id = "anthropic"
 name = "Anthropic"
 sub = "API Key"
 category = "llm"
+group = "anthropic"
 
 [upstream]
 url = "https://api.anthropic.com"
