@@ -5,7 +5,7 @@ sub = "Messaging"
 category = "channel"
 
 [upstream]
-url = "http://localhost:23295/wechat"
+url = "https://ilinkai.weixin.qq.com"
 
 [upstream.auth]
 type = "bearer"
