@@ -56,10 +56,10 @@ Some requests need human approval. When you receive HTTP 202, the response body 
 
 #### Step 1 — Ask the user to approve
 
-Send **three separate messages**, in order:
+Send these separate messages, in order:
 
 1. What you were trying to do (service + action)
-2. The `safeclaw_approve_url` **from the actual 202 response** — the URL alone, nothing else
+2. Each `safeclaw_approve_url` on its own line — one per 202 response, URL alone so it's easy to tap/copy
 3. An inline button: `[{"text": "✅ Done", "callback_data": "done"}]` — you must render it as an actual inline button, not as text. The user taps this after approving.
 
 Then **stop and wait** for the user to tap the button or reply.
