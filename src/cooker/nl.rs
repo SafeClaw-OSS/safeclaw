@@ -70,7 +70,8 @@ pub fn render(service_id: &str, recipe: &Recipe) {
     // Recipe steps
     for step in &recipe.steps {
         step_num += 1;
-        eprintln!("\nStep {}: {}", step_num, step.title);
+        let target_label = if step.target == "safeclaw" { " [SafeClaw]" } else { " [OpenClaw]" };
+        eprintln!("\nStep {}:{} {}", step_num, target_label, step.title);
 
         if let Some(desc) = &step.description {
             eprintln!("  {}", desc);

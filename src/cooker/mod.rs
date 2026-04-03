@@ -78,7 +78,12 @@ pub struct Step {
     pub vault_credential: Option<bool>,
     #[serde(default)]
     pub restart: Option<bool>,
+    /// Which environment executes this step: "safeclaw" or "openclaw" (default).
+    #[serde(default = "default_step_target")]
+    pub target: String,
 }
+
+fn default_step_target() -> String { "openclaw".to_string() }
 
 // ── Recipe loading ────────────────────────────────────────────────────────────
 

@@ -10,12 +10,15 @@ origins = ["https://nodpay.ai"]
 [[steps]]
 title = "Install NodPay CLI"
 run = "npm install -g nodpay"
+target = "safeclaw"
 
 [[steps]]
 title = "Generate agent keypair"
 run = "npx nodpay keygen"
 note = "Reuses existing key if already generated"
+target = "safeclaw"
 
 [[steps]]
 title = "Enable passkey sharing"
 description = "Allows NodPay to create wallets using the same biometric passkey"
+target = "safeclaw"

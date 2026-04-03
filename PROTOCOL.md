@@ -203,6 +203,7 @@ run = "npm install @tencent-weixin/openclaw-weixin@latest"  # Shell command. Opt
 cwd = "openclaw"                        # Working directory. Optional.
 note = "Requires Node.js 18+"          # Additional note. Optional.
 restart = true                          # Restart OpenClaw after this step. Optional.
+target = "openclaw"                     # openclaw | safeclaw. Default: openclaw.
 
 [[steps]]
 title = "Create account config"
@@ -217,6 +218,15 @@ config_patches = [                      # OpenClaw config changes. Optional.
   { path = "channels.openclaw-weixin.enabled", value = true },
 ]
 ```
+
+**`target` field**: Controls which environment executes the step.
+
+| Value | Description |
+|-------|-------------|
+| `openclaw` | Executed on the OpenClaw/agent side (default). Sent to provisioner via webhook. |
+| `safeclaw` | Executed on the SafeClaw vault machine locally. Used for local service dependencies (e.g., CLI tools). |
+
+Steps without `target` default to `openclaw` for backward compatibility. NL-Cooker (`safeclaw connect`) prints all steps with their target noted.
 
 ## Adding a new service
 
