@@ -229,8 +229,9 @@ config_patches = [                      # Config changes (dot-path notation). Op
 
 | Value | Description |
 |-------|-------------|
-| `openclaw` | Executed on the OpenClaw/agent side. Sent to provisioner via webhook. |
-| `safeclaw` | Executed on the SafeClaw vault machine locally. Used for local service dependencies (e.g., CLI tools). |
+| `openclaw` | Executed inside the OpenClaw container (agent runtime). |
+| `safeclaw` | Executed inside the SafeClaw container (vault). Used for local service dependencies (e.g., CLI tools). |
+| `host` | Executed on the VM host directly. Used for system-level ops (e.g., firewall rules). Not used by built-in recipes. |
 
 **`files` field**: Creates files on the target environment.
 

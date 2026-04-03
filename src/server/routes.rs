@@ -712,173 +712,123 @@ fn dispatch_cook(secrets: serde_json::Value, proxy_port: u16, console_url: Strin
         let md = crate::cli::generate::generate_safeclaw_md(&secrets, false, proxy_port, &console_url);
         let snippet = crate::cli::generate::generate_agents_md_snippet(&secrets, proxy_port);
 
-        let mut ops = vec![
-            serde_json::json!({ "type": "file", "path": ".openclaw/workspace/safeclaw.md", "content": md }),
-            serde_json::json!({ "type": "file", "path": ".openclaw/workspace/AGENTS.md", "content": snippet, "upsert_block": "SAFECLAW" }),
-        ];
+        // Build steps in recipe format — provisioner executes them directly.
+        let mut steps: Vec<serde_json::Value> = vec![];
 
-        let mut needs_restart = true;
+        // Workspace files as recipe steps
+        steps.push(serde_json::json!({
+            "title": "Write safeclaw.md",
+            "target": "openclaw",
+            "files": [{ "path": ".openclaw/workspace/safeclaw.md", "content": md }]
+        }));
+        steps.push(serde_json::json!({
+            "title": "Update AGENTS.md",
+            "target": "openclaw",
+            "files": [{ "path": ".openclaw/workspace/AGENTS.md", "content": snippet, "upsert_block": "SAFECLAW" }]
+        }));
 
-        // Build config patch from vault secrets.
-        let mut config_patch = serde_json::json!({});
+        // Config patches from vault secrets
+        let mut config_patches = vec![];
 
-        // Telegram: token + ownerId for OpenClaw channel config.
+        if let Some(model) = secrets.get("model") {
+            config_patches.push(serde_json::json!({ "path": "model", "value": model }));
+        }
+
         if let Some(token) = secrets
             .get("services").and_then(|s| s.get("telegram"))
             .and_then(|t| t.get("auth")).and_then(|a| a.get("secret"))
             .and_then(|s| s.as_str())
         {
-            let mut tg_patch = serde_json::json!({ "token": token });
+            config_patches.push(serde_json::json!({ "path": "channels.telegram.token", "value": token }));
             if let Some(owner_id) = secrets
                 .get("services").and_then(|s| s.get("telegram"))
                 .and_then(|t| t.get("owner_id").or_else(|| t.get("ownerId")))
                 .and_then(|o| o.as_str())
             {
-                tg_patch["ownerId"] = serde_json::json!(owner_id);
+                config_patches.push(serde_json::json!({ "path": "channels.telegram.ownerId", "value": owner_id }));
             }
-            config_patch["channels"] = serde_json::json!({ "telegram": tg_patch });
         }
 
-        // Model config (primary + fallback).
-        if let Some(model) = secrets.get("model") {
-            config_patch["model"] = model.clone();
-        }
-
-        // Pass full service data so cooker can extract auth tokens (e.g. access_token
-        // for openai-codex OAuth).
+        // Pass full service data (auth tokens for openai-codex OAuth, etc.)
         if let Some(svcs) = secrets.get("services").and_then(|s| s.as_object()) {
-            config_patch["services"] = serde_json::json!({});
             for (k, v) in svcs {
-                config_patch["services"][k] = v.clone();
+                config_patches.push(serde_json::json!({ "path": format!("services.{k}"), "value": v }));
             }
         }
 
-        if config_patch.as_object().map_or(false, |o| !o.is_empty()) {
-            ops.push(serde_json::json!({
-                "type": "config",
-                "patch": config_patch
+        if !config_patches.is_empty() {
+            steps.push(serde_json::json!({
+                "title": "Sync vault config",
+                "target": "openclaw",
+                "config_patches": config_patches
             }));
         }
 
-        // WeChat: push channel op if wechat service exists in vault.
+        // WeChat channel setup
         if secrets.get("services").and_then(|s| s.get("wechat")).is_some() {
-            ops.push(serde_json::json!({
-                "type": "channel",
-                "patch": { "wechat": true }
+            steps.push(serde_json::json!({
+                "title": "Configure WeChat channel",
+                "target": "openclaw",
+                "channel": "wechat"
             }));
         }
 
-        // Execute recipe steps for each enabled service.
-        // Recipe source: built-in TOML first, then vault blob's "recipe" field.
+        // Collect recipe steps for each enabled service (sent as-is, provisioner executes).
+        // Built-in recipe steps first, then vault-side steps (overrides/additions).
         if let Some(svcs) = secrets.get("services").and_then(|s| s.as_object()) {
+            let resolve = |s: &str, svc_id: &str| -> String {
+                s.replace("{{proxy_port}}", &proxy_port.to_string())
+                 .replace("{{admin_port}}", &console_url.split(':').last().unwrap_or("23294"))
+                 .replace("{{admin_url}}", &console_url)
+                 .replace("{{service_id}}", svc_id)
+            };
+            let resolve_step = |step: &serde_json::Value, svc_id: &str| -> serde_json::Value {
+                let mut s = step.clone();
+                if let Some(files) = s.get_mut("files").and_then(|f| f.as_array_mut()) {
+                    for f in files.iter_mut() {
+                        if let Some(c) = f.get("content").and_then(|c| c.as_str()).map(|c| resolve(c, svc_id)) {
+                            f["content"] = serde_json::json!(c);
+                        }
+                        if let Some(p) = f.get("path").and_then(|p| p.as_str()).map(|p| resolve(p, svc_id)) {
+                            f["path"] = serde_json::json!(p);
+                        }
+                    }
+                }
+                if let Some(r) = s.get("run").and_then(|r| r.as_str()).map(|r| resolve(r, svc_id)) {
+                    s["run"] = serde_json::json!(r);
+                }
+                s
+            };
             for (svc_id, svc_data) in svcs {
-                let recipe = crate::cooker::load_recipe(svc_id).or_else(|| {
-                    // Custom service: recipe stored in vault blob
-                    svc_data.get("recipe")
-                        .and_then(|r| serde_json::from_value::<crate::cooker::Recipe>(r.clone()).ok())
-                });
-                if let Some(recipe) = recipe {
-                    for step in &recipe.steps {
-                        // Only include openclaw-targeted steps (safeclaw steps run locally)
-                        if step.target != "openclaw" { continue; }
+                // Recipe source: vault config.recipe.steps (full replace) → built-in TOML
+                let recipe_steps: Option<Vec<serde_json::Value>> = svc_data
+                    .get("recipe")
+                    .and_then(|r| r.get("steps"))
+                    .and_then(|s| s.as_array())
+                    .map(|arr| arr.clone())
+                    .or_else(|| {
+                        crate::cooker::load_recipe(svc_id).map(|recipe| {
+                            recipe.steps.iter()
+                                .filter_map(|step| serde_json::to_value(step).ok())
+                                .collect()
+                        })
+                    });
 
-                        // Translate recipe step files → file ops
-                        if let Some(files) = &step.files {
-                            for f in files {
-                                let path = f.get("path").and_then(|v| v.as_str());
-                                let content = f.get("content").and_then(|v| v.as_str());
-                                let template = f.get("template").and_then(|v| v.as_str());
-                                if let Some(path) = path {
-                                    // Resolve template variables
-                                    let resolve = |s: &str| -> String {
-                                        s.replace("{{proxy_port}}", &proxy_port.to_string())
-                                         .replace("{{admin_port}}", &console_url.split(':').last().unwrap_or("23294"))
-                                         .replace("{{admin_url}}", &console_url)
-                                         .replace("{{service_id}}", svc_id)
-                                    };
-                                    let resolved_content = if let Some(c) = content {
-                                        Some(resolve(c))
-                                    } else if let Some(_tmpl) = template {
-                                        // Template files are loaded by provisioner from service folder
-                                        // (not resolved here — provisioner has access to the files)
-                                        None
-                                    } else {
-                                        None
-                                    };
-                                    if let Some(content) = resolved_content {
-                                        ops.push(serde_json::json!({
-                                            "type": "file",
-                                            "path": resolve(path),
-                                            "content": content
-                                        }));
-                                    }
-                                }
-                            }
-                        }
-
-                        // Translate recipe step config_patches → config ops
-                        if let Some(patches) = &step.config_patches {
-                            let mut patch = serde_json::json!({});
-                            for p in patches {
-                                if let (Some(dot_path), Some(value)) = (
-                                    p.get("path").and_then(|v| v.as_str()),
-                                    p.get("value"),
-                                ) {
-                                    // Convert dot-path to nested JSON
-                                    let parts: Vec<&str> = dot_path.split('.').collect();
-                                    let mut target = &mut patch;
-                                    for (i, part) in parts.iter().enumerate() {
-                                        if i == parts.len() - 1 {
-                                            target[part] = value.clone();
-                                        } else {
-                                            if target.get(part).is_none() {
-                                                target[part] = serde_json::json!({});
-                                            }
-                                            target = &mut target[part];
-                                        }
-                                    }
-                                }
-                            }
-                            if patch.as_object().map_or(false, |o| !o.is_empty()) {
-                                ops.push(serde_json::json!({
-                                    "type": "config",
-                                    "patch": patch
-                                }));
-                            }
-                        }
-
-                        // Translate recipe step run → exec ops
-                        if let Some(run) = &step.run {
-                            let resolved_run = run
-                                .replace("{{proxy_port}}", &proxy_port.to_string())
-                                .replace("{{admin_url}}", &console_url)
-                                .replace("{{service_id}}", svc_id);
-                            let mut exec_op = serde_json::json!({
-                                "type": "exec",
-                                "command": resolved_run
-                            });
-                            if let Some(cwd) = &step.cwd {
-                                exec_op["cwd"] = serde_json::json!(cwd);
-                            }
-                            ops.push(exec_op);
-                        }
+                if let Some(recipe_steps) = recipe_steps {
+                    for step in &recipe_steps {
+                        steps.push(resolve_step(step, svc_id));
                     }
                 }
             }
         }
 
-        // IDENTITY.md: write agent name if present in secrets (merged from setup config).
-        if let Some(name) = secrets.get("agentName").and_then(|v| v.as_str()) {
-            if !name.is_empty() {
-                ops.push(serde_json::json!({
-                    "type": "file",
-                    "path": ".openclaw/workspace/IDENTITY.md",
-                    "content": format!("# IDENTITY.md\n\n- **Name:** {name}\n")
-                }));
-            }
-        }
+        // Final restart
+        steps.push(serde_json::json!({
+            "title": "Restart OpenClaw",
+            "target": "openclaw",
+            "restart": true
+        }));
 
-        // Use host.docker.internal when running inside Docker (host-gateway mapping).
         let provisioner_host = if std::path::Path::new("/.dockerenv").exists() {
             "host.docker.internal"
         } else {
@@ -887,10 +837,7 @@ fn dispatch_cook(secrets: serde_json::Value, proxy_port: u16, console_url: Strin
         let _ = reqwest::Client::new()
             .post(format!("http://{}:23296/cook", provisioner_host))
             .timeout(std::time::Duration::from_secs(120))
-            .json(&serde_json::json!({
-                "ops": ops,
-                "restart": needs_restart
-            }))
+            .json(&serde_json::json!({ "steps": steps }))
             .send()
             .await;
     });

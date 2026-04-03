@@ -55,7 +55,7 @@ pub struct PasskeySharingDef {
     pub origins: Vec<String>,
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
 pub struct Step {
     pub title: String,
     #[serde(default)]
