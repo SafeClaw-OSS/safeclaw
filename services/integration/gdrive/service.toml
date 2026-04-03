@@ -1,7 +1,7 @@
 [service]
 id = "gdrive"
 name = "Google Drive"
-description = "Google Drive file management"
+sub = "Google"
 category = "integration"
 color = "#4285f4"
 docs = "https://developers.google.com/drive/api"
@@ -15,3 +15,8 @@ provider = "google"
 
 [defaults]
 levels = { read = "ask", write = "ask-always" }
+
+[[defaults.rules]]
+method = "GET"
+pathExact = "/drive/v3/files"
+level = "allow"

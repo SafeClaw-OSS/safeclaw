@@ -1,7 +1,7 @@
 [service]
 id = "github"
 name = "GitHub"
-description = "GitHub REST API"
+sub = "REST API"
 category = "integration"
 color = "#e6edf3"
 docs = "https://docs.github.com/en/rest"

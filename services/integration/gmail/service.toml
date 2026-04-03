@@ -1,7 +1,7 @@
 [service]
 id = "gmail"
 name = "Gmail"
-description = "Google Gmail API"
+sub = "Google"
 category = "integration"
 color = "#ea4335"
 docs = "https://developers.google.com/gmail/api"
@@ -15,3 +15,13 @@ provider = "google"
 
 [defaults]
 levels = { read = "ask", write = "ask-always" }
+
+[[defaults.rules]]
+method = "GET"
+pathExact = "/gmail/v1/users/me/messages"
+level = "allow"
+
+[[defaults.rules]]
+method = "GET"
+pathExact = "/gmail/v1/users/me/labels"
+level = "allow"

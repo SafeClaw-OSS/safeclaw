@@ -1,7 +1,7 @@
 [service]
 id = "twilio"
 name = "Twilio"
-description = "SMS and voice API"
+sub = "SMS & voice"
 category = "integration"
 color = "#f22f46"
 docs = "https://www.twilio.com/docs/usage/api"

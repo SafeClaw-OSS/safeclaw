@@ -1,7 +1,7 @@
 [service]
 id = "brave"
 name = "Brave Search"
-description = "Web search API"
+sub = "Web search"
 category = "integration"
 color = "#f55036"
 docs = "https://brave.com/search/api/"

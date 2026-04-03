@@ -40,9 +40,15 @@ pub struct OpenClawDef {
     #[serde(default)]
     pub proxy_path: Option<String>,
     #[serde(default)]
-    pub models: Option<Vec<String>>,
+    pub models: Vec<ModelDef>,
     #[serde(default)]
     pub essential: Option<bool>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct ModelDef {
+    pub id: String,
+    pub name: String,
 }
 
 #[derive(Debug, serde::Deserialize)]

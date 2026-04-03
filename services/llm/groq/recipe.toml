@@ -4,6 +4,7 @@ api = "openai-completions"
 env_key = "GROQ_API_KEY"
 env_base_url = "GROQ_BASE_URL"
 proxy_path = "/groq/openai/v1"
-models = [
-    "llama-3.3-70b-versatile",
-]
+
+[[openclaw.models]]
+id = "llama-3.3-70b-versatile"
+name = "Llama 3.3 70B"

@@ -4,8 +4,15 @@ api = "anthropic-messages"
 env_key = "ANTHROPIC_API_KEY"
 env_base_url = "ANTHROPIC_BASE_URL"
 proxy_path = "/anthropic/v1"
-models = [
-    "claude-sonnet-4-20250514",
-    "claude-opus-4-20250514",
-    "claude-haiku-3-5-20241022",
-]
+
+[[openclaw.models]]
+id = "claude-sonnet-4-20250514"
+name = "Claude Sonnet 4"
+
+[[openclaw.models]]
+id = "claude-opus-4-20250514"
+name = "Claude Opus 4"
+
+[[openclaw.models]]
+id = "claude-haiku-3-5-20241022"
+name = "Claude Haiku 3.5"

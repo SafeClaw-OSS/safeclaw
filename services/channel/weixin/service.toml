@@ -1,7 +1,7 @@
 [service]
 id = "weixin"
 name = "WeChat iLink"
-description = "WeChat messaging via iLink plugin"
+sub = "Messaging"
 category = "channel"
 color = "#07c160"
 docs = "https://weixin.qq.com"

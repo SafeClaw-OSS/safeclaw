@@ -1,7 +1,7 @@
 [service]
 id = "google"
 name = "Google AI"
-description = "Gemini models via AI Studio"
+sub = "Gemini"
 category = "llm"
 color = "#4285f4"
 docs = "https://ai.google.dev/docs"

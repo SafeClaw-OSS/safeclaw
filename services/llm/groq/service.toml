@@ -1,7 +1,7 @@
 [service]
 id = "groq"
 name = "Groq"
-description = "Fast inference for open models"
+sub = "Fast inference"
 category = "llm"
 color = "#f55036"
 docs = "https://console.groq.com/docs"

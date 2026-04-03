@@ -28,13 +28,18 @@ pub struct ServiceDef {
 pub struct ServiceMeta {
     pub id: String,
     pub name: String,
-    pub description: String,
+    #[serde(default)]
+    pub sub: Option<String>,
     #[serde(default = "default_category")]
     pub category: String,
     #[serde(default)]
     pub color: Option<String>,
     #[serde(default)]
     pub docs: Option<String>,
+    /// If set, this service is grouped with the service whose id matches this value.
+    /// Services sharing the same group are merged into one card in the UI.
+    #[serde(default)]
+    pub group: Option<String>,
 }
 
 fn default_category() -> String { "integration".to_string() }
@@ -65,6 +70,19 @@ pub struct AuthDef {
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct DefaultsDef {
     pub levels: Option<HashMap<String, String>>,
+    #[serde(default)]
+    pub rules: Vec<DefaultRule>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct DefaultRule {
+    #[serde(default)]
+    pub method: Option<String>,
+    #[serde(default)]
+    pub pathExact: Option<String>,
+    #[serde(default)]
+    pub pathSuffix: Option<String>,
+    pub level: String,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]

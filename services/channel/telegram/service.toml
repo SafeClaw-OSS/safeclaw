@@ -1,7 +1,7 @@
 [service]
 id = "telegram"
 name = "Telegram"
-description = "Telegram Bot API"
+sub = "Bot API"
 category = "channel"
 color = "#26a5e4"
 docs = "https://core.telegram.org/bots/api"

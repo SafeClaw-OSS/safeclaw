@@ -1,7 +1,7 @@
 [service]
 id = "anthropic"
 name = "Anthropic"
-description = "Claude AI models via API key"
+sub = "API Key"
 category = "llm"
 color = "#d4a017"
 docs = "https://docs.anthropic.com"

@@ -1,7 +1,7 @@
 [service]
 id = "deepseek"
 name = "DeepSeek"
-description = "DeepSeek Chat and reasoning models"
+sub = "DeepSeek API"
 category = "llm"
 color = "#5b5de5"
 docs = "https://platform.deepseek.com/api-docs"

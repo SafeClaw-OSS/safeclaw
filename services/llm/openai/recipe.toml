@@ -4,14 +4,39 @@ api = "openai-completions"
 env_key = "OPENAI_API_KEY"
 env_base_url = "OPENAI_BASE_URL"
 proxy_path = "/openai/v1"
-models = [
-    "gpt-5.4",
-    "gpt-5.4-mini",
-    "gpt-5.3-codex",
-    "gpt-5.2-codex",
-    "gpt-5.2",
-    "gpt-5.1-codex",
-    "gpt-5.1",
-    "o3",
-    "o4-mini",
-]
+
+[[openclaw.models]]
+id = "gpt-5.4"
+name = "GPT-5.4"
+
+[[openclaw.models]]
+id = "gpt-5.4-mini"
+name = "GPT-5.4 Mini"
+
+[[openclaw.models]]
+id = "gpt-5.3-codex"
+name = "GPT-5.3 Codex"
+
+[[openclaw.models]]
+id = "gpt-5.2-codex"
+name = "GPT-5.2 Codex"
+
+[[openclaw.models]]
+id = "gpt-5.2"
+name = "GPT-5.2"
+
+[[openclaw.models]]
+id = "gpt-5.1-codex"
+name = "GPT-5.1 Codex"
+
+[[openclaw.models]]
+id = "gpt-5.1"
+name = "GPT-5.1"
+
+[[openclaw.models]]
+id = "o3"
+name = "o3"
+
+[[openclaw.models]]
+id = "o4-mini"
+name = "o4-mini"

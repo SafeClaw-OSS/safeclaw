@@ -46,13 +46,11 @@ pub fn render(service_id: &str, recipe: &Recipe) {
             }
         }
 
-        if let Some(models) = &oc.models {
-            if !models.is_empty() {
-                step_num += 1;
-                eprintln!("\nStep {}: Available models", step_num);
-                for m in models {
-                    eprintln!("    {}/{}", service_id, m);
-                }
+        if !oc.models.is_empty() {
+            step_num += 1;
+            eprintln!("\nStep {}: Available models", step_num);
+            for m in &oc.models {
+                eprintln!("    {}/{:<30} {}", service_id, m.id, m.name);
             }
         }
     }
