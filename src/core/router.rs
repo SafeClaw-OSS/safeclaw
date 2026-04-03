@@ -625,7 +625,33 @@ async fn proxy_handler(
         None
     };
 
-    // ── Forward request ────────────────────────────────────────────────────────
+    // ── Local service (CLI bridge) ───────────────────────────────────────────
+
+    if state.services.is_local(&route_service) {
+        let request_start = Instant::now();
+        let response = handle_local_service(
+            &state.services,
+            &route_service,
+            method.as_str(),
+            &route_path,
+            body_bytes,
+        ).await;
+        let duration_ms = request_start.elapsed().as_millis() as i64;
+        let upstream_status = response.status().as_u16();
+        state.audit_log.log_request(
+            &route_service,
+            method.as_str(),
+            &route_path,
+            &access_level.to_string(),
+            "allowed",
+            Some(duration_ms),
+            Some(upstream_status),
+            None,
+        );
+        return response;
+    }
+
+    // ── Forward request (proxy) ───────────────────────────────────────────────
 
     let request_start = Instant::now();
     let response = forward_request(
@@ -708,6 +734,95 @@ fn find_rule_ttl(
         }
     }
     None
+}
+
+// ── Local service handler (CLI bridge) ────────────────────────────────────────
+
+async fn handle_local_service(
+    registry: &ServiceRegistry,
+    service_name: &str,
+    method: &str,
+    path: &str,
+    body: Bytes,
+) -> Response {
+    let api = match registry.find_local_api(service_name, method, path) {
+        Some(a) => a,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": format!("no local API matches {} {}", method, path),
+                    "code": "NOT_FOUND"
+                })),
+            ).into_response();
+        }
+    };
+
+    tracing::info!("local exec: {} {} → {}", method, path, api.command);
+
+    let parts: Vec<&str> = api.command.split_whitespace().collect();
+    if parts.is_empty() {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "empty command" })),
+        ).into_response();
+    }
+
+    let result = tokio::process::Command::new(parts[0])
+        .args(&parts[1..])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn();
+
+    let mut child = match result {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("local exec failed to spawn '{}': {}", api.command, e);
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({ "error": format!("spawn failed: {}", e) })),
+            ).into_response();
+        }
+    };
+
+    // Write body to stdin
+    if let Some(mut stdin) = child.stdin.take() {
+        use tokio::io::AsyncWriteExt;
+        let _ = stdin.write_all(&body).await;
+        drop(stdin);
+    }
+
+    match child.wait_with_output().await {
+        Ok(output) => {
+            let status = if output.status.success() {
+                StatusCode::OK
+            } else {
+                StatusCode::BAD_GATEWAY
+            };
+
+            let stdout = output.stdout;
+            // Try to parse as JSON, otherwise return as text
+            if let Ok(json_val) = serde_json::from_slice::<serde_json::Value>(&stdout) {
+                (status, Json(json_val)).into_response()
+            } else {
+                let mut resp = Response::new(axum::body::Body::from(stdout));
+                *resp.status_mut() = status;
+                resp.headers_mut().insert(
+                    axum::http::header::CONTENT_TYPE,
+                    axum::http::HeaderValue::from_static("text/plain; charset=utf-8"),
+                );
+                resp
+            }
+        }
+        Err(e) => {
+            tracing::warn!("local exec wait failed for '{}': {}", api.command, e);
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({ "error": format!("exec failed: {}", e) })),
+            ).into_response()
+        }
+    }
 }
 
 async fn read_body_limited(req: Request, limit: usize) -> Result<Bytes, String> {

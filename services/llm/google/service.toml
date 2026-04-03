@@ -3,19 +3,18 @@ id = "google"
 name = "Google AI"
 sub = "Gemini"
 category = "llm"
-color = "#4285f4"
-docs = "https://ai.google.dev/docs"
 
 [upstream]
 url = "https://generativelanguage.googleapis.com"
 
-[auth]
+[upstream.auth]
 type = "query"
 param = "key"
 key_placeholder = "AIza..."
 
-[defaults]
-levels = { read = "allow", write = "allow" }
-
-[locked_response]
+[upstream.locked]
 template = "gemini"
+
+[policy.levels]
+read = "allow"
+write = "allow"

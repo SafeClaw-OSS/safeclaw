@@ -3,21 +3,21 @@ id = "openai"
 name = "OpenAI"
 sub = "API Key"
 category = "llm"
-color = "#10a37f"
-docs = "https://platform.openai.com/docs"
+group = "openai"
 
 [upstream]
 url = "https://api.openai.com"
 
-[auth]
+[upstream.auth]
 type = "bearer"
 key_placeholder = "sk-..."
 
-[defaults]
-levels = { read = "allow", write = "allow" }
-
-[locked_response]
+[upstream.locked]
 template = "openai"
 
-[locked_response.routes]
+[upstream.locked.routes]
 "/responses" = "openai-responses"
+
+[policy.levels]
+read = "allow"
+write = "allow"

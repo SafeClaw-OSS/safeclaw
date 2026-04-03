@@ -3,18 +3,17 @@ id = "deepseek"
 name = "DeepSeek"
 sub = "DeepSeek API"
 category = "llm"
-color = "#5b5de5"
-docs = "https://platform.deepseek.com/api-docs"
 
 [upstream]
 url = "https://api.deepseek.com"
 
-[auth]
+[upstream.auth]
 type = "bearer"
 key_placeholder = "sk-..."
 
-[defaults]
-levels = { read = "allow", write = "allow" }
-
-[locked_response]
+[upstream.locked]
 template = "openai"
+
+[policy.levels]
+read = "allow"
+write = "allow"

@@ -3,16 +3,15 @@ id = "brave"
 name = "Brave Search"
 sub = "Web search"
 category = "integration"
-color = "#f55036"
-docs = "https://brave.com/search/api/"
 
 [upstream]
 url = "https://api.search.brave.com"
 
-[auth]
+[upstream.auth]
 type = "header"
 header = "X-Subscription-Token"
 key_placeholder = "BSA..."
 
-[defaults]
-levels = { read = "allow", write = "allow" }
+[policy.levels]
+read = "allow"
+write = "allow"

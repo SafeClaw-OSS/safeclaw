@@ -3,25 +3,24 @@ id = "gmail"
 name = "Gmail"
 sub = "Google"
 category = "integration"
-color = "#ea4335"
-docs = "https://developers.google.com/gmail/api"
 
 [upstream]
 url = "https://gmail.googleapis.com"
 
-[auth]
+[upstream.auth]
 type = "oauth2"
 provider = "google"
 
-[defaults]
-levels = { read = "ask", write = "ask-always" }
+[policy.levels]
+read = "ask"
+write = "ask-always"
 
-[[defaults.rules]]
+[[policy.rules]]
 method = "GET"
 pathExact = "/gmail/v1/users/me/messages"
 level = "allow"
 
-[[defaults.rules]]
+[[policy.rules]]
 method = "GET"
 pathExact = "/gmail/v1/users/me/labels"
 level = "allow"

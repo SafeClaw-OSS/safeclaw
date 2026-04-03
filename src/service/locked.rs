@@ -1,7 +1,7 @@
 /// Locked proxy response generators (by template name).
 ///
 /// When the vault is locked, the proxy returns API-format-aware placeholder
-/// responses. Template names come from service.toml `[locked_response]`.
+/// responses. Template names come from service.toml `[upstream.locked]`.
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 

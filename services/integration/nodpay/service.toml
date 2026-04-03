@@ -1,0 +1,22 @@
+[service]
+id = "nodpay"
+name = "NodPay"
+sub = "Web3 agent"
+category = "integration"
+
+[upstream]
+type = "local"
+
+[[upstream.apis]]
+method = "POST"
+path = "/sign"
+command = "npx nodpay sign"
+
+[[upstream.apis]]
+method = "GET"
+path = "/address"
+command = "npx nodpay address"
+
+[policy.levels]
+read = "allow"
+write = "allow"

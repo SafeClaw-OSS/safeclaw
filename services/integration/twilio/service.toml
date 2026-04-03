@@ -3,15 +3,14 @@ id = "twilio"
 name = "Twilio"
 sub = "SMS & voice"
 category = "integration"
-color = "#f22f46"
-docs = "https://www.twilio.com/docs/usage/api"
 
 [upstream]
 url = "https://api.twilio.com/2010-04-01"
 
-[auth]
+[upstream.auth]
 type = "basic"
 username_label = "Account SID"
 
-[defaults]
-levels = { read = "allow", write = "ask-always" }
+[policy.levels]
+read = "allow"
+write = "ask-always"

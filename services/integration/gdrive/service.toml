@@ -3,20 +3,19 @@ id = "gdrive"
 name = "Google Drive"
 sub = "Google"
 category = "integration"
-color = "#4285f4"
-docs = "https://developers.google.com/drive/api"
 
 [upstream]
 url = "https://www.googleapis.com/drive/v3"
 
-[auth]
+[upstream.auth]
 type = "oauth2"
 provider = "google"
 
-[defaults]
-levels = { read = "ask", write = "ask-always" }
+[policy.levels]
+read = "ask"
+write = "ask-always"
 
-[[defaults.rules]]
+[[policy.rules]]
 method = "GET"
 pathExact = "/drive/v3/files"
 level = "allow"

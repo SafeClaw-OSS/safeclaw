@@ -3,24 +3,23 @@ id = "claude-code"
 name = "Claude Code"
 sub = "Claude Code OAuth"
 category = "llm"
-color = "#d4a017"
-docs = "https://docs.anthropic.com"
 group = "anthropic"
 
 [upstream]
 url = "https://api.anthropic.com"
 
-[auth]
+[upstream.auth]
 type = "oauth2"
 oauth_style = "json"
 
-[defaults]
-levels = { read = "allow", write = "allow" }
-
-[headers]
+[upstream.headers]
 "anthropic-beta" = "oauth-2025-04-20,interleaved-thinking-2025-05-14"
 "user-agent" = "claude-cli/2.1.87 (external, cli)"
 "x-claude-code-session-id" = "{{uuid_v4}}"
 
-[locked_response]
+[upstream.locked]
 template = "anthropic"
+
+[policy.levels]
+read = "allow"
+write = "allow"

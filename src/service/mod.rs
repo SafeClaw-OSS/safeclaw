@@ -17,11 +17,7 @@ use crate::auth::oauth2::OAuthStyle;
 pub struct ServiceDef {
     pub service: ServiceMeta,
     pub upstream: Option<UpstreamDef>,
-    pub auth: Option<AuthDef>,
-    pub defaults: Option<DefaultsDef>,
-    #[serde(default)]
-    pub headers: HashMap<String, String>,
-    pub locked_response: Option<LockedResponseDef>,
+    pub policy: Option<PolicyDef>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -32,10 +28,6 @@ pub struct ServiceMeta {
     pub sub: Option<String>,
     #[serde(default = "default_category")]
     pub category: String,
-    #[serde(default)]
-    pub color: Option<String>,
-    #[serde(default)]
-    pub docs: Option<String>,
     /// If set, this service is grouped with the service whose id matches this value.
     /// Services sharing the same group are merged into one card in the UI.
     #[serde(default)]
@@ -46,7 +38,27 @@ fn default_category() -> String { "integration".to_string() }
 
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct UpstreamDef {
-    pub url: String,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(rename = "type", default = "default_upstream_type")]
+    pub upstream_type: String,
+    #[serde(default)]
+    pub auth: Option<AuthDef>,
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+    #[serde(default)]
+    pub locked: Option<LockedResponseDef>,
+    #[serde(default)]
+    pub apis: Vec<LocalApiDef>,
+}
+
+fn default_upstream_type() -> String { "proxy".to_string() }
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct LocalApiDef {
+    pub method: String,
+    pub path: String,
+    pub command: String,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -68,14 +80,14 @@ pub struct AuthDef {
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
-pub struct DefaultsDef {
+pub struct PolicyDef {
     pub levels: Option<HashMap<String, String>>,
     #[serde(default)]
-    pub rules: Vec<DefaultRule>,
+    pub rules: Vec<PolicyRule>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
-pub struct DefaultRule {
+pub struct PolicyRule {
     #[serde(default)]
     pub method: Option<String>,
     #[serde(default)]
@@ -225,7 +237,8 @@ impl ServiceRegistry {
     /// Get OAuth style for a service (if oauth2 with custom style).
     pub fn oauth_style(&self, service_name: &str) -> Option<OAuthStyle> {
         let def = self.services.get(service_name)?;
-        let auth = def.auth.as_ref()?;
+        let upstream = def.upstream.as_ref()?;
+        let auth = upstream.auth.as_ref()?;
         match auth.oauth_style.as_deref() {
             Some("json") => Some(OAuthStyle::Json),
             _ => None,
@@ -241,7 +254,8 @@ impl ServiceRegistry {
         path: &str,
     ) -> Option<Response> {
         let def = self.services.get(service_name)?;
-        let lr = def.locked_response.as_ref()?;
+        let upstream = def.upstream.as_ref()?;
+        let lr = upstream.locked.as_ref()?;
 
         // Check path-specific routes first
         for (route_prefix, template_name) in &lr.routes {
@@ -253,6 +267,23 @@ impl ServiceRegistry {
         // Fall back to default template
         lr.template.as_ref()
             .and_then(|t| locked::render(t, is_stream, admin_url))
+    }
+
+    /// Check if a service is a local CLI bridge (not an HTTP proxy).
+    pub fn is_local(&self, service_name: &str) -> bool {
+        self.services.get(service_name)
+            .and_then(|d| d.upstream.as_ref())
+            .map(|u| u.upstream_type == "local")
+            .unwrap_or(false)
+    }
+
+    /// Find a matching local API definition for the given method + path.
+    pub fn find_local_api(&self, service_name: &str, method: &str, path: &str) -> Option<&LocalApiDef> {
+        let def = self.services.get(service_name)?;
+        let upstream = def.upstream.as_ref()?;
+        upstream.apis.iter().find(|api| {
+            api.method.eq_ignore_ascii_case(method) && path.starts_with(&api.path)
+        })
     }
 
     /// Return all service definitions (for catalog/UI use).
@@ -310,7 +341,12 @@ pub fn apply_service_headers(
         None => return,
     };
 
-    if def.headers.is_empty() {
+    let upstream = match def.upstream.as_ref() {
+        Some(u) => u,
+        None => return,
+    };
+
+    if upstream.headers.is_empty() {
         return;
     }
 
@@ -319,7 +355,7 @@ pub fn apply_service_headers(
     if auth.auth_type == "oauth2" && resolved_bearer.is_some() {
         let ctx = HeaderContext { auth, resolved_bearer };
 
-        for (name, template) in &def.headers {
+        for (name, template) in &upstream.headers {
             if let Some(value) = resolve_header_value(template, &ctx) {
                 if let (Ok(header_name), Ok(header_value)) = (
                     reqwest::header::HeaderName::from_bytes(name.as_bytes()),

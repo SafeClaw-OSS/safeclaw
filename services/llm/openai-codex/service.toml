@@ -3,25 +3,24 @@ id = "openai-codex"
 name = "OpenAI Codex"
 sub = "ChatGPT"
 category = "llm"
-color = "#10a37f"
-docs = "https://platform.openai.com/docs"
 group = "openai"
 
 [upstream]
 url = "https://api.openai.com"
 
-[auth]
+[upstream.auth]
 type = "oauth2"
 
-[defaults]
-levels = { read = "allow", write = "allow" }
-
-[headers]
+[upstream.headers]
 "openai-beta" = "responses=experimental"
 "chatgpt-account-id" = "{{auth.account_id}}"
 
-[locked_response]
+[upstream.locked]
 template = "openai"
 
-[locked_response.routes]
+[upstream.locked.routes]
 "/responses" = "openai-responses"
+
+[policy.levels]
+read = "allow"
+write = "allow"

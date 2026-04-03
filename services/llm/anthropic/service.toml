@@ -3,19 +3,18 @@ id = "anthropic"
 name = "Anthropic"
 sub = "API Key"
 category = "llm"
-color = "#d4a017"
-docs = "https://docs.anthropic.com"
 
 [upstream]
 url = "https://api.anthropic.com"
 
-[auth]
+[upstream.auth]
 type = "header"
 header = "x-api-key"
 key_placeholder = "sk-ant-api03-..."
 
-[defaults]
-levels = { read = "allow", write = "allow" }
-
-[locked_response]
+[upstream.locked]
 template = "anthropic"
+
+[policy.levels]
+read = "allow"
+write = "allow"
