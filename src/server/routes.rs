@@ -152,18 +152,32 @@ fn read_index(state: &AppState) -> Value {
 }
 
 fn write_index(state: &AppState, secrets: &Value) -> std::io::Result<()> {
-    // Store lightweight service metadata (name + category) — no credentials.
+    // Store lightweight service metadata (name + category + group) — no credentials.
+    // group and category are enriched from service.toml via ServiceRegistry.
+    let registry = crate::service::ServiceRegistry::load();
     let services: Vec<Value> = secrets
         .get("services")
         .and_then(|s| s.as_object())
         .map(|obj| {
             obj.iter()
                 .map(|(name, cfg)| {
-                    let category = cfg
-                        .get("category")
-                        .and_then(|v| v.as_str())
+                    let svc_def = registry.get(name);
+                    let category = svc_def
+                        .map(|d| d.service.category.as_str())
+                        .or_else(|| cfg.get("category").and_then(|v| v.as_str()))
                         .unwrap_or("service");
                     let mut entry = json!({ "name": name, "category": category });
+                    // Add group from service.toml (for UI card merging)
+                    if let Some(group) = svc_def.and_then(|d| d.service.group.as_deref()) {
+                        entry["group"] = json!(group);
+                    }
+                    // Add display name from service.toml
+                    if let Some(display_name) = svc_def.map(|d| d.service.name.as_str()) {
+                        entry["display_name"] = json!(display_name);
+                    }
+                    if let Some(sub) = svc_def.and_then(|d| d.service.sub.as_deref()) {
+                        entry["sub"] = json!(sub);
+                    }
                     // Expose wallet metadata (safe address, chains) for integration services
                     if let Some(wallet) = cfg.get("wallet") {
                         let mut meta = serde_json::Map::new();
@@ -421,6 +435,16 @@ pub async fn setup(
             &state.config.effective_origin(),
             &state.config.effective_rp_id(),
         )?;
+    }
+
+    // vault.enc = secrets + config. Frontend sends them separately but both
+    // must persist — merge entire config into secrets before encryption.
+    if let Some(config) = parsed.get("config").and_then(|c| c.as_object()) {
+        if let Some(secrets_obj) = secrets.as_object_mut() {
+            for (k, v) in config {
+                secrets_obj.insert(k.clone(), v.clone());
+            }
+        }
     }
 
     fs::create_dir_all(&state.config.data_dir)?;
@@ -840,6 +864,17 @@ fn dispatch_cook(secrets: serde_json::Value, proxy_port: u16, console_url: Strin
                         }
                     }
                 }
+            }
+        }
+
+        // IDENTITY.md: write agent name if present in secrets (merged from setup config).
+        if let Some(name) = secrets.get("agentName").and_then(|v| v.as_str()) {
+            if !name.is_empty() {
+                ops.push(serde_json::json!({
+                    "type": "file",
+                    "path": ".openclaw/workspace/IDENTITY.md",
+                    "content": format!("# IDENTITY.md\n\n- **Name:** {name}\n")
+                }));
             }
         }
 
