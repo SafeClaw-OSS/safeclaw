@@ -13,3 +13,8 @@ config_patches = [
     { path = "channels.telegram.enabled", value = true },
 ]
 target = "openclaw"
+
+[[steps]]
+title = "Restart OpenClaw"
+restart = true
+target = "openclaw"

@@ -822,13 +822,6 @@ fn dispatch_cook(secrets: serde_json::Value, proxy_port: u16, console_url: Strin
             }
         }
 
-        // Final restart
-        steps.push(serde_json::json!({
-            "title": "Restart OpenClaw",
-            "target": "openclaw",
-            "restart": true
-        }));
-
         let provisioner_host = if std::path::Path::new("/.dockerenv").exists() {
             "host.docker.internal"
         } else {
