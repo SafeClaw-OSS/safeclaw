@@ -7,14 +7,6 @@ requires_credential = false
 enabled = true
 origins = ["https://nodpay.ai"]
 
-# ── SafeClaw vault side ──────────────────────────────────────────────────
-
-[[steps]]
-title = "Install NodPay CLI on vault"
-run = "npm install -g nodpay"
-target = "safeclaw"
-note = "Required for local signing oracle (npx nodpay sign/address/wallets)"
-
 # ── OpenClaw agent side ──────────────────────────────────────────────────
 
 [[steps]]

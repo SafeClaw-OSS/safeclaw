@@ -68,6 +68,8 @@ method = "POST"
 path = "/sign"
 command = "npx nodpay sign"     # Command to execute. Request body is piped to stdin.
                                 # Stdout is returned as the HTTP response body.
+env = { NODPAY_AGENT_KEY = "{{auth.secret}}" }  # Env vars injected into subprocess. Optional.
+                                # Supports {{auth.secret}} template (resolved from vault).
 
 [[upstream.apis]]
 method = "GET"

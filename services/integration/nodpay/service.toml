@@ -1,7 +1,7 @@
 [service]
 id = "nodpay"
 name = "NodPay"
-sub = "Web3 agent"
+sub = "Web3 agent wallet"
 category = "integration"
 
 [upstream]
@@ -10,12 +10,8 @@ type = "local"
 [[upstream.apis]]
 method = "POST"
 path = "/sign"
+env = { NODPAY_AGENT_KEY = "{{auth.secret}}" }
 command = "npx nodpay sign"
-
-[[upstream.apis]]
-method = "GET"
-path = "/address"
-command = "npx nodpay address"
 
 [[upstream.apis]]
 method = "GET"

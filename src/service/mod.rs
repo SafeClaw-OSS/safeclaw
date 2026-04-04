@@ -59,6 +59,8 @@ pub struct LocalApiDef {
     pub method: String,
     pub path: String,
     pub command: String,
+    #[serde(default)]
+    pub env: std::collections::HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]

@@ -192,6 +192,7 @@ async function main() {
   // service.toml: local type with mock commands
   const echoScript = join(localSvcDir, 'echo.sh')
   const signScript = join(localSvcDir, 'sign.sh')
+  const envScript = join(localSvcDir, 'env-key.sh')
   writeFileSync(join(localSvcDir, 'service.toml'), `
 [service]
 id = "testlocal"
@@ -212,6 +213,12 @@ method = "POST"
 path = "/sign"
 command = "${signScript}"
 
+[[upstream.apis]]
+method = "GET"
+path = "/env-key"
+env = { INJECTED_SECRET = "{{auth.secret}}" }
+command = "${envScript}"
+
 [policy.levels]
 read = "allow"
 write = "allow"
@@ -229,6 +236,12 @@ BODY=$(cat)
 echo "{\\"signed\\":true,\\"input\\":$BODY}"
 `)
   chmodSync(signScript, '755')
+
+  // GET /env-key: echoes the injected env var (resolves {{auth.secret}} from vault)
+  writeFileSync(envScript, `#!/bin/sh
+echo "{\\"secret\\":\\"$INJECTED_SECRET\\"}"
+`)
+  chmodSync(envScript, '755')
 
   // Start Rust server
   console.log('Starting Rust server...')
@@ -614,6 +627,13 @@ echo "{\\"signed\\":true,\\"input\\":$BODY}"
       method: 'GET',
     })
     assert.equal(res.status, 404)
+  })
+
+  await test('Local service: env injection resolves {{auth.secret}}', async () => {
+    const res = await fetch(`http://127.0.0.1:${PROXY_PORT}/testlocal/env-key`)
+    assert.equal(res.status, 200, `Env inject GET failed: ${res.status}`)
+    const body = await res.json()
+    assert.equal(body.secret, '0xdeadbeef', `Expected vault secret, got: ${body.secret}`)
   })
 
   // ── Vault update (destructive — runs last as it replaces all secrets) ──

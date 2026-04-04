@@ -42,19 +42,24 @@ pub fn generate_safeclaw_md(secrets: &serde_json::Value, locked: bool, proxy_por
         .unwrap_or_default();
 
     // Build service table rows
+    let registry = crate::service::ServiceRegistry::load();
     let mut rows = vec![
         "| Service | Upstream | Proxy URL | Auth | Approval |".to_string(),
         "|---------|----------|-----------|------|----------|".to_string(),
     ];
     if let Some(services) = secrets.get("services").and_then(|s| s.as_object()) {
         for (name, svc) in services {
-            // Skip internal services (no upstream = not a proxy service, e.g. agent-identity, openclaw-dashboard)
-            if !crate::service::is_proxy_service(svc) {
+            // Skip internal services — check both vault data and service.toml
+            let has_upstream = crate::service::is_proxy_service(svc)
+                || registry.get(name).and_then(|d| d.upstream.as_ref()).is_some();
+            if !has_upstream {
                 continue;
             }
             let proxy_url = format!("{}/{}/", proxy_base, name);
             let upstream = if locked || svc.is_null() { "-".to_string() } else {
-                svc.get("upstream").and_then(|u| u.as_str()).unwrap_or("-").to_string()
+                svc.get("upstream").and_then(|u| u.as_str())
+                    .or_else(|| registry.get(name).and_then(|d| d.upstream.as_ref()).and_then(|u| u.url.as_deref()))
+                    .unwrap_or("local").to_string()
             };
             let auth = if locked || svc.is_null() { "-".to_string() } else { auth_display(svc) };
             let level = if locked || svc.is_null() { "-".to_string() } else { level_display(svc) };

@@ -191,6 +191,7 @@ async fn proxy_poll_approval(
                     method.as_str(),
                     &rest_path,
                     snapshot.req_body.clone(),
+                    &service_vault,
                 ).await
             } else {
                 forward_request(
@@ -647,6 +648,7 @@ async fn proxy_handler(
             method.as_str(),
             &route_path,
             body_bytes,
+            &service_vault,
         ).await;
         let duration_ms = request_start.elapsed().as_millis() as i64;
         let upstream_status = response.status().as_u16();
@@ -756,6 +758,7 @@ async fn handle_local_service(
     method: &str,
     path: &str,
     body: Bytes,
+    service_vault: &crate::auth::ServiceVault,
 ) -> Response {
     let api = match registry.find_local_api(service_name, method, path) {
         Some(a) => a,
@@ -780,12 +783,20 @@ async fn handle_local_service(
         ).into_response();
     }
 
-    let result = tokio::process::Command::new(parts[0])
-        .args(&parts[1..])
+    let mut cmd = tokio::process::Command::new(parts[0]);
+    cmd.args(&parts[1..])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn();
+        .stderr(std::process::Stdio::piped());
+
+    // Resolve env template variables and inject into subprocess.
+    // Supported: {{auth.secret}}
+    for (key, template) in &api.env {
+        let resolved = resolve_env_template(template, service_vault);
+        cmd.env(key, &resolved);
+    }
+
+    let result = cmd.spawn();
 
     let mut child = match result {
         Ok(c) => c,
@@ -835,6 +846,18 @@ async fn handle_local_service(
             ).into_response()
         }
     }
+}
+
+/// Resolve `{{auth.secret}}` (and future templates) against vault service config.
+fn resolve_env_template(template: &str, vault: &crate::auth::ServiceVault) -> String {
+    let mut result = template.to_string();
+    if result.contains("{{auth.secret}}") {
+        let secret = vault.auth.as_ref()
+            .and_then(|a| a.secret.as_deref())
+            .unwrap_or("");
+        result = result.replace("{{auth.secret}}", secret);
+    }
+    result
 }
 
 async fn read_body_limited(req: Request, limit: usize) -> Result<Bytes, String> {

@@ -178,6 +178,15 @@ fn write_index(state: &AppState, secrets: &Value) -> std::io::Result<()> {
                     if let Some(sub) = svc_def.and_then(|d| d.service.sub.as_deref()) {
                         entry["sub"] = json!(sub);
                     }
+                    // Upstream: vault data first, then service.toml (local services have upstream in toml but not vault)
+                    let has_upstream = cfg.get("upstream").and_then(|u| u.as_str()).is_some()
+                        || svc_def.and_then(|d| d.upstream.as_ref()).is_some();
+                    if has_upstream {
+                        entry["upstream"] = json!(cfg.get("upstream").and_then(|u| u.as_str())
+                            .or_else(|| svc_def.and_then(|d| d.upstream.as_ref())
+                                .and_then(|u| u.url.as_deref())
+                            ).unwrap_or("local"));
+                    }
                     // Expose wallet metadata (safe address, chains) for integration services
                     if let Some(wallet) = cfg.get("wallet") {
                         let mut meta = serde_json::Map::new();
