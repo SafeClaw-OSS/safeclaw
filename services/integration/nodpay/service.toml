@@ -21,3 +21,14 @@ command = "npx nodpay wallets --json"
 [policy.levels]
 read = "allow"
 write = "allow"
+
+[guidance]
+summary = """
+A shared on-chain wallet is configured and ready. **Skip the NodPay SKILL.md setup section** — \
+keygen and wallet creation are already done by SafeClaw.
+
+- **Safe address:** `{{wallet.safe}}`
+- Run `npx nodpay wallets` to get full wallet details (signers, passkey coords, recovery, etc.)
+- Propose transactions with `npx nodpay propose` as described in the NodPay skill
+- Signing is handled automatically via SafeClaw — you do not have the private key and don't need it
+"""

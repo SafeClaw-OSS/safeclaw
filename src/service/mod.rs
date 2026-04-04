@@ -18,6 +18,14 @@ pub struct ServiceDef {
     pub service: ServiceMeta,
     pub upstream: Option<UpstreamDef>,
     pub policy: Option<PolicyDef>,
+    pub guidance: Option<GuidanceDef>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct GuidanceDef {
+    /// Agent-facing instructions rendered into safeclaw.md when this service is connected.
+    /// Supports template variables: {{wallet.*}} resolved from vault service data.
+    pub summary: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]

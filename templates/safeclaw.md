@@ -22,7 +22,7 @@ Send this URL to the user when they need to connect services or configure their 
 
 {{AVAILABLE_SERVICES}}
 
-{{NODPAY_SECTION}}
+{{GUIDANCE_SECTIONS}}
 
 ## How to use
 

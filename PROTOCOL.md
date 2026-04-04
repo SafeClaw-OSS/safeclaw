@@ -158,6 +158,22 @@ Rules are evaluated most-specific-first. A matching rule overrides the service-l
 
 **Future extensibility**: Additional match fields (e.g., `body_contains`, `header_match`) can be added to rules without protocol changes. Existing rules without these fields continue to work.
 
+### `[guidance]` — Agent instructions
+
+```toml
+[guidance]
+summary = """
+A shared wallet is configured. **Skip the SKILL.md setup** — already done.
+
+- **Safe address:** `{{wallet.safe}}`
+- Run `npx nodpay wallets` to get wallet details
+"""
+```
+
+When this service is connected, `summary` is rendered into `safeclaw.md` (the agent's workspace guidance file). Template variables `{{wallet.*}}` are resolved from vault service data at render time.
+
+Optional. Services without `[guidance]` simply appear in the service table without extra instructions.
+
 ## recipe.toml
 
 Defines first-time installation instructions. Consumed by:
@@ -325,4 +341,4 @@ File paths in cook ops are relative to the user's home directory (`~`). Paths ty
 - **Vault stores only secrets**: auth type, upstream URL, and other static config live in service.toml, not vault
 - **No hidden protocols**: every field has one clear meaning; grouping is explicit via `group`
 - **Backward-compatible extension**: new fields can be added to any section without breaking existing definitions
-- **Separation of concerns**: `[service]` = identity, `[upstream]` = connection, `[policy]` = access control
+- **Separation of concerns**: `[service]` = identity, `[upstream]` = connection, `[policy]` = access control, `[guidance]` = agent instructions

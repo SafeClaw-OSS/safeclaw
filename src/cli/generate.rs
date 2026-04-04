@@ -85,28 +85,51 @@ pub fn generate_safeclaw_md(secrets: &serde_json::Value, locked: bool, proxy_por
         )
     };
 
-    // NodPay wallet section — only when nodpay service is connected
-    let nodpay_section = if let Some(nodpay) = secrets.get("services").and_then(|s| s.get("nodpay")) {
-        let safe = nodpay.get("wallet").and_then(|w| w.get("safe")).and_then(|s| s.as_str()).unwrap_or("unknown");
-        format!(
-            "## NodPay Wallet\n\n\
-             A shared on-chain wallet is configured and ready. **Skip the NodPay SKILL.md setup section** — \
-             keygen and wallet creation are already done.\n\n\
-             - **Safe address:** `{safe}`\n\
-             - Run `npx nodpay wallets` to get full wallet details (signers, passkey coords, etc.)\n\
-             - Propose transactions with `npx nodpay propose` as described in the NodPay skill\n\
-             - Signing is handled automatically via SafeClaw — you do not have the private key and don't need it"
-        )
-    } else {
-        String::new()
-    };
+    // Build guidance sections from service.toml [guidance].summary for each connected service.
+    // Template variables like {{wallet.safe}} are resolved from vault service data.
+    let mut guidance_sections = vec![];
+    if let Some(services) = secrets.get("services").and_then(|s| s.as_object()) {
+        for (name, svc_data) in services {
+            let svc_def = registry.get(name);
+            let summary = svc_def
+                .and_then(|d| d.guidance.as_ref())
+                .and_then(|g| g.summary.as_deref());
+            if let Some(summary) = summary {
+                let display_name = svc_def.map(|d| d.service.name.as_str()).unwrap_or(name);
+                let resolved = resolve_guidance_templates(summary, svc_data);
+                guidance_sections.push(format!("## {}\n\n{}", display_name, resolved));
+            }
+        }
+    }
+    let guidance_text = guidance_sections.join("\n\n");
 
     template
         .replace("{{PROXY_BASE}}", &proxy_base)
         .replace("{{CONSOLE_URL}}", console_url)
         .replace("{{SERVICE_TABLE}}", &rows.join("\n"))
         .replace("{{AVAILABLE_SERVICES}}", &available_section)
-        .replace("{{NODPAY_SECTION}}", &nodpay_section)
+        .replace("{{GUIDANCE_SECTIONS}}", &guidance_text)
+}
+
+/// Resolve `{{wallet.*}}` and other template variables in guidance text
+/// from vault service data (the JSON stored per-service in vault.enc).
+fn resolve_guidance_templates(template: &str, svc_data: &serde_json::Value) -> String {
+    let mut result = template.to_string();
+    // {{wallet.*}} — e.g. {{wallet.safe}}, {{wallet.chains}}
+    while let Some(start) = result.find("{{wallet.") {
+        let Some(end) = result[start..].find("}}") else { break };
+        let key = &result[start + 9..start + end]; // after "{{wallet." before "}}"
+        let value = svc_data
+            .get("wallet")
+            .and_then(|w| w.get(key))
+            .map(|v| match v {
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            })
+            .unwrap_or_else(|| "unknown".to_string());
+        result = format!("{}{}{}", &result[..start], value, &result[start + end + 2..]);
+    }
+    result
 }
 
 /// Return the static AGENTS.md snippet (managed block).
@@ -216,6 +239,24 @@ mod tests {
         let s = generate_safeclaw_md(&two_service_secrets(), false, 23295, "https://example.com/console");
         // anthropic has write:allow, read:allow → just "allow"
         assert!(s.contains("| allow |"));
+    }
+
+    #[test]
+    fn resolve_guidance_templates_replaces_wallet_fields() {
+        let svc_data = json!({
+            "wallet": { "safe": "0xABC123", "chains": ["sepolia", "base"] }
+        });
+        let result = resolve_guidance_templates("Address: {{wallet.safe}}, chains: {{wallet.chains}}", &svc_data);
+        assert!(result.contains("0xABC123"), "safe not resolved: {}", result);
+        assert!(result.contains("sepolia"), "chains not resolved: {}", result);
+        assert!(!result.contains("{{"), "unresolved template: {}", result);
+    }
+
+    #[test]
+    fn resolve_guidance_templates_missing_field() {
+        let svc_data = json!({});
+        let result = resolve_guidance_templates("Safe: {{wallet.safe}}", &svc_data);
+        assert_eq!(result, "Safe: unknown");
     }
 
     #[test]
