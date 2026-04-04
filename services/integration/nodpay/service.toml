@@ -29,6 +29,6 @@ keygen and wallet creation are already done by SafeClaw.
 
 - **Safe address:** `{{wallet.safe}}`
 - Run `npx nodpay wallets` to get full wallet details (signers, passkey coords, recovery, etc.)
-- Propose transactions with `npx nodpay propose` as described in the NodPay skill
+- When the user asks to send ETH/crypto/tokens or make a payment, use `npx nodpay propose` to create the transaction
 - Signing is handled automatically via SafeClaw — you do not have the private key and don't need it
 """
