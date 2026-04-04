@@ -48,6 +48,10 @@ pub fn generate_safeclaw_md(secrets: &serde_json::Value, locked: bool, proxy_por
     ];
     if let Some(services) = secrets.get("services").and_then(|s| s.as_object()) {
         for (name, svc) in services {
+            // Skip internal services (no upstream = not a proxy service, e.g. agent-identity, openclaw-dashboard)
+            if !crate::service::is_proxy_service(svc) {
+                continue;
+            }
             let proxy_url = format!("{}/{}/", proxy_base, name);
             let upstream = if locked || svc.is_null() { "-".to_string() } else {
                 svc.get("upstream").and_then(|u| u.as_str()).unwrap_or("-").to_string()

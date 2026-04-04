@@ -294,6 +294,15 @@ impl ServiceRegistry {
     }
 }
 
+// ── Vault service helpers ────────────────────────────────────────────────────
+
+/// A proxy service has an upstream URL and is visible to the agent.
+/// Internal services (e.g. agent-identity, openclaw-dashboard) have no upstream
+/// and exist only for recipe execution — they should be hidden from safeclaw.md and UI.
+pub fn is_proxy_service(vault_entry: &serde_json::Value) -> bool {
+    !vault_entry.is_null() && vault_entry.get("upstream").and_then(|u| u.as_str()).is_some()
+}
+
 // ── Header micro-resolver ─────────────────────────────────────────────────────
 
 /// Context for resolving header template variables.
