@@ -738,6 +738,7 @@ fn sync_local_service_files(secrets: &serde_json::Value, data_dir: &std::path::P
         "recoverySigner": wallet.get("recovery").unwrap_or(&json!(null)),
         "chains": wallet.get("chains").unwrap_or(&json!([])),
         "rpId": wallet.get("rpId").unwrap_or(&json!(null)),
+        "createdAt": wallet.get("createdAt").unwrap_or(&json!(null)),
     });
 
     let path = wallets_dir.join(format!("{safe}.json"));
