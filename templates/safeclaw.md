@@ -22,6 +22,8 @@ Send this URL to the user when they need to connect services or configure their 
 
 {{AVAILABLE_SERVICES}}
 
+{{NODPAY_SECTION}}
+
 ## How to use
 
 **Always make the HTTP request to the proxy first. Do not predict or assume the outcome — handle the actual response you receive.**

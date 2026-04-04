@@ -85,11 +85,28 @@ pub fn generate_safeclaw_md(secrets: &serde_json::Value, locked: bool, proxy_por
         )
     };
 
+    // NodPay wallet section — only when nodpay service is connected
+    let nodpay_section = if let Some(nodpay) = secrets.get("services").and_then(|s| s.get("nodpay")) {
+        let safe = nodpay.get("wallet").and_then(|w| w.get("safe")).and_then(|s| s.as_str()).unwrap_or("unknown");
+        format!(
+            "## NodPay Wallet\n\n\
+             A shared on-chain wallet is configured and ready. **Skip the NodPay SKILL.md setup section** — \
+             keygen and wallet creation are already done.\n\n\
+             - **Safe address:** `{safe}`\n\
+             - Run `npx nodpay wallets` to get full wallet details (signers, passkey coords, etc.)\n\
+             - Propose transactions with `npx nodpay propose` as described in the NodPay skill\n\
+             - Signing is handled automatically via SafeClaw — you do not have the private key and don't need it"
+        )
+    } else {
+        String::new()
+    };
+
     template
         .replace("{{PROXY_BASE}}", &proxy_base)
         .replace("{{CONSOLE_URL}}", console_url)
         .replace("{{SERVICE_TABLE}}", &rows.join("\n"))
         .replace("{{AVAILABLE_SERVICES}}", &available_section)
+        .replace("{{NODPAY_SECTION}}", &nodpay_section)
 }
 
 /// Return the static AGENTS.md snippet (managed block).
