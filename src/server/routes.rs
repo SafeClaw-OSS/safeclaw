@@ -711,6 +711,42 @@ pub async fn vault_update(
     Ok(Json(json!({ "ok": true })))
 }
 
+// ── Local Service File Sync ───────────────────────────────────────────────────
+
+/// Write local service files to the data volume so CLI subprocesses can read them.
+/// Currently handles NodPay: writes wallet JSON to {data_dir}/.nodpay/wallets/{safe}.json
+/// so that `npx nodpay wallets --json` works inside the safeclaw container.
+fn sync_local_service_files(secrets: &serde_json::Value, data_dir: &std::path::Path) {
+    let Some(nodpay) = secrets.get("services").and_then(|s| s.get("nodpay")) else { return };
+    let Some(wallet) = nodpay.get("wallet") else { return };
+    let Some(safe) = wallet.get("safe").and_then(|s| s.as_str()) else { return };
+
+    let wallets_dir = data_dir.join(".nodpay").join("wallets");
+    if let Err(e) = fs::create_dir_all(&wallets_dir) {
+        tracing::warn!("Failed to create .nodpay/wallets dir: {e}");
+        return;
+    }
+
+    // Build wallet JSON matching nodpay CLI's expected format
+    let wallet_json = json!({
+        "safe": safe,
+        "agentSigner": wallet.get("agentSigner")
+            .or_else(|| nodpay.get("auth").and_then(|a| a.get("address")))
+            .unwrap_or(&json!(null)),
+        "humanSignerPasskeyX": wallet.get("passkeyX").unwrap_or(&json!(null)),
+        "humanSignerPasskeyY": wallet.get("passkeyY").unwrap_or(&json!(null)),
+        "recoverySigner": wallet.get("recovery").unwrap_or(&json!(null)),
+        "chains": wallet.get("chains").unwrap_or(&json!([])),
+        "rpId": wallet.get("rpId").unwrap_or(&json!(null)),
+    });
+
+    let path = wallets_dir.join(format!("{safe}.json"));
+    match fs::write(&path, serde_json::to_string_pretty(&wallet_json).unwrap_or_default()) {
+        Ok(_) => tracing::info!("Synced NodPay wallet file: {}", path.display()),
+        Err(e) => tracing::warn!("Failed to write NodPay wallet file: {e}"),
+    }
+}
+
 // ── Cook Dispatch ─────────────────────────────────────────────────────────────
 
 /// Spawn a background task that dispatches cook ops to the local cooker endpoint

@@ -192,6 +192,7 @@ async fn proxy_poll_approval(
                     &rest_path,
                     snapshot.req_body.clone(),
                     &service_vault,
+                    &state.config.data_dir,
                 ).await
             } else {
                 forward_request(
@@ -649,6 +650,7 @@ async fn proxy_handler(
             &route_path,
             body_bytes,
             &service_vault,
+            &state.config.data_dir,
         ).await;
         let duration_ms = request_start.elapsed().as_millis() as i64;
         let upstream_status = response.status().as_u16();
@@ -759,6 +761,7 @@ async fn handle_local_service(
     path: &str,
     body: Bytes,
     service_vault: &crate::auth::ServiceVault,
+    data_dir: &std::path::Path,
 ) -> Response {
     let api = match registry.find_local_api(service_name, method, path) {
         Some(a) => a,
@@ -788,6 +791,9 @@ async fn handle_local_service(
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+
+    // Set HOME to data_dir so CLIs find local files (e.g. ~/.nodpay/wallets/)
+    cmd.env("HOME", data_dir);
 
     // Resolve env template variables and inject into subprocess.
     // Supported: {{auth.secret}}
