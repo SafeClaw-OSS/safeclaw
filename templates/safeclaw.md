@@ -13,6 +13,7 @@ SafeClaw is the API proxy on this machine. It holds encrypted credentials and fo
 
 - Only services listed above are accessible. Anything else returns 403 `UNKNOWN_SERVICE`.
 - Do **not** add API keys or Authorization headers — SafeClaw injects them automatically.
+- **Use these services proactively.** When the user asks you to do something a connected service can handle (send email → gmail, make a payment → nodpay, etc.), call the API through the proxy. You have full access — don't wait to be told about SafeClaw.
 
 ## Console
 
