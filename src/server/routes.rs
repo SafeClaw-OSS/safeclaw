@@ -538,7 +538,7 @@ pub async fn setup(
     state.vault.set_secrets(secrets.clone());
 
     // Dispatch cook ops (workspace files, config, recipe steps)
-    dispatch_cook(secrets, state.config.proxy_port, state.config.effective_admin_url());
+    dispatch_cook(secrets, state.config.proxy_port, state.config.effective_admin_url(), state.config.data_dir.clone());
 
 
     Ok(Json(json!({ "ok": true })))
@@ -601,8 +601,9 @@ pub async fn vault_unlock(
     // Dispatch cook ops on unlock
     let proxy_port = state.config.proxy_port;
     let console_url = state.config.effective_admin_url();
+    let data_dir = state.config.data_dir.clone();
     if let Some(unlocked_secrets) = state.vault.secrets.lock().unwrap().clone() {
-        dispatch_cook(unlocked_secrets, proxy_port, console_url);
+        dispatch_cook(unlocked_secrets, proxy_port, console_url, data_dir);
     }
 
     Ok(Json(json!({ "ok": true })))
@@ -705,7 +706,7 @@ pub async fn vault_update(
     state.vault.set_secrets(new_secrets.clone());
 
     // Keep VM-side SafeClaw guidance in sync with the latest vault config.
-    dispatch_cook(new_secrets, state.config.proxy_port, state.config.effective_admin_url());
+    dispatch_cook(new_secrets, state.config.proxy_port, state.config.effective_admin_url(), state.config.data_dir.clone());
 
     Ok(Json(json!({ "ok": true })))
 }
@@ -716,7 +717,10 @@ pub async fn vault_update(
 /// after vault state changes (setup, unlock, service add/update/remove).
 /// Builds ops from vault secrets + service recipes, sends a single POST /cook.
 /// Failures are silently discarded — the vault operation has already succeeded.
-fn dispatch_cook(secrets: serde_json::Value, proxy_port: u16, console_url: String) {
+fn dispatch_cook(secrets: serde_json::Value, proxy_port: u16, console_url: String, data_dir: std::path::PathBuf) {
+    // Sync local service files (e.g. NodPay wallet JSON) before dispatching to provisioner.
+    sync_local_service_files(&secrets, &data_dir);
+
     tokio::spawn(async move {
         let md = crate::cli::generate::generate_safeclaw_md(&secrets, false, proxy_port, &console_url);
         let snippet = crate::cli::generate::generate_agents_md_snippet(&secrets, proxy_port);
@@ -831,6 +835,7 @@ fn dispatch_cook(secrets: serde_json::Value, proxy_port: u16, console_url: Strin
             }
         }
 
+
         let provisioner_host = if std::path::Path::new("/.dockerenv").exists() {
             "host.docker.internal"
         } else {
@@ -889,8 +894,9 @@ pub async fn vault_services_add(
     // Dispatch cook ops for updated vault state
     let proxy_port = state.config.proxy_port;
     let console_url = state.config.effective_admin_url();
+    let data_dir = state.config.data_dir.clone();
     if let Some(secrets) = state.vault.secrets.lock().unwrap().clone() {
-        dispatch_cook(secrets, proxy_port, console_url);
+        dispatch_cook(secrets, proxy_port, console_url, data_dir);
     }
 
     Ok(Json(json!({ "ok": true })))
@@ -929,8 +935,9 @@ pub async fn vault_services_update(
     // Dispatch cook ops for updated vault state
     let proxy_port = state.config.proxy_port;
     let console_url = state.config.effective_admin_url();
+    let data_dir = state.config.data_dir.clone();
     if let Some(secrets) = state.vault.secrets.lock().unwrap().clone() {
-        dispatch_cook(secrets, proxy_port, console_url);
+        dispatch_cook(secrets, proxy_port, console_url, data_dir);
     }
 
     Ok(Json(json!({ "ok": true })))
@@ -960,8 +967,9 @@ pub async fn vault_services_remove(
     // Dispatch cook ops for updated vault state
     let proxy_port = state.config.proxy_port;
     let console_url = state.config.effective_admin_url();
+    let data_dir = state.config.data_dir.clone();
     if let Some(secrets) = state.vault.secrets.lock().unwrap().clone() {
-        dispatch_cook(secrets, proxy_port, console_url);
+        dispatch_cook(secrets, proxy_port, console_url, data_dir);
     }
 
     Ok(Json(json!({ "ok": true })))
