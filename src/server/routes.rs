@@ -799,19 +799,31 @@ fn dispatch_cook(secrets: serde_json::Value, proxy_port: u16, console_url: Strin
             }
         }
 
-        // Pass full service data (auth tokens for openai-codex OAuth, etc.)
-        if let Some(svcs) = secrets.get("services").and_then(|s| s.as_object()) {
-            for (k, v) in svcs {
-                config_patches.push(serde_json::json!({ "path": format!("services.{k}"), "value": v }));
-            }
-        }
-
         if !config_patches.is_empty() {
             steps.push(serde_json::json!({
                 "title": "Sync vault config",
                 "target": "openclaw",
                 "config_patches": config_patches
             }));
+        }
+
+        // Claude Code CLI credentials (anthropic OAuth — direct API access, not proxied)
+        if let Some(auth) = secrets
+            .get("services").and_then(|s| s.get("anthropic"))
+            .and_then(|a| a.get("auth"))
+        {
+            if auth.get("access_token").and_then(|t| t.as_str()).is_some() {
+                steps.push(serde_json::json!({
+                    "title": "Write Claude CLI credentials",
+                    "target": "host",
+                    "credentials": {
+                        "type": "claude-cli",
+                        "access_token": auth.get("access_token"),
+                        "refresh_token": auth.get("refresh_token"),
+                        "expires_at": auth.get("expires_at")
+                    }
+                }));
+            }
         }
 
         // WeChat channel setup
