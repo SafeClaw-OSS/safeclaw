@@ -799,15 +799,6 @@ fn dispatch_cook(secrets: serde_json::Value, proxy_port: u16, console_url: Strin
             }
         }
 
-        // OpenAI Codex OAuth: openclaw needs real access_token (extracts accountId from JWT)
-        if let Some(token) = secrets
-            .get("services").and_then(|s| s.get("openai-codex"))
-            .and_then(|s| s.get("auth")).and_then(|a| a.get("access_token"))
-            .and_then(|t| t.as_str())
-        {
-            config_patches.push(serde_json::json!({ "path": "openai_codex_token", "value": token }));
-        }
-
         if !config_patches.is_empty() {
             steps.push(serde_json::json!({
                 "title": "Sync vault config",
