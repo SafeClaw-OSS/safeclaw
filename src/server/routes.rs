@@ -419,6 +419,7 @@ pub async fn setup(
     for (i, pk_val) in passkeys_arr.iter().enumerate() {
         let x = pk_val.get("x").and_then(|v| v.as_str()).unwrap_or("");
         let y = pk_val.get("y").and_then(|v| v.as_str()).unwrap_or("");
+        let pk_cred_id = pk_val.get("credentialId").and_then(|v| v.as_str()).unwrap_or("");
 
         if x.is_empty() || y.is_empty() {
             return Err(AppError::BadRequest(format!(
@@ -437,6 +438,20 @@ pub async fn setup(
             .map_err(|e| {
                 AppError::BadRequest(format!("Invalid assertion for passkey {}: {}", i, e))
             })?;
+
+        // Defense in depth: if the assertion carries a credentialId, ensure it
+        // matches the passkey we're about to verify against. Without this we
+        // would fall through to "Signature verification failed" — same effect
+        // but a much harder error to diagnose.
+        if let Some(ref a_cred_id) = assertion.credential_id {
+            if !pk_cred_id.is_empty() && a_cred_id != pk_cred_id {
+                return Err(AppError::BadRequest(format!(
+                    "Passkey {}: assertion credentialId does not match passkey credentialId (wrong passkey was used to sign)",
+                    i
+                )));
+            }
+        }
+
         verify_assertion(
             &assertion,
             x,

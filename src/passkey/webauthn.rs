@@ -19,6 +19,9 @@ use crate::error::{AppError, Result};
 /// Assertion data as sent by the browser client (all fields are standard base64)
 #[derive(Debug, Deserialize, Clone)]
 pub struct AssertionData {
+    /// base64url credential id (optional for back-compat with older clients)
+    #[serde(rename = "credentialId", default)]
+    pub credential_id: Option<String>,
     #[serde(rename = "authenticatorData")]
     pub authenticator_data: String, // base64
     #[serde(rename = "clientDataJSON")]
