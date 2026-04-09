@@ -869,25 +869,39 @@ fn dispatch_cook(secrets: serde_json::Value, proxy_port: u16, console_url: Strin
         // Collect recipe steps for each enabled service (sent as-is, provisioner executes).
         // Built-in recipe steps first, then vault-side steps (overrides/additions).
         if let Some(svcs) = secrets.get("services").and_then(|s| s.as_object()) {
-            let resolve = |s: &str, svc_id: &str| -> String {
-                s.replace("{{proxy_port}}", &proxy_port.to_string())
-                 .replace("{{admin_port}}", &console_url.split(':').last().unwrap_or("23294"))
-                 .replace("{{admin_url}}", &console_url)
-                 .replace("{{service_id}}", svc_id)
+            let resolve = |s: &str, svc_id: &str, svc_data: &serde_json::Value| -> String {
+                let mut result = s.replace("{{proxy_port}}", &proxy_port.to_string())
+                    .replace("{{admin_port}}", &console_url.split(':').last().unwrap_or("23294"))
+                    .replace("{{admin_url}}", &console_url)
+                    .replace("{{service_id}}", svc_id);
+                // Resolve {{config.KEY}} from service vault data
+                while let Some(start) = result.find("{{config.") {
+                    let rest = &result[start + 9..];
+                    if let Some(end) = rest.find("}}") {
+                        let key = &rest[..end];
+                        let val = svc_data.get(key)
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        result = format!("{}{}{}", &result[..start], val, &rest[end + 2..]);
+                    } else {
+                        break;
+                    }
+                }
+                result
             };
-            let resolve_step = |step: &serde_json::Value, svc_id: &str| -> serde_json::Value {
+            let resolve_step = |step: &serde_json::Value, svc_id: &str, svc_data: &serde_json::Value| -> serde_json::Value {
                 let mut s = step.clone();
                 if let Some(files) = s.get_mut("files").and_then(|f| f.as_array_mut()) {
                     for f in files.iter_mut() {
-                        if let Some(c) = f.get("content").and_then(|c| c.as_str()).map(|c| resolve(c, svc_id)) {
+                        if let Some(c) = f.get("content").and_then(|c| c.as_str()).map(|c| resolve(c, svc_id, svc_data)) {
                             f["content"] = serde_json::json!(c);
                         }
-                        if let Some(p) = f.get("path").and_then(|p| p.as_str()).map(|p| resolve(p, svc_id)) {
+                        if let Some(p) = f.get("path").and_then(|p| p.as_str()).map(|p| resolve(p, svc_id, svc_data)) {
                             f["path"] = serde_json::json!(p);
                         }
                     }
                 }
-                if let Some(r) = s.get("run").and_then(|r| r.as_str()).map(|r| resolve(r, svc_id)) {
+                if let Some(r) = s.get("run").and_then(|r| r.as_str()).map(|r| resolve(r, svc_id, svc_data)) {
                     s["run"] = serde_json::json!(r);
                 }
                 s
@@ -909,7 +923,7 @@ fn dispatch_cook(secrets: serde_json::Value, proxy_port: u16, console_url: Strin
 
                 if let Some(recipe_steps) = recipe_steps {
                     for step in &recipe_steps {
-                        steps.push(resolve_step(step, svc_id));
+                        steps.push(resolve_step(step, svc_id, svc_data));
                     }
                 }
             }
