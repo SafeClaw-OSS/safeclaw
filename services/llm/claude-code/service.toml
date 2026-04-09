@@ -5,20 +5,19 @@ sub = "Claude Code OAuth"
 category = "llm"
 group = "anthropic"
 
-[upstream]
+[[upstream]]
+id = "default"
 url = "https://api.anthropic.com"
+auth = { type = "oauth2", oauth_style = "json" }
+headers = { "anthropic-beta" = "oauth-2025-04-20,interleaved-thinking-2025-05-14", "user-agent" = "claude-cli/2.1.87 (external, cli)", "x-claude-code-session-id" = "{{uuid_v4}}" }
+locked = { response = "Please unlock the SafeClaw vault to use this service." }
 
-[upstream.auth]
-type = "oauth2"
-oauth_style = "json"
+[[api]]
+path = "*"
 
-[upstream.headers]
-"anthropic-beta" = "oauth-2025-04-20,interleaved-thinking-2025-05-14"
-"user-agent" = "claude-cli/2.1.87 (external, cli)"
-"x-claude-code-session-id" = "{{uuid_v4}}"
-
-[upstream.locked]
-template = "anthropic"
+  [[api.steps]]
+  target = "upstream:default"
+  returns = true
 
 [policy.levels]
 read = "allow"

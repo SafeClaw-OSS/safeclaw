@@ -1,22 +1,51 @@
-/// Locked proxy response generators (by template name).
+/// Locked proxy response generators.
 ///
 /// When the vault is locked, the proxy returns API-format-aware placeholder
-/// responses. Template names come from service.toml `[upstream.locked]`.
+/// responses. In v2, the format is auto-detected from the upstream URL.
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 
-/// Render a locked response by template name.
+/// Render a locked response by template name (legacy, still used as fallback).
 pub fn render(template: &str, is_stream: bool, admin_url: &str) -> Option<Response> {
+    let message = default_locked_message(admin_url);
     match template {
-        "anthropic" => Some(anthropic(is_stream, admin_url)),
-        "openai" => Some(openai(is_stream, admin_url)),
-        "openai-responses" => Some(openai_responses(is_stream, admin_url)),
-        "gemini" => Some(gemini(admin_url)),
+        "anthropic" => Some(anthropic(is_stream, &message)),
+        "openai" => Some(openai(is_stream, &message)),
+        "openai-responses" => Some(openai_responses(is_stream, &message)),
+        "gemini" => Some(gemini(&message)),
         _ => None,
     }
 }
 
-fn locked_message(admin_url: &str) -> String {
+/// Auto-detect API format from upstream URL and render appropriate locked response.
+/// If `custom_message` is provided, it replaces the default locked message.
+pub fn render_for_upstream(
+    upstream_url: &str,
+    is_stream: bool,
+    admin_url: &str,
+    custom_message: Option<&str>,
+) -> Option<Response> {
+    let message = match custom_message {
+        Some(msg) => msg.to_string(),
+        None => default_locked_message(admin_url),
+    };
+
+    let url_lower = upstream_url.to_lowercase();
+    if url_lower.contains("anthropic.com") {
+        Some(anthropic(is_stream, &message))
+    } else if url_lower.contains("generativelanguage.googleapis.com") {
+        Some(gemini(&message))
+    } else if url_lower.contains("openai.com") || url_lower.contains("groq.com")
+        || url_lower.contains("deepseek.com") || url_lower.contains("openrouter.ai")
+    {
+        Some(openai(is_stream, &message))
+    } else {
+        // Generic fallback: use OpenAI format (most common)
+        Some(openai(is_stream, &message))
+    }
+}
+
+fn default_locked_message(admin_url: &str) -> String {
     let display = admin_url
         .trim_start_matches("https://")
         .trim_start_matches("http://");
@@ -37,8 +66,8 @@ fn now_secs() -> u64 {
 }
 
 /// Anthropic Messages API locked response
-fn anthropic(is_stream: bool, admin_url: &str) -> Response {
-    let content = locked_message(admin_url);
+fn anthropic(is_stream: bool, message: &str) -> Response {
+    let content = message;
     let id = msg_id();
 
     if !is_stream {
@@ -116,8 +145,8 @@ fn anthropic(is_stream: bool, admin_url: &str) -> Response {
 }
 
 /// OpenAI Chat Completions locked response
-fn openai(is_stream: bool, admin_url: &str) -> Response {
-    let content = locked_message(admin_url);
+fn openai(is_stream: bool, message: &str) -> Response {
+    let content = message;
     let now = now_secs();
 
     if !is_stream {
@@ -132,9 +161,6 @@ fn openai(is_stream: bool, admin_url: &str) -> Response {
                 "finish_reason": "stop"
             }],
             "usage": { "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0 },
-            "safeclaw_locked": true,
-            "safeclaw_unlock_url": admin_url,
-            "safeclaw_buttons": [[{ "text": "🔓 Unlock SafeClaw", "url": admin_url }]],
         }))
         .unwrap_or_default();
         return (StatusCode::OK, [("content-type", "application/json")], body).into_response();
@@ -170,8 +196,8 @@ fn openai(is_stream: bool, admin_url: &str) -> Response {
 }
 
 /// OpenAI Responses API locked response
-fn openai_responses(is_stream: bool, admin_url: &str) -> Response {
-    let content = locked_message(admin_url);
+fn openai_responses(is_stream: bool, message: &str) -> Response {
+    let content = message;
     let now = now_secs();
     let resp_id = format!("resp_locked_{}", now);
     let msg_id_val = format!("msg_locked_{}", now);
@@ -210,8 +236,8 @@ fn openai_responses(is_stream: bool, admin_url: &str) -> Response {
 }
 
 /// Google Gemini locked response
-fn gemini(admin_url: &str) -> Response {
-    let content = locked_message(admin_url);
+fn gemini(message: &str) -> Response {
+    let content = message;
     let body = serde_json::to_string(&serde_json::json!({
         "candidates": [{
             "content": { "parts": [{ "text": content }], "role": "model" },
@@ -223,4 +249,125 @@ fn gemini(admin_url: &str) -> Response {
     }))
     .unwrap_or_default();
     (StatusCode::OK, [("content-type", "application/json")], body).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::to_bytes;
+
+    async fn body_string(resp: Response) -> String {
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn custom_message_appears_in_openai_response() {
+        let resp = render_for_upstream(
+            "https://api.openai.com/v1",
+            false,
+            "https://admin.example.com",
+            Some("Custom locked text here"),
+        ).unwrap();
+        let body = body_string(resp).await;
+        assert!(body.contains("Custom locked text here"), "body: {}", body);
+        // Should NOT contain the default message
+        assert!(!body.contains("vault is locked"), "body: {}", body);
+    }
+
+    #[tokio::test]
+    async fn none_message_uses_default() {
+        let resp = render_for_upstream(
+            "https://api.openai.com/v1",
+            false,
+            "https://admin.example.com",
+            None,
+        ).unwrap();
+        let body = body_string(resp).await;
+        assert!(body.contains("vault is locked"), "body: {}", body);
+        assert!(body.contains("admin.example.com"), "body: {}", body);
+    }
+
+    #[tokio::test]
+    async fn anthropic_url_uses_anthropic_format() {
+        let resp = render_for_upstream(
+            "https://api.anthropic.com/v1",
+            false,
+            "https://x.com",
+            Some("locked"),
+        ).unwrap();
+        let body = body_string(resp).await;
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        // Anthropic format has "type": "message"
+        assert_eq!(json["type"], "message");
+        assert_eq!(json["content"][0]["type"], "text");
+    }
+
+    #[tokio::test]
+    async fn openai_url_uses_openai_format() {
+        let resp = render_for_upstream(
+            "https://api.openai.com/v1",
+            false,
+            "https://x.com",
+            Some("locked"),
+        ).unwrap();
+        let body = body_string(resp).await;
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["object"], "chat.completion");
+    }
+
+    #[tokio::test]
+    async fn gemini_url_uses_gemini_format() {
+        let resp = render_for_upstream(
+            "https://generativelanguage.googleapis.com/v1",
+            false,
+            "https://x.com",
+            Some("locked"),
+        ).unwrap();
+        let body = body_string(resp).await;
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(json["candidates"].is_array());
+    }
+
+    #[tokio::test]
+    async fn deepseek_uses_openai_format() {
+        let resp = render_for_upstream(
+            "https://api.deepseek.com/v1",
+            false,
+            "https://x.com",
+            Some("msg"),
+        ).unwrap();
+        let body = body_string(resp).await;
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["object"], "chat.completion");
+    }
+
+    #[tokio::test]
+    async fn streaming_anthropic_uses_sse() {
+        let resp = render_for_upstream(
+            "https://api.anthropic.com/v1",
+            true,
+            "https://x.com",
+            Some("stream msg"),
+        ).unwrap();
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "text/event-stream"
+        );
+        let body = body_string(resp).await;
+        assert!(body.contains("event: message_start"), "body: {}", body);
+        assert!(body.contains("stream msg"), "body: {}", body);
+    }
+
+    #[tokio::test]
+    async fn render_legacy_template_works() {
+        let resp = render("openai", false, "https://x.com").unwrap();
+        let body = body_string(resp).await;
+        assert!(body.contains("vault is locked"));
+    }
+
+    #[tokio::test]
+    async fn render_unknown_template_returns_none() {
+        assert!(render("unknown_format", false, "https://x.com").is_none());
+    }
 }

@@ -4,11 +4,15 @@ display_name = "OpenClaw Dashboard"
 
 [[steps]]
 title = "Enable Control UI"
-run = "openclaw config set gateway.controlUi.enabled true"
 target = "openclaw"
+run = "openclaw config set gateway.controlUi.enabled true --strict-json"
+
+[[steps]]
+title = "Set allowed origins"
+target = "openclaw"
+run = """openclaw config set gateway.controlUi.allowedOrigins '["https://www.safeclaw.pro"]' --strict-json"""
 
 [[steps]]
 title = "Restart OpenClaw"
-note = "Restart to apply dashboard configuration"
-restart = true
 target = "openclaw"
+restart = true

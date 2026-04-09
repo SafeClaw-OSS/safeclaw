@@ -1,32 +1,32 @@
-[openclaw]
-plugin = "openclaw-weixin"
+[recipe]
+id = "weixin"
+display_name = "WeChat iLink"
 
 [[steps]]
 title = "Install WeChat iLink plugin"
-run = "npm install @tencent-weixin/openclaw-weixin@latest"
-cwd = "openclaw"
 target = "openclaw"
+run = "openclaw plugins install @tencent-weixin/openclaw-weixin@latest"
+
+[[steps]]
+title = "Enable WeChat iLink plugin"
+target = "openclaw"
+run = "openclaw plugins enable openclaw-weixin"
+
+[[steps]]
+title = "Configure WeChat channel"
+target = "openclaw"
+run = """openclaw config set channels.openclaw-weixin '{"enabled":true,"options":{"base_url":"http://localhost:{{proxy_port}}/wechat","token":"sk-dummy-safeclaw-wechat"}}' --strict-json"""
 
 [[steps]]
 title = "Create account config"
+target = "openclaw"
 files = [
-    { path = "openclaw-weixin/accounts.json", content = '["safeclaw"]' },
-    { path = "openclaw-weixin/accounts/safeclaw.json", template = "weixin-account.json" },
+  { path = ".openclaw/openclaw-weixin/accounts.json", content = '["safeclaw"]' },
+  { path = ".openclaw/openclaw-weixin/accounts/safeclaw.json", template = "weixin-account.json" },
 ]
-target = "openclaw"
-
-[[steps]]
-title = "Enable WeChat channel"
-config_patches = [
-    { path = "plugins.entries.openclaw-weixin.enabled", value = true },
-    { path = "channels.openclaw-weixin.enabled", value = true },
-    { path = "channels.openclaw-weixin.options.base_url", value = "http://localhost:{{proxy_port}}/wechat" },
-    { path = "channels.openclaw-weixin.options.token", value = "sk-dummy-safeclaw-wechat" },
-]
-target = "openclaw"
 
 [[steps]]
 title = "Restart OpenClaw"
+target = "openclaw"
 note = "Restart to load the new plugin"
 restart = true
-target = "openclaw"

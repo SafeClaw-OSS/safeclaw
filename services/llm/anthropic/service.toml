@@ -5,16 +5,18 @@ sub = "API Key"
 category = "llm"
 group = "anthropic"
 
-[upstream]
+[[upstream]]
+id = "default"
 url = "https://api.anthropic.com"
+auth = { type = "header", header = "x-api-key", placeholder = "sk-ant-api03-..." }
+locked = { response = "Please unlock the SafeClaw vault to use this service." }
 
-[upstream.auth]
-type = "header"
-header = "x-api-key"
-key_placeholder = "sk-ant-api03-..."
+[[api]]
+path = "*"
 
-[upstream.locked]
-template = "anthropic"
+  [[api.steps]]
+  target = "upstream:default"
+  returns = true
 
 [policy.levels]
 read = "allow"

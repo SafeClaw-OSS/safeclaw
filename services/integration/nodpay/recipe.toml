@@ -1,29 +1,26 @@
 [recipe]
 id = "nodpay"
 display_name = "NodPay"
-requires_credential = false
 
 [passkey_sharing]
 enabled = true
 origins = ["https://nodpay.ai"]
 
-# ── OpenClaw agent side ──────────────────────────────────────────────────
-
 [[steps]]
 title = "Install NodPay CLI"
-run = "npm install -g nodpay"
 target = "openclaw"
+run = "npm install -g nodpay"
 
 [[steps]]
 title = "Configure remote wallet"
-files = [
-    { path = ".nodpay/config.json", content = '{"remote_wallet":"http://localhost:{{proxy_port}}/nodpay"}' },
-]
 target = "openclaw"
+files = [
+  { path = ".nodpay/config.json", content = '{"remote_wallet":"http://localhost:{{proxy_port}}/nodpay"}' },
+]
 note = "CLI reads remote_wallet to delegate sign/address/wallets to SafeClaw vault"
 
 [[steps]]
 title = "Load NodPay skill"
-run = "openclaw skill load nodpay"
 target = "openclaw"
+run = "openclaw skill load nodpay"
 note = "Enables agent to use NodPay propose/approve via SKILL.md"

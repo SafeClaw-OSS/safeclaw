@@ -5,21 +5,19 @@ sub = "ChatGPT"
 category = "llm"
 group = "openai"
 
-[upstream]
+[[upstream]]
+id = "default"
 url = "https://api.openai.com"
+auth = { type = "oauth2" }
+headers = { "openai-beta" = "responses=experimental", "chatgpt-account-id" = "{{auth.account_id}}" }
+locked = { response = "Please unlock the SafeClaw vault to use this service." }
 
-[upstream.auth]
-type = "oauth2"
+[[api]]
+path = "*"
 
-[upstream.headers]
-"openai-beta" = "responses=experimental"
-"chatgpt-account-id" = "{{auth.account_id}}"
-
-[upstream.locked]
-template = "openai"
-
-[upstream.locked.routes]
-"/responses" = "openai-responses"
+  [[api.steps]]
+  target = "upstream:default"
+  returns = true
 
 [policy.levels]
 read = "allow"

@@ -1,18 +1,13 @@
-[openclaw]
-plugin = "anthropic"
-api = "anthropic-messages"
-env_key = "ANTHROPIC_API_KEY"
-env_base_url = "ANTHROPIC_BASE_URL"
-proxy_path = "/anthropic/v1"
+[recipe]
+id = "anthropic"
+display_name = "Anthropic"
 
-[[openclaw.models]]
-id = "claude-sonnet-4-20250514"
-name = "Claude Sonnet 4"
+[[steps]]
+title = "Register Anthropic provider"
+target = "openclaw"
+run = """openclaw config set models.providers.anthropic '{"apiKey":"sk-safeclaw-proxy","baseUrl":"http://localhost:{{proxy_port}}/anthropic/v1","api":"anthropic-messages","models":[]}' --strict-json"""
 
-[[openclaw.models]]
-id = "claude-opus-4-20250514"
-name = "Claude Opus 4"
-
-[[openclaw.models]]
-id = "claude-haiku-3-5-20241022"
-name = "Claude Haiku 3.5"
+[[steps]]
+title = "Restart OpenClaw"
+target = "openclaw"
+restart = true

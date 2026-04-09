@@ -1,10 +1,13 @@
-[openclaw]
-plugin = "deepseek"
-api = "openai-completions"
-env_key = "DEEPSEEK_API_KEY"
-env_base_url = "DEEPSEEK_BASE_URL"
-proxy_path = "/deepseek/v1"
+[recipe]
+id = "deepseek"
+display_name = "DeepSeek"
 
-[[openclaw.models]]
-id = "deepseek-chat"
-name = "DeepSeek Chat"
+[[steps]]
+title = "Register DeepSeek provider"
+target = "openclaw"
+run = """openclaw config set models.providers.deepseek '{"apiKey":"sk-safeclaw-proxy","baseUrl":"http://localhost:{{proxy_port}}/deepseek/v1","api":"openai-completions","models":[]}' --strict-json"""
+
+[[steps]]
+title = "Restart OpenClaw"
+target = "openclaw"
+restart = true

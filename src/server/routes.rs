@@ -100,7 +100,7 @@ pub async fn auth_verify(
 }
 
 pub async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let vapid_public_key = state.vault.vapid_public_key.lock().unwrap().clone();
+    let vapid_public_key = state.vault.vapid.lock().unwrap().as_ref().map(|kp| kp.public_key.clone());
     // started_at: Unix ms timestamp of when the process started.
     // Clients compute uptime = Date.now() - started_at, so the counter
     // keeps ticking even if the health endpoint becomes temporarily unreachable.
@@ -178,14 +178,13 @@ fn write_index(state: &AppState, secrets: &Value) -> std::io::Result<()> {
                     if let Some(sub) = svc_def.and_then(|d| d.service.sub.as_deref()) {
                         entry["sub"] = json!(sub);
                     }
-                    // Upstream: vault data first, then service.toml (local services have upstream in toml but not vault)
+                    // Upstream: vault data first, then service.toml
                     let has_upstream = cfg.get("upstream").and_then(|u| u.as_str()).is_some()
-                        || svc_def.and_then(|d| d.upstream.as_ref()).is_some();
+                        || svc_def.map(|d| !d.upstream.is_empty()).unwrap_or(false);
                     if has_upstream {
                         entry["upstream"] = json!(cfg.get("upstream").and_then(|u| u.as_str())
-                            .or_else(|| svc_def.and_then(|d| d.upstream.as_ref())
-                                .and_then(|u| u.url.as_deref())
-                            ).unwrap_or("local"));
+                            .or_else(|| svc_def.and_then(|d| d.upstream_url()))
+                            .unwrap_or("local"));
                     }
                     // Expose wallet metadata (safe address, chains) for integration services
                     if let Some(wallet) = cfg.get("wallet") {
@@ -780,7 +779,36 @@ fn dispatch_cook(secrets: serde_json::Value, proxy_port: u16, console_url: Strin
         // Build steps in recipe format — provisioner executes them directly.
         let mut steps: Vec<serde_json::Value> = vec![];
 
-        // Workspace files as recipe steps
+        // ── Bootstrap: global openclaw config (idempotent, runs every cook) ────
+        steps.push(serde_json::json!({
+            "title": "Bootstrap gateway mode",
+            "target": "openclaw",
+            "run": "openclaw config set gateway.mode local"
+        }));
+        steps.push(serde_json::json!({
+            "title": "Bootstrap models mode",
+            "target": "openclaw",
+            "run": "openclaw config set models.mode replace"
+        }));
+        steps.push(serde_json::json!({
+            "title": "Bootstrap thinking default",
+            "target": "openclaw",
+            "run": "openclaw config set agents.defaults.thinkingDefault adaptive"
+        }));
+        // Disable openclaw exec approval prompts — VM is sandboxed, SafeClaw handles auth.
+        steps.push(serde_json::json!({
+            "title": "Bootstrap exec approvals",
+            "target": "openclaw",
+            "files": [{
+                "path": ".openclaw/exec-approvals.json",
+                "content": serde_json::json!({
+                    "version": 1,
+                    "defaults": { "security": "full", "ask": "off", "autoAllowSkills": true }
+                }).to_string()
+            }]
+        }));
+
+        // Workspace files
         steps.push(serde_json::json!({
             "title": "Write safeclaw.md",
             "target": "openclaw",
@@ -792,11 +820,16 @@ fn dispatch_cook(secrets: serde_json::Value, proxy_port: u16, console_url: Strin
             "files": [{ "path": ".openclaw/workspace/AGENTS.md", "content": snippet, "upsert_block": "SAFECLAW" }]
         }));
 
-        // Config patches from vault secrets
-        let mut config_patches = vec![];
-
+        // Vault-driven config: set model, telegram token, etc. via openclaw CLI
         if let Some(model) = secrets.get("model") {
-            config_patches.push(serde_json::json!({ "path": "model", "value": model }));
+            let model_json = serde_json::to_string(model).unwrap_or_default();
+            // Escape single quotes in JSON for shell
+            let escaped = model_json.replace('\'', "'\\''");
+            steps.push(serde_json::json!({
+                "title": "Set model config",
+                "target": "openclaw",
+                "run": format!("openclaw config set agents.defaults.model '{}' --strict-json", escaped)
+            }));
         }
 
         if let Some(token) = secrets
@@ -804,25 +837,25 @@ fn dispatch_cook(secrets: serde_json::Value, proxy_port: u16, console_url: Strin
             .and_then(|t| t.get("auth")).and_then(|a| a.get("secret"))
             .and_then(|s| s.as_str())
         {
-            config_patches.push(serde_json::json!({ "path": "channels.telegram.token", "value": token }));
+            steps.push(serde_json::json!({
+                "title": "Set Telegram bot token",
+                "target": "openclaw",
+                "run": format!("openclaw config set channels.telegram.botToken '{}'", token.replace('\'', "'\\''"))
+            }));
             if let Some(owner_id) = secrets
                 .get("services").and_then(|s| s.get("telegram"))
                 .and_then(|t| t.get("owner_id").or_else(|| t.get("ownerId")))
                 .and_then(|o| o.as_str())
             {
-                config_patches.push(serde_json::json!({ "path": "channels.telegram.ownerId", "value": owner_id }));
+                steps.push(serde_json::json!({
+                    "title": "Set Telegram owner",
+                    "target": "openclaw",
+                    "run": format!("openclaw config set channels.telegram.allowFrom '[\"{}\"]' --strict-json", owner_id)
+                }));
             }
         }
 
-        if !config_patches.is_empty() {
-            steps.push(serde_json::json!({
-                "title": "Sync vault config",
-                "target": "openclaw",
-                "config_patches": config_patches
-            }));
-        }
-
-        // Claude Code CLI credentials (anthropic OAuth — direct API access, not proxied)
+        // Claude Code CLI credentials (anthropic OAuth — written to openclaw container filesystem)
         if let Some(auth) = secrets
             .get("services").and_then(|s| s.get("anthropic"))
             .and_then(|a| a.get("auth"))
@@ -830,7 +863,7 @@ fn dispatch_cook(secrets: serde_json::Value, proxy_port: u16, console_url: Strin
             if auth.get("access_token").and_then(|t| t.as_str()).is_some() {
                 steps.push(serde_json::json!({
                     "title": "Write Claude CLI credentials",
-                    "target": "host",
+                    "target": "openclaw",
                     "credentials": {
                         "type": "claude-cli",
                         "access_token": auth.get("access_token"),
@@ -839,15 +872,6 @@ fn dispatch_cook(secrets: serde_json::Value, proxy_port: u16, console_url: Strin
                     }
                 }));
             }
-        }
-
-        // WeChat channel setup
-        if secrets.get("services").and_then(|s| s.get("wechat")).is_some() {
-            steps.push(serde_json::json!({
-                "title": "Configure WeChat channel",
-                "target": "openclaw",
-                "channel": "wechat"
-            }));
         }
 
         // Collect recipe steps for each enabled service (sent as-is, provisioner executes).
@@ -1096,7 +1120,7 @@ pub async fn vault_files_read_approved(
 
     // Take DEK from pending_deks (one-time use)
     let mut dek = {
-        let mut deks = state.vault.pending_deks.lock().unwrap();
+        let mut deks = state.vault.cache.pending_deks.lock().unwrap();
         deks.remove(approval_id).ok_or_else(|| {
             AppError::Unauthorized("No DEK available — approval may have expired".into())
         })?
@@ -1487,14 +1511,14 @@ pub async fn approval_confirm(
         kek.zeroize();
 
         // Store DEK keyed by approval ID — consumed and zeroized at file read time
-        state.vault.pending_deks.lock().unwrap().insert(id.clone(), dek);
+        state.vault.cache.pending_deks.lock().unwrap().insert(id.clone(), dek);
 
         if state.approval_manager.confirm(&id, None) {
             Ok(Json(json!({ "ok": true })))
         } else {
             // Clean up if confirm failed
             use zeroize::Zeroize;
-            if let Some(mut d) = state.vault.pending_deks.lock().unwrap().remove(&id) { d.zeroize(); }
+            if let Some(mut d) = state.vault.cache.pending_deks.lock().unwrap().remove(&id) { d.zeroize(); }
             Err(AppError::NotFound)
         }
     } else {

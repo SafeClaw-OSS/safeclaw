@@ -4,16 +4,18 @@ name = "Google AI"
 sub = "Gemini"
 category = "llm"
 
-[upstream]
+[[upstream]]
+id = "default"
 url = "https://generativelanguage.googleapis.com"
+auth = { type = "query", param = "key", placeholder = "AIza..." }
+locked = { response = "Please unlock the SafeClaw vault to use this service." }
 
-[upstream.auth]
-type = "query"
-param = "key"
-key_placeholder = "AIza..."
+[[api]]
+path = "*"
 
-[upstream.locked]
-template = "gemini"
+  [[api.steps]]
+  target = "upstream:default"
+  returns = true
 
 [policy.levels]
 read = "allow"

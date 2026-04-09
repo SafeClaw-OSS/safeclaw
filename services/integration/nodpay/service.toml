@@ -4,19 +4,24 @@ name = "NodPay"
 sub = "Web3 agent wallet"
 category = "integration"
 
-[upstream]
-type = "local"
-
-[[upstream.apis]]
+[[api]]
 method = "POST"
 path = "/sign"
-env = { NODPAY_AGENT_KEY = "{{auth.secret}}" }
-command = "npx nodpay sign"
 
-[[upstream.apis]]
+  [[api.steps]]
+  target = "safeclaw"
+  run = "npx nodpay sign"
+  env = { NODPAY_AGENT_KEY = "{{auth.secret}}" }
+  returns = true
+
+[[api]]
 method = "GET"
 path = "/wallets"
-command = "npx nodpay wallets --json"
+
+  [[api.steps]]
+  target = "safeclaw"
+  run = "npx nodpay wallets --json"
+  returns = true
 
 [policy.levels]
 read = "allow"

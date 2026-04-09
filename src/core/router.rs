@@ -16,7 +16,7 @@ use super::approval::{ApprovalManager, ApprovalStatus, CachedResponse};
 use super::audit::AuditLog;
 use crate::config::Config;
 use super::policy::{evaluate_policy, AccessLevel};
-use crate::state::VaultState;
+use crate::vault::Vault;
 use super::forward::{forward_request, parse_route};
 use crate::auth::{AuthConfig, ServiceVault};
 use crate::auth::oauth2::refresh_token as refresh_oauth2_token;
@@ -24,7 +24,7 @@ use crate::service::ServiceRegistry;
 
 /// Shared state for the proxy server
 pub struct ProxyState {
-    pub vault: Arc<VaultState>,
+    pub vault: Arc<Vault>,
     pub config: Config,
     pub approval_manager: Arc<ApprovalManager>,
     pub audit_log: Arc<AuditLog>,
@@ -119,7 +119,7 @@ async fn proxy_poll_approval(
                 if a.auth_type == "oauth2" {
                     let service_name = &snapshot.service;
                     let cached_token = {
-                        let tokens = state.vault.oauth2_tokens.lock().unwrap();
+                        let tokens = state.vault.cache.oauth2_tokens.lock().unwrap();
                         tokens.get(service_name).cloned()
                     };
                     let now_secs = SystemTime::now()
@@ -138,7 +138,7 @@ async fn proxy_poll_approval(
                             Ok((access_token, expires_at)) => {
                                 state
                                     .vault
-                                    .oauth2_tokens
+                                    .cache.oauth2_tokens
                                     .lock()
                                     .unwrap()
                                     .insert(service_name.clone(), (access_token.clone(), expires_at));
@@ -186,13 +186,12 @@ async fn proxy_poll_approval(
                 let (_, rest_path, _) = parse_route(&replay_uri)
                     .unwrap_or_default();
                 handle_local_service(
-                    &state.services,
+                    &state,
                     &snapshot.service,
                     method.as_str(),
                     &rest_path,
                     snapshot.req_body.clone(),
                     &service_vault,
-                    &state.config.data_dir,
                 ).await
             } else {
                 forward_request(
@@ -416,11 +415,15 @@ async fn proxy_handler(
         .unwrap_or_else(|| state.services.default_category(&route_service));
 
     let policy_defaults = state.vault.get_policy_defaults();
+    // Use vault levels if set, otherwise fall back to service.toml policy.levels
+    let toml_levels = state.services.default_policy_levels(&route_service);
+    let effective_levels = service_vault.levels.as_ref()
+        .or(toml_levels.as_ref());
     let access_level = evaluate_policy(
         method.as_str(),
         &route_path,
         service_vault.rules.as_ref(),
-        service_vault.levels.as_ref(),
+        effective_levels,
         &policy_defaults,
         Some(category),
     );
@@ -523,7 +526,7 @@ async fn proxy_handler(
                 tokio::time::sleep(std::time::Duration::from_secs(timeout)).await;
                 if level_clone == AccessLevel::Ask {
                     vault_clone
-                        .approval_cache
+                        .cache.approvals
                         .lock()
                         .unwrap()
                         .remove(&svc_clone);
@@ -542,8 +545,8 @@ async fn proxy_handler(
                 "level": access_level.to_string(),
             });
             let subs = state.vault.push_subscriptions.lock().unwrap().clone();
-            let priv_key = state.vault.vapid_private_key.lock().unwrap().clone();
-            if let Some(priv_b64) = priv_key {
+            let priv_b64 = state.vault.vapid.lock().unwrap().as_ref().map(|kp| kp.private_key.clone());
+            if let Some(priv_b64) = priv_b64 {
                 let vault_clone = state.vault.clone();
                 tokio::spawn(async move {
                     let dead =
@@ -599,7 +602,7 @@ async fn proxy_handler(
     let resolved_bearer: Option<String> = if let Some(a) = &service_vault.auth {
         if a.auth_type == "oauth2" {
             let cached = {
-                let tokens = state.vault.oauth2_tokens.lock().unwrap();
+                let tokens = state.vault.cache.oauth2_tokens.lock().unwrap();
                 tokens.get(&route_service).cloned()
             };
 
@@ -620,7 +623,7 @@ async fn proxy_handler(
                     Ok((access_token, expires_at)) => {
                         state
                             .vault
-                            .oauth2_tokens
+                            .cache.oauth2_tokens
                             .lock()
                             .unwrap()
                             .insert(route_service.clone(), (access_token.clone(), expires_at));
@@ -644,13 +647,12 @@ async fn proxy_handler(
     if state.services.is_local(&route_service) {
         let request_start = Instant::now();
         let response = handle_local_service(
-            &state.services,
+            &state,
             &route_service,
             method.as_str(),
             &route_path,
             body_bytes,
             &service_vault,
-            &state.config.data_dir,
         ).await;
         let duration_ms = request_start.elapsed().as_millis() as i64;
         let upstream_status = response.status().as_u16();
@@ -752,18 +754,17 @@ fn find_rule_ttl(
     None
 }
 
-// ── Local service handler (CLI bridge) ────────────────────────────────────────
+// ── Local service handler (multi-step execution engine) ──────────────────────
 
 async fn handle_local_service(
-    registry: &ServiceRegistry,
+    state: &Arc<ProxyState>,
     service_name: &str,
     method: &str,
     path: &str,
     body: Bytes,
     service_vault: &crate::auth::ServiceVault,
-    data_dir: &std::path::Path,
 ) -> Response {
-    let api = match registry.find_local_api(service_name, method, path) {
+    let api_def = match state.services.find_local_api(service_name, method, path) {
         Some(a) => a,
         None => {
             return (
@@ -776,14 +777,147 @@ async fn handle_local_service(
         }
     };
 
-    tracing::info!("local exec: {} {} → {}", method, path, api.command);
+    // Clone steps to avoid borrow issues during async execution
+    let steps = api_def.steps.clone();
 
-    let parts: Vec<&str> = api.command.split_whitespace().collect();
-    if parts.is_empty() {
-        return (
+    tracing::info!("local exec: {} {} → {} step(s)", method, path, steps.len());
+
+    // The response to return to the caller (from the step with returns=true)
+    let mut return_value: Option<serde_json::Value> = None;
+
+    for (i, step) in steps.iter().enumerate() {
+        let step_result = execute_step(state, service_name, &step, &body, service_vault).await;
+
+        match step_result {
+            Ok(value) => {
+                if step.returns {
+                    return_value = Some(value);
+                }
+            }
+            Err(resp) => {
+                // Step failed — return error immediately
+                return resp;
+            }
+        }
+
+        tracing::debug!("step {}/{} ({}) completed", i + 1, steps.len(), step.target);
+    }
+
+    // Return the value from the step marked with returns=true, or empty 200
+    match return_value {
+        Some(val) => (StatusCode::OK, Json(val)).into_response(),
+        None => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response(),
+    }
+}
+
+/// Execute a single step. Returns Ok(Value) on success, Err(Response) on failure.
+async fn execute_step(
+    state: &Arc<ProxyState>,
+    service_name: &str,
+    step: &crate::service::ApiStep,
+    body: &Bytes,
+    service_vault: &crate::auth::ServiceVault,
+) -> Result<serde_json::Value, Response> {
+    // ── Vault read step (target = "safeclaw.vault") ─────────────────────────
+    if step.target == "safeclaw.vault" {
+        return execute_vault_read(state, service_name, step);
+    }
+
+    // ── Exec step (target = "safeclaw" or "openclaw", with run command) ─────
+    if step.target == "safeclaw" || step.target == "openclaw" {
+        let command = step.run.as_deref().ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "exec step has no run command" })),
+            ).into_response()
+        })?;
+
+        let retry = step.retry.as_ref();
+        let max_attempts = retry.map(|r| r.attempts).unwrap_or(1);
+        let interval_ms = retry.map(|r| r.interval_ms).unwrap_or(500);
+
+        let mut last_err = String::new();
+        for attempt in 1..=max_attempts {
+            match execute_command(command, body, service_vault, &state.config.data_dir, &step.env).await {
+                Ok(value) => return Ok(value),
+                Err(e) => {
+                    last_err = e.clone();
+                    if attempt < max_attempts {
+                        tracing::debug!(
+                            "step '{}' attempt {}/{} failed: {}, retrying in {}ms",
+                            command, attempt, max_attempts, e, interval_ms
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(interval_ms)).await;
+                    }
+                }
+            }
+        }
+
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({
+                "error": format!("exec failed after {} attempts: {}", max_attempts, last_err)
+            })),
+        ).into_response());
+    }
+
+    // Unknown target
+    Err((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({ "error": format!("unknown step target: {}", step.target) })),
+    ).into_response())
+}
+
+/// Execute a vault read step: read a dotted path from vault secrets.
+pub(crate) fn execute_vault_read(
+    state: &Arc<ProxyState>,
+    _service_name: &str,
+    step: &crate::service::ApiStep,
+) -> Result<serde_json::Value, Response> {
+    let read_path = step.read.as_deref().ok_or_else(|| {
+        (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "empty command" })),
-        ).into_response();
+            Json(serde_json::json!({ "error": "vault read step has no read path" })),
+        ).into_response()
+    })?;
+
+    let secrets_guard = state.vault.secrets.lock().unwrap();
+    let secrets = secrets_guard.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "vault is locked" })),
+        ).into_response()
+    })?;
+
+    // Navigate the dotted path (e.g. "services.openclaw-dashboard.gatewayToken")
+    let mut current = secrets;
+    for segment in read_path.split('.') {
+        current = current.get(segment).ok_or_else(|| {
+            tracing::debug!("vault read: path '{}' not found at segment '{}'", read_path, segment);
+            (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": format!("vault path not found: {}", read_path),
+                    "code": "NOT_FOUND"
+                })),
+            ).into_response()
+        })?;
+    }
+
+    Ok(current.clone())
+}
+
+/// Execute a shell command. Returns Ok(Value) on success, Err(message) on failure.
+pub(crate) async fn execute_command(
+    command: &str,
+    body: &Bytes,
+    service_vault: &crate::auth::ServiceVault,
+    data_dir: &std::path::Path,
+    env: &HashMap<String, String>,
+) -> Result<serde_json::Value, String> {
+    let parts: Vec<&str> = command.split_whitespace().collect();
+    if parts.is_empty() {
+        return Err("empty command".into());
     }
 
     let mut cmd = tokio::process::Command::new(parts[0]);
@@ -796,62 +930,35 @@ async fn handle_local_service(
     cmd.env("HOME", data_dir);
 
     // Resolve env template variables and inject into subprocess.
-    // Supported: {{auth.secret}}
-    for (key, template) in &api.env {
+    for (key, template) in env {
         let resolved = resolve_env_template(template, service_vault);
         cmd.env(key, &resolved);
     }
 
-    let result = cmd.spawn();
-
-    let mut child = match result {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!("local exec failed to spawn '{}': {}", api.command, e);
-            return (
-                StatusCode::BAD_GATEWAY,
-                Json(serde_json::json!({ "error": format!("spawn failed: {}", e) })),
-            ).into_response();
-        }
-    };
+    let mut child = cmd.spawn().map_err(|e| format!("spawn failed: {}", e))?;
 
     // Write body to stdin
     if let Some(mut stdin) = child.stdin.take() {
         use tokio::io::AsyncWriteExt;
-        let _ = stdin.write_all(&body).await;
+        let _ = stdin.write_all(body).await;
         drop(stdin);
     }
 
-    match child.wait_with_output().await {
-        Ok(output) => {
-            let status = if output.status.success() {
-                StatusCode::OK
-            } else {
-                StatusCode::BAD_GATEWAY
-            };
+    let output = child.wait_with_output().await
+        .map_err(|e| format!("exec failed: {}", e))?;
 
-            let stdout = output.stdout;
-            // Try to parse as JSON, otherwise return as text
-            if let Ok(json_val) = serde_json::from_slice::<serde_json::Value>(&stdout) {
-                (status, Json(json_val)).into_response()
-            } else {
-                let mut resp = Response::new(axum::body::Body::from(stdout));
-                *resp.status_mut() = status;
-                resp.headers_mut().insert(
-                    axum::http::header::CONTENT_TYPE,
-                    axum::http::HeaderValue::from_static("text/plain; charset=utf-8"),
-                );
-                resp
-            }
-        }
-        Err(e) => {
-            tracing::warn!("local exec wait failed for '{}': {}", api.command, e);
-            (
-                StatusCode::BAD_GATEWAY,
-                Json(serde_json::json!({ "error": format!("exec failed: {}", e) })),
-            ).into_response()
-        }
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("exit code {}: {}", output.status, stderr.trim()));
     }
+
+    // Parse stdout as JSON, or wrap as string
+    let value = serde_json::from_slice::<serde_json::Value>(&output.stdout)
+        .unwrap_or_else(|_| {
+            serde_json::Value::String(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        });
+
+    Ok(value)
 }
 
 /// Resolve `{{auth.secret}}` (and future templates) against vault service config.

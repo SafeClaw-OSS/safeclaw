@@ -280,7 +280,8 @@ mod tests {
         use crate::passkey::nonce::NonceStore;
         use crate::config::Config;
         use crate::crypto::keys::generate_keypair;
-        use crate::state::{AppState, RateLimiter, VaultState};
+        use crate::state::{AppState, RateLimiter};
+        use crate::vault::Vault;
 
         fn make_test_state() -> Arc<AppState> {
             let config = Config {
@@ -298,7 +299,7 @@ mod tests {
                 init: false,
             };
             let keypair = generate_keypair().expect("generate_keypair failed");
-            let vault = Arc::new(VaultState::new());
+            let vault = Arc::new(Vault::new());
             let audit_log = Arc::new(
                 AuditLog::open_in_memory().expect("audit log failed"),
             );
@@ -566,49 +567,213 @@ mod tests {
         }
     }
 
-    // ── VaultState approval session cache ────────────────────────────────────────
+    // ── Multi-step execution engine ─────────────────────────────────────────────
 
-    mod vault_approval_cache {
-        use crate::state::VaultState;
+    mod multi_step_engine {
+        use std::sync::Arc;
+        use crate::vault::Vault;
+        use crate::core::router::ProxyState;
+        use crate::config::Config;
+        use crate::core::approval::ApprovalManager;
+        use crate::core::audit::AuditLog;
+        use crate::service::ServiceRegistry;
 
-        fn dummy_auth() -> serde_json::Value {
-            serde_json::json!({"type": "bearer", "secret": "tok"})
+        fn make_proxy_state_with_vault(vault_json: serde_json::Value) -> Arc<ProxyState> {
+            let vault = Arc::new(Vault::new());
+            vault.set_secrets(vault_json);
+            let audit = Arc::new(AuditLog::open_in_memory().unwrap());
+            Arc::new(ProxyState {
+                vault,
+                config: Config {
+                    data_dir: std::path::PathBuf::from("/tmp/safeclaw-test"),
+                    port: 23294,
+                    bind: "127.0.0.1".into(),
+                    proxy_port: 23295,
+                    proxy_bind: "127.0.0.1".into(),
+                    origin: None,
+                    rp_id: None,
+                    admin_url: None,
+                    instance_id: None,
+                    rate_limit: 0,
+                    rate_limit_exempt: vec![],
+                    init: false,
+                },
+                approval_manager: Arc::new(ApprovalManager::new(audit.clone())),
+                audit_log: audit,
+                services: ServiceRegistry::load(),
+            })
         }
 
         #[test]
-        fn no_session_initially() {
-            let vs = VaultState::new();
-            assert!(vs.check_approval_session("github").is_none());
+        fn vault_read_dotted_path_navigates_correctly() {
+            let state = make_proxy_state_with_vault(serde_json::json!({
+                "services": {
+                    "openclaw-dashboard": {
+                        "gatewayToken": "gw_tok_12345"
+                    }
+                }
+            }));
+
+            let step = crate::service::ApiStep {
+                target: "safeclaw.vault".into(),
+                run: None,
+                env: std::collections::HashMap::new(),
+                read: Some("services.openclaw-dashboard.gatewayToken".into()),
+                returns: true,
+                retry: None,
+                title: None,
+                note: None,
+            };
+
+            let result = crate::core::router::execute_vault_read(&state, "openclaw-dashboard", &step);
+            assert!(result.is_ok(), "vault read should succeed");
+            assert_eq!(result.unwrap(), "gw_tok_12345");
         }
 
         #[test]
-        fn long_ttl_session_is_valid() {
-            let vs = VaultState::new();
-            vs.set_approval_session("github", dummy_auth(), 3600);
-            assert!(vs.check_approval_session("github").is_some());
+        fn vault_read_missing_path_returns_error() {
+            let state = make_proxy_state_with_vault(serde_json::json!({
+                "services": {}
+            }));
+
+            let step = crate::service::ApiStep {
+                target: "safeclaw.vault".into(),
+                run: None,
+                env: std::collections::HashMap::new(),
+                read: Some("services.nonexistent.token".into()),
+                returns: true,
+                retry: None,
+                title: None,
+                note: None,
+            };
+
+            let result = crate::core::router::execute_vault_read(&state, "test", &step);
+            assert!(result.is_err(), "should fail for missing path");
         }
 
         #[test]
-        fn cached_auth_is_returned() {
-            let vs = VaultState::new();
-            vs.set_approval_session("github", dummy_auth(), 3600);
-            let auth = vs.check_approval_session("github").expect("should be present");
-            assert_eq!(auth["type"], "bearer");
+        fn vault_read_no_read_field_returns_error() {
+            let state = make_proxy_state_with_vault(serde_json::json!({
+                "services": {}
+            }));
+
+            let step = crate::service::ApiStep {
+                target: "safeclaw.vault".into(),
+                run: None,
+                env: std::collections::HashMap::new(),
+                read: None, // no read path
+                returns: true,
+                retry: None,
+                title: None,
+                note: None,
+            };
+
+            let result = crate::core::router::execute_vault_read(&state, "test", &step);
+            assert!(result.is_err());
         }
 
         #[test]
-        fn zero_ttl_session_is_expired() {
-            let vs = VaultState::new();
-            vs.set_approval_session("github", dummy_auth(), 0);
-            assert!(vs.check_approval_session("github").is_none());
+        fn vault_read_locked_returns_unavailable() {
+            let vault = Arc::new(Vault::new());
+            // Don't set secrets → vault stays locked
+            let audit = Arc::new(AuditLog::open_in_memory().unwrap());
+            let state = Arc::new(ProxyState {
+                vault,
+                config: Config {
+                    data_dir: std::path::PathBuf::from("/tmp"),
+                    port: 23294,
+                    bind: "127.0.0.1".into(),
+                    proxy_port: 23295,
+                    proxy_bind: "127.0.0.1".into(),
+                    origin: None,
+                    rp_id: None,
+                    admin_url: None,
+                    instance_id: None,
+                    rate_limit: 0,
+                    rate_limit_exempt: vec![],
+                    init: false,
+                },
+                approval_manager: Arc::new(ApprovalManager::new(audit.clone())),
+                audit_log: audit,
+                services: ServiceRegistry::load(),
+            });
+
+            let step = crate::service::ApiStep {
+                target: "safeclaw.vault".into(),
+                run: None,
+                env: std::collections::HashMap::new(),
+                read: Some("services.x.token".into()),
+                returns: true,
+                retry: None,
+                title: None,
+                note: None,
+            };
+
+            let result = crate::core::router::execute_vault_read(&state, "test", &step);
+            assert!(result.is_err(), "should fail when vault is locked");
         }
 
-        #[test]
-        fn lock_clears_cache() {
-            let vs = VaultState::new();
-            vs.set_approval_session("github", dummy_auth(), 3600);
-            vs.lock();
-            assert!(vs.check_approval_session("github").is_none());
+        #[tokio::test]
+        async fn execute_command_succeeds() {
+            let body = hyper::body::Bytes::new();
+            let vault = crate::auth::ServiceVault {
+                upstream: None,
+                auth: None,
+                levels: None,
+                rules: None,
+                category: None,
+            };
+            let result = crate::core::router::execute_command(
+                "echo hello",
+                &body,
+                &vault,
+                std::path::Path::new("/tmp"),
+                &std::collections::HashMap::new(),
+            ).await;
+            assert!(result.is_ok());
+            assert_eq!(result.unwrap().as_str().unwrap().trim(), "hello");
+        }
+
+        #[tokio::test]
+        async fn execute_command_failure_returns_err() {
+            let body = hyper::body::Bytes::new();
+            let vault = crate::auth::ServiceVault {
+                upstream: None,
+                auth: None,
+                levels: None,
+                rules: None,
+                category: None,
+            };
+            let result = crate::core::router::execute_command(
+                "false",  // always exits with code 1
+                &body,
+                &vault,
+                std::path::Path::new("/tmp"),
+                &std::collections::HashMap::new(),
+            ).await;
+            assert!(result.is_err());
+            assert!(result.unwrap_err().contains("exit code"));
+        }
+
+        #[tokio::test]
+        async fn execute_command_nonexistent_binary_returns_err() {
+            let body = hyper::body::Bytes::new();
+            let vault = crate::auth::ServiceVault {
+                upstream: None,
+                auth: None,
+                levels: None,
+                rules: None,
+                category: None,
+            };
+            let result = crate::core::router::execute_command(
+                "/nonexistent/binary",
+                &body,
+                &vault,
+                std::path::Path::new("/tmp"),
+                &std::collections::HashMap::new(),
+            ).await;
+            assert!(result.is_err());
+            assert!(result.unwrap_err().contains("spawn failed"));
         }
     }
 

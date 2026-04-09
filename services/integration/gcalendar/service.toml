@@ -4,12 +4,17 @@ name = "Google Calendar"
 sub = "Google"
 category = "integration"
 
-[upstream]
+[[upstream]]
+id = "default"
 url = "https://www.googleapis.com/calendar/v3"
+auth = { type = "oauth2", provider = "google" }
 
-[upstream.auth]
-type = "oauth2"
-provider = "google"
+[[api]]
+path = "*"
+
+  [[api.steps]]
+  target = "upstream:default"
+  returns = true
 
 [policy.levels]
 read = "allow"

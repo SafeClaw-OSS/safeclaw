@@ -4,12 +4,17 @@ name = "Gmail"
 sub = "Google"
 category = "integration"
 
-[upstream]
+[[upstream]]
+id = "default"
 url = "https://gmail.googleapis.com"
+auth = { type = "oauth2", provider = "google" }
 
-[upstream.auth]
-type = "oauth2"
-provider = "google"
+[[api]]
+path = "*"
+
+  [[api.steps]]
+  target = "upstream:default"
+  returns = true
 
 [policy.levels]
 read = "ask"

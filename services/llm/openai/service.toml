@@ -5,18 +5,18 @@ sub = "API Key"
 category = "llm"
 group = "openai"
 
-[upstream]
+[[upstream]]
+id = "default"
 url = "https://api.openai.com"
+auth = { type = "bearer", placeholder = "sk-..." }
+locked = { response = "Please unlock the SafeClaw vault to use this service." }
 
-[upstream.auth]
-type = "bearer"
-key_placeholder = "sk-..."
+[[api]]
+path = "*"
 
-[upstream.locked]
-template = "openai"
-
-[upstream.locked.routes]
-"/responses" = "openai-responses"
+  [[api.steps]]
+  target = "upstream:default"
+  returns = true
 
 [policy.levels]
 read = "allow"

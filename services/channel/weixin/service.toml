@@ -4,11 +4,17 @@ name = "WeChat iLink"
 sub = "Messaging"
 category = "channel"
 
-[upstream]
+[[upstream]]
+id = "default"
 url = "https://ilinkai.weixin.qq.com"
+auth = { type = "bearer" }
 
-[upstream.auth]
-type = "bearer"
+[[api]]
+path = "*"
+
+  [[api.steps]]
+  target = "upstream:default"
+  returns = true
 
 [policy.levels]
 read = "allow"

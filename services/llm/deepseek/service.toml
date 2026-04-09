@@ -4,15 +4,18 @@ name = "DeepSeek"
 sub = "DeepSeek API"
 category = "llm"
 
-[upstream]
+[[upstream]]
+id = "default"
 url = "https://api.deepseek.com"
+auth = { type = "bearer", placeholder = "sk-..." }
+locked = { response = "Please unlock the SafeClaw vault to use this service." }
 
-[upstream.auth]
-type = "bearer"
-key_placeholder = "sk-..."
+[[api]]
+path = "*"
 
-[upstream.locked]
-template = "openai"
+  [[api.steps]]
+  target = "upstream:default"
+  returns = true
 
 [policy.levels]
 read = "allow"

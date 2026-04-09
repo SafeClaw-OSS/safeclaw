@@ -1,7 +1,7 @@
-/// Cooker — recipe loading and consumption engine.
+/// Cooker — recipe loading and consumption engine (protocol v2).
 ///
 /// Loads recipe.toml definitions from filesystem or compiled-in defaults.
-/// Provides recipe data to consumers (NL-Cooker, future local executor, etc.)
+/// Provides recipe data to consumers (NL-Cooker, dispatch_cook, etc.)
 pub mod nl;
 
 use std::path::Path;
@@ -11,7 +11,6 @@ use std::path::Path;
 #[derive(Debug, serde::Deserialize)]
 pub struct Recipe {
     pub recipe: Option<RecipeMeta>,
-    pub openclaw: Option<OpenClawDef>,
     pub passkey_sharing: Option<PasskeySharingDef>,
     #[serde(default)]
     pub steps: Vec<Step>,
@@ -23,28 +22,6 @@ pub struct RecipeMeta {
     pub id: Option<String>,
     #[serde(default)]
     pub display_name: Option<String>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-pub struct OpenClawDef {
-    #[serde(default)]
-    pub plugin: Option<String>,
-    #[serde(default)]
-    pub api: Option<String>,
-    #[serde(default)]
-    pub env_key: Option<String>,
-    #[serde(default)]
-    pub env_base_url: Option<String>,
-    #[serde(default)]
-    pub proxy_path: Option<String>,
-    #[serde(default)]
-    pub models: Vec<ModelDef>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-pub struct ModelDef {
-    pub id: String,
-    pub name: String,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -72,7 +49,10 @@ pub struct Step {
     pub files: Option<Vec<serde_json::Value>>,
     #[serde(default)]
     pub restart: Option<bool>,
-    /// Which environment executes this step: "safeclaw" or "openclaw" (default).
+    #[serde(default)]
+    pub env: Option<std::collections::HashMap<String, String>>,
+    /// Which environment executes this step. Required in v2.
+    /// Values: "safeclaw", "safeclaw.vault", "openclaw"
     #[serde(default = "default_step_target")]
     pub target: String,
 }

@@ -1,10 +1,13 @@
-[openclaw]
-plugin = "groq"
-api = "openai-completions"
-env_key = "GROQ_API_KEY"
-env_base_url = "GROQ_BASE_URL"
-proxy_path = "/groq/openai/v1"
+[recipe]
+id = "groq"
+display_name = "Groq"
 
-[[openclaw.models]]
-id = "llama-3.3-70b-versatile"
-name = "Llama 3.3 70B"
+[[steps]]
+title = "Register Groq provider"
+target = "openclaw"
+run = """openclaw config set models.providers.groq '{"apiKey":"sk-safeclaw-proxy","baseUrl":"http://localhost:{{proxy_port}}/groq/openai/v1","api":"openai-completions","models":[]}' --strict-json"""
+
+[[steps]]
+title = "Restart OpenClaw"
+target = "openclaw"
+restart = true

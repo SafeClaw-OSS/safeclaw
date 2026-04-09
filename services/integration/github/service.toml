@@ -4,12 +4,17 @@ name = "GitHub"
 sub = "REST API"
 category = "integration"
 
-[upstream]
+[[upstream]]
+id = "default"
 url = "https://api.github.com"
+auth = { type = "bearer", placeholder = "ghp_..." }
 
-[upstream.auth]
-type = "bearer"
-key_placeholder = "ghp_..."
+[[api]]
+path = "*"
+
+  [[api.steps]]
+  target = "upstream:default"
+  returns = true
 
 [policy.levels]
 read = "allow"

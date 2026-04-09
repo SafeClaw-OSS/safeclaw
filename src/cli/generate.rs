@@ -51,14 +51,14 @@ pub fn generate_safeclaw_md(secrets: &serde_json::Value, locked: bool, proxy_por
         for (name, svc) in services {
             // Skip internal services — check both vault data and service.toml
             let has_upstream = crate::service::is_proxy_service(svc)
-                || registry.get(name).and_then(|d| d.upstream.as_ref()).is_some();
+                || registry.has_upstream(name);
             if !has_upstream {
                 continue;
             }
             let proxy_url = format!("{}/{}/", proxy_base, name);
             let upstream = if locked || svc.is_null() { "-".to_string() } else {
                 svc.get("upstream").and_then(|u| u.as_str())
-                    .or_else(|| registry.get(name).and_then(|d| d.upstream.as_ref()).and_then(|u| u.url.as_deref()))
+                    .or_else(|| registry.get(name).and_then(|d| d.upstream_url()))
                     .unwrap_or("local").to_string()
             };
             let auth = if locked || svc.is_null() { "-".to_string() } else { auth_display(svc) };

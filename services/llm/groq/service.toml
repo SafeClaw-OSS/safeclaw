@@ -4,15 +4,18 @@ name = "Groq"
 sub = "Fast inference"
 category = "llm"
 
-[upstream]
+[[upstream]]
+id = "default"
 url = "https://api.groq.com/openai/v1"
+auth = { type = "bearer", placeholder = "gsk_..." }
+locked = { response = "Please unlock the SafeClaw vault to use this service." }
 
-[upstream.auth]
-type = "bearer"
-key_placeholder = "gsk_..."
+[[api]]
+path = "*"
 
-[upstream.locked]
-template = "openai"
+  [[api.steps]]
+  target = "upstream:default"
+  returns = true
 
 [policy.levels]
 read = "allow"

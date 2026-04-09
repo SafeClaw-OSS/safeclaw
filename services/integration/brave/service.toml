@@ -4,13 +4,17 @@ name = "Brave Search"
 sub = "Web search"
 category = "integration"
 
-[upstream]
+[[upstream]]
+id = "default"
 url = "https://api.search.brave.com"
+auth = { type = "header", header = "X-Subscription-Token", placeholder = "BSA..." }
 
-[upstream.auth]
-type = "header"
-header = "X-Subscription-Token"
-key_placeholder = "BSA..."
+[[api]]
+path = "*"
+
+  [[api.steps]]
+  target = "upstream:default"
+  returns = true
 
 [policy.levels]
 read = "allow"

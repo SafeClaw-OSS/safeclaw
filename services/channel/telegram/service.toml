@@ -4,11 +4,17 @@ name = "Telegram"
 sub = "Bot API"
 category = "channel"
 
-[upstream]
+[[upstream]]
+id = "default"
 url = "https://api.telegram.org"
+auth = { type = "path" }
 
-[upstream.auth]
-type = "path"
+[[api]]
+path = "*"
+
+  [[api.steps]]
+  target = "upstream:default"
+  returns = true
 
 [policy.levels]
 read = "allow"

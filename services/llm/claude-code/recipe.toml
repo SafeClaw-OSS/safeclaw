@@ -1,21 +1,31 @@
-[openclaw]
-plugin = "anthropic"
-api = "anthropic-messages"
-env_key = "ANTHROPIC_API_KEY"
-env_base_url = "ANTHROPIC_BASE_URL"
-proxy_path = "/anthropic/v1"
+[recipe]
+id = "claude-code"
+display_name = "Claude Code"
 
-[[openclaw.models]]
-id = "claude-sonnet-4-20250514"
-name = "Claude Sonnet 4"
+[[steps]]
+title = "Register Anthropic provider"
+target = "openclaw"
+run = """openclaw config set models.providers.anthropic '{"apiKey":"sk-safeclaw-proxy","baseUrl":"http://localhost:{{proxy_port}}/anthropic/v1","api":"anthropic-messages","models":[]}' --strict-json"""
 
-[[openclaw.models]]
-id = "claude-opus-4-20250514"
-name = "Claude Opus 4"
+[[steps]]
+title = "Configure Claude CLI backend"
+target = "openclaw"
+run = """openclaw config set agents.defaults.cliBackends '{"claude-cli":{"command":"/usr/local/bin/claude"}}' --strict-json"""
 
-[[openclaw.models]]
-id = "claude-haiku-3-5-20241022"
-name = "Claude Haiku 3.5"
+[[steps]]
+title = "Disable sandbox for Claude CLI"
+target = "openclaw"
+run = """openclaw config set agents.defaults.sandbox '{"mode":"off"}' --strict-json"""
 
-[openclaw.claude_cli]
-credentials_path = "/root/.claude/.credentials.json"
+[[steps]]
+title = "Write Claude CLI credentials"
+target = "openclaw"
+files = [
+  { path = ".claude/.credentials.json", template = "claude-credentials.json" },
+]
+note = "Writes OAuth tokens to the Claude CLI credentials file"
+
+[[steps]]
+title = "Restart OpenClaw"
+target = "openclaw"
+restart = true

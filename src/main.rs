@@ -11,6 +11,7 @@ mod passkey;
 mod service;
 mod server;
 mod state;
+mod vault;
 #[cfg(test)]
 mod tests;
 
@@ -26,7 +27,8 @@ use core::approval::ApprovalManager;
 use core::audit::AuditLog;
 use config::Config;
 use crypto::keys::load_or_create_keypair;
-use state::{AppState, RateLimiter, VaultState};
+use state::{AppState, RateLimiter};
+use vault::Vault;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -93,7 +95,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let approval_manager = Arc::new(ApprovalManager::new(audit_log.clone()));
 
     // Build shared vault state
-    let vault = Arc::new(VaultState::new());
+    let vault = Arc::new(Vault::new());
 
     // Build app state
     let state = Arc::new(AppState {
