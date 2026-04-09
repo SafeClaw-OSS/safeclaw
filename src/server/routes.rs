@@ -841,7 +841,7 @@ fn dispatch_cook(secrets: serde_json::Value, proxy_port: u16, console_url: Strin
                 steps.push(serde_json::json!({
                     "title": "Set Telegram owner",
                     "target": "openclaw",
-                    "run": format!("openclaw config set channels.telegram.allowFrom '[\"{}\"]' --strict-json", owner_id)
+                    "run": format!("openclaw config set channels.telegram.ownerId '{}'", owner_id)
                 }));
             }
         }
