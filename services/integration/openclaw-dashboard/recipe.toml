@@ -12,6 +12,19 @@ title = "Set allowed origins"
 target = "openclaw"
 run = """openclaw config set gateway.controlUi.allowedOrigins '["https://www.safeclaw.pro"]' --strict-json"""
 
+# gateway.auth.token is set dynamically via the frontend-provided recipe
+# (token generated client-side, included in inline recipe steps)
+
+[[steps]]
+title = "Bind to LAN"
+target = "openclaw"
+run = "openclaw config set gateway.bind lan"
+
+[[steps]]
+title = "Open firewall port"
+target = "host"
+run = "ufw allow 18789/tcp"
+
 [[steps]]
 title = "Restart OpenClaw"
 target = "openclaw"
