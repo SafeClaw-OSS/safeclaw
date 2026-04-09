@@ -51,6 +51,10 @@ Additional fields available only in API steps: `read`, `returns`, `retry`, `meth
 
 ```
 services/
+  system/                       ← runs first (before all other categories)
+    openclaw-runtime/
+      service.toml
+      recipe.toml
   llm/
     anthropic/
       service.toml
@@ -68,6 +72,15 @@ services/
     ...
 ```
 
+### Category execution order
+
+| Category | Priority | Description |
+|----------|----------|-------------|
+| `system` | **first** | Environment bootstrap. Runs before any service recipe to set up gateway lifecycle, model catalog, exec approvals, etc. Not user-visible. |
+| `llm`, `channel`, `integration` | normal | User-facing services. Run after system recipes, in vault enumeration order. |
+
+`dispatch_cook` loads all `category = "system"` recipes first, then iterates enabled services. System recipe steps are idempotent — they run on every cook.
+
 ---
 
 ## service.toml
@@ -81,7 +94,7 @@ Defines how a service behaves at runtime: identity, upstream connections, API en
 id = "openai"                   # Machine identifier (vault key, proxy route). Required.
 name = "OpenAI"                 # Human-readable name. Required.
 sub = "API Key"                 # Short tagline (card subtitle). Optional.
-category = "llm"                # llm | channel | integration. Required.
+category = "llm"                # system | llm | channel | integration. Required.
 group = "openai"                # UI merge key — services with the same group value
                                 # display as one card with multiple auth tabs. Optional.
 ```
