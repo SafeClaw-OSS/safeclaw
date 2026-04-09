@@ -833,15 +833,16 @@ fn dispatch_cook(secrets: serde_json::Value, proxy_port: u16, console_url: Strin
                 "target": "openclaw",
                 "run": format!("openclaw config set channels.telegram.botToken '{}'", token.replace('\'', "'\\''"))
             }));
+            // ownerId lives in secrets.channels.telegram (frontend puts it there via configChannels)
             if let Some(owner_id) = secrets
-                .get("services").and_then(|s| s.get("telegram"))
-                .and_then(|t| t.get("owner_id").or_else(|| t.get("ownerId")))
+                .get("channels").and_then(|c| c.get("telegram"))
+                .and_then(|t| t.get("ownerId").or_else(|| t.get("owner_id")))
                 .and_then(|o| o.as_str())
             {
                 steps.push(serde_json::json!({
-                    "title": "Set Telegram owner",
+                    "title": "Set Telegram allow list",
                     "target": "openclaw",
-                    "run": format!("openclaw config set channels.telegram.ownerId '{}'", owner_id)
+                    "run": format!("openclaw config set channels.telegram.allowFrom '[\"{}\"]' --strict-json", owner_id)
                 }));
             }
         }
