@@ -21,3 +21,7 @@ path = "/access"
   target = "openclaw"
   run = "openclaw devices approve --latest"
   retry = { attempts = 6, interval_ms = 500 }
+
+[policy.levels]
+read = "allow"
+write = "allow"
