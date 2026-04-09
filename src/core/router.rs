@@ -795,8 +795,13 @@ async fn handle_local_service(
                 }
             }
             Err(resp) => {
-                // Step failed — return error immediately
-                return resp;
+                if return_value.is_some() {
+                    // A returns=true step already succeeded — log and continue
+                    tracing::warn!("step {}/{} ({}) failed after return value captured, ignoring", i + 1, steps.len(), step.target);
+                } else {
+                    // No return value yet — fail immediately
+                    return resp;
+                }
             }
         }
 
