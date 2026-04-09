@@ -81,6 +81,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 
         // ── Vault Service CRUD ───────────────────────────────────────────────
         .route("/vault/services", get(vault_services_list))
+        .route("/vault/services/{name}/{key}", get(vault_service_field))
         .route("/vault/services/add", post(vault_services_add))
         .route("/vault/services/update", post(vault_services_update))
         .route("/vault/services/remove", post(vault_services_remove))

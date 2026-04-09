@@ -958,6 +958,33 @@ pub async fn vault_services_list(
     Json(json!({ "services": services }))
 }
 
+/// GET /vault/services/:name/:key — read a single vault field for a service.
+/// Returns the value directly (no passkey required — vault must be unlocked).
+/// Only fields declared as [[vault]] in service.toml are accessible.
+pub async fn vault_service_field(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path((name, key)): axum::extract::Path<(String, String)>,
+) -> Result<impl IntoResponse> {
+    // Validate: only declared vault fields are readable
+    let fields = state.services.vault_fields(&name);
+    if !fields.iter().any(|f| f.name == key) {
+        return Err(AppError::BadRequest(format!("no such vault field: {}.{}", name, key)));
+    }
+
+    let secrets = state.vault.secrets.lock().unwrap();
+    let secrets = secrets.as_ref()
+        .ok_or_else(|| AppError::BadRequest("vault is locked".into()))?;
+
+    let value = secrets
+        .get("services")
+        .and_then(|s| s.get(&name))
+        .and_then(|svc| svc.get(&key))
+        .cloned()
+        .ok_or_else(|| AppError::BadRequest(format!("field not found: {}.{}", name, key)))?;
+
+    Ok(Json(value))
+}
+
 /// POST /vault/services/add — add or replace a service (passkey required)
 pub async fn vault_services_add(
     State(state): State<Arc<AppState>>,
