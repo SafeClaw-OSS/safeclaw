@@ -64,7 +64,7 @@ fn default_step_target() -> String { "openclaw".to_string() }
 /// Load a recipe by service ID. Checks filesystem first, falls back to compiled-in.
 pub fn load_recipe(service_id: &str) -> Option<Recipe> {
     // Try filesystem paths
-    let categories = ["llm", "channel", "integration"];
+    let categories = ["system", "llm", "channel", "integration"];
     let base_dirs = discover_base_dirs();
 
     for base in &base_dirs {

@@ -779,34 +779,25 @@ fn dispatch_cook(secrets: serde_json::Value, proxy_port: u16, console_url: Strin
         // Build steps in recipe format — provisioner executes them directly.
         let mut steps: Vec<serde_json::Value> = vec![];
 
-        // ── Bootstrap: global openclaw config (idempotent, runs every cook) ────
-        steps.push(serde_json::json!({
-            "title": "Bootstrap gateway mode",
-            "target": "openclaw",
-            "run": "openclaw config set gateway.mode local"
-        }));
-        steps.push(serde_json::json!({
-            "title": "Bootstrap models mode",
-            "target": "openclaw",
-            "run": "openclaw config set models.mode replace"
-        }));
-        steps.push(serde_json::json!({
-            "title": "Bootstrap thinking default",
-            "target": "openclaw",
-            "run": "openclaw config set agents.defaults.thinkingDefault adaptive"
-        }));
-        // Disable openclaw exec approval prompts — VM is sandboxed, SafeClaw handles auth.
-        steps.push(serde_json::json!({
-            "title": "Bootstrap exec approvals",
-            "target": "openclaw",
-            "files": [{
-                "path": ".openclaw/exec-approvals.json",
-                "content": serde_json::json!({
-                    "version": 1,
-                    "defaults": { "security": "full", "ask": "off", "autoAllowSkills": true }
-                }).to_string()
-            }]
-        }));
+        // ── System recipes (category = "system") run first, before any service recipes.
+        // Currently: openclaw-runtime (gateway lifecycle, model catalog, exec approvals).
+        {
+            let system_recipes = crate::generated_services::compiled_recipe_tomls();
+            let system_services = crate::generated_services::compiled_service_tomls();
+            for (id, _toml_str) in system_services {
+                // Only include system-category services
+                if let Ok(def) = toml::from_str::<crate::service::ServiceDef>(_toml_str) {
+                    if def.service.category != "system" { continue; }
+                }
+                if let Some(recipe) = crate::cooker::load_recipe(id) {
+                    for step in &recipe.steps {
+                        if let Ok(val) = serde_json::to_value(step) {
+                            steps.push(val);
+                        }
+                    }
+                }
+            }
+        }
 
         // Workspace files
         steps.push(serde_json::json!({
