@@ -5,7 +5,7 @@ display_name = "Claude Code"
 [[steps]]
 title = "Register Anthropic provider"
 target = "openclaw"
-run = """openclaw config set models.providers.anthropic '{"apiKey":"sk-safeclaw-proxy","baseUrl":"http://localhost:{{proxy_port}}/anthropic/v1","api":"anthropic-messages","models":[]}' --strict-json"""
+run = """openclaw config set models.providers.anthropic '{"apiKey":"sk-safeclaw-proxy","baseUrl":"http://localhost:{{safeclaw.proxy_port}}/anthropic/v1","api":"anthropic-messages","models":[]}' --strict-json"""
 
 [[steps]]
 title = "Configure Claude CLI backend"

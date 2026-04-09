@@ -5,7 +5,7 @@ display_name = "OpenAI"
 [[steps]]
 title = "Register OpenAI provider"
 target = "openclaw"
-run = """openclaw config set models.providers.openai '{"apiKey":"sk-safeclaw-proxy","baseUrl":"http://localhost:{{proxy_port}}/openai/v1","api":"openai-completions","models":[]}' --strict-json"""
+run = """openclaw config set models.providers.openai '{"apiKey":"sk-safeclaw-proxy","baseUrl":"http://localhost:{{safeclaw.proxy_port}}/openai/v1","api":"openai-completions","models":[]}' --strict-json"""
 
 [[steps]]
 title = "Restart OpenClaw"

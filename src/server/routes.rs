@@ -870,13 +870,13 @@ fn dispatch_cook(secrets: serde_json::Value, proxy_port: u16, console_url: Strin
         // Built-in recipe steps first, then vault-side steps (overrides/additions).
         if let Some(svcs) = secrets.get("services").and_then(|s| s.as_object()) {
             let resolve = |s: &str, svc_id: &str, svc_data: &serde_json::Value| -> String {
-                let mut result = s.replace("{{proxy_port}}", &proxy_port.to_string())
-                    .replace("{{admin_port}}", &console_url.split(':').last().unwrap_or("23294"))
-                    .replace("{{admin_url}}", &console_url)
-                    .replace("{{service_id}}", svc_id);
-                // Resolve {{config.KEY}} from service vault data
-                while let Some(start) = result.find("{{config.") {
-                    let rest = &result[start + 9..];
+                let mut result = s.replace("{{safeclaw.proxy_port}}", &proxy_port.to_string())
+                    .replace("{{safeclaw.admin_port}}", &console_url.split(':').last().unwrap_or("23294"))
+                    .replace("{{safeclaw.admin_url}}", &console_url)
+                    .replace("{{service.id}}", svc_id);
+                // Resolve {{service.vault.KEY}} from service vault data
+                while let Some(start) = result.find("{{service.vault.") {
+                    let rest = &result[start + 16..];
                     if let Some(end) = rest.find("}}") {
                         let key = &rest[..end];
                         let val = svc_data.get(key)

@@ -5,7 +5,7 @@ display_name = "Google AI"
 [[steps]]
 title = "Register Google AI provider"
 target = "openclaw"
-run = """openclaw config set models.providers.google '{"apiKey":"sk-safeclaw-proxy","baseUrl":"http://localhost:{{proxy_port}}/google/v1beta","api":"google-generative-ai","models":[]}' --strict-json"""
+run = """openclaw config set models.providers.google '{"apiKey":"sk-safeclaw-proxy","baseUrl":"http://localhost:{{safeclaw.proxy_port}}/google/v1beta","api":"google-generative-ai","models":[]}' --strict-json"""
 
 [[steps]]
 title = "Restart OpenClaw"

@@ -15,7 +15,7 @@ run = "openclaw plugins enable openclaw-weixin"
 [[steps]]
 title = "Configure WeChat channel"
 target = "openclaw"
-run = """openclaw config set channels.openclaw-weixin '{"enabled":true,"options":{"base_url":"http://localhost:{{proxy_port}}/wechat","token":"sk-dummy-safeclaw-wechat"}}' --strict-json"""
+run = """openclaw config set channels.openclaw-weixin '{"enabled":true,"options":{"base_url":"http://localhost:{{safeclaw.proxy_port}}/wechat","token":"sk-dummy-safeclaw-wechat"}}' --strict-json"""
 
 [[steps]]
 title = "Create account config"

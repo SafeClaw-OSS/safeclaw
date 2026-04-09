@@ -5,7 +5,7 @@ display_name = "DeepSeek"
 [[steps]]
 title = "Register DeepSeek provider"
 target = "openclaw"
-run = """openclaw config set models.providers.deepseek '{"apiKey":"sk-safeclaw-proxy","baseUrl":"http://localhost:{{proxy_port}}/deepseek/v1","api":"openai-completions","models":[]}' --strict-json"""
+run = """openclaw config set models.providers.deepseek '{"apiKey":"sk-safeclaw-proxy","baseUrl":"http://localhost:{{safeclaw.proxy_port}}/deepseek/v1","api":"openai-completions","models":[]}' --strict-json"""
 
 [[steps]]
 title = "Restart OpenClaw"
