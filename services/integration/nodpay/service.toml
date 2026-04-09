@@ -4,6 +4,11 @@ name = "NodPay"
 sub = "Web3 agent wallet"
 category = "integration"
 
+[[vault]]
+name = "wallet"
+kind = "config"
+description = "On-chain wallet state (safe address, signers, passkey coords)"
+
 [[api]]
 method = "POST"
 path = "/sign"

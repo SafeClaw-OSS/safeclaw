@@ -19,9 +19,28 @@ pub struct ServiceDef {
     pub upstream: Vec<UpstreamDef>,
     #[serde(default)]
     pub api: Vec<ApiDef>,
+    #[serde(default)]
+    pub vault: Vec<VaultField>,
     pub policy: Option<PolicyDef>,
     pub guidance: Option<GuidanceDef>,
 }
+
+/// Declares a field stored in the vault for this service.
+/// Used for schema validation, documentation, and frontend form generation.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct VaultField {
+    /// Key name in the vault JSON (e.g. "gatewayToken").
+    pub name: String,
+    /// "secret" if the value should be masked in UI / never logged.
+    /// Omit or use "config" for non-sensitive values.
+    #[serde(default = "default_vault_kind")]
+    pub kind: String,
+    /// Human-readable description for docs and UI labels.
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+fn default_vault_kind() -> String { "config".to_string() }
 
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct GuidanceDef {
@@ -356,6 +375,13 @@ impl ServiceRegistry {
             && def.api.iter().all(|api| {
                 api.steps.iter().all(|s| !s.target.starts_with("upstream:"))
             })
+    }
+
+    /// Get vault field declarations for a service.
+    pub fn vault_fields(&self, service_name: &str) -> &[VaultField] {
+        self.services.get(service_name)
+            .map(|d| d.vault.as_slice())
+            .unwrap_or(&[])
     }
 
     /// Find a matching local API definition for the given method + path.
@@ -811,5 +837,65 @@ path = "/do"
         services.insert("x".into(), def);
         let reg = ServiceRegistry { services };
         assert!(reg.find_local_api("x", "GET", "/do").is_none());
+    }
+
+    // ── vault field parsing ──────────────────────────────────────────────────
+
+    #[test]
+    fn parse_vault_fields() {
+        let toml_str = r#"
+[service]
+id = "dashboard"
+name = "Dashboard"
+
+[[vault]]
+name = "gatewayToken"
+kind = "secret"
+description = "Auth token"
+
+[[vault]]
+name = "theme"
+description = "UI theme preference"
+"#;
+        let def: ServiceDef = toml::from_str(toml_str).unwrap();
+        assert_eq!(def.vault.len(), 2);
+        assert_eq!(def.vault[0].name, "gatewayToken");
+        assert_eq!(def.vault[0].kind, "secret");
+        assert_eq!(def.vault[0].description.as_deref(), Some("Auth token"));
+        assert_eq!(def.vault[1].name, "theme");
+        assert_eq!(def.vault[1].kind, "config"); // default
+        assert_eq!(def.vault[1].description.as_deref(), Some("UI theme preference"));
+    }
+
+    #[test]
+    fn vault_fields_empty_by_default() {
+        let toml_str = r#"
+[service]
+id = "openai"
+name = "OpenAI"
+category = "llm"
+"#;
+        let def: ServiceDef = toml::from_str(toml_str).unwrap();
+        assert!(def.vault.is_empty());
+    }
+
+    #[test]
+    fn vault_fields_accessor() {
+        let toml_str = r#"
+[service]
+id = "dash"
+name = "Dash"
+[[vault]]
+name = "token"
+kind = "secret"
+"#;
+        let def: ServiceDef = toml::from_str(toml_str).unwrap();
+        let mut services = HashMap::new();
+        services.insert("dash".into(), def);
+        let reg = ServiceRegistry { services };
+        let fields = reg.vault_fields("dash");
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].name, "token");
+        assert!(reg.vault_fields("nonexistent").is_empty());
     }
 }

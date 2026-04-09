@@ -10,6 +10,7 @@ use crate::core::approval::ApprovalManager;
 use crate::core::audit::AuditLog;
 use crate::config::Config;
 use crate::crypto::keys::ServerKeypair;
+use crate::service::ServiceRegistry;
 use crate::vault::Vault;
 
 // ── AppState ───────────────────────────────────────────────────────────────────
@@ -19,6 +20,7 @@ pub struct AppState {
     pub config: Config,
     pub keypair: ServerKeypair,
     pub vault: Arc<Vault>,
+    pub services: ServiceRegistry,
     pub nonces: Arc<Mutex<crate::passkey::nonce::NonceStore>>,
     pub challenges: Arc<Mutex<crate::passkey::challenge::ChallengeStore>>,
     pub start_time: Instant,

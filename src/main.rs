@@ -97,10 +97,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Build shared vault state
     let vault = Arc::new(Vault::new());
 
+    // Load service definitions
+    let services = service::ServiceRegistry::load();
+
     // Build app state
     let state = Arc::new(AppState {
         keypair,
         vault: vault.clone(),
+        services,
         nonces: Arc::new(Mutex::new(passkey::nonce::NonceStore::new())),
         challenges: Arc::new(Mutex::new(passkey::challenge::ChallengeStore::new())),
         start_time: Instant::now(),

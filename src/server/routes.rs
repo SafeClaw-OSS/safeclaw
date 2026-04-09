@@ -976,6 +976,15 @@ pub async fn vault_services_add(
         .cloned()
         .ok_or_else(|| AppError::BadRequest("Missing service config".into()))?;
 
+    // Validate declared vault fields are present
+    for field in state.services.vault_fields(&name) {
+        if config.get(&field.name).is_none() {
+            return Err(AppError::BadRequest(format!(
+                "Missing required vault field: {}", field.name
+            )));
+        }
+    }
+
     with_vault_mut(&state, &auth, move |secrets| {
         let services = secrets
             .get_mut("services")

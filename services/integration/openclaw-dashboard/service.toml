@@ -3,6 +3,11 @@ id = "openclaw-dashboard"
 name = "OpenClaw Dashboard"
 category = "integration"
 
+[[vault]]
+name = "gatewayToken"
+kind = "secret"
+description = "Gateway auth token for dashboard WebSocket"
+
 [[api]]
 method = "POST"
 path = "/access"

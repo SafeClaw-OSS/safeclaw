@@ -280,6 +280,7 @@ mod tests {
         use crate::passkey::nonce::NonceStore;
         use crate::config::Config;
         use crate::crypto::keys::generate_keypair;
+        use crate::service::ServiceRegistry;
         use crate::state::{AppState, RateLimiter};
         use crate::vault::Vault;
 
@@ -309,6 +310,7 @@ mod tests {
                 config,
                 keypair,
                 vault,
+                services: ServiceRegistry::load(),
                 nonces: Arc::new(Mutex::new(NonceStore::new())),
                 challenges: Arc::new(Mutex::new(crate::passkey::challenge::ChallengeStore::new())),
                 start_time: Instant::now(),
@@ -316,7 +318,6 @@ mod tests {
                 rate_limiter: Arc::new(Mutex::new(RateLimiter::new(0))),
                 approval_manager,
                 audit_log,
-
             })
         }
 
