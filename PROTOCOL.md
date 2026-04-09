@@ -45,6 +45,27 @@ The atomic unit of execution in both TOML files. Recipe steps and API steps shar
 Additional fields available only in recipe steps: `files`, `config_patches`, `restart`, `cwd`, `description`.
 Additional fields available only in API steps: `read`, `returns`, `retry`, `method` (inherited from parent `[[api]]`).
 
+### Vault field declarations
+
+Services can declare what fields they store in the vault using `[[vault]]` blocks in `service.toml`. This serves as schema documentation, enables frontend form generation, and powers validation on service add.
+
+```toml
+[[vault]]
+name = "gatewayToken"
+kind = "secret"
+description = "Gateway auth token for dashboard WebSocket"
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `name` | string | **Required.** Key name in the vault JSON (`secrets.services.{id}.{name}`). |
+| `kind` | string | `"secret"` (masked in UI, never logged) or `"config"` (default). |
+| `description` | string | Human-readable description for docs and UI labels. |
+
+All declared fields are required — if a service declares a vault field, `POST /vault/services/add` will reject requests missing that field. Services that only use standard auth credentials (defined by `[[upstream]]` auth type) do not need `[[vault]]` declarations.
+
+Recipe steps reference vault values via `{{service.vault.KEY}}` template variables (see Template variables below).
+
 ---
 
 ## File structure
@@ -255,7 +276,7 @@ note = "Requires Node.js 18+"          # Optional.
 title = "Create config files"
 target = "openclaw"
 files = [                               # Files to create. Optional.
-  { path = ".nodpay/config.json", content = '{"remote_wallet":"http://localhost:{{proxy_port}}/nodpay"}' },
+  { path = ".nodpay/config.json", content = '{"remote_wallet":"http://localhost:{{safeclaw.proxy_port}}/nodpay"}' },
   { path = "accounts/safeclaw.json", template = "weixin-account.json" },
 ]
 
@@ -307,10 +328,13 @@ restart = true                          # Restart the target container. Optional
 
 | Variable | Description |
 |----------|-------------|
-| `{{proxy_port}}` | SafeClaw proxy port (default: 23295) |
-| `{{admin_port}}` | SafeClaw admin port (default: 23294) |
-| `{{admin_url}}` | SafeClaw admin URL |
-| `{{service_id}}` | Current service ID |
+| `{{safeclaw.proxy_port}}` | SafeClaw proxy port (default: 23295) |
+| `{{safeclaw.admin_port}}` | SafeClaw admin port (default: 23294) |
+| `{{safeclaw.admin_url}}` | SafeClaw admin URL |
+| `{{service.id}}` | Current service ID |
+| `{{service.vault.KEY}}` | Value of `KEY` from this service's vault data |
+
+Two namespaces: `safeclaw.*` for runtime properties, `service.*` for the current service context. `{{service.vault.KEY}}` reads from `secrets.services.{service.id}.KEY` in the vault.
 
 ---
 
@@ -356,7 +380,7 @@ display_name = "OpenAI"
 [[steps]]
 title = "Register OpenAI provider"
 target = "openclaw"
-run = """openclaw config set models.providers.openai '{"apiKey":"sk-safeclaw-proxy","baseUrl":"http://localhost:{{proxy_port}}/openai/v1","api":"openai-completions","models":[]}' --strict-json"""
+run = """openclaw config set models.providers.openai '{"apiKey":"sk-safeclaw-proxy","baseUrl":"http://localhost:{{safeclaw.proxy_port}}/openai/v1","api":"openai-completions","models":[]}' --strict-json"""
 
 [[steps]]
 title = "Restart OpenClaw"
@@ -406,6 +430,11 @@ name = "NodPay"
 sub = "Web3 agent wallet"
 category = "integration"
 
+[[vault]]
+name = "wallet"
+kind = "config"
+description = "On-chain wallet state (safe address, signers, passkey coords)"
+
 [[api]]
 method = "POST"
 path = "/sign"
@@ -451,6 +480,11 @@ id = "openclaw-dashboard"
 name = "OpenClaw Dashboard"
 category = "integration"
 
+[[vault]]
+name = "gatewayToken"
+kind = "secret"
+description = "Gateway auth token for dashboard WebSocket"
+
 [[api]]
 method = "POST"
 path = "/access"
@@ -464,6 +498,44 @@ path = "/access"
   target = "openclaw"
   run = "openclaw devices approve --latest"
   retry = { attempts = 6, interval_ms = 500 }
+```
+
+```toml
+# ═══ services/integration/openclaw-dashboard/recipe.toml ═══
+
+[recipe]
+id = "openclaw-dashboard"
+display_name = "OpenClaw Dashboard"
+
+[[steps]]
+title = "Enable Control UI"
+target = "openclaw"
+run = "openclaw config set gateway.controlUi.enabled true --strict-json"
+
+[[steps]]
+title = "Set allowed origins"
+target = "openclaw"
+run = """openclaw config set gateway.controlUi.allowedOrigins '["https://www.safeclaw.pro"]' --strict-json"""
+
+[[steps]]
+title = "Set gateway token"
+target = "openclaw"
+run = "openclaw config set gateway.auth.token '{{service.vault.gatewayToken}}' --strict-json"
+
+[[steps]]
+title = "Bind to LAN"
+target = "openclaw"
+run = "openclaw config set gateway.bind lan"
+
+[[steps]]
+title = "Open firewall port"
+target = "host"
+run = "ufw allow 18789/tcp"
+
+[[steps]]
+title = "Restart OpenClaw"
+target = "openclaw"
+restart = true
 ```
 
 ### Channel with plugin setup (Telegram)
@@ -553,7 +625,7 @@ display_name = "Claude Code"
 [[steps]]
 title = "Register Anthropic provider"
 target = "openclaw"
-run = """openclaw config set models.providers.anthropic '{"apiKey":"sk-safeclaw-proxy","baseUrl":"http://localhost:{{proxy_port}}/anthropic/v1","api":"anthropic-messages","models":[]}' --strict-json"""
+run = """openclaw config set models.providers.anthropic '{"apiKey":"sk-safeclaw-proxy","baseUrl":"http://localhost:{{safeclaw.proxy_port}}/anthropic/v1","api":"anthropic-messages","models":[]}' --strict-json"""
 
 [[steps]]
 title = "Write Claude CLI credentials"
@@ -612,8 +684,9 @@ Agent → GET /proxy/{service_id}/wallets
 - **Single source of truth.** `service.toml` = runtime; `recipe.toml` = setup. No God functions translating vault state — each service's recipe declares its own setup.
 - **Explicit over implicit.** Every `[[api]]` declares its steps and target. No default forwarding; catch-all requires `path = "*"`.
 - **Upstream is a reusable module.** Named `[[upstream]]` blocks are referenced by `target = "upstream:<id>"`, not inlined per API.
-- **Vault stores only secrets.** Auth types, upstream URLs, and policies live in TOML, not vault.
+- **Vault stores only user-specific data.** Auth credentials, generated tokens, and per-user config live in the vault. Service definitions (auth types, upstream URLs, policies) live in TOML. `[[vault]]` declarations make the schema explicit.
 - **Locked response is a plain string.** The proxy wraps it into the appropriate API format automatically.
+- **SafeClaw manages openclaw lifecycle.** Recipe steps use `openclaw config set` with `gateway.reload.mode off` to batch config changes, then explicitly `restart = true` at the end. This prevents race conditions from openclaw auto-restarting on each config write. SafeClaw is the orchestrator; openclaw is the managed runtime.
 
 ---
 
