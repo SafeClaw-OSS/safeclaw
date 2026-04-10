@@ -40,7 +40,3 @@ method = "GET"
 path_exact = "/"
 level = "allow"
 
-[[policy.rules]]
-method = "GET"
-path_exact = "/help"
-level = "allow"

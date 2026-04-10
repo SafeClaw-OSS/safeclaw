@@ -1146,20 +1146,6 @@ pub async fn vault_policy_update(
 
 // ── Files ──────────────────────────────────────────────────────────────────────
 
-/// GET /vault/files/help — returns help text from service.toml
-pub async fn vault_files_help(
-    State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
-    let help = state.services.get("files")
-        .and_then(|d| d.service.help.as_deref())
-        .unwrap_or("No help available.");
-    (
-        axum::http::StatusCode::OK,
-        [("content-type", "text/markdown; charset=utf-8")],
-        help.to_string(),
-    )
-}
-
 /// Validate file name: reject path traversal, absolute paths, hidden files.
 /// The name is a logical path only (physical storage uses UUID), but we still
 /// validate strictly since it appears in API responses and frontend rendering.

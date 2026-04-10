@@ -311,6 +311,18 @@ async fn proxy_handler(
         }
     };
 
+    // GET /{service}/help — always allowed, no policy check, no vault needed
+    if method == hyper::Method::GET && (route_path == "/help" || route_path == "/help/") {
+        let help = state.services.get(&route_service)
+            .and_then(|d| d.service.help.as_deref())
+            .unwrap_or("No help available for this service.");
+        return (
+            StatusCode::OK,
+            [("content-type", "text/markdown; charset=utf-8")],
+            help.to_string(),
+        ).into_response();
+    }
+
     if state.vault.is_locked() {
         // Detect stream from headers / URL before reading body
         let accept_sse = headers
