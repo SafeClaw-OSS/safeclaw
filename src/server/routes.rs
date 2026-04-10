@@ -874,49 +874,51 @@ fn dispatch_cook(secrets: serde_json::Value, proxy_port: u16, console_url: Strin
         // Built-in recipe steps first, then vault-side steps (overrides/additions).
         if let Some(svcs) = secrets.get("services").and_then(|s| s.as_object()) {
             let relay_ip = std::env::var("SAFECLAW_RELAY_EGRESS_IP").unwrap_or_default();
-            let resolve = |s: &str, svc_id: &str, svc_data: &serde_json::Value| -> String {
+            let resolve = |s: &str, svc_id: &str, svc_data: &serde_json::Value| -> std::result::Result<String, String> {
                 let mut result = s.replace("{{safeclaw.proxy_port}}", &proxy_port.to_string())
                     .replace("{{safeclaw.admin_port}}", &console_url.split(':').last().unwrap_or("23294"))
                     .replace("{{safeclaw.admin_url}}", &console_url)
                     .replace("{{safeclaw.relay_egress_ip}}", &relay_ip)
                     .replace("{{service.id}}", svc_id);
-                // Resolve {{service.vault.KEY}} from service vault data
-                // KEY can be dotted (e.g. "auth.secret") for nested access
+                // Resolve {{service.vault.KEY}} — dotted keys for nested access
                 while let Some(start) = result.find("{{service.vault.") {
                     let rest = &result[start + 16..];
                     if let Some(end) = rest.find("}}") {
                         let key = &rest[..end];
-                        let val = key.split('.')
+                        let val = match key.split('.')
                             .fold(Some(svc_data as &serde_json::Value), |acc, part| {
                                 acc?.get(part)
                             })
                             .and_then(|v| v.as_str())
-                            .unwrap_or("");
+                        {
+                            Some(v) => v,
+                            None => return Err(format!("recipe template variable '{{{{service.vault.{}}}}}' not found in vault data for service '{}'", key, svc_id)),
+                        };
                         result = format!("{}{}{}", &result[..start], val, &rest[end + 2..]);
                     } else {
                         break;
                     }
                 }
-                result
+                Ok(result)
             };
-            let resolve_step = |step: &serde_json::Value, svc_id: &str, svc_data: &serde_json::Value| -> serde_json::Value {
+            let resolve_step = |step: &serde_json::Value, svc_id: &str, svc_data: &serde_json::Value| -> std::result::Result<serde_json::Value, String> {
                 let mut s = step.clone();
                 if let Some(files) = s.get_mut("files").and_then(|f| f.as_array_mut()) {
                     for f in files.iter_mut() {
-                        if let Some(c) = f.get("content").and_then(|c| c.as_str()).map(|c| resolve(c, svc_id, svc_data)) {
-                            f["content"] = serde_json::json!(c);
+                        if let Some(c) = f.get("content").and_then(|c| c.as_str()) {
+                            f["content"] = serde_json::json!(resolve(c, svc_id, svc_data)?);
                         }
-                        if let Some(p) = f.get("path").and_then(|p| p.as_str()).map(|p| resolve(p, svc_id, svc_data)) {
-                            f["path"] = serde_json::json!(p);
+                        if let Some(p) = f.get("path").and_then(|p| p.as_str()) {
+                            f["path"] = serde_json::json!(resolve(p, svc_id, svc_data)?);
                         }
                     }
                 }
-                if let Some(r) = s.get("run").and_then(|r| r.as_str()).map(|r| resolve(r, svc_id, svc_data)) {
-                    s["run"] = serde_json::json!(r);
+                if let Some(r) = s.get("run").and_then(|r| r.as_str()) {
+                    s["run"] = serde_json::json!(resolve(r, svc_id, svc_data)?);
                 }
-                s
+                Ok(s)
             };
-            for (svc_id, svc_data) in svcs {
+            'svc_loop: for (svc_id, svc_data) in svcs {
                 if let Some(ref only) = service_only {
                     if svc_id != only { continue; }
                 }
@@ -936,7 +938,13 @@ fn dispatch_cook(secrets: serde_json::Value, proxy_port: u16, console_url: Strin
 
                 if let Some(recipe_steps) = recipe_steps {
                     for step in &recipe_steps {
-                        steps.push(resolve_step(step, svc_id, svc_data));
+                        match resolve_step(step, svc_id, svc_data) {
+                            Ok(resolved) => steps.push(resolved),
+                            Err(e) => {
+                                tracing::error!("Recipe resolution failed for service '{}': {}", svc_id, e);
+                                continue 'svc_loop;
+                            }
+                        }
                     }
                 }
             }
