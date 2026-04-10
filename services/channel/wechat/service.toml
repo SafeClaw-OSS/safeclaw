@@ -1,5 +1,5 @@
 [service]
-id = "weixin"
+id = "wechat"
 name = "WeChat iLink"
 sub = "Messaging"
 category = "channel"

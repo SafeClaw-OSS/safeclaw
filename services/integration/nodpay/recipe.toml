@@ -22,5 +22,5 @@ note = "CLI reads remote_wallet to delegate sign/address/wallets to SafeClaw vau
 [[steps]]
 title = "Load NodPay skill"
 target = "openclaw"
-run = "openclaw skill load nodpay"
+run = "openclaw skills load nodpay"
 note = "Enables agent to use NodPay propose/approve via SKILL.md"

@@ -85,7 +85,7 @@ services/
     ...
   channel/
     telegram/
-    weixin/
+    wechat/
   integration/
     github/
     nodpay/
@@ -277,7 +277,7 @@ title = "Create config files"
 target = "openclaw"
 files = [                               # Files to create. Optional.
   { path = ".nodpay/config.json", content = '{"remote_wallet":"http://localhost:{{safeclaw.proxy_port}}/nodpay"}' },
-  { path = "accounts/safeclaw.json", template = "weixin-account.json" },
+  { path = "accounts/safeclaw.json", content = '{"token":"...","baseUrl":"..."}' },
 ]
 
 [[steps]]
@@ -710,7 +710,7 @@ Agent → GET /proxy/{service_id}/wallets
 | Category | Description | Examples |
 |----------|-------------|---------|
 | `llm` | LLM providers | anthropic, openai, google, deepseek, groq |
-| `channel` | Messaging channels | telegram, weixin |
+| `channel` | Messaging channels | telegram, wechat |
 | `integration` | Apps, tools, APIs | github, gmail, nodpay, openclaw-dashboard |
 
 ---

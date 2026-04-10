@@ -1,5 +1,5 @@
 [recipe]
-id = "weixin"
+id = "wechat"
 display_name = "WeChat iLink"
 
 [[steps]]
@@ -22,7 +22,7 @@ title = "Create account config"
 target = "openclaw"
 files = [
   { path = ".openclaw/openclaw-weixin/accounts.json", content = '["safeclaw"]' },
-  { path = ".openclaw/openclaw-weixin/accounts/safeclaw.json", template = "weixin-account.json" },
+  { path = ".openclaw/openclaw-weixin/accounts/safeclaw.json", content = '{"token":"sk-dummy-safeclaw-wechat","baseUrl":"http://localhost:{{safeclaw.proxy_port}}/wechat"}' },
 ]
 
 [[steps]]
