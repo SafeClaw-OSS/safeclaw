@@ -3,3 +3,8 @@ id = "openclaw-dashboard"
 name = "OpenClaw Dashboard"
 category = "integration"
 
+[[vault]]
+name = "gateway_token"
+kind = "secret"
+description = "Gateway auth token for dashboard access"
+

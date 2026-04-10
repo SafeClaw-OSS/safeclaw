@@ -8,29 +8,14 @@ target = "openclaw"
 run = "openclaw config set gateway.controlUi.enabled true --strict-json"
 
 [[steps]]
-title = "Set allowed origins"
+title = "Set token auth mode"
 target = "openclaw"
-run = """openclaw config set gateway.controlUi.allowedOrigins '["https://www.safeclaw.pro"]' --strict-json"""
+run = "openclaw config set gateway.auth.mode token"
 
 [[steps]]
-title = "Set trusted proxy auth"
+title = "Set gateway token"
 target = "openclaw"
-run = """openclaw config set gateway.auth '{"mode":"trusted-proxy","trustedProxy":{"userHeader":"x-safeclaw-user"}}' --strict-json"""
-
-[[steps]]
-title = "Set trusted proxy IPs"
-target = "openclaw"
-run = """openclaw config set gateway.trustedProxies '["{{safeclaw.relay_egress_ip}}","127.0.0.1"]' --strict-json"""
-
-[[steps]]
-title = "Bind to LAN"
-target = "openclaw"
-run = "openclaw config set gateway.bind lan"
-
-[[steps]]
-title = "Open dashboard port"
-target = "host"
-run = "ufw allow 18789/tcp"
+run = "openclaw config set gateway.auth.token {{service.vault.gateway_token}}"
 
 [[steps]]
 title = "Restart OpenClaw"
