@@ -470,39 +470,71 @@ keygen and wallet creation are already done by SafeClaw.
 """
 ```
 
-### VM exec with vault read (OpenClaw Dashboard)
+### Dashboard embedding (OpenClaw Dashboard)
+
+The dashboard is embedded as an iframe in the SafeClaw Pro console. This requires a multi-layer proxy chain and careful auth coordination.
+
+#### Proxy chain
+
+```
+HTML:      browser → Next.js rewrite → relay → VM:18789 (openclaw gateway)
+WebSocket: browser → wss://api.safeclaw.pro → relay upgrade handler → VM:18789
+```
+
+Next.js rewrites handle HTTP but **not** WebSocket upgrades. WebSocket connections must go directly to the backend's public URL. The frontend passes `gatewayUrl=wss://api.safeclaw.pro/...` in the iframe's hash fragment.
+
+#### Auth model: trusted-proxy
+
+The gateway runs in `trusted-proxy` auth mode. The relay is the auth boundary — it verifies account session before proxying. The gateway trusts the relay via IP whitelist.
+
+```json
+{
+  "gateway": {
+    "auth": {
+      "mode": "trusted-proxy",
+      "trustedProxy": { "userHeader": "x-safeclaw-user" }
+    },
+    "trustedProxies": ["RELAY_EGRESS_IP"],
+    "bind": "lan",
+    "controlUi": {
+      "enabled": true,
+      "allowedOrigins": ["https://www.safeclaw.pro"]
+    }
+  }
+}
+```
+
+**Prerequisites:**
+- Relay must have a **fixed egress IP** (Railway paid feature). Currently `162.220.232.99`.
+- VM firewall must allow inbound on port 18789 (`ufw allow 18789/tcp`).
+- Gateway must bind to LAN (`gateway.bind lan`) for external access.
+
+**Relay responsibilities:**
+- HTTP proxy: inject `<base href>`, rewrite CSP, strip browser headers, set `x-safeclaw-user`
+- WS upgrade: verify VM exists, set `x-safeclaw-user`, pipe TCP to VM:18789
+
+**Limitations:**
+- If Railway egress IP changes, `gateway.trustedProxies` must be updated on all VMs (via recipe re-cook or admin API).
+- `trustedProxies` is per-VM config, not centralized. A bulk update mechanism may be needed.
+
+#### service.toml
 
 ```toml
-# ═══ services/integration/openclaw-dashboard/service.toml ═══
-
 [service]
 id = "openclaw-dashboard"
 name = "OpenClaw Dashboard"
 category = "integration"
 
-[[vault]]
-name = "gatewayToken"
-kind = "secret"
-description = "Gateway auth token for dashboard WebSocket"
-
-[[api]]
-method = "POST"
-path = "/access"
-
-  [[api.steps]]
-  target = "safeclaw.vault"
-  read = "services.openclaw-dashboard.gatewayToken"
-  returns = true
-
-  [[api.steps]]
-  target = "openclaw"
-  run = "openclaw devices approve --latest"
-  retry = { attempts = 6, interval_ms = 500 }
+[policy.levels]
+read = "allow"
+write = "allow"
 ```
 
-```toml
-# ═══ services/integration/openclaw-dashboard/recipe.toml ═══
+No `[[vault]]` or `[[api]]` needed — trusted-proxy mode eliminates the need for gateway tokens and `/access` endpoints.
 
+#### recipe.toml
+
+```toml
 [recipe]
 id = "openclaw-dashboard"
 display_name = "OpenClaw Dashboard"
@@ -518,9 +550,14 @@ target = "openclaw"
 run = """openclaw config set gateway.controlUi.allowedOrigins '["https://www.safeclaw.pro"]' --strict-json"""
 
 [[steps]]
-title = "Set gateway token"
+title = "Set trusted proxy auth"
 target = "openclaw"
-run = "openclaw config set gateway.auth.token '{{service.vault.gatewayToken}}' --strict-json"
+run = """openclaw config set gateway.auth '{"mode":"trusted-proxy","trustedProxy":{"userHeader":"x-safeclaw-user"}}' --strict-json"""
+
+[[steps]]
+title = "Set trusted proxy IPs"
+target = "openclaw"
+run = """openclaw config set gateway.trustedProxies '["{{safeclaw.relay_egress_ip}}"]' --strict-json"""
 
 [[steps]]
 title = "Bind to LAN"
@@ -537,6 +574,8 @@ title = "Restart OpenClaw"
 target = "openclaw"
 restart = true
 ```
+
+`{{safeclaw.relay_egress_ip}}` is a template variable resolved from SafeClaw config, making the IP updateable without changing the recipe.
 
 ### Channel with plugin setup (Telegram)
 
