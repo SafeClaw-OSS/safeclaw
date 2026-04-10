@@ -3,6 +3,11 @@ id = "telegram"
 display_name = "Telegram"
 
 [[steps]]
+title = "Set Telegram bot token"
+target = "openclaw"
+run = "openclaw config set channels.telegram.botToken {{service.vault.auth.secret}}"
+
+[[steps]]
 title = "Enable Telegram channel"
 target = "openclaw"
 run = "openclaw config set channels.telegram.enabled true --strict-json"
