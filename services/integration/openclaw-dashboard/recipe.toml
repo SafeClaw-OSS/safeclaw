@@ -15,7 +15,7 @@ run = """openclaw config set gateway.controlUi.allowedOrigins '["https://www.saf
 [[steps]]
 title = "Set gateway token"
 target = "openclaw"
-run = "openclaw config set gateway.auth.token '{{service.vault.gatewayToken}}' --strict-json"
+run = "openclaw config set gateway.auth.token '{{service.vault.gatewayToken}}'"
 
 [[steps]]
 title = "Bind to LAN"
