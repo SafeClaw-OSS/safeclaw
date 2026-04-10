@@ -2,9 +2,8 @@
   <img src="docs/logo.png" alt="SafeClaw" width="72" />
 </p>
 
-# SafeClaw
-
-Protect your API keys with passkeys. No passwords, no `.env` files, no plaintext secrets on disk.
+<h1 align="center">SafeClaw</h1>
+<p align="center">Protect your API keys with passkeys. No passwords, no <code>.env</code> files, no plaintext secrets on disk.</p>
 
 SafeClaw is a local vault + proxy for AI agents. You store your API keys encrypted with your fingerprint (via WebAuthn passkeys), and your agent talks to a local proxy that injects credentials on-the-fly.
 
