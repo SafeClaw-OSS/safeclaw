@@ -3,25 +3,6 @@ id = "openclaw-dashboard"
 name = "OpenClaw Dashboard"
 category = "integration"
 
-[[vault]]
-name = "gatewayToken"
-kind = "secret"
-description = "Gateway auth token for dashboard WebSocket"
-
-[[api]]
-method = "POST"
-path = "/access"
-
-  [[api.steps]]
-  target = "safeclaw.vault"
-  read = "services.openclaw-dashboard.gatewayToken"
-  returns = true
-
-  [[api.steps]]
-  target = "openclaw"
-  run = "openclaw devices approve --latest"
-  retry = { attempts = 6, interval_ms = 500 }
-
 [policy.levels]
 read = "allow"
 write = "allow"

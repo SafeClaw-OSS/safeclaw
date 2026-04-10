@@ -61,6 +61,8 @@ pub struct Config {
     pub rate_limit: u32,
     /// Path prefixes exempt from rate limiting. Prefix match: /health matches /health and /health/foo.
     pub rate_limit_exempt: Vec<String>,
+    /// Relay egress IP for trusted-proxy recipe (e.g. Railway fixed IP).
+    pub relay_egress_ip: Option<String>,
     pub init: bool,
 }
 
@@ -110,9 +112,10 @@ impl Config {
             .filter(|s| !s.is_empty())
             .collect();
 
+        let relay_egress_ip = env_str("SAFECLAW_RELAY_EGRESS_IP");
         let init = cli.init;
 
-        Self { data_dir, port, bind, proxy_port, proxy_bind, origin, rp_id, admin_url, instance_id, rate_limit, rate_limit_exempt, init }
+        Self { data_dir, port, bind, proxy_port, proxy_bind, origin, rp_id, admin_url, instance_id, rate_limit, rate_limit_exempt, relay_egress_ip, init }
     }
 
     pub fn effective_origin(&self) -> String {

@@ -297,6 +297,7 @@ mod tests {
                 instance_id: None,
                 rate_limit: 0,
                 rate_limit_exempt: vec![],
+                relay_egress_ip: None,
                 init: false,
             };
             let keypair = generate_keypair().expect("generate_keypair failed");
@@ -597,6 +598,7 @@ mod tests {
                     instance_id: None,
                     rate_limit: 0,
                     rate_limit_exempt: vec![],
+                    relay_egress_ip: None,
                     init: false,
                 },
                 approval_manager: Arc::new(ApprovalManager::new(audit.clone())),
@@ -692,6 +694,7 @@ mod tests {
                     instance_id: None,
                     rate_limit: 0,
                     rate_limit_exempt: vec![],
+                    relay_egress_ip: None,
                     init: false,
                 },
                 approval_manager: Arc::new(ApprovalManager::new(audit.clone())),
