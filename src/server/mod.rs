@@ -91,6 +91,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 
         // ── Files ────────────────────────────────────────────────────────────
         .route("/vault/files", get(vault_files_list))
+        .route("/vault/files/help", get(vault_files_help))
         .route("/vault/files/{id}", get(vault_files_read_approved))
         .route("/vault/files/upload", post(vault_files_upload))
         .route("/vault/files/read", post(vault_files_read))

@@ -1146,6 +1146,65 @@ pub async fn vault_policy_update(
 
 // ── Files ──────────────────────────────────────────────────────────────────────
 
+const FILES_HELP: &str = "\
+# Files API
+
+Encrypted file storage in SafeClaw vault.
+
+## Endpoints (via proxy)
+
+### List files
+GET /files/
+Response: {\"files\": [{\"id\":\"uuid\",\"name\":\"path/to/file.txt\",\"size\":1234}]}
+
+### Read file content
+GET /files/{id}
+Returns file bytes with Content-Type inferred from name.
+Requires approval — follow the standard 202 approval flow.
+
+### Upload file
+POST /files/upload
+Body: {\"name\":\"reports/q1.pdf\",\"data\":\"<base64>\"}
+The name may include `/` path separators for directory organization.
+Requires approval.
+
+### Delete file
+POST /files/remove
+Body: {\"id\":\"uuid\"}
+Requires approval.
+";
+
+/// GET /vault/files/help — self-documenting API reference
+pub async fn vault_files_help() -> impl IntoResponse {
+    (
+        axum::http::StatusCode::OK,
+        [("content-type", "text/markdown; charset=utf-8")],
+        FILES_HELP,
+    )
+}
+
+/// Validate file name: reject path traversal, absolute paths, hidden files.
+/// The name is a logical path only (physical storage uses UUID), but we still
+/// validate strictly since it appears in API responses and frontend rendering.
+fn validate_file_name(name: &str) -> Result<()> {
+    if name.is_empty() || name.len() > 512 {
+        return Err(AppError::BadRequest("Invalid file name length".into()));
+    }
+    if name.contains("..") {
+        return Err(AppError::BadRequest("Path traversal not allowed".into()));
+    }
+    if name.starts_with('/') || name.contains('\\') || name.contains('\0') {
+        return Err(AppError::BadRequest("Invalid characters in file name".into()));
+    }
+    if name.starts_with('.') || name.contains("/.") {
+        return Err(AppError::BadRequest("Hidden paths not allowed".into()));
+    }
+    if name.contains("//") {
+        return Err(AppError::BadRequest("Invalid path".into()));
+    }
+    Ok(())
+}
+
 /// GET /vault/files — list files (no passkey, from index)
 pub async fn vault_files_list(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let index = read_index(&state);
@@ -1227,6 +1286,8 @@ pub async fn vault_files_upload(
         .and_then(|v| v.as_str())
         .ok_or_else(|| AppError::BadRequest("Missing file name".into()))?
         .to_string();
+
+    validate_file_name(&file_name)?;
 
     let data_b64 = auth
         .payload

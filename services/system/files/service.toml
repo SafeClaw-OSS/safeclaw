@@ -1,0 +1,25 @@
+[service]
+id = "files"
+name = "Files"
+sub = "Encrypted vault storage"
+category = "system"
+
+[policy.levels]
+read = "ask"
+write = "ask"
+
+[[policy.rules]]
+method = "GET"
+path_exact = "/"
+level = "allow"
+
+[[policy.rules]]
+method = "GET"
+path_exact = "/help"
+level = "allow"
+
+[guidance]
+summary = """\
+Encrypted file storage built into SafeClaw — not a well-known API. \
+`GET /files/help` returns the full endpoint reference.\
+"""

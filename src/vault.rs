@@ -145,8 +145,7 @@ impl Vault {
             if !services.contains_key("files") {
                 services.insert("files".into(), serde_json::json!({
                     "upstream": "http://localhost:23294/vault/files",
-                    "category": "service",
-                    "levels": { "read": "ask", "write": "ask" }
+                    "category": "system",
                 }));
             }
         }
