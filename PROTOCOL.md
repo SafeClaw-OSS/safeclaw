@@ -477,15 +477,16 @@ The dashboard is embedded as an iframe in the SafeClaw Pro console. This require
 #### Proxy chain
 
 ```
-HTML:      browser → Next.js rewrite → relay → VM:18789 (openclaw gateway)
-WebSocket: browser → wss://api.safeclaw.pro → relay upgrade handler → VM:18789
+HTTP + WS: browser → Railway rewrite (same-origin) → relay → VM:18789
 ```
 
-Next.js rewrites handle HTTP but **not** WebSocket upgrades. WebSocket connections must go directly to the backend's public URL. The frontend passes `gatewayUrl=wss://api.safeclaw.pro/...` in the iframe's hash fragment.
+Both HTTP and WebSocket go through the same-origin Railway proxy. The dashboard iframe loads at `www.safeclaw.pro/api/v/{id}/oc/` and derives its WebSocket URL from `window.location` — no explicit `gatewayUrl` is needed. The `sc_token` cookie (set by the parent page with `path=/api/v/`) is sent automatically for same-origin requests.
+
+> **Note:** Vercel rewrites do **not** proxy WebSocket upgrades. Railway does. This architecture requires Railway (or equivalent) for the frontend host.
 
 #### Auth model: trusted-proxy
 
-The gateway runs in `trusted-proxy` auth mode. The relay is the auth boundary — it verifies account session before proxying. The gateway trusts the relay via IP whitelist.
+The gateway runs in `trusted-proxy` auth mode. The relay is the auth boundary — it verifies account session (via `sc_token` cookie) before proxying. The gateway trusts the relay via IP whitelist.
 
 ```json
 {
@@ -510,8 +511,8 @@ The gateway runs in `trusted-proxy` auth mode. The relay is the auth boundary �
 - Gateway must bind to LAN (`gateway.bind lan`) for external access.
 
 **Relay responsibilities:**
-- HTTP proxy: inject `<base href>`, rewrite CSP, strip browser headers, set `x-safeclaw-user`
-- WS upgrade: verify VM exists, set `x-safeclaw-user`, pipe TCP to VM:18789
+- HTTP proxy: inject `<base href>`, rewrite CSP (`frame-ancestors`, `base-uri`), strip browser headers, set `x-safeclaw-user`
+- WS upgrade: verify `sc_token` cookie + instance ownership, set `x-safeclaw-user`, pipe TCP to VM:18789
 
 **Limitations:**
 - If Railway egress IP changes, `gateway.trustedProxies` must be updated on all VMs (via recipe re-cook or admin API).
@@ -686,11 +687,20 @@ restart = true
 
 ```
 Frontend → POST /vault/services/add → vault stores secret
-         → dispatch_cook(secrets)
-           → builds ops from vault state + recipe [[steps]]
+         → dispatch_cook(secrets, service_only = "service-id")
+           → builds ops from this service's recipe only
            → POST /cook to provisioner
            → provisioner executes steps sequentially
 ```
+
+`dispatch_cook` supports incremental execution via the `service_only` parameter:
+
+| Mode | When | What runs |
+|------|------|-----------|
+| Full (`None`) | `admin_setup`, `vault_update` | System recipes → workspace files → vault config → all service recipes |
+| Incremental (`Some(id)`) | `services/add`, `services/remove` | Workspace files → that service's recipe only |
+
+Vault unlock does **not** trigger cook. Config persists in the docker volume; unlock only decrypts the vault in memory.
 
 ### Runtime flow (API call)
 
@@ -702,6 +712,25 @@ Agent → GET /proxy/{service_id}/wallets
         → step 2: forward to upstream (target = upstream:default)
       → return output of step marked returns = true
 ```
+
+---
+
+## Vault partial read
+
+`POST /vault/credentials` supports an optional `select` field for returning only matching subtrees instead of the full vault.
+
+```json
+{ "userKey": "...", "select": "services.telegram,channels.telegram" }
+```
+
+| Aspect | Detail |
+|--------|--------|
+| Format | Comma-separated dot-notation path prefixes |
+| Semantics | OR (union) — "services.telegram,model" returns both |
+| Default | Omit `select` → full vault (backward compatible) |
+| Structure | Returned JSON preserves the original path hierarchy |
+
+The VM decrypts the full vault in memory, extracts matching subtrees, re-encrypts the subset, and zeros out the plaintext. This enables per-service credential reveal without exposing the entire vault.
 
 ---
 
