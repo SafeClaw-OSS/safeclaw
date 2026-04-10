@@ -894,25 +894,6 @@ fn dispatch_cook(secrets: serde_json::Value, proxy_port: u16, console_url: Strin
             }
         }
 
-        // Claude Code CLI credentials (anthropic OAuth — written to openclaw container filesystem)
-        if let Some(auth) = secrets
-            .get("services").and_then(|s| s.get("anthropic"))
-            .and_then(|a| a.get("auth"))
-        {
-            if auth.get("access_token").and_then(|t| t.as_str()).is_some() {
-                steps.push(serde_json::json!({
-                    "title": "Write Claude CLI credentials",
-                    "target": "openclaw",
-                    "credentials": {
-                        "type": "claude-cli",
-                        "access_token": auth.get("access_token"),
-                        "refresh_token": auth.get("refresh_token"),
-                        "expires_at": auth.get("expires_at")
-                    }
-                }));
-            }
-        }
-
         } // end service_only.is_none() guard for vault-driven config
 
         // Collect recipe steps for each enabled service (sent as-is, provisioner executes).
