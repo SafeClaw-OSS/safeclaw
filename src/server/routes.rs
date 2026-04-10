@@ -551,8 +551,8 @@ pub async fn setup(
     // Unlock proxy immediately after setup
     state.vault.set_secrets(secrets.clone());
 
-    // Dispatch cook ops (workspace files, config, recipe steps)
-    dispatch_cook(secrets, state.config.proxy_port, state.config.effective_admin_url(), state.config.data_dir.clone());
+    // Dispatch cook ops (workspace files, config, recipe steps) — full cook on setup
+    dispatch_cook(secrets, state.config.proxy_port, state.config.effective_admin_url(), state.config.data_dir.clone(), None);
 
 
     Ok(Json(json!({ "ok": true })))
@@ -612,13 +612,8 @@ pub async fn vault_unlock(
 
     state.vault.set_secrets(secrets);
 
-    // Dispatch cook ops on unlock
-    let proxy_port = state.config.proxy_port;
-    let console_url = state.config.effective_admin_url();
-    let data_dir = state.config.data_dir.clone();
-    if let Some(unlocked_secrets) = state.vault.secrets.lock().unwrap().clone() {
-        dispatch_cook(unlocked_secrets, proxy_port, console_url, data_dir);
-    }
+    // No cook on unlock — config set by previous cook is persisted in docker volume.
+    // Unlock only decrypts vault in memory.
 
     Ok(Json(json!({ "ok": true })))
 }
@@ -671,11 +666,57 @@ pub async fn vault_credentials(
     let secrets_bytes = decrypt_vault(&dek, &vault_enc)?;
     dek.zeroize();
 
+    // Optional partial read: if `select` is provided, return only matching subtrees.
+    let output_bytes = if let Some(select) = auth.payload.get("select").and_then(|v| v.as_str()) {
+        let full: Value = serde_json::from_slice(&secrets_bytes)
+            .map_err(|e| AppError::Internal(format!("Failed to parse vault: {}", e)))?;
+        let filtered = select_paths(&full, select);
+        serde_json::to_vec(&filtered)
+            .map_err(|e| AppError::Internal(format!("Failed to serialize filtered vault: {}", e)))?
+    } else {
+        secrets_bytes
+    };
+
     let mut response_key = derive_response_key(&user_key, &nonce_bytes)?;
-    let sealed = aes_encrypt(&response_key, &secrets_bytes)?;
+    let sealed = aes_encrypt(&response_key, &output_bytes)?;
     response_key.zeroize();
 
     Ok(Json(json!({ "sealed": STANDARD.encode(&sealed) })))
+}
+
+/// Extract subtrees from a JSON value by dot-notation path prefixes.
+/// `paths` is a comma-separated string like "services.telegram,channels.telegram".
+/// Returns a new JSON object preserving the original structure with only matching subtrees.
+fn select_paths(full: &Value, paths: &str) -> Value {
+    let mut result = serde_json::Map::new();
+    for path in paths.split(',') {
+        let segments: Vec<&str> = path.trim().split('.').filter(|s| !s.is_empty()).collect();
+        if segments.is_empty() { continue; }
+        // Walk into `full` to find the value at this path
+        let mut cursor = full;
+        let mut found = true;
+        for seg in &segments {
+            match cursor.get(*seg) {
+                Some(v) => cursor = v,
+                None => { found = false; break; }
+            }
+        }
+        if !found { continue; }
+        // Rebuild the path structure in result
+        let mut target = &mut result;
+        for (i, seg) in segments.iter().enumerate() {
+            if i == segments.len() - 1 {
+                target.insert(seg.to_string(), cursor.clone());
+            } else {
+                target = target
+                    .entry(seg.to_string())
+                    .or_insert_with(|| Value::Object(serde_json::Map::new()))
+                    .as_object_mut()
+                    .unwrap();
+            }
+        }
+    }
+    Value::Object(result)
 }
 
 // ── Vault Update ───────────────────────────────────────────────────────────────
@@ -719,8 +760,8 @@ pub async fn vault_update(
     let _ = write_index(&state, &new_secrets);
     state.vault.set_secrets(new_secrets.clone());
 
-    // Keep VM-side SafeClaw guidance in sync with the latest vault config.
-    dispatch_cook(new_secrets, state.config.proxy_port, state.config.effective_admin_url(), state.config.data_dir.clone());
+    // Keep VM-side SafeClaw guidance in sync with the latest vault config — full cook
+    dispatch_cook(new_secrets, state.config.proxy_port, state.config.effective_admin_url(), state.config.data_dir.clone(), None);
 
     Ok(Json(json!({ "ok": true })))
 }
@@ -768,7 +809,7 @@ fn sync_local_service_files(secrets: &serde_json::Value, data_dir: &std::path::P
 /// after vault state changes (setup, unlock, service add/update/remove).
 /// Builds ops from vault secrets + service recipes, sends a single POST /cook.
 /// Failures are silently discarded — the vault operation has already succeeded.
-fn dispatch_cook(secrets: serde_json::Value, proxy_port: u16, console_url: String, data_dir: std::path::PathBuf) {
+fn dispatch_cook(secrets: serde_json::Value, proxy_port: u16, console_url: String, data_dir: std::path::PathBuf, service_only: Option<String>) {
     // Sync local service files (e.g. NodPay wallet JSON) before dispatching to provisioner.
     sync_local_service_files(&secrets, &data_dir);
 
@@ -781,7 +822,8 @@ fn dispatch_cook(secrets: serde_json::Value, proxy_port: u16, console_url: Strin
 
         // ── System recipes (category = "system") run first, before any service recipes.
         // Currently: openclaw-runtime (gateway lifecycle, model catalog, exec approvals).
-        {
+        // Skipped when only cooking a single service's recipe.
+        if service_only.is_none() {
             let system_recipes = crate::generated_services::compiled_recipe_tomls();
             let system_services = crate::generated_services::compiled_service_tomls();
             for (id, _toml_str) in system_services {
@@ -812,6 +854,8 @@ fn dispatch_cook(secrets: serde_json::Value, proxy_port: u16, console_url: Strin
         }));
 
         // Vault-driven config: set model, telegram token, etc. via openclaw CLI
+        // Skipped when only cooking a single service's recipe.
+        if service_only.is_none() {
         if let Some(model) = secrets.get("model") {
             let model_json = serde_json::to_string(model).unwrap_or_default();
             // Escape single quotes in JSON for shell
@@ -866,6 +910,8 @@ fn dispatch_cook(secrets: serde_json::Value, proxy_port: u16, console_url: Strin
             }
         }
 
+        } // end service_only.is_none() guard for vault-driven config
+
         // Collect recipe steps for each enabled service (sent as-is, provisioner executes).
         // Built-in recipe steps first, then vault-side steps (overrides/additions).
         if let Some(svcs) = secrets.get("services").and_then(|s| s.as_object()) {
@@ -909,6 +955,9 @@ fn dispatch_cook(secrets: serde_json::Value, proxy_port: u16, console_url: Strin
                 s
             };
             for (svc_id, svc_data) in svcs {
+                if let Some(ref only) = service_only {
+                    if svc_id != only { continue; }
+                }
                 // Recipe source: vault config.recipe.steps (full replace) → built-in TOML
                 let recipe_steps: Option<Vec<serde_json::Value>> = svc_data
                     .get("recipe")
@@ -1014,6 +1063,7 @@ pub async fn vault_services_add(
         }
     }
 
+    let service_id = name.clone();
     with_vault_mut(&state, &auth, move |secrets| {
         let services = secrets
             .get_mut("services")
@@ -1023,53 +1073,12 @@ pub async fn vault_services_add(
         Ok(())
     })?;
 
-    // Dispatch cook ops for updated vault state
+    // Dispatch cook — only run this service's recipe
     let proxy_port = state.config.proxy_port;
     let console_url = state.config.effective_admin_url();
     let data_dir = state.config.data_dir.clone();
     if let Some(secrets) = state.vault.secrets.lock().unwrap().clone() {
-        dispatch_cook(secrets, proxy_port, console_url, data_dir);
-    }
-
-    Ok(Json(json!({ "ok": true })))
-}
-
-/// POST /vault/services/update — update an existing service (passkey required)
-pub async fn vault_services_update(
-    State(state): State<Arc<AppState>>,
-    auth: AuthenticatedRequest,
-) -> Result<impl IntoResponse> {
-    let name = auth
-        .payload
-        .get("name")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| AppError::BadRequest("Missing service name".into()))?
-        .to_string();
-
-    let config = auth
-        .payload
-        .get("config")
-        .cloned()
-        .ok_or_else(|| AppError::BadRequest("Missing service config".into()))?;
-
-    with_vault_mut(&state, &auth, move |secrets| {
-        let services = secrets
-            .get_mut("services")
-            .and_then(|s| s.as_object_mut())
-            .ok_or_else(|| AppError::Internal("Vault missing 'services' object".into()))?;
-        if !services.contains_key(&name) {
-            return Err(AppError::NotFound);
-        }
-        services.insert(name, config);
-        Ok(())
-    })?;
-
-    // Dispatch cook ops for updated vault state
-    let proxy_port = state.config.proxy_port;
-    let console_url = state.config.effective_admin_url();
-    let data_dir = state.config.data_dir.clone();
-    if let Some(secrets) = state.vault.secrets.lock().unwrap().clone() {
-        dispatch_cook(secrets, proxy_port, console_url, data_dir);
+        dispatch_cook(secrets, proxy_port, console_url, data_dir, Some(service_id));
     }
 
     Ok(Json(json!({ "ok": true })))
@@ -1087,6 +1096,7 @@ pub async fn vault_services_remove(
         .ok_or_else(|| AppError::BadRequest("Missing service name".into()))?
         .to_string();
 
+    let service_id = name.clone();
     with_vault_mut(&state, &auth, move |secrets| {
         let services = secrets
             .get_mut("services")
@@ -1096,12 +1106,12 @@ pub async fn vault_services_remove(
         Ok(())
     })?;
 
-    // Dispatch cook ops for updated vault state
+    // Dispatch cook — update workspace files (service removed, no recipe to run)
     let proxy_port = state.config.proxy_port;
     let console_url = state.config.effective_admin_url();
     let data_dir = state.config.data_dir.clone();
     if let Some(secrets) = state.vault.secrets.lock().unwrap().clone() {
-        dispatch_cook(secrets, proxy_port, console_url, data_dir);
+        dispatch_cook(secrets, proxy_port, console_url, data_dir, Some(service_id));
     }
 
     Ok(Json(json!({ "ok": true })))
