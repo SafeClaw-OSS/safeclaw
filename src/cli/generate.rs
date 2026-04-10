@@ -27,15 +27,15 @@ fn load_catalog() -> Vec<(String, String)> {
 /// Generate safeclaw.md content describing all services and their proxy URLs.
 ///
 /// When `locked` is true, auth/level details are omitted (only names shown).
-/// `secrets` should be the full vault JSON when unlocked, or a minimal
+/// `vault_data` should be the full vault JSON when unlocked, or a minimal
 /// `{"services": {"name": null, ...}}` when locked.
 
-pub fn generate_safeclaw_md(secrets: &serde_json::Value, locked: bool, proxy_port: u16, console_url: &str) -> String {
+pub fn generate_safeclaw_md(vault_data: &serde_json::Value, locked: bool, proxy_port: u16, console_url: &str) -> String {
     let template = read_template("safeclaw.md", include_str!("../../templates/safeclaw.md"));
     let proxy_base = format!("http://localhost:{}", proxy_port);
 
     // Collect connected service IDs
-    let connected: std::collections::HashSet<String> = secrets
+    let connected: std::collections::HashSet<String> = vault_data
         .get("services")
         .and_then(|s| s.as_object())
         .map(|m| m.keys().cloned().collect())
@@ -47,7 +47,7 @@ pub fn generate_safeclaw_md(secrets: &serde_json::Value, locked: bool, proxy_por
         "| Service | Upstream | Proxy URL | Auth | Approval |".to_string(),
         "|---------|----------|-----------|------|----------|".to_string(),
     ];
-    if let Some(services) = secrets.get("services").and_then(|s| s.as_object()) {
+    if let Some(services) = vault_data.get("services").and_then(|s| s.as_object()) {
         for (name, svc) in services {
             // Skip services not callable by the agent (no [[upstream]] or [[api]])
             if !crate::service::is_proxy_service(svc) && !registry.is_agent_visible(name) {
@@ -86,7 +86,7 @@ pub fn generate_safeclaw_md(secrets: &serde_json::Value, locked: bool, proxy_por
     // Build help sections from service.toml `help` field for each connected service.
     // Template variables like {{wallet.safe}} are resolved from vault service data.
     let mut guidance_sections = vec![];
-    let vault_services = secrets.get("services").and_then(|s| s.as_object());
+    let vault_services = vault_data.get("services").and_then(|s| s.as_object());
     // Vault-connected services
     if let Some(services) = vault_services {
         for (name, svc_data) in services {
@@ -143,7 +143,7 @@ fn resolve_guidance_templates(template: &str, svc_data: &serde_json::Value) -> S
 /// Return the static AGENTS.md snippet (managed block).
 ///
 /// This is now fully static — dynamic service info lives in safeclaw.md.
-pub fn generate_agents_md_snippet(_secrets: &serde_json::Value, _proxy_port: u16) -> String {
+pub fn generate_agents_md_snippet(_vault_data: &serde_json::Value, _proxy_port: u16) -> String {
     read_template("agents-snippet.md", include_str!("../../templates/agents-snippet.md"))
 }
 
@@ -200,7 +200,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn two_service_secrets() -> serde_json::Value {
+    fn two_service_vault_data() -> serde_json::Value {
         json!({
             "services": {
                 "anthropic": {
@@ -219,7 +219,7 @@ mod tests {
 
     #[test]
     fn safeclaw_md_unlocked_contains_service_rows() {
-        let s = generate_safeclaw_md(&two_service_secrets(), false, 23295, "https://example.com/console");
+        let s = generate_safeclaw_md(&two_service_vault_data(), false, 23295, "https://example.com/console");
         assert!(s.contains("anthropic"));
         assert!(s.contains("gmail"));
         assert!(s.contains("header (x-api-key)"));
@@ -237,14 +237,14 @@ mod tests {
 
     #[test]
     fn safeclaw_md_level_display_mixed() {
-        let s = generate_safeclaw_md(&two_service_secrets(), false, 23295, "https://example.com/console");
+        let s = generate_safeclaw_md(&two_service_vault_data(), false, 23295, "https://example.com/console");
         // gmail has write:ask-always, read:ask
         assert!(s.contains("write:ask-always, read:ask"));
     }
 
     #[test]
     fn safeclaw_md_level_display_same() {
-        let s = generate_safeclaw_md(&two_service_secrets(), false, 23295, "https://example.com/console");
+        let s = generate_safeclaw_md(&two_service_vault_data(), false, 23295, "https://example.com/console");
         // anthropic has write:allow, read:allow → just "allow"
         assert!(s.contains("| allow |"));
     }
@@ -269,7 +269,7 @@ mod tests {
 
     #[test]
     fn agents_snippet_is_static() {
-        let s1 = generate_agents_md_snippet(&two_service_secrets(), 23295);
+        let s1 = generate_agents_md_snippet(&two_service_vault_data(), 23295);
         let names = json!({ "services": { "anthropic": null } });
         let s2 = generate_agents_md_snippet(&names, 23295);
         // Snippet is now fully static — same output regardless of input

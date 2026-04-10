@@ -151,11 +151,11 @@ fn read_index(state: &AppState) -> Value {
     }
 }
 
-fn write_index(state: &AppState, secrets: &Value) -> std::io::Result<()> {
+fn write_index(state: &AppState, vault_data: &Value) -> std::io::Result<()> {
     // Store lightweight service metadata (name + category + group) — no credentials.
     // group and category are enriched from service.toml via ServiceRegistry.
     let registry = crate::service::ServiceRegistry::load();
-    let services: Vec<Value> = secrets
+    let services: Vec<Value> = vault_data
         .get("services")
         .and_then(|s| s.as_object())
         .map(|obj| {
@@ -203,7 +203,7 @@ fn write_index(state: &AppState, secrets: &Value) -> std::io::Result<()> {
         })
         .unwrap_or_default();
 
-    let files: Vec<Value> = secrets
+    let files: Vec<Value> = vault_data
         .get("files")
         .and_then(|f| f.as_array())
         .cloned()
@@ -245,10 +245,10 @@ fn decrypt_vault_json(state: &AppState, auth: &AuthenticatedRequest) -> Result<V
     kek.zeroize();
 
     let vault_enc = fs::read(state.config.data_dir.join("vault.enc"))?;
-    let secrets_bytes = decrypt_vault(&dek, &vault_enc)?;
+    let plaintext_bytes = decrypt_vault(&dek, &vault_enc)?;
     dek.zeroize();
 
-    serde_json::from_slice(&secrets_bytes)
+    serde_json::from_slice(&plaintext_bytes)
         .map_err(|e| AppError::Internal(format!("Failed to parse vault: {}", e)))
 }
 
@@ -281,21 +281,21 @@ where
     kek.zeroize();
 
     let vault_enc = fs::read(state.config.data_dir.join("vault.enc"))?;
-    let secrets_bytes = decrypt_vault(&dek, &vault_enc)?;
-    let mut secrets: Value = serde_json::from_slice(&secrets_bytes)
+    let plaintext_bytes = decrypt_vault(&dek, &vault_enc)?;
+    let mut vault_data: Value = serde_json::from_slice(&plaintext_bytes)
         .map_err(|e| AppError::Internal(format!("Failed to parse vault: {}", e)))?;
 
     // Apply mutation
-    f(&mut secrets)?;
+    f(&mut vault_data)?;
 
     // Re-encrypt and write
     let new_enc =
-        encrypt_vault(&dek, serde_json::to_string(&secrets)?.as_bytes())?;
+        encrypt_vault(&dek, serde_json::to_string(&vault_data)?.as_bytes())?;
     dek.zeroize();
 
     fs::write(state.config.data_dir.join("vault.enc"), &new_enc)?;
-    let _ = write_index(state, &secrets);
-    state.vault.set_secrets(secrets);
+    let _ = write_index(state, &vault_data);
+    state.vault.set_plaintext(vault_data);
 
     Ok(())
 }
@@ -351,16 +351,16 @@ pub async fn setup(
         .and_then(|v| v.as_array())
         .ok_or_else(|| AppError::BadRequest("Missing userKeys array".into()))?;
 
-    let mut secrets = parsed
-        .get("secrets")
+    let mut vault_data = parsed
+        .get("vault")
         .cloned()
-        .ok_or_else(|| AppError::BadRequest("Missing secrets".into()))?;
+        .ok_or_else(|| AppError::BadRequest("Missing vault".into()))?;
 
     // Inject VAPID key pair if not already present (fresh setup or migration)
-    if secrets.get("vapid_private_key").is_none() {
+    if vault_data.get("vapid_private_key").is_none() {
         match crate::notify::webpush::generate_vapid_keypair() {
             Ok((priv_b64, _pub_b64)) => {
-                secrets.as_object_mut().map(|m| m.insert(
+                vault_data.as_object_mut().map(|m| m.insert(
                     "vapid_private_key".into(),
                     serde_json::Value::String(priv_b64),
                 ));
@@ -463,19 +463,9 @@ pub async fn setup(
         )?;
     }
 
-    // vault.enc = secrets + config. Frontend sends them separately but both
-    // must persist — merge entire config into secrets before encryption.
-    if let Some(config) = parsed.get("config").and_then(|c| c.as_object()) {
-        if let Some(secrets_obj) = secrets.as_object_mut() {
-            for (k, v) in config {
-                secrets_obj.insert(k.clone(), v.clone());
-            }
-        }
-    }
-
     fs::create_dir_all(&state.config.data_dir)?;
     let dek = generate_dek();
-    let vault_enc = encrypt_vault(&dek, serde_json::to_string(&secrets)?.as_bytes())?;
+    let vault_enc = encrypt_vault(&dek, serde_json::to_string(&vault_data)?.as_bytes())?;
     fs::write(state.config.data_dir.join("vault.enc"), &vault_enc)?;
 
     let mut passkeys_map: HashMap<String, PasskeyEntry> = HashMap::new();
@@ -549,13 +539,13 @@ pub async fn setup(
     fs::write(&passkeys_path, serde_json::to_string(&passkeys_map)?)?;
 
     // Write index.json
-    let _ = write_index(&state, &secrets);
+    let _ = write_index(&state, &vault_data);
 
     // Unlock proxy immediately after setup
-    state.vault.set_secrets(secrets.clone());
+    state.vault.set_plaintext(vault_data.clone());
 
     // Dispatch cook ops (workspace files, config, recipe steps) — full cook on setup
-    dispatch_cook(secrets, state.config.proxy_port, state.config.effective_admin_url(), state.config.data_dir.clone(), None);
+    dispatch_cook(vault_data, state.config.proxy_port, state.config.effective_admin_url(), state.config.data_dir.clone(), None);
 
 
     Ok(Json(json!({ "ok": true })))
@@ -590,21 +580,21 @@ pub async fn vault_unlock(
     kek.zeroize();
 
     let vault_enc = fs::read(state.config.data_dir.join("vault.enc"))?;
-    let secrets_bytes = decrypt_vault(&dek, &vault_enc)?;
+    let plaintext_bytes = decrypt_vault(&dek, &vault_enc)?;
 
-    let mut secrets: Value = serde_json::from_slice(&secrets_bytes)
+    let mut vault_data: Value = serde_json::from_slice(&plaintext_bytes)
         .map_err(|e| AppError::Internal(format!("Failed to parse vault: {}", e)))?;
 
     // Migration: generate VAPID key pair if not present (existing vaults pre-dating Web Push)
-    if secrets.get("vapid_private_key").is_none() {
+    if vault_data.get("vapid_private_key").is_none() {
         match crate::notify::webpush::generate_vapid_keypair() {
             Ok((priv_b64, _)) => {
-                secrets.as_object_mut().map(|m| m.insert(
+                vault_data.as_object_mut().map(|m| m.insert(
                     "vapid_private_key".into(),
                     serde_json::Value::String(priv_b64),
                 ));
                 // Re-encrypt and persist migrated vault
-                let new_enc = encrypt_vault(&dek, serde_json::to_string(&secrets)?.as_bytes())?;
+                let new_enc = encrypt_vault(&dek, serde_json::to_string(&vault_data)?.as_bytes())?;
                 fs::write(state.config.data_dir.join("vault.enc"), &new_enc)?;
                 tracing::info!("Migrated vault: generated VAPID key pair");
             }
@@ -613,7 +603,7 @@ pub async fn vault_unlock(
     }
     dek.zeroize();
 
-    state.vault.set_secrets(secrets);
+    state.vault.set_plaintext(vault_data);
 
     // No cook on unlock — config set by previous cook is persisted in docker volume.
     // Unlock only decrypts vault in memory.
@@ -666,18 +656,18 @@ pub async fn vault_credentials(
     kek.zeroize();
 
     let vault_enc = fs::read(state.config.data_dir.join("vault.enc"))?;
-    let secrets_bytes = decrypt_vault(&dek, &vault_enc)?;
+    let plaintext_bytes = decrypt_vault(&dek, &vault_enc)?;
     dek.zeroize();
 
     // Optional partial read: if `select` is provided, return only matching subtrees.
     let output_bytes = if let Some(select) = auth.payload.get("select").and_then(|v| v.as_str()) {
-        let full: Value = serde_json::from_slice(&secrets_bytes)
+        let full: Value = serde_json::from_slice(&plaintext_bytes)
             .map_err(|e| AppError::Internal(format!("Failed to parse vault: {}", e)))?;
         let filtered = select_paths(&full, select);
         serde_json::to_vec(&filtered)
             .map_err(|e| AppError::Internal(format!("Failed to serialize filtered vault: {}", e)))?
     } else {
-        secrets_bytes
+        plaintext_bytes
     };
 
     let mut response_key = derive_response_key(&user_key, &nonce_bytes)?;
@@ -728,7 +718,7 @@ pub async fn vault_update(
     State(state): State<Arc<AppState>>,
     auth: AuthenticatedRequest,
 ) -> Result<impl IntoResponse> {
-    let new_secrets = auth
+    let new_vault_data = auth
         .payload
         .get("newSecrets")
         .cloned()
@@ -756,15 +746,15 @@ pub async fn vault_update(
     let mut dek = unwrap_dek(&wrapped, &kek)?;
     kek.zeroize();
 
-    let vault_enc = encrypt_vault(&dek, serde_json::to_string(&new_secrets)?.as_bytes())?;
+    let vault_enc = encrypt_vault(&dek, serde_json::to_string(&new_vault_data)?.as_bytes())?;
     dek.zeroize();
     fs::write(state.config.data_dir.join("vault.enc"), &vault_enc)?;
 
-    let _ = write_index(&state, &new_secrets);
-    state.vault.set_secrets(new_secrets.clone());
+    let _ = write_index(&state, &new_vault_data);
+    state.vault.set_plaintext(new_vault_data.clone());
 
     // Keep VM-side SafeClaw guidance in sync with the latest vault config — full cook
-    dispatch_cook(new_secrets, state.config.proxy_port, state.config.effective_admin_url(), state.config.data_dir.clone(), None);
+    dispatch_cook(new_vault_data, state.config.proxy_port, state.config.effective_admin_url(), state.config.data_dir.clone(), None);
 
     Ok(Json(json!({ "ok": true })))
 }
@@ -774,8 +764,8 @@ pub async fn vault_update(
 /// Write local service files to the data volume so CLI subprocesses can read them.
 /// Currently handles NodPay: writes wallet JSON to {data_dir}/.nodpay/wallets/{safe}.json
 /// so that `npx nodpay wallets --json` works inside the safeclaw container.
-fn sync_local_service_files(secrets: &serde_json::Value, data_dir: &std::path::Path) {
-    let Some(nodpay) = secrets.get("services").and_then(|s| s.get("nodpay")) else { return };
+fn sync_local_service_files(vault_data: &serde_json::Value, data_dir: &std::path::Path) {
+    let Some(nodpay) = vault_data.get("services").and_then(|s| s.get("nodpay")) else { return };
     let Some(wallet) = nodpay.get("wallet") else { return };
     let Some(safe) = wallet.get("safe").and_then(|s| s.as_str()) else { return };
 
@@ -810,15 +800,15 @@ fn sync_local_service_files(secrets: &serde_json::Value, data_dir: &std::path::P
 
 /// Spawn a background task that dispatches cook ops to the local cooker endpoint
 /// after vault state changes (setup, unlock, service add/update/remove).
-/// Builds ops from vault secrets + service recipes, sends a single POST /cook.
+/// Builds ops from vault plaintext + service recipes, sends a single POST /cook.
 /// Failures are silently discarded — the vault operation has already succeeded.
-fn dispatch_cook(secrets: serde_json::Value, proxy_port: u16, console_url: String, data_dir: std::path::PathBuf, service_only: Option<String>) {
+fn dispatch_cook(vault_data: serde_json::Value, proxy_port: u16, console_url: String, data_dir: std::path::PathBuf, service_only: Option<String>) {
     // Sync local service files (e.g. NodPay wallet JSON) before dispatching to provisioner.
-    sync_local_service_files(&secrets, &data_dir);
+    sync_local_service_files(&vault_data, &data_dir);
 
     tokio::spawn(async move {
-        let md = crate::cli::generate::generate_safeclaw_md(&secrets, false, proxy_port, &console_url);
-        let snippet = crate::cli::generate::generate_agents_md_snippet(&secrets, proxy_port);
+        let md = crate::cli::generate::generate_safeclaw_md(&vault_data, false, proxy_port, &console_url);
+        let snippet = crate::cli::generate::generate_agents_md_snippet(&vault_data, proxy_port);
 
         // Build steps in recipe format — provisioner executes them directly.
         let mut steps: Vec<serde_json::Value> = vec![];
@@ -859,7 +849,7 @@ fn dispatch_cook(secrets: serde_json::Value, proxy_port: u16, console_url: Strin
         // Vault-driven config: set model via openclaw CLI
         // Skipped when only cooking a single service's recipe.
         if service_only.is_none() {
-        if let Some(model) = secrets.get("model") {
+        if let Some(model) = vault_data.get("model") {
             let model_json = serde_json::to_string(model).unwrap_or_default();
             let escaped = model_json.replace('\'', "'\\''");
             steps.push(serde_json::json!({
@@ -872,7 +862,7 @@ fn dispatch_cook(secrets: serde_json::Value, proxy_port: u16, console_url: Strin
 
         // Collect recipe steps for each enabled service (sent as-is, provisioner executes).
         // Built-in recipe steps first, then vault-side steps (overrides/additions).
-        if let Some(svcs) = secrets.get("services").and_then(|s| s.as_object()) {
+        if let Some(svcs) = vault_data.get("services").and_then(|s| s.as_object()) {
             let relay_ip = std::env::var("SAFECLAW_RELAY_EGRESS_IP").unwrap_or_default();
             let resolve = |s: &str, svc_id: &str, svc_data: &serde_json::Value| -> std::result::Result<String, String> {
                 let mut result = s.replace("{{safeclaw.proxy_port}}", &proxy_port.to_string())
@@ -992,11 +982,11 @@ pub async fn vault_service_field(
         return Err(AppError::BadRequest(format!("no such vault field: {}.{}", name, key)));
     }
 
-    let secrets = state.vault.secrets.lock().unwrap();
-    let secrets = secrets.as_ref()
+    let plaintext = state.vault.plaintext.lock().unwrap();
+    let plaintext = plaintext.as_ref()
         .ok_or_else(|| AppError::BadRequest("vault is locked".into()))?;
 
-    let value = secrets
+    let value = plaintext
         .get("services")
         .and_then(|s| s.get(&name))
         .and_then(|svc| svc.get(&key))
@@ -1034,8 +1024,8 @@ pub async fn vault_services_add(
     }
 
     let service_id = name.clone();
-    with_vault_mut(&state, &auth, move |secrets| {
-        let services = secrets
+    with_vault_mut(&state, &auth, move |vault_data| {
+        let services = vault_data
             .get_mut("services")
             .and_then(|s| s.as_object_mut())
             .ok_or_else(|| AppError::Internal("Vault missing 'services' object".into()))?;
@@ -1047,8 +1037,8 @@ pub async fn vault_services_add(
     let proxy_port = state.config.proxy_port;
     let console_url = state.config.effective_admin_url();
     let data_dir = state.config.data_dir.clone();
-    if let Some(secrets) = state.vault.secrets.lock().unwrap().clone() {
-        dispatch_cook(secrets, proxy_port, console_url, data_dir, Some(service_id));
+    if let Some(vault_data) = state.vault.plaintext.lock().unwrap().clone() {
+        dispatch_cook(vault_data, proxy_port, console_url, data_dir, Some(service_id));
     }
 
     Ok(Json(json!({ "ok": true })))
@@ -1067,8 +1057,8 @@ pub async fn vault_services_remove(
         .to_string();
 
     let service_id = name.clone();
-    with_vault_mut(&state, &auth, move |secrets| {
-        let services = secrets
+    with_vault_mut(&state, &auth, move |vault_data| {
+        let services = vault_data
             .get_mut("services")
             .and_then(|s| s.as_object_mut())
             .ok_or_else(|| AppError::Internal("Vault missing 'services' object".into()))?;
@@ -1080,8 +1070,8 @@ pub async fn vault_services_remove(
     let proxy_port = state.config.proxy_port;
     let console_url = state.config.effective_admin_url();
     let data_dir = state.config.data_dir.clone();
-    if let Some(secrets) = state.vault.secrets.lock().unwrap().clone() {
-        dispatch_cook(secrets, proxy_port, console_url, data_dir, Some(service_id));
+    if let Some(vault_data) = state.vault.plaintext.lock().unwrap().clone() {
+        dispatch_cook(vault_data, proxy_port, console_url, data_dir, Some(service_id));
     }
 
     Ok(Json(json!({ "ok": true })))
@@ -1106,8 +1096,8 @@ pub async fn vault_policy_update(
         .cloned()
         .ok_or_else(|| AppError::BadRequest("Missing policy_defaults".into()))?;
 
-    with_vault_mut(&state, &auth, move |secrets| {
-        secrets["policy_defaults"] = new_defaults;
+    with_vault_mut(&state, &auth, move |vault_data| {
+        vault_data["policy_defaults"] = new_defaults;
         Ok(())
     })?;
 
@@ -1269,11 +1259,11 @@ pub async fn vault_files_upload(
     with_vault_mut(&state, &auth, {
         let file_id2 = file_id.clone();
         let file_name2 = file_name.clone();
-        move |secrets| {
-            if secrets.get("files").is_none() {
-                secrets["files"] = json!([]);
+        move |vault_data| {
+            if vault_data.get("files").is_none() {
+                vault_data["files"] = json!([]);
             }
-            if let Some(arr) = secrets["files"].as_array_mut() {
+            if let Some(arr) = vault_data["files"].as_array_mut() {
                 arr.push(json!({
                     "id": file_id2,
                     "name": file_name2,
@@ -1376,8 +1366,8 @@ pub async fn vault_files_remove(
     // Remove from vault JSON
     with_vault_mut(&state, &auth, {
         let file_id2 = file_id.clone();
-        move |secrets| {
-            if let Some(files) = secrets.get_mut("files").and_then(|f| f.as_array_mut()) {
+        move |vault_data| {
+            if let Some(files) = vault_data.get_mut("files").and_then(|f| f.as_array_mut()) {
                 files.retain(|f| f.get("id").and_then(|v| v.as_str()) != Some(&file_id2));
             }
             Ok(())
@@ -1414,18 +1404,18 @@ pub async fn vault_notifications_subscribe(
         .map(|s| s.endpoint.clone())
         .collect();
 
-    with_vault_mut(&state, &auth, move |secrets| {
+    with_vault_mut(&state, &auth, move |vault_data| {
         // Migrate flat key to nested structure if needed
-        if let Some(old) = secrets.get("push_subscriptions").cloned() {
-            if secrets.get("notifications").is_none() {
-                secrets["notifications"] = json!({ "subscriptions": old });
+        if let Some(old) = vault_data.get("push_subscriptions").cloned() {
+            if vault_data.get("notifications").is_none() {
+                vault_data["notifications"] = json!({ "subscriptions": old });
             }
-            secrets.as_object_mut().map(|m| m.remove("push_subscriptions"));
+            vault_data.as_object_mut().map(|m| m.remove("push_subscriptions"));
         }
-        if secrets.get("notifications").is_none() {
-            secrets["notifications"] = json!({ "subscriptions": [] });
+        if vault_data.get("notifications").is_none() {
+            vault_data["notifications"] = json!({ "subscriptions": [] });
         }
-        if let Some(arr) = secrets["notifications"]["subscriptions"].as_array_mut() {
+        if let Some(arr) = vault_data["notifications"]["subscriptions"].as_array_mut() {
             // Prune dead subscriptions (410/404 since last vault write)
             arr.retain(|s| {
                 s.get("endpoint")
@@ -1573,8 +1563,8 @@ pub async fn approval_confirm(
         // Normal service: decrypt vault and extract auth config for replay
         let auth_json = decrypt_vault_json(&state, &auth)
             .ok()
-            .and_then(|secrets| {
-                secrets
+            .and_then(|vault_data| {
+                vault_data
                     .get("services")
                     .and_then(|s| s.get(&service_name))
                     .and_then(|svc| svc.get("auth"))
@@ -1767,11 +1757,11 @@ pub async fn admin_safeclaw_md(State(state): State<Arc<AppState>>) -> impl IntoR
     let locked = state.vault.is_locked();
     let console_url = state.config.effective_admin_url();
     let content = {
-        let secrets_guard = state.vault.secrets.lock().unwrap();
-        if let Some(ref s) = *secrets_guard {
+        let plaintext_guard = state.vault.plaintext.lock().unwrap();
+        if let Some(ref s) = *plaintext_guard {
             crate::cli::generate::generate_safeclaw_md(s, false, state.config.proxy_port, &console_url)
         } else {
-            drop(secrets_guard);
+            drop(plaintext_guard);
             let names = state.vault.service_names.lock().unwrap().clone();
             let services: serde_json::Map<String, Value> =
                 names.into_iter().map(|n| (n, Value::Null)).collect();
@@ -1792,11 +1782,11 @@ pub async fn admin_safeclaw_md(State(state): State<Arc<AppState>>) -> impl IntoR
 /// GET /admin/agents-snippet — returns AGENTS.md routing instructions (no passkey required)
 pub async fn admin_agents_snippet(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let content = {
-        let secrets_guard = state.vault.secrets.lock().unwrap();
-        if let Some(ref s) = *secrets_guard {
+        let plaintext_guard = state.vault.plaintext.lock().unwrap();
+        if let Some(ref s) = *plaintext_guard {
             crate::cli::generate::generate_agents_md_snippet(s, state.config.proxy_port)
         } else {
-            drop(secrets_guard);
+            drop(plaintext_guard);
             let names = state.vault.service_names.lock().unwrap().clone();
             let services: serde_json::Map<String, Value> =
                 names.into_iter().map(|n| (n, Value::Null)).collect();

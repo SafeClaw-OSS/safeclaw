@@ -1,6 +1,7 @@
-//! Vault — encrypted secret store held in memory when unlocked.
+//! Vault — encrypted store held in memory when unlocked.
 //!
-//! Separates core secrets from runtime caches. Both are cleared on lock.
+//! `vault.plaintext` holds the decrypted JSON; `vault.enc` is the on-disk ciphertext.
+//! Runtime caches are peer state, cleared together on lock.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -30,7 +31,7 @@ pub struct ApprovalSession {
 // ── VaultCache ───────────────────────────────────────────────────────────────
 
 /// Ephemeral runtime caches — all cleared when the vault locks.
-/// These are peer to `secrets`, not children of it.
+/// These are peer to `plaintext`, not children of it.
 pub struct VaultCache {
     /// OAuth2 token cache: service_name → (access_token, expires_at_unix_secs)
     pub oauth2_tokens: Mutex<HashMap<String, (String, u64)>>,
@@ -108,13 +109,13 @@ fn service_needs_auth_stripped(svc: &serde_json::Value) -> bool {
     false
 }
 
-/// Vault state — secrets + derived state + runtime caches.
+/// Vault state — plaintext + derived state + runtime caches.
 pub struct Vault {
-    // ── Core secrets (encrypted at rest) ─────────────────────────────────────
+    // ── Plaintext (decrypted vault.enc) ──────────────────────────────────────
     /// Decrypted vault JSON (all services). None = locked.
-    pub secrets: Mutex<Option<serde_json::Value>>,
+    pub plaintext: Mutex<Option<serde_json::Value>>,
 
-    // ── Derived state (extracted from secrets at unlock) ─────────────────────
+    // ── Derived state (extracted from plaintext at unlock) ───────────────────
     /// Service name list (populated at unlock)
     pub service_names: Mutex<Vec<String>>,
     /// Policy defaults (loaded at unlock)
@@ -131,7 +132,7 @@ pub struct Vault {
 impl Vault {
     pub fn new() -> Self {
         Self {
-            secrets: Mutex::new(None),
+            plaintext: Mutex::new(None),
             service_names: Mutex::new(Vec::new()),
             policy_defaults: Mutex::new(PolicyDefaults::default()),
             push_subscriptions: Mutex::new(Vec::new()),
@@ -141,16 +142,16 @@ impl Vault {
     }
 
     pub fn is_locked(&self) -> bool {
-        self.secrets.lock().unwrap().is_none()
+        self.plaintext.lock().unwrap().is_none()
     }
 
     /// Load decrypted vault JSON into memory.
     /// Parses service names, policy defaults, and push subscriptions.
     /// Auth is stripped from services whose access level requires approval (ask / ask-always) —
     /// credentials for those services are only available transiently via approval.
-    pub fn set_secrets(&self, mut secrets: serde_json::Value) {
+    pub fn set_plaintext(&self, mut vault_data: serde_json::Value) {
         // Auto-inject built-in "files" service (vault file storage, accessed via proxy)
-        if let Some(services) = secrets.get_mut("services").and_then(|s| s.as_object_mut()) {
+        if let Some(services) = vault_data.get_mut("services").and_then(|s| s.as_object_mut()) {
             if !services.contains_key("files") {
                 services.insert("files".into(), serde_json::json!({
                     "upstream": "http://localhost:23294/vault/files",
@@ -160,7 +161,7 @@ impl Vault {
         }
 
         // Strip auth from approval-required services
-        if let Some(services) = secrets.get_mut("services").and_then(|s| s.as_object_mut()) {
+        if let Some(services) = vault_data.get_mut("services").and_then(|s| s.as_object_mut()) {
             for svc in services.values_mut() {
                 if service_needs_auth_stripped(svc) {
                     svc.as_object_mut().map(|m| m.remove("auth"));
@@ -169,28 +170,28 @@ impl Vault {
         }
 
         // Extract service names
-        let names: Vec<String> = secrets
+        let names: Vec<String> = vault_data
             .get("services")
             .and_then(|s| s.as_object())
             .map(|obj| obj.keys().cloned().collect())
             .unwrap_or_default();
 
         // Extract policy defaults
-        let policy_defaults = secrets
+        let policy_defaults = vault_data
             .get("policy_defaults")
             .and_then(|v| serde_json::from_value::<PolicyDefaults>(v.clone()).ok())
             .unwrap_or_default();
 
         // Extract push subscriptions (support both nested and flat key for compat)
-        let push_subs = secrets
+        let push_subs = vault_data
             .get("notifications")
             .and_then(|n| n.get("subscriptions"))
-            .or_else(|| secrets.get("push_subscriptions"))
+            .or_else(|| vault_data.get("push_subscriptions"))
             .and_then(|v| serde_json::from_value::<Vec<PushSubscription>>(v.clone()).ok())
             .unwrap_or_default();
 
         // Load VAPID private key and derive public key
-        let vapid = secrets
+        let vapid = vault_data
             .get("vapid_private_key")
             .and_then(|v| v.as_str())
             .and_then(|priv_b64| {
@@ -205,18 +206,18 @@ impl Vault {
         *self.service_names.lock().unwrap() = names;
         *self.policy_defaults.lock().unwrap() = policy_defaults;
         *self.push_subscriptions.lock().unwrap() = push_subs;
-        // Zeroize old secrets before replacing
+        // Zeroize old plaintext before replacing
         {
-            let mut guard = self.secrets.lock().unwrap();
+            let mut guard = self.plaintext.lock().unwrap();
             crate::crypto::zeroize::zeroize_json_option(&mut *guard);
-            *guard = Some(secrets);
+            *guard = Some(vault_data);
         }
     }
 
-    /// Lock the vault — zeroize and clear all in-memory secrets.
+    /// Lock the vault — zeroize and clear all in-memory plaintext.
     pub fn lock(&self) {
-        // Zeroize vault secrets (API keys, OAuth tokens, etc.) before drop
-        crate::crypto::zeroize::zeroize_json_option(&mut *self.secrets.lock().unwrap());
+        // Zeroize vault plaintext (API keys, OAuth tokens, etc.) before drop
+        crate::crypto::zeroize::zeroize_json_option(&mut *self.plaintext.lock().unwrap());
         *self.service_names.lock().unwrap() = Vec::new();
         *self.push_subscriptions.lock().unwrap() = Vec::new();
         *self.policy_defaults.lock().unwrap() = PolicyDefaults::default();

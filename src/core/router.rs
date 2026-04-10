@@ -366,10 +366,10 @@ async fn proxy_handler(
         }
     };
 
-    // Look up service config from vault secrets
+    // Look up service config from vault plaintext
     let mut service_vault = {
-        let secrets_guard = state.vault.secrets.lock().unwrap();
-        let secrets = match secrets_guard.as_ref() {
+        let plaintext_guard = state.vault.plaintext.lock().unwrap();
+        let vault_data = match plaintext_guard.as_ref() {
             Some(s) => s.clone(),
             None => {
                 return (
@@ -379,9 +379,9 @@ async fn proxy_handler(
                     .into_response();
             }
         };
-        drop(secrets_guard);
+        drop(plaintext_guard);
 
-        let svc_val = secrets
+        let svc_val = vault_data
             .get("services")
             .and_then(|s| s.get(&route_service))
             .cloned();
@@ -903,7 +903,7 @@ async fn execute_step(
     ).into_response())
 }
 
-/// Execute a vault read step: read a dotted path from vault secrets.
+/// Execute a vault read step: read a dotted path from vault plaintext.
 pub(crate) fn execute_vault_read(
     state: &Arc<ProxyState>,
     _service_name: &str,
@@ -916,8 +916,8 @@ pub(crate) fn execute_vault_read(
         ).into_response()
     })?;
 
-    let secrets_guard = state.vault.secrets.lock().unwrap();
-    let secrets = secrets_guard.as_ref().ok_or_else(|| {
+    let plaintext_guard = state.vault.plaintext.lock().unwrap();
+    let plaintext = plaintext_guard.as_ref().ok_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({ "error": "vault is locked" })),
@@ -925,7 +925,7 @@ pub(crate) fn execute_vault_read(
     })?;
 
     // Navigate the dotted path (e.g. "services.openclaw-dashboard.gatewayToken")
-    let mut current = secrets;
+    let mut current = plaintext;
     for segment in read_path.split('.') {
         current = current.get(segment).ok_or_else(|| {
             tracing::debug!("vault read: path '{}' not found at segment '{}'", read_path, segment);
