@@ -8,6 +8,11 @@ target = "openclaw"
 run = "openclaw config set gateway.controlUi.enabled true --strict-json"
 
 [[steps]]
+title = "Allow embedding from SafeClaw Pro"
+target = "openclaw"
+run = """openclaw config set gateway.controlUi.allowedOrigins '["https://www.safeclaw.pro"]' --strict-json"""
+
+[[steps]]
 title = "Set token auth mode"
 target = "openclaw"
 run = "openclaw config set gateway.auth.mode token"
