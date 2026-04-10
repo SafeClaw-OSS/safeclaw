@@ -412,10 +412,17 @@ impl ServiceRegistry {
         &self.services
     }
 
-    /// Check if a service has any upstream blocks (is a proxy service).
+    /// Check if a service has any upstream blocks.
     pub fn has_upstream(&self, service_name: &str) -> bool {
         self.services.get(service_name)
             .map(|d| !d.upstream.is_empty())
+            .unwrap_or(false)
+    }
+
+    /// Check if a service is callable by the agent (has [[upstream]] or [[api]]).
+    pub fn is_agent_visible(&self, service_name: &str) -> bool {
+        self.services.get(service_name)
+            .map(|d| !d.upstream.is_empty() || !d.api.is_empty())
             .unwrap_or(false)
     }
 }

@@ -49,10 +49,8 @@ pub fn generate_safeclaw_md(secrets: &serde_json::Value, locked: bool, proxy_por
     ];
     if let Some(services) = secrets.get("services").and_then(|s| s.as_object()) {
         for (name, svc) in services {
-            // Skip internal services — check both vault data and service.toml
-            let has_upstream = crate::service::is_proxy_service(svc)
-                || registry.has_upstream(name);
-            if !has_upstream {
+            // Skip services not callable by the agent (no [[upstream]] or [[api]])
+            if !crate::service::is_proxy_service(svc) && !registry.is_agent_visible(name) {
                 continue;
             }
             let proxy_url = format!("{}/{}/", proxy_base, name);
