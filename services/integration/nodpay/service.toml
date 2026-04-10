@@ -32,8 +32,7 @@ path = "/wallets"
 read = "allow"
 write = "allow"
 
-[guidance]
-summary = """
+help = """
 A shared on-chain wallet is configured and ready. **Skip the NodPay SKILL.md setup section** — \
 keygen and wallet creation are already done by SafeClaw.
 

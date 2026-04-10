@@ -85,18 +85,16 @@ pub fn generate_safeclaw_md(secrets: &serde_json::Value, locked: bool, proxy_por
         )
     };
 
-    // Build guidance sections from service.toml [guidance].summary for each connected service.
+    // Build help sections from service.toml `help` field for each connected service.
     // Template variables like {{wallet.safe}} are resolved from vault service data.
     let mut guidance_sections = vec![];
     if let Some(services) = secrets.get("services").and_then(|s| s.as_object()) {
         for (name, svc_data) in services {
             let svc_def = registry.get(name);
-            let summary = svc_def
-                .and_then(|d| d.guidance.as_ref())
-                .and_then(|g| g.summary.as_deref());
-            if let Some(summary) = summary {
+            let help = svc_def.and_then(|d| d.help.as_deref());
+            if let Some(help) = help {
                 let display_name = svc_def.map(|d| d.service.name.as_str()).unwrap_or(name);
-                let resolved = resolve_guidance_templates(summary, svc_data);
+                let resolved = resolve_guidance_templates(help, svc_data);
                 guidance_sections.push(format!("## {}\n\n{}", display_name, resolved));
             }
         }

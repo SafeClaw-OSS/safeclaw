@@ -18,8 +18,7 @@ method = "GET"
 path_exact = "/help"
 level = "allow"
 
-[guidance]
-summary = """\
+help = """\
 Encrypted file storage built into SafeClaw — not a well-known API. \
 `GET /files/help` returns the full endpoint reference.\
 """

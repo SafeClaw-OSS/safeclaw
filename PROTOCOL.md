@@ -221,17 +221,20 @@ level = "ask-always"
 
 Rules are evaluated most-specific-first. A matching rule overrides service-level defaults.
 
-### `[guidance]` — Agent instructions
+### `help` — Service help text
 
 ```toml
-[guidance]
-summary = """
+help = """
 A shared wallet is configured. **Skip the SKILL.md setup** — already done.
 - **Safe address:** `{{wallet.safe}}`
 """
 ```
 
-Rendered into `safeclaw.md` when the service is connected. Template variables `{{wallet.*}}` are resolved from vault service data. Optional.
+A markdown string under `[service]`. Serves two purposes:
+1. **`GET /{service}/help`** — returns the resolved help text (always allowed, no policy check)
+2. **`safeclaw.md`** — rendered as a section when the service is connected
+
+Template variables `{{wallet.*}}` are resolved from vault service data. Optional.
 
 ---
 
@@ -458,8 +461,7 @@ path = "/wallets"
 read = "allow"
 write = "allow"
 
-[guidance]
-summary = """
+help = """
 A shared on-chain wallet is configured and ready. **Skip the NodPay SKILL.md setup section** — \
 keygen and wallet creation are already done by SafeClaw.
 

@@ -22,7 +22,10 @@ pub struct ServiceDef {
     #[serde(default)]
     pub vault: Vec<VaultField>,
     pub policy: Option<PolicyDef>,
-    pub guidance: Option<GuidanceDef>,
+    /// Help text returned by GET /{service}/help and rendered into safeclaw.md.
+    /// Supports template variables: {{wallet.*}} resolved from vault service data.
+    #[serde(default)]
+    pub help: Option<String>,
 }
 
 /// Declares a field stored in the vault for this service.
@@ -41,13 +44,6 @@ pub struct VaultField {
 }
 
 fn default_vault_kind() -> String { "config".to_string() }
-
-#[derive(Debug, Clone, serde::Deserialize)]
-pub struct GuidanceDef {
-    /// Agent-facing instructions rendered into safeclaw.md when this service is connected.
-    /// Supports template variables: {{wallet.*}} resolved from vault service data.
-    pub summary: Option<String>,
-}
 
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct ServiceMeta {
