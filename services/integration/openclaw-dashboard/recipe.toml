@@ -18,6 +18,11 @@ target = "openclaw"
 run = "openclaw config set gateway.auth.token '{{service.vault.gatewayToken}}'"
 
 [[steps]]
+title = "Enable trusted proxy"
+target = "openclaw"
+run = """openclaw config set gateway.auth.trustedProxy '{"userHeader":"x-safeclaw-user"}' --strict-json"""
+
+[[steps]]
 title = "Bind to LAN"
 target = "openclaw"
 run = "openclaw config set gateway.bind lan"
