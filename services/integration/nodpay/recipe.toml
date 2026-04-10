@@ -20,7 +20,7 @@ files = [
 note = "CLI reads remote_wallet to delegate sign/address/wallets to SafeClaw vault"
 
 [[steps]]
-title = "Load NodPay skill"
+title = "Install NodPay skill from ClawHub"
 target = "openclaw"
-run = "openclaw skills load nodpay"
-note = "Enables agent to use NodPay propose/approve via SKILL.md"
+run = "openclaw skills install nodpay --force"
+note = "Downloads skill from ClawHub and enables agent to use NodPay propose/approve via SKILL.md"
