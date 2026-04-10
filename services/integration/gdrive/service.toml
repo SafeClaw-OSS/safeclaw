@@ -15,12 +15,3 @@ path = "*"
   [[api.steps]]
   target = "upstream:default"
   returns = true
-
-[policy.levels]
-read = "ask"
-write = "ask-always"
-
-[[policy.rules]]
-method = "GET"
-path_exact = "/drive/v3/files"
-level = "allow"

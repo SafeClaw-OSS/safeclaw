@@ -3,6 +3,3 @@ id = "openclaw-dashboard"
 name = "OpenClaw Dashboard"
 category = "integration"
 
-[policy.levels]
-read = "allow"
-write = "allow"

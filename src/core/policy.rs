@@ -1,5 +1,10 @@
 /// Policy engine: access levels, rules, and evaluation logic.
+///
+/// Rule matching uses standard regex (Rust `regex` crate, RE2 semantics).
+/// - `match_pattern`: matched against `"METHOD /path"` (e.g. `"POST /v1/chat/completions"`)
+/// - `body_pattern`: matched against the request body text (optional)
 use serde::{Deserialize, Serialize};
+use regex::Regex;
 
 // ── Access Level ───────────────────────────────────────────────────────────────
 
@@ -31,18 +36,26 @@ impl std::fmt::Display for AccessLevel {
 
 // ── Policy Types ───────────────────────────────────────────────────────────────
 
-/// Per-request rule override for specific method/path patterns
+/// Per-request policy rule. Matched against `"METHOD /path"` and optionally
+/// the request body, using standard regex (RE2 semantics).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PolicyRule {
-    pub method: Option<String>,
-    #[serde(rename = "pathSuffix")]
-    pub path_suffix: Option<String>,
-    /// Exact path match (query string stripped before comparison)
-    #[serde(rename = "pathExact")]
-    pub path_exact: Option<String>,
+    /// Unique identifier (e.g. "send-email"). Used as key for vault overrides.
+    #[serde(default)]
+    pub id: Option<String>,
+    /// Human-readable label for console UI (e.g. "Send email").
+    #[serde(default)]
+    pub label: Option<String>,
+    /// Regex matched against `"METHOD /path"` (e.g. `"POST /gmail/v1/users/me/messages/send"`).
+    /// Omit to match all requests.
+    #[serde(default, rename = "match")]
+    pub match_pattern: Option<String>,
+    /// Regex matched against request body text. Omit to skip body matching.
+    #[serde(default, rename = "body")]
+    pub body_pattern: Option<String>,
     pub level: AccessLevel,
     /// Session TTL in seconds (for `ask` level; cached after first approval)
-    #[serde(rename = "sessionTTL")]
+    #[serde(default, rename = "sessionTTL")]
     pub session_ttl: Option<u64>,
 }
 
@@ -99,6 +112,7 @@ impl Default for PolicyDefaults {
 pub fn evaluate_policy(
     method: &str,
     path: &str,
+    body: Option<&str>,
     rules: Option<&Vec<PolicyRule>>,
     service_levels: Option<&ServiceLevels>,
     defaults: &PolicyDefaults,
@@ -107,7 +121,7 @@ pub fn evaluate_policy(
     // 1. Check service rules (most specific)
     if let Some(rules) = rules {
         for rule in rules {
-            if matches_rule(rule, method, path) {
+            if matches_rule(rule, method, path, body) {
                 return rule.level.clone();
             }
         }
@@ -159,22 +173,36 @@ fn is_write_method(method: &str) -> bool {
     matches!(method, "POST" | "PUT" | "PATCH" | "DELETE")
 }
 
-fn matches_rule(rule: &PolicyRule, method: &str, path: &str) -> bool {
-    if let Some(ref m) = rule.method {
-        if m != method {
-            return false;
+fn matches_rule(rule: &PolicyRule, method: &str, path: &str, body: Option<&str>) -> bool {
+    // Match against "METHOD /path" using regex
+    if let Some(ref pattern) = rule.match_pattern {
+        let path_no_query = path.split('?').next().unwrap_or(path);
+        let input = format!("{} {}", method, path_no_query);
+        match Regex::new(pattern) {
+            Ok(re) => {
+                if !re.is_match(&input) {
+                    return false;
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Invalid match regex '{}': {}", pattern, e);
+                return false;
+            }
         }
     }
-    if let Some(ref exact) = rule.path_exact {
-        let path_no_query = path.split('?').next().unwrap_or(path).trim_end_matches('/');
-        let exact_trimmed = exact.trim_end_matches('/');
-        if path_no_query != exact_trimmed {
-            return false;
-        }
-    }
-    if let Some(ref suffix) = rule.path_suffix {
-        if !path.contains(suffix.as_str()) {
-            return false;
+    // Match against body using regex
+    if let Some(ref pattern) = rule.body_pattern {
+        let body_text = body.unwrap_or("");
+        match Regex::new(pattern) {
+            Ok(re) => {
+                if !re.is_match(body_text) {
+                    return false;
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Invalid body regex '{}': {}", pattern, e);
+                return false;
+            }
         }
     }
     true
@@ -190,15 +218,26 @@ mod tests {
         PolicyDefaults::default()
     }
 
+    fn rule(match_pat: &str) -> PolicyRule {
+        PolicyRule {
+            id: None,
+            label: None,
+            match_pattern: Some(match_pat.to_string()),
+            body_pattern: None,
+            level: AccessLevel::AskAlways,
+            session_ttl: None,
+        }
+    }
+
     #[test]
     fn default_no_category_is_ask_always() {
-        let level = evaluate_policy("GET", "/foo", None, None, &defaults(), None);
+        let level = evaluate_policy("GET", "/foo", None, None, None, &defaults(), None);
         assert_eq!(level, AccessLevel::AskAlways);
     }
 
     #[test]
     fn llm_category_is_allow() {
-        let level = evaluate_policy("POST", "/v1/chat/completions", None, None, &defaults(), Some("llm"));
+        let level = evaluate_policy("POST", "/v1/chat/completions", None, None, None, &defaults(), Some("llm"));
         assert_eq!(level, AccessLevel::Allow);
     }
 
@@ -208,7 +247,7 @@ mod tests {
             write: Some(AccessLevel::Ask),
             read: Some(AccessLevel::Allow),
         };
-        let level = evaluate_policy("POST", "/create", None, Some(&levels), &defaults(), None);
+        let level = evaluate_policy("POST", "/create", None, None, Some(&levels), &defaults(), None);
         assert_eq!(level, AccessLevel::Ask);
     }
 
@@ -218,20 +257,15 @@ mod tests {
             write: Some(AccessLevel::AskAlways),
             read: None,
         };
-        // Even though category is "llm" (default allow), service-level override wins
-        let level = evaluate_policy("POST", "/foo", None, Some(&levels), &defaults(), Some("llm"));
+        let level = evaluate_policy("POST", "/foo", None, None, Some(&levels), &defaults(), Some("llm"));
         assert_eq!(level, AccessLevel::AskAlways);
     }
 
     #[test]
     fn rule_takes_priority_over_service_levels() {
-        let rules = vec![PolicyRule {
-            method: Some("DELETE".to_string()),
-            path_suffix: Some("/admin".to_string()),
-            path_exact: None,
-            level: AccessLevel::AskAlways,
-            session_ttl: None,
-        }];
+        let mut r = rule("DELETE /api/admin");
+        r.level = AccessLevel::AskAlways;
+        let rules = vec![r];
         let levels = ServiceLevels {
             write: Some(AccessLevel::Ask),
             read: None,
@@ -239,6 +273,7 @@ mod tests {
         let level = evaluate_policy(
             "DELETE",
             "/api/admin",
+            None,
             Some(&rules),
             Some(&levels),
             &defaults(),
@@ -249,15 +284,9 @@ mod tests {
 
     #[test]
     fn rule_method_mismatch_falls_through() {
-        let rules = vec![PolicyRule {
-            method: Some("DELETE".to_string()),
-            path_suffix: None,
-            path_exact: None,
-            level: AccessLevel::AskAlways,
-            session_ttl: None,
-        }];
-        let level = evaluate_policy("GET", "/foo", Some(&rules), None, &defaults(), None);
-        assert_eq!(level, AccessLevel::AskAlways);
+        let rules = vec![rule("DELETE /.*")];
+        let level = evaluate_policy("GET", "/foo", None, Some(&rules), None, &defaults(), None);
+        assert_eq!(level, AccessLevel::AskAlways); // falls to global default
     }
 
     #[test]
@@ -267,7 +296,64 @@ mod tests {
             write: Some(AccessLevel::Ask),
             read: None,
         });
-        let level = evaluate_policy("POST", "/x", None, None, &def, None);
+        let level = evaluate_policy("POST", "/x", None, None, None, &def, None);
         assert_eq!(level, AccessLevel::Ask);
+    }
+
+    #[test]
+    fn regex_wildcard_path() {
+        let mut r = rule("GET /gmail/v1/users/me/messages/.*");
+        r.level = AccessLevel::Ask;
+        let rules = vec![r];
+        let level = evaluate_policy("GET", "/gmail/v1/users/me/messages/abc123", None, Some(&rules), None, &defaults(), None);
+        assert_eq!(level, AccessLevel::Ask);
+    }
+
+    #[test]
+    fn regex_no_match_falls_through() {
+        let mut r = rule("POST /gmail/v1/users/me/messages/send");
+        r.level = AccessLevel::Deny;
+        let rules = vec![r];
+        // GET doesn't match POST rule
+        let level = evaluate_policy("GET", "/gmail/v1/users/me/messages/send", None, Some(&rules), None, &defaults(), None);
+        assert_eq!(level, AccessLevel::AskAlways); // global default
+    }
+
+    #[test]
+    fn body_pattern_matches() {
+        let mut r = rule("POST /v1/chat/completions");
+        r.body_pattern = Some("o3|o4-mini".to_string());
+        r.level = AccessLevel::Ask;
+        let rules = vec![r];
+        let body = r#"{"model": "o3", "messages": []}"#;
+        let level = evaluate_policy("POST", "/v1/chat/completions", Some(body), Some(&rules), None, &defaults(), None);
+        assert_eq!(level, AccessLevel::Ask);
+    }
+
+    #[test]
+    fn body_pattern_no_match_falls_through() {
+        let mut r = rule("POST /v1/chat/completions");
+        r.body_pattern = Some("o3|o4-mini".to_string());
+        r.level = AccessLevel::Deny;
+        let rules = vec![r];
+        let body = r#"{"model": "gpt-4o", "messages": []}"#;
+        let level = evaluate_policy("POST", "/v1/chat/completions", Some(body), Some(&rules), None, &defaults(), None);
+        assert_eq!(level, AccessLevel::AskAlways); // no match, falls through
+    }
+
+    #[test]
+    fn match_any_method_with_path_only() {
+        let mut r = rule("/admin/.*");
+        r.level = AccessLevel::Deny;
+        let rules = vec![r];
+        // Both GET and POST should match
+        assert_eq!(
+            evaluate_policy("GET", "/admin/settings", None, Some(&rules), None, &defaults(), None),
+            AccessLevel::Deny,
+        );
+        assert_eq!(
+            evaluate_policy("POST", "/admin/delete", None, Some(&rules), None, &defaults(), None),
+            AccessLevel::Deny,
+        );
     }
 }

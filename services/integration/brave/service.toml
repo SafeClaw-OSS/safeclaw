@@ -16,6 +16,3 @@ path = "*"
   target = "upstream:default"
   returns = true
 
-[policy.levels]
-read = "allow"
-write = "allow"

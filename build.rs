@@ -3,6 +3,7 @@
 /// Generates src/generated_services.rs with:
 ///   - compiled_service_tomls() -> &[(&str, &str)]
 ///   - compiled_recipe_tomls() -> &[(&str, &str)]
+///   - compiled_policy_tomls() -> &[(&str, &str)]
 ///
 /// This eliminates hand-written include_str! lists — adding a new service
 /// just requires creating a TOML file in services/.
@@ -16,15 +17,17 @@ fn main() {
 
     let mut service_entries = Vec::new();
     let mut recipe_entries = Vec::new();
+    let mut policy_entries = Vec::new();
 
     // Scan services/{category}/{id}/ layout
     if services_dir.is_dir() {
-        scan_services(services_dir, &mut service_entries, &mut recipe_entries);
+        scan_services(services_dir, &mut service_entries, &mut recipe_entries, &mut policy_entries);
     }
 
     // Sort for deterministic output
     service_entries.sort();
     recipe_entries.sort();
+    policy_entries.sort();
 
     // Generate Rust source
     let mut code = String::new();
@@ -44,6 +47,14 @@ fn main() {
     for (id, rel_path) in &recipe_entries {
         code.push_str(&format!("        (\"{}\", include_str!(\"../{}\") ),\n", id, rel_path));
     }
+    code.push_str("    ]\n}\n\n");
+
+    code.push_str("/// Compiled-in policy.toml definitions.\n");
+    code.push_str("pub fn compiled_policy_tomls() -> &'static [(&'static str, &'static str)] {\n");
+    code.push_str("    &[\n");
+    for (id, rel_path) in &policy_entries {
+        code.push_str(&format!("        (\"{}\", include_str!(\"../{}\") ),\n", id, rel_path));
+    }
     code.push_str("    ]\n}\n");
 
     fs::write(&out_path, code).expect("Failed to write generated_services.rs");
@@ -56,6 +67,7 @@ fn scan_services(
     base: &Path,
     service_entries: &mut Vec<(String, String)>,
     recipe_entries: &mut Vec<(String, String)>,
+    policy_entries: &mut Vec<(String, String)>,
 ) {
     let Ok(categories) = fs::read_dir(base) else { return };
 
@@ -73,7 +85,12 @@ fn scan_services(
 
             let recipe_toml = cat_path.join("recipe.toml");
             if recipe_toml.exists() {
-                recipe_entries.push((id, recipe_toml.to_str().unwrap().to_string()));
+                recipe_entries.push((id.clone(), recipe_toml.to_str().unwrap().to_string()));
+            }
+
+            let policy_toml = cat_path.join("policy.toml");
+            if policy_toml.exists() {
+                policy_entries.push((id, policy_toml.to_str().unwrap().to_string()));
             }
             continue;
         }
@@ -93,7 +110,12 @@ fn scan_services(
 
             let rt = svc_path.join("recipe.toml");
             if rt.exists() {
-                recipe_entries.push((id, rt.to_str().unwrap().to_string()));
+                recipe_entries.push((id.clone(), rt.to_str().unwrap().to_string()));
+            }
+
+            let pt = svc_path.join("policy.toml");
+            if pt.exists() {
+                policy_entries.push((id, pt.to_str().unwrap().to_string()));
             }
         }
     }

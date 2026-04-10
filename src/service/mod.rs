@@ -135,35 +135,35 @@ pub struct AuthDef {
     pub username_label: Option<String>,
 }
 
+/// Inline policy in service.toml (legacy, still supported as fallback).
+/// Prefer standalone policy.toml for new services.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct PolicyDef {
     pub levels: Option<HashMap<String, String>>,
     #[serde(default)]
-    pub rules: Vec<PolicyRule>,
+    pub rules: Vec<TomlPolicyRule>,
 }
 
 impl PolicyDef {
     /// Convert to the policy engine's ServiceLevels type.
     pub fn to_service_levels(&self) -> Option<crate::core::policy::ServiceLevels> {
         let levels = self.levels.as_ref()?;
-        let parse = |key: &str| -> Option<crate::core::policy::AccessLevel> {
-            match levels.get(key)?.as_str() {
-                "allow" => Some(crate::core::policy::AccessLevel::Allow),
-                "ask" => Some(crate::core::policy::AccessLevel::Ask),
-                "ask-always" => Some(crate::core::policy::AccessLevel::AskAlways),
-                "deny" => Some(crate::core::policy::AccessLevel::Deny),
-                _ => None,
-            }
-        };
         Some(crate::core::policy::ServiceLevels {
-            write: parse("write"),
-            read: parse("read"),
+            write: parse_access_level(levels.get("write")),
+            read: parse_access_level(levels.get("read")),
         })
+    }
+
+    /// Convert inline rules to core PolicyRule format.
+    pub fn to_policy_rules(&self) -> Vec<crate::core::policy::PolicyRule> {
+        self.rules.iter().filter_map(|r| r.to_core_rule()).collect()
     }
 }
 
+/// Policy rule as it appears in legacy service.toml `[[policy.rules]]`.
+/// Converted to core PolicyRule at load time.
 #[derive(Debug, Clone, serde::Deserialize)]
-pub struct PolicyRule {
+pub struct TomlPolicyRule {
     #[serde(default)]
     pub method: Option<String>,
     #[serde(default)]
@@ -171,6 +171,94 @@ pub struct PolicyRule {
     #[serde(default)]
     pub path_suffix: Option<String>,
     pub level: String,
+}
+
+impl TomlPolicyRule {
+    /// Convert legacy method+path_exact+path_suffix to a regex match pattern.
+    fn to_core_rule(&self) -> Option<crate::core::policy::PolicyRule> {
+        let level = parse_access_level(Some(&self.level))?;
+
+        // Build regex from legacy fields
+        let path_part = if let Some(ref exact) = self.path_exact {
+            regex::escape(exact.trim_end_matches('/'))
+        } else if let Some(ref suffix) = self.path_suffix {
+            format!(".*{}", regex::escape(suffix))
+        } else {
+            ".*".to_string()
+        };
+        let match_pattern = if let Some(ref m) = self.method {
+            format!("{} {}", m, path_part)
+        } else {
+            path_part
+        };
+
+        Some(crate::core::policy::PolicyRule {
+            id: None,
+            label: None,
+            match_pattern: Some(match_pattern),
+            body_pattern: None,
+            level,
+            session_ttl: None,
+        })
+    }
+}
+
+/// Standalone policy.toml file: `[default]` + `[[rule]]`.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct PolicyFileDef {
+    pub default: Option<HashMap<String, String>>,
+    #[serde(default)]
+    pub rule: Vec<PolicyFileRule>,
+}
+
+/// A rule in policy.toml.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct PolicyFileRule {
+    pub id: String,
+    pub label: String,
+    /// Regex matched against "METHOD /path".
+    #[serde(rename = "match")]
+    pub match_pattern: String,
+    /// Regex matched against request body (optional).
+    #[serde(default)]
+    pub body: Option<String>,
+    pub level: String,
+    #[serde(default)]
+    pub session_ttl: Option<u64>,
+}
+
+impl PolicyFileDef {
+    pub fn to_service_levels(&self) -> Option<crate::core::policy::ServiceLevels> {
+        let levels = self.default.as_ref()?;
+        Some(crate::core::policy::ServiceLevels {
+            write: parse_access_level(levels.get("write")),
+            read: parse_access_level(levels.get("read")),
+        })
+    }
+
+    pub fn to_policy_rules(&self) -> Vec<crate::core::policy::PolicyRule> {
+        self.rule.iter().filter_map(|r| {
+            let level = parse_access_level(Some(&r.level))?;
+            Some(crate::core::policy::PolicyRule {
+                id: Some(r.id.clone()),
+                label: Some(r.label.clone()),
+                match_pattern: Some(r.match_pattern.clone()),
+                body_pattern: r.body.clone(),
+                level,
+                session_ttl: r.session_ttl,
+            })
+        }).collect()
+    }
+}
+
+fn parse_access_level(s: Option<&String>) -> Option<crate::core::policy::AccessLevel> {
+    match s?.as_str() {
+        "allow" => Some(crate::core::policy::AccessLevel::Allow),
+        "ask" => Some(crate::core::policy::AccessLevel::Ask),
+        "ask-always" => Some(crate::core::policy::AccessLevel::AskAlways),
+        "deny" => Some(crate::core::policy::AccessLevel::Deny),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -185,35 +273,47 @@ pub struct LockedResponseDef {
 
 pub struct ServiceRegistry {
     services: HashMap<String, ServiceDef>,
+    /// Parsed policy.toml files (service_id → PolicyFileDef).
+    policies: HashMap<String, PolicyFileDef>,
 }
 
 impl ServiceRegistry {
-    /// Load all service definitions from `services/*/service.toml`.
+    /// Load all service definitions from `services/*/service.toml` and `services/*/policy.toml`.
     /// Falls back to compiled-in definitions if the directory is not found.
     pub fn load() -> Self {
         let mut services = HashMap::new();
+        let mut policies = HashMap::new();
 
         // Try runtime path first ($SAFECLAW_DATA/services/), then compiled-in
         let dirs = Self::discover_service_dirs();
-        for (id, toml_str) in dirs {
-            match toml::from_str::<ServiceDef>(&toml_str) {
-                Ok(def) => { services.insert(id, def); }
+        for (id, service_toml, policy_toml) in dirs {
+            match toml::from_str::<ServiceDef>(&service_toml) {
+                Ok(def) => { services.insert(id.clone(), def); }
                 Err(e) => {
                     tracing::warn!("Failed to parse service.toml for {}: {}", id, e);
+                }
+            }
+            if let Some(policy_str) = policy_toml {
+                match toml::from_str::<PolicyFileDef>(&policy_str) {
+                    Ok(def) => { policies.insert(id, def); }
+                    Err(e) => {
+                        tracing::warn!("Failed to parse policy.toml for {}: {}", id, e);
+                    }
                 }
             }
         }
 
         if services.is_empty() {
             tracing::warn!("No service definitions found, loading compiled-in defaults");
-            Self::load_compiled_defaults(&mut services);
+            Self::load_compiled_defaults(&mut services, &mut policies);
         }
 
-        tracing::info!("Loaded {} service definitions", services.len());
-        Self { services }
+        tracing::info!("Loaded {} service definitions, {} policy files", services.len(), policies.len());
+        Self { services, policies }
     }
 
-    fn discover_service_dirs() -> Vec<(String, String)> {
+    /// Returns (service_id, service_toml_content, optional_policy_toml_content).
+    fn discover_service_dirs() -> Vec<(String, String, Option<String>)> {
         let mut results = vec![];
 
         // Check $SAFECLAW_DATA/services/ first (runtime override)
@@ -243,10 +343,8 @@ impl ServiceRegistry {
         results
     }
 
-    /// Scan for service.toml files. Supports both flat and nested layouts:
-    ///   services/anthropic/service.toml          (flat)
-    ///   services/llm/anthropic/service.toml      (nested by category)
-    fn scan_dir(base: &std::path::Path, results: &mut Vec<(String, String)>) {
+    /// Scan for service.toml and policy.toml files. Supports both flat and nested layouts.
+    fn scan_dir(base: &std::path::Path, results: &mut Vec<(String, String, Option<String>)>) {
         let Ok(entries) = std::fs::read_dir(base) else { return };
         for entry in entries.flatten() {
             let path = entry.path();
@@ -261,7 +359,8 @@ impl ServiceRegistry {
                         .unwrap_or("")
                         .to_string();
                     if !id.is_empty() {
-                        results.push((id, content));
+                        let policy = std::fs::read_to_string(path.join("policy.toml")).ok();
+                        results.push((id, content, policy));
                     }
                 }
                 continue;
@@ -280,7 +379,8 @@ impl ServiceRegistry {
                             .unwrap_or("")
                             .to_string();
                         if !id.is_empty() {
-                            results.push((id, content));
+                            let policy = std::fs::read_to_string(sub_path.join("policy.toml")).ok();
+                            results.push((id, content, policy));
                         }
                     }
                 }
@@ -290,11 +390,17 @@ impl ServiceRegistry {
 
     /// Compiled-in service definitions for when filesystem discovery fails.
     /// Uses the auto-generated registry from build.rs.
-    fn load_compiled_defaults(services: &mut HashMap<String, ServiceDef>) {
+    fn load_compiled_defaults(services: &mut HashMap<String, ServiceDef>, policies: &mut HashMap<String, PolicyFileDef>) {
         let defaults = crate::generated_services::compiled_service_tomls();
         for (id, toml_str) in defaults {
             if let Ok(def) = toml::from_str::<ServiceDef>(toml_str) {
                 services.insert(id.to_string(), def);
+            }
+        }
+        let policy_defaults = crate::generated_services::compiled_policy_tomls();
+        for (id, toml_str) in policy_defaults {
+            if let Ok(def) = toml::from_str::<PolicyFileDef>(toml_str) {
+                policies.insert(id.to_string(), def);
             }
         }
     }
@@ -401,10 +507,38 @@ impl ServiceRegistry {
         None
     }
 
-    /// Get the service.toml policy levels as a fallback when vault has none.
+    /// Get default policy levels: policy.toml > service.toml [policy.levels].
     pub fn default_policy_levels(&self, service_name: &str) -> Option<crate::core::policy::ServiceLevels> {
+        // Prefer policy.toml [default]
+        if let Some(policy) = self.policies.get(service_name) {
+            if let Some(levels) = policy.to_service_levels() {
+                return Some(levels);
+            }
+        }
+        // Fall back to service.toml [policy.levels]
         let def = self.services.get(service_name)?;
         def.policy.as_ref()?.to_service_levels()
+    }
+
+    /// Get default policy rules: policy.toml [[rule]] > service.toml [[policy.rules]].
+    pub fn default_policy_rules(&self, service_name: &str) -> Option<Vec<crate::core::policy::PolicyRule>> {
+        // Prefer policy.toml [[rule]]
+        if let Some(policy) = self.policies.get(service_name) {
+            let rules = policy.to_policy_rules();
+            if !rules.is_empty() {
+                return Some(rules);
+            }
+        }
+        // Fall back to service.toml [[policy.rules]] (legacy, converted to regex)
+        let def = self.services.get(service_name)?;
+        let policy = def.policy.as_ref()?;
+        let rules = policy.to_policy_rules();
+        if rules.is_empty() { None } else { Some(rules) }
+    }
+
+    /// Get policy file definition (for console UI to show action labels).
+    pub fn policy_file(&self, service_name: &str) -> Option<&PolicyFileDef> {
+        self.policies.get(service_name)
     }
 
     /// Return all service definitions (for catalog/UI use).
@@ -632,6 +766,7 @@ mod tests {
         let access = crate::core::policy::evaluate_policy(
             "POST", "/v1/chat",
             None,
+            None,
             effective,
             &crate::core::policy::PolicyDefaults::default(),
             Some("integration"), // not llm, so type defaults = ask-always
@@ -659,6 +794,7 @@ mod tests {
 
         let access = crate::core::policy::evaluate_policy(
             "POST", "/v1/chat",
+            None,
             None,
             effective,
             &crate::core::policy::PolicyDefaults::default(),
@@ -769,7 +905,7 @@ path = "*"
         let def: ServiceDef = toml::from_str(toml_str).unwrap();
         let mut services = HashMap::new();
         services.insert("openai".into(), def);
-        let reg = ServiceRegistry { services };
+        let reg = ServiceRegistry { services, policies: HashMap::new() };
         assert!(!reg.is_local("openai"));
     }
 
@@ -793,7 +929,7 @@ path = "/access"
         let def: ServiceDef = toml::from_str(toml_str).unwrap();
         let mut services = HashMap::new();
         services.insert("dashboard".into(), def);
-        let reg = ServiceRegistry { services };
+        let reg = ServiceRegistry { services, policies: HashMap::new() };
         assert!(reg.is_local("dashboard"));
     }
 
@@ -817,7 +953,7 @@ path = "/access"
         let def: ServiceDef = toml::from_str(toml_str).unwrap();
         let mut services = HashMap::new();
         services.insert("dash".into(), def);
-        let reg = ServiceRegistry { services };
+        let reg = ServiceRegistry { services, policies: HashMap::new() };
         let api = reg.find_local_api("dash", "POST", "/access").unwrap();
         assert_eq!(api.steps.len(), 2);
     }
@@ -838,7 +974,7 @@ path = "/do"
         let def: ServiceDef = toml::from_str(toml_str).unwrap();
         let mut services = HashMap::new();
         services.insert("x".into(), def);
-        let reg = ServiceRegistry { services };
+        let reg = ServiceRegistry { services, policies: HashMap::new() };
         assert!(reg.find_local_api("x", "GET", "/do").is_none());
     }
 
@@ -895,7 +1031,7 @@ kind = "secret"
         let def: ServiceDef = toml::from_str(toml_str).unwrap();
         let mut services = HashMap::new();
         services.insert("dash".into(), def);
-        let reg = ServiceRegistry { services };
+        let reg = ServiceRegistry { services, policies: HashMap::new() };
         let fields = reg.vault_fields("dash");
         assert_eq!(fields.len(), 1);
         assert_eq!(fields[0].name, "token");

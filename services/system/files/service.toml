@@ -31,12 +31,3 @@ Body: {"id":"uuid"}
 Requires approval.
 """
 
-[policy.levels]
-read = "ask"
-write = "ask"
-
-[[policy.rules]]
-method = "GET"
-path_exact = "/"
-level = "allow"
-

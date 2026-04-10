@@ -43,6 +43,9 @@ ureq = { version = "2", features = ["json"] }
 flate2 = "1"
 tar = "0.4"
 
+# Regex (policy rule matching — RE2 semantics via rust `regex` crate)
+regex = "1"
+
 # Misc
 clap = { version = "4", features = ["derive"] }
 once_cell = "1"

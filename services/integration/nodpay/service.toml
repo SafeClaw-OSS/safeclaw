@@ -37,6 +37,3 @@ path = "/wallets"
   run = "npx nodpay wallets --json"
   returns = true
 
-[policy.levels]
-read = "allow"
-write = "allow"

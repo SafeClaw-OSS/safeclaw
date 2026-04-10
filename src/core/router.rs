@@ -431,10 +431,18 @@ async fn proxy_handler(
     let toml_levels = state.services.default_policy_levels(&route_service);
     let effective_levels = service_vault.levels.as_ref()
         .or(toml_levels.as_ref());
+    // Merge rules: vault rules take priority, then service.toml/policy.toml defaults
+    let toml_rules = state.services.default_policy_rules(&route_service);
+    let effective_rules = service_vault.rules.as_ref()
+        .or(toml_rules.as_ref());
+    let body_text = if body_bytes.is_empty() { None } else {
+        Some(String::from_utf8_lossy(&body_bytes))
+    };
     let access_level = evaluate_policy(
         method.as_str(),
         &route_path,
-        service_vault.rules.as_ref(),
+        body_text.as_deref(),
+        effective_rules,
         effective_levels,
         &policy_defaults,
         Some(category),
@@ -573,7 +581,7 @@ async fn proxy_handler(
 
         // Approval session cache TTL (for agent-side)
         if access_level == AccessLevel::Ask {
-            let ttl = find_rule_ttl(service_vault.rules.as_ref(), method.as_str(), &route_path)
+            let ttl = find_rule_ttl(effective_rules, method.as_str(), &route_path, body_text.as_deref())
                 .unwrap_or(3600);
             // Cache a placeholder; real auth stored in PendingApproval.approved_auth
             // and injected into approval cache only after execution (in poll handler).
@@ -746,17 +754,27 @@ fn find_rule_ttl(
     rules: Option<&Vec<super::policy::PolicyRule>>,
     method: &str,
     path: &str,
+    body: Option<&str>,
 ) -> Option<u64> {
     let rules = rules?;
+    let path_no_query = path.split('?').next().unwrap_or(path);
+    let input = format!("{} {}", method, path_no_query);
     for rule in rules {
-        if let Some(ref m) = rule.method {
-            if m != method {
-                continue;
+        if let Some(ref pattern) = rule.match_pattern {
+            match regex::Regex::new(pattern) {
+                Ok(re) => {
+                    if !re.is_match(&input) { continue; }
+                }
+                Err(_) => continue,
             }
         }
-        if let Some(ref suffix) = rule.path_suffix {
-            if !path.contains(suffix.as_str()) {
-                continue;
+        if let Some(ref pattern) = rule.body_pattern {
+            let body_text = body.unwrap_or("");
+            match regex::Regex::new(pattern) {
+                Ok(re) => {
+                    if !re.is_match(body_text) { continue; }
+                }
+                Err(_) => continue,
             }
         }
         if let Some(ttl) = rule.session_ttl {

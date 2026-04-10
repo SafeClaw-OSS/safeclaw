@@ -89,9 +89,18 @@ fn service_needs_auth_stripped(svc: &serde_json::Value) -> bool {
             return true;
         }
     }
+    // Check rules for any approval-required level
     if let Some(rules) = svc.get("rules").and_then(|r| r.as_array()) {
         for rule in rules {
             if rule.get("level").and_then(|v| v.as_str()).map(is_sensitive).unwrap_or(false) {
+                return true;
+            }
+        }
+    }
+    // Also check action_levels (user overrides from policy.toml actions)
+    if let Some(overrides) = svc.get("action_levels").and_then(|v| v.as_object()) {
+        for (_, level) in overrides {
+            if level.as_str().map(is_sensitive).unwrap_or(false) {
                 return true;
             }
         }

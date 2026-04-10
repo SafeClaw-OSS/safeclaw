@@ -1,0 +1,9 @@
+[default]
+read = "ask"
+write = "ask"
+
+[[rule]]
+id = "list-files"
+label = "List files"
+match = "GET /$"
+level = "allow"

@@ -15,7 +15,3 @@ path = "*"
   [[api.steps]]
   target = "upstream:default"
   returns = true
-
-[policy.levels]
-read = "allow"
-write = "ask-always"

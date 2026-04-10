@@ -388,13 +388,13 @@ mod tests {
 
         #[test]
         fn default_policy_is_ask_always() {
-            let level = evaluate_policy("GET", "/foo", None, None, &defaults(), None);
+            let level = evaluate_policy("GET", "/foo", None, None, None, &defaults(), None);
             assert_eq!(level, AccessLevel::AskAlways);
         }
 
         #[test]
         fn llm_category_is_allow() {
-            let level = evaluate_policy("POST", "/v1/chat", None, None, &defaults(), Some("llm"));
+            let level = evaluate_policy("POST", "/v1/chat", None, None, None, &defaults(), Some("llm"));
             assert_eq!(level, AccessLevel::Allow);
         }
 
@@ -404,16 +404,17 @@ mod tests {
                 write: Some(AccessLevel::Ask),
                 read: None,
             };
-            let level = evaluate_policy("POST", "/data", None, Some(&levels), &defaults(), None);
+            let level = evaluate_policy("POST", "/data", None, None, Some(&levels), &defaults(), None);
             assert_eq!(level, AccessLevel::Ask);
         }
 
         #[test]
         fn ask_always_rule_overrides_service_levels() {
             let rules = vec![PolicyRule {
-                method: Some("DELETE".to_string()),
-                path_suffix: Some("/admin".to_string()),
-                path_exact: None,
+                id: None,
+                label: None,
+                match_pattern: Some("DELETE /api/admin".to_string()),
+                body_pattern: None,
                 level: AccessLevel::AskAlways,
                 session_ttl: None,
             }];
@@ -424,6 +425,7 @@ mod tests {
             let level = evaluate_policy(
                 "DELETE",
                 "/api/admin",
+                None,
                 Some(&rules),
                 Some(&levels),
                 &defaults(),
@@ -439,7 +441,7 @@ mod tests {
                 read: None,
             };
             // No read at service level, no category → falls to global default (ask-always)
-            let level = evaluate_policy("GET", "/data", None, Some(&levels), &defaults(), None);
+            let level = evaluate_policy("GET", "/data", None, None, Some(&levels), &defaults(), None);
             assert_eq!(level, AccessLevel::AskAlways);
         }
 
