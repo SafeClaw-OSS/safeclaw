@@ -192,6 +192,9 @@ fn write_index(state: &AppState, secrets: &Value) -> std::io::Result<()> {
                         if let Some(safe) = wallet.get("safe") { meta.insert("safe".into(), safe.clone()); }
                         if let Some(chains) = wallet.get("chains") { meta.insert("chains".into(), chains.clone()); }
                         if let Some(rpid) = wallet.get("rpId") { meta.insert("rpId".into(), rpid.clone()); }
+                        if let Some(px) = wallet.get("passkeyX") { meta.insert("passkeyX".into(), px.clone()); }
+                        if let Some(py) = wallet.get("passkeyY") { meta.insert("passkeyY".into(), py.clone()); }
+                        if let Some(rc) = wallet.get("recovery") { meta.insert("recovery".into(), rc.clone()); }
                         entry["wallet"] = Value::Object(meta);
                     }
                     entry
