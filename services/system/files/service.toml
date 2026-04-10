@@ -3,6 +3,33 @@ id = "files"
 name = "Files"
 sub = "Encrypted vault storage"
 category = "system"
+help = """
+# Files API
+
+Encrypted file storage in SafeClaw vault.
+
+## Endpoints (via proxy)
+
+### List files
+GET /files/
+Response: {"files": [{"id":"uuid","name":"path/to/file.txt","size":1234}]}
+
+### Read file content
+GET /files/{id}
+Returns file bytes with Content-Type inferred from name.
+Requires approval — follow the standard 202 approval flow.
+
+### Upload file
+POST /files/upload
+Body: {"name":"reports/q1.pdf","data":"<base64>"}
+The name may include `/` path separators for directory organization.
+Requires approval.
+
+### Delete file
+POST /files/remove
+Body: {"id":"uuid"}
+Requires approval.
+"""
 
 [policy.levels]
 read = "ask"
@@ -17,8 +44,3 @@ level = "allow"
 method = "GET"
 path_exact = "/help"
 level = "allow"
-
-help = """\
-Encrypted file storage built into SafeClaw — not a well-known API. \
-`GET /files/help` returns the full endpoint reference.\
-"""

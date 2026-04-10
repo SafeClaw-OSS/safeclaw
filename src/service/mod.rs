@@ -22,10 +22,6 @@ pub struct ServiceDef {
     #[serde(default)]
     pub vault: Vec<VaultField>,
     pub policy: Option<PolicyDef>,
-    /// Help text returned by GET /{service}/help and rendered into safeclaw.md.
-    /// Supports template variables: {{wallet.*}} resolved from vault service data.
-    #[serde(default)]
-    pub help: Option<String>,
 }
 
 /// Declares a field stored in the vault for this service.
@@ -57,6 +53,10 @@ pub struct ServiceMeta {
     /// Services sharing the same group are merged into one card in the UI.
     #[serde(default)]
     pub group: Option<String>,
+    /// Help text returned by GET /{service}/help and rendered into safeclaw.md.
+    /// Supports template variables: {{wallet.*}} resolved from vault service data.
+    #[serde(default)]
+    pub help: Option<String>,
 }
 
 fn default_category() -> String { "integration".to_string() }

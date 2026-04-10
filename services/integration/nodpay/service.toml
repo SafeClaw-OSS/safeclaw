@@ -3,6 +3,15 @@ id = "nodpay"
 name = "NodPay"
 sub = "Web3 agent wallet"
 category = "integration"
+help = """
+A shared on-chain wallet is configured and ready. **Skip the NodPay SKILL.md setup section** — \
+keygen and wallet creation are already done by SafeClaw.
+
+- **Safe address:** `{{wallet.safe}}`
+- Run `npx nodpay wallets` to get full wallet details (signers, passkey coords, recovery, etc.)
+- When the user asks to send ETH/crypto/tokens or make a payment, use `npx nodpay propose` to create the transaction
+- Signing is handled automatically via SafeClaw — you do not have the private key and don't need it
+"""
 
 [[vault]]
 name = "wallet"
@@ -31,13 +40,3 @@ path = "/wallets"
 [policy.levels]
 read = "allow"
 write = "allow"
-
-help = """
-A shared on-chain wallet is configured and ready. **Skip the NodPay SKILL.md setup section** — \
-keygen and wallet creation are already done by SafeClaw.
-
-- **Safe address:** `{{wallet.safe}}`
-- Run `npx nodpay wallets` to get full wallet details (signers, passkey coords, recovery, etc.)
-- When the user asks to send ETH/crypto/tokens or make a payment, use `npx nodpay propose` to create the transaction
-- Signing is handled automatically via SafeClaw — you do not have the private key and don't need it
-"""

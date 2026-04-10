@@ -91,7 +91,7 @@ pub fn generate_safeclaw_md(secrets: &serde_json::Value, locked: bool, proxy_por
     if let Some(services) = secrets.get("services").and_then(|s| s.as_object()) {
         for (name, svc_data) in services {
             let svc_def = registry.get(name);
-            let help = svc_def.and_then(|d| d.help.as_deref());
+            let help = svc_def.and_then(|d| d.service.help.as_deref());
             if let Some(help) = help {
                 let display_name = svc_def.map(|d| d.service.name.as_str()).unwrap_or(name);
                 let resolved = resolve_guidance_templates(help, svc_data);

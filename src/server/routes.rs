@@ -1146,40 +1146,17 @@ pub async fn vault_policy_update(
 
 // ── Files ──────────────────────────────────────────────────────────────────────
 
-const FILES_HELP: &str = "\
-# Files API
-
-Encrypted file storage in SafeClaw vault.
-
-## Endpoints (via proxy)
-
-### List files
-GET /files/
-Response: {\"files\": [{\"id\":\"uuid\",\"name\":\"path/to/file.txt\",\"size\":1234}]}
-
-### Read file content
-GET /files/{id}
-Returns file bytes with Content-Type inferred from name.
-Requires approval — follow the standard 202 approval flow.
-
-### Upload file
-POST /files/upload
-Body: {\"name\":\"reports/q1.pdf\",\"data\":\"<base64>\"}
-The name may include `/` path separators for directory organization.
-Requires approval.
-
-### Delete file
-POST /files/remove
-Body: {\"id\":\"uuid\"}
-Requires approval.
-";
-
-/// GET /vault/files/help — self-documenting API reference
-pub async fn vault_files_help() -> impl IntoResponse {
+/// GET /vault/files/help — returns help text from service.toml
+pub async fn vault_files_help(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    let help = state.services.get("files")
+        .and_then(|d| d.service.help.as_deref())
+        .unwrap_or("No help available.");
     (
         axum::http::StatusCode::OK,
         [("content-type", "text/markdown; charset=utf-8")],
-        FILES_HELP,
+        help.to_string(),
     )
 }
 
