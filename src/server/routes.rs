@@ -545,7 +545,7 @@ pub async fn setup(
     state.vault.set_plaintext(vault_data.clone());
 
     // Dispatch cook ops (workspace files, config, recipe steps) — full cook on setup
-    dispatch_cook(vault_data, state.config.proxy_port, state.config.effective_admin_url(), state.config.data_dir.clone(), None);
+    dispatch_cook(vault_data, state.config.proxy_port, state.config.effective_admin_url(), state.config.data_dir.clone(), state.config.instance_id.clone().unwrap_or_default(), None);
 
 
     Ok(Json(json!({ "ok": true })))
@@ -754,7 +754,7 @@ pub async fn vault_update(
     state.vault.set_plaintext(new_vault_data.clone());
 
     // Keep VM-side SafeClaw guidance in sync with the latest vault config — full cook
-    dispatch_cook(new_vault_data, state.config.proxy_port, state.config.effective_admin_url(), state.config.data_dir.clone(), None);
+    dispatch_cook(new_vault_data, state.config.proxy_port, state.config.effective_admin_url(), state.config.data_dir.clone(), state.config.instance_id.clone().unwrap_or_default(), None);
 
     Ok(Json(json!({ "ok": true })))
 }
@@ -802,7 +802,7 @@ fn sync_local_service_files(vault_data: &serde_json::Value, data_dir: &std::path
 /// after vault state changes (setup, unlock, service add/update/remove).
 /// Builds ops from vault plaintext + service recipes, sends a single POST /cook.
 /// Failures are silently discarded — the vault operation has already succeeded.
-fn dispatch_cook(vault_data: serde_json::Value, proxy_port: u16, console_url: String, data_dir: std::path::PathBuf, service_only: Option<String>) {
+fn dispatch_cook(vault_data: serde_json::Value, proxy_port: u16, console_url: String, data_dir: std::path::PathBuf, instance_id: String, service_only: Option<String>) {
     // Sync local service files (e.g. NodPay wallet JSON) before dispatching to provisioner.
     sync_local_service_files(&vault_data, &data_dir);
 
@@ -868,6 +868,7 @@ fn dispatch_cook(vault_data: serde_json::Value, proxy_port: u16, console_url: St
                 let mut result = s.replace("{{safeclaw.proxy_port}}", &proxy_port.to_string())
                     .replace("{{safeclaw.admin_port}}", &console_url.split(':').last().unwrap_or("23294"))
                     .replace("{{safeclaw.admin_url}}", &console_url)
+                    .replace("{{safeclaw.instance_id}}", &instance_id)
                     .replace("{{safeclaw.relay_egress_ip}}", &relay_ip)
                     .replace("{{service.id}}", svc_id);
                 // Resolve {{service.vault.KEY}} — dotted keys for nested access
@@ -1037,8 +1038,9 @@ pub async fn vault_services_add(
     let proxy_port = state.config.proxy_port;
     let console_url = state.config.effective_admin_url();
     let data_dir = state.config.data_dir.clone();
+    let instance_id = state.config.instance_id.clone().unwrap_or_default();
     if let Some(vault_data) = state.vault.plaintext.lock().unwrap().clone() {
-        dispatch_cook(vault_data, proxy_port, console_url, data_dir, Some(service_id));
+        dispatch_cook(vault_data, proxy_port, console_url, data_dir, instance_id, Some(service_id));
     }
 
     Ok(Json(json!({ "ok": true })))
@@ -1070,8 +1072,9 @@ pub async fn vault_services_remove(
     let proxy_port = state.config.proxy_port;
     let console_url = state.config.effective_admin_url();
     let data_dir = state.config.data_dir.clone();
+    let instance_id = state.config.instance_id.clone().unwrap_or_default();
     if let Some(vault_data) = state.vault.plaintext.lock().unwrap().clone() {
-        dispatch_cook(vault_data, proxy_port, console_url, data_dir, Some(service_id));
+        dispatch_cook(vault_data, proxy_port, console_url, data_dir, instance_id, Some(service_id));
     }
 
     Ok(Json(json!({ "ok": true })))
