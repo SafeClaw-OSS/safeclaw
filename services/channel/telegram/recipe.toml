@@ -8,6 +8,11 @@ target = "openclaw"
 run = "openclaw config set channels.telegram.botToken {{service.vault.auth.secret}}"
 
 [[steps]]
+title = "Set Telegram owner allow list"
+target = "openclaw"
+run = "openclaw config set channels.telegram.allowFrom '[\"{{service.vault.ownerId}}\"]' --strict-json"
+
+[[steps]]
 title = "Enable Telegram channel"
 target = "openclaw"
 run = "openclaw config set channels.telegram.enabled true --strict-json"
