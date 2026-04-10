@@ -419,10 +419,10 @@ impl ServiceRegistry {
             .unwrap_or(false)
     }
 
-    /// Check if a service is callable by the agent (has [[upstream]] or [[api]]).
+    /// Check if a service is callable by the agent (has [[upstream]], [[api]], or help).
     pub fn is_agent_visible(&self, service_name: &str) -> bool {
         self.services.get(service_name)
-            .map(|d| !d.upstream.is_empty() || !d.api.is_empty())
+            .map(|d| !d.upstream.is_empty() || !d.api.is_empty() || d.service.help.is_some())
             .unwrap_or(false)
     }
 }
