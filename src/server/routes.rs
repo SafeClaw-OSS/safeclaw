@@ -856,12 +856,11 @@ fn dispatch_cook(secrets: serde_json::Value, proxy_port: u16, console_url: Strin
             "files": [{ "path": ".openclaw/workspace/AGENTS.md", "content": snippet, "upsert_block": "SAFECLAW" }]
         }));
 
-        // Vault-driven config: set model, telegram token, etc. via openclaw CLI
+        // Vault-driven config: set model via openclaw CLI
         // Skipped when only cooking a single service's recipe.
         if service_only.is_none() {
         if let Some(model) = secrets.get("model") {
             let model_json = serde_json::to_string(model).unwrap_or_default();
-            // Escape single quotes in JSON for shell
             let escaped = model_json.replace('\'', "'\\''");
             steps.push(serde_json::json!({
                 "title": "Set model config",
@@ -869,32 +868,7 @@ fn dispatch_cook(secrets: serde_json::Value, proxy_port: u16, console_url: Strin
                 "run": format!("openclaw config set agents.defaults.model '{}' --strict-json", escaped)
             }));
         }
-
-        if let Some(token) = secrets
-            .get("services").and_then(|s| s.get("telegram"))
-            .and_then(|t| t.get("auth")).and_then(|a| a.get("secret"))
-            .and_then(|s| s.as_str())
-        {
-            steps.push(serde_json::json!({
-                "title": "Set Telegram bot token",
-                "target": "openclaw",
-                "run": format!("openclaw config set channels.telegram.botToken '{}'", token.replace('\'', "'\\''"))
-            }));
-            // ownerId lives in secrets.channels.telegram (frontend puts it there via configChannels)
-            if let Some(owner_id) = secrets
-                .get("channels").and_then(|c| c.get("telegram"))
-                .and_then(|t| t.get("ownerId").or_else(|| t.get("owner_id")))
-                .and_then(|o| o.as_str())
-            {
-                steps.push(serde_json::json!({
-                    "title": "Set Telegram allow list",
-                    "target": "openclaw",
-                    "run": format!("openclaw config set channels.telegram.allowFrom '[\"{}\"]' --strict-json", owner_id)
-                }));
-            }
-        }
-
-        } // end service_only.is_none() guard for vault-driven config
+        } // end service_only.is_none() guard
 
         // Collect recipe steps for each enabled service (sent as-is, provisioner executes).
         // Built-in recipe steps first, then vault-side steps (overrides/additions).
@@ -907,11 +881,15 @@ fn dispatch_cook(secrets: serde_json::Value, proxy_port: u16, console_url: Strin
                     .replace("{{safeclaw.relay_egress_ip}}", &relay_ip)
                     .replace("{{service.id}}", svc_id);
                 // Resolve {{service.vault.KEY}} from service vault data
+                // KEY can be dotted (e.g. "auth.secret") for nested access
                 while let Some(start) = result.find("{{service.vault.") {
                     let rest = &result[start + 16..];
                     if let Some(end) = rest.find("}}") {
                         let key = &rest[..end];
-                        let val = svc_data.get(key)
+                        let val = key.split('.')
+                            .fold(Some(svc_data as &serde_json::Value), |acc, part| {
+                                acc?.get(part)
+                            })
                             .and_then(|v| v.as_str())
                             .unwrap_or("");
                         result = format!("{}{}{}", &result[..start], val, &rest[end + 2..]);
