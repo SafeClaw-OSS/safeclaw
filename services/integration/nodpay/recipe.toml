@@ -15,7 +15,7 @@ run = "npm install -g nodpay"
 title = "Configure remote wallet"
 target = "openclaw"
 files = [
-  { path = ".nodpay/config.json", content = '{"remote_wallet":"http://localhost:{{safeclaw.proxy_port}}/nodpay"}' },
+  { path = ".nodpay/config.json", content = '{"remote_wallet":"http://localhost:{{safeclaw.proxy_port}}/nodpay","approve_base":"{{safeclaw.admin_url}}/approve/nodpay"}' },
 ]
 note = "CLI reads remote_wallet to delegate sign/address/wallets to SafeClaw vault"
 
