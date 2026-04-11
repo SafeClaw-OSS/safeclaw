@@ -403,6 +403,7 @@ mod tests {
             let levels = ServiceLevels {
                 write: Some(AccessLevel::Ask),
                 read: None,
+                ask_ttl: None,
             };
             let level = evaluate_policy("POST", "/data", None, None, Some(&levels), &defaults(), None);
             assert_eq!(level, AccessLevel::Ask);
@@ -414,13 +415,14 @@ mod tests {
                 id: None,
                 label: None,
                 match_pattern: Some("DELETE /api/admin".to_string()),
-                body_pattern: None,
+                body: None,
                 level: AccessLevel::AskAlways,
-                session_ttl: None,
+                ask_ttl: None,
             }];
             let levels = ServiceLevels {
                 write: Some(AccessLevel::Ask),
                 read: None,
+                ask_ttl: None,
             };
             let level = evaluate_policy(
                 "DELETE",
@@ -439,6 +441,7 @@ mod tests {
             let levels = ServiceLevels {
                 write: Some(AccessLevel::Ask),
                 read: None,
+                ask_ttl: None,
             };
             // No read at service level, no category → falls to global default (ask-always)
             let level = evaluate_policy("GET", "/data", None, None, Some(&levels), &defaults(), None);
@@ -584,7 +587,7 @@ mod tests {
 
         fn make_proxy_state_with_vault(vault_json: serde_json::Value) -> Arc<ProxyState> {
             let vault = Arc::new(Vault::new());
-            vault.set_secrets(vault_json);
+            vault.set_plaintext(vault_json);
             let audit = Arc::new(AuditLog::open_in_memory().unwrap());
             Arc::new(ProxyState {
                 vault,

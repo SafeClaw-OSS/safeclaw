@@ -5,12 +5,12 @@ write = "ask"
 [[rule]]
 id = "delete-branch"
 label = "Delete branch"
-match = "DELETE /repos/[^/]+/[^/]+/git/refs/.+"
+match = "DELETE /repos/*/*/git/refs/*"
 level = "ask-always"
 
 [[rule]]
 id = "make-public"
 label = "Make repo public"
-match = "PATCH /repos/[^/]+/[^/]+"
+match = "PATCH /repos/*/*"
 body = "\"private\"\\s*:\\s*false"
 level = "deny"

@@ -145,23 +145,21 @@ pub struct PolicyDef {
 }
 
 impl PolicyDef {
-    /// Convert to the policy engine's ServiceLevels type.
     pub fn to_service_levels(&self) -> Option<crate::core::policy::ServiceLevels> {
         let levels = self.levels.as_ref()?;
         Some(crate::core::policy::ServiceLevels {
             write: parse_access_level(levels.get("write")),
             read: parse_access_level(levels.get("read")),
+            ask_ttl: None,
         })
     }
 
-    /// Convert inline rules to core PolicyRule format.
     pub fn to_policy_rules(&self) -> Vec<crate::core::policy::PolicyRule> {
         self.rules.iter().filter_map(|r| r.to_core_rule()).collect()
     }
 }
 
 /// Policy rule as it appears in legacy service.toml `[[policy.rules]]`.
-/// Converted to core PolicyRule at load time.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct TomlPolicyRule {
     #[serde(default)]
@@ -174,17 +172,15 @@ pub struct TomlPolicyRule {
 }
 
 impl TomlPolicyRule {
-    /// Convert legacy method+path_exact+path_suffix to a regex match pattern.
+    /// Convert legacy method+path_exact+path_suffix to path pattern.
     fn to_core_rule(&self) -> Option<crate::core::policy::PolicyRule> {
         let level = parse_access_level(Some(&self.level))?;
 
-        // Build regex from legacy fields
         let path_part = if let Some(ref exact) = self.path_exact {
-            regex::escape(exact.trim_end_matches('/'))
-        } else if let Some(ref suffix) = self.path_suffix {
-            format!(".*{}", regex::escape(suffix))
+            exact.trim_end_matches('/').to_string()
         } else {
-            ".*".to_string()
+            // path_suffix rules can't cleanly map to path patterns; skip them
+            return None;
         };
         let match_pattern = if let Some(ref m) = self.method {
             format!("{} {}", m, path_part)
@@ -196,9 +192,9 @@ impl TomlPolicyRule {
             id: None,
             label: None,
             match_pattern: Some(match_pattern),
-            body_pattern: None,
+            body: None,
             level,
-            session_ttl: None,
+            ask_ttl: None,
         })
     }
 }
@@ -216,7 +212,7 @@ pub struct PolicyFileDef {
 pub struct PolicyFileRule {
     pub id: String,
     pub label: String,
-    /// Regex matched against "METHOD /path".
+    /// Path pattern: "METHOD /path" or "/path" (any method). `*` = one segment.
     #[serde(rename = "match")]
     pub match_pattern: String,
     /// Regex matched against request body (optional).
@@ -224,7 +220,7 @@ pub struct PolicyFileRule {
     pub body: Option<String>,
     pub level: String,
     #[serde(default)]
-    pub session_ttl: Option<u64>,
+    pub ask_ttl: Option<u64>,
 }
 
 impl PolicyFileDef {
@@ -233,6 +229,7 @@ impl PolicyFileDef {
         Some(crate::core::policy::ServiceLevels {
             write: parse_access_level(levels.get("write")),
             read: parse_access_level(levels.get("read")),
+            ask_ttl: levels.get("ask_ttl").and_then(|v| v.parse().ok()),
         })
     }
 
@@ -243,9 +240,9 @@ impl PolicyFileDef {
                 id: Some(r.id.clone()),
                 label: Some(r.label.clone()),
                 match_pattern: Some(r.match_pattern.clone()),
-                body_pattern: r.body.clone(),
+                body: r.body.clone(),
                 level,
-                session_ttl: r.session_ttl,
+                ask_ttl: r.ask_ttl,
             })
         }).collect()
     }
@@ -781,6 +778,7 @@ mod tests {
         let vault_levels = crate::core::policy::ServiceLevels {
             write: Some(AccessLevel::Ask),
             read: Some(AccessLevel::Ask),
+            ask_ttl: None,
         };
 
         let mut toml_map = HashMap::new();

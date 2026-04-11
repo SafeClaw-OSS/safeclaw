@@ -5,13 +5,13 @@ write = "ask-always"
 [[rule]]
 id = "list-emails"
 label = "List emails"
-match = "GET /gmail/v1/users/me/messages$"
+match = "GET /gmail/v1/users/me/messages"
 level = "allow"
 
 [[rule]]
 id = "read-email"
 label = "Read email content"
-match = "GET /gmail/v1/users/me/messages/.+"
+match = "GET /gmail/v1/users/me/messages/*"
 level = "ask"
 
 [[rule]]
@@ -29,5 +29,5 @@ level = "ask-always"
 [[rule]]
 id = "delete-email"
 label = "Delete email"
-match = "DELETE /gmail/v1/users/me/messages/.+"
+match = "DELETE /gmail/v1/users/me/messages/*"
 level = "deny"

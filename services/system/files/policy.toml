@@ -5,5 +5,5 @@ write = "ask"
 [[rule]]
 id = "list-files"
 label = "List files"
-match = "GET /$"
+match = "GET /"
 level = "allow"

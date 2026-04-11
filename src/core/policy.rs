@@ -1,8 +1,15 @@
 /// Policy engine: access levels, rules, and evaluation logic.
 ///
-/// Rule matching uses standard regex (Rust `regex` crate, RE2 semantics).
-/// - `match_pattern`: matched against `"METHOD /path"` (e.g. `"POST /v1/chat/completions"`)
-/// - `body_pattern`: matched against the request body text (optional)
+/// Rule matching uses path patterns (nginx-style, longest match wins):
+/// - `match`: `"METHOD /path/with/*/wildcards"` — `*` matches one path segment
+/// - `body`: regex matched against request body text (optional)
+///
+/// Specificity (highest priority first):
+///   1. Rules with `body` pattern > rules without (more conditions = more specific)
+///   2. Longer literal path > shorter (nginx longest-match principle)
+///   3. Exact path > path with wildcards
+///   4. With method > without method (any-method)
+///   5. TOML order as tiebreaker
 use serde::{Deserialize, Serialize};
 use regex::Regex;
 
@@ -36,8 +43,14 @@ impl std::fmt::Display for AccessLevel {
 
 // ── Policy Types ───────────────────────────────────────────────────────────────
 
-/// Per-request policy rule. Matched against `"METHOD /path"` and optionally
-/// the request body, using standard regex (RE2 semantics).
+/// Per-request policy rule.
+///
+/// `match` uses path patterns (nginx-style):
+///   - `"GET /gmail/v1/users/me/messages"` — exact match with method
+///   - `"DELETE /repos/*/git/refs/*"` — `*` matches one path segment
+///   - `"/admin/*"` — no method = matches any method
+///
+/// `body` uses regex (for unstructured content matching).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PolicyRule {
     /// Unique identifier (e.g. "send-email"). Used as key for vault overrides.
@@ -46,17 +59,17 @@ pub struct PolicyRule {
     /// Human-readable label for console UI (e.g. "Send email").
     #[serde(default)]
     pub label: Option<String>,
-    /// Regex matched against `"METHOD /path"` (e.g. `"POST /gmail/v1/users/me/messages/send"`).
-    /// Omit to match all requests.
+    /// Path pattern: `"METHOD /path"` or `"/path"` (any method).
+    /// `*` matches exactly one path segment. Omit to match all requests.
     #[serde(default, rename = "match")]
     pub match_pattern: Option<String>,
     /// Regex matched against request body text. Omit to skip body matching.
-    #[serde(default, rename = "body")]
-    pub body_pattern: Option<String>,
+    #[serde(default)]
+    pub body: Option<String>,
     pub level: AccessLevel,
-    /// Session TTL in seconds (for `ask` level; cached after first approval)
-    #[serde(default, rename = "sessionTTL")]
-    pub session_ttl: Option<u64>,
+    /// Cache TTL in seconds after approval (for `ask` level only).
+    #[serde(default)]
+    pub ask_ttl: Option<u64>,
 }
 
 /// Per-service read/write access levels
@@ -64,14 +77,12 @@ pub struct PolicyRule {
 pub struct ServiceLevels {
     pub write: Option<AccessLevel>,
     pub read: Option<AccessLevel>,
+    /// Default ask-level cache TTL in seconds for this service.
+    #[serde(default)]
+    pub ask_ttl: Option<u64>,
 }
 
 /// Global policy defaults (stored in vault.enc under "policy_defaults")
-///
-/// Note: `unknown_domain` was removed. The proxy enforces domain allowlisting
-/// by construction — upstream URLs are derived from `service_config.upstream`,
-/// and unconfigured services return 403 UNKNOWN_SERVICE. Agents cannot target
-/// arbitrary domains through the proxy.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PolicyDefaults {
     /// Approval timeout in seconds (default 300)
@@ -89,26 +100,128 @@ impl Default for PolicyDefaults {
         type_levels.insert("llm".into(), ServiceLevels {
             write: Some(AccessLevel::Allow),
             read: Some(AccessLevel::Allow),
+            ask_ttl: None,
         });
         type_levels.insert("channel".into(), ServiceLevels {
             write: Some(AccessLevel::Allow),
             read: Some(AccessLevel::Allow),
+            ask_ttl: None,
         });
         Self {
             timeout: Some(300),
             levels: Some(ServiceLevels {
                 write: Some(AccessLevel::AskAlways),
                 read: Some(AccessLevel::AskAlways),
+                ask_ttl: None,
             }),
             type_levels: Some(type_levels),
         }
     }
 }
 
+// ── Path Pattern Matching ─────────────────────────────────────────────────────
+
+/// Parse a match pattern into (optional_method, path_pattern).
+/// Examples: `"GET /foo/bar"` → `(Some("GET"), "/foo/bar")`
+///           `"/foo/*"` → `(None, "/foo/*")`
+fn parse_match_pattern(pattern: &str) -> (Option<&str>, &str) {
+    if let Some(space_pos) = pattern.find(' ') {
+        let method = &pattern[..space_pos];
+        // Only treat as method if it's all uppercase ASCII (HTTP method)
+        if method.bytes().all(|b| b.is_ascii_uppercase()) {
+            return (Some(method), &pattern[space_pos + 1..]);
+        }
+    }
+    (None, pattern)
+}
+
+/// Match a request path against a pattern. `*` matches exactly one path segment.
+fn path_matches(pattern: &str, path: &str) -> bool {
+    let pat_segments: Vec<&str> = pattern.trim_end_matches('/').split('/').collect();
+    let path_segments: Vec<&str> = path.trim_end_matches('/').split('/').collect();
+
+    if pat_segments.len() != path_segments.len() {
+        return false;
+    }
+    for (p, s) in pat_segments.iter().zip(path_segments.iter()) {
+        if *p == "*" {
+            continue;
+        }
+        if p != s {
+            return false;
+        }
+    }
+    true
+}
+
+/// Compute specificity score for a match pattern. Higher = more specific.
+///
+/// Scoring (nginx longest-match principle):
+///   - Base: number of literal (non-wildcard) path segments × 10
+///   - Bonus +5 if method is specified
+///   - Bonus +1000 if rule has body pattern
+fn specificity(rule: &PolicyRule) -> u32 {
+    let mut score: u32 = 0;
+
+    if rule.body.is_some() {
+        score += 1000;
+    }
+
+    if let Some(ref pattern) = rule.match_pattern {
+        let (method, path) = parse_match_pattern(pattern);
+        if method.is_some() {
+            score += 5;
+        }
+        // Count literal segments (non-wildcard)
+        for seg in path.split('/') {
+            if !seg.is_empty() && seg != "*" {
+                score += 10;
+            }
+        }
+    }
+
+    score
+}
+
+/// Check if a single rule matches the given request.
+fn matches_rule(rule: &PolicyRule, method: &str, path: &str, body: Option<&str>) -> bool {
+    if let Some(ref pattern) = rule.match_pattern {
+        let path_no_query = path.split('?').next().unwrap_or(path);
+        let (rule_method, rule_path) = parse_match_pattern(pattern);
+
+        // Check method (if specified)
+        if let Some(m) = rule_method {
+            if m != method {
+                return false;
+            }
+        }
+        // Check path pattern
+        if !path_matches(rule_path, path_no_query) {
+            return false;
+        }
+    }
+    // Check body regex
+    if let Some(ref pattern) = rule.body {
+        let body_text = body.unwrap_or("");
+        match Regex::new(pattern) {
+            Ok(re) => {
+                if !re.is_match(body_text) {
+                    return false;
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Invalid body regex '{}': {}", pattern, e);
+                return false;
+            }
+        }
+    }
+    true
+}
+
 // ── Policy Evaluation ──────────────────────────────────────────────────────────
 
 /// Determine the access level for a given request.
-/// Priority: service rules > service levels > type defaults > global defaults > fallback
+/// Priority: service rules (most specific match) > service levels > type defaults > global defaults
 pub fn evaluate_policy(
     method: &str,
     path: &str,
@@ -118,12 +231,19 @@ pub fn evaluate_policy(
     defaults: &PolicyDefaults,
     service_category: Option<&str>,
 ) -> AccessLevel {
-    // 1. Check service rules (most specific)
+    // 1. Check service rules — most specific match wins (nginx-style)
     if let Some(rules) = rules {
+        let mut best: Option<(u32, &PolicyRule)> = None;
         for rule in rules {
             if matches_rule(rule, method, path, body) {
-                return rule.level.clone();
+                let s = specificity(rule);
+                if best.is_none() || s > best.unwrap().0 {
+                    best = Some((s, rule));
+                }
             }
+        }
+        if let Some((_, rule)) = best {
+            return rule.level.clone();
         }
     }
 
@@ -165,47 +285,41 @@ pub fn evaluate_policy(
         }
     }
 
-    // 5. Default: ask-always (safe default — require approval for every request)
+    // 5. Safe default
     AccessLevel::AskAlways
+}
+
+/// Find the ask_ttl for the best matching rule.
+pub fn find_ask_ttl(
+    rules: Option<&Vec<PolicyRule>>,
+    service_levels: Option<&ServiceLevels>,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+) -> Option<u64> {
+    // Check per-rule ask_ttl (best matching rule)
+    if let Some(rules) = rules {
+        let mut best: Option<(u32, &PolicyRule)> = None;
+        for rule in rules {
+            if matches_rule(rule, method, path, body) {
+                let s = specificity(rule);
+                if best.is_none() || s > best.unwrap().0 {
+                    best = Some((s, rule));
+                }
+            }
+        }
+        if let Some((_, rule)) = best {
+            if let Some(ttl) = rule.ask_ttl {
+                return Some(ttl);
+            }
+        }
+    }
+    // Fall back to service-level ask_ttl
+    service_levels.and_then(|l| l.ask_ttl)
 }
 
 fn is_write_method(method: &str) -> bool {
     matches!(method, "POST" | "PUT" | "PATCH" | "DELETE")
-}
-
-fn matches_rule(rule: &PolicyRule, method: &str, path: &str, body: Option<&str>) -> bool {
-    // Match against "METHOD /path" using regex
-    if let Some(ref pattern) = rule.match_pattern {
-        let path_no_query = path.split('?').next().unwrap_or(path);
-        let input = format!("{} {}", method, path_no_query);
-        match Regex::new(pattern) {
-            Ok(re) => {
-                if !re.is_match(&input) {
-                    return false;
-                }
-            }
-            Err(e) => {
-                tracing::warn!("Invalid match regex '{}': {}", pattern, e);
-                return false;
-            }
-        }
-    }
-    // Match against body using regex
-    if let Some(ref pattern) = rule.body_pattern {
-        let body_text = body.unwrap_or("");
-        match Regex::new(pattern) {
-            Ok(re) => {
-                if !re.is_match(body_text) {
-                    return false;
-                }
-            }
-            Err(e) => {
-                tracing::warn!("Invalid body regex '{}': {}", pattern, e);
-                return false;
-            }
-        }
-    }
-    true
 }
 
 // ── Unit Tests ─────────────────────────────────────────────────────────────────
@@ -218,16 +332,110 @@ mod tests {
         PolicyDefaults::default()
     }
 
-    fn rule(match_pat: &str) -> PolicyRule {
+    fn rule(match_pat: &str, level: AccessLevel) -> PolicyRule {
         PolicyRule {
             id: None,
             label: None,
             match_pattern: Some(match_pat.to_string()),
-            body_pattern: None,
-            level: AccessLevel::AskAlways,
-            session_ttl: None,
+            body: None,
+            level,
+            ask_ttl: None,
         }
     }
+
+    // ── Path pattern matching ──────────────────────────────────────────────
+
+    #[test]
+    fn exact_path_matches() {
+        assert!(path_matches("/gmail/v1/users/me/messages", "/gmail/v1/users/me/messages"));
+    }
+
+    #[test]
+    fn exact_path_no_match() {
+        assert!(!path_matches("/gmail/v1/users/me/messages", "/gmail/v1/users/me/labels"));
+    }
+
+    #[test]
+    fn wildcard_matches_one_segment() {
+        assert!(path_matches("/repos/*/issues", "/repos/myrepo/issues"));
+        assert!(!path_matches("/repos/*/issues", "/repos/myrepo/pulls"));
+    }
+
+    #[test]
+    fn wildcard_does_not_match_multiple_segments() {
+        assert!(!path_matches("/repos/*", "/repos/owner/repo"));
+    }
+
+    #[test]
+    fn multiple_wildcards() {
+        assert!(path_matches("/repos/*/*/git/refs/*", "/repos/owner/repo/git/refs/heads"));
+    }
+
+    #[test]
+    fn trailing_slash_normalized() {
+        assert!(path_matches("/foo/bar/", "/foo/bar"));
+        assert!(path_matches("/foo/bar", "/foo/bar/"));
+    }
+
+    // ── parse_match_pattern ────────────────────────────────────────────────
+
+    #[test]
+    fn parse_with_method() {
+        let (m, p) = parse_match_pattern("POST /foo/bar");
+        assert_eq!(m, Some("POST"));
+        assert_eq!(p, "/foo/bar");
+    }
+
+    #[test]
+    fn parse_without_method() {
+        let (m, p) = parse_match_pattern("/foo/bar");
+        assert_eq!(m, None);
+        assert_eq!(p, "/foo/bar");
+    }
+
+    #[test]
+    fn parse_path_with_space_not_method() {
+        // "not ALLCAPS" shouldn't be parsed as method
+        let (m, p) = parse_match_pattern("foo /bar");
+        assert_eq!(m, None);
+        assert_eq!(p, "foo /bar");
+    }
+
+    // ── Specificity ────────────────────────────────────────────────────────
+
+    #[test]
+    fn specificity_exact_with_method_beats_wildcard() {
+        let r1 = rule("POST /gmail/v1/users/me/messages/send", AccessLevel::Deny);
+        let r2 = rule("POST /gmail/v1/users/me/messages/*", AccessLevel::Allow);
+        assert!(specificity(&r1) > specificity(&r2));
+    }
+
+    #[test]
+    fn specificity_body_rule_beats_no_body() {
+        let r1 = PolicyRule {
+            match_pattern: Some("POST /v1/chat/completions".into()),
+            body: Some("o3".into()),
+            ..rule("POST /v1/chat/completions", AccessLevel::Ask)
+        };
+        let r2 = rule("POST /v1/chat/completions", AccessLevel::Allow);
+        assert!(specificity(&r1) > specificity(&r2));
+    }
+
+    #[test]
+    fn specificity_longer_path_beats_shorter() {
+        let r1 = rule("GET /gmail/v1/users/me/messages", AccessLevel::Allow);
+        let r2 = rule("GET /gmail/v1/users/me", AccessLevel::Ask);
+        assert!(specificity(&r1) > specificity(&r2));
+    }
+
+    #[test]
+    fn specificity_with_method_beats_without() {
+        let r1 = rule("GET /foo", AccessLevel::Allow);
+        let r2 = rule("/foo", AccessLevel::Allow);
+        assert!(specificity(&r1) > specificity(&r2));
+    }
+
+    // ── evaluate_policy ────────────────────────────────────────────────────
 
     #[test]
     fn default_no_category_is_ask_always() {
@@ -243,117 +451,101 @@ mod tests {
 
     #[test]
     fn write_method_ask_via_service_levels() {
-        let levels = ServiceLevels {
-            write: Some(AccessLevel::Ask),
-            read: Some(AccessLevel::Allow),
-        };
+        let levels = ServiceLevels { write: Some(AccessLevel::Ask), read: Some(AccessLevel::Allow), ask_ttl: None };
         let level = evaluate_policy("POST", "/create", None, None, Some(&levels), &defaults(), None);
         assert_eq!(level, AccessLevel::Ask);
     }
 
     #[test]
     fn service_levels_override_type_defaults() {
-        let levels = ServiceLevels {
-            write: Some(AccessLevel::AskAlways),
-            read: None,
-        };
+        let levels = ServiceLevels { write: Some(AccessLevel::AskAlways), read: None, ask_ttl: None };
         let level = evaluate_policy("POST", "/foo", None, None, Some(&levels), &defaults(), Some("llm"));
         assert_eq!(level, AccessLevel::AskAlways);
     }
 
     #[test]
     fn rule_takes_priority_over_service_levels() {
-        let mut r = rule("DELETE /api/admin");
-        r.level = AccessLevel::AskAlways;
-        let rules = vec![r];
-        let levels = ServiceLevels {
-            write: Some(AccessLevel::Ask),
-            read: None,
-        };
-        let level = evaluate_policy(
-            "DELETE",
-            "/api/admin",
-            None,
-            Some(&rules),
-            Some(&levels),
-            &defaults(),
-            None,
-        );
+        let rules = vec![rule("DELETE /api/admin", AccessLevel::AskAlways)];
+        let levels = ServiceLevels { write: Some(AccessLevel::Ask), read: None, ask_ttl: None };
+        let level = evaluate_policy("DELETE", "/api/admin", None, Some(&rules), Some(&levels), &defaults(), None);
         assert_eq!(level, AccessLevel::AskAlways);
     }
 
     #[test]
-    fn rule_method_mismatch_falls_through() {
-        let rules = vec![rule("DELETE /.*")];
+    fn method_mismatch_falls_through() {
+        let rules = vec![rule("DELETE /foo", AccessLevel::Deny)];
         let level = evaluate_policy("GET", "/foo", None, Some(&rules), None, &defaults(), None);
-        assert_eq!(level, AccessLevel::AskAlways); // falls to global default
+        assert_eq!(level, AccessLevel::AskAlways);
     }
 
     #[test]
-    fn global_defaults_apply_when_no_service_levels() {
-        let mut def = defaults();
-        def.levels = Some(ServiceLevels {
-            write: Some(AccessLevel::Ask),
-            read: None,
-        });
-        let level = evaluate_policy("POST", "/x", None, None, None, &def, None);
-        assert_eq!(level, AccessLevel::Ask);
-    }
-
-    #[test]
-    fn regex_wildcard_path() {
-        let mut r = rule("GET /gmail/v1/users/me/messages/.*");
-        r.level = AccessLevel::Ask;
-        let rules = vec![r];
+    fn wildcard_path_matches() {
+        let rules = vec![rule("GET /gmail/v1/users/me/messages/*", AccessLevel::Ask)];
         let level = evaluate_policy("GET", "/gmail/v1/users/me/messages/abc123", None, Some(&rules), None, &defaults(), None);
         assert_eq!(level, AccessLevel::Ask);
     }
 
     #[test]
-    fn regex_no_match_falls_through() {
-        let mut r = rule("POST /gmail/v1/users/me/messages/send");
-        r.level = AccessLevel::Deny;
-        let rules = vec![r];
-        // GET doesn't match POST rule
-        let level = evaluate_policy("GET", "/gmail/v1/users/me/messages/send", None, Some(&rules), None, &defaults(), None);
-        assert_eq!(level, AccessLevel::AskAlways); // global default
+    fn most_specific_rule_wins_regardless_of_order() {
+        // Less specific first in list, more specific second — more specific should still win
+        let rules = vec![
+            rule("POST /gmail/v1/users/me/messages/*", AccessLevel::Ask),
+            rule("POST /gmail/v1/users/me/messages/send", AccessLevel::Deny),
+        ];
+        let level = evaluate_policy("POST", "/gmail/v1/users/me/messages/send", None, Some(&rules), None, &defaults(), None);
+        assert_eq!(level, AccessLevel::Deny); // exact beats wildcard
     }
 
     #[test]
-    fn body_pattern_matches() {
-        let mut r = rule("POST /v1/chat/completions");
-        r.body_pattern = Some("o3|o4-mini".to_string());
-        r.level = AccessLevel::Ask;
-        let rules = vec![r];
-        let body = r#"{"model": "o3", "messages": []}"#;
+    fn body_rule_beats_path_only_rule() {
+        let mut body_rule = rule("POST /v1/chat/completions", AccessLevel::Deny);
+        body_rule.body = Some("o3|o4-mini".to_string());
+        let path_rule = rule("POST /v1/chat/completions", AccessLevel::Allow);
+        let rules = vec![path_rule, body_rule];
+        let body = r#"{"model": "o3"}"#;
         let level = evaluate_policy("POST", "/v1/chat/completions", Some(body), Some(&rules), None, &defaults(), None);
+        assert_eq!(level, AccessLevel::Deny); // body rule wins
+    }
+
+    #[test]
+    fn body_no_match_falls_to_path_rule() {
+        let mut body_rule = rule("POST /v1/chat/completions", AccessLevel::Deny);
+        body_rule.body = Some("o3|o4-mini".to_string());
+        let path_rule = rule("POST /v1/chat/completions", AccessLevel::Allow);
+        let rules = vec![path_rule, body_rule];
+        let body = r#"{"model": "gpt-4o"}"#;
+        let level = evaluate_policy("POST", "/v1/chat/completions", Some(body), Some(&rules), None, &defaults(), None);
+        assert_eq!(level, AccessLevel::Allow); // body rule doesn't match, path rule wins
+    }
+
+    #[test]
+    fn no_method_matches_any_method() {
+        let rules = vec![rule("/admin/*", AccessLevel::Deny)];
+        assert_eq!(evaluate_policy("GET", "/admin/settings", None, Some(&rules), None, &defaults(), None), AccessLevel::Deny);
+        assert_eq!(evaluate_policy("POST", "/admin/delete", None, Some(&rules), None, &defaults(), None), AccessLevel::Deny);
+    }
+
+    #[test]
+    fn global_defaults_apply_when_no_service_levels() {
+        let mut def = defaults();
+        def.levels = Some(ServiceLevels { write: Some(AccessLevel::Ask), read: None, ask_ttl: None });
+        let level = evaluate_policy("POST", "/x", None, None, None, &def, None);
         assert_eq!(level, AccessLevel::Ask);
     }
 
+    // ── find_ask_ttl ───────────────────────────────────────────────────────
+
     #[test]
-    fn body_pattern_no_match_falls_through() {
-        let mut r = rule("POST /v1/chat/completions");
-        r.body_pattern = Some("o3|o4-mini".to_string());
-        r.level = AccessLevel::Deny;
+    fn ask_ttl_from_matching_rule() {
+        let mut r = rule("GET /data/*", AccessLevel::Ask);
+        r.ask_ttl = Some(600);
         let rules = vec![r];
-        let body = r#"{"model": "gpt-4o", "messages": []}"#;
-        let level = evaluate_policy("POST", "/v1/chat/completions", Some(body), Some(&rules), None, &defaults(), None);
-        assert_eq!(level, AccessLevel::AskAlways); // no match, falls through
+        assert_eq!(find_ask_ttl(Some(&rules), None, "GET", "/data/123", None), Some(600));
     }
 
     #[test]
-    fn match_any_method_with_path_only() {
-        let mut r = rule("/admin/.*");
-        r.level = AccessLevel::Deny;
-        let rules = vec![r];
-        // Both GET and POST should match
-        assert_eq!(
-            evaluate_policy("GET", "/admin/settings", None, Some(&rules), None, &defaults(), None),
-            AccessLevel::Deny,
-        );
-        assert_eq!(
-            evaluate_policy("POST", "/admin/delete", None, Some(&rules), None, &defaults(), None),
-            AccessLevel::Deny,
-        );
+    fn ask_ttl_falls_back_to_service_level() {
+        let levels = ServiceLevels { write: None, read: None, ask_ttl: Some(1800) };
+        assert_eq!(find_ask_ttl(None, Some(&levels), "GET", "/foo", None), Some(1800));
     }
 }

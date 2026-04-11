@@ -581,7 +581,7 @@ async fn proxy_handler(
 
         // Approval session cache TTL (for agent-side)
         if access_level == AccessLevel::Ask {
-            let ttl = find_rule_ttl(effective_rules, method.as_str(), &route_path, body_text.as_deref())
+            let ttl = crate::core::policy::find_ask_ttl(effective_rules, effective_levels, method.as_str(), &route_path, body_text.as_deref())
                 .unwrap_or(3600);
             // Cache a placeholder; real auth stored in PendingApproval.approved_auth
             // and injected into approval cache only after execution (in poll handler).
@@ -749,40 +749,6 @@ fn filter_replay_headers(headers: &axum::http::HeaderMap) -> axum::http::HeaderM
     out
 }
 
-/// Find session TTL from matching rule (for `ask` access level).
-fn find_rule_ttl(
-    rules: Option<&Vec<super::policy::PolicyRule>>,
-    method: &str,
-    path: &str,
-    body: Option<&str>,
-) -> Option<u64> {
-    let rules = rules?;
-    let path_no_query = path.split('?').next().unwrap_or(path);
-    let input = format!("{} {}", method, path_no_query);
-    for rule in rules {
-        if let Some(ref pattern) = rule.match_pattern {
-            match regex::Regex::new(pattern) {
-                Ok(re) => {
-                    if !re.is_match(&input) { continue; }
-                }
-                Err(_) => continue,
-            }
-        }
-        if let Some(ref pattern) = rule.body_pattern {
-            let body_text = body.unwrap_or("");
-            match regex::Regex::new(pattern) {
-                Ok(re) => {
-                    if !re.is_match(body_text) { continue; }
-                }
-                Err(_) => continue,
-            }
-        }
-        if let Some(ttl) = rule.session_ttl {
-            return Some(ttl);
-        }
-    }
-    None
-}
 
 // ── Local service handler (multi-step execution engine) ──────────────────────
 

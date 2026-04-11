@@ -5,11 +5,11 @@ write = "ask"
 [[rule]]
 id = "list-events"
 label = "List events"
-match = "GET /calendar/v3/calendars/.+/events$"
+match = "GET /calendar/v3/calendars/*/events"
 level = "allow"
 
 [[rule]]
 id = "delete-event"
 label = "Delete event"
-match = "DELETE /calendar/v3/calendars/.+/events/.+"
+match = "DELETE /calendar/v3/calendars/*/events/*"
 level = "ask-always"
