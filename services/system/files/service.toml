@@ -3,6 +3,7 @@ id = "files"
 name = "Files"
 sub = "Encrypted vault storage"
 category = "system"
+activation = "auto"
 help = """
 # Files API
 

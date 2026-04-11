@@ -57,6 +57,10 @@ pub struct ServiceMeta {
     /// Supports template variables: {{wallet.*}} resolved from vault service data.
     #[serde(default)]
     pub help: Option<String>,
+    /// Activation mode: "auto" = starts automatically without credentials.
+    /// Absent/None = requires user "connect" (provide API key / OAuth).
+    #[serde(default)]
+    pub activation: Option<String>,
 }
 
 fn default_category() -> String { "integration".to_string() }
@@ -275,35 +279,40 @@ pub struct ServiceRegistry {
 }
 
 impl ServiceRegistry {
-    /// Load all service definitions from `services/*/service.toml` and `services/*/policy.toml`.
-    /// Falls back to compiled-in definitions if the directory is not found.
+    /// Load all service definitions in priority layers:
+    /// 1. Compiled-in defaults (always loaded as base)
+    /// 2. $SAFECLAW_DATA/services/ (runtime override for dev/deployment)
+    /// 3. ~/.safeclaw/services/ (user-installed services, highest priority)
     pub fn load() -> Self {
         let mut services = HashMap::new();
         let mut policies = HashMap::new();
 
-        // Try runtime path first ($SAFECLAW_DATA/services/), then compiled-in
+        // Layer 1: compiled-in defaults (always loaded as base)
+        Self::load_compiled_defaults(&mut services, &mut policies);
+
+        // Layer 2: $SAFECLAW_DATA/services/ override
         let dirs = Self::discover_service_dirs();
-        for (id, service_toml, policy_toml) in dirs {
-            match toml::from_str::<ServiceDef>(&service_toml) {
-                Ok(def) => { services.insert(id.clone(), def); }
-                Err(e) => {
-                    tracing::warn!("Failed to parse service.toml for {}: {}", id, e);
-                }
-            }
-            if let Some(policy_str) = policy_toml {
-                match toml::from_str::<PolicyFileDef>(&policy_str) {
-                    Ok(def) => { policies.insert(id, def); }
+        if !dirs.is_empty() {
+            for (id, service_toml, policy_toml) in dirs {
+                match toml::from_str::<ServiceDef>(&service_toml) {
+                    Ok(def) => { services.insert(id.clone(), def); }
                     Err(e) => {
-                        tracing::warn!("Failed to parse policy.toml for {}: {}", id, e);
+                        tracing::warn!("Failed to parse service.toml for {}: {}", id, e);
+                    }
+                }
+                if let Some(policy_str) = policy_toml {
+                    match toml::from_str::<PolicyFileDef>(&policy_str) {
+                        Ok(def) => { policies.insert(id, def); }
+                        Err(e) => {
+                            tracing::warn!("Failed to parse policy.toml for {}: {}", id, e);
+                        }
                     }
                 }
             }
         }
 
-        if services.is_empty() {
-            tracing::warn!("No service definitions found, loading compiled-in defaults");
-            Self::load_compiled_defaults(&mut services, &mut policies);
-        }
+        // Layer 3: ~/.safeclaw/services/ (user-installed, overrides everything)
+        Self::load_user_services(&mut services, &mut policies);
 
         tracing::info!("Loaded {} service definitions, {} policy files", services.len(), policies.len());
         Self { services, policies }
@@ -382,6 +391,52 @@ impl ServiceRegistry {
                     }
                 }
             }
+        }
+    }
+
+    /// Load user-installed services from ~/.safeclaw/services/.
+    /// Skips directories with a `.disabled` marker file.
+    fn load_user_services(services: &mut HashMap<String, ServiceDef>, policies: &mut HashMap<String, PolicyFileDef>) {
+        let user_dir = match user_services_dir() {
+            Some(d) if d.is_dir() => d,
+            _ => return,
+        };
+
+        let Ok(entries) = std::fs::read_dir(&user_dir) else { return };
+        let mut count = 0u32;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() { continue; }
+
+            // Skip disabled services
+            if path.join(".disabled").exists() { continue; }
+
+            let id = match path.file_name().and_then(|n| n.to_str()) {
+                Some(s) if !s.is_empty() => s.to_string(),
+                _ => continue,
+            };
+
+            let toml_path = path.join("service.toml");
+            let Ok(content) = std::fs::read_to_string(&toml_path) else { continue };
+            match toml::from_str::<ServiceDef>(&content) {
+                Ok(def) => {
+                    services.insert(id.clone(), def);
+                    count += 1;
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to parse user service {}: {}", id, e);
+                    continue;
+                }
+            }
+
+            if let Ok(policy_str) = std::fs::read_to_string(path.join("policy.toml")) {
+                if let Ok(def) = toml::from_str::<PolicyFileDef>(&policy_str) {
+                    policies.insert(id, def);
+                }
+            }
+        }
+        if count > 0 {
+            tracing::info!("Loaded {} user-installed services from {}", count, user_dir.display());
         }
     }
 
@@ -550,6 +605,13 @@ impl ServiceRegistry {
             .unwrap_or(false)
     }
 
+    /// Check if a service auto-activates (no credentials needed).
+    pub fn is_auto_activated(&self, service_name: &str) -> bool {
+        self.services.get(service_name)
+            .map(|d| d.service.activation.as_deref() == Some("auto"))
+            .unwrap_or(false)
+    }
+
     /// Check if a service is callable by the agent (has [[upstream]], [[api]], or help).
     pub fn is_agent_visible(&self, service_name: &str) -> bool {
         self.services.get(service_name)
@@ -591,6 +653,13 @@ impl ServiceDef {
     pub fn upstream_auth(&self) -> Option<&AuthDef> {
         self.find_upstream("default").and_then(|u| u.auth.as_ref())
     }
+}
+
+// ── User service directory ───────────────────────────────────────────────────
+
+/// Returns ~/.safeclaw/services/ path, or None if home dir can't be resolved.
+pub fn user_services_dir() -> Option<std::path::PathBuf> {
+    dirs::home_dir().map(|h| h.join(".safeclaw").join("services"))
 }
 
 // ── Vault service helpers ────────────────────────────────────────────────────

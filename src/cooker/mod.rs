@@ -109,5 +109,11 @@ fn discover_base_dirs() -> Vec<std::path::PathBuf> {
             dirs.push(parent.join("services"));
         }
     }
+    // User-installed services (~/.safeclaw/services/)
+    if let Some(user_dir) = crate::service::user_services_dir() {
+        if user_dir.is_dir() {
+            dirs.push(user_dir);
+        }
+    }
     dirs
 }

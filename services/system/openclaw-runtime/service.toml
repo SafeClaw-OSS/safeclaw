@@ -2,3 +2,4 @@
 id = "openclaw-runtime"
 name = "OpenClaw Runtime"
 category = "system"
+activation = "auto"

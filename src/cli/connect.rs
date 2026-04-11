@@ -30,14 +30,20 @@ fn list_services() {
     let mut channel = Vec::new();
     let mut integration = Vec::new();
 
+    // Track seen IDs to avoid duplicates when merging compiled + user services
+    let mut seen = std::collections::HashSet::new();
+
     for (id, toml_str) in all_services {
         if !recipe_ids.contains(id) { continue; } // only show services with recipes
         let name = extract_field(toml_str, "name").unwrap_or_else(|| id.to_string());
         let cat = extract_field(toml_str, "category").unwrap_or_else(|| "integration".to_string());
+        let activation = extract_field(toml_str, "activation");
+        if activation.as_deref() == Some("auto") { continue; } // skip auto-activated system services
+        seen.insert(id.to_string());
         match cat.as_str() {
-            "llm" => llm.push((*id, name)),
-            "channel" => channel.push((*id, name)),
-            _ => integration.push((*id, name)),
+            "llm" => llm.push((id.to_string(), name)),
+            "channel" => channel.push((id.to_string(), name)),
+            _ => integration.push((id.to_string(), name)),
         }
     }
 
@@ -46,7 +52,33 @@ fn list_services() {
     for (id, toml_str) in all_recipes {
         if service_ids.contains(id) { continue; }
         let name = extract_recipe_name(toml_str).unwrap_or_else(|| id.to_string());
-        integration.push((*id, name));
+        seen.insert(id.to_string());
+        integration.push((id.to_string(), name));
+    }
+
+    // Add user-installed services from ~/.safeclaw/services/
+    if let Some(user_dir) = crate::service::user_services_dir() {
+        if let Ok(entries) = std::fs::read_dir(&user_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_dir() || path.join(".disabled").exists() { continue; }
+                let id = match path.file_name().and_then(|n| n.to_str()) {
+                    Some(s) => s.to_string(),
+                    None => continue,
+                };
+                if seen.contains(&id) { continue; }
+                let toml_path = path.join("service.toml");
+                if let Ok(content) = std::fs::read_to_string(&toml_path) {
+                    let name = extract_field(&content, "name").unwrap_or_else(|| id.clone());
+                    let cat = extract_field(&content, "category").unwrap_or_else(|| "integration".to_string());
+                    match cat.as_str() {
+                        "llm" => llm.push((id, name)),
+                        "channel" => channel.push((id, name)),
+                        _ => integration.push((id, name)),
+                    }
+                }
+            }
+        }
     }
 
     eprintln!("Available services:\n");

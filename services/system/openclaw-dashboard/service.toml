@@ -1,7 +1,7 @@
 [service]
 id = "openclaw-dashboard"
 name = "OpenClaw Dashboard"
-category = "integration"
+category = "system"
 
 [[vault]]
 name = "gateway_token"

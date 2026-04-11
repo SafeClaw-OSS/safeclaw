@@ -40,6 +40,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.len() >= 2 && args[1] == "connect" {
         return cli::connect::run(&args[2..]).map_err(Into::into);
     }
+    if args.len() >= 2 && args[1] == "install" {
+        return cli::install::run_install(&args[2..]).map_err(Into::into);
+    }
+    if args.len() >= 2 && args[1] == "uninstall" {
+        return cli::install::run_uninstall(&args[2..]).map_err(Into::into);
+    }
+    if args.len() >= 2 && args[1] == "enable" {
+        return cli::install::run_enable(&args[2..]).map_err(Into::into);
+    }
+    if args.len() >= 2 && args[1] == "disable" {
+        return cli::install::run_disable(&args[2..]).map_err(Into::into);
+    }
+    if args.len() >= 2 && args[1] == "services" {
+        return cli::install::run_list(&args[2..]).map_err(Into::into);
+    }
 
     // Initialize tracing subscriber
     tracing_subscriber::fmt::init();
