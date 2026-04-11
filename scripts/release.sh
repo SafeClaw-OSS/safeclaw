@@ -67,4 +67,4 @@ EOF
 )" $DRAFT
 
 echo ""
-echo "[release] Done: https://github.com/xhyumiracle/safeclaw/releases/tag/$TAG"
+echo "[release] Done: https://github.com/SafeClaw-OSS/safeclaw/releases/tag/$TAG"
