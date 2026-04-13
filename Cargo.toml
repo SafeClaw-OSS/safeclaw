@@ -17,12 +17,16 @@ http-body-util = "0.1"
 
 # Crypto
 p256 = { version = "0.13", features = ["ecdh", "ecdsa", "jwk"] }
+chacha20poly1305 = "0.10"
+# aes-gcm is used only by notify::webpush for RFC 8188 Web Push content encoding.
+# The vault protocol itself uses XChaCha20-Poly1305 exclusively.
 aes-gcm = "0.10"
 jwt-simple = { version = "0.12", default-features = false, features = ["pure-rust"] }
 hkdf = "0.12"
 sha2 = "0.10"
 rand = "0.8"
 zeroize = { version = "1", features = ["derive"] }
+subtle = "2"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

@@ -230,80 +230,23 @@ async function startUnlock() {
   setBtn('<div class="spinner"></div> Contacting server…', true);
   setStatus('', '');
 
-  let serverPk;
-
-  try {
-    // Fetch server public key
-    const res = await fetch('/pk');
-    if (!res.ok) throw new Error(`Server returned ${res.status}`);
-    const data = await res.json();
-    serverPk = data.pk;  // JWK object
-  } catch (e) {
-    setStatus(`❌ Could not reach server: ${e.message}`, 'error');
-    setBtn('🔑 Unlock with Passkey', false);
-    return;
-  }
-
   try {
     setBtn('<div class="spinner"></div> Waiting for authenticator…', true);
 
-    const prfSalt = SafeClaw.getPrfSalt();
-    const webauthnChallenge = crypto.getRandomValues(new Uint8Array(32));
-
-    // No allowCredentials — let browser show any registered passkey for this RP
-    const assertion = await navigator.credentials.get({
-      publicKey: {
-        challenge: webauthnChallenge,
-        userVerification: 'required',
-        extensions: { prf: { eval: { first: prfSalt } } },
-      },
+    const body = await SafeClaw.buildAuthenticatedRequest({
+      method: 'POST',
+      path: '/vault/unlock',
+      body: {},
+      domain: SafeClaw.BINDING_STANDARD,
+      rotate: false,
     });
-
-    const prfFirst = assertion.getClientExtensionResults()?.prf?.results?.first;
-    if (!prfFirst) {
-      setStatus(
-        "❌ Your browser/device doesn't support PRF. Please use Chrome 116+ or Safari 18+.",
-        'error'
-      );
-      setBtn('🔑 Unlock with Passkey', false);
-      return;
-    }
-
-    setBtn('<div class="spinner"></div> Encrypting…', true);
-
-    // HKDF-normalize PRF output — must match setup.html / safeclaw-client.js:derivePRF()
-    const rawKey = new Uint8Array(prfFirst);
-    const keyMaterial = await crypto.subtle.importKey('raw', rawKey, 'HKDF', false, ['deriveBits']);
-    const userKeyBits = await crypto.subtle.deriveBits(
-      { name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(32), info: new TextEncoder().encode('safeclaw-user-key') },
-      keyMaterial, 256
-    );
-    const userKey = new Uint8Array(userKeyBits);
-    rawKey.fill(0);
-    const credentialId = assertion.id;  // base64url string
-
-    // Capture assertion data (public, goes in request body top-level)
-    const assertionData = {
-      authenticatorData: SafeClaw.toBase64(new Uint8Array(assertion.response.authenticatorData)),
-      clientDataJSON: SafeClaw.toBase64(new Uint8Array(assertion.response.clientDataJSON)),
-      signature: SafeClaw.toBase64(new Uint8Array(assertion.response.signature)),
-    };
-
-    const nonce = SafeClaw.toBase64(crypto.getRandomValues(new Uint8Array(32)));
-    const payload = { userKey: SafeClaw.toBase64(userKey), nonce, credentialId, assertion: assertionData };
-    const plaintext = new TextEncoder().encode(JSON.stringify(payload));
-    const sealed = await SafeClaw.e2eEncrypt(plaintext, serverPk);
-    const payloadB64 = SafeClaw.toBase64(sealed);
-
-    // Zeroize key material
-    userKey.fill(0);
 
     setBtn('<div class="spinner"></div> Unlocking vault…', true);
 
     const res = await fetch('/vault/unlock', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ payload: payloadB64 }),
+      body: JSON.stringify(body),
     });
 
     if (!res.ok) {
@@ -311,7 +254,6 @@ async function startUnlock() {
       throw new Error(errData.error || `HTTP ${res.status}`);
     }
 
-    // Animate lock icon and show success
     document.getElementById('lock-icon').classList.add('unlocked');
     setTimeout(() => {
       document.body.classList.add('unlocked');

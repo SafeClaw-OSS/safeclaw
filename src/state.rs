@@ -1,6 +1,10 @@
 //! Application-level state: AppState (shared across handlers) and RateLimiter.
 //!
 //! Vault state lives in vault.rs.
+//!
+//! v2 note: the server no longer holds a long-lived P-256 keypair in memory.
+//! Transport confidentiality is TLS-only, and envelope wrapping uses
+//! per-credential PRF-derived material rather than a server-held key.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -9,7 +13,6 @@ use std::time::Instant;
 use crate::core::approval::ApprovalManager;
 use crate::core::audit::AuditLog;
 use crate::config::Config;
-use crate::crypto::keys::ServerKeypair;
 use crate::service::ServiceRegistry;
 use crate::vault::Vault;
 
@@ -18,13 +21,15 @@ use crate::vault::Vault;
 /// Shared application state (Arc-wrapped)
 pub struct AppState {
     pub config: Config,
-    pub keypair: ServerKeypair,
     pub vault: Arc<Vault>,
     pub services: ServiceRegistry,
     pub nonces: Arc<Mutex<crate::passkey::nonce::NonceStore>>,
     pub challenges: Arc<Mutex<crate::passkey::challenge::ChallengeStore>>,
+    /// Serializes vault write operations across the process. Cross-process
+    /// exclusion is handled by an advisory file lock at the write path.
+    pub write_mutex: Arc<Mutex<()>>,
     pub start_time: Instant,
-    pub started_at_ms: u64,  // Unix ms timestamp at startup (for client-side uptime calc)
+    pub started_at_ms: u64,
     pub rate_limiter: Arc<Mutex<RateLimiter>>,
     pub approval_manager: Arc<ApprovalManager>,
     pub audit_log: Arc<AuditLog>,

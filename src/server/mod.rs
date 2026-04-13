@@ -62,28 +62,28 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 
         // ── Public ──────────────────────────────────────────────────────────
         .route("/health", get(health))
-        .route("/pk", get(server_pk))
-        .route("/challenge", get(issue_challenge))
+        .route("/challenge", get(challenge))
         .route("/auth/verify", post(auth_verify))
-        .route("/vault/credentials", post(vault_credentials))
 
-        // ── Admin (instance management) ─────────────────────────────────────
-        .route("/admin/setup", get(serve_setup).post(setup))
-        .route("/admin/unlock", get(serve_unlock).post(vault_unlock))
+        // ── Admin static pages + workspace helpers ─────────────────────────
+        .route("/admin/setup", get(serve_setup))
+        .route("/admin/unlock", get(serve_unlock))
         .route("/admin", get(serve_admin))
-        // /admin/shutdown removed — process lifecycle is the supervisor's job
         .route("/admin/safeclaw.md", get(admin_safeclaw_md))
         .route("/admin/agents-snippet", get(admin_agents_snippet))
 
         // ── Vault (authenticated) ───────────────────────────────────────────
+        .route("/vault/setup", post(setup))
+        .route("/vault/unlock", post(vault_unlock))
         .route("/vault/lock", post(vault_lock))
-        .route("/vault/update", post(vault_update))
+        .route("/vault/read", post(vault_read))
+        .route("/vault/write", post(vault_update))
 
         // ── Vault Service CRUD ───────────────────────────────────────────────
         .route("/vault/services", get(vault_services_list))
         .route("/vault/services/{name}/{key}", get(vault_service_field))
-        .route("/vault/services/add", post(vault_services_add))
-        .route("/vault/services/remove", post(vault_services_remove))
+        .route("/vault/services/install", post(vault_services_add))
+        .route("/vault/services/uninstall", post(vault_services_remove))
 
         // ── Policy Defaults ──────────────────────────────────────────────────
         .route("/vault/policy", get(vault_policy_get))
@@ -94,8 +94,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // /help is handled generically by the proxy layer (GET /{service}/help)
         .route("/vault/files/{id}", get(vault_files_read_approved))
         .route("/vault/files/upload", post(vault_files_upload))
-        .route("/vault/files/read", post(vault_files_read))
-        .route("/vault/files/remove", post(vault_files_remove))
+        .route("/vault/files/download", post(vault_files_read))
+        .route("/vault/files/delete", post(vault_files_remove))
 
         // ── Push Notifications ───────────────────────────────────────────────
         .route("/vault/notifications/subscribe", post(vault_notifications_subscribe))
@@ -115,9 +115,9 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/audit/log", get(audit_log_list))
 
         // ── Passkeys (authenticated) ────────────────────────────────────────
-        .route("/passkeys/add", post(identity_add_passkey))
-        .route("/passkeys/remove", post(identity_remove_passkey))
-        .route("/passkeys/public", get(passkeys_public))
+        .route("/vault/passkeys/enroll", post(identity_add_passkey))
+        .route("/vault/passkeys/revoke", post(identity_remove_passkey))
+        .route("/vault/passkeys/public", get(passkeys_public))
 
         // ── Static ──────────────────────────────────────────────────────────
         .route("/", get(serve_index))

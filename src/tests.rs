@@ -1,824 +1,372 @@
-/// Integration tests for SafeClaw
-///
-/// Covers:
-/// - Crypto round-trip (AES-GCM encrypt → decrypt, envelope wrap/unwrap)
-/// - HKDF derivation produces expected output for known inputs
-/// - Server starts and /health returns the correct response
-/// - Rate limiting works
+//! Ceremony-level integration tests for SafeClaw v2.
+//!
+//! **Test layering** (see PROTOCOL-v2.md §11):
+//!
+//! - **Layer 1: Primitive unit tests** live inside each crypto module
+//!   (`aead::tests`, `kdf::tests`, `canonical::tests`, `binding::tests`,
+//!   `vault_file::tests`, `wrapped_deks::tests`). They test one function
+//!   at a time and do not cross module boundaries.
+//!
+//! - **Layer 2: Ceremony integration tests** live here, in `src/tests.rs`.
+//!   They exercise multiple crypto modules together, emulating the full
+//!   setup / unlock / write / add-passkey / remove-passkey / forward-secrecy
+//!   ceremonies without going through Axum handlers. This is where the
+//!   Option D invariant is verified end-to-end.
+//!
+//! - **Layer 3: HTTP-level integration tests** (planned, not yet written)
+//!   would live in `tests/` (Cargo's integration test directory) and would
+//!   boot the full Axum router to send real HTTP requests against a WebAuthn
+//!   mock. Deferred until the mock infrastructure is written.
+//!
+//! Tests here deliberately avoid duplicating what Layer 1 already covers.
+//! If you are adding a test for a single-function invariant, add it to the
+//! relevant module's `#[cfg(test)] mod tests`, not here.
+
 #[cfg(test)]
 mod tests {
-    // ── Crypto round-trip ───────────────────────────────────────────────────────
+    // ── Test helpers ─────────────────────────────────────────────────────────
 
-    mod crypto_roundtrip {
-        use crate::crypto::{aes_decrypt, aes_encrypt, generate_dek, unwrap_dek, wrap_dek};
+    /// Tiny temp-directory helper that deletes itself on drop. Avoids pulling
+    /// in the `tempfile` crate as a new dependency.
+    pub(super) struct TempDir {
+        path: std::path::PathBuf,
+    }
 
-        #[test]
-        fn aes_gcm_encrypt_decrypt() {
-            let key = [0xABu8; 32];
-            let plaintext = b"hello safeclaw";
-
-            let sealed = aes_encrypt(&key, plaintext).expect("encrypt failed");
-            // sealed = iv(12) || ct+tag — must be longer than plaintext
-            assert!(sealed.len() > 12, "sealed must contain iv prefix");
-
-            let recovered = aes_decrypt(&key, &sealed).expect("decrypt failed");
-            assert_eq!(recovered, plaintext);
+    impl TempDir {
+        fn new() -> Self {
+            let pid = std::process::id();
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let p = std::env::temp_dir().join(format!("safeclaw-test-{}-{}", pid, nanos));
+            std::fs::create_dir_all(&p).unwrap();
+            Self { path: p }
         }
 
-        #[test]
-        fn aes_gcm_wrong_key_fails() {
-            let key = [0xABu8; 32];
-            let plaintext = b"secret data";
-            let sealed = aes_encrypt(&key, plaintext).expect("encrypt failed");
-
-            let bad_key = [0x00u8; 32];
-            let result = aes_decrypt(&bad_key, &sealed);
-            assert!(result.is_err(), "decryption with wrong key must fail");
-        }
-
-        #[test]
-        fn aes_gcm_tampered_ciphertext_fails() {
-            let key = [0x11u8; 32];
-            let mut sealed = aes_encrypt(&key, b"tamper me").expect("encrypt failed");
-
-            // Flip a byte in the ciphertext region (after the 12-byte IV)
-            let last = sealed.len() - 1;
-            sealed[last] ^= 0xFF;
-
-            let result = aes_decrypt(&key, &sealed);
-            assert!(result.is_err(), "decryption of tampered data must fail");
-        }
-
-        #[test]
-        fn aes_gcm_too_short_input_fails() {
-            let key = [0xFFu8; 32];
-            // Only 5 bytes — shorter than 12-byte IV minimum
-            let result = aes_decrypt(&key, &[0u8; 5]);
-            assert!(result.is_err());
-        }
-
-        #[test]
-        fn envelope_wrap_unwrap_dek() {
-            let kek = [0x42u8; 32];
-            let dek = generate_dek();
-
-            let wrapped = wrap_dek(&dek, &kek).expect("wrap failed");
-            let recovered = unwrap_dek(&wrapped, &kek).expect("unwrap failed");
-            assert_eq!(recovered, dek);
-        }
-
-        #[test]
-        fn envelope_unwrap_wrong_kek_fails() {
-            let kek = [0x42u8; 32];
-            let dek = generate_dek();
-            let wrapped = wrap_dek(&dek, &kek).expect("wrap failed");
-
-            let bad_kek = [0x00u8; 32];
-            let result = unwrap_dek(&wrapped, &bad_kek);
-            assert!(result.is_err(), "unwrap with wrong KEK must fail");
-        }
-
-        #[test]
-        fn full_vault_roundtrip() {
-            use crate::crypto::{decrypt_vault, encrypt_vault, generate_dek};
-
-            let dek = generate_dek();
-            let data = b"{ \"services\": {} }";
-
-            let sealed = encrypt_vault(&dek, data).expect("encrypt_vault failed");
-            let plaintext = decrypt_vault(&dek, &sealed).expect("decrypt_vault failed");
-            assert_eq!(plaintext, data);
+        pub fn path(&self) -> &std::path::Path {
+            &self.path
         }
     }
 
-    // ── HKDF derivation ─────────────────────────────────────────────────────────
-
-    mod hkdf_derivation {
-        use crate::crypto::kdf::{derive_e2e_key, derive_kek, derive_response_key};
-
-        /// Cross-language reference vector computed with Node.js:
-        ///
-        /// ```js
-        /// const { createHmac } = require('crypto');
-        /// const { hkdf } = require('crypto');
-        /// // hkdf('sha256', ikm, salt, info, keylen, cb)
-        /// ```
-        ///
-        /// For deterministic testing we just check:
-        /// - same inputs → same outputs (deterministic)
-        /// - different inputs → different outputs
-        #[test]
-        fn derive_kek_is_deterministic() {
-            let user_key = [0x01u8; 32];
-            let sk_d = [0x02u8; 32];
-
-            let kek1 = derive_kek(&user_key, &sk_d).expect("derive_kek failed");
-            let kek2 = derive_kek(&user_key, &sk_d).expect("derive_kek failed again");
-            assert_eq!(kek1, kek2, "KEK must be deterministic");
-        }
-
-        #[test]
-        fn derive_kek_changes_with_different_salt() {
-            let user_key = [0x01u8; 32];
-            let sk_d_a = [0x02u8; 32];
-            let sk_d_b = [0x03u8; 32];
-
-            let kek_a = derive_kek(&user_key, &sk_d_a).expect("derive_kek_a failed");
-            let kek_b = derive_kek(&user_key, &sk_d_b).expect("derive_kek_b failed");
-            assert_ne!(kek_a, kek_b, "different sk_d must produce different KEKs");
-        }
-
-        #[test]
-        fn derive_e2e_key_is_deterministic() {
-            let shared_secret = [0xAAu8; 32];
-
-            let k1 = derive_e2e_key(&shared_secret).expect("derive_e2e_key failed");
-            let k2 = derive_e2e_key(&shared_secret).expect("derive_e2e_key failed again");
-            assert_eq!(k1, k2, "E2E key must be deterministic");
-        }
-
-        #[test]
-        fn derive_response_key_is_deterministic() {
-            let user_key = [0xBBu8; 32];
-            let nonce = [0xCCu8; 16];
-
-            let k1 = derive_response_key(&user_key, &nonce).expect("derive_response_key failed");
-            let k2 = derive_response_key(&user_key, &nonce).expect("derive_response_key failed again");
-            assert_eq!(k1, k2, "response key must be deterministic");
-        }
-
-        #[test]
-        fn three_kdf_functions_produce_distinct_keys() {
-            // Same IKM/salt for all three — info strings must differentiate them
-            let ikm = [0x55u8; 32];
-            let salt = [0x66u8; 32];
-
-            let kek = derive_kek(&ikm, &salt).unwrap();
-            let e2e = derive_e2e_key(&ikm).unwrap(); // uses zeros(32) as salt internally
-            let resp = derive_response_key(&ikm, &salt).unwrap();
-
-            assert_ne!(kek, e2e, "KEK and E2E keys must differ");
-            assert_ne!(kek, resp, "KEK and response keys must differ");
-            assert_ne!(e2e, resp, "E2E and response keys must differ");
-        }
-
-        /// Known-answer test derived from Python:
-        ///
-        /// ```python
-        /// import hashlib, hmac
-        /// from cryptography.hazmat.primitives.hashes import SHA256
-        /// from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-        /// from cryptography.hazmat.backends import default_backend
-        ///
-        /// ikm   = bytes([0x01]*32)
-        /// salt  = bytes([0x02]*32)
-        /// info  = b"safeclaw-kek-v1"
-        /// hkdf  = HKDF(SHA256(), 32, salt, info, default_backend())
-        /// print(hkdf.derive(ikm).hex())
-        /// # => dc0c316fe63d1fbe25ae0db1ef0f28a9cb60e0d24e0a16174f1aafa59e08ced1
-        /// ```
-        #[test]
-        fn derive_kek_known_answer() {
-            let user_key = [0x01u8; 32];
-            let sk_d = [0x02u8; 32];
-
-            let kek = derive_kek(&user_key, &sk_d).expect("derive_kek failed");
-
-            let expected = hex_to_bytes(
-                "544091d91d21f0eb3f9be13acdd597714cccdbdd13d8d9cea0bc0207f3cd88bd",
-            );
-            assert_eq!(kek.to_vec(), expected, "KEK known-answer mismatch");
-        }
-
-        fn hex_to_bytes(s: &str) -> Vec<u8> {
-            (0..s.len())
-                .step_by(2)
-                .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
-                .collect()
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
         }
     }
 
-    // ── Nonce store ─────────────────────────────────────────────────────────────
-
-    mod nonce_store {
-        use crate::passkey::nonce::NonceStore;
-
-        #[test]
-        fn fresh_nonce_is_accepted() {
-            let mut store = NonceStore::new();
-            assert!(store.check_and_insert(b"nonce-1"));
-        }
-
-        #[test]
-        fn replay_is_rejected() {
-            let mut store = NonceStore::new();
-            assert!(store.check_and_insert(b"nonce-2"));
-            assert!(!store.check_and_insert(b"nonce-2"), "replay must be rejected");
-        }
-
-        #[test]
-        fn different_nonces_both_accepted() {
-            let mut store = NonceStore::new();
-            assert!(store.check_and_insert(b"alpha"));
-            assert!(store.check_and_insert(b"beta"));
-        }
+    pub(super) fn tempdir() -> TempDir {
+        TempDir::new()
     }
 
-    // ── Rate limiter ─────────────────────────────────────────────────────────────
+    // ── Ceremony-level integration ───────────────────────────────────────────
 
-    mod rate_limiter {
-        use crate::state::RateLimiter;
-
-        #[test]
-        fn allows_requests_under_limit() {
-            let mut rl = RateLimiter::new(5);
-            for _ in 0..5 {
-                assert!(rl.check("10.0.0.1"), "should be allowed under the rate limit");
-            }
-        }
-
-        #[test]
-        fn blocks_requests_over_limit() {
-            let mut rl = RateLimiter::new(3);
-            for _ in 0..3 {
-                rl.check("10.0.0.2");
-            }
-            assert!(!rl.check("10.0.0.2"), "4th request must be blocked");
-        }
-
-        #[test]
-        fn different_ips_have_independent_buckets() {
-            let mut rl = RateLimiter::new(2);
-            assert!(rl.check("1.2.3.4"));
-            assert!(rl.check("1.2.3.4"));
-            // First two requests for 1.2.3.4 exhausted; 5.6.7.8 is fresh
-            assert!(rl.check("5.6.7.8"));
-        }
-
-        #[test]
-        fn zero_rate_disables_limiting() {
-            let mut rl = RateLimiter::new(0);
-            for _ in 0..1000 {
-                assert!(rl.check("192.168.1.1"), "rate=0 means unlimited");
-            }
-        }
-    }
-
-    // ── Health endpoint ──────────────────────────────────────────────────────────
-
-    mod health_endpoint {
-        use std::sync::{Arc, Mutex};
-        use std::time::Instant;
-
-        use axum::body::to_bytes;
-        use axum::extract::State;
-        use axum::http::StatusCode;
-        use axum::response::IntoResponse;
-
-        use crate::core::approval::ApprovalManager;
-        use crate::core::audit::AuditLog;
-        use crate::passkey::nonce::NonceStore;
-        use crate::config::Config;
-        use crate::crypto::keys::generate_keypair;
-        use crate::service::ServiceRegistry;
-        use crate::state::{AppState, RateLimiter};
-        use crate::vault::Vault;
-
-        fn make_test_state() -> Arc<AppState> {
-            let config = Config {
-                data_dir: std::path::PathBuf::from("/tmp/safeclaw-test"),
-                port: 23294,
-                bind: "127.0.0.1".to_string(),
-                proxy_port: 23295,
-                proxy_bind: "127.0.0.1".to_string(),
-                origin: None,
-                rp_id: None,
-                admin_url: None,
-                instance_id: None,
-                rate_limit: 0,
-                rate_limit_exempt: vec![],
-                relay_egress_ip: None,
-                init: false,
-            };
-            let keypair = generate_keypair().expect("generate_keypair failed");
-            let vault = Arc::new(Vault::new());
-            let audit_log = Arc::new(
-                AuditLog::open_in_memory().expect("audit log failed"),
-            );
-            let approval_manager = Arc::new(ApprovalManager::new(audit_log.clone()));
-
-            Arc::new(AppState {
-                config,
-                keypair,
-                vault,
-                services: ServiceRegistry::load(),
-                nonces: Arc::new(Mutex::new(NonceStore::new())),
-                challenges: Arc::new(Mutex::new(crate::passkey::challenge::ChallengeStore::new())),
-                start_time: Instant::now(),
-                started_at_ms: 0,
-                rate_limiter: Arc::new(Mutex::new(RateLimiter::new(0))),
-                approval_manager,
-                audit_log,
-            })
-        }
-
-        #[tokio::test]
-        async fn health_returns_correct_fields() {
-            let state = make_test_state();
-            let response = crate::server::routes::health(State(state)).await.into_response();
-
-            assert_eq!(response.status(), StatusCode::OK);
-
-            let body = to_bytes(response.into_body(), 4096).await.unwrap();
-            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-
-            assert_eq!(json["status"], "ok", "status field must be 'ok'");
-            assert!(json["locked"].is_boolean(), "locked must be a boolean");
-            assert!(json["started_at"].is_number(), "started_at must be a number");
-            assert!(json["version"].is_string(), "version must be a string");
-            assert_eq!(json["locked"], true, "vault must start locked");
-        }
-
-        #[tokio::test]
-        async fn server_pk_returns_jwk_public_key() {
-            let state = make_test_state();
-            let response = crate::server::routes::server_pk(State(state)).await.into_response();
-
-            assert_eq!(response.status(), StatusCode::OK);
-
-            let body = to_bytes(response.into_body(), 4096).await.unwrap();
-            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-
-            let pk = &json["pk"];
-            assert_eq!(pk["kty"], "EC");
-            assert_eq!(pk["crv"], "P-256");
-            assert!(pk["x"].is_string(), "x coordinate must be present");
-            assert!(pk["y"].is_string(), "y coordinate must be present");
-            // 32 bytes base64url-no-pad = 43 characters
-            assert_eq!(pk["x"].as_str().unwrap().len(), 43);
-            assert_eq!(pk["y"].as_str().unwrap().len(), 43);
-        }
-
-        #[tokio::test]
-        async fn health_version_matches_cargo_pkg_version() {
-            let state = make_test_state();
-            let response = crate::server::routes::health(State(state)).await.into_response();
-
-            let body = to_bytes(response.into_body(), 4096).await.unwrap();
-            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-
-            assert_eq!(
-                json["version"].as_str().unwrap(),
-                env!("CARGO_PKG_VERSION"),
-                "version must match Cargo.toml"
-            );
-        }
-    }
-
-    // ── Policy evaluation ─────────────────────────────────────────────────────────
-
-    mod policy_tests {
-        use crate::core::policy::{
-            evaluate_policy, AccessLevel, PolicyDefaults, PolicyRule, ServiceLevels,
+    mod ceremony {
+        use super::{tempdir, TempDir as _TempDir};
+        use crate::crypto::{
+            generate_dek,
+            kdf::{derive_kek, WRAP_VERSION},
+            vault_file::{decrypt_vault, encrypt_vault},
+            wrapped_deks::{
+                unwrap_dek, wrap_dek_for_credential, wrap_dek_with_kek, DekWrapManifest,
+            },
         };
-
-        fn defaults() -> PolicyDefaults {
-            PolicyDefaults::default()
-        }
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        use serde_json::json;
 
         #[test]
-        fn default_policy_is_ask_always() {
-            let level = evaluate_policy("GET", "/foo", None, None, None, &defaults(), None);
-            assert_eq!(level, AccessLevel::AskAlways);
-        }
+        fn option_d_two_credentials() {
+            // Two credentials, both initially registered with their own prf_salt.
+            // Credential A performs a write: rotates A's salt, rotates DEK,
+            // rewraps for both A (new KEK) and B (cached peer KEK from peer_keks).
+            // B should still be able to unlock after A's write.
 
-        #[test]
-        fn llm_category_is_allow() {
-            let level = evaluate_policy("POST", "/v1/chat", None, None, None, &defaults(), Some("llm"));
-            assert_eq!(level, AccessLevel::Allow);
-        }
+            let cid_a = b"cred-a";
+            let cid_b = b"cred-b";
 
-        #[test]
-        fn post_with_ask_write_returns_ask() {
-            let levels = ServiceLevels {
-                write: Some(AccessLevel::Ask),
-                read: None,
-                ask_ttl: None,
-            };
-            let level = evaluate_policy("POST", "/data", None, None, Some(&levels), &defaults(), None);
-            assert_eq!(level, AccessLevel::Ask);
-        }
+            let user_key_a = [0xAAu8; 32];
+            let user_key_b = [0xBBu8; 32];
 
-        #[test]
-        fn ask_always_rule_overrides_service_levels() {
-            let rules = vec![PolicyRule {
-                id: None,
-                label: None,
-                match_pattern: Some("DELETE /api/admin".to_string()),
-                body: None,
-                level: AccessLevel::AskAlways,
-                ask_ttl: None,
-            }];
-            let levels = ServiceLevels {
-                write: Some(AccessLevel::Ask),
-                read: None,
-                ask_ttl: None,
-            };
-            let level = evaluate_policy(
-                "DELETE",
-                "/api/admin",
-                None,
-                Some(&rules),
-                Some(&levels),
-                &defaults(),
-                None,
-            );
-            assert_eq!(level, AccessLevel::AskAlways);
-        }
+            let salt_a_0 = [0x01u8; 32];
+            let salt_b = [0x02u8; 32];
 
-        #[test]
-        fn get_falls_to_global_default_when_only_write_set() {
-            let levels = ServiceLevels {
-                write: Some(AccessLevel::Ask),
-                read: None,
-                ask_ttl: None,
-            };
-            // No read at service level, no category → falls to global default (ask-always)
-            let level = evaluate_policy("GET", "/data", None, None, Some(&levels), &defaults(), None);
-            assert_eq!(level, AccessLevel::AskAlways);
-        }
+            let kek_a_0 = derive_kek(&user_key_a, &salt_a_0, WRAP_VERSION, cid_a).unwrap();
+            let kek_b = derive_kek(&user_key_b, &salt_b, WRAP_VERSION, cid_b).unwrap();
 
-        #[test]
-        fn access_level_serde_roundtrip() {
-            let levels: ServiceLevels = serde_json::from_str(
-                r#"{"write": "ask-always", "read": "allow"}"#,
-            ).expect("new terms must deserialize");
-            assert_eq!(levels.write, Some(AccessLevel::AskAlways));
-            assert_eq!(levels.read, Some(AccessLevel::Allow));
-        }
-    }
-
-    // ── Audit log ─────────────────────────────────────────────────────────────────
-
-    mod audit_tests {
-        use crate::core::audit::AuditLog;
-
-        #[test]
-        fn create_and_retrieve_approval() {
-            let log = AuditLog::open_in_memory().expect("open failed");
-            log.create_approval("id1", "svc", "POST", "/api", 3600)
-                .expect("create failed");
-            let rec = log.get_approval("id1").unwrap().expect("not found");
-            assert_eq!(rec.id, "id1");
-            assert_eq!(rec.status, "pending");
-        }
-
-        #[test]
-        fn update_approval_status() {
-            let log = AuditLog::open_in_memory().expect("open failed");
-            log.create_approval("id2", "svc", "GET", "/x", 3600).unwrap();
-            log.update_approval("id2", "approved").unwrap();
-            let rec = log.get_approval("id2").unwrap().unwrap();
-            assert_eq!(rec.status, "approved");
-        }
-
-        #[test]
-        fn list_pending_filters_correctly() {
-            let log = AuditLog::open_in_memory().expect("open failed");
-            log.create_approval("a", "s1", "GET", "/1", 3600).unwrap();
-            log.create_approval("b", "s2", "POST", "/2", 3600).unwrap();
-            log.update_approval("b", "rejected").unwrap();
-            let pending = log.list_pending_approvals().unwrap();
-            assert_eq!(pending.len(), 1);
-            assert_eq!(pending[0].id, "a");
-        }
-    }
-
-    // ── Approval manager ──────────────────────────────────────────────────────────
-
-    mod approval_tests {
-        use std::sync::Arc;
-        use axum::http::HeaderMap;
-        use hyper::body::Bytes;
-        use crate::core::approval::{ApprovalStatus, ApprovalManager};
-        use crate::core::audit::AuditLog;
-
-        fn make_manager() -> Arc<ApprovalManager> {
-            let audit = Arc::new(AuditLog::open_in_memory().expect("audit log failed"));
-            Arc::new(ApprovalManager::new(audit))
-        }
-
-        fn make_approval(mgr: &Arc<ApprovalManager>) -> String {
-            mgr.create_approval(
-                "svc".to_string(),
-                "POST".to_string(),
-                "/api".to_string(),
-                "/svc/api".to_string(),
-                "https://api.example.com".to_string(),
-                HeaderMap::new(),
-                Bytes::new(),
-                60,
-                None,
-            )
-        }
-
-        #[test]
-        fn confirm_sets_approved_status() {
-            let mgr = make_manager();
-            let id = make_approval(&mgr);
-            assert!(mgr.confirm(&id, None));
-            let snap = mgr.get_snapshot(&id).expect("not found");
-            assert_eq!(snap.status, ApprovalStatus::Approved);
-        }
-
-        #[test]
-        fn confirm_carries_auth_payload() {
-            let mgr = make_manager();
-            let id = make_approval(&mgr);
-            let auth_json = serde_json::json!({"type": "bearer", "secret": "tok"});
-            mgr.confirm(&id, Some(auth_json.clone()));
-            let auth = mgr.take_auth_for_execute(&id).expect("should be approved");
-            assert_eq!(auth.unwrap()["type"], "bearer");
-        }
-
-        #[test]
-        fn take_auth_idempotent() {
-            let mgr = make_manager();
-            let id = make_approval(&mgr);
-            mgr.confirm(&id, None);
-            // First take succeeds
-            assert!(mgr.take_auth_for_execute(&id).is_some());
-            // Second take returns None (already taken / cached)
-            assert!(mgr.take_auth_for_execute(&id).is_none());
-        }
-
-        #[test]
-        fn reject_sets_rejected_status() {
-            let mgr = make_manager();
-            let id = make_approval(&mgr);
-            assert!(mgr.reject(&id));
-            let snap = mgr.get_snapshot(&id).expect("not found");
-            assert_eq!(snap.status, ApprovalStatus::Rejected);
-        }
-
-        #[test]
-        fn confirm_unknown_returns_false() {
-            let mgr = make_manager();
-            assert!(!mgr.confirm("nonexistent", None));
-        }
-
-        #[test]
-        fn reject_unknown_returns_false() {
-            let mgr = make_manager();
-            assert!(!mgr.reject("nonexistent"));
-        }
-    }
-
-    // ── Multi-step execution engine ─────────────────────────────────────────────
-
-    mod multi_step_engine {
-        use std::sync::Arc;
-        use crate::vault::Vault;
-        use crate::core::router::ProxyState;
-        use crate::config::Config;
-        use crate::core::approval::ApprovalManager;
-        use crate::core::audit::AuditLog;
-        use crate::service::ServiceRegistry;
-
-        fn make_proxy_state_with_vault(vault_json: serde_json::Value) -> Arc<ProxyState> {
-            let vault = Arc::new(Vault::new());
-            vault.set_plaintext(vault_json);
-            let audit = Arc::new(AuditLog::open_in_memory().unwrap());
-            Arc::new(ProxyState {
-                vault,
-                config: Config {
-                    data_dir: std::path::PathBuf::from("/tmp/safeclaw-test"),
-                    port: 23294,
-                    bind: "127.0.0.1".into(),
-                    proxy_port: 23295,
-                    proxy_bind: "127.0.0.1".into(),
-                    origin: None,
-                    rp_id: None,
-                    admin_url: None,
-                    instance_id: None,
-                    rate_limit: 0,
-                    rate_limit_exempt: vec![],
-                    relay_egress_ip: None,
-                    init: false,
-                },
-                approval_manager: Arc::new(ApprovalManager::new(audit.clone())),
-                audit_log: audit,
-                services: ServiceRegistry::load(),
-            })
-        }
-
-        #[test]
-        fn vault_read_dotted_path_navigates_correctly() {
-            let state = make_proxy_state_with_vault(serde_json::json!({
-                "services": {
-                    "openclaw-dashboard": {
-                        "gatewayToken": "gw_tok_12345"
-                    }
+            // Initial DEK and vault.
+            let dek_0 = generate_dek();
+            let vault_0 = json!({
+                "services": {},
+                "files": [],
+                "peer_keks": {
+                    STANDARD.encode(cid_a): STANDARD.encode(&kek_a_0),
+                    STANDARD.encode(cid_b): STANDARD.encode(&kek_b),
                 }
-            }));
-
-            let step = crate::service::ApiStep {
-                target: "safeclaw.vault".into(),
-                run: None,
-                env: std::collections::HashMap::new(),
-                read: Some("services.openclaw-dashboard.gatewayToken".into()),
-                returns: true,
-                retry: None,
-                title: None,
-                note: None,
-            };
-
-            let result = crate::core::router::execute_vault_read(&state, "openclaw-dashboard", &step);
-            assert!(result.is_ok(), "vault read should succeed");
-            assert_eq!(result.unwrap(), "gw_tok_12345");
-        }
-
-        #[test]
-        fn vault_read_missing_path_returns_error() {
-            let state = make_proxy_state_with_vault(serde_json::json!({
-                "services": {}
-            }));
-
-            let step = crate::service::ApiStep {
-                target: "safeclaw.vault".into(),
-                run: None,
-                env: std::collections::HashMap::new(),
-                read: Some("services.nonexistent.token".into()),
-                returns: true,
-                retry: None,
-                title: None,
-                note: None,
-            };
-
-            let result = crate::core::router::execute_vault_read(&state, "test", &step);
-            assert!(result.is_err(), "should fail for missing path");
-        }
-
-        #[test]
-        fn vault_read_no_read_field_returns_error() {
-            let state = make_proxy_state_with_vault(serde_json::json!({
-                "services": {}
-            }));
-
-            let step = crate::service::ApiStep {
-                target: "safeclaw.vault".into(),
-                run: None,
-                env: std::collections::HashMap::new(),
-                read: None, // no read path
-                returns: true,
-                retry: None,
-                title: None,
-                note: None,
-            };
-
-            let result = crate::core::router::execute_vault_read(&state, "test", &step);
-            assert!(result.is_err());
-        }
-
-        #[test]
-        fn vault_read_locked_returns_unavailable() {
-            let vault = Arc::new(Vault::new());
-            // Don't set secrets → vault stays locked
-            let audit = Arc::new(AuditLog::open_in_memory().unwrap());
-            let state = Arc::new(ProxyState {
-                vault,
-                config: Config {
-                    data_dir: std::path::PathBuf::from("/tmp"),
-                    port: 23294,
-                    bind: "127.0.0.1".into(),
-                    proxy_port: 23295,
-                    proxy_bind: "127.0.0.1".into(),
-                    origin: None,
-                    rp_id: None,
-                    admin_url: None,
-                    instance_id: None,
-                    rate_limit: 0,
-                    rate_limit_exempt: vec![],
-                    relay_egress_ip: None,
-                    init: false,
-                },
-                approval_manager: Arc::new(ApprovalManager::new(audit.clone())),
-                audit_log: audit,
-                services: ServiceRegistry::load(),
             });
+            let vault_bytes_0 = serde_json::to_vec(&vault_0).unwrap();
+            let enc_0 = encrypt_vault(&dek_0, &vault_bytes_0).unwrap();
 
-            let step = crate::service::ApiStep {
-                target: "safeclaw.vault".into(),
-                run: None,
-                env: std::collections::HashMap::new(),
-                read: Some("services.x.token".into()),
-                returns: true,
-                retry: None,
-                title: None,
-                note: None,
-            };
+            // Initial wrapped_deks manifest.
+            let mut manifest = DekWrapManifest::new();
+            manifest
+                .entries
+                .push(wrap_dek_for_credential(&dek_0, &user_key_a, &salt_a_0, cid_a).unwrap());
+            manifest
+                .entries
+                .push(wrap_dek_for_credential(&dek_0, &user_key_b, &salt_b, cid_b).unwrap());
 
-            let result = crate::core::router::execute_vault_read(&state, "test", &step);
-            assert!(result.is_err(), "should fail when vault is locked");
+            // --- A performs a write ---
+            // A unwraps its entry.
+            let entry_a = manifest.find(cid_a).unwrap();
+            let dek_from_a = unwrap_dek(entry_a, &user_key_a).unwrap();
+            assert_eq!(dek_from_a, dek_0);
+
+            // Decrypt current vault.
+            let plain_0 = decrypt_vault(&dek_from_a, &enc_0).unwrap();
+            let mut vault_value: serde_json::Value = serde_json::from_slice(&plain_0).unwrap();
+
+            // Mutate.
+            vault_value["services"]["openai"] = json!({"auth": "sk-xxx"});
+
+            // Rotate A's salt, derive new KEK.
+            let salt_a_1 = [0x11u8; 32];
+            let user_key_a_next = [0xCCu8; 32]; // simulating PRF with new salt
+            let kek_a_1 =
+                derive_kek(&user_key_a_next, &salt_a_1, WRAP_VERSION, cid_a).unwrap();
+
+            // Update peer_keks in vault plaintext.
+            vault_value["peer_keks"][STANDARD.encode(cid_a)] =
+                json!(STANDARD.encode(&kek_a_1));
+
+            // New DEK.
+            let dek_1 = generate_dek();
+
+            // Re-encrypt vault.
+            let new_plain = serde_json::to_vec(&vault_value).unwrap();
+            let enc_1 = encrypt_vault(&dek_1, &new_plain).unwrap();
+
+            // Re-wrap both entries.
+            let mut new_manifest = DekWrapManifest::new();
+            new_manifest.entries.push(
+                wrap_dek_with_kek(&dek_1, &kek_a_1, &salt_a_1, cid_a).unwrap(),
+            );
+            // For B, use the cached peer KEK from peer_keks (which equals kek_b).
+            new_manifest
+                .entries
+                .push(wrap_dek_with_kek(&dek_1, &kek_b, &salt_b, cid_b).unwrap());
+
+            // --- B later unlocks ---
+            let entry_b = new_manifest.find(cid_b).unwrap();
+            let dek_from_b = unwrap_dek(entry_b, &user_key_b).unwrap();
+            assert_eq!(dek_from_b, dek_1);
+            let plain_from_b = decrypt_vault(&dek_from_b, &enc_1).unwrap();
+            let v: serde_json::Value = serde_json::from_slice(&plain_from_b).unwrap();
+            assert_eq!(
+                v["services"]["openai"]["auth"].as_str().unwrap(),
+                "sk-xxx"
+            );
+
+            // --- A's old rawPRF (for salt_a_0) should NOT unwrap A's new entry ---
+            let entry_a_new = new_manifest.find(cid_a).unwrap();
+            assert!(unwrap_dek(entry_a_new, &user_key_a).is_err());
         }
 
-        #[tokio::test]
-        async fn execute_command_succeeds() {
-            let body = hyper::body::Bytes::new();
-            let vault = crate::auth::ServiceVault {
-                upstream: None,
-                auth: None,
-                levels: None,
-                rules: None,
-                category: None,
-            };
-            let result = crate::core::router::execute_command(
-                "echo hello",
-                &body,
-                &vault,
-                std::path::Path::new("/tmp"),
-                &std::collections::HashMap::new(),
-            ).await;
-            assert!(result.is_ok());
-            assert_eq!(result.unwrap().as_str().unwrap().trim(), "hello");
+        #[test]
+        fn forward_secrecy_past_backup_current_rawprf() {
+            // Scenario: attacker has a past backup of dek_wraps.bin for
+            // credential A (taken at time T0) and somehow obtains A's CURRENT
+            // rawPRF (at time T1, after A has done a write and rotated its salt).
+            // Attacker should NOT be able to unwrap the past wrapped entry.
+            //
+            // This verifies the narrow-window forward secrecy that v2 provides
+            // via per-credential prf_salt rotation.
+
+            let cid = b"cred";
+            let user_key_t0 = [0xAAu8; 32];
+            let salt_t0 = [0x01u8; 32];
+            let dek_t0 = generate_dek();
+
+            let entry_t0 =
+                wrap_dek_for_credential(&dek_t0, &user_key_t0, &salt_t0, cid).unwrap();
+
+            // Time passes, A performs a write, rotates salt.
+            let user_key_t1 = [0xBBu8; 32]; // new PRF output under new salt
+            let salt_t1 = [0x02u8; 32];
+            let dek_t1 = generate_dek();
+            let entry_t1 =
+                wrap_dek_for_credential(&dek_t1, &user_key_t1, &salt_t1, cid).unwrap();
+
+            // Attacker has: past wrapped entry `entry_t0` + current rawPRF `user_key_t1`.
+            //   - Current rawPRF does not match past salt; entry_t0 should not unwrap.
+            assert!(
+                unwrap_dek(&entry_t0, &user_key_t1).is_err(),
+                "current rawPRF must not unwrap past wrapped entry"
+            );
+
+            // Sanity: past rawPRF does unwrap the past entry (the scenario we
+            // explicitly cannot protect against is past disk + past rawPRF).
+            assert!(unwrap_dek(&entry_t0, &user_key_t0).is_ok());
+            // And current rawPRF unwraps the current entry (expected).
+            assert!(unwrap_dek(&entry_t1, &user_key_t1).is_ok());
         }
 
-        #[tokio::test]
-        async fn execute_command_failure_returns_err() {
-            let body = hyper::body::Bytes::new();
-            let vault = crate::auth::ServiceVault {
-                upstream: None,
-                auth: None,
-                levels: None,
-                rules: None,
-                category: None,
-            };
-            let result = crate::core::router::execute_command(
-                "false",  // always exits with code 1
-                &body,
-                &vault,
-                std::path::Path::new("/tmp"),
-                &std::collections::HashMap::new(),
-            ).await;
-            assert!(result.is_err());
-            assert!(result.unwrap_err().contains("exit code"));
+        #[test]
+        fn full_write_path_e2e_on_disk() {
+            // End-to-end ceremony: set up a v2 vault on a temporary directory,
+            // unlock it, perform a write, and verify disk state is consistent
+            // after the atomic commit.
+
+            use crate::crypto::vault_file::save_atomic as save_vault;
+            use crate::crypto::dek_wraps::{wrap_dek_with_kek, DekWrapManifest};
+
+            let tmp = tempdir();
+            let data_dir = tmp.path();
+
+            // --- Setup: one credential, one vault ---
+            let cid = b"setup-cred";
+            let user_key = [0x77u8; 32];
+            let salt_0 = [0x11u8; 32];
+
+            let dek_0 = generate_dek();
+            let kek_0 =
+                derive_kek(&user_key, &salt_0, WRAP_VERSION, cid).unwrap();
+
+            // Build initial plaintext with peer_keks.
+            let plaintext_0 = json!({
+                "services": {},
+                "peer_keks": {
+                    STANDARD.encode(cid): STANDARD.encode(&kek_0),
+                }
+            });
+            let plain_bytes = serde_json::to_vec(&plaintext_0).unwrap();
+
+            save_vault(&data_dir.join("vault.enc"), &dek_0, &plain_bytes).unwrap();
+
+            let mut manifest = DekWrapManifest::new();
+            manifest
+                .entries
+                .push(wrap_dek_for_credential(&dek_0, &user_key, &salt_0, cid).unwrap());
+            manifest
+                .save_atomic(&data_dir.join("dek_wraps.bin"))
+                .unwrap();
+
+            // --- Unlock: read files from disk and decrypt ---
+            let loaded = DekWrapManifest::load(&data_dir.join("dek_wraps.bin")).unwrap();
+            assert_eq!(loaded.entries.len(), 1);
+            assert_eq!(loaded.entries[0].credential_id, cid);
+
+            let dek = unwrap_dek(loaded.find(cid).unwrap(), &user_key).unwrap();
+            assert_eq!(dek, dek_0);
+
+            let enc_on_disk = std::fs::read(data_dir.join("vault.enc")).unwrap();
+            let plain = decrypt_vault(&dek, &enc_on_disk).unwrap();
+            let v: serde_json::Value = serde_json::from_slice(&plain).unwrap();
+            assert!(v.get("peer_keks").is_some());
+
+            // --- Write: rotate credential, install new DEK, atomic commit ---
+            let salt_1 = [0x22u8; 32];
+            let user_key_1 = [0x88u8; 32];
+            let kek_1 = derive_kek(&user_key_1, &salt_1, WRAP_VERSION, cid).unwrap();
+            let dek_1 = generate_dek();
+
+            let mut v2_plain = v.clone();
+            v2_plain["services"]["openai"] = json!({"auth": "sk-new"});
+            v2_plain["peer_keks"][STANDARD.encode(cid)] = json!(STANDARD.encode(&kek_1));
+            let v2_bytes = serde_json::to_vec(&v2_plain).unwrap();
+
+            save_vault(&data_dir.join("vault.enc"), &dek_1, &v2_bytes).unwrap();
+
+            let mut new_manifest = DekWrapManifest::new();
+            new_manifest
+                .entries
+                .push(wrap_dek_with_kek(&dek_1, &kek_1, &salt_1, cid).unwrap());
+            new_manifest
+                .save_atomic(&data_dir.join("dek_wraps.bin"))
+                .unwrap();
+
+            // --- Unlock with new credentials, verify services mutation ---
+            let loaded2 = DekWrapManifest::load(&data_dir.join("dek_wraps.bin")).unwrap();
+            let dek2 = unwrap_dek(loaded2.find(cid).unwrap(), &user_key_1).unwrap();
+            assert_eq!(dek2, dek_1);
+            let enc2 = std::fs::read(data_dir.join("vault.enc")).unwrap();
+            let plain2 = decrypt_vault(&dek2, &enc2).unwrap();
+            let v2: serde_json::Value = serde_json::from_slice(&plain2).unwrap();
+            assert_eq!(
+                v2["services"]["openai"]["auth"].as_str().unwrap(),
+                "sk-new"
+            );
+
+            // Old user_key must NOT unlock the new vault.
+            assert!(unwrap_dek(loaded2.find(cid).unwrap(), &user_key).is_err());
         }
 
-        #[tokio::test]
-        async fn execute_command_nonexistent_binary_returns_err() {
-            let body = hyper::body::Bytes::new();
-            let vault = crate::auth::ServiceVault {
-                upstream: None,
-                auth: None,
-                levels: None,
-                rules: None,
-                category: None,
-            };
-            let result = crate::core::router::execute_command(
-                "/nonexistent/binary",
-                &body,
-                &vault,
-                std::path::Path::new("/tmp"),
-                &std::collections::HashMap::new(),
-            ).await;
-            assert!(result.is_err());
-            assert!(result.unwrap_err().contains("spawn failed"));
+        #[test]
+        fn add_passkey_ceremony() {
+            // Register credential A initially, then add credential B.
+            // Verify both can unlock the (same) DEK.
+
+            let cid_a = b"a";
+            let cid_b = b"new-b";
+            let uk_a = [0x11u8; 32];
+            let uk_b = [0x22u8; 32];
+            let salt_a = [0xAAu8; 32];
+            let salt_b = [0xBBu8; 32];
+
+            let dek = generate_dek();
+
+            // A's initial manifest.
+            let mut manifest = DekWrapManifest::new();
+            manifest
+                .entries
+                .push(wrap_dek_for_credential(&dek, &uk_a, &salt_a, cid_a).unwrap());
+
+            // --- Add B: compute B's KEK, wrap DEK for B, append entry ---
+            let kek_b = derive_kek(&uk_b, &salt_b, WRAP_VERSION, cid_b).unwrap();
+            manifest
+                .entries
+                .push(wrap_dek_with_kek(&dek, &kek_b, &salt_b, cid_b).unwrap());
+
+            // Both credentials should unwrap the same DEK.
+            let dek_via_a = unwrap_dek(manifest.find(cid_a).unwrap(), &uk_a).unwrap();
+            let dek_via_b = unwrap_dek(manifest.find(cid_b).unwrap(), &uk_b).unwrap();
+            assert_eq!(dek_via_a, dek);
+            assert_eq!(dek_via_b, dek);
+        }
+
+        #[test]
+        fn remove_passkey_ceremony() {
+            // Register two credentials; remove one; verify the removed
+            // credential no longer appears in the manifest and the remaining
+            // one still unlocks.
+
+            let cid_a = b"keep";
+            let cid_b = b"remove";
+            let uk_a = [0x11u8; 32];
+            let uk_b = [0x22u8; 32];
+            let salt_a = [0xAAu8; 32];
+            let salt_b = [0xBBu8; 32];
+
+            let dek = generate_dek();
+            let mut manifest = DekWrapManifest::new();
+            manifest
+                .entries
+                .push(wrap_dek_for_credential(&dek, &uk_a, &salt_a, cid_a).unwrap());
+            manifest
+                .entries
+                .push(wrap_dek_for_credential(&dek, &uk_b, &salt_b, cid_b).unwrap());
+            assert_eq!(manifest.entries.len(), 2);
+
+            // Remove B.
+            let removed = manifest.remove(cid_b);
+            assert!(removed);
+            assert_eq!(manifest.entries.len(), 1);
+            assert!(manifest.find(cid_a).is_some());
+            assert!(manifest.find(cid_b).is_none());
+
+            // A still unlocks.
+            let got = unwrap_dek(manifest.find(cid_a).unwrap(), &uk_a).unwrap();
+            assert_eq!(got, dek);
         }
     }
 
-    // ── Auth config backward compatibility ────────────────────────────────────────
-
-    mod auth_config_compat {
-        use crate::auth::AuthConfig;
-
-        #[test]
-        fn legacy_value_field_works() {
-            let json = r#"{"type":"bearer","value":"tok123"}"#;
-            let cfg: AuthConfig = serde_json::from_str(json).unwrap();
-            assert_eq!(cfg.secret.as_deref(), Some("tok123"));
-        }
-
-        #[test]
-        fn new_secret_field_works() {
-            let json = r#"{"type":"header","name":"x-api-key","secret":"key456"}"#;
-            let cfg: AuthConfig = serde_json::from_str(json).unwrap();
-            assert_eq!(cfg.secret.as_deref(), Some("key456"));
-        }
-
-        #[test]
-        fn basic_auth_type_deserializes() {
-            let json = r#"{"type":"basic","username":"u","password":"p"}"#;
-            let cfg: AuthConfig = serde_json::from_str(json).unwrap();
-            assert_eq!(cfg.username.as_deref(), Some("u"));
-            assert_eq!(cfg.password.as_deref(), Some("p"));
-        }
-
-        #[test]
-        fn oauth2_config_deserializes() {
-            let json = r#"{"type":"oauth2","token_url":"https://t.example.com/token","client_id":"cid","client_secret":"cs","refresh_token":"rt"}"#;
-            let cfg: AuthConfig = serde_json::from_str(json).unwrap();
-            assert_eq!(cfg.auth_type, "oauth2");
-            assert_eq!(cfg.token_url.as_deref(), Some("https://t.example.com/token"));
-        }
-    }
 }

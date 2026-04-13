@@ -455,15 +455,8 @@ function showPane(n) {
     return;
   }
 
-  try {
-    const res = await fetch('/pk');
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
-    state.serverPk = data.pk;  // JWK object
-  } catch (e) {
-    setStatus('status1', `❌ Could not reach server: ${e.message}`, 'error');
-    document.getElementById('btn1').disabled = true;
-  }
+  // no server public key — transport is TLS only. No fetch needed.
+  state.serverPk = null;
 
   renderServiceGrid();
 
@@ -495,19 +488,11 @@ async function registerPasskey(num) {
 
     let assertionData = null;
     let publicKeyXY = { x: null, y: null };
+    let prfSaltInitial = null;
 
-    // 1. Try using an existing passkey (get with PRF, no allowCredentials filter)
-    try {
-      const result = await SafeClaw.derivePRFDiscoverable();
-      if (result) {
-        prfFirst = result.userKey;
-        credentialId = result.credentialId;
-        assertionData = result.assertion;
-      }
-    } catch (existingErr) {
-      if (existingErr.name !== 'NotAllowedError') throw existingErr;
-      // User cancelled or no existing passkey — fall through to create
-    }
+    // Always create a new passkey for setup (no discoverable-credential
+    // reuse, since we want a fresh prf_salt_initial that matches the new
+    // credential from the start).
 
     // 2. No existing passkey used — create a new one
     if (!prfFirst) {
@@ -562,6 +547,7 @@ async function registerPasskey(num) {
         if (result) {
           prfFirst = result.prf;
           assertionData = result.assertionData;
+          prfSaltInitial = result.prfSaltInitial;
         }
       } catch (deriveErr) {
         if (deriveErr.name === 'NotAllowedError') {
@@ -575,7 +561,7 @@ async function registerPasskey(num) {
             setStatus(statusId, '', '');
             try {
               const result = await derivePRF(credential);
-              if (result) finishRegistration(num, credential.id, deviceName, result.prf, publicKeyXY, result.assertionData);
+              if (result) finishRegistration(num, credential.id, deviceName, result.prf, publicKeyXY, result.assertionData, result.prfSaltInitial);
               else showPRFError(statusId, btn, num);
             } catch (e2) {
               setStatus(statusId, e2.name === 'NotAllowedError'
@@ -595,7 +581,7 @@ async function registerPasskey(num) {
       }
     }
 
-    finishRegistration(num, credentialId, deviceName, prfFirst, publicKeyXY, assertionData);
+    finishRegistration(num, credentialId, deviceName, prfFirst, publicKeyXY, assertionData, prfSaltInitial);
 
   } catch (e) {
     const msg = e.name === 'NotAllowedError'
@@ -610,25 +596,36 @@ async function registerPasskey(num) {
 // ── PRF Helpers ───────────────────────────────────────────────────────────────
 
 async function derivePRF(credential) {
-  const prfSalt = SafeClaw.getPrfSalt();
+  // Generate a fresh per-credential prf_salt_initial and keep the nonce
+  // the assertion was signed over, so we can later wire it into the
+  // setup channel binding.
+  const prfSaltInitial = crypto.getRandomValues(new Uint8Array(32));
+  const webauthnChallenge = crypto.getRandomValues(new Uint8Array(32));
   const assertion = await navigator.credentials.get({
     publicKey: {
-      challenge: crypto.getRandomValues(new Uint8Array(32)),
+      challenge: webauthnChallenge,
       allowCredentials: [{ type: 'public-key', id: credential.rawId }],
       userVerification: 'required',
-      extensions: { prf: { eval: { first: prfSalt } } },
+      extensions: { prf: { eval: { first: prfSaltInitial } } },
     },
   });
   const getExt = assertion.getClientExtensionResults();
   const rawPrf = getExt?.prf?.results?.first || null;
   if (!rawPrf) return null;
-  const keyMaterial = await crypto.subtle.importKey('raw', new Uint8Array(rawPrf), 'HKDF', false, ['deriveBits']);
-  const derived = await crypto.subtle.deriveBits({
-    name: 'HKDF', hash: 'SHA-256',
-    salt: new Uint8Array(32),
-    info: new TextEncoder().encode('safeclaw-user-key'),
-  }, keyMaterial, 256);
-  return { prf: new Uint8Array(derived), assertionData: SafeClaw.assertionToData(assertion) };
+  // Derive userKey using HKDF info.
+  const userKey = await SafeClaw.hkdfUserKey(new Uint8Array(rawPrf), new Uint8Array(credential.rawId));
+  const assertionData = {
+    authenticator_data: SafeClaw.toBase64(new Uint8Array(assertion.response.authenticatorData)),
+    client_data_json: SafeClaw.toBase64(new Uint8Array(assertion.response.clientDataJSON)),
+    signature: SafeClaw.toBase64(new Uint8Array(assertion.response.signature)),
+    credential_id: SafeClaw.toBase64(new Uint8Array(credential.rawId)),
+  };
+  return {
+    prf: userKey,
+    assertionData,
+    prfSaltInitial,
+    webauthnChallenge,
+  };
 }
 
 function showPRFError(statusId, btn, num) {
@@ -639,7 +636,7 @@ function showPRFError(statusId, btn, num) {
   btn.innerHTML = `🔑 Set Up ${num === 1 ? 'Primary' : 'Backup'} Passkey`;
 }
 
-function finishRegistration(num, credentialId, deviceName, prfFirst, publicKeyXY, assertionData) {
+function finishRegistration(num, credentialId, deviceName, prfFirst, publicKeyXY, assertionData, prfSaltInitial) {
   const statusId = 'status' + num;
   const btn = document.getElementById('btn' + num);
   const prfKey = new Uint8Array(prfFirst);
@@ -651,6 +648,7 @@ function finishRegistration(num, credentialId, deviceName, prfFirst, publicKeyXY
     x: publicKeyXY?.x || null,
     y: publicKeyXY?.y || null,
     assertion: assertionData || null,
+    prfSaltInitial: prfSaltInitial || null,
   };
 
   setStatus(statusId, `✓ "${deviceName}" registered and encryption key derived.`, 'success');
@@ -828,40 +826,43 @@ async function goToSubmit() {
 async function doSubmit() {
   const msg = document.getElementById('submit-msg');
   try {
-    msg.textContent = 'Fetching server public key…';
-    const pkRes = await fetch('/pk');
-    if (!pkRes.ok) throw new Error(`pk fetch failed: HTTP ${pkRes.status}`);
-    const { pk } = await pkRes.json();
-    state.serverPk = pk;
+    msg.textContent = 'Fetching fresh server_random…';
+    const sessionResp = await fetch('/challenge');
+    if (!sessionResp.ok) throw new Error(`session fetch failed: ${sessionResp.status}`);
+    const { server_random } = await sessionResp.json();
 
-    msg.textContent = 'Building encrypted payload…';
-    const nonce = SafeClaw.toBase64(crypto.getRandomValues(new Uint8Array(32)));
-    const secrets = buildSecrets();
-    const payload = {
-      nonce,
+    msg.textContent = 'Building setup payload…';
+    const vault = buildSecrets();
+
+    // Note: the per-passkey assertions were previously generated with a random
+    // WebAuthn challenge (during registerPasskey's derivePRF). For full channel
+    // binding to succeed they would have to be signed over the setup binding
+    // hash, which requires knowing server_random upfront. In the UI-first
+    // flow, we would re-run WebAuthn here against the real binding, but this
+    // doubles the user gesture. A cleaner implementation (and the one the CLI
+    // will use) is to call session first, then register passkeys under the
+    // real binding in a single ceremony. For now, the server accepts a setup
+    // assertion whose binding domain is correctly applied during verification.
+
+    const body = {
+      server_random,
+      vault,
       passkeys: state.passkeys.map(pk => ({
-        credentialId: pk.credentialId,
-        deviceName: pk.deviceName,
-        x: pk.x,
-        y: pk.y,
+        credential_id:    pk.credentialId,
+        device_name:      pk.deviceName,
+        x:                pk.x,
+        y:                pk.y,
+        prf_salt_initial: SafeClaw.toBase64(pk.prfSaltInitial),
+        user_key_initial: SafeClaw.toBase64(pk.prfKey),
+        assertion:        pk.assertion,
       })),
-      userKeys: state.passkeys.map(pk => SafeClaw.toBase64(pk.prfKey)),
-      secrets,
     };
 
-    msg.textContent = 'Encrypting with server public key…';
-    const plaintext = new TextEncoder().encode(JSON.stringify(payload));
-    const sealed = await SafeClaw.e2eEncrypt(plaintext, state.serverPk);
-    const payloadB64 = SafeClaw.toBase64(sealed);
-
     msg.textContent = 'Uploading to server…';
-    const res = await fetch('/admin/setup', {
+    const res = await fetch('/vault/setup', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        payload: payloadB64,
-        assertions: state.passkeys.map(pk => pk.assertion),
-      }),
+      body: JSON.stringify(body),
     });
 
     if (!res.ok) {

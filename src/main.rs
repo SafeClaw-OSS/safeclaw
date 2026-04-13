@@ -26,7 +26,6 @@ use tracing::{info, warn};
 use core::approval::ApprovalManager;
 use core::audit::AuditLog;
 use config::Config;
-use crypto::keys::load_or_create_keypair;
 use state::{AppState, RateLimiter};
 use vault::Vault;
 
@@ -80,19 +79,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         warn!("SAFECLAW_RP_ID not set — defaulting to 'localhost'. Set this for production.");
     }
 
-    // Load or create server keypair
-    let keypair = load_or_create_keypair(&config.data_dir)?;
-    info!(
-        "Server keypair loaded (pk.x={}...)",
-        &keypair.pk.x[..8.min(keypair.pk.x.len())]
-    );
-
-    // --init: generate keypair and exit (for deployment scripts)
+    // v1: no long-lived server keypair. Transport is TLS, envelope is PRF-derived.
     if config.init {
-        info!(
-            "--init: keypair ready at {}/sc_pk.jwk, exiting",
-            config.data_dir.display()
-        );
+        std::fs::create_dir_all(&config.data_dir)?;
+        info!("--init: data directory ready at {}, exiting", config.data_dir.display());
         return Ok(());
     }
 
@@ -117,11 +107,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Build app state
     let state = Arc::new(AppState {
-        keypair,
         vault: vault.clone(),
         services,
         nonces: Arc::new(Mutex::new(passkey::nonce::NonceStore::new())),
         challenges: Arc::new(Mutex::new(passkey::challenge::ChallengeStore::new())),
+        write_mutex: Arc::new(Mutex::new(())),
         start_time: Instant::now(),
         started_at_ms: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

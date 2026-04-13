@@ -240,6 +240,45 @@ impl Vault {
         self.service_names.lock().unwrap().clone()
     }
 
+    /// Return a clone of the vault plaintext with the `peer_keks` field stripped.
+    /// Used for serializing vault state to the client (the client has no
+    /// business knowing other credentials' KEKs, and the field is server-internal).
+    pub fn plaintext_for_client(&self) -> Option<serde_json::Value> {
+        let guard = self.plaintext.lock().unwrap();
+        guard.as_ref().map(|v| {
+            let mut cloned = v.clone();
+            if let Some(obj) = cloned.as_object_mut() {
+                obj.remove("peer_keks");
+            }
+            cloned
+        })
+    }
+
+    /// Extract the current `peer_keks` map from vault plaintext as a
+    /// `HashMap<credential_id_b64, KEK_32bytes>`. Returns an empty map if
+    /// the vault is locked or the field is missing/malformed.
+    pub fn peer_keks_map(&self) -> std::collections::HashMap<String, [u8; 32]> {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        let mut out = std::collections::HashMap::new();
+        let guard = self.plaintext.lock().unwrap();
+        if let Some(v) = guard.as_ref() {
+            if let Some(pk_obj) = v.get("peer_keks").and_then(|p| p.as_object()) {
+                for (cid, kek_val) in pk_obj {
+                    if let Some(kek_b64) = kek_val.as_str() {
+                        if let Ok(kek_bytes) = STANDARD.decode(kek_b64) {
+                            if kek_bytes.len() == 32 {
+                                let mut kek = [0u8; 32];
+                                kek.copy_from_slice(&kek_bytes);
+                                out.insert(cid.clone(), kek);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// Check if an approval session is still valid for the given service.
     /// Returns the cached auth config if valid, or None if expired/absent.
     pub fn check_approval_session(&self, service: &str) -> Option<serde_json::Value> {

@@ -7,7 +7,6 @@ use axum::{
 const INDEX_HTML: &[u8] = include_bytes!("../../public/index.html");
 const SETUP_HTML: &[u8] = include_bytes!("../../public/setup.html");
 const UNLOCK_HTML: &[u8] = include_bytes!("../../public/unlock.html");
-const ADMIN_HTML: &[u8] = include_bytes!("../../public/admin.html");
 const SAFECLAW_CLIENT_JS: &[u8] = include_bytes!("../../public/safeclaw-client.js");
 
 fn html_response(content: &'static [u8]) -> Response {
@@ -46,8 +45,10 @@ pub async fn serve_unlock() -> Response {
     html_response(UNLOCK_HTML)
 }
 
+/// v2: `/admin` is an alias for the index page. The dashboard that used to
+/// live here has moved to the CLI.
 pub async fn serve_admin() -> Response {
-    html_response(ADMIN_HTML)
+    html_response(INDEX_HTML)
 }
 
 pub async fn serve_client_js() -> Response {

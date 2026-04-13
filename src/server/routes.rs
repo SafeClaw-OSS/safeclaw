@@ -15,14 +15,17 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use serde_json::{json, Value};
 use zeroize::Zeroize;
 
-// ApprovalDecision removed (async 202 flow — no more oneshot channel)
-use crate::passkey::{AuthenticatedRequest, PasskeyEntry};
-use crate::passkey::webauthn::{verify_assertion, AssertionData};
-use crate::crypto::{
-    aes_encrypt, decrypt_vault, derive_kek, derive_response_key, encrypt_vault,
-    generate_dek, jwk_sk_d_bytes, unwrap_dek, wrap_dek,
+use crate::crypto::binding::{
+    binding_for_request, DOMAIN_IDENTITY, DOMAIN_SETUP, DOMAIN_SETUP_OVERWRITE,
 };
-use crate::crypto::keys::credential_id_to_filename;
+use crate::crypto::kdf::{derive_kek, derive_response_seal_key};
+use crate::crypto::vault_file::{decrypt_vault as vf_decrypt, save_atomic as save_vault};
+use crate::crypto::dek_wraps::{
+    unwrap_dek, wrap_dek_for_credential, wrap_dek_with_kek, DekWrapManifest, DekWrapEntry,
+};
+use crate::crypto::{aead, fresh_file_key, fresh_prf_salt, generate_dek, vault_file};
+use crate::passkey::webauthn::{verify_assertion, AssertionData, AssertionKind};
+use crate::passkey::{authenticate_bytes, AuthenticatedRequest, PasskeyEntry};
 use crate::error::{AppError, Result};
 use crate::notify::PushSubscription;
 use crate::state::AppState;
@@ -114,30 +117,58 @@ pub async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     }))
 }
 
-// ── VM Public Key ──────────────────────────────────────────────────────────────
+// ── Challenge ─────────────────────────────────────────────────────────────────
 
-pub async fn server_pk(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    Json(json!({ "pk": state.keypair.pk }))
-}
-
-/// GET /challenge — issue a server challenge for replay protection.
-/// Returns { challenge: base64 }. TTL 5min, single-use, 60/min/IP.
-pub async fn issue_challenge(
+/// GET /challenge — issue a one-time `server_random` and return the
+/// `(credential_id, prf_salt)` list so the client can prepare a channel-bound
+/// WebAuthn request.
+///
+/// The response contains only public material. Single-use, TTL 5min, rate-limited.
+/// Pre-setup: returns empty `dek_wraps` list so the setup flow can still
+/// use this endpoint for a proper server-issued challenge.
+pub async fn challenge(
     State(state): State<Arc<AppState>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
 ) -> impl IntoResponse {
     let ip = addr.ip();
-    let mut store = state.challenges.lock().unwrap();
-    match store.issue(ip) {
-        Some(challenge) => (
-            StatusCode::OK,
-            Json(json!({ "challenge": challenge })),
-        ).into_response(),
-        None => (
-            StatusCode::TOO_MANY_REQUESTS,
-            Json(json!({ "error": "Challenge rate limit exceeded" })),
-        ).into_response(),
-    }
+    let server_random = {
+        let mut store = state.challenges.lock().unwrap();
+        match store.issue(ip) {
+            Some(c) => c,
+            None => {
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(json!({ "error": "challenge rate limit exceeded" })),
+                )
+                    .into_response();
+            }
+        }
+    };
+
+    let dek_wraps_path = state.config.data_dir.join("dek_wraps.bin");
+    let wrapped = if dek_wraps_path.exists() {
+        match DekWrapManifest::load(&dek_wraps_path) {
+            Ok(m) => m
+                .entries
+                .iter()
+                .map(|e| {
+                    json!({
+                        "credential_id": STANDARD.encode(&e.credential_id),
+                        "prf_salt":      STANDARD.encode(&e.prf_salt),
+                    })
+                })
+                .collect::<Vec<Value>>(),
+            Err(_) => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
+
+    Json(json!({
+        "server_random": server_random,
+        "dek_wraps":  wrapped,
+    }))
+    .into_response()
 }
 
 // ── Vault Index Helpers ────────────────────────────────────────────────────────
@@ -216,239 +247,445 @@ fn write_index(state: &AppState, vault_data: &Value) -> std::io::Result<()> {
     )
 }
 
-// ── Vault Decrypt/Encrypt Helpers ──────────────────────────────────────────────
+// ── v2 Vault Decrypt/Write Helpers ─────────────────────────────────────────────
 
-/// Decrypt vault.enc into a JSON Value using passkey auth credentials.
-fn decrypt_vault_json(state: &AppState, auth: &AuthenticatedRequest) -> Result<Value> {
-    let user_key_b64 = auth.get_str("userKey")?;
-    let mut user_key = STANDARD
-        .decode(user_key_b64)
-        .map_err(|e| AppError::BadRequest(format!("Invalid userKey: {}", e)))?;
-
-    let fname = credential_id_to_filename(&auth.credential_id)?;
-    let wrapped_path = state
-        .config
-        .data_dir
-        .join(format!("wrapped_dek_{}.bin", fname));
-    if !wrapped_path.exists() {
-        user_key.zeroize();
-        return Err(AppError::Unauthorized(
-            "No wrapped DEK for this credential".into(),
-        ));
-    }
-
-    let sk_d = jwk_sk_d_bytes(&state.keypair.sk)?;
-    let mut kek = derive_kek(&user_key, &sk_d)?;
-    user_key.zeroize();
-    let wrapped = fs::read(&wrapped_path)?;
-    let mut dek = unwrap_dek(&wrapped, &kek)?;
-    kek.zeroize();
-
-    let vault_enc = fs::read(state.config.data_dir.join("vault.enc"))?;
-    let plaintext_bytes = decrypt_vault(&dek, &vault_enc)?;
-    dek.zeroize();
-
-    serde_json::from_slice(&plaintext_bytes)
-        .map_err(|e| AppError::Internal(format!("Failed to parse vault: {}", e)))
+/// Load `dek_wraps.bin` from disk.
+fn load_dek_wraps(state: &AppState) -> Result<DekWrapManifest> {
+    let path = state.config.data_dir.join("dek_wraps.bin");
+    DekWrapManifest::load(&path)
 }
 
-/// Decrypt vault, apply a mutation, re-encrypt and write back.
-/// Also updates the in-memory VaultState and index.json.
+/// Save `dek_wraps.bin` atomically.
+fn save_dek_wraps(state: &AppState, manifest: &DekWrapManifest) -> Result<()> {
+    let path = state.config.data_dir.join("dek_wraps.bin");
+    manifest.save_atomic(&path)
+}
+
+/// Unwrap the current DEK using the acting credential's userKey.
+/// Returns the DEK (32 bytes). Caller is responsible for zeroization.
+fn unwrap_current_dek(state: &AppState, auth: &AuthenticatedRequest) -> Result<[u8; 32]> {
+    let manifest = load_dek_wraps(state)?;
+    let entry = manifest
+        .find(&auth.credential_id_bytes)
+        .ok_or_else(|| AppError::Unauthorized("no wrap entry for this credential".into()))?;
+
+    if auth.user_key.len() != 32 {
+        return Err(AppError::BadRequest("user_key wrong length".into()));
+    }
+    let mut user_key_arr = [0u8; 32];
+    user_key_arr.copy_from_slice(&auth.user_key);
+    let dek = unwrap_dek(entry, &user_key_arr)?;
+    user_key_arr.zeroize();
+    Ok(dek)
+}
+
+/// Derive the response-seal key for the acting credential and encrypt a JSON
+/// response body. Returns a JSON object `{ "sealed": "<b64>", "credential_id": "<b64>" }`.
+///
+/// The sealed payload is `nonce (24B) || ciphertext+tag`. The AAD is
+/// `"safeclaw/v1/sealed_response\0" || path` to bind the response to its endpoint.
+fn seal_response(state: &AppState, auth: &AuthenticatedRequest, plaintext_json: &Value) -> Result<Value> {
+    let manifest = load_dek_wraps(state)?;
+    let entry = manifest
+        .find(&auth.credential_id_bytes)
+        .ok_or_else(|| AppError::Internal("no wrap entry for seal".into()))?;
+
+    let mut user_key_arr = [0u8; 32];
+    user_key_arr.copy_from_slice(&auth.user_key);
+    let mut seal_key = derive_response_seal_key(&user_key_arr, &entry.prf_salt, &auth.credential_id_bytes)?;
+    user_key_arr.zeroize();
+
+    let plaintext_bytes = serde_json::to_vec(plaintext_json)
+        .map_err(|e| AppError::Internal(format!("seal serialize: {}", e)))?;
+
+    let mut aad = Vec::with_capacity(30 + auth.path.len());
+    aad.extend_from_slice(b"safeclaw/v1/sealed_response\x00");
+    aad.extend_from_slice(auth.path.as_bytes());
+
+    let nonce = aead::fresh_nonce();
+    let ct = aead::encrypt(&seal_key, &nonce, &plaintext_bytes, &aad)?;
+    seal_key.zeroize();
+
+    let mut sealed = Vec::with_capacity(24 + ct.len());
+    sealed.extend_from_slice(&nonce);
+    sealed.extend_from_slice(&ct);
+
+    Ok(json!({
+        "sealed": STANDARD.encode(&sealed),
+        "credential_id": auth.credential_id,
+    }))
+}
+
+/// Read and decrypt `vault.enc` into a JSON Value.
+/// The returned value contains `peer_keks` under its reserved key.
+fn decrypt_vault_cached(state: &AppState, dek: &[u8; 32]) -> Result<Value> {
+    let vault_enc = fs::read(state.config.data_dir.join("vault.enc"))?;
+    let plaintext_bytes = vf_decrypt(dek, &vault_enc)?;
+    serde_json::from_slice(&plaintext_bytes)
+        .map_err(|e| AppError::Internal(format!("vault JSON parse: {}", e)))
+}
+
+/// End-to-end v2 write flow (Option D): decrypt, apply mutation, generate new DEK,
+/// rotate prf_salt for acting credential, re-wrap for all credentials, atomic commit.
+///
+/// The closure `f` receives the old plaintext (including `peer_keks`) and must
+/// produce the new plaintext (also including `peer_keks`, which this function
+/// will overwrite with the authoritative value — so the closure may leave it
+/// unchanged).
 fn with_vault_mut<F>(state: &AppState, auth: &AuthenticatedRequest, f: F) -> Result<()>
 where
     F: FnOnce(&mut Value) -> Result<()>,
 {
-    let user_key_b64 = auth.get_str("userKey")?;
-    let user_key = STANDARD
-        .decode(user_key_b64)
-        .map_err(|e| AppError::BadRequest(format!("Invalid userKey: {}", e)))?;
+    // Serialize writes in-process.
+    let _guard = state.write_mutex.lock().unwrap();
 
-    let fname = credential_id_to_filename(&auth.credential_id)?;
-    let wrapped_path = state
-        .config
-        .data_dir
-        .join(format!("wrapped_dek_{}.bin", fname));
-    if !wrapped_path.exists() {
-        return Err(AppError::Unauthorized(
-            "No wrapped DEK for this credential".into(),
-        ));
+    // Acting credential must have supplied user_key_next and prf_salt_next
+    // (write operations always rotate).
+    let user_key_next = auth
+        .user_key_next
+        .as_ref()
+        .ok_or_else(|| AppError::BadRequest("write op requires user_key_next".into()))?;
+    let prf_salt_next = auth
+        .prf_salt_next
+        .as_ref()
+        .ok_or_else(|| AppError::BadRequest("write op requires prf_salt_next".into()))?;
+
+    if user_key_next.len() != 32 {
+        return Err(AppError::BadRequest("user_key_next wrong length".into()));
     }
 
-    let sk_d = jwk_sk_d_bytes(&state.keypair.sk)?;
-    let mut kek = derive_kek(&user_key, &sk_d)?;
-    let wrapped = fs::read(&wrapped_path)?;
-    let mut dek = unwrap_dek(&wrapped, &kek)?;
-    kek.zeroize();
+    // 1. Unwrap current DEK.
+    let mut dek_old = unwrap_current_dek(state, auth)?;
 
-    let vault_enc = fs::read(state.config.data_dir.join("vault.enc"))?;
-    let plaintext_bytes = decrypt_vault(&dek, &vault_enc)?;
-    let mut vault_data: Value = serde_json::from_slice(&plaintext_bytes)
-        .map_err(|e| AppError::Internal(format!("Failed to parse vault: {}", e)))?;
+    // 2. Decrypt vault.
+    let mut plaintext = decrypt_vault_cached(state, &dek_old)?;
+    dek_old.zeroize();
 
-    // Apply mutation
-    f(&mut vault_data)?;
+    // 3. Apply caller mutation.
+    f(&mut plaintext)?;
 
-    // Re-encrypt and write
-    let new_enc =
-        encrypt_vault(&dek, serde_json::to_string(&vault_data)?.as_bytes())?;
-    dek.zeroize();
+    // 4. Ensure peer_keks exists; read current peer KEKs for re-wrapping.
+    let mut peer_keks_map: HashMap<String, [u8; 32]> = HashMap::new();
+    if let Some(pk_val) = plaintext.get("peer_keks").and_then(|p| p.as_object()) {
+        for (cid, kek_val) in pk_val {
+            if let Some(kek_b64) = kek_val.as_str() {
+                if let Ok(kek_bytes) = STANDARD.decode(kek_b64) {
+                    if kek_bytes.len() == 32 {
+                        let mut arr = [0u8; 32];
+                        arr.copy_from_slice(&kek_bytes);
+                        peer_keks_map.insert(cid.clone(), arr);
+                    }
+                }
+            }
+        }
+    }
 
-    fs::write(state.config.data_dir.join("vault.enc"), &new_enc)?;
-    let _ = write_index(state, &vault_data);
-    state.vault.set_plaintext(vault_data);
+    // 5. Compute acting credential's new KEK.
+    let mut user_key_next_arr = [0u8; 32];
+    user_key_next_arr.copy_from_slice(user_key_next);
+    let mut kek_new = derive_kek(
+        &user_key_next_arr,
+        prf_salt_next,
+        crate::crypto::WRAP_VERSION,
+        &auth.credential_id_bytes,
+    )?;
+    user_key_next_arr.zeroize();
+
+    // 6. Update peer_keks[acting credential] = new KEK.
+    peer_keks_map.insert(auth.credential_id.clone(), kek_new);
+    let peer_keks_json: serde_json::Map<String, Value> = peer_keks_map
+        .iter()
+        .map(|(k, v)| (k.clone(), Value::String(STANDARD.encode(v))))
+        .collect();
+    if let Some(obj) = plaintext.as_object_mut() {
+        obj.insert("peer_keks".into(), Value::Object(peer_keks_json));
+    }
+
+    // 7. Generate DEK_new and encrypt the new vault plaintext.
+    let mut dek_new = generate_dek();
+    let plaintext_bytes = serde_json::to_vec(&plaintext)
+        .map_err(|e| AppError::Internal(format!("vault serialize: {}", e)))?;
+
+    // 8. Build new wrapped_deks manifest.
+    let old_manifest = load_dek_wraps(state).unwrap_or_else(|_| DekWrapManifest::new());
+    let mut new_manifest = DekWrapManifest::new();
+
+    // For each existing credential, decide how to wrap the new DEK.
+    for entry in &old_manifest.entries {
+        let cid_b64 = STANDARD.encode(&entry.credential_id);
+        if entry.credential_id == auth.credential_id_bytes {
+            // Acting credential: use the new KEK and new prf_salt.
+            let new_entry = wrap_dek_with_kek(
+                &dek_new,
+                &kek_new,
+                prf_salt_next,
+                &entry.credential_id,
+            )?;
+            new_manifest.entries.push(new_entry);
+        } else {
+            // Peer credential: use its cached KEK from peer_keks, preserve its prf_salt.
+            let peer_kek = peer_keks_map.get(&cid_b64).ok_or_else(|| {
+                AppError::Internal(format!(
+                    "peer_keks missing entry for credential {}",
+                    cid_b64
+                ))
+            })?;
+            let new_entry =
+                wrap_dek_with_kek(&dek_new, peer_kek, &entry.prf_salt, &entry.credential_id)?;
+            new_manifest.entries.push(new_entry);
+        }
+    }
+
+    // 9. Atomic commit: write vault.enc.tmp, write dek_wraps.bin.tmp,
+    //    rename dek_wraps.bin, rename vault.enc.
+    let vault_path = state.config.data_dir.join("vault.enc");
+    save_vault(&vault_path, &dek_new, &plaintext_bytes)?;
+    save_dek_wraps(state, &new_manifest)?;
+
+    // 10. Update in-memory vault plaintext.
+    state.vault.set_plaintext(plaintext.clone());
+
+    // 11. Update index.
+    let _ = write_index(state, &plaintext);
+
+    // 12. Zeroize.
+    dek_new.zeroize();
+    kek_new.zeroize();
+    // Clear peer_keks_map in-place
+    for (_, v) in peer_keks_map.iter_mut() {
+        v.zeroize();
+    }
 
     Ok(())
 }
 
-// ── Setup ──────────────────────────────────────────────────────────────────────
+// ── Setup (v2) ─────────────────────────────────────────────────────────────────
 
-#[derive(Debug, serde::Deserialize)]
-pub struct SetupBody {
-    pub payload: String,
-    pub assertions: Option<Vec<Value>>,
-}
-
+/// POST /vault/setup — initial vault creation (or overwrite if existing).
+///
+/// v2 schema:
+/// ```json
+/// {
+///   "server_random": "<b64 16B>",        // from GET /challenge
+///   "vault": { ... initial vault JSON, must not contain peer_keks ... },
+///   "passkeys": [
+///     {
+///       "credential_id":    "<b64>",
+///       "x": "<b64>", "y": "<b64>",
+///       "device_name":      "<string>",
+///       "prf_salt_initial": "<b64 32B>",
+///       "user_key_initial": "<b64 32B>",
+///       "assertion":        { authenticator_data, client_data_json, signature }
+///     }
+///   ],
+///   "existing_credential_id": "<b64>" | null,
+///   "existing_assertion":     { ... } | null
+/// }
+/// ```
+///
+/// Setup uses the standard `GET /session` to obtain a `server_random` from the
+/// server-side `ChallengeStore`. When no vault exists yet, `GET /session` returns
+/// the random plus an empty `wrapped_deks` list. This gives setup the same
+/// server-issued freshness guarantee as every other authenticated operation.
 pub async fn setup(
     State(state): State<Arc<AppState>>,
     bytes: Bytes,
 ) -> Result<impl IntoResponse> {
-    let body: SetupBody = serde_json::from_slice(&bytes)
-        .map_err(|_| AppError::BadRequest("Invalid setup request body".into()))?;
+    let parsed: Value = serde_json::from_slice(&bytes)
+        .map_err(|_| AppError::BadRequest("setup body not valid JSON".into()))?;
 
-    let wire_bytes = STANDARD
-        .decode(&body.payload)
-        .map_err(|e| AppError::BadRequest(format!("Invalid payload base64: {}", e)))?;
-
-    let sk_d = jwk_sk_d_bytes(&state.keypair.sk)?;
-    let plaintext = crate::crypto::ecies::e2e_decrypt(&wire_bytes, &sk_d)?;
-
-    let parsed: Value = serde_json::from_slice(&plaintext)
-        .map_err(|_| AppError::BadRequest("Decrypted payload is not valid JSON".into()))?;
-
-    let nonce_b64 = parsed
-        .get("nonce")
+    // Server-issued one-time challenge. Consumed from ChallengeStore here.
+    let server_random_b64 = parsed
+        .get("server_random")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| AppError::BadRequest("Missing nonce".into()))?;
-
-    let nonce_bytes = STANDARD
-        .decode(nonce_b64)
-        .map_err(|e| AppError::BadRequest(format!("Invalid nonce: {}", e)))?;
-
+        .ok_or_else(|| AppError::BadRequest("missing server_random".into()))?
+        .to_string();
+    let server_random = STANDARD
+        .decode(&server_random_b64)
+        .map_err(|_| AppError::BadRequest("server_random not base64".into()))?;
+    if server_random.len() != 16 {
+        return Err(AppError::BadRequest("server_random must be 16 bytes".into()));
+    }
     {
-        let mut ns = state.nonces.lock().unwrap();
-        if !ns.check_and_insert(&nonce_bytes) {
-            return Err(AppError::BadRequest("Nonce already used".into()));
+        let mut cs = state.challenges.lock().unwrap();
+        if !cs.verify(&server_random_b64) {
+            return Err(AppError::Unauthorized(
+                "invalid or expired server_random".into(),
+            ));
         }
     }
 
     let passkeys_arr = parsed
         .get("passkeys")
         .and_then(|v| v.as_array())
-        .ok_or_else(|| AppError::BadRequest("Missing passkeys array".into()))?;
-
-    let user_keys_arr = parsed
-        .get("userKeys")
-        .and_then(|v| v.as_array())
-        .ok_or_else(|| AppError::BadRequest("Missing userKeys array".into()))?;
+        .ok_or_else(|| AppError::BadRequest("missing passkeys array".into()))?;
+    if passkeys_arr.is_empty() {
+        return Err(AppError::BadRequest("at least one passkey required".into()));
+    }
 
     let mut vault_data = parsed
         .get("vault")
         .cloned()
-        .ok_or_else(|| AppError::BadRequest("Missing vault".into()))?;
+        .ok_or_else(|| AppError::BadRequest("missing vault".into()))?;
 
-    // Inject VAPID key pair if not already present (fresh setup or migration)
+    // Strip any client-supplied peer_keks; we'll install the authoritative map below.
+    if let Some(obj) = vault_data.as_object_mut() {
+        obj.remove("peer_keks");
+    }
+
+    // Inject VAPID key pair if not already present.
     if vault_data.get("vapid_private_key").is_none() {
-        match crate::notify::webpush::generate_vapid_keypair() {
-            Ok((priv_b64, _pub_b64)) => {
-                vault_data.as_object_mut().map(|m| m.insert(
+        if let Ok((priv_b64, _)) = crate::notify::webpush::generate_vapid_keypair() {
+            if let Some(obj) = vault_data.as_object_mut() {
+                obj.insert(
                     "vapid_private_key".into(),
                     serde_json::Value::String(priv_b64),
-                ));
-                tracing::info!("Generated VAPID key pair for vault");
+                );
             }
-            Err(e) => tracing::warn!("Failed to generate VAPID keypair: {e}"),
         }
     }
 
-    // If vault already exists, require existing passkey auth before overwrite
+    // Overwrite gate: if a vault already exists, require an assertion from an
+    // existing credential with setup-overwrite channel binding.
     let passkeys_path = state.config.data_dir.join("passkeys.json");
     if passkeys_path.exists() {
         let existing_passkeys: HashMap<String, PasskeyEntry> =
             serde_json::from_str(&fs::read_to_string(&passkeys_path)?)
-                .map_err(|e| AppError::Internal(format!("Failed to read passkeys.json: {}", e)))?;
+                .map_err(|e| AppError::Internal(format!("passkeys.json: {}", e)))?;
 
         let existing_cred_id = parsed
-            .get("existingCredentialId")
-            .and_then(|v| v.as_str());
-        let existing_assertion_val = parsed.get("existingAssertion").cloned();
-
-        let cid = existing_cred_id.ok_or_else(|| {
-            AppError::Unauthorized("Vault exists: existing passkey required".into())
-        })?;
+            .get("existing_credential_id")
+            .or_else(|| parsed.get("existingCredentialId"))
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                AppError::Unauthorized("vault exists: existing passkey required".into())
+            })?;
+        let existing_assertion_val = parsed
+            .get("existing_assertion")
+            .or_else(|| parsed.get("existingAssertion"))
+            .cloned()
+            .ok_or_else(|| AppError::Unauthorized("missing existing_assertion".into()))?;
 
         let entry = existing_passkeys
-            .get(cid)
-            .ok_or_else(|| AppError::Unauthorized("Existing credential not found".into()))?;
+            .get(existing_cred_id)
+            .ok_or_else(|| AppError::Unauthorized("unknown existing credential".into()))?;
 
-        let existing_assertion: AssertionData = serde_json::from_value(
-            existing_assertion_val.ok_or_else(|| {
-                AppError::Unauthorized("Missing existing assertion".into())
-            })?,
-        )
-        .map_err(|e| AppError::BadRequest(format!("Invalid existing assertion: {}", e)))?;
+        let existing_assertion: AssertionData = serde_json::from_value(existing_assertion_val)
+            .map_err(|e| AppError::BadRequest(format!("invalid existing_assertion: {}", e)))?;
 
-        if entry.x.is_empty() || entry.y.is_empty() {
-            return Err(AppError::Unauthorized(
-                "Existing passkey has missing coordinates".into(),
-            ));
+        // Channel binding: compute expected challenge from the setup body
+        // minus the assertion fields (which are computed using the binding).
+        // The canonicalizer strips `assertion` and `server_random` automatically.
+        let mut body_for_binding = parsed.clone();
+        if let Some(obj) = body_for_binding.as_object_mut() {
+            obj.remove("existing_assertion");
+            obj.remove("existingAssertion");
         }
+        let expected_binding = binding_for_request(
+            DOMAIN_SETUP_OVERWRITE,
+            &server_random,
+            "POST",
+            "/vault/setup",
+            &body_for_binding,
+        );
+
         verify_assertion(
             &existing_assertion,
             &entry.x,
             &entry.y,
             &state.config.effective_origin(),
             &state.config.effective_rp_id(),
+            &expected_binding,
+            AssertionKind::Get,
         )?;
     }
 
-    // D31: assertions MUST come from inside the ECIES envelope (integrity-protected).
-    // Never fall back to outer (unencrypted) body — that would bypass AEAD protection.
-    let assertions_src = parsed
-        .get("assertions")
-        .and_then(|v| v.as_array())
-        .cloned();
+    // Verify each passkey's assertion. The binding for setup is:
+    //   binding = SHA-256("safeclaw/v1/binding-setup\0" || server_random || request_hash)
+    let mut body_for_setup_binding = parsed.clone();
+    if let Some(obj) = body_for_setup_binding.as_object_mut() {
+        // Strip per-passkey assertion fields before computing the hash.
+        if let Some(arr) = obj.get_mut("passkeys").and_then(|v| v.as_array_mut()) {
+            for pk in arr.iter_mut() {
+                if let Some(pkobj) = pk.as_object_mut() {
+                    pkobj.remove("assertion");
+                }
+            }
+        }
+        obj.remove("existing_assertion");
+        obj.remove("existingAssertion");
+    }
+    let setup_binding = binding_for_request(
+        DOMAIN_SETUP,
+        &server_random,
+        "POST",
+        "/vault/setup",
+        &body_for_setup_binding,
+    );
+
+    let mut passkeys_map: HashMap<String, PasskeyEntry> = HashMap::new();
+    let mut collected_initial: Vec<(String, Vec<u8>, [u8; 32], [u8; 32])> = Vec::new();
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
 
     for (i, pk_val) in passkeys_arr.iter().enumerate() {
-        let x = pk_val.get("x").and_then(|v| v.as_str()).unwrap_or("");
-        let y = pk_val.get("y").and_then(|v| v.as_str()).unwrap_or("");
-        let pk_cred_id = pk_val.get("credentialId").and_then(|v| v.as_str()).unwrap_or("");
-
+        let cred_id_b64 = pk_val
+            .get("credential_id")
+            .or_else(|| pk_val.get("credentialId"))
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| AppError::BadRequest(format!("passkey {}: missing credential_id", i)))?;
+        let cred_id_bytes = STANDARD
+            .decode(cred_id_b64)
+            .map_err(|_| AppError::BadRequest(format!("passkey {}: credential_id not base64", i)))?;
+        let x = pk_val.get("x").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let y = pk_val.get("y").and_then(|v| v.as_str()).unwrap_or("").to_string();
         if x.is_empty() || y.is_empty() {
-            return Err(AppError::BadRequest(format!(
-                "Passkey {} has missing x/y coordinates",
-                i
-            )));
+            return Err(AppError::BadRequest(format!("passkey {}: missing x/y", i)));
         }
 
-        let assertions = assertions_src
-            .as_ref()
-            .ok_or_else(|| AppError::BadRequest("Missing assertions array".into()))?;
-        let assertion_val = assertions
-            .get(i)
-            .ok_or_else(|| AppError::BadRequest(format!("Missing assertion for passkey {}", i)))?;
-        let assertion: AssertionData = serde_json::from_value(assertion_val.clone())
-            .map_err(|e| {
-                AppError::BadRequest(format!("Invalid assertion for passkey {}: {}", i, e))
-            })?;
+        let prf_salt_b64 = pk_val
+            .get("prf_salt_initial")
+            .or_else(|| pk_val.get("prfSaltInitial"))
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| AppError::BadRequest(format!("passkey {}: missing prf_salt_initial", i)))?;
+        let user_key_b64 = pk_val
+            .get("user_key_initial")
+            .or_else(|| pk_val.get("userKeyInitial"))
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| AppError::BadRequest(format!("passkey {}: missing user_key_initial", i)))?;
 
-        // Defense in depth: if the assertion carries a credentialId, ensure it
-        // matches the passkey we're about to verify against. Without this we
-        // would fall through to "Signature verification failed" — same effect
-        // but a much harder error to diagnose.
-        if let Some(ref a_cred_id) = assertion.credential_id {
-            if !pk_cred_id.is_empty() && a_cred_id != pk_cred_id {
+        let prf_salt_bytes = STANDARD
+            .decode(prf_salt_b64)
+            .map_err(|_| AppError::BadRequest(format!("passkey {}: prf_salt_initial not base64", i)))?;
+        if prf_salt_bytes.len() != 32 {
+            return Err(AppError::BadRequest(format!("passkey {}: prf_salt must be 32B", i)));
+        }
+        let mut prf_salt_arr = [0u8; 32];
+        prf_salt_arr.copy_from_slice(&prf_salt_bytes);
+
+        let user_key_bytes = STANDARD
+            .decode(user_key_b64)
+            .map_err(|_| AppError::BadRequest(format!("passkey {}: user_key_initial not base64", i)))?;
+        if user_key_bytes.len() != 32 {
+            return Err(AppError::BadRequest(format!("passkey {}: user_key must be 32B", i)));
+        }
+        let mut user_key_arr = [0u8; 32];
+        user_key_arr.copy_from_slice(&user_key_bytes);
+
+        // Verify this passkey's assertion with setup channel binding.
+        let assertion_val = pk_val
+            .get("assertion")
+            .cloned()
+            .ok_or_else(|| AppError::BadRequest(format!("passkey {}: missing assertion", i)))?;
+        let assertion: AssertionData = serde_json::from_value(assertion_val)
+            .map_err(|e| AppError::BadRequest(format!("passkey {}: invalid assertion: {}", i, e)))?;
+
+        if let Some(ref a_cid) = assertion.credential_id {
+            if a_cid != cred_id_b64 {
                 return Err(AppError::BadRequest(format!(
-                    "Passkey {}: assertion credentialId does not match passkey credentialId (wrong passkey was used to sign)",
+                    "passkey {}: assertion credential_id mismatch",
                     i
                 )));
             }
@@ -456,158 +693,97 @@ pub async fn setup(
 
         verify_assertion(
             &assertion,
-            x,
-            y,
+            &x,
+            &y,
             &state.config.effective_origin(),
             &state.config.effective_rp_id(),
+            &setup_binding,
+            AssertionKind::Get,
         )?;
-    }
 
-    fs::create_dir_all(&state.config.data_dir)?;
-    let dek = generate_dek();
-    let vault_enc = encrypt_vault(&dek, serde_json::to_string(&vault_data)?.as_bytes())?;
-    fs::write(state.config.data_dir.join("vault.enc"), &vault_enc)?;
-
-    let mut passkeys_map: HashMap<String, PasskeyEntry> = HashMap::new();
-    let now_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
-
-    for (i, pk_val) in passkeys_arr.iter().enumerate() {
-        let cred_id = pk_val
-            .get("credentialId")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                AppError::BadRequest(format!("Missing credentialId for passkey {}", i))
-            })?;
-        let x = pk_val
-            .get("x")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let y = pk_val
-            .get("y")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        if x.is_empty() || y.is_empty() {
-            return Err(AppError::BadRequest(format!(
-                "Passkey {} has missing x/y coordinates",
-                i
-            )));
-        }
         let device_name = pk_val
-            .get("deviceName")
+            .get("device_name")
+            .or_else(|| pk_val.get("deviceName"))
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
 
         passkeys_map.insert(
-            cred_id.to_string(),
+            cred_id_b64.to_string(),
             PasskeyEntry {
-                x,
-                y,
+                x: x.clone(),
+                y: y.clone(),
                 device_name,
                 created_at: now_ms,
             },
         );
 
-        let user_key_b64 = user_keys_arr
-            .get(i)
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| AppError::BadRequest(format!("Missing userKey for passkey {}", i)))?;
-        let user_key_bytes = STANDARD
-            .decode(user_key_b64)
-            .map_err(|e| AppError::BadRequest(format!("Invalid userKey: {}", e)))?;
-
-        let sk_d_local = jwk_sk_d_bytes(&state.keypair.sk)?;
-        let mut kek = derive_kek(&user_key_bytes, &sk_d_local)?;
-        let wrapped = wrap_dek(&dek, &kek)?;
-        kek.zeroize();
-
-        let fname = credential_id_to_filename(cred_id)?;
-        fs::write(
-            state
-                .config
-                .data_dir
-                .join(format!("wrapped_dek_{}.bin", fname)),
-            &wrapped,
-        )?;
+        collected_initial.push((cred_id_b64.to_string(), cred_id_bytes, prf_salt_arr, user_key_arr));
     }
+
+    // Build peer_keks and wrapped_deks manifest.
+    fs::create_dir_all(&state.config.data_dir)?;
+
+    let mut dek = generate_dek();
+    let mut peer_keks_obj = serde_json::Map::new();
+    let mut manifest = DekWrapManifest::new();
+
+    for (cid_b64, cid_bytes, prf_salt, mut user_key) in collected_initial {
+        let entry = wrap_dek_for_credential(&dek, &user_key, &prf_salt, &cid_bytes)?;
+        // Compute and store this credential's current KEK in peer_keks.
+        let mut kek = derive_kek(
+            &user_key,
+            &prf_salt,
+            crate::crypto::WRAP_VERSION,
+            &cid_bytes,
+        )?;
+        peer_keks_obj.insert(cid_b64.clone(), Value::String(STANDARD.encode(&kek)));
+        kek.zeroize();
+        user_key.zeroize();
+        manifest.entries.push(entry);
+    }
+
+    if let Some(obj) = vault_data.as_object_mut() {
+        obj.insert("peer_keks".into(), Value::Object(peer_keks_obj));
+    }
+
+    // Encrypt vault and commit files atomically.
+    let vault_path = state.config.data_dir.join("vault.enc");
+    let plaintext_bytes = serde_json::to_vec(&vault_data)
+        .map_err(|e| AppError::Internal(format!("vault serialize: {}", e)))?;
+    save_vault(&vault_path, &dek, &plaintext_bytes)?;
+    dek.zeroize();
+
+    save_dek_wraps(&state, &manifest)?;
 
     fs::write(&passkeys_path, serde_json::to_string(&passkeys_map)?)?;
 
-    // Write index.json
     let _ = write_index(&state, &vault_data);
-
-    // Unlock proxy immediately after setup
     state.vault.set_plaintext(vault_data.clone());
 
-    // Dispatch cook ops (workspace files, config, recipe steps) — full cook on setup
-    dispatch_cook(vault_data, state.config.proxy_port, state.config.effective_admin_url(), state.config.data_dir.clone(), state.config.instance_id.clone().unwrap_or_default(), None);
-
+    dispatch_cook(
+        vault_data,
+        state.config.proxy_port,
+        state.config.effective_admin_url(),
+        state.config.data_dir.clone(),
+        state.config.instance_id.clone().unwrap_or_default(),
+        None,
+    );
 
     Ok(Json(json!({ "ok": true })))
 }
 
-// ── Vault Unlock ───────────────────────────────────────────────────────────────
+// ── Vault Unlock (v2) ──────────────────────────────────────────────────────────
 
+/// POST /vault/unlock — decrypt vault.enc into server memory.
 pub async fn vault_unlock(
     State(state): State<Arc<AppState>>,
     auth: AuthenticatedRequest,
 ) -> Result<impl IntoResponse> {
-    let user_key_b64 = auth.get_str("userKey")?;
-    let user_key = STANDARD
-        .decode(user_key_b64)
-        .map_err(|e| AppError::BadRequest(format!("Invalid userKey: {}", e)))?;
-
-    let fname = credential_id_to_filename(&auth.credential_id)?;
-    let wrapped_path = state
-        .config
-        .data_dir
-        .join(format!("wrapped_dek_{}.bin", fname));
-    if !wrapped_path.exists() {
-        return Err(AppError::Unauthorized(
-            "No wrapped DEK for this credential".into(),
-        ));
-    }
-
-    let sk_d = jwk_sk_d_bytes(&state.keypair.sk)?;
-    let mut kek = derive_kek(&user_key, &sk_d)?;
-    let wrapped = fs::read(&wrapped_path)?;
-    let mut dek = unwrap_dek(&wrapped, &kek)?;
-    kek.zeroize();
-
-    let vault_enc = fs::read(state.config.data_dir.join("vault.enc"))?;
-    let plaintext_bytes = decrypt_vault(&dek, &vault_enc)?;
-
-    let mut vault_data: Value = serde_json::from_slice(&plaintext_bytes)
-        .map_err(|e| AppError::Internal(format!("Failed to parse vault: {}", e)))?;
-
-    // Migration: generate VAPID key pair if not present (existing vaults pre-dating Web Push)
-    if vault_data.get("vapid_private_key").is_none() {
-        match crate::notify::webpush::generate_vapid_keypair() {
-            Ok((priv_b64, _)) => {
-                vault_data.as_object_mut().map(|m| m.insert(
-                    "vapid_private_key".into(),
-                    serde_json::Value::String(priv_b64),
-                ));
-                // Re-encrypt and persist migrated vault
-                let new_enc = encrypt_vault(&dek, serde_json::to_string(&vault_data)?.as_bytes())?;
-                fs::write(state.config.data_dir.join("vault.enc"), &new_enc)?;
-                tracing::info!("Migrated vault: generated VAPID key pair");
-            }
-            Err(e) => tracing::warn!("VAPID migration failed: {e}"),
-        }
-    }
+    let mut dek = unwrap_current_dek(&state, &auth)?;
+    let vault_data = decrypt_vault_cached(&state, &dek)?;
     dek.zeroize();
-
     state.vault.set_plaintext(vault_data);
-
-    // No cook on unlock — config set by previous cook is persisted in docker volume.
-    // Unlock only decrypts vault in memory.
-
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -622,59 +798,32 @@ pub async fn vault_lock(
     Ok(Json(json!({ "ok": true })))
 }
 
-// ── Vault Credentials ──────────────────────────────────────────────────────────
+// ── Vault Read ────────────────────────────────────────────────────────────────
 
-pub async fn vault_credentials(
+/// POST /vault/read — return vault plaintext, sealed with the response seal key.
+///
+/// The response is encrypted with a credential-specific key derived from
+/// `user_key + prf_salt`, providing defense-in-depth beyond TLS.
+pub async fn vault_read(
     State(state): State<Arc<AppState>>,
     auth: AuthenticatedRequest,
 ) -> Result<impl IntoResponse> {
-    let user_key_b64 = auth.get_str("userKey")?;
-    let nonce_b64 = auth.replay_token_b64()?;
-
-    let user_key = STANDARD
-        .decode(user_key_b64)
-        .map_err(|e| AppError::BadRequest(format!("Invalid userKey: {}", e)))?;
-    let nonce_bytes = STANDARD
-        .decode(nonce_b64)
-        .map_err(|e| AppError::BadRequest(format!("Invalid nonce: {}", e)))?;
-
-    let fname = credential_id_to_filename(&auth.credential_id)?;
-    let wrapped_path = state
-        .config
-        .data_dir
-        .join(format!("wrapped_dek_{}.bin", fname));
-    if !wrapped_path.exists() {
-        return Err(AppError::Unauthorized(
-            "No wrapped DEK for this credential".into(),
-        ));
-    }
-
-    let sk_d = jwk_sk_d_bytes(&state.keypair.sk)?;
-    let mut kek = derive_kek(&user_key, &sk_d)?;
-    let wrapped = fs::read(&wrapped_path)?;
-    let mut dek = unwrap_dek(&wrapped, &kek)?;
-    kek.zeroize();
-
-    let vault_enc = fs::read(state.config.data_dir.join("vault.enc"))?;
-    let plaintext_bytes = decrypt_vault(&dek, &vault_enc)?;
+    let mut dek = unwrap_current_dek(&state, &auth)?;
+    let mut plaintext = decrypt_vault_cached(&state, &dek)?;
     dek.zeroize();
 
-    // Optional partial read: if `select` is provided, return only matching subtrees.
-    let output_bytes = if let Some(select) = auth.payload.get("select").and_then(|v| v.as_str()) {
-        let full: Value = serde_json::from_slice(&plaintext_bytes)
-            .map_err(|e| AppError::Internal(format!("Failed to parse vault: {}", e)))?;
-        let filtered = select_paths(&full, select);
-        serde_json::to_vec(&filtered)
-            .map_err(|e| AppError::Internal(format!("Failed to serialize filtered vault: {}", e)))?
+    // Strip peer_keks from the client-visible plaintext.
+    if let Some(obj) = plaintext.as_object_mut() {
+        obj.remove("peer_keks");
+    }
+
+    let output = if let Some(select) = auth.payload.get("select").and_then(|v| v.as_str()) {
+        select_paths(&plaintext, select)
     } else {
-        plaintext_bytes
+        plaintext
     };
 
-    let mut response_key = derive_response_key(&user_key, &nonce_bytes)?;
-    let sealed = aes_encrypt(&response_key, &output_bytes)?;
-    response_key.zeroize();
-
-    Ok(Json(json!({ "sealed": STANDARD.encode(&sealed) })))
+    Ok(Json(seal_response(&state, &auth, &output)?))
 }
 
 /// Extract subtrees from a JSON value by dot-notation path prefixes.
@@ -712,49 +861,47 @@ fn select_paths(full: &Value, paths: &str) -> Value {
     Value::Object(result)
 }
 
-// ── Vault Update ───────────────────────────────────────────────────────────────
+// ── Vault Update (v2) ──────────────────────────────────────────────────────────
 
+/// POST /vault/update — replace vault contents and rotate DEK.
 pub async fn vault_update(
     State(state): State<Arc<AppState>>,
     auth: AuthenticatedRequest,
 ) -> Result<impl IntoResponse> {
     let new_vault_data = auth
         .payload
-        .get("newSecrets")
+        .get("new_vault")
+        .or_else(|| auth.payload.get("newSecrets"))
         .cloned()
-        .ok_or_else(|| AppError::BadRequest("Missing newSecrets".into()))?;
+        .ok_or_else(|| AppError::BadRequest("missing new_vault".into()))?;
 
-    let user_key_b64 = auth.get_str("userKey")?;
-    let user_key = STANDARD
-        .decode(user_key_b64)
-        .map_err(|e| AppError::BadRequest(format!("Invalid userKey: {}", e)))?;
+    with_vault_mut(&state, &auth, move |vault_data| {
+        // Replace the top-level vault with new_vault_data, but keep peer_keks
+        // (with_vault_mut will re-install the authoritative value after this closure).
+        let existing_peer_keks = vault_data.get("peer_keks").cloned();
+        *vault_data = new_vault_data;
+        if let Some(obj) = vault_data.as_object_mut() {
+            // Strip any client-supplied peer_keks and restore the existing one;
+            // with_vault_mut will mutate it further for the acting credential.
+            obj.remove("peer_keks");
+            if let Some(pk) = existing_peer_keks {
+                obj.insert("peer_keks".into(), pk);
+            }
+        }
+        Ok(())
+    })?;
 
-    let fname = credential_id_to_filename(&auth.credential_id)?;
-    let wrapped_path = state
-        .config
-        .data_dir
-        .join(format!("wrapped_dek_{}.bin", fname));
-    if !wrapped_path.exists() {
-        return Err(AppError::Unauthorized(
-            "No wrapped DEK for this credential".into(),
-        ));
+    // Trigger a full cook with the updated vault.
+    if let Some(vault_data) = state.vault.plaintext.lock().unwrap().clone() {
+        dispatch_cook(
+            vault_data,
+            state.config.proxy_port,
+            state.config.effective_admin_url(),
+            state.config.data_dir.clone(),
+            state.config.instance_id.clone().unwrap_or_default(),
+            None,
+        );
     }
-
-    let sk_d = jwk_sk_d_bytes(&state.keypair.sk)?;
-    let mut kek = derive_kek(&user_key, &sk_d)?;
-    let wrapped = fs::read(&wrapped_path)?;
-    let mut dek = unwrap_dek(&wrapped, &kek)?;
-    kek.zeroize();
-
-    let vault_enc = encrypt_vault(&dek, serde_json::to_string(&new_vault_data)?.as_bytes())?;
-    dek.zeroize();
-    fs::write(state.config.data_dir.join("vault.enc"), &vault_enc)?;
-
-    let _ = write_index(&state, &new_vault_data);
-    state.vault.set_plaintext(new_vault_data.clone());
-
-    // Keep VM-side SafeClaw guidance in sync with the latest vault config — full cook
-    dispatch_cook(new_vault_data, state.config.proxy_port, state.config.effective_admin_url(), state.config.data_dir.clone(), state.config.instance_id.clone().unwrap_or_default(), None);
 
     Ok(Json(json!({ "ok": true })))
 }
@@ -1138,70 +1285,79 @@ pub async fn vault_files_list(State(state): State<Arc<AppState>>) -> impl IntoRe
     Json(json!({ "files": files }))
 }
 
-/// GET /vault/files/:id?approval=:approval_id — read file using short-lived DEK from approval.
-/// The DEK was stashed by approval_confirm and is consumed (zeroized) after this read.
+/// GET /vault/files/:id?approval=:approval_id — read file using a short-lived
+/// per-file key stashed by `approval_confirm` and consumed on this read.
 pub async fn vault_files_read_approved(
     State(state): State<Arc<AppState>>,
     Path(file_id): Path<String>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<impl IntoResponse> {
-    // Sanitize file_id
     if !file_id.chars().all(|c| c.is_alphanumeric() || c == '-') || file_id.len() > 40 {
-        return Err(AppError::BadRequest("Invalid file id".into()));
+        return Err(AppError::BadRequest("invalid file id".into()));
     }
 
-    let approval_id = params.get("approval").ok_or_else(|| {
-        AppError::BadRequest("Missing approval parameter".into())
-    })?;
+    let approval_id = params
+        .get("approval")
+        .ok_or_else(|| AppError::BadRequest("missing approval param".into()))?;
     if approval_id.len() > 64 {
-        return Err(AppError::BadRequest("Invalid approval id".into()));
+        return Err(AppError::BadRequest("invalid approval id".into()));
     }
 
-    // Take DEK from pending_deks (one-time use)
-    let mut dek = {
+    // Take the stashed file_key from pending_deks (one-time use).
+    let mut file_key = {
         let mut deks = state.vault.cache.pending_deks.lock().unwrap();
-        deks.remove(approval_id).ok_or_else(|| {
-            AppError::Unauthorized("No DEK available — approval may have expired".into())
-        })?
+        deks.remove(approval_id)
+            .ok_or_else(|| AppError::Unauthorized("no file_key available".into()))?
     };
 
-    let enc_path = state.config.data_dir.join(format!("files/{}.enc", file_id));
+    let enc_path = state
+        .config
+        .data_dir
+        .join(format!("files/{}.enc", file_id));
     if !enc_path.exists() {
-        dek.zeroize();
+        file_key.zeroize();
         return Err(AppError::NotFound);
     }
 
-    // Decrypt
     let enc_data = fs::read(&enc_path)?;
-    let plaintext = crate::crypto::aes_decrypt(&dek, &enc_data);
-    dek.zeroize(); // DEK gone immediately
-
+    let plaintext = vault_file::decrypt_file(&file_key, &file_id, &enc_data);
+    file_key.zeroize();
     let plaintext = plaintext?;
 
-    // Look up filename from index for content-type
     let index = read_index(&state);
-    let filename = index.get("files")
+    let filename = index
+        .get("files")
         .and_then(|f| f.as_array())
-        .and_then(|arr| arr.iter().find(|f| f.get("id").and_then(|v| v.as_str()) == Some(&file_id)))
+        .and_then(|arr| {
+            arr.iter()
+                .find(|f| f.get("id").and_then(|v| v.as_str()) == Some(&file_id))
+        })
         .and_then(|f| f.get("name").and_then(|v| v.as_str()))
         .unwrap_or("file");
 
-    let content_type = if filename.ends_with(".json") { "application/json" }
-        else if filename.ends_with(".txt") || filename.ends_with(".md") || filename.ends_with(".csv") { "text/plain; charset=utf-8" }
-        else if filename.ends_with(".pdf") { "application/pdf" }
-        else { "application/octet-stream" };
+    let content_type = if filename.ends_with(".json") {
+        "application/json"
+    } else if filename.ends_with(".txt") || filename.ends_with(".md") || filename.ends_with(".csv") {
+        "text/plain; charset=utf-8"
+    } else if filename.ends_with(".pdf") {
+        "application/pdf"
+    } else {
+        "application/octet-stream"
+    };
 
     Ok((
         axum::http::StatusCode::OK,
-        [
-            ("content-type", content_type),
-        ],
+        [("content-type", content_type)],
         plaintext,
     ))
 }
 
-/// POST /vault/files/upload — encrypt and store a file (passkey required)
-/// Payload: { "name": "...", "data": "<base64>" }
+/// POST /vault/files/upload — encrypt and store a file under a fresh per-file DEK.
+///
+/// The file_key is generated randomly, the file is sealed as `files/<uuid>.enc`
+/// in v2 format, and the file_key is stored in the vault plaintext's `files`
+/// array alongside the file metadata. The vault itself is rotated as part of
+/// this operation (this is a write with prf_salt_next rotation).
 pub async fn vault_files_upload(
     State(state): State<Arc<AppState>>,
     auth: AuthenticatedRequest,
@@ -1210,67 +1366,51 @@ pub async fn vault_files_upload(
         .payload
         .get("name")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| AppError::BadRequest("Missing file name".into()))?
+        .ok_or_else(|| AppError::BadRequest("missing name".into()))?
         .to_string();
-
     validate_file_name(&file_name)?;
 
     let data_b64 = auth
         .payload
         .get("data")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| AppError::BadRequest("Missing file data".into()))?;
-
+        .ok_or_else(|| AppError::BadRequest("missing data".into()))?;
     let file_bytes = STANDARD
         .decode(data_b64)
-        .map_err(|e| AppError::BadRequest(format!("Invalid file data base64: {}", e)))?;
-
+        .map_err(|_| AppError::BadRequest("data not base64".into()))?;
     let file_size = file_bytes.len();
     let file_id = uuid::Uuid::new_v4().to_string();
 
-    // Auth already verified by AuthenticatedRequest extractor.
-    // Derive DEK directly from user key + wrapped DEK on disk.
-    let user_key_b64 = auth.get_str("userKey")?;
-    let user_key = STANDARD
-        .decode(user_key_b64)
-        .map_err(|e| AppError::BadRequest(format!("Invalid userKey: {}", e)))?;
+    // Generate a fresh file key and seal the file.
+    let mut file_key = fresh_file_key();
+    let sealed = vault_file::encrypt_file(&file_key, &file_id, &file_bytes)?;
 
-    let fname = credential_id_to_filename(&auth.credential_id)?;
-    let wrapped_path = state
-        .config
-        .data_dir
-        .join(format!("wrapped_dek_{}.bin", fname));
-
-    let sk_d = jwk_sk_d_bytes(&state.keypair.sk)?;
-    let mut kek = derive_kek(&user_key, &sk_d)?;
-    let wrapped = fs::read(&wrapped_path)?;
-    let mut dek = unwrap_dek(&wrapped, &kek)?;
-    kek.zeroize();
-
-    // Encrypt the file
-    let encrypted_file = crate::crypto::aes_encrypt(&dek, &file_bytes)?;
-    dek.zeroize();
-
-    // Write encrypted file
     fs::create_dir_all(state.config.data_dir.join("files"))?;
     fs::write(
-        state.config.data_dir.join(format!("files/{}.enc", file_id)),
-        &encrypted_file,
+        state
+            .config
+            .data_dir
+            .join(format!("files/{}.enc", file_id)),
+        &sealed,
     )?;
 
-    // Update vault JSON with file metadata
+    let file_key_b64 = STANDARD.encode(&file_key);
+    file_key.zeroize();
+
     with_vault_mut(&state, &auth, {
         let file_id2 = file_id.clone();
         let file_name2 = file_name.clone();
+        let file_key_b64 = file_key_b64.clone();
         move |vault_data| {
             if vault_data.get("files").is_none() {
                 vault_data["files"] = json!([]);
             }
             if let Some(arr) = vault_data["files"].as_array_mut() {
                 arr.push(json!({
-                    "id": file_id2,
-                    "name": file_name2,
-                    "size": file_size,
+                    "id":       file_id2,
+                    "name":     file_name2,
+                    "size":     file_size,
+                    "file_key": file_key_b64,
                 }));
             }
             Ok(())
@@ -1280,8 +1420,7 @@ pub async fn vault_files_upload(
     Ok(Json(json!({ "ok": true, "id": file_id })))
 }
 
-/// POST /vault/files/read — decrypt and return a file E2E (passkey required)
-/// Payload: { "id": "...", "nonce": "<base64>" }
+/// POST /vault/files/read — decrypt and return a file as base64 JSON.
 pub async fn vault_files_read(
     State(state): State<Arc<AppState>>,
     auth: AuthenticatedRequest,
@@ -1290,17 +1429,11 @@ pub async fn vault_files_read(
         .payload
         .get("id")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| AppError::BadRequest("Missing file id".into()))?
+        .ok_or_else(|| AppError::BadRequest("missing id".into()))?
         .to_string();
 
-    let nonce_b64 = auth.replay_token_b64()?;
-    let nonce_bytes = STANDARD
-        .decode(nonce_b64)
-        .map_err(|e| AppError::BadRequest(format!("Invalid nonce: {}", e)))?;
-
-    // Sanitize file_id (UUID format only)
     if !file_id.chars().all(|c| c.is_alphanumeric() || c == '-') || file_id.len() > 40 {
-        return Err(AppError::BadRequest("Invalid file id".into()));
+        return Err(AppError::BadRequest("invalid file id".into()));
     }
 
     let enc_path = state
@@ -1311,37 +1444,48 @@ pub async fn vault_files_read(
         return Err(AppError::NotFound);
     }
 
-    let user_key_b64 = auth.get_str("userKey")?;
-    let user_key = STANDARD
-        .decode(user_key_b64)
-        .map_err(|e| AppError::BadRequest(format!("Invalid userKey: {}", e)))?;
-
-    let fname = credential_id_to_filename(&auth.credential_id)?;
-    let wrapped_path = state
-        .config
-        .data_dir
-        .join(format!("wrapped_dek_{}.bin", fname));
-
-    let sk_d = jwk_sk_d_bytes(&state.keypair.sk)?;
-    let mut kek = derive_kek(&user_key, &sk_d)?;
-    let wrapped = fs::read(&wrapped_path)?;
-    let mut dek = unwrap_dek(&wrapped, &kek)?;
-    kek.zeroize();
-
-    // Decrypt file
-    let enc_data = fs::read(&enc_path)?;
-    let plaintext = crate::crypto::aes_decrypt(&dek, &enc_data)?;
+    let mut dek = unwrap_current_dek(&state, &auth)?;
+    let plaintext = decrypt_vault_cached(&state, &dek)?;
     dek.zeroize();
 
-    // E2E encrypt for client
-    let mut response_key = derive_response_key(&user_key, &nonce_bytes)?;
-    let sealed = aes_encrypt(&response_key, &plaintext)?;
-    response_key.zeroize();
+    let (file_name, file_key_b64) = plaintext
+        .get("files")
+        .and_then(|f| f.as_array())
+        .and_then(|arr| {
+            arr.iter()
+                .find(|f| f.get("id").and_then(|v| v.as_str()) == Some(&file_id))
+        })
+        .and_then(|f| {
+            let name = f.get("name").and_then(|v| v.as_str()).unwrap_or("file").to_string();
+            let fk = f.get("file_key").and_then(|v| v.as_str())?.to_string();
+            Some((name, fk))
+        })
+        .ok_or(AppError::NotFound)?;
 
-    Ok(Json(json!({ "sealed": STANDARD.encode(&sealed) })))
+    let mut file_key_bytes = STANDARD
+        .decode(&file_key_b64)
+        .map_err(|_| AppError::Internal("file_key not base64".into()))?;
+    if file_key_bytes.len() != 32 {
+        file_key_bytes.zeroize();
+        return Err(AppError::Internal("file_key wrong length".into()));
+    }
+    let mut file_key = [0u8; 32];
+    file_key.copy_from_slice(&file_key_bytes);
+    file_key_bytes.zeroize();
+
+    let enc_data = fs::read(&enc_path)?;
+    let file_plain = vault_file::decrypt_file(&file_key, &file_id, &enc_data)?;
+    file_key.zeroize();
+
+    let file_response = json!({
+        "name": file_name,
+        "data": STANDARD.encode(&file_plain),
+    });
+
+    Ok(Json(seal_response(&state, &auth, &file_response)?))
 }
 
-/// POST /vault/files/remove — delete an encrypted file (passkey required)
+/// POST /vault/files/delete — delete an encrypted file and its metadata.
 pub async fn vault_files_remove(
     State(state): State<Arc<AppState>>,
     auth: AuthenticatedRequest,
@@ -1350,12 +1494,11 @@ pub async fn vault_files_remove(
         .payload
         .get("id")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| AppError::BadRequest("Missing file id".into()))?
+        .ok_or_else(|| AppError::BadRequest("missing id".into()))?
         .to_string();
 
-    // Sanitize
     if !file_id.chars().all(|c| c.is_alphanumeric() || c == '-') || file_id.len() > 40 {
-        return Err(AppError::BadRequest("Invalid file id".into()));
+        return Err(AppError::BadRequest("invalid file id".into()));
     }
 
     let enc_path = state
@@ -1366,7 +1509,6 @@ pub async fn vault_files_remove(
         fs::remove_file(&enc_path)?;
     }
 
-    // Remove from vault JSON
     with_vault_mut(&state, &auth, {
         let file_id2 = file_id.clone();
         move |vault_data| {
@@ -1486,23 +1628,12 @@ pub async fn approval_list_pending(
     }
 }
 
-/// POST /approve/:id/details — return E2E-encrypted request details (passkey required).
-/// Details are in-memory only; cleared automatically when the approval is resolved/timed-out.
+/// POST /approve/:id/details — return approval details as sealed JSON (auth required).
 pub async fn approval_details(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     auth: AuthenticatedRequest,
 ) -> Result<impl IntoResponse> {
-    let nonce_b64 = auth.replay_token_b64()?;
-    let nonce_bytes = STANDARD
-        .decode(nonce_b64)
-        .map_err(|e| AppError::BadRequest(format!("Invalid nonce: {}", e)))?;
-
-    let user_key_b64 = auth.get_str("userKey")?;
-    let user_key = STANDARD
-        .decode(user_key_b64)
-        .map_err(|e| AppError::BadRequest(format!("Invalid userKey: {}", e)))?;
-
     let details: serde_json::Value = {
         let pending = state.approval_manager.pending.lock().unwrap();
         pending
@@ -1510,75 +1641,102 @@ pub async fn approval_details(
             .map(|a| a.details.clone().unwrap_or(serde_json::Value::Null))
             .ok_or(AppError::NotFound)?
     };
-
-    let details_bytes = serde_json::to_vec(&details)
-        .map_err(|e| AppError::Internal(format!("Failed to serialize details: {}", e)))?;
-
-    let mut response_key = derive_response_key(&user_key, &nonce_bytes)?;
-    let sealed = aes_encrypt(&response_key, &details_bytes)?;
-    response_key.zeroize();
-
-    Ok(Json(json!({ "sealed": STANDARD.encode(&sealed) })))
+    Ok(Json(seal_response(&state, &auth, &details)?))
 }
 
-/// POST /approve/:id/confirm — approve a pending request (passkey required)
+/// POST /approve/:id/confirm — approve a pending request.
 pub async fn approval_confirm(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     auth: AuthenticatedRequest,
 ) -> Result<impl IntoResponse> {
-    // Get service name from the pending approval
     let service_name = {
         let pending = state.approval_manager.pending.lock().unwrap();
         pending.get(&id).map(|a| a.service.clone())
     };
+    let service_name = service_name.ok_or(AppError::NotFound)?;
 
-    let service_name = match service_name {
-        Some(s) => s,
-        None => return Err(AppError::NotFound),
-    };
-
-    // For "files" service: derive DEK and stash it for the upcoming replay request
     if service_name == "files" {
-        let user_key_b64 = auth.get_str("userKey")?;
-        let user_key = STANDARD.decode(user_key_b64)
-            .map_err(|e| AppError::BadRequest(format!("Invalid userKey: {}", e)))?;
-        let fname = credential_id_to_filename(&auth.credential_id)?;
-        let wrapped_path = state.config.data_dir.join(format!("wrapped_dek_{}.bin", fname));
-        let sk_d = jwk_sk_d_bytes(&state.keypair.sk)?;
-        let mut kek = derive_kek(&user_key, &sk_d)?;
-        let wrapped = fs::read(&wrapped_path)?;
-        let dek = unwrap_dek(&wrapped, &kek)?;
-        kek.zeroize();
+        // v2: for approval-gated file reads, we need to stash the file's per-file
+        // key (not the DEK, since v2 uses per-file keys). The caller must supply
+        // `file_id` in the approval confirm body so we know which file_key to
+        // stash. If missing, fall back to the generic vault auth path.
+        let file_id = auth
+            .payload
+            .get("file_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
 
-        // Store DEK keyed by approval ID — consumed and zeroized at file read time
-        state.vault.cache.pending_deks.lock().unwrap().insert(id.clone(), dek);
+        if let Some(fid) = file_id {
+            let mut dek = unwrap_current_dek(&state, &auth)?;
+            let plaintext = decrypt_vault_cached(&state, &dek)?;
+            dek.zeroize();
 
-        if state.approval_manager.confirm(&id, None) {
-            Ok(Json(json!({ "ok": true })))
+            let file_key_b64 = plaintext
+                .get("files")
+                .and_then(|f| f.as_array())
+                .and_then(|arr| {
+                    arr.iter()
+                        .find(|f| f.get("id").and_then(|v| v.as_str()) == Some(&fid))
+                })
+                .and_then(|f| f.get("file_key").and_then(|v| v.as_str()))
+                .ok_or(AppError::NotFound)?
+                .to_string();
+
+            let mut fk_bytes = STANDARD
+                .decode(&file_key_b64)
+                .map_err(|_| AppError::Internal("file_key not base64".into()))?;
+            if fk_bytes.len() != 32 {
+                fk_bytes.zeroize();
+                return Err(AppError::Internal("file_key wrong length".into()));
+            }
+            let mut fk = [0u8; 32];
+            fk.copy_from_slice(&fk_bytes);
+            fk_bytes.zeroize();
+
+            state
+                .vault
+                .cache
+                .pending_deks
+                .lock()
+                .unwrap()
+                .insert(id.clone(), fk);
+
+            if state.approval_manager.confirm(&id, None) {
+                return Ok(Json(json!({ "ok": true })));
+            } else {
+                if let Some(mut d) =
+                    state.vault.cache.pending_deks.lock().unwrap().remove(&id)
+                {
+                    d.zeroize();
+                }
+                return Err(AppError::NotFound);
+            }
         } else {
-            // Clean up if confirm failed
-            use zeroize::Zeroize;
-            if let Some(mut d) = state.vault.cache.pending_deks.lock().unwrap().remove(&id) { d.zeroize(); }
-            Err(AppError::NotFound)
+            // No file_id supplied: confirm without stashing (approval completes
+            // but any subsequent file read will need a fresh auth'd request).
+            if state.approval_manager.confirm(&id, None) {
+                return Ok(Json(json!({ "ok": true })));
+            }
+            return Err(AppError::NotFound);
         }
+    }
+
+    // Normal service: decrypt vault, extract auth config for replay.
+    let mut dek = unwrap_current_dek(&state, &auth)?;
+    let vault_data = decrypt_vault_cached(&state, &dek)?;
+    dek.zeroize();
+
+    let auth_json = vault_data
+        .get("services")
+        .and_then(|s| s.get(&service_name))
+        .and_then(|svc| svc.get("auth"))
+        .cloned();
+
+    if state.approval_manager.confirm(&id, auth_json) {
+        Ok(Json(json!({ "ok": true })))
     } else {
-        // Normal service: decrypt vault and extract auth config for replay
-        let auth_json = decrypt_vault_json(&state, &auth)
-            .ok()
-            .and_then(|vault_data| {
-                vault_data
-                    .get("services")
-                    .and_then(|s| s.get(&service_name))
-                    .and_then(|svc| svc.get("auth"))
-                    .cloned()
-            });
-
-        if state.approval_manager.confirm(&id, auth_json) {
-            Ok(Json(json!({ "ok": true })))
-        } else {
-            Err(AppError::NotFound)
-        }
+        Err(AppError::NotFound)
     }
 }
 
@@ -1612,72 +1770,31 @@ pub async fn approval_reject(
     }
 }
 
-// ── Identity: Add Passkey ──────────────────────────────────────────────────────
+// ── Identity: Add Passkey (v2) ─────────────────────────────────────────────────
 
+/// POST /passkeys/add — register an additional credential.
+///
+/// The acting credential's auth path provides `user_key`/`user_key_next` as
+/// usual (so its own wrapping rotates). The new credential's material comes
+/// in as an inline `new_passkey` object with its own `assertion` field that
+/// must verify with channel binding.
 pub async fn identity_add_passkey(
     State(state): State<Arc<AppState>>,
     auth: AuthenticatedRequest,
 ) -> Result<impl IntoResponse> {
-    let user_key_b64 = auth.get_str("userKey")?;
-    let user_key = STANDARD
-        .decode(user_key_b64)
-        .map_err(|e| AppError::BadRequest(format!("Invalid userKey: {}", e)))?;
-
     let new_passkey = auth
         .payload
-        .get("newPasskey")
+        .get("new_passkey")
+        .or_else(|| auth.payload.get("newPasskey"))
         .cloned()
-        .ok_or_else(|| AppError::BadRequest("Missing newPasskey".into()))?;
-    let new_user_key_b64 = auth
-        .payload
-        .get("newUserKey")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| AppError::BadRequest("Missing newUserKey".into()))?;
+        .ok_or_else(|| AppError::BadRequest("missing new_passkey".into()))?;
+
     let new_cred_id = new_passkey
-        .get("credentialId")
+        .get("credential_id")
+        .or_else(|| new_passkey.get("credentialId"))
         .and_then(|v| v.as_str())
-        .ok_or_else(|| AppError::BadRequest("Missing credentialId in newPasskey".into()))?;
-
-    let fname = credential_id_to_filename(&auth.credential_id)?;
-    let wrapped_path = state
-        .config
-        .data_dir
-        .join(format!("wrapped_dek_{}.bin", fname));
-    if !wrapped_path.exists() {
-        return Err(AppError::Unauthorized(
-            "No wrapped DEK for this credential".into(),
-        ));
-    }
-
-    let sk_d = jwk_sk_d_bytes(&state.keypair.sk)?;
-    let mut kek = derive_kek(&user_key, &sk_d)?;
-    let wrapped = fs::read(&wrapped_path)?;
-    let mut dek = unwrap_dek(&wrapped, &kek)?;
-    kek.zeroize();
-
-    let new_user_key = STANDARD
-        .decode(new_user_key_b64)
-        .map_err(|e| AppError::BadRequest(format!("Invalid newUserKey: {}", e)))?;
-    let mut new_kek = derive_kek(&new_user_key, &sk_d)?;
-    let new_wrapped = wrap_dek(&dek, &new_kek)?;
-    dek.zeroize();
-    new_kek.zeroize();
-
-    let new_fname = credential_id_to_filename(new_cred_id)?;
-    fs::write(
-        state
-            .config
-            .data_dir
-            .join(format!("wrapped_dek_{}.bin", new_fname)),
-        &new_wrapped,
-    )?;
-
-    let passkeys_path = state.config.data_dir.join("passkeys.json");
-    let mut passkeys = auth.passkeys.clone();
-    let now_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
+        .ok_or_else(|| AppError::BadRequest("missing new_passkey.credential_id".into()))?
+        .to_string();
     let new_x = new_passkey
         .get("x")
         .and_then(|v| v.as_str())
@@ -1689,20 +1806,185 @@ pub async fn identity_add_passkey(
         .unwrap_or("")
         .to_string();
     if new_x.is_empty() || new_y.is_empty() {
-        return Err(AppError::BadRequest(
-            "New passkey has missing x/y coordinates".into(),
-        ));
+        return Err(AppError::BadRequest("new_passkey missing x/y".into()));
     }
+
+    let prf_salt_b64 = new_passkey
+        .get("prf_salt_initial")
+        .or_else(|| new_passkey.get("prfSaltInitial"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| AppError::BadRequest("missing new_passkey.prf_salt_initial".into()))?;
+    let user_key_b64 = new_passkey
+        .get("user_key_initial")
+        .or_else(|| new_passkey.get("userKeyInitial"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| AppError::BadRequest("missing new_passkey.user_key_initial".into()))?;
+
+    let prf_salt_bytes = STANDARD
+        .decode(prf_salt_b64)
+        .map_err(|_| AppError::BadRequest("prf_salt_initial not base64".into()))?;
+    let user_key_bytes = STANDARD
+        .decode(user_key_b64)
+        .map_err(|_| AppError::BadRequest("user_key_initial not base64".into()))?;
+    if prf_salt_bytes.len() != 32 || user_key_bytes.len() != 32 {
+        return Err(AppError::BadRequest("prf_salt/user_key must be 32B".into()));
+    }
+    let mut prf_salt_arr = [0u8; 32];
+    prf_salt_arr.copy_from_slice(&prf_salt_bytes);
+    let mut user_key_arr = [0u8; 32];
+    user_key_arr.copy_from_slice(&user_key_bytes);
+
+    let new_cred_id_bytes = STANDARD
+        .decode(&new_cred_id)
+        .map_err(|_| AppError::BadRequest("new credential_id not base64".into()))?;
+
+    // Verify the new passkey's own assertion with a nested identity channel binding.
+    let new_assertion_val = new_passkey
+        .get("assertion")
+        .cloned()
+        .ok_or_else(|| AppError::BadRequest("missing new_passkey.assertion".into()))?;
+    let new_assertion: AssertionData = serde_json::from_value(new_assertion_val)
+        .map_err(|e| AppError::BadRequest(format!("invalid new assertion: {}", e)))?;
+
+    // The new credential's assertion binds to: identity domain + server_random
+    // + request hash of the top-level body with assertion fields stripped.
+    let mut body_for_identity_binding = auth.payload.clone();
+    if let Some(obj) = body_for_identity_binding.as_object_mut() {
+        obj.remove("assertion");
+        // Also strip the nested new_passkey.assertion
+        if let Some(np) = obj.get_mut("new_passkey").and_then(|v| v.as_object_mut()) {
+            np.remove("assertion");
+        }
+        if let Some(np) = obj.get_mut("newPasskey").and_then(|v| v.as_object_mut()) {
+            np.remove("assertion");
+        }
+    }
+    let identity_binding = binding_for_request(
+        DOMAIN_IDENTITY,
+        &auth.server_random,
+        &auth.method,
+        &auth.path,
+        &body_for_identity_binding,
+    );
+    verify_assertion(
+        &new_assertion,
+        &new_x,
+        &new_y,
+        &state.config.effective_origin(),
+        &state.config.effective_rp_id(),
+        &identity_binding,
+        AssertionKind::Get,
+    )?;
+
+    // Apply the identity change inside a vault write: this rotates DEK and
+    // rewraps for all credentials, and adds a new wrapped_deks entry + a new
+    // peer_keks entry for the new credential.
+    let new_cred_id_clone = new_cred_id.clone();
+    let new_cred_id_bytes_clone = new_cred_id_bytes.clone();
+    let new_x_clone = new_x.clone();
+    let new_y_clone = new_y.clone();
+    let new_device_name = new_passkey
+        .get("device_name")
+        .or_else(|| new_passkey.get("deviceName"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    // Precompute the new credential's KEK so the write closure can install it.
+    let mut new_kek = derive_kek(
+        &user_key_arr,
+        &prf_salt_arr,
+        crate::crypto::WRAP_VERSION,
+        &new_cred_id_bytes_clone,
+    )?;
+    let new_kek_b64 = STANDARD.encode(&new_kek);
+
+    with_vault_mut(&state, &auth, move |vault_data| {
+        if let Some(obj) = vault_data.as_object_mut() {
+            let peer = obj
+                .entry("peer_keks".to_string())
+                .or_insert_with(|| Value::Object(serde_json::Map::new()));
+            if let Some(pk_obj) = peer.as_object_mut() {
+                pk_obj.insert(new_cred_id_clone.clone(), Value::String(new_kek_b64));
+            }
+        }
+        Ok(())
+    })?;
+
+    // After with_vault_mut commits, add the new credential's entry to
+    // dek_wraps.bin separately (wrapping the *current* DEK via the new KEK).
+    // We must unwrap the current DEK via the acting credential first.
+    // Actually, the simpler path is: with_vault_mut already rotated the DEK and
+    // wrapped it for existing credentials. We need a matching entry for the new
+    // credential. We re-read the vault with the newly-current DEK.
+    //
+    // Approach: unwrap with the new credential's freshly-derived KEK after the
+    // write. But the wrapped_deks manifest that with_vault_mut wrote has no
+    // entry for the new credential yet. So we have to add one.
+    //
+    // Steps:
+    //   1. Reload wrapped_deks.
+    //   2. Find any existing entry, unwrap DEK using acting credential's
+    //      user_key_next (since the rotation is done).
+    //   3. Wrap DEK under new KEK with the new prf_salt and add to manifest.
+    //   4. Save manifest.
+    let mut manifest = load_dek_wraps(&state)?;
+    let acting_entry = manifest
+        .find(&auth.credential_id_bytes)
+        .ok_or_else(|| AppError::Internal("acting credential missing after write".into()))?
+        .clone();
+
+    // The acting credential's wrapped_deks entry after the write is under
+    // user_key_next (the rotation moved its KEK to the next salt). We don't
+    // have user_key_next here directly since AuthenticatedRequest zeroized it
+    // in with_vault_mut — but the DEK was just generated fresh in the write.
+    // Simpler alternative: reload plaintext and read peer_keks[acting] to
+    // reconstruct the acting credential's KEK? peer_keks stores the KEK, which
+    // can unwrap the new entry.
+    let peer_keks_map = state.vault.peer_keks_map();
+    let acting_kek = peer_keks_map
+        .get(&auth.credential_id)
+        .copied()
+        .ok_or_else(|| AppError::Internal("peer_keks missing acting credential".into()))?;
+
+    let aad = crate::crypto::wrap_aad(crate::crypto::WRAP_VERSION, &auth.credential_id_bytes);
+    let mut dek = aead::decrypt(
+        &acting_kek,
+        &acting_entry.aead_nonce,
+        &acting_entry.wrapped,
+        &aad,
+    )?;
+    let mut dek_arr = [0u8; 32];
+    if dek.len() != 32 {
+        dek.zeroize();
+        return Err(AppError::Internal("DEK wrong length".into()));
+    }
+    dek_arr.copy_from_slice(&dek);
+    dek.zeroize();
+
+    let new_entry =
+        wrap_dek_with_kek(&dek_arr, &new_kek, &prf_salt_arr, &new_cred_id_bytes_clone)?;
+    dek_arr.zeroize();
+    new_kek.zeroize();
+    user_key_arr.zeroize();
+    prf_salt_arr.zeroize();
+
+    manifest.upsert(new_entry);
+    save_dek_wraps(&state, &manifest)?;
+
+    // Update passkeys.json.
+    let passkeys_path = state.config.data_dir.join("passkeys.json");
+    let mut passkeys = auth.passkeys.clone();
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
     passkeys.insert(
-        new_cred_id.to_string(),
+        new_cred_id.clone(),
         PasskeyEntry {
-            x: new_x,
-            y: new_y,
-            device_name: new_passkey
-                .get("deviceName")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
+            x: new_x_clone,
+            y: new_y_clone,
+            device_name: new_device_name,
             created_at: now_ms,
         },
     );
@@ -1711,44 +1993,60 @@ pub async fn identity_add_passkey(
     Ok(Json(json!({ "ok": true })))
 }
 
-// ── Identity: Remove Passkey ───────────────────────────────────────────────────
+// ── Identity: Remove Passkey (v2) ─────────────────────────────────────────────
 
+/// POST /passkeys/remove — remove a credential.
 pub async fn identity_remove_passkey(
     State(state): State<Arc<AppState>>,
     auth: AuthenticatedRequest,
 ) -> Result<impl IntoResponse> {
     let remove_id = auth
         .payload
-        .get("removeCredentialId")
+        .get("remove_credential_id")
+        .or_else(|| auth.payload.get("removeCredentialId"))
         .and_then(|v| v.as_str())
-        .ok_or_else(|| AppError::BadRequest("Missing removeCredentialId".into()))?
+        .ok_or_else(|| AppError::BadRequest("missing remove_credential_id".into()))?
         .to_string();
 
-    if !auth.passkeys.contains_key(&remove_id) {
+    if remove_id == auth.credential_id {
         return Err(AppError::BadRequest(
-            "Credential to remove not found".into(),
+            "cannot remove the acting credential".into(),
         ));
+    }
+    if !auth.passkeys.contains_key(&remove_id) {
+        return Err(AppError::BadRequest("credential not found".into()));
     }
     if auth.passkeys.len() <= 1 {
-        return Err(AppError::BadRequest(
-            "Cannot remove the last passkey".into(),
-        ));
+        return Err(AppError::BadRequest("cannot remove last passkey".into()));
     }
 
+    let remove_id_bytes = STANDARD
+        .decode(&remove_id)
+        .map_err(|_| AppError::BadRequest("remove credential_id not base64".into()))?;
+    let remove_id_clone = remove_id.clone();
+
+    // Remove from peer_keks inside a vault write.
+    with_vault_mut(&state, &auth, move |vault_data| {
+        if let Some(obj) = vault_data.as_object_mut() {
+            if let Some(pk) = obj.get_mut("peer_keks").and_then(|v| v.as_object_mut()) {
+                pk.remove(&remove_id_clone);
+            }
+        }
+        Ok(())
+    })?;
+
+    // Remove from dek_wraps.bin manifest.
+    let mut manifest = load_dek_wraps(&state)?;
+    manifest.remove(&remove_id_bytes);
+    save_dek_wraps(&state, &manifest)?;
+
+    // Remove from passkeys.json.
     let mut passkeys = auth.passkeys.clone();
     passkeys.remove(&remove_id);
-
-    let passkeys_path = state.config.data_dir.join("passkeys.json");
-    fs::write(&passkeys_path, serde_json::to_string(&passkeys)?)?;
-
-    let fname = credential_id_to_filename(&remove_id)?;
-    let wrapped_path = state
-        .config
-        .data_dir
-        .join(format!("wrapped_dek_{}.bin", fname));
-    if wrapped_path.exists() {
-        let _ = fs::remove_file(&wrapped_path);
-    }
+    fs::write(
+        state.config.data_dir.join("passkeys.json"),
+        serde_json::to_string(&passkeys)?,
+    )?;
 
     Ok(Json(json!({ "ok": true })))
 }

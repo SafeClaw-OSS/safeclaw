@@ -1,3 +1,28 @@
+//! SafeClaw v1 passkey authentication.
+//!
+//! This module exposes [`AuthenticatedRequest`], an Axum extractor that parses
+//! an incoming request body, runs the full WebAuthn verification chain
+//! including the channel binding check, and returns a struct the route
+//! handler can use to look up the credential and access the operation payload.
+//!
+//! Wire format for authenticated requests:
+//!
+//! ```json
+//! {
+//!   "server_random": "<b64 16B>",
+//!   "credential_id": "<b64>",
+//!   "user_key":      "<b64 32B>",
+//!   "user_key_next": "<b64 32B>",   // optional, for write-rotation operations
+//!   "prf_salt_next": "<b64 32B>",   // optional, paired with user_key_next
+//!   "assertion": {
+//!     "authenticator_data": "<b64>",
+//!     "client_data_json":   "<b64>",
+//!     "signature":          "<b64>"
+//!   },
+//!   /* ... operation-specific fields ... */
+//! }
+//! ```
+
 pub mod challenge;
 pub mod nonce;
 pub mod webauthn;
@@ -7,188 +32,267 @@ use std::fs;
 use std::sync::Arc;
 
 use axum::{
-    extract::{FromRequest, Request},
     body::Bytes,
+    extract::{FromRequest, Request},
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use zeroize::Zeroize;
 
-use crate::crypto::ecies::e2e_decrypt;
-use crate::crypto::keys::jwk_sk_d_bytes;
+use crate::crypto::binding::{binding_for_request, DOMAIN_STANDARD};
 use crate::error::{AppError, Result};
 use crate::state::AppState;
-use self::webauthn::{verify_assertion, AssertionData};
 
-/// Passkey entry as stored in passkeys.json
+use self::webauthn::{verify_assertion, AssertionData, AssertionKind};
+
+/// Passkey entry as stored in `data/passkeys.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PasskeyEntry {
-    pub x: String, // standard base64
-    pub y: String, // standard base64
+    pub x: String,
+    pub y: String,
     #[serde(rename = "deviceName", default)]
     pub device_name: String,
     #[serde(rename = "createdAt", default)]
     pub created_at: u64,
 }
 
-/// Result of a successful authenticated request
+/// An authenticated request extracted from an incoming HTTP POST.
+///
+/// The presence of this struct in a route handler parameter list triggers full
+/// verification including channel binding. On any failure, the Axum extractor
+/// returns `401 Unauthorized` before the handler runs.
 pub struct AuthenticatedRequest {
-    /// Decrypted inner payload as JSON
-    pub payload: Value,
-    /// Credential ID of the authenticating passkey
+    /// HTTP method (for introspection; the binding check already consumed it).
+    pub method: String,
+    /// URL path.
+    pub path: String,
+    /// Credential ID as base64 (matches the key in `passkeys.json`).
     pub credential_id: String,
-    /// Full passkeys map from passkeys.json
+    /// Credential ID as raw bytes (for domain separators).
+    pub credential_id_bytes: Vec<u8>,
+    /// 32-byte client-derived userKey for the acting credential's current salt.
+    pub user_key: Vec<u8>,
+    /// 32-byte client-derived userKey for the acting credential's next salt.
+    /// Present on write-rotation operations.
+    pub user_key_next: Option<Vec<u8>>,
+    /// 32-byte fresh prf_salt for the next rotation. Paired with `user_key_next`.
+    pub prf_salt_next: Option<[u8; 32]>,
+    /// Server-issued one-time challenge consumed by this request.
+    pub server_random: Vec<u8>,
+    /// Full parsed body as JSON (including `assertion`, `user_key`, etc.).
+    pub payload: Value,
+    /// Loaded passkeys map from `passkeys.json`, cached for the handler's use.
     pub passkeys: HashMap<String, PasskeyEntry>,
 }
 
 impl AuthenticatedRequest {
-    /// Get a field from the inner payload
+    /// Access a top-level payload field as a string.
     pub fn get_str(&self, key: &str) -> Result<&str> {
         self.payload
             .get(key)
             .and_then(|v| v.as_str())
-            .ok_or_else(|| AppError::BadRequest(format!("Missing field '{}' in payload", key)))
+            .ok_or_else(|| AppError::BadRequest(format!("missing field '{}' in payload", key)))
     }
 
-    /// Get the replay-protection value (challenge or nonce) as base64 string.
-    /// Used as salt for response_key derivation.
-    pub fn replay_token_b64(&self) -> Result<&str> {
-        self.payload
-            .get("challenge")
-            .or_else(|| self.payload.get("nonce"))
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| AppError::BadRequest("Missing 'challenge' or 'nonce' in payload".into()))
+    /// Access a top-level payload field by key (returns None if absent).
+    pub fn get(&self, key: &str) -> Option<&Value> {
+        self.payload.get(key)
     }
 }
 
-/// Axum extractor that performs the full auth flow:
-///   1. Read body → parse { payload: base64 }
-///   2. Base64-decode payload → JSON bytes (E2E wire format)
-///   3. E2E decrypt using VM private key
-///   4. Parse inner JSON → extract { nonce, credentialId, assertion }
-///   5. Check nonce (in-memory HashSet)
-///   6. Load passkey (x, y) from passkeys.json
-///   7. Verify WebAuthn P-256 assertion
+impl Drop for AuthenticatedRequest {
+    fn drop(&mut self) {
+        self.user_key.zeroize();
+        if let Some(uk) = self.user_key_next.as_mut() {
+            uk.zeroize();
+        }
+        self.prf_salt_next.as_mut().map(|s| s.zeroize());
+    }
+}
+
 impl FromRequest<Arc<AppState>> for AuthenticatedRequest {
     type Rejection = AppError;
 
-    async fn from_request(req: Request, state: &Arc<AppState>) -> std::result::Result<Self, Self::Rejection> {
-        // Read body bytes
+    async fn from_request(
+        req: Request,
+        state: &Arc<AppState>,
+    ) -> std::result::Result<Self, Self::Rejection> {
+        let method = req.method().clone();
+        let path = req.uri().path().to_string();
+
         let bytes = Bytes::from_request(req, state)
             .await
-            .map_err(|_| AppError::BadRequest("Failed to read request body".into()))?;
+            .map_err(|_| AppError::BadRequest("failed to read body".into()))?;
 
-        authenticate_bytes(&bytes, state)
+        authenticate_bytes(&method.to_string(), &path, &bytes, state, DOMAIN_STANDARD)
     }
 }
 
-/// Core authentication logic, extracted so routes can call it with pre-read body bytes too
-pub fn authenticate_bytes(bytes: &[u8], state: &Arc<AppState>) -> Result<AuthenticatedRequest> {
-    // Parse outer body: { payload: base64 }
-    let outer: serde_json::Value = serde_json::from_slice(bytes)
-        .map_err(|_| AppError::BadRequest("Invalid JSON body".into()))?;
+/// Core authentication logic. Exposed so route handlers that pre-read the body
+/// (or that need to pass a non-standard binding domain) can call it directly.
+pub fn authenticate_bytes(
+    method: &str,
+    path: &str,
+    body_bytes: &[u8],
+    state: &Arc<AppState>,
+    domain: &[u8],
+) -> Result<AuthenticatedRequest> {
+    // 1. Parse body as JSON.
+    let payload: Value = serde_json::from_slice(body_bytes)
+        .map_err(|_| AppError::BadRequest("body is not valid JSON".into()))?;
 
-    let payload_b64 = outer
-        .get("payload")
+    // 2. Extract required fields.
+    let server_random_b64 = payload
+        .get("server_random")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| AppError::BadRequest("Missing 'payload' field in body".into()))?;
-
-    // Decode base64 → E2E wire bytes
-    let wire_bytes = STANDARD
-        .decode(payload_b64)
-        .map_err(|e| AppError::BadRequest(format!("Invalid payload base64: {}", e)))?;
-
-    // E2E decrypt
-    let sk_d = jwk_sk_d_bytes(&state.keypair.sk)?;
-    let plaintext = e2e_decrypt(&wire_bytes, &sk_d)?;
-
-    // Parse inner payload
-    let inner: Value = serde_json::from_slice(&plaintext)
-        .map_err(|_| AppError::BadRequest("Decrypted payload is not valid JSON".into()))?;
-
-    // Extract required fields
-    let credential_id = inner
-        .get("credentialId")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| AppError::BadRequest("Missing 'credentialId' in decrypted payload".into()))?
+        .ok_or_else(|| AppError::BadRequest("missing server_random".into()))?
         .to_string();
+    let credential_id = payload
+        .get("credential_id")
+        .or_else(|| payload.get("credentialId"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| AppError::BadRequest("missing credential_id".into()))?
+        .to_string();
+    let user_key_b64 = payload
+        .get("user_key")
+        .or_else(|| payload.get("userKey"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| AppError::BadRequest("missing user_key".into()))?
+        .to_string();
+    let assertion_val = payload
+        .get("assertion")
+        .cloned()
+        .ok_or_else(|| AppError::BadRequest("missing assertion".into()))?;
 
-    // Dual-track replay protection:
-    //   "challenge" → server-issued (daily ops: unlock, vault, approve, etc.)
-    //   "nonce"     → client-generated (setup only, append-only file on disk)
-    let challenge_b64 = inner.get("challenge").and_then(|v| v.as_str());
-    let nonce_b64 = inner.get("nonce").and_then(|v| v.as_str());
+    let server_random = STANDARD
+        .decode(&server_random_b64)
+        .map_err(|_| AppError::BadRequest("server_random not base64".into()))?;
+    if server_random.len() != 16 {
+        return Err(AppError::BadRequest("server_random must be 16 bytes".into()));
+    }
 
-    match (challenge_b64, nonce_b64) {
-        (Some(c), _) => {
-            // Server challenge path: verify against issued challenges
-            let mut store = state.challenges.lock().unwrap();
-            if !store.verify(c) {
-                return Err(AppError::BadRequest("Invalid or expired challenge".into()));
-            }
+    let credential_id_bytes = STANDARD
+        .decode(&credential_id)
+        .map_err(|_| AppError::BadRequest("credential_id not base64".into()))?;
+
+    let mut user_key = STANDARD
+        .decode(&user_key_b64)
+        .map_err(|_| AppError::BadRequest("user_key not base64".into()))?;
+    if user_key.len() != 32 {
+        user_key.zeroize();
+        return Err(AppError::BadRequest("user_key must be 32 bytes".into()));
+    }
+
+    // 3. Optional write-rotation fields.
+    let user_key_next = if let Some(uk_next_b64) = payload
+        .get("user_key_next")
+        .or_else(|| payload.get("userKeyNext"))
+        .and_then(|v| v.as_str())
+    {
+        let mut uk = STANDARD
+            .decode(uk_next_b64)
+            .map_err(|_| AppError::BadRequest("user_key_next not base64".into()))?;
+        if uk.len() != 32 {
+            uk.zeroize();
+            return Err(AppError::BadRequest("user_key_next must be 32 bytes".into()));
         }
-        (None, Some(n)) => {
-            // Client nonce path (setup): verify via in-memory nonce store
-            let nonce_bytes = STANDARD
-                .decode(n)
-                .map_err(|e| AppError::BadRequest(format!("Invalid nonce base64: {}", e)))?;
+        Some(uk)
+    } else {
+        None
+    };
 
-            if nonce_bytes.len() < 16 {
-                return Err(AppError::BadRequest(format!(
-                    "Nonce too short: {} bytes (minimum 16)", nonce_bytes.len()
-                )));
-            }
-
-            let mut nonce_store = state.nonces.lock().unwrap();
-            if !nonce_store.check_and_insert(&nonce_bytes) {
-                return Err(AppError::BadRequest("Nonce already used".into()));
-            }
+    let prf_salt_next = if let Some(ps_next_b64) = payload
+        .get("prf_salt_next")
+        .or_else(|| payload.get("prfSaltNext"))
+        .and_then(|v| v.as_str())
+    {
+        let ps = STANDARD
+            .decode(ps_next_b64)
+            .map_err(|_| AppError::BadRequest("prf_salt_next not base64".into()))?;
+        if ps.len() != 32 {
+            return Err(AppError::BadRequest("prf_salt_next must be 32 bytes".into()));
         }
-        (None, None) => {
-            return Err(AppError::BadRequest(
-                "Missing 'challenge' or 'nonce' in decrypted payload".into(),
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&ps);
+        Some(arr)
+    } else {
+        None
+    };
+
+    // user_key_next and prf_salt_next must appear together.
+    if user_key_next.is_some() != prf_salt_next.is_some() {
+        return Err(AppError::BadRequest(
+            "user_key_next and prf_salt_next must be provided together".into(),
+        ));
+    }
+
+    // 4. Consume server_random from ChallengeStore.
+    {
+        let mut store = state.challenges.lock().unwrap();
+        if !store.verify(&server_random_b64) {
+            return Err(AppError::Unauthorized(
+                "invalid or expired server_random".into(),
             ));
         }
     }
 
-    // Load passkeys.json
+    // 5. Compute expected binding from the actual request.
+    let expected_binding = binding_for_request(domain, &server_random, method, path, &payload);
+
+    // 6. Look up credential in passkeys.json.
     let passkeys_path = state.config.data_dir.join("passkeys.json");
     if !passkeys_path.exists() {
-        return Err(AppError::Unauthorized("Not set up — no passkeys registered".into()));
+        return Err(AppError::Unauthorized(
+            "no passkeys registered on this instance".into(),
+        ));
     }
     let passkeys: HashMap<String, PasskeyEntry> =
         serde_json::from_str(&fs::read_to_string(&passkeys_path)?)
-            .map_err(|e| AppError::Internal(format!("Failed to parse passkeys.json: {}", e)))?;
-
-    // Look up the credential
+            .map_err(|e| AppError::Internal(format!("passkeys.json: {}", e)))?;
     let entry = passkeys
         .get(&credential_id)
-        .ok_or_else(|| AppError::Unauthorized("Unknown credential ID".into()))?;
+        .ok_or_else(|| AppError::Unauthorized("unknown credential".into()))?;
 
-    // Extract assertion from inner payload
-    let assertion: AssertionData = serde_json::from_value(
-        inner
-            .get("assertion")
-            .cloned()
-            .ok_or_else(|| AppError::BadRequest("Missing 'assertion' in decrypted payload".into()))?,
-    )
-    .map_err(|e| AppError::BadRequest(format!("Invalid assertion format: {}", e)))?;
-
-    // Verify assertion — x and y coordinates are required for signature verification
     if entry.x.is_empty() || entry.y.is_empty() {
-        return Err(AppError::Unauthorized("Passkey has missing coordinates — cannot verify".into()));
+        return Err(AppError::Unauthorized(
+            "credential missing public key coordinates".into(),
+        ));
     }
+
+    // 7. Parse and verify the assertion.
+    let assertion: AssertionData = serde_json::from_value(assertion_val.clone())
+        .map_err(|e| AppError::BadRequest(format!("invalid assertion: {}", e)))?;
+
+    // Defense: if the assertion carries a credentialId, it must match.
+    if let Some(ref a_cred_id) = assertion.credential_id {
+        if a_cred_id != &credential_id {
+            return Err(AppError::Unauthorized(
+                "assertion.credentialId != credential_id".into(),
+            ));
+        }
+    }
+
     verify_assertion(
         &assertion,
         &entry.x,
         &entry.y,
         &state.config.effective_origin(),
         &state.config.effective_rp_id(),
+        &expected_binding,
+        AssertionKind::Get,
     )?;
 
     Ok(AuthenticatedRequest {
-        payload: inner,
+        method: method.to_string(),
+        path: path.to_string(),
         credential_id,
+        credential_id_bytes,
+        user_key,
+        user_key_next,
+        prf_salt_next,
+        server_random,
+        payload,
         passkeys,
     })
 }
