@@ -85,6 +85,9 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/vault/services/add", post(vault_services_add))
         .route("/vault/services/remove", post(vault_services_remove))
 
+        // ── Vault Env ───────────────────────────────────────────────────
+        .route("/vault/env/update", post(vault_env_update))
+
         // ── Policy Defaults ──────────────────────────────────────────────────
         .route("/vault/policy", get(vault_policy_get))
         .route("/vault/policy/update", post(vault_policy_update))

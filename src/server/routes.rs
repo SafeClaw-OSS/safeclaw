@@ -1082,6 +1082,105 @@ pub async fn vault_services_remove(
     Ok(Json(json!({ "ok": true })))
 }
 
+// ── Vault Env CRUD ────────────────────────────────────────────────────────────
+
+/// POST /vault/env/update — update environment variables (passkey required)
+///
+/// Payload: { env: { "KEY": "value", ... } }
+/// Replaces the vault's top-level `env` object, then dispatches a minimal cook
+/// that writes openclaw.env and recreates the container (no service recipe re-runs).
+pub async fn vault_env_update(
+    State(state): State<Arc<AppState>>,
+    auth: AuthenticatedRequest,
+) -> Result<impl IntoResponse> {
+    let env = auth
+        .payload
+        .get("env")
+        .cloned()
+        .ok_or_else(|| AppError::BadRequest("Missing env object".into()))?;
+
+    // Validate: must be an object with string keys/values
+    let env_map = env
+        .as_object()
+        .ok_or_else(|| AppError::BadRequest("env must be a JSON object".into()))?;
+
+    for (key, val) in env_map {
+        // Key: standard env var naming
+        if key.is_empty()
+            || key.starts_with(|c: char| c.is_ascii_digit())
+            || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            return Err(AppError::BadRequest(format!(
+                "Invalid env var name: {key} (must match [A-Za-z_][A-Za-z0-9_]*)"
+            )));
+        }
+        // Value: must be string, no newlines
+        let val_str = val
+            .as_str()
+            .ok_or_else(|| AppError::BadRequest(format!("env var {key} value must be a string")))?;
+        if val_str.contains('\n') || val_str.contains('\r') {
+            return Err(AppError::BadRequest(format!(
+                "env var {key} value must not contain newlines"
+            )));
+        }
+    }
+
+    with_vault_mut(&state, &auth, |vault_data| {
+        if env_map.is_empty() {
+            vault_data.as_object_mut().unwrap().remove("env");
+        } else {
+            vault_data["env"] = env.clone();
+        }
+        Ok(())
+    })?;
+
+    // Dispatch env-only cook (writes openclaw.env + recreates container)
+    if let Some(vault_data) = state.vault.plaintext.lock().unwrap().clone() {
+        dispatch_env_cook(vault_data);
+    }
+
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// Dispatch a minimal cook that only writes the openclaw.env file and recreates
+/// the container. No service recipes are re-run.
+fn dispatch_env_cook(vault_data: serde_json::Value) {
+    tokio::spawn(async move {
+        let mut env_content = String::new();
+        if let Some(env_map) = vault_data.get("env").and_then(|v| v.as_object()) {
+            let mut keys: Vec<&String> = env_map.keys().collect();
+            keys.sort();
+            for key in keys {
+                if let Some(val) = env_map.get(key).and_then(|v| v.as_str()) {
+                    env_content.push_str(&format!("{}={}\n", key, val));
+                }
+            }
+        }
+
+        let steps = vec![serde_json::json!({
+            "title": "Write openclaw.env",
+            "target": "host",
+            "host_files": [{
+                "path": "/opt/safeclaw/data/openclaw.env",
+                "content": env_content
+            }],
+            "recreate_openclaw": true
+        })];
+
+        let provisioner_host = if std::path::Path::new("/.dockerenv").exists() {
+            "host.docker.internal"
+        } else {
+            "localhost"
+        };
+        let _ = reqwest::Client::new()
+            .post(format!("http://{}:23296/cook", provisioner_host))
+            .timeout(std::time::Duration::from_secs(120))
+            .json(&serde_json::json!({ "steps": steps }))
+            .send()
+            .await;
+    });
+}
+
 // ── Policy Defaults ────────────────────────────────────────────────────────────
 
 /// GET /vault/policy — read policy defaults (no passkey)
