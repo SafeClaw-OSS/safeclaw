@@ -865,11 +865,13 @@ fn dispatch_cook(vault_data: serde_json::Value, proxy_port: u16, console_url: St
         if let Some(svcs) = vault_data.get("services").and_then(|s| s.as_object()) {
             let relay_ip = std::env::var("SAFECLAW_RELAY_EGRESS_IP").unwrap_or_default();
             let resolve = |s: &str, svc_id: &str, svc_data: &serde_json::Value| -> std::result::Result<String, String> {
+                let safeclaw_origin = std::env::var("SAFECLAW_ORIGIN").unwrap_or_default();
                 let mut result = s.replace("{{safeclaw.proxy_port}}", &proxy_port.to_string())
                     .replace("{{safeclaw.admin_port}}", &console_url.split(':').last().unwrap_or("23294"))
                     .replace("{{safeclaw.admin_url}}", &console_url)
                     .replace("{{safeclaw.instance_id}}", &instance_id)
                     .replace("{{safeclaw.relay_egress_ip}}", &relay_ip)
+                    .replace("{{safeclaw.origin}}", &safeclaw_origin)
                     .replace("{{service.id}}", svc_id);
                 // Resolve {{service.vault.KEY}} — dotted keys for nested access
                 while let Some(start) = result.find("{{service.vault.") {
