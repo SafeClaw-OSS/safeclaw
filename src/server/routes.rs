@@ -1158,13 +1158,9 @@ fn dispatch_env_cook(vault_data: serde_json::Value) {
         }
 
         let steps = vec![serde_json::json!({
-            "title": "Write openclaw.env",
-            "target": "host",
-            "host_files": [{
-                "path": "/opt/safeclaw/data/openclaw.env",
-                "content": env_content
-            }],
-            "recreate_openclaw": true
+            "title": "Update runtime env",
+            "target": "openclaw",
+            "runtime_env": env_content
         })];
 
         let provisioner_host = if std::path::Path::new("/.dockerenv").exists() {
