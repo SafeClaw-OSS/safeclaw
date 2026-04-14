@@ -3,24 +3,9 @@ id = "telegram"
 display_name = "Telegram"
 
 [[steps]]
-title = "Set Telegram bot token"
+title = "Configure Telegram channel + elevated tools (batch)"
 target = "openclaw"
-run = "openclaw config set channels.telegram.botToken {{service.vault.auth.secret}}"
-
-[[steps]]
-title = "Set Telegram owner allow list"
-target = "openclaw"
-run = "openclaw config set channels.telegram.allowFrom '[\"{{service.vault.ownerId}}\"]' --strict-json"
-
-[[steps]]
-title = "Allow owner to use elevated tools via Telegram"
-target = "openclaw"
-run = "openclaw config set tools.elevated.allowFrom.telegram '[\"{{service.vault.ownerId}}\"]' --strict-json"
-
-[[steps]]
-title = "Enable Telegram channel"
-target = "openclaw"
-run = "openclaw config set channels.telegram.enabled true --strict-json"
+run = """openclaw config set --batch-json '[{"path":"channels.telegram.enabled","value":true},{"path":"channels.telegram.botToken","value":"{{service.vault.auth.secret}}"},{"path":"channels.telegram.allowFrom","value":["{{service.vault.ownerId}}"]},{"path":"channels.telegram.groupPolicy","value":"open"},{"path":"channels.telegram.groupAllowFrom","value":["{{service.vault.ownerId}}"]},{"path":"channels.telegram.reactionLevel","value":"minimal"},{"path":"channels.telegram.ackReaction","value":"👀"},{"path":"tools.elevated.allowFrom.telegram","value":["{{service.vault.ownerId}}"]}]' --strict-json"""
 
 [[steps]]
 title = "Restart OpenClaw"
