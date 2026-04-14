@@ -7,25 +7,20 @@ display_name = "OpenClaw Runtime"
 # a temp container, so no auto-reload races occur regardless of gateway's
 # file-watcher behavior.
 
+# ── Runtime config (batch) ───────────────────────────────────────────────────
+# - gateway.mode=local: non-interactive mode
+# - models.mode=replace: disable built-in catalog (800+ models)
+# - agents.defaults.thinkingDefault=adaptive: auto-pick thinking mode
+# - messages.ackReactionScope=all: react to both DMs and group messages
+# - messages.groupChat.mentionPatterns=[".*"]: treat every group message as a
+#   mention so owner doesn't need to @-tag the bot. Safe because each channel
+#   recipe sets groupAllowFrom=[ownerId], so only owner messages reach here.
+# - tools.elevated.enabled=true: allow elevated tools (per-channel allowFrom
+#   set by each channel recipe, e.g. tools.elevated.allowFrom.telegram)
 [[steps]]
-title = "Set gateway mode to local (non-interactive)"
+title = "Runtime config (batch)"
 target = "openclaw"
-run = "openclaw config set gateway.mode local"
-
-# ── Model catalog ────────────────────────────────────────────────────────────
-# Replace built-in model list (800+ models) with only SafeClaw-registered providers.
-
-[[steps]]
-title = "Disable built-in model catalog"
-target = "openclaw"
-run = "openclaw config set models.mode replace"
-
-# ── Agent defaults ───────────────────────────────────────────────────────────
-
-[[steps]]
-title = "Set default thinking mode"
-target = "openclaw"
-run = "openclaw config set agents.defaults.thinkingDefault adaptive"
+run = """openclaw config set --batch-json '[{"path":"gateway.mode","value":"local"},{"path":"models.mode","value":"replace"},{"path":"agents.defaults.thinkingDefault","value":"adaptive"},{"path":"messages.ackReactionScope","value":"all"},{"path":"messages.groupChat.mentionPatterns","value":[".*"]},{"path":"tools.elevated.enabled","value":true}]' --strict-json"""
 
 # ── Exec approvals ───────────────────────────────────────────────────────────
 # VM is sandboxed and has no terminal; SafeClaw handles auth at the proxy layer.
@@ -34,13 +29,3 @@ run = "openclaw config set agents.defaults.thinkingDefault adaptive"
 title = "Disable exec approval prompts (headless VM)"
 target = "openclaw"
 files = [{ path = ".openclaw/exec-approvals.json", content = '{"version":1,"defaults":{"security":"full","ask":"off","autoAllowSkills":true}}' }]
-
-# ── Elevated tools ───────────────────────────────────────────────────────────
-# Enable elevated tool access globally. Per-channel allowFrom is set by each
-# channel recipe (e.g. telegram adds owner to tools.elevated.allowFrom.telegram).
-# Safe here because SafeClaw VMs are single-owner, isolated, disposable.
-
-[[steps]]
-title = "Enable elevated tool access"
-target = "openclaw"
-run = "openclaw config set tools.elevated.enabled true --strict-json"
