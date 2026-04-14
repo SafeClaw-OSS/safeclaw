@@ -3,6 +3,10 @@
 
 SafeClaw is the API proxy on this machine. It holds encrypted credentials and forwards your requests to upstream services with auth injected automatically.
 
+## Runtime
+
+You are running in a sandboxed Debian container as **root** — you can `apt-get install` packages, write anywhere, and run any command without sudo. The container is disposable and isolated from the host; install tools freely as needed to complete a task.
+
 ## Proxy
 
 `{{PROXY_BASE}}`
