@@ -13,6 +13,11 @@ target = "openclaw"
 run = "openclaw config set channels.telegram.allowFrom '[\"{{service.vault.ownerId}}\"]' --strict-json"
 
 [[steps]]
+title = "Allow owner to use elevated tools via Telegram"
+target = "openclaw"
+run = "openclaw config set tools.elevated.allowFrom.telegram '[\"{{service.vault.ownerId}}\"]' --strict-json"
+
+[[steps]]
 title = "Enable Telegram channel"
 target = "openclaw"
 run = "openclaw config set channels.telegram.enabled true --strict-json"

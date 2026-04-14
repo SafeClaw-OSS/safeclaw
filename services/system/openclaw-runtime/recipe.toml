@@ -34,3 +34,13 @@ run = "openclaw config set agents.defaults.thinkingDefault adaptive"
 title = "Disable exec approval prompts (headless VM)"
 target = "openclaw"
 files = [{ path = ".openclaw/exec-approvals.json", content = '{"version":1,"defaults":{"security":"full","ask":"off","autoAllowSkills":true}}' }]
+
+# ── Elevated tools ───────────────────────────────────────────────────────────
+# Enable elevated tool access globally. Per-channel allowFrom is set by each
+# channel recipe (e.g. telegram adds owner to tools.elevated.allowFrom.telegram).
+# Safe here because SafeClaw VMs are single-owner, isolated, disposable.
+
+[[steps]]
+title = "Enable elevated tool access"
+target = "openclaw"
+run = "openclaw config set tools.elevated.enabled true --strict-json"
