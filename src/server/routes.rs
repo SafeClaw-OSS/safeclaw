@@ -1204,6 +1204,122 @@ pub async fn vault_policy_update(
     Ok(Json(json!({ "ok": true })))
 }
 
+// ── Per-service Policy ─────────────────────────────────────────────────────────
+
+/// GET /vault/services/:name/policy — read built-in rules + per-id overrides.
+/// No passkey required (same access model as /vault/policy).
+pub async fn vault_service_policy_get(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> Result<impl IntoResponse> {
+    // Service must exist in the registry
+    if state.services.all().get(&name).is_none() {
+        return Err(AppError::NotFound);
+    }
+
+    let category = state.services.default_category(&name).to_string();
+
+    // Built-in defaults from policy.toml / service.toml
+    let default_levels = state.services.default_policy_levels(&name);
+    let default_rules = state.services.default_policy_rules(&name).unwrap_or_default();
+
+    // Overrides from vault.enc
+    let rule_overrides = {
+        let plaintext = state.vault.plaintext.lock().unwrap();
+        plaintext.as_ref()
+            .and_then(|p| p.get("services"))
+            .and_then(|s| s.get(&name))
+            .and_then(|svc| svc.get("rule_overrides"))
+            .cloned()
+            .unwrap_or_else(|| json!({}))
+    };
+
+    Ok(Json(json!({
+        "name": name,
+        "category": category,
+        "defaults": {
+            "levels": default_levels,
+            "rules": default_rules,
+        },
+        "overrides": {
+            "rule_overrides": rule_overrides,
+        },
+    })))
+}
+
+/// POST /vault/services/:name/policy/update — write per-id rule overrides (passkey required).
+/// Payload: `{ "rule_overrides": { "send-email": { "level": "ask", "ask_ttl": null } } }`
+/// or `{ "rule_overrides": null }` / `{}` to clear all overrides for the service.
+pub async fn vault_service_policy_update(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+    auth: AuthenticatedRequest,
+) -> Result<impl IntoResponse> {
+    // Service must exist in the registry
+    if state.services.all().get(&name).is_none() {
+        return Err(AppError::NotFound);
+    }
+
+    // Validate payload: each override must parse as RuleOverride.
+    // We accept `null`, missing, or empty object as "clear overrides".
+    let overrides_val = auth.payload.get("rule_overrides").cloned();
+    let overrides_obj: Option<serde_json::Map<String, Value>> = match overrides_val {
+        None | Some(Value::Null) => None,
+        Some(Value::Object(map)) if map.is_empty() => None,
+        Some(Value::Object(map)) => {
+            // Validate each entry
+            for (id, v) in &map {
+                if id.is_empty() || id.len() > 64 {
+                    return Err(AppError::BadRequest(format!("invalid override id: '{}'", id)));
+                }
+                let _: crate::core::policy::RuleOverride = serde_json::from_value(v.clone())
+                    .map_err(|e| AppError::BadRequest(format!("invalid override for '{}': {}", id, e)))?;
+            }
+            // Validate that every id corresponds to a built-in rule id for this service
+            let built_in_ids: std::collections::HashSet<String> = state
+                .services
+                .default_policy_rules(&name)
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|r| r.id)
+                .collect();
+            for id in map.keys() {
+                if !built_in_ids.contains(id) {
+                    return Err(AppError::BadRequest(format!(
+                        "rule id '{}' is not a built-in rule for service '{}'", id, name
+                    )));
+                }
+            }
+            Some(map)
+        }
+        _ => return Err(AppError::BadRequest("rule_overrides must be an object or null".into())),
+    };
+
+    let service_name = name.clone();
+    with_vault_mut(&state, &auth, move |vault_data| {
+        let services = vault_data
+            .get_mut("services")
+            .and_then(|s| s.as_object_mut())
+            .ok_or_else(|| AppError::Internal("Vault missing 'services' object".into()))?;
+
+        // Ensure a service entry exists so overrides can persist even before `add`.
+        let entry = services
+            .entry(service_name.clone())
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        let obj = entry
+            .as_object_mut()
+            .ok_or_else(|| AppError::Internal("Service entry is not an object".into()))?;
+
+        match overrides_obj {
+            Some(map) => { obj.insert("rule_overrides".into(), Value::Object(map)); }
+            None => { obj.remove("rule_overrides"); }
+        }
+        Ok(())
+    })?;
+
+    Ok(Json(json!({ "ok": true })))
+}
+
 // ── Files ──────────────────────────────────────────────────────────────────────
 
 /// Validate file name: reject path traversal, absolute paths, hidden files.

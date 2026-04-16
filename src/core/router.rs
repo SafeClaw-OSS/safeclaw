@@ -111,6 +111,7 @@ async fn proxy_poll_approval(
                 auth: auth_config,
                 levels: None,
                 rules: None,
+                rule_overrides: None,
                 category: None,
             };
 
@@ -431,9 +432,19 @@ async fn proxy_handler(
     let toml_levels = state.services.default_policy_levels(&route_service);
     let effective_levels = service_vault.levels.as_ref()
         .or(toml_levels.as_ref());
-    // Merge rules: vault rules take priority, then service.toml/policy.toml defaults
+    // Merge rules:
+    //   1. vault `rules` (fully custom list) takes priority if set
+    //   2. else: built-in policy.toml rules, patched by vault `rule_overrides` (sparse, by id)
     let toml_rules = state.services.default_policy_rules(&route_service);
+    let merged_from_overrides: Option<Vec<crate::core::policy::PolicyRule>> =
+        match (&service_vault.rule_overrides, &toml_rules) {
+            (Some(overrides), Some(base)) if !overrides.is_empty() => {
+                Some(crate::core::policy::merge_rule_overrides(base, overrides))
+            }
+            _ => None,
+        };
     let effective_rules = service_vault.rules.as_ref()
+        .or(merged_from_overrides.as_ref())
         .or(toml_rules.as_ref());
     let body_text = if body_bytes.is_empty() { None } else {
         Some(String::from_utf8_lossy(&body_bytes))

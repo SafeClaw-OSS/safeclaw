@@ -730,6 +730,7 @@ mod tests {
                 auth: None,
                 levels: None,
                 rules: None,
+                rule_overrides: None,
                 category: None,
             };
             let result = crate::core::router::execute_command(
@@ -751,6 +752,7 @@ mod tests {
                 auth: None,
                 levels: None,
                 rules: None,
+                rule_overrides: None,
                 category: None,
             };
             let result = crate::core::router::execute_command(
@@ -772,6 +774,7 @@ mod tests {
                 auth: None,
                 levels: None,
                 rules: None,
+                rule_overrides: None,
                 category: None,
             };
             let result = crate::core::router::execute_command(

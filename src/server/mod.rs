@@ -92,6 +92,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/vault/policy", get(vault_policy_get))
         .route("/vault/policy/update", post(vault_policy_update))
 
+        // ── Per-service Policy ───────────────────────────────────────────────
+        .route("/vault/services/{name}/policy", get(vault_service_policy_get))
+        .route("/vault/services/{name}/policy/update", post(vault_service_policy_update))
+
         // ── Files ────────────────────────────────────────────────────────────
         .route("/vault/files", get(vault_files_list))
         // /help is handled generically by the proxy layer (GET /{service}/help)

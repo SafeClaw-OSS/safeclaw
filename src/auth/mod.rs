@@ -9,7 +9,8 @@ pub mod query;
 pub mod path;
 pub mod oauth2;
 
-use crate::core::policy::{PolicyRule, ServiceLevels};
+use std::collections::HashMap;
+use crate::core::policy::{PolicyRule, RuleOverride, ServiceLevels};
 
 // ── Vault Types ──────────────────────────────────────────────────────────────
 
@@ -22,8 +23,13 @@ pub struct ServiceVault {
     pub auth: Option<AuthConfig>,
     /// Per-service access levels (optional; falls back to policy defaults)
     pub levels: Option<ServiceLevels>,
-    /// Per-request rule overrides (optional; most specific match wins)
+    /// Fully custom rule list — replaces built-in policy.toml rules when set.
+    /// For sparse per-rule level edits, prefer `rule_overrides` instead.
     pub rules: Option<Vec<PolicyRule>>,
+    /// Sparse overrides applied on top of built-in policy.toml rules (keyed by rule id).
+    /// Only considered when `rules` is None.
+    #[serde(default)]
+    pub rule_overrides: Option<HashMap<String, RuleOverride>>,
     /// UI display category — "llm" | "channel" | "integration" (default: "integration").
     /// Pure metadata; not used by proxy routing or auth logic.
     #[serde(default)]
