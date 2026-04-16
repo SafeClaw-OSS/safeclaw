@@ -2,32 +2,125 @@
 read = "ask"
 write = "ask-always"
 
+# ── Discover: downgrade reads to allow ──────────────────────────────
 [[rule]]
-id = "list-emails"
+id = "list-messages"
 label = "List emails"
-match = "GET /gmail/v1/users/me/messages"
+match = "GET /gmail/v1/users/*/messages"
 level = "allow"
 
 [[rule]]
-id = "read-email"
-label = "Read email content"
-match = "GET /gmail/v1/users/me/messages/*"
-level = "ask"
+id = "list-threads"
+label = "List email threads"
+match = "GET /gmail/v1/users/*/threads"
+level = "allow"
 
 [[rule]]
 id = "list-labels"
 label = "List labels"
-match = "GET /gmail/v1/users/me/labels"
+match = "GET /gmail/v1/users/*/labels"
 level = "allow"
 
 [[rule]]
-id = "send-email"
-label = "Send email"
-match = "POST /gmail/v1/users/me/messages/send"
-level = "ask-always"
+id = "read-label"
+label = "Get label info"
+match = "GET /gmail/v1/users/*/labels/*"
+level = "allow"
 
 [[rule]]
-id = "delete-email"
-label = "Delete email"
-match = "DELETE /gmail/v1/users/me/messages/*"
+id = "list-drafts"
+label = "List drafts"
+match = "GET /gmail/v1/users/*/drafts"
+level = "allow"
+
+[[rule]]
+id = "get-profile"
+label = "Get Gmail profile"
+match = "GET /gmail/v1/users/*/profile"
+level = "allow"
+
+# ── Routine writes: downgrade from ask-always to ask ────────────────
+[[rule]]
+id = "edit-message-labels"
+label = "Change email labels"
+match = "POST /gmail/v1/users/*/messages/*/modify"
+level = "ask"
+
+[[rule]]
+id = "edit-thread-labels"
+label = "Change thread labels"
+match = "POST /gmail/v1/users/*/threads/*/modify"
+level = "ask"
+
+[[rule]]
+id = "trash-message"
+label = "Move email to trash"
+match = "POST /gmail/v1/users/*/messages/*/trash"
+level = "ask"
+
+[[rule]]
+id = "trash-thread"
+label = "Move thread to trash"
+match = "POST /gmail/v1/users/*/threads/*/trash"
+level = "ask"
+
+[[rule]]
+id = "untrash-message"
+label = "Restore email from trash"
+match = "POST /gmail/v1/users/*/messages/*/untrash"
+level = "ask"
+
+[[rule]]
+id = "untrash-thread"
+label = "Restore thread from trash"
+match = "POST /gmail/v1/users/*/threads/*/untrash"
+level = "ask"
+
+[[rule]]
+id = "create-draft"
+label = "Create draft"
+match = "POST /gmail/v1/users/*/drafts"
+level = "ask"
+
+[[rule]]
+id = "edit-draft"
+label = "Edit draft"
+match = "PUT /gmail/v1/users/*/drafts/*"
+level = "ask"
+
+[[rule]]
+id = "delete-draft"
+label = "Delete draft"
+match = "DELETE /gmail/v1/users/*/drafts/*"
+level = "ask"
+
+[[rule]]
+id = "create-label"
+label = "Create label"
+match = "POST /gmail/v1/users/*/labels"
+level = "ask"
+
+[[rule]]
+id = "edit-label"
+label = "Edit label"
+match = "PATCH /gmail/v1/users/*/labels/*"
+level = "ask"
+
+# ── Destructive: deny ───────────────────────────────────────────────
+[[rule]]
+id = "delete-message"
+label = "Permanently delete email"
+match = "DELETE /gmail/v1/users/*/messages/*"
+level = "deny"
+
+[[rule]]
+id = "delete-thread"
+label = "Permanently delete thread"
+match = "DELETE /gmail/v1/users/*/threads/*"
+level = "deny"
+
+[[rule]]
+id = "batch-delete"
+label = "Bulk permanently delete emails"
+match = "POST /gmail/v1/users/*/messages/batchDelete"
 level = "deny"
