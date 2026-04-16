@@ -512,6 +512,12 @@ async fn proxy_handler(
                     serde_json::Value::String(ct.to_string()),
                 );
             }
+            // Full URI incl. query string — lets the frontend surface filters
+            // like ?q=... / ?pageSize=... that otherwise hide in the stripped path.
+            d.insert(
+                "uri_path".to_string(),
+                serde_json::Value::String(uri_path.clone()),
+            );
             if !body_bytes.is_empty() {
                 let preview =
                     String::from_utf8_lossy(&body_bytes[..body_bytes.len().min(2048)]);
