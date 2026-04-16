@@ -77,8 +77,8 @@ pub fn generate_safeclaw_md(vault_data: &serde_json::Value, locked: bool, proxy_
         let names: Vec<String> = not_connected.iter().map(|(_, name)| name.clone()).collect();
         format!(
             "**Need a service that's not connected?** SafeClaw also supports: {}. \
-             Tell the user to connect it in the SafeClaw console (URL above) — \
-             do not configure API keys or credentials yourself.",
+             The user can connect it in the SafeClaw console (URL above) under the Connections tab. \
+             Do not configure credentials yourself — the console handles this.",
             names.join(", ")
         )
     };

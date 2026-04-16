@@ -865,11 +865,13 @@ fn dispatch_cook(vault_data: serde_json::Value, proxy_port: u16, console_url: St
         if let Some(svcs) = vault_data.get("services").and_then(|s| s.as_object()) {
             let relay_ip = std::env::var("SAFECLAW_RELAY_EGRESS_IP").unwrap_or_default();
             let resolve = |s: &str, svc_id: &str, svc_data: &serde_json::Value| -> std::result::Result<String, String> {
+                let safeclaw_origin = std::env::var("SAFECLAW_ORIGIN").unwrap_or_default();
                 let mut result = s.replace("{{safeclaw.proxy_port}}", &proxy_port.to_string())
                     .replace("{{safeclaw.admin_port}}", &console_url.split(':').last().unwrap_or("23294"))
                     .replace("{{safeclaw.admin_url}}", &console_url)
                     .replace("{{safeclaw.instance_id}}", &instance_id)
                     .replace("{{safeclaw.relay_egress_ip}}", &relay_ip)
+                    .replace("{{safeclaw.origin}}", &safeclaw_origin)
                     .replace("{{service.id}}", svc_id);
                 // Resolve {{service.vault.KEY}} — dotted keys for nested access
                 while let Some(start) = result.find("{{service.vault.") {
@@ -1080,6 +1082,101 @@ pub async fn vault_services_remove(
     Ok(Json(json!({ "ok": true })))
 }
 
+// ── Vault Env CRUD ────────────────────────────────────────────────────────────
+
+/// POST /vault/env/update — update environment variables (passkey required)
+///
+/// Payload: { env: { "KEY": "value", ... } }
+/// Replaces the vault's top-level `env` object, then dispatches a minimal cook
+/// that writes openclaw.env and recreates the container (no service recipe re-runs).
+pub async fn vault_env_update(
+    State(state): State<Arc<AppState>>,
+    auth: AuthenticatedRequest,
+) -> Result<impl IntoResponse> {
+    let env = auth
+        .payload
+        .get("env")
+        .cloned()
+        .ok_or_else(|| AppError::BadRequest("Missing env object".into()))?;
+
+    // Validate: must be an object with string keys/values
+    let env_map = env
+        .as_object()
+        .ok_or_else(|| AppError::BadRequest("env must be a JSON object".into()))?;
+
+    for (key, val) in env_map {
+        // Key: standard env var naming
+        if key.is_empty()
+            || key.starts_with(|c: char| c.is_ascii_digit())
+            || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            return Err(AppError::BadRequest(format!(
+                "Invalid env var name: {key} (must match [A-Za-z_][A-Za-z0-9_]*)"
+            )));
+        }
+        // Value: must be string, no newlines
+        let val_str = val
+            .as_str()
+            .ok_or_else(|| AppError::BadRequest(format!("env var {key} value must be a string")))?;
+        if val_str.contains('\n') || val_str.contains('\r') {
+            return Err(AppError::BadRequest(format!(
+                "env var {key} value must not contain newlines"
+            )));
+        }
+    }
+
+    with_vault_mut(&state, &auth, |vault_data| {
+        if env_map.is_empty() {
+            vault_data.as_object_mut().unwrap().remove("env");
+        } else {
+            vault_data["env"] = env.clone();
+        }
+        Ok(())
+    })?;
+
+    // Dispatch env-only cook (writes openclaw.env + recreates container)
+    if let Some(vault_data) = state.vault.plaintext.lock().unwrap().clone() {
+        dispatch_env_cook(vault_data);
+    }
+
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// Dispatch a minimal cook that only writes the openclaw.env file and recreates
+/// the container. No service recipes are re-run.
+fn dispatch_env_cook(vault_data: serde_json::Value) {
+    tokio::spawn(async move {
+        let mut env_content = String::new();
+        if let Some(env_map) = vault_data.get("env").and_then(|v| v.as_object()) {
+            let mut keys: Vec<&String> = env_map.keys().collect();
+            keys.sort();
+            for key in keys {
+                if let Some(val) = env_map.get(key).and_then(|v| v.as_str()) {
+                    env_content.push_str(&format!("{}={}\n", key, val));
+                }
+            }
+        }
+
+        let steps = vec![serde_json::json!({
+            "title": "Update runtime env",
+            "target": "openclaw",
+            "runtime_env": env_content
+        })];
+
+        let provisioner_host = if std::path::Path::new("/.dockerenv").exists() {
+            "host.docker.internal"
+        } else {
+            "localhost"
+        };
+        let _ = reqwest::Client::new()
+            .post(format!("http://{}:23296/cook", provisioner_host))
+            .timeout(std::time::Duration::from_secs(120))
+            .json(&serde_json::json!({ "steps": steps }))
+            .send()
+            .await;
+    });
+}
+
 // ── Policy Defaults ────────────────────────────────────────────────────────────
 
 /// GET /vault/policy — read policy defaults (no passkey)
@@ -1101,6 +1198,122 @@ pub async fn vault_policy_update(
 
     with_vault_mut(&state, &auth, move |vault_data| {
         vault_data["policy_defaults"] = new_defaults;
+        Ok(())
+    })?;
+
+    Ok(Json(json!({ "ok": true })))
+}
+
+// ── Per-service Policy ─────────────────────────────────────────────────────────
+
+/// GET /vault/services/:name/policy — read built-in rules + per-id overrides.
+/// No passkey required (same access model as /vault/policy).
+pub async fn vault_service_policy_get(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> Result<impl IntoResponse> {
+    // Service must exist in the registry
+    if state.services.all().get(&name).is_none() {
+        return Err(AppError::NotFound);
+    }
+
+    let category = state.services.default_category(&name).to_string();
+
+    // Built-in defaults from policy.toml / service.toml
+    let default_levels = state.services.default_policy_levels(&name);
+    let default_rules = state.services.default_policy_rules(&name).unwrap_or_default();
+
+    // Overrides from vault.enc
+    let rule_overrides = {
+        let plaintext = state.vault.plaintext.lock().unwrap();
+        plaintext.as_ref()
+            .and_then(|p| p.get("services"))
+            .and_then(|s| s.get(&name))
+            .and_then(|svc| svc.get("rule_overrides"))
+            .cloned()
+            .unwrap_or_else(|| json!({}))
+    };
+
+    Ok(Json(json!({
+        "name": name,
+        "category": category,
+        "defaults": {
+            "levels": default_levels,
+            "rules": default_rules,
+        },
+        "overrides": {
+            "rule_overrides": rule_overrides,
+        },
+    })))
+}
+
+/// POST /vault/services/:name/policy/update — write per-id rule overrides (passkey required).
+/// Payload: `{ "rule_overrides": { "send-email": { "level": "ask", "ask_ttl": null } } }`
+/// or `{ "rule_overrides": null }` / `{}` to clear all overrides for the service.
+pub async fn vault_service_policy_update(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+    auth: AuthenticatedRequest,
+) -> Result<impl IntoResponse> {
+    // Service must exist in the registry
+    if state.services.all().get(&name).is_none() {
+        return Err(AppError::NotFound);
+    }
+
+    // Validate payload: each override must parse as RuleOverride.
+    // We accept `null`, missing, or empty object as "clear overrides".
+    let overrides_val = auth.payload.get("rule_overrides").cloned();
+    let overrides_obj: Option<serde_json::Map<String, Value>> = match overrides_val {
+        None | Some(Value::Null) => None,
+        Some(Value::Object(map)) if map.is_empty() => None,
+        Some(Value::Object(map)) => {
+            // Validate each entry
+            for (id, v) in &map {
+                if id.is_empty() || id.len() > 64 {
+                    return Err(AppError::BadRequest(format!("invalid override id: '{}'", id)));
+                }
+                let _: crate::core::policy::RuleOverride = serde_json::from_value(v.clone())
+                    .map_err(|e| AppError::BadRequest(format!("invalid override for '{}': {}", id, e)))?;
+            }
+            // Validate that every id corresponds to a built-in rule id for this service
+            let built_in_ids: std::collections::HashSet<String> = state
+                .services
+                .default_policy_rules(&name)
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|r| r.id)
+                .collect();
+            for id in map.keys() {
+                if !built_in_ids.contains(id) {
+                    return Err(AppError::BadRequest(format!(
+                        "rule id '{}' is not a built-in rule for service '{}'", id, name
+                    )));
+                }
+            }
+            Some(map)
+        }
+        _ => return Err(AppError::BadRequest("rule_overrides must be an object or null".into())),
+    };
+
+    let service_name = name.clone();
+    with_vault_mut(&state, &auth, move |vault_data| {
+        let services = vault_data
+            .get_mut("services")
+            .and_then(|s| s.as_object_mut())
+            .ok_or_else(|| AppError::Internal("Vault missing 'services' object".into()))?;
+
+        // Ensure a service entry exists so overrides can persist even before `add`.
+        let entry = services
+            .entry(service_name.clone())
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        let obj = entry
+            .as_object_mut()
+            .ok_or_else(|| AppError::Internal("Service entry is not an object".into()))?;
+
+        match overrides_obj {
+            Some(map) => { obj.insert("rule_overrides".into(), Value::Object(map)); }
+            None => { obj.remove("rule_overrides"); }
+        }
         Ok(())
     })?;
 
@@ -1623,16 +1836,52 @@ pub async fn identity_add_passkey(
         .decode(user_key_b64)
         .map_err(|e| AppError::BadRequest(format!("Invalid userKey: {}", e)))?;
 
-    let new_passkey = auth
+    let sk_d = jwk_sk_d_bytes(&state.keypair.sk)?;
+
+    // Two payload shapes for the new credential:
+    //   inline (in-person two-device flow): payload contains `newPasskey` + `newUserKey`
+    //   deposit (cross-device "Save for later" flow): payload contains `newPasskeyDeposit`,
+    //     an inner ECIES envelope encrypted to vmPk that wraps {newPasskey, newUserKey}.
+    // The deposit path lets a user create a new passkey on Device A (no old-passkey access),
+    // and complete install later from Device B (which has the old passkey). Same crypto
+    // primitives (ECIES + sk_d), no new protocol — just a second decryption layer.
+    let (new_passkey, new_user_key_b64) = if let Some(dep_b64) = auth
         .payload
-        .get("newPasskey")
-        .cloned()
-        .ok_or_else(|| AppError::BadRequest("Missing newPasskey".into()))?;
-    let new_user_key_b64 = auth
-        .payload
-        .get("newUserKey")
+        .get("newPasskeyDeposit")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| AppError::BadRequest("Missing newUserKey".into()))?;
+    {
+        let dep_bytes = STANDARD
+            .decode(dep_b64)
+            .map_err(|e| AppError::BadRequest(format!("Invalid deposit base64: {}", e)))?;
+        let inner_pt = crate::crypto::ecies::e2e_decrypt(&dep_bytes, &sk_d)?;
+        let inner: serde_json::Value = serde_json::from_slice(&inner_pt)
+            .map_err(|_| AppError::BadRequest("Deposit payload is not valid JSON".into()))?;
+        let np = inner
+            .get("newPasskey")
+            .cloned()
+            .ok_or_else(|| AppError::BadRequest("Deposit missing newPasskey".into()))?;
+        let nuk = inner
+            .get("newUserKey")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| AppError::BadRequest("Deposit missing newUserKey".into()))?
+            .to_string();
+        (np, nuk)
+    } else {
+        let np = auth
+            .payload
+            .get("newPasskey")
+            .cloned()
+            .ok_or_else(|| AppError::BadRequest("Missing newPasskey".into()))?;
+        let nuk = auth
+            .payload
+            .get("newUserKey")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| AppError::BadRequest("Missing newUserKey".into()))?
+            .to_string();
+        (np, nuk)
+    };
+    let new_user_key_b64: &str = &new_user_key_b64;
+
     let new_cred_id = new_passkey
         .get("credentialId")
         .and_then(|v| v.as_str())
@@ -1649,7 +1898,6 @@ pub async fn identity_add_passkey(
         ));
     }
 
-    let sk_d = jwk_sk_d_bytes(&state.keypair.sk)?;
     let mut kek = derive_kek(&user_key, &sk_d)?;
     let wrapped = fs::read(&wrapped_path)?;
     let mut dek = unwrap_dek(&wrapped, &kek)?;

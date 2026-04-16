@@ -1,6 +1,11 @@
 [package]
 name = "safeclaw"
-version = "0.4.0"
+# Bump this (MINOR for breaking, PATCH for fixes) whenever you make a
+# user-visible protocol/behavior change before baking. `/health` surfaces
+# this version and the frontend uses it as a capability gate — so bumping
+# is how old VMs learn they lack a feature. See safeclaw-pro-backend
+# README "Baking a new VM image" for the full workflow.
+version = "0.5.0"
 edition = "2021"
 description = "Passkey-encrypted credential vault and proxy for AI agents"
 license = "Apache-2.0"

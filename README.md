@@ -25,7 +25,7 @@ Your AI Agent → SafeClaw Proxy (localhost:23295) → OpenAI / Anthropic / Goog
 
 ```bash
 # Download
-curl -fsSL https://github.com/xhyumiracle/safeclaw/releases/latest/download/safeclaw-linux-x86_64.tar.gz \
+curl -fsSL https://github.com/SafeClaw-OSS/safeclaw/releases/latest/download/safeclaw-linux-x86_64.tar.gz \
   | tar xz
 chmod +x safeclaw
 

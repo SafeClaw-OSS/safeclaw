@@ -82,6 +82,34 @@ pub struct ServiceLevels {
     pub ask_ttl: Option<u64>,
 }
 
+/// Sparse override for a single built-in rule, keyed by rule id in the vault.
+/// Only the fields set here replace the built-in rule's equivalents.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuleOverride {
+    pub level: AccessLevel,
+    #[serde(default)]
+    pub ask_ttl: Option<u64>,
+}
+
+/// Apply sparse overrides onto built-in rules, matching by `id`.
+/// Rules without an `id`, or whose `id` has no override, are left unchanged.
+pub fn merge_rule_overrides(
+    built_in: &[PolicyRule],
+    overrides: &std::collections::HashMap<String, RuleOverride>,
+) -> Vec<PolicyRule> {
+    built_in.iter().map(|rule| {
+        let ov = rule.id.as_ref().and_then(|id| overrides.get(id));
+        match ov {
+            Some(o) => PolicyRule {
+                level: o.level.clone(),
+                ask_ttl: o.ask_ttl.or(rule.ask_ttl),
+                ..rule.clone()
+            },
+            None => rule.clone(),
+        }
+    }).collect()
+}
+
 /// Global policy defaults (stored in vault.enc under "policy_defaults")
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PolicyDefaults {
@@ -547,5 +575,37 @@ mod tests {
     fn ask_ttl_falls_back_to_service_level() {
         let levels = ServiceLevels { write: None, read: None, ask_ttl: Some(1800) };
         assert_eq!(find_ask_ttl(None, Some(&levels), "GET", "/foo", None), Some(1800));
+    }
+
+    // ── merge_rule_overrides ───────────────────────────────────────────────
+
+    #[test]
+    fn override_replaces_level_by_id() {
+        let built_in = vec![
+            PolicyRule {
+                id: Some("send-email".into()),
+                label: Some("Send email".into()),
+                match_pattern: Some("POST /gmail/v1/users/me/messages/send".into()),
+                body: None,
+                level: AccessLevel::AskAlways,
+                ask_ttl: None,
+            },
+        ];
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert("send-email".into(), RuleOverride {
+            level: AccessLevel::Ask, ask_ttl: None,
+        });
+        let merged = merge_rule_overrides(&built_in, &overrides);
+        assert_eq!(merged[0].level, AccessLevel::Ask);
+        // Match pattern / label preserved
+        assert_eq!(merged[0].label.as_deref(), Some("Send email"));
+    }
+
+    #[test]
+    fn override_missing_id_leaves_rule_untouched() {
+        let built_in = vec![rule("GET /foo", AccessLevel::Allow)];
+        let overrides = std::collections::HashMap::new();
+        let merged = merge_rule_overrides(&built_in, &overrides);
+        assert_eq!(merged[0].level, AccessLevel::Allow);
     }
 }

@@ -8,7 +8,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const GITHUB_REPO: &str = "xhyumiracle/safeclaw";
+const GITHUB_REPO: &str = "SafeClaw-OSS/safeclaw";
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Resolved latest release info from GitHub.
