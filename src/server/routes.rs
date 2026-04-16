@@ -1836,16 +1836,52 @@ pub async fn identity_add_passkey(
         .decode(user_key_b64)
         .map_err(|e| AppError::BadRequest(format!("Invalid userKey: {}", e)))?;
 
-    let new_passkey = auth
+    let sk_d = jwk_sk_d_bytes(&state.keypair.sk)?;
+
+    // Two payload shapes for the new credential:
+    //   inline (in-person two-device flow): payload contains `newPasskey` + `newUserKey`
+    //   deposit (cross-device "Save for later" flow): payload contains `newPasskeyDeposit`,
+    //     an inner ECIES envelope encrypted to vmPk that wraps {newPasskey, newUserKey}.
+    // The deposit path lets a user create a new passkey on Device A (no old-passkey access),
+    // and complete install later from Device B (which has the old passkey). Same crypto
+    // primitives (ECIES + sk_d), no new protocol — just a second decryption layer.
+    let (new_passkey, new_user_key_b64) = if let Some(dep_b64) = auth
         .payload
-        .get("newPasskey")
-        .cloned()
-        .ok_or_else(|| AppError::BadRequest("Missing newPasskey".into()))?;
-    let new_user_key_b64 = auth
-        .payload
-        .get("newUserKey")
+        .get("newPasskeyDeposit")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| AppError::BadRequest("Missing newUserKey".into()))?;
+    {
+        let dep_bytes = STANDARD
+            .decode(dep_b64)
+            .map_err(|e| AppError::BadRequest(format!("Invalid deposit base64: {}", e)))?;
+        let inner_pt = crate::crypto::ecies::e2e_decrypt(&dep_bytes, &sk_d)?;
+        let inner: serde_json::Value = serde_json::from_slice(&inner_pt)
+            .map_err(|_| AppError::BadRequest("Deposit payload is not valid JSON".into()))?;
+        let np = inner
+            .get("newPasskey")
+            .cloned()
+            .ok_or_else(|| AppError::BadRequest("Deposit missing newPasskey".into()))?;
+        let nuk = inner
+            .get("newUserKey")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| AppError::BadRequest("Deposit missing newUserKey".into()))?
+            .to_string();
+        (np, nuk)
+    } else {
+        let np = auth
+            .payload
+            .get("newPasskey")
+            .cloned()
+            .ok_or_else(|| AppError::BadRequest("Missing newPasskey".into()))?;
+        let nuk = auth
+            .payload
+            .get("newUserKey")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| AppError::BadRequest("Missing newUserKey".into()))?
+            .to_string();
+        (np, nuk)
+    };
+    let new_user_key_b64: &str = &new_user_key_b64;
+
     let new_cred_id = new_passkey
         .get("credentialId")
         .and_then(|v| v.as_str())
@@ -1862,7 +1898,6 @@ pub async fn identity_add_passkey(
         ));
     }
 
-    let sk_d = jwk_sk_d_bytes(&state.keypair.sk)?;
     let mut kek = derive_kek(&user_key, &sk_d)?;
     let wrapped = fs::read(&wrapped_path)?;
     let mut dek = unwrap_dek(&wrapped, &kek)?;
