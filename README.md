@@ -155,7 +155,7 @@ The `connect` command reads the service's `recipe.toml` and prints human-readabl
 
 ### Service protocol
 
-See [PROTOCOL.md](PROTOCOL.md) for the full service.toml and recipe.toml specification, including auth types, header templates, policy rules, local service handlers, and step targets.
+See [docs/SERVICES.md](docs/SERVICES.md) for the full service.toml and recipe.toml specification, including auth types, header templates, policy rules, local service handlers, and step targets. See [docs/PROTOCOL.md](docs/PROTOCOL.md) for the SUDP cryptographic protocol concrete profile.
 
 ## Remote deployment
 

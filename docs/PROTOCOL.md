@@ -8,7 +8,7 @@
 > - SUDP paper: `safeclaw-paper-nips/sections/{main,appendix}/0[3-9]-*.tex`（canonical 抽象协议）
 > - System design + SUDP-aligned 决策: `../SAFECLAW_V1_DESIGN_HANDOFF.md`
 > - CLI architecture: `../CLI_DESIGN_HANDOFF.md`
-> - Service TOML schema: `../PROTOCOL.md`（不同文档，service 协议层）
+> - Service TOML schema: `./SERVICES.md`（不同文档，service 协议层）
 
 ---
 
@@ -120,12 +120,14 @@ o = {
 | `write` | Phase III.3 (lifecycle) | 写 M（services config / policy / preferences），每写自动轮换 K + acting credential 的 η_c |
 | `enroll` | Phase III.3 (lifecycle) | 注册新 passkey 加入现有 vault |
 | `revoke` | Phase III.3 (lifecycle) | 删除一个 passkey |
-| `export` | Phase III.2 | 导出 M 子集到 recipient（recipient 通过 ECDH/KEM sealed） |
+| `export` | Phase III.2 | 导出 M 子集到 recipient（recipient 通过 ECDH/KEM sealed）；`o.bind.recipient` **必填**，缺则 400 |
+| `reveal` | Phase III.2 (SafeClaw 扩展) | 明文返回 M 子集给 R，**无** ECDH sealing；`o.bind.recipient` **必空**，有则 400 |
+
+`reveal` 是 SafeClaw 对 SUDP 抽象 type 词汇的显式扩展（详 paper feedback proposal #4）。覆盖 R 无 KEM 客户端能力的场景，最常见就是透明 HTTP proxy UX 下 agent 通过 `safeclaw-vault` 虚拟服务取 secret（§4.6）。`export` 和 `reveal` 显式两 mode，**绝不让 export 在 recipient 缺失时静默降级为 plaintext**（footgun 避免）。
 
 **未实现/推迟**:
-- `use` 类（SUDP III.1）的形式化 op 不进 `/operation`；通过 proxy port (`:23295`) 触发，由 daemon 内部走 policy + approval（详 §4.5）
+- `use` 类（SUDP III.1）的形式化 op 不进 `/grant`；通过 proxy port (`:23295`) 触发，由 daemon 内部走 policy + approval（详 §4.5）
 - `rotate` 类（SUDP III.3 sub-case）暂不暴露独立 endpoint；K 的轮换隐含在每个 `write/enroll/revoke` 中
-- `reveal` 不引入；read-class 用 `export`
 
 ### 3.3 Type-specific `act.scope` schemas
 
@@ -182,7 +184,7 @@ o = {
 ```
 SUDP cryptographic protocol layer:
   GET  /challenge                       # Phase II.1 freshness
-  POST /operation                       # Phase I + III, type-dispatched          [HPKE-wrapped]
+  POST /grant                       # Phase I + III, type-dispatched          [HPKE-wrapped]
 
 Daemon control (deployment, 非 SUDP):
   GET  /health                          # status
@@ -203,6 +205,10 @@ Approval workflow (Phase II 的 OOB 实现):
 
 Proxy port (separate :23295, 非 admin API):
   *  /<service>/...                     # R 入口；触发 Phase II/III
+                                        # 含内置虚拟服务 safeclaw-vault/<dotted-path> (§4.6.1)
+
+Multi-tenant: 所有 :23294 + :23295 请求**必须**带 X-Safeclaw-Tenant header (§4.7)
+              缺则 400；daemon 不 fallback 到默认 tenant
 ```
 
 **`[HPKE-wrapped]`** 标注的 endpoint 接受 HPKE 加密的请求体（详 §4.2）。其他 endpoint 接受/返回的都是 public material，不需要 envelope。
@@ -232,14 +238,14 @@ pkR    = sc_pk (server static public key, 详 §4.2.1)
 info   = "safeclaw/v1/envelope\0"
 aad    = method ‖ 0x00 ‖ path
         # method 是 ASCII uppercase, path 是 URL path
-plaintext = JSON of inner request body (e.g., SUDP grant G for /operation)
+plaintext = JSON of inner request body (e.g., SUDP grant G for /grant)
 ```
 
 **Server-side**: 用 sc_sk + 同样的 info/aad open，验证 AEAD tag 后得到 inner JSON，按 inner schema 处理。
 
 **为什么 AAD 包含 method+path**:
 - 把 envelope 绑死在特定 endpoint 调用
-- 防止攻击者抓到一个 `/operation` envelope 重放到 `/state/lock` 之类的 endpoint
+- 防止攻击者抓到一个 `/grant` envelope 重放到 `/state/lock` 之类的 endpoint
 - AAD 失配 → AEAD tag verification fail → reject
 
 **响应方向**:
@@ -322,7 +328,9 @@ CLI 根据 daemon 的位置选择如何获取 sc_pk：
 
 `r` 单次使用、TTL 5min（默认，可配）。详见 `src/passkey/challenge.rs`。
 
-### 4.4 `POST /operation`
+### 4.4 `POST /grant`
+
+> **Naming note**: 这个 endpoint 之前叫 `/operation`，2026-05 改名为 `/grant`。HTTP body 装的就是 SUDP grant `G`；`o` 只是 grant 的内嵌字段。endpoint 名跟 body 类型对齐，更符合 paper 术语层级。`Operation` 在代码里仍是一等公民类型（`Grant.o: Operation`）。
 
 **Request body** (SUDP grant `G = (o, r, cid_c, W_c, σ_c, opt)`)，**整体被 HPKE envelope 包裹**（详 §4.2）；下面是 HPKE 解密后的 inner JSON:
 ```json
@@ -388,6 +396,26 @@ s := XChaCha20-Poly1305_Decrypt(k_d, nonce, ct, AAD = DS_deliver-ad ‖ H(o))
 - 这是真 E2E 加密的 export delivery，**不依赖 TLS** 提供 confidentiality
 - 详细论证见 SUDP paper §09-security-analysis.tex Proposition non-disclosure
 
+### 4.5.1 Reveal (SafeClaw 扩展，明文返回)
+
+T 收到 `type=reveal` op 验证通过后:
+```
+s := M[o.act.target]
+Response: 200 OK, body = { value: <s as plaintext string> }
+```
+
+**与 export 的本质区别**：
+- 不做 KEM Encap，不做 AEAD 加密
+- response body 直接装 plaintext，**TLS 路径上的所有 trusted/中介节点都能看到**（含 SaaS 形态的 Pro relay）
+- AV / OB / RR 三 property 与 export 完全一致；仅 non-disclosure 让步
+
+**适用场景**：
+- transparent HTTP proxy UX 下 R 通过 `safeclaw-vault` 虚拟服务取 secret（详 §4.6）
+- R 没有 ECDH 客户端能力（任何不 import SafeClaw lib 的标准 HTTP client）
+- toy / game demo（无真凭据，安全主张退化可接受）
+
+**不适用**：跨 trust boundary 投递严格 secret（用 export）；migration 跨设备的 self-import（用 export with U's own pk）。
+
 ### 4.6 Proxy port (separate)
 
 Agent (R) 通过 `:23295/<service>/...` 发请求。Daemon 的处理流程（详 `src/core/router.rs::proxy_handler`）：
@@ -409,6 +437,54 @@ Agent (R) 通过 `:23295/<service>/...` 发请求。Daemon 的处理流程（详
 - `o` = (service, method, path, body) 的 sanitized 版本（user 在 web 上看到的就是 `Render(o)`）
 - `σ_c` = `POST /approve/{id}/confirm` 时的 WebAuthn assertion
 - 见 SUDP paper §05-sudp-protocol/05-phase2-grant.tex 关于 R↔U OOB channel 的描述
+
+### 4.6.1 内置虚拟服务 `safeclaw-vault`
+
+为了让 R 透明取 stored secrets（无需懂 SUDP），proxy port 上注册一个内置虚拟服务 `safeclaw-vault`：
+
+```
+GET :23295/safeclaw-vault/<dotted-path>
+    Authorization: Bearer <session-or-sc_xxx>
+    [optional] X-Recipient-Epk: <base64 ECDH pk>      # 走 reveal vs export
+```
+
+**daemon 内部**:
+1. 识别 `safeclaw-vault` 是内置虚拟服务（不是 upstream HTTP forward）
+2. 解析 `<dotted-path>` 为 `o.act.target`（如 `services.openai.api_key`）
+3. `X-Recipient-Epk` header 决定 type：缺则 `reveal`，存在则 `export` 并把值放进 `o.bind.recipient`
+4. policy 评估走 §5.4
+5. 需要 approval 时：渲染 approve 页 → user passkey → 浏览器把构造好的 grant 提交到 `:23294/grant`
+6. T 派发 `handle_reveal` 或 `handle_export`，结果存到 approval state
+7. R 轮询 `:23295/...` 拿结果（与其他 service 一致）
+
+**对 R 的关键性质**:
+- R 不构造 SUDP `o`（adapter 在 T 一侧自动 canonicalize HTTP 请求 → `o`）
+- R 不签 grant（R 没 passkey）
+- R 永远只看见 HTTP，**完全 SUDP-unaware**
+- 这就是 paper §05-agentic-systems "tool adapter compiles into o" 的 T-side adapter 实例化（详 paper feedback proposal #1）
+
+### 4.7 Multi-tenant routing
+
+V1 daemon 是 tenant-routed（单租户 = N=1 多租户的 special case）：
+
+```
+所有 :23294 + :23295 请求必须带:
+  X-Safeclaw-Tenant: <tenant_id>
+缺则 400；daemon 不 fallback 到默认 tenant
+```
+
+**谁负责设置 header**：
+- 本地 CLI：自动塞入（CLI 知道自己服务的 tenant）
+- Pro relay：验完 sc_xxx 翻译为 tenant_id 后塞入
+- openclaw bundle：启动脚本预创建 tenant，bundle 内的 dashboard / agent 自动塞入
+
+**daemon 不验证 header 真实性** — transport 层（unix socket / 内网 / mTLS）负责限制谁能注入 header。
+
+state dir 路由：
+- 单租户部署：`~/.safeclaw/vault.dat`（无 `tenants/` 子目录），daemon 仍要求 header（约定优于配置；CLI 自动塞 `default`）
+- 多租户部署：`<state_dir>/tenants/<tenant_id>/vault.dat`
+
+详 §5.3 directory layout。
 
 ---
 
@@ -496,6 +572,8 @@ ct        = XChaCha20-Poly1305_Encrypt(K, nonce, plaintext, AAD)
 
 ### 5.3 Directory layout
 
+**单租户部署**（OSS 自托管 / openclaw bundle / 本地 CLI）:
+
 ```
 ~/.safeclaw/
   vault.dat                      # ★单文件 SCSV
@@ -512,11 +590,36 @@ ct        = XChaCha20-Poly1305_Encrypt(K, nonce, plaintext, AAD)
     sc_sk.jwk                    # daemon 静态 X25519 secret key
 ```
 
+**多租户部署**（safeclaw.pro SaaS）:
+
+```
+/var/lib/safeclaw/
+  config.toml
+  crypto/                        # daemon 全局共享（HPKE keypair 不分 tenant）
+    sc_pk.jwk
+    sc_sk.jwk
+    README.md
+  tenants/
+    <tenant_id_1>/
+      vault.dat
+      passkeys.json
+      audit.db
+      services/
+    <tenant_id_2>/...
+```
+
+**关键不变量**：
+- daemon binary 同一份；无 `--multi-tenant` flag——是否多租户由 state dir 是否含 `tenants/` 子目录决定（约定优于配置）
+- HPKE keypair `sc_*.jwk` 是 daemon 全局，**不分 tenant**（仅 transport 加密）
+- 每 tenant 各自独立 vault.dat / passkeys / audit / services，跨 tenant 永远隔离
+- `<tenant_id>` 是 opaque 字符串（UUID 或类似），daemon 不解释其语义
+
 **关键变化 vs CHO §6**:
 - CHO 当时把 `sc_*.jwk` 标为"vault 加密的一部分，删除会锁死 vault" — 那是 v0.5.0 的 dual-role；**v1 不再如此**
 - v1 `sc_*.jwk` 仅做 transport encryption；丢失只影响 client 需要重新 TOFU
 - `wrapped_dek_<credId>.bin` 全部合并进 `vault.dat`（CHO 那部分目录条目移除）
 - 新增 `known_servers.json`（CLI-side state，跟 vault/daemon 无关）
+- 多租户布局：用 `tenants/<id>/` 子目录隔离每个租户
 
 详细解释见 `../SAFECLAW_V1_DESIGN_HANDOFF.md` §6。
 
@@ -716,7 +819,7 @@ Step 3: 组装 grant + 发送
   }
   β = SHA-256(DS_setup ‖ r ‖ H(canonical(o)))
   σ ← navigator.credentials.create() 顺带产生 attestation
-  POST /operation { o, r, credential_id: cid, user_key: user_key_initial, assertion: ... }
+  POST /grant { o, r, credential_id: cid, user_key: user_key_initial, assertion: ... }
 
 Step 4: server
   - HPKE Open envelope (§4.2) → recover grant
@@ -736,7 +839,7 @@ Step 3: o = {
   valid: { expiry: r.expires_at }
 }
 Step 4: 做 WebAuthn get() with challenge=β, 拿 σ
-Step 5: POST /operation { o, r, credential_id: cid, user_key: W_c, assertion: ... }
+Step 5: POST /grant { o, r, credential_id: cid, user_key: W_c, assertion: ... }
 Step 6: server validate + Encap(epk) + 加密 s + return π = { ct_d, delta }
 Step 7: client Decap(esk, ct_d) → k_d → 解开 delta 得到 s
 ```
@@ -754,7 +857,7 @@ Step 3: o = {
   bind: { redeemer: T_id },
   valid: { expiry: r.expires_at }
 }
-Step 4: POST /operation { o, r, credential_id: cid, user_key, user_key_next, prf_salt_next, assertion }
+Step 4: POST /grant { o, r, credential_id: cid, user_key, user_key_next, prf_salt_next, assertion }
 Step 5: server validate + 走 Phase III.3:
   - unwrap K_old via W_c
   - decrypt M, apply patch
