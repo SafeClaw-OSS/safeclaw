@@ -60,6 +60,7 @@ pub async fn details(
         Act::Reveal { path } => Some(path.clone()),
         _ => None,
     };
+    let op_json = serde_json::to_value(&rec.op)?;
     Ok(Json(json!({
         "id": rec.id,
         "status": match &rec.status {
@@ -71,6 +72,7 @@ pub async fn details(
         "act": act_kind,
         "path": path,
         "display": display,
+        "op": op_json,
     })))
 }
 
