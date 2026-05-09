@@ -45,7 +45,7 @@ pub struct NewCredential {
     pub device_name: String,
 }
 
-/// Write patch — for v0 toy this is a full replace.
+/// Write patch — for v0 this is a full replace.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WritePatch {
     /// Base64 of new sealed body (XChaCha20-Poly1305 of canonical KV under DEK).
@@ -78,7 +78,7 @@ pub enum Act {
         patch: WritePatch,
     },
     /// Decrypt a single key from the vault and return its plaintext value.
-    /// The path is dot-separated, e.g. `services.toy.api_key`.
+    /// The path is dot-separated, e.g. `env.api_key`.
     Reveal {
         path: String,
     },
@@ -94,7 +94,7 @@ impl Act {
     }
 }
 
-/// Operation — the U↔T contract. Bind is dropped from v0 toy (no policy).
+/// Operation — the U↔T contract. Bind is dropped from v0 (no policy).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Operation {
     pub act: Act,

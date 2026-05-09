@@ -48,9 +48,9 @@ pub async fn passkeys(
 }
 
 /// `GET /metadata/keys` — return the list of K names visible inside the
-/// `services.toy.*` namespace WITHOUT revealing values.
+/// `env.*` namespace WITHOUT revealing values.
 ///
-/// Toy v0: requires the user to have already supplied a `user_key` query param
+/// Demo v0: requires the user to have already supplied a `user_key` query param
 /// (which would be sensitive). For now, we return only what's possible without
 /// any decryption: the credential metadata. Full K-list disclosure happens
 /// during /grant{type=write} responses (frontend gets back its own ciphertext).

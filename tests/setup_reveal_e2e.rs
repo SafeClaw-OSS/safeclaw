@@ -4,7 +4,7 @@
 //! setup → reveal. Catches binding/canonicalization/AEAD bugs that unit
 //! tests miss (they cover individual primitives but not the full chain).
 //!
-//! Mirrors what the frontend does in `lib/toy-grant.ts` but in Rust:
+//! Mirrors what the frontend does in `lib/env-grant.ts` but in Rust:
 //!   1. Generate a P-256 "passkey".
 //!   2. Build a setup operation (wrapped DEK + sealed body).
 //!   3. Issue daemon challenge `r`, compute β = H(domain ‖ 0x00 ‖ r ‖ H(canonical(o))).
@@ -157,11 +157,9 @@ async fn full_setup_then_reveal_succeeds() {
     let prf_salt: [u8; 32] = rand::random();
     let dek: [u8; 32] = rand::random();
     let initial_kv = json!({
-        "services": {
-            "toy": {
-                "api_key": "sk-test-12345",
-                "github_token": "ghp_demo_abc",
-            }
+        "env": {
+            "api_key": "sk-test-12345",
+            "github_token": "ghp_demo_abc",
         }
     });
     let (wrapped_dek, body) =
@@ -218,7 +216,7 @@ async fn full_setup_then_reveal_succeeds() {
 
     // ── Build REVEAL operation ─────────────────────────────────────────────
     let reveal_op = Operation {
-        act: Act::Reveal { path: "services.toy.api_key".into() },
+        act: Act::Reveal { path: "env.api_key".into() },
         valid: Valid { iat: now_secs(), exp: None },
     };
     let reveal_r = issue_challenge(&state);
@@ -267,7 +265,7 @@ async fn write_then_reveal_returns_new_value() {
     let user_key: [u8; 32] = rand::random();
     let prf_salt: [u8; 32] = rand::random();
     let dek: [u8; 32] = rand::random();
-    let initial_kv = json!({ "services": { "toy": { "k": "v0" } } });
+    let initial_kv = json!({ "env": { "k": "v0" } });
     let (wrapped_dek, body) =
         wrap_dek_and_body(&user_key, &prf_salt, &credential_id_raw, &dek, &initial_kv);
 
@@ -303,7 +301,7 @@ async fn write_then_reveal_returns_new_value() {
     // ── WRITE: rotate prf_salt, build new wrapped_dek, new body ────────────
     let new_prf_salt: [u8; 32] = rand::random();
     let new_dek: [u8; 32] = rand::random();
-    let new_kv = json!({ "services": { "toy": { "k": "v1" } } });
+    let new_kv = json!({ "env": { "k": "v1" } });
     let (new_wrapped, new_body) =
         wrap_dek_and_body(&user_key, &new_prf_salt, &credential_id_raw, &new_dek, &new_kv);
 
@@ -336,7 +334,7 @@ async fn write_then_reveal_returns_new_value() {
 
     // ── REVEAL: should now read v1 ──────────────────────────────────────────
     let reveal_op = Operation {
-        act: Act::Reveal { path: "services.toy.k".into() },
+        act: Act::Reveal { path: "env.k".into() },
         valid: Valid { iat: now_secs(), exp: None },
     };
     let reveal_r = issue_challenge(&state);
@@ -370,7 +368,7 @@ async fn cross_tenant_isolation() {
 
     // tenant B is empty — reveal against B should 409 (vault not initialized).
     let reveal_op = Operation {
-        act: Act::Reveal { path: "services.toy.k".into() },
+        act: Act::Reveal { path: "env.k".into() },
         valid: Valid { iat: now_secs(), exp: None },
     };
     let r = issue_challenge(&state);
@@ -399,7 +397,7 @@ async fn challenge_replay_rejected() {
     // First reveal: succeeds.
     let r = issue_challenge(&state);
     let reveal_op = Operation {
-        act: Act::Reveal { path: "services.toy.k".into() },
+        act: Act::Reveal { path: "env.k".into() },
         valid: Valid { iat: now_secs(), exp: None },
     };
     let r_raw = STANDARD.decode(&r).unwrap();
@@ -461,7 +459,7 @@ async fn agent_proxy_then_user_confirm_full_flow() {
     let pending_op_value = &details.0["op"];
     assert_eq!(details.0["status"], json!("pending"));
     assert_eq!(details.0["act"], json!("reveal"));
-    assert_eq!(details.0["path"], json!("services.toy.k"));
+    assert_eq!(details.0["path"], json!("env.k"));
 
     // ── User builds a grant over the canonical op and confirms. ────────────
     let pending_op: Operation = serde_json::from_value(pending_op_value.clone()).unwrap();
@@ -574,7 +572,7 @@ async fn setup_tenant(state: &Arc<AppState>, tenant_id: &str, value: &str) -> Te
     let user_key: [u8; 32] = rand::random();
     let prf_salt: [u8; 32] = rand::random();
     let dek: [u8; 32] = rand::random();
-    let initial_kv = json!({ "services": { "toy": { "k": value } } });
+    let initial_kv = json!({ "env": { "k": value } });
     let (wrapped_dek, body) =
         wrap_dek_and_body(&user_key, &prf_salt, &credential_id_raw, &dek, &initial_kv);
 

@@ -41,7 +41,7 @@ impl ApprovalRecord {
     }
 }
 
-/// Default TTL for approvals. Toy v0 = 5 minutes.
+/// Default TTL for approvals. Demo v0 = 5 minutes.
 pub const DEFAULT_TTL: Duration = Duration::from_secs(300);
 
 #[derive(Default)]
@@ -127,7 +127,7 @@ mod tests {
     fn fake_op() -> Operation {
         Operation {
             act: Act::Reveal {
-                path: "services.toy.x".into(),
+                path: "env.x".into(),
             },
             valid: Valid { iat: 0, exp: None },
         }

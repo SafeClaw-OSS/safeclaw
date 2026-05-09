@@ -1,7 +1,7 @@
 //! `POST /grant` — main act dispatch.
 //!
 //! Setup and Write are handled inline. Reveal returns `{ value }` directly
-//! (used by the user-driven flow in the toy console).
+//! (used by user-driven flows in the web console).
 //! For the agent-driven reveal flow, see `proxy::safeclaw_vault` which creates
 //! an approval and dispatches the reveal via `/approve/{id}/confirm`.
 
@@ -118,7 +118,7 @@ pub async fn dispatch_grant(
     }
 }
 
-/// Walk a dot-separated path like `services.toy.api_key` and return the value.
+/// Walk a dot-separated path like `env.api_key` and return the value.
 fn lookup_path(root: &Value, path: &str) -> Option<Value> {
     let mut cur = root;
     for seg in path.split('.') {
@@ -134,12 +134,12 @@ mod tests {
     #[test]
     fn lookup_path_works() {
         let v = serde_json::json!({
-            "services": { "toy": { "api_key": "sk-abc" } }
+            "env": { "api_key": "sk-abc" }
         });
         assert_eq!(
-            lookup_path(&v, "services.toy.api_key"),
+            lookup_path(&v, "env.api_key"),
             Some(serde_json::Value::String("sk-abc".into()))
         );
-        assert_eq!(lookup_path(&v, "services.toy.missing"), None);
+        assert_eq!(lookup_path(&v, "env.missing"), None);
     }
 }

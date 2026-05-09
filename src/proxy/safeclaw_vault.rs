@@ -10,7 +10,7 @@
 //!     └─ returns same shape as /approve/{id} (status + value if approved)
 //! ```
 //!
-//! For toy v0 we keep the contract minimal: every call without a query
+//! For demo v0 we keep the contract minimal: every call without a query
 //! `approval_id=<id>` creates a fresh approval. Idempotency tracking is
 //! deferred until v0.1.
 
@@ -31,7 +31,7 @@ use crate::protocol::operation::{Act, Operation, Valid};
 use crate::server::tenant_extractor::TenantId;
 use crate::state::AppState;
 
-const SERVICES_TOY_PREFIX: &str = "services.toy";
+const ENV_NAMESPACE_PREFIX: &str = "env";
 
 #[derive(Debug, Deserialize)]
 pub struct PollQuery {
@@ -53,7 +53,7 @@ pub async fn handle(
     }
 
     let TenantId(tenant_id) = tenant.clone();
-    let path = format!("{}.{}", SERVICES_TOY_PREFIX, key);
+    let path = format!("{}.{}", ENV_NAMESPACE_PREFIX, key);
     let op = Operation {
         act: Act::Reveal { path: path.clone() },
         valid: Valid {
