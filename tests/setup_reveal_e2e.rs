@@ -38,7 +38,9 @@ use safeclaw::protocol::{
     grant::Grant,
     operation::{Act, NewCredential, Operation, Valid, WritePatch},
 };
+use safeclaw::server::handlers::approve;
 use safeclaw::server::handlers::grant::dispatch_grant;
+use safeclaw::server::tenant_extractor::TenantId;
 use safeclaw::state::AppState;
 use safeclaw::storage::TenantDir;
 
@@ -427,6 +429,129 @@ async fn challenge_replay_rejected() {
         dispatch_grant(&state, tenant_id, &grant2).await.is_err(),
         "replayed challenge must be rejected"
     );
+}
+
+#[tokio::test]
+async fn agent_proxy_then_user_confirm_full_flow() {
+    use axum::extract::{Path, Query, State};
+    use safeclaw::proxy::safeclaw_vault::{handle as proxy_handle, poll as proxy_poll, PollQuery};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let state = fresh_state(tmp.path());
+    let tenant_id = "tenant-agent-flow";
+    let a = setup_tenant(&state, tenant_id, "agent-secret-XYZ").await;
+
+    // ── Agent calls proxy port. Daemon creates a pending approval. ─────────
+    let (status, body) = proxy_handle(
+        State(state.clone()),
+        TenantId(tenant_id.into()),
+        Path("k".into()),
+        Query(PollQuery { approval_id: None }),
+    )
+    .await
+    .expect("proxy create should succeed");
+    assert_eq!(status.as_u16(), 202);
+    let approval_id = body.0["approval_id"].as_str().unwrap().to_string();
+    assert_eq!(body.0["status"], json!("pending_approval"));
+
+    // ── User pulls the canonical op back via /details. ─────────────────────
+    let details = approve::details(State(state.clone()), Path(approval_id.clone()))
+        .await
+        .expect("details should succeed");
+    let pending_op_value = &details.0["op"];
+    assert_eq!(details.0["status"], json!("pending"));
+    assert_eq!(details.0["act"], json!("reveal"));
+    assert_eq!(details.0["path"], json!("services.toy.k"));
+
+    // ── User builds a grant over the canonical op and confirms. ────────────
+    let pending_op: Operation = serde_json::from_value(pending_op_value.clone()).unwrap();
+    let r = issue_challenge(&state);
+    let r_raw = STANDARD.decode(&r).unwrap();
+    let pending_op_serialized = serde_json::to_value(&pending_op).unwrap();
+    let beta = binding_for_op(DOMAIN_STANDARD, &r_raw, &pending_op_serialized);
+    let assertion = build_assertion(&a.signing_key, &a.credential_id_b64, &beta, RP_ID, ORIGIN);
+    let confirm_grant = Grant {
+        o: pending_op,
+        r,
+        credential_id: a.credential_id_b64.clone(),
+        user_key: STANDARD.encode(a.user_key),
+        assertion,
+        opt: None,
+    };
+    let confirm_resp = approve::confirm(
+        State(state.clone()),
+        Path(approval_id.clone()),
+        axum::Json(confirm_grant),
+    )
+    .await
+    .expect("confirm should succeed");
+    assert_eq!(confirm_resp.0["status"], json!("approved"));
+
+    // ── Agent polls. First poll consumes the cached value. ────────────────
+    let (status, poll_body) = proxy_poll(
+        State(state.clone()),
+        Path("k".into()),
+        Query(PollQuery {
+            approval_id: Some(approval_id.clone()),
+        }),
+    )
+    .await
+    .expect("poll should succeed");
+    assert_eq!(status.as_u16(), 200);
+    assert_eq!(poll_body.0["status"], json!("ok"));
+    assert_eq!(poll_body.0["value"], json!("agent-secret-XYZ"));
+
+    // ── A second poll on the same approval id is consumed. ────────────────
+    let (status2, _) = proxy_poll(
+        State(state.clone()),
+        Path("k".into()),
+        Query(PollQuery {
+            approval_id: Some(approval_id.clone()),
+        }),
+    )
+    .await
+    .expect("second poll resolves");
+    assert_eq!(status2.as_u16(), 410, "consumed approval should return 410");
+}
+
+#[tokio::test]
+async fn user_rejects_approval() {
+    use axum::extract::{Path, Query, State};
+    use safeclaw::proxy::safeclaw_vault::{handle as proxy_handle, poll as proxy_poll, PollQuery};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let state = fresh_state(tmp.path());
+    let tenant_id = "tenant-reject";
+    let _a = setup_tenant(&state, tenant_id, "secret").await;
+
+    let (_status, body) = proxy_handle(
+        State(state.clone()),
+        TenantId(tenant_id.into()),
+        Path("k".into()),
+        Query(PollQuery { approval_id: None }),
+    )
+    .await
+    .unwrap();
+    let approval_id = body.0["approval_id"].as_str().unwrap().to_string();
+
+    // User rejects.
+    let resp = approve::reject(State(state.clone()), Path(approval_id.clone()))
+        .await
+        .unwrap();
+    assert_eq!(resp.0["status"], json!("rejected"));
+
+    // Agent poll → 403.
+    let (status, body) = proxy_poll(
+        State(state.clone()),
+        Path("k".into()),
+        Query(PollQuery {
+            approval_id: Some(approval_id),
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(status.as_u16(), 403);
+    assert_eq!(body.0["status"], json!("rejected"));
 }
 
 // ─── Helpers ───────────────────────────────────────────────────────────────
