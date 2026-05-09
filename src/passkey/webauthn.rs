@@ -15,7 +15,7 @@ use base64::{
     Engine,
 };
 use p256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::crypto::binding::constant_time_eq;
@@ -26,7 +26,7 @@ use crate::error::{AppError, Result};
 ///
 /// All base64 fields are **standard** base64 (with padding). The `credential_id`
 /// field is optional and used only for defensive sanity checks.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct AssertionData {
     #[serde(rename = "credentialId", default, alias = "credential_id")]
     pub credential_id: Option<String>,
