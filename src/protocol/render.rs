@@ -6,7 +6,7 @@ use super::operation::{Act, Operation};
 /// Frontend can show this to the user before they confirm.
 pub fn render_operation(op: &Operation) -> String {
     match &op.act {
-        Act::Setup { credential, .. } => {
+        Act::Setup { credential } => {
             format!(
                 "Set up vault with passkey \"{}\".",
                 if credential.device_name.is_empty() {

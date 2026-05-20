@@ -23,9 +23,27 @@ pub struct Grant {
     pub user_key: String,
     /// WebAuthn assertion.
     pub assertion: AssertionData,
+    /// TLS-bound side payload — values that depend on the post-PRF KEK and
+    /// therefore cannot be hashed into β at the moment the WebAuthn assertion
+    /// is generated. Channel integrity is provided by TLS, not the assertion.
+    /// Currently only used by `Act::Setup`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup_payload: Option<SetupPayload>,
     /// Optional unbound payload (ignored by v0).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub opt: Option<serde_json::Value>,
+}
+
+/// Side payload for `Act::Setup`. Carried out-of-band of the canonical op so
+/// that β = SHA-256(domain ‖ 0x00 ‖ r ‖ SHA-256(canonical(o))) can be
+/// pre-computed before the PRF-bearing WebAuthn `.get()` runs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetupPayload {
+    /// Base64 of wrapped DEK (XChaCha20-Poly1305 under KEK derived from
+    /// `user_key` + `credential.prf_salt`).
+    pub wrapped_dek: String,
+    /// Base64 of initial sealed body (XChaCha20-Poly1305 under DEK).
+    pub body: String,
 }
 
 /// Output of `validate_grant` — what the act dispatcher uses.
@@ -71,7 +89,7 @@ pub fn validate_grant(
 
     // 3. Resolve credential public key (from body for setup, from store otherwise).
     let (entry, domain) = match &grant.o.act {
-        Act::Setup { credential, .. } => {
+        Act::Setup { credential } => {
             if credential.credential_id != grant.credential_id {
                 return Err(AppError::BadRequest(
                     "grant.credential_id != setup.credential.credential_id".into(),

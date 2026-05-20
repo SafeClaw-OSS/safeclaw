@@ -6,7 +6,7 @@
 //!
 //! Mirrors what the frontend does in `lib/env-grant.ts` but in Rust:
 //!   1. Generate a P-256 "passkey".
-//!   2. Build a setup operation (wrapped DEK + sealed body).
+//!   2. Build a setup operation; wrapped DEK + sealed body go in `setup_payload`.
 //!   3. Issue daemon challenge `r`, compute β = H(domain ‖ 0x00 ‖ r ‖ H(canonical(o))).
 //!   4. Construct a synthetic WebAuthn assertion (clientDataJSON.challenge =
 //!      base64url(β); authenticatorData with valid rpIdHash + UP flag).
@@ -35,7 +35,7 @@ use safeclaw::crypto::{
 use safeclaw::passkey::challenge::ChallengeStore;
 use safeclaw::passkey::webauthn::AssertionData;
 use safeclaw::protocol::{
-    grant::Grant,
+    grant::{Grant, SetupPayload},
     operation::{Act, NewCredential, Operation, Valid, WritePatch},
 };
 use safeclaw::server::handlers::approve;
@@ -175,8 +175,6 @@ async fn full_setup_then_reveal_succeeds() {
                 prf_salt: STANDARD.encode(prf_salt),
                 device_name: "test-device".into(),
             },
-            wrapped_dek: STANDARD.encode(&wrapped_dek),
-            body: STANDARD.encode(&body),
         },
         valid: Valid { iat: now_secs(), exp: None },
     };
@@ -200,6 +198,10 @@ async fn full_setup_then_reveal_succeeds() {
         credential_id: credential_id_b64.clone(),
         user_key: STANDARD.encode(user_key),
         assertion: setup_assertion,
+        setup_payload: Some(SetupPayload {
+            wrapped_dek: STANDARD.encode(&wrapped_dek),
+            body: STANDARD.encode(&body),
+        }),
         opt: None,
     };
 
@@ -236,6 +238,7 @@ async fn full_setup_then_reveal_succeeds() {
         credential_id: credential_id_b64.clone(),
         user_key: STANDARD.encode(user_key),
         assertion: reveal_assertion,
+        setup_payload: None,
         opt: None,
     };
 
@@ -278,8 +281,6 @@ async fn write_then_reveal_returns_new_value() {
                 prf_salt: STANDARD.encode(prf_salt),
                 device_name: "".into(),
             },
-            wrapped_dek: STANDARD.encode(&wrapped_dek),
-            body: STANDARD.encode(&body),
         },
         valid: Valid { iat: now_secs(), exp: None },
     };
@@ -294,6 +295,10 @@ async fn write_then_reveal_returns_new_value() {
         credential_id: credential_id_b64.clone(),
         user_key: STANDARD.encode(user_key),
         assertion,
+        setup_payload: Some(SetupPayload {
+            wrapped_dek: STANDARD.encode(&wrapped_dek),
+            body: STANDARD.encode(&body),
+        }),
         opt: None,
     };
     let _ = dispatch_grant(&state, tenant_id, &setup_grant).await.unwrap();
@@ -327,6 +332,7 @@ async fn write_then_reveal_returns_new_value() {
         credential_id: credential_id_b64.clone(),
         user_key: STANDARD.encode(user_key),
         assertion: write_assertion,
+        setup_payload: None,
         opt: None,
     };
     let write_resp = dispatch_grant(&state, tenant_id, &write_grant).await.unwrap();
@@ -352,6 +358,7 @@ async fn write_then_reveal_returns_new_value() {
         credential_id: credential_id_b64.clone(),
         user_key: STANDARD.encode(user_key),
         assertion: reveal_assertion,
+        setup_payload: None,
         opt: None,
     };
     let reveal_resp = dispatch_grant(&state, tenant_id, &reveal_grant).await.unwrap();
@@ -381,6 +388,7 @@ async fn cross_tenant_isolation() {
         credential_id: a.credential_id_b64.clone(),
         user_key: STANDARD.encode(a.user_key),
         assertion,
+        setup_payload: None,
         opt: None,
     };
     let err = dispatch_grant(&state, "tenant-B", &grant).await.err();
@@ -409,6 +417,7 @@ async fn challenge_replay_rejected() {
         credential_id: a.credential_id_b64.clone(),
         user_key: STANDARD.encode(a.user_key),
         assertion,
+        setup_payload: None,
         opt: None,
     };
     let _ = dispatch_grant(&state, tenant_id, &grant1).await.unwrap();
@@ -421,6 +430,7 @@ async fn challenge_replay_rejected() {
         credential_id: a.credential_id_b64.clone(),
         user_key: STANDARD.encode(a.user_key),
         assertion: assertion2,
+        setup_payload: None,
         opt: None,
     };
     assert!(
@@ -474,6 +484,7 @@ async fn agent_proxy_then_user_confirm_full_flow() {
         credential_id: a.credential_id_b64.clone(),
         user_key: STANDARD.encode(a.user_key),
         assertion,
+        setup_payload: None,
         opt: None,
     };
     let confirm_resp = approve::confirm(
@@ -585,8 +596,6 @@ async fn setup_tenant(state: &Arc<AppState>, tenant_id: &str, value: &str) -> Te
                 prf_salt: STANDARD.encode(prf_salt),
                 device_name: "".into(),
             },
-            wrapped_dek: STANDARD.encode(&wrapped_dek),
-            body: STANDARD.encode(&body),
         },
         valid: Valid { iat: now_secs(), exp: None },
     };
@@ -600,6 +609,10 @@ async fn setup_tenant(state: &Arc<AppState>, tenant_id: &str, value: &str) -> Te
         credential_id: credential_id_b64.clone(),
         user_key: STANDARD.encode(user_key),
         assertion,
+        setup_payload: Some(SetupPayload {
+            wrapped_dek: STANDARD.encode(&wrapped_dek),
+            body: STANDARD.encode(&body),
+        }),
         opt: None,
     };
     let _ = dispatch_grant(state, tenant_id, &setup_grant).await.unwrap();

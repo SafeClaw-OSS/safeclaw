@@ -56,16 +56,15 @@ pub async fn dispatch_grant(
     };
 
     match &validated.op.act {
-        Act::Setup {
-            credential,
-            wrapped_dek,
-            body,
-        } => {
+        Act::Setup { credential } => {
             if existing_vault.is_some() {
                 return Err(AppError::Conflict(
                     "vault already initialized for this tenant".into(),
                 ));
             }
+            let payload = grant.setup_payload.as_ref().ok_or_else(|| {
+                AppError::BadRequest("setup grant missing setup_payload".into())
+            })?;
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
@@ -77,9 +76,9 @@ pub async fn dispatch_grant(
                 device_name: credential.device_name.clone(),
                 created_at: now,
                 prf_salt: credential.prf_salt.clone(),
-                wrapped_dek: wrapped_dek.clone(),
+                wrapped_dek: payload.wrapped_dek.clone(),
             };
-            let vault = SealedVault::empty(sealed_cred, body.clone());
+            let vault = SealedVault::empty(sealed_cred, payload.body.clone());
             state.tenants.ensure_dir(tenant_id)?;
             vault.write_atomic(&vault_path)?;
             tracing::info!(tenant = %tenant_id, "vault setup complete");

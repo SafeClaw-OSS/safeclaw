@@ -62,15 +62,12 @@ pub struct WritePatch {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum Act {
-    /// First-time vault creation. Body carries the new credential, an initial
-    /// wrapped DEK, and an initial sealed body.
+    /// First-time vault creation. Carries the new credential metadata only;
+    /// the post-PRF wrapped DEK + sealed body travel in `Grant.setup_payload`
+    /// (TLS-bound, not included in β) so setup can complete in a single
+    /// WebAuthn ceremony.
     Setup {
         credential: NewCredential,
-        /// Base64 of wrapped DEK (XChaCha20-Poly1305 under KEK derived from
-        /// `user_key` + `credential.prf_salt`).
-        wrapped_dek: String,
-        /// Base64 of initial sealed body (XChaCha20-Poly1305 under DEK).
-        body: String,
     },
     /// Replace the sealed body and rotate prf_salt + wrapped DEK.
     Write {
