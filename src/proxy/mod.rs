@@ -13,9 +13,12 @@ use axum::{
     routing::{any, get},
     Router,
 };
-use tower_http::cors::{Any, CorsLayer};
 
 use crate::state::AppState;
+
+// CORS not handled here — agents are server-side (CLI / daemons), no browser
+// cross-origin path hits the proxy port. If a reverse proxy later fronts this
+// port for browser use, CORS belongs there.
 
 pub fn proxy_router(state: Arc<AppState>) -> Router {
     Router::new()
@@ -23,12 +26,6 @@ pub fn proxy_router(state: Arc<AppState>) -> Router {
         .route(
             "/safeclaw-vault/{key}/poll",
             get(safeclaw_vault::poll),
-        )
-        .layer(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods(Any)
-                .allow_headers(Any),
         )
         .with_state(state)
 }

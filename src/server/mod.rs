@@ -1,4 +1,9 @@
 //! HTTP server: admin port (`:23294`) router and handler wiring.
+//!
+//! CORS is intentionally NOT handled here — it is a web-layer concern and
+//! belongs to whatever reverse proxy fronts the daemon (Caddy in our SaaS
+//! deployment). Server-side relays (per-VM model, console proxy) don't need
+//! CORS at all.
 
 pub mod handlers;
 pub mod tenant_extractor;
@@ -9,7 +14,6 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use tower_http::cors::{Any, CorsLayer};
 
 use crate::state::AppState;
 
@@ -24,11 +28,5 @@ pub fn admin_router(state: Arc<AppState>) -> Router {
         .route("/approve/{id}/details", post(handlers::approve::details))
         .route("/approve/{id}/confirm", post(handlers::approve::confirm))
         .route("/approve/{id}/reject", post(handlers::approve::reject))
-        .layer(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods(Any)
-                .allow_headers(Any),
-        )
         .with_state(state)
 }
