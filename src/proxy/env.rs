@@ -1,12 +1,13 @@
-//! `safeclaw-vault` virtual service handler.
+//! `env` virtual service handler — agent-facing key/value secret access.
+//! Renamed from `safeclaw-vault` (the legacy demo name).
 //!
 //! Flow per `safeclaw-protocol/PRO_API_DESIGN.md` §2.4:
 //!
 //! ```text
-//! agent → POST /safeclaw-vault/<key>     (with X-Safeclaw-Tenant + Idempotency-Key)
+//! agent → POST /env/<key>     (with X-Safeclaw-Tenant + Idempotency-Key)
 //!     ├─ no pending approval → daemon creates one → 202 { approval_id, approve_url, poll_url }
 //!     └─ pending approval already approved → 200 { value }
-//! agent → GET /safeclaw-vault/<key>/poll?approval_id=<id>
+//! agent → GET /env/<key>/poll?approval_id=<id>
 //!     └─ returns same shape as /approve/{id} (status + value if approved)
 //! ```
 //!
@@ -38,7 +39,7 @@ pub struct PollQuery {
     pub approval_id: Option<String>,
 }
 
-/// `* /safeclaw-vault/{key}` — create approval (or return cached value).
+/// `* /env/{key}` — create approval (or return cached value).
 pub async fn handle(
     State(state): State<Arc<AppState>>,
     tenant: TenantId,
@@ -76,12 +77,12 @@ pub async fn handle(
             "status": "pending_approval",
             "approval_id": approval_id,
             "approve_url": format!("/approve/{}", approval_id),
-            "poll_url": format!("/safeclaw-vault/{}/poll?approval_id={}", key, approval_id),
+            "poll_url": format!("/env/{}/poll?approval_id={}", key, approval_id),
         })),
     ))
 }
 
-/// `GET /safeclaw-vault/{key}/poll?approval_id=<id>` — agent-friendly poll.
+/// `GET /env/{key}/poll?approval_id=<id>` — agent-friendly poll.
 pub async fn poll(
     State(state): State<Arc<AppState>>,
     Path(_key): Path<String>,

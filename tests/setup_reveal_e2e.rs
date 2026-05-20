@@ -442,7 +442,7 @@ async fn challenge_replay_rejected() {
 #[tokio::test]
 async fn agent_proxy_then_user_confirm_full_flow() {
     use axum::extract::{Path, Query, State};
-    use safeclaw::proxy::safeclaw_vault::{handle as proxy_handle, poll as proxy_poll, PollQuery};
+    use safeclaw::proxy::env::{handle as proxy_handle, poll as proxy_poll, PollQuery};
 
     let tmp = tempfile::tempdir().unwrap();
     let state = fresh_state(tmp.path());
@@ -526,7 +526,7 @@ async fn agent_proxy_then_user_confirm_full_flow() {
 #[tokio::test]
 async fn user_rejects_approval() {
     use axum::extract::{Path, Query, State};
-    use safeclaw::proxy::safeclaw_vault::{handle as proxy_handle, poll as proxy_poll, PollQuery};
+    use safeclaw::proxy::env::{handle as proxy_handle, poll as proxy_poll, PollQuery};
 
     let tmp = tempfile::tempdir().unwrap();
     let state = fresh_state(tmp.path());

@@ -1,10 +1,11 @@
 //! HTTP server: admin port (`:23294`) router and handler wiring.
 //!
-//! CORS is intentionally NOT handled here — it is a web-layer concern and
-//! belongs to whatever reverse proxy fronts the daemon (Caddy in our SaaS
-//! deployment). Server-side relays (per-VM model, console proxy) don't need
-//! CORS at all.
+//! CORS is added only when `SAFECLAW_CORS_ALLOW_ORIGINS` env var is set
+//! (see [`cors::build_cors`]); production deployments terminate CORS at the
+//! reverse proxy and leave it unset, while localhost dev sets it to allow
+//! `http://localhost:3000` etc. for direct browser-to-daemon traffic.
 
+pub mod cors;
 pub mod handlers;
 pub mod tenant_extractor;
 
@@ -18,7 +19,7 @@ use axum::{
 use crate::state::AppState;
 
 pub fn admin_router(state: Arc<AppState>) -> Router {
-    Router::new()
+    let mut router = Router::new()
         .route("/health", get(handlers::health::health))
         .route("/challenge", get(handlers::challenge::challenge))
         .route("/grant", post(handlers::grant::grant))
@@ -28,5 +29,9 @@ pub fn admin_router(state: Arc<AppState>) -> Router {
         .route("/approve/{id}/details", post(handlers::approve::details))
         .route("/approve/{id}/confirm", post(handlers::approve::confirm))
         .route("/approve/{id}/reject", post(handlers::approve::reject))
-        .with_state(state)
+        .with_state(state);
+    if let Some(cors) = cors::build_cors() {
+        router = router.layer(cors);
+    }
+    router
 }

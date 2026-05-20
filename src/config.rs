@@ -12,7 +12,7 @@ pub struct Cli {
     #[arg(long, env = "SAFECLAW_PORT", default_value = "23294")]
     pub port: u16,
 
-    /// Proxy port (agent transparent HTTP for safeclaw-vault virtual service).
+    /// Proxy port (agent transparent HTTP for env virtual service).
     #[arg(long, env = "SAFECLAW_PROXY_PORT", default_value = "23295")]
     pub proxy_port: u16,
 

@@ -2,7 +2,7 @@
 //!
 //! Setup and Write are handled inline. Reveal returns `{ value }` directly
 //! (used by user-driven flows in the web console).
-//! For the agent-driven reveal flow, see `proxy::safeclaw_vault` which creates
+//! For the agent-driven reveal flow, see `proxy::env` which creates
 //! an approval and dispatches the reveal via `/approve/{id}/confirm`.
 
 use std::sync::Arc;

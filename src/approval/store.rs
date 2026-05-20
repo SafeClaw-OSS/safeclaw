@@ -1,6 +1,6 @@
 //! In-memory approval state.
 //!
-//! When the agent calls `:23295/safeclaw-vault/<key>` and the daemon decides
+//! When the agent calls `:23295/env/<key>` and the daemon decides
 //! human approval is required, an `ApprovalRecord` is created. The user
 //! approves it via `/approve/{id}/confirm`, which validates a passkey-signed
 //! grant and caches the resulting plaintext value. The agent's next poll
