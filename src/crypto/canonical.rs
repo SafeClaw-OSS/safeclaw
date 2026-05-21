@@ -1,22 +1,18 @@
-//! JSON canonicalization for channel binding (RFC 8785 JCS subset).
+//! JSON canonicalization for channel binding — thin adapter over
+//! `sudp::canonical`.
 //!
-//! The server and client must agree byte-for-byte on the canonical form of the
-//! request body so that `request_hash` can be recomputed independently. This
-//! module implements the subset of JCS that SafeClaw's request bodies exercise:
+//! `canonicalize` and `canonicalize_body` are SafeClaw's call sites; the byte
+//! encoding (JCS subset: sorted keys, no whitespace, standard JSON escapes) is
+//! produced by sudp so client and server stay in lockstep. SafeClaw adds the
+//! request-body field filter (`EXCLUDED_FIELDS`) — that's a deployment concern
+//! about which fields are part of the bound operation `o`, not part of the
+//! canonical-encoding contract.
 //!
-//! - Object keys sorted lexicographically by UTF-16 code unit order (which, for
-//!   the ASCII keys SafeClaw uses, is equivalent to byte order).
-//! - No insignificant whitespace.
-//! - Array order preserved.
-//! - Strings re-serialized through `serde_json::to_string` which produces the
-//!   standard JSON escape forms.
-//! - Numbers re-serialized through `serde_json::Number::to_string`. SafeClaw's
-//!   request bodies never contain floats, so number edge cases do not apply.
-//!
-//! The matching client-side implementation lives in `public/safeclaw-client.js`
-//! (see `canonicalizeJson`).
+//! The matching client-side implementation lives in
+//! `safeclaw-pro-frontend/lib/vault-crypto.ts` (see `canonicalize`).
 
 use serde_json::Value;
+use sudp::canonical as sudp_canonical;
 
 /// Fields excluded from canonicalization before channel binding.
 /// These are the fields that are *produced using* the binding, or that are
@@ -45,67 +41,13 @@ pub fn canonicalize_body(value: &Value) -> Vec<u8> {
         }
         other => other.clone(),
     };
-    let mut buf = Vec::new();
-    canonicalize_into(&filtered, &mut buf);
-    buf
+    sudp_canonical::canonicalize(&filtered)
 }
 
 /// Produce a canonical byte representation of `value` without any field
 /// filtering. Useful for hashing sub-objects.
 pub fn canonicalize(value: &Value) -> Vec<u8> {
-    let mut buf = Vec::new();
-    canonicalize_into(value, &mut buf);
-    buf
-}
-
-fn canonicalize_into(value: &Value, out: &mut Vec<u8>) {
-    match value {
-        Value::Null => out.extend_from_slice(b"null"),
-        Value::Bool(true) => out.extend_from_slice(b"true"),
-        Value::Bool(false) => out.extend_from_slice(b"false"),
-        Value::Number(n) => {
-            // serde_json's Number serialization is shortest-roundtrip for integers,
-            // which is all SafeClaw request bodies contain.
-            out.extend_from_slice(n.to_string().as_bytes());
-        }
-        Value::String(s) => {
-            // Re-serialize via serde_json to get standard JSON escaping.
-            let encoded = serde_json::to_string(s).unwrap_or_else(|_| String::new());
-            out.extend_from_slice(encoded.as_bytes());
-        }
-        Value::Array(arr) => {
-            out.push(b'[');
-            for (i, item) in arr.iter().enumerate() {
-                if i > 0 {
-                    out.push(b',');
-                }
-                canonicalize_into(item, out);
-            }
-            out.push(b']');
-        }
-        Value::Object(obj) => {
-            out.push(b'{');
-            let mut keys: Vec<&String> = obj.keys().collect();
-            keys.sort_by(|a, b| {
-                // RFC 8785: sort by UTF-16 code unit order. For ASCII strings
-                // this is identical to byte order. Use a UTF-16-safe comparator
-                // to be correct for non-ASCII keys as well.
-                let a16: Vec<u16> = a.encode_utf16().collect();
-                let b16: Vec<u16> = b.encode_utf16().collect();
-                a16.cmp(&b16)
-            });
-            for (i, k) in keys.iter().enumerate() {
-                if i > 0 {
-                    out.push(b',');
-                }
-                let key_encoded = serde_json::to_string(k).unwrap_or_else(|_| String::new());
-                out.extend_from_slice(key_encoded.as_bytes());
-                out.push(b':');
-                canonicalize_into(&obj[*k], out);
-            }
-            out.push(b'}');
-        }
-    }
+    sudp_canonical::canonicalize(value)
 }
 
 #[cfg(test)]

@@ -13,10 +13,12 @@ tokio = { version = "1", features = ["full"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 tower = "0.5"
 
-# Crypto
+# Protocol / crypto core — see [[sudp-crate]]. SafeClaw is a custodian
+# implementation; sudp provides the abstract protocol + standard cryptographic
+# profile (Hash/Kdf/Aead/KeyWrap, β computation, grant validation, WebAuthn
+# Authenticator). We keep p256 direct only for places sudp doesn't yet cover.
+sudp = { path = "../sudp", features = ["std-primitives", "webauthn", "json-canonical"] }
 p256 = { version = "0.13", features = ["ecdh", "ecdsa", "jwk"] }
-chacha20poly1305 = "0.10"
-hkdf = "0.12"
 sha2 = "0.10"
 rand = "0.8"
 zeroize = { version = "1", features = ["derive"] }

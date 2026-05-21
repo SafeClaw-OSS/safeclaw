@@ -6,7 +6,7 @@ use zeroize::Zeroize;
 
 use crate::crypto::binding::{binding_for_op, DOMAIN_SETUP, DOMAIN_STANDARD};
 use crate::error::{AppError, Result};
-use crate::passkey::webauthn::{verify_assertion, AssertionData, AssertionKind};
+use crate::passkey::webauthn::{verify_assertion, AssertionData};
 use crate::passkey::PasskeyEntry;
 use crate::protocol::operation::{Act, Operation};
 
@@ -137,7 +137,6 @@ pub fn validate_grant(
         origin,
         rp_id,
         &beta,
-        AssertionKind::Get,
     )?;
 
     // 7. Decode user_key + credential_id raw bytes.
