@@ -1,11 +1,14 @@
 pub mod approval;
+pub mod auth;
 pub mod config;
 pub mod core;
 pub mod crypto;
 pub mod error;
+mod generated_services;
 pub mod passkey;
 pub mod protocol;
 pub mod proxy;
 pub mod server;
+pub mod service;
 pub mod state;
 pub mod storage;

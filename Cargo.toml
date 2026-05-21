@@ -31,6 +31,11 @@ base64 = "0.22"
 
 # Broker / service routing (ported from dev branch)
 regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+futures-util = "0.3"
+toml = "0.8"
+dirs = "5"
+url = "2"
 
 # Misc
 clap = { version = "4", features = ["derive", "env"] }
