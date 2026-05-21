@@ -1,5 +1,6 @@
 pub mod approval;
 pub mod config;
+pub mod core;
 pub mod crypto;
 pub mod error;
 pub mod passkey;
