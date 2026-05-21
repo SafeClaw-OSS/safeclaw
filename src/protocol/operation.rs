@@ -81,14 +81,18 @@ pub fn as_enroll_credential(op: &Operation) -> Result<NewCredential> {
 
 /// Write patch — for v0 this is a full replace. Lives in `act.scope` for
 /// an `ActType::Write` Operation.
+///
+/// Field names match the SUDP storage shape (`wrapped_key` = `K̂_c`,
+/// `ciphertext` = sealed `M`). `prf_salt_next` is the new `η_c` for the
+/// rotated wrap.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WritePatch {
-    /// Base64 of new sealed body (XChaCha20-Poly1305 of canonical KV under DEK).
-    pub body: String,
-    /// Base64 of new wrapped DEK (XChaCha20-Poly1305 under KEK derived from
-    /// `user_key` + `prf_salt_next`).
-    pub wrapped_dek: String,
-    /// Base64 of next prf_salt (32B raw).
+    /// Base64 of new sealed `ProtectedState` ciphertext (under rotated K, AAD
+    /// `DS_SEAL ‖ ver_be`).
+    pub ciphertext: String,
+    /// Base64 of new `K̂_c = Wrap_{W_c_next}(K)` (under WrapBinding AAD).
+    pub wrapped_key: String,
+    /// Base64 of next prf_salt `η_c` (32B raw).
     pub prf_salt_next: String,
 }
 
@@ -102,8 +106,8 @@ pub fn as_write_patch(op: &Operation) -> Result<WritePatch> {
     }
     let scope = &op.act.scope;
     Ok(WritePatch {
-        body: scope_string(scope, "body")?,
-        wrapped_dek: scope_string(scope, "wrapped_dek")?,
+        ciphertext: scope_string(scope, "ciphertext")?,
+        wrapped_key: scope_string(scope, "wrapped_key")?,
         prf_salt_next: scope_string(scope, "prf_salt_next")?,
     })
 }

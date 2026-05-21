@@ -13,6 +13,10 @@ use crate::protocol::operation::{
 };
 
 /// Grant submitted to `POST /grant` (or to `/approve/{id}/confirm`).
+///
+/// Matches the SUDP paper §5.5 wire shape `G := (o, r, cid_{c*}, W*, σ*, opt)`
+/// — `wrapping_key` is `W*` (= `W_c` for the acting credential), derived on
+/// the client from `userKey` and shipped over the confidential TLS leg.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Grant {
     /// Operation contract.
@@ -21,31 +25,31 @@ pub struct Grant {
     pub r: String,
     /// Acting credential id (base64).
     pub credential_id: String,
-    /// PRF-derived userKey (base64, 32B raw).
-    pub user_key: String,
+    /// `W*` — wrapping key for the acting credential (base64, 32B raw).
+    pub wrapping_key: String,
     /// WebAuthn assertion.
     pub assertion: AssertionData,
-    /// TLS-bound side payload — values that depend on the post-PRF KEK and
-    /// therefore cannot be hashed into β at the moment the WebAuthn assertion
-    /// is generated. Channel integrity is provided by TLS, not the assertion.
-    /// Currently only used by `Act::Setup`.
+    /// TLS-bound side payload — sealed bytes that depend on `W*` and so
+    /// cannot be hashed into β at the moment the WebAuthn assertion is
+    /// generated. Channel integrity is provided by TLS. Currently only used
+    /// by `Act::Enroll` (initial setup).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub setup_payload: Option<SetupPayload>,
-    /// Optional unbound payload (ignored by v0).
+    /// Optional rotation payload (`W*_next` for write/rotate/enroll/revoke).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub opt: Option<serde_json::Value>,
 }
 
-/// Side payload for `Act::Setup`. Carried out-of-band of the canonical op so
+/// Side payload for `Act::Enroll`. Carried out-of-band of the canonical op so
 /// that β = SHA-256(domain ‖ 0x00 ‖ r ‖ SHA-256(canonical(o))) can be
 /// pre-computed before the PRF-bearing WebAuthn `.get()` runs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SetupPayload {
-    /// Base64 of wrapped DEK (XChaCha20-Poly1305 under KEK derived from
-    /// `user_key` + `credential.prf_salt`).
-    pub wrapped_dek: String,
-    /// Base64 of initial sealed body (XChaCha20-Poly1305 under DEK).
-    pub body: String,
+    /// Base64 of `K̂_c = Wrap_{W_c}(K)` — the wrapped state-encryption key.
+    /// AAD is sudp's `WrapBinding ‖ cid ‖ ver_be`.
+    pub wrapped_key: String,
+    /// Base64 of `C = Enc_K(canonical(ProtectedState); DS_seal ‖ ver_be)`.
+    pub ciphertext: String,
 }
 
 /// Output of `validate_grant` — what the act dispatcher uses.
@@ -53,15 +57,15 @@ pub struct ValidatedGrant {
     pub op: Operation,
     /// Acting credential id (raw bytes).
     pub credential_id_bytes: Vec<u8>,
-    /// 32-byte userKey (zeroized on drop).
-    pub user_key: Vec<u8>,
+    /// 32-byte wrapping key `W*` (zeroized on drop).
+    pub wrapping_key: Vec<u8>,
     /// `r` consumed (raw bytes).
     pub r_bytes: Vec<u8>,
 }
 
 impl Drop for ValidatedGrant {
     fn drop(&mut self) {
-        self.user_key.zeroize();
+        self.wrapping_key.zeroize();
     }
 }
 
@@ -142,21 +146,21 @@ pub fn validate_grant(
         &beta,
     )?;
 
-    // 7. Decode user_key + credential_id raw bytes.
+    // 7. Decode wrapping_key + credential_id raw bytes.
     let credential_id_bytes = STANDARD
         .decode(&grant.credential_id)
         .map_err(|_| AppError::BadRequest("credential_id not base64".into()))?;
-    let user_key = STANDARD
-        .decode(&grant.user_key)
-        .map_err(|_| AppError::BadRequest("user_key not base64".into()))?;
-    if user_key.len() != 32 {
-        return Err(AppError::BadRequest("user_key must be 32 bytes".into()));
+    let wrapping_key = STANDARD
+        .decode(&grant.wrapping_key)
+        .map_err(|_| AppError::BadRequest("wrapping_key not base64".into()))?;
+    if wrapping_key.len() != 32 {
+        return Err(AppError::BadRequest("wrapping_key must be 32 bytes".into()));
     }
 
     Ok(ValidatedGrant {
         op: grant.o.clone(),
         credential_id_bytes,
-        user_key,
+        wrapping_key,
         r_bytes,
     })
 }

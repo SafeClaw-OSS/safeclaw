@@ -1,27 +1,29 @@
 //! HKDF-SHA-256 — thin adapter over `sudp::primitives::HkdfSha256`.
 //!
 //! ```text
-//! userKey = HKDF(ikm=rawPRF, salt=∅,        info="safeclaw/v1/userkey\0" ‖ credentialId)
-//! KEK     = HKDF(ikm=userKey, salt=prf_salt, info="safeclaw/v1/kek\0" ‖ u16_be(ver) ‖ credentialId)
+//! userKey      = HKDF(ikm=rawPRF, salt=∅,         info="safeclaw/v1/userkey\0" ‖ credentialId)
+//! wrappingKey  = HKDF(ikm=userKey, salt=prf_salt, info=DS_WRAP ‖ credentialId ‖ ver_be)
 //! ```
 //!
-//! SafeClaw owns the `info` schema (domain-separation labels are deployment
-//! choices); sudp provides the standard HKDF-SHA-256 realization.
+//! `wrappingKey` is `W_c` in the SUDP paper (§5.5 II.2). It's the per-credential
+//! key that wraps the state key `K = sudp::SealedState.ciphertext`-encryption-
+//! key. SUDP leaves the client-side derivation of `W_c` to deployments;
+//! safeclaw picks HKDF with `DS_WRAP` as the info prefix so the label matches
+//! the AEAD AAD that the wrap step itself uses.
 
-use sudp::primitives::{HkdfSha256, Kdf as _};
+use sudp::primitives::{domain::DS_WRAP, HkdfSha256, Kdf as _};
 
 use crate::error::{AppError, Result};
 
-const KEK_INFO_PREFIX: &[u8] = b"safeclaw/v1/kek\x00";
 const USERKEY_INFO_PREFIX: &[u8] = b"safeclaw/v1/userkey\x00";
 
-/// Current wrap version used in KEK and AEAD AAD domain separation.
+/// Current wrap version used in the WrapBinding AAD.
 pub const WRAP_VERSION: u16 = 0x0001;
 
-/// Derive the per-credential userKey from raw PRF output.
+/// Derive the per-credential `userKey` (= `y_c` in SUDP) from raw PRF output.
 ///
-/// The client derives userKey in JavaScript before sending; this helper exists
-/// for tests and reference implementations.
+/// The client derives `userKey` in JavaScript and then derives `wrappingKey`
+/// from it; this helper exists for tests and reference parity.
 pub fn derive_user_key(raw_prf: &[u8], credential_id: &[u8]) -> Result<[u8; 32]> {
     let mut info = Vec::with_capacity(USERKEY_INFO_PREFIX.len() + credential_id.len());
     info.extend_from_slice(USERKEY_INFO_PREFIX);
@@ -30,19 +32,24 @@ pub fn derive_user_key(raw_prf: &[u8], credential_id: &[u8]) -> Result<[u8; 32]>
         .map_err(|e| AppError::Internal(format!("HKDF expand (userkey): {}", e)))
 }
 
-/// Derive the KEK for wrapping a DEK under the given credential.
-pub fn derive_kek(
+/// Derive the per-credential wrapping key `W_c` from `userKey`.
+///
+/// `info = DS_WRAP ‖ credential_id ‖ ver_be`. Matches the AAD layout that
+/// `sudp::primitives::WrapBinding::to_canonical_ad()` produces, modulo the
+/// fact that this is *KDF info* (driving HKDF expand) and not *AEAD AD*.
+/// Using the same label structure keeps the deployment story tidy.
+pub fn derive_wrapping_key(
     user_key: &[u8],
     prf_salt: &[u8],
-    wrap_version: u16,
     credential_id: &[u8],
+    wrap_version: u16,
 ) -> Result<[u8; 32]> {
-    let mut info = Vec::with_capacity(KEK_INFO_PREFIX.len() + 2 + credential_id.len());
-    info.extend_from_slice(KEK_INFO_PREFIX);
-    info.extend_from_slice(&wrap_version.to_be_bytes());
+    let mut info = Vec::with_capacity(DS_WRAP.len() + credential_id.len() + 2);
+    info.extend_from_slice(DS_WRAP);
     info.extend_from_slice(credential_id);
+    info.extend_from_slice(&wrap_version.to_be_bytes());
     HkdfSha256::derive_32(user_key, prf_salt, &info)
-        .map_err(|e| AppError::Internal(format!("HKDF expand (kek): {}", e)))
+        .map_err(|e| AppError::Internal(format!("HKDF expand (wrap): {}", e)))
 }
 
 #[cfg(test)]
@@ -50,43 +57,48 @@ mod tests {
     use super::*;
 
     #[test]
-    fn kek_is_deterministic() {
+    fn wrapping_key_is_deterministic() {
         let uk = [0x42u8; 32];
         let salt = [0x11u8; 32];
         let cid = b"credential_id_bytes";
-        let k1 = derive_kek(&uk, &salt, WRAP_VERSION, cid).unwrap();
-        let k2 = derive_kek(&uk, &salt, WRAP_VERSION, cid).unwrap();
+        let k1 = derive_wrapping_key(&uk, &salt, cid, WRAP_VERSION).unwrap();
+        let k2 = derive_wrapping_key(&uk, &salt, cid, WRAP_VERSION).unwrap();
         assert_eq!(k1, k2);
     }
 
     #[test]
-    fn kek_changes_with_salt() {
+    fn wrapping_key_changes_with_salt() {
         let uk = [0x42u8; 32];
         let cid = b"cid";
-        let k1 = derive_kek(&uk, &[0x11u8; 32], WRAP_VERSION, cid).unwrap();
-        let k2 = derive_kek(&uk, &[0x22u8; 32], WRAP_VERSION, cid).unwrap();
+        let k1 = derive_wrapping_key(&uk, &[0x11u8; 32], cid, WRAP_VERSION).unwrap();
+        let k2 = derive_wrapping_key(&uk, &[0x22u8; 32], cid, WRAP_VERSION).unwrap();
         assert_ne!(k1, k2);
     }
 
     #[test]
-    fn kek_changes_with_credential_id() {
+    fn wrapping_key_changes_with_credential_id() {
         let uk = [0x42u8; 32];
         let salt = [0x11u8; 32];
-        let k1 = derive_kek(&uk, &salt, WRAP_VERSION, b"cred1").unwrap();
-        let k2 = derive_kek(&uk, &salt, WRAP_VERSION, b"cred2").unwrap();
+        let k1 = derive_wrapping_key(&uk, &salt, b"cred1", WRAP_VERSION).unwrap();
+        let k2 = derive_wrapping_key(&uk, &salt, b"cred2", WRAP_VERSION).unwrap();
         assert_ne!(k1, k2);
     }
 
     #[test]
-    fn userkey_matches_legacy_hkdf() {
-        // Sanity check: HKDF(ikm, salt=∅, info=userkey-prefix ‖ cid) result must
-        // be reproducible. Output verified against a known HKDF-SHA-256 vector.
+    fn wrapping_key_changes_with_version() {
+        let uk = [0x42u8; 32];
+        let salt = [0x11u8; 32];
+        let cid = b"cid";
+        let k1 = derive_wrapping_key(&uk, &salt, cid, 1).unwrap();
+        let k2 = derive_wrapping_key(&uk, &salt, cid, 2).unwrap();
+        assert_ne!(k1, k2);
+    }
+
+    #[test]
+    fn userkey_smoke() {
         let prf = [0x42u8; 32];
         let cid = b"cred-id";
         let uk = derive_user_key(&prf, cid).unwrap();
         assert_eq!(uk.len(), 32);
-        // (We don't pin a specific vector here — the test exercises that the
-        // adapter pipes through; cross-impl byte-for-byte agreement is verified
-        // by integration tests against the frontend.)
     }
 }

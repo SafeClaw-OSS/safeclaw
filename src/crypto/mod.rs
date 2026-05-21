@@ -13,7 +13,7 @@ pub use binding::{
     DOMAIN_SETUP, DOMAIN_STANDARD,
 };
 pub use canonical::{canonicalize, canonicalize_body};
-pub use kdf::{derive_kek, derive_user_key, WRAP_VERSION};
+pub use kdf::{derive_user_key, derive_wrapping_key, WRAP_VERSION};
 
 use rand::{rngs::OsRng, RngCore};
 

@@ -21,8 +21,9 @@ use sudp::canonical as sudp_canonical;
 pub const EXCLUDED_FIELDS: &[&str] = &[
     "assertion",
     "server_random",
-    "user_key",
-    "user_key_next",
+    "wrapping_key",
+    "wrapping_key_next",
+    "setup_payload",
 ];
 
 /// Produce a canonical byte representation of `value` with the excluded
@@ -67,8 +68,9 @@ mod tests {
         let v = json!({
             "credential_id": "abc",
             "server_random": "xxx",
-            "user_key": "yyy",
+            "wrapping_key": "yyy",
             "assertion": { "anything": 1 },
+            "setup_payload": { "any": "blob" },
             "payload": 42
         });
         let out = canonicalize_body(&v);

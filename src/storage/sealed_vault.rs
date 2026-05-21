@@ -1,192 +1,146 @@
-//! SCSV (SafeClaw Sealed Vault) — toy v0 single-DEK simplification.
+//! Sealed-vault on-disk format = [`sudp::state::SealedState`].
 //!
-//! On-disk format is a single JSON document. AEAD ciphertexts and salts are
-//! base64. This trades a few bytes for transparency; production builds will
-//! switch to a binary container with HPKE outer envelope.
+//! As of Phase 3b.M (2026-05-21), safeclaw uses sudp's canonical state shape
+//! for vault.dat: `{ version, registry, credentials, ciphertext }` where
+//! - `registry` keys credential_id → opaque public-key JSON (WebAuthn x/y/
+//!   device_name)
+//! - `credentials[i]` carries `cid, prf_salt, wrapped_key` (= `K̂_c` =
+//!   AEAD-wrap of K under W_c with AAD `DS_WRAP ‖ cid ‖ ver_be`)
+//! - `ciphertext` = AEAD-seal of canonical(ProtectedState) under K with AAD
+//!   `DS_SEAL ‖ ver_be`
 //!
-//! ```text
-//! {
-//!   "version": 1,
-//!   "credentials": [
-//!     {
-//!       "credential_id": "...b64...",
-//!       "x":             "...b64...",
-//!       "y":             "...b64...",
-//!       "device_name":   "Chrome (MacOS)",
-//!       "created_at":    1746780000,
-//!       "prf_salt":      "...b64 32B...",
-//!       "wrapped_dek":   "...b64 nonce|ct|tag (XChaCha20-Poly1305)..."
-//!     }
-//!   ],
-//!   "body": "...b64 nonce|ct|tag (XChaCha20-Poly1305 of canonical KV under DEK)..."
-//! }
-//! ```
+//! The client does the sealing — safeclaw daemon never sees `K` (the state
+//! key) or `M` (ProtectedState) in plaintext at setup time. The client sends
+//! the already-sealed bytes; the daemon just rehouses them into a SealedState
+//! file. At grant redemption (export / use / write) the client transmits `W_c`
+//! over the confidential TLS leg; the daemon momentarily unwraps and acts on
+//! `M`, then drops `K` and any decrypted target bytes.
 
 use std::path::Path;
 
 use base64::{engine::general_purpose::STANDARD, Engine};
-use serde::{Deserialize, Serialize};
+use sudp::passkey::WebAuthn;
+use sudp::state::{Registry, SealedCredential, SealedState, CURRENT_VERSION};
 
-use crate::crypto::aead::{open as aead_open, seal as aead_seal};
-use crate::crypto::kdf::{derive_kek, WRAP_VERSION};
 use crate::error::{AppError, Result};
 use crate::passkey::PasskeyEntry;
 
-pub const VAULT_VERSION: u16 = 1;
+/// On-disk vault is exactly the sudp sealed-state JSON.
+pub type SealedVault = SealedState;
 
-const WRAP_AAD: &[u8] = b"safeclaw/v1/wrap-dek";
-const BODY_AAD: &[u8] = b"safeclaw/v1/vault-body";
+/// File suffix for atomic-replace writes.
+const TMP_EXT: &str = "dat.tmp";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SealedCredential {
-    pub credential_id: String,
-    pub x: String,
-    pub y: String,
-    #[serde(default)]
-    pub device_name: String,
-    #[serde(default)]
-    pub created_at: u64,
-    /// Base64 of 32B prf_salt.
-    pub prf_salt: String,
-    /// Base64 of nonce(24) || ciphertext || tag(16). DEK is 32B.
-    pub wrapped_dek: String,
+/// Read the vault file. Returns `None` if it doesn't exist.
+pub fn read(path: &Path) -> Result<Option<SealedVault>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let bytes = std::fs::read(path)?;
+    let v: SealedVault = serde_json::from_slice(&bytes)
+        .map_err(|e| AppError::Internal(format!("vault.dat parse: {}", e)))?;
+    if v.version != CURRENT_VERSION {
+        return Err(AppError::Internal(format!(
+            "vault.dat version mismatch: {} (expected {})",
+            v.version, CURRENT_VERSION
+        )));
+    }
+    Ok(Some(v))
 }
 
-impl SealedCredential {
-    pub fn passkey_entry(&self) -> PasskeyEntry {
-        PasskeyEntry {
-            x: self.x.clone(),
-            y: self.y.clone(),
-            device_name: self.device_name.clone(),
-            created_at: self.created_at,
-        }
+/// Atomically write vault.dat.
+pub fn write_atomic(path: &Path, vault: &SealedVault) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
     }
+    let bytes = serde_json::to_vec_pretty(vault)?;
+    let tmp = path.with_extension(TMP_EXT);
+    std::fs::write(&tmp, &bytes)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SealedVault {
-    pub version: u16,
-    pub credentials: Vec<SealedCredential>,
-    /// Base64 of nonce(24) || ciphertext || tag(16) of the canonical-KV body
-    /// under the (single shared) DEK.
-    pub body: String,
+/// Look up a credential's WebAuthn public key from the registry.
+///
+/// Returns a safeclaw-side [`PasskeyEntry`] so existing call sites that fetch
+/// `(x, y, device_name)` for binding verification don't need to know the
+/// sudp Registry shape.
+pub fn find_pubkey(vault: &SealedVault, credential_id_b64: &str) -> Option<PasskeyEntry> {
+    let cid_bytes = STANDARD.decode(credential_id_b64).ok()?;
+    let pk = vault.registry.get::<WebAuthn>(&cid_bytes).ok().flatten()?;
+    Some(PasskeyEntry {
+        x: pk.x,
+        y: pk.y,
+        device_name: pk.device_name,
+        created_at: 0, // sudp Registry doesn't track this; lossy.
+    })
 }
 
-impl SealedVault {
-    pub fn empty(credential: SealedCredential, body: String) -> Self {
-        Self {
-            version: VAULT_VERSION,
-            credentials: vec![credential],
-            body,
-        }
-    }
-
-    pub fn find_credential(&self, credential_id_b64: &str) -> Option<&SealedCredential> {
-        self.credentials
-            .iter()
-            .find(|c| c.credential_id == credential_id_b64)
-    }
-
-    pub fn replace_credential_after_write(
-        &mut self,
-        credential_id_b64: &str,
-        new_prf_salt_b64: &str,
-        new_wrapped_dek_b64: &str,
-        new_body_b64: &str,
-    ) -> Result<()> {
-        let cred = self
-            .credentials
-            .iter_mut()
-            .find(|c| c.credential_id == credential_id_b64)
-            .ok_or_else(|| AppError::Unauthorized("unknown credential for write".into()))?;
-        cred.prf_salt = new_prf_salt_b64.to_string();
-        cred.wrapped_dek = new_wrapped_dek_b64.to_string();
-        self.body = new_body_b64.to_string();
-        Ok(())
-    }
-
-    pub fn read(path: &Path) -> Result<Option<Self>> {
-        if !path.exists() {
-            return Ok(None);
-        }
-        let bytes = std::fs::read(path)?;
-        let v: SealedVault = serde_json::from_slice(&bytes)
-            .map_err(|e| AppError::Internal(format!("vault.dat parse: {}", e)))?;
-        if v.version != VAULT_VERSION {
-            return Err(AppError::Internal(format!(
-                "vault.dat version mismatch: {} (expected {})",
-                v.version, VAULT_VERSION
-            )));
-        }
-        Ok(Some(v))
-    }
-
-    pub fn write_atomic(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let bytes = serde_json::to_vec_pretty(self)?;
-        let tmp = path.with_extension("dat.tmp");
-        std::fs::write(&tmp, &bytes)?;
-        std::fs::rename(&tmp, path)?;
-        Ok(())
-    }
+/// Find a credential entry by base64 id. Returns None if absent.
+pub fn find_credential<'a>(
+    vault: &'a SealedVault,
+    credential_id_b64: &str,
+) -> Option<&'a SealedCredential> {
+    let cid_bytes = STANDARD.decode(credential_id_b64).ok()?;
+    vault.find_credential(&cid_bytes)
 }
 
-// ── DEK helpers ────────────────────────────────────────────────────────────
-
-/// Decrypt the wrapped DEK for a specific credential, given the PRF-derived
-/// `user_key`.
-pub fn unwrap_dek(
-    user_key: &[u8],
-    credential: &SealedCredential,
-    credential_id_bytes: &[u8],
-) -> Result<[u8; 32]> {
-    let prf_salt = STANDARD
-        .decode(&credential.prf_salt)
-        .map_err(|_| AppError::Internal("prf_salt not base64".into()))?;
-    if prf_salt.len() != 32 {
-        return Err(AppError::Internal("prf_salt wrong length".into()));
-    }
-    let kek = derive_kek(user_key, &prf_salt, WRAP_VERSION, credential_id_bytes)?;
-
-    let wrapped = STANDARD
-        .decode(&credential.wrapped_dek)
-        .map_err(|_| AppError::Internal("wrapped_dek not base64".into()))?;
-    let plaintext = aead_open(&kek, &wrapped, WRAP_AAD)?;
-    if plaintext.len() != 32 {
-        return Err(AppError::Internal("DEK wrong length".into()));
-    }
-    let mut dek = [0u8; 32];
-    dek.copy_from_slice(&plaintext);
-    Ok(dek)
+/// Build a fresh single-credential vault for first-time setup.
+///
+/// All sealing is performed by the client; the daemon receives the already-
+/// sealed bytes (`wrapped_key`, `ciphertext`) and just assembles the file.
+pub fn build_initial(
+    credential_id: Vec<u8>,
+    public_key_x_b64: String,
+    public_key_y_b64: String,
+    device_name: String,
+    prf_salt: Vec<u8>,
+    wrapped_key: Vec<u8>,
+    ciphertext: Vec<u8>,
+) -> Result<SealedVault> {
+    let mut registry = Registry::new();
+    let pk = sudp::passkey::WebAuthnPublicKey {
+        x: public_key_x_b64,
+        y: public_key_y_b64,
+        device_name,
+    };
+    registry
+        .insert::<WebAuthn>(&credential_id, &pk)
+        .map_err(|e| AppError::Internal(format!("registry insert: {}", e)))?;
+    let sealed_cred = SealedCredential {
+        credential_id,
+        prf_salt,
+        wrapped_key,
+    };
+    Ok(SealedState {
+        version: CURRENT_VERSION,
+        registry,
+        credentials: vec![sealed_cred],
+        ciphertext,
+    })
 }
 
-/// Wrap a freshly-generated DEK for a credential. Returns base64(nonce|ct|tag).
-pub fn wrap_dek(
-    user_key: &[u8],
-    prf_salt: &[u8],
-    credential_id_bytes: &[u8],
-    dek: &[u8; 32],
-) -> Result<String> {
-    let kek = derive_kek(user_key, prf_salt, WRAP_VERSION, credential_id_bytes)?;
-    let sealed = aead_seal(&kek, dek, WRAP_AAD)?;
-    Ok(STANDARD.encode(sealed))
-}
-
-/// Decrypt the vault body to canonical KV bytes. Caller is responsible for
-/// parsing and zeroizing.
-pub fn open_body(dek: &[u8; 32], body_b64: &str) -> Result<Vec<u8>> {
-    let sealed = STANDARD
-        .decode(body_b64)
-        .map_err(|_| AppError::Internal("body not base64".into()))?;
-    aead_open(dek, &sealed, BODY_AAD)
-}
-
-/// Encrypt a body. Returns base64(nonce|ct|tag).
-pub fn seal_body(dek: &[u8; 32], plaintext: &[u8]) -> Result<String> {
-    let sealed = aead_seal(dek, plaintext, BODY_AAD)?;
-    Ok(STANDARD.encode(sealed))
+/// Rotate the acting credential's `(prf_salt, wrapped_key)` after a Write and
+/// replace the body ciphertext. Used by the write handler.
+pub fn replace_after_write(
+    vault: &mut SealedVault,
+    credential_id_b64: &str,
+    new_prf_salt: Vec<u8>,
+    new_wrapped_key: Vec<u8>,
+    new_ciphertext: Vec<u8>,
+) -> Result<()> {
+    let cid_bytes = STANDARD
+        .decode(credential_id_b64)
+        .map_err(|_| AppError::BadRequest("credential_id not base64".into()))?;
+    let cred = vault
+        .credentials
+        .iter_mut()
+        .find(|c| c.credential_id == cid_bytes)
+        .ok_or_else(|| AppError::Unauthorized("unknown credential for write".into()))?;
+    cred.prf_salt = new_prf_salt;
+    cred.wrapped_key = new_wrapped_key;
+    vault.ciphertext = new_ciphertext;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -195,53 +149,26 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn roundtrip_dek() {
-        let user_key = [0x42u8; 32];
-        let prf_salt = [0x11u8; 32];
-        let cid = b"credential-bytes";
-        let dek = [0x77u8; 32];
-        let wrapped = wrap_dek(&user_key, &prf_salt, cid, &dek).unwrap();
-        let cred = SealedCredential {
-            credential_id: "AAAA".into(),
-            x: "".into(),
-            y: "".into(),
-            device_name: "".into(),
-            created_at: 0,
-            prf_salt: STANDARD.encode(prf_salt),
-            wrapped_dek: wrapped,
-        };
-        let unwrapped = unwrap_dek(&user_key, &cred, cid).unwrap();
-        assert_eq!(unwrapped, dek);
-    }
-
-    #[test]
-    fn roundtrip_body() {
-        let dek = [0x77u8; 32];
-        let plaintext = b"{\"a\":1}";
-        let sealed = seal_body(&dek, plaintext).unwrap();
-        let opened = open_body(&dek, &sealed).unwrap();
-        assert_eq!(opened, plaintext);
-    }
-
-    #[test]
-    fn vault_write_read() {
+    fn vault_write_read_roundtrip() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("vault.dat");
-        let v = SealedVault::empty(
-            SealedCredential {
-                credential_id: "abc".into(),
-                x: "x".into(),
-                y: "y".into(),
-                device_name: "test".into(),
-                created_at: 1,
-                prf_salt: STANDARD.encode([0u8; 32]),
-                wrapped_dek: STANDARD.encode([0u8; 64]),
-            },
-            STANDARD.encode([0u8; 64]),
-        );
-        v.write_atomic(&path).unwrap();
-        let loaded = SealedVault::read(&path).unwrap().unwrap();
-        assert_eq!(loaded.version, VAULT_VERSION);
+        let v = build_initial(
+            b"cred-bytes".to_vec(),
+            "x_b64".into(),
+            "y_b64".into(),
+            "Test Device".into(),
+            vec![0u8; 32],
+            vec![0u8; 48],
+            vec![0u8; 64],
+        )
+        .unwrap();
+        write_atomic(&path, &v).unwrap();
+        let loaded = read(&path).unwrap().unwrap();
+        assert_eq!(loaded.version, CURRENT_VERSION);
         assert_eq!(loaded.credentials.len(), 1);
+        assert_eq!(loaded.credentials[0].credential_id, b"cred-bytes");
+        let pk = find_pubkey(&v, &STANDARD.encode(b"cred-bytes")).unwrap();
+        assert_eq!(pk.x, "x_b64");
+        assert_eq!(pk.device_name, "Test Device");
     }
 }

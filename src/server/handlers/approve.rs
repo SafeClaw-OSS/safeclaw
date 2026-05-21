@@ -12,7 +12,7 @@ use axum::{
     extract::{Path, State},
     Json,
 };
-use serde::Deserialize;
+use base64::{engine::general_purpose::STANDARD, Engine};
 use serde_json::{json, Value};
 
 use crate::approval::ApprovalStatus;
@@ -20,10 +20,10 @@ use crate::error::{AppError, Result};
 use crate::passkey::PasskeyEntry;
 use crate::protocol::operation::{as_export_path, discriminator, ActType};
 use crate::protocol::{render_operation, validate_grant, Grant};
-use crate::server::handlers::metadata::decrypt_vault_map;
+use crate::server::handlers::metadata::decrypt_vault_targets;
 use crate::server::tenant_extractor::TenantId;
 use crate::state::AppState;
-use crate::storage::SealedVault;
+use crate::storage::sealed_vault::{find_pubkey, read as read_vault};
 
 pub async fn get_approval(
     State(state): State<Arc<AppState>>,
@@ -102,10 +102,10 @@ pub async fn confirm(
 
     // 3. Validate the grant (passkey assertion + binding + freshness).
     let vault_path = state.tenants.vault_path(&tenant_id)?;
-    let vault = SealedVault::read(&vault_path)?
+    let vault = read_vault(&vault_path)?
         .ok_or_else(|| AppError::Conflict("vault not initialized".into()))?;
     let lookup_credential = |cred_id_b64: &str| -> Option<PasskeyEntry> {
-        vault.find_credential(cred_id_b64).map(|c| c.passkey_entry())
+        find_pubkey(&vault, cred_id_b64)
     };
 
     let validated = {
@@ -123,15 +123,24 @@ pub async fn confirm(
     let cached_value = match &validated.op.act.kind {
         ActType::Export => {
             let path = as_export_path(&validated.op)?;
-            let kv = decrypt_vault_map(
-                &validated.user_key,
-                &grant.credential_id,
+            let targets = decrypt_vault_targets(
+                &validated.op,
+                &validated.wrapping_key,
                 &validated.credential_id_bytes,
                 &vault,
             )?;
-            let v = lookup_path_str(&kv, path)
+            // Targets are flat `{ name: b64(bytes) }`. Lookup the path and
+            // decode back to a UTF-8 string for legacy display.
+            let v_b64 = targets
+                .get(path)
+                .and_then(|x| x.as_str())
                 .ok_or(AppError::NotFound)?;
-            Some(v)
+            let raw = STANDARD
+                .decode(v_b64)
+                .map_err(|_| AppError::Internal("target value not base64".into()))?;
+            let s = String::from_utf8(raw)
+                .map_err(|_| AppError::Internal("target value not utf8".into()))?;
+            Some(s)
         }
         _ => None,
     };
@@ -156,17 +165,6 @@ pub async fn reject(
         .reject(&id, "user denied")
         .ok_or(AppError::NotFound)?;
     Ok(Json(json!({ "ok": true, "id": rec.id, "status": "rejected" })))
-}
-
-fn lookup_path_str(root: &Value, path: &str) -> Option<String> {
-    let mut cur = root;
-    for seg in path.split('.') {
-        cur = cur.get(seg)?;
-    }
-    match cur {
-        Value::String(s) => Some(s.clone()),
-        other => Some(other.to_string()),
-    }
 }
 
 // Placeholder for future use: tenant header is currently ignored on these
