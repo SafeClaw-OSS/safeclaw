@@ -20,13 +20,10 @@ use sudp::primitives::{Hash as _, Sha256};
 
 use crate::crypto::canonical;
 
-/// Default domain separator for grants. Setup, identity, and offline flows
-/// each have their own to prevent cross-context replay.
+/// Default domain separator for grants. Setup gets its own to prevent
+/// cross-context replay of a Reveal grant as a Setup grant (or vice versa).
 pub const DOMAIN_STANDARD: &[u8] = b"safeclaw/v1/binding";
 pub const DOMAIN_SETUP: &[u8] = b"safeclaw/v1/binding-setup";
-pub const DOMAIN_SETUP_OVERWRITE: &[u8] = b"safeclaw/v1/binding-setup-overwrite";
-pub const DOMAIN_IDENTITY: &[u8] = b"safeclaw/v1/binding-identity";
-pub const DOMAIN_OFFLINE: &[u8] = b"safeclaw/v1/binding-offline";
 
 /// Compute SHA-256 over the request body bytes.
 pub fn compute_request_hash(_method: &str, _path: &str, body_bytes: &[u8]) -> [u8; 32] {

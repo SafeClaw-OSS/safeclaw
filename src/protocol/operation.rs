@@ -21,23 +21,17 @@ pub use sudp::{Act, ActType, Bind, Operation, RecipientPk, Valid};
 use crate::error::{AppError, Result};
 
 /// SafeClaw-side validity check that reads the system clock and applies a
-/// 5-minute `iat` skew tolerance. Equivalent to sudp's
-/// `Operation::check_validity(now, 300)`, exposed against `&Valid` because
-/// some call sites have the `Valid` in hand without the full `Operation`.
+/// 5-minute `iat` skew tolerance. Thin adapter over `sudp::Valid::check`.
 pub fn check_now(valid: &Valid) -> Result<()> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    if valid.iat > now + 300 {
-        return Err(AppError::BadRequest("iat in future".into()));
-    }
-    if let Some(exp) = valid.exp {
-        if exp < now {
-            return Err(AppError::BadRequest("operation expired".into()));
-        }
-    }
-    Ok(())
+    valid.check(now, 300).map_err(|e| match e {
+        sudp::Error::OperationExpired => AppError::BadRequest("operation expired".into()),
+        sudp::Error::OperationIatSkew => AppError::BadRequest("iat in future".into()),
+        other => AppError::Internal(format!("validity check: {}", other)),
+    })
 }
 
 // ─── Enroll (a.k.a. Setup) payload extraction ──────────────────────────────
