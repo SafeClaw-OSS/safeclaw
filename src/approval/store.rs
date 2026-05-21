@@ -122,12 +122,18 @@ impl ApprovalStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::operation::{Act, Valid};
+    use crate::protocol::operation::{Act, ActType, Bind, Valid};
 
     fn fake_op() -> Operation {
         Operation {
-            act: Act::Reveal {
-                path: "env.x".into(),
+            act: Act {
+                kind: ActType::Export,
+                target: "env.x".into(),
+                scope: serde_json::Value::Null,
+            },
+            bind: Bind {
+                redeemer: "tenant1".into(),
+                recipient: None,
             },
             valid: Valid { iat: 0, exp: None },
         }

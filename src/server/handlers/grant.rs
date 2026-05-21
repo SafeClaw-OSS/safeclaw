@@ -12,7 +12,9 @@ use serde_json::{json, Value};
 
 use crate::error::{AppError, Result};
 use crate::passkey::PasskeyEntry;
-use crate::protocol::operation::Act;
+use crate::protocol::operation::{
+    as_enroll_credential, as_export_path, as_write_patch, ActType,
+};
 use crate::protocol::{validate_grant, Grant};
 use crate::server::handlers::metadata::decrypt_vault_map;
 use crate::server::tenant_extractor::TenantId;
@@ -55,15 +57,16 @@ pub async fn dispatch_grant(
         )?
     };
 
-    match &validated.op.act {
-        Act::Setup { credential } => {
+    match &validated.op.act.kind {
+        ActType::Enroll => {
+            let credential = as_enroll_credential(&validated.op)?;
             if existing_vault.is_some() {
                 return Err(AppError::Conflict(
                     "vault already initialized for this tenant".into(),
                 ));
             }
             let payload = grant.setup_payload.as_ref().ok_or_else(|| {
-                AppError::BadRequest("setup grant missing setup_payload".into())
+                AppError::BadRequest("enroll grant missing setup_payload".into())
             })?;
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -81,12 +84,13 @@ pub async fn dispatch_grant(
             let vault = SealedVault::empty(sealed_cred, payload.body.clone());
             state.tenants.ensure_dir(tenant_id)?;
             vault.write_atomic(&vault_path)?;
-            tracing::info!(tenant = %tenant_id, "vault setup complete");
+            tracing::info!(tenant = %tenant_id, "vault setup (enroll) complete");
             Ok(Json(
-                json!({ "ok": true, "tenant_id": tenant_id, "act": "setup" }),
+                json!({ "ok": true, "tenant_id": tenant_id, "act": "enroll" }),
             ))
         }
-        Act::Write { patch } => {
+        ActType::Write => {
+            let patch = as_write_patch(&validated.op)?;
             let mut vault = existing_vault
                 .ok_or_else(|| AppError::Conflict("vault not initialized".into()))?;
             vault.replace_credential_after_write(
@@ -99,7 +103,8 @@ pub async fn dispatch_grant(
             tracing::info!(tenant = %tenant_id, "vault write applied");
             Ok(Json(json!({ "ok": true, "act": "write" })))
         }
-        Act::Reveal { path } => {
+        ActType::Export => {
+            let path = as_export_path(&validated.op)?;
             let vault = existing_vault
                 .ok_or_else(|| AppError::Conflict("vault not initialized".into()))?;
             let kv = decrypt_vault_map(
@@ -111,9 +116,13 @@ pub async fn dispatch_grant(
             let value = lookup_path(&kv, path)
                 .ok_or_else(|| AppError::NotFound)?;
             Ok(Json(
-                json!({ "ok": true, "act": "reveal", "path": path, "value": value }),
+                json!({ "ok": true, "act": "export", "path": path, "value": value }),
             ))
         }
+        other => Err(AppError::BadRequest(format!(
+            "unsupported act kind: {:?}",
+            other
+        ))),
     }
 }
 

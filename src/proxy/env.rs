@@ -28,7 +28,7 @@ use serde_json::{json, Value};
 
 use crate::approval::ApprovalStatus;
 use crate::error::{AppError, Result};
-use crate::protocol::operation::{Act, Operation, Valid};
+use crate::protocol::operation::{Act, ActType, Bind, Operation, Valid};
 use crate::server::tenant_extractor::TenantId;
 use crate::state::AppState;
 
@@ -56,7 +56,15 @@ pub async fn handle(
     let TenantId(tenant_id) = tenant.clone();
     let path = format!("{}.{}", ENV_NAMESPACE_PREFIX, key);
     let op = Operation {
-        act: Act::Reveal { path: path.clone() },
+        act: Act {
+            kind: ActType::Export,
+            target: path.clone(),
+            scope: serde_json::Value::Null,
+        },
+        bind: Bind {
+            redeemer: tenant_id.clone(),
+            recipient: None,
+        },
         valid: Valid {
             iat: SystemTime::now()
                 .duration_since(UNIX_EPOCH)

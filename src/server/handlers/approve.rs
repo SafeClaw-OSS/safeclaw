@@ -18,7 +18,7 @@ use serde_json::{json, Value};
 use crate::approval::ApprovalStatus;
 use crate::error::{AppError, Result};
 use crate::passkey::PasskeyEntry;
-use crate::protocol::operation::Act;
+use crate::protocol::operation::{as_export_path, discriminator, ActType};
 use crate::protocol::{render_operation, validate_grant, Grant};
 use crate::server::handlers::metadata::decrypt_vault_map;
 use crate::server::tenant_extractor::TenantId;
@@ -54,10 +54,10 @@ pub async fn details(
 ) -> Result<Json<Value>> {
     let store = state.approvals.lock().unwrap();
     let rec = store.get(&id).ok_or(AppError::NotFound)?;
-    let act_kind = rec.op.act.discriminator();
+    let act_kind = discriminator(&rec.op.act);
     let display = render_operation(&rec.op);
-    let path = match &rec.op.act {
-        Act::Reveal { path } => Some(path.clone()),
+    let path = match &rec.op.act.kind {
+        ActType::Export => Some(rec.op.act.target.clone()),
         _ => None,
     };
     let op_json = serde_json::to_value(&rec.op)?;
@@ -119,9 +119,10 @@ pub async fn confirm(
         )?
     };
 
-    // 4. Execute the act. Toy v0 only supports Reveal via approval.
-    let cached_value = match &validated.op.act {
-        Act::Reveal { path } => {
+    // 4. Execute the act. v0 only supports Export (reveal) via approval.
+    let cached_value = match &validated.op.act.kind {
+        ActType::Export => {
+            let path = as_export_path(&validated.op)?;
             let kv = decrypt_vault_map(
                 &validated.user_key,
                 &grant.credential_id,

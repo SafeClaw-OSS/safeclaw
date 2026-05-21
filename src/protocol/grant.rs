@@ -8,7 +8,9 @@ use crate::crypto::binding::{binding_for_op, DOMAIN_SETUP, DOMAIN_STANDARD};
 use crate::error::{AppError, Result};
 use crate::passkey::webauthn::{verify_assertion, AssertionData};
 use crate::passkey::PasskeyEntry;
-use crate::protocol::operation::{Act, Operation};
+use crate::protocol::operation::{
+    as_enroll_credential, check_now, ActType, Operation,
+};
 
 /// Grant submitted to `POST /grant` (or to `/approve/{id}/confirm`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -85,14 +87,15 @@ pub fn validate_grant(
     }
 
     // 2. Validity window.
-    grant.o.valid.check_now()?;
+    check_now(&grant.o.valid)?;
 
-    // 3. Resolve credential public key (from body for setup, from store otherwise).
-    let (entry, domain) = match &grant.o.act {
-        Act::Setup { credential } => {
+    // 3. Resolve credential public key (from op for Enroll, from store otherwise).
+    let (entry, domain) = match &grant.o.act.kind {
+        ActType::Enroll => {
+            let credential = as_enroll_credential(&grant.o)?;
             if credential.credential_id != grant.credential_id {
                 return Err(AppError::BadRequest(
-                    "grant.credential_id != setup.credential.credential_id".into(),
+                    "grant.credential_id != enroll.credential.credential_id".into(),
                 ));
             }
             let entry = PasskeyEntry {
