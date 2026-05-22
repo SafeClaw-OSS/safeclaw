@@ -1,0 +1,9 @@
+[default]
+write = "ask"
+read = "ask"
+
+[[rule]]
+id = "demo-any"
+label = "Any call to demo upstream"
+match = "*"
+level = "ask"

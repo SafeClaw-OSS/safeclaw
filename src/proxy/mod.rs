@@ -6,6 +6,7 @@
 //! pending approval and returns 202.
 
 pub mod env;
+pub mod use_broker;
 
 use std::sync::Arc;
 
@@ -21,6 +22,8 @@ pub fn proxy_router(state: Arc<AppState>) -> Router {
     let mut router = Router::new()
         .route("/env/{entry}", any(env::handle))
         .route("/env/{entry}/poll", get(env::poll))
+        .route("/use/poll", get(use_broker::poll))
+        .route("/use/{service}/{*rest}", any(use_broker::handle))
         .with_state(state);
     if let Some(cors) = build_cors() {
         router = router.layer(cors);

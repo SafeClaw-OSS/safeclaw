@@ -132,8 +132,49 @@ pub async fn dispatch_grant(
                 &validated.credential_id_bytes,
                 &vault,
             )?;
-            let value = lookup_path(&targets, path)
-                .ok_or_else(|| AppError::NotFound)?;
+
+            // Editor reveal-all: when target = "env" (or empty), surface every
+            // `env.*` target with its plaintext UTF-8 value (legacy editor
+            // contract). Per-target Export goes through the else branch.
+            //
+            // TODO (env-is-vault refactor): drop the `env.` prefix; this special
+            // case becomes "return all targets" with no namespace remapping.
+            if path == "env" || path.is_empty() {
+                let mut all = serde_json::Map::new();
+                if let Some(obj) = targets.as_object() {
+                    for (k, v) in obj {
+                        let b64 = match v.as_str() {
+                            Some(s) => s,
+                            None => continue,
+                        };
+                        let raw = STANDARD.decode(b64).map_err(|_| {
+                            AppError::Internal("target value not base64".into())
+                        })?;
+                        let s = String::from_utf8(raw).map_err(|_| {
+                            AppError::Internal("target value not utf8".into())
+                        })?;
+                        let key = k.strip_prefix("env.").unwrap_or(k).to_string();
+                        all.insert(key, serde_json::Value::String(s));
+                    }
+                }
+                return Ok(Json(json!({
+                    "ok": true, "act": "export", "path": path,
+                    "value": serde_json::Value::Object(all),
+                })));
+            }
+
+            // Per-target Export (e.g., from /approve/:id/confirm with
+            // target = "env.api_key"). Decode the b64 target back to a
+            // plaintext string for the response.
+            let v_b64 = targets
+                .get(path)
+                .and_then(|x| x.as_str())
+                .ok_or(AppError::NotFound)?;
+            let raw = STANDARD
+                .decode(v_b64)
+                .map_err(|_| AppError::Internal("target value not base64".into()))?;
+            let value = String::from_utf8(raw)
+                .map_err(|_| AppError::Internal("target value not utf8".into()))?;
             Ok(Json(
                 json!({ "ok": true, "act": "export", "path": path, "value": value }),
             ))

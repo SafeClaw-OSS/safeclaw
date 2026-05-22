@@ -5,6 +5,7 @@
 //! reverse proxy and leave it unset, while localhost dev sets it to allow
 //! `http://localhost:3000` etc. for direct browser-to-daemon traffic.
 
+pub mod broker;
 pub mod cors;
 pub mod handlers;
 pub mod tenant_extractor;

@@ -119,7 +119,7 @@ pub async fn confirm(
         )?
     };
 
-    // 4. Execute the act. v0 only supports Export (reveal) via approval.
+    // 4. Execute the act. Supports Export (reveal) and Use (broker).
     let cached_value = match &validated.op.act.kind {
         ActType::Export => {
             let path = as_export_path(&validated.op)?;
@@ -141,6 +141,16 @@ pub async fn confirm(
             let s = String::from_utf8(raw)
                 .map_err(|_| AppError::Internal("target value not utf8".into()))?;
             Some(s)
+        }
+        ActType::Use => {
+            let response = crate::server::broker::execute_use_forward(
+                &validated.op,
+                &validated.wrapping_key,
+                &validated.credential_id_bytes,
+                &vault,
+            )
+            .await?;
+            Some(serde_json::to_string(&response)?)
         }
         _ => None,
     };

@@ -5,6 +5,7 @@ use std::sync::Mutex;
 use crate::approval::ApprovalStore;
 use crate::config::Config;
 use crate::passkey::challenge::ChallengeStore;
+use crate::service::ServiceRegistry;
 use crate::storage::TenantDir;
 
 pub struct AppState {
@@ -12,6 +13,7 @@ pub struct AppState {
     pub tenants: TenantDir,
     pub challenges: Mutex<ChallengeStore>,
     pub approvals: Mutex<ApprovalStore>,
+    pub services: ServiceRegistry,
 }
 
 impl AppState {
@@ -22,6 +24,7 @@ impl AppState {
             tenants,
             challenges: Mutex::new(ChallengeStore::new()),
             approvals: Mutex::new(ApprovalStore::new()),
+            services: ServiceRegistry::load(),
         }
     }
 }
