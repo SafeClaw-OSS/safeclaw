@@ -1,0 +1,26 @@
+[service]
+id = "inbox"
+name = "Inbox"
+sub = "demo target"
+category = "integration"
+help = """
+A live target that receives broker-forwarded requests so you can see
+SafeClaw's contract end-to-end. POST anything via `/api/use/inbox`:
+the daemon injects your `env.inbox_api_key` into the Authorization
+header and forwards to inbox.dev.safeclaw.pro. The /try page tails
+the inbox over SSE and shows the request that arrived — including
+the injected credential — so you can see exactly what the receiver
+saw, without the agent ever holding the raw value.
+"""
+
+[[upstream]]
+id = "default"
+url = "https://inbox.dev.safeclaw.pro"
+auth = { type = "bearer", env = "inbox_api_key" }
+
+[[api]]
+path = "*"
+
+  [[api.steps]]
+  target = "upstream:default"
+  returns = true

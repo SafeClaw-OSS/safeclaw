@@ -3,7 +3,7 @@ write = "ask"
 read = "ask"
 
 [[rule]]
-id = "demo-any"
-label = "Any call to demo upstream"
+id = "inbox-any"
+label = "Any call to the inbox service"
 match = "*"
 level = "ask"
