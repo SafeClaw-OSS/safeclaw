@@ -7,7 +7,7 @@ category = "llm"
 [[upstream]]
 id = "default"
 url = "https://generativelanguage.googleapis.com"
-auth = { type = "query", param = "key", placeholder = "AIza..." }
+auth = { type = "query", param = "key", env = "google_api_key", placeholder = "AIza..." }
 locked = { response = "Please unlock the SafeClaw vault to use this service." }
 
 [[api]]

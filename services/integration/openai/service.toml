@@ -14,7 +14,7 @@ raw key.
 [[upstream]]
 id = "default"
 url = "https://api.openai.com/v1"
-auth = { type = "bearer", placeholder = "{{ env.openai_api_key }}" }
+auth = { type = "bearer", env = "openai_api_key", placeholder = "sk-..." }
 
 [[api]]
 path = "*"
