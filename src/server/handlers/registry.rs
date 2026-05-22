@@ -28,6 +28,11 @@ pub struct RegistryEndpoint {
     /// Approval level summarised in the service-level policy. "ask" by default
     /// when no explicit level is declared.
     pub approval: String,
+    /// True when `path` is the service root and any sub-path under it works
+    /// (the daemon-side TOML used `path = "*"`). Agents can interpret this
+    /// as "POST to `path` directly, or append whatever the upstream needs".
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub wildcard: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -62,17 +67,24 @@ pub async fn registry(State(state): State<Arc<AppState>>) -> Result<Json<Value>>
                 .iter()
                 .map(|api| {
                     // api.path may be "*" (catch-all), "/sign", "/wallets/", etc.
-                    // We always need a `/` between the service id and the
-                    // path — service-relative paths sometimes omit the leading
-                    // slash. Normalise to "/api/use/{id}/{rest}".
+                    // For catch-alls we drop the `*` and emit the service root
+                    // with `wildcard: true`, so the agent sees a real URL it
+                    // can call directly instead of "/api/use/demo/*". For
+                    // fixed paths we just normalise the slash.
                     let rest = api.path.trim_start_matches('/');
+                    let (path, wildcard) = if rest == "*" {
+                        (format!("/api/use/{}", id), true)
+                    } else {
+                        (format!("/api/use/{}/{}", id, rest), false)
+                    };
                     RegistryEndpoint {
                         method: api.method.clone().unwrap_or_else(|| "ANY".to_string()),
-                        path: format!("/api/use/{}/{}", id, rest),
+                        path,
                         // Per-endpoint policy resolution is a follow-up; declare
                         // "ask" uniformly so the agent doesn't pre-assume free
                         // passes. Policies still gate the actual broker call.
                         approval: "ask".to_string(),
+                        wildcard,
                     }
                 })
                 .collect();
