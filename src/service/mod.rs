@@ -123,6 +123,11 @@ fn default_retry_interval() -> u64 { 500 }
 pub struct AuthDef {
     #[serde(rename = "type")]
     pub auth_type: String,
+    /// Vault entry key feeding this credential (just the key name, no `env.`
+    /// prefix). Replaces the older `placeholder = "{{ env.X }}"` templating
+    /// convention. `placeholder` continues to mean "UI input hint" only.
+    #[serde(default)]
+    pub env: Option<String>,
     #[serde(default)]
     pub header: Option<String>,
     #[serde(default)]
@@ -460,6 +465,18 @@ impl ServiceRegistry {
     /// Resolve a service by name. Returns None if not found.
     pub fn get(&self, service_name: &str) -> Option<&ServiceDef> {
         self.services.get(service_name)
+    }
+
+    /// Iterate all loaded service definitions, sorted by id for stable ordering.
+    /// Used by the `/v/{vid}/registry` endpoint.
+    pub fn iter_sorted(&self) -> Vec<(&str, &ServiceDef)> {
+        let mut entries: Vec<(&str, &ServiceDef)> = self
+            .services
+            .iter()
+            .map(|(k, v)| (k.as_str(), v))
+            .collect();
+        entries.sort_by_key(|(k, _)| *k);
+        entries
     }
 
     /// Get default category for a service, falling back to "service".

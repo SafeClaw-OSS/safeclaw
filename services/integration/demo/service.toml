@@ -15,7 +15,7 @@ Authorization header — visible proof the secret was injected.
 [[upstream]]
 id = "echo"
 url = "https://httpbin.org/anything"
-auth = { type = "bearer", placeholder = "{{ env.demo_api_key }}" }
+auth = { type = "bearer", env = "demo_api_key" }
 
 [[api]]
 path = "*"
