@@ -39,6 +39,11 @@ pub struct RegistryEndpoint {
 pub struct RegistryService {
     pub id: String,
     pub name: String,
+    /// One-line sub-title (e.g. "demo target", "REST API"). UI surfaces it
+    /// in parentheses after `name` so users see what kind of service this
+    /// is without reading the full description.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sub: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     pub endpoints: Vec<RegistryEndpoint>,
@@ -91,6 +96,7 @@ pub async fn registry(State(state): State<Arc<AppState>>) -> Result<Json<Value>>
             RegistryService {
                 id: id.to_string(),
                 name: def.service.name.clone(),
+                sub: def.service.sub.clone(),
                 description: def.service.help.clone(),
                 endpoints,
             }
