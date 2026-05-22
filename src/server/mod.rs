@@ -1,14 +1,26 @@
-//! HTTP server: admin port (`:23294`) router and handler wiring.
+//! HTTP server: admin port (`:23294`) router.
 //!
-//! CORS is added only when `SAFECLAW_CORS_ALLOW_ORIGINS` env var is set
-//! (see [`cors::build_cors`]); production deployments terminate CORS at the
-//! reverse proxy and leave it unset, while localhost dev sets it to allow
-//! `http://localhost:3000` etc. for direct browser-to-daemon traffic.
+//! v1 URL surface (PROTOCOL.md §4.1 / `[[v1-endpoint-design]]`):
+//!
+//! ```text
+//! POST /v/{vid}/op              R-side op creation (or U-direct: Enroll/Write/Export)
+//! GET  /v/{vid}/passkeys        list enrolled credentials for this vault
+//! GET  /v/{vid}/events          SSE lifecycle stream
+//! GET  /c/registry              public service catalog (no vault contents)
+//! GET  /op/{op_id}              poll op status + cached value
+//! POST /op/{op_id}/approve      U submits grant G → T validates, dispatches act
+//! POST /op/{op_id}/reject       U denies
+//! GET  /c/health                custodian health
+//! GET  /c/pubkey                custodian HPKE bootstrap key (placeholder)
+//! ```
+//!
+//! Vault selection is via URL path (`{vid}`). The custodian does no
+//! principal authentication — that's a deployment-layer concern (the
+//! SafeClaw pro-backend is the auth boundary).
 
 pub mod broker;
 pub mod cors;
 pub mod handlers;
-pub mod tenant_extractor;
 
 use std::sync::Arc;
 
@@ -21,16 +33,18 @@ use crate::state::AppState;
 
 pub fn admin_router(state: Arc<AppState>) -> Router {
     let mut router = Router::new()
-        .route("/health", get(handlers::health::health))
-        .route("/challenge", get(handlers::challenge::challenge))
-        .route("/grant", post(handlers::grant::grant))
-        .route("/metadata/passkeys", get(handlers::metadata::passkeys))
-        .route("/metadata/keys", get(handlers::metadata::vault_keys))
-        .route("/approve/{id}", get(handlers::approve::get_approval))
-        .route("/approve/{id}/details", post(handlers::approve::details))
-        .route("/approve/{id}/confirm", post(handlers::approve::confirm))
-        .route("/approve/{id}/reject", post(handlers::approve::reject))
-        .route("/events", get(handlers::events::stream))
+        // Custodian-level (no vault context).
+        .route("/c/health", get(handlers::health::health))
+        .route("/c/pubkey", get(handlers::metadata::pubkey))
+        .route("/c/registry", get(handlers::registry::registry))
+        // Vault-scoped.
+        .route("/v/{vid}/op", post(handlers::op::create))
+        .route("/v/{vid}/passkeys", get(handlers::metadata::passkeys))
+        .route("/v/{vid}/events", get(handlers::events::stream))
+        // Op-flat (vault context lives on the approval record).
+        .route("/op/{op_id}", get(handlers::approve::get_op))
+        .route("/op/{op_id}/approve", post(handlers::approve::approve_op))
+        .route("/op/{op_id}/reject", post(handlers::approve::reject_op))
         .with_state(state);
     if let Some(cors) = cors::build_cors() {
         router = router.layer(cors);

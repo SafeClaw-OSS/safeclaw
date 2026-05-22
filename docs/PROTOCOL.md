@@ -1,5 +1,7 @@
 # SafeClaw Protocol — SUDP Concrete Profile
 
+> **Doc state (2026-05-22)**: §4.0 + §4.1 endpoint table 和 §4.7 vault selection 已同步到 v1 design。§4.3 (`/challenge`)、§4.4 (`/grant`)、§4.5 (broker)、§4.6 + §4.6.1 (`safeclaw-vault` virtual service)、§6.2 (`/state/*`)、§8 sequences 仍引用 legacy endpoint 名，**待统一**。冲突时以 §4.0/§4.1 为准。
+>
 > 本文是 SafeClaw daemon 实现的 cryptographic protocol 规约。它是 **SUDP paper** 的一个 **concrete profile**：固定算法选择、wire format、endpoint 映射、domain-separation labels 等。
 >
 > **不重复 SUDP paper 的内容**（key hierarchy 推导、phase 形式化、安全证明等），仅在需要锚定时 cross-reference。
@@ -17,7 +19,7 @@
 | SUDP role | SafeClaw 实例 |
 |---|---|
 | **U** Authorizer | 用户本人，通过 WebAuthn passkey + browser |
-| **R** Requester | LLM agent，通过 proxy port (`:23295`) 发起 op |
+| **R** Requester | LLM agent，通过 `POST /v/{vid}/use/<svc>/<rest>` 发起 op |
 | **T** Custodian | safeclaw daemon |
 | **E** Environment | 上游 service (OpenAI/Anthropic/...)，非 SUDP 参与者 |
 | **`\Sigma`** Sealed state | `~/.safeclaw/vault.dat`（SCSV format，§5.1） |
@@ -114,20 +116,20 @@ o = {
 
 ### 3.2 Type 词汇表
 
+ActType vocabulary 跟随 `sudp` 上游：`Enroll / Write / Rotate / Revoke / Export / Use / Custom`。
+
 | `act.type` | SUDP phase | 说明 |
 |---|---|---|
-| `setup` | Phase I | 初始化 vault（首个 passkey + 初始 M） |
-| `write` | Phase III.3 (lifecycle) | 写 M（services config / policy / preferences），每写自动轮换 K + acting credential 的 η_c |
-| `enroll` | Phase III.3 (lifecycle) | 注册新 passkey 加入现有 vault |
-| `revoke` | Phase III.3 (lifecycle) | 删除一个 passkey |
-| `export` | Phase III.2 | 导出 M 子集到 recipient（recipient 通过 ECDH/KEM sealed）；`o.bind.recipient` **必填**，缺则 400 |
-| `reveal` | Phase III.2 (SafeClaw 扩展) | 明文返回 M 子集给 R，**无** ECDH sealing；`o.bind.recipient` **必空**，有则 400 |
+| `enroll` | Phase I + III.3 | 初始化 vault（首个 passkey）或注册新 passkey；vault 已存在时需要 `overwrite_proof.existing_assertion`（§3.5）|
+| `write` | Phase III.3 | 写 M；每写自动轮换 K + acting credential 的 η_c |
+| `revoke` | Phase III.3 | 删除一个 passkey |
+| `rotate` | Phase III.3 | K 的轮换（v1 隐含在 write/enroll/revoke 中，不独立暴露） |
+| `export` | Phase III.2 | 导出 M 子集；`o.bind.recipient` **必填**（sudp 2026-05-22 breaking change）|
+| `use` | Phase III.1 | broker：T 取 secret 注入 R 的 upstream 调用，secret 不出 T |
 
-`reveal` 是 SafeClaw 对 SUDP 抽象 type 词汇的显式扩展（详 paper feedback proposal #4）。覆盖 R 无 KEM 客户端能力的场景，最常见就是透明 HTTP proxy UX 下 agent 通过 `safeclaw-vault` 虚拟服务取 secret（§4.6）。`export` 和 `reveal` 显式两 mode，**绝不让 export 在 recipient 缺失时静默降级为 plaintext**（footgun 避免）。
+**`reveal` 已废弃。** 历史的 "reveal = plaintext export to R" mode 已并入 `export` + "custodian-as-recipient" 部署模式：当 R 无 KEM 能力时，custodian 自己生成 ephemeral keypair、自己充当 recipient、execute_export → decap → 业务层用明文（如转给 agent over TLS）。custodian 显式承担"我把 secret 给出去了"的安全责任，paper 不打折，footgun 在 [[approve-ui-ownership-transfer]] UI 警告里显式化。
 
-**未实现/推迟**:
-- `use` 类（SUDP III.1）的形式化 op 不进 `/grant`；通过 proxy port (`:23295`) 触发，由 daemon 内部走 policy + approval（详 §4.5）
-- `rotate` 类（SUDP III.3 sub-case）暂不暴露独立 endpoint；K 的轮换隐含在每个 `write/enroll/revoke` 中
+**Use op** 不再走 `proxy port :23295`（已废弃）；直接走 `POST /v/{vid}/use/<svc>/<rest>` R-side sugar（§4.1），内部 compile 成 Use op 后 redemption 阶段汇流到 `POST /op/{op_id}/approve`。
 
 ### 3.3 Type-specific `act.scope` schemas
 
@@ -179,39 +181,46 @@ o = {
 
 ## 4. API Surface
 
+### 4.0 URL conventions & vocabulary
+
+**URL 分三组**：vault-scoped (`/v/{vid}/...`)、op-flat (`/op/{op_id}/...`)、custodian-level (`/c/...`)。Vault selection 永远走 URL path，不走 header；selection (URL) 与 authentication (Authorization header) 解耦。Custodian 不感知 user—`{vid}` 是 vault 标识符，principal→vault 的映射是部署层的事。
+
+**Vault evolution guarantee.** SafeClaw 当前部署 `{vid}` = Supabase user UUID（1:1 user-to-vault）；将来扩展 multi-vault-per-user 时 URL shape 不变，只需在部署层加 principal→vaults lookup。
+
+**Phase II.3 三动作 vocabulary.** U **authorizes** G（设备本地签）→ carrier **submits** G（网络传输；SafeClaw 用 Topology A，即 U-direct）→ T **redeems** G（验签 + execute）。Paper Phase II.3 形式上的 "Redemption" 严格指 T 端动作；submission 是 deployment 层动作，无独立 paper 动词。
+
 ### 4.1 Endpoint table
 
 ```
-SUDP cryptographic protocol layer:
-  GET  /challenge                       # Phase II.1 freshness
-  POST /grant                       # Phase I + III, type-dispatched          [HPKE-wrapped]
+─── Vault-scoped (creation / management) ─────────────────────────────────────
 
-Daemon control (deployment, 非 SUDP):
-  GET  /health                          # status
-  POST /state/unlock                    # 打开 vault（带 grant）                   [HPKE-wrapped]
-  POST /state/lock                      # 锁定 vault（带 grant）                   [HPKE-wrapped]
+POST  /v/{vid}/op                    R 创建 op            → { op_id, r, expires_at }    [HPKE: SHOULD]
+POST  /v/{vid}/use/<svc>/<rest>      R-side sugar (Use)   → 同上                          [HPKE: SHOULD]
+POST  /v/{vid}/export/<key>          R-side sugar (Export)→ 同上                          [HPKE: SHOULD]
+POST  /v/{vid}/unlock                U: 解锁 vault                                        [HPKE: MUST]
+POST  /v/{vid}/lock                  U: 锁 vault
+GET   /v/{vid}/passkeys              该 vault 的凭据列表
+GET   /v/{vid}/events                tenant-scoped SSE 流
 
-Public metadata (非 SUDP, observable, non-secret):
-  GET  /metadata/server_pubkey          # 返回 sc_pk（HPKE 用）
-  GET  /metadata/passkeys               # public keys + cid + η_c
-  GET  /metadata/services               # service names + categories
+─── Op-flat (对已存在 op 的动作) ─────────────────────────────────────────────
 
-Approval workflow (Phase II 的 OOB 实现):
-  GET  /approve/pending
-  GET  /approve/{id}
-  POST /approve/{id}/details            # 含 grant；export-class 响应自带 ECDH    [HPKE-wrapped]
-  POST /approve/{id}/confirm                                                       [HPKE-wrapped]
-  POST /approve/{id}/reject                                                        [HPKE-wrapped]
+GET   /op/{op_id}                    R: 轮询状态 / 结果
+POST  /op/{op_id}/approve            U: submit G → redeem → result                       [HPKE: MUST]
+POST  /op/{op_id}/reject             U: 拒绝                                              [HPKE: MUST]
 
-Proxy port (separate :23295, 非 admin API):
-  *  /<service>/...                     # R 入口；触发 Phase II/III
-                                        # 含内置虚拟服务 safeclaw-vault/<dotted-path> (§4.6.1)
+─── Custodian-level (无 vault 上下文) ────────────────────────────────────────
 
-Multi-tenant: 所有 :23294 + :23295 请求**必须**带 X-Safeclaw-Tenant header (§4.7)
-              缺则 400；daemon 不 fallback 到默认 tenant
+GET   /c/health
+GET   /c/pubkey                      sc_pk (HPKE bootstrap)
 ```
 
-**`[HPKE-wrapped]`** 标注的 endpoint 接受 HPKE 加密的请求体（详 §4.2）。其他 endpoint 接受/返回的都是 public material，不需要 envelope。
+**HPKE coverage.** 标注 `[HPKE: MUST]` 的 endpoint 请求体含 G 或同等密码学敏感物质，必须 HPKE 外信封封装（详 §4.2）。`[HPKE: SHOULD]` 的请求体含可观测意图（target 名、上游业务 payload），建议封装。无标注 = 无敏感载荷，TLS 足够。响应方向机密性由 SUDP Export sealing 在协议内部负责（§4.5）。
+
+**R-side sugar 共用 SUDP-aware 内部实现.** `/v/{vid}/use/...`、`/v/{vid}/export/...` 的 handler 只做"URL+body → sudp::Operation"编译，编译完调同一个 op-creation service。**无 HTTP redirect，无平行实现。** Redemption 阶段统一 `POST /op/{op_id}/approve`。
+
+**Creation 在 parent 下，存在物的动作 flat at root.** 任何 URL 中**最多出现一个 ID** — `/v/{vid}/...` 创建（vault 是 parent）、`/op/{op_id}/...` 操作 op（op_id 自带 vault 归属，daemon 内部 lookup）。杜绝 `/v/{vid}/op/{op_id}/...` 这种双 ID URL。
+
+**Authentication.** 上面所有 endpoint 的 auth 由 `Authorization` header 承载（部署层任选：Supabase session / API key / mTLS / …）；selection 在 URL，authentication 在 header，正交。Custodian-level `/c/...` 无 vault 上下文，部分 endpoint（如 `/c/pubkey`）公开访问无 auth。
 
 ### 4.2 Outer envelope (HPKE)
 
@@ -275,7 +284,7 @@ CLI 根据 daemon 的位置选择如何获取 sc_pk：
 - 这是默认场景，多数 OSS user 走这条路径
 
 **路径 B（remote mode）**: daemon 在跨网位置（VPS、Pro relay、Docker 远端容器等）
-- CLI 走 `GET /metadata/server_pubkey` 跨网 HTTP fetch
+- CLI 走 `GET /c/pubkey` 跨网 HTTP fetch
 - TOFU pin 写到 `~/.safeclaw/known_servers.json`
 - 后续连接对比 fingerprint：match → 用；mismatch → 警告（潜在 MITM 或 server keypair rotation）
 
@@ -463,28 +472,11 @@ GET :23295/safeclaw-vault/<dotted-path>
 - R 永远只看见 HTTP，**完全 SUDP-unaware**
 - 这就是 paper §05-agentic-systems "tool adapter compiles into o" 的 T-side adapter 实例化（详 paper feedback proposal #1）
 
-### 4.7 Multi-tenant routing
+### 4.7 Vault selection
 
-V1 daemon 是 tenant-routed（单租户 = N=1 多租户的 special case）：
+Vault 选择由 URL path 的 `{vid}` segment 承载（详 §4.0），不再使用 `X-Safeclaw-Tenant` header。Custodian 不感知 user—principal→vault 的映射是部署层职责，custodian 只看 `{vid}`。
 
-```
-所有 :23294 + :23295 请求必须带:
-  X-Safeclaw-Tenant: <tenant_id>
-缺则 400；daemon 不 fallback 到默认 tenant
-```
-
-**谁负责设置 header**：
-- 本地 CLI：自动塞入（CLI 知道自己服务的 tenant）
-- Pro relay：验完 sc_xxx 翻译为 tenant_id 后塞入
-- openclaw bundle：启动脚本预创建 tenant，bundle 内的 dashboard / agent 自动塞入
-
-**daemon 不验证 header 真实性** — transport 层（unix socket / 内网 / mTLS）负责限制谁能注入 header。
-
-state dir 路由：
-- 单租户部署：`~/.safeclaw/vault.dat`（无 `tenants/` 子目录），daemon 仍要求 header（约定优于配置；CLI 自动塞 `default`）
-- 多租户部署：`<state_dir>/tenants/<tenant_id>/vault.dat`
-
-详 §5.3 directory layout。
+State dir 路由：`<state_dir>/vaults/<vid>/vault.dat`。单 vault 部署本质是多 vault 的 N=1 case，无特殊路径。
 
 ---
 

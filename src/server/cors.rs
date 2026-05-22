@@ -17,7 +17,7 @@
 
 use axum::http::{
     header::{AUTHORIZATION, CONTENT_TYPE},
-    HeaderName, HeaderValue, Method,
+    HeaderValue, Method,
 };
 use tower_http::cors::CorsLayer;
 
@@ -40,11 +40,7 @@ pub fn build_cors() -> Option<CorsLayer> {
         CorsLayer::new()
             .allow_origin(origins)
             .allow_credentials(true)
-            .allow_headers([
-                AUTHORIZATION,
-                CONTENT_TYPE,
-                HeaderName::from_static("x-safeclaw-tenant"),
-            ])
+            .allow_headers([AUTHORIZATION, CONTENT_TYPE])
             .allow_methods([Method::GET, Method::POST, Method::OPTIONS]),
     )
 }

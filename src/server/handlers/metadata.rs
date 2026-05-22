@@ -1,12 +1,17 @@
-//! Read-only metadata endpoints (no passkey required).
+//! Vault-scoped and custodian-level read-only endpoints.
 //!
-//! - `GET /metadata/passkeys`: list registered credentials' public metadata
-//! - `GET /metadata/keys`: list vault credential count (key NAMES require
-//!   a passkey-signed Export grant via /grant)
+//! - `GET /v/{vid}/passkeys` — list this vault's enrolled credentials (public metadata only)
+//! - `GET /c/pubkey`         — custodian's HPKE public key (bootstrap for outer envelope)
+//!
+//! Listing actual target names still requires a passkey-signed Export op via
+//! `POST /v/{vid}/op` + `POST /op/{op_id}/approve`.
 
 use std::sync::Arc;
 
-use axum::{extract::State, Json};
+use axum::{
+    extract::{Path, State},
+    Json,
+};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -16,7 +21,7 @@ use sudp::primitives::StdPrimitives;
 
 use crate::error::Result;
 use crate::protocol::Operation;
-use crate::server::tenant_extractor::TenantId;
+use crate::server::handlers::op::validate_vault_id;
 use crate::state::AppState;
 use crate::storage::sealed_vault::find_pubkey;
 
@@ -33,10 +38,10 @@ pub struct PasskeyMeta {
 
 pub async fn passkeys(
     State(state): State<Arc<AppState>>,
-    tenant: TenantId,
+    Path(vault_id): Path<String>,
 ) -> Result<Json<serde_json::Value>> {
-    let TenantId(tenant_id) = tenant;
-    let vault_path = state.tenants.vault_path(&tenant_id)?;
+    validate_vault_id(&vault_id)?;
+    let vault_path = state.tenants.vault_path(&vault_id)?;
     let Some(vault) = crate::storage::sealed_vault::read(&vault_path)? else {
         return Ok(Json(json!({ "vault_exists": false, "passkeys": [] })));
     };
@@ -57,33 +62,20 @@ pub async fn passkeys(
     Ok(Json(json!({ "vault_exists": true, "passkeys": metas })))
 }
 
-/// `GET /metadata/keys` — surface vault existence + version without
-/// touching plaintext. Listing actual target names requires a passkey-signed
-/// Export grant via `/grant`.
-pub async fn vault_keys(
-    State(state): State<Arc<AppState>>,
-    tenant: TenantId,
-) -> Result<Json<Value>> {
-    let TenantId(tenant_id) = tenant;
-    let vault_path = state.tenants.vault_path(&tenant_id)?;
-    let Some(vault) = crate::storage::sealed_vault::read(&vault_path)? else {
-        return Ok(Json(json!({ "vault_exists": false, "keys": [] })));
-    };
-    Ok(Json(json!({
-        "vault_exists": true,
-        "version": vault.version,
-        "credential_count": vault.credentials.len(),
-        "note": "Listing key names requires a passkey-signed Export grant; use POST /grant.",
-    })))
+/// `GET /c/pubkey` — custodian-level HPKE public key.
+///
+/// Placeholder: HPKE outer-envelope is not yet implemented (M1 in
+/// protocol-md-review). Returns `{ hpke_supported: false }` so clients can
+/// detect non-support and fall back to TLS-only confidentiality.
+pub async fn pubkey(State(_state): State<Arc<AppState>>) -> Json<Value> {
+    Json(json!({
+        "hpke_supported": false,
+        "note": "HPKE outer envelope (sc_pk) not yet implemented; see PROTOCOL.md M1.",
+    }))
 }
 
 /// Decrypt vault and return the `ProtectedState.targets` map as JSON (key →
-/// base64 of secret bytes). Used by act dispatchers in `grant.rs` and
-/// `approve.rs` for Export-class operations.
-///
-/// Internally constructs a `sudp::RedeemedGrant` from the safeclaw
-/// `ValidatedGrant` data and calls `sudp::phases::consumption::open` to
-/// recover `M`.
+/// base64 of secret bytes). Used by `approve.rs` for Export/Use act dispatch.
 pub fn decrypt_vault_targets(
     op: &Operation,
     wrapping_key: &[u8],
@@ -99,19 +91,14 @@ pub fn decrypt_vault_targets(
     let opened = sudp::phases::consumption::open::<StdPrimitives>(&redeemed, vault)
         .map_err(|e| crate::error::AppError::Unauthorized(format!("vault open: {}", e)))?;
 
-    // Convert ProtectedState.targets (BTreeMap<String, TargetValue>) to a
-    // JSON map of `{ name: base64(bytes) }` for legacy callers that walk by
-    // dotted path. Future: callers should consume `opened.m` directly.
     let mut out = serde_json::Map::new();
     for (k, v) in opened.m.targets.iter() {
         out.insert(k.clone(), serde_json::Value::String(STANDARD.encode(v.as_bytes())));
     }
-    let _ = redeemed_zeroize_marker(); // touch to keep import alive
+    let _ = redeemed_zeroize_marker();
     Ok(serde_json::Value::Object(out))
 }
 
-// Tiny helper to keep WebAuthn import path obvious (used elsewhere via
-// SealedState registry typing); not actually invoked.
 fn redeemed_zeroize_marker() -> std::marker::PhantomData<WebAuthn> {
     std::marker::PhantomData
 }

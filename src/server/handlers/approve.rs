@@ -1,10 +1,11 @@
-//! `/approve/{id}` family — approval workflow.
+//! `/op/{op_id}` family — op lifecycle (poll, approve, reject).
 //!
-//! - `GET /approve/{id}`: poll endpoint (agent or browser checks status)
-//! - `POST /approve/{id}/details`: returns `render(o)` plus structured op summary
-//! - `POST /approve/{id}/confirm`: body = a Grant. Validates and executes the
-//!   approved act; caches plaintext result for the agent.
-//! - `POST /approve/{id}/reject`: marks rejected.
+//! - `GET  /op/{op_id}`            — poll: status + cached value + render(o)
+//! - `POST /op/{op_id}/approve`    — U submits grant G; T validates, dispatches act
+//! - `POST /op/{op_id}/reject`     — U denies
+//!
+//! All act kinds (Enroll, Write, Export, Use) flow through `approve_op`; the
+//! act-specific dispatch is inlined per the SUDP protocol.
 
 use std::sync::Arc;
 
@@ -18,39 +19,26 @@ use serde_json::{json, Value};
 use crate::approval::ApprovalStatus;
 use crate::error::{AppError, Result};
 use crate::passkey::PasskeyEntry;
-use crate::protocol::operation::{as_export_path, discriminator, ActType};
+use crate::protocol::operation::{
+    as_enroll_credential, as_export_path, as_write_patch, discriminator, ActType,
+};
 use crate::protocol::{render_operation, validate_grant, Grant};
 use crate::server::handlers::metadata::decrypt_vault_targets;
-use crate::server::tenant_extractor::TenantId;
 use crate::state::{ApprovalEvent, AppState};
-use crate::storage::sealed_vault::{find_pubkey, read as read_vault};
+use crate::storage::sealed_vault::{
+    build_initial, find_pubkey, read as read_vault, replace_after_write, write_atomic,
+};
 
-pub async fn get_approval(
+/// `GET /op/{op_id}` — unified poll + details.
+///
+/// Returns the canonical op, render string, status, expires_at, and (when
+/// approved-and-not-yet-consumed) the cached `value`.
+pub async fn get_op(
     State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
+    Path(op_id): Path<String>,
 ) -> Result<Json<Value>> {
     let store = state.approvals.lock().unwrap();
-    let rec = store.get(&id).ok_or(AppError::NotFound)?;
-    let expires_at = rec.expires_at_unix;
-    let body = match &rec.status {
-        ApprovalStatus::Pending => json!({ "status": "pending", "expires_at": expires_at }),
-        ApprovalStatus::Approved => {
-            json!({ "status": "approved", "value": rec.cached_value, "expires_at": expires_at })
-        }
-        ApprovalStatus::Rejected { reason } => {
-            json!({ "status": "rejected", "reason": reason })
-        }
-        ApprovalStatus::Consumed => json!({ "status": "consumed" }),
-    };
-    Ok(Json(body))
-}
-
-pub async fn details(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-) -> Result<Json<Value>> {
-    let store = state.approvals.lock().unwrap();
-    let rec = store.get(&id).ok_or(AppError::NotFound)?;
+    let rec = store.get(&op_id).ok_or(AppError::NotFound)?;
     let act_kind = discriminator(&rec.op.act);
     let display = render_operation(&rec.op);
     let path = match &rec.op.act.kind {
@@ -58,54 +46,61 @@ pub async fn details(
         _ => None,
     };
     let op_json = serde_json::to_value(&rec.op)?;
+    let (status, value) = match &rec.status {
+        ApprovalStatus::Pending => ("pending", None),
+        ApprovalStatus::Approved => ("approved", rec.cached_value.clone()),
+        ApprovalStatus::Rejected { .. } => ("rejected", None),
+        ApprovalStatus::Consumed => ("consumed", None),
+    };
     Ok(Json(json!({
-        "id": rec.id,
-        "status": match &rec.status {
-            ApprovalStatus::Pending => "pending",
-            ApprovalStatus::Approved => "approved",
-            ApprovalStatus::Rejected { .. } => "rejected",
-            ApprovalStatus::Consumed => "consumed",
-        },
+        "op_id": rec.id,
+        "r": rec.r,
+        "status": status,
         "act": act_kind,
         "path": path,
         "display": display,
         "op": op_json,
+        "value": value,
         "expires_at": rec.expires_at_unix,
     })))
 }
 
-pub async fn confirm(
+/// `POST /op/{op_id}/approve` — U submits the signed grant. T validates and
+/// dispatches the act (Enroll / Write / Export / Use).
+pub async fn approve_op(
     State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
+    Path(op_id): Path<String>,
     Json(grant): Json<Grant>,
 ) -> Result<Json<Value>> {
-    // 1. Look up approval (also gives us tenant_id and the canonical op).
-    let (tenant_id, approval_op) = {
+    // 1. Look up the pending op.
+    let (vault_id, approval_op) = {
         let store = state.approvals.lock().unwrap();
-        let rec = store.get(&id).ok_or(AppError::NotFound)?;
+        let rec = store.get(&op_id).ok_or(AppError::NotFound)?;
         if !matches!(rec.status, ApprovalStatus::Pending) {
-            return Err(AppError::Conflict("approval not pending".into()));
+            return Err(AppError::Conflict("op not pending".into()));
         }
         (rec.tenant_id.clone(), rec.op.clone())
     };
 
-    // 2. Sanity: the grant's operation must equal the approval's pending op.
+    // 2. grant.o must equal the stored op (canonical equality).
     let canonical_grant_op = serde_json::to_value(&grant.o)?;
-    let canonical_approval_op = serde_json::to_value(&approval_op)?;
-    if canonical_grant_op != canonical_approval_op {
+    let canonical_stored_op = serde_json::to_value(&approval_op)?;
+    if canonical_grant_op != canonical_stored_op {
         return Err(AppError::BadRequest(
-            "grant.o does not match the pending approval's operation".into(),
+            "grant.o does not match the stored op".into(),
         ));
     }
 
-    // 3. Validate the grant (passkey assertion + binding + freshness).
-    let vault_path = state.tenants.vault_path(&tenant_id)?;
-    let vault = read_vault(&vault_path)?
-        .ok_or_else(|| AppError::Conflict("vault not initialized".into()))?;
+    // 3. Resolve credential pubkey lookup.
+    //
+    // For Enroll, the credential is brand-new (not in vault yet) — pubkey is
+    // taken from the op's scope. For Write/Export/Use, the credential must be
+    // already enrolled — look it up in the existing vault.
+    let vault_path = state.tenants.vault_path(&vault_id)?;
+    let existing_vault = read_vault(&vault_path)?;
     let lookup_credential = |cred_id_b64: &str| -> Option<PasskeyEntry> {
-        find_pubkey(&vault, cred_id_b64)
+        existing_vault.as_ref().and_then(|v| find_pubkey(v, cred_id_b64))
     };
-
     let validated = {
         let mut chs = state.challenges.lock().unwrap();
         validate_grant(
@@ -117,30 +112,131 @@ pub async fn confirm(
         )?
     };
 
-    // 4. Execute the act. Supports Export (reveal) and Use (broker).
-    let cached_value = match &validated.op.act.kind {
+    // 4. Act dispatch — same logic that previously lived in grant.rs.
+    let (response, cached_value) = match &validated.op.act.kind {
+        ActType::Enroll => {
+            let credential = as_enroll_credential(&validated.op)?;
+            if existing_vault.is_some() {
+                return Err(AppError::Conflict(
+                    "vault already initialized for this vault_id".into(),
+                ));
+            }
+            let payload = grant.setup_payload.as_ref().ok_or_else(|| {
+                AppError::BadRequest("enroll grant missing setup_payload".into())
+            })?;
+            let cid_bytes = STANDARD
+                .decode(&credential.credential_id)
+                .map_err(|_| AppError::BadRequest("credential_id not base64".into()))?;
+            let prf_salt = STANDARD
+                .decode(&credential.prf_salt)
+                .map_err(|_| AppError::BadRequest("prf_salt not base64".into()))?;
+            let wrapped_key = STANDARD
+                .decode(&payload.wrapped_key)
+                .map_err(|_| AppError::BadRequest("wrapped_key not base64".into()))?;
+            let ciphertext = STANDARD
+                .decode(&payload.ciphertext)
+                .map_err(|_| AppError::BadRequest("ciphertext not base64".into()))?;
+            let vault = build_initial(
+                cid_bytes,
+                credential.public_key_x,
+                credential.public_key_y,
+                credential.device_name,
+                prf_salt,
+                wrapped_key,
+                ciphertext,
+            )?;
+            state.tenants.ensure_dir(&vault_id)?;
+            write_atomic(&vault_path, &vault)?;
+            tracing::info!(vault = %vault_id, "vault enroll complete");
+            (
+                json!({ "ok": true, "vault_id": vault_id, "act": "enroll" }),
+                None,
+            )
+        }
+        ActType::Write => {
+            let patch = as_write_patch(&validated.op)?;
+            let mut vault = existing_vault
+                .clone()
+                .ok_or_else(|| AppError::Conflict("vault not initialized".into()))?;
+            let new_prf_salt = STANDARD
+                .decode(&patch.prf_salt_next)
+                .map_err(|_| AppError::BadRequest("prf_salt_next not base64".into()))?;
+            let new_wrapped_key = STANDARD
+                .decode(&patch.wrapped_key)
+                .map_err(|_| AppError::BadRequest("wrapped_key not base64".into()))?;
+            let new_ciphertext = STANDARD
+                .decode(&patch.ciphertext)
+                .map_err(|_| AppError::BadRequest("ciphertext not base64".into()))?;
+            replace_after_write(
+                &mut vault,
+                &grant.credential_id,
+                new_prf_salt,
+                new_wrapped_key,
+                new_ciphertext,
+            )?;
+            write_atomic(&vault_path, &vault)?;
+            tracing::info!(vault = %vault_id, "vault write applied");
+            (json!({ "ok": true, "act": "write" }), None)
+        }
         ActType::Export => {
             let path = as_export_path(&validated.op)?;
+            let vault = existing_vault
+                .clone()
+                .ok_or_else(|| AppError::Conflict("vault not initialized".into()))?;
             let targets = decrypt_vault_targets(
                 &validated.op,
                 &validated.wrapping_key,
                 &validated.credential_id_bytes,
                 &vault,
             )?;
-            // Targets are flat `{ name: b64(bytes) }`. Lookup the path and
-            // decode back to a UTF-8 string for legacy display.
-            let v_b64 = targets
-                .get(path)
-                .and_then(|x| x.as_str())
-                .ok_or(AppError::NotFound)?;
-            let raw = STANDARD
-                .decode(v_b64)
-                .map_err(|_| AppError::Internal("target value not base64".into()))?;
-            let s = String::from_utf8(raw)
-                .map_err(|_| AppError::Internal("target value not utf8".into()))?;
-            Some(s)
+
+            // Editor reveal-all: when target = "env" (or empty), surface every
+            // `env.*` target with its plaintext UTF-8 value (legacy editor
+            // contract). Per-target Export goes through the else branch.
+            if path == "env" || path.is_empty() {
+                let mut all = serde_json::Map::new();
+                if let Some(obj) = targets.as_object() {
+                    for (k, v) in obj {
+                        let b64 = match v.as_str() {
+                            Some(s) => s,
+                            None => continue,
+                        };
+                        let raw = STANDARD.decode(b64).map_err(|_| {
+                            AppError::Internal("target value not base64".into())
+                        })?;
+                        let s = String::from_utf8(raw).map_err(|_| {
+                            AppError::Internal("target value not utf8".into())
+                        })?;
+                        let key = k.strip_prefix("env.").unwrap_or(k).to_string();
+                        all.insert(key, serde_json::Value::String(s));
+                    }
+                }
+                let resp = json!({
+                    "ok": true, "act": "export", "path": path,
+                    "value": serde_json::Value::Object(all),
+                });
+                let cached = Some(resp["value"].to_string());
+                (resp, cached)
+            } else {
+                let v_b64 = targets
+                    .get(path)
+                    .and_then(|x| x.as_str())
+                    .ok_or(AppError::NotFound)?;
+                let raw = STANDARD
+                    .decode(v_b64)
+                    .map_err(|_| AppError::Internal("target value not base64".into()))?;
+                let value = String::from_utf8(raw)
+                    .map_err(|_| AppError::Internal("target value not utf8".into()))?;
+                (
+                    json!({ "ok": true, "act": "export", "path": path, "value": value.clone() }),
+                    Some(value),
+                )
+            }
         }
         ActType::Use => {
+            let vault = existing_vault
+                .clone()
+                .ok_or_else(|| AppError::Conflict("vault not initialized".into()))?;
             let response = crate::server::broker::execute_use_forward(
                 &validated.op,
                 &validated.wrapping_key,
@@ -148,19 +244,26 @@ pub async fn confirm(
                 &vault,
             )
             .await?;
-            Some(serde_json::to_string(&response)?)
+            let body = serde_json::to_string(&response)?;
+            (
+                json!({ "ok": true, "act": "use", "response": serde_json::from_str::<Value>(&body).unwrap_or(Value::Null) }),
+                Some(body),
+            )
         }
-        _ => None,
+        other => {
+            return Err(AppError::BadRequest(format!(
+                "unsupported act kind: {:?}",
+                other
+            )));
+        }
     };
 
-    let (rec_id, rec_tenant_id, response_preview) = {
+    // 5. Mark approved + emit event.
+    let (rec_id, rec_vault_id, response_preview) = {
         let mut store = state.approvals.lock().unwrap();
-        let rec = store.approve(&id, cached_value.clone()).ok_or_else(|| {
-            AppError::Conflict("approval no longer pending after validation".into())
+        let rec = store.approve(&op_id, cached_value.clone()).ok_or_else(|| {
+            AppError::Conflict("op no longer pending after validation".into())
         })?;
-        // For broker (Use), cached_value carries a JSON-stringified
-        // BrokerResponse — parse for the SSE preview. For Export, it's a raw
-        // plaintext string; we don't surface that in the watcher feed.
         let preview = match &validated.op.act.kind {
             ActType::Use => cached_value
                 .as_deref()
@@ -171,35 +274,31 @@ pub async fn confirm(
     };
 
     state.emit_event(ApprovalEvent {
-        tenant_id: rec_tenant_id,
-        approval_id: rec_id.clone(),
+        tenant_id: rec_vault_id,
+        approval_id: rec_id,
         kind: "approved".into(),
         op_summary: None,
         response_preview,
         reason: None,
     });
 
-    Ok(Json(json!({
-        "ok": true,
-        "id": rec_id,
-        "status": "approved",
-    })))
+    Ok(Json(response))
 }
 
-pub async fn reject(
+pub async fn reject_op(
     State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
+    Path(op_id): Path<String>,
 ) -> Result<Json<Value>> {
-    let (rec_id, rec_tenant_id) = {
+    let (rec_id, rec_vault_id) = {
         let mut store = state.approvals.lock().unwrap();
         let rec = store
-            .reject(&id, "user denied")
+            .reject(&op_id, "user denied")
             .ok_or(AppError::NotFound)?;
         (rec.id.clone(), rec.tenant_id.clone())
     };
 
     state.emit_event(ApprovalEvent {
-        tenant_id: rec_tenant_id,
+        tenant_id: rec_vault_id,
         approval_id: rec_id.clone(),
         kind: "rejected".into(),
         op_summary: None,
@@ -207,16 +306,5 @@ pub async fn reject(
         reason: Some("user denied".into()),
     });
 
-    Ok(Json(json!({ "ok": true, "id": rec_id, "status": "rejected" })))
-}
-
-// Placeholder for future use: tenant header is currently ignored on these
-// endpoints because the approval id already binds to a tenant. We could
-// optionally enforce equality between header tenant and rec.tenant_id.
-#[allow(dead_code)]
-fn _enforce_tenant(rec_tenant: &str, header: TenantId) -> Result<()> {
-    if rec_tenant != header.0 {
-        return Err(AppError::Forbidden("tenant mismatch".into()));
-    }
-    Ok(())
+    Ok(Json(json!({ "ok": true, "op_id": rec_id, "status": "rejected" })))
 }

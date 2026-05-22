@@ -1,87 +1,71 @@
-//! `env` virtual service handler — agent-facing key/value secret access.
-//! Renamed from `safeclaw-vault` (the legacy demo name).
+//! `POST /v/{vid}/export/{key}` — R-side sugar for Export-class operations.
 //!
-//! Flow per `safeclaw-protocol/PRO_API_DESIGN.md` §2.4:
-//!
-//! ```text
-//! agent → POST /env/<key>     (with X-Safeclaw-Tenant + Idempotency-Key)
-//!     ├─ no pending approval → daemon creates one → 202 { approval_id, approve_url, poll_url }
-//!     └─ pending approval already approved → 200 { value }
-//! agent → GET /env/<key>/poll?approval_id=<id>
-//!     └─ returns same shape as /approve/{id} (status + value if approved)
-//! ```
-//!
-//! For demo v0 we keep the contract minimal: every call without a query
-//! `approval_id=<id>` creates a fresh approval. Idempotency tracking is
-//! deferred until v0.1.
+//! Compiles `(vid, key)` into a sudp `Operation { act: Export, target: env.{key} }`
+//! and creates a pending approval via the shared op-creation helper. Returns
+//! `{ op_id, r, expires_at }` — same shape as `POST /v/{vid}/op`. R then polls
+//! `GET /op/{op_id}` until U approves.
 
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{ConnectInfo, Path, State},
     http::StatusCode,
     Json,
 };
-use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::approval::ApprovalStatus;
 use crate::error::{AppError, Result};
 use crate::protocol::operation::{Act, ActType, Bind, Operation, Valid};
-use crate::server::tenant_extractor::TenantId;
+use crate::server::handlers::op::validate_vault_id;
 use crate::state::{ApprovalEvent, AppState};
 
 const ENV_NAMESPACE_PREFIX: &str = "env";
 
-#[derive(Debug, Deserialize)]
-pub struct PollQuery {
-    pub approval_id: Option<String>,
-}
-
-/// `* /env/{key}` — create approval (or return cached value).
 pub async fn handle(
     State(state): State<Arc<AppState>>,
-    tenant: TenantId,
-    Path(key): Path<String>,
-    Query(q): Query<PollQuery>,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    Path((vault_id, key)): Path<(String, String)>,
 ) -> Result<(StatusCode, Json<Value>)> {
+    validate_vault_id(&vault_id)?;
     validate_key(&key)?;
 
-    // If the caller already has an approval_id, treat as a poll.
-    if let Some(approval_id) = q.approval_id.as_deref() {
-        return poll_inner(&state, approval_id).await;
-    }
-
-    let TenantId(tenant_id) = tenant.clone();
-    let path = format!("{}.{}", ENV_NAMESPACE_PREFIX, key);
+    let target = format!("{}.{}", ENV_NAMESPACE_PREFIX, key);
     let op = Operation {
         act: Act {
             kind: ActType::Export,
-            target: path.clone(),
+            target,
             scope: serde_json::Value::Null,
         },
         bind: Bind {
-            redeemer: tenant_id.clone(),
+            redeemer: vault_id.clone(),
             recipient: None,
         },
-        valid: Valid {
-            iat: SystemTime::now()
+        valid: Valid::single_use(
+            SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
-            exp: None,
-        },
+            None,
+        ),
     };
 
-    let approval_id = {
+    let ip: IpAddr = addr.ip();
+    let r = {
+        let mut store = state.challenges.lock().unwrap();
+        store.issue(ip).ok_or(AppError::TooManyRequests)?
+    };
+    let (op_id, expires_at) = {
         let mut store = state.approvals.lock().unwrap();
-        store.create(tenant_id.clone(), op.clone())
+        let id = store.create(vault_id.clone(), op.clone(), r.clone());
+        let exp = store.get(&id).map(|r| r.expires_at_unix).unwrap_or(0);
+        (id, exp)
     };
 
     state.emit_event(ApprovalEvent {
-        tenant_id: tenant_id.clone(),
-        approval_id: approval_id.clone(),
+        tenant_id: vault_id,
+        approval_id: op_id.clone(),
         kind: "pending".into(),
         op_summary: Some(serde_json::to_value(&op).unwrap_or(Value::Null)),
         response_preview: None,
@@ -92,54 +76,13 @@ pub async fn handle(
         StatusCode::ACCEPTED,
         Json(json!({
             "status": "pending_approval",
-            "approval_id": approval_id,
-            "approve_url": format!("/approve/{}", approval_id),
-            "poll_url": format!("/env/{}/poll?approval_id={}", key, approval_id),
+            "op_id": op_id,
+            "r": r,
+            "expires_at": expires_at,
+            "approve_url": format!("/op/{}", op_id),
+            "poll_url": format!("/op/{}", op_id),
         })),
     ))
-}
-
-/// `GET /env/{key}/poll?approval_id=<id>` — agent-friendly poll.
-pub async fn poll(
-    State(state): State<Arc<AppState>>,
-    Path(_key): Path<String>,
-    Query(q): Query<PollQuery>,
-) -> Result<(StatusCode, Json<Value>)> {
-    let id = q
-        .approval_id
-        .ok_or_else(|| AppError::BadRequest("missing approval_id query param".into()))?;
-    poll_inner(&state, &id).await
-}
-
-async fn poll_inner(state: &Arc<AppState>, approval_id: &str) -> Result<(StatusCode, Json<Value>)> {
-    let mut store = state.approvals.lock().unwrap();
-    let rec = store
-        .get(approval_id)
-        .ok_or(AppError::NotFound)?
-        .clone();
-    match &rec.status {
-        ApprovalStatus::Pending => Ok((
-            StatusCode::ACCEPTED,
-            Json(json!({ "status": "pending", "approval_id": approval_id })),
-        )),
-        ApprovalStatus::Approved => {
-            let value = store
-                .consume(approval_id)
-                .ok_or_else(|| AppError::Internal("approved but no cached value".into()))?;
-            Ok((
-                StatusCode::OK,
-                Json(json!({ "status": "ok", "value": value })),
-            ))
-        }
-        ApprovalStatus::Rejected { reason } => Ok((
-            StatusCode::FORBIDDEN,
-            Json(json!({ "status": "rejected", "reason": reason })),
-        )),
-        ApprovalStatus::Consumed => Ok((
-            StatusCode::GONE,
-            Json(json!({ "status": "consumed" })),
-        )),
-    }
 }
 
 fn validate_key(k: &str) -> Result<()> {

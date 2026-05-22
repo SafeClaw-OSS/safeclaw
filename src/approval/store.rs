@@ -28,13 +28,17 @@ pub struct ApprovalRecord {
     pub id: String,
     pub tenant_id: String,
     pub op: Operation,
+    /// Challenge `r` issued by the custodian when this op was created. Returned
+    /// to U via `GET /op/{op_id}` so U can compute β = H(domain ‖ r ‖ H(o))
+    /// for the grant. Validated against the challenge store on
+    /// `POST /op/{op_id}/approve`.
+    pub r: String,
     pub status: ApprovalStatus,
     /// Cached plaintext result (e.g. for reveal). Available once status=Approved.
     pub cached_value: Option<String>,
     pub created_at: Instant,
-    /// Wall-clock unix seconds when this approval expires. Exposed verbatim
-    /// in /approve/:id responses so the UI can render a countdown without a
-    /// pro-side mapping table (replaces the old supabase.approvals TTL).
+    /// Wall-clock unix seconds when this op expires. Exposed verbatim in
+    /// `GET /op/{op_id}` responses so the UI can render a countdown.
     pub expires_at_unix: u64,
     pub ttl: Duration,
 }
@@ -59,7 +63,7 @@ impl ApprovalStore {
     }
 
     /// Create a new pending approval. Returns the new approval id.
-    pub fn create(&mut self, tenant_id: String, op: Operation) -> String {
+    pub fn create(&mut self, tenant_id: String, op: Operation, r: String) -> String {
         let id = Uuid::new_v4().to_string();
         let now_unix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -69,6 +73,7 @@ impl ApprovalStore {
             id: id.clone(),
             tenant_id,
             op,
+            r,
             status: ApprovalStatus::Pending,
             cached_value: None,
             created_at: Instant::now(),
@@ -144,7 +149,7 @@ mod tests {
                 redeemer: "tenant1".into(),
                 recipient: None,
             },
-            valid: Valid { iat: 0, exp: None },
+            valid: Valid::single_use(0, None),
         }
     }
 
@@ -154,7 +159,7 @@ mod tests {
     #[test]
     fn create_approve_consume() {
         let mut s = ApprovalStore::new();
-        let id = s.create("tenant1".into(), fake_op());
+        let id = s.create("tenant1".into(), fake_op(), "fake_r".into());
         assert!(matches!(s.get(&id).unwrap().status, ApprovalStatus::Pending));
         s.approve(&id, Some("secret".into()));
         assert!(matches!(
@@ -174,7 +179,7 @@ mod tests {
     #[test]
     fn reject_blocks_consume() {
         let mut s = ApprovalStore::new();
-        let id = s.create("tenant1".into(), fake_op());
+        let id = s.create("tenant1".into(), fake_op(), "fake_r".into());
         s.reject(&id, "user denied");
         assert!(s.consume(&id).is_none());
     }
