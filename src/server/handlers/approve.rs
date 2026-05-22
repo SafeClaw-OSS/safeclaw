@@ -22,7 +22,7 @@ use crate::protocol::operation::{as_export_path, discriminator, ActType};
 use crate::protocol::{render_operation, validate_grant, Grant};
 use crate::server::handlers::metadata::decrypt_vault_targets;
 use crate::server::tenant_extractor::TenantId;
-use crate::state::AppState;
+use crate::state::{ApprovalEvent, AppState};
 use crate::storage::sealed_vault::{find_pubkey, read as read_vault};
 
 pub async fn get_approval(
@@ -155,13 +155,35 @@ pub async fn confirm(
         _ => None,
     };
 
-    let mut store = state.approvals.lock().unwrap();
-    let rec = store.approve(&id, cached_value).ok_or_else(|| {
-        AppError::Conflict("approval no longer pending after validation".into())
-    })?;
+    let (rec_id, rec_tenant_id, response_preview) = {
+        let mut store = state.approvals.lock().unwrap();
+        let rec = store.approve(&id, cached_value.clone()).ok_or_else(|| {
+            AppError::Conflict("approval no longer pending after validation".into())
+        })?;
+        // For broker (Use), cached_value carries a JSON-stringified
+        // BrokerResponse — parse for the SSE preview. For Export, it's a raw
+        // plaintext string; we don't surface that in the watcher feed.
+        let preview = match &validated.op.act.kind {
+            ActType::Use => cached_value
+                .as_deref()
+                .and_then(|s| serde_json::from_str::<Value>(s).ok()),
+            _ => None,
+        };
+        (rec.id.clone(), rec.tenant_id.clone(), preview)
+    };
+
+    state.emit_event(ApprovalEvent {
+        tenant_id: rec_tenant_id,
+        approval_id: rec_id.clone(),
+        kind: "approved".into(),
+        op_summary: None,
+        response_preview,
+        reason: None,
+    });
+
     Ok(Json(json!({
         "ok": true,
-        "id": rec.id,
+        "id": rec_id,
         "status": "approved",
     })))
 }
@@ -170,11 +192,24 @@ pub async fn reject(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>> {
-    let mut store = state.approvals.lock().unwrap();
-    let rec = store
-        .reject(&id, "user denied")
-        .ok_or(AppError::NotFound)?;
-    Ok(Json(json!({ "ok": true, "id": rec.id, "status": "rejected" })))
+    let (rec_id, rec_tenant_id) = {
+        let mut store = state.approvals.lock().unwrap();
+        let rec = store
+            .reject(&id, "user denied")
+            .ok_or(AppError::NotFound)?;
+        (rec.id.clone(), rec.tenant_id.clone())
+    };
+
+    state.emit_event(ApprovalEvent {
+        tenant_id: rec_tenant_id,
+        approval_id: rec_id.clone(),
+        kind: "rejected".into(),
+        op_summary: None,
+        response_preview: None,
+        reason: Some("user denied".into()),
+    });
+
+    Ok(Json(json!({ "ok": true, "id": rec_id, "status": "rejected" })))
 }
 
 // Placeholder for future use: tenant header is currently ignored on these

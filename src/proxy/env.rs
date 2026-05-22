@@ -30,7 +30,7 @@ use crate::approval::ApprovalStatus;
 use crate::error::{AppError, Result};
 use crate::protocol::operation::{Act, ActType, Bind, Operation, Valid};
 use crate::server::tenant_extractor::TenantId;
-use crate::state::AppState;
+use crate::state::{ApprovalEvent, AppState};
 
 const ENV_NAMESPACE_PREFIX: &str = "env";
 
@@ -76,8 +76,17 @@ pub async fn handle(
 
     let approval_id = {
         let mut store = state.approvals.lock().unwrap();
-        store.create(tenant_id, op)
+        store.create(tenant_id.clone(), op.clone())
     };
+
+    state.emit_event(ApprovalEvent {
+        tenant_id: tenant_id.clone(),
+        approval_id: approval_id.clone(),
+        kind: "pending".into(),
+        op_summary: Some(serde_json::to_value(&op).unwrap_or(Value::Null)),
+        response_preview: None,
+        reason: None,
+    });
 
     Ok((
         StatusCode::ACCEPTED,

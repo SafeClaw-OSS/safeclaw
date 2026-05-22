@@ -30,6 +30,7 @@ pub fn admin_router(state: Arc<AppState>) -> Router {
         .route("/approve/{id}/details", post(handlers::approve::details))
         .route("/approve/{id}/confirm", post(handlers::approve::confirm))
         .route("/approve/{id}/reject", post(handlers::approve::reject))
+        .route("/events", get(handlers::events::stream))
         .with_state(state);
     if let Some(cors) = cors::build_cors() {
         router = router.layer(cors);
