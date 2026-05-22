@@ -4,7 +4,8 @@
 //!
 //! ```text
 //! POST /v/{vid}/export/{key}                R-side Export sugar
-//! POST /v/{vid}/use/{service}/{*rest}       R-side Use (broker) sugar
+//! POST /v/{vid}/use/{service}                R-side Use (no sub-path)
+//! POST /v/{vid}/use/{service}/{*rest}       R-side Use (with sub-path)
 //! ```
 //!
 //! Both compile the request to a sudp `Operation` and create a pending
@@ -25,6 +26,7 @@ use crate::state::AppState;
 pub fn proxy_router(state: Arc<AppState>) -> Router {
     let mut router = Router::new()
         .route("/v/{vid}/export/{key}", post(env::handle))
+        .route("/v/{vid}/use/{service}", post(use_broker::handle_no_rest))
         .route("/v/{vid}/use/{service}/{*rest}", post(use_broker::handle))
         .with_state(state);
     if let Some(cors) = build_cors() {

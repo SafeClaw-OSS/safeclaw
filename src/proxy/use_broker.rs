@@ -25,11 +25,39 @@ use crate::server::handlers::op::validate_vault_id;
 use crate::service::UpstreamDef;
 use crate::state::{ApprovalEvent, AppState};
 
+/// Variant for the no-rest URL (`POST /v/{vid}/use/{service}`). Lets a
+/// service whose [[api]] is path = "*" be called with no sub-path —
+/// agent just hits the service root.
+pub async fn handle_no_rest(
+    state: State<Arc<AppState>>,
+    addr: ConnectInfo<std::net::SocketAddr>,
+    method: Method,
+    Path((vault_id, service)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<(StatusCode, Json<Value>)> {
+    handle_impl(state, addr, method, vault_id, service, String::new(), headers, body).await
+}
+
 pub async fn handle(
+    state: State<Arc<AppState>>,
+    addr: ConnectInfo<std::net::SocketAddr>,
+    method: Method,
+    Path((vault_id, service, rest)): Path<(String, String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<(StatusCode, Json<Value>)> {
+    handle_impl(state, addr, method, vault_id, service, rest, headers, body).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_impl(
     State(state): State<Arc<AppState>>,
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     method: Method,
-    Path((vault_id, service, rest)): Path<(String, String, String)>,
+    vault_id: String,
+    service: String,
+    rest: String,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<(StatusCode, Json<Value>)> {
