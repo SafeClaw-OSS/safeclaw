@@ -1,0 +1,24 @@
+[service]
+id = "openai"
+name = "OpenAI"
+sub = "REST API"
+category = "integration"
+help = """
+Broker for the OpenAI REST API (api.openai.com/v1). Put your `sk-…`
+key into `env.openai_api_key`, then have your agent call
+`/use/openai/chat/completions` (or any other v1 endpoint). SafeClaw
+injects the bearer token at forward time — your agent never sees the
+raw key.
+"""
+
+[[upstream]]
+id = "default"
+url = "https://api.openai.com/v1"
+auth = { type = "bearer", placeholder = "{{ env.openai_api_key }}" }
+
+[[api]]
+path = "*"
+
+  [[api.steps]]
+  target = "upstream:default"
+  returns = true
