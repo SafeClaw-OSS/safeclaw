@@ -31,14 +31,11 @@ pub async fn get_approval(
 ) -> Result<Json<Value>> {
     let store = state.approvals.lock().unwrap();
     let rec = store.get(&id).ok_or(AppError::NotFound)?;
+    let expires_at = rec.expires_at_unix;
     let body = match &rec.status {
-        ApprovalStatus::Pending => json!({ "status": "pending" }),
+        ApprovalStatus::Pending => json!({ "status": "pending", "expires_at": expires_at }),
         ApprovalStatus::Approved => {
-            // For the agent's polling: include the cached value (will be marked
-            // consumed when /proxy returns it). To avoid leaking on direct
-            // GET we only return value if Bearer-equivalent (which the daemon
-            // can't check without trust headers). For toy v0 we expose it here.
-            json!({ "status": "approved", "value": rec.cached_value })
+            json!({ "status": "approved", "value": rec.cached_value, "expires_at": expires_at })
         }
         ApprovalStatus::Rejected { reason } => {
             json!({ "status": "rejected", "reason": reason })
@@ -73,6 +70,7 @@ pub async fn details(
         "path": path,
         "display": display,
         "op": op_json,
+        "expires_at": rec.expires_at_unix,
     })))
 }
 

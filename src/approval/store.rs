@@ -7,7 +7,7 @@
 //! retrieves the cached value and the record is consumed.
 
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 use uuid::Uuid;
@@ -32,6 +32,10 @@ pub struct ApprovalRecord {
     /// Cached plaintext result (e.g. for reveal). Available once status=Approved.
     pub cached_value: Option<String>,
     pub created_at: Instant,
+    /// Wall-clock unix seconds when this approval expires. Exposed verbatim
+    /// in /approve/:id responses so the UI can render a countdown without a
+    /// pro-side mapping table (replaces the old supabase.approvals TTL).
+    pub expires_at_unix: u64,
     pub ttl: Duration,
 }
 
@@ -57,6 +61,10 @@ impl ApprovalStore {
     /// Create a new pending approval. Returns the new approval id.
     pub fn create(&mut self, tenant_id: String, op: Operation) -> String {
         let id = Uuid::new_v4().to_string();
+        let now_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
         let rec = ApprovalRecord {
             id: id.clone(),
             tenant_id,
@@ -64,6 +72,7 @@ impl ApprovalStore {
             status: ApprovalStatus::Pending,
             cached_value: None,
             created_at: Instant::now(),
+            expires_at_unix: now_unix + DEFAULT_TTL.as_secs(),
             ttl: DEFAULT_TTL,
         };
         self.inner.insert(id.clone(), rec);
@@ -138,6 +147,9 @@ mod tests {
             valid: Valid { iat: 0, exp: None },
         }
     }
+
+    // Keep test fixture consistent with the new ApprovalRecord shape.
+    // (no behaviour change; just satisfies the struct literal in create_approve_consume.)
 
     #[test]
     fn create_approve_consume() {
