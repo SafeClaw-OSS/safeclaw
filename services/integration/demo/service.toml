@@ -1,20 +1,21 @@
 [service]
 id = "demo"
-name = "Demo (Echo)"
+name = "Demo Inbox"
 sub = "broker proof"
 category = "integration"
 help = """
-A built-in playground service that proves SafeClaw's broker contract:
-the daemon injects your vault secret into an upstream request without
-ever exposing it to the agent. Drop a value into `env.demo_api_key`
-on /try, then point any agent at `/use/demo/`. The destination
-(httpbin.org/anything) echoes back the request including the
-Authorization header — visible proof the secret was injected.
+A built-in demo target that proves SafeClaw's broker contract end-to-end.
+POST anything via `/api/use/demo/<any-path>`: the daemon injects your
+`env.demo_api_key` into the Authorization header and forwards to a live
+inbox at inbox.dev.safeclaw.pro. The /try page subscribes to the inbox
+over SSE and shows the request that arrived — including the injected
+credential — so you can see exactly what the receiver saw, without the
+agent ever holding the raw value.
 """
 
 [[upstream]]
 id = "echo"
-url = "https://httpbin.org/anything"
+url = "https://inbox.dev.safeclaw.pro"
 auth = { type = "bearer", env = "demo_api_key" }
 
 [[api]]
