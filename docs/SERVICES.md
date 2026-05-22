@@ -131,13 +131,19 @@ url = "https://api.openai.com"          # Base URL. Required.
 
 [upstream.auth]                         # Credential injection. Optional.
 type = "bearer"                         # bearer | basic | header | query | path | oauth2
-placeholder = "sk-..."                  # Input hint for UI. Optional.
+env = "openai_api_key"                  # Vault entry feeding this credential, no `env.` prefix.
+                                        # The broker resolves `env.<value>` from the user's
+                                        # vault at forward time and injects it per `type`.
+                                        # Required for non-oauth2 auth types; replaces the
+                                        # legacy `placeholder = "{{ env.X }}"` template hack.
+placeholder = "sk-..."                  # UI input hint only. Optional.
 # Type-specific fields:
 #   header:  header = "x-api-key", prefix = "Bearer " (optional)
 #   query:   param = "key"
 #   basic:   username_label = "Account SID"
 #   oauth2:  oauth_style = "json" | "form" (default: form)
 #            provider = "google" (for shared OAuth flows)
+#            (no `env` — oauth2 reads from the OAuth-stored token bundle)
 
 [upstream.headers]                      # Custom headers injected per-request. Optional.
 "anthropic-beta" = "oauth-2025-04-20"
@@ -358,7 +364,7 @@ group = "openai"
 [[upstream]]
 id = "default"
 url = "https://api.openai.com"
-auth = { type = "bearer", placeholder = "sk-..." }
+auth = { type = "bearer", env = "openai_api_key", placeholder = "sk-..." }
 locked = { response = "Please unlock the SafeClaw vault to use this service." }
 
 [[api]]
@@ -773,3 +779,4 @@ The VM decrypts the full vault in memory, extracts matching subtrees, re-encrypt
 | Implicit catch-all (no `[[api]]` = forward all) | Explicit `[[api]] path = "*"` | All forwarding must be declared |
 | `command` in `[[upstream.apis]]` | `run` in `[[api.steps]]` | Unified with recipe step vocabulary |
 | `target` optional (default "openclaw") | `target` required on every step | Self-documenting; no hidden defaults |
+| `placeholder = "{{ env.X }}"` template (2026-05-23 update) | `env = "X"` explicit field | The broker prefers `auth.env` over parsing templates out of the UI placeholder. Placeholder kept as input hint only. Fallback parser still handles legacy v2 services until they're migrated. |

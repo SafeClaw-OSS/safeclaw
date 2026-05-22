@@ -1,6 +1,8 @@
 # SafeClaw Protocol — SUDP Concrete Profile
 
-> **Doc state (2026-05-22)**: §4.0 + §4.1 endpoint table 和 §4.7 vault selection 已同步到 v1 design。§4.3 (`/challenge`)、§4.4 (`/grant`)、§4.5 (broker)、§4.6 + §4.6.1 (`safeclaw-vault` virtual service)、§6.2 (`/state/*`)、§8 sequences 仍引用 legacy endpoint 名，**待统一**。冲突时以 §4.0/§4.1 为准。
+> **Doc state (2026-05-23)**: §4.0 + §4.1 endpoint table 和 §4.7 vault selection 已同步到 v1 design。§4.3 (`/challenge`)、§4.4 (`/grant`)、§4.5 (broker)、§4.6 + §4.6.1 (`safeclaw-vault` virtual service)、§6.2 (`/state/*`)、§8 sequences 仍引用 legacy endpoint 名，**待统一**。冲突时以 §4.0/§4.1 为准。
+>
+> **2026-05-23 update**: §4.1 endpoint table 补上 `GET /c/registry`（service catalog，含 `sub` field）；`POST /v/{vid}/use/{service}` 与 `POST /v/{vid}/use/{service}/{rest}` 两种 form（catch-all service 走前者）。`/c/registry` 把 service.toml 的 `name + sub` 暴露给前端，approve UI 用它显示 "Inbox (demo target)" 而不是 raw id。
 >
 > 本文是 SafeClaw daemon 实现的 cryptographic protocol 规约。它是 **SUDP paper** 的一个 **concrete profile**：固定算法选择、wire format、endpoint 映射、domain-separation labels 等。
 >
@@ -195,7 +197,8 @@ ActType vocabulary 跟随 `sudp` 上游：`Enroll / Write / Rotate / Revoke / Ex
 ─── Vault-scoped (creation / management) ─────────────────────────────────────
 
 POST  /v/{vid}/op                    R 创建 op            → { op_id, r, expires_at }    [HPKE: SHOULD]
-POST  /v/{vid}/use/<svc>/<rest>      R-side sugar (Use)   → 同上                          [HPKE: SHOULD]
+POST  /v/{vid}/use/{service}         R-side sugar (Use, catch-all path = "*")           [HPKE: SHOULD]
+POST  /v/{vid}/use/{service}/{rest}  R-side sugar (Use, sub-path under service root)    [HPKE: SHOULD]
 POST  /v/{vid}/export/<key>          R-side sugar (Export)→ 同上                          [HPKE: SHOULD]
 POST  /v/{vid}/unlock                U: 解锁 vault                                        [HPKE: MUST]
 POST  /v/{vid}/lock                  U: 锁 vault
@@ -204,7 +207,7 @@ GET   /v/{vid}/events                tenant-scoped SSE 流
 
 ─── Op-flat (对已存在 op 的动作) ─────────────────────────────────────────────
 
-GET   /op/{op_id}                    R: 轮询状态 / 结果
+GET   /op/{op_id}                    R: 轮询状态 / 结果 (unified poll + details)
 POST  /op/{op_id}/approve            U: submit G → redeem → result                       [HPKE: MUST]
 POST  /op/{op_id}/reject             U: 拒绝                                              [HPKE: MUST]
 
@@ -212,7 +215,15 @@ POST  /op/{op_id}/reject             U: 拒绝                                  
 
 GET   /c/health
 GET   /c/pubkey                      sc_pk (HPKE bootstrap)
+GET   /c/registry                    service catalog: { id, name, sub?, description?,
+                                     endpoints: [{ method, path, approval, wildcard? }] }
+                                     —— 公开访问 (no auth)，frontend approve UI 用它把 service
+                                     id 解析成 "Name (sub)" 展示
 ```
+
+**`/v/{vid}/use/{service}` 两种 form 的边界**：services with `[[api]] path = "*"` 是 catch-all，agent 可以直接 POST 到 `/v/{vid}/use/{service}`（rest 为空），daemon 把 `path` 编入 op.scope 为 `/`；带 sub-path 的 service（如 OpenAI 的 `/v1/chat/completions`）走 `/v/{vid}/use/{service}/{rest}`。这两个 route 共享同一个内部 handler（`handle_no_rest` 是 thin wrapper），URL grammar 区分仅是 axum router 层面的事。
+
+**`/c/registry` `sub` field**：v1 起 service.toml 的 `[service] sub` 通过 registry 暴露。前端不再在 UI 层 hardcode service 描述——`/approve/{op_id}` 收到 `use` op 时 fetch /c/registry 一次，按 `op.scope.service` 查 `name + sub`，渲染 "Inbox (demo target)"；找不到 fallback raw id。
 
 **HPKE coverage.** 标注 `[HPKE: MUST]` 的 endpoint 请求体含 G 或同等密码学敏感物质，必须 HPKE 外信封封装（详 §4.2）。`[HPKE: SHOULD]` 的请求体含可观测意图（target 名、上游业务 payload），建议封装。无标注 = 无敏感载荷，TLS 足够。响应方向机密性由 SUDP Export sealing 在协议内部负责（§4.5）。
 
