@@ -47,6 +47,33 @@ pub struct RegistryService {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     pub endpoints: Vec<RegistryEndpoint>,
+    /// Vault entries this service expects to be populated. Driven by:
+    ///   1. Explicit `[[vault]]` blocks in service.toml — the schema source
+    ///      of truth (name + kind + description, used for richer
+    ///      multi-field services like wallets/configs).
+    ///   2. Synthesized from `[upstream.auth].env` when the service didn't
+    ///      declare `[[vault]]` blocks but does have a credential field —
+    ///      lets the frontend show an "Add OpenAI key" picker for any
+    ///      service with `auth.env = "openai_api_key"`, without forcing
+    ///      every service.toml to redundantly declare the same field.
+    /// Empty vec for oauth services (no vault entry — credentials come
+    /// from the connect/OAuth flow) and for fully-internal services.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub vault_fields: Vec<RegistryVaultField>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RegistryVaultField {
+    /// Vault entry key (no `env.` prefix).
+    pub name: String,
+    /// "secret" → mask in UI / never log. "config" → plain text.
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// UI input hint pulled from service.toml `auth.placeholder` when
+    /// available (e.g. "sk-..."). Optional.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub placeholder: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -93,12 +120,55 @@ pub async fn registry(State(state): State<Arc<AppState>>) -> Result<Json<Value>>
                     }
                 })
                 .collect();
+            // Vault field schema:
+            //  - explicit [[vault]] blocks win
+            //  - else, synthesize from the first upstream's auth.env (the
+            //    common single-secret case)
+            //  - oauth2 / no env / no [[vault]] → empty
+            let vault_fields: Vec<RegistryVaultField> = if !def.vault.is_empty() {
+                def.vault.iter().map(|vf| RegistryVaultField {
+                    name: vf.name.clone(),
+                    kind: vf.kind.clone(),
+                    description: vf.description.clone(),
+                    placeholder: None,
+                }).collect()
+            } else if let Some(env_name) = def
+                .upstream
+                .first()
+                .and_then(|u| u.auth.as_ref())
+                .and_then(|a| a.env.as_ref())
+                .filter(|s| !s.trim().is_empty())
+            {
+                let placeholder = def
+                    .upstream
+                    .first()
+                    .and_then(|u| u.auth.as_ref())
+                    .and_then(|a| a.placeholder.clone())
+                    // Templated placeholders like "{{ env.X }}" aren't UI
+                    // hints — drop them so the frontend doesn't show that
+                    // as the input ghost.
+                    .filter(|p| !p.contains("{{"));
+                vec![RegistryVaultField {
+                    name: env_name.clone(),
+                    kind: "secret".to_string(),
+                    description: def
+                        .service
+                        .sub
+                        .clone()
+                        .or_else(|| Some(format!("{} credential", def.service.name))),
+                    placeholder,
+                }]
+            } else {
+                vec![]
+            };
+
             RegistryService {
                 id: id.to_string(),
                 name: def.service.name.clone(),
                 sub: def.service.sub.clone(),
                 description: def.service.help.clone(),
                 endpoints,
+                vault_fields,
             }
         })
         .collect();
