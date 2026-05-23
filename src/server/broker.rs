@@ -42,7 +42,8 @@ pub struct BrokerResponse {
 }
 
 /// Run Phase III.1 (execute_use) for the validated Use grant and forward the
-/// captured agent request to the upstream service.
+/// captured agent request to the upstream service. Cache-miss path — used
+/// when the secret isn't already in the daemon's secrets_cache.
 pub async fn execute_use_forward(
     op: &Operation,
     wrapping_key: &[u8],
@@ -86,52 +87,79 @@ pub async fn execute_use_forward(
         .decode(body_b64)
         .map_err(|_| AppError::BadRequest("Use scope.body not base64".into()))?;
 
-    // Build the upstream URL.
+    let headers: Vec<(String, String)> = scope
+        .get("headers")
+        .and_then(|v| v.as_object())
+        .map(|m| {
+            m.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    forward_to_upstream(
+        &s_o,
+        upstream_url,
+        method_str,
+        path,
+        headers.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+        body_bytes,
+        Some(op.act.target.as_str()),
+    )
+    .await
+}
+
+/// Forward an agent request to an upstream service with `s_o` injected as the
+/// bearer token. Shared between the cache-miss (post-execute_use) and the
+/// cache-hit (H3 fast-path) call sites. Caller is responsible for having
+/// `s_o` legitimately — either freshly derived via sudp, or pulled from
+/// secrets_cache after a verified unlock grant.
+pub async fn forward_to_upstream<'a>(
+    s_o: &[u8],
+    upstream_url: &str,
+    method_str: &str,
+    path: &str,
+    headers_iter: impl IntoIterator<Item = (&'a str, &'a str)>,
+    body_bytes: Vec<u8>,
+    target_for_log: Option<&str>,
+) -> Result<BrokerResponse> {
     let full_url = format!("{}{}", upstream_url.trim_end_matches('/'), path);
     let reqwest_method = reqwest::Method::from_str(method_str)
         .map_err(|_| AppError::BadRequest(format!("unsupported method: {}", method_str)))?;
 
-    // Forwarded headers: copy what the agent sent (minus hop-by-hop and the
-    // agent's own auth) then inject ours.
     let mut headers = reqwest::header::HeaderMap::new();
-    if let Some(map) = scope.get("headers").and_then(|v| v.as_object()) {
-        for (k, v) in map.iter() {
-            let lc = k.to_ascii_lowercase();
-            if matches!(
-                lc.as_str(),
-                "authorization"
-                    | "host"
-                    | "content-length"
-                    | "transfer-encoding"
-                    | "x-api-key"
-            ) {
-                continue;
-            }
-            let val_s = match v.as_str() {
-                Some(s) => s,
-                None => continue,
-            };
-            if let (Ok(hn), Ok(hv)) = (
-                reqwest::header::HeaderName::from_str(k),
-                reqwest::header::HeaderValue::from_str(val_s),
-            ) {
-                headers.insert(hn, hv);
-            }
+    for (k, v) in headers_iter {
+        let lc = k.to_ascii_lowercase();
+        if matches!(
+            lc.as_str(),
+            "authorization"
+                | "host"
+                | "content-length"
+                | "transfer-encoding"
+                | "x-api-key"
+        ) {
+            continue;
+        }
+        if let (Ok(hn), Ok(hv)) = (
+            reqwest::header::HeaderName::from_str(k),
+            reqwest::header::HeaderValue::from_str(v),
+        ) {
+            headers.insert(hn, hv);
         }
     }
 
     // Bearer injection. Future: read service auth_type and dispatch.
     let bearer_token =
-        String::from_utf8(s_o.clone()).map_err(|_| AppError::Internal("s_o not utf8".into()))?;
+        String::from_utf8(s_o.to_vec()).map_err(|_| AppError::Internal("s_o not utf8".into()))?;
     if let Ok(hv) = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", bearer_token)) {
         headers.insert(reqwest::header::AUTHORIZATION, hv);
     }
 
     tracing::info!(
-        target = %op.act.target,
+        target = target_for_log.unwrap_or(""),
         method = %method_str,
         url = %full_url,
-        "broker forward (Use)"
+        "broker forward"
     );
 
     let resp = HTTP_CLIENT
@@ -149,14 +177,14 @@ pub async fn execute_use_forward(
             resp_headers.insert(k.as_str().to_string(), Value::String(s.to_string()));
         }
     }
-    let body_bytes = resp
+    let resp_bytes = resp
         .bytes()
         .await
         .map_err(|e| AppError::Internal(format!("upstream body read: {}", e)))?;
 
-    let (body, body_base64) = match std::str::from_utf8(&body_bytes) {
+    let (body, body_base64) = match std::str::from_utf8(&resp_bytes) {
         Ok(s) => (s.to_string(), false),
-        Err(_) => (STANDARD.encode(&body_bytes), true),
+        Err(_) => (STANDARD.encode(&resp_bytes), true),
     };
 
     Ok(BrokerResponse {

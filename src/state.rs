@@ -1,6 +1,8 @@
 //! Top-level application state.
 
+use std::collections::HashMap;
 use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -38,6 +40,37 @@ pub struct ApprovalEvent {
 /// fresh and lose history, which is acceptable for a watcher UI.
 const EVENT_CHANNEL_CAPACITY: usize = 128;
 
+// ── Vault state (H3 / PROTOCOL.md §6.3) ──────────────────────────────────────
+//
+// Per-vault runtime state. Daemon boots Locked; user runs the SUDP
+// `Custom("vault-unlock")` op to transition Unlocked (and side-effect a
+// per-service secrets_cache bootstrap for `allow`-policy services). No auto-
+// lock timer — that would break the `allow` invariant ("once unlocked, no
+// further friction during the session"). Lock is always user-initiated via
+// `Custom("vault-lock")` op.
+
+#[derive(Debug, Clone, Default)]
+pub struct SecretsCache {
+    /// service_id → resolved auth value bytes. Only populated for services
+    /// whose default-read policy level is `allow`. Per-rule overrides (e.g.
+    /// github's `delete-branch` ask-always) are still evaluated at /use time,
+    /// so cache presence ≠ approval skip — it just means the auth is ready
+    /// if policy says go.
+    pub entries: HashMap<String, Vec<u8>>,
+}
+
+#[derive(Debug)]
+pub enum VaultState {
+    Locked,
+    Unlocked {
+        cache: SecretsCache,
+        /// Unix epoch seconds when this Unlocked state began. Informational
+        /// only today (no auto-lock); kept for future audit / debug.
+        #[allow(dead_code)]
+        unlocked_at: u64,
+    },
+}
+
 pub struct AppState {
     pub config: Config,
     pub tenants: TenantDir,
@@ -45,6 +78,9 @@ pub struct AppState {
     pub approvals: Mutex<ApprovalStore>,
     pub services: ServiceRegistry,
     pub events: broadcast::Sender<ApprovalEvent>,
+    /// Per-vault Locked/Unlocked state. Absent entry = Locked. Lives entirely
+    /// in process memory; daemon restart returns all vaults to Locked.
+    pub vault_states: Mutex<HashMap<String, VaultState>>,
 }
 
 impl AppState {
@@ -58,6 +94,7 @@ impl AppState {
             approvals: Mutex::new(ApprovalStore::new()),
             services: ServiceRegistry::load(),
             events,
+            vault_states: Mutex::new(HashMap::new()),
         }
     }
 
@@ -66,5 +103,41 @@ impl AppState {
     /// connected).
     pub fn emit_event(&self, ev: ApprovalEvent) {
         let _ = self.events.send(ev);
+    }
+
+    /// True iff this vault is currently Locked (including "never unlocked
+    /// since process boot").
+    pub fn is_vault_locked(&self, vault_id: &str) -> bool {
+        let states = self.vault_states.lock().unwrap();
+        !matches!(states.get(vault_id), Some(VaultState::Unlocked { .. }))
+    }
+
+    /// Transition a vault to Unlocked with the given bootstrap cache.
+    /// Overwrites any prior state (a fresh unlock invalidates the previous
+    /// cache).
+    pub fn unlock_vault(&self, vault_id: String, cache: SecretsCache) {
+        let unlocked_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let mut states = self.vault_states.lock().unwrap();
+        states.insert(vault_id, VaultState::Unlocked { cache, unlocked_at });
+    }
+
+    /// Transition a vault to Locked, zeroing any cached secrets.
+    pub fn lock_vault(&self, vault_id: &str) {
+        let mut states = self.vault_states.lock().unwrap();
+        states.insert(vault_id.to_string(), VaultState::Locked);
+    }
+
+    /// Look up a cached auth value for `(vault, service)`. Returns None if
+    /// the vault is Locked, the service isn't bootstrapped, or the vault has
+    /// never been unlocked.
+    pub fn cache_lookup(&self, vault_id: &str, service_id: &str) -> Option<Vec<u8>> {
+        let states = self.vault_states.lock().unwrap();
+        match states.get(vault_id) {
+            Some(VaultState::Unlocked { cache, .. }) => cache.entries.get(service_id).cloned(),
+            _ => None,
+        }
     }
 }

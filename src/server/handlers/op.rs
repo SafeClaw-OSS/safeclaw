@@ -17,7 +17,7 @@ use axum::{
 use serde_json::{json, Value};
 
 use crate::error::{AppError, Result};
-use crate::protocol::operation::Operation;
+use crate::protocol::operation::{ActType, Operation};
 use crate::state::{ApprovalEvent, AppState};
 
 pub async fn create(
@@ -27,6 +27,15 @@ pub async fn create(
     Json(op): Json<Operation>,
 ) -> Result<Json<Value>> {
     validate_vault_id(&vault_id)?;
+    // Locked-state gate (H3 / PROTOCOL.md §6.3): when the vault is Locked,
+    // only the unlock ceremony (and first-time Enroll, which auto-unlocks)
+    // is admissible. Everything else gets a canned 409 so the caller knows
+    // to drive a `Custom("vault-unlock")` op first.
+    let is_lifecycle_bypass = matches!(&op.act.kind, ActType::Enroll)
+        || matches!(&op.act.kind, ActType::Custom(name) if name == "vault-unlock");
+    if !is_lifecycle_bypass && state.is_vault_locked(&vault_id) {
+        return Err(AppError::Conflict("vault locked — unlock first".into()));
+    }
     let ip: IpAddr = addr.ip();
     let r = {
         let mut store = state.challenges.lock().unwrap();

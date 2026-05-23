@@ -486,6 +486,61 @@ impl ServiceRegistry {
             .unwrap_or("service")
     }
 
+    /// Default-read AccessLevel for a service (H3 unlock bootstrap predicate).
+    /// Priority: standalone policy.toml `[default] read` > service.toml inline
+    /// `policy.levels.read` > safe default (AskAlways). Per-rule overrides
+    /// (e.g. github's `delete-branch ask-always`) are NOT consulted here —
+    /// they're evaluated per request at /use time. This helper answers only
+    /// "is this service's bulk default `allow`?", i.e. "should its auth value
+    /// be bootstrapped into secrets_cache at unlock?".
+    pub fn default_read_level(&self, service_id: &str) -> crate::core::policy::AccessLevel {
+        if let Some(policy) = self.policies.get(service_id) {
+            if let Some(default) = policy.default.as_ref() {
+                if let Some(read) = default.get("read") {
+                    if let Some(level) = parse_access_level(Some(read)) {
+                        return level;
+                    }
+                }
+            }
+        }
+        if let Some(svc) = self.services.get(service_id) {
+            if let Some(policy) = svc.policy.as_ref() {
+                if let Some(levels) = policy.to_service_levels() {
+                    if let Some(read) = levels.read {
+                        return read;
+                    }
+                }
+            }
+        }
+        crate::core::policy::AccessLevel::AskAlways
+    }
+
+    /// Resolve the env vault key that backs a service's first upstream's auth,
+    /// if any. Preferred path: `auth.env = "key"`. Legacy fallback: parse
+    /// `auth.placeholder = "{{ env.key }}"`. Returns `None` if the service has
+    /// no upstream, no auth, or an unparseable placeholder.
+    pub fn service_env_key(&self, service_id: &str) -> Option<String> {
+        let svc = self.services.get(service_id)?;
+        let upstream = svc.upstream.first()?;
+        let auth = upstream.auth.as_ref()?;
+        if let Some(k) = auth.env.as_deref() {
+            let trimmed = k.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+        // Legacy `placeholder = "{{ env.X }}"` template.
+        let placeholder = auth.placeholder.as_deref()?;
+        let start = placeholder.find("{{")?;
+        let end = placeholder[start..].find("}}")?;
+        let inner = placeholder[start + 2..start + end].trim();
+        let key = inner.strip_prefix("env.")?.trim();
+        if key.is_empty() {
+            return None;
+        }
+        Some(key.to_string())
+    }
+
     /// Get OAuth style for a service (if oauth2 with custom style).
     pub fn oauth_style(&self, service_name: &str) -> Option<OAuthStyle> {
         let def = self.services.get(service_name)?;

@@ -7,6 +7,7 @@
 //! All act kinds (Enroll, Write, Export, Use) flow through `approve_op`; the
 //! act-specific dispatch is inlined per the SUDP protocol.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::{
@@ -17,6 +18,7 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use serde_json::{json, Value};
 
 use crate::approval::ApprovalStatus;
+use crate::core::policy::AccessLevel;
 use crate::error::{AppError, Result};
 use crate::passkey::PasskeyEntry;
 use crate::protocol::operation::{
@@ -24,7 +26,7 @@ use crate::protocol::operation::{
 };
 use crate::protocol::{render_operation, validate_grant, Grant};
 use crate::server::handlers::metadata::decrypt_vault_targets;
-use crate::state::{ApprovalEvent, AppState};
+use crate::state::{ApprovalEvent, AppState, SecretsCache};
 use crate::storage::sealed_vault::{
     build_initial, find_pubkey, read as read_vault, replace_after_write, write_atomic,
 };
@@ -148,6 +150,50 @@ pub async fn approve_op(
             state.tenants.ensure_dir(&vault_id)?;
             write_atomic(&vault_path, &vault)?;
             tracing::info!(vault = %vault_id, "vault enroll complete");
+            // Auto-unlock after Enroll: the user just proved their passkey,
+            // and we already hold W_c. Bootstrapping the cache inline here
+            // saves /try (and any first-time-setup flow) a second passkey
+            // ceremony before the agent's first /use call. Best-effort — a
+            // bootstrap failure leaves the vault Locked (user can manually
+            // unlock later) rather than failing the enroll.
+            if let Ok(targets) = decrypt_vault_targets(
+                &validated.op,
+                &validated.wrapping_key,
+                &validated.credential_id_bytes,
+                &vault,
+            ) {
+                let mut env_raw: HashMap<String, Vec<u8>> = HashMap::new();
+                if let Some(obj) = targets.as_object() {
+                    for (k, v) in obj {
+                        let b64 = match v.as_str() {
+                            Some(s) => s,
+                            None => continue,
+                        };
+                        if let Ok(raw) = STANDARD.decode(b64) {
+                            let key = k.strip_prefix("env.").unwrap_or(k).to_string();
+                            env_raw.insert(key, raw);
+                        }
+                    }
+                }
+                let mut cache = SecretsCache::default();
+                for (service_id, _) in state.services.iter_sorted() {
+                    if state.services.default_read_level(service_id) != AccessLevel::Allow {
+                        continue;
+                    }
+                    let Some(env_key) = state.services.service_env_key(service_id) else {
+                        continue;
+                    };
+                    if let Some(val) = env_raw.get(&env_key) {
+                        cache.entries.insert(service_id.to_string(), val.clone());
+                    }
+                }
+                tracing::info!(
+                    vault = %vault_id,
+                    cached_services = cache.entries.len(),
+                    "vault auto-unlocked after enroll"
+                );
+                state.unlock_vault(vault_id.clone(), cache);
+            }
             (
                 json!({ "ok": true, "vault_id": vault_id, "act": "enroll" }),
                 None,
@@ -250,6 +296,90 @@ pub async fn approve_op(
                 Some(body),
             )
         }
+        ActType::Custom(name) => match name.as_str() {
+            // Lifecycle op (H3 / PROTOCOL.md §6.3): decrypt vault, bootstrap
+            // secrets_cache for allow-policy services, transition to Unlocked,
+            // and return all target plaintexts to the requester (the same
+            // shape Export-with-target="env" returned, so /try's editor
+            // doesn't need a separate reveal call).
+            "vault-unlock" => {
+                let vault = existing_vault
+                    .clone()
+                    .ok_or_else(|| AppError::Conflict("vault not initialized".into()))?;
+                let targets = decrypt_vault_targets(
+                    &validated.op,
+                    &validated.wrapping_key,
+                    &validated.credential_id_bytes,
+                    &vault,
+                )?;
+                // Walk the decrypted env map once, building both:
+                //   - `all`: JSON {key → utf8 string} for the response (editor)
+                //   - `env_raw`: {key → bytes} for cache bootstrap (broker)
+                let mut all = serde_json::Map::new();
+                let mut env_raw: HashMap<String, Vec<u8>> = HashMap::new();
+                if let Some(obj) = targets.as_object() {
+                    for (k, v) in obj {
+                        let b64 = match v.as_str() {
+                            Some(s) => s,
+                            None => continue,
+                        };
+                        let raw = STANDARD.decode(b64).map_err(|_| {
+                            AppError::Internal("target value not base64".into())
+                        })?;
+                        let key = k.strip_prefix("env.").unwrap_or(k).to_string();
+                        env_raw.insert(key.clone(), raw.clone());
+                        let s = String::from_utf8(raw).map_err(|_| {
+                            AppError::Internal("target value not utf8".into())
+                        })?;
+                        all.insert(key, Value::String(s));
+                    }
+                }
+                // Bootstrap cache: every service whose static default-read
+                // level is `allow` gets its resolved auth value cached. Per-
+                // rule overrides (e.g. github's `delete-branch ask-always`)
+                // are still evaluated per request at /use time — cache
+                // presence ≠ approval skip.
+                let mut cache = SecretsCache::default();
+                for (service_id, _) in state.services.iter_sorted() {
+                    if state.services.default_read_level(service_id) != AccessLevel::Allow {
+                        continue;
+                    }
+                    let Some(env_key) = state.services.service_env_key(service_id) else {
+                        continue;
+                    };
+                    if let Some(val) = env_raw.get(&env_key) {
+                        cache.entries.insert(service_id.to_string(), val.clone());
+                    }
+                }
+                tracing::info!(
+                    vault = %vault_id,
+                    cached_services = cache.entries.len(),
+                    "vault unlocked"
+                );
+                state.unlock_vault(vault_id.clone(), cache);
+                let resp = json!({
+                    "ok": true, "act": "vault-unlock",
+                    "value": Value::Object(all),
+                });
+                let cached = Some(resp["value"].to_string());
+                (resp, cached)
+            }
+            // Lifecycle op: drop the cache and flip Locked. No vault read
+            // needed — pure state transition. Requires a fresh grant so an
+            // attacker with the user's session token can't DOS-lock without
+            // a passkey gesture.
+            "vault-lock" => {
+                state.lock_vault(&vault_id);
+                tracing::info!(vault = %vault_id, "vault locked");
+                (json!({ "ok": true, "act": "vault-lock" }), None)
+            }
+            other => {
+                return Err(AppError::BadRequest(format!(
+                    "unsupported Custom act: {}",
+                    other
+                )));
+            }
+        },
         other => {
             return Err(AppError::BadRequest(format!(
                 "unsupported act kind: {:?}",

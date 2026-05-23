@@ -63,6 +63,14 @@ async fn handle_impl(
 ) -> Result<(StatusCode, Json<Value>)> {
     validate_vault_id(&vault_id)?;
 
+    // Locked-state gate (H3 / PROTOCOL.md §6.3). When the vault is Locked,
+    // /use rejects without creating a pending op — agent must trigger an
+    // unlock ceremony first. Future: dispatch the service's `[upstream.locked]
+    // response` template here so the agent gets a service-shaped error.
+    if state.is_vault_locked(&vault_id) {
+        return Err(AppError::Conflict("vault locked — unlock first".into()));
+    }
+
     // Service lookup.
     let svc = state
         .services
@@ -75,7 +83,7 @@ async fn handle_impl(
     // Resolve vault target from auth template `{{ env.X }}`.
     let target = resolve_vault_target(upstream).unwrap_or_else(|| "env.unknown".to_string());
 
-    // Capture request headers (excluding hop-by-hop) for replay.
+    // Capture request headers (excluding hop-by-hop) for replay or cache fast-path.
     let mut headers_map = serde_json::Map::new();
     for (k, v) in headers.iter() {
         let name = k.as_str();
@@ -85,6 +93,42 @@ async fn handle_impl(
         if let Ok(s) = v.to_str() {
             headers_map.insert(name.to_string(), Value::String(s.to_string()));
         }
+    }
+
+    // H3 cache fast-path: if the unlock ceremony already bootstrapped this
+    // service's auth into secrets_cache, skip the approval flow entirely and
+    // forward synchronously. Cache presence implies `allow`-policy at the
+    // service-default level; per-rule overrides aren't evaluated yet here
+    // (Phase 2 — see project_protocol_md_review §6.4 specificity scoring).
+    if let Some(cached_secret) = state.cache_lookup(&vault_id, &service) {
+        let path_str = format!("/{}", rest);
+        let header_pairs: Vec<(String, String)> = headers_map
+            .iter()
+            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+            .collect();
+        let body_vec = body.to_vec();
+        let response = crate::server::broker::forward_to_upstream(
+            &cached_secret,
+            &upstream.url,
+            method.as_str(),
+            &path_str,
+            header_pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+            body_vec,
+            Some(&target),
+        )
+        .await?;
+        // Same response shape the agent sees when polling /op/{id} after a
+        // cache-miss approval — `{ status, ok, response: BrokerResponse }`
+        // — so the skill can handle 200-immediate and 202-then-poll uniformly.
+        return Ok((
+            StatusCode::OK,
+            Json(json!({
+                "status": "ok",
+                "ok": true,
+                "act": "use",
+                "response": serde_json::to_value(&response).unwrap_or(Value::Null),
+            })),
+        ));
     }
 
     let body_b64 = STANDARD.encode(&body);
