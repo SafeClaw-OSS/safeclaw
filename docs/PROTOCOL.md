@@ -200,8 +200,6 @@ POST  /v/{vid}/op                    R 创建 op            → { op_id, r, expi
 POST  /v/{vid}/use/{service}         R-side sugar (Use, catch-all path = "*")           [HPKE: SHOULD]
 POST  /v/{vid}/use/{service}/{rest}  R-side sugar (Use, sub-path under service root)    [HPKE: SHOULD]
 POST  /v/{vid}/export/<key>          R-side sugar (Export)→ 同上                          [HPKE: SHOULD]
-POST  /v/{vid}/unlock                U: 解锁 vault                                        [HPKE: MUST]
-POST  /v/{vid}/lock                  U: 锁 vault
 GET   /v/{vid}/passkeys              该 vault 的凭据列表
 GET   /v/{vid}/events                tenant-scoped SSE 流
 
@@ -230,6 +228,8 @@ GET   /c/registry                    service catalog: { id, name, sub?, descript
 **R-side sugar 共用 SUDP-aware 内部实现.** `/v/{vid}/use/...`、`/v/{vid}/export/...` 的 handler 只做"URL+body → sudp::Operation"编译，编译完调同一个 op-creation service。**无 HTTP redirect，无平行实现。** Redemption 阶段统一 `POST /op/{op_id}/approve`。
 
 **Creation 在 parent 下，存在物的动作 flat at root.** 任何 URL 中**最多出现一个 ID** — `/v/{vid}/...` 创建（vault 是 parent）、`/op/{op_id}/...` 操作 op（op_id 自带 vault 归属，daemon 内部 lookup）。杜绝 `/v/{vid}/op/{op_id}/...` 这种双 ID URL。
+
+**Lifecycle ops live on `/v/{vid}/op`，不开独立 route.** Vault state 转换（unlock / lock）用 SUDP 的 `Custom(String)` 变体表达——`Custom("vault-unlock")` / `Custom("vault-lock")`——通过标准 `POST /v/{vid}/op` 创建、`POST /op/{op_id}/approve` 兑现。**没有** 专用 `/v/{vid}/unlock` / `/v/{vid}/lock` 路由。理由：SUDP 的 `Custom` 槽就是给 deployment 加生命周期 op 留的（详 sudp::ActType 文档），用它能继承 β / freshness / 凭据绑定的全部 grant machinery，又不污染 sudp 协议层。详 §6.3。
 
 **Authentication.** 上面所有 endpoint 的 auth 由 `Authorization` header 承载（部署层任选：Supabase session / API key / mTLS / …）；selection 在 URL，authentication 在 header，正交。Custodian-level `/c/...` 无 vault 上下文，部分 endpoint（如 `/c/pubkey`）公开访问无 auth。
 
@@ -265,7 +265,7 @@ plaintext = JSON of inner request body (e.g., SUDP grant G for /grant)
 
 **为什么 AAD 包含 method+path**:
 - 把 envelope 绑死在特定 endpoint 调用
-- 防止攻击者抓到一个 `/grant` envelope 重放到 `/state/lock` 之类的 endpoint
+- 防止攻击者抓到一个 `/op/{op_id}/approve` envelope 重放到另一个 op_id 上
 - AAD 失配 → AEAD tag verification fail → reject
 
 **响应方向**:
@@ -683,10 +683,19 @@ User 可在 vault `services.<name>.memory_ttl` 显式覆盖。
 | State | 行为 |
 |---|---|
 | **Unlocked** | 接受 op；按 policy 走；secrets_cache 各 entry 独立 expire |
-| **Locked** | **任何 op 都拒**（不触发 fresh gesture）；proxy 返回 auto-formatted "vault locked" 响应 |
+| **Locked** | 仅接受 **lifecycle bypass** op（`Enroll` + `Custom("vault-unlock")`）；其余 op 创建直接 409 `vault locked — unlock first`；proxy（`/use`）返 auto-formatted "vault locked" 响应 |
 
-`POST /state/unlock` (带 grant) → 进入 Unlocked + bootstrap secrets_cache  
-`POST /state/lock` (带 grant) → 进入 Locked + 清空所有 cache
+**State transitions** — 都是标准 sudp `Custom(String)` op，走 `POST /v/{vid}/op` + `POST /op/{op_id}/approve` 标准两步：
+
+| Op | Effect |
+|---|---|
+| `Custom("vault-unlock")` | 解锁：decrypt M（用 grant 携带的 W_c），bootstrap secrets_cache（对 default-read=`allow` 的 service，把 resolved auth 装进 mem），把所有 target plaintexts 返给 requester（user 编辑器复用此响应，免一次额外 ceremony）。进入 Unlocked。 |
+| `Custom("vault-lock")` | 锁定：清空 secrets_cache + 进入 Locked。Grant required —— lock 本身是 daemon state mutation，SUDP 不变量"U-attested state changes only" 同样适用（否则任何持 session token 的 attacker 可以 DOS-lock）。 |
+| `Enroll` | First-time setup：建 vault 后 **auto-unlock**（W_c 已在 grant 里，inline bootstrap，省一次 ceremony）。 |
+
+**Custom 变体的 paper 定位**：SUDP 协议层只承诺 6 个 core acts (Use/Export/Write/Rotate/Enroll/Revoke) 的语义+安全证明；`Custom(name)` 是 deployment 扩展槽，享受 grant machinery 但 dispatch 自定义。SafeClaw 用 `vault-unlock` / `vault-lock` 表达 lifecycle 而非污染 SUDP 表面。
+
+**Daemon-side auto-lock timer = 不引入。** 它会等价于把所有 `allow` 政策变成 "ask every N minutes"，违背 `allow` 语义（"once unlocked, no further friction during session"）。Lock 永远是 user-initiated，daemon 仅在进程重启时实质重置（vault_states 不持久化，重启 = 全部 Locked）。
 
 不引入 "session" 概念。
 
@@ -794,8 +803,8 @@ v1 不主动 rotation HPKE 静态 keypair。Future work:
 ### 9.7 Concurrent operations
 
 - `with_vault_mut` 用 `state.write_mutex` 串行化 write/enroll/revoke ops（per-process mutex）
-- `/state/unlock` 是幂等的：重复调用刷新 secrets_cache 的 `expires_at`（最后一次 win）
-- `/state/lock` 是 idempotent + atomic：清空 cache 一次性
+- `Custom("vault-unlock")` 是幂等的：重复 unlock 刷新 secrets_cache + `unlocked_at`（最后一次 win，覆盖前一次的 cache）
+- `Custom("vault-lock")` 是 idempotent + atomic：清空 cache 一次性
 - 同一时刻只允许一个 grant 在 II.3 → III 之间（避免对同一个 r 的并发消费——`ChallengeStore.take` 有 atomic 语义）
 
 ---
