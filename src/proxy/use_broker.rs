@@ -80,8 +80,9 @@ async fn handle_impl(
         AppError::Conflict(format!("service '{}' has no upstream defined", service))
     })?;
 
-    // Resolve vault target from auth template `{{ env.X }}`.
-    let target = resolve_vault_target(upstream).unwrap_or_else(|| "env.unknown".to_string());
+    // Resolve the bare item name this upstream needs (v3 store-order
+    // resolution happens daemon-side at execute-use time).
+    let target = resolve_vault_target(upstream).unwrap_or_else(|| "unknown".to_string());
 
     // Capture request headers (excluding hop-by-hop) for replay or cache fast-path.
     let mut headers_map = serde_json::Map::new();
@@ -197,16 +198,17 @@ async fn handle_impl(
 
 fn resolve_vault_target(upstream: &UpstreamDef) -> Option<String> {
     let auth = upstream.auth.as_ref()?;
-    // Preferred path: explicit `auth.env = "key"` in service.toml.
+    // Preferred path: explicit `auth.env = "key"` in service.toml. In v3
+    // the value of this field IS the bare item name (no `env.` prefix).
     if let Some(key) = auth.env.as_deref() {
         let trimmed = key.trim();
         if !trimmed.is_empty() {
-            return Some(format!("env.{}", trimmed));
+            return Some(trimmed.to_string());
         }
     }
     // Fallback: legacy `placeholder = "{{ env.key }}"` template. Kept so
-    // unmigrated services still work; remove once all service.toml files
-    // use the explicit field.
+    // unmigrated services still work; the `env.` prefix in the template
+    // is part of dev-branch syntax and is stripped here.
     let placeholder = auth.placeholder.as_ref()?;
     extract_env_template(placeholder)
 }
@@ -219,7 +221,7 @@ fn extract_env_template(s: &str) -> Option<String> {
     if env_key.is_empty() {
         return None;
     }
-    Some(format!("env.{}", env_key))
+    Some(env_key.to_string())
 }
 
 fn is_hop_by_hop(name: &str) -> bool {
@@ -245,7 +247,7 @@ mod tests {
     fn extract_env_simple() {
         assert_eq!(
             extract_env_template("{{ env.demo_api_key }}"),
-            Some("env.demo_api_key".to_string())
+            Some("demo_api_key".to_string())
         );
     }
 
@@ -253,7 +255,7 @@ mod tests {
     fn extract_env_no_spaces() {
         assert_eq!(
             extract_env_template("{{env.token}}"),
-            Some("env.token".to_string())
+            Some("token".to_string())
         );
     }
 

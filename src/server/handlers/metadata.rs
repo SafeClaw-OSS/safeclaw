@@ -19,10 +19,11 @@ use sudp::grant::{GrantOpt, RedeemedGrant, WrappingKey};
 use sudp::passkey::WebAuthn;
 use sudp::primitives::StdPrimitives;
 
-use crate::error::Result;
+use crate::error::{AppError, Result};
 use crate::protocol::Operation;
 use crate::server::handlers::op::validate_vault_id;
 use crate::state::AppState;
+use crate::storage::plaintext::VaultPlaintextView;
 use crate::storage::sealed_vault::find_pubkey;
 
 #[derive(Debug, Serialize)]
@@ -74,14 +75,16 @@ pub async fn pubkey(State(_state): State<Arc<AppState>>) -> Json<Value> {
     }))
 }
 
-/// Decrypt vault and return the `ProtectedState.targets` map as JSON (key →
-/// base64 of secret bytes). Used by `approve.rs` for Export/Use act dispatch.
-pub fn decrypt_vault_targets(
+/// Decrypt vault and return a parsed v3 view of the plaintext. Used by
+/// `approve.rs` for Export/Use act dispatch and by the unlock-bootstrap
+/// path. Hard-fails on `version != 3` (callers should treat this as
+/// "user must re-enroll under the new binary").
+pub fn decrypt_vault_view(
     op: &Operation,
     wrapping_key: &[u8],
     credential_id_bytes: &[u8],
     vault: &crate::storage::SealedVault,
-) -> Result<serde_json::Value> {
+) -> Result<VaultPlaintextView> {
     let redeemed = RedeemedGrant {
         o: op.clone(),
         credential_id: credential_id_bytes.to_vec(),
@@ -89,14 +92,10 @@ pub fn decrypt_vault_targets(
         opt: GrantOpt::default(),
     };
     let opened = sudp::phases::consumption::open::<StdPrimitives>(&redeemed, vault)
-        .map_err(|e| crate::error::AppError::Unauthorized(format!("vault open: {}", e)))?;
-
-    let mut out = serde_json::Map::new();
-    for (k, v) in opened.m.targets.iter() {
-        out.insert(k.clone(), serde_json::Value::String(STANDARD.encode(v.as_bytes())));
-    }
+        .map_err(|e| AppError::Unauthorized(format!("vault open: {}", e)))?;
+    let view = VaultPlaintextView::from_protected_state(&opened.m)?;
     let _ = redeemed_zeroize_marker();
-    Ok(serde_json::Value::Object(out))
+    Ok(view)
 }
 
 fn redeemed_zeroize_marker() -> std::marker::PhantomData<WebAuthn> {

@@ -1,9 +1,10 @@
 //! `POST /v/{vid}/export/{key}` — R-side sugar for Export-class operations.
 //!
-//! Compiles `(vid, key)` into a sudp `Operation { act: Export, target: env.{key} }`
+//! Compiles `(vid, key)` into a sudp `Operation { act: Export, target: <key> }`
 //! and creates a pending approval via the shared op-creation helper. Returns
 //! `{ op_id, r, expires_at }` — same shape as `POST /v/{vid}/op`. R then polls
-//! `GET /op/{op_id}` until U approves.
+//! `GET /op/{op_id}` until U approves. In v3 the target is the bare item
+//! name (no `env.` prefix); resolution goes through the v3 store_order.
 
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -21,8 +22,6 @@ use crate::protocol::operation::{Act, ActType, Bind, Operation, Valid};
 use crate::server::handlers::op::validate_vault_id;
 use crate::state::{ApprovalEvent, AppState};
 
-const ENV_NAMESPACE_PREFIX: &str = "env";
-
 pub async fn handle(
     State(state): State<Arc<AppState>>,
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
@@ -31,7 +30,7 @@ pub async fn handle(
     validate_vault_id(&vault_id)?;
     validate_key(&key)?;
 
-    let target = format!("{}.{}", ENV_NAMESPACE_PREFIX, key);
+    let target = key.clone();
     let op = Operation {
         act: Act {
             kind: ActType::Export,

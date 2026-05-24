@@ -7,7 +7,6 @@
 //! All act kinds (Enroll, Write, Export, Use) flow through `approve_op`; the
 //! act-specific dispatch is inlined per the SUDP protocol.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::{
@@ -25,7 +24,8 @@ use crate::protocol::operation::{
     as_enroll_credential, as_export_path, as_write_patch, discriminator, ActType,
 };
 use crate::protocol::{render_operation, validate_grant, Grant};
-use crate::server::handlers::metadata::decrypt_vault_targets;
+use crate::server::handlers::metadata::decrypt_vault_view;
+use crate::storage::plaintext::VaultPlaintextView;
 use crate::state::{ApprovalEvent, AppState, SecretsCache};
 use crate::storage::sealed_vault::{
     build_initial, find_pubkey, read as read_vault, replace_after_write, write_atomic,
@@ -156,37 +156,13 @@ pub async fn approve_op(
             // ceremony before the agent's first /use call. Best-effort — a
             // bootstrap failure leaves the vault Locked (user can manually
             // unlock later) rather than failing the enroll.
-            if let Ok(targets) = decrypt_vault_targets(
+            if let Ok(view) = decrypt_vault_view(
                 &validated.op,
                 &validated.wrapping_key,
                 &validated.credential_id_bytes,
                 &vault,
             ) {
-                let mut env_raw: HashMap<String, Vec<u8>> = HashMap::new();
-                if let Some(obj) = targets.as_object() {
-                    for (k, v) in obj {
-                        let b64 = match v.as_str() {
-                            Some(s) => s,
-                            None => continue,
-                        };
-                        if let Ok(raw) = STANDARD.decode(b64) {
-                            let key = k.strip_prefix("env.").unwrap_or(k).to_string();
-                            env_raw.insert(key, raw);
-                        }
-                    }
-                }
-                let mut cache = SecretsCache::default();
-                for (service_id, _) in state.services.iter_sorted() {
-                    if state.services.default_read_level(service_id) != AccessLevel::Allow {
-                        continue;
-                    }
-                    let Some(env_key) = state.services.service_env_key(service_id) else {
-                        continue;
-                    };
-                    if let Some(val) = env_raw.get(&env_key) {
-                        cache.entries.insert(service_id.to_string(), val.clone());
-                    }
-                }
+                let cache = bootstrap_cache_from_view(&view, &state);
                 tracing::info!(
                     vault = %vault_id,
                     cached_services = cache.entries.len(),
@@ -229,33 +205,24 @@ pub async fn approve_op(
             let vault = existing_vault
                 .clone()
                 .ok_or_else(|| AppError::Conflict("vault not initialized".into()))?;
-            let targets = decrypt_vault_targets(
+            let view = decrypt_vault_view(
                 &validated.op,
                 &validated.wrapping_key,
                 &validated.credential_id_bytes,
                 &vault,
             )?;
 
-            // Editor reveal-all: when target = "env" (or empty), surface every
-            // `env.*` target with its plaintext UTF-8 value (legacy editor
-            // contract). Per-target Export goes through the else branch.
+            // Editor reveal-all: target = "env" (legacy alias) or "" surfaces
+            // every native-secrets item as a plaintext UTF-8 string map.
+            // Per-item Export goes through the else branch and looks up a
+            // single item by name (no `env.` prefix in v3).
             if path == "env" || path.is_empty() {
                 let mut all = serde_json::Map::new();
-                if let Some(obj) = targets.as_object() {
-                    for (k, v) in obj {
-                        let b64 = match v.as_str() {
-                            Some(s) => s,
-                            None => continue,
-                        };
-                        let raw = STANDARD.decode(b64).map_err(|_| {
-                            AppError::Internal("target value not base64".into())
-                        })?;
-                        let s = String::from_utf8(raw).map_err(|_| {
-                            AppError::Internal("target value not utf8".into())
-                        })?;
-                        let key = k.strip_prefix("env.").unwrap_or(k).to_string();
-                        all.insert(key, serde_json::Value::String(s));
-                    }
+                for (k, v) in view.native_secrets.iter() {
+                    let s = String::from_utf8(v.clone()).map_err(|_| {
+                        AppError::Internal("native-secrets item not utf8".into())
+                    })?;
+                    all.insert(k.clone(), serde_json::Value::String(s));
                 }
                 let resp = json!({
                     "ok": true, "act": "export", "path": path,
@@ -264,15 +231,11 @@ pub async fn approve_op(
                 let cached = Some(resp["value"].to_string());
                 (resp, cached)
             } else {
-                let v_b64 = targets
-                    .get(path)
-                    .and_then(|x| x.as_str())
+                let raw = view
+                    .resolve_value(path)
                     .ok_or(AppError::NotFound)?;
-                let raw = STANDARD
-                    .decode(v_b64)
-                    .map_err(|_| AppError::Internal("target value not base64".into()))?;
-                let value = String::from_utf8(raw)
-                    .map_err(|_| AppError::Internal("target value not utf8".into()))?;
+                let value = String::from_utf8(raw.to_vec())
+                    .map_err(|_| AppError::Internal("native-secrets item not utf8".into()))?;
                 (
                     json!({ "ok": true, "act": "export", "path": path, "value": value.clone() }),
                     Some(value),
@@ -306,51 +269,26 @@ pub async fn approve_op(
                 let vault = existing_vault
                     .clone()
                     .ok_or_else(|| AppError::Conflict("vault not initialized".into()))?;
-                let targets = decrypt_vault_targets(
+                let view = decrypt_vault_view(
                     &validated.op,
                     &validated.wrapping_key,
                     &validated.credential_id_bytes,
                     &vault,
                 )?;
-                // Walk the decrypted env map once, building both:
-                //   - `all`: JSON {key → utf8 string} for the response (editor)
-                //   - `env_raw`: {key → bytes} for cache bootstrap (broker)
+                // Build the editor's response map (native-secrets only — the
+                // legacy reveal-all surfaced as utf8 strings).
                 let mut all = serde_json::Map::new();
-                let mut env_raw: HashMap<String, Vec<u8>> = HashMap::new();
-                if let Some(obj) = targets.as_object() {
-                    for (k, v) in obj {
-                        let b64 = match v.as_str() {
-                            Some(s) => s,
-                            None => continue,
-                        };
-                        let raw = STANDARD.decode(b64).map_err(|_| {
-                            AppError::Internal("target value not base64".into())
-                        })?;
-                        let key = k.strip_prefix("env.").unwrap_or(k).to_string();
-                        env_raw.insert(key.clone(), raw.clone());
-                        let s = String::from_utf8(raw).map_err(|_| {
-                            AppError::Internal("target value not utf8".into())
-                        })?;
-                        all.insert(key, Value::String(s));
-                    }
+                for (k, v) in view.native_secrets.iter() {
+                    let s = String::from_utf8(v.clone()).map_err(|_| {
+                        AppError::Internal("native-secrets item not utf8".into())
+                    })?;
+                    all.insert(k.clone(), Value::String(s));
                 }
-                // Bootstrap cache: every service whose static default-read
-                // level is `allow` gets its resolved auth value cached. Per-
-                // rule overrides (e.g. github's `delete-branch ask-always`)
-                // are still evaluated per request at /use time — cache
-                // presence ≠ approval skip.
-                let mut cache = SecretsCache::default();
-                for (service_id, _) in state.services.iter_sorted() {
-                    if state.services.default_read_level(service_id) != AccessLevel::Allow {
-                        continue;
-                    }
-                    let Some(env_key) = state.services.service_env_key(service_id) else {
-                        continue;
-                    };
-                    if let Some(val) = env_raw.get(&env_key) {
-                        cache.entries.insert(service_id.to_string(), val.clone());
-                    }
-                }
+                // Bootstrap cache: every allow-policy service's auth value
+                // resolved via the v3 store_order. Per-rule overrides are
+                // still evaluated at /use time (cache presence ≠ approval
+                // skip).
+                let cache = bootstrap_cache_from_view(&view, &state);
                 tracing::info!(
                     vault = %vault_id,
                     cached_services = cache.entries.len(),
@@ -437,4 +375,28 @@ pub async fn reject_op(
     });
 
     Ok(Json(json!({ "ok": true, "op_id": rec_id, "status": "rejected" })))
+}
+
+
+/// Build the per-service `secrets_cache` from a decrypted v3 view. For every
+/// service whose static default-read policy is `allow`, resolve its required
+/// item via the v3 store_order (Phase 1: only native-secrets adapter is
+/// honored; later phases dispatch to per-kind adapters).
+fn bootstrap_cache_from_view(
+    view: &VaultPlaintextView,
+    state: &AppState,
+) -> SecretsCache {
+    let mut cache = SecretsCache::default();
+    for (service_id, _) in state.services.iter_sorted() {
+        if state.services.default_read_level(service_id) != AccessLevel::Allow {
+            continue;
+        }
+        let Some(item_name) = state.services.service_env_key(service_id) else {
+            continue;
+        };
+        if let Some(val) = view.resolve_value(&item_name) {
+            cache.entries.insert(service_id.to_string(), val.to_vec());
+        }
+    }
+    cache
 }

@@ -353,13 +353,15 @@ github_app_pem = "GitHub App private key (PEM file)"
 
 ---
 
-## 11. Physical layout (per dev branch)
+## 11. Physical layout
+
+### 11.1 On-disk
 
 Unchanged from dev. v3 only changes the logical shape inside `vault.enc`.
 
 | File | Format | Sensitivity |
 |------|--------|-------------|
-| `vault.enc` | `iv ‖ ct ‖ tag` AES-256-GCM, plaintext = JSON of §7 | encrypted under DEK |
+| `vault.enc` (= `vault.dat`) | sudp `SealedState` JSON — outer envelope holds `{ version, registry, credentials, ciphertext }`; `ciphertext` decrypts to a sudp `ProtectedState` (see §11.2) | encrypted under DEK `K` |
 | `files/<uuid>.enc` | `iv ‖ ct ‖ tag` AES-256-GCM, plaintext = file bytes | encrypted under same DEK |
 | `index.json` | unencrypted metadata cache (store list, item names, file sizes — no values) | UI offline display |
 
@@ -370,6 +372,23 @@ re-encrypting the whole vault.
 
 **One vault.enc** (not multiple). Splitting per-store would buy nothing
 (same DEK; no security benefit) and would cost cross-file atomicity.
+
+### 11.2 Inside the ciphertext — Design B split
+
+The §7 schema is the *logical* view. Physically, the decrypted
+`ProtectedState M = { targets, peers, aux }` splits the v3 schema across
+two of sudp's three fields:
+
+| sudp field | What we put there | Why |
+|------------|-------------------|-----|
+| `M.targets` | `native-secrets` item bytes, keyed by bare item name | sudp's `TargetValue` zero-on-drop + b64-binary-safe encoding gives byte-safe storage for the only store kind that holds authoritative bytes locally |
+| `M.aux` | `{ version, stores, store_order }` + every other store's items metadata (no native-secrets items here — they're in targets) | sudp's "deployment-specific auxiliary state, out-of-scope of the protocol" slot |
+| `M.peers` | (sudp-internal credential rewrap map — untouched by v3) | structural |
+
+Runtime code goes through `storage::plaintext::VaultPlaintextView` which
+merges the two pools so callers query items by name through the
+store_order without caring about layout. The §7 example is what you'd
+see after the merge.
 
 ---
 
