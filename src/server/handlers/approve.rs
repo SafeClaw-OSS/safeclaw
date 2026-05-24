@@ -232,10 +232,11 @@ pub async fn approve_op(
                 (resp, cached)
             } else {
                 let raw = view
-                    .resolve_value(path)
+                    .resolve_value_async(path)
+                    .await?
                     .ok_or(AppError::NotFound)?;
-                let value = String::from_utf8(raw.to_vec())
-                    .map_err(|_| AppError::Internal("native-secrets item not utf8".into()))?;
+                let value = String::from_utf8(raw)
+                    .map_err(|_| AppError::Internal("resolved item not utf8".into()))?;
                 (
                     json!({ "ok": true, "act": "export", "path": path, "value": value.clone() }),
                     Some(value),
@@ -275,19 +276,20 @@ pub async fn approve_op(
                     &validated.credential_id_bytes,
                     &vault,
                 )?;
-                // Build the editor's response map (native-secrets only — the
-                // legacy reveal-all surfaced as utf8 strings).
-                let mut all = serde_json::Map::new();
+                // Editor response: native-secrets items as utf8 strings + the
+                // full v3 aux so the editor can render the stores list and
+                // build a new aux when the user writes.
+                let mut kv = serde_json::Map::new();
                 for (k, v) in view.native_secrets.iter() {
                     let s = String::from_utf8(v.clone()).map_err(|_| {
                         AppError::Internal("native-secrets item not utf8".into())
                     })?;
-                    all.insert(k.clone(), Value::String(s));
+                    kv.insert(k.clone(), Value::String(s));
                 }
+                let aux_json = serde_json::to_value(&view.aux)?;
                 // Bootstrap cache: every allow-policy service's auth value
-                // resolved via the v3 store_order. Per-rule overrides are
-                // still evaluated at /use time (cache presence ≠ approval
-                // skip).
+                // resolved via the v3 store_order. Native-only at unlock time
+                // — external adapters (gcp/1p/aws) fetch lazily at /use time.
                 let cache = bootstrap_cache_from_view(&view, &state);
                 tracing::info!(
                     vault = %vault_id,
@@ -295,9 +297,10 @@ pub async fn approve_op(
                     "vault unlocked"
                 );
                 state.unlock_vault(vault_id.clone(), cache);
+                let value = json!({ "kv": Value::Object(kv), "aux": aux_json });
                 let resp = json!({
                     "ok": true, "act": "vault-unlock",
-                    "value": Value::Object(all),
+                    "value": value,
                 });
                 let cached = Some(resp["value"].to_string());
                 (resp, cached)
@@ -394,7 +397,7 @@ fn bootstrap_cache_from_view(
         let Some(item_name) = state.services.service_env_key(service_id) else {
             continue;
         };
-        if let Some(val) = view.resolve_value(&item_name) {
+        if let Some(val) = view.resolve_value_native(&item_name) {
             cache.entries.insert(service_id.to_string(), val.to_vec());
         }
     }

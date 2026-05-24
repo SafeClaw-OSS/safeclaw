@@ -21,11 +21,13 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sudp::grant::{GrantOpt, RedeemedGrant, WrappingKey};
+use sudp::phases::consumption::open;
 use sudp::primitives::StdPrimitives;
 
 use crate::core::forward::HTTP_CLIENT;
 use crate::error::{AppError, Result};
 use crate::protocol::Operation;
+use crate::storage::plaintext::VaultPlaintextView;
 use crate::storage::SealedVault;
 
 /// JSON-friendly upstream response packaged into the ApprovalRecord's
@@ -41,35 +43,36 @@ pub struct BrokerResponse {
     pub body_base64: bool,
 }
 
-/// Run Phase III.1 (execute_use) for the validated Use grant and forward the
-/// captured agent request to the upstream service. Cache-miss path — used
-/// when the secret isn't already in the daemon's secrets_cache.
+/// Run the cache-miss /use forwarder. Opens the vault, resolves the
+/// requested item through the v3 store_order (so native-secrets *or*
+/// external stores like GCP can back it), and forwards the captured
+/// agent request to the upstream.
+///
+/// The grant has already been verified (β, assertion, freshness) by
+/// `validate_grant` earlier in the call path; one-shot consumption is
+/// enforced at the ApprovalRecord level (status flip to `Consumed`),
+/// not by the sudp type system here.
 pub async fn execute_use_forward(
     op: &Operation,
     wrapping_key: &[u8],
     credential_id_bytes: &[u8],
     vault: &SealedVault,
 ) -> Result<BrokerResponse> {
-    // Re-assemble a sudp::RedeemedGrant from our ValidatedGrant fields. The
-    // grant has already been verified (β, assertion, freshness) by
-    // validate_grant earlier in the call path; this struct is the input
-    // shape sudp's execute_use expects.
     let redeemed = RedeemedGrant {
         o: op.clone(),
         credential_id: credential_id_bytes.to_vec(),
         wrapping_key: WrappingKey::from_bytes(wrapping_key.to_vec()),
         opt: GrantOpt::default(),
     };
-
-    // Pull bytes out of sudp's sealed boundary. The closure extracts the
-    // owned Vec<u8>; the async forward happens after sudp's lifetime guard
-    // returns, by design (we can't await inside an FnOnce, but the secret
-    // is moved out under our explicit responsibility).
-    let s_o: Vec<u8> =
-        sudp::phases::consumption::execute_use::<StdPrimitives, _, _>(redeemed, vault, |_target, s_o| {
-            Ok(s_o.to_vec())
-        })
-        .map_err(|e| AppError::Internal(format!("execute_use: {}", e)))?;
+    let opened = open::<StdPrimitives>(&redeemed, vault)
+        .map_err(|e| AppError::Unauthorized(format!("vault open: {}", e)))?;
+    let view = VaultPlaintextView::from_protected_state(&opened.m)?;
+    let s_o = view
+        .resolve_value_async(&op.act.target)
+        .await?
+        .ok_or_else(|| {
+            AppError::NotFound
+        })?;
 
     // Extract request payload from the operation's scope.
     let scope = &op.act.scope;

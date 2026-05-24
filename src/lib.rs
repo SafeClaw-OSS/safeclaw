@@ -12,3 +12,4 @@ pub mod server;
 pub mod service;
 pub mod state;
 pub mod storage;
+pub mod store;

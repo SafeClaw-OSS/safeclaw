@@ -133,11 +133,11 @@ impl VaultPlaintextView {
         Ok(VaultPlaintextView { aux, native_secrets })
     }
 
-    /// Resolve a value-category item by name following `store_order`.
-    /// First match wins. Phase 1 only knows how to read `native-secrets`;
-    /// other kinds in the order are skipped silently. Phase 2 introduces
-    /// the adapter trait and proper error propagation.
-    pub fn resolve_value(&self, item_name: &str) -> Option<&[u8]> {
+    /// Synchronous resolve restricted to `native-secrets`. Used by the
+    /// unlock cache-bootstrap path that runs inside a non-async section.
+    /// Other store kinds (gcp/1p/aws) require async I/O — use
+    /// [`Self::resolve_value_async`] to walk those.
+    pub fn resolve_value_native(&self, item_name: &str) -> Option<&[u8]> {
         for store_id in &self.aux.store_order {
             let Some(store) = self.aux.stores.get(store_id) else {
                 continue;
@@ -150,9 +150,33 @@ impl VaultPlaintextView {
                     return Some(bytes.as_slice());
                 }
             }
-            // Phase 2+: dispatch other adapter kinds.
+            // External adapter kinds are skipped here; caller that needs
+            // them should use the async path.
         }
         None
+    }
+
+    /// Resolve a value-category item by name through the full store_order
+    /// using the v3 adapter dispatch. First match wins; errors from a
+    /// configured store propagate (no silent fallback). `Ok(None)` means
+    /// no store has the item.
+    pub async fn resolve_value_async(
+        &self,
+        item_name: &str,
+    ) -> crate::error::Result<Option<Vec<u8>>> {
+        for store_id in &self.aux.store_order {
+            let Some(store) = self.aux.stores.get(store_id) else {
+                continue;
+            };
+            if store.category != Category::Value {
+                continue;
+            }
+            let adapter = crate::store::build_adapter(store_id, store, self)?;
+            if let Some(bytes) = adapter.resolve(item_name).await? {
+                return Ok(Some(bytes));
+            }
+        }
+        Ok(None)
     }
 }
 
@@ -185,8 +209,8 @@ mod tests {
         let view = VaultPlaintextView::from_protected_state(&m).unwrap();
         assert_eq!(view.aux.version, 3);
         assert_eq!(view.aux.store_order, vec!["native-secrets", "native-files"]);
-        assert_eq!(view.resolve_value("openai_api_key"), Some(&b"sk-test"[..]));
-        assert_eq!(view.resolve_value("nonexistent"), None);
+        assert_eq!(view.resolve_value_native("openai_api_key"), Some(&b"sk-test"[..]));
+        assert_eq!(view.resolve_value_native("nonexistent"), None);
     }
 
     #[test]
