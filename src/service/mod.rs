@@ -148,8 +148,13 @@ fn default_retry_interval() -> u64 { 500 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct AuthDef {
-    #[serde(rename = "type")]
-    pub auth_type: String,
+    /// Legacy auth-style discriminator (`bearer` / `header` / `query` /
+    /// `basic` / `oauth2` / `path`). Optional in the new template-driven
+    /// shape — services that declare `[upstream.headers]` / `[upstream.query]`
+    /// instead drop this field; the daemon's injection logic reads the
+    /// templates directly. Still required for `oauth2`-flow services.
+    #[serde(rename = "type", default)]
+    pub auth_type: Option<String>,
     /// Vault entry key feeding this credential (just the key name, no `env.`
     /// prefix). Replaces the older `placeholder = "{{ env.X }}"` templating
     /// convention. `placeholder` continues to mean "UI input hint" only.
