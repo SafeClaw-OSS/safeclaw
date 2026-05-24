@@ -181,6 +181,18 @@ impl AuditStore {
         Ok(())
     }
 
+    /// Drop every row whose `created_at` is older than `cutoff` (unix
+     /// seconds). Returns the number of deleted rows. Used for opportunistic
+     /// retention cleanup — caller picks the cutoff based on the vault's
+     /// `audit_retention_days` setting (None = keep forever).
+    pub fn prune_older_than(&self, cutoff: i64) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        let count = conn
+            .execute("DELETE FROM approvals WHERE created_at < ?1", params![cutoff])
+            .map_err(|e| AppError::Internal(format!("audit prune: {}", e)))?;
+        Ok(count as u64)
+    }
+
     /// Transition a pending row to a terminal status (approved | rejected
     /// | expired | denied). No-op if the row doesn't exist (e.g., audit
     /// was disabled when the pending was created).

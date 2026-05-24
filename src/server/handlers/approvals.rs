@@ -82,6 +82,29 @@ pub async fn list(
         Err(_) => return Ok(Json(json!({ "entries": [], "next_since": null }))),
     };
 
+    // Opportunistic retention prune. Only runs when the vault is currently
+    // unlocked (the only state in which the daemon knows the user's
+    // `audit_retention_days` setting) AND the user has actually set a
+    // value (None = keep forever). Best-effort: a prune failure is logged
+    // but doesn't block the list response.
+    if let Some(days) = state.audit_retention_days(&vault_id) {
+        let days = days.max(1) as i64;
+        let cutoff = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0)
+            - days * 86_400;
+        match store.prune_older_than(cutoff) {
+            Ok(n) if n > 0 => {
+                tracing::info!(vault = %vault_id, deleted = n, "audit prune");
+            }
+            Err(e) => {
+                tracing::warn!(vault = %vault_id, "audit prune failed: {}", e);
+            }
+            _ => {}
+        }
+    }
+
     let entries = store.list(status_filter, q.service.as_deref(), q.since, limit)?;
     // Next-page cursor: the oldest row's created_at, only if we returned a
     // full page (otherwise we know the caller has seen everything).

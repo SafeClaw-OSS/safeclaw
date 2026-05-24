@@ -87,6 +87,12 @@ pub struct VaultAux {
     /// authored state appear here.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub service_state: BTreeMap<String, ServiceState>,
+    /// Audit log retention in days. `None` = keep forever; integer = drop
+    /// rows older than this on the next `GET /v/{vid}/approvals` call.
+    /// Frontend offers 7 / 30 / 90 / forever; the daemon clamps to a
+    /// sensible range during prune.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit_retention_days: Option<u32>,
 }
 
 impl VaultAux {
@@ -119,6 +125,7 @@ impl VaultAux {
             store_order: vec![NATIVE_SECRETS_ID.to_string(), NATIVE_FILES_ID.to_string()],
             policy_defaults: None,
             service_state: BTreeMap::new(),
+            audit_retention_days: None,
         }
     }
 }

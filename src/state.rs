@@ -68,6 +68,10 @@ pub struct SecretsCache {
     /// Layered on top of the daemon's compiled-in `PolicyDefaults::default()`
     /// during evaluation. Absent → fall back to compiled defaults.
     pub policy_defaults: Option<crate::core::policy::PolicyDefaults>,
+    /// Audit log retention in days. Snapshot of `aux.audit_retention_days`
+    /// at unlock. `None` = keep forever. Used by `GET /v/{vid}/approvals` to
+    /// opportunistically prune old rows before listing.
+    pub audit_retention_days: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -145,6 +149,18 @@ impl AppState {
     pub fn lock_vault(&self, vault_id: &str) {
         let mut states = self.vault_states.lock().unwrap();
         states.insert(vault_id.to_string(), VaultState::Locked);
+    }
+
+    /// Retention setting for this vault's audit log. `None` when the vault
+    /// is locked (so the daemon has no view into aux) OR when the user
+    /// hasn't configured a retention (keep-forever default). The audit
+    /// list handler treats both cases the same: skip prune.
+    pub fn audit_retention_days(&self, vault_id: &str) -> Option<u32> {
+        let states = self.vault_states.lock().unwrap();
+        match states.get(vault_id) {
+            Some(VaultState::Unlocked { cache, .. }) => cache.audit_retention_days,
+            _ => None,
+        }
     }
 
     /// Look up a cached auth value for `(vault, service)`. Returns None if

@@ -456,6 +456,7 @@ fn bootstrap_cache_from_view(
 ) -> SecretsCache {
     let mut cache = SecretsCache::default();
     cache.policy_defaults = view.aux.policy_defaults.clone();
+    cache.audit_retention_days = view.aux.audit_retention_days;
     for (service_id, _) in state.services.iter_sorted() {
         // Cache auth bytes if the service's required item resolves through
         // the v3 store_order. native-secrets is the only sync path today;
