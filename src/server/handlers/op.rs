@@ -9,6 +9,7 @@
 
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{
     extract::{ConnectInfo, Path, State},
@@ -16,6 +17,7 @@ use axum::{
 };
 use serde_json::{json, Value};
 
+use crate::audit;
 use crate::error::{AppError, Result};
 use crate::protocol::operation::{ActType, Operation};
 use crate::state::{ApprovalEvent, AppState};
@@ -47,6 +49,20 @@ pub async fn create(
         let exp = store.get(&id).map(|r| r.expires_at_unix).unwrap_or(0);
         (id, exp)
     };
+
+    // Persist a `pending` audit row so `GET /v/{vid}/approvals?status=pending`
+    // can return current pendings on page load (in-memory ApprovalStore is
+    // process-bound). Best-effort — audit failure must NOT block op creation.
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    if let Ok(store) = state.audits.for_tenant(&vault_id) {
+        let row = audit::row_from_op(&op_id, &op, now, expires_at as i64);
+        if let Err(e) = store.insert(&row) {
+            tracing::warn!(vault = %vault_id, op = %op_id, "audit insert pending failed: {}", e);
+        }
+    }
 
     state.emit_event(ApprovalEvent {
         tenant_id: vault_id,

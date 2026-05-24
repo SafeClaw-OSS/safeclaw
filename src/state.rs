@@ -9,6 +9,7 @@ use serde_json::Value;
 use tokio::sync::broadcast;
 
 use crate::approval::ApprovalStore;
+use crate::audit::AuditRegistry;
 use crate::config::Config;
 use crate::passkey::challenge::ChallengeStore;
 use crate::service::ServiceRegistry;
@@ -81,12 +82,17 @@ pub struct AppState {
     /// Per-vault Locked/Unlocked state. Absent entry = Locked. Lives entirely
     /// in process memory; daemon restart returns all vaults to Locked.
     pub vault_states: Mutex<HashMap<String, VaultState>>,
+    /// Per-tenant audit log (PROTOCOL.md §5.3). Connections opened lazily on
+    /// first write/query per tenant. Survives daemon restarts — unlike
+    /// `approvals` / `vault_states` which are in-memory only.
+    pub audits: AuditRegistry,
 }
 
 impl AppState {
     pub fn new(config: Config) -> Self {
         let tenants = TenantDir::new(&config.state_dir);
         let (events, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+        let audits = AuditRegistry::new(tenants.clone());
         Self {
             config,
             tenants,
@@ -95,6 +101,7 @@ impl AppState {
             services: ServiceRegistry::load(),
             events,
             vault_states: Mutex::new(HashMap::new()),
+            audits,
         }
     }
 

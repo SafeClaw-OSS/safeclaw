@@ -45,6 +45,10 @@ impl TenantDir {
         Ok(self.dir_for(tenant_id)?.join("vault.dat"))
     }
 
+    pub fn audit_path(&self, tenant_id: &str) -> Result<PathBuf> {
+        Ok(self.dir_for(tenant_id)?.join("audit.db"))
+    }
+
     pub fn ensure_dir(&self, tenant_id: &str) -> Result<PathBuf> {
         let d = self.dir_for(tenant_id)?;
         std::fs::create_dir_all(&d)?;

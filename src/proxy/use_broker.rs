@@ -19,11 +19,13 @@ use axum::{
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde_json::{json, Value};
 
+use crate::audit::{self, ApprovalRow, STATUS_ALLOWED};
 use crate::error::{AppError, Result};
 use crate::protocol::operation::{Act, ActType, Bind, Operation, Valid};
 use crate::server::handlers::op::validate_vault_id;
 use crate::service::UpstreamDef;
 use crate::state::{ApprovalEvent, AppState};
+use uuid::Uuid;
 
 /// Variant for the no-rest URL (`POST /v/{vid}/use/{service}`). Lets a
 /// service whose [[api]] is path = "*" be called with no sub-path —
@@ -118,6 +120,33 @@ async fn handle_impl(
             Some(&target),
         )
         .await?;
+        // Audit: synthetic `allowed` row — no ApprovalRecord ever existed for
+        // this forward (cache-hit bypassed the whole approval flow). created_at
+        // == decided_at; credential_id == None (no passkey gesture happened).
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        if let Ok(store) = state.audits.for_tenant(&vault_id) {
+            let row = ApprovalRow {
+                id: Uuid::new_v4().to_string(),
+                created_at: now,
+                decided_at: Some(now),
+                expires_at: now,
+                status: STATUS_ALLOWED.into(),
+                act_kind: "use".into(),
+                service: Some(service.clone()),
+                method: Some(method.as_str().to_string()),
+                path: Some(path_str.clone()),
+                target: Some(target.clone()),
+                reason: None,
+                credential_id: None,
+                upstream_status: Some(response.status as i64),
+            };
+            if let Err(e) = store.insert(&row) {
+                tracing::warn!(vault = %vault_id, "audit insert allowed (cache-hit) failed: {}", e);
+            }
+        }
         // Same response shape the agent sees when polling /op/{id} after a
         // cache-miss approval — `{ status, ok, response: BrokerResponse }`
         // — so the skill can handle 200-immediate and 202-then-poll uniformly.
@@ -173,6 +202,15 @@ async fn handle_impl(
         let exp = store.get(&id).map(|r| r.expires_at_unix).unwrap_or(0);
         (id, exp)
     };
+
+    // Persist `pending` audit row (mirror of op.rs::create path; this is the
+    // /use sugar variant that wraps op-create internally).
+    if let Ok(audit_store) = state.audits.for_tenant(&vault_id) {
+        let row = audit::row_from_op(&op_id, &op, now as i64, expires_at as i64);
+        if let Err(e) = audit_store.insert(&row) {
+            tracing::warn!(vault = %vault_id, op = %op_id, "audit insert pending (use) failed: {}", e);
+        }
+    }
 
     state.emit_event(ApprovalEvent {
         tenant_id: vault_id,

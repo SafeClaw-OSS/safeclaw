@@ -49,6 +49,10 @@ thiserror = "1"
 # Store adapters — GCP Secret Manager (REST + SA JWT)
 jsonwebtoken = "9"
 
+# Per-tenant audit log (SQLite); bundled so deployments don't need libsqlite3
+# on the host. See src/audit.rs + PROTOCOL.md §5.3 layout.
+rusqlite = { version = "0.31", features = ["bundled"] }
+
 [dev-dependencies]
 tempfile = "3"
 

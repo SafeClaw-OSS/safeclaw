@@ -203,6 +203,7 @@ POST  /v/{vid}/use/{service}/{rest}  R-side sugar (Use, sub-path under service r
 POST  /v/{vid}/export/<key>          R-side sugar (Export)→ 同上                          [HPKE: SHOULD]
 GET   /v/{vid}/passkeys              该 vault 的凭据列表
 GET   /v/{vid}/events                tenant-scoped SSE 流
+GET   /v/{vid}/approvals             paginated approval/audit history (详 §5.4)
 
 ─── Op-flat (对已存在 op 的动作) ─────────────────────────────────────────────
 
@@ -596,7 +597,8 @@ Sketch:
 **多租户部署**（safeclaw.pro SaaS）:
 
 ```
-/var/lib/safeclaw/
+<STATE_DIR>/                     # 实际部署：/var/lib/safeclaw/state/ (per systemd
+                                 # SAFECLAW_STATE_DIR=/var/lib/safeclaw/state)
   config.toml
   crypto/                        # daemon 全局共享（HPKE keypair 不分 tenant）
     sc_pk.jwk
@@ -606,7 +608,7 @@ Sketch:
     <tenant_id_1>/
       vault.dat
       passkeys.json
-      audit.db
+      audit.db                   # 详 §5.4
       services/
     <tenant_id_2>/...
 ```
@@ -625,6 +627,72 @@ Sketch:
 - 多租户布局：用 `tenants/<id>/` 子目录隔离每个租户
 
 详细解释见 `../SAFECLAW_V1_DESIGN_HANDOFF.md` §6。
+
+### 5.4 Audit log (`audit.db`)
+
+每 tenant 一份 SQLite，append-only，**只存 operational metadata，零 secret 值**——
+请求 body / 响应 body / 凭据明文都不落盘。安全等级跟 web 服务器 access log 等同
+（user 自己机器上的自己的活动记录），不需要 SUDP 协议级加密。
+
+**Schema**:
+
+```sql
+CREATE TABLE approvals (
+    id              TEXT PRIMARY KEY,        -- approval_id (UUIDv4)
+    created_at      INTEGER NOT NULL,        -- unix seconds
+    decided_at      INTEGER,                 -- null while pending
+    expires_at      INTEGER NOT NULL,
+    status          TEXT NOT NULL,           -- pending|allowed|approved|denied|rejected|expired
+    act_kind        TEXT NOT NULL,           -- "use"|"export"|"write"|"enroll"|"custom:<name>"
+    service         TEXT,                    -- service id (Use only)
+    method          TEXT,                    -- HTTP method (Use only)
+    path            TEXT,                    -- request path (Use only)
+    target          TEXT,                    -- op.act.target, e.g. "env.github_token"
+    reason          TEXT,                    -- rejection reason
+    credential_id   TEXT,                    -- 谁决定的 (passkey base64 id);
+                                             -- null for daemon-decisions (allowed/denied)
+    upstream_status INTEGER                  -- HTTP status from upstream (Use only)
+);
+CREATE INDEX idx_approvals_status_created ON approvals(status, created_at DESC);
+```
+
+**Status 词汇** (PROTOCOL.md §6.3 lifecycle):
+
+| 值 | 含义 | 何时写 |
+|---|---|---|
+| `pending` | ask-policy op 待用户决定 | op 创建（`POST /v/{vid}/op` 或 `/use` sugar） |
+| `allowed` | allow-policy auto-forward，无用户介入 | `/use` cache-hit |
+| `approved` | 用户 approve 了 pending | `POST /op/{id}/approve` |
+| `denied` | deny-policy 自动拦截（无 pending）| 政策 auto-deny（future） |
+| `rejected` | 用户 reject 了 pending | `POST /op/{id}/reject` |
+| `expired` | ask-policy TTL 跑完无人响应 | background sweep（future） |
+
+**写入语义**：所有 audit 写入是 best-effort——daemon 行为不能因 audit 失败而 fail。
+失败时 `tracing::warn` 记一条，op 该咋走还咋走。
+
+**Retention**：v1 不做 eviction（observation 表明 SQLite 10k+ 行性能良好）。若
+单租户写入率超预期，后续加 ring-buffer cleanup（DELETE WHERE id NOT IN
+top-N by created_at）。
+
+**查询接口** (§4.1)：
+
+```
+GET /v/{vid}/approvals
+  ?status=pending|past|all|<single-status>    (default: all)
+  ?service=<id>                                (filter)
+  ?since=<unix_seconds>                        (exclusive upper bound, for pagination)
+  ?limit=<n>                                   (default 100, max 500)
+
+→ { entries: ApprovalRow[], next_since: number | null }
+```
+
+`status=past` 是 `{allowed, approved, denied, rejected, expired}` 的别名（一切非
+pending 的终态）。`next_since` 在返回了 `limit` 行时是最旧一行的 `created_at`，
+否则 `null`（已到尾）。
+
+**Auth**：跟 `/passkeys` 同等级——deployment-layer Auth header（Supabase
+session token 等），不要求 SUDP grant。audit row 不含 secret 值，泄露顶多暴露
+"agent 在 N 时刻调用 service X" 这种元数据，跟服务器 access log 同。
 
 ---
 

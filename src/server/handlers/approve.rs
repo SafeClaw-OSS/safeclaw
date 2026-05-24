@@ -8,6 +8,7 @@
 //! act-specific dispatch is inlined per the SUDP protocol.
 
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{
     extract::{Path, State},
@@ -17,6 +18,7 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use serde_json::{json, Value};
 
 use crate::approval::ApprovalStatus;
+use crate::audit::{STATUS_APPROVED, STATUS_REJECTED};
 use crate::core::policy::AccessLevel;
 use crate::error::{AppError, Result};
 use crate::passkey::PasskeyEntry;
@@ -115,6 +117,9 @@ pub async fn approve_op(
     };
 
     // 4. Act dispatch — same logic that previously lived in grant.rs.
+    // Captured here for the audit row finalize at the bottom (Use's upstream
+    // status code; None for all other act kinds).
+    let mut audit_upstream_status: Option<i64> = None;
     let (response, cached_value) = match &validated.op.act.kind {
         ActType::Enroll => {
             let credential = as_enroll_credential(&validated.op)?;
@@ -254,6 +259,7 @@ pub async fn approve_op(
                 &vault,
             )
             .await?;
+            audit_upstream_status = Some(response.status as i64);
             let body = serde_json::to_string(&response)?;
             (
                 json!({ "ok": true, "act": "use", "response": serde_json::from_str::<Value>(&body).unwrap_or(Value::Null) }),
@@ -344,6 +350,25 @@ pub async fn approve_op(
         (rec.id.clone(), rec.tenant_id.clone(), preview)
     };
 
+    // Audit: pending → approved. Best-effort; daemon UX must not depend on
+    // audit being healthy.
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    if let Ok(store) = state.audits.for_tenant(&rec_vault_id) {
+        if let Err(e) = store.finalize(
+            &op_id,
+            STATUS_APPROVED,
+            now,
+            Some(&grant.credential_id),
+            None,
+            audit_upstream_status,
+        ) {
+            tracing::warn!(vault = %rec_vault_id, op = %op_id, "audit finalize approved failed: {}", e);
+        }
+    }
+
     state.emit_event(ApprovalEvent {
         tenant_id: rec_vault_id,
         approval_id: rec_id,
@@ -367,6 +392,17 @@ pub async fn reject_op(
             .ok_or(AppError::NotFound)?;
         (rec.id.clone(), rec.tenant_id.clone())
     };
+
+    // Audit: pending → rejected.
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    if let Ok(store) = state.audits.for_tenant(&rec_vault_id) {
+        if let Err(e) = store.finalize(&op_id, STATUS_REJECTED, now, None, Some("user denied"), None) {
+            tracing::warn!(vault = %rec_vault_id, op = %op_id, "audit finalize rejected failed: {}", e);
+        }
+    }
 
     state.emit_event(ApprovalEvent {
         tenant_id: rec_vault_id,
