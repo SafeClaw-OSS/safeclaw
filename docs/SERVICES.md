@@ -1,6 +1,6 @@
 # SafeClaw Service Protocol
 
-**Protocol version: 2** — Breaking changes from v1; see migration notes at the end.
+**Protocol version: 3** — Breaking changes from v2; see [Migration from v2](#migration-from-v2) at the end.
 
 This document defines the declarative service protocol used by SafeClaw. Each service is a folder in `services/{category}/{id}/` containing two TOML files:
 
@@ -8,6 +8,10 @@ This document defines the declarative service protocol used by SafeClaw. Each se
 - **`recipe.toml`** — setup behavior (what happens when the service is first enabled)
 
 Both files share a common execution primitive: **step**. A step is a single action with a `target` specifying where it runs.
+
+**Related docs**:
+- [STORES_AND_ITEMS.md](./STORES_AND_ITEMS.md) — vault schema, stores, items, adapter contract (referenced by `{{X}}` templates in this doc)
+- [PROTOCOL.md](./PROTOCOL.md) — wire protocol, sealed-state mechanics
 
 ---
 
@@ -43,28 +47,20 @@ The atomic unit of execution in both TOML files. Recipe steps and API steps shar
 | `note` | string | Human-readable note. Optional. |
 
 Additional fields available only in recipe steps: `files`, `config_patches`, `restart`, `cwd`, `description`.
-Additional fields available only in API steps: `read`, `returns`, `retry`, `method` (inherited from parent `[[api]]`).
+Additional fields available only in API steps: `returns`, `retry`, `method` (inherited from parent `[[api]]`).
 
-### Vault field declarations
+### Template substitution
 
-Services can declare what fields they store in the vault using `[[vault]]` blocks in `service.toml`. This serves as schema documentation, enables frontend form generation, and powers validation on service add.
+String values in `[upstream.headers]`, `[upstream.query]`, `[upstream.path_params]`, the URL itself, and step `run` / `env` fields support `{{...}}` template expressions:
 
-```toml
-[[vault]]
-name = "gatewayToken"
-kind = "secret"
-description = "Gateway auth token for dashboard WebSocket"
-```
+| Form | Resolves to | Notes |
+|------|-------------|-------|
+| `{{X}}` | item X's string value | item resolved via `store_order`; see STORES_AND_ITEMS.md §5 |
+| `{{b64:X}}` | item X's value, base64-encoded | useful for Basic auth |
+| `{{uuid_v4}}` | a fresh UUID v4 | generated per request |
+| `{{auth.access_token}}` / `{{auth.account_id}}` / ... | OAuth-managed token bundle fields | only when `[upstream.auth] provider = "oauth2"` |
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `name` | string | **Required.** Key name in the vault JSON (`secrets.services.{id}.{name}`). |
-| `kind` | string | `"secret"` (masked in UI, never logged) or `"config"` (default). |
-| `description` | string | Human-readable description for docs and UI labels. |
-
-All declared fields are required — if a service declares a vault field, `POST /vault/services/add` will reject requests missing that field. Services that only use standard auth credentials (defined by `[[upstream]]` auth type) do not need `[[vault]]` declarations.
-
-Recipe steps reference vault values via `{{service.vault.KEY}}` template variables (see Template variables below).
+If an item referenced by `{{X}}` is unresolvable (no store provides it), the request errors. Required items are derived by scanning `{{X}}` occurrences across service.toml — see [the `[items]` block](#items--optional-ui-descriptions) for optional descriptions.
 
 ---
 
@@ -126,38 +122,73 @@ Zero or more upstream blocks. Each defines a remote HTTP endpoint that API steps
 
 ```toml
 [[upstream]]
-id = "default"                          # Unique identifier, referenced by target = "upstream:<id>". Required.
-url = "https://api.openai.com"          # Base URL. Required.
-
-[upstream.auth]                         # Credential injection. Optional.
-type = "bearer"                         # bearer | basic | header | query | path | oauth2
-env = "openai_api_key"                  # Vault entry feeding this credential, no `env.` prefix.
-                                        # The broker resolves `env.<value>` from the user's
-                                        # vault at forward time and injects it per `type`.
-                                        # Required for non-oauth2 auth types; replaces the
-                                        # legacy `placeholder = "{{ env.X }}"` template hack.
-placeholder = "sk-..."                  # UI input hint only. Optional.
-# Type-specific fields:
-#   header:  header = "x-api-key", prefix = "Bearer " (optional)
-#   query:   param = "key"
-#   basic:   username_label = "Account SID"
-#   oauth2:  oauth_style = "json" | "form" (default: form)
-#            provider = "google" (for shared OAuth flows)
-#            (no `env` — oauth2 reads from the OAuth-stored token bundle)
-
-[upstream.headers]                      # Custom headers injected per-request. Optional.
-"anthropic-beta" = "oauth-2025-04-20"
-"x-session-id" = "{{uuid_v4}}"         # Template: random UUID v4
-"chatgpt-account-id" = "{{auth.account_id}}"  # Template: from vault auth config
-
-[upstream.locked]                       # Response when vault is locked. Optional.
-response = "Please unlock the SafeClaw vault to use this service."
-                                        # Plain text. The proxy wraps it into the appropriate
-                                        # API response format (OpenAI, Anthropic, etc.)
-                                        # so the agent receives it as a natural completion.
+id   = "default"                # Unique identifier, referenced by target = "upstream:<id>". Required.
+url  = "https://api.openai.com" # Base URL. Required. Keep clean — no auth in the URL.
 ```
 
-If no `[[upstream]]` is declared, the service has no HTTP forwarding capability.
+`url` may contain `:placeholder` path parameters (Express/OpenAPI style), substituted via `[upstream.path_params]`.
+
+#### `[upstream.headers]` — Headers injected on every forward
+
+```toml
+[upstream.headers]
+Authorization     = "Bearer {{openai_api_key}}"
+"anthropic-beta"  = "oauth-2025-04-20"
+"x-session-id"    = "{{uuid_v4}}"
+```
+
+**Replace-all-matching semantics**: for each header name set here, the broker removes all matching headers from the incoming agent request, then writes the value from this section. The agent cannot pollute auth.
+
+#### `[upstream.query]` — Query parameters auto-attached
+
+```toml
+[upstream.query]
+api_key = "{{some_service_key}}"
+```
+
+Same replace-all-matching semantics as headers. Query keys present here are stripped from the incoming agent request and replaced.
+
+#### `[upstream.path_params]` — URL `:placeholder` substitution
+
+Used with `:name`-style placeholders in `url`:
+
+```toml
+[[upstream]]
+url = "https://api.telegram.org/:bot_token"
+
+[upstream.path_params]
+bot_token = "{{telegram_bot_token}}"
+```
+
+Only declared placeholders are substituted. Undeclared `:placeholder` in URL → error at registration time.
+
+#### `[upstream.auth]` — Stateful auth (reserved)
+
+Used **only** for auth that cannot be expressed as a simple template (OAuth refresh cycles, SigV4 signing, HMAC). In v3.0, `provider = "oauth2"` is the only supported value:
+
+```toml
+[upstream.auth]
+provider = "oauth2"             # discriminator; only "oauth2" supported in v3.0
+# Provider-specific tuning fields go here. For oauth2:
+#   style = "json" | "form"     # request encoding when refreshing
+#
+# OAuth tokens are managed by the OAuth subsystem (refresh, rotation).
+# Templates reference fields from the managed token bundle:
+#   {{auth.access_token}}, {{auth.account_id}}, ...
+```
+
+Service.toml without `[upstream.auth]` is valid and common (most services use only `[upstream.headers]` / `.query` / `.path_params`).
+
+Other providers (`aws-sigv4`, `hmac-sha256`, ...) are reserved for the future and not implemented.
+
+#### `[upstream.locked]` — Response when vault is locked
+
+```toml
+[upstream.locked]
+response = "Please unlock the SafeClaw vault to use this service."
+```
+
+Plain text. The proxy wraps it into the upstream's API response format (OpenAI / Anthropic / etc.) so the agent receives it as a natural completion rather than a 5xx.
 
 ### `[[api]]` — Runtime endpoints
 
@@ -165,20 +196,20 @@ Each `[[api]]` is a request handler containing one or more steps executed sequen
 
 ```toml
 [[api]]
-method = "POST"                         # HTTP method. Optional (matches all if omitted).
-path = "/sign"                          # URL path pattern. Required.
-                                        # Exact paths match literally.
-                                        # "*" matches all paths (catch-all).
-                                        # When multiple [[api]] match, longest prefix wins
-                                        # (nginx-style longest-prefix-match).
+method = "POST"                 # HTTP method. Optional (matches all if omitted).
+path   = "/sign"                # URL path pattern. Required.
+                                # Exact paths match literally.
+                                # "*" matches all paths (catch-all).
+                                # When multiple [[api]] match, longest prefix wins
+                                # (nginx-style longest-prefix-match).
 
   [[api.steps]]
-  target = "safeclaw"
-  run = "npx nodpay sign"
+  target  = "safeclaw"
+  run     = "npx nodpay sign"
   returns = true
 ```
 
-**If no `[[api]]` is declared**, the service has no runtime endpoints. This is valid for services that only need a recipe (setup-only) or only serve as upstream definitions consumed by other services.
+**If no `[[api]]` is declared**, the service has no runtime endpoints. Valid for services that only need a recipe (setup-only) or only serve as upstream definitions consumed by other services.
 
 **Catch-all forwarding** (e.g., proxy all requests to upstream):
 
@@ -187,7 +218,7 @@ path = "/sign"                          # URL path pattern. Required.
 path = "*"
 
   [[api.steps]]
-  target = "upstream:default"
+  target  = "upstream:default"
   returns = true
 ```
 
@@ -197,7 +228,6 @@ In addition to the shared step fields, API steps support:
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `read` | string | Vault key path to read (dot-separated). Used with `target = "safeclaw.vault"`. |
 | `returns` | bool | If `true`, this step's output is the API response. At most one step per `[[api]]` may set this. Default: `false`. |
 | `retry` | table | Retry policy: `{ attempts = 6, interval_ms = 500 }`. Optional. |
 
@@ -211,18 +241,18 @@ In addition to the shared step fields, API steps support:
 
 ```toml
 [policy.levels]
-read = "allow"                  # Default read level: allow | ask | ask-always | deny
+read  = "allow"                 # Default read level: allow | ask | ask-always | deny
 write = "allow"                 # Default write level
 
 [[policy.rules]]                # Per-path overrides. Optional.
-method = "GET"
+method     = "GET"
 path_exact = "/v1/models"
-level = "allow"
+level      = "allow"
 
 [[policy.rules]]
-method = "DELETE"
+method      = "DELETE"
 path_suffix = "/admin"
-level = "ask-always"
+level       = "ask-always"
 ```
 
 Rules are evaluated most-specific-first. A matching rule overrides service-level defaults.
@@ -232,7 +262,7 @@ Rules are evaluated most-specific-first. A matching rule overrides service-level
 ```toml
 help = """
 A shared wallet is configured. **Skip the SKILL.md setup** — already done.
-- **Safe address:** `{{wallet.safe}}`
+- **Safe address:** `{{nodpay_safe}}`
 """
 ```
 
@@ -240,7 +270,19 @@ A markdown string under `[service]`. Serves two purposes:
 1. **`GET /{service}/help`** — returns the resolved help text (always allowed, no policy check)
 2. **`safeclaw.md`** — rendered as a section when the service is connected
 
-Template variables `{{wallet.*}}` are resolved from vault service data. Optional.
+Template variables resolve via items lookup. Optional.
+
+### `[items]` — Optional UI descriptions
+
+Pure UI hint for the connect-service flow. Required items are derived from scanning `{{X}}` template occurrences across service.toml (no need to declare them here). This block is **only** for human-readable descriptions used by the connect-service form:
+
+```toml
+[items]
+openai_api_key = "Your OpenAI API key from platform.openai.com"
+github_app_pem = "GitHub App private key (PEM file)"
+```
+
+Optional. Absent entries fall back to the bare item name in the UI.
 
 ---
 
@@ -254,11 +296,11 @@ Defines first-time setup instructions. Consumed by:
 
 ```toml
 [recipe]
-id = "nodpay"
+id           = "nodpay"
 display_name = "NodPay"
 ```
 
-Whether a service requires vault credentials is derived from `service.toml` — if any `[[upstream]]` has `[upstream.auth]`, credentials are required.
+Whether a service requires items in the vault is derived from `service.toml` template scan (no explicit declaration).
 
 ### `[passkey_sharing]` — Cross-origin passkey access
 
@@ -274,32 +316,32 @@ Configures `/.well-known/webauthn` to allow external origins to use passkeys reg
 
 ```toml
 [[steps]]
-title = "Install NodPay CLI"            # Human-readable label. Required.
-target = "openclaw"                     # Required. See Target table.
-run = "npm install -g nodpay"           # Shell command. Optional.
-cwd = "openclaw"                        # Working directory for run. Optional.
-description = "Detailed explanation"    # Optional.
-note = "Requires Node.js 18+"          # Optional.
+title       = "Install NodPay CLI"
+target      = "openclaw"
+run         = "npm install -g nodpay"
+cwd         = "openclaw"
+description = "Detailed explanation"
+note        = "Requires Node.js 18+"
 
 [[steps]]
-title = "Create config files"
+title  = "Create config files"
 target = "openclaw"
-files = [                               # Files to create. Optional.
+files = [
   { path = ".nodpay/config.json", content = '{"remote_wallet":"http://localhost:{{safeclaw.proxy_port}}/nodpay"}' },
   { path = "accounts/safeclaw.json", content = '{"token":"...","baseUrl":"..."}' },
 ]
 
 [[steps]]
-title = "Enable channel"
+title  = "Enable channel"
 target = "openclaw"
-config_patches = [                      # Config changes to openclaw.json. Optional.
+config_patches = [
   { path = "channels.telegram.enabled", value = true },
 ]
 
 [[steps]]
-title = "Restart OpenClaw"
-target = "openclaw"
-restart = true                          # Restart the target container. Optional.
+title   = "Restart OpenClaw"
+target  = "openclaw"
+restart = true
 ```
 
 #### Recipe step fields
@@ -333,7 +375,7 @@ restart = true                          # Restart the target container. Optional
 | `path` | Dot-separated config key path (e.g., `channels.telegram.enabled`). |
 | `value` | Any JSON-compatible value (bool, string, number, object). |
 
-**Template variables** (resolved in `run`, `content`, `path`, `config_patches` values):
+**Template variables in recipe step values:**
 
 | Variable | Description |
 |----------|-------------|
@@ -341,9 +383,7 @@ restart = true                          # Restart the target container. Optional
 | `{{safeclaw.admin_port}}` | SafeClaw admin port (default: 23294) |
 | `{{safeclaw.admin_url}}` | SafeClaw admin URL |
 | `{{service.id}}` | Current service ID |
-| `{{service.vault.KEY}}` | Value of `KEY` from this service's vault data |
-
-Two namespaces: `safeclaw.*` for runtime properties, `service.*` for the current service context. `{{service.vault.KEY}}` reads from `secrets.services.{service.id}.KEY` in the vault.
+| `{{X}}` | Item X — same resolution as service.toml templates |
 
 ---
 
@@ -355,45 +395,52 @@ Two namespaces: `safeclaw.*` for runtime properties, `service.*` for the current
 # ═══ services/llm/openai/service.toml ═══
 
 [service]
-id = "openai"
-name = "OpenAI"
-sub = "API Key"
+id       = "openai"
+name     = "OpenAI"
+sub      = "API Key"
 category = "llm"
-group = "openai"
+group    = "openai"
 
 [[upstream]]
-id = "default"
+id  = "default"
 url = "https://api.openai.com"
-auth = { type = "bearer", env = "openai_api_key", placeholder = "sk-..." }
-locked = { response = "Please unlock the SafeClaw vault to use this service." }
+
+[upstream.headers]
+Authorization = "Bearer {{openai_api_key}}"
+
+[upstream.locked]
+response = "Please unlock the SafeClaw vault to use this service."
 
 [[api]]
 path = "*"
 
   [[api.steps]]
-  target = "upstream:default"
+  target  = "upstream:default"
   returns = true
 
 [policy.levels]
-read = "allow"
+read  = "allow"
 write = "allow"
+
+[items]
+openai_api_key = "Your OpenAI API key from platform.openai.com"
 ```
 
 ```toml
 # ═══ services/llm/openai/recipe.toml ═══
 
 [recipe]
-id = "openai"
+id           = "openai"
 display_name = "OpenAI"
 
 [[steps]]
-title = "Register OpenAI provider"
+title  = "Register OpenAI provider"
 target = "openclaw"
-run = """openclaw config set models.providers.openai '{"apiKey":"sk-safeclaw-proxy","baseUrl":"http://localhost:{{safeclaw.proxy_port}}/openai/v1","api":"openai-completions","models":[]}' --strict-json"""
+run    = """openclaw config set models.providers.openai '{"apiKey":"sk-safeclaw-proxy","baseUrl":"http://localhost:{{safeclaw.proxy_port}}/openai/v1","api":"openai-completions","models":[]}' --strict-json"""
 
 [[steps]]
-title = "Restart OpenClaw"
-target = "openclaw"
+title   = "Restart OpenClaw"
+target  = "openclaw"
 restart = true
 ```
 
@@ -403,28 +450,36 @@ restart = true
 # ═══ services/llm/openai-codex/service.toml ═══
 
 [service]
-id = "openai-codex"
-name = "OpenAI Codex"
-sub = "ChatGPT"
+id       = "openai-codex"
+name     = "OpenAI Codex"
+sub      = "ChatGPT"
 category = "llm"
-group = "openai"
+group    = "openai"
 
 [[upstream]]
-id = "default"
+id  = "default"
 url = "https://api.openai.com"
-auth = { type = "oauth2" }
-headers = { "openai-beta" = "responses=experimental", "chatgpt-account-id" = "{{auth.account_id}}" }
-locked = { response = "Please unlock the SafeClaw vault to use this service." }
+
+[upstream.headers]
+Authorization        = "Bearer {{auth.access_token}}"
+"openai-beta"        = "responses=experimental"
+"chatgpt-account-id" = "{{auth.account_id}}"
+
+[upstream.auth]
+provider = "oauth2"
+
+[upstream.locked]
+response = "Please unlock the SafeClaw vault to use this service."
 
 [[api]]
 path = "*"
 
   [[api.steps]]
-  target = "upstream:default"
+  target  = "upstream:default"
   returns = true
 
 [policy.levels]
-read = "allow"
+read  = "allow"
 write = "allow"
 ```
 
@@ -434,201 +489,99 @@ write = "allow"
 # ═══ services/integration/nodpay/service.toml ═══
 
 [service]
-id = "nodpay"
-name = "NodPay"
-sub = "Web3 agent wallet"
+id       = "nodpay"
+name     = "NodPay"
+sub      = "Web3 agent wallet"
 category = "integration"
-
-[[vault]]
-name = "wallet"
-kind = "config"
-description = "On-chain wallet state (safe address, signers, passkey coords)"
 
 [[api]]
 method = "POST"
-path = "/sign"
+path   = "/sign"
 
   [[api.steps]]
-  target = "safeclaw"
-  run = "npx nodpay sign"
-  env = { NODPAY_AGENT_KEY = "{{auth.secret}}" }
+  target  = "safeclaw"
+  run     = "npx nodpay sign"
+  env     = { NODPAY_AGENT_KEY = "{{nodpay_agent_key}}" }
   returns = true
 
 [[api]]
 method = "GET"
-path = "/wallets"
+path   = "/wallets"
 
   [[api.steps]]
-  target = "safeclaw"
-  run = "npx nodpay wallets --json"
+  target  = "safeclaw"
+  run     = "npx nodpay wallets --json"
   returns = true
 
 [policy.levels]
-read = "allow"
+read  = "allow"
 write = "allow"
 
 help = """
 A shared on-chain wallet is configured and ready. **Skip the NodPay SKILL.md setup section** — \
 keygen and wallet creation are already done by SafeClaw.
 
-- **Safe address:** `{{wallet.safe}}`
+- **Safe address:** `{{nodpay_safe}}`
 - Run `npx nodpay wallets` to get full wallet details (signers, passkey coords, recovery, etc.)
 - When the user asks to send ETH/crypto/tokens or make a payment, use `npx nodpay propose` to create the transaction
 - Signing is handled automatically via SafeClaw — you do not have the private key and don't need it
 """
+
+[items]
+nodpay_agent_key = "NodPay agent signing key"
+nodpay_safe      = "Safe contract address (0x...)"
 ```
 
-### Dashboard embedding (OpenClaw Dashboard)
+NodPay carries multiple items (`nodpay_agent_key`, `nodpay_safe`, ...) — all flat in the items namespace, all resolved through `store_order`. No per-service vault namespace.
 
-The dashboard is embedded as an iframe in the SafeClaw Pro console. This requires a multi-layer proxy chain and careful auth coordination.
-
-#### Proxy chain
-
-```
-HTTP + WS: browser → Railway rewrite (same-origin) → relay → VM:18789
-```
-
-Both HTTP and WebSocket go through the same-origin Railway proxy. The dashboard iframe loads at `www.safeclaw.pro/api/v/{id}/oc/` and derives its WebSocket URL from `window.location` — no explicit `gatewayUrl` is needed. The `sc_token` cookie (set by the parent page with `path=/api/v/`) is sent automatically for same-origin requests.
-
-> **Note:** Vercel rewrites do **not** proxy WebSocket upgrades. Railway does. This architecture requires Railway (or equivalent) for the frontend host.
-
-#### Auth model: trusted-proxy
-
-The gateway runs in `trusted-proxy` auth mode. The relay is the auth boundary — it verifies account session (via `sc_token` cookie) before proxying. The gateway trusts the relay via IP whitelist.
-
-```json
-{
-  "gateway": {
-    "auth": {
-      "mode": "trusted-proxy",
-      "trustedProxy": { "userHeader": "x-safeclaw-user" }
-    },
-    "trustedProxies": ["RELAY_EGRESS_IP"],
-    "bind": "lan",
-    "controlUi": {
-      "enabled": true,
-      "allowedOrigins": ["https://www.safeclaw.pro"]
-    }
-  }
-}
-```
-
-**Prerequisites:**
-- Relay must have a **fixed egress IP** (Railway paid feature). Currently `162.220.232.99`.
-- VM firewall must allow inbound on port 18789 (`ufw allow 18789/tcp`).
-- Gateway must bind to LAN (`gateway.bind lan`) for external access.
-
-**Relay responsibilities:**
-- HTTP proxy: inject `<base href>`, rewrite CSP (`frame-ancestors`, `base-uri`), strip browser headers, set `x-safeclaw-user`
-- WS upgrade: verify `sc_token` cookie + instance ownership, set `x-safeclaw-user`, pipe TCP to VM:18789
-
-**Limitations:**
-- If Railway egress IP changes, `gateway.trustedProxies` must be updated on all VMs (via recipe re-cook or admin API).
-- `trustedProxies` is per-VM config, not centralized. A bulk update mechanism may be needed.
-
-#### service.toml
-
-```toml
-[service]
-id = "openclaw-dashboard"
-name = "OpenClaw Dashboard"
-category = "integration"
-
-[policy.levels]
-read = "allow"
-write = "allow"
-```
-
-No `[[vault]]` or `[[api]]` needed — trusted-proxy mode eliminates the need for gateway tokens and `/access` endpoints.
-
-#### recipe.toml
-
-```toml
-[recipe]
-id = "openclaw-dashboard"
-display_name = "OpenClaw Dashboard"
-
-[[steps]]
-title = "Enable Control UI"
-target = "openclaw"
-run = "openclaw config set gateway.controlUi.enabled true --strict-json"
-
-[[steps]]
-title = "Set allowed origins"
-target = "openclaw"
-run = """openclaw config set gateway.controlUi.allowedOrigins '["https://www.safeclaw.pro"]' --strict-json"""
-
-[[steps]]
-title = "Set trusted proxy auth"
-target = "openclaw"
-run = """openclaw config set gateway.auth '{"mode":"trusted-proxy","trustedProxy":{"userHeader":"x-safeclaw-user"}}' --strict-json"""
-
-[[steps]]
-title = "Set trusted proxy IPs"
-target = "openclaw"
-run = """openclaw config set gateway.trustedProxies '["{{safeclaw.relay_egress_ip}}"]' --strict-json"""
-
-[[steps]]
-title = "Bind to LAN"
-target = "openclaw"
-run = "openclaw config set gateway.bind lan"
-
-[[steps]]
-title = "Open firewall port"
-target = "host"
-run = "ufw allow 18789/tcp"
-
-[[steps]]
-title = "Restart OpenClaw"
-target = "openclaw"
-restart = true
-```
-
-`{{safeclaw.relay_egress_ip}}` is a template variable resolved from SafeClaw config, making the IP updateable without changing the recipe.
-
-### Channel with plugin setup (Telegram)
+### Channel with path-token auth (Telegram)
 
 ```toml
 # ═══ services/channel/telegram/service.toml ═══
 
 [service]
-id = "telegram"
-name = "Telegram"
-sub = "Bot API"
+id       = "telegram"
+name     = "Telegram"
+sub      = "Bot API"
 category = "channel"
 
 [[upstream]]
-id = "default"
-url = "https://api.telegram.org"
-auth = { type = "path" }
+id  = "default"
+url = "https://api.telegram.org/:bot_token"
+
+[upstream.path_params]
+bot_token = "{{telegram_bot_token}}"
 
 [[api]]
 path = "*"
 
   [[api.steps]]
-  target = "upstream:default"
+  target  = "upstream:default"
   returns = true
 
 [policy.levels]
-read = "allow"
+read  = "allow"
 write = "allow"
+
+[items]
+telegram_bot_token = "Bot token from @BotFather"
 ```
 
 ```toml
 # ═══ services/channel/telegram/recipe.toml ═══
 
 [recipe]
-id = "telegram"
+id           = "telegram"
 display_name = "Telegram"
 
 [[steps]]
-title = "Enable Telegram channel"
+title  = "Enable Telegram channel"
 target = "openclaw"
-run = "openclaw config set channels.telegram.enabled true --strict-json"
+run    = "openclaw config set channels.telegram.enabled true --strict-json"
 
 [[steps]]
-title = "Restart OpenClaw"
-target = "openclaw"
+title   = "Restart OpenClaw"
+target  = "openclaw"
 restart = true
 ```
 
@@ -638,28 +591,38 @@ restart = true
 # ═══ services/llm/claude-code/service.toml ═══
 
 [service]
-id = "claude-code"
-name = "Claude Code"
-sub = "Claude Code OAuth"
+id       = "claude-code"
+name     = "Claude Code"
+sub      = "Claude Code OAuth"
 category = "llm"
-group = "anthropic"
+group    = "anthropic"
 
 [[upstream]]
-id = "default"
+id  = "default"
 url = "https://api.anthropic.com"
-auth = { type = "oauth2", oauth_style = "json" }
-headers = { "anthropic-beta" = "oauth-2025-04-20,interleaved-thinking-2025-05-14", "user-agent" = "claude-cli/2.1.87 (external, cli)", "x-claude-code-session-id" = "{{uuid_v4}}" }
-locked = { response = "Please unlock the SafeClaw vault to use this service." }
+
+[upstream.headers]
+Authorization              = "Bearer {{auth.access_token}}"
+"anthropic-beta"           = "oauth-2025-04-20,interleaved-thinking-2025-05-14"
+"user-agent"               = "claude-cli/2.1.87 (external, cli)"
+"x-claude-code-session-id" = "{{uuid_v4}}"
+
+[upstream.auth]
+provider = "oauth2"
+style    = "json"
+
+[upstream.locked]
+response = "Please unlock the SafeClaw vault to use this service."
 
 [[api]]
 path = "*"
 
   [[api.steps]]
-  target = "upstream:default"
+  target  = "upstream:default"
   returns = true
 
 [policy.levels]
-read = "allow"
+read  = "allow"
 write = "allow"
 ```
 
@@ -667,34 +630,40 @@ write = "allow"
 # ═══ services/llm/claude-code/recipe.toml ═══
 
 [recipe]
-id = "claude-code"
+id           = "claude-code"
 display_name = "Claude Code"
 
 [[steps]]
-title = "Register Anthropic provider"
+title  = "Register Anthropic provider"
 target = "openclaw"
-run = """openclaw config set models.providers.anthropic '{"apiKey":"sk-safeclaw-proxy","baseUrl":"http://localhost:{{safeclaw.proxy_port}}/anthropic/v1","api":"anthropic-messages","models":[]}' --strict-json"""
+run    = """openclaw config set models.providers.anthropic '{"apiKey":"sk-safeclaw-proxy","baseUrl":"http://localhost:{{safeclaw.proxy_port}}/anthropic/v1","api":"anthropic-messages","models":[]}' --strict-json"""
 
 [[steps]]
-title = "Write Claude CLI credentials"
+title  = "Write Claude CLI credentials"
 target = "openclaw"
 files = [
   { path = ".claude/.credentials.json", template = "claude-credentials.json" },
 ]
-note = "Writes OAuth tokens to the Claude CLI credentials file"
+note   = "Writes OAuth tokens to the Claude CLI credentials file"
 
 [[steps]]
-title = "Restart OpenClaw"
-target = "openclaw"
+title   = "Restart OpenClaw"
+target  = "openclaw"
 restart = true
 ```
+
+### Dashboard embedding (OpenClaw Dashboard)
+
+The dashboard is embedded as an iframe in the SafeClaw Pro console. This requires a multi-layer proxy chain and a `trusted-proxy` auth mode in the gateway. The v3 protocol does not change this architecture; see git history for the full `openclaw-dashboard` example (auth-model heavy, orthogonal to the v3 changes).
+
+For v3, the relevant excerpt is that `openclaw-dashboard` has no `[[upstream]]` (trusted-proxy mode), no items required, just `[policy]` and a recipe to set gateway config.
 
 ---
 
 ## Enable flow
 
 ```
-Frontend → POST /vault/services/add → vault stores secret
+Frontend → POST /vault/services/add → vault stores service_state entry
          → dispatch_cook(secrets, service_only = "service-id")
            → builds ops from this service's recipe only
            → POST /cook to provisioner
@@ -716,29 +685,11 @@ Vault unlock does **not** trigger cook. Config persists in the docker volume; un
 Agent → GET /proxy/{service_id}/wallets
       → match [[api]] by path
       → execute [[api.steps]] sequentially
-        → step 1: run command (target = safeclaw)
-        → step 2: forward to upstream (target = upstream:default)
+        → step N: resolve templates via store_order (see STORES_AND_ITEMS.md §5)
+                  ↳ headers / query / path_params get replace-all-matching injection
+        → forward to upstream (target = upstream:default)
       → return output of step marked returns = true
 ```
-
----
-
-## Vault partial read
-
-`POST /vault/credentials` supports an optional `select` field for returning only matching subtrees instead of the full vault.
-
-```json
-{ "userKey": "...", "select": "services.telegram,channels.telegram" }
-```
-
-| Aspect | Detail |
-|--------|--------|
-| Format | Comma-separated dot-notation path prefixes |
-| Semantics | OR (union) — "services.telegram,model" returns both |
-| Default | Omit `select` → full vault (backward compatible) |
-| Structure | Returned JSON preserves the original path hierarchy |
-
-The VM decrypts the full vault in memory, extracts matching subtrees, re-encrypts the subset, and zeros out the plaintext. This enables per-service credential reveal without exposing the entire vault.
 
 ---
 
@@ -755,28 +706,51 @@ The VM decrypts the full vault in memory, extracts matching subtrees, re-encrypt
 ## Design principles
 
 - **Step is the universal primitive.** Both recipe setup and runtime APIs are sequences of steps with the same `target` vocabulary.
-- **CLI first.** Recipe steps prefer `openclaw config set` / `openclaw plugins install` over direct file manipulation. Use the same CLI commands a human would use.
+- **CLI first.** Recipe steps prefer `openclaw config set` / `openclaw plugins install` over direct file manipulation.
 - **Declarative over imperative.** TOML definitions, not Rust code per service.
-- **Single source of truth.** `service.toml` = runtime; `recipe.toml` = setup. No God functions translating vault state — each service's recipe declares its own setup.
+- **Templates over typed auth.** Common auth flows (bearer, header, query, basic, path-token) are expressed as `{{X}}` template substitutions in `[upstream.headers]` / `.query` / `.path_params`. Stateful auth (OAuth refresh, signing) uses `[upstream.auth] provider = "..."`.
+- **Replace-all-matching is the auth contract.** For every name set by upstream config, broker strips agent's matching entries first, then writes upstream's value. Agent cannot pollute.
+- **Single items namespace.** Templates reference items by bare name (`{{openai_api_key}}`), resolved across all stores per `store_order`. Service authors don't see store boundaries.
 - **Explicit over implicit.** Every `[[api]]` declares its steps and target. No default forwarding; catch-all requires `path = "*"`.
-- **Upstream is a reusable module.** Named `[[upstream]]` blocks are referenced by `target = "upstream:<id>"`, not inlined per API.
-- **Vault stores only user-specific data.** Auth credentials, generated tokens, and per-user config live in the vault. Service definitions (auth types, upstream URLs, policies) live in TOML. `[[vault]]` declarations make the schema explicit.
-- **Locked response is a plain string.** The proxy wraps it into the appropriate API format automatically.
-- **SafeClaw manages openclaw lifecycle.** Recipe steps use `openclaw config set` with `gateway.reload.mode off` to batch config changes, then explicitly `restart = true` at the end. This prevents race conditions from openclaw auto-restarting on each config write. SafeClaw is the orchestrator; openclaw is the managed runtime.
+- **SafeClaw manages openclaw lifecycle.** Recipe steps use `openclaw config set` with `gateway.reload.mode off` to batch config changes, then explicitly `restart = true` at the end.
 
 ---
 
-## Migration from v1
+## Migration from v2
 
-| v1 | v2 | Notes |
-|----|-----|-------|
-| `[upstream]` singleton | `[[upstream]]` array with `id` | Supports multiple upstreams per service |
-| `upstream.type = "local"` | No `[[upstream]]`; use `target = "safeclaw"` in `[[api.steps]]` | Local exec is a step target, not an upstream type |
-| `upstream.type = "proxy"` | `[[upstream]]` with `url` | Proxy is defined by having a URL |
-| `[[upstream.apis]]` | `[[api]]` with `[[api.steps]]` | APIs are top-level; steps replace inline command |
-| `upstream.locked.template` + `upstream.locked.routes` | `upstream.locked.response` (plain text) | Single string; proxy auto-formats per API type |
-| `[openclaw]` in recipe.toml | Removed | `models` removed from protocol (frontend-only concern); `plugin`/`api`/`env_key`/`proxy_path` either moved to `[[steps]]` or handled by runtime |
-| Implicit catch-all (no `[[api]]` = forward all) | Explicit `[[api]] path = "*"` | All forwarding must be declared |
-| `command` in `[[upstream.apis]]` | `run` in `[[api.steps]]` | Unified with recipe step vocabulary |
-| `target` optional (default "openclaw") | `target` required on every step | Self-documenting; no hidden defaults |
-| `placeholder = "{{ env.X }}"` template (2026-05-23 update) | `env = "X"` explicit field | The broker prefers `auth.env` over parsing templates out of the UI placeholder. Placeholder kept as input hint only. Fallback parser still handles legacy v2 services until they're migrated. |
+Pre-launch — no user data migration. In-tree service definitions migrate mechanically.
+
+### Field-by-field changes
+
+| v2 | v3 |
+|----|-----|
+| `auth = { type = "bearer", env = "X" }` | Removed. Use `[upstream.headers] Authorization = "Bearer {{X}}"` |
+| `auth = { type = "header", header = "X-Key", env = "X" }` | Removed. Use `[upstream.headers] X-Key = "{{X}}"` |
+| `auth = { type = "query", param = "key", env = "X" }` | Removed. Use `[upstream.query] key = "{{X}}"` |
+| `auth = { type = "path", env = "X" }` | Removed. URL with `:placeholder` + `[upstream.path_params]` |
+| `auth = { type = "basic", env = "X" }` | Removed. Use `[upstream.headers] Authorization = "Basic {{b64:X}}"` |
+| `auth = { type = "oauth2" }` | Repurposed as `[upstream.auth] provider = "oauth2"`; templates reference `{{auth.access_token}}` etc. |
+| `[[vault]]` schema declarations | Removed. Required items derived from template scan; optional `[items]` block for descriptions |
+| `{{ env.X }}` / `{{service.vault.X}}` template prefixes | Removed. Just `{{X}}` |
+| `placeholder = "sk-..."` (legacy UI hint via template-parsing) | Removed. Use `[items]` for descriptions |
+
+### Conceptual changes
+
+- **No per-service vault namespace.** v2 had `secrets.services.<id>.<key>` referenced by `{{service.vault.X}}`. v3 has one flat items namespace. Service authors prefix item names for clarity (e.g., `nodpay_safe` instead of `service.vault.safe`).
+- **No `[[vault]]` block.** What items a service needs is derived from `{{X}}` occurrences in service.toml. `[items]` is optional, descriptions only.
+- **Storage is decoupled from service definition.** v2 implied "credentials live in env namespace". v3 has the items+stores model — service.toml never references store names. Where an item lives is the user's vault configuration, not the service author's concern. See [STORES_AND_ITEMS.md](./STORES_AND_ITEMS.md).
+- **`auth.placeholder` legacy template parsing dropped.** Broker no longer parses `{{ env.X }}` out of placeholders. Templates live in headers/query/path_params.
+
+### Vault state changes (orthogonal but related)
+
+- `services.<name>.upstream` / `services.<name>.auth` (registry-shadow fields in vault.enc) — no longer stored. Broker reads service.toml at runtime.
+- Top-level service-defined keys (`wallet`, `gatewayToken`, ...) — moved into `stores["native-secrets"].items` (see STORES_AND_ITEMS.md §14 for migration).
+- `files: [{id, name, size}]` — moved into `stores["native-files"].items`.
+
+Protocol version bump: `health.version` increments to 3. Frontend gates compat via the version handshake.
+
+---
+
+## Vault partial read (wire endpoint, unchanged)
+
+The `POST /vault/credentials` endpoint supports an optional `select` field for returning only matching subtrees. See [PROTOCOL.md](./PROTOCOL.md) for full wire-protocol details. The v3 vault schema affects what paths are valid (`stores.prod-gcp.credentials_item`, `stores["native-secrets"].items.openai_api_key`, etc.) but the endpoint mechanics are unchanged.

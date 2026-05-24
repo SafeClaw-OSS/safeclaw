@@ -12,7 +12,8 @@
 > - SUDP paper: `safeclaw-paper-nips/sections/{main,appendix}/0[3-9]-*.tex`（canonical 抽象协议）
 > - System design + SUDP-aligned 决策: `../SAFECLAW_V1_DESIGN_HANDOFF.md`
 > - CLI architecture: `../CLI_DESIGN_HANDOFF.md`
-> - Service TOML schema: `./SERVICES.md`（不同文档，service 协议层）
+> - Service TOML schema: `./SERVICES.md`（service.toml v3）
+> - Vault content schema: `./STORES_AND_ITEMS.md`（stores / items / adapter contract — §5.2 引用此为 M 的 canonical 定义）
 
 ---
 
@@ -539,38 +540,37 @@ ct        = XChaCha20-Poly1305_Encrypt(K, nonce, plaintext, AAD)
 
 ### 5.2 Vault plaintext (M) schema
 
+**Canonical**: see [STORES_AND_ITEMS.md §7](./STORES_AND_ITEMS.md#7-vault-schema) for the full schema and per-field justification.
+
+Sketch:
+
 ```json
 {
-  "services": {
-    "openai":    { "api_key": "sk-...", "memory_ttl": -1 },
-    "anthropic": { "api_key": "sk-ant-..." },
-    "gmail":     { "oauth_refresh_token": "...", "memory_ttl": 1800 }
-  },
-  "policy": {
-    "default_levels": { "ask": "ask-always", "...": "..." },
-    "rules": [
-      { "id": "<rule_id>", "match": "POST /v1/...", "level": "ask", "ttl": 3600 }
-    ]
-  },
-  "preferences": {
-    "model": { "primary": "..." }
-  },
-  "peer_keks": {
+  "version": 3,
+  "stores":   { /* connected backends + their data; see STORES_AND_ITEMS.md */ },
+  "store_order": [ "native-secrets", "prod-gcp", "...", "native-files" ],
+
+  "service_state":      { /* per-user enabled services + policy overrides */ },
+  "policy_defaults":    { /* global policy preferences */ },
+  "push_subscriptions": [ /* web-push endpoints */ ],
+  "vapid_private_key":  "...",
+
+  "peers": {
     "<cid_b64>": "<base64 W_c>"
-  },
-  "vapid_private_key": "..."
+  }
 }
 ```
 
-**字段说明**:
-- `services.*`: per-service config + auth + 可选 `memory_ttl`（详 §6.1）
-- `policy`: standing authorization 规则（SUDP §02 "Policy"）
-- `preferences`: 不归 SafeClaw 解析的 frontend 配置（OSS daemon 不写）
-- `peer_keks`: SUDP rotation 的 in-state peer map（每次 write op 由 acting credential 更新自己的 entry，对其他 credentials 用缓存的 W_c 重新 wrap K'，详 SUDP paper §05-sudp-protocol/06-phase3-consumption.tex Default recoverability policy）
-- `vapid_private_key`: Web Push key（如保留 Web Push 功能）
+**关键 sections**:
+- `stores` / `store_order` / per-store `items`: 见 STORES_AND_ITEMS.md（核心 vault 内容模型）
+- `service_state`: per-user 服务启用 + policy override（不含 service.toml 定义的字段——那些 runtime 从 registry 读）
+- `policy_defaults`: standing authorization 全局规则（SUDP §02 "Policy"）
+- `push_subscriptions`: Web Push 订阅端点
+- `vapid_private_key`: Web Push 签名私钥
+- `peers`: SUDP rotation 的 in-state peer map（每次 write op 由 acting credential 更新自己的 entry，对其他 credentials 用缓存的 W_c 重新 wrap K'，详 SUDP paper §05-sudp-protocol/06-phase3-consumption.tex Default recoverability policy）
 
 **未含**:
-- `files`: v1 不含，推迟到 v1.1
+- 文件 blobs: 不在 vault.dat 内；存为独立的 `files/<blob_id>.enc`（同 DEK 加密），由 `stores["native-files"].items` 的 `blob_id` 索引（详 STORES_AND_ITEMS.md §11）
 - `audit`: 永远不进 vault（独立 `audit.db`）
 
 ### 5.3 Directory layout
