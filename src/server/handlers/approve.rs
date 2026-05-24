@@ -491,7 +491,12 @@ fn effective_read_level(
             return level.clone();
         }
     }
-    if category == "service" {
+    // `levels` is the legacy "global default" slot used by the per-VM
+    // console UI; in v3 it applies to the `integration` row (Gmail / Drive
+    // / GitHub / …). Keep accepting both `integration` and the older
+    // `service` category name for back-compat with vaults sealed before
+    // the rename.
+    if category == "integration" || category == "service" {
         if let Some(level) = user_defaults
             .levels
             .as_ref()
