@@ -438,16 +438,19 @@ pub async fn reject_op(
 
 
 /// Build the per-service `secrets_cache` from a decrypted v3 view. For every
-/// service whose static default-read policy is `allow`, resolve its required
-/// item via the v3 store_order (Phase 1: only native-secrets adapter is
-/// honored; later phases dispatch to per-kind adapters).
+/// service whose **effective** default-read level is `allow`, resolve its
+/// required item via the v3 store_order. The effective level walks the
+/// user's `aux.policy_defaults` (category override → global override) before
+/// falling back to the service's compiled-in default — so the policy UI's
+/// "Use AI models = Ask every time" actually changes whether the agent gets
+/// the cache fast-path.
 fn bootstrap_cache_from_view(
     view: &VaultPlaintextView,
     state: &AppState,
 ) -> SecretsCache {
     let mut cache = SecretsCache::default();
     for (service_id, _) in state.services.iter_sorted() {
-        if state.services.default_read_level(service_id) != AccessLevel::Allow {
+        if effective_read_level(view, state, service_id) != AccessLevel::Allow {
             continue;
         }
         let Some(item_name) = state.services.service_env_key(service_id) else {
@@ -458,4 +461,44 @@ fn bootstrap_cache_from_view(
         }
     }
     cache
+}
+
+/// Resolve the read-level a service should be cached at after the user's
+/// `aux.policy_defaults` is layered over the service's compiled-in default.
+///
+/// Priority:
+///   1. User's per-category override (`policy_defaults.type_levels.<cat>.read`)
+///   2. User's global override (`policy_defaults.levels.read`) — applies to
+///      `service` category only, matching what the legacy console UI does
+///   3. Service's compiled-in default (standalone policy.toml > service.toml
+///      [policy] > safe `ask-always`).
+fn effective_read_level(
+    view: &VaultPlaintextView,
+    state: &AppState,
+    service_id: &str,
+) -> AccessLevel {
+    let compiled = state.services.default_read_level(service_id);
+    let Some(user_defaults) = view.aux.policy_defaults.as_ref() else {
+        return compiled;
+    };
+    let category = state.services.default_category(service_id);
+    if let Some(per_cat) = user_defaults
+        .type_levels
+        .as_ref()
+        .and_then(|m| m.get(category))
+    {
+        if let Some(level) = per_cat.read.as_ref() {
+            return level.clone();
+        }
+    }
+    if category == "service" {
+        if let Some(level) = user_defaults
+            .levels
+            .as_ref()
+            .and_then(|l| l.read.as_ref())
+        {
+            return level.clone();
+        }
+    }
+    compiled
 }

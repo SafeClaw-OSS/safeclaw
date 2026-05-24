@@ -44,6 +44,10 @@ pub struct RegistryService {
     /// is without reading the full description.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sub: Option<String>,
+    /// Service category — drives global policy bucketing on the UI
+    /// (`llm` / `channel` / `service` etc.). Always present; defaults to
+    /// `"service"` if the toml didn't declare one.
+    pub category: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     pub endpoints: Vec<RegistryEndpoint>,
@@ -60,6 +64,46 @@ pub struct RegistryService {
     /// from the connect/OAuth flow) and for fully-internal services.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub vault_fields: Vec<RegistryVaultField>,
+    /// Built-in policy snapshot — global default levels for this service
+    /// plus the explicit per-action rule list. Frontend uses this to
+    /// render the per-app fine-tuning UI; user overrides come from
+    /// `aux.service_state.<svc>.rule_overrides`. Absent when the service
+    /// has no policy.toml AND no inline [policy] block.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy: Option<RegistryServicePolicy>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RegistryServicePolicy {
+    /// Default read / write levels for the service. Either may be absent
+    /// (defer to category-level global default in that case).
+    pub defaults: RegistryPolicyDefaults,
+    /// Ordered list of built-in rules. Empty when the service has no
+    /// per-action rules (rare — most services declare at least one).
+    pub rules: Vec<RegistryPolicyRule>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RegistryPolicyDefaults {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub write: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ask_ttl: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RegistryPolicyRule {
+    pub id: String,
+    pub label: String,
+    #[serde(rename = "match")]
+    pub match_pattern: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    pub level: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ask_ttl: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -81,6 +125,12 @@ pub struct RegistryResponse {
     pub version: u32,
     pub proxy_base: String,
     pub services: Vec<RegistryService>,
+    /// Per-category global default levels — what the UI shows in the top
+    /// "What can your agent do without asking?" block. Read straight from
+    /// `PolicyDefaults::default()` so the policy crate stays the source
+    /// of truth for the safe defaults. Users override these via
+    /// `aux.policy_defaults`.
+    pub policy_defaults: serde_json::Value,
 }
 
 pub async fn registry(State(state): State<Arc<AppState>>) -> Result<Json<Value>> {
@@ -162,21 +212,61 @@ pub async fn registry(State(state): State<Arc<AppState>>) -> Result<Json<Value>>
                 vec![]
             };
 
+            // Policy snapshot: prefer the standalone policy.toml (has
+            // explicit rule ids/labels) over the inline service.toml
+            // [policy]. Absent → service has no per-action rules; the
+            // category default still governs (handled by the frontend).
+            let policy = state.services.policy_file(id).map(|p| {
+                let defaults = p
+                    .default
+                    .as_ref()
+                    .map(|m| RegistryPolicyDefaults {
+                        read: m.get("read").cloned(),
+                        write: m.get("write").cloned(),
+                        ask_ttl: m.get("ask_ttl").and_then(|v| v.parse().ok()),
+                    })
+                    .unwrap_or(RegistryPolicyDefaults {
+                        read: None,
+                        write: None,
+                        ask_ttl: None,
+                    });
+                let rules = p
+                    .rule
+                    .iter()
+                    .map(|r| RegistryPolicyRule {
+                        id: r.id.clone(),
+                        label: r.label.clone(),
+                        match_pattern: r.match_pattern.clone(),
+                        body: r.body.clone(),
+                        level: r.level.clone(),
+                        ask_ttl: r.ask_ttl,
+                    })
+                    .collect();
+                RegistryServicePolicy { defaults, rules }
+            });
+
             RegistryService {
                 id: id.to_string(),
                 name: def.service.name.clone(),
                 sub: def.service.sub.clone(),
+                category: def.service.category.clone(),
                 description: def.service.help.clone(),
                 endpoints,
                 vault_fields,
+                policy,
             }
         })
         .collect();
+
+    // Surface the compiled-in safe defaults so the UI can render globals
+    // even when the vault aux doesn't carry user-set overrides yet.
+    let policy_defaults = serde_json::to_value(crate::core::policy::PolicyDefaults::default())?;
 
     let body = RegistryResponse {
         version: 1,
         proxy_base,
         services,
+        policy_defaults,
     };
     Ok(Json(serde_json::to_value(body)?))
 }

@@ -15,11 +15,12 @@
 //! two physical pools; runtime code goes through [`VaultPlaintextView`]
 //! to query items by name with resolution-order semantics.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
 use sudp::state::ProtectedState;
 
+use crate::core::policy::{PolicyDefaults, RuleOverride};
 use crate::error::{AppError, Result};
 
 /// Current schema version. Hard-fail on any other value.
@@ -62,12 +63,30 @@ pub struct Store {
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
+/// Per-service user state — currently just sparse rule overrides keyed by
+/// the built-in rule's `id`. Per the policy design doc, reverting to the
+/// built-in level drops the entry (no identity no-op).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ServiceState {
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub rule_overrides: HashMap<String, RuleOverride>,
+}
+
 /// `aux` payload — everything inside `ProtectedState.aux` for v3 vaults.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VaultAux {
     pub version: u32,
     pub stores: BTreeMap<String, Store>,
     pub store_order: Vec<String>,
+    /// Global access-level defaults. Absent on fresh vaults → daemon falls
+    /// back to `PolicyDefaults::default()` (the safe defaults compiled in).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_defaults: Option<PolicyDefaults>,
+    /// Per-service user state (rule overrides today; per-service ask_ttl,
+    /// custom rule lists, etc. later). Sparse — only services with user-
+    /// authored state appear here.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub service_state: BTreeMap<String, ServiceState>,
 }
 
 impl VaultAux {
@@ -98,6 +117,8 @@ impl VaultAux {
             version: PLAINTEXT_VERSION,
             stores,
             store_order: vec![NATIVE_SECRETS_ID.to_string(), NATIVE_FILES_ID.to_string()],
+            policy_defaults: None,
+            service_state: BTreeMap::new(),
         }
     }
 }
