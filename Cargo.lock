@@ -1814,6 +1814,8 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 [[package]]
 name = "sudp"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b1c983c3590c935bd7a827d6c28a6349d58c8b6ca4eb9dfe927d80efee464f78"
 dependencies = [
  "base64",
  "chacha20poly1305",

@@ -60,6 +60,9 @@ Browser → `http://localhost:3000/vault`
   hard-fail with "vault plaintext version X (expected 3) — vault is
   from an older binary; re-enroll required". Wipe and retry:
   ```bash
+  # Local ./dev.sh state lives under the workspace root.
+  # For other deployments see safeclaw/docs/DEPLOYMENT.md for the
+  # canonical state path.
   rm -rf ~/projects/safeclaw/.state/safeclaw-daemon/tenants
   ```
 - Click "Seal vault with passkey", do the passkey ceremony.
