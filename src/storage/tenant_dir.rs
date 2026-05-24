@@ -55,6 +55,18 @@ impl TenantDir {
         Ok(d)
     }
 
+    /// Recursively delete the tenant's directory (vault.dat + any files/
+    /// blobs alongside). Idempotent: no error if the directory is already
+    /// missing. Caller is responsible for any in-memory state cleanup
+    /// (e.g. flushing the vault_states cache).
+    pub fn remove(&self, tenant_id: &str) -> Result<()> {
+        let d = self.dir_for(tenant_id)?;
+        if d.exists() {
+            std::fs::remove_dir_all(&d)?;
+        }
+        Ok(())
+    }
+
     pub fn list(&self) -> Result<Vec<String>> {
         if !self.root.exists() {
             return Ok(Vec::new());

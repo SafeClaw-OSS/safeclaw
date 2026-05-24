@@ -320,6 +320,26 @@ pub async fn approve_op(
                 tracing::info!(vault = %vault_id, "vault locked");
                 (json!({ "ok": true, "act": "vault-lock" }), None)
             }
+            // Lifecycle op: wipe the tenant's on-disk state (vault.dat +
+            // any sibling blob files) and clear the in-memory locked/
+            // unlocked entry. Passkey-gated through the standard grant
+            // machinery so a stolen session token can't destroy data. Once
+            // approved, this is irreversible — the user must re-enroll to
+            // get a new vault.
+            "vault-delete" => {
+                if existing_vault.is_none() {
+                    return Err(AppError::Conflict("vault not initialized".into()));
+                }
+                state.tenants.remove(&vault_id).map_err(|e| {
+                    AppError::Internal(format!("vault dir remove: {}", e))
+                })?;
+                {
+                    let mut states = state.vault_states.lock().unwrap();
+                    states.remove(&vault_id);
+                }
+                tracing::info!(vault = %vault_id, "vault deleted");
+                (json!({ "ok": true, "act": "vault-delete" }), None)
+            }
             other => {
                 return Err(AppError::BadRequest(format!(
                     "unsupported Custom act: {}",
