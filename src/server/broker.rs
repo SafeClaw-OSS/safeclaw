@@ -234,9 +234,14 @@ pub async fn forward_to_upstream_with_extras<'a>(
         }
         _ => path.to_string(),
     };
+    // URL itself may carry a template — e.g. Telegram's Bot API puts the
+    // token in the URL path: `https://api.telegram.org/bot{{auth_value}}`.
+    // Render with the same engine that handles headers/query templates so
+    // the user/service author has one consistent placeholder vocabulary.
+    let url_rendered = render_upstream_template(upstream_url, s_o);
     let full_url = format!(
         "{}{}",
-        upstream_url.trim_end_matches('/'),
+        url_rendered.trim_end_matches('/'),
         path_with_query
     );
     let reqwest_method = reqwest::Method::from_str(method_str)
