@@ -41,6 +41,28 @@ pub struct ApprovalRecord {
     /// `GET /op/{op_id}` responses so the UI can render a countdown.
     pub expires_at_unix: u64,
     pub ttl: Duration,
+    /// Policy decision context captured when the op was created. Used by
+    /// approve.rs to write into the rule-approvals cache after a
+    /// successful Use op — so the `ask`-with-TTL semantic kicks in on the
+    /// next matching request. Daemon-internal: never appears on the wire,
+    /// never signed into the grant.
+    pub policy_context: Option<PolicyContext>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PolicyContext {
+    /// The decision level when this op was created. `Ask` is the only
+    /// value that drives cache writes; we keep the others for audit /
+    /// debug. `AskAlways` is explicitly excluded — that's the whole
+    /// point of the level.
+    pub level: crate::core::policy::AccessLevel,
+    /// Matched rule id from `evaluate_policy_with_match`. `None` =
+    /// category / global default fired; cache key uses `(svc, None)`.
+    pub rule_id: Option<String>,
+    /// TTL in seconds the approval should remain cached. Threaded from
+    /// the matched rule's `ask_ttl`, the service / category default's
+    /// `ask_ttl`, or `PolicyDefaults::timeout` as last resort.
+    pub ttl_seconds: u64,
 }
 
 impl ApprovalRecord {
@@ -64,6 +86,19 @@ impl ApprovalStore {
 
     /// Create a new pending approval. Returns the new approval id.
     pub fn create(&mut self, tenant_id: String, op: Operation, r: String) -> String {
+        self.create_with_policy(tenant_id, op, r, None)
+    }
+
+    /// Same as [`create`] but stashes the policy-decision context that led
+    /// to this op being created. Used by /use; ops created by other paths
+    /// (export, write, lifecycle) pass `None`.
+    pub fn create_with_policy(
+        &mut self,
+        tenant_id: String,
+        op: Operation,
+        r: String,
+        policy_context: Option<PolicyContext>,
+    ) -> String {
         let id = Uuid::new_v4().to_string();
         let now_unix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -79,6 +114,7 @@ impl ApprovalStore {
             created_at: Instant::now(),
             expires_at_unix: now_unix + DEFAULT_TTL.as_secs(),
             ttl: DEFAULT_TTL,
+            policy_context,
         };
         self.inner.insert(id.clone(), rec);
         id

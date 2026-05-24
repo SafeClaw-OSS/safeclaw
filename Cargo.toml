@@ -37,6 +37,7 @@ futures-util = "0.3"
 toml = "0.8"
 dirs = "5"
 url = "2"
+urlencoding = "2"
 
 # Misc
 clap = { version = "4", features = ["derive", "env"] }

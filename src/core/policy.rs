@@ -259,6 +259,27 @@ pub fn evaluate_policy(
     defaults: &PolicyDefaults,
     service_category: Option<&str>,
 ) -> AccessLevel {
+    evaluate_policy_with_match(method, path, body, rules, service_levels, defaults, service_category).0
+}
+
+/// Same as [`evaluate_policy`] but also returns the matching rule (if any)
+/// and its TTL. The matched-rule reference lets callers identify the exact
+/// scope of an approval — e.g. caching `ask` decisions by rule id so the
+/// TTL applies to the specific scope the user said "yes" to, not every
+/// request to the service.
+///
+/// Returned tuple: `(level, matched_rule_id, ttl_seconds)`. Both extras are
+/// `None` when no rule matched (level came from category / global default);
+/// the caller should still cache under `(service, None)` in that case.
+pub fn evaluate_policy_with_match(
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+    rules: Option<&Vec<PolicyRule>>,
+    service_levels: Option<&ServiceLevels>,
+    defaults: &PolicyDefaults,
+    service_category: Option<&str>,
+) -> (AccessLevel, Option<String>, Option<u64>) {
     // 1. Check service rules — most specific match wins (nginx-style)
     if let Some(rules) = rules {
         let mut best: Option<(u32, &PolicyRule)> = None;
@@ -271,7 +292,7 @@ pub fn evaluate_policy(
             }
         }
         if let Some((_, rule)) = best {
-            return rule.level.clone();
+            return (rule.level.clone(), rule.id.clone(), rule.ask_ttl);
         }
     }
 
@@ -283,7 +304,7 @@ pub fn evaluate_policy(
             &levels.read
         };
         if let Some(l) = level {
-            return l.clone();
+            return (l.clone(), None, levels.ask_ttl);
         }
     }
 
@@ -296,7 +317,7 @@ pub fn evaluate_policy(
                 &type_def.read
             };
             if let Some(l) = level {
-                return l.clone();
+                return (l.clone(), None, type_def.ask_ttl);
             }
         }
     }
@@ -309,12 +330,12 @@ pub fn evaluate_policy(
             &def_levels.read
         };
         if let Some(l) = level {
-            return l.clone();
+            return (l.clone(), None, def_levels.ask_ttl);
         }
     }
 
     // 5. Safe default
-    AccessLevel::AskAlways
+    (AccessLevel::AskAlways, None, None)
 }
 
 /// Find the ask_ttl for the best matching rule.

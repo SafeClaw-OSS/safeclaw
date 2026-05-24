@@ -72,6 +72,20 @@ pub struct SecretsCache {
     /// at unlock. `None` = keep forever. Used by `GET /v/{vid}/approvals` to
     /// opportunistically prune old rows before listing.
     pub audit_retention_days: Option<u32>,
+    /// Honors the `ask` (vs `ask-always`) semantic: after the user approves
+    /// an Ask-level op, the daemon caches `(service, matched_rule_id) →
+    /// expires_at` so subsequent requests within the TTL fast-path without
+    /// re-prompting. `ask-always` never lands here; `allow` doesn't need it.
+    ///
+    /// Key shape: `(service_id, Option<rule_id>)`. `None` covers the case
+    /// where no per-rule matched and the approval was driven by category-
+    /// default Ask — the cache covers that whole category-default decision
+    /// for the service. Value: Unix-epoch-second expiry.
+    ///
+    /// Lives in the same memory window as the rest of the cache: dropped on
+    /// lock (which zero-outs the entire cache via Default drop). Daemon
+    /// restart also blows it away (vaults boot Locked, cache starts empty).
+    pub rule_approvals: HashMap<(String, Option<String>), u64>,
 }
 
 #[derive(Debug)]
@@ -174,17 +188,20 @@ impl AppState {
         }
     }
 
-    /// Evaluate the per-request policy level for `(vault, service, method,
-    /// path, body)`. Returns `None` only when the vault is Locked or never
-    /// unlocked (the caller should treat that as "vault locked"; the existing
-    /// is_vault_locked check usually catches it first). Otherwise returns
-    /// the merged-rules / merged-defaults decision.
+    /// Evaluate the per-request policy decision for `(vault, service,
+    /// method, path, body)`. Returns `None` when the vault is Locked or
+    /// never unlocked (caller should treat that as "vault locked").
+    ///
+    /// Returned tuple: `(effective_level, matched_rule_id, ttl_seconds)`.
     ///
     /// Honors:
     ///   - user-overridden per-rule levels (`aux.service_state[svc].rule_overrides`)
     ///   - user global policy_defaults (per-category + legacy `levels`)
     ///   - service's compiled-in [policy] levels
     ///   - safe compiled-in defaults at the very end
+    ///   - **active `ask` approvals** — if the decision is `Ask` AND the
+    ///     `(service, rule_id)` pair is in the unexpired rule_approvals
+    ///     cache, downgrades to `Allow` so the request fast-paths.
     pub fn evaluate_request_policy(
         &self,
         vault_id: &str,
@@ -192,9 +209,13 @@ impl AppState {
         method: &str,
         path: &str,
         body: Option<&str>,
-    ) -> Option<crate::core::policy::AccessLevel> {
-        let states = self.vault_states.lock().unwrap();
-        let cache = match states.get(vault_id) {
+    ) -> Option<(crate::core::policy::AccessLevel, Option<String>, Option<u64>)> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let mut states = self.vault_states.lock().unwrap();
+        let cache = match states.get_mut(vault_id) {
             Some(VaultState::Unlocked { cache, .. }) => cache,
             _ => return None,
         };
@@ -223,7 +244,7 @@ impl AppState {
             }
         }
         let category = self.services.default_category(service_id);
-        Some(crate::core::policy::evaluate_policy(
+        let (level, matched_rule, ttl) = crate::core::policy::evaluate_policy_with_match(
             method,
             path,
             body,
@@ -231,6 +252,56 @@ impl AppState {
             service_levels.as_ref(),
             &defaults,
             Some(category),
-        ))
+        );
+
+        // Cache hit honors the `ask`-with-TTL semantic: a prior approval at
+        // the same (service, rule) scope, not yet expired, downgrades this
+        // Ask to Allow so the request fast-paths without a passkey prompt.
+        // Passive cleanup: if expired, drop the entry instead of returning
+        // a hit. `ask-always` and `deny` never consult or write the cache;
+        // `allow` doesn't need to.
+        if level == crate::core::policy::AccessLevel::Ask {
+            let key = (service_id.to_string(), matched_rule.clone());
+            if let Some(&exp) = cache.rule_approvals.get(&key) {
+                if exp > now {
+                    return Some((
+                        crate::core::policy::AccessLevel::Allow,
+                        matched_rule,
+                        ttl,
+                    ));
+                } else {
+                    cache.rule_approvals.remove(&key);
+                }
+            }
+        }
+
+        Some((level, matched_rule, ttl))
+    }
+
+    /// Record an `ask`-level approval into the per-vault TTL cache. Called
+    /// from approve.rs when a Use op was approved AND the decision that
+    /// created it was Ask (not AskAlways). `ttl_seconds` is the level's
+    /// `ask_ttl` falling back to `policy.timeout` or a safe 300s default.
+    ///
+    /// No-op when the vault is locked at the moment of the call — that
+    /// shouldn't happen in practice (the approve happens while the
+    /// vault is unlocked) but we don't want to panic if it does.
+    pub fn record_ask_approval(
+        &self,
+        vault_id: &str,
+        service_id: &str,
+        rule_id: Option<String>,
+        ttl_seconds: u64,
+    ) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let mut states = self.vault_states.lock().unwrap();
+        if let Some(VaultState::Unlocked { cache, .. }) = states.get_mut(vault_id) {
+            cache
+                .rule_approvals
+                .insert((service_id.to_string(), rule_id), now + ttl_seconds);
+        }
     }
 }

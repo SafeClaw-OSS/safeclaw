@@ -1,3 +1,3 @@
 pub mod store;
 
-pub use store::{ApprovalRecord, ApprovalStatus, ApprovalStore};
+pub use store::{ApprovalRecord, ApprovalStatus, ApprovalStore, PolicyContext};

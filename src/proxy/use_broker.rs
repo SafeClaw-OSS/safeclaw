@@ -107,7 +107,7 @@ async fn handle_impl(
     // the lock check and here — should never happen but treat as locked.
     let path_for_eval = format!("/{}", rest);
     let body_text = std::str::from_utf8(&body).ok();
-    let level = state
+    let (level, matched_rule_id, level_ask_ttl) = state
         .evaluate_request_policy(
             &vault_id,
             &service,
@@ -160,7 +160,7 @@ async fn handle_impl(
             .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
             .collect();
         let body_vec = body.to_vec();
-        let response = crate::server::broker::forward_to_upstream(
+        let response = crate::server::broker::forward_to_upstream_with_extras(
             &cached_secret,
             &upstream.url,
             method.as_str(),
@@ -168,6 +168,8 @@ async fn handle_impl(
             header_pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())),
             body_vec,
             Some(&target),
+            if upstream.headers.is_empty() { None } else { Some(&upstream.headers) },
+            if upstream.query.is_empty() { None } else { Some(&upstream.query) },
         )
         .await?;
         // Audit: synthetic `allowed` row — no ApprovalRecord ever existed for
@@ -250,9 +252,25 @@ async fn handle_impl(
         let mut store = state.challenges.lock().unwrap();
         store.issue(ip).ok_or(AppError::TooManyRequests)?
     };
+    // Resolve the TTL to honor when the user approves this Ask: matched
+    // rule's `ask_ttl` > policy_defaults.timeout > safe 300s default.
+    // `AskAlways` short-circuits to a None policy_context — that level
+    // explicitly skips cache writes.
+    let policy_context = match level {
+        AccessLevel::Ask => {
+            let ttl = level_ask_ttl.unwrap_or(300);
+            Some(crate::approval::PolicyContext {
+                level: AccessLevel::Ask,
+                rule_id: matched_rule_id.clone(),
+                ttl_seconds: ttl,
+            })
+        }
+        _ => None,
+    };
+
     let (op_id, expires_at) = {
         let mut store = state.approvals.lock().unwrap();
-        let id = store.create(vault_id.clone(), op.clone(), r.clone());
+        let id = store.create_with_policy(vault_id.clone(), op.clone(), r.clone(), policy_context);
         let exp = store.get(&id).map(|r| r.expires_at_unix).unwrap_or(0);
         (id, exp)
     };

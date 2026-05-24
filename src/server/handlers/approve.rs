@@ -256,6 +256,7 @@ pub async fn approve_op(
                 &validated.wrapping_key,
                 &validated.credential_id_bytes,
                 &vault,
+                &state.services,
             )
             .await?;
             audit_upstream_status = Some(response.status as i64);
@@ -354,8 +355,11 @@ pub async fn approve_op(
         }
     };
 
-    // 5. Mark approved + emit event.
-    let (rec_id, rec_vault_id, response_preview) = {
+    // 5. Mark approved + emit event. We also pull the policy_context off
+    // the record before mutation so we can write into the rule-approvals
+    // cache below — without this, an `ask`-with-TTL approval would never
+    // short-circuit the next matching request.
+    let (rec_id, rec_vault_id, response_preview, policy_ctx_for_cache) = {
         let mut store = state.approvals.lock().unwrap();
         let rec = store.approve(&op_id, cached_value.clone()).ok_or_else(|| {
             AppError::Conflict("op no longer pending after validation".into())
@@ -366,8 +370,39 @@ pub async fn approve_op(
                 .and_then(|s| serde_json::from_str::<Value>(s).ok()),
             _ => None,
         };
-        (rec.id.clone(), rec.tenant_id.clone(), preview)
+        // Only Use ops carry a policy_context (other op kinds bypass the
+        // policy gate). Cache writes are gated by Ask level — AskAlways is
+        // explicitly excluded at op-create time so it'll be None here.
+        let pc = if matches!(validated.op.act.kind, ActType::Use) {
+            rec.policy_context.clone()
+        } else {
+            None
+        };
+        (rec.id.clone(), rec.tenant_id.clone(), preview, pc)
     };
+
+    // Cache write: an Ask-level approval scopes a TTL'd "next matching
+    // request fast-paths" effect. Service id pulled off the op's scope
+    // (which `use_broker` populates verbatim). No-op when:
+    //   - The op wasn't a Use (policy_ctx_for_cache is None)
+    //   - The level was Allow / AskAlways / Deny (not stored)
+    //   - The vault relocked between approve and now (record_ask_approval
+    //     is a no-op then)
+    if let Some(pc) = policy_ctx_for_cache {
+        if pc.level == crate::core::policy::AccessLevel::Ask {
+            let svc = validated
+                .op
+                .act
+                .scope
+                .get("service")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if !svc.is_empty() {
+                state.record_ask_approval(&rec_vault_id, &svc, pc.rule_id, pc.ttl_seconds);
+            }
+        }
+    }
 
     // Audit: pending → approved. Best-effort; daemon UX must not depend on
     // audit being healthy.

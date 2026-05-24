@@ -70,10 +70,37 @@ fn default_category() -> String { "integration".to_string() }
 pub struct UpstreamDef {
     pub id: String,
     pub url: String,
+    /// Legacy auth block. When present, drives the daemon's hardcoded
+    /// bearer-style injection: `Authorization: Bearer {{auth.env}}`.
+    /// New services SHOULD prefer the explicit `[upstream.headers]` /
+    /// `[upstream.query]` template blocks below — `auth` stays compiled
+    /// for the existing 18+ services that still declare it.
     #[serde(default)]
     pub auth: Option<AuthDef>,
+    /// Static header values to attach to every outbound request to this
+    /// upstream. Values may reference `{{auth_value}}` which the daemon
+    /// substitutes with the resolved secret bytes (via store_order
+    /// lookup of `auth.env`). When the map is non-empty, it OVERRIDES
+    /// the legacy auth-block's hardcoded `Authorization: Bearer …`
+    /// injection — pick one or the other per upstream, not both.
+    ///
+    /// Example (Stripe-style basic auth — the canonical "weird case"):
+    ///   ```toml
+    ///   [[upstream]]
+    ///   id  = "default"
+    ///   url = "https://api.stripe.com"
+    ///   auth = { type = "bearer", env = "stripe_secret_key" }
+    ///
+    ///   [upstream.headers]
+    ///   Authorization = "Basic {{auth_value_basic}}"
+    ///   ```
+    /// `{{auth_value_basic}}` is `base64(s_o + ':')`, the Stripe shape.
     #[serde(default)]
     pub headers: HashMap<String, String>,
+    /// Query-string params to attach to every outbound request. Same
+    /// template semantics as `headers`.
+    #[serde(default)]
+    pub query: HashMap<String, String>,
     #[serde(default)]
     pub locked: Option<LockedResponseDef>,
 }

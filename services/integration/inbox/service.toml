@@ -16,7 +16,10 @@ saw, without the agent ever holding the raw value.
 [[upstream]]
 id = "default"
 url = "https://inbox.dev.safeclaw.pro"
-auth = { type = "bearer", env = "inbox_api_key" }
+auth = { env = "inbox_api_key" }
+
+  [upstream.headers]
+  Authorization = "Bearer {{auth_value}}"
 
 [[api]]
 path = "*"
