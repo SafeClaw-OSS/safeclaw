@@ -19,7 +19,8 @@ use axum::{
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde_json::{json, Value};
 
-use crate::audit::{self, ApprovalRow, STATUS_ALLOWED};
+use crate::audit::{self, ApprovalRow, STATUS_ALLOWED, STATUS_DENIED};
+use crate::core::policy::AccessLevel;
 use crate::error::{AppError, Result};
 use crate::protocol::operation::{Act, ActType, Bind, Operation, Valid};
 use crate::server::handlers::op::validate_vault_id;
@@ -98,12 +99,61 @@ async fn handle_impl(
         }
     }
 
-    // H3 cache fast-path: if the unlock ceremony already bootstrapped this
-    // service's auth into secrets_cache, skip the approval flow entirely and
-    // forward synchronously. Cache presence implies `allow`-policy at the
-    // service-default level; per-rule overrides aren't evaluated yet here
-    // (Phase 2 — see project_protocol_md_review §6.4 specificity scoring).
-    if let Some(cached_secret) = state.cache_lookup(&vault_id, &service) {
+    // Per-request policy evaluation. Walks the user's merged rule list
+    // (built-in policy.toml rules + sparse `rule_overrides` from
+    // `aux.service_state`) under longest-match semantics, then falls back
+    // to the user's category-level defaults, then to the daemon's safe
+    // compiled defaults. `None` only when the vault entry is gone between
+    // the lock check and here — should never happen but treat as locked.
+    let path_for_eval = format!("/{}", rest);
+    let body_text = std::str::from_utf8(&body).ok();
+    let level = state
+        .evaluate_request_policy(
+            &vault_id,
+            &service,
+            method.as_str(),
+            &path_for_eval,
+            body_text,
+        )
+        .ok_or_else(|| AppError::Conflict("vault locked — unlock first".into()))?;
+
+    // Deny short-circuits: no upstream call, no pending op, agent gets 403
+    // immediately. Audit row carries the resolved level so reviewers can
+    // trace why the call was blocked.
+    if level == AccessLevel::Deny {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        if let Ok(store) = state.audits.for_tenant(&vault_id) {
+            let row = ApprovalRow {
+                id: Uuid::new_v4().to_string(),
+                created_at: now,
+                decided_at: Some(now),
+                expires_at: now,
+                status: STATUS_DENIED.into(),
+                act_kind: "use".into(),
+                service: Some(service.clone()),
+                method: Some(method.as_str().to_string()),
+                path: Some(path_for_eval.clone()),
+                target: Some(target.clone()),
+                reason: Some("policy: deny".into()),
+                credential_id: None,
+                upstream_status: None,
+            };
+            let _ = store.insert(&row);
+        }
+        return Err(AppError::Forbidden(
+            "blocked by policy (level=deny)".into(),
+        ));
+    }
+
+    // Allow short-circuits straight to the cache fast-path if the bytes
+    // are ready. Cache miss for an Allow request degrades to the pending-
+    // op flow below — typical when the auth lives in an external store
+    // that wasn't pre-resolved at unlock (e.g. GCP Secret Manager).
+    if level == AccessLevel::Allow {
+        if let Some(cached_secret) = state.cache_lookup(&vault_id, &service) {
         let path_str = format!("/{}", rest);
         let header_pairs: Vec<(String, String)> = headers_map
             .iter()
@@ -159,6 +209,10 @@ async fn handle_impl(
                 "response": serde_json::to_value(&response).unwrap_or(Value::Null),
             })),
         ));
+        }
+        // Allow + cache miss falls through: pending op below will lazily
+        // resolve via execute_use_forward (which walks store_order through
+        // the adapter dispatch — works for GCP / 1P / etc.).
     }
 
     let body_b64 = STANDARD.encode(&body);

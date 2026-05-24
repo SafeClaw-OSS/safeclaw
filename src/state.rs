@@ -52,12 +52,22 @@ const EVENT_CHANNEL_CAPACITY: usize = 128;
 
 #[derive(Debug, Clone, Default)]
 pub struct SecretsCache {
-    /// service_id → resolved auth value bytes. Only populated for services
-    /// whose default-read policy level is `allow`. Per-rule overrides (e.g.
-    /// github's `delete-branch` ask-always) are still evaluated at /use time,
-    /// so cache presence ≠ approval skip — it just means the auth is ready
-    /// if policy says go.
+    /// service_id → resolved auth value bytes. Populated at unlock for every
+    /// service whose required item resolves through the v3 store_order — not
+    /// just allow-default services. The per-request evaluator below decides
+    /// whether to USE the cached bytes (level=Allow), create a pending op
+    /// (Ask / AskAlways), or short-circuit (Deny).
     pub entries: HashMap<String, Vec<u8>>,
+    /// service_id → effective ordered rule list. Built at unlock time by
+    /// merging the service's built-in rules with the user's sparse
+    /// `aux.service_state.<svc>.rule_overrides`. The /use handler walks
+    /// this list (longest-match-wins per `core::policy::evaluate_policy`)
+    /// to decide the approval level for each incoming request.
+    pub policy_rules: HashMap<String, Vec<crate::core::policy::PolicyRule>>,
+    /// User's global policy defaults (per-category + global levels) snapshot.
+    /// Layered on top of the daemon's compiled-in `PolicyDefaults::default()`
+    /// during evaluation. Absent → fall back to compiled defaults.
+    pub policy_defaults: Option<crate::core::policy::PolicyDefaults>,
 }
 
 #[derive(Debug)]
@@ -146,5 +156,65 @@ impl AppState {
             Some(VaultState::Unlocked { cache, .. }) => cache.entries.get(service_id).cloned(),
             _ => None,
         }
+    }
+
+    /// Evaluate the per-request policy level for `(vault, service, method,
+    /// path, body)`. Returns `None` only when the vault is Locked or never
+    /// unlocked (the caller should treat that as "vault locked"; the existing
+    /// is_vault_locked check usually catches it first). Otherwise returns
+    /// the merged-rules / merged-defaults decision.
+    ///
+    /// Honors:
+    ///   - user-overridden per-rule levels (`aux.service_state[svc].rule_overrides`)
+    ///   - user global policy_defaults (per-category + legacy `levels`)
+    ///   - service's compiled-in [policy] levels
+    ///   - safe compiled-in defaults at the very end
+    pub fn evaluate_request_policy(
+        &self,
+        vault_id: &str,
+        service_id: &str,
+        method: &str,
+        path: &str,
+        body: Option<&str>,
+    ) -> Option<crate::core::policy::AccessLevel> {
+        let states = self.vault_states.lock().unwrap();
+        let cache = match states.get(vault_id) {
+            Some(VaultState::Unlocked { cache, .. }) => cache,
+            _ => return None,
+        };
+        let rules = cache.policy_rules.get(service_id);
+        let service_levels = self
+            .services
+            .get(service_id)
+            .and_then(|d| d.policy.as_ref())
+            .and_then(|p| p.to_service_levels());
+        // Layer user's global policy_defaults on top of compiled defaults so
+        // a per-category override (e.g. "Use AI models = Ask every time")
+        // affects evaluation even when no per-rule entry matches.
+        let mut defaults = crate::core::policy::PolicyDefaults::default();
+        if let Some(user) = cache.policy_defaults.as_ref() {
+            if user.timeout.is_some() {
+                defaults.timeout = user.timeout;
+            }
+            if user.levels.is_some() {
+                defaults.levels = user.levels.clone();
+            }
+            if let Some(user_type_levels) = user.type_levels.as_ref() {
+                let merged = defaults.type_levels.get_or_insert_with(Default::default);
+                for (k, v) in user_type_levels {
+                    merged.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        let category = self.services.default_category(service_id);
+        Some(crate::core::policy::evaluate_policy(
+            method,
+            path,
+            body,
+            rules,
+            service_levels.as_ref(),
+            &defaults,
+            Some(category),
+        ))
     }
 }

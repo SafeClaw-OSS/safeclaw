@@ -19,7 +19,6 @@ use serde_json::{json, Value};
 
 use crate::approval::ApprovalStatus;
 use crate::audit::{STATUS_APPROVED, STATUS_REJECTED};
-use crate::core::policy::AccessLevel;
 use crate::error::{AppError, Result};
 use crate::passkey::PasskeyEntry;
 use crate::protocol::operation::{
@@ -437,73 +436,58 @@ pub async fn reject_op(
 }
 
 
-/// Build the per-service `secrets_cache` from a decrypted v3 view. For every
-/// service whose **effective** default-read level is `allow`, resolve its
-/// required item via the v3 store_order. The effective level walks the
-/// user's `aux.policy_defaults` (category override → global override) before
-/// falling back to the service's compiled-in default — so the policy UI's
-/// "Use AI models = Ask every time" actually changes whether the agent gets
-/// the cache fast-path.
+/// Build the per-service `secrets_cache` from a decrypted v3 view. The cache
+/// carries three things per session:
+///   1. `entries` — resolved auth bytes for every service whose required
+///      item is currently available (any store). Per-rule evaluation at /use
+///      time decides whether to USE them (Allow), prompt (Ask / AskAlways),
+///      or block (Deny) — so we don't pre-filter to allow-default services
+///      anymore: a rule-level Allow on a service whose default was Ask still
+///      needs the bytes ready for fast-path forwarding.
+///   2. `policy_rules` — merged effective rule list per service (built-in
+///      rules with user `rule_overrides` applied by id). The /use handler
+///      walks this through `evaluate_policy`.
+///   3. `policy_defaults` — verbatim snapshot of `aux.policy_defaults` so
+///      the evaluator can layer user globals on top of the compiled-in
+///      `PolicyDefaults::default()` without re-decrypting the vault.
 fn bootstrap_cache_from_view(
     view: &VaultPlaintextView,
     state: &AppState,
 ) -> SecretsCache {
     let mut cache = SecretsCache::default();
+    cache.policy_defaults = view.aux.policy_defaults.clone();
     for (service_id, _) in state.services.iter_sorted() {
-        if effective_read_level(view, state, service_id) != AccessLevel::Allow {
-            continue;
+        // Cache auth bytes if the service's required item resolves through
+        // the v3 store_order. native-secrets is the only sync path today;
+        // external adapters (gcp) resolve lazily at /use time.
+        if let Some(item_name) = state.services.service_env_key(service_id) {
+            if let Some(val) = view.resolve_value_native(&item_name) {
+                cache.entries.insert(service_id.to_string(), val.to_vec());
+            }
         }
-        let Some(item_name) = state.services.service_env_key(service_id) else {
+
+        // Merge built-in rules with the user's sparse rule_overrides. Empty
+        // built-in rule list ⇒ the user can still NOT have overrides
+        // (sparse map keys must match a built-in rule id), so we skip the
+        // entry entirely to keep the cache slim.
+        let Some(policy_file) = state.services.policy_file(service_id) else {
             continue;
         };
-        if let Some(val) = view.resolve_value_native(&item_name) {
-            cache.entries.insert(service_id.to_string(), val.to_vec());
+        let built_in = policy_file.to_policy_rules();
+        if built_in.is_empty() {
+            continue;
         }
+        let user_overrides = view
+            .aux
+            .service_state
+            .get(service_id)
+            .map(|s| s.rule_overrides.clone())
+            .unwrap_or_default();
+        let merged = crate::core::policy::merge_rule_overrides(&built_in, &user_overrides);
+        cache
+            .policy_rules
+            .insert(service_id.to_string(), merged);
     }
     cache
 }
 
-/// Resolve the read-level a service should be cached at after the user's
-/// `aux.policy_defaults` is layered over the service's compiled-in default.
-///
-/// Priority:
-///   1. User's per-category override (`policy_defaults.type_levels.<cat>.read`)
-///   2. User's global override (`policy_defaults.levels.read`) — applies to
-///      `service` category only, matching what the legacy console UI does
-///   3. Service's compiled-in default (standalone policy.toml > service.toml
-///      [policy] > safe `ask-always`).
-fn effective_read_level(
-    view: &VaultPlaintextView,
-    state: &AppState,
-    service_id: &str,
-) -> AccessLevel {
-    let compiled = state.services.default_read_level(service_id);
-    let Some(user_defaults) = view.aux.policy_defaults.as_ref() else {
-        return compiled;
-    };
-    let category = state.services.default_category(service_id);
-    if let Some(per_cat) = user_defaults
-        .type_levels
-        .as_ref()
-        .and_then(|m| m.get(category))
-    {
-        if let Some(level) = per_cat.read.as_ref() {
-            return level.clone();
-        }
-    }
-    // `levels` is the legacy "global default" slot used by the per-VM
-    // console UI; in v3 it applies to the `integration` row (Gmail / Drive
-    // / GitHub / …). Keep accepting both `integration` and the older
-    // `service` category name for back-compat with vaults sealed before
-    // the rename.
-    if category == "integration" || category == "service" {
-        if let Some(level) = user_defaults
-            .levels
-            .as_ref()
-            .and_then(|l| l.read.as_ref())
-        {
-            return level.clone();
-        }
-    }
-    compiled
-}
