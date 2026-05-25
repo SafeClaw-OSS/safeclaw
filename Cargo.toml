@@ -1,6 +1,6 @@
 [package]
 name = "safeclaw"
-version = "1.0.0-demo.4"
+version = "1.0.0-demo.5"
 edition = "2021"
 description = "SafeClaw daemon — multi-tenant passkey-gated credential vault for AI agents"
 license = "Apache-2.0"

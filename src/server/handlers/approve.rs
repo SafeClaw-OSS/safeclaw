@@ -492,6 +492,38 @@ fn bootstrap_cache_from_view(
     let mut cache = SecretsCache::default();
     cache.policy_defaults = view.aux.policy_defaults.clone();
     cache.audit_retention_days = view.aux.audit_retention_days;
+    // Snapshot native-store item names (names only, never values). Surface
+    // for GET /v/{vid}/keys-known so the frontend can compute "which
+    // services are reachable" without re-walking the kv map.
+    for name in view.native_secrets.keys() {
+        cache.native_keys.insert(name.clone());
+    }
+    // Snapshot per-service user-authored basic R/W. Sparse — only services
+    // the user actually customized show up. Layered over the registry's
+    // service-default during evaluate.
+    for (svc, svc_state) in view.aux.service_state.iter() {
+        if let Some(levels) = svc_state.levels.as_ref() {
+            cache.service_levels.insert(svc.clone(), levels.clone());
+        }
+    }
+    // Snapshot external stores' adapter inputs so GET /v/{vid}/keys-known
+    // can list() them later without re-decrypting the vault. Only kinds
+    // we have an adapter for today — others are skipped (they live in
+    // store_order but never resolve).
+    for (store_id, store) in view.aux.stores.iter() {
+        if store.kind != "gcp-secret-manager" {
+            continue;
+        }
+        let Some(creds_item) = store
+            .extra
+            .get("credentials_item")
+            .and_then(|v| v.as_str())
+        else { continue };
+        let Some(sa_json) = view.native_secrets.get(creds_item).cloned() else { continue };
+        cache
+            .external_stores
+            .insert(store_id.clone(), (store.clone(), sa_json));
+    }
     for (service_id, _) in state.services.iter_sorted() {
         // Cache auth bytes if the service's required item resolves through
         // the v3 store_order. native-secrets is the only sync path today;

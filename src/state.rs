@@ -1,6 +1,6 @@
 //! Top-level application state.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -86,6 +86,22 @@ pub struct SecretsCache {
     /// lock (which zero-outs the entire cache via Default drop). Daemon
     /// restart also blows it away (vaults boot Locked, cache starts empty).
     pub rule_approvals: HashMap<(String, Option<String>), u64>,
+    /// User-authored per-service basic R/W. Snapshot of every populated
+    /// `aux.service_state.<svc>.levels` at unlock. Layered above the
+    /// service's registry-declared default in `evaluate` so a user pick
+    /// like "GitHub: R: Allow" takes effect even when no rule matches.
+    pub service_levels: HashMap<String, crate::core::policy::ServiceLevels>,
+    /// Item names present in the decrypted `native-secrets` kv (names only,
+    /// never values). Surface for `GET /v/{vid}/keys-known` so the frontend
+    /// can decide which services are "reachable" without paying for an
+    /// external-store roundtrip. Populated at unlock; cleared on lock.
+    pub native_keys: HashSet<String>,
+    /// External stores' adapter inputs, snapshotted at unlock so live
+    /// `list()` calls from `GET /v/{vid}/keys-known` can rebuild adapters
+    /// without re-decrypting the vault. Value: (store record from aux,
+    /// resolved credential bytes from native-secrets). Sparse — only
+    /// kinds with an adapter (today: gcp-secret-manager) populate.
+    pub external_stores: HashMap<String, (crate::storage::plaintext::Store, Vec<u8>)>,
 }
 
 #[derive(Debug)]
@@ -220,11 +236,20 @@ impl AppState {
             _ => return None,
         };
         let rules = cache.policy_rules.get(service_id);
-        let service_levels = self
+        // Service-level basic R/W resolves as: user override (this vault's
+        // aux.service_state.<svc>.levels) field-wise over the registry-
+        // declared default. Either may be absent — `merge_service_levels`
+        // returns the meaningful intersection.
+        let registry_service_levels = self
             .services
             .get(service_id)
             .and_then(|d| d.policy.as_ref())
             .and_then(|p| p.to_service_levels());
+        let user_service_levels = cache.service_levels.get(service_id).cloned();
+        let service_levels = crate::core::policy::merge_service_levels(
+            user_service_levels.as_ref(),
+            registry_service_levels.as_ref(),
+        );
         // Layer user's global policy_defaults on top of compiled defaults so
         // a per-category override (e.g. "Use AI models = Ask every time")
         // affects evaluation even when no per-rule entry matches.

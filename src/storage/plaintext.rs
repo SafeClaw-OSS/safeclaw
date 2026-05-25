@@ -20,7 +20,7 @@ use std::collections::{BTreeMap, HashMap};
 use serde::{Deserialize, Serialize};
 use sudp::state::ProtectedState;
 
-use crate::core::policy::{PolicyDefaults, RuleOverride};
+use crate::core::policy::{PolicyDefaults, RuleOverride, ServiceLevels};
 use crate::error::{AppError, Result};
 
 /// Current schema version. Hard-fail on any other value.
@@ -63,11 +63,17 @@ pub struct Store {
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
-/// Per-service user state — currently just sparse rule overrides keyed by
-/// the built-in rule's `id`. Per the policy design doc, reverting to the
-/// built-in level drops the entry (no identity no-op).
+/// Per-service user state. Two layers, both sparse:
+///   * `levels` — user-authored basic R/W for this one service. Beats
+///     the registry-declared service default and the global category
+///     default; loses to rule-level overrides for matching paths.
+///     Stays absent unless the user actually customized this service.
+///   * `rule_overrides` — per-rule overrides keyed by the built-in
+///     rule's `id`. Reverting to the built-in level drops the entry.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ServiceState {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub levels: Option<ServiceLevels>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub rule_overrides: HashMap<String, RuleOverride>,
 }

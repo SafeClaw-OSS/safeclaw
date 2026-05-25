@@ -91,6 +91,27 @@ pub struct RuleOverride {
     pub ask_ttl: Option<u64>,
 }
 
+/// Field-wise merge of two ServiceLevels with user > registry precedence.
+/// Returns `None` only if both inputs are absent. Each field independently
+/// takes the user's value when set, otherwise falls back to the registry's.
+/// Lets the user override just one of (read, write) without forcing them
+/// to restate the other.
+pub fn merge_service_levels(
+    user: Option<&ServiceLevels>,
+    registry: Option<&ServiceLevels>,
+) -> Option<ServiceLevels> {
+    match (user, registry) {
+        (None, None) => None,
+        (Some(u), None) => Some(u.clone()),
+        (None, Some(r)) => Some(r.clone()),
+        (Some(u), Some(r)) => Some(ServiceLevels {
+            read: u.read.clone().or_else(|| r.read.clone()),
+            write: u.write.clone().or_else(|| r.write.clone()),
+            ask_ttl: u.ask_ttl.or(r.ask_ttl),
+        }),
+    }
+}
+
 /// Apply sparse overrides onto built-in rules, matching by `id`.
 /// Rules without an `id`, or whose `id` has no override, are left unchanged.
 pub fn merge_rule_overrides(
@@ -379,6 +400,44 @@ mod tests {
 
     fn defaults() -> PolicyDefaults {
         PolicyDefaults::default()
+    }
+
+    fn levels(read: Option<AccessLevel>, write: Option<AccessLevel>, ask_ttl: Option<u64>) -> ServiceLevels {
+        ServiceLevels { read, write, ask_ttl }
+    }
+
+    #[test]
+    fn merge_service_levels_both_absent_returns_none() {
+        assert!(merge_service_levels(None, None).is_none());
+    }
+
+    #[test]
+    fn merge_service_levels_user_only_passes_through() {
+        let u = levels(Some(AccessLevel::Allow), None, Some(60));
+        let m = merge_service_levels(Some(&u), None).unwrap();
+        assert!(matches!(m.read, Some(AccessLevel::Allow)));
+        assert!(m.write.is_none());
+        assert_eq!(m.ask_ttl, Some(60));
+    }
+
+    #[test]
+    fn merge_service_levels_registry_only_passes_through() {
+        let r = levels(Some(AccessLevel::Ask), Some(AccessLevel::Deny), None);
+        let m = merge_service_levels(None, Some(&r)).unwrap();
+        assert!(matches!(m.read, Some(AccessLevel::Ask)));
+        assert!(matches!(m.write, Some(AccessLevel::Deny)));
+    }
+
+    #[test]
+    fn merge_service_levels_user_wins_fieldwise() {
+        // User sets only read; registry sets both. Result: user's read,
+        // registry's write — proves the merge is field-wise, not all-or-nothing.
+        let u = levels(Some(AccessLevel::Allow), None, None);
+        let r = levels(Some(AccessLevel::Ask), Some(AccessLevel::Deny), Some(30));
+        let m = merge_service_levels(Some(&u), Some(&r)).unwrap();
+        assert!(matches!(m.read, Some(AccessLevel::Allow)));
+        assert!(matches!(m.write, Some(AccessLevel::Deny)));
+        assert_eq!(m.ask_ttl, Some(30));
     }
 
     fn rule(match_pat: &str, level: AccessLevel) -> PolicyRule {

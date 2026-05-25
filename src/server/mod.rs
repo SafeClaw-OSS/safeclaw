@@ -42,6 +42,7 @@ pub fn admin_router(state: Arc<AppState>) -> Router {
         .route("/v/{vid}/passkeys", get(handlers::metadata::passkeys))
         .route("/v/{vid}/events", get(handlers::events::stream))
         .route("/v/{vid}/approvals", get(handlers::approvals::list))
+        .route("/v/{vid}/keys-known", get(handlers::keys_known::keys_known))
         // Op-flat (vault context lives on the approval record).
         .route("/op/{op_id}", get(handlers::approve::get_op))
         .route("/op/{op_id}/approve", post(handlers::approve::approve_op))
