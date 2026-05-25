@@ -12,8 +12,8 @@ auth = {
   provider = "google",
   env = "gdrive_refresh_token",
   token_url = "https://oauth2.googleapis.com/token",
-  client_id_env = "SAFECLAW_GOOGLE_CLIENT_ID",
-  client_secret_env = "SAFECLAW_GOOGLE_CLIENT_SECRET",
+  client_id_env = "GOOGLE_CLIENT_ID",
+  client_secret_env = "GOOGLE_CLIENT_SECRET",
 }
 
   [upstream.headers]
