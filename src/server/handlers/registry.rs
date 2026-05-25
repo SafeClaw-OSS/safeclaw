@@ -124,8 +124,11 @@ pub struct RegistryResponse {
     pub services: Vec<RegistryService>,
     pub policy_defaults: serde_json::Value,
     // ── Per-vault overlay — only set by /v/{vid}/registry ────────────
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub vault_id: Option<String>,
+    //
+    // Deliberately no `vault_id` field. The agent's mental model is
+    // "I have an apiKey that points to my vault"; exposing vid would
+    // let the agent bypass the SaaS apiKey gate by hitting the
+    // daemon's auth-free `/v/{vid}/*` endpoints directly.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vault_locked: Option<bool>,
     /// Native-secrets item names present in this vault. `Some([..])` when
@@ -299,7 +302,6 @@ pub async fn menu(
         proxy_base: proxy_base(&state),
         services,
         policy_defaults: serde_json::to_value(crate::core::policy::PolicyDefaults::default())?,
-        vault_id: None,
         vault_locked: None,
         vault_entries: None,
         console_url: None,
@@ -351,12 +353,13 @@ pub async fn vault_registry(
         Some(Some(entries))
     };
 
+    // vault_id intentionally NOT returned — see RegistryResponse comment.
+    let _ = vault_id;
     let body = RegistryResponse {
         version: 2,
         proxy_base: proxy_base(&state),
         services,
         policy_defaults: serde_json::to_value(crate::core::policy::PolicyDefaults::default())?,
-        vault_id: Some(vault_id),
         vault_locked: Some(locked),
         vault_entries,
         console_url: Some(console_url(&state)),
