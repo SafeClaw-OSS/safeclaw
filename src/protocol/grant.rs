@@ -93,8 +93,21 @@ pub fn validate_grant(
     // 2. Validity window.
     check_now(&grant.o.valid)?;
 
-    // 3. Resolve credential public key (from op for Enroll, from store otherwise).
+    // 3. Resolve credential public key:
+    //    - first-time Enroll (target empty): pubkey comes from the op body
+    //      (no enrolled credential to look up yet), DOMAIN_SETUP.
+    //    - add-passkey Enroll (target == "passkeys"): signed by an EXISTING
+    //      acting credential — the new credential's pubkey rides in
+    //      scope.new and only gets installed on the approve path. Use the
+    //      standard lookup + DOMAIN_STANDARD to match what the frontend's
+    //      addPasskey actually signs with.
+    //    - everything else: standard lookup.
     let (entry, domain) = match &grant.o.act.kind {
+        ActType::Enroll if grant.o.act.target == "passkeys" => {
+            let entry = credential_lookup(&grant.credential_id)
+                .ok_or_else(|| AppError::Unauthorized("unknown credential".into()))?;
+            (entry, DOMAIN_STANDARD)
+        }
         ActType::Enroll => {
             let credential = as_enroll_credential(&grant.o)?;
             if credential.credential_id != grant.credential_id {
