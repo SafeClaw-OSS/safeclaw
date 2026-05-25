@@ -6,7 +6,8 @@
 //! POST /v/{vid}/op              R-side op creation (or U-direct: Enroll/Write/Export)
 //! GET  /v/{vid}/passkeys        list enrolled credentials for this vault
 //! GET  /v/{vid}/events          SSE lifecycle stream
-//! GET  /c/registry              public service catalog (no vault contents)
+//! GET  /c/menu                  static service catalog (no vault contents)
+//! GET  /v/{vid}/registry        per-vault live view (catalog + connected state)
 //! GET  /op/{op_id}              poll op status + cached value
 //! POST /op/{op_id}/approve      U submits grant G → T validates, dispatches act
 //! POST /op/{op_id}/reject       U denies
@@ -36,13 +37,16 @@ pub fn admin_router(state: Arc<AppState>) -> Router {
         // Custodian-level (no vault context).
         .route("/c/health", get(handlers::health::health))
         .route("/c/pubkey", get(handlers::metadata::pubkey))
-        .route("/c/registry", get(handlers::registry::registry))
+        .route("/c/menu", get(handlers::registry::menu))
+        // Back-compat: serve `/c/registry` as `/c/menu` for old clients.
+        .route("/c/registry", get(handlers::registry::registry_legacy))
         // Vault-scoped.
         .route("/v/{vid}/op", post(handlers::op::create))
         .route("/v/{vid}/passkeys", get(handlers::metadata::passkeys))
         .route("/v/{vid}/events", get(handlers::events::stream))
         .route("/v/{vid}/approvals", get(handlers::approvals::list))
         .route("/v/{vid}/keys-known", get(handlers::keys_known::keys_known))
+        .route("/v/{vid}/registry", get(handlers::registry::vault_registry))
         // Op-flat (vault context lives on the approval record).
         .route("/op/{op_id}", get(handlers::approve::get_op))
         .route("/op/{op_id}/approve", post(handlers::approve::approve_op))
