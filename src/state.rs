@@ -50,14 +50,39 @@ const EVENT_CHANNEL_CAPACITY: usize = 128;
 // further friction during the session"). Lock is always user-initiated via
 // `Custom("vault-lock")` op.
 
+/// A cached secret value with optional expiry. Per PROTOCOL.md §6.2,
+/// memory residence is policy-driven:
+///   - `allow` services → `expires_at = None` (lives the whole unlocked
+///     session, populated at unlock bootstrap)
+///   - `ask` services → `expires_at = Some(unix_secs)`, filled after
+///     `approval-confirm` with the matched rule's `ask_ttl`
+///   - `ask-always` services → never cached (entry simply absent)
+///
+/// `cache_lookup` does lazy eviction: an entry past its `expires_at`
+/// is removed and treated as a miss. No active sweeper today —
+/// expired bytes linger in memory until the next lookup, which is
+/// acceptable since the daemon already holds plaintexts for all
+/// allow-level services anyway.
+#[derive(Debug, Clone)]
+pub struct CacheEntry {
+    pub value: Vec<u8>,
+    /// `None` = never expires within the unlocked session (allow-level).
+    /// `Some(t)` = expires at unix-second `t` (ask-level TTL).
+    pub expires_at: Option<u64>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SecretsCache {
-    /// service_id → resolved auth value bytes. Populated at unlock for every
-    /// service whose required item resolves through the v3 store_order — not
-    /// just allow-default services. The per-request evaluator below decides
-    /// whether to USE the cached bytes (level=Allow), create a pending op
-    /// (Ask / AskAlways), or short-circuit (Deny).
-    pub entries: HashMap<String, Vec<u8>>,
+    /// service_id → cached auth value with per-entry expiry. Filled by:
+    ///   - unlock bootstrap (only services whose default read level is
+    ///     `allow` — see `bootstrap_cache_from_view`)
+    ///   - post-approval insert from `approve_op` for `ask` and `allow`-
+    ///     cache-miss paths (the secret was fresh-decrypted under the
+    ///     grant's W_c during forward; we re-use it for subsequent
+    ///     requests up to the policy TTL).
+    /// `ask-always` services are deliberately absent (PROTOCOL.md §6.2
+    /// "ask-always 服务: 永不进 cache").
+    pub entries: HashMap<String, CacheEntry>,
     /// service_id → effective ordered rule list. Built at unlock time by
     /// merging the service's built-in rules with the user's sparse
     /// `aux.service_state.<svc>.rule_overrides`. The /use handler walks
@@ -194,13 +219,51 @@ impl AppState {
     }
 
     /// Look up a cached auth value for `(vault, service)`. Returns None if
-    /// the vault is Locked, the service isn't bootstrapped, or the vault has
-    /// never been unlocked.
+    /// the vault is Locked, the service isn't bootstrapped/cached, the
+    /// vault has never been unlocked, OR the entry's `expires_at` is in
+    /// the past (lazy eviction).
     pub fn cache_lookup(&self, vault_id: &str, service_id: &str) -> Option<Vec<u8>> {
-        let states = self.vault_states.lock().unwrap();
-        match states.get(vault_id) {
-            Some(VaultState::Unlocked { cache, .. }) => cache.entries.get(service_id).cloned(),
-            _ => None,
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let mut states = self.vault_states.lock().unwrap();
+        let cache = match states.get_mut(vault_id) {
+            Some(VaultState::Unlocked { cache, .. }) => cache,
+            _ => return None,
+        };
+        let entry = cache.entries.get(service_id)?;
+        if let Some(exp) = entry.expires_at {
+            if now >= exp {
+                // Lazy eviction: TTL-expired entries are dropped here so
+                // ask services correctly fall back to the pending-op flow
+                // once their cache window closes.
+                cache.entries.remove(service_id);
+                return None;
+            }
+        }
+        Some(entry.value.clone())
+    }
+
+    /// Insert (or overwrite) a cached auth value with optional TTL.
+    /// `expires_at = None` means "live until lock" (allow-level
+    /// semantics). `Some(t)` is unix-second expiry for ask-level
+    /// TTL caching. No-op when the vault is locked at the time of
+    /// the call (shouldn't happen on the approve-time write path,
+    /// but defensive — `approve_op` runs concurrently with locks).
+    pub fn cache_insert(
+        &self,
+        vault_id: &str,
+        service_id: &str,
+        value: Vec<u8>,
+        expires_at: Option<u64>,
+    ) {
+        let mut states = self.vault_states.lock().unwrap();
+        if let Some(VaultState::Unlocked { cache, .. }) = states.get_mut(vault_id) {
+            cache.entries.insert(
+                service_id.to_string(),
+                CacheEntry { value, expires_at },
+            );
         }
     }
 
@@ -328,5 +391,66 @@ impl AppState {
                 .rule_approvals
                 .insert((service_id.to_string(), rule_id), now + ttl_seconds);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use std::path::PathBuf;
+
+    fn test_state() -> AppState {
+        let cfg = Config {
+            state_dir: PathBuf::from(format!("/tmp/safeclaw-test-{}", std::process::id())),
+            port: 0,
+            proxy_port: 0,
+            bind: "127.0.0.1".into(),
+            origin: "http://localhost".into(),
+            rp_id: "localhost".into(),
+        };
+        AppState::new(cfg)
+    }
+
+    fn unlock_with_empty_cache(state: &AppState, vault_id: &str) {
+        state.unlock_vault(vault_id.to_string(), SecretsCache::default());
+    }
+
+    #[test]
+    fn cache_insert_no_expiry_persists_lookups() {
+        let state = test_state();
+        unlock_with_empty_cache(&state, "v1");
+        state.cache_insert("v1", "svc", b"secret".to_vec(), None);
+        assert_eq!(state.cache_lookup("v1", "svc"), Some(b"secret".to_vec()));
+        // Multiple lookups still hit (no eviction without expiry).
+        assert_eq!(state.cache_lookup("v1", "svc"), Some(b"secret".to_vec()));
+    }
+
+    #[test]
+    fn cache_lookup_evicts_expired_entry() {
+        let state = test_state();
+        unlock_with_empty_cache(&state, "v1");
+        // Already-expired entry.
+        state.cache_insert("v1", "svc", b"secret".to_vec(), Some(0));
+        assert_eq!(state.cache_lookup("v1", "svc"), None);
+        // Subsequent insert with valid TTL should succeed (lazy eviction
+        // dropped the stale entry; nothing leaks across).
+        let future = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600;
+        state.cache_insert("v1", "svc", b"new".to_vec(), Some(future));
+        assert_eq!(state.cache_lookup("v1", "svc"), Some(b"new".to_vec()));
+    }
+
+    #[test]
+    fn cache_lookup_returns_none_when_locked() {
+        let state = test_state();
+        // Never unlocked.
+        assert_eq!(state.cache_lookup("v1", "svc"), None);
+        // Insert into a locked vault should be a no-op too.
+        state.cache_insert("v1", "svc", b"x".to_vec(), None);
+        assert_eq!(state.cache_lookup("v1", "svc"), None);
     }
 }

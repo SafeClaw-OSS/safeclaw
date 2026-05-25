@@ -52,13 +52,23 @@ pub struct BrokerResponse {
 /// `validate_grant` earlier in the call path; one-shot consumption is
 /// enforced at the ApprovalRecord level (status flip to `Consumed`),
 /// not by the sudp type system here.
+/// Returned alongside the broker's HTTP response so the approve_op
+/// handler can populate the secrets_cache for ask/allow paths (per
+/// PROTOCOL.md §6.2). The bytes here are the resolved `s_o` —
+/// scoped to the caller, which decides whether to cache them or
+/// drop them on the floor (ask-always case).
+pub struct UseForwardOutcome {
+    pub response: BrokerResponse,
+    pub s_o: Vec<u8>,
+}
+
 pub async fn execute_use_forward(
     op: &Operation,
     wrapping_key: &[u8],
     credential_id_bytes: &[u8],
     vault: &SealedVault,
     services: &crate::service::ServiceRegistry,
-) -> Result<BrokerResponse> {
+) -> Result<UseForwardOutcome> {
     let redeemed = RedeemedGrant {
         o: op.clone(),
         credential_id: credential_id_bytes.to_vec(),
@@ -116,7 +126,7 @@ pub async fn execute_use_forward(
         .map(|u| (u.headers.clone(), u.query.clone()))
         .unwrap_or_default();
 
-    forward_to_upstream_with_extras(
+    let response = forward_to_upstream_with_extras(
         &s_o,
         upstream_url,
         method_str,
@@ -127,7 +137,8 @@ pub async fn execute_use_forward(
         if tpl_headers.is_empty() { None } else { Some(&tpl_headers) },
         if tpl_query.is_empty() { None } else { Some(&tpl_query) },
     )
-    .await
+    .await?;
+    Ok(UseForwardOutcome { response, s_o })
 }
 
 /// Render an upstream-config template string by substituting the supported

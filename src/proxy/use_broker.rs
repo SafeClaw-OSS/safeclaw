@@ -252,10 +252,15 @@ async fn handle_impl(
         let mut store = state.challenges.lock().unwrap();
         store.issue(ip).ok_or(AppError::TooManyRequests)?
     };
-    // Resolve the TTL to honor when the user approves this Ask: matched
-    // rule's `ask_ttl` > policy_defaults.timeout > safe 300s default.
-    // `AskAlways` short-circuits to a None policy_context — that level
-    // explicitly skips cache writes.
+    // Stamp the policy decision on the pending op so the approve handler
+    // can populate the secrets_cache per PROTOCOL.md §6.2:
+    //   - Ask: cache the resolved s_o for `ttl_seconds` after forward.
+    //   - Allow: cache forever (until lock). This branch only fires for
+    //     Allow + cache MISS (the fast-path above already covered cache
+    //     hits) — typical example: an `allow` service whose secret lives
+    //     in an external store (GCP) that wasn't pre-resolved at unlock.
+    //   - AskAlways: explicit None → no cache write (the bytes get
+    //     fresh-decrypted per request and dropped after forward).
     let policy_context = match level {
         AccessLevel::Ask => {
             let ttl = level_ask_ttl.unwrap_or(300);
@@ -265,6 +270,11 @@ async fn handle_impl(
                 ttl_seconds: ttl,
             })
         }
+        AccessLevel::Allow => Some(crate::approval::PolicyContext {
+            level: AccessLevel::Allow,
+            rule_id: matched_rule_id.clone(),
+            ttl_seconds: 0, // not used for Allow (caches forever)
+        }),
         _ => None,
     };
 

@@ -381,7 +381,7 @@ pub async fn approve_op(
             let vault = existing_vault
                 .clone()
                 .ok_or_else(|| AppError::Conflict("vault not initialized".into()))?;
-            let response = crate::server::broker::execute_use_forward(
+            let outcome = crate::server::broker::execute_use_forward(
                 &validated.op,
                 &validated.wrapping_key,
                 &validated.credential_id_bytes,
@@ -389,8 +389,55 @@ pub async fn approve_op(
                 &state.services,
             )
             .await?;
-            audit_upstream_status = Some(response.status as i64);
-            let body = serde_json::to_string(&response)?;
+            // Cache the resolved s_o per PROTOCOL.md §6.2 — but ONLY if
+            // the policy decision that drove this op was allow or ask
+            // (with TTL). ask-always explicitly never caches (the bytes
+            // go out of scope here and Rust drops them; we don't
+            // re-export them anywhere).
+            //
+            // The `policy_context` was stamped on the ApprovalRecord at
+            // /use time; we read it here without mutating state. Cache
+            // write happens *after* a successful forward, so a failed
+            // upstream call doesn't pollute the cache.
+            {
+                let pc_for_cache = state
+                    .approvals
+                    .lock()
+                    .unwrap()
+                    .get(&op_id)
+                    .and_then(|r| r.policy_context.clone());
+                if let Some(pc) = pc_for_cache {
+                    let svc = validated
+                        .op
+                        .act
+                        .scope
+                        .get("service")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if !svc.is_empty() {
+                        let now = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        let expires_at = match pc.level {
+                            crate::core::policy::AccessLevel::Allow => None, // ∞ until lock
+                            crate::core::policy::AccessLevel::Ask => Some(now + pc.ttl_seconds),
+                            _ => Some(0), // sentinel: don't cache (shouldn't be reached)
+                        };
+                        if expires_at != Some(0) {
+                            state.cache_insert(
+                                &vault_id,
+                                &svc,
+                                outcome.s_o.clone(),
+                                expires_at,
+                            );
+                        }
+                    }
+                }
+            }
+            audit_upstream_status = Some(outcome.response.status as i64);
+            let body = serde_json::to_string(&outcome.response)?;
             (
                 json!({ "ok": true, "act": "use", "response": serde_json::from_str::<Value>(&body).unwrap_or(Value::Null) }),
                 Some(body),
@@ -779,19 +826,33 @@ fn bootstrap_cache_from_view(
             .insert(store_id.clone(), (store.clone(), sa_json));
     }
     for (service_id, _) in state.services.iter_sorted() {
-        // Cache auth bytes if the service's required item resolves through
-        // the v3 store_order. native-secrets is the only sync path today;
-        // external adapters (gcp) resolve lazily at /use time.
-        if let Some(item_name) = state.services.service_env_key(service_id) {
-            if let Some(val) = view.resolve_value_native(&item_name) {
-                cache.entries.insert(service_id.to_string(), val.to_vec());
+        // PROTOCOL.md §6.2: only services whose default read level is
+        // `allow` get their auth value loaded at unlock. ask / ask-always
+        // services have memory_ttl = rule.ttl / 0 respectively, so the
+        // bytes shouldn't sit in cache pre-approval. They're filled
+        // lazily by `approve_op` after the user passkey gesture (ask) or
+        // never (ask-always — fresh-decrypted-per-request via the
+        // grant's W_c and immediately zeroized).
+        if state.services.default_read_level(service_id)
+            == crate::core::policy::AccessLevel::Allow
+        {
+            if let Some(item_name) = state.services.service_env_key(service_id) {
+                if let Some(val) = view.resolve_value_native(&item_name) {
+                    cache.entries.insert(
+                        service_id.to_string(),
+                        crate::state::CacheEntry {
+                            value: val.to_vec(),
+                            expires_at: None, // allow = lives whole unlocked session
+                        },
+                    );
+                }
             }
         }
 
-        // Merge built-in rules with the user's sparse rule_overrides. Empty
-        // built-in rule list ⇒ the user can still NOT have overrides
-        // (sparse map keys must match a built-in rule id), so we skip the
-        // entry entirely to keep the cache slim.
+        // Policy rule lists are runtime metadata, not raw secrets — load
+        // for every service regardless of access level so the per-request
+        // evaluator can walk them. (PROTOCOL.md §6.2 lists policy rules
+        // under "Runtime metadata, 无 secret, 可一直驻留".)
         let Some(policy_file) = state.services.policy_file(service_id) else {
             continue;
         };
