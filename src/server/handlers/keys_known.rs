@@ -1,31 +1,29 @@
-//! `GET /v/{vid}/keys-known` — what item names this vault can resolve.
+//! `GET /v/{vid}/keys-known` — per-store breakdown of what this vault can resolve.
 //!
-//! Returns the union of:
-//!   * native-secrets item names (from the unlocked cache, no network)
-//!   * each external store's `list()` output (live call per store, with
-//!     a short timeout — partial success is fine)
-//!
-//! Frontend uses this to compute "is service X reachable" without having
-//! to maintain per-service "connected" flags or guess from kv presence
-//! alone (which would mis-report a service whose key lives in GCP).
+//! Returns native-secrets item names + each external store's `list()` output
+//! tagged with the store id. Frontend uses this to render the unified Entries
+//! view (one row per effective key with a source badge + shadowed-by chip)
+//! and to drive "is service X reachable" checks across Connections /
+//! Permissions / Overview.
 //!
 //! Response shape:
 //! ```json
 //! {
-//!   "keys": ["openai_api_key", "github_token", ...],
+//!   "native_keys": ["openai_api_key", "github_token", ...],
+//!   "stores": [
+//!     { "id": "prod-gcp", "kind": "gcp-secret-manager", "keys": ["openai_api_key", "stripe_key"] }
+//!   ],
 //!   "store_errors": [
 //!     { "store_id": "prod-gcp", "error": "listSecrets returned 403: ..." }
 //!   ]
 //! }
 //! ```
 //!
-//! Errors at the *individual* store level are non-fatal — they only mean
-//! that store's contribution is missing from the returned union. A
-//! frontend showing "OpenAI: Not configured" when the SA lacks list
-//! permission is a known limitation we surface explicitly via
-//! `store_errors` rather than silently under-report.
+//! Errors at the individual store level are non-fatal — they only mean
+//! that store's keys are missing from the response. A frontend showing
+//! "OpenAI: Not configured" when the SA lacks list permission is a
+//! known limitation we surface explicitly via `store_errors`.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -54,17 +52,19 @@ pub async fn keys_known(
     // Snapshot what we need under the lock, then drop it before any
     // network work — list() is async and we don't want to hold the
     // vault-states mutex across an await.
-    let (mut keys, external_stores) = {
+    let (mut native_keys, external_stores) = {
         let states = state.vault_states.lock().unwrap();
         let cache = match states.get(&vault_id) {
             Some(VaultState::Unlocked { cache, .. }) => cache,
             _ => return Err(AppError::Conflict("vault locked — unlock first".into())),
         };
-        let keys: HashSet<String> = cache.native_keys.iter().cloned().collect();
+        let native: Vec<String> = cache.native_keys.iter().cloned().collect();
         let external = cache.external_stores.clone();
-        (keys, external)
+        (native, external)
     };
+    native_keys.sort();
 
+    let mut stores: Vec<Value> = Vec::new();
     let mut store_errors: Vec<Value> = Vec::new();
 
     for (store_id, (store, sa_json)) in external_stores {
@@ -98,7 +98,14 @@ pub async fn keys_known(
             }
         };
         match tokio::time::timeout(LIST_TIMEOUT, adapter.list()).await {
-            Ok(Ok(names)) => keys.extend(names),
+            Ok(Ok(mut names)) => {
+                names.sort();
+                stores.push(json!({
+                    "id": store_id,
+                    "kind": store.kind,
+                    "keys": names,
+                }));
+            }
             Ok(Err(e)) => store_errors.push(json!({
                 "store_id": store_id,
                 "error": e.to_string(),
@@ -110,11 +117,9 @@ pub async fn keys_known(
         }
     }
 
-    let mut keys: Vec<String> = keys.into_iter().collect();
-    keys.sort();
-
     Ok(Json(json!({
-        "keys": keys,
+        "native_keys": native_keys,
+        "stores": stores,
         "store_errors": store_errors,
     })))
 }
