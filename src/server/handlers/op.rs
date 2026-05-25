@@ -29,6 +29,7 @@ pub async fn create(
     Json(op): Json<Operation>,
 ) -> Result<Json<Value>> {
     validate_vault_id(&vault_id)?;
+    reject_broker_kind(&op.act.kind)?;
     // Locked-state gate (H3 / PROTOCOL.md §6.3): when the vault is Locked,
     // only the unlock ceremony (and first-time Enroll, which auto-unlocks)
     // is admissible. Everything else gets a canned 409 so the caller knows
@@ -80,6 +81,26 @@ pub async fn create(
     })))
 }
 
+/// Reject op kinds that are broker-plane primitives. Today: `Use`.
+///
+/// Reasoning: a Use op forwards an upstream HTTP request and is the unit
+/// SaaS bills on. It must originate from the broker path (proxy port for
+/// the network-gate deployment; SaaS-stamped JSON-API for a future
+/// crypto-gate deployment) — never from the control-plane endpoint, which
+/// has no billing gate by construction.
+///
+/// Control-plane ops (Enroll, Write, Export, Custom("vault-unlock"/...))
+/// pass through; they're user-initiated state changes authorized by a
+/// passkey-signed grant.
+fn reject_broker_kind(kind: &ActType) -> Result<()> {
+    if matches!(kind, ActType::Use) {
+        return Err(AppError::BadRequest(
+            "Use ops must be created via the broker path, not the control-plane op endpoint".into(),
+        ));
+    }
+    Ok(())
+}
+
 pub fn validate_vault_id(id: &str) -> Result<()> {
     if id.is_empty() || id.len() > 128 {
         return Err(AppError::BadRequest("invalid vault_id".into()));
@@ -91,4 +112,29 @@ pub fn validate_vault_id(id: &str) -> Result<()> {
         return Err(AppError::BadRequest("vault_id has illegal chars".into()));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reject_use_kind() {
+        let r = reject_broker_kind(&ActType::Use);
+        assert!(matches!(r, Err(AppError::BadRequest(_))));
+    }
+
+    #[test]
+    fn accept_control_plane_kinds() {
+        for kind in [
+            ActType::Enroll,
+            ActType::Write,
+            ActType::Export,
+            ActType::Custom("vault-unlock".into()),
+            ActType::Custom("vault-lock".into()),
+            ActType::Custom("vault-delete".into()),
+        ] {
+            assert!(reject_broker_kind(&kind).is_ok(), "kind {:?} should pass", kind);
+        }
+    }
 }
