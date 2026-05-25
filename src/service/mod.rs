@@ -158,6 +158,11 @@ pub struct AuthDef {
     /// Vault entry key feeding this credential (just the key name, no `env.`
     /// prefix). Replaces the older `placeholder = "{{ env.X }}"` templating
     /// convention. `placeholder` continues to mean "UI input hint" only.
+    ///
+    /// For oauth2 services, this names the native-secrets item holding the
+    /// long-lived refresh_token. The short-lived access_token derived from
+    /// it lives in-memory only (per the design: only the immutable refresh
+    /// token enters the vault).
     #[serde(default)]
     pub env: Option<String>,
     #[serde(default)]
@@ -168,10 +173,31 @@ pub struct AuthDef {
     pub param: Option<String>,
     #[serde(default)]
     pub placeholder: Option<String>,
+    /// oauth2: body style for the refresh /token call. `form` (default) or
+    /// `json` (Anthropic). Reused by `auth::oauth2::refresh_token`.
     #[serde(default)]
     pub oauth_style: Option<String>,
+    /// oauth2: identity-provider key (`google` / `openai` / `anthropic`).
+    /// Used by the consent-flow side of the OAuth ceremony to pick the
+    /// right provider config; daemon doesn't read it at refresh time.
     #[serde(default)]
     pub provider: Option<String>,
+    /// oauth2: provider's token endpoint, e.g.
+    /// `https://oauth2.googleapis.com/token`. Public info, baked into
+    /// service.toml.
+    #[serde(default)]
+    pub token_url: Option<String>,
+    /// oauth2: name of the daemon-startup env var holding the OAuth client_id
+    /// (public but kept off the binary so self-hosters can register their own
+    /// OAuth app). e.g. `SAFECLAW_GOOGLE_CLIENT_ID`.
+    #[serde(default)]
+    pub client_id_env: Option<String>,
+    /// oauth2: name of the daemon-startup env var holding the OAuth
+    /// client_secret. Required for confidential clients (Google) and absent
+    /// for PKCE clients (OpenAI Codex / Anthropic). e.g.
+    /// `SAFECLAW_GOOGLE_CLIENT_SECRET`.
+    #[serde(default)]
+    pub client_secret_env: Option<String>,
     #[serde(default)]
     pub username_label: Option<String>,
 }
@@ -1207,5 +1233,50 @@ kind = "secret"
         assert_eq!(fields.len(), 1);
         assert_eq!(fields[0].name, "token");
         assert!(reg.vault_fields("nonexistent").is_empty());
+    }
+
+    #[test]
+    fn oauth2_env_field_drives_service_env_key() {
+        // OAuth services in the SaaS schema declare their refresh_token
+        // vault item via `auth.env`, same as API-key services. service_env_key
+        // must pick this up so registry surfaces a vault_field and the
+        // unlock-time cache bootstrap loads the refresh_token (when policy
+        // is allow).
+        let toml_str = r#"
+[service]
+id = "gmail"
+name = "Gmail"
+category = "integration"
+
+[[upstream]]
+id = "default"
+url = "https://gmail.googleapis.com"
+
+[upstream.auth]
+type = "oauth2"
+provider = "google"
+env = "gmail_refresh_token"
+token_url = "https://oauth2.googleapis.com/token"
+client_id_env = "SAFECLAW_GOOGLE_CLIENT_ID"
+client_secret_env = "SAFECLAW_GOOGLE_CLIENT_SECRET"
+"#;
+        let def: ServiceDef = toml::from_str(toml_str).unwrap();
+        let upstream = def.upstream.first().unwrap();
+        let auth = upstream.auth.as_ref().unwrap();
+        assert_eq!(auth.auth_type.as_deref(), Some("oauth2"));
+        assert_eq!(auth.env.as_deref(), Some("gmail_refresh_token"));
+        assert_eq!(auth.token_url.as_deref(), Some("https://oauth2.googleapis.com/token"));
+        assert_eq!(auth.client_id_env.as_deref(), Some("SAFECLAW_GOOGLE_CLIENT_ID"));
+        assert_eq!(auth.client_secret_env.as_deref(), Some("SAFECLAW_GOOGLE_CLIENT_SECRET"));
+
+        // service_env_key uses auth.env first, so OAuth services now resolve
+        // to their refresh_token item — exactly like API-key services.
+        let mut services = HashMap::new();
+        services.insert("gmail".into(), def);
+        let reg = ServiceRegistry { services, policies: HashMap::new() };
+        assert_eq!(
+            reg.service_env_key("gmail").as_deref(),
+            Some("gmail_refresh_token"),
+        );
     }
 }
