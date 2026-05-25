@@ -120,6 +120,94 @@ pub async fn approve_op(
     // status code; None for all other act kinds).
     let mut audit_upstream_status: Option<i64> = None;
     let (response, cached_value) = match &validated.op.act.kind {
+        ActType::Enroll if validated.op.act.target == "passkeys" => {
+            // Add-passkey-to-existing-vault path. PROTOCOL.md §3.4 maps
+            // `target = "passkeys"` to "register a new credential against
+            // the already-enrolled vault". K stays the same (no state-key
+            // rotation), but a new SealedCredential entry gets appended
+            // with K wrapped under the new credential's W_c.
+            //
+            // Acting credential authenticates via the standard grant
+            // pipeline (validate_grant ran already); we trust the
+            // grant.wrapping_key to be the acting cred's current W_c,
+            // which gets used to open K below.
+            let vault = existing_vault.clone().ok_or_else(|| {
+                AppError::Conflict("vault not initialized — first-time enroll required".into())
+            })?;
+            // New credential's public material lives under `scope.new`.
+            let new_credential = parse_new_passkey(&validated.op)?;
+            // Wrapping key for the new credential travels in `grant.opt`
+            // (TLS-protected, like the acting `wrapping_key` in the grant
+            // root). Out of the canonical op so β doesn't depend on a
+            // key the WebAuthn assertion can't observe in advance.
+            let new_w_c = extract_new_wrapping_key(grant.opt.as_ref())?;
+            // Open the vault to recover K. We deliberately don't reuse
+            // decrypt_vault_view here because we need K itself, not the
+            // ProtectedState view.
+            use crate::passkey::webauthn::AssertionData as _AssertionData;
+            let _ = (|| -> Option<_> { Some::<&_AssertionData>(&grant.assertion) })();
+            let redeemed = sudp::grant::RedeemedGrant {
+                o: validated.op.clone(),
+                credential_id: validated.credential_id_bytes.clone(),
+                wrapping_key: sudp::grant::WrappingKey::from_bytes(
+                    validated.wrapping_key.clone(),
+                ),
+                opt: sudp::grant::GrantOpt::default(),
+            };
+            let opened = sudp::phases::consumption::open::<sudp::primitives::StdPrimitives>(
+                &redeemed, &vault,
+            )
+            .map_err(|e| AppError::Unauthorized(format!("vault open: {}", e)))?;
+            // Wrap K under the new W_c with sudp's canonical wrap
+            // primitive — same AEAD-as-wrap construction the lifecycle
+            // helper uses, just invoked directly since we're not running
+            // a full lifecycle here.
+            use sudp::primitives::{KeyWrap as _KeyWrap, WrapBinding};
+            type Wrap = <sudp::primitives::StdPrimitives as sudp::primitives::PrimitiveSuite>::Wrap;
+            let new_cid_bytes = STANDARD
+                .decode(&new_credential.credential_id)
+                .map_err(|_| AppError::BadRequest("new credential_id not base64".into()))?;
+            if vault.find_credential(&new_cid_bytes).is_some() {
+                return Err(AppError::Conflict(
+                    "credential already enrolled on this vault".into(),
+                ));
+            }
+            let binding = WrapBinding {
+                credential_id: &new_cid_bytes,
+                version: vault.version,
+            };
+            let wrapped_for_new = Wrap::wrap(&new_w_c, &opened.k[..], &binding)
+                .map_err(|e| AppError::Internal(format!("wrap K under new W_c: {}", e)))?;
+            // Append to credentials + registry.
+            let mut updated = vault.clone();
+            let new_prf_salt = STANDARD
+                .decode(&new_credential.prf_salt)
+                .map_err(|_| AppError::BadRequest("prf_salt not base64".into()))?;
+            updated.credentials.push(sudp::state::SealedCredential {
+                credential_id: new_cid_bytes.clone(),
+                prf_salt: new_prf_salt,
+                wrapped_key: wrapped_for_new,
+            });
+            let pk = sudp::passkey::WebAuthnPublicKey {
+                x: new_credential.public_key_x,
+                y: new_credential.public_key_y,
+                device_name: new_credential.device_name,
+            };
+            updated
+                .registry
+                .insert::<sudp::passkey::WebAuthn>(&new_cid_bytes, &pk)
+                .map_err(|e| AppError::Internal(format!("registry insert: {}", e)))?;
+            write_atomic(&vault_path, &updated)?;
+            tracing::info!(
+                vault = %vault_id,
+                cred_count = updated.credentials.len(),
+                "vault add-passkey applied"
+            );
+            (
+                json!({ "ok": true, "act": "enroll", "target": "passkeys" }),
+                None,
+            )
+        }
         ActType::Enroll => {
             let credential = as_enroll_credential(&validated.op)?;
             if existing_vault.is_some() {
@@ -203,6 +291,48 @@ pub async fn approve_op(
             write_atomic(&vault_path, &vault)?;
             tracing::info!(vault = %vault_id, "vault write applied");
             (json!({ "ok": true, "act": "write" }), None)
+        }
+        ActType::Revoke => {
+            // Remove-passkey. `target = "passkeys.<cid_b64>"`. K stays
+            // the same — we only drop the named credential's SealedCredential
+            // entry and Registry record. At-least-one safeguard prevents
+            // locking the user out of their own vault.
+            //
+            // Acting credential CAN revoke itself (matches per-VM and 1P
+            // behavior — user might want to remove a compromised device).
+            // The at-least-one safeguard still catches "revoking the only
+            // remaining credential".
+            let target = validated.op.act.target.as_str();
+            let cid_b64 = target
+                .strip_prefix("passkeys.")
+                .ok_or_else(|| AppError::BadRequest(
+                    "revoke target must be 'passkeys.<credential_id>'".into(),
+                ))?;
+            let mut vault = existing_vault
+                .clone()
+                .ok_or_else(|| AppError::Conflict("vault not initialized".into()))?;
+            if vault.credentials.len() <= 1 {
+                return Err(AppError::BadRequest(
+                    "cannot remove the last passkey — add another one first".into(),
+                ));
+            }
+            let cid_bytes = STANDARD
+                .decode(cid_b64)
+                .map_err(|_| AppError::BadRequest("target credential_id not base64".into()))?;
+            if vault.find_credential(&cid_bytes).is_none() {
+                return Err(AppError::BadRequest(
+                    "target credential not enrolled on this vault".into(),
+                ));
+            }
+            vault.credentials.retain(|c| c.credential_id != cid_bytes);
+            vault.registry.remove(&cid_bytes);
+            write_atomic(&vault_path, &vault)?;
+            tracing::info!(
+                vault = %vault_id,
+                cred_count = vault.credentials.len(),
+                "vault revoke-passkey applied"
+            );
+            (json!({ "ok": true, "act": "revoke", "target": target }), None)
         }
         ActType::Export => {
             let path = as_export_path(&validated.op)?;
@@ -339,6 +469,72 @@ pub async fn approve_op(
                 }
                 tracing::info!(vault = %vault_id, "vault deleted");
                 (json!({ "ok": true, "act": "vault-delete" }), None)
+            }
+            // Rename a passkey's `device_name`. Pure registry update — K,
+            // M, and credentials list stay untouched. Modeled as Custom
+            // (not Write/Rotate) because it doesn't mutate the protected
+            // state, just an opaque public-info field.
+            //
+            // Wire shape: `target = "passkeys.<cid_b64>"`,
+            // `scope = { device_name: "<new name>" }`.
+            // Acting credential authenticates via the standard grant
+            // pipeline. Self-rename allowed (matches per-VM UX).
+            "rename-passkey" => {
+                let target = validated.op.act.target.as_str();
+                let cid_b64 = target
+                    .strip_prefix("passkeys.")
+                    .ok_or_else(|| AppError::BadRequest(
+                        "rename-passkey target must be 'passkeys.<credential_id>'".into(),
+                    ))?;
+                let new_name = validated
+                    .op
+                    .act
+                    .scope
+                    .get("device_name")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| AppError::BadRequest(
+                        "rename-passkey scope.device_name required".into(),
+                    ))?
+                    .trim()
+                    .to_string();
+                if new_name.is_empty() {
+                    return Err(AppError::BadRequest(
+                        "device_name cannot be empty".into(),
+                    ));
+                }
+                if new_name.len() > 120 {
+                    return Err(AppError::BadRequest(
+                        "device_name too long (max 120 chars)".into(),
+                    ));
+                }
+                let mut vault = existing_vault
+                    .clone()
+                    .ok_or_else(|| AppError::Conflict("vault not initialized".into()))?;
+                let cid_bytes = STANDARD
+                    .decode(cid_b64)
+                    .map_err(|_| AppError::BadRequest("target credential_id not base64".into()))?;
+                let mut pk = vault
+                    .registry
+                    .get::<sudp::passkey::WebAuthn>(&cid_bytes)
+                    .map_err(|e| AppError::Internal(format!("registry get: {}", e)))?
+                    .ok_or_else(|| AppError::BadRequest(
+                        "target credential not enrolled on this vault".into(),
+                    ))?;
+                pk.device_name = new_name.clone();
+                vault
+                    .registry
+                    .insert::<sudp::passkey::WebAuthn>(&cid_bytes, &pk)
+                    .map_err(|e| AppError::Internal(format!("registry insert: {}", e)))?;
+                write_atomic(&vault_path, &vault)?;
+                tracing::info!(
+                    vault = %vault_id,
+                    cred = %cid_b64,
+                    "passkey rename applied"
+                );
+                (
+                    json!({ "ok": true, "act": "rename-passkey", "target": target, "device_name": new_name }),
+                    None,
+                )
             }
             other => {
                 return Err(AppError::BadRequest(format!(
@@ -485,6 +681,64 @@ pub async fn reject_op(
 ///   3. `policy_defaults` — verbatim snapshot of `aux.policy_defaults` so
 ///      the evaluator can layer user globals on top of the compiled-in
 ///      `PolicyDefaults::default()` without re-decrypting the vault.
+/// New-credential payload pulled from `act.scope.new` for the
+/// add-passkey-to-existing-vault path (target = "passkeys"). Distinct
+/// from first-time Enroll's `as_enroll_credential` because the wire
+/// shape is different — first-time puts cid in `act.target` and the
+/// rest at scope top-level; add-passkey nests everything under `new`
+/// per PROTOCOL.md §3.4.
+fn parse_new_passkey(
+    op: &crate::protocol::operation::Operation,
+) -> Result<crate::protocol::operation::NewCredential> {
+    let new = op
+        .act
+        .scope
+        .get("new")
+        .ok_or_else(|| AppError::BadRequest("add-passkey: scope.new required".into()))?;
+    let str_field = |k: &str| -> Result<String> {
+        new.get(k)
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| AppError::BadRequest(format!("add-passkey: scope.new.{} required", k)))
+    };
+    Ok(crate::protocol::operation::NewCredential {
+        credential_id: str_field("credential_id")?,
+        public_key_x: str_field("public_key_x")?,
+        public_key_y: str_field("public_key_y")?,
+        prf_salt: str_field("prf_salt")?,
+        device_name: new
+            .get("device_name")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_default(),
+    })
+}
+
+/// Pull the new credential's wrapping key (W_c for cid_new) out of the
+/// grant's `opt` field. Travels here rather than in `act.scope` because
+/// raw key material doesn't belong in the canonical op (which feeds β
+/// and is logged); `opt` is TLS-protected and not bound into β.
+fn extract_new_wrapping_key(opt: Option<&Value>) -> Result<Vec<u8>> {
+    let opt = opt.ok_or_else(|| AppError::BadRequest(
+        "add-passkey: grant.opt.new_credential_wrapping_key required".into(),
+    ))?;
+    let key_b64 = opt
+        .get("new_credential_wrapping_key")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| AppError::BadRequest(
+            "add-passkey: grant.opt.new_credential_wrapping_key missing".into(),
+        ))?;
+    let bytes = STANDARD
+        .decode(key_b64)
+        .map_err(|_| AppError::BadRequest("new_credential_wrapping_key not base64".into()))?;
+    if bytes.len() != 32 {
+        return Err(AppError::BadRequest(
+            "new_credential_wrapping_key must be 32 bytes".into(),
+        ));
+    }
+    Ok(bytes)
+}
+
 fn bootstrap_cache_from_view(
     view: &VaultPlaintextView,
     state: &AppState,
