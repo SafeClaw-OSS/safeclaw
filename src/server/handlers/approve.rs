@@ -386,7 +386,8 @@ pub async fn approve_op(
                 &validated.wrapping_key,
                 &validated.credential_id_bytes,
                 &vault,
-                &state.services,
+                &state,
+                &vault_id,
             )
             .await?;
             // Cache the resolved s_o per PROTOCOL.md §6.2 — but ONLY if

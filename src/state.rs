@@ -127,6 +127,19 @@ pub struct SecretsCache {
     /// resolved credential bytes from native-secrets). Sparse — only
     /// kinds with an adapter (today: gcp-secret-manager) populate.
     pub external_stores: HashMap<String, (crate::storage::plaintext::Store, Vec<u8>)>,
+    /// Derived OAuth access_tokens, keyed by service_id. These are the
+    /// short-lived bearer values minted by exchanging the long-lived
+    /// `refresh_token` (which lives in `entries`) at the provider's
+    /// /token endpoint. **Never persisted to vault** — the design says
+    /// only the immutable refresh_token enters the vault; the
+    /// access_token is derived state that's allowed to evaporate on
+    /// lock / daemon restart (next /use just re-mints it).
+    ///
+    /// `expires_at` tracks the provider-reported expiry (with a 60s
+    /// safety margin baked in at insert time). `cache_lookup`'s
+    /// generic eviction doesn't apply here — `oauth_access_lookup`
+    /// has its own lazy eviction below.
+    pub oauth_access: HashMap<String, CacheEntry>,
 }
 
 #[derive(Debug)]
@@ -263,6 +276,53 @@ impl AppState {
             cache.entries.insert(
                 service_id.to_string(),
                 CacheEntry { value, expires_at },
+            );
+        }
+    }
+
+    /// Look up a cached OAuth `access_token` for `(vault, service)`.
+    /// Returns `None` if locked, never minted, or past its expiry.
+    /// Lazily evicts expired entries (same shape as `cache_lookup`).
+    pub fn oauth_access_lookup(&self, vault_id: &str, service_id: &str) -> Option<Vec<u8>> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let mut states = self.vault_states.lock().unwrap();
+        let cache = match states.get_mut(vault_id) {
+            Some(VaultState::Unlocked { cache, .. }) => cache,
+            _ => return None,
+        };
+        let entry = cache.oauth_access.get(service_id)?;
+        if let Some(exp) = entry.expires_at {
+            if now >= exp {
+                cache.oauth_access.remove(service_id);
+                return None;
+            }
+        }
+        Some(entry.value.clone())
+    }
+
+    /// Store a freshly-minted OAuth `access_token`. `expires_at` should
+    /// be the provider-reported absolute expiry minus a small safety
+    /// margin (the broker uses ~60s) so we refresh before the upstream
+    /// would reject. No-op when the vault is locked at the time of
+    /// the call.
+    pub fn oauth_access_insert(
+        &self,
+        vault_id: &str,
+        service_id: &str,
+        value: Vec<u8>,
+        expires_at: u64,
+    ) {
+        let mut states = self.vault_states.lock().unwrap();
+        if let Some(VaultState::Unlocked { cache, .. }) = states.get_mut(vault_id) {
+            cache.oauth_access.insert(
+                service_id.to_string(),
+                CacheEntry {
+                    value,
+                    expires_at: Some(expires_at),
+                },
             );
         }
     }

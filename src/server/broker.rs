@@ -67,8 +67,10 @@ pub async fn execute_use_forward(
     wrapping_key: &[u8],
     credential_id_bytes: &[u8],
     vault: &SealedVault,
-    services: &crate::service::ServiceRegistry,
+    state: &crate::state::AppState,
+    vault_id: &str,
 ) -> Result<UseForwardOutcome> {
+    let services = &state.services;
     let redeemed = RedeemedGrant {
         o: op.clone(),
         credential_id: credential_id_bytes.to_vec(),
@@ -126,8 +128,13 @@ pub async fn execute_use_forward(
         .map(|u| (u.headers.clone(), u.query.clone()))
         .unwrap_or_default();
 
+    // OAuth2 services: exchange the refresh_token (`s_o`) for a fresh
+    // access_token via the provider's /token endpoint before forwarding.
+    // No-op for non-oauth services (returns s_o unchanged).
+    let auth_value = resolve_auth_value(state, vault_id, service_id, &s_o).await?;
+
     let response = forward_to_upstream_with_extras(
-        &s_o,
+        &auth_value,
         upstream_url,
         method_str,
         path,
@@ -138,6 +145,9 @@ pub async fn execute_use_forward(
         if tpl_query.is_empty() { None } else { Some(&tpl_query) },
     )
     .await?;
+    // Return the raw `s_o` (refresh_token for oauth2 services, the
+    // bearer for others) so the caller can cache it per policy TTL —
+    // the access_token is cached separately in `state.oauth_access`.
     Ok(UseForwardOutcome { response, s_o })
 }
 
@@ -176,6 +186,118 @@ fn render_upstream_template(tpl: &str, s_o: &[u8]) -> String {
         i += 1;
     }
     out
+}
+
+/// Resolve the auth value for a service before forwarding. For most
+/// services this is a no-op (returns the input bytes — the bearer
+/// stored in `cache.entries`). For oauth2 services, the `raw` bytes
+/// are the *refresh_token*, not the access_token the upstream wants:
+/// we exchange them at the provider's /token endpoint (or use a
+/// cached access_token if one is still valid) and return the fresh
+/// access_token.
+///
+/// The access_token cache lives on `AppState::oauth_access` keyed by
+/// service — derived state, never persisted to vault. Cache hits
+/// have ~60s safety margin so we don't hand the upstream a token
+/// that's about to expire mid-request.
+///
+/// Errors propagate from `auth::oauth2::perform_refresh` — caller
+/// can inspect for `invalid_grant` to mark the connection
+/// needs-reauth (Stage 5 wires the UI; the daemon just logs warn
+/// for now).
+pub async fn resolve_auth_value(
+    state: &crate::state::AppState,
+    vault_id: &str,
+    service_id: &str,
+    raw: &[u8],
+) -> Result<Vec<u8>> {
+    let svc = state.services.get(service_id);
+    let auth = svc
+        .and_then(|s| s.upstream.first())
+        .and_then(|u| u.auth.as_ref());
+    let is_oauth = matches!(auth.and_then(|a| a.auth_type.as_deref()), Some("oauth2"));
+    if !is_oauth {
+        return Ok(raw.to_vec());
+    }
+    let auth = auth.expect("oauth2 branch implies auth present");
+
+    // Cache hit — return the cached access_token directly.
+    if let Some(cached) = state.oauth_access_lookup(vault_id, service_id) {
+        return Ok(cached);
+    }
+
+    // Cache miss → call provider's /token endpoint to mint a fresh
+    // access_token from our refresh_token.
+    let token_url = auth.token_url.as_deref().ok_or_else(|| {
+        AppError::Internal(format!(
+            "service '{}' is oauth2 but missing auth.token_url",
+            service_id
+        ))
+    })?;
+    let client_id_env = auth.client_id_env.as_deref().ok_or_else(|| {
+        AppError::Internal(format!(
+            "service '{}' is oauth2 but missing auth.client_id_env",
+            service_id
+        ))
+    })?;
+    let client_id = std::env::var(client_id_env).map_err(|_| {
+        AppError::Internal(format!(
+            "oauth2 client_id env var '{}' not set (required by service '{}')",
+            client_id_env, service_id
+        ))
+    })?;
+    // client_secret is optional — PKCE flows (OpenAI Codex / Anthropic)
+    // omit `client_secret_env`; confidential clients (Google) supply it.
+    let client_secret = auth
+        .client_secret_env
+        .as_deref()
+        .and_then(|n| std::env::var(n).ok());
+
+    let refresh_token_str = std::str::from_utf8(raw).map_err(|_| {
+        AppError::Internal(format!(
+            "oauth2 refresh_token for '{}' not utf-8",
+            service_id
+        ))
+    })?;
+    let style = match auth.oauth_style.as_deref() {
+        Some("json") => crate::auth::oauth2::OAuthStyle::Json,
+        _ => crate::auth::oauth2::OAuthStyle::Form,
+    };
+
+    let (access_token, expires_at) = crate::auth::oauth2::perform_refresh(
+        token_url,
+        &client_id,
+        client_secret.as_deref(),
+        refresh_token_str,
+        style,
+    )
+    .await
+    .map_err(|e| {
+        tracing::warn!(
+            vault = %vault_id, service = %service_id,
+            "oauth2 refresh failed: {}", e,
+        );
+        // `invalid_grant` means refresh_token itself is dead — needs
+        // user re-consent. Propagate as Unauthorized so the agent's
+        // 4xx response cleanly distinguishes "auth gone" from
+        // "upstream down".
+        if e.contains("invalid_grant") {
+            AppError::Unauthorized(format!("oauth2 refresh_token invalid — reconnect {}", service_id))
+        } else {
+            AppError::Internal(format!("oauth2 refresh failed: {}", e))
+        }
+    })?;
+
+    // Cache with 60s safety margin so the next request mid-window
+    // doesn't grab a near-expired token.
+    let safe_expires_at = expires_at.saturating_sub(60);
+    state.oauth_access_insert(
+        vault_id,
+        service_id,
+        access_token.as_bytes().to_vec(),
+        safe_expires_at,
+    );
+    Ok(access_token.into_bytes())
 }
 
 /// Forward an agent request to an upstream service with `s_o` injected

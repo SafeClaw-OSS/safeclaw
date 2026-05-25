@@ -160,8 +160,16 @@ async fn handle_impl(
             .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
             .collect();
         let body_vec = body.to_vec();
+        // OAuth2 services: `cached_secret` is the refresh_token (not the
+        // access_token the upstream wants). Resolve to a fresh
+        // access_token via the provider's /token endpoint, using the
+        // per-vault in-memory oauth_access cache to avoid hammering the
+        // provider on every request. No-op for non-oauth services.
+        let auth_value =
+            crate::server::broker::resolve_auth_value(&state, &vault_id, &service, &cached_secret)
+                .await?;
         let response = crate::server::broker::forward_to_upstream_with_extras(
-            &cached_secret,
+            &auth_value,
             &upstream.url,
             method.as_str(),
             &path_str,
