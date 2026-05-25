@@ -38,8 +38,6 @@ pub fn admin_router(state: Arc<AppState>) -> Router {
         .route("/c/health", get(handlers::health::health))
         .route("/c/pubkey", get(handlers::metadata::pubkey))
         .route("/c/menu", get(handlers::registry::menu))
-        // Back-compat: serve `/c/registry` as `/c/menu` for old clients.
-        .route("/c/registry", get(handlers::registry::registry_legacy))
         // Vault-scoped.
         .route("/v/{vid}/op", post(handlers::op::create))
         .route("/v/{vid}/passkeys", get(handlers::metadata::passkeys))

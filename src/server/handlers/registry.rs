@@ -367,12 +367,3 @@ pub async fn vault_registry(
     Ok(Json(serde_json::to_value(body)?))
 }
 
-/// Back-compat shim. Some old clients still hit `/c/registry`; serve
-/// them the same static catalog so URLs that escaped into the wild
-/// (skill templates, docs) keep working until they're updated.
-pub async fn registry_legacy(
-    state: State<Arc<AppState>>,
-    q: Query<RegistryQuery>,
-) -> Result<Json<Value>> {
-    menu(state, q).await
-}
