@@ -290,6 +290,40 @@ pub async fn approve_op(
             )?;
             write_atomic(&vault_path, &vault)?;
             tracing::info!(vault = %vault_id, "vault write applied");
+            // Auto-refresh cache from the new ciphertext using the same
+            // wrapping_key the grant carries (Write doesn't rotate W_c
+            // unless paired with a passkey op). Without this, the
+            // daemon's `entries` / `native_keys` / `external_stores`
+            // snapshots stay stuck on the pre-Write state until the
+            // user manually locks + unlocks — most visible symptom is
+            // a freshly-Connected GCP store whose `list()` keys never
+            // surface in /v/{vid}/keys-known. Best-effort: a rotation-
+            // case decrypt failure leaves the cache stale but doesn't
+            // fail the Write.
+            if state.is_vault_locked(&vault_id) {
+                // Vault was Locked when this Write arrived. Don't
+                // auto-unlock from a Write — the user expects unlock
+                // to be a deliberate ceremony.
+            } else if let Ok(view) = decrypt_vault_view(
+                &validated.op,
+                &validated.wrapping_key,
+                &validated.credential_id_bytes,
+                &vault,
+            ) {
+                let cache = bootstrap_cache_from_view(&view, &state);
+                tracing::info!(
+                    vault = %vault_id,
+                    cached_services = cache.entries.len(),
+                    external_stores = cache.external_stores.len(),
+                    "vault cache re-bootstrapped after write"
+                );
+                state.unlock_vault(vault_id.clone(), cache);
+            } else {
+                tracing::warn!(
+                    vault = %vault_id,
+                    "post-write cache refresh skipped — decrypt failed (rotation?); user must lock+unlock to see new state",
+                );
+            }
             (json!({ "ok": true, "act": "write" }), None)
         }
         ActType::Revoke => {
