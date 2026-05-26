@@ -138,9 +138,9 @@ pub fn validate_grant(
         return Err(AppError::BadRequest("r too short".into()));
     }
 
-    // 5. Compute β over canonical(o).
+    // 5. Compute β over canonical(o) using strict float-rejecting encoder.
     let op_value = serde_json::to_value(&grant.o)?;
-    let beta = binding_for_op(domain, &r_bytes, &op_value);
+    let beta = binding_for_op(domain, &r_bytes, &op_value)?;
 
     // 6. Verify WebAuthn assertion against credential's public key.
     if let Some(ref a_cred_id) = grant.assertion.credential_id {

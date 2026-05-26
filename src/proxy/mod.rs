@@ -18,7 +18,9 @@ pub mod use_broker;
 
 use std::sync::Arc;
 
-use axum::{routing::post, Router};
+use axum::{extract::DefaultBodyLimit, routing::post, Router};
+
+const MAX_BODY_BYTES: usize = 256 * 1024;
 
 use crate::server::cors::build_cors;
 use crate::state::AppState;
@@ -31,9 +33,10 @@ pub fn proxy_router(state: Arc<AppState>) -> Router {
     // The `build_cors` import is retained for potential future per-port
     // configuration; unused-import lint is suppressed via the use statement.
     let _ = build_cors; // keep import to document intentional non-use
-    Router::new()
+    let router = Router::new()
         .route("/v/{vid}/export/{key}", post(env::handle))
         .route("/v/{vid}/use/{service}", post(use_broker::handle_no_rest))
         .route("/v/{vid}/use/{service}/{*rest}", post(use_broker::handle))
-        .with_state(state)
+        .with_state(state);
+    router.layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
 }

@@ -370,6 +370,11 @@ impl AuditStore {
 
 /// Per-vault `AuditStore` cache. Lazy-init on first `for_vault` call —
 /// no DB file exists until that vault's first op writes audit.
+/// Maximum number of simultaneously cached audit-store handles.
+/// Each handle holds an open SQLite fd; capping prevents fd exhaustion via
+/// vault_id enumeration from unauthenticated callers.
+const AUDIT_REGISTRY_CAP: usize = 500;
+
 pub struct AuditRegistry {
     vaults: VaultDir,
     stores: Mutex<HashMap<String, Arc<AuditStore>>>,
@@ -388,6 +393,11 @@ impl AuditRegistry {
             let stores = self.stores.lock().unwrap();
             if let Some(s) = stores.get(vault_id) {
                 return Ok(s.clone());
+            }
+            if stores.len() >= AUDIT_REGISTRY_CAP {
+                return Err(crate::error::AppError::Internal(
+                    "audit registry capacity exceeded".into(),
+                ));
             }
         }
         // Open outside the lock so a slow disk doesn't block other vaults.

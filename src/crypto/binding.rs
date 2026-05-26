@@ -19,6 +19,7 @@
 use sudp::primitives::{Hash as _, Sha256};
 
 use crate::crypto::canonical;
+use crate::error::Result;
 
 /// Default domain separator for grants. Setup gets its own to prevent
 /// cross-context replay of a Reveal grant as a Setup grant (or vice versa).
@@ -36,14 +37,16 @@ pub fn compute_binding(domain: &[u8], r: &[u8], op_hash: &[u8; 32]) -> [u8; 32] 
 }
 
 /// End-to-end binding from canonical operation `o` and challenge `r`.
-pub fn binding_for_op(domain: &[u8], r: &[u8], op: &serde_json::Value) -> [u8; 32] {
-    let canonical_o = canonical::canonicalize_body(op);
+/// Returns `Err` if `op` contains float values (rejected by strict canonicalization).
+pub fn binding_for_op(domain: &[u8], r: &[u8], op: &serde_json::Value) -> Result<[u8; 32]> {
+    let canonical_o = canonical::canonicalize_body(op)?;
     let op_hash = Sha256::hash(&canonical_o);
-    compute_binding(domain, r, &op_hash)
+    Ok(compute_binding(domain, r, &op_hash))
 }
 
 /// Legacy helper retained for tests: includes method+path in the binding.
-/// Not used by the v1 grant pipeline.
+/// Not used by the v1 grant pipeline; uses non-strict canonicalization so
+/// test values with floats don't spuriously fail.
 pub fn binding_for_request(
     domain: &[u8],
     r: &[u8],
@@ -51,7 +54,7 @@ pub fn binding_for_request(
     path: &str,
     body: &serde_json::Value,
 ) -> [u8; 32] {
-    let canonical_body = canonical::canonicalize_body(body);
+    let canonical_body = canonical::canonicalize(body);
     let req_hash = Sha256::hash_slices(&[
         method.to_ascii_uppercase().as_bytes(),
         b"\x00",
@@ -77,24 +80,24 @@ mod tests {
         let op = json!({ "act": { "type": "reveal", "path": "x" } });
         let r = [0x11u8; 16];
         assert_eq!(
-            binding_for_op(DOMAIN_STANDARD, &r, &op),
-            binding_for_op(DOMAIN_STANDARD, &r, &op)
+            binding_for_op(DOMAIN_STANDARD, &r, &op).unwrap(),
+            binding_for_op(DOMAIN_STANDARD, &r, &op).unwrap()
         );
     }
 
     #[test]
     fn op_binding_changes_with_op() {
         let r = [0x11u8; 16];
-        let a = binding_for_op(DOMAIN_STANDARD, &r, &json!({ "act": { "type": "reveal", "path": "x" } }));
-        let b = binding_for_op(DOMAIN_STANDARD, &r, &json!({ "act": { "type": "reveal", "path": "y" } }));
+        let a = binding_for_op(DOMAIN_STANDARD, &r, &json!({ "act": { "type": "reveal", "path": "x" } })).unwrap();
+        let b = binding_for_op(DOMAIN_STANDARD, &r, &json!({ "act": { "type": "reveal", "path": "y" } })).unwrap();
         assert_ne!(a, b);
     }
 
     #[test]
     fn op_binding_changes_with_r() {
         let op = json!({ "act": { "type": "reveal", "path": "x" } });
-        let a = binding_for_op(DOMAIN_STANDARD, &[0u8; 16], &op);
-        let b = binding_for_op(DOMAIN_STANDARD, &[1u8; 16], &op);
+        let a = binding_for_op(DOMAIN_STANDARD, &[0u8; 16], &op).unwrap();
+        let b = binding_for_op(DOMAIN_STANDARD, &[1u8; 16], &op).unwrap();
         assert_ne!(a, b);
     }
 
@@ -102,8 +105,15 @@ mod tests {
     fn op_binding_changes_with_domain() {
         let op = json!({ "x": 1 });
         let r = [0u8; 16];
-        let a = binding_for_op(DOMAIN_STANDARD, &r, &op);
-        let b = binding_for_op(DOMAIN_SETUP, &r, &op);
+        let a = binding_for_op(DOMAIN_STANDARD, &r, &op).unwrap();
+        let b = binding_for_op(DOMAIN_SETUP, &r, &op).unwrap();
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn op_binding_rejects_float() {
+        let op = json!({ "x": 1.5 });
+        let r = [0u8; 16];
+        assert!(binding_for_op(DOMAIN_STANDARD, &r, &op).is_err());
     }
 }

@@ -182,7 +182,7 @@ async fn full_setup_then_reveal_succeeds() {
     let setup_r = issue_challenge(&state);
     let setup_r_raw = STANDARD.decode(&setup_r).unwrap();
     let setup_op_value = serde_json::to_value(&setup_op).unwrap();
-    let setup_beta = binding_for_op(DOMAIN_SETUP, &setup_r_raw, &setup_op_value);
+    let setup_beta = binding_for_op(DOMAIN_SETUP, &setup_r_raw, &setup_op_value).unwrap();
 
     let setup_assertion = build_assertion(
         &signing_key,
@@ -224,7 +224,7 @@ async fn full_setup_then_reveal_succeeds() {
     let reveal_r = issue_challenge(&state);
     let reveal_r_raw = STANDARD.decode(&reveal_r).unwrap();
     let reveal_op_value = serde_json::to_value(&reveal_op).unwrap();
-    let reveal_beta = binding_for_op(DOMAIN_STANDARD, &reveal_r_raw, &reveal_op_value);
+    let reveal_beta = binding_for_op(DOMAIN_STANDARD, &reveal_r_raw, &reveal_op_value).unwrap();
     let reveal_assertion = build_assertion(
         &signing_key,
         &credential_id_b64,
@@ -287,7 +287,7 @@ async fn write_then_reveal_returns_new_value() {
 
     let r = issue_challenge(&state);
     let r_raw = STANDARD.decode(&r).unwrap();
-    let beta = binding_for_op(DOMAIN_SETUP, &r_raw, &serde_json::to_value(&setup_op).unwrap());
+    let beta = binding_for_op(DOMAIN_SETUP, &r_raw, &serde_json::to_value(&setup_op).unwrap()).unwrap();
     let assertion = build_assertion(&signing_key, &credential_id_b64, &beta, RP_ID, ORIGIN);
     let setup_grant = Grant {
         o: setup_op,
@@ -323,7 +323,7 @@ async fn write_then_reveal_returns_new_value() {
     let write_r = issue_challenge(&state);
     let write_r_raw = STANDARD.decode(&write_r).unwrap();
     let write_beta =
-        binding_for_op(DOMAIN_STANDARD, &write_r_raw, &serde_json::to_value(&write_op).unwrap());
+        binding_for_op(DOMAIN_STANDARD, &write_r_raw, &serde_json::to_value(&write_op).unwrap()).unwrap();
     let write_assertion =
         build_assertion(&signing_key, &credential_id_b64, &write_beta, RP_ID, ORIGIN);
     let write_grant = Grant {
@@ -349,7 +349,7 @@ async fn write_then_reveal_returns_new_value() {
         DOMAIN_STANDARD,
         &reveal_r_raw,
         &serde_json::to_value(&reveal_op).unwrap(),
-    );
+    ).unwrap();
     let reveal_assertion =
         build_assertion(&signing_key, &credential_id_b64, &reveal_beta, RP_ID, ORIGIN);
     let reveal_grant = Grant {
@@ -380,7 +380,7 @@ async fn cross_tenant_isolation() {
     };
     let r = issue_challenge(&state);
     let r_raw = STANDARD.decode(&r).unwrap();
-    let beta = binding_for_op(DOMAIN_STANDARD, &r_raw, &serde_json::to_value(&reveal_op).unwrap());
+    let beta = binding_for_op(DOMAIN_STANDARD, &r_raw, &serde_json::to_value(&reveal_op).unwrap()).unwrap();
     let assertion = build_assertion(&a.signing_key, &a.credential_id_b64, &beta, RP_ID, ORIGIN);
     let grant = Grant {
         o: reveal_op,
@@ -409,7 +409,7 @@ async fn challenge_replay_rejected() {
         valid: Valid { iat: now_secs(), exp: None },
     };
     let r_raw = STANDARD.decode(&r).unwrap();
-    let beta = binding_for_op(DOMAIN_STANDARD, &r_raw, &serde_json::to_value(&reveal_op).unwrap());
+    let beta = binding_for_op(DOMAIN_STANDARD, &r_raw, &serde_json::to_value(&reveal_op).unwrap()).unwrap();
     let assertion = build_assertion(&a.signing_key, &a.credential_id_b64, &beta, RP_ID, ORIGIN);
     let grant1 = Grant {
         o: reveal_op.clone(),
@@ -476,7 +476,7 @@ async fn agent_proxy_then_user_confirm_full_flow() {
     let r = issue_challenge(&state);
     let r_raw = STANDARD.decode(&r).unwrap();
     let pending_op_serialized = serde_json::to_value(&pending_op).unwrap();
-    let beta = binding_for_op(DOMAIN_STANDARD, &r_raw, &pending_op_serialized);
+    let beta = binding_for_op(DOMAIN_STANDARD, &r_raw, &pending_op_serialized).unwrap();
     let assertion = build_assertion(&a.signing_key, &a.credential_id_b64, &beta, RP_ID, ORIGIN);
     let confirm_grant = Grant {
         o: pending_op,
@@ -601,7 +601,7 @@ async fn setup_tenant(state: &Arc<AppState>, tenant_id: &str, value: &str) -> Te
     };
     let r = issue_challenge(state);
     let r_raw = STANDARD.decode(&r).unwrap();
-    let beta = binding_for_op(DOMAIN_SETUP, &r_raw, &serde_json::to_value(&setup_op).unwrap());
+    let beta = binding_for_op(DOMAIN_SETUP, &r_raw, &serde_json::to_value(&setup_op).unwrap()).unwrap();
     let assertion = build_assertion(&signing_key, &credential_id_b64, &beta, RP_ID, ORIGIN);
     let setup_grant = Grant {
         o: setup_op,

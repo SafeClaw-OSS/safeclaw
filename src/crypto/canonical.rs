@@ -14,6 +14,8 @@
 use serde_json::Value;
 use sudp::canonical as sudp_canonical;
 
+use crate::error::{AppError, Result};
+
 /// Fields excluded from canonicalization before channel binding.
 /// These are the fields that are *produced using* the binding, or that are
 /// cryptographic material transmitted alongside the request but not part of
@@ -29,7 +31,7 @@ pub const EXCLUDED_FIELDS: &[&str] = &[
 /// Produce a canonical byte representation of `value` with the excluded
 /// top-level fields stripped. If `value` is not an object, this just
 /// canonicalizes `value` unchanged.
-pub fn canonicalize_body(value: &Value) -> Vec<u8> {
+pub fn canonicalize_body(value: &Value) -> Result<Vec<u8>> {
     let filtered = match value {
         Value::Object(map) => {
             let mut out = serde_json::Map::new();
@@ -42,7 +44,8 @@ pub fn canonicalize_body(value: &Value) -> Vec<u8> {
         }
         other => other.clone(),
     };
-    sudp_canonical::canonicalize(&filtered)
+    sudp_canonical::canonicalize_strict(&filtered)
+        .map_err(|_| AppError::BadRequest("op contains float values (not permitted in canonical form)".into()))
 }
 
 /// Produce a canonical byte representation of `value` without any field
@@ -73,11 +76,17 @@ mod tests {
             "setup_payload": { "any": "blob" },
             "payload": 42
         });
-        let out = canonicalize_body(&v);
+        let out = canonicalize_body(&v).unwrap();
         assert_eq!(
             std::str::from_utf8(&out).unwrap(),
             r#"{"credential_id":"abc","payload":42}"#
         );
+    }
+
+    #[test]
+    fn rejects_float_in_body() {
+        let v = json!({ "x": 1.5 });
+        assert!(canonicalize_body(&v).is_err());
     }
 
     #[test]

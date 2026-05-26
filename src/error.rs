@@ -25,7 +25,10 @@ impl IntoResponse for AppError {
             AppError::NotFound => (StatusCode::NOT_FOUND, "Not found".to_string(), "not_found"),
             AppError::Conflict(msg) => (StatusCode::CONFLICT, msg.clone(), "conflict"),
             AppError::TooManyRequests => (StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded".to_string(), "rate_limited"),
-            AppError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone(), "internal"),
+            AppError::Internal(msg) => {
+                tracing::error!("internal error: {}", msg);
+                (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error".to_string(), "internal")
+            }
         };
         (status, Json(json!({ "error": code, "message": message }))).into_response()
     }
