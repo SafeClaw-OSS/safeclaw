@@ -18,11 +18,11 @@
 
 use std::path::Path;
 
-use base64::{engine::general_purpose::STANDARD, Engine};
 use sudp::passkey::WebAuthn;
 use sudp::state::{Registry, SealedCredential, SealedState, CURRENT_VERSION};
 
 use crate::error::{AppError, Result};
+use crate::protocol::operation::decode_credential_id;
 use crate::passkey::PasskeyEntry;
 
 /// On-disk vault is exactly the sudp sealed-state JSON.
@@ -66,7 +66,7 @@ pub fn write_atomic(path: &Path, vault: &SealedVault) -> Result<()> {
 /// `(x, y, device_name)` for binding verification don't need to know the
 /// sudp Registry shape.
 pub fn find_pubkey(vault: &SealedVault, credential_id_b64: &str) -> Option<PasskeyEntry> {
-    let cid_bytes = STANDARD.decode(credential_id_b64).ok()?;
+    let cid_bytes = decode_credential_id(credential_id_b64).ok()?;
     let pk = vault.registry.get::<WebAuthn>(&cid_bytes).ok().flatten()?;
     Some(PasskeyEntry {
         x: pk.x,
@@ -81,7 +81,7 @@ pub fn find_credential<'a>(
     vault: &'a SealedVault,
     credential_id_b64: &str,
 ) -> Option<&'a SealedCredential> {
-    let cid_bytes = STANDARD.decode(credential_id_b64).ok()?;
+    let cid_bytes = decode_credential_id(credential_id_b64).ok()?;
     vault.find_credential(&cid_bytes)
 }
 
@@ -129,9 +129,7 @@ pub fn replace_after_write(
     new_wrapped_key: Vec<u8>,
     new_ciphertext: Vec<u8>,
 ) -> Result<()> {
-    let cid_bytes = STANDARD
-        .decode(credential_id_b64)
-        .map_err(|_| AppError::BadRequest("credential_id not base64".into()))?;
+    let cid_bytes = decode_credential_id(credential_id_b64)?;
     let cred = vault
         .credentials
         .iter_mut()

@@ -22,7 +22,8 @@ use crate::audit::{STATUS_APPROVED, STATUS_REJECTED};
 use crate::error::{AppError, Result};
 use crate::passkey::PasskeyEntry;
 use crate::protocol::operation::{
-    as_enroll_credential, as_export_path, as_write_patch, discriminator, ActType,
+    as_enroll_credential, as_export_path, as_write_patch, decode_credential_id,
+    discriminator, ActType,
 };
 use crate::protocol::{render_operation, validate_grant, Grant};
 use crate::server::handlers::metadata::decrypt_vault_view;
@@ -164,9 +165,7 @@ pub async fn approve_op(
             // a full lifecycle here.
             use sudp::primitives::{KeyWrap as _KeyWrap, WrapBinding};
             type Wrap = <sudp::primitives::StdPrimitives as sudp::primitives::PrimitiveSuite>::Wrap;
-            let new_cid_bytes = STANDARD
-                .decode(&new_credential.credential_id)
-                .map_err(|_| AppError::BadRequest("new credential_id not base64".into()))?;
+            let new_cid_bytes = decode_credential_id(&new_credential.credential_id)?;
             if vault.find_credential(&new_cid_bytes).is_some() {
                 return Err(AppError::Conflict(
                     "credential already enrolled on this vault".into(),
@@ -218,9 +217,7 @@ pub async fn approve_op(
             let payload = grant.setup_payload.as_ref().ok_or_else(|| {
                 AppError::BadRequest("enroll grant missing setup_payload".into())
             })?;
-            let cid_bytes = STANDARD
-                .decode(&credential.credential_id)
-                .map_err(|_| AppError::BadRequest("credential_id not base64".into()))?;
+            let cid_bytes = decode_credential_id(&credential.credential_id)?;
             let prf_salt = STANDARD
                 .decode(&credential.prf_salt)
                 .map_err(|_| AppError::BadRequest("prf_salt not base64".into()))?;
@@ -350,9 +347,7 @@ pub async fn approve_op(
                     "cannot remove the last passkey — add another one first".into(),
                 ));
             }
-            let cid_bytes = STANDARD
-                .decode(cid_b64)
-                .map_err(|_| AppError::BadRequest("target credential_id not base64".into()))?;
+            let cid_bytes = decode_credential_id(cid_b64)?;
             if vault.find_credential(&cid_bytes).is_none() {
                 return Err(AppError::BadRequest(
                     "target credential not enrolled on this vault".into(),
@@ -592,9 +587,7 @@ pub async fn approve_op(
                 let mut vault = existing_vault
                     .clone()
                     .ok_or_else(|| AppError::Conflict("vault not initialized".into()))?;
-                let cid_bytes = STANDARD
-                    .decode(cid_b64)
-                    .map_err(|_| AppError::BadRequest("target credential_id not base64".into()))?;
+                let cid_bytes = decode_credential_id(cid_b64)?;
                 let mut pk = vault
                     .registry
                     .get::<sudp::passkey::WebAuthn>(&cid_bytes)

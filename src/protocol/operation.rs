@@ -158,3 +158,33 @@ fn scope_string(scope: &serde_json::Value, field: &str) -> Result<String> {
         .map(|s| s.to_string())
         .ok_or_else(|| AppError::BadRequest(format!("act.scope.{} missing or not a string", field)))
 }
+
+/// Decode a WebAuthn `credentialId` from its on-wire base64 string.
+///
+/// `credential_id` is the one sudp field that crosses the WebAuthn boundary,
+/// where base64url (RFC 4648 §5) is the spec-mandated convention — and the
+/// SafeClaw pro-backend's `parseAttestation` correctly emits base64url. The
+/// SUDP daemon's own metadata responses also emit base64url (per
+/// `metadata.rs`). Older clients (and incoming WebAuthn `assertion.credentialId`
+/// fields via the frontend's `toBase64`) may still send standard base64. So
+/// accept either alphabet — convert URL-safe chars back to standard and let
+/// the standard decoder do the rest, padding if needed.
+///
+/// All other sudp fields (signatures, public keys, prf_salt, ciphertext,
+/// wrapping_key, …) stay strict-STANDARD — they never cross the WebAuthn
+/// boundary, never appear in URL paths, and don't have the dual-format
+/// problem.
+pub fn decode_credential_id(s: &str) -> Result<Vec<u8>> {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    // Normalise URL-safe alphabet to standard, then pad to 4-byte boundary.
+    let mut normalised = s.replace('-', "+").replace('_', "/");
+    match normalised.len() % 4 {
+        0 => {}
+        2 => normalised.push_str("=="),
+        3 => normalised.push('='),
+        _ => return Err(AppError::BadRequest("credential_id: malformed base64 length".into())),
+    }
+    STANDARD
+        .decode(&normalised)
+        .map_err(|_| AppError::BadRequest("credential_id: not valid base64 / base64url".into()))
+}

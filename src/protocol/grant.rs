@@ -9,7 +9,7 @@ use crate::error::{AppError, Result};
 use crate::passkey::webauthn::{verify_assertion, AssertionData};
 use crate::passkey::PasskeyEntry;
 use crate::protocol::operation::{
-    as_enroll_credential, check_now, ActType, Operation,
+    as_enroll_credential, check_now, decode_credential_id, ActType, Operation,
 };
 
 /// Grant submitted to `POST /grant` (or to `/approve/{id}/confirm`).
@@ -143,8 +143,15 @@ pub fn validate_grant(
     let beta = binding_for_op(domain, &r_bytes, &op_value);
 
     // 6. Verify WebAuthn assertion against credential's public key.
+    // Byte-compare both sides instead of string-compare: assertion.credential_id
+    // comes from the frontend's `assertionToWire` (which uses standard base64
+    // via `toBase64`), while grant.credential_id is whatever the frontend has
+    // cached from earlier metadata responses (which now arrive as
+    // base64url-no-pad). Same underlying bytes, two on-wire encodings.
     if let Some(ref a_cred_id) = grant.assertion.credential_id {
-        if a_cred_id != &grant.credential_id {
+        let assertion_bytes = decode_credential_id(a_cred_id)?;
+        let grant_bytes = decode_credential_id(&grant.credential_id)?;
+        if assertion_bytes != grant_bytes {
             return Err(AppError::Unauthorized(
                 "assertion.credential_id != grant.credential_id".into(),
             ));
@@ -160,9 +167,7 @@ pub fn validate_grant(
     )?;
 
     // 7. Decode wrapping_key + credential_id raw bytes.
-    let credential_id_bytes = STANDARD
-        .decode(&grant.credential_id)
-        .map_err(|_| AppError::BadRequest("credential_id not base64".into()))?;
+    let credential_id_bytes = decode_credential_id(&grant.credential_id)?;
     let wrapping_key = STANDARD
         .decode(&grant.wrapping_key)
         .map_err(|_| AppError::BadRequest("wrapping_key not base64".into()))?;

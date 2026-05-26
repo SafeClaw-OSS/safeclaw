@@ -12,7 +12,7 @@ use axum::{
     extract::{Path, State},
     Json,
 };
-use base64::{engine::general_purpose::STANDARD, Engine};
+use base64::{engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD}, Engine};
 use serde::Serialize;
 use serde_json::{json, Value};
 use sudp::grant::{GrantOpt, RedeemedGrant, WrappingKey};
@@ -50,7 +50,13 @@ pub async fn passkeys(
         .credentials
         .iter()
         .map(|c| {
-            let cid_b64 = STANDARD.encode(&c.credential_id);
+            // Emit credential_id as base64url-no-pad. credentialId is the one
+            // sudp field that crosses the WebAuthn boundary (W3C spec specifies
+            // base64url here) and that appears in URL paths on the pro-backend.
+            // Everything else (prf_salt, wrapped_key, ciphertext, signatures…)
+            // stays strict-STANDARD — those don't have the same cross-system
+            // / URL-safety pressure.
+            let cid_b64 = URL_SAFE_NO_PAD.encode(&c.credential_id);
             let pk = find_pubkey(&vault, &cid_b64);
             PasskeyMeta {
                 credential_id: cid_b64,
