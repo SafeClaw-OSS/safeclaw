@@ -3,6 +3,7 @@
 pub mod aead;
 pub mod binding;
 pub mod canonical;
+pub mod envelope;
 pub mod kdf;
 pub mod keys;
 pub mod zeroize;

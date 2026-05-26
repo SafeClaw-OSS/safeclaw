@@ -69,15 +69,27 @@ pub async fn passkeys(
     Ok(Json(json!({ "vault_exists": true, "passkeys": metas })))
 }
 
-/// `GET /c/pubkey` — custodian-level HPKE public key.
+/// `GET /c/pubkey` — daemon HPKE outer-envelope public key (PROTOCOL.md §4.2.1 M1).
 ///
-/// Placeholder: HPKE outer-envelope is not yet implemented (M1 in
-/// protocol-md-review). Returns `{ hpke_supported: false }` so clients can
-/// detect non-support and fall back to TLS-only confidentiality.
-pub async fn pubkey(State(_state): State<Arc<AppState>>) -> Json<Value> {
+/// Returns the daemon's static `sc_pk` plus the suite identifier so clients
+/// can pick the matching HPKE implementation. Currently used by the
+/// pending-passkey deposit flow (cross-device add-passkey); future use:
+/// `[HPKE: MUST]` grant submissions.
+///
+/// `sc_pk_fingerprint` lets remote clients OOB-verify the key on first pin
+/// (per PROTOCOL.md §4.2.2 trust establishment).
+pub async fn pubkey(State(state): State<Arc<AppState>>) -> Json<Value> {
+    use base64::{engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD}, Engine};
+    use sha2::{Digest, Sha256};
+    let pk_bytes = state.sc.pk_bytes();
+    let fp = Sha256::digest(&pk_bytes);
     Json(json!({
-        "hpke_supported": false,
-        "note": "HPKE outer envelope (sc_pk) not yet implemented; see PROTOCOL.md M1.",
+        "hpke_supported": true,
+        "kem": "x25519-hkdf-sha256",
+        "kdf": "hkdf-sha256",
+        "aead": "chacha20-poly1305",
+        "sc_pk": URL_SAFE_NO_PAD.encode(&pk_bytes),
+        "sc_pk_fingerprint": STANDARD.encode(fp),
     }))
 }
 

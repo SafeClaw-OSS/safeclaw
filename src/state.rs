@@ -168,6 +168,10 @@ pub struct AppState {
     /// first write/query per tenant. Survives daemon restarts — unlike
     /// `approvals` / `vault_states` which are in-memory only.
     pub audits: AuditRegistry,
+    /// Daemon HPKE outer-envelope keypair (PROTOCOL.md §4.2.1 M1). Loaded
+    /// once at startup, used to open pending-passkey seals (cross-device
+    /// add-passkey) and — in future — `[HPKE: MUST]` grant submissions.
+    pub sc: crate::crypto::envelope::ScKeyPair,
 }
 
 impl AppState {
@@ -175,6 +179,8 @@ impl AppState {
         let tenants = TenantDir::new(&config.state_dir);
         let (events, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let audits = AuditRegistry::new(tenants.clone());
+        let sc = crate::crypto::envelope::ScKeyPair::load_or_generate()
+            .expect("sc_sk load/generate failed — check ~/.safeclaw/crypto perms");
         Self {
             config,
             tenants,
@@ -184,6 +190,7 @@ impl AppState {
             events,
             vault_states: Mutex::new(HashMap::new()),
             audits,
+            sc,
         }
     }
 

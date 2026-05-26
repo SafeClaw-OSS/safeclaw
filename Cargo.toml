@@ -24,6 +24,10 @@ sha2 = "0.10"
 rand = "0.8"
 zeroize = { version = "1", features = ["derive"] }
 subtle = "2"
+# HPKE outer envelope (PROTOCOL.md §4.2 M1) — daemon-static sc_pk/sc_sk used
+# for cross-device pending-passkey seals. Suite: DHKEM(X25519, HKDF-SHA-256)
+# + HKDF-SHA-256 + ChaCha20-Poly1305 (= PROTOCOL.md §4.2 mandated).
+hpke = { version = "0.12", features = ["x25519"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
