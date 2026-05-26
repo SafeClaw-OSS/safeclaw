@@ -7,7 +7,7 @@ use clap::{Args, Parser, Subcommand};
 ///     production usage; what systemd executes.
 ///   - `safeclaw <cmd>` — short-lived CLI commands that talk to a
 ///     daemon over HTTP. Today: login / status / unlock / lock / ls /
-///     read / doctor / version.
+///     read / doctor / vaults / stores / version.
 ///
 /// Bare `safeclaw` (no subcommand) prints help. This matches mainstream
 /// CLI conventions (git, docker, gh, kubectl). The systemd unit on
@@ -46,11 +46,70 @@ pub enum Command {
     /// page for the passkey ceremony; the value comes back via GET
     /// `/op/{op_id}` (never via the browser URL).
     Read(ReadArgs),
+    /// Manage local vault profiles (the `(daemon, vault)` pairs in
+    /// `~/.config/safeclaw/config.toml`) and per-vault lifecycle ops.
+    Vaults(VaultsArgs),
+    /// Manage external stores connected to the active vault. Today: list.
+    /// Connect / disconnect are deferred until the Write op lands in the
+    /// CLI (they rewrite vault.dat).
+    Stores(StoresArgs),
     /// Print the safeclaw binary version.
     Version,
     /// Health + reachability checks: daemon connectivity, active profile,
     /// API key presence. Read-only; no vault state mutation.
     Doctor(ProfileSelectArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct VaultsArgs {
+    #[command(subcommand)]
+    pub sub: VaultsSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum VaultsSubcommand {
+    /// List local profiles. Marks the active one (selected by
+    /// `default_profile` in config.toml or `$SAFECLAW_PROFILE`).
+    Ls,
+    /// Irreversibly delete a vault's daemon-side state. Passkey-gated via
+    /// `/cli/auth?op=vault-delete`. Requires a typed `--yes-i-mean-it` flag
+    /// to bypass the confirmation prompt; without it, refuses to proceed.
+    Delete(VaultDeleteArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct VaultDeleteArgs {
+    /// Vault id to delete. Required even when only one profile exists —
+    /// no implicit "current vault" for destructive ops.
+    pub vault: String,
+
+    #[arg(long, env = "SAFECLAW_DAEMON")]
+    pub daemon: Option<String>,
+    #[arg(long, env = "SAFECLAW_PROFILE")]
+    pub profile: Option<String>,
+
+    /// Bypass the interactive confirmation. Without this flag the command
+    /// refuses to proceed (since deletion is irreversible).
+    #[arg(long)]
+    pub yes_i_mean_it: bool,
+
+    #[arg(long)]
+    pub no_browser: bool,
+    #[arg(long, default_value = "120")]
+    pub timeout: u64,
+}
+
+#[derive(Debug, Args)]
+pub struct StoresArgs {
+    #[command(subcommand)]
+    pub sub: StoresSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum StoresSubcommand {
+    /// List external stores connected to the active vault. Needs the
+    /// vault unlocked (we read from daemon's cache snapshot).
+    Ls(ProfileSelectArgs),
 }
 
 #[derive(Debug, Args)]

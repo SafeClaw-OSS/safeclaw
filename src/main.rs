@@ -58,6 +58,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 e.into()
             })
         }
+        Command::Vaults(args) => {
+            cli::vaults::run(args.sub).await.map_err(|e| -> Box<dyn std::error::Error> {
+                eprintln!("safeclaw vaults: {}", e);
+                e.into()
+            })
+        }
+        Command::Stores(args) => {
+            cli::stores::run(args.sub).await.map_err(|e| -> Box<dyn std::error::Error> {
+                eprintln!("safeclaw stores: {}", e);
+                e.into()
+            })
+        }
         Command::Version => {
             println!("safeclaw {}", env!("CARGO_PKG_VERSION"));
             Ok(())

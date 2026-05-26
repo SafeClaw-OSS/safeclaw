@@ -54,7 +54,7 @@ function abort(msg) {
 }
 
 // ── Param validation ────────────────────────────────────────────────────────
-const KNOWN_OPS = new Set(["unlock", "lock", "export"]);
+const KNOWN_OPS = new Set(["unlock", "lock", "export", "vault-delete"]);
 if (!KNOWN_OPS.has(op)) {
   abort(`unknown op: ${op || "(empty)"}`);
 } else if (!vault) {
@@ -79,6 +79,7 @@ const OP_LABELS = {
   unlock: "Unlock vault",
   lock: "Lock vault",
   export: `Reveal “${exportKey}”`,
+  "vault-delete": "⚠ Delete vault (irreversible)",
 };
 $("op-label").textContent = OP_LABELS[op] || op;
 $("vault-label").textContent = vault ? `· vault ${vault}` : "";
@@ -157,6 +158,8 @@ function buildOp(op, vault, exportKey) {
       return { act: { type: { custom: "vault-lock" }, target: "", scope: null }, bind, valid };
     case "export":
       return { act: { type: "export", target: exportKey, scope: null }, bind, valid };
+    case "vault-delete":
+      return { act: { type: { custom: "vault-delete" }, target: "", scope: null }, bind, valid };
     default:
       throw new Error(`unsupported op: ${op}`);
   }
@@ -223,6 +226,7 @@ async function runCeremony() {
     unlock: "vault unlocked",
     lock: "vault locked",
     export: `revealed ${exportKey}`,
+    "vault-delete": "vault deleted",
   };
   status(done[op] || "ok", "ok");
   // Return the op_id so the caller can pull the cached value (export) or

@@ -10,4 +10,6 @@ pub mod ls;
 pub mod profile;
 pub mod read;
 pub mod status;
+pub mod stores;
 pub mod unlock;
+pub mod vaults;
