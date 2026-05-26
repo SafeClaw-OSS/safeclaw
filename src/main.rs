@@ -2,13 +2,34 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use clap::Parser;
-use safeclaw::config::{Cli, Config};
+use safeclaw::cli;
+use safeclaw::config::{Cli, Command, Config, ServeArgs};
 use safeclaw::proxy::proxy_router;
 use safeclaw::server::admin_router;
 use safeclaw::state::AppState;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let cli = Cli::parse();
+    match cli.command {
+        Command::Serve(args) => run_daemon(args).await,
+        Command::Status(args) => {
+            // CLI commands log to stderr; don't initialise the tracing
+            // subscriber here (it'd pollute the user-facing output of a
+            // short-lived command). The daemon path enables it below.
+            cli::status::run(args).await.map_err(|e| -> Box<dyn std::error::Error> {
+                eprintln!("safeclaw status: {}", e);
+                e.into()
+            })
+        }
+        Command::Version => {
+            println!("safeclaw {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
+    }
+}
+
+async fn run_daemon(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -16,8 +37,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
-    let cli = Cli::parse();
-    let config = Config::from_cli(cli);
+    let config = Config::from_serve_args(args);
 
     std::fs::create_dir_all(&config.state_dir)?;
     std::fs::create_dir_all(config.state_dir.join("tenants"))?;

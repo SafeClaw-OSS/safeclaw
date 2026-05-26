@@ -144,6 +144,10 @@ pub fn replace_after_write(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Test fixture encodes credential_id with base64url-no-pad to match
+    // `decode_credential_id`'s wire format (the WebAuthn convention).
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use tempfile::tempdir;
 
     #[test]
@@ -165,7 +169,7 @@ mod tests {
         assert_eq!(loaded.version, CURRENT_VERSION);
         assert_eq!(loaded.credentials.len(), 1);
         assert_eq!(loaded.credentials[0].credential_id, b"cred-bytes");
-        let pk = find_pubkey(&v, &STANDARD.encode(b"cred-bytes")).unwrap();
+        let pk = find_pubkey(&v, &URL_SAFE_NO_PAD.encode(b"cred-bytes")).unwrap();
         assert_eq!(pk.x, "x_b64");
         assert_eq!(pk.device_name, "Test Device");
     }

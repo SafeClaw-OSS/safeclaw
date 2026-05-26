@@ -1,9 +1,36 @@
 use std::path::PathBuf;
-use clap::Parser;
+use clap::{Args, Parser, Subcommand};
 
+/// Top-level CLI shape. `safeclaw` is one binary in two modes:
+///
+///   - `safeclaw serve` — long-running daemon (HTTP server). Today's
+///     production usage; what systemd executes.
+///   - `safeclaw <cmd>` — short-lived CLI commands that talk to a
+///     daemon over HTTP. Today: `status` and `version`. Future:
+///     setup / unlock / read / write / run / …
+///
+/// Bare `safeclaw` (no subcommand) prints help. This matches mainstream
+/// CLI conventions (git, docker, gh, kubectl). The systemd unit on
+/// safeclaw-daemon-dev runs the explicit `safeclaw serve` form.
 #[derive(Debug, Parser)]
-#[command(name = "safeclaw", about = "SafeClaw multi-tenant daemon")]
+#[command(name = "safeclaw", version, about = "SafeClaw — passkey-gated credential broker")]
 pub struct Cli {
+    #[command(subcommand)]
+    pub command: Command,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum Command {
+    /// Run the daemon (HTTP server on admin + proxy ports).
+    Serve(ServeArgs),
+    /// Print daemon health and version.
+    Status(StatusArgs),
+    /// Print the safeclaw binary version.
+    Version,
+}
+
+#[derive(Debug, Args)]
+pub struct ServeArgs {
     /// Top-level state directory. Tenants live at <state-dir>/tenants/<id>/.
     #[arg(long, env = "SAFECLAW_STATE_DIR", default_value = "./state")]
     pub state_dir: PathBuf,
@@ -37,6 +64,15 @@ pub struct Cli {
     pub admin_key: Option<String>,
 }
 
+#[derive(Debug, Args)]
+pub struct StatusArgs {
+    /// Daemon admin URL. Defaults to local development daemon. Override
+    /// with `--daemon https://custodian.safeclaw.pro` for the Pro
+    /// custodian, or a self-hosted URL.
+    #[arg(long, env = "SAFECLAW_DAEMON", default_value = "http://127.0.0.1:23294")]
+    pub daemon: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub state_dir: PathBuf,
@@ -49,15 +85,15 @@ pub struct Config {
 }
 
 impl Config {
-    pub fn from_cli(cli: Cli) -> Self {
+    pub fn from_serve_args(args: ServeArgs) -> Self {
         Self {
-            state_dir: cli.state_dir,
-            port: cli.port,
-            proxy_port: cli.proxy_port,
-            bind: cli.bind,
-            origin: cli.origin,
-            rp_id: cli.rp_id,
-            admin_key: cli.admin_key,
+            state_dir: args.state_dir,
+            port: args.port,
+            proxy_port: args.proxy_port,
+            bind: args.bind,
+            origin: args.origin,
+            rp_id: args.rp_id,
+            admin_key: args.admin_key,
         }
     }
 }
