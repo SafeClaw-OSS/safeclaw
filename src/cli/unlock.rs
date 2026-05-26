@@ -26,7 +26,7 @@ use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tokio::sync::oneshot;
 
-use crate::cli::profile::{load as load_profiles, ProfileConfig, DEFAULT_PROFILE};
+use crate::cli::profile::resolve_active;
 use crate::config::UnlockArgs;
 
 #[derive(Debug, Deserialize)]
@@ -58,7 +58,11 @@ pub async fn run_lock(args: UnlockArgs) -> Result<(), String> {
 }
 
 async fn drive(op_label: &str, args: UnlockArgs) -> Result<(), String> {
-    let (daemon, vault) = resolve_profile(&args)?;
+    let (daemon, vault) = resolve_active(
+        args.daemon.as_deref(),
+        args.vault.as_deref(),
+        args.profile.as_deref(),
+    )?;
 
     // 1. Bind localhost listener on a random port.
     let listener = TcpListener::bind("127.0.0.1:0")
@@ -168,33 +172,6 @@ async fn handle_done(
         let _ = tx.send(outcome);
     }
     (StatusCode::OK, body)
-}
-
-/// Pick `(daemon, vault)` from explicit flags first, falling back to the
-/// active profile in `~/.config/safeclaw/config.toml`.
-fn resolve_profile(args: &UnlockArgs) -> Result<(String, String), String> {
-    if let (Some(d), Some(v)) = (args.daemon.as_ref(), args.vault.as_ref()) {
-        return Ok((d.clone(), v.clone()));
-    }
-    let cfg: ProfileConfig = load_profiles()?;
-    let profile_name = args
-        .profile
-        .clone()
-        .or_else(|| cfg.default_profile.clone())
-        .unwrap_or_else(|| DEFAULT_PROFILE.to_string());
-    let p = cfg
-        .profiles
-        .get(&profile_name)
-        .ok_or_else(|| {
-            format!(
-                "profile '{}' not found in config — run `safeclaw login` first",
-                profile_name
-            )
-        })?;
-    Ok((
-        args.daemon.clone().unwrap_or_else(|| p.daemon.clone()),
-        args.vault.clone().unwrap_or_else(|| p.vault.clone()),
-    ))
 }
 
 fn random_hex(bytes: usize) -> String {
