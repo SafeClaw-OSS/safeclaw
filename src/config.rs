@@ -6,8 +6,8 @@ use clap::{Args, Parser, Subcommand};
 ///   - `safeclaw serve` — long-running daemon (HTTP server). Today's
 ///     production usage; what systemd executes.
 ///   - `safeclaw <cmd>` — short-lived CLI commands that talk to a
-///     daemon over HTTP. Today: `status` and `version`. Future:
-///     setup / unlock / read / write / run / …
+///     daemon over HTTP. Today: login / status / unlock / lock / ls /
+///     read / doctor / version.
 ///
 /// Bare `safeclaw` (no subcommand) prints help. This matches mainstream
 /// CLI conventions (git, docker, gh, kubectl). The systemd unit on
@@ -38,8 +38,19 @@ pub enum Command {
     /// Also a passkey-gated ceremony (PROTOCOL.md §6.3 — H3 requires a fresh
     /// grant so a stolen session token can't DOS-lock the vault).
     Lock(UnlockArgs),
+    /// List secret names this vault can resolve (native + each external
+    /// store). Does NOT print values — just names + their source. Requires
+    /// the vault to be unlocked.
+    Ls(ProfileSelectArgs),
+    /// Read a single native secret to stdout. Drives the daemon's `/cli/auth`
+    /// page for the passkey ceremony; the value comes back via GET
+    /// `/op/{op_id}` (never via the browser URL).
+    Read(ReadArgs),
     /// Print the safeclaw binary version.
     Version,
+    /// Health + reachability checks: daemon connectivity, active profile,
+    /// API key presence. Read-only; no vault state mutation.
+    Doctor(ProfileSelectArgs),
 }
 
 #[derive(Debug, Args)]
@@ -79,11 +90,16 @@ pub struct ServeArgs {
 
 #[derive(Debug, Args)]
 pub struct StatusArgs {
-    /// Daemon admin URL. Defaults to local development daemon. Override
-    /// with `--daemon https://custodian.safeclaw.pro` for the Pro
-    /// custodian, or a self-hosted URL.
-    #[arg(long, env = "SAFECLAW_DAEMON", default_value = "http://127.0.0.1:23294")]
-    pub daemon: String,
+    /// Daemon admin URL. Falls back to the active profile's daemon, then
+    /// to `http://127.0.0.1:23294` if no profile is configured. Override
+    /// with `--daemon https://custodian.safeclaw.pro` for the Pro custodian
+    /// or any self-hosted URL.
+    #[arg(long, env = "SAFECLAW_DAEMON")]
+    pub daemon: Option<String>,
+
+    /// Profile to read the daemon URL from when `--daemon` is omitted.
+    #[arg(long, env = "SAFECLAW_PROFILE")]
+    pub profile: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -131,6 +147,37 @@ pub struct UnlockArgs {
     pub no_browser: bool,
 
     /// How long (seconds) to wait for the browser-callback before giving up.
+    #[arg(long, default_value = "120")]
+    pub timeout: u64,
+}
+
+/// Reusable arg set for read-only short-lived commands that only need to
+/// pick a daemon URL + vault id from the active profile (or explicit
+/// flags). No subcommand-specific options.
+#[derive(Debug, Args)]
+pub struct ProfileSelectArgs {
+    #[arg(long, env = "SAFECLAW_DAEMON")]
+    pub daemon: Option<String>,
+    #[arg(long)]
+    pub vault: Option<String>,
+    #[arg(long, env = "SAFECLAW_PROFILE")]
+    pub profile: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct ReadArgs {
+    /// Native-secrets key name to reveal (`safeclaw read OPENAI_API_KEY`).
+    pub key: String,
+
+    #[arg(long, env = "SAFECLAW_DAEMON")]
+    pub daemon: Option<String>,
+    #[arg(long)]
+    pub vault: Option<String>,
+    #[arg(long, env = "SAFECLAW_PROFILE")]
+    pub profile: Option<String>,
+
+    #[arg(long)]
+    pub no_browser: bool,
     #[arg(long, default_value = "120")]
     pub timeout: u64,
 }

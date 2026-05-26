@@ -40,6 +40,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 e.into()
             })
         }
+        Command::Ls(args) => {
+            cli::ls::run(args).await.map_err(|e| -> Box<dyn std::error::Error> {
+                eprintln!("safeclaw ls: {}", e);
+                e.into()
+            })
+        }
+        Command::Read(args) => {
+            cli::read::run(args).await.map_err(|e| -> Box<dyn std::error::Error> {
+                eprintln!("safeclaw read: {}", e);
+                e.into()
+            })
+        }
+        Command::Doctor(args) => {
+            cli::doctor::run(args).await.map_err(|e| -> Box<dyn std::error::Error> {
+                eprintln!("safeclaw doctor: {}", e);
+                e.into()
+            })
+        }
         Command::Version => {
             println!("safeclaw {}", env!("CARGO_PKG_VERSION"));
             Ok(())

@@ -77,3 +77,36 @@ pub fn put_profile(name: &str, profile: Profile) -> Result<PathBuf, String> {
     }
     save(&cfg)
 }
+
+/// Resolve the active `(daemon, vault)` pair for short-lived CLI commands.
+/// Explicit `--daemon` / `--vault` flags always win; otherwise the named
+/// profile (default: `$SAFECLAW_PROFILE` env, then `config.default_profile`,
+/// then `"default"`) is loaded.
+pub fn resolve_active(
+    daemon_override: Option<&str>,
+    vault_override: Option<&str>,
+    profile_override: Option<&str>,
+) -> Result<(String, String), String> {
+    if let (Some(d), Some(v)) = (daemon_override, vault_override) {
+        return Ok((d.to_string(), v.to_string()));
+    }
+    let cfg = load()?;
+    let profile_name = profile_override
+        .map(str::to_string)
+        .or_else(|| cfg.default_profile.clone())
+        .unwrap_or_else(|| DEFAULT_PROFILE.to_string());
+    let p = cfg.profiles.get(&profile_name).ok_or_else(|| {
+        format!(
+            "profile '{}' not found in config — run `safeclaw login` first",
+            profile_name
+        )
+    })?;
+    Ok((
+        daemon_override
+            .map(str::to_string)
+            .unwrap_or_else(|| p.daemon.clone()),
+        vault_override
+            .map(str::to_string)
+            .unwrap_or_else(|| p.vault.clone()),
+    ))
+}

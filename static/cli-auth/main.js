@@ -28,10 +28,11 @@ const status = (msg, cls) => {
 };
 
 const params = new URLSearchParams(window.location.search);
-const op = params.get("op") || "";        // "unlock" | "lock"
+const op = params.get("op") || "";        // "unlock" | "lock" | "export"
 const vault = params.get("vault") || "";
 const cb = params.get("cb") || "";        // CLI's localhost callback URL
 const state = params.get("state") || "";  // anti-CSRF token from CLI
+const exportKey = params.get("key") || ""; // for op=export: native-secrets key name
 
 $("daemon-origin").textContent = window.location.origin;
 
@@ -53,10 +54,13 @@ function abort(msg) {
 }
 
 // ── Param validation ────────────────────────────────────────────────────────
-if (op !== "unlock" && op !== "lock") {
+const KNOWN_OPS = new Set(["unlock", "lock", "export"]);
+if (!KNOWN_OPS.has(op)) {
   abort(`unknown op: ${op || "(empty)"}`);
 } else if (!vault) {
   abort("missing vault id (?vault=...)");
+} else if (op === "export" && !exportKey) {
+  abort("missing key (?key=...) for op=export");
 } else if (!cb) {
   abort("missing CLI callback (?cb=...)");
 } else {
@@ -71,7 +75,12 @@ if (op !== "unlock" && op !== "lock") {
 }
 
 // ── UI summary ──────────────────────────────────────────────────────────────
-$("op-label").textContent = op === "unlock" ? "Unlock vault" : "Lock vault";
+const OP_LABELS = {
+  unlock: "Unlock vault",
+  lock: "Lock vault",
+  export: `Reveal “${exportKey}”`,
+};
+$("op-label").textContent = OP_LABELS[op] || op;
 $("vault-label").textContent = vault ? `· vault ${vault}` : "";
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -133,6 +142,26 @@ async function safePasskeyGet({ challenge, allowCredentials, rpId, prfSalt }) {
   return { credential, prfFirst };
 }
 
+// ── Op constructor ──────────────────────────────────────────────────────────
+// Each known `op` URL param maps to a canonical sudp Operation. The page is
+// a stateless ceremony runner — it doesn't store secrets, just shapes the
+// op + drives the WebAuthn ceremony + submits the grant. New op kinds get
+// a case here without touching the rest of the page.
+function buildOp(op, vault, exportKey) {
+  const valid = { iat: Math.floor(Date.now() / 1000), multiplicity: "one" };
+  const bind = { redeemer: vault };
+  switch (op) {
+    case "unlock":
+      return { act: { type: { custom: "vault-unlock" }, target: "", scope: null }, bind, valid };
+    case "lock":
+      return { act: { type: { custom: "vault-lock" }, target: "", scope: null }, bind, valid };
+    case "export":
+      return { act: { type: "export", target: exportKey, scope: null }, bind, valid };
+    default:
+      throw new Error(`unsupported op: ${op}`);
+  }
+}
+
 // ── The ceremony ────────────────────────────────────────────────────────────
 async function runCeremony() {
   status("fetching passkeys…");
@@ -145,11 +174,7 @@ async function runCeremony() {
   const credIdRaw = fromBase64(meta.credential_id);
 
   status("creating op…");
-  const opBody = {
-    act: { type: { custom: op === "unlock" ? "vault-unlock" : "vault-lock" }, target: "", scope: null },
-    bind: { redeemer: vault },
-    valid: { iat: Math.floor(Date.now() / 1000), multiplicity: "one" },
-  };
+  const opBody = buildOp(op, vault, exportKey);
   const createResp = await fetch(`/v/${encodeURIComponent(vault)}/op`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -191,16 +216,25 @@ async function runCeremony() {
     const text = await approveResp.text();
     throw new Error(`approve HTTP ${approveResp.status}: ${text.slice(0, 200)}`);
   }
-  // Don't display the unlock response body (it includes plaintext kv).
-  // The daemon's in-memory cache is what the CLI actually wanted.
-  status(op === "unlock" ? "vault unlocked" : "vault locked", "ok");
+  // Don't display the unlock/export response body (it may contain plaintext).
+  // For export, the CLI will fetch the cached value via GET /op/{op_id} using
+  // the op_id we hand back via the callback.
+  const done = {
+    unlock: "vault unlocked",
+    lock: "vault locked",
+    export: `revealed ${exportKey}`,
+  };
+  status(done[op] || "ok", "ok");
+  // Return the op_id so the caller can pull the cached value (export) or
+  // correlate audit (unlock/lock). Unused by unlock/lock callers — safe.
+  return { op_id: created.op_id };
 }
 
 $("go-btn").addEventListener("click", async () => {
   $("go-btn").disabled = true;
   try {
-    await runCeremony();
-    setTimeout(() => redirectBack({ status: "ok" }), 200);
+    const result = await runCeremony();
+    setTimeout(() => redirectBack({ status: "ok", op_id: result.op_id }), 200);
   } catch (e) {
     const msg = String(e?.message || e);
     status(msg, "err");
@@ -212,9 +246,7 @@ $("cancel-btn").addEventListener("click", () => {
 });
 
 // Auto-enable the button once initial validation passed.
-if (op === "unlock" || op === "lock") {
-  if (vault && cb) {
-    status("ready — click Authorize to start the passkey ceremony", "muted");
-    $("go-btn").disabled = false;
-  }
+if (KNOWN_OPS.has(op) && vault && cb && (op !== "export" || exportKey)) {
+  status("ready — click Authorize to start the passkey ceremony", "muted");
+  $("go-btn").disabled = false;
 }
