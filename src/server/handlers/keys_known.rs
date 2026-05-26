@@ -90,7 +90,10 @@ pub async fn keys_known(
                 continue;
             }
         };
-        let adapter = match GcpSecretManagerAdapter::new(project_id, sa_json) {
+        // F-19: sa_json is Zeroizing<Vec<u8>>; clone the inner bytes for the adapter
+        // (GcpSecretManagerAdapter takes ownership; the local Zeroizing copy is dropped
+        // and zeroed immediately after the call).
+        let adapter = match GcpSecretManagerAdapter::new(project_id, sa_json.to_vec()) {
             Ok(a) => a,
             Err(e) => {
                 store_errors.push(json!({ "store_id": store_id, "error": e.to_string() }));

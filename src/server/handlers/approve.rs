@@ -909,7 +909,8 @@ fn bootstrap_cache_from_view(
         let Some(sa_json) = view.native_secrets.get(creds_item).cloned() else { continue };
         cache
             .external_stores
-            .insert(store_id.clone(), (store.clone(), sa_json));
+            // F-19: wrap SA JSON bytes in Zeroizing so they are zeroed on drop.
+            .insert(store_id.clone(), (store.clone(), zeroize::Zeroizing::new(sa_json)));
     }
     for (service_id, _) in state.services.iter_sorted() {
         // PROTOCOL.md §6.2: only services whose default read level is
