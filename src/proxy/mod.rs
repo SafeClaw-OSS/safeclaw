@@ -24,13 +24,16 @@ use crate::server::cors::build_cors;
 use crate::state::AppState;
 
 pub fn proxy_router(state: Arc<AppState>) -> Router {
-    let mut router = Router::new()
+    // F-25: the proxy port (:23295) is a machine-to-machine interface used
+    // by AI agents — not by browsers. Applying the admin CORS config here
+    // would expose it to cross-origin browser requests, which is undesirable.
+    // We intentionally do NOT add any CorsLayer to this router.
+    // The `build_cors` import is retained for potential future per-port
+    // configuration; unused-import lint is suppressed via the use statement.
+    let _ = build_cors; // keep import to document intentional non-use
+    Router::new()
         .route("/v/{vid}/export/{key}", post(env::handle))
         .route("/v/{vid}/use/{service}", post(use_broker::handle_no_rest))
         .route("/v/{vid}/use/{service}/{*rest}", post(use_broker::handle))
-        .with_state(state);
-    if let Some(cors) = build_cors() {
-        router = router.layer(cors);
-    }
-    router
+        .with_state(state)
 }
