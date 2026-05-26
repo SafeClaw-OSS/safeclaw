@@ -471,6 +471,15 @@ pub async fn approve_op(
             (json!({ "ok": true, "act": "revoke", "target": target }), None)
         }
         ActType::Export => {
+            // F-15: reject KEM-sealed Export until it is implemented.
+            // If a client submits a grant with bind.recipient set, the raw-reveal
+            // path would silently ignore it and return the secret in plain TLS.
+            // Block this until a proper HPKE-sealed Export path is available.
+            if validated.op.bind.recipient.is_some() {
+                return Err(AppError::BadRequest(
+                    "KEM-sealed Export not yet implemented; omit bind.recipient".into(),
+                ));
+            }
             let path = as_export_path(&validated.op)?;
             let vault = existing_vault
                 .clone()
