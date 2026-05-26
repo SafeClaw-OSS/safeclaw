@@ -27,6 +27,14 @@ pub struct Cli {
     /// WebAuthn relying party ID (e.g. "safeclaw.pro").
     #[arg(long, env = "SAFECLAW_RP_ID", default_value = "localhost")]
     pub rp_id: String,
+
+    /// Shared secret gating the `/admin/*` surface (today: tenant
+    /// deletion for SaaS demo-cleanup). When unset, `/admin/*` is
+    /// disabled and returns 403. Set on the daemon AND on any caller
+    /// that needs admin access (the SaaS pro-backend); the values must
+    /// match. Rotate by changing the env var and redeploying.
+    #[arg(long, env = "SAFECLAW_ADMIN_KEY")]
+    pub admin_key: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -37,6 +45,7 @@ pub struct Config {
     pub bind: String,
     pub origin: String,
     pub rp_id: String,
+    pub admin_key: Option<String>,
 }
 
 impl Config {
@@ -48,6 +57,7 @@ impl Config {
             bind: cli.bind,
             origin: cli.origin,
             rp_id: cli.rp_id,
+            admin_key: cli.admin_key,
         }
     }
 }

@@ -26,7 +26,7 @@ pub mod handlers;
 use std::sync::Arc;
 
 use axum::{
-    routing::{get, post},
+    routing::{delete, get, post},
     Router,
 };
 
@@ -50,6 +50,8 @@ pub fn admin_router(state: Arc<AppState>) -> Router {
         .route("/op/{op_id}", get(handlers::approve::get_op))
         .route("/op/{op_id}/approve", post(handlers::approve::approve_op))
         .route("/op/{op_id}/reject", post(handlers::approve::reject_op))
+        // Admin (X-Admin-Key gated; off when SAFECLAW_ADMIN_KEY unset).
+        .route("/admin/tenants/{vid}", delete(handlers::admin::delete_tenant))
         .with_state(state);
     if let Some(cors) = cors::build_cors() {
         router = router.layer(cors);

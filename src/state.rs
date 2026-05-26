@@ -468,6 +468,7 @@ mod tests {
             bind: "127.0.0.1".into(),
             origin: "http://localhost".into(),
             rp_id: "localhost".into(),
+            admin_key: None,
         };
         AppState::new(cfg)
     }

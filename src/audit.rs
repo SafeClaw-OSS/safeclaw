@@ -386,6 +386,14 @@ impl AuditRegistry {
         stores.insert(tenant_id.to_string(), store.clone());
         Ok(store)
     }
+
+    /// Drop the cached `AuditStore` handle for a tenant. Used during
+    /// admin-driven tenant deletion so the SQLite connection is closed
+    /// before we `rm -rf` the directory it points at. Idempotent.
+    pub fn forget(&self, tenant_id: &str) {
+        let mut stores = self.stores.lock().unwrap();
+        stores.remove(tenant_id);
+    }
 }
 
 #[cfg(test)]
