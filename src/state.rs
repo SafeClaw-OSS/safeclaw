@@ -126,7 +126,10 @@ pub struct SecretsCache {
     /// without re-decrypting the vault. Value: (store record from aux,
     /// resolved credential bytes from native-secrets). Sparse — only
     /// kinds with an adapter (today: gcp-secret-manager) populate.
-    pub external_stores: HashMap<String, (crate::storage::plaintext::Store, Vec<u8>)>,
+    ///
+    /// F-19: credential bytes (GCP SA JSON with RSA private key) are wrapped
+    /// in `Zeroizing` so they are zeroed on drop when the vault is locked.
+    pub external_stores: HashMap<String, (crate::storage::plaintext::Store, zeroize::Zeroizing<Vec<u8>>)>,
     /// Derived OAuth access_tokens, keyed by service_id. These are the
     /// short-lived bearer values minted by exchanging the long-lived
     /// `refresh_token` (which lives in `entries`) at the provider's

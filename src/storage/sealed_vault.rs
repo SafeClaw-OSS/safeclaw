@@ -28,8 +28,7 @@ use crate::passkey::PasskeyEntry;
 /// On-disk vault is exactly the sudp sealed-state JSON.
 pub type SealedVault = SealedState;
 
-/// File suffix for atomic-replace writes.
-const TMP_EXT: &str = "dat.tmp";
+// (F-18) TMP_EXT removed — temp path is now generated with a random suffix per call.
 
 /// Read the vault file. Returns `None` if it doesn't exist.
 pub fn read(path: &Path) -> Result<Option<SealedVault>> {
@@ -49,14 +48,26 @@ pub fn read(path: &Path) -> Result<Option<SealedVault>> {
 }
 
 /// Atomically write vault.dat.
+///
+/// F-18: The temp file gets a random 32-bit hex suffix so that two
+/// concurrent calls (which the per-vault async mutex in approve.rs should
+/// prevent, but we defend in-depth) cannot collide on the same tmp path.
+/// On success the tmp file is renamed over the final path. On any error
+/// the tmp file is unlinked so stale temps don't accumulate.
 pub fn write_atomic(path: &Path, vault: &SealedVault) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let bytes = serde_json::to_vec_pretty(vault)?;
-    let tmp = path.with_extension(TMP_EXT);
-    std::fs::write(&tmp, &bytes)?;
-    std::fs::rename(&tmp, path)?;
+    let tmp = path.with_extension(format!("dat.tmp.{:08x}", rand::random::<u32>()));
+    if let Err(e) = std::fs::write(&tmp, &bytes) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
     Ok(())
 }
 

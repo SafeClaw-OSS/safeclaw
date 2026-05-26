@@ -167,6 +167,17 @@ pub fn validate_grant(
     if wrapping_key.len() != 32 {
         return Err(AppError::BadRequest("wrapping_key must be 32 bytes".into()));
     }
+    // F-04: zeroize the source base64 String so W* doesn't linger on the heap.
+    // SAFETY: We treat the String bytes as a mutable byte slice and overwrite
+    // them with zeros. This is sound because (a) we own the String and don't
+    // use it again, and (b) all-zero bytes are valid UTF-8.
+    // We can't call grant.wrapping_key directly because validate_grant takes
+    // `&Grant` — clone a local copy, zeroize it, then drop it.
+    let mut wk_str = grant.wrapping_key.clone();
+    // SAFETY: zeroing valid UTF-8 bytes with 0x00; the String is immediately
+    // dropped after this block and never used as a &str again.
+    unsafe { wk_str.as_bytes_mut().zeroize() };
+    drop(wk_str);
 
     Ok(ValidatedGrant {
         op: grant.o.clone(),

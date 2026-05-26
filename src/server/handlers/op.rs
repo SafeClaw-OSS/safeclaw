@@ -30,6 +30,15 @@ pub async fn create(
 ) -> Result<Json<Value>> {
     validate_vault_id(&vault_id)?;
     reject_broker_kind(&op.act.kind)?;
+    // F-11: validate op.act.target length. A 256-char cap prevents
+    // unbounded strings from reaching audit rows and downstream handlers.
+    // Character set is not enforced globally (target syntax is act-kind
+    // specific), but the length cap applies universally.
+    if op.act.target.len() > 256 {
+        return Err(AppError::BadRequest(
+            "op.act.target too long (max 256 chars)".into(),
+        ));
+    }
     // Locked-state gate (H3 / PROTOCOL.md §6.3): when the vault is Locked,
     // only the unlock ceremony (and first-time Enroll, which auto-unlocks)
     // is admissible. Everything else gets a canned 409 so the caller knows
@@ -59,6 +68,18 @@ pub async fn create(
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     if let Ok(store) = state.audits.for_vault(&vault_id) {
+        // F-22: cap pending ops per vault to prevent SQLite table flooding.
+        const MAX_PENDING_PER_VAULT: i64 = 500;
+        match store.count_pending() {
+            Ok(n) if n >= MAX_PENDING_PER_VAULT => {
+                return Err(AppError::TooManyRequests);
+            }
+            Err(e) => {
+                tracing::warn!(vault = %vault_id, "audit count_pending failed: {}", e);
+                // non-fatal — let the op through rather than blocking legitimate use
+            }
+            _ => {}
+        }
         let row = audit::row_from_op(&op_id, &op, now, expires_at as i64);
         if let Err(e) = store.insert(&row) {
             tracing::warn!(vault = %vault_id, op = %op_id, "audit insert pending failed: {}", e);

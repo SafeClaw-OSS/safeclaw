@@ -90,10 +90,18 @@ pub async fn keys_known(
                 continue;
             }
         };
-        let adapter = match GcpSecretManagerAdapter::new(project_id, sa_json) {
+        // F-19: sa_json is Zeroizing<Vec<u8>>; clone the inner bytes for the adapter
+        // (GcpSecretManagerAdapter takes ownership; the local Zeroizing copy is dropped
+        // and zeroed immediately after the call).
+        let adapter = match GcpSecretManagerAdapter::new(project_id, sa_json.to_vec()) {
             Ok(a) => a,
             Err(e) => {
-                store_errors.push(json!({ "store_id": store_id, "error": e.to_string() }));
+                // F-20: log full error server-side; return sanitised message to caller.
+                tracing::warn!(store = %store_id, "keys-known adapter init error: {}", e);
+                store_errors.push(json!({
+                    "store_id": store_id,
+                    "error": format!("store '{}' unavailable", store_id),
+                }));
                 continue;
             }
         };
@@ -106,10 +114,16 @@ pub async fn keys_known(
                     "keys": names,
                 }));
             }
-            Ok(Err(e)) => store_errors.push(json!({
-                "store_id": store_id,
-                "error": e.to_string(),
-            })),
+            Ok(Err(e)) => {
+                // F-20: log the full error (may contain project id / GCP response body)
+                // server-side only; return a sanitised summary to the caller so we
+                // don't leak GCP project identifiers or raw API responses.
+                tracing::warn!(store = %store_id, "keys-known list error: {}", e);
+                store_errors.push(json!({
+                    "store_id": store_id,
+                    "error": format!("store '{}' unavailable", store_id),
+                }));
+            }
             Err(_) => store_errors.push(json!({
                 "store_id": store_id,
                 "error": format!("timed out after {}s", LIST_TIMEOUT.as_secs()),

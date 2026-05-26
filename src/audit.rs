@@ -181,6 +181,21 @@ impl AuditStore {
         Ok(())
     }
 
+    /// F-22: Count pending rows for this vault. Used to enforce a per-vault
+    /// cap on the number of concurrent pending ops so a rogue agent cannot
+    /// fill the SQLite table unboundedly.
+    pub fn count_pending(&self) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM approvals WHERE status = 'pending'",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| AppError::Internal(format!("audit count_pending: {}", e)))?;
+        Ok(count)
+    }
+
     /// Drop every row whose `created_at` is older than `cutoff` (unix
      /// seconds). Returns the number of deleted rows. Used for opportunistic
      /// retention cleanup — caller picks the cutoff based on the vault's
