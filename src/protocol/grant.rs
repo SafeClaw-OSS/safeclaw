@@ -143,15 +143,8 @@ pub fn validate_grant(
     let beta = binding_for_op(domain, &r_bytes, &op_value);
 
     // 6. Verify WebAuthn assertion against credential's public key.
-    // Byte-compare both sides instead of string-compare: assertion.credential_id
-    // comes from the frontend's `assertionToWire` (which uses standard base64
-    // via `toBase64`), while grant.credential_id is whatever the frontend has
-    // cached from earlier metadata responses (which now arrive as
-    // base64url-no-pad). Same underlying bytes, two on-wire encodings.
     if let Some(ref a_cred_id) = grant.assertion.credential_id {
-        let assertion_bytes = decode_credential_id(a_cred_id)?;
-        let grant_bytes = decode_credential_id(&grant.credential_id)?;
-        if assertion_bytes != grant_bytes {
+        if a_cred_id != &grant.credential_id {
             return Err(AppError::Unauthorized(
                 "assertion.credential_id != grant.credential_id".into(),
             ));
