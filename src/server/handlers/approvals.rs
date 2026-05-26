@@ -105,6 +105,15 @@ pub async fn list(
         }
     }
 
+    // F-21: reject over-long service filter to prevent unbounded DB params.
+    if let Some(ref s) = q.service {
+        if s.len() > 64 {
+            return Err(crate::error::AppError::BadRequest(
+                "service filter too long (max 64 chars)".into(),
+            ));
+        }
+    }
+
     let entries = store.list(status_filter, q.service.as_deref(), q.since, limit)?;
     // Next-page cursor: the oldest row's created_at, only if we returned a
     // full page (otherwise we know the caller has seen everything).
