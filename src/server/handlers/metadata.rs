@@ -46,6 +46,24 @@ pub async fn passkeys(
     let Some(vault) = crate::storage::sealed_vault::read(&vault_path)? else {
         return Ok(Json(json!({ "vault_exists": false, "passkeys": [] })));
     };
+    // F-24: prf_salt exposure mitigation.
+    //
+    // Protocol constraint: prf_salt IS required by the client to run WebAuthn
+    // PRF and derive W_c for the vault-unlock ceremony — the ceremony begins
+    // from the Locked state. Suppressing prf_salt universally when locked
+    // would therefore break unlock. The correct long-term fix is a session-
+    // token gate on this endpoint so only the authenticated vault owner can
+    // retrieve the salt.
+    //
+    // For now we add a tracing event when the vault is locked so operators can
+    // see unauthenticated probes in their logs, and include a TODO so this is
+    // not forgotten.
+    //
+    // TODO: Add a lightweight session-token requirement to this endpoint so
+    // prf_salt is only returned to the authenticated vault owner (F-24).
+    if state.is_vault_locked(&vault_id) {
+        tracing::debug!(vault = %vault_id, "GET /passkeys while vault locked — prf_salt returned; TODO: gate on session token (F-24)");
+    }
     let metas: Vec<PasskeyMeta> = vault
         .credentials
         .iter()
