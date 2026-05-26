@@ -66,7 +66,20 @@ pub async fn passkeys(
             }
         })
         .collect();
-    Ok(Json(json!({ "vault_exists": true, "passkeys": metas })))
+    // Pending-passkey deposits (Stage 1 done, awaiting Stage 2 Enroll).
+    // list() opportunistically GC-sweeps expired files — that's the only
+    // place we know the daemon is actively serving this vault. Failure to
+    // list isn't fatal: pending list just renders empty.
+    let pending: Vec<Value> = crate::storage::pending_passkey::list(&state.tenants, &vault_id)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|p| p.public_metadata())
+        .collect();
+    Ok(Json(json!({
+        "vault_exists": true,
+        "passkeys": metas,
+        "pending_passkeys": pending,
+    })))
 }
 
 /// `GET /c/pubkey` — daemon HPKE outer-envelope public key (PROTOCOL.md §4.2.1 M1).

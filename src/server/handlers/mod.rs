@@ -6,5 +6,6 @@ pub mod health;
 pub mod keys_known;
 pub mod metadata;
 pub mod op;
+pub mod pending_passkey;
 pub mod registry;
 pub mod usage;

@@ -41,6 +41,7 @@ pub fn admin_router(state: Arc<AppState>) -> Router {
         // Vault-scoped.
         .route("/v/{vid}/op", post(handlers::op::create))
         .route("/v/{vid}/passkeys", get(handlers::metadata::passkeys))
+        .route("/v/{vid}/pending-passkeys", post(handlers::pending_passkey::create))
         .route("/v/{vid}/events", get(handlers::events::stream))
         .route("/v/{vid}/approvals", get(handlers::approvals::list))
         .route("/v/{vid}/keys-known", get(handlers::keys_known::keys_known))

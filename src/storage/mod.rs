@@ -6,6 +6,7 @@
 //!   `docs/STORES_AND_ITEMS.md`).
 //! - `tenant_dir`: state-dir layout helpers (tenants/<id>/vault.dat).
 
+pub mod pending_passkey;
 pub mod plaintext;
 pub mod sealed_vault;
 pub mod tenant_dir;

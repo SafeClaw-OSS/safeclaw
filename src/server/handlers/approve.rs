@@ -14,7 +14,14 @@ use axum::{
     extract::{Path, State},
     Json,
 };
-use base64::{engine::general_purpose::STANDARD, Engine};
+use base64::{engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD}, Engine};
+
+/// HPKE `info` prefix for the pending-passkey deposit seal. The full info
+/// string is `PENDING_PASSKEY_INFO_PREFIX ‖ vault_id ‖ 0x1F ‖ cid_new` —
+/// binding the seal to (vault, cid) so a deposit prepared for one pairing
+/// can't be opened against another. Frontend builds the same string in
+/// `lib/passkey-vault-primitive.ts`.
+const PENDING_PASSKEY_INFO_PREFIX: &[u8] = b"safeclaw/v1/pending-passkey";
 use serde_json::{json, Value};
 
 use crate::approval::ApprovalStatus;
@@ -128,25 +135,67 @@ pub async fn approve_op(
             // rotation), but a new SealedCredential entry gets appended
             // with K wrapped under the new credential's W_c.
             //
-            // Acting credential authenticates via the standard grant
-            // pipeline (validate_grant ran already); we trust the
-            // grant.wrapping_key to be the acting cred's current W_c,
-            // which gets used to open K below.
+            // Same- and cross-device add-passkey both go through the
+            // pending-passkey deposit (`storage::pending_passkey`):
+            //   - Stage 1 (any device with the new credential): POST
+            //     /v/{vid}/pending-passkeys with HPKE-sealed user_key_initial.
+            //   - Stage 2 (any device with an existing vault-enrolled
+            //     credential, possibly the same device): this op, with
+            //     `scope.new = { credential_id }` referring to the pending.
+            //
+            // grant.opt is NOT consulted — the new credential's W_c lives
+            // exclusively in the daemon-stored pending-passkey blob.
             let vault = existing_vault.clone().ok_or_else(|| {
                 AppError::Conflict("vault not initialized — first-time enroll required".into())
             })?;
-            // New credential's public material lives under `scope.new`.
-            let new_credential = parse_new_passkey(&validated.op)?;
-            // Wrapping key for the new credential travels in `grant.opt`
-            // (TLS-protected, like the acting `wrapping_key` in the grant
-            // root). Out of the canonical op so β doesn't depend on a
-            // key the WebAuthn assertion can't observe in advance.
-            let new_w_c = extract_new_wrapping_key(grant.opt.as_ref())?;
+            // scope.new should just carry { credential_id } — that's the
+            // pointer to the pending-passkey file. No public-key / W_c
+            // material inline.
+            let new_cid_str = validated
+                .op
+                .act
+                .scope
+                .get("new")
+                .and_then(|n| n.get("credential_id"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| AppError::BadRequest(
+                    "add-passkey: scope.new.credential_id required".into(),
+                ))?
+                .to_string();
+            // Pop the pending file (single-use, deleted on read).
+            let pending = crate::storage::pending_passkey::load_and_consume(
+                &state.tenants,
+                &vault_id,
+                &new_cid_str,
+            )
+            .map_err(|_| AppError::NotFound)?;
+            // HPKE-open the sealed user_key_initial with daemon's sc_sk.
+            // info binds the seal to (vault_id, cid) — the Stage 1 device
+            // committed to those at seal time, so a deposit prepared for
+            // (vault_A, cidA) can't be replayed against a different vault
+            // or cid.
+            let enc = URL_SAFE_NO_PAD
+                .decode(&pending.enc)
+                .map_err(|_| AppError::BadRequest("pending.enc not base64url".into()))?;
+            let ct = URL_SAFE_NO_PAD
+                .decode(&pending.ct)
+                .map_err(|_| AppError::BadRequest("pending.ct not base64url".into()))?;
+            let mut info: Vec<u8> = Vec::with_capacity(
+                PENDING_PASSKEY_INFO_PREFIX.len() + vault_id.len() + new_cid_str.len() + 2,
+            );
+            info.extend_from_slice(PENDING_PASSKEY_INFO_PREFIX);
+            info.extend_from_slice(vault_id.as_bytes());
+            info.push(0x1f); // unit separator
+            info.extend_from_slice(new_cid_str.as_bytes());
+            let new_w_c = state.sc.open(&enc, &ct, &info, b"")?;
+            if new_w_c.len() != 32 {
+                return Err(AppError::BadRequest(
+                    "sealed user_key_initial must be 32 bytes after open".into(),
+                ));
+            }
             // Open the vault to recover K. We deliberately don't reuse
             // decrypt_vault_view here because we need K itself, not the
             // ProtectedState view.
-            use crate::passkey::webauthn::AssertionData as _AssertionData;
-            let _ = (|| -> Option<_> { Some::<&_AssertionData>(&grant.assertion) })();
             let redeemed = sudp::grant::RedeemedGrant {
                 o: validated.op.clone(),
                 credential_id: validated.credential_id_bytes.clone(),
@@ -159,13 +208,10 @@ pub async fn approve_op(
                 &redeemed, &vault,
             )
             .map_err(|e| AppError::Unauthorized(format!("vault open: {}", e)))?;
-            // Wrap K under the new W_c with sudp's canonical wrap
-            // primitive — same AEAD-as-wrap construction the lifecycle
-            // helper uses, just invoked directly since we're not running
-            // a full lifecycle here.
+            // Wrap K under the new W_c with sudp's canonical wrap primitive.
             use sudp::primitives::{KeyWrap as _KeyWrap, WrapBinding};
             type Wrap = <sudp::primitives::StdPrimitives as sudp::primitives::PrimitiveSuite>::Wrap;
-            let new_cid_bytes = decode_credential_id(&new_credential.credential_id)?;
+            let new_cid_bytes = decode_credential_id(&new_cid_str)?;
             if vault.find_credential(&new_cid_bytes).is_some() {
                 return Err(AppError::Conflict(
                     "credential already enrolled on this vault".into(),
@@ -177,10 +223,11 @@ pub async fn approve_op(
             };
             let wrapped_for_new = Wrap::wrap(&new_w_c, &opened.k[..], &binding)
                 .map_err(|e| AppError::Internal(format!("wrap K under new W_c: {}", e)))?;
-            // Append to credentials + registry.
+            // Append to credentials + registry, using the (x, y, prf_salt,
+            // device_name) we just popped from the pending file.
             let mut updated = vault.clone();
             let new_prf_salt = STANDARD
-                .decode(&new_credential.prf_salt)
+                .decode(&pending.prf_salt)
                 .map_err(|_| AppError::BadRequest("prf_salt not base64".into()))?;
             updated.credentials.push(sudp::state::SealedCredential {
                 credential_id: new_cid_bytes.clone(),
@@ -188,9 +235,9 @@ pub async fn approve_op(
                 wrapped_key: wrapped_for_new,
             });
             let pk = sudp::passkey::WebAuthnPublicKey {
-                x: new_credential.public_key_x,
-                y: new_credential.public_key_y,
-                device_name: new_credential.device_name,
+                x: pending.x,
+                y: pending.y,
+                device_name: pending.device_name,
             };
             updated
                 .registry
@@ -200,7 +247,7 @@ pub async fn approve_op(
             tracing::info!(
                 vault = %vault_id,
                 cred_count = updated.credentials.len(),
-                "vault add-passkey applied"
+                "vault add-passkey applied (pending-passkey consumed)"
             );
             (
                 json!({ "ok": true, "act": "enroll", "target": "passkeys" }),
@@ -756,64 +803,6 @@ pub async fn reject_op(
 ///   3. `policy_defaults` — verbatim snapshot of `aux.policy_defaults` so
 ///      the evaluator can layer user globals on top of the compiled-in
 ///      `PolicyDefaults::default()` without re-decrypting the vault.
-/// New-credential payload pulled from `act.scope.new` for the
-/// add-passkey-to-existing-vault path (target = "passkeys"). Distinct
-/// from first-time Enroll's `as_enroll_credential` because the wire
-/// shape is different — first-time puts cid in `act.target` and the
-/// rest at scope top-level; add-passkey nests everything under `new`
-/// per PROTOCOL.md §3.4.
-fn parse_new_passkey(
-    op: &crate::protocol::operation::Operation,
-) -> Result<crate::protocol::operation::NewCredential> {
-    let new = op
-        .act
-        .scope
-        .get("new")
-        .ok_or_else(|| AppError::BadRequest("add-passkey: scope.new required".into()))?;
-    let str_field = |k: &str| -> Result<String> {
-        new.get(k)
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            .ok_or_else(|| AppError::BadRequest(format!("add-passkey: scope.new.{} required", k)))
-    };
-    Ok(crate::protocol::operation::NewCredential {
-        credential_id: str_field("credential_id")?,
-        public_key_x: str_field("public_key_x")?,
-        public_key_y: str_field("public_key_y")?,
-        prf_salt: str_field("prf_salt")?,
-        device_name: new
-            .get("device_name")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            .unwrap_or_default(),
-    })
-}
-
-/// Pull the new credential's wrapping key (W_c for cid_new) out of the
-/// grant's `opt` field. Travels here rather than in `act.scope` because
-/// raw key material doesn't belong in the canonical op (which feeds β
-/// and is logged); `opt` is TLS-protected and not bound into β.
-fn extract_new_wrapping_key(opt: Option<&Value>) -> Result<Vec<u8>> {
-    let opt = opt.ok_or_else(|| AppError::BadRequest(
-        "add-passkey: grant.opt.new_credential_wrapping_key required".into(),
-    ))?;
-    let key_b64 = opt
-        .get("new_credential_wrapping_key")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| AppError::BadRequest(
-            "add-passkey: grant.opt.new_credential_wrapping_key missing".into(),
-        ))?;
-    let bytes = STANDARD
-        .decode(key_b64)
-        .map_err(|_| AppError::BadRequest("new_credential_wrapping_key not base64".into()))?;
-    if bytes.len() != 32 {
-        return Err(AppError::BadRequest(
-            "new_credential_wrapping_key must be 32 bytes".into(),
-        ));
-    }
-    Ok(bytes)
-}
-
 fn bootstrap_cache_from_view(
     view: &VaultPlaintextView,
     state: &AppState,
