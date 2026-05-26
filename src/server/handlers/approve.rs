@@ -144,7 +144,7 @@ pub async fn approve_op(
     let lookup_credential = |cred_id_b64: &str| -> Option<PasskeyEntry> {
         existing_vault.as_ref().and_then(|v| find_pubkey(v, cred_id_b64))
     };
-    let validated = {
+    let mut validated = {
         let result = {
             let mut chs = state.challenges.lock().unwrap();
             validate_grant(
@@ -251,11 +251,13 @@ pub async fn approve_op(
             // Open the vault to recover K. We deliberately don't reuse
             // decrypt_vault_view here because we need K itself, not the
             // ProtectedState view.
+            // F-05: move W_c bytes into RedeemedGrant instead of cloning so
+            // there is only one copy of the key on the heap at a time.
             let redeemed = sudp::grant::RedeemedGrant {
                 o: validated.op.clone(),
                 credential_id: validated.credential_id_bytes.clone(),
                 wrapping_key: sudp::grant::WrappingKey::from_bytes(
-                    validated.wrapping_key.clone(),
+                    std::mem::take(&mut validated.wrapping_key),
                 ),
                 opt: sudp::grant::GrantOpt::default(),
             };
