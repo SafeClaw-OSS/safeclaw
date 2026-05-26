@@ -296,6 +296,61 @@ impl AuditStore {
         }
         Ok(out)
     }
+
+    /// Billable Use-op aggregate over `[since, until)`.
+    ///
+    /// **Billable** = `act_kind = 'use' AND status IN ('allowed', 'approved')`.
+    /// - `allowed`: auto-passed by allow-level policy / cached secret — broker
+    ///   forwarded an upstream request, charge it.
+    /// - `approved`: user passkey-approved an ask-level op — broker forwarded
+    ///   on approve, charge it.
+    /// - `pending` / `denied` / `rejected` / `expired`: no forward happened,
+    ///   don't charge.
+    /// - Anything where `act_kind != 'use'` is control-plane (write/unlock/...)
+    ///   — never billable.
+    ///
+    /// Time anchor: `COALESCE(decided_at, created_at)`. For `allowed` ops the
+    /// decision is instantaneous (often unset), so `created_at` is the only
+    /// time stamp available. For `approved` ops `decided_at` reflects when
+    /// the forward actually fired.
+    ///
+    /// Returns `(total, by_service)`. Rows with `service IS NULL` are counted
+    /// in `total` but skipped from `by_service`.
+    pub fn aggregate_usage(
+        &self,
+        since: i64,
+        until: i64,
+    ) -> Result<(i64, std::collections::BTreeMap<String, i64>)> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT service, COUNT(*) AS n
+                 FROM approvals
+                 WHERE act_kind = 'use'
+                   AND status IN ('allowed', 'approved')
+                   AND COALESCE(decided_at, created_at) >= ?1
+                   AND COALESCE(decided_at, created_at) <  ?2
+                 GROUP BY service",
+            )
+            .map_err(|e| AppError::Internal(format!("usage prepare: {}", e)))?;
+        let rows = stmt
+            .query_map(params![since, until], |row| {
+                let svc: Option<String> = row.get(0)?;
+                let n: i64 = row.get(1)?;
+                Ok((svc, n))
+            })
+            .map_err(|e| AppError::Internal(format!("usage query: {}", e)))?;
+        let mut total: i64 = 0;
+        let mut by_service: std::collections::BTreeMap<String, i64> = std::collections::BTreeMap::new();
+        for r in rows {
+            let (svc, n) = r.map_err(|e| AppError::Internal(format!("usage row: {}", e)))?;
+            total += n;
+            if let Some(s) = svc {
+                by_service.insert(s, n);
+            }
+        }
+        Ok((total, by_service))
+    }
 }
 
 /// Per-tenant `AuditStore` cache. Lazy-init on first `for_tenant` call —
@@ -412,6 +467,69 @@ mod tests {
         let page2 = s.list(None, None, Some(page1.last().unwrap().created_at), 3).unwrap();
         assert_eq!(page2.len(), 3);
         assert_eq!(page2[0].id, "op7");
+    }
+
+    #[test]
+    fn aggregate_usage_counts_only_billable_use_ops() {
+        let (_tmp, s) = fresh_store();
+
+        // Billable: approved + allowed within window
+        let mut approved = row("op1", STATUS_APPROVED, 100);
+        approved.decided_at = Some(150);
+        approved.service = Some("openai".into());
+        s.insert(&approved).unwrap();
+
+        let mut allowed = row("op2", STATUS_ALLOWED, 200);
+        allowed.decided_at = Some(200);
+        allowed.service = Some("openai".into());
+        s.insert(&allowed).unwrap();
+
+        let mut gmail = row("op3", STATUS_APPROVED, 300);
+        gmail.decided_at = Some(305);
+        gmail.service = Some("gmail".into());
+        s.insert(&gmail).unwrap();
+
+        // Non-billable: pending / rejected / expired / denied
+        s.insert(&row("op-pending", STATUS_PENDING, 400)).unwrap();
+        let mut rejected = row("op-rej", STATUS_REJECTED, 410);
+        rejected.decided_at = Some(420);
+        s.insert(&rejected).unwrap();
+        let mut expired = row("op-exp", STATUS_EXPIRED, 430);
+        expired.decided_at = Some(440);
+        s.insert(&expired).unwrap();
+
+        // Non-billable: control-plane op (act_kind != 'use')
+        let mut write = row("op-write", STATUS_APPROVED, 500);
+        write.decided_at = Some(510);
+        write.act_kind = "write".into();
+        write.service = None;
+        s.insert(&write).unwrap();
+
+        // Out-of-window approved Use
+        let mut outside = row("op-old", STATUS_APPROVED, 50);
+        outside.decided_at = Some(60);
+        outside.service = Some("openai".into());
+        s.insert(&outside).unwrap();
+
+        let (total, by_svc) = s.aggregate_usage(100, 400).unwrap();
+        assert_eq!(total, 3, "expected 3 billable ops in [100, 400)");
+        assert_eq!(by_svc.get("openai").copied(), Some(2));
+        assert_eq!(by_svc.get("gmail").copied(), Some(1));
+        assert!(by_svc.get("write").is_none(), "write op must not appear");
+    }
+
+    #[test]
+    fn aggregate_usage_uses_created_at_when_decided_at_null() {
+        let (_tmp, s) = fresh_store();
+        // status='allowed' may legitimately have decided_at = NULL — make sure
+        // the COALESCE fallback to created_at still puts the row in-window.
+        let mut allowed = row("op1", STATUS_ALLOWED, 250);
+        allowed.decided_at = None;
+        s.insert(&allowed).unwrap();
+        let (total, _) = s.aggregate_usage(200, 300).unwrap();
+        assert_eq!(total, 1);
+        let (zero, _) = s.aggregate_usage(300, 400).unwrap();
+        assert_eq!(zero, 0);
     }
 
     #[test]
