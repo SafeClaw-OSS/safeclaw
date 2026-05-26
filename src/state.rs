@@ -1,7 +1,7 @@
 //! Top-level application state.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -13,13 +13,13 @@ use crate::audit::AuditRegistry;
 use crate::config::Config;
 use crate::passkey::challenge::ChallengeStore;
 use crate::service::ServiceRegistry;
-use crate::storage::TenantDir;
+use crate::storage::VaultDir;
 
-/// Broadcast payload for the per-tenant SSE channel. The receiver-side filter
-/// is on `tenant_id`; subscribers belonging to other tenants drop the event.
+/// Broadcast payload for the per-vault SSE channel. The receiver-side filter
+/// is on `vault_id`; subscribers belonging to other vaults drop the event.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApprovalEvent {
-    pub tenant_id: String,
+    pub vault_id: String,
     pub approval_id: String,
     /// One of "pending" | "approved" | "rejected".
     pub kind: String,
@@ -156,7 +156,7 @@ pub enum VaultState {
 
 pub struct AppState {
     pub config: Config,
-    pub tenants: TenantDir,
+    pub vaults: VaultDir,
     pub challenges: Mutex<ChallengeStore>,
     pub approvals: Mutex<ApprovalStore>,
     pub services: ServiceRegistry,
@@ -164,26 +164,36 @@ pub struct AppState {
     /// Per-vault Locked/Unlocked state. Absent entry = Locked. Lives entirely
     /// in process memory; daemon restart returns all vaults to Locked.
     pub vault_states: Mutex<HashMap<String, VaultState>>,
-    /// Per-tenant audit log (PROTOCOL.md §5.3). Connections opened lazily on
-    /// first write/query per tenant. Survives daemon restarts — unlike
+    /// Per-vault audit log (PROTOCOL.md §5.3). Connections opened lazily on
+    /// first write/query per vault. Survives daemon restarts — unlike
     /// `approvals` / `vault_states` which are in-memory only.
     pub audits: AuditRegistry,
     /// Daemon HPKE outer-envelope keypair (PROTOCOL.md §4.2.1 M1). Loaded
     /// once at startup, used to open pending-passkey seals (cross-device
     /// add-passkey) and — in future — `[HPKE: MUST]` grant submissions.
     pub sc: crate::crypto::envelope::ScKeyPair,
+    /// Per-vault async mutex serializing vault.dat read-modify-write cycles.
+    /// Two concurrent approve calls on the same vault both read the pre-write
+    /// state and race to rename the tmpfile — the second write wins silently.
+    /// Holding this lock for the full approve lifetime prevents that race.
+    /// Uses tokio::sync::Mutex so it can be held across await points.
+    pub vault_write_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Per-vault SSE connection semaphore (cap = MAX_SSE_PER_VAULT).
+    /// OwnedSemaphorePermit is stored in each live stream; dropping the
+    /// stream drops the permit, automatically releasing the slot.
+    pub sse_semaphores: Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>,
 }
 
 impl AppState {
     pub fn new(config: Config) -> Self {
-        let tenants = TenantDir::new(&config.state_dir);
+        let vaults = VaultDir::new(&config.state_dir);
         let (events, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
-        let audits = AuditRegistry::new(tenants.clone());
+        let audits = AuditRegistry::new(vaults.clone());
         let sc = crate::crypto::envelope::ScKeyPair::load_or_generate()
             .expect("sc_sk load/generate failed — check ~/.safeclaw/crypto perms");
         Self {
             config,
-            tenants,
+            vaults,
             challenges: Mutex::new(ChallengeStore::new()),
             approvals: Mutex::new(ApprovalStore::new()),
             services: ServiceRegistry::load(),
@@ -191,6 +201,8 @@ impl AppState {
             vault_states: Mutex::new(HashMap::new()),
             audits,
             sc,
+            vault_write_locks: Mutex::new(HashMap::new()),
+            sse_semaphores: Mutex::new(HashMap::new()),
         }
     }
 

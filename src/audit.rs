@@ -1,6 +1,6 @@
-//! Per-tenant audit log (PROTOCOL.md §5.3).
+//! Per-vault audit log (PROTOCOL.md §5.3).
 //!
-//! Append-only SQLite at `<state>/tenants/<vid>/audit.db`. Records every
+//! Append-only SQLite at `<state>/vaults/<vid>/audit.db`. Records every
 //! op lifecycle event — pending creation, terminal decision, cache-hit
 //! auto-forward. Only operational metadata (service / method / path /
 //! status / timestamps / credential_id); **no secret values, request
@@ -8,8 +8,8 @@
 //! file at the same trust level as a web-server access log — useful for
 //! "what did my agent do" without needing SUDP-grade encryption.
 //!
-//! Per-tenant DB (one file per vault) is the spec's isolation guarantee
-//! (PROTOCOL.md §5.3 "跨 tenant 永远隔离"). Connections cached lazily in
+//! Per-vault DB (one file per vault) is the spec's isolation guarantee
+//! (PROTOCOL.md §5.3 "跨 vault 永远隔离"). Connections cached lazily in
 //! `AuditRegistry`.
 
 use std::collections::HashMap;
@@ -20,7 +20,7 @@ use rusqlite::{params, Connection};
 use serde::Serialize;
 
 use crate::error::{AppError, Result};
-use crate::storage::TenantDir;
+use crate::storage::VaultDir;
 
 // ── Status vocabulary ────────────────────────────────────────────────────
 //
@@ -353,46 +353,46 @@ impl AuditStore {
     }
 }
 
-/// Per-tenant `AuditStore` cache. Lazy-init on first `for_tenant` call —
-/// no DB file exists until that tenant's first op writes audit.
+/// Per-vault `AuditStore` cache. Lazy-init on first `for_vault` call —
+/// no DB file exists until that vault's first op writes audit.
 pub struct AuditRegistry {
-    tenants: TenantDir,
+    vaults: VaultDir,
     stores: Mutex<HashMap<String, Arc<AuditStore>>>,
 }
 
 impl AuditRegistry {
-    pub fn new(tenants: TenantDir) -> Self {
+    pub fn new(vaults: VaultDir) -> Self {
         Self {
-            tenants,
+            vaults,
             stores: Mutex::new(HashMap::new()),
         }
     }
 
-    pub fn for_tenant(&self, tenant_id: &str) -> Result<Arc<AuditStore>> {
+    pub fn for_vault(&self, vault_id: &str) -> Result<Arc<AuditStore>> {
         {
             let stores = self.stores.lock().unwrap();
-            if let Some(s) = stores.get(tenant_id) {
+            if let Some(s) = stores.get(vault_id) {
                 return Ok(s.clone());
             }
         }
-        // Open outside the lock so a slow disk doesn't block other tenants.
-        let db_path = self.tenants.audit_path(tenant_id)?;
+        // Open outside the lock so a slow disk doesn't block other vaults.
+        let db_path = self.vaults.audit_path(vault_id)?;
         let store = Arc::new(AuditStore::open(&db_path)?);
         let mut stores = self.stores.lock().unwrap();
         // Race: another thread may have inserted in the meantime — keep theirs.
-        if let Some(existing) = stores.get(tenant_id) {
+        if let Some(existing) = stores.get(vault_id) {
             return Ok(existing.clone());
         }
-        stores.insert(tenant_id.to_string(), store.clone());
+        stores.insert(vault_id.to_string(), store.clone());
         Ok(store)
     }
 
-    /// Drop the cached `AuditStore` handle for a tenant. Used during
-    /// admin-driven tenant deletion so the SQLite connection is closed
+    /// Drop the cached `AuditStore` handle for a vault. Used during
+    /// admin-driven vault deletion so the SQLite connection is closed
     /// before we `rm -rf` the directory it points at. Idempotent.
-    pub fn forget(&self, tenant_id: &str) {
+    pub fn forget(&self, vault_id: &str) {
         let mut stores = self.stores.lock().unwrap();
-        stores.remove(tenant_id);
+        stores.remove(vault_id);
     }
 }
 

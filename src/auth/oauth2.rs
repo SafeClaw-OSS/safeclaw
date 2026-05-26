@@ -115,7 +115,7 @@ pub async fn refresh_token(
     Ok((access_token, now_secs + expires_in))
 }
 
-/// Multi-tenant SaaS daemon's refresh-on-use entry point. Same wire
+/// Multi-vault SaaS daemon's refresh-on-use entry point. Same wire
 /// behavior as `refresh_token` (which takes the legacy AuthConfig
 /// blob), but accepts inputs as primitive params so callers can mix
 /// per-vault state (the refresh_token, from `cache.entries`) with

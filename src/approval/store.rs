@@ -26,7 +26,7 @@ pub enum ApprovalStatus {
 #[derive(Debug, Clone)]
 pub struct ApprovalRecord {
     pub id: String,
-    pub tenant_id: String,
+    pub vault_id: String,
     pub op: Operation,
     /// Challenge `r` issued by the custodian when this op was created. Returned
     /// to U via `GET /op/{op_id}` so U can compute β = H(domain ‖ r ‖ H(o))
@@ -41,6 +41,10 @@ pub struct ApprovalRecord {
     /// `GET /op/{op_id}` responses so the UI can render a countdown.
     pub expires_at_unix: u64,
     pub ttl: Duration,
+    /// Number of failed `POST /op/{id}/approve` attempts (passkey verify
+    /// failed, wrong grant, etc.). Auto-rejects the op at MAX_APPROVE_ATTEMPTS
+    /// to prevent brute-force on expensive crypto operations.
+    pub fail_count: u32,
     /// Policy decision context captured when the op was created. Used by
     /// approve.rs to write into the rule-approvals cache after a
     /// successful Use op — so the `ask`-with-TTL semantic kicks in on the
@@ -74,6 +78,11 @@ impl ApprovalRecord {
 /// Default TTL for approvals. Demo v0 = 5 minutes.
 pub const DEFAULT_TTL: Duration = Duration::from_secs(300);
 
+/// Maximum consecutive failed approve attempts before the op is auto-rejected.
+/// Generous enough that a legitimate user never hits it, but blocks brute-force
+/// on the computationally-expensive ECDSA verify + AEAD decrypt path.
+pub const MAX_APPROVE_ATTEMPTS: u32 = 10;
+
 #[derive(Default)]
 pub struct ApprovalStore {
     inner: HashMap<String, ApprovalRecord>,
@@ -85,8 +94,8 @@ impl ApprovalStore {
     }
 
     /// Create a new pending approval. Returns the new approval id.
-    pub fn create(&mut self, tenant_id: String, op: Operation, r: String) -> String {
-        self.create_with_policy(tenant_id, op, r, None)
+    pub fn create(&mut self, vault_id: String, op: Operation, r: String) -> String {
+        self.create_with_policy(vault_id, op, r, None)
     }
 
     /// Same as [`create`] but stashes the policy-decision context that led
@@ -94,7 +103,7 @@ impl ApprovalStore {
     /// (export, write, lifecycle) pass `None`.
     pub fn create_with_policy(
         &mut self,
-        tenant_id: String,
+        vault_id: String,
         op: Operation,
         r: String,
         policy_context: Option<PolicyContext>,
@@ -106,7 +115,7 @@ impl ApprovalStore {
             .unwrap_or(0);
         let rec = ApprovalRecord {
             id: id.clone(),
-            tenant_id,
+            vault_id,
             op,
             r,
             status: ApprovalStatus::Pending,
@@ -115,6 +124,7 @@ impl ApprovalStore {
             expires_at_unix: now_unix + DEFAULT_TTL.as_secs(),
             ttl: DEFAULT_TTL,
             policy_context,
+            fail_count: 0,
         };
         self.inner.insert(id.clone(), rec);
         id
@@ -161,6 +171,22 @@ impl ApprovalStore {
         v
     }
 
+    /// Increment the failure counter for `id`. If the counter reaches
+    /// `MAX_APPROVE_ATTEMPTS`, auto-rejects the op and returns `true` so
+    /// the caller can emit an audit event / SSE notification.
+    pub fn record_failure(&mut self, id: &str) -> bool {
+        if let Some(rec) = self.inner.get_mut(id) {
+            rec.fail_count += 1;
+            if rec.fail_count >= MAX_APPROVE_ATTEMPTS {
+                rec.status = ApprovalStatus::Rejected {
+                    reason: "too many failed approve attempts".into(),
+                };
+                return true;
+            }
+        }
+        false
+    }
+
     /// Drop expired and consumed records.
     pub fn cleanup(&mut self) {
         self.inner.retain(|_, r| {
@@ -182,7 +208,7 @@ mod tests {
                 scope: serde_json::Value::Null,
             },
             bind: Bind {
-                redeemer: "tenant1".into(),
+                redeemer: "vault1".into(),
                 recipient: None,
             },
             valid: Valid::single_use(0, None),
@@ -195,7 +221,7 @@ mod tests {
     #[test]
     fn create_approve_consume() {
         let mut s = ApprovalStore::new();
-        let id = s.create("tenant1".into(), fake_op(), "fake_r".into());
+        let id = s.create("vault1".into(), fake_op(), "fake_r".into());
         assert!(matches!(s.get(&id).unwrap().status, ApprovalStatus::Pending));
         s.approve(&id, Some("secret".into()));
         assert!(matches!(
@@ -215,7 +241,7 @@ mod tests {
     #[test]
     fn reject_blocks_consume() {
         let mut s = ApprovalStore::new();
-        let id = s.create("tenant1".into(), fake_op(), "fake_r".into());
+        let id = s.create("vault1".into(), fake_op(), "fake_r".into());
         s.reject(&id, "user denied");
         assert!(s.consume(&id).is_none());
     }

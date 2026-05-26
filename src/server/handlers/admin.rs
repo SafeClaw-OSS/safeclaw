@@ -1,6 +1,6 @@
 //! `/admin/*` — operator-driven endpoints that bypass normal vault auth.
 //!
-//! Today: `DELETE /admin/tenants/{vid}` to nuke a tenant for SaaS-side
+//! Today: `DELETE /admin/vaults/{vid}` to nuke a vault for SaaS-side
 //! demo-data cleanup. The SaaS pro-backend is the only caller — it
 //! resolves which vaults are demo (`auth.users.is_anonymous = true`) and
 //! batches calls here. Each request must carry `X-Admin-Key: <secret>`
@@ -50,12 +50,12 @@ fn check_admin_key(state: &AppState, headers: &HeaderMap) -> Result<()> {
     }
 }
 
-/// `DELETE /admin/tenants/{vid}` — nuke a tenant's daemon-side state.
+/// `DELETE /admin/vaults/{vid}` — nuke a vault's daemon-side state.
 ///
-/// Idempotent — non-existent tenant returns ok with `existed: false`.
+/// Idempotent — non-existent vault returns ok with `existed: false`.
 /// Always returns 200 on auth + valid id; the body tells the caller
 /// what actually happened.
-pub async fn delete_tenant(
+pub async fn delete_vault(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(vault_id): Path<String>,
@@ -72,16 +72,16 @@ pub async fn delete_tenant(
     }
 
     // 2. Close the audit SQLite handle (if any) before deleting its
-    //    backing file. AuditRegistry::forget is a no-op for tenants
+    //    backing file. AuditRegistry::forget is a no-op for vaults
     //    that never opened.
     state.audits.forget(&vault_id);
 
-    // 3. rm -rf the tenant directory. `tenants.remove` is itself
+    // 3. rm -rf the vault directory. `vaults.remove` is itself
     //    idempotent; existed is captured beforehand for diagnostics.
-    let existed = state.tenants.dir_for(&vault_id)?.exists();
-    state.tenants.remove(&vault_id)?;
+    let existed = state.vaults.dir_for(&vault_id)?.exists();
+    state.vaults.remove(&vault_id)?;
 
-    tracing::info!(vault = %vault_id, existed, "admin: tenant deleted");
+    tracing::info!(vault = %vault_id, existed, "admin: vault deleted");
 
     Ok(Json(json!({
         "ok": true,
@@ -109,7 +109,7 @@ mod tests {
             admin_key: key.map(|s| s.to_string()),
         };
         let _ = std::fs::create_dir_all(&cfg.state_dir);
-        let _ = std::fs::create_dir_all(cfg.state_dir.join("tenants"));
+        let _ = std::fs::create_dir_all(cfg.state_dir.join("vaults"));
         // Suppress unused warnings; the AppState constructor reads cfg fields.
         let _ = &mut cfg;
         AppState::new(cfg)

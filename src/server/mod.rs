@@ -26,11 +26,16 @@ pub mod handlers;
 use std::sync::Arc;
 
 use axum::{
+    extract::DefaultBodyLimit,
     routing::{delete, get, post},
     Router,
 };
 
 use crate::state::AppState;
+
+/// Maximum request body size for all admin endpoints.
+/// 256 KB is ample for any legitimate operation descriptor or grant.
+const MAX_BODY_BYTES: usize = 256 * 1024;
 
 pub fn admin_router(state: Arc<AppState>) -> Router {
     let mut router = Router::new()
@@ -51,9 +56,22 @@ pub fn admin_router(state: Arc<AppState>) -> Router {
         .route("/op/{op_id}", get(handlers::approve::get_op))
         .route("/op/{op_id}/approve", post(handlers::approve::approve_op))
         .route("/op/{op_id}/reject", post(handlers::approve::reject_op))
+        // CLI auth page (embedded static — no daemon state needed).
+        // See `[[cli-implementation]]` Phase 2 + the doc comment in
+        // `handlers::cli_auth` for the WebAuthn flow.
+        .route("/cli/auth", get(handlers::cli_auth::index))
+        .route("/cli/auth/main.js", get(handlers::cli_auth::main_js))
+        .route("/cli/auth/sudp/bytes.js", get(handlers::cli_auth::sudp_bytes))
+        .route("/cli/auth/sudp/canonical.js", get(handlers::cli_auth::sudp_canonical))
+        .route("/cli/auth/sudp/hash.js", get(handlers::cli_auth::sudp_hash))
+        .route("/cli/auth/sudp/aad.js", get(handlers::cli_auth::sudp_aad))
+        .route("/cli/auth/sudp/binding.js", get(handlers::cli_auth::sudp_binding))
+        .route("/cli/auth/sudp/kdf.js", get(handlers::cli_auth::sudp_kdf))
+        .route("/cli/auth/sudp/webauthn.js", get(handlers::cli_auth::sudp_webauthn))
         // Admin (X-Admin-Key gated; off when SAFECLAW_ADMIN_KEY unset).
-        .route("/admin/tenants/{vid}", delete(handlers::admin::delete_tenant))
+        .route("/admin/vaults/{vid}", delete(handlers::admin::delete_vault))
         .with_state(state);
+    router = router.layer(DefaultBodyLimit::max(MAX_BODY_BYTES));
     if let Some(cors) = cors::build_cors() {
         router = router.layer(cors);
     }

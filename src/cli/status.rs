@@ -23,7 +23,7 @@ pub async fn run(args: StatusArgs) -> Result<(), String> {
         .await
         .map_err(|e| format!("parse response: {}", e))?;
 
-    // Expected shape: {"ok": true, "name": "safeclaw", "version": "...", "tenant_count": N}
+    // Expected shape: {"ok": true, "name": "safeclaw", "version": "...", "vault_count": N}
     if !status.is_success() {
         return Err(format!(
             "daemon returned HTTP {}: {}",
@@ -33,11 +33,11 @@ pub async fn run(args: StatusArgs) -> Result<(), String> {
     }
     let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("?");
     let version = body.get("version").and_then(|v| v.as_str()).unwrap_or("?");
-    let tenants = body.get("tenant_count").and_then(|v| v.as_u64()).unwrap_or(0);
+    let vaults = body.get("vault_count").and_then(|v| v.as_u64()).unwrap_or(0);
     println!("safeclaw — daemon ok");
     println!("  url:     {}", args.daemon);
     println!("  name:    {}", name);
     println!("  version: {}", version);
-    println!("  tenants: {}", tenants);
+    println!("  vaults:  {}", vaults);
     Ok(())
 }

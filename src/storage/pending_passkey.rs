@@ -31,7 +31,7 @@
 //!
 //! ## Storage
 //!
-//! `tenants/{vid}/pending-passkeys/{cid_filename}.json` — one file per
+//! `vaults/{vid}/pending-passkeys/{cid_filename}.json` — one file per
 //! pending credential. `cid_filename` is the URL-safe base64url cid
 //! (already filename-safe by construction since we standardized on
 //! base64url-no-pad in commit ca2ffd2 / c382eac).
@@ -47,7 +47,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{AppError, Result};
-use crate::storage::tenant_dir::TenantDir;
+use crate::storage::vault_dir::VaultDir;
 
 /// Wall-clock TTL for a pending-passkey file. After this, Stage 2
 /// `load_and_consume` returns `NotFound` and the opportunistic GC
@@ -104,8 +104,8 @@ impl PendingPasskey {
 
 /// Write or overwrite a pending-passkey deposit for this vault. Existing
 /// records for the same cid are replaced (idempotent retries are fine).
-pub fn put(tenants: &TenantDir, vault_id: &str, pending: &PendingPasskey) -> Result<()> {
-    let dir = ensure_dir(tenants, vault_id)?;
+pub fn put(vaults: &VaultDir, vault_id: &str, pending: &PendingPasskey) -> Result<()> {
+    let dir = ensure_dir(vaults, vault_id)?;
     let path = dir.join(filename_for(&pending.credential_id));
     let body = serde_json::to_vec_pretty(pending)
         .map_err(|e| AppError::Internal(format!("serialize pending: {}", e)))?;
@@ -122,11 +122,11 @@ pub fn put(tenants: &TenantDir, vault_id: &str, pending: &PendingPasskey) -> Res
 /// or `NotFound` if the file's missing / expired / malformed (the
 /// expired branch also deletes).
 pub fn load_and_consume(
-    tenants: &TenantDir,
+    vaults: &VaultDir,
     vault_id: &str,
     credential_id: &str,
 ) -> Result<PendingPasskey> {
-    let dir = tenants.pending_passkeys_dir(vault_id)?;
+    let dir = vaults.pending_passkeys_dir(vault_id)?;
     let path = dir.join(filename_for(credential_id));
     let bytes = match fs::read(&path) {
         Ok(b) => b,
@@ -149,8 +149,8 @@ pub fn load_and_consume(
 /// List all non-expired pending-passkey deposits for this vault. Side
 /// effect: deletes any expired files encountered (opportunistic GC, same
 /// pattern as the audit prune in approvals.rs).
-pub fn list(tenants: &TenantDir, vault_id: &str) -> Result<Vec<PendingPasskey>> {
-    let dir = tenants.pending_passkeys_dir(vault_id)?;
+pub fn list(vaults: &VaultDir, vault_id: &str) -> Result<Vec<PendingPasskey>> {
+    let dir = vaults.pending_passkeys_dir(vault_id)?;
     if !dir.exists() {
         return Ok(Vec::new());
     }
@@ -184,8 +184,8 @@ pub fn list(tenants: &TenantDir, vault_id: &str) -> Result<Vec<PendingPasskey>> 
     Ok(out)
 }
 
-fn ensure_dir(tenants: &TenantDir, vault_id: &str) -> Result<PathBuf> {
-    let dir = tenants.pending_passkeys_dir(vault_id)?;
+fn ensure_dir(vaults: &VaultDir, vault_id: &str) -> Result<PathBuf> {
+    let dir = vaults.pending_passkeys_dir(vault_id)?;
     fs::create_dir_all(&dir)
         .map_err(|e| AppError::Internal(format!("mkdir pending: {}", e)))?;
     Ok(dir)

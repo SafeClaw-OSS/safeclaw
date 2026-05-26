@@ -136,7 +136,7 @@ pub async fn create(
         ct: body.ct,
         created_at: now,
     };
-    put(&state.tenants, &vault_id, &pending)?;
+    put(&state.vaults, &vault_id, &pending)?;
 
     tracing::info!(
         vault = %vault_id,

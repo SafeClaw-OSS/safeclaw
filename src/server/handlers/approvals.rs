@@ -76,8 +76,8 @@ pub async fn list(
         }),
     };
 
-    // No tenant audit DB yet = vault never had any op = empty list.
-    let store = match state.audits.for_tenant(&vault_id) {
+    // No vault audit DB yet = vault never had any op = empty list.
+    let store = match state.audits.for_vault(&vault_id) {
         Ok(s) => s,
         Err(_) => return Ok(Json(json!({ "entries": [], "next_since": null }))),
     };

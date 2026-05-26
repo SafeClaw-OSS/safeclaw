@@ -10,6 +10,8 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use zeroize::Zeroize as _;
+
 use axum::{
     extract::{Path, State},
     Json,
@@ -50,6 +52,18 @@ pub async fn get_op(
 ) -> Result<Json<Value>> {
     let store = state.approvals.lock().unwrap();
     let rec = store.get(&op_id).ok_or(AppError::NotFound)?;
+    // Consumed ops: the approve window is closed. Return a minimal tombstone
+    // — no op content — to limit the exposure window for the agent request
+    // body and upstream URL that live in op.act.scope. The op_id's 122-bit
+    // entropy is the access-control mechanism for in-flight ops; once the
+    // op is consumed, that window should close.
+    if matches!(rec.status, ApprovalStatus::Consumed) {
+        return Ok(Json(json!({
+            "op_id": rec.id,
+            "status": "consumed",
+        })));
+    }
+
     let act_kind = discriminator(&rec.op.act);
     let display = render_operation(&rec.op);
     let path = match &rec.op.act.kind {
@@ -61,7 +75,7 @@ pub async fn get_op(
         ApprovalStatus::Pending => ("pending", None),
         ApprovalStatus::Approved => ("approved", rec.cached_value.clone()),
         ApprovalStatus::Rejected { .. } => ("rejected", None),
-        ApprovalStatus::Consumed => ("consumed", None),
+        ApprovalStatus::Consumed => unreachable!("handled above"),
     };
     Ok(Json(json!({
         "op_id": rec.id,
@@ -90,7 +104,10 @@ pub async fn approve_op(
         if !matches!(rec.status, ApprovalStatus::Pending) {
             return Err(AppError::Conflict("op not pending".into()));
         }
-        (rec.tenant_id.clone(), rec.op.clone())
+        if rec.fail_count >= crate::approval::store::MAX_APPROVE_ATTEMPTS {
+            return Err(AppError::TooManyRequests);
+        }
+        (rec.vault_id.clone(), rec.op.clone())
     };
 
     // 2. grant.o must equal the stored op (canonical equality).
@@ -102,26 +119,64 @@ pub async fn approve_op(
         ));
     }
 
-    // 3. Resolve credential pubkey lookup.
+    // 3. Serialize vault reads/writes per vault (F-17).
+    // Two concurrent approve calls on the same vault both read the same
+    // on-disk state and race to write_atomic — the second rename wins
+    // silently. This per-vault async mutex ensures the full read-validate-
+    // write cycle is atomic per vault without blocking unrelated vaults.
+    let vault_write_lock = {
+        let mut locks = state.vault_write_locks.lock().unwrap();
+        Arc::clone(
+            locks
+                .entry(vault_id.clone())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+        )
+    };
+    let _vault_write_guard = vault_write_lock.lock().await;
+
+    // 3b. Resolve credential pubkey lookup.
     //
     // For Enroll, the credential is brand-new (not in vault yet) — pubkey is
     // taken from the op's scope. For Write/Export/Use, the credential must be
     // already enrolled — look it up in the existing vault.
-    let vault_path = state.tenants.vault_path(&vault_id)?;
+    let vault_path = state.vaults.vault_path(&vault_id)?;
     let existing_vault = read_vault(&vault_path)?;
     let lookup_credential = |cred_id_b64: &str| -> Option<PasskeyEntry> {
         existing_vault.as_ref().and_then(|v| find_pubkey(v, cred_id_b64))
     };
     let validated = {
-        let mut chs = state.challenges.lock().unwrap();
-        validate_grant(
-            &grant,
-            &mut chs,
-            &state.config.origin,
-            &state.config.rp_id,
-            lookup_credential,
-        )?
+        let result = {
+            let mut chs = state.challenges.lock().unwrap();
+            validate_grant(
+                &grant,
+                &mut chs,
+                &state.config.origin,
+                &state.config.rp_id,
+                lookup_credential,
+            )
+        };
+        match result {
+            Ok(v) => v,
+            Err(e) => {
+                // Track failure; auto-reject op if limit reached.
+                let auto_rejected = state.approvals.lock().unwrap().record_failure(&op_id);
+                if auto_rejected {
+                    tracing::warn!(op = %op_id, "op auto-rejected after too many failed approve attempts");
+                }
+                return Err(e);
+            }
+        }
     };
+
+    // 3b. Verify bind.redeemer matches the vault this op was created for.
+    // SUDP §4 binds an op to a specific custodian/vault via bind.redeemer;
+    // failing to check this would let a grant authorized for vault A be
+    // submitted against vault B's approve endpoint.
+    if validated.op.bind.redeemer != vault_id {
+        return Err(AppError::Unauthorized(
+            "grant.o.bind.redeemer does not match vault".into(),
+        ));
+    }
 
     // 4. Act dispatch — same logic that previously lived in grant.rs.
     // Captured here for the audit row finalize at the bottom (Use's upstream
@@ -164,7 +219,7 @@ pub async fn approve_op(
                 .to_string();
             // Pop the pending file (single-use, deleted on read).
             let pending = crate::storage::pending_passkey::load_and_consume(
-                &state.tenants,
+                &state.vaults,
                 &vault_id,
                 &new_cid_str,
             )
@@ -223,6 +278,9 @@ pub async fn approve_op(
             };
             let wrapped_for_new = Wrap::wrap(&new_w_c, &opened.k[..], &binding)
                 .map_err(|e| AppError::Internal(format!("wrap K under new W_c: {}", e)))?;
+            // W_c for the new credential is no longer needed — zeroize immediately.
+            let mut new_w_c = new_w_c;
+            new_w_c.zeroize();
             // Append to credentials + registry, using the (x, y, prf_salt,
             // device_name) we just popped from the pending file.
             let mut updated = vault.clone();
@@ -283,7 +341,7 @@ pub async fn approve_op(
                 wrapped_key,
                 ciphertext,
             )?;
-            state.tenants.ensure_dir(&vault_id)?;
+            state.vaults.ensure_dir(&vault_id)?;
             write_atomic(&vault_path, &vault)?;
             tracing::info!(vault = %vault_id, "vault enroll complete");
             // Auto-unlock after Enroll: the user just proved their passkey,
@@ -574,7 +632,7 @@ pub async fn approve_op(
                 tracing::info!(vault = %vault_id, "vault locked");
                 (json!({ "ok": true, "act": "vault-lock" }), None)
             }
-            // Lifecycle op: wipe the tenant's on-disk state (vault.dat +
+            // Lifecycle op: wipe the vault's on-disk state (vault.dat +
             // any sibling blob files) and clear the in-memory locked/
             // unlocked entry. Passkey-gated through the standard grant
             // machinery so a stolen session token can't destroy data. Once
@@ -584,7 +642,7 @@ pub async fn approve_op(
                 if existing_vault.is_none() {
                     return Err(AppError::Conflict("vault not initialized".into()));
                 }
-                state.tenants.remove(&vault_id).map_err(|e| {
+                state.vaults.remove(&vault_id).map_err(|e| {
                     AppError::Internal(format!("vault dir remove: {}", e))
                 })?;
                 {
@@ -696,7 +754,7 @@ pub async fn approve_op(
         } else {
             None
         };
-        (rec.id.clone(), rec.tenant_id.clone(), preview, pc)
+        (rec.id.clone(), rec.vault_id.clone(), preview, pc)
     };
 
     // Cache write: an Ask-level approval scopes a TTL'd "next matching
@@ -728,7 +786,7 @@ pub async fn approve_op(
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    if let Ok(store) = state.audits.for_tenant(&rec_vault_id) {
+    if let Ok(store) = state.audits.for_vault(&rec_vault_id) {
         if let Err(e) = store.finalize(
             &op_id,
             STATUS_APPROVED,
@@ -742,7 +800,7 @@ pub async fn approve_op(
     }
 
     state.emit_event(ApprovalEvent {
-        tenant_id: rec_vault_id,
+        vault_id: rec_vault_id,
         approval_id: rec_id,
         kind: "approved".into(),
         op_summary: None,
@@ -762,7 +820,7 @@ pub async fn reject_op(
         let rec = store
             .reject(&op_id, "user denied")
             .ok_or(AppError::NotFound)?;
-        (rec.id.clone(), rec.tenant_id.clone())
+        (rec.id.clone(), rec.vault_id.clone())
     };
 
     // Audit: pending → rejected.
@@ -770,14 +828,14 @@ pub async fn reject_op(
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    if let Ok(store) = state.audits.for_tenant(&rec_vault_id) {
+    if let Ok(store) = state.audits.for_vault(&rec_vault_id) {
         if let Err(e) = store.finalize(&op_id, STATUS_REJECTED, now, None, Some("user denied"), None) {
             tracing::warn!(vault = %rec_vault_id, op = %op_id, "audit finalize rejected failed: {}", e);
         }
     }
 
     state.emit_event(ApprovalEvent {
-        tenant_id: rec_vault_id,
+        vault_id: rec_vault_id,
         approval_id: rec_id.clone(),
         kind: "rejected".into(),
         op_summary: None,

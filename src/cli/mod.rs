@@ -4,4 +4,7 @@
 //! because handlers are the daemon's HTTP request side; this is the
 //! client side. Same binary, different mode.
 
+pub mod login;
+pub mod profile;
 pub mod status;
+pub mod unlock;

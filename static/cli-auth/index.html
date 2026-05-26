@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SafeClaw — CLI auth</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body {
+      font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      max-width: 36rem; margin: 4rem auto; padding: 1rem;
+      line-height: 1.5;
+    }
+    h1 { font-size: 1.25rem; margin: 0 0 0.5rem; }
+    .muted { color: #6b7280; font-size: 0.9rem; }
+    .card {
+      border: 1px solid #e5e7eb; border-radius: 8px; padding: 1.25rem;
+      margin: 1rem 0;
+    }
+    button {
+      font: inherit; padding: 0.5rem 1rem; border-radius: 6px;
+      border: 1px solid currentColor; background: transparent; cursor: pointer;
+    }
+    button[disabled] { opacity: 0.5; cursor: not-allowed; }
+    .status { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.85rem; white-space: pre-wrap; }
+    .ok { color: #15803d; }
+    .err { color: #b91c1c; }
+    .row { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; }
+    @media (prefers-color-scheme: dark) {
+      .card { border-color: #374151; }
+      .muted { color: #9ca3af; }
+    }
+  </style>
+</head>
+<body>
+  <h1>SafeClaw — CLI authorisation</h1>
+  <p class="muted">
+    This page is served by your SafeClaw daemon. It runs the passkey ceremony
+    locally and sends the result back to the CLI that opened it.
+  </p>
+
+  <div class="card">
+    <div id="summary" class="row">
+      <strong id="op-label">…</strong>
+      <span class="muted" id="vault-label"></span>
+    </div>
+    <div class="row" style="margin-top: 1rem">
+      <button id="go-btn" disabled>Authorize</button>
+      <button id="cancel-btn">Cancel</button>
+    </div>
+    <p id="status" class="status muted" style="margin-top: 0.75rem">Loading…</p>
+  </div>
+
+  <p class="muted">
+    No data is uploaded anywhere — the passkey ceremony stays between your
+    authenticator, this page, and the daemon at <code id="daemon-origin"></code>.
+  </p>
+
+  <script type="module" src="./main.js"></script>
+</body>
+</html>

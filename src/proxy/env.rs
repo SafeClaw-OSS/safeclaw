@@ -63,7 +63,7 @@ pub async fn handle(
     };
 
     state.emit_event(ApprovalEvent {
-        tenant_id: vault_id,
+        vault_id: vault_id,
         approval_id: op_id.clone(),
         kind: "pending".into(),
         op_summary: Some(serde_json::to_value(&op).unwrap_or(Value::Null)),

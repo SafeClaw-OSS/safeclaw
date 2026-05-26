@@ -22,6 +22,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 e.into()
             })
         }
+        Command::Login(args) => {
+            cli::login::run(args).await.map_err(|e| -> Box<dyn std::error::Error> {
+                eprintln!("safeclaw login: {}", e);
+                e.into()
+            })
+        }
+        Command::Unlock(args) => {
+            cli::unlock::run_unlock(args).await.map_err(|e| -> Box<dyn std::error::Error> {
+                eprintln!("safeclaw unlock: {}", e);
+                e.into()
+            })
+        }
+        Command::Lock(args) => {
+            cli::unlock::run_lock(args).await.map_err(|e| -> Box<dyn std::error::Error> {
+                eprintln!("safeclaw lock: {}", e);
+                e.into()
+            })
+        }
         Command::Version => {
             println!("safeclaw {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -40,7 +58,7 @@ async fn run_daemon(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::from_serve_args(args);
 
     std::fs::create_dir_all(&config.state_dir)?;
-    std::fs::create_dir_all(config.state_dir.join("tenants"))?;
+    std::fs::create_dir_all(config.state_dir.join("vaults"))?;
 
     let state = Arc::new(AppState::new(config.clone()));
 

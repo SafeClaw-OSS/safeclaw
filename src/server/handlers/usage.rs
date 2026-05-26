@@ -1,6 +1,6 @@
 //! `GET /v/{vid}/usage` — billable-Use aggregate over a time window.
 //!
-//! Reads straight from the per-tenant audit log; no separate counter
+//! Reads straight from the per-vault audit log; no separate counter
 //! state. Same SSoT used by the approvals listing and retention prune.
 //!
 //! Auth: this endpoint is *daemon-perimeter* (no token check here). In the
@@ -54,7 +54,7 @@ pub async fn usage(
             "since must be strictly less than until".into(),
         ));
     }
-    let store = state.audits.for_tenant(&vault_id)?;
+    let store = state.audits.for_vault(&vault_id)?;
     let (total, by_service) = store.aggregate_usage(q.since, until)?;
     let body = UsageResponse {
         since: q.since,

@@ -125,7 +125,7 @@ async fn handle_impl(
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
-        if let Ok(store) = state.audits.for_tenant(&vault_id) {
+        if let Ok(store) = state.audits.for_vault(&vault_id) {
             let row = ApprovalRow {
                 id: Uuid::new_v4().to_string(),
                 created_at: now,
@@ -187,7 +187,7 @@ async fn handle_impl(
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
-        if let Ok(store) = state.audits.for_tenant(&vault_id) {
+        if let Ok(store) = state.audits.for_vault(&vault_id) {
             let row = ApprovalRow {
                 id: Uuid::new_v4().to_string(),
                 created_at: now,
@@ -295,7 +295,7 @@ async fn handle_impl(
 
     // Persist `pending` audit row (mirror of op.rs::create path; this is the
     // /use sugar variant that wraps op-create internally).
-    if let Ok(audit_store) = state.audits.for_tenant(&vault_id) {
+    if let Ok(audit_store) = state.audits.for_vault(&vault_id) {
         let row = audit::row_from_op(&op_id, &op, now as i64, expires_at as i64);
         if let Err(e) = audit_store.insert(&row) {
             tracing::warn!(vault = %vault_id, op = %op_id, "audit insert pending (use) failed: {}", e);
@@ -303,7 +303,7 @@ async fn handle_impl(
     }
 
     state.emit_event(ApprovalEvent {
-        tenant_id: vault_id,
+        vault_id: vault_id,
         approval_id: op_id.clone(),
         kind: "pending".into(),
         op_summary: Some(serde_json::to_value(&op).unwrap_or(Value::Null)),

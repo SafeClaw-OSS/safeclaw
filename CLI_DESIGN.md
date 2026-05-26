@@ -15,7 +15,7 @@
 - One binary (`safeclaw`) does everything — daemon mode and CLI mode. Same artifact, no separate client install.
 - A new OSS user can go from `cargo install` to "my agent is calling OpenAI through my locally-sealed vault" in three commands.
 - Vault ops are passkey-gated end-to-end. The CLI never sees plaintext credentials except where it's intrinsic to the operation (e.g., `write` reads the value off stdin, sends to daemon under passkey-bound op).
-- Multi-tenant aware. Defaults are coherent for the 1-user-1-vault case; extra flags let power users address specific vaults.
+- Multi-vault aware. Defaults are coherent for the 1-user-1-vault case; extra flags let power users address specific vaults.
 - Mainstream conventions: subcommand UX (`docker`, `git`, `gh`), `--help` at every level, machine-readable `--json` output, config from `~/.config/safeclaw/`.
 
 ### Non-goals
@@ -66,7 +66,7 @@ Default context is `local`. `safeclaw context use work` switches sticky. Most us
 
 ### State layout (daemon side, unchanged)
 
-`SAFECLAW_STATE_DIR` (today: `./state`), with `tenants/<vault-id>/vault.dat` per the existing multi-tenant model.
+`SAFECLAW_STATE_DIR` (today: `./state`), with `vaults/<vault-id>/vault.dat` per the existing multi-vault model.
 
 ---
 
@@ -124,7 +124,7 @@ safeclaw stores add gcp --project-id ... --sa-json @path/to/sa.json
 safeclaw stores remove <id>
 ```
 
-### Multi-tenant (power users)
+### Multi-vault (power users)
 
 ```
 safeclaw vaults ls
@@ -185,9 +185,9 @@ We considered the OAuth device-code pattern (browser shows code, user types code
 
 ---
 
-## 5. Multi-tenant behavior
+## 5. Multi-vault behavior
 
-**Default behavior matches single-tenant intuition.**
+**Default behavior matches single-vault intuition.**
 
 - `safeclaw setup` creates one vault and writes it as default in config.
 - All subsequent `safeclaw <op>` commands target the default vault, no flag needed.
@@ -263,7 +263,7 @@ Phases 1-5 = MVP. 6 is the differentiator. 7 only when someone actually asks.
 2. **REVIEW — passkey storage on the daemon side, OSS deployment.** Today the SaaS deployment stores passkey public keys in Supabase (`passkeys` table). OSS doesn't have Supabase. Options:
    - (a) Add a SQLite-backed `passkeys` table inside the daemon, alongside audit log. Cleanest.
    - (b) Stuff passkey records into the existing `vault.dat` aux. Already encrypted, no new dep.
-   - (c) Per-tenant `passkeys.json` on disk. Simple.
+   - (c) Per-vault `passkeys.json` on disk. Simple.
    I lean (a) — it's the only one that handles "list passkeys before unlock" cleanly, which `safeclaw setup`/`enroll` paths need.
 
 3. **REVIEW — naming for the headless paste mode page.** `/cli/auth` is what I drafted. Other candidates: `/cli/grant`, `/grant`, `/authorize-cli`. The page exists on the SaaS frontend AND in the OSS-self-host frontend (or do OSS users not get a frontend?). Which brings us to:

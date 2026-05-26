@@ -1,7 +1,7 @@
 //! Service discovery — two endpoints, one shared catalog.
 //!
 //! - `GET /c/menu` — static service catalog. What SafeClaw *supports*,
-//!   tenant-agnostic. Drives /try landing, docs, public browse. No vault
+//!   vault-agnostic. Drives /try landing, docs, public browse. No vault
 //!   state — no `connected`, `vault_entries`, `console_url`.
 //!
 //! - `GET /v/{vid}/registry` — live, per-vault view. Same catalog with

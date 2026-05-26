@@ -42,7 +42,7 @@ pub async fn passkeys(
     Path(vault_id): Path<String>,
 ) -> Result<Json<serde_json::Value>> {
     validate_vault_id(&vault_id)?;
-    let vault_path = state.tenants.vault_path(&vault_id)?;
+    let vault_path = state.vaults.vault_path(&vault_id)?;
     let Some(vault) = crate::storage::sealed_vault::read(&vault_path)? else {
         return Ok(Json(json!({ "vault_exists": false, "passkeys": [] })));
     };
@@ -70,7 +70,7 @@ pub async fn passkeys(
     // list() opportunistically GC-sweeps expired files — that's the only
     // place we know the daemon is actively serving this vault. Failure to
     // list isn't fatal: pending list just renders empty.
-    let pending: Vec<Value> = crate::storage::pending_passkey::list(&state.tenants, &vault_id)
+    let pending: Vec<Value> = crate::storage::pending_passkey::list(&state.vaults, &vault_id)
         .unwrap_or_default()
         .into_iter()
         .map(|p| p.public_metadata())
