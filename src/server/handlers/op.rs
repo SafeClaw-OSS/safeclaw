@@ -59,6 +59,18 @@ pub async fn create(
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     if let Ok(store) = state.audits.for_vault(&vault_id) {
+        // F-22: cap pending ops per vault to prevent SQLite table flooding.
+        const MAX_PENDING_PER_VAULT: i64 = 500;
+        match store.count_pending() {
+            Ok(n) if n >= MAX_PENDING_PER_VAULT => {
+                return Err(AppError::TooManyRequests);
+            }
+            Err(e) => {
+                tracing::warn!(vault = %vault_id, "audit count_pending failed: {}", e);
+                // non-fatal — let the op through rather than blocking legitimate use
+            }
+            _ => {}
+        }
         let row = audit::row_from_op(&op_id, &op, now, expires_at as i64);
         if let Err(e) = store.insert(&row) {
             tracing::warn!(vault = %vault_id, op = %op_id, "audit insert pending failed: {}", e);
