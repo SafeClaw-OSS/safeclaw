@@ -42,13 +42,28 @@ use crate::storage::sealed_vault::{
     build_initial, find_pubkey, read as read_vault, replace_after_write, write_atomic,
 };
 
-/// `GET /op/{op_id}` — unified poll + details.
+/// `GET /op/{op_id}` — content-negotiated.
 ///
-/// Returns the canonical op, render string, status, expires_at, and (when
-/// approved-and-not-yet-consumed) the cached `value`.
+/// Accept: text/html → returns the embedded passkey-ceremony HTML page.
+/// Otherwise → JSON with op details, status, cached value, etc.
 pub async fn get_op(
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     Path(op_id): Path<String>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if super::cli_auth::wants_html(&headers) {
+        return super::cli_auth::op_page_html().await.into_response();
+    }
+    match get_op_json(state, op_id).await {
+        Ok(j) => j.into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+async fn get_op_json(
+    state: Arc<AppState>,
+    op_id: String,
 ) -> Result<Json<Value>> {
     let store = state.approvals.lock().unwrap();
     let rec = store.get(&op_id).ok_or(AppError::NotFound)?;

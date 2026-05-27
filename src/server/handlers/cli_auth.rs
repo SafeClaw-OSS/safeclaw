@@ -16,6 +16,9 @@ use axum::response::IntoResponse;
 const INDEX_HTML: &str = include_str!("../../../static/cli-auth/index.html");
 const MAIN_JS: &str = include_str!("../../../static/cli-auth/main.js");
 
+const OP_PAGE_HTML: &str = include_str!("../../../static/op-page/index.html");
+const OP_PAGE_JS: &str = include_str!("../../../static/op-page/main.js");
+
 // Vendored authorizer dist files. See `static/cli-auth/sudp/VENDOR.md`.
 const SUDP_BYTES: &str = include_str!("../../../static/cli-auth/sudp/bytes.js");
 const SUDP_CANONICAL: &str = include_str!("../../../static/cli-auth/sudp/canonical.js");
@@ -51,6 +54,22 @@ pub async fn index() -> impl IntoResponse {
 
 pub async fn main_js() -> impl IntoResponse {
     js_response(MAIN_JS)
+}
+
+pub async fn op_page_html() -> impl IntoResponse {
+    html_response(OP_PAGE_HTML)
+}
+
+pub async fn op_page_js() -> impl IntoResponse {
+    js_response(OP_PAGE_JS)
+}
+
+pub fn wants_html(headers: &HeaderMap) -> bool {
+    headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.split(',').any(|part| part.trim().starts_with("text/html")))
+        .unwrap_or(false)
 }
 
 pub async fn sudp_bytes() -> impl IntoResponse {

@@ -59,12 +59,16 @@ pub fn admin_router(state: Arc<AppState>) -> Router {
         .route("/v/{vid}/registry", get(handlers::registry::vault_registry))
         .route("/v/{vid}/usage", get(handlers::usage::usage))
         // Op-flat (vault context lives on the approval record).
+        // GET /op/{id} content-negotiates: Accept text/html → passkey
+        // page (OSS auth page), else → JSON poll response.
         .route("/op/{op_id}", get(handlers::approve::get_op))
         .route("/op/{op_id}/approve", post(handlers::approve::approve_op))
         .route("/op/{op_id}/reject", post(handlers::approve::reject_op))
-        // CLI auth page (embedded static — no daemon state needed).
-        // See `[[cli-implementation]]` Phase 2 + the doc comment in
-        // `handlers::cli_auth` for the WebAuthn flow.
+        // New passkey page (minimal — assertion + PRF only, CLI does all crypto).
+        .route("/op-page/main.js", get(handlers::cli_auth::op_page_js))
+        // Legacy CLI auth page (sc unlock / sc lock / sc read / sc vault delete
+        // still open /cli/auth?op=...; kept for backward compat until those
+        // commands are migrated to the /op/{id} flow).
         .route("/cli/auth", get(handlers::cli_auth::index))
         .route("/cli/auth/main.js", get(handlers::cli_auth::main_js))
         .route("/cli/auth/sudp/bytes.js", get(handlers::cli_auth::sudp_bytes))
