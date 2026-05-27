@@ -49,8 +49,6 @@ pub fn admin_router(state: Arc<AppState>) -> Router {
         .route("/health", get(handlers::health::health))
         .route("/pubkey", get(handlers::metadata::pubkey))
         .route("/menu", get(handlers::registry::menu))
-        // Vault bootstrap (create a new vault — vid doesn't exist yet).
-        .route("/v/new", post(handlers::op::create_vault))
         // Vault-scoped.
         .route("/v/{vid}/op", post(handlers::op::create))
         .route("/v/{vid}/passkeys", get(handlers::metadata::passkeys))

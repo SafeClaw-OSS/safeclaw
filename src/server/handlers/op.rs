@@ -102,67 +102,6 @@ pub async fn create(
     })))
 }
 
-/// `POST /v/new` — bootstrap a vault that doesn't exist yet.
-///
-/// Generates a fresh vault id (UUID), creates a pending Enroll op for it,
-/// and returns `{ vault_id, op_id, r, expires_at }`. The caller opens the
-/// browser at `/op/{op_id}` for the WebAuthn `create()` ceremony.
-pub async fn create_vault(
-    State(state): State<Arc<AppState>>,
-    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
-) -> Result<Json<Value>> {
-    let vault_id = uuid::Uuid::new_v4().to_string();
-    std::fs::create_dir_all(
-        state.config.state_dir.join("vaults").join(&vault_id),
-    )
-    .map_err(|e| AppError::Internal(format!("mkdir vault: {}", e)))?;
-
-    let op = Operation {
-        act: crate::protocol::operation::Act {
-            kind: ActType::Enroll,
-            target: String::new(),
-            scope: serde_json::Value::Null,
-        },
-        bind: crate::protocol::operation::Bind {
-            redeemer: vault_id.clone(),
-            recipient: None,
-        },
-        valid: crate::protocol::operation::Valid {
-            iat: now_unix(),
-            exp: None,
-            multiplicity: sudp::operation::Multiplicity::One,
-        },
-    };
-
-    let ip: IpAddr = addr.ip();
-    let r = {
-        let mut store = state.challenges.lock().unwrap();
-        store.issue(ip).ok_or(AppError::TooManyRequests)?
-    };
-    let (op_id, expires_at) = {
-        let mut store = state.approvals.lock().unwrap();
-        let id = store.create(vault_id.clone(), op.clone(), r.clone());
-        let exp = store.get(&id).map(|r| r.expires_at_unix).unwrap_or(0);
-        (id, exp)
-    };
-
-    tracing::info!(vault = %vault_id, op = %op_id, "vault bootstrap: Enroll op created");
-
-    Ok(Json(json!({
-        "vault_id": vault_id,
-        "op_id": op_id,
-        "r": r,
-        "expires_at": expires_at,
-    })))
-}
-
-fn now_unix() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-
 /// Reject op kinds that are broker-plane primitives. Today: `Use`.
 ///
 /// Reasoning: a Use op forwards an upstream HTTP request and is the unit
