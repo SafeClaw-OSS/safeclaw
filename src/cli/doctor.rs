@@ -2,7 +2,7 @@
 //!
 //! Read-only. Reports on:
 //!   - active profile (which custodian + vault)
-//!   - custodian reachability (`/c/health`)
+//!   - custodian reachability (`/health`)
 //!   - whether the vault dir exists on the custodian (vault id resolves)
 //!   - whether `$SAFECLAW_API_KEY` is set (informational only — local
 //!     daemons typically don't need it; SaaS does)
@@ -12,7 +12,7 @@
 
 use std::time::Duration;
 
-use crate::cli::profile::{config_path, load as load_profiles, resolve_active};
+use crate::cli::profile::{config_path, resolve_active};
 use crate::config::ProfileSelectArgs;
 
 #[derive(Debug, Clone, Copy)]
@@ -64,24 +64,23 @@ pub async fn run(args: ProfileSelectArgs) -> Result<(), String> {
         Err(e) => report.push(Mark::Fail, format!("config path: {}", e)),
     }
 
-    // Active profile resolution
+    // Active config resolution
     let resolved = resolve_active(
         args.custodian.as_deref(),
         args.vault.as_deref(),
-        args.profile.as_deref(),
     );
     let (custodian, vault) = match resolved {
         Ok(pair) => {
             report.push(
                 Mark::Ok,
-                format!("profile: custodian={} vault={}", pair.0, pair.1),
+                format!("active: custodian={} vault={}", pair.0, pair.1),
             );
             pair
         }
         Err(e) => {
-            report.push(Mark::Fail, format!("profile: {}", e));
+            report.push(Mark::Fail, format!("active config: {}", e));
             let _ = report.print_and_status();
-            return Err("profile resolution failed".into());
+            return Err("active-config resolution failed".into());
         }
     };
 
@@ -90,7 +89,7 @@ pub async fn run(args: ProfileSelectArgs) -> Result<(), String> {
         .timeout(Duration::from_secs(5))
         .build()
         .map_err(|e| format!("client init: {}", e))?;
-    let health_url = format!("{}/c/health", custodian.trim_end_matches('/'));
+    let health_url = format!("{}/health", custodian.trim_end_matches('/'));
     match client.get(&health_url).send().await {
         Ok(resp) => {
             let status = resp.status();
@@ -178,12 +177,6 @@ pub async fn run(args: ProfileSelectArgs) -> Result<(), String> {
             Mark::Ok,
             "$SAFECLAW_API_KEY: unset (not required for local custodian)",
         ),
-    }
-
-    // Sanity: profile load consistency
-    if let Ok(cfg) = load_profiles() {
-        let n = cfg.profiles.len();
-        report.push(Mark::Ok, format!("profiles: {} configured", n));
     }
 
     let ok = report.print_and_status();

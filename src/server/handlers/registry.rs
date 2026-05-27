@@ -1,6 +1,6 @@
 //! Service discovery — two endpoints, one shared catalog.
 //!
-//! - `GET /c/menu` — static service catalog. What SafeClaw *supports*,
+//! - `GET /menu` — static service catalog. What SafeClaw *supports*,
 //!   vault-agnostic. Drives /try landing, docs, public browse. No vault
 //!   state — no `connected`, `vault_entries`, `console_url`.
 //!
@@ -141,7 +141,7 @@ pub struct RegistryResponse {
 }
 
 /// Per-vault overlay fed into `build_service` so a single rendering path
-/// covers both `/c/menu` (overlay=None) and `/v/{vid}/registry`.
+/// covers both `/menu` (overlay=None) and `/v/{vid}/registry`.
 struct VaultOverlay<'a> {
     /// Item names available to satisfy a service's vault_fields. Includes
     /// native-secrets only — external stores (GCP etc.) require an async
@@ -285,7 +285,7 @@ fn console_url(state: &AppState) -> String {
     format!("{}/vault", state.config.origin.trim_end_matches('/'))
 }
 
-/// `GET /c/menu` — static service catalog.
+/// `GET /menu` — static service catalog.
 pub async fn menu(
     State(state): State<Arc<AppState>>,
     Query(q): Query<RegistryQuery>,

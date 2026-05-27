@@ -61,7 +61,6 @@ async fn drive(op_label: &str, args: UnlockArgs) -> Result<(), String> {
     let (custodian, vault) = resolve_active(
         args.custodian.as_deref(),
         args.vault.as_deref(),
-        args.profile.as_deref(),
     )?;
 
     // 1. Bind localhost listener on a random port.

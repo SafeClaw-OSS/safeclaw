@@ -28,7 +28,7 @@ These were closed during the 2026-05-25 hardening pass; mention only if you find
 
 2. **`Use` ops via control-plane endpoint** — fixed in `3e5c711`. `POST /v/{vid}/op` rejects `ActType::Use` so the broker plane (proxy port) is the only forward-producing surface. (See `reject_broker_kind` in [src/server/handlers/op.rs](src/server/handlers/op.rs).)
 
-3. **`/c/registry` legacy alias** — removed `9a033ac`. Only `/c/menu` exists now.
+3. **`/c/registry` legacy alias** — removed `9a033ac`. Catalog endpoint is `/menu` (2026-05-27: dropped `/c/` prefix; was `/c/menu`).
 
 ---
 

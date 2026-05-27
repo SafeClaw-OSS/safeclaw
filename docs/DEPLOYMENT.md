@@ -126,4 +126,4 @@ itself.
   `safeclaw/src/storage/plaintext.rs` (constant `PLAINTEXT_VERSION`).
   Bumping it = breaking change; bump `Cargo.toml` package version in
   the same commit so the frontend can detect the mismatch via
-  `/c/health`.
+  `/health`.

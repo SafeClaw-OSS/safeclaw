@@ -41,7 +41,6 @@ pub async fn run(args: ProfileSelectArgs) -> Result<(), String> {
     let (custodian, vault) = resolve_active(
         args.custodian.as_deref(),
         args.vault.as_deref(),
-        args.profile.as_deref(),
     )?;
 
     let url = format!(

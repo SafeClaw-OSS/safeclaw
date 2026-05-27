@@ -1,7 +1,7 @@
 //! Vault-scoped and custodian-level read-only endpoints.
 //!
 //! - `GET /v/{vid}/passkeys` — list this vault's enrolled credentials (public metadata only)
-//! - `GET /c/pubkey`         — custodian's HPKE public key (bootstrap for outer envelope)
+//! - `GET /pubkey`           — custodian's HPKE public key (bootstrap for outer envelope)
 //!
 //! Listing actual target names still requires a passkey-signed Export op via
 //! `POST /v/{vid}/op` + `POST /op/{op_id}/approve`.
@@ -100,7 +100,7 @@ pub async fn passkeys(
     })))
 }
 
-/// `GET /c/pubkey` — daemon HPKE outer-envelope public key (PROTOCOL.md §4.2.1 M1).
+/// `GET /pubkey` — daemon HPKE outer-envelope public key (PROTOCOL.md §4.2.1 M1).
 ///
 /// Returns the daemon's static `sc_pk` plus the suite identifier so clients
 /// can pick the matching HPKE implementation. Currently used by the

@@ -1,6 +1,6 @@
-//! `safeclaw stores ...` — external store inspection.
+//! `safeclaw store ...` — external store inspection.
 //!
-//! Today: `stores ls` only. `connect` / `disconnect` need the Write op
+//! Today: `store ls` only. `connect` / `disconnect` need the Write op
 //! path (vault re-encryption), which isn't shipped on the CLI yet — see
 //! the pending decision in `[[cli-implementation]]`.
 
@@ -9,15 +9,14 @@ use std::time::Duration;
 use serde::Deserialize;
 
 use crate::cli::profile::resolve_active;
-use crate::config::StoresSubcommand;
+use crate::config::StoreSubcommand;
 
-pub async fn run(sub: StoresSubcommand) -> Result<(), String> {
+pub async fn run(sub: StoreSubcommand) -> Result<(), String> {
     match sub {
-        StoresSubcommand::Ls(args) => {
+        StoreSubcommand::Ls(args) => {
             let (custodian, vault) = resolve_active(
                 args.custodian.as_deref(),
                 args.vault.as_deref(),
-                args.profile.as_deref(),
             )?;
             ls(&custodian, &vault).await
         }

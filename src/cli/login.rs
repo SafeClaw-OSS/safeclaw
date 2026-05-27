@@ -1,12 +1,12 @@
-//! `safeclaw login` — save a `(custodian, vault)` pair to the CLI's profile
+//! `safeclaw login` — save the active `(custodian, vault)` to the CLI
 //! config.
 //!
-//! This is config-only. It does NOT enroll a passkey or unlock the vault —
-//! those are per-operation passkey ceremonies. Login's job is just to make
-//! later commands ergonomic (`safeclaw status` instead of
+//! Config-only. Does NOT enroll a passkey or unlock the vault — those are
+//! per-operation passkey ceremonies. Login's job is just to make later
+//! commands ergonomic (`safeclaw status` instead of
 //! `safeclaw status --custodian https://...`).
 
-use crate::cli::profile::{put_profile, Profile};
+use crate::cli::profile::put_active;
 use crate::config::LoginArgs;
 
 pub async fn run(args: LoginArgs) -> Result<(), String> {
@@ -20,31 +20,28 @@ pub async fn run(args: LoginArgs) -> Result<(), String> {
         probe_daemon(&custodian).await?;
     }
 
-    let path = put_profile(
-        &args.profile,
-        Profile {
-            custodian: custodian.clone(),
-            vault: vault.clone(),
-        },
-    )?;
+    let path = put_active(&custodian, &vault)?;
 
-    println!("safeclaw — profile '{}' saved", args.profile);
-    println!("  config:  {}", path.display());
-    println!("  custodian:  {}", custodian);
-    println!("  vault:   {}", vault);
-    if std::env::var("SAFECLAW_API_KEY").is_err() {
+    println!("safeclaw — config saved");
+    println!("  config:    {}", path.display());
+    println!("  custodian: {}", custodian);
+    println!("  vault:     {}", vault);
+    println!();
+    println!("Run `eval \"$(safeclaw env)\"` in your shell to export");
+    println!("$SAFECLAW_VAULT_URL for agents that read the env directly.");
+    if std::env::var("SAFECLAW_API_KEY").is_err() && custodian.starts_with("https://") {
         println!();
-        println!("note: for SaaS daemons, set $SAFECLAW_API_KEY in your shell env.");
+        println!("note: SaaS custodians require $SAFECLAW_API_KEY in your shell env.");
         println!("      (the api key is never written to config.toml).");
     }
     Ok(())
 }
 
-/// Hit `/c/health` to confirm the custodian is reachable + responding. Bails
-/// with a clear error message — don't write a profile pointing at a dead
-/// URL silently.
+/// Hit `/health` to confirm the custodian is reachable + responding. Bails
+/// with a clear error message — don't write config pointing at a dead URL
+/// silently.
 async fn probe_daemon(custodian: &str) -> Result<(), String> {
-    let url = format!("{}/c/health", custodian);
+    let url = format!("{}/health", custodian);
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()

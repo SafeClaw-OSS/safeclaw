@@ -1,8 +1,11 @@
-//! `safeclaw vaults ...` — local profile management + vault lifecycle ops.
+//! `safeclaw vault ...` — vault lifecycle ops.
 //!
-//! - `vaults ls` is pure local config inspection (no custodian round-trip).
-//! - `vaults delete <id>` is the destructive vault-wipe via the standard
-//!   browser-callback passkey ceremony (`/cli/auth?op=vault-delete`).
+//! - `vault ls` queries the daemon's `GET /admin/vaults`. Requires
+//!   `SAFECLAW_ADMIN_KEY` to be set both on the daemon (otherwise the
+//!   admin surface is disabled) and on the CLI side as `$SAFECLAW_ADMIN_KEY`.
+//! - `vault delete <id>` is the destructive vault-wipe via the standard
+//!   browser-callback passkey ceremony (a SUDP grant on a `Custom`
+//!   vault-delete op, surfaced as `/op/{op_id}` in the browser).
 //!   Requires `--yes-i-mean-it` to bypass the confirmation prompt.
 
 use std::io::{self, Write as _};
@@ -20,56 +23,85 @@ use serde::Deserialize;
 use tokio::net::TcpListener;
 use tokio::sync::{oneshot, Mutex};
 
-use crate::cli::profile::{load as load_profiles, resolve_active};
-use crate::config::{VaultDeleteArgs, VaultsSubcommand};
+use crate::cli::profile::resolve_active;
+use crate::config::{ProfileSelectArgs, VaultDeleteArgs, VaultSubcommand};
 
-pub async fn run(sub: VaultsSubcommand) -> Result<(), String> {
+pub async fn run(sub: VaultSubcommand) -> Result<(), String> {
     match sub {
-        VaultsSubcommand::Ls => run_ls(),
-        VaultsSubcommand::Delete(a) => run_delete(a).await,
+        VaultSubcommand::Ls(a) => run_ls(a).await,
+        VaultSubcommand::Delete(a) => run_delete(a).await,
     }
 }
 
-fn run_ls() -> Result<(), String> {
-    let cfg = load_profiles()?;
-    if cfg.profiles.is_empty() {
-        println!("(no profiles — run `safeclaw login` to add one)");
+async fn run_ls(args: ProfileSelectArgs) -> Result<(), String> {
+    // Vault list is admin-scoped (cross-vault enumeration). The CLI only
+    // needs the custodian root, not a vault id; pass a placeholder vault
+    // so resolve_active is happy if the config has none.
+    let custodian = match args.custodian.as_deref() {
+        Some(c) => c.to_string(),
+        None => {
+            // Reuse resolve_active for the custodian half; ignore the vault.
+            // If the user has no config at all, default to localhost so
+            // OSS users on a fresh machine still get a reasonable error
+            // from the admin endpoint instead of "no custodian configured".
+            resolve_active(None, args.vault.as_deref())
+                .map(|(c, _)| c)
+                .unwrap_or_else(|_| "http://127.0.0.1:23294".to_string())
+        }
+    };
+    let admin_key = std::env::var("SAFECLAW_ADMIN_KEY").map_err(|_| {
+        "vault ls needs $SAFECLAW_ADMIN_KEY (the daemon's SAFECLAW_ADMIN_KEY \
+         env). Self-host: set it on the daemon; SaaS: this command is \
+         operator-only and not exposed."
+            .to_string()
+    })?;
+    let url = format!("{}/admin/vaults", custodian.trim_end_matches('/'));
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(8))
+        .build()
+        .map_err(|e| format!("client init: {}", e))?;
+    let resp = client
+        .get(&url)
+        .header("X-Admin-Key", admin_key)
+        .send()
+        .await
+        .map_err(|e| format!("reach custodian: {}", e))?;
+    let status = resp.status();
+    if status.as_u16() == 403 {
+        return Err(
+            "custodian returned 403 — daemon has no SAFECLAW_ADMIN_KEY set, or yours doesn't match"
+                .into(),
+        );
+    }
+    if !status.is_success() {
+        return Err(format!(
+            "custodian returned HTTP {}: {}",
+            status,
+            resp.text().await.unwrap_or_default()
+        ));
+    }
+    #[derive(Deserialize)]
+    struct Body {
+        vaults: Vec<String>,
+    }
+    let body: Body = resp.json().await.map_err(|e| format!("parse: {}", e))?;
+    if body.vaults.is_empty() {
+        println!("(no vaults on {})", custodian);
         return Ok(());
     }
-    let active = cfg.default_profile.as_deref();
-    let name_w = cfg
-        .profiles
-        .keys()
-        .map(|k| k.len())
-        .max()
-        .unwrap_or(0)
-        .max(4);
-    let daemon_w = cfg
-        .profiles
-        .values()
-        .map(|p| p.custodian.len())
-        .max()
-        .unwrap_or(0)
-        .max(6);
-    println!(
-        "  {:<nw$}  {:<dw$}  {}",
-        "NAME",
-        "DAEMON",
-        "VAULT",
-        nw = name_w + 1,
-        dw = daemon_w
-    );
-    for (name, p) in &cfg.profiles {
-        let marker = if Some(name.as_str()) == active { "*" } else { " " };
-        println!(
-            "  {}{:<nw$}  {:<dw$}  {}",
-            marker,
-            name,
-            p.custodian,
-            p.vault,
-            nw = name_w,
-            dw = daemon_w
-        );
+    // Mark which one is "active" from the perspective of this CLI's config.
+    let active = match args.vault.as_deref() {
+        Some(v) => Some(v.to_string()),
+        None => resolve_active(Some(&custodian), None).ok().map(|(_, v)| v),
+    };
+    println!("vaults on {}", custodian);
+    for v in &body.vaults {
+        let marker = if active.as_deref() == Some(v.as_str()) {
+            "*"
+        } else {
+            " "
+        };
+        println!("  {} {}", marker, v);
     }
     Ok(())
 }
@@ -106,12 +138,11 @@ async fn run_delete(args: VaultDeleteArgs) -> Result<(), String> {
             "destructive — pass --yes-i-mean-it to confirm vault deletion".into(),
         );
     }
-    // Use the explicit vault arg for the destructive op; the profile only
-    // drives the custodian URL fallback.
+    // Use the explicit vault arg for the destructive op; the active
+    // config only drives the custodian URL fallback.
     let (custodian, _) = resolve_active(
         args.custodian.as_deref(),
         Some(args.vault.as_str()),
-        args.profile.as_deref(),
     )?;
     let vault = args.vault.trim().to_string();
     if vault.is_empty() {
@@ -154,7 +185,7 @@ async fn run_delete(args: VaultDeleteArgs) -> Result<(), String> {
         urlencoding::encode(&cb),
         urlencoding::encode(&state_token),
     );
-    eprintln!("safeclaw vaults delete {} — opening browser…", vault);
+    eprintln!("safeclaw vault delete {} — opening browser…", vault);
     eprintln!("If your browser doesn't open, visit this URL manually:");
     eprintln!("  {}", auth_url);
     eprintln!();
@@ -180,7 +211,7 @@ async fn run_delete(args: VaultDeleteArgs) -> Result<(), String> {
     server_task.abort();
     match outcome {
         Outcome::Ok { .. } => {
-            eprintln!("safeclaw vaults delete — ok (vault {} wiped)", vault);
+            eprintln!("safeclaw vault delete — ok (vault {} wiped)", vault);
             Ok(())
         }
         Outcome::Cancelled => Err("user cancelled the ceremony".into()),

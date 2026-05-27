@@ -7,7 +7,7 @@ use clap::{Args, Parser, Subcommand};
 ///     production usage; what systemd executes.
 ///   - `safeclaw <cmd>` — short-lived CLI commands that talk to a
 ///     daemon over HTTP. Today: login / status / unlock / lock / ls /
-///     read / doctor / vaults / stores / version.
+///     read / doctor / vault / stores / version.
 ///
 /// Bare `safeclaw` (no subcommand) prints help. This matches mainstream
 /// CLI conventions (git, docker, gh, kubectl). The systemd unit on
@@ -47,13 +47,25 @@ pub enum Command {
     /// `/cli/auth` page for the passkey ceremony; the value comes back via
     /// GET `/op/{op_id}` (never via the browser URL).
     Read(ReadArgs),
-    /// Manage local vault profiles (the `(custodian, vault)` pairs in
-    /// `~/.config/safeclaw/config.toml`) and per-vault lifecycle ops.
-    Vaults(VaultsArgs),
+    /// Per-vault lifecycle ops. Today: `vault delete` to nuke a vault's
+    /// daemon-side state (irreversible, passkey-gated).
+    Vault(VaultArgs),
+    /// Manage the active vault's enrolled passkeys. `ls` is read-only;
+    /// `add` / `remove` / `rename` need crypto ceremonies and are deferred
+    /// to a later session.
+    Passkey(PasskeyArgs),
+    /// Operator-only commands. Each subcommand requires `$SAFECLAW_ADMIN_KEY`
+    /// to be set on the CLI side AND match the daemon's `SAFECLAW_ADMIN_KEY`
+    /// env. In SaaS deployments only the SafeClaw team holds this key.
+    Admin(AdminArgs),
+    /// Print the active vault as shell `export` lines so agents see
+    /// `SAFECLAW_VAULT_URL` + `SAFECLAW_API_KEY` from the env. Run as
+    /// `eval "$(safeclaw env)"`.
+    Env,
     /// Manage external stores connected to the active vault. Today: list.
     /// Connect / disconnect are deferred until the Write op lands in the
     /// CLI (they rewrite vault.dat).
-    Stores(StoresArgs),
+    Store(StoreArgs),
     /// Print the safeclaw binary version.
     Version,
     /// Health + reachability checks: custodian connectivity, active
@@ -62,32 +74,114 @@ pub enum Command {
 }
 
 #[derive(Debug, Args)]
-pub struct VaultsArgs {
+pub struct VaultArgs {
     #[command(subcommand)]
-    pub sub: VaultsSubcommand,
+    pub sub: VaultSubcommand,
+}
+
+#[derive(Debug, Args)]
+pub struct PasskeyArgs {
+    #[command(subcommand)]
+    pub sub: PasskeySubcommand,
 }
 
 #[derive(Debug, Subcommand)]
-pub enum VaultsSubcommand {
-    /// List local profiles. Marks the active one (selected by
-    /// `default_profile` in config.toml or `$SAFECLAW_PROFILE`).
-    Ls,
+pub enum PasskeySubcommand {
+    /// List passkeys enrolled on the active vault (public metadata only:
+    /// credential id, device name, transports, timestamps). No vault
+    /// unlock or passkey gesture required.
+    Ls(ProfileSelectArgs),
+    /// Add a new passkey (cross-device or same-device). NOT YET
+    /// IMPLEMENTED — needs the daemon-side `/cli/auth?op=enroll-passkey`
+    /// page and the same crypto vendoring as `sc setup`.
+    Add(ProfileSelectArgs),
+    /// Remove an enrolled passkey by credential id. NOT YET IMPLEMENTED.
+    Remove(PasskeyRemoveArgs),
+    /// Rename an enrolled passkey's `device_name`. NOT YET IMPLEMENTED —
+    /// daemon currently has no metadata-update endpoint.
+    Rename(PasskeyRenameArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct PasskeyRemoveArgs {
+    /// base64url credential id (as shown in `passkeys ls`).
+    pub credential_id: String,
+    #[arg(long, env = "SAFECLAW_CUSTODIAN")]
+    pub custodian: Option<String>,
+    #[arg(long)]
+    pub vault: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct PasskeyRenameArgs {
+    pub credential_id: String,
+    pub new_name: String,
+    #[arg(long, env = "SAFECLAW_CUSTODIAN")]
+    pub custodian: Option<String>,
+    #[arg(long)]
+    pub vault: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct AdminArgs {
+    #[command(subcommand)]
+    pub sub: AdminSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AdminSubcommand {
+    /// Tail the daemon's audit log for a specific vault. Calls
+    /// `GET /v/{vid}/approvals` with operator credentials.
+    Audit(AdminAuditArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct AdminAuditArgs {
+    #[command(subcommand)]
+    pub sub: AdminAuditSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AdminAuditSubcommand {
+    /// List approvals (op-history) for a vault. Default: last 50 rows.
+    Ls(AdminAuditLsArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct AdminAuditLsArgs {
+    /// Vault id to inspect. Defaults to the active vault from config.
+    #[arg(long)]
+    pub vault: Option<String>,
+    #[arg(long, env = "SAFECLAW_CUSTODIAN")]
+    pub custodian: Option<String>,
+    /// Max rows to print. Daemon caps at 200 — bigger values silently
+    /// truncate.
+    #[arg(long, default_value = "50")]
+    pub limit: u32,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum VaultSubcommand {
+    /// List vaults known to the active custodian. Hits the admin
+    /// endpoint `GET /admin/vaults` — requires `SAFECLAW_ADMIN_KEY` to
+    /// be set on the daemon (typical OSS self-host) and exposed to the
+    /// CLI via `$SAFECLAW_ADMIN_KEY`.
+    Ls(ProfileSelectArgs),
     /// Irreversibly delete a vault's daemon-side state. Passkey-gated via
-    /// `/cli/auth?op=vault-delete`. Requires a typed `--yes-i-mean-it` flag
-    /// to bypass the confirmation prompt; without it, refuses to proceed.
+    /// the standard `/op/{op_id}` browser-callback ceremony. Requires a
+    /// typed `--yes-i-mean-it` flag to bypass the confirmation prompt;
+    /// without it, refuses to proceed.
     Delete(VaultDeleteArgs),
 }
 
 #[derive(Debug, Args)]
 pub struct VaultDeleteArgs {
-    /// Vault id to delete. Required even when only one profile exists —
+    /// Vault id to delete. Required even when only one config exists —
     /// no implicit "current vault" for destructive ops.
     pub vault: String,
 
     #[arg(long, env = "SAFECLAW_CUSTODIAN")]
     pub custodian: Option<String>,
-    #[arg(long, env = "SAFECLAW_PROFILE")]
-    pub profile: Option<String>,
 
     /// Bypass the interactive confirmation. Without this flag the command
     /// refuses to proceed (since deletion is irreversible).
@@ -101,13 +195,13 @@ pub struct VaultDeleteArgs {
 }
 
 #[derive(Debug, Args)]
-pub struct StoresArgs {
+pub struct StoreArgs {
     #[command(subcommand)]
-    pub sub: StoresSubcommand,
+    pub sub: StoreSubcommand,
 }
 
 #[derive(Debug, Subcommand)]
-pub enum StoresSubcommand {
+pub enum StoreSubcommand {
     /// List external stores connected to the active vault. Needs the
     /// vault unlocked (we read from daemon's cache snapshot).
     Ls(ProfileSelectArgs),
@@ -150,59 +244,44 @@ pub struct ServeArgs {
 
 #[derive(Debug, Args)]
 pub struct StatusArgs {
-    /// Custodian URL. Falls back to the active profile's custodian, then
-    /// to `http://127.0.0.1:23294` if no profile is configured. Override
-    /// with `--custodian https://custodian.safeclaw.pro` for the Pro
+    /// Custodian URL. Falls back to the active config's custodian (then
+    /// to the root parsed out of `$SAFECLAW_VAULT_URL`), then to
+    /// `http://127.0.0.1:23294` if nothing is configured. Override with
+    /// `--custodian https://custodian.safeclaw.pro` for the Pro
     /// custodian or any self-hosted URL.
     #[arg(long, env = "SAFECLAW_CUSTODIAN")]
     pub custodian: Option<String>,
-
-    /// Profile to read the custodian URL from when `--custodian` is
-    /// omitted.
-    #[arg(long, env = "SAFECLAW_PROFILE")]
-    pub profile: Option<String>,
 }
 
 #[derive(Debug, Args)]
 pub struct LoginArgs {
     /// Custodian URL to save. Defaults to local. For SaaS pass
-    /// `https://custodian.safeclaw.pro`.
+    /// `https://api.safeclaw.pro`.
     #[arg(long, default_value = "http://127.0.0.1:23294")]
     pub custodian: String,
 
-    /// Vault id to save as the default for this profile. Required.
-    /// Self-hosted single-user setups conventionally use `default`.
+    /// Vault id to save as the active vault. Required. Self-hosted
+    /// single-user setups conventionally use `default`.
     #[arg(long)]
     pub vault: String,
 
-    /// Profile name to write under in `config.toml`. Multiple profiles can
-    /// coexist; the active one is selected by `SAFECLAW_PROFILE` (default
-    /// `default`).
-    #[arg(long, default_value = "default")]
-    pub profile: String,
-
-    /// Skip the `/c/health` probe before writing config. Useful when
-    /// initialising a profile against a custodian that's intentionally
-    /// offline.
+    /// Skip the `/health` probe before writing config. Useful when
+    /// initialising against a custodian that's intentionally offline.
     #[arg(long)]
     pub no_probe: bool,
 }
 
 #[derive(Debug, Args)]
 pub struct UnlockArgs {
-    /// Override the custodian URL (otherwise loaded from the active
-    /// profile in `~/.config/safeclaw/config.toml`).
+    /// Override the custodian URL (otherwise loaded from
+    /// `$SAFECLAW_VAULT_URL` or `~/.config/safeclaw/config.toml`).
     #[arg(long, env = "SAFECLAW_CUSTODIAN")]
     pub custodian: Option<String>,
 
-    /// Override the vault id (otherwise loaded from the active profile).
+    /// Override the vault id (otherwise loaded from
+    /// `$SAFECLAW_VAULT_URL` or `~/.config/safeclaw/config.toml`).
     #[arg(long)]
     pub vault: Option<String>,
-
-    /// Profile to load when `--custodian` / `--vault` are omitted. Defaults
-    /// to `$SAFECLAW_PROFILE` or the config's `default_profile`.
-    #[arg(long, env = "SAFECLAW_PROFILE")]
-    pub profile: Option<String>,
 
     /// Don't try to auto-launch a browser; just print the URL.
     #[arg(long)]
@@ -214,7 +293,7 @@ pub struct UnlockArgs {
 }
 
 /// Reusable arg set for read-only short-lived commands that only need to
-/// pick a daemon URL + vault id from the active profile (or explicit
+/// pick a daemon URL + vault id (from the active config or explicit
 /// flags). No subcommand-specific options.
 #[derive(Debug, Args)]
 pub struct ProfileSelectArgs {
@@ -222,8 +301,6 @@ pub struct ProfileSelectArgs {
     pub custodian: Option<String>,
     #[arg(long)]
     pub vault: Option<String>,
-    #[arg(long, env = "SAFECLAW_PROFILE")]
-    pub profile: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -235,8 +312,6 @@ pub struct ReadArgs {
     pub custodian: Option<String>,
     #[arg(long)]
     pub vault: Option<String>,
-    #[arg(long, env = "SAFECLAW_PROFILE")]
-    pub profile: Option<String>,
 
     #[arg(long)]
     pub no_browser: bool,

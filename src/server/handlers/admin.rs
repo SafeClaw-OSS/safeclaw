@@ -1,12 +1,15 @@
 //! `/admin/*` — operator-driven endpoints that bypass normal vault auth.
 //!
-//! Today: `DELETE /admin/vaults/{vid}` to nuke a vault for SaaS-side
-//! demo-data cleanup. The SaaS pro-backend is the only caller — it
-//! resolves which vaults are demo (`auth.users.is_anonymous = true`) and
-//! batches calls here. Each request must carry `X-Admin-Key: <secret>`
-//! matching the daemon's `SAFECLAW_ADMIN_KEY` env. When the env is
-//! unset the whole surface returns 403 — admin endpoints are off by
-//! default so an OSS deploy that doesn't opt in is never exposed.
+//! Today:
+//!   - `GET    /admin/vaults`       list all vault ids on this daemon
+//!   - `DELETE /admin/vaults/{vid}` nuke a vault (SaaS demo-data cleanup;
+//!                                  also lets OSS operator wipe a vault
+//!                                  whose user lost their passkey)
+//!
+//! Each request must carry `X-Admin-Key: <secret>` matching the daemon's
+//! `SAFECLAW_ADMIN_KEY` env. When the env is unset the whole surface
+//! returns 403 — admin endpoints are off by default so an OSS deploy
+//! that doesn't opt in is never exposed.
 //!
 //! NOTE: this is deliberately a "trust the holder of the shared secret"
 //! design, not RBAC. The secret is a single shared value between
@@ -48,6 +51,25 @@ fn check_admin_key(state: &AppState, headers: &HeaderMap) -> Result<()> {
     } else {
         Err(AppError::Unauthorized("invalid admin key".into()))
     }
+}
+
+/// `GET /admin/vaults` — list all vault ids materialised on disk.
+///
+/// Returns just the ids; no contents, no sizes, no unlock state. Useful
+/// for an OSS operator to enumerate what's on this daemon (e.g. for a
+/// `sc admin vaults ls` view) and for SaaS cleanup tooling to reconcile
+/// against the Supabase side. Vault list is alphabetised for stable
+/// output.
+pub async fn list_vaults(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Value>> {
+    check_admin_key(&state, &headers)?;
+    let mut vaults = state.vaults.list()?;
+    vaults.sort();
+    Ok(Json(json!({
+        "vaults": vaults,
+    })))
 }
 
 /// `DELETE /admin/vaults/{vid}` — nuke a vault's daemon-side state.

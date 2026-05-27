@@ -58,15 +58,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 e.into()
             })
         }
-        Command::Vaults(args) => {
-            cli::vaults::run(args.sub).await.map_err(|e| -> Box<dyn std::error::Error> {
-                eprintln!("safeclaw vaults: {}", e);
+        Command::Vault(args) => {
+            cli::vault::run(args.sub).await.map_err(|e| -> Box<dyn std::error::Error> {
+                eprintln!("safeclaw vault: {}", e);
                 e.into()
             })
         }
-        Command::Stores(args) => {
-            cli::stores::run(args.sub).await.map_err(|e| -> Box<dyn std::error::Error> {
-                eprintln!("safeclaw stores: {}", e);
+        Command::Store(args) => {
+            cli::store::run(args.sub).await.map_err(|e| -> Box<dyn std::error::Error> {
+                eprintln!("safeclaw store: {}", e);
+                e.into()
+            })
+        }
+        Command::Passkey(args) => {
+            cli::passkey::run(args.sub).await.map_err(|e| -> Box<dyn std::error::Error> {
+                eprintln!("safeclaw passkey: {}", e);
+                e.into()
+            })
+        }
+        Command::Admin(args) => {
+            cli::admin::run(args.sub).await.map_err(|e| -> Box<dyn std::error::Error> {
+                eprintln!("safeclaw admin: {}", e);
+                e.into()
+            })
+        }
+        Command::Env => {
+            cli::env::run().map_err(|e| -> Box<dyn std::error::Error> {
+                eprintln!("safeclaw env: {}", e);
                 e.into()
             })
         }

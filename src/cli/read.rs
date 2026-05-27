@@ -47,7 +47,6 @@ pub async fn run(args: ReadArgs) -> Result<(), String> {
     let (custodian, vault) = resolve_active(
         args.custodian.as_deref(),
         args.vault.as_deref(),
-        args.profile.as_deref(),
     )?;
     let key = args.key.trim().to_string();
     if key.is_empty() {
