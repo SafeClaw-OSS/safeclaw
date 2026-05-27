@@ -67,6 +67,8 @@ pub async fn do_browser_gesture(
     let bind_addr = format!("127.0.0.1:{}", cb_port.unwrap_or(0));
     let listener = TcpListener::bind(&bind_addr).await
         .map_err(|e| format!("bind {}: {}", bind_addr, e))?;
+    // Use "localhost" not "127.0.0.1" — WebAuthn treats localhost as a
+    // valid origin but rejects raw IP addresses.
     let local_addr = listener.local_addr().map_err(|e| format!("addr: {}", e))?;
     let state_token = random_hex(16);
     let (tx, rx) = oneshot::channel::<GestureResult>();
@@ -75,7 +77,7 @@ pub async fn do_browser_gesture(
         .route("/done", get(handle_done))
         .with_state(cb_state);
 
-    let cb_url = format!("http://{}/done", local_addr);
+    let cb_url = format!("http://localhost:{}/done", local_addr.port());
     let mut auth_url = format!(
         "{}/op/{}?challenge={}&cred_id={}&cb={}&state={}&label={}",
         custodian.trim_end_matches('/'),
