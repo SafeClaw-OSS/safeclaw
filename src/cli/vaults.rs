@@ -1,6 +1,6 @@
 //! `safeclaw vaults ...` — local profile management + vault lifecycle ops.
 //!
-//! - `vaults ls` is pure local config inspection (no daemon round-trip).
+//! - `vaults ls` is pure local config inspection (no custodian round-trip).
 //! - `vaults delete <id>` is the destructive vault-wipe via the standard
 //!   browser-callback passkey ceremony (`/cli/auth?op=vault-delete`).
 //!   Requires `--yes-i-mean-it` to bypass the confirmation prompt.
@@ -47,7 +47,7 @@ fn run_ls() -> Result<(), String> {
     let daemon_w = cfg
         .profiles
         .values()
-        .map(|p| p.daemon.len())
+        .map(|p| p.custodian.len())
         .max()
         .unwrap_or(0)
         .max(6);
@@ -65,7 +65,7 @@ fn run_ls() -> Result<(), String> {
             "  {}{:<nw$}  {:<dw$}  {}",
             marker,
             name,
-            p.daemon,
+            p.custodian,
             p.vault,
             nw = name_w,
             dw = daemon_w
@@ -107,9 +107,9 @@ async fn run_delete(args: VaultDeleteArgs) -> Result<(), String> {
         );
     }
     // Use the explicit vault arg for the destructive op; the profile only
-    // drives the daemon URL fallback.
-    let (daemon, _) = resolve_active(
-        args.daemon.as_deref(),
+    // drives the custodian URL fallback.
+    let (custodian, _) = resolve_active(
+        args.custodian.as_deref(),
         Some(args.vault.as_str()),
         args.profile.as_deref(),
     )?;
@@ -149,7 +149,7 @@ async fn run_delete(args: VaultDeleteArgs) -> Result<(), String> {
     let cb = format!("http://{}/done", local_addr);
     let auth_url = format!(
         "{}/cli/auth?op=vault-delete&vault={}&cb={}&state={}",
-        daemon.trim_end_matches('/'),
+        custodian.trim_end_matches('/'),
         urlencoding::encode(&vault),
         urlencoding::encode(&cb),
         urlencoding::encode(&state_token),

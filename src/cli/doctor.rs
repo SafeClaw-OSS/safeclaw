@@ -1,9 +1,9 @@
 //! `safeclaw doctor` — quick self-check for "is my CLI set up right?"
 //!
 //! Read-only. Reports on:
-//!   - active profile (which daemon + vault)
-//!   - daemon reachability (`/c/health`)
-//!   - whether the vault dir exists on the daemon (vault id resolves)
+//!   - active profile (which custodian + vault)
+//!   - custodian reachability (`/c/health`)
+//!   - whether the vault dir exists on the custodian (vault id resolves)
 //!   - whether `$SAFECLAW_API_KEY` is set (informational only — local
 //!     daemons typically don't need it; SaaS does)
 //!
@@ -66,15 +66,15 @@ pub async fn run(args: ProfileSelectArgs) -> Result<(), String> {
 
     // Active profile resolution
     let resolved = resolve_active(
-        args.daemon.as_deref(),
+        args.custodian.as_deref(),
         args.vault.as_deref(),
         args.profile.as_deref(),
     );
-    let (daemon, vault) = match resolved {
+    let (custodian, vault) = match resolved {
         Ok(pair) => {
             report.push(
                 Mark::Ok,
-                format!("profile: daemon={} vault={}", pair.0, pair.1),
+                format!("profile: custodian={} vault={}", pair.0, pair.1),
             );
             pair
         }
@@ -85,12 +85,12 @@ pub async fn run(args: ProfileSelectArgs) -> Result<(), String> {
         }
     };
 
-    // Daemon health
+    // Custodian health
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .build()
         .map_err(|e| format!("client init: {}", e))?;
-    let health_url = format!("{}/c/health", daemon.trim_end_matches('/'));
+    let health_url = format!("{}/c/health", custodian.trim_end_matches('/'));
     match client.get(&health_url).send().await {
         Ok(resp) => {
             let status = resp.status();
@@ -104,24 +104,24 @@ pub async fn run(args: ProfileSelectArgs) -> Result<(), String> {
                 report.push(
                     Mark::Ok,
                     format!(
-                        "daemon: reachable (version {}, {} vault(s))",
+                        "custodian: reachable (version {}, {} vault(s))",
                         version, count
                     ),
                 );
             } else {
                 report.push(
                     Mark::Fail,
-                    format!("daemon: {} returned HTTP {}", daemon, status),
+                    format!("custodian: {} returned HTTP {}", custodian, status),
                 );
             }
         }
-        Err(e) => report.push(Mark::Fail, format!("daemon: unreachable — {}", e)),
+        Err(e) => report.push(Mark::Fail, format!("custodian: unreachable — {}", e)),
     }
 
     // Vault dir exists?
     let passkeys_url = format!(
         "{}/v/{}/passkeys",
-        daemon.trim_end_matches('/'),
+        custodian.trim_end_matches('/'),
         urlencoding::encode(&vault)
     );
     match client.get(&passkeys_url).send().await {
@@ -158,7 +158,7 @@ pub async fn run(args: ProfileSelectArgs) -> Result<(), String> {
     // SAFECLAW_API_KEY (informational). Only matters for daemons that
     // sit behind the SaaS auth boundary (typically https + non-localhost
     // host). Local daemons accept any caller — the env var is moot.
-    let needs_api_key = match url::Url::parse(&daemon) {
+    let needs_api_key = match url::Url::parse(&custodian) {
         Ok(u) => {
             u.scheme() == "https"
                 && !matches!(u.host_str(), Some("localhost") | Some("127.0.0.1") | Some("[::1]"))
@@ -176,7 +176,7 @@ pub async fn run(args: ProfileSelectArgs) -> Result<(), String> {
         ),
         _ => report.push(
             Mark::Ok,
-            "$SAFECLAW_API_KEY: unset (not required for local daemon)",
+            "$SAFECLAW_API_KEY: unset (not required for local custodian)",
         ),
     }
 

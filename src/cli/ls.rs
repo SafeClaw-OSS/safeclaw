@@ -1,7 +1,7 @@
 //! `safeclaw ls` — list secret names known to the active vault.
 //!
-//! Hits the daemon's `GET /v/{vid}/keys-known` (cache-driven; no passkey
-//! ceremony). Vault must be Unlocked — the daemon returns 409 otherwise,
+//! Hits the custodian's `GET /v/{vid}/keys-known` (cache-driven; no passkey
+//! ceremony). Vault must be Unlocked — the custodian returns 409 otherwise,
 //! which we map to a "run `safeclaw unlock` first" hint.
 //!
 //! Output is one row per key with its source tag. Same key surfacing from
@@ -38,15 +38,15 @@ struct StoreError {
 }
 
 pub async fn run(args: ProfileSelectArgs) -> Result<(), String> {
-    let (daemon, vault) = resolve_active(
-        args.daemon.as_deref(),
+    let (custodian, vault) = resolve_active(
+        args.custodian.as_deref(),
         args.vault.as_deref(),
         args.profile.as_deref(),
     )?;
 
     let url = format!(
         "{}/v/{}/keys-known",
-        daemon.trim_end_matches('/'),
+        custodian.trim_end_matches('/'),
         urlencoding::encode(&vault)
     );
     let client = reqwest::Client::builder()
@@ -57,14 +57,14 @@ pub async fn run(args: ProfileSelectArgs) -> Result<(), String> {
         .get(&url)
         .send()
         .await
-        .map_err(|e| format!("reach daemon at {}: {}", daemon, e))?;
+        .map_err(|e| format!("reach custodian at {}: {}", custodian, e))?;
 
     if resp.status().as_u16() == 409 {
         return Err("vault locked — run `safeclaw unlock` first".into());
     }
     if !resp.status().is_success() {
         return Err(format!(
-            "daemon returned HTTP {}: {}",
+            "custodian returned HTTP {}: {}",
             resp.status(),
             resp.text().await.unwrap_or_default()
         ));

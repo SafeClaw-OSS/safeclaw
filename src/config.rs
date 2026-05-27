@@ -23,30 +23,31 @@ pub struct Cli {
 pub enum Command {
     /// Run the daemon (HTTP server on admin + proxy ports).
     Serve(ServeArgs),
-    /// Print daemon health and version.
+    /// Print custodian health and version.
     Status(StatusArgs),
-    /// Save a daemon URL + vault id to ~/.config/safeclaw/config.toml so later
-    /// commands can omit `--daemon` / `--vault`. Does NOT unlock the vault —
-    /// passkey gestures happen per-operation. For SaaS the apiKey lives in
-    /// $SAFECLAW_API_KEY (never on disk).
+    /// Save a custodian URL + vault id to ~/.config/safeclaw/config.toml so
+    /// later commands can omit `--custodian` / `--vault`. Does NOT unlock
+    /// the vault — passkey gestures happen per-operation. For SaaS the
+    /// apiKey lives in $SAFECLAW_API_KEY (never on disk).
     Login(LoginArgs),
     /// Bring the vault from Locked → Unlocked. Opens a browser to the
-    /// daemon's `/cli/auth` page; the page runs the passkey ceremony and
-    /// redirects back to a localhost callback this command spawns.
+    /// custodian's `/cli/auth` page; the page runs the passkey ceremony
+    /// and redirects back to a localhost callback this command spawns.
     Unlock(UnlockArgs),
-    /// Drop the daemon's in-memory secrets cache and flip back to Locked.
-    /// Also a passkey-gated ceremony (PROTOCOL.md §6.3 — H3 requires a fresh
-    /// grant so a stolen session token can't DOS-lock the vault).
+    /// Drop the custodian's in-memory secrets cache and flip back to
+    /// Locked. Also a passkey-gated ceremony (PROTOCOL.md §6.3 — H3
+    /// requires a fresh grant so a stolen session token can't DOS-lock
+    /// the vault).
     Lock(UnlockArgs),
     /// List secret names this vault can resolve (native + each external
     /// store). Does NOT print values — just names + their source. Requires
     /// the vault to be unlocked.
     Ls(ProfileSelectArgs),
-    /// Read a single native secret to stdout. Drives the daemon's `/cli/auth`
-    /// page for the passkey ceremony; the value comes back via GET
-    /// `/op/{op_id}` (never via the browser URL).
+    /// Read a single native secret to stdout. Drives the custodian's
+    /// `/cli/auth` page for the passkey ceremony; the value comes back via
+    /// GET `/op/{op_id}` (never via the browser URL).
     Read(ReadArgs),
-    /// Manage local vault profiles (the `(daemon, vault)` pairs in
+    /// Manage local vault profiles (the `(custodian, vault)` pairs in
     /// `~/.config/safeclaw/config.toml`) and per-vault lifecycle ops.
     Vaults(VaultsArgs),
     /// Manage external stores connected to the active vault. Today: list.
@@ -55,8 +56,8 @@ pub enum Command {
     Stores(StoresArgs),
     /// Print the safeclaw binary version.
     Version,
-    /// Health + reachability checks: daemon connectivity, active profile,
-    /// API key presence. Read-only; no vault state mutation.
+    /// Health + reachability checks: custodian connectivity, active
+    /// profile, API key presence. Read-only; no vault state mutation.
     Doctor(ProfileSelectArgs),
 }
 
@@ -83,8 +84,8 @@ pub struct VaultDeleteArgs {
     /// no implicit "current vault" for destructive ops.
     pub vault: String,
 
-    #[arg(long, env = "SAFECLAW_DAEMON")]
-    pub daemon: Option<String>,
+    #[arg(long, env = "SAFECLAW_CUSTODIAN")]
+    pub custodian: Option<String>,
     #[arg(long, env = "SAFECLAW_PROFILE")]
     pub profile: Option<String>,
 
@@ -149,24 +150,25 @@ pub struct ServeArgs {
 
 #[derive(Debug, Args)]
 pub struct StatusArgs {
-    /// Daemon admin URL. Falls back to the active profile's daemon, then
+    /// Custodian URL. Falls back to the active profile's custodian, then
     /// to `http://127.0.0.1:23294` if no profile is configured. Override
-    /// with `--daemon https://custodian.safeclaw.pro` for the Pro custodian
-    /// or any self-hosted URL.
-    #[arg(long, env = "SAFECLAW_DAEMON")]
-    pub daemon: Option<String>,
+    /// with `--custodian https://custodian.safeclaw.pro` for the Pro
+    /// custodian or any self-hosted URL.
+    #[arg(long, env = "SAFECLAW_CUSTODIAN")]
+    pub custodian: Option<String>,
 
-    /// Profile to read the daemon URL from when `--daemon` is omitted.
+    /// Profile to read the custodian URL from when `--custodian` is
+    /// omitted.
     #[arg(long, env = "SAFECLAW_PROFILE")]
     pub profile: Option<String>,
 }
 
 #[derive(Debug, Args)]
 pub struct LoginArgs {
-    /// Daemon admin URL to save. Defaults to local. For SaaS pass
+    /// Custodian URL to save. Defaults to local. For SaaS pass
     /// `https://custodian.safeclaw.pro`.
     #[arg(long, default_value = "http://127.0.0.1:23294")]
-    pub daemon: String,
+    pub custodian: String,
 
     /// Vault id to save as the default for this profile. Required.
     /// Self-hosted single-user setups conventionally use `default`.
@@ -180,24 +182,25 @@ pub struct LoginArgs {
     pub profile: String,
 
     /// Skip the `/c/health` probe before writing config. Useful when
-    /// initialising a profile against a daemon that's intentionally offline.
+    /// initialising a profile against a custodian that's intentionally
+    /// offline.
     #[arg(long)]
     pub no_probe: bool,
 }
 
 #[derive(Debug, Args)]
 pub struct UnlockArgs {
-    /// Override the daemon URL (otherwise loaded from the active profile in
-    /// `~/.config/safeclaw/config.toml`).
-    #[arg(long, env = "SAFECLAW_DAEMON")]
-    pub daemon: Option<String>,
+    /// Override the custodian URL (otherwise loaded from the active
+    /// profile in `~/.config/safeclaw/config.toml`).
+    #[arg(long, env = "SAFECLAW_CUSTODIAN")]
+    pub custodian: Option<String>,
 
     /// Override the vault id (otherwise loaded from the active profile).
     #[arg(long)]
     pub vault: Option<String>,
 
-    /// Profile to load when `--daemon` / `--vault` are omitted. Defaults to
-    /// `$SAFECLAW_PROFILE` or the config's `default_profile`.
+    /// Profile to load when `--custodian` / `--vault` are omitted. Defaults
+    /// to `$SAFECLAW_PROFILE` or the config's `default_profile`.
     #[arg(long, env = "SAFECLAW_PROFILE")]
     pub profile: Option<String>,
 
@@ -215,8 +218,8 @@ pub struct UnlockArgs {
 /// flags). No subcommand-specific options.
 #[derive(Debug, Args)]
 pub struct ProfileSelectArgs {
-    #[arg(long, env = "SAFECLAW_DAEMON")]
-    pub daemon: Option<String>,
+    #[arg(long, env = "SAFECLAW_CUSTODIAN")]
+    pub custodian: Option<String>,
     #[arg(long)]
     pub vault: Option<String>,
     #[arg(long, env = "SAFECLAW_PROFILE")]
@@ -228,8 +231,8 @@ pub struct ReadArgs {
     /// Native-secrets key name to reveal (`safeclaw read OPENAI_API_KEY`).
     pub key: String,
 
-    #[arg(long, env = "SAFECLAW_DAEMON")]
-    pub daemon: Option<String>,
+    #[arg(long, env = "SAFECLAW_CUSTODIAN")]
+    pub custodian: Option<String>,
     #[arg(long)]
     pub vault: Option<String>,
     #[arg(long, env = "SAFECLAW_PROFILE")]

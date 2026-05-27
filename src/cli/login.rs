@@ -1,36 +1,36 @@
-//! `safeclaw login` — save a `(daemon, vault)` pair to the CLI's profile
+//! `safeclaw login` — save a `(custodian, vault)` pair to the CLI's profile
 //! config.
 //!
 //! This is config-only. It does NOT enroll a passkey or unlock the vault —
 //! those are per-operation passkey ceremonies. Login's job is just to make
 //! later commands ergonomic (`safeclaw status` instead of
-//! `safeclaw status --daemon https://...`).
+//! `safeclaw status --custodian https://...`).
 
 use crate::cli::profile::{put_profile, Profile};
 use crate::config::LoginArgs;
 
 pub async fn run(args: LoginArgs) -> Result<(), String> {
-    let daemon = args.daemon.trim_end_matches('/').to_string();
+    let custodian = args.custodian.trim_end_matches('/').to_string();
     let vault = args.vault.trim().to_string();
     if vault.is_empty() {
         return Err("--vault cannot be empty".into());
     }
 
     if !args.no_probe {
-        probe_daemon(&daemon).await?;
+        probe_daemon(&custodian).await?;
     }
 
     let path = put_profile(
         &args.profile,
         Profile {
-            daemon: daemon.clone(),
+            custodian: custodian.clone(),
             vault: vault.clone(),
         },
     )?;
 
     println!("safeclaw — profile '{}' saved", args.profile);
     println!("  config:  {}", path.display());
-    println!("  daemon:  {}", daemon);
+    println!("  custodian:  {}", custodian);
     println!("  vault:   {}", vault);
     if std::env::var("SAFECLAW_API_KEY").is_err() {
         println!();
@@ -40,11 +40,11 @@ pub async fn run(args: LoginArgs) -> Result<(), String> {
     Ok(())
 }
 
-/// Hit `/c/health` to confirm the daemon is reachable + responding. Bails
+/// Hit `/c/health` to confirm the custodian is reachable + responding. Bails
 /// with a clear error message — don't write a profile pointing at a dead
 /// URL silently.
-async fn probe_daemon(daemon: &str) -> Result<(), String> {
-    let url = format!("{}/c/health", daemon);
+async fn probe_daemon(custodian: &str) -> Result<(), String> {
+    let url = format!("{}/c/health", custodian);
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()
@@ -53,10 +53,10 @@ async fn probe_daemon(daemon: &str) -> Result<(), String> {
         .get(&url)
         .send()
         .await
-        .map_err(|e| format!("reach daemon at {}: {}", daemon, e))?;
+        .map_err(|e| format!("reach custodian at {}: {}", custodian, e))?;
     let status = resp.status();
     if !status.is_success() {
-        return Err(format!("daemon at {} returned HTTP {}", daemon, status));
+        return Err(format!("custodian at {} returned HTTP {}", custodian, status));
     }
     let body: serde_json::Value = resp
         .json()
@@ -66,6 +66,6 @@ async fn probe_daemon(daemon: &str) -> Result<(), String> {
         .get("version")
         .and_then(|v| v.as_str())
         .unwrap_or("?");
-    println!("safeclaw — daemon ok ({})", version);
+    println!("safeclaw — custodian ok ({})", version);
     Ok(())
 }

@@ -1,12 +1,12 @@
-//! `safeclaw unlock` / `safeclaw lock` — drives the daemon's `/cli/auth`
+//! `safeclaw unlock` / `safeclaw lock` — drives the custodian's `/cli/auth`
 //! browser page over a localhost callback.
 //!
 //! Flow:
-//!   1. Resolve `(daemon, vault)` from CLI flags or active profile.
+//!   1. Resolve `(custodian, vault)` from CLI flags or active profile.
 //!   2. Bind a tiny axum server on `127.0.0.1:RANDOM` (one route, `/done`).
 //!   3. Generate a 16-byte hex `state` token (CSRF).
 //!   4. Try to open the user's default browser at
-//!      `<daemon>/cli/auth?op=<unlock|lock>&vault=<vid>&cb=<cb>&state=<token>`.
+//!      `<custodian>/cli/auth?op=<unlock|lock>&vault=<vid>&cb=<cb>&state=<token>`.
 //!      Fall back to printing the URL.
 //!   5. Block up to `timeout` seconds waiting for the callback's GET.
 //!   6. Verify `state` matches; report the page's `status` (ok/error/cancelled).
@@ -58,8 +58,8 @@ pub async fn run_lock(args: UnlockArgs) -> Result<(), String> {
 }
 
 async fn drive(op_label: &str, args: UnlockArgs) -> Result<(), String> {
-    let (daemon, vault) = resolve_active(
-        args.daemon.as_deref(),
+    let (custodian, vault) = resolve_active(
+        args.custodian.as_deref(),
         args.vault.as_deref(),
         args.profile.as_deref(),
     )?;
@@ -89,7 +89,7 @@ async fn drive(op_label: &str, args: UnlockArgs) -> Result<(), String> {
     let cb = format!("http://{}/done", local_addr);
     let auth_url = format!(
         "{}/cli/auth?op={}&vault={}&cb={}&state={}",
-        daemon.trim_end_matches('/'),
+        custodian.trim_end_matches('/'),
         op_label,
         urlencoding::encode(&vault),
         urlencoding::encode(&cb),
@@ -97,7 +97,7 @@ async fn drive(op_label: &str, args: UnlockArgs) -> Result<(), String> {
     );
 
     println!("safeclaw {} — opening browser…", op_label);
-    println!("  daemon: {}", daemon);
+    println!("  custodian: {}", custodian);
     println!("  vault:  {}", vault);
     println!("  cb:     {}", cb);
     println!();

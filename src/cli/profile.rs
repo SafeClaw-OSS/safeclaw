@@ -1,8 +1,8 @@
 //! CLI-side profile config (`~/.config/safeclaw/config.toml`).
 //!
-//! The CLI persists per-profile `(daemon, vault)` pairs here so users don't
-//! type `--daemon URL --vault VID` on every command. The api key (for SaaS)
-//! lives only in `$SAFECLAW_API_KEY` — never on disk.
+//! The CLI persists per-profile `(custodian, vault)` pairs here so users
+//! don't type `--custodian URL --vault VID` on every command. The api key
+//! (for SaaS) lives only in `$SAFECLAW_API_KEY` — never on disk.
 
 use std::fs;
 use std::io::Write as _;
@@ -25,7 +25,10 @@ pub struct ProfileConfig {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Profile {
-    pub daemon: String,
+    /// Custodian URL — accepted under either field name on read for
+    /// rolling-config compat; serialised as `custodian` on write.
+    #[serde(alias = "daemon")]
+    pub custodian: String,
     pub vault: String,
 }
 
@@ -78,16 +81,16 @@ pub fn put_profile(name: &str, profile: Profile) -> Result<PathBuf, String> {
     save(&cfg)
 }
 
-/// Resolve the active `(daemon, vault)` pair for short-lived CLI commands.
-/// Explicit `--daemon` / `--vault` flags always win; otherwise the named
-/// profile (default: `$SAFECLAW_PROFILE` env, then `config.default_profile`,
-/// then `"default"`) is loaded.
+/// Resolve the active `(custodian, vault)` pair for short-lived CLI
+/// commands. Explicit `--custodian` / `--vault` flags always win; otherwise
+/// the named profile (default: `$SAFECLAW_PROFILE` env, then
+/// `config.default_profile`, then `"default"`) is loaded.
 pub fn resolve_active(
-    daemon_override: Option<&str>,
+    custodian_override: Option<&str>,
     vault_override: Option<&str>,
     profile_override: Option<&str>,
 ) -> Result<(String, String), String> {
-    if let (Some(d), Some(v)) = (daemon_override, vault_override) {
+    if let (Some(d), Some(v)) = (custodian_override, vault_override) {
         return Ok((d.to_string(), v.to_string()));
     }
     let cfg = load()?;
@@ -102,9 +105,9 @@ pub fn resolve_active(
         )
     })?;
     Ok((
-        daemon_override
+        custodian_override
             .map(str::to_string)
-            .unwrap_or_else(|| p.daemon.clone()),
+            .unwrap_or_else(|| p.custodian.clone()),
         vault_override
             .map(str::to_string)
             .unwrap_or_else(|| p.vault.clone()),

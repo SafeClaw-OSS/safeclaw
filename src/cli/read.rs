@@ -1,6 +1,6 @@
 //! `safeclaw read <KEY>` — reveal a single native secret to stdout.
 //!
-//! Mirrors `safeclaw unlock`'s browser-callback driver — opens the daemon's
+//! Mirrors `safeclaw unlock`'s browser-callback driver — opens the custodian's
 //! `/cli/auth?op=export&key=...` page, listens on a random localhost port,
 //! waits for the page to redirect back with the op id. The plaintext value
 //! is **never** put in the URL — we fetch it out-of-band via
@@ -44,8 +44,8 @@ enum Outcome {
 }
 
 pub async fn run(args: ReadArgs) -> Result<(), String> {
-    let (daemon, vault) = resolve_active(
-        args.daemon.as_deref(),
+    let (custodian, vault) = resolve_active(
+        args.custodian.as_deref(),
         args.vault.as_deref(),
         args.profile.as_deref(),
     )?;
@@ -72,7 +72,7 @@ pub async fn run(args: ReadArgs) -> Result<(), String> {
     let cb = format!("http://{}/done", local_addr);
     let auth_url = format!(
         "{}/cli/auth?op=export&vault={}&key={}&cb={}&state={}",
-        daemon.trim_end_matches('/'),
+        custodian.trim_end_matches('/'),
         urlencoding::encode(&vault),
         urlencoding::encode(&key),
         urlencoding::encode(&cb),
@@ -108,7 +108,7 @@ pub async fn run(args: ReadArgs) -> Result<(), String> {
     server_task.abort();
 
     match outcome {
-        Outcome::Ok { op_id } => fetch_and_print(&daemon, &op_id).await,
+        Outcome::Ok { op_id } => fetch_and_print(&custodian, &op_id).await,
         Outcome::Cancelled => Err("user cancelled the ceremony".into()),
         Outcome::Error(e) => Err(format!("browser page reported error: {}", e)),
         Outcome::BadState => Err("callback state mismatch (CSRF guard)".into()),
@@ -116,10 +116,10 @@ pub async fn run(args: ReadArgs) -> Result<(), String> {
 }
 
 /// Fetch the approved Export op's cached value and print it to stdout.
-async fn fetch_and_print(daemon: &str, op_id: &str) -> Result<(), String> {
+async fn fetch_and_print(custodian: &str, op_id: &str) -> Result<(), String> {
     let url = format!(
         "{}/op/{}",
-        daemon.trim_end_matches('/'),
+        custodian.trim_end_matches('/'),
         urlencoding::encode(op_id)
     );
     let client = reqwest::Client::builder()
@@ -143,7 +143,7 @@ async fn fetch_and_print(daemon: &str, op_id: &str) -> Result<(), String> {
         .get("value")
         .and_then(|v| v.as_str())
         .ok_or_else(|| {
-            "daemon did not return a `value` field — op may have been consumed already".to_string()
+            "custodian did not return a `value` field — op may have been consumed already".to_string()
         })?;
     // stdout, no trailing newline padding — same as `cat`. Lets shell
     // pipelines pipe into `pbcopy` / `xclip` / etc cleanly.

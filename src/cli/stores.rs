@@ -14,12 +14,12 @@ use crate::config::StoresSubcommand;
 pub async fn run(sub: StoresSubcommand) -> Result<(), String> {
     match sub {
         StoresSubcommand::Ls(args) => {
-            let (daemon, vault) = resolve_active(
-                args.daemon.as_deref(),
+            let (custodian, vault) = resolve_active(
+                args.custodian.as_deref(),
                 args.vault.as_deref(),
                 args.profile.as_deref(),
             )?;
-            ls(&daemon, &vault).await
+            ls(&custodian, &vault).await
         }
     }
 }
@@ -45,10 +45,10 @@ struct StoreError {
     error: String,
 }
 
-async fn ls(daemon: &str, vault: &str) -> Result<(), String> {
+async fn ls(custodian: &str, vault: &str) -> Result<(), String> {
     let url = format!(
         "{}/v/{}/keys-known",
-        daemon.trim_end_matches('/'),
+        custodian.trim_end_matches('/'),
         urlencoding::encode(vault)
     );
     let client = reqwest::Client::builder()
@@ -59,13 +59,13 @@ async fn ls(daemon: &str, vault: &str) -> Result<(), String> {
         .get(&url)
         .send()
         .await
-        .map_err(|e| format!("reach daemon: {}", e))?;
+        .map_err(|e| format!("reach custodian: {}", e))?;
     if resp.status().as_u16() == 409 {
         return Err("vault locked — run `safeclaw unlock` first".into());
     }
     if !resp.status().is_success() {
         return Err(format!(
-            "daemon returned HTTP {}: {}",
+            "custodian returned HTTP {}: {}",
             resp.status(),
             resp.text().await.unwrap_or_default()
         ));
