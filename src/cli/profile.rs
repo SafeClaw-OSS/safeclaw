@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
 pub struct CliConfig {
     /// Custodian (daemon) base URL, no trailing slash and no `/v/<vid>`
-    /// suffix. e.g. `http://127.0.0.1:23294` or
+    /// suffix. e.g. `http://localhost:23294` or
     /// `https://api.safeclaw.pro`.
     #[serde(default)]
     pub custodian: Option<String>,

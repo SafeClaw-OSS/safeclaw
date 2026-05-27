@@ -4,13 +4,13 @@
 //! `GET /health` and pretty-prints the result. Custodian URL is resolved
 //! from (in order): `--custodian` flag, `$SAFECLAW_CUSTODIAN`,
 //! `$SAFECLAW_VAULT_URL` (parsed for root), the active config in
-//! `~/.config/safeclaw/config.toml`, then `127.0.0.1:23294`. Exit code is
+//! `~/.config/safeclaw/config.toml`, then `localhost:23294`. Exit code is
 //! non-zero on transport / parse failure so shell scripts can gate on it.
 
 use crate::cli::profile::load as load_config;
 use crate::config::StatusArgs;
 
-const LOCAL_DEFAULT: &str = "http://127.0.0.1:23294";
+const LOCAL_DEFAULT: &str = "http://localhost:23294";
 
 pub async fn run(args: StatusArgs) -> Result<(), String> {
     let custodian = resolve_custodian(args.custodian.as_deref())?;

@@ -22,7 +22,7 @@ async fn run_ls(args: ProfileSelectArgs) -> Result<(), String> {
         Some(c) => c.to_string(),
         None => resolve_active(None, args.vault.as_deref())
             .map(|(c, _)| c)
-            .unwrap_or_else(|_| "http://127.0.0.1:23294".to_string()),
+            .unwrap_or_else(|_| "http://localhost:23294".to_string()),
     };
     let admin_key = std::env::var("SAFECLAW_ADMIN_KEY").map_err(|_| {
         "vault ls needs $SAFECLAW_ADMIN_KEY".to_string()
@@ -65,7 +65,7 @@ async fn run_create(args: VaultCreateArgs) -> Result<(), String> {
         .unwrap_or_else(|| {
             resolve_active(None, None)
                 .map(|(c, _)| c)
-                .unwrap_or_else(|_| "http://127.0.0.1:23294".to_string())
+                .unwrap_or_else(|_| "http://localhost:23294".to_string())
         });
     let vault_id = uuid::Uuid::new_v4().to_string();
     eprintln!("safeclaw vault create — new vault {} on {}", vault_id, custodian);
