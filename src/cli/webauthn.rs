@@ -32,6 +32,8 @@ pub struct GestureResult {
     pub signature: Option<String>,
     pub prf_first: Option<String>,
     pub attestation_object: Option<String>,
+    pub public_key_x: Option<String>,
+    pub public_key_y: Option<String>,
     pub error: Option<String>,
     pub state: Option<String>,
 }

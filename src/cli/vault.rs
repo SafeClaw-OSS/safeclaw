@@ -58,6 +58,8 @@ async fn run_ls(args: ProfileSelectArgs) -> Result<(), String> {
 }
 
 async fn run_create(args: VaultCreateArgs) -> Result<(), String> {
+    use crate::crypto::kdf::WRAP_VERSION;
+
     let custodian = args.custodian.as_deref()
         .map(|s| s.to_string())
         .unwrap_or_else(|| {
@@ -65,60 +67,148 @@ async fn run_create(args: VaultCreateArgs) -> Result<(), String> {
                 .map(|(c, _)| c)
                 .unwrap_or_else(|_| "http://127.0.0.1:23294".to_string())
         });
+    let vault_id = uuid::Uuid::new_v4().to_string();
+    eprintln!("safeclaw vault create — new vault {} on {}", vault_id, custodian);
 
-    eprintln!("safeclaw vault create — bootstrapping new vault on {}…", custodian);
-
-    let client = http_client()?;
-    let resp = client
-        .post(format!("{}/v/new", custodian.trim_end_matches('/')))
-        .send()
-        .await
-        .map_err(|e| format!("POST /v/new: {}", e))?;
-    if !resp.status().is_success() {
-        return Err(format!("/v/new HTTP {}: {}", resp.status(), resp.text().await.unwrap_or_default()));
-    }
-    let body: serde_json::Value = resp.json().await.map_err(|e| format!("parse: {}", e))?;
-    let vault_id = body["vault_id"].as_str().ok_or("no vault_id")?.to_string();
-    let op_id = body["op_id"].as_str().ok_or("no op_id")?.to_string();
-    let r = body["r"].as_str().ok_or("no r")?.to_string();
-
-    eprintln!("  vault id: {}", vault_id);
-    eprintln!("  op id:    {}", op_id);
-
-    let r_bytes = STANDARD.decode(&r).map_err(|e| format!("decode r: {}", e))?;
-    let enroll_op = json!({
-        "act": { "type": "enroll", "target": "", "scope": null },
-        "bind": { "redeemer": vault_id },
-        "valid": { "iat": now_unix(), "multiplicity": "one" }
-    });
-    let beta = compute_beta(&r_bytes, &enroll_op)?;
-
-    eprintln!("safeclaw vault create — register a passkey in your browser…");
-    let result = do_browser_gesture(
-        &custodian, &op_id, &beta,
-        None, "",
+    // ── Step 1: register passkey (WebAuthn create()) ───────────────────
+    // PRF eval salt for the create ceremony. Some authenticators support
+    // PRF on create; others need a separate get(). We try PRF here and
+    // fall back to a second get() below if needed.
+    let prf_eval_salt_js = b"safeclaw-prf-v1";
+    eprintln!("  step 1/3: register a passkey in your browser…");
+    let create_result = do_browser_gesture(
+        &custodian, &vault_id, &[0u8; 32],
+        Some(prf_eval_salt_js), "",
         "Create vault (register passkey)",
         args.no_browser, args.timeout, true,
     ).await?;
 
-    let _attestation = result.attestation_object.as_deref()
-        .ok_or("browser didn't return attestation_object")?;
+    let cred_id = create_result.credential_id.clone()
+        .ok_or("browser didn't return credential_id")?;
+    let pub_x = create_result.public_key_x.clone()
+        .ok_or("browser didn't return public_key_x")?;
+    let pub_y = create_result.public_key_y.clone()
+        .ok_or("browser didn't return public_key_y")?;
+    let cred_id_raw = URL_SAFE_NO_PAD.decode(&cred_id)
+        .map_err(|e| format!("decode cred_id: {}", e))?;
 
-    // TODO: CLI builds the initial SealedVault from the attestation +
-    // PRF output (if the browser returned one) and submits the Enroll
-    // grant. For now, report the vault_id and op_id — the daemon's
-    // Enroll handler needs the full grant body (credential pubkey,
-    // initial wrapped_key, initial ciphertext) which requires porting
-    // the setup ceremony from pro-frontend/lib/vault-grant.ts.
-    //
-    // This is the LAST piece of Wave 2. The CLI has all the Rust
-    // primitives (build_initial, derive_wrapping_key, Aead::seal,
-    // KeyWrap::wrap); the missing part is parsing the WebAuthn
-    // attestation to extract the credential public key (x, y coords)
-    // — which the browser returns in attestationObject.
+    // ── Step 2: get PRF output (from create if available, else second gesture) ─
+    let prf_first_b64 = if let Some(ref pf) = create_result.prf_first {
+        pf.clone()
+    } else {
+        eprintln!("  step 2/3: PRF not available on create — doing a second passkey gesture…");
+        let dummy_beta = [0u8; 32];
+        let get_result = do_browser_gesture(
+            &custodian, &vault_id, &dummy_beta,
+            Some(prf_eval_salt_js), &cred_id,
+            "Vault setup (PRF)",
+            args.no_browser, args.timeout, false,
+        ).await?;
+        get_result.prf_first.ok_or("PRF still unavailable — authenticator may not support PRF extension")?
+    };
+    let prf_first_bytes = URL_SAFE_NO_PAD.decode(&prf_first_b64)
+        .map_err(|e| format!("decode prf_first: {}", e))?;
+    let user_key = prf_to_user_key(&prf_first_bytes)?;
 
-    eprintln!("safeclaw vault create — passkey registered (vault {})", vault_id);
-    eprintln!("  Save this vault id. Run `safeclaw login --custodian {} --vault {}` to set it as active.", custodian, vault_id);
+    // ── Step 3: seal initial vault state ──────────────────────────────
+    eprintln!("  step 3/3: sealing initial vault state…");
+    let prf_salt = random_bytes(32);
+    let state_key = random_bytes(32); // K
+    let wrapping_key = crate::crypto::kdf::derive_wrapping_key(
+        &user_key, &prf_salt, &cred_id_raw, WRAP_VERSION,
+    ).map_err(|e| format!("derive wrapping key: {}", e))?;
+
+    let binding = sudp::primitives::WrapBinding { credential_id: &cred_id_raw, version: WRAP_VERSION };
+    let wrapped_key = <sudp::primitives::AeadWrap<sudp::primitives::ChaCha20Poly1305>
+        as sudp::primitives::KeyWrap>::wrap(&wrapping_key, &state_key, &binding)
+        .map_err(|e| format!("wrap K: {}", e))?;
+
+    let empty_state = json!({
+        "targets": {},
+        "peers": { &cred_id: STANDARD.encode(&wrapping_key) },
+        "aux": null
+    });
+    let canonical_m = sudp::canonical::canonicalize_strict(&empty_state)
+        .map_err(|e| format!("canonicalize: {}", e))?;
+    let seal_ad = {
+        let mut ad = Vec::with_capacity(b"sudp/v1/seal".len() + 2);
+        ad.extend_from_slice(b"sudp/v1/seal");
+        ad.extend_from_slice(&WRAP_VERSION.to_be_bytes());
+        ad
+    };
+    let ciphertext = <sudp::primitives::ChaCha20Poly1305 as sudp::primitives::Aead>::seal(
+        &state_key, &canonical_m, &seal_ad,
+    ).map_err(|e| format!("seal M: {}", e))?;
+
+    // ── Build Enroll op + create on daemon ────────────────────────────
+    let enroll_op = json!({
+        "act": {
+            "type": "enroll",
+            "target": cred_id,
+            "scope": {
+                "public_key_x": pub_x,
+                "public_key_y": pub_y,
+                "prf_salt": STANDARD.encode(&prf_salt),
+                "device_name": "CLI",
+            }
+        },
+        "bind": { "redeemer": vault_id },
+        "valid": { "iat": now_unix(), "multiplicity": "one" }
+    });
+    let (op_id, r) = create_op(&custodian, &vault_id, &enroll_op).await?;
+    let r_bytes = STANDARD.decode(&r).map_err(|e| format!("decode r: {}", e))?;
+    // Enroll uses DOMAIN_SETUP for β, not DOMAIN_STANDARD.
+    let canonical_op = sudp::canonical::canonicalize_strict(&enroll_op)
+        .map_err(|e| format!("canonicalize op: {}", e))?;
+    let domain_setup = b"safeclaw/v1/binding-setup";
+    let beta = sudp::beta::compute_beta_from_canonical::<sudp::primitives::Sha256>(
+        domain_setup, &r_bytes, &canonical_op,
+    );
+
+    // ── Assertion gesture (sign β) ────────────────────────────────────
+    eprintln!("  signing enrollment grant — touch passkey again…");
+    let assert_result = do_browser_gesture(
+        &custodian, &op_id, &beta,
+        None, &cred_id,
+        "Confirm vault creation",
+        args.no_browser, args.timeout, false,
+    ).await?;
+
+    // ── Submit Enroll grant ───────────────────────────────────────────
+    let grant = json!({
+        "o": enroll_op,
+        "r": r,
+        "credential_id": cred_id,
+        "wrapping_key": STANDARD.encode(&wrapping_key),
+        "assertion": assertion_json(
+            &assert_result.credential_id,
+            &assert_result.authenticator_data,
+            &assert_result.client_data_json,
+            &assert_result.signature,
+        ),
+        "setup_payload": {
+            "wrapped_key": STANDARD.encode(&wrapped_key),
+            "ciphertext": STANDARD.encode(&ciphertext),
+        }
+    });
+    let client = http_client()?;
+    let resp = client
+        .post(format!("{}/op/{}/approve", custodian.trim_end_matches('/'), urlencoding::encode(&op_id)))
+        .json(&grant)
+        .send()
+        .await
+        .map_err(|e| format!("approve: {}", e))?;
+    if !resp.status().is_success() {
+        return Err(format!("approve HTTP {}: {}", resp.status(), resp.text().await.unwrap_or_default()));
+    }
+
+    // ── Save to config ────────────────────────────────────────────────
+    crate::cli::profile::put_active(&custodian, &vault_id)
+        .map_err(|e| format!("save config: {}", e))?;
+    eprintln!("safeclaw vault create — done!");
+    eprintln!("  vault:     {}", vault_id);
+    eprintln!("  custodian: {}", custodian);
+    eprintln!("  config saved to ~/.config/safeclaw/config.toml");
     Ok(())
 }
 
