@@ -16,3 +16,4 @@ pub mod status;
 pub mod store;
 pub mod unlock;
 pub mod vault;
+pub mod write;

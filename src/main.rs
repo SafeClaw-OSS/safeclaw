@@ -88,6 +88,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 e.into()
             })
         }
+        Command::Write(args) => {
+            cli::write::run(args).await.map_err(|e| -> Box<dyn std::error::Error> {
+                eprintln!("safeclaw write: {}", e);
+                e.into()
+            })
+        }
+        Command::Delete(args) => {
+            cli::write::run_delete(args).await.map_err(|e| -> Box<dyn std::error::Error> {
+                eprintln!("safeclaw delete: {}", e);
+                e.into()
+            })
+        }
         Command::Version => {
             println!("safeclaw {}", env!("CARGO_PKG_VERSION"));
             Ok(())

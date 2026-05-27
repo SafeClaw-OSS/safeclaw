@@ -66,6 +66,14 @@ pub enum Command {
     /// Connect / disconnect are deferred until the Write op lands in the
     /// CLI (they rewrite vault.dat).
     Store(StoreArgs),
+    /// Write a native secret to the vault. Two passkey gestures: unlock
+    /// (to read current state) then write (to seal modified state). All
+    /// crypto happens locally; the browser page is a minimal passkey proxy.
+    Write(WriteArgs),
+    /// Delete a native secret from the vault. Same two-gesture flow as
+    /// write — the deletion is a Write op with the key removed from the
+    /// sealed protected state.
+    Delete(DeleteArgs),
     /// Print the safeclaw binary version.
     Version,
     /// Health + reachability checks: custodian connectivity, active
@@ -313,6 +321,36 @@ pub struct ReadArgs {
     #[arg(long)]
     pub vault: Option<String>,
 
+    #[arg(long)]
+    pub no_browser: bool,
+    #[arg(long, default_value = "120")]
+    pub timeout: u64,
+}
+
+#[derive(Debug, Args)]
+pub struct WriteArgs {
+    /// Native-secrets key name to write (`safeclaw write OPENAI_API_KEY sk-...`).
+    pub key: String,
+    /// The secret value. Shell quoting recommended for special chars.
+    pub value: String,
+    #[arg(long, env = "SAFECLAW_CUSTODIAN")]
+    pub custodian: Option<String>,
+    #[arg(long)]
+    pub vault: Option<String>,
+    #[arg(long)]
+    pub no_browser: bool,
+    #[arg(long, default_value = "120")]
+    pub timeout: u64,
+}
+
+#[derive(Debug, Args)]
+pub struct DeleteArgs {
+    /// Native-secrets key name to remove from the vault.
+    pub key: String,
+    #[arg(long, env = "SAFECLAW_CUSTODIAN")]
+    pub custodian: Option<String>,
+    #[arg(long)]
+    pub vault: Option<String>,
     #[arg(long)]
     pub no_browser: bool,
     #[arg(long, default_value = "120")]
