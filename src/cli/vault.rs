@@ -80,7 +80,7 @@ async fn run_create(args: VaultCreateArgs) -> Result<(), String> {
         &custodian, &vault_id, &[0u8; 32],
         Some(prf_eval_salt_js), "",
         "Create vault (register passkey)",
-        args.no_browser, args.timeout, true,
+        args.no_browser, args.timeout, true, args.cb_port,
     ).await?;
 
     let cred_id = create_result.credential_id.clone()
@@ -102,7 +102,7 @@ async fn run_create(args: VaultCreateArgs) -> Result<(), String> {
             &custodian, &vault_id, &dummy_beta,
             Some(prf_eval_salt_js), &cred_id,
             "Vault setup (PRF)",
-            args.no_browser, args.timeout, false,
+            args.no_browser, args.timeout, false, args.cb_port,
         ).await?;
         get_result.prf_first.ok_or("PRF still unavailable — authenticator may not support PRF extension")?
     };
@@ -171,7 +171,7 @@ async fn run_create(args: VaultCreateArgs) -> Result<(), String> {
         &custodian, &op_id, &beta,
         None, &cred_id,
         "Confirm vault creation",
-        args.no_browser, args.timeout, false,
+        args.no_browser, args.timeout, false, args.cb_port,
     ).await?;
 
     // ── Submit Enroll grant ───────────────────────────────────────────
@@ -252,7 +252,7 @@ async fn run_delete(args: VaultDeleteArgs) -> Result<(), String> {
         &custodian, &op_id, &beta,
         Some(&prf_salt_bytes), &meta.credential_id,
         "Delete vault (irreversible)",
-        args.no_browser, args.timeout, false,
+        args.no_browser, args.timeout, false, args.cb_port,
     ).await?;
 
     let prf_first = result.prf_first.ok_or("gesture didn't return prf_first")?;

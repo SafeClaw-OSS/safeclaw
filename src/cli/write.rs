@@ -23,12 +23,12 @@ pub async fn run(args: WriteArgs) -> Result<(), String> {
     eprintln!("safeclaw write {} — two passkey gestures (unlock + write)", key);
 
     let meta = fetch_passkey_meta(&custodian, &vault).await?;
-    let (kv, aux, user_key) = do_unlock(&custodian, &vault, &meta, args.no_browser, args.timeout).await?;
+    let (kv, aux, user_key) = do_unlock(&custodian, &vault, &meta, args.no_browser, args.timeout, args.cb_port).await?;
 
     let mut new_kv = kv;
     new_kv.insert(key.clone(), value);
 
-    seal_and_submit_write(&custodian, &vault, &meta, &user_key, &new_kv, &aux, args.no_browser, args.timeout).await?;
+    seal_and_submit_write(&custodian, &vault, &meta, &user_key, &new_kv, &aux, args.no_browser, args.timeout, args.cb_port).await?;
     eprintln!("safeclaw write — {} written", key);
     Ok(())
 }
@@ -39,21 +39,21 @@ pub async fn run_delete(args: DeleteArgs) -> Result<(), String> {
     eprintln!("safeclaw delete {} — two passkey gestures (unlock + write)", key);
 
     let meta = fetch_passkey_meta(&custodian, &vault).await?;
-    let (kv, aux, user_key) = do_unlock(&custodian, &vault, &meta, args.no_browser, args.timeout).await?;
+    let (kv, aux, user_key) = do_unlock(&custodian, &vault, &meta, args.no_browser, args.timeout, args.cb_port).await?;
 
     let mut new_kv = kv;
     if new_kv.remove(&key).is_none() {
         return Err(format!("key {} not found in vault", key));
     }
 
-    seal_and_submit_write(&custodian, &vault, &meta, &user_key, &new_kv, &aux, args.no_browser, args.timeout).await?;
+    seal_and_submit_write(&custodian, &vault, &meta, &user_key, &new_kv, &aux, args.no_browser, args.timeout, args.cb_port).await?;
     eprintln!("safeclaw delete — {} removed", key);
     Ok(())
 }
 
 async fn do_unlock(
     custodian: &str, vault: &str, meta: &PasskeyMeta,
-    no_browser: bool, timeout: u64,
+    no_browser: bool, timeout: u64, cb_port: Option<u16>,
 ) -> Result<(BTreeMap<String, String>, Value, Vec<u8>), String> {
     let op = json!({
         "act": { "type": { "custom": "vault-unlock" }, "target": "", "scope": null },
@@ -69,7 +69,7 @@ async fn do_unlock(
     let result = do_browser_gesture(
         custodian, &op_id, &beta,
         Some(&prf_salt_bytes), &meta.credential_id,
-        "Unlock vault", no_browser, timeout, false,
+        "Unlock vault", no_browser, timeout, false, cb_port,
     ).await?;
 
     let prf_first = result.prf_first.as_deref()
@@ -109,7 +109,7 @@ async fn do_unlock(
 async fn seal_and_submit_write(
     custodian: &str, vault: &str, meta: &PasskeyMeta,
     user_key: &[u8], kv: &BTreeMap<String, String>, aux: &Value,
-    no_browser: bool, timeout: u64,
+    no_browser: bool, timeout: u64, cb_port: Option<u16>,
 ) -> Result<(), String> {
     let cred_id_raw = URL_SAFE_NO_PAD.decode(&meta.credential_id)
         .map_err(|e| format!("decode cred_id: {}", e))?;
@@ -149,7 +149,7 @@ async fn seal_and_submit_write(
     let result = do_browser_gesture(
         custodian, &op_id, &beta,
         None, &meta.credential_id,
-        "Write vault", no_browser, timeout, false,
+        "Write vault", no_browser, timeout, false, cb_port,
     ).await?;
 
     let grant = json!({

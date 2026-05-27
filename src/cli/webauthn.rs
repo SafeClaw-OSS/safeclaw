@@ -62,9 +62,11 @@ pub async fn do_browser_gesture(
     no_browser: bool,
     timeout_secs: u64,
     enroll: bool,
+    cb_port: Option<u16>,
 ) -> Result<GestureResult, String> {
-    let listener = TcpListener::bind("127.0.0.1:0").await
-        .map_err(|e| format!("bind: {}", e))?;
+    let bind_addr = format!("127.0.0.1:{}", cb_port.unwrap_or(0));
+    let listener = TcpListener::bind(&bind_addr).await
+        .map_err(|e| format!("bind {}: {}", bind_addr, e))?;
     let local_addr = listener.local_addr().map_err(|e| format!("addr: {}", e))?;
     let state_token = random_hex(16);
     let (tx, rx) = oneshot::channel::<GestureResult>();

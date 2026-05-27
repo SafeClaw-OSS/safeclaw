@@ -193,6 +193,11 @@ pub struct VaultCreateArgs {
     pub custodian: Option<String>,
     #[arg(long)]
     pub no_browser: bool,
+    /// Fixed port for the localhost callback server. When set, the CLI
+    /// always binds to this port (useful for SSH port-forwarding).
+    /// Default: random OS-assigned port.
+    #[arg(long)]
+    pub cb_port: Option<u16>,
     #[arg(long, default_value = "120")]
     pub timeout: u64,
 }
@@ -213,6 +218,11 @@ pub struct VaultDeleteArgs {
 
     #[arg(long)]
     pub no_browser: bool,
+    /// Fixed port for the localhost callback server. When set, the CLI
+    /// always binds to this port (useful for SSH port-forwarding).
+    /// Default: random OS-assigned port.
+    #[arg(long)]
+    pub cb_port: Option<u16>,
     #[arg(long, default_value = "120")]
     pub timeout: u64,
 }
@@ -311,6 +321,10 @@ pub struct UnlockArgs {
     #[arg(long)]
     pub no_browser: bool,
 
+    /// Fixed port for the localhost callback server (for SSH port-forwarding).
+    #[arg(long)]
+    pub cb_port: Option<u16>,
+
     /// How long (seconds) to wait for the browser-callback before giving up.
     #[arg(long, default_value = "120")]
     pub timeout: u64,
@@ -339,6 +353,11 @@ pub struct ReadArgs {
 
     #[arg(long)]
     pub no_browser: bool,
+    /// Fixed port for the localhost callback server. When set, the CLI
+    /// always binds to this port (useful for SSH port-forwarding).
+    /// Default: random OS-assigned port.
+    #[arg(long)]
+    pub cb_port: Option<u16>,
     #[arg(long, default_value = "120")]
     pub timeout: u64,
 }
@@ -355,6 +374,11 @@ pub struct WriteArgs {
     pub vault: Option<String>,
     #[arg(long)]
     pub no_browser: bool,
+    /// Fixed port for the localhost callback server. When set, the CLI
+    /// always binds to this port (useful for SSH port-forwarding).
+    /// Default: random OS-assigned port.
+    #[arg(long)]
+    pub cb_port: Option<u16>,
     #[arg(long, default_value = "120")]
     pub timeout: u64,
 }
@@ -369,6 +393,11 @@ pub struct DeleteArgs {
     pub vault: Option<String>,
     #[arg(long)]
     pub no_browser: bool,
+    /// Fixed port for the localhost callback server. When set, the CLI
+    /// always binds to this port (useful for SSH port-forwarding).
+    /// Default: random OS-assigned port.
+    #[arg(long)]
+    pub cb_port: Option<u16>,
     #[arg(long, default_value = "120")]
     pub timeout: u64,
 }

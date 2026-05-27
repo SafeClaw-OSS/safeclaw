@@ -38,7 +38,7 @@ pub async fn run(args: ReadArgs) -> Result<(), String> {
         &custodian, &op_id, &beta,
         Some(&prf_salt_bytes), &meta.credential_id,
         &format!("Reveal {}", key),
-        args.no_browser, args.timeout, false,
+        args.no_browser, args.timeout, false, args.cb_port,
     ).await?;
 
     let prf_first = result.prf_first.ok_or("gesture didn't return prf_first")?;

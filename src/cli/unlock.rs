@@ -37,7 +37,7 @@ async fn drive(custom_op: &str, label: &str, args: UnlockArgs) -> Result<(), Str
     let result = do_browser_gesture(
         &custodian, &op_id, &beta,
         Some(&prf_salt_bytes), &meta.credential_id,
-        label, args.no_browser, args.timeout, false,
+        label, args.no_browser, args.timeout, false, args.cb_port,
     ).await?;
 
     let prf_first = result.prf_first.ok_or("gesture didn't return prf_first")?;
