@@ -5,7 +5,7 @@ use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
 use serde_json::json;
 
-use crate::cli::gesture::*;
+use crate::cli::callback::*;
 use crate::cli::profile::resolve_active;
 use crate::config::UnlockArgs;
 
