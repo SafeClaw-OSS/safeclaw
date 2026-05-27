@@ -248,11 +248,12 @@ pub struct ServeArgs {
     #[arg(long, env = "SAFECLAW_BIND", default_value = "127.0.0.1")]
     pub bind: String,
 
-    /// Expected WebAuthn origin (e.g. "https://safeclaw.pro").
-    #[arg(long, env = "SAFECLAW_ORIGIN", default_value = "http://localhost:3000")]
-    pub origin: String,
+    /// Expected WebAuthn origin. Defaults to http://localhost:{port} so
+    /// OSS self-host works out of the box. SaaS overrides via env.
+    #[arg(long, env = "SAFECLAW_ORIGIN")]
+    pub origin: Option<String>,
 
-    /// WebAuthn relying party ID (e.g. "safeclaw.pro").
+    /// WebAuthn relying party ID. Defaults to "localhost" for self-host.
     #[arg(long, env = "SAFECLAW_RP_ID", default_value = "localhost")]
     pub rp_id: String,
 
@@ -385,12 +386,13 @@ pub struct Config {
 
 impl Config {
     pub fn from_serve_args(args: ServeArgs) -> Self {
+        let origin = args.origin.unwrap_or_else(|| format!("http://localhost:{}", args.port));
         Self {
             state_dir: args.state_dir,
             port: args.port,
             proxy_port: args.proxy_port,
             bind: args.bind,
-            origin: args.origin,
+            origin,
             rp_id: args.rp_id,
             admin_key: args.admin_key,
         }
