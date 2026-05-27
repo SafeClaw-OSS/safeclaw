@@ -370,10 +370,14 @@ impl AuditStore {
 
 /// Per-vault `AuditStore` cache. Lazy-init on first `for_vault` call —
 /// no DB file exists until that vault's first op writes audit.
-/// Maximum number of simultaneously cached audit-store handles.
-/// Each handle holds an open SQLite fd; capping prevents fd exhaustion via
-/// vault_id enumeration from unauthenticated callers.
-const AUDIT_REGISTRY_CAP: usize = 500;
+
+/// fd ceiling for simultaneously open SQLite connection handles.
+/// Each WAL-mode SQLite connection uses ~3 fds; 2000 × 3 = 6000 fds,
+/// well within Linux's default nofile=65536. This is a resource management
+/// ceiling, not a DoS gate — the DoS gate is the vault-existence check in
+/// `for_vault`. When the ceiling is hit, one cached handle is evicted (fd
+/// closed, on-disk data untouched); the next access reopens the file.
+const AUDIT_REGISTRY_CAP: usize = 2000;
 
 pub struct AuditRegistry {
     vaults: VaultDir,
@@ -394,20 +398,36 @@ impl AuditRegistry {
             if let Some(s) = stores.get(vault_id) {
                 return Ok(s.clone());
             }
-            if stores.len() >= AUDIT_REGISTRY_CAP {
-                return Err(crate::error::AppError::Internal(
-                    "audit registry capacity exceeded".into(),
-                ));
-            }
         }
-        // Open outside the lock so a slow disk doesn't block other vaults.
+
+        // Layer 1 — DoS gate: verify the vault exists before touching any fd.
+        // Fake vault_ids have no directory on disk; without this check, open()
+        // would call create_dir_all and allocate a real fd for a non-vault.
+        let vault_dir = self.vaults.dir_for(vault_id)?;
+        if !vault_dir.exists() {
+            return Err(crate::error::AppError::NotFound);
+        }
+
+        // Open the SQLite connection outside the lock so a slow disk access
+        // doesn't block concurrent requests to other vaults.
         let db_path = self.vaults.audit_path(vault_id)?;
         let store = Arc::new(AuditStore::open(&db_path)?);
+
         let mut stores = self.stores.lock().unwrap();
-        // Race: another thread may have inserted in the meantime — keep theirs.
+        // Race: another thread may have inserted while we were opening — keep theirs.
         if let Some(existing) = stores.get(vault_id) {
             return Ok(existing.clone());
         }
+
+        // Layer 2 — fd ceiling: evict one handle when at capacity.
+        // The evicted vault's SQLite fd is closed; its on-disk data is untouched.
+        // The next request for that vault simply reopens the file.
+        if stores.len() >= AUDIT_REGISTRY_CAP {
+            if let Some(key) = stores.keys().next().cloned() {
+                stores.remove(&key);
+            }
+        }
+
         stores.insert(vault_id.to_string(), store.clone());
         Ok(store)
     }
