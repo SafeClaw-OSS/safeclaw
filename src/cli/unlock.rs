@@ -36,7 +36,7 @@ async fn drive(custom_op: &str, label: &str, args: UnlockArgs) -> Result<(), Str
     eprintln!("safeclaw {} — touch passkey…", label.to_lowercase());
     let result = do_browser_gesture(
         &custodian, &op_id, &beta,
-        Some(&prf_salt_bytes), &meta.credential_id,
+        Some(PRF_EVAL_SALT), &meta.credential_id,
         label, args.no_browser, args.timeout, false, args.cb_port,
     ).await?;
 

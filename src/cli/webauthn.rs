@@ -151,6 +151,8 @@ pub fn compute_beta_setup(r: &[u8], op: &Value) -> Result<Vec<u8>, String> {
     Ok(beta.to_vec())
 }
 
+pub const PRF_EVAL_SALT: &[u8] = b"safeclaw-prf-v1";
+
 pub fn prf_to_user_key(prf_first: &[u8]) -> Result<Vec<u8>, String> {
     use sudp::primitives::{HkdfSha256, Kdf as _};
     let salt = [0u8; 32];

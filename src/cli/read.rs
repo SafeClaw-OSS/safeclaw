@@ -36,7 +36,7 @@ pub async fn run(args: ReadArgs) -> Result<(), String> {
     eprintln!("safeclaw read {} — touch passkey…", key);
     let result = do_browser_gesture(
         &custodian, &op_id, &beta,
-        Some(&prf_salt_bytes), &meta.credential_id,
+        Some(PRF_EVAL_SALT), &meta.credential_id,
         &format!("Reveal {}", key),
         args.no_browser, args.timeout, false, args.cb_port,
     ).await?;

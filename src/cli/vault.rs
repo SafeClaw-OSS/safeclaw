@@ -244,7 +244,7 @@ async fn run_delete(args: VaultDeleteArgs) -> Result<(), String> {
     eprintln!("safeclaw vault delete {} — touch passkey…", vault);
     let result = do_browser_gesture(
         &custodian, &op_id, &beta,
-        Some(&prf_salt_bytes), &meta.credential_id,
+        Some(PRF_EVAL_SALT), &meta.credential_id,
         "Delete vault (irreversible)",
         args.no_browser, args.timeout, false, args.cb_port,
     ).await?;

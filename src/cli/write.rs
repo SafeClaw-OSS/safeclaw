@@ -68,7 +68,7 @@ async fn do_unlock(
     eprintln!("  gesture 1/2: unlock — touch passkey…");
     let result = do_browser_gesture(
         custodian, &op_id, &beta,
-        Some(&prf_salt_bytes), &meta.credential_id,
+        Some(PRF_EVAL_SALT), &meta.credential_id,
         "Unlock vault", no_browser, timeout, false, cb_port,
     ).await?;
 
