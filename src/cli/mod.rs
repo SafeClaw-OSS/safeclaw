@@ -7,6 +7,7 @@
 pub mod admin;
 pub mod doctor;
 pub mod env;
+pub mod gesture;
 pub mod login;
 pub mod ls;
 pub mod passkey;

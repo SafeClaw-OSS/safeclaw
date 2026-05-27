@@ -64,20 +64,10 @@ pub fn admin_router(state: Arc<AppState>) -> Router {
         .route("/op/{op_id}", get(handlers::approve::get_op))
         .route("/op/{op_id}/approve", post(handlers::approve::approve_op))
         .route("/op/{op_id}/reject", post(handlers::approve::reject_op))
-        // New passkey page (minimal — assertion + PRF only, CLI does all crypto).
+        // Passkey page (minimal — assertion + PRF only, CLI does all crypto).
+        // GET /op/{id} with Accept: text/html serves the HTML; /op-page/main.js
+        // is the JS asset. All CLI commands use this unified page.
         .route("/op-page/main.js", get(handlers::cli_auth::op_page_js))
-        // Legacy CLI auth page (sc unlock / sc lock / sc read / sc vault delete
-        // still open /cli/auth?op=...; kept for backward compat until those
-        // commands are migrated to the /op/{id} flow).
-        .route("/cli/auth", get(handlers::cli_auth::index))
-        .route("/cli/auth/main.js", get(handlers::cli_auth::main_js))
-        .route("/cli/auth/sudp/bytes.js", get(handlers::cli_auth::sudp_bytes))
-        .route("/cli/auth/sudp/canonical.js", get(handlers::cli_auth::sudp_canonical))
-        .route("/cli/auth/sudp/hash.js", get(handlers::cli_auth::sudp_hash))
-        .route("/cli/auth/sudp/aad.js", get(handlers::cli_auth::sudp_aad))
-        .route("/cli/auth/sudp/binding.js", get(handlers::cli_auth::sudp_binding))
-        .route("/cli/auth/sudp/kdf.js", get(handlers::cli_auth::sudp_kdf))
-        .route("/cli/auth/sudp/webauthn.js", get(handlers::cli_auth::sudp_webauthn))
         // Admin (X-Admin-Key gated; off when SAFECLAW_ADMIN_KEY unset).
         .route("/admin/vaults", get(handlers::admin::list_vaults))
         .route("/admin/vaults/{vid}", delete(handlers::admin::delete_vault))

@@ -1,205 +1,72 @@
-//! `safeclaw unlock` / `safeclaw lock` — drives the custodian's `/cli/auth`
-//! browser page over a localhost callback.
-//!
-//! Flow:
-//!   1. Resolve `(custodian, vault)` from CLI flags or active profile.
-//!   2. Bind a tiny axum server on `127.0.0.1:RANDOM` (one route, `/done`).
-//!   3. Generate a 16-byte hex `state` token (CSRF).
-//!   4. Try to open the user's default browser at
-//!      `<custodian>/cli/auth?op=<unlock|lock>&vault=<vid>&cb=<cb>&state=<token>`.
-//!      Fall back to printing the URL.
-//!   5. Block up to `timeout` seconds waiting for the callback's GET.
-//!   6. Verify `state` matches; report the page's `status` (ok/error/cancelled).
+//! `safeclaw unlock` / `safeclaw lock` — CLI creates the op, browser does
+//! passkey gesture only, CLI builds grant + submits.
 
-use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::Duration;
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+use base64::Engine;
+use serde_json::json;
 
-use axum::extract::{Query, State};
-use axum::http::StatusCode;
-use axum::response::IntoResponse;
-use axum::routing::get;
-use axum::Router;
-use rand::RngCore;
-use serde::Deserialize;
-use tokio::net::TcpListener;
-use tokio::sync::Mutex;
-use tokio::sync::oneshot;
-
+use crate::cli::gesture::*;
 use crate::cli::profile::resolve_active;
 use crate::config::UnlockArgs;
 
-#[derive(Debug, Deserialize)]
-struct CallbackParams {
-    status: Option<String>,
-    error: Option<String>,
-    state: Option<String>,
-}
-
-struct CallbackState {
-    expected_state: String,
-    tx: Mutex<Option<oneshot::Sender<CallbackOutcome>>>,
-}
-
-enum CallbackOutcome {
-    Ok,
-    Cancelled,
-    Error(String),
-    BadState,
-}
-
-/// Public entry point — dispatch to the unified driver below with the right
-/// op label.
 pub async fn run_unlock(args: UnlockArgs) -> Result<(), String> {
-    drive("unlock", args).await
+    drive("vault-unlock", "Unlock vault", args).await
 }
 pub async fn run_lock(args: UnlockArgs) -> Result<(), String> {
-    drive("lock", args).await
+    drive("vault-lock", "Lock vault", args).await
 }
 
-async fn drive(op_label: &str, args: UnlockArgs) -> Result<(), String> {
-    let (custodian, vault) = resolve_active(
-        args.custodian.as_deref(),
-        args.vault.as_deref(),
-    )?;
+async fn drive(custom_op: &str, label: &str, args: UnlockArgs) -> Result<(), String> {
+    let (custodian, vault) = resolve_active(args.custodian.as_deref(), args.vault.as_deref())?;
+    let meta = fetch_passkey_meta(&custodian, &vault).await?;
 
-    // 1. Bind localhost listener on a random port.
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let op = json!({
+        "act": { "type": { "custom": custom_op }, "target": "", "scope": null },
+        "bind": { "redeemer": vault },
+        "valid": { "iat": now_unix(), "multiplicity": "one" }
+    });
+    let (op_id, r) = create_op(&custodian, &vault, &op).await?;
+    let r_bytes = STANDARD.decode(&r).map_err(|e| format!("decode r: {}", e))?;
+    let beta = compute_beta(&r_bytes, &op)?;
+
+    let prf_salt_bytes = STANDARD.decode(&meta.prf_salt)
+        .or_else(|_| URL_SAFE_NO_PAD.decode(&meta.prf_salt))
+        .map_err(|e| format!("decode prf_salt: {}", e))?;
+
+    eprintln!("safeclaw {} — touch passkey…", label.to_lowercase());
+    let result = do_browser_gesture(
+        &custodian, &op_id, &beta,
+        Some(&prf_salt_bytes), &meta.credential_id,
+        label, args.no_browser, args.timeout, false,
+    ).await?;
+
+    let prf_first = result.prf_first.ok_or("gesture didn't return prf_first")?;
+    let prf_first_bytes = URL_SAFE_NO_PAD.decode(&prf_first)
+        .map_err(|e| format!("decode prf_first: {}", e))?;
+    let user_key = prf_to_user_key(&prf_first_bytes)?;
+    let cred_id_raw = URL_SAFE_NO_PAD.decode(&meta.credential_id)
+        .map_err(|e| format!("decode cred_id: {}", e))?;
+    let wrapping_key = crate::crypto::kdf::derive_wrapping_key(
+        &user_key, &prf_salt_bytes, &cred_id_raw, crate::crypto::kdf::WRAP_VERSION,
+    ).map_err(|e| format!("derive wrapping key: {}", e))?;
+
+    let grant = json!({
+        "o": op,
+        "r": r,
+        "credential_id": meta.credential_id,
+        "wrapping_key": STANDARD.encode(&wrapping_key),
+        "assertion": assertion_json(&result.credential_id, &result.authenticator_data, &result.client_data_json, &result.signature),
+    });
+    let client = http_client()?;
+    let resp = client
+        .post(format!("{}/op/{}/approve", custodian.trim_end_matches('/'), urlencoding::encode(&op_id)))
+        .json(&grant)
+        .send()
         .await
-        .map_err(|e| format!("bind localhost: {}", e))?;
-    let local_addr = listener
-        .local_addr()
-        .map_err(|e| format!("local_addr: {}", e))?;
-
-    // 2. Generate state token for CSRF.
-    let state_token = random_hex(16);
-
-    // 3. Wire up the callback server.
-    let (tx, rx) = oneshot::channel::<CallbackOutcome>();
-    let app_state = Arc::new(CallbackState {
-        expected_state: state_token.clone(),
-        tx: Mutex::new(Some(tx)),
-    });
-    let app = Router::new()
-        .route("/done", get(handle_done))
-        .with_state(app_state.clone());
-
-    // 4. Build the URL we want the browser to open.
-    let cb = format!("http://{}/done", local_addr);
-    let auth_url = format!(
-        "{}/cli/auth?op={}&vault={}&cb={}&state={}",
-        custodian.trim_end_matches('/'),
-        op_label,
-        urlencoding::encode(&vault),
-        urlencoding::encode(&cb),
-        urlencoding::encode(&state_token),
-    );
-
-    println!("safeclaw {} — opening browser…", op_label);
-    println!("  custodian: {}", custodian);
-    println!("  vault:  {}", vault);
-    println!("  cb:     {}", cb);
-    println!();
-    println!("If your browser doesn't open, visit this URL manually:");
-    println!("  {}", auth_url);
-    println!();
-
-    if !args.no_browser {
-        if let Err(e) = open_browser(&auth_url) {
-            eprintln!("(could not auto-open browser: {}) — visit the URL above.", e);
-        }
+        .map_err(|e| format!("approve: {}", e))?;
+    if !resp.status().is_success() {
+        return Err(format!("approve HTTP {}: {}", resp.status(), resp.text().await.unwrap_or_default()));
     }
-
-    // 5. Spawn the callback server in a task; await either the channel or
-    // the timeout. The server is dropped (and the listener closed) when we
-    // exit the select! arm — no graceful shutdown needed, the OS reclaims.
-    let server_task = tokio::spawn(async move {
-        let _ = axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .await;
-    });
-
-    let outcome = tokio::select! {
-        outcome = rx => outcome.unwrap_or(CallbackOutcome::Error("callback channel dropped".into())),
-        _ = tokio::time::sleep(Duration::from_secs(args.timeout)) => {
-            server_task.abort();
-            return Err(format!("timed out after {}s waiting for browser callback", args.timeout));
-        }
-    };
-    server_task.abort();
-
-    match outcome {
-        CallbackOutcome::Ok => {
-            println!("safeclaw {} — ok", op_label);
-            Ok(())
-        }
-        CallbackOutcome::Cancelled => Err("user cancelled the ceremony".into()),
-        CallbackOutcome::Error(e) => Err(format!("browser page reported error: {}", e)),
-        CallbackOutcome::BadState => Err("callback state mismatch (CSRF guard)".into()),
-    }
-}
-
-async fn handle_done(
-    State(state): State<Arc<CallbackState>>,
-    Query(params): Query<CallbackParams>,
-) -> impl IntoResponse {
-    let s = params.state.unwrap_or_default();
-    let outcome = if s != state.expected_state {
-        CallbackOutcome::BadState
-    } else {
-        match params.status.as_deref() {
-            Some("ok") => CallbackOutcome::Ok,
-            Some("cancelled") => CallbackOutcome::Cancelled,
-            _ => CallbackOutcome::Error(
-                params
-                    .error
-                    .unwrap_or_else(|| "unknown".into()),
-            ),
-        }
-    };
-
-    let body = match &outcome {
-        CallbackOutcome::Ok => "OK — you can close this tab and return to the terminal.\n",
-        CallbackOutcome::Cancelled => "Cancelled — return to the terminal.\n",
-        CallbackOutcome::Error(_) => "Error — see terminal for details.\n",
-        CallbackOutcome::BadState => "Bad state — return to the terminal.\n",
-    };
-
-    if let Some(tx) = state.tx.lock().await.take() {
-        let _ = tx.send(outcome);
-    }
-    (StatusCode::OK, body)
-}
-
-fn random_hex(bytes: usize) -> String {
-    let mut buf = vec![0u8; bytes];
-    rand::thread_rng().fill_bytes(&mut buf);
-    buf.iter().map(|b| format!("{:02x}", b)).collect()
-}
-
-/// Best-effort browser open. Try `xdg-open` (linux), `open` (macOS), `start`
-/// (windows) — first one that succeeds wins.
-fn open_browser(url: &str) -> Result<(), String> {
-    #[cfg(target_os = "linux")]
-    let candidates: &[&[&str]] = &[&["xdg-open"], &["wslview"], &["x-www-browser"]];
-    #[cfg(target_os = "macos")]
-    let candidates: &[&[&str]] = &[&["open"]];
-    #[cfg(target_os = "windows")]
-    let candidates: &[&[&str]] = &[&["cmd", "/C", "start", ""]];
-
-    for cmd in candidates {
-        let mut c = std::process::Command::new(cmd[0]);
-        for arg in &cmd[1..] {
-            c.arg(arg);
-        }
-        c.arg(url);
-        c.stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        if c.spawn().is_ok() {
-            return Ok(());
-        }
-    }
-    Err("no browser opener available".into())
+    eprintln!("safeclaw {} — ok", label.to_lowercase());
+    Ok(())
 }

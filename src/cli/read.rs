@@ -1,212 +1,81 @@
 //! `safeclaw read <KEY>` — reveal a single native secret to stdout.
 //!
-//! Mirrors `safeclaw unlock`'s browser-callback driver — opens the custodian's
-//! `/cli/auth?op=export&key=...` page, listens on a random localhost port,
-//! waits for the page to redirect back with the op id. The plaintext value
-//! is **never** put in the URL — we fetch it out-of-band via
-//! `GET /op/{op_id}` after the callback confirms approval.
+//! CLI creates an Export op, browser does passkey gesture, CLI builds
+//! grant + submits, then reads the cached value from GET /op/{op_id}.
 
-use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::Duration;
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+use base64::Engine;
+use serde_json::json;
 
-use axum::extract::{Query, State};
-use axum::http::StatusCode;
-use axum::response::IntoResponse;
-use axum::routing::get;
-use axum::Router;
-use rand::RngCore;
-use serde::Deserialize;
-use tokio::net::TcpListener;
-use tokio::sync::{oneshot, Mutex};
-
+use crate::cli::gesture::*;
 use crate::cli::profile::resolve_active;
 use crate::config::ReadArgs;
 
-#[derive(Debug, Deserialize)]
-struct CallbackParams {
-    status: Option<String>,
-    error: Option<String>,
-    state: Option<String>,
-    op_id: Option<String>,
-}
-
-struct CbState {
-    expected_state: String,
-    tx: Mutex<Option<oneshot::Sender<Outcome>>>,
-}
-
-enum Outcome {
-    Ok { op_id: String },
-    Cancelled,
-    Error(String),
-    BadState,
-}
-
 pub async fn run(args: ReadArgs) -> Result<(), String> {
-    let (custodian, vault) = resolve_active(
-        args.custodian.as_deref(),
-        args.vault.as_deref(),
-    )?;
+    let (custodian, vault) = resolve_active(args.custodian.as_deref(), args.vault.as_deref())?;
     let key = args.key.trim().to_string();
     if key.is_empty() {
         return Err("key cannot be empty".into());
     }
 
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .map_err(|e| format!("bind localhost: {}", e))?;
-    let local_addr = listener.local_addr().map_err(|e| format!("local_addr: {}", e))?;
-    let state_token = random_hex(16);
+    let meta = fetch_passkey_meta(&custodian, &vault).await?;
 
-    let (tx, rx) = oneshot::channel::<Outcome>();
-    let cb_state = Arc::new(CbState {
-        expected_state: state_token.clone(),
-        tx: Mutex::new(Some(tx)),
+    let op = json!({
+        "act": { "type": "export", "target": key, "scope": null },
+        "bind": { "redeemer": vault },
+        "valid": { "iat": now_unix(), "multiplicity": "one" }
     });
-    let app = Router::new()
-        .route("/done", get(handle_done))
-        .with_state(cb_state.clone());
+    let (op_id, r) = create_op(&custodian, &vault, &op).await?;
+    let r_bytes = STANDARD.decode(&r).map_err(|e| format!("decode r: {}", e))?;
+    let beta = compute_beta(&r_bytes, &op)?;
 
-    let cb = format!("http://{}/done", local_addr);
-    let auth_url = format!(
-        "{}/cli/auth?op=export&vault={}&key={}&cb={}&state={}",
-        custodian.trim_end_matches('/'),
-        urlencoding::encode(&vault),
-        urlencoding::encode(&key),
-        urlencoding::encode(&cb),
-        urlencoding::encode(&state_token),
-    );
+    let prf_salt_bytes = STANDARD.decode(&meta.prf_salt)
+        .or_else(|_| URL_SAFE_NO_PAD.decode(&meta.prf_salt))
+        .map_err(|e| format!("decode prf_salt: {}", e))?;
 
-    eprintln!("safeclaw read {} — opening browser…", key);
-    eprintln!("If your browser doesn't open, visit this URL manually:");
-    eprintln!("  {}", auth_url);
-    eprintln!();
+    eprintln!("safeclaw read {} — touch passkey…", key);
+    let result = do_browser_gesture(
+        &custodian, &op_id, &beta,
+        Some(&prf_salt_bytes), &meta.credential_id,
+        &format!("Reveal {}", key),
+        args.no_browser, args.timeout, false,
+    ).await?;
 
-    if !args.no_browser {
-        if let Err(e) = open_browser(&auth_url) {
-            eprintln!("(could not auto-open browser: {}) — visit the URL above.", e);
-        }
-    }
+    let prf_first = result.prf_first.ok_or("gesture didn't return prf_first")?;
+    let prf_first_bytes = URL_SAFE_NO_PAD.decode(&prf_first)
+        .map_err(|e| format!("decode prf_first: {}", e))?;
+    let user_key = prf_to_user_key(&prf_first_bytes)?;
+    let cred_id_raw = URL_SAFE_NO_PAD.decode(&meta.credential_id)
+        .map_err(|e| format!("decode cred_id: {}", e))?;
+    let wrapping_key = crate::crypto::kdf::derive_wrapping_key(
+        &user_key, &prf_salt_bytes, &cred_id_raw, crate::crypto::kdf::WRAP_VERSION,
+    ).map_err(|e| format!("derive wrapping key: {}", e))?;
 
-    let server_task = tokio::spawn(async move {
-        let _ = axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .await;
+    let grant = json!({
+        "o": op,
+        "r": r,
+        "credential_id": meta.credential_id,
+        "wrapping_key": STANDARD.encode(&wrapping_key),
+        "assertion": assertion_json(&result.credential_id, &result.authenticator_data, &result.client_data_json, &result.signature),
     });
-
-    let outcome = tokio::select! {
-        outcome = rx => outcome.unwrap_or(Outcome::Error("callback channel dropped".into())),
-        _ = tokio::time::sleep(Duration::from_secs(args.timeout)) => {
-            server_task.abort();
-            return Err(format!("timed out after {}s waiting for browser callback", args.timeout));
-        }
-    };
-    server_task.abort();
-
-    match outcome {
-        Outcome::Ok { op_id } => fetch_and_print(&custodian, &op_id).await,
-        Outcome::Cancelled => Err("user cancelled the ceremony".into()),
-        Outcome::Error(e) => Err(format!("browser page reported error: {}", e)),
-        Outcome::BadState => Err("callback state mismatch (CSRF guard)".into()),
-    }
-}
-
-/// Fetch the approved Export op's cached value and print it to stdout.
-async fn fetch_and_print(custodian: &str, op_id: &str) -> Result<(), String> {
-    let url = format!(
-        "{}/op/{}",
-        custodian.trim_end_matches('/'),
-        urlencoding::encode(op_id)
-    );
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(8))
-        .build()
-        .map_err(|e| format!("client init: {}", e))?;
+    let client = http_client()?;
     let resp = client
-        .get(&url)
+        .post(format!("{}/op/{}/approve", custodian.trim_end_matches('/'), urlencoding::encode(&op_id)))
+        .json(&grant)
         .send()
         .await
-        .map_err(|e| format!("fetch op: {}", e))?;
+        .map_err(|e| format!("approve: {}", e))?;
     if !resp.status().is_success() {
-        return Err(format!(
-            "GET /op/{} returned HTTP {}",
-            op_id,
-            resp.status()
-        ));
+        return Err(format!("approve HTTP {}: {}", resp.status(), resp.text().await.unwrap_or_default()));
     }
+
     let body: serde_json::Value = resp.json().await.map_err(|e| format!("parse: {}", e))?;
-    let value = body
-        .get("value")
+    let value = body.get("value")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| {
-            "custodian did not return a `value` field — op may have been consumed already".to_string()
-        })?;
-    // stdout, no trailing newline padding — same as `cat`. Lets shell
-    // pipelines pipe into `pbcopy` / `xclip` / etc cleanly.
+        .ok_or("no value in response — op may have been consumed")?;
     use std::io::Write as _;
     let mut out = std::io::stdout().lock();
-    out.write_all(value.as_bytes()).map_err(|e| format!("stdout write: {}", e))?;
+    out.write_all(value.as_bytes()).map_err(|e| format!("stdout: {}", e))?;
     out.write_all(b"\n").ok();
     Ok(())
-}
-
-async fn handle_done(
-    State(state): State<Arc<CbState>>,
-    Query(params): Query<CallbackParams>,
-) -> impl IntoResponse {
-    let s = params.state.unwrap_or_default();
-    let outcome = if s != state.expected_state {
-        Outcome::BadState
-    } else {
-        match params.status.as_deref() {
-            Some("ok") => match params.op_id {
-                Some(id) if !id.is_empty() => Outcome::Ok { op_id: id },
-                _ => Outcome::Error("page reported ok but didn't return op_id".into()),
-            },
-            Some("cancelled") => Outcome::Cancelled,
-            _ => Outcome::Error(params.error.unwrap_or_else(|| "unknown".into())),
-        }
-    };
-    let body = match &outcome {
-        Outcome::Ok { .. } => "OK — you can close this tab and return to the terminal.\n",
-        Outcome::Cancelled => "Cancelled — return to the terminal.\n",
-        Outcome::Error(_) => "Error — see terminal for details.\n",
-        Outcome::BadState => "Bad state — return to the terminal.\n",
-    };
-    if let Some(tx) = state.tx.lock().await.take() {
-        let _ = tx.send(outcome);
-    }
-    (StatusCode::OK, body)
-}
-
-fn random_hex(bytes: usize) -> String {
-    let mut buf = vec![0u8; bytes];
-    rand::thread_rng().fill_bytes(&mut buf);
-    buf.iter().map(|b| format!("{:02x}", b)).collect()
-}
-
-fn open_browser(url: &str) -> Result<(), String> {
-    #[cfg(target_os = "linux")]
-    let candidates: &[&[&str]] = &[&["xdg-open"], &["wslview"], &["x-www-browser"]];
-    #[cfg(target_os = "macos")]
-    let candidates: &[&[&str]] = &[&["open"]];
-    #[cfg(target_os = "windows")]
-    let candidates: &[&[&str]] = &[&["cmd", "/C", "start", ""]];
-
-    for cmd in candidates {
-        let mut c = std::process::Command::new(cmd[0]);
-        for arg in &cmd[1..] {
-            c.arg(arg);
-        }
-        c.arg(url);
-        c.stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        if c.spawn().is_ok() {
-            return Ok(());
-        }
-    }
-    Err("no browser opener available".into())
 }
