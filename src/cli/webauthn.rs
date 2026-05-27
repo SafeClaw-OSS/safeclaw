@@ -120,6 +120,7 @@ pub async fn do_browser_gesture(
     if result.state.as_deref() != Some(&state_token) {
         return Err("CSRF state mismatch".into());
     }
+    eprintln!("  passkey ok");
     Ok(result)
 }
 
@@ -137,12 +138,16 @@ pub async fn create_op(custodian: &str, vault: &str, op: &Value) -> Result<(Stri
 }
 
 pub fn compute_beta(r: &[u8], op: &Value) -> Result<Vec<u8>, String> {
-    let canonical = sudp::canonical::canonicalize_strict(op)
-        .map_err(|e| format!("canonicalize op: {}", e))?;
-    let domain = b"safeclaw/v1/binding\x00";
-    let beta = sudp::beta::compute_beta_from_canonical::<sudp::primitives::Sha256>(
-        domain, r, &canonical,
-    );
+    let beta = crate::crypto::binding::binding_for_op(
+        crate::crypto::binding::DOMAIN_STANDARD, r, op,
+    ).map_err(|e| format!("beta: {}", e))?;
+    Ok(beta.to_vec())
+}
+
+pub fn compute_beta_setup(r: &[u8], op: &Value) -> Result<Vec<u8>, String> {
+    let beta = crate::crypto::binding::binding_for_op(
+        crate::crypto::binding::DOMAIN_SETUP, r, op,
+    ).map_err(|e| format!("beta: {}", e))?;
     Ok(beta.to_vec())
 }
 

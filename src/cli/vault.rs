@@ -157,13 +157,7 @@ async fn run_create(args: VaultCreateArgs) -> Result<(), String> {
     });
     let (op_id, r) = create_op(&custodian, &vault_id, &enroll_op).await?;
     let r_bytes = STANDARD.decode(&r).map_err(|e| format!("decode r: {}", e))?;
-    // Enroll uses DOMAIN_SETUP for β, not DOMAIN_STANDARD.
-    let canonical_op = sudp::canonical::canonicalize_strict(&enroll_op)
-        .map_err(|e| format!("canonicalize op: {}", e))?;
-    let domain_setup = b"safeclaw/v1/binding-setup";
-    let beta = sudp::beta::compute_beta_from_canonical::<sudp::primitives::Sha256>(
-        domain_setup, &r_bytes, &canonical_op,
-    );
+    let beta = compute_beta_setup(&r_bytes, &enroll_op)?;
 
     // ── Assertion gesture (sign β) ────────────────────────────────────
     eprintln!("  signing enrollment grant — touch passkey again…");
