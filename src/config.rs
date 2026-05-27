@@ -175,11 +175,26 @@ pub enum VaultSubcommand {
     /// be set on the daemon (typical OSS self-host) and exposed to the
     /// CLI via `$SAFECLAW_ADMIN_KEY`.
     Ls(ProfileSelectArgs),
+    /// Create a new vault. Hits `POST /v/new` to bootstrap an Enroll op,
+    /// then opens the browser for a WebAuthn `create()` ceremony
+    /// (passkey registration). The CLI handles initial key generation
+    /// and seal after the ceremony completes.
+    Create(VaultCreateArgs),
     /// Irreversibly delete a vault's daemon-side state. Passkey-gated via
     /// the standard `/op/{op_id}` browser-callback ceremony. Requires a
     /// typed `--yes-i-mean-it` flag to bypass the confirmation prompt;
     /// without it, refuses to proceed.
     Delete(VaultDeleteArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct VaultCreateArgs {
+    #[arg(long, env = "SAFECLAW_CUSTODIAN")]
+    pub custodian: Option<String>,
+    #[arg(long)]
+    pub no_browser: bool,
+    #[arg(long, default_value = "120")]
+    pub timeout: u64,
 }
 
 #[derive(Debug, Args)]

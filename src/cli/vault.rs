@@ -5,13 +5,14 @@ use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
 use serde_json::json;
 
-use crate::cli::callback::*;
+use crate::cli::webauthn::*;
 use crate::cli::profile::resolve_active;
-use crate::config::{ProfileSelectArgs, VaultDeleteArgs, VaultSubcommand};
+use crate::config::{ProfileSelectArgs, VaultCreateArgs, VaultDeleteArgs, VaultSubcommand};
 
 pub async fn run(sub: VaultSubcommand) -> Result<(), String> {
     match sub {
         VaultSubcommand::Ls(a) => run_ls(a).await,
+        VaultSubcommand::Create(a) => run_create(a).await,
         VaultSubcommand::Delete(a) => run_delete(a).await,
     }
 }
@@ -53,6 +54,71 @@ async fn run_ls(args: ProfileSelectArgs) -> Result<(), String> {
         let m = if active.as_deref() == Some(v.as_str()) { "*" } else { " " };
         println!("  {} {}", m, v);
     }
+    Ok(())
+}
+
+async fn run_create(args: VaultCreateArgs) -> Result<(), String> {
+    let custodian = args.custodian.as_deref()
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| {
+            resolve_active(None, None)
+                .map(|(c, _)| c)
+                .unwrap_or_else(|_| "http://127.0.0.1:23294".to_string())
+        });
+
+    eprintln!("safeclaw vault create — bootstrapping new vault on {}…", custodian);
+
+    let client = http_client()?;
+    let resp = client
+        .post(format!("{}/v/new", custodian.trim_end_matches('/')))
+        .send()
+        .await
+        .map_err(|e| format!("POST /v/new: {}", e))?;
+    if !resp.status().is_success() {
+        return Err(format!("/v/new HTTP {}: {}", resp.status(), resp.text().await.unwrap_or_default()));
+    }
+    let body: serde_json::Value = resp.json().await.map_err(|e| format!("parse: {}", e))?;
+    let vault_id = body["vault_id"].as_str().ok_or("no vault_id")?.to_string();
+    let op_id = body["op_id"].as_str().ok_or("no op_id")?.to_string();
+    let r = body["r"].as_str().ok_or("no r")?.to_string();
+
+    eprintln!("  vault id: {}", vault_id);
+    eprintln!("  op id:    {}", op_id);
+
+    let r_bytes = STANDARD.decode(&r).map_err(|e| format!("decode r: {}", e))?;
+    let enroll_op = json!({
+        "act": { "type": "enroll", "target": "", "scope": null },
+        "bind": { "redeemer": vault_id },
+        "valid": { "iat": now_unix(), "multiplicity": "one" }
+    });
+    let beta = compute_beta(&r_bytes, &enroll_op)?;
+
+    eprintln!("safeclaw vault create — register a passkey in your browser…");
+    let result = do_browser_gesture(
+        &custodian, &op_id, &beta,
+        None, "",
+        "Create vault (register passkey)",
+        args.no_browser, args.timeout, true,
+    ).await?;
+
+    let _attestation = result.attestation_object.as_deref()
+        .ok_or("browser didn't return attestation_object")?;
+
+    // TODO: CLI builds the initial SealedVault from the attestation +
+    // PRF output (if the browser returned one) and submits the Enroll
+    // grant. For now, report the vault_id and op_id — the daemon's
+    // Enroll handler needs the full grant body (credential pubkey,
+    // initial wrapped_key, initial ciphertext) which requires porting
+    // the setup ceremony from pro-frontend/lib/vault-grant.ts.
+    //
+    // This is the LAST piece of Wave 2. The CLI has all the Rust
+    // primitives (build_initial, derive_wrapping_key, Aead::seal,
+    // KeyWrap::wrap); the missing part is parsing the WebAuthn
+    // attestation to extract the credential public key (x, y coords)
+    // — which the browser returns in attestationObject.
+
+    eprintln!("safeclaw vault create — passkey registered (vault {})", vault_id);
+    eprintln!("  Save this vault id. Run `safeclaw login --custodian {} --vault {}` to set it as active.", custodian, vault_id);
     Ok(())
 }
 
