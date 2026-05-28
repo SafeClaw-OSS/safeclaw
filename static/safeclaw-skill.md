@@ -51,28 +51,26 @@ Authorization: Bearer $SAFECLAW_API_KEY
 Use `connected: true` services freely.
 
 If a service is `connected: false` (or absent from `services`), the user
-needs to add credentials. How to guide them depends on the deployment:
+needs to add credentials. Default to the CLI path:
 
-- **SaaS / cloud vault** (`$SAFECLAW_VAULT_URL` host is not `localhost` /
-  `127.0.0.1`): direct the user to open `console_url` from the registry
-  response — they add credentials in the browser UI there.
-- **Self-hosted / localhost**: there is no web console. Use the CLI
-  instead. Look up the service's `vault_fields` array in the registry
-  response — each entry's `name` is the key to set:
+Look up the service's `vault_fields` array in the registry response —
+each entry's `name` is the key to set:
 
-  ```
-  sc set <vault_fields[n].name> <value>
-  # example: sc set github_api_key ghp_xxxxx
-  ```
+```
+sc set <vault_fields[n].name> <value>
+# example: sc set github_api_key ghp_xxxxx
+```
 
-  This opens a browser passkey gesture to seal the value into the vault.
-  After it succeeds, the service will show `connected: true`.
+This opens a browser passkey gesture to seal the value into the vault.
+After it succeeds, the service will show `connected: true`.
+
+If `console_url` in the registry response points to `safeclaw.pro`, the
+user can alternatively add credentials via the web console there.
 
 Never offer to enter credentials yourself. Never echo a credential back.
 
-If `vault_locked: true`, the user must unlock first:
-- SaaS: open `console_url`
-- Self-hosted: run `sc unlock`
+If `vault_locked: true`, run `sc unlock` first (or open `console_url` if
+on safeclaw.pro).
 
 ## Call shape
 
