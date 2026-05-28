@@ -9,4 +9,5 @@ pub mod metadata;
 pub mod op;
 pub mod pending_passkey;
 pub mod registry;
+pub mod skill;
 pub mod usage;

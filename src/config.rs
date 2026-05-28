@@ -66,6 +66,12 @@ pub enum Command {
     /// `SAFECLAW_VAULT_URL` + `SAFECLAW_API_KEY` from the env. Run as
     /// `eval "$(safeclaw env)"`.
     Env,
+    /// Print the two-sentence agent install prompt: skill URL + env vars.
+    /// Paste the output into your agent; it self-fetches the skill and
+    /// sets the env vars. `--agent` controls the `?agent=` query param
+    /// on the skill URL (frontmatter variant). Unified with the SaaS
+    /// "Install on agent" modal prompt format.
+    Install(InstallArgs),
     /// Manage external stores connected to the active vault. Today: list.
     /// Connect / disconnect are deferred until the Write op lands in the
     /// CLI (they rewrite vault.dat).
@@ -426,6 +432,18 @@ pub struct UnlockArgs {
     /// How long (seconds) to wait for the browser-callback before giving up.
     #[arg(long, default_value = "120")]
     pub timeout: u64,
+}
+
+/// Args for `sc install`.
+#[derive(Debug, Args)]
+pub struct InstallArgs {
+    /// Agent variant — controls the `?agent=` query param on the skill URL
+    /// and thus the frontmatter in the downloaded skill file.
+    /// Supported: claude (YAML name+desc), cursor (YAML desc+globs),
+    /// codex (no frontmatter, filename AGENTS.md), openclaw, other/omitted
+    /// (no frontmatter, filename safeclaw.md).
+    #[arg(long)]
+    pub agent: Option<String>,
 }
 
 /// Reusable arg set for read-only short-lived commands that only need to

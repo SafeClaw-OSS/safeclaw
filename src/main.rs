@@ -100,6 +100,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 e.into()
             })
         }
+        Command::Install(args) => {
+            cli::install::run(args).map_err(|e| -> Box<dyn std::error::Error> {
+                eprintln!("safeclaw install: {}", e);
+                e.into()
+            })
+        }
         Command::Secret(args) => {
             use safeclaw::config::SecretSubcommand;
             let r = match args.sub {

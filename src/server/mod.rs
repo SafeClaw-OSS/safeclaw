@@ -15,9 +15,10 @@
 //! GET  /health                  custodian health
 //! GET  /pubkey                  custodian HPKE bootstrap key (placeholder)
 //! GET  /admin/vaults            list all vault ids on this daemon (admin-gated)
+//! GET  /skill.md                skill file for agents (?agent=claude|cursor|codex)
 //! ```
 //!
-//! Public root paths (`/health`, `/menu`, `/pubkey`) were originally
+//! Public root paths (`/health`, `/menu`, `/pubkey`, `/skill.md`) were originally
 //! prefixed `/c/*`; the prefix was dropped 2026-05-27 to align with the
 //! "zero remapping" backend story (SaaS proxy forwards the same URLs).
 //!
@@ -49,6 +50,7 @@ pub fn admin_router(state: Arc<AppState>) -> Router {
         .route("/health", get(handlers::health::health))
         .route("/pubkey", get(handlers::metadata::pubkey))
         .route("/menu", get(handlers::registry::menu))
+        .route("/skill.md", get(handlers::skill::skill_md))
         // Vault-scoped.
         .route("/v/{vid}/op", post(handlers::op::create))
         .route("/v/{vid}/passkeys", get(handlers::metadata::passkeys))

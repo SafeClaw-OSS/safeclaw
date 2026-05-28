@@ -10,6 +10,7 @@ pub mod config;
 pub mod custodian;
 pub mod doctor;
 pub mod env;
+pub mod install;
 pub mod ls;
 pub mod passkey;
 pub mod secret;
