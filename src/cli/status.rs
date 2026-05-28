@@ -21,6 +21,20 @@ pub enum VaultState {
     Unlocked { passkeys: usize, secrets: usize },
 }
 
+/// Cheap probe: does a local safeclaw daemon answer on the default port?
+/// Used to specialize "no daemon" vs "no vault" hints. ~400ms timeout.
+pub async fn local_daemon_up() -> bool {
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_millis(400))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    client.get("http://localhost:23294/c/health").send().await
+        .map(|r| r.status().is_success()).unwrap_or(false)
+}
+
 pub async fn fetch_status(custodian: &str, vault: &str) -> VaultStatus {
     let url = join_vault_url(custodian, vault);
     let client = match reqwest::Client::builder().timeout(std::time::Duration::from_secs(5)).build() {
@@ -72,9 +86,15 @@ pub async fn run(args: StatusArgs) -> Result<(), String> {
             Ok(())
         }
         _ => {
+            let up = local_daemon_up().await;
             println!("safeclaw — no active vault");
-            println!("  hint: `safeclaw vault use` to select one, or");
-            println!("        `safeclaw vault create` to make a new one");
+            if up {
+                println!("  hint: `safeclaw vault use` to select one, or");
+                println!("        `safeclaw vault create` to make a new one");
+            } else {
+                println!("  hint: no local daemon on :23294 — start one with `safeclaw serve`,");
+                println!("        then `safeclaw vault create` for your first vault");
+            }
             Ok(())
         }
     }
@@ -85,7 +105,11 @@ pub fn print_status(s: &VaultStatus) {
     println!("  url:   {}", s.url);
     match &s.state {
         VaultState::Unreachable => {
-            println!("  state: unreachable (is the daemon running?)");
+            if s.url.contains("//localhost") || s.url.contains("//127.0.0.1") {
+                println!("  state: unreachable — start daemon with `safeclaw serve`");
+            } else {
+                println!("  state: unreachable (is the daemon running?)");
+            }
         }
         VaultState::NotFound => {
             println!("  state: not found (run `safeclaw vault create`, or pick a different URL with `safeclaw vault use`)");
