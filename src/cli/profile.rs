@@ -1,4 +1,4 @@
-//! CLI-side config (`~/.config/safeclaw/config.toml`).
+//! CLI-side config (`~/.safeclaw/config.toml`).
 //!
 //! Stores a single active `(custodian, vault)` pair so short-lived CLI
 //! commands don't have to retype `--custodian URL --vault VID` every
@@ -37,11 +37,11 @@ pub struct CliConfig {
     pub vault: Option<String>,
 }
 
-/// Path to `~/.config/safeclaw/config.toml` (or the platform-specific
-/// equivalent). Errors only if the platform has no config dir at all.
+/// Path to `~/.safeclaw/config.toml`. AI-product convention (Claude
+/// Code, Cursor etc. use the same dotfile-under-HOME pattern).
 pub fn config_path() -> Result<PathBuf, String> {
-    let base = dirs::config_dir().ok_or_else(|| "no platform config dir".to_string())?;
-    Ok(base.join("safeclaw").join("config.toml"))
+    let base = dirs::home_dir().ok_or_else(|| "no home dir".to_string())?;
+    Ok(base.join(".safeclaw").join("config.toml"))
 }
 
 /// Load `config.toml` if present; returns an empty config if not.
@@ -110,7 +110,7 @@ fn split_vault_url(url: &str) -> Option<(String, String)> {
 /// 2. `SAFECLAW_VAULT_URL` env (split into root + vid).
 /// 3. `SAFECLAW_CUSTODIAN` / `SAFECLAW_VAULT` env (handled upstream via
 ///    clap `env = "..."` on each flag; arrives as Some at this point).
-/// 4. The active `~/.config/safeclaw/config.toml`.
+/// 4. The active `~/.safeclaw/config.toml`.
 pub fn resolve_active(
     custodian_override: Option<&str>,
     vault_override: Option<&str>,

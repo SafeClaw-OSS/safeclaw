@@ -25,7 +25,7 @@ pub enum Command {
     Serve(ServeArgs),
     /// Print custodian health and version.
     Status(StatusArgs),
-    /// Save a custodian URL + vault id to ~/.config/safeclaw/config.toml so
+    /// Save a custodian URL + vault id to ~/.safeclaw/config.toml so
     /// later commands can omit `--custodian` / `--vault`. Does NOT unlock
     /// the vault — passkey gestures happen per-operation. For SaaS the
     /// apiKey lives in $SAFECLAW_API_KEY (never on disk).
@@ -308,12 +308,12 @@ pub struct LoginArgs {
 #[derive(Debug, Args)]
 pub struct UnlockArgs {
     /// Override the custodian URL (otherwise loaded from
-    /// `$SAFECLAW_VAULT_URL` or `~/.config/safeclaw/config.toml`).
+    /// `$SAFECLAW_VAULT_URL` or `~/.safeclaw/config.toml`).
     #[arg(long, env = "SAFECLAW_CUSTODIAN")]
     pub custodian: Option<String>,
 
     /// Override the vault id (otherwise loaded from
-    /// `$SAFECLAW_VAULT_URL` or `~/.config/safeclaw/config.toml`).
+    /// `$SAFECLAW_VAULT_URL` or `~/.safeclaw/config.toml`).
     #[arg(long)]
     pub vault: Option<String>,
 

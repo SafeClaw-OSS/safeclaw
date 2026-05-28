@@ -204,7 +204,7 @@ async fn run_create(args: VaultCreateArgs) -> Result<(), String> {
     eprintln!("safeclaw vault create — done!");
     eprintln!("  vault:     {}", vault_id);
     eprintln!("  custodian: {}", custodian);
-    eprintln!("  config saved to ~/.config/safeclaw/config.toml");
+    eprintln!("  config saved to ~/.safeclaw/config.toml");
     Ok(())
 }
 
