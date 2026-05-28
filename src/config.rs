@@ -255,7 +255,7 @@ pub struct VaultCreateArgs {
     /// Skips the create() ceremony; uses get() PRF from an already-enrolled
     /// vault. Saves a browser gesture when the hardware key is already set up.
     #[arg(long)]
-    pub reuse: bool,
+    pub reuse_passkey: bool,
 }
 
 #[derive(Debug, Args)]

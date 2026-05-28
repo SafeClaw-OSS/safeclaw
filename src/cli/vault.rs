@@ -192,7 +192,7 @@ async fn run_create(args: VaultCreateArgs) -> Result<(), String> {
     //   skip the create() ceremony, do a single get() with PRF instead.
     // default: register a new passkey (create()), fall back to get() if PRF
     //   wasn't available on create.
-    let (cred_id, pub_x, pub_y, prf_first_b64) = if args.reuse {
+    let (cred_id, pub_x, pub_y, prf_first_b64) = if args.reuse_passkey {
         let meta = pick_reuse_passkey(&custodian, &vault_id).await?;
         let cred_id = meta.credential_id;
         let pub_x = meta.public_key_x
@@ -249,7 +249,7 @@ async fn run_create(args: VaultCreateArgs) -> Result<(), String> {
         .map_err(|e| format!("decode cred_id: {}", e))?;
 
     // ── Seal initial vault state ──────────────────────────────────────
-    let seal_step = if args.reuse { "step 2/2" } else { "step 3/3" };
+    let seal_step = if args.reuse_passkey { "step 2/2" } else { "step 3/3" };
     eprintln!("  {}: sealing initial vault state…", seal_step);
     let prf_salt = random_bytes(32);
     let state_key = random_bytes(32); // K
