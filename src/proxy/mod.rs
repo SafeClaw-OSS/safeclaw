@@ -18,7 +18,7 @@ pub mod use_broker;
 
 use std::sync::Arc;
 
-use axum::{extract::DefaultBodyLimit, routing::post, Router};
+use axum::{extract::DefaultBodyLimit, routing::{any, post}, Router};
 
 const MAX_BODY_BYTES: usize = 256 * 1024;
 
@@ -33,10 +33,15 @@ pub fn proxy_router(state: Arc<AppState>) -> Router {
     // The `build_cors` import is retained for potential future per-port
     // configuration; unused-import lint is suppressed via the use statement.
     let _ = build_cors; // keep import to document intentional non-use
+    // /use/* accepts any HTTP method — the daemon forwards verbatim to
+    // the upstream, so GET-shaped read routes (e.g. `GET inbox/recent`)
+    // work alongside POST/PUT/PATCH/DELETE per the upstream's contract.
+    // `/export/*` stays POST-only since it's an R-side sudp ceremony,
+    // not a transparent upstream forward.
     let router = Router::new()
         .route("/v/{vid}/export/{key}", post(env::handle))
-        .route("/v/{vid}/use/{service}", post(use_broker::handle_no_rest))
-        .route("/v/{vid}/use/{service}/{*rest}", post(use_broker::handle))
+        .route("/v/{vid}/use/{service}", any(use_broker::handle_no_rest))
+        .route("/v/{vid}/use/{service}/{*rest}", any(use_broker::handle))
         .with_state(state);
     router.layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
 }
