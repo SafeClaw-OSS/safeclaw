@@ -41,17 +41,7 @@ async fn run_use(args: VaultUseArgs) -> Result<(), String> {
     } else if let Some(u) = args.url {
         u
     } else {
-        // Interactive prompt
-        eprint!("Paste a SAFECLAW_VAULT_URL (or press Enter for local default): ");
-        io::stderr().flush().ok();
-        let mut buf = String::new();
-        io::stdin().read_line(&mut buf).map_err(|e| e.to_string())?;
-        let trimmed = buf.trim();
-        if trimmed.is_empty() {
-            join_vault_url(LOCAL_CUSTODIAN, LOCAL_VAULT_ID)
-        } else {
-            trimmed.to_string()
-        }
+        interactive_pick()?
     };
 
     let (custodian, vault) = split_vault_url(&url)
@@ -59,6 +49,29 @@ async fn run_use(args: VaultUseArgs) -> Result<(), String> {
     put_active(&custodian, &vault).map_err(|e| format!("save config: {}", e))?;
     println!("active vault: {}", join_vault_url(&custodian, &vault));
     Ok(())
+}
+
+fn interactive_pick() -> Result<String, String> {
+    let cfg = load_config().unwrap_or_default();
+    let active = (cfg.custodian.as_deref(), cfg.vault.as_deref());
+    if !cfg.known_vaults.is_empty() {
+        eprintln!("Known vaults:");
+        for kv in &cfg.known_vaults {
+            let marker = if active == (Some(&kv.custodian), Some(&kv.vault)) { " (active)" } else { "" };
+            eprintln!("  {}{}", join_vault_url(&kv.custodian, &kv.vault), marker);
+        }
+        eprintln!();
+    }
+    eprint!("Paste a SAFECLAW_VAULT_URL (or press Enter for local default): ");
+    io::stderr().flush().ok();
+    let mut buf = String::new();
+    io::stdin().read_line(&mut buf).map_err(|e| e.to_string())?;
+    let trimmed = buf.trim();
+    if trimmed.is_empty() {
+        Ok(join_vault_url(LOCAL_CUSTODIAN, LOCAL_VAULT_ID))
+    } else {
+        Ok(trimmed.to_string())
+    }
 }
 
 async fn run_create(args: VaultCreateArgs) -> Result<(), String> {
