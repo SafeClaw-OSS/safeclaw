@@ -3,7 +3,6 @@
 use crate::cli::active::{join_vault_url, load as load_config};
 use crate::config::StatusArgs;
 
-/// Vault state snapshot. `None` means the daemon was unreachable.
 #[derive(Debug)]
 pub struct VaultStatus {
     pub url: String,
@@ -15,7 +14,7 @@ pub enum VaultState {
     /// Daemon unreachable.
     Unreachable,
     /// Vault id doesn't exist on the custodian.
-    NotEnrolled,
+    NotFound,
     /// Vault locked. Passkey count from /passkeys.
     Locked { passkeys: usize },
     /// Vault unlocked. Passkey + native-secret counts.
@@ -40,7 +39,7 @@ pub async fn fetch_status(custodian: &str, vault: &str) -> VaultStatus {
     };
     let exists = pk_body.get("vault_exists").and_then(|v| v.as_bool()).unwrap_or(false);
     if !exists {
-        return VaultStatus { url, state: VaultState::NotEnrolled };
+        return VaultStatus { url, state: VaultState::NotFound };
     }
     let passkeys = pk_body.get("passkeys").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
 
@@ -88,8 +87,8 @@ pub fn print_status(s: &VaultStatus) {
         VaultState::Unreachable => {
             println!("  state: unreachable (is the daemon running?)");
         }
-        VaultState::NotEnrolled => {
-            println!("  state: not enrolled (run `safeclaw vault create`)");
+        VaultState::NotFound => {
+            println!("  state: not found (run `safeclaw vault create`, or pick a different URL with `safeclaw vault use`)");
         }
         VaultState::Locked { passkeys } => {
             println!("  state: locked (run `safeclaw unlock`)");

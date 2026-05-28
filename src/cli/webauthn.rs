@@ -178,7 +178,7 @@ pub async fn fetch_passkey_meta(custodian: &str, vault: &str) -> Result<PasskeyM
     let body: Value = resp.json().await.map_err(|e| format!("parse: {}", e))?;
     let vault_exists = body.get("vault_exists").and_then(|v| v.as_bool()).unwrap_or(false);
     if !vault_exists {
-        return Err("vault not enrolled on this custodian — run `safeclaw vault create`".into());
+        return Err("vault not found on this custodian — run `safeclaw vault create`".into());
     }
     let passkeys = body["passkeys"].as_array().ok_or("no passkeys array")?;
     if passkeys.is_empty() {

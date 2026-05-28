@@ -66,15 +66,23 @@ async fn run_use(args: VaultUseArgs) -> Result<(), String> {
             .ok_or_else(|| format!("not a valid SAFECLAW_VAULT_URL: {}", url))?
     };
 
-    // Save first, then print status (which probes the daemon).
-    put_active(&custodian, &vault).map_err(|e| format!("save config: {}", e))?;
+    // Probe before saving. If the vault doesn't exist on the custodian,
+    // refuse — bad active state would silently confuse later commands.
+    // (Daemon unreachable is OK — accept and warn; user might be offline.)
     let s = fetch_status(&custodian, &vault).await;
-    if matches!(s.state, VaultState::NotEnrolled) {
-        eprintln!("warning: this vault is not yet enrolled on the custodian");
-        eprintln!("  run `safeclaw vault create` to enroll, or pick a different URL");
-    } else if matches!(s.state, VaultState::Unreachable) {
-        eprintln!("warning: couldn't reach custodian; saved anyway");
+    match s.state {
+        VaultState::NotFound => {
+            return Err(format!(
+                "vault not found on custodian: {}\n  run `safeclaw vault create` to make a new one, or pick a different URL",
+                join_vault_url(&custodian, &vault)
+            ));
+        }
+        VaultState::Unreachable => {
+            eprintln!("warning: couldn't reach custodian; saving anyway");
+        }
+        _ => {}
     }
+    put_active(&custodian, &vault).map_err(|e| format!("save config: {}", e))?;
     print_status(&s);
     Ok(())
 }
