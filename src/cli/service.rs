@@ -66,6 +66,15 @@ pub async fn run_start_systemd() -> Result<(), String> {
     let unit_path = unit_dir.join(UNIT_BASENAME);
     std::fs::write(&unit_path, &unit)
         .map_err(|e| format!("write {}: {}", unit_path.display(), e))?;
+    // Unit may embed SAFECLAW_ADMIN_KEY and other secrets via
+    // Environment= lines. Tighten to user-only so other accounts on a
+    // multi-user host can't read them.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&unit_path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("chmod 0600 {}: {}", unit_path.display(), e))?;
+    }
 
     run_systemctl(&["daemon-reload"], "daemon-reload")?;
     run_systemctl(&["enable", "--now", UNIT_BASENAME], "enable+start")?;
