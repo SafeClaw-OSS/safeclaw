@@ -63,9 +63,36 @@ async fn run_use(args: VaultUseArgs) -> Result<(), String> {
         split_vault_url(&url)
             .ok_or_else(|| format!("not a valid SAFECLAW_VAULT_URL: {}", url))?
     };
+
+    // Probe vault existence on the custodian. If it doesn't exist, warn
+    // — user might be picking a URL before running `vault create`, which
+    // is valid, but the typo case is worth surfacing.
+    let url = join_vault_url(&custodian, &vault);
+    match probe_vault_exists(&custodian, &vault).await {
+        Ok(true) => {}
+        Ok(false) => {
+            eprintln!("warning: vault not enrolled on custodian yet");
+            eprintln!("  run `safeclaw vault create` to enroll, or pick a different URL");
+        }
+        Err(e) => {
+            eprintln!("warning: couldn't verify vault ({}); saving anyway", e);
+        }
+    }
+
     put_active(&custodian, &vault).map_err(|e| format!("save config: {}", e))?;
-    println!("active vault: {}", join_vault_url(&custodian, &vault));
+    println!("active vault: {}", url);
     Ok(())
+}
+
+async fn probe_vault_exists(custodian: &str, vault: &str) -> Result<bool, String> {
+    let url = format!("{}/v/{}/passkeys", custodian.trim_end_matches('/'), urlencoding::encode(vault));
+    let client = http_client()?;
+    let resp = client.get(&url).send().await.map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("HTTP {}", resp.status()));
+    }
+    let body: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    Ok(body.get("vault_exists").and_then(|v| v.as_bool()).unwrap_or(false))
 }
 
 async fn run_forget(args: VaultForgetArgs) -> Result<(), String> {
