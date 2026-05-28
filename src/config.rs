@@ -46,7 +46,7 @@ pub enum Command {
     /// Read a single native secret to stdout. Drives the custodian's
     /// `/cli/auth` page for the passkey ceremony; the value comes back via
     /// GET `/op/{op_id}` (never via the browser URL).
-    Read(ReadArgs),
+    Get(GetArgs),
     /// Per-vault lifecycle ops. Today: `vault delete` to nuke a vault's
     /// daemon-side state (irreversible, passkey-gated).
     Vault(VaultArgs),
@@ -69,11 +69,11 @@ pub enum Command {
     /// Write a native secret to the vault. Two passkey gestures: unlock
     /// (to read current state) then write (to seal modified state). All
     /// crypto happens locally; the browser page is a minimal passkey proxy.
-    Write(WriteArgs),
+    Set(SetArgs),
     /// Delete a native secret from the vault. Same two-gesture flow as
     /// write — the deletion is a Write op with the key removed from the
     /// sealed protected state.
-    Delete(DeleteArgs),
+    Rm(RmArgs),
     /// Print the safeclaw binary version.
     Version,
     /// Health + reachability checks: custodian connectivity, active
@@ -342,7 +342,7 @@ pub struct CommonArgs {
 }
 
 #[derive(Debug, Args)]
-pub struct ReadArgs {
+pub struct GetArgs {
     /// Native-secrets key name to reveal (`safeclaw read OPENAI_API_KEY`).
     pub key: String,
 
@@ -363,7 +363,7 @@ pub struct ReadArgs {
 }
 
 #[derive(Debug, Args)]
-pub struct WriteArgs {
+pub struct SetArgs {
     /// Native-secrets key name to write (`safeclaw write OPENAI_API_KEY sk-...`).
     pub key: String,
     /// The secret value. Shell quoting recommended for special chars.
@@ -384,7 +384,7 @@ pub struct WriteArgs {
 }
 
 #[derive(Debug, Args)]
-pub struct DeleteArgs {
+pub struct RmArgs {
     /// Native-secrets key name to remove from the vault.
     pub key: String,
     #[arg(long, env = "SAFECLAW_CUSTODIAN")]

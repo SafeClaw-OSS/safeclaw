@@ -46,9 +46,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 e.into()
             })
         }
-        Command::Read(args) => {
-            cli::read::run(args).await.map_err(|e| -> Box<dyn std::error::Error> {
-                eprintln!("safeclaw read: {}", e);
+        Command::Get(args) => {
+            cli::secret::run_get(args).await.map_err(|e| -> Box<dyn std::error::Error> {
+                eprintln!("safeclaw get: {}", e);
                 e.into()
             })
         }
@@ -88,15 +88,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 e.into()
             })
         }
-        Command::Write(args) => {
-            cli::write::run(args).await.map_err(|e| -> Box<dyn std::error::Error> {
-                eprintln!("safeclaw write: {}", e);
+        Command::Set(args) => {
+            cli::secret::run_set(args).await.map_err(|e| -> Box<dyn std::error::Error> {
+                eprintln!("safeclaw set: {}", e);
                 e.into()
             })
         }
-        Command::Delete(args) => {
-            cli::write::run_delete(args).await.map_err(|e| -> Box<dyn std::error::Error> {
-                eprintln!("safeclaw delete: {}", e);
+        Command::Rm(args) => {
+            cli::secret::run_rm(args).await.map_err(|e| -> Box<dyn std::error::Error> {
+                eprintln!("safeclaw rm: {}", e);
                 e.into()
             })
         }

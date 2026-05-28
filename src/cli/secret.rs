@@ -1,4 +1,4 @@
-//! `safeclaw write <KEY> <VALUE>` / `safeclaw delete <KEY>`
+//! `safeclaw set <KEY> <VALUE>` / `safeclaw get <KEY>` / `safeclaw rm <KEY>`
 //!
 //! Two passkey gestures: unlock (PRF + assertion) for current state,
 //! then write (assertion only) to seal + submit. All crypto local.
@@ -11,16 +11,16 @@ use serde_json::{json, Value};
 
 use crate::cli::active::resolve_active;
 use crate::cli::webauthn::*;
-use crate::config::{DeleteArgs, WriteArgs};
+use crate::config::{GetArgs, RmArgs, SetArgs};
 use crate::crypto::kdf::WRAP_VERSION;
 
 const DS_SEAL: &[u8] = b"sudp/v1/seal";
 
-pub async fn run(args: WriteArgs) -> Result<(), String> {
+pub async fn run_set(args: SetArgs) -> Result<(), String> {
     let (custodian, vault) = resolve_active(args.custodian.as_deref(), args.vault.as_deref())?;
     let key = args.key.clone();
     let value = args.value.clone();
-    eprintln!("safeclaw write {} — two passkey gestures (unlock + write)", key);
+    eprintln!("safeclaw set {} — two passkey gestures (unlock + write)", key);
 
     let meta = fetch_passkey_meta(&custodian, &vault).await?;
     let (kv, aux, user_key) = do_unlock(&custodian, &vault, &meta, args.no_browser, args.timeout, args.cb_port).await?;
@@ -29,14 +29,14 @@ pub async fn run(args: WriteArgs) -> Result<(), String> {
     new_kv.insert(key.clone(), value);
 
     seal_and_submit_write(&custodian, &vault, &meta, &user_key, &new_kv, &aux, args.no_browser, args.timeout, args.cb_port).await?;
-    eprintln!("safeclaw write — {} written", key);
+    eprintln!("safeclaw set — {} written", key);
     Ok(())
 }
 
-pub async fn run_delete(args: DeleteArgs) -> Result<(), String> {
+pub async fn run_rm(args: RmArgs) -> Result<(), String> {
     let (custodian, vault) = resolve_active(args.custodian.as_deref(), args.vault.as_deref())?;
     let key = args.key.clone();
-    eprintln!("safeclaw delete {} — two passkey gestures (unlock + write)", key);
+    eprintln!("safeclaw rm {} — two passkey gestures (unlock + write)", key);
 
     let meta = fetch_passkey_meta(&custodian, &vault).await?;
     let (kv, aux, user_key) = do_unlock(&custodian, &vault, &meta, args.no_browser, args.timeout, args.cb_port).await?;
@@ -47,7 +47,7 @@ pub async fn run_delete(args: DeleteArgs) -> Result<(), String> {
     }
 
     seal_and_submit_write(&custodian, &vault, &meta, &user_key, &new_kv, &aux, args.no_browser, args.timeout, args.cb_port).await?;
-    eprintln!("safeclaw delete — {} removed", key);
+    eprintln!("safeclaw rm — {} removed", key);
     Ok(())
 }
 
@@ -182,4 +182,64 @@ fn decode_prf_salt(s: &str) -> Result<Vec<u8>, String> {
     STANDARD.decode(s)
         .or_else(|_| URL_SAFE_NO_PAD.decode(s))
         .map_err(|e| format!("decode prf_salt: {}", e))
+}
+
+pub async fn run_get(args: GetArgs) -> Result<(), String> {
+    let (custodian, vault) = resolve_active(args.custodian.as_deref(), args.vault.as_deref())?;
+    let key = args.key.trim().to_string();
+    if key.is_empty() {
+        return Err("key cannot be empty".into());
+    }
+
+    let meta = fetch_passkey_meta(&custodian, &vault).await?;
+
+    let op = json!({
+        "act": { "type": "export", "target": key, "scope": null },
+        "bind": { "redeemer": vault },
+        "valid": { "iat": now_unix(), "multiplicity": "one" }
+    });
+    let (op_id, r) = create_op(&custodian, &vault, &op).await?;
+    let r_bytes = STANDARD.decode(&r).map_err(|e| format!("decode r: {}", e))?;
+    let beta = compute_beta(&r_bytes, &op)?;
+    let prf_salt_bytes = decode_prf_salt(&meta.prf_salt)?;
+
+    eprintln!("safeclaw get {} — touch passkey…", key);
+    let result = do_browser_gesture(
+        &custodian, &op_id, &beta,
+        Some(PRF_EVAL_SALT), &meta.credential_id,
+        &format!("Reveal {}", key),
+        args.no_browser, args.timeout, false, args.cb_port,
+    ).await?;
+
+    let prf_first = result.prf_first.as_deref().ok_or("gesture didn't return prf_first")?;
+    let prf_first_bytes = URL_SAFE_NO_PAD.decode(prf_first)
+        .map_err(|e| format!("decode prf_first: {}", e))?;
+    let user_key = prf_to_user_key(&prf_first_bytes)?;
+    let cred_id_raw = URL_SAFE_NO_PAD.decode(&meta.credential_id)
+        .map_err(|e| format!("decode cred_id: {}", e))?;
+    let wrapping_key = crate::crypto::kdf::derive_wrapping_key(
+        &user_key, &prf_salt_bytes, &cred_id_raw, WRAP_VERSION,
+    ).map_err(|e| format!("derive wrapping key: {}", e))?;
+
+    let grant = json!({
+        "o": op, "r": r,
+        "credential_id": meta.credential_id,
+        "wrapping_key": STANDARD.encode(&wrapping_key),
+        "assertion": assertion_json(&result.credential_id, &result.authenticator_data, &result.client_data_json, &result.signature),
+    });
+    let client = http_client()?;
+    let resp = client
+        .post(format!("{}/op/{}/approve", custodian.trim_end_matches('/'), urlencoding::encode(&op_id)))
+        .json(&grant).send().await.map_err(|e| format!("approve: {}", e))?;
+    if !resp.status().is_success() {
+        return Err(format!("approve HTTP {}: {}", resp.status(), resp.text().await.unwrap_or_default()));
+    }
+    let body: Value = resp.json().await.map_err(|e| format!("parse: {}", e))?;
+    let value = body.get("value").and_then(|v| v.as_str())
+        .ok_or("no value in response — op may have been consumed")?;
+    use std::io::Write as _;
+    let mut out = std::io::stdout().lock();
+    out.write_all(value.as_bytes()).map_err(|e| format!("stdout: {}", e))?;
+    out.write_all(b"\n").ok();
+    Ok(())
 }
