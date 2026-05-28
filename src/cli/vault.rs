@@ -15,7 +15,7 @@ const LOCAL_VAULT_ID: &str = "default";
 
 /// True if the custodian URL points at this machine. Used to specialize
 /// "daemon down" hints — a remote daemon being unreachable is a network
-/// problem; a local one almost always means `safeclaw serve` isn't running.
+/// problem; a local one almost always means `safeclaw start` isn't running.
 fn is_localhost(custodian: &str) -> bool {
     let after_scheme = custodian
         .trim_start_matches("http://")
@@ -73,7 +73,7 @@ async fn run_use(args: VaultUseArgs) -> Result<(), String> {
     } else if let Some(arg) = args.url_or_idx {
         resolve_url_or_idx(&arg)?
     } else {
-        let url = interactive_pick("Choose: index, SAFECLAW_VAULT_URL, or Enter for local default: ", OnEmpty::UseLocalDefault)?
+        let url = interactive_pick(OnEmpty::UseLocalDefault)?
             .expect("UseLocalDefault never returns None");
         split_vault_url(&url)
             .ok_or_else(|| format!("not a valid SAFECLAW_VAULT_URL: {}", url))?
@@ -92,7 +92,7 @@ async fn run_use(args: VaultUseArgs) -> Result<(), String> {
         }
         VaultState::Unreachable => {
             if is_localhost(&custodian) {
-                eprintln!("warning: no local daemon at {} — start one with `safeclaw serve`", custodian);
+                eprintln!("warning: no local daemon at {} — start one with `safeclaw start`", custodian);
                 eprintln!("  (saving anyway; `safeclaw status` will recheck once the daemon is up)");
             } else {
                 eprintln!("warning: couldn't reach custodian; saving anyway");
@@ -113,8 +113,7 @@ async fn run_forget(args: VaultForgetArgs) -> Result<(), String> {
         if cfg.known_vaults.is_empty() {
             return Err("no vaults in known list — nothing to forget".into());
         }
-        let url = interactive_pick("Choose: index or SAFECLAW_VAULT_URL (Enter to cancel): ", OnEmpty::Abort)?
-            .ok_or("cancelled")?;
+        let url = interactive_pick(OnEmpty::Abort)?.ok_or("cancelled")?;
         split_vault_url(&url)
             .ok_or_else(|| format!("not a valid SAFECLAW_VAULT_URL: {}", url))?
     };
@@ -135,10 +134,11 @@ enum OnEmpty {
     Abort,
 }
 
-fn interactive_pick(prompt: &str, on_empty: OnEmpty) -> Result<Option<String>, String> {
+fn interactive_pick(on_empty: OnEmpty) -> Result<Option<String>, String> {
     let cfg = load_config().unwrap_or_default();
     let active = (cfg.custodian.as_deref(), cfg.vault.as_deref());
-    if !cfg.known_vaults.is_empty() {
+    let has_known = !cfg.known_vaults.is_empty();
+    if has_known {
         eprintln!("Known vaults:");
         for (i, kv) in cfg.known_vaults.iter().enumerate() {
             let marker = if active == (Some(&kv.custodian), Some(&kv.vault)) { " (active)" } else { "" };
@@ -146,6 +146,15 @@ fn interactive_pick(prompt: &str, on_empty: OnEmpty) -> Result<Option<String>, S
         }
         eprintln!();
     }
+    // Prompt shape depends on what input is actually meaningful here:
+    // - has_known controls whether "index" is offered
+    // - on_empty controls what Enter does
+    let prompt = match (has_known, &on_empty) {
+        (true,  OnEmpty::UseLocalDefault) => "Pick: index, SAFECLAW_VAULT_URL, or Enter for local default: ",
+        (true,  OnEmpty::Abort)           => "Pick: index or SAFECLAW_VAULT_URL (Enter to cancel): ",
+        (false, OnEmpty::UseLocalDefault) => "Paste a SAFECLAW_VAULT_URL, or press Enter for local default: ",
+        (false, OnEmpty::Abort)           => "Paste a SAFECLAW_VAULT_URL (Enter to cancel): ",
+    };
     eprint!("{}", prompt);
     io::stderr().flush().ok();
     let mut buf = String::new();

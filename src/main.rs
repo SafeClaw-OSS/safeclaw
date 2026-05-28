@@ -3,16 +3,46 @@ use std::sync::Arc;
 
 use clap::Parser;
 use safeclaw::cli;
-use safeclaw::config::{Cli, Command, Config, ServeArgs};
+use safeclaw::config::{Cli, Command, Config, ServeArgs, StartArgs};
 use safeclaw::proxy::proxy_router;
 use safeclaw::server::admin_router;
 use safeclaw::state::AppState;
 
+/// One-cycle migration shim: accept the old SAFECLAW_BIND env var as
+/// an alias for SAFECLAW_LISTEN. Remove after VM units are migrated.
+fn migrate_legacy_env_vars() {
+    if std::env::var_os("SAFECLAW_LISTEN").is_none() {
+        if let Ok(legacy) = std::env::var("SAFECLAW_BIND") {
+            std::env::set_var("SAFECLAW_LISTEN", &legacy);
+            eprintln!("warning: SAFECLAW_BIND is deprecated; rename to SAFECLAW_LISTEN.");
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    migrate_legacy_env_vars();
     let cli = Cli::parse();
     match cli.command {
-        Command::Serve(args) => run_daemon(args).await,
+        Command::Start(args) => run_start(args).await,
+        Command::Stop => cli::service::run_stop().map_err(|e| -> Box<dyn std::error::Error> {
+            eprintln!("safeclaw stop: {}", e);
+            e.into()
+        }),
+        Command::Restart => cli::service::run_restart().map_err(|e| -> Box<dyn std::error::Error> {
+            eprintln!("safeclaw restart: {}", e);
+            e.into()
+        }),
+        Command::Logs(args) => cli::service::run_logs(args).map_err(|e| -> Box<dyn std::error::Error> {
+            eprintln!("safeclaw logs: {}", e);
+            e.into()
+        }),
+        Command::Serve(args) => {
+            // Deprecated alias for `start --foreground`. One migration
+            // cycle, then delete (along with the VM unit's old ExecStart).
+            eprintln!("warning: `safeclaw serve` is deprecated. Use `safeclaw start --foreground`.");
+            run_daemon(args).await
+        }
         Command::Status(args) => {
             // CLI commands log to stderr; don't initialise the tracing
             // subscriber here (it'd pollute the user-facing output of a
@@ -120,6 +150,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
+async fn run_start(args: StartArgs) -> Result<(), Box<dyn std::error::Error>> {
+    if args.foreground {
+        return run_daemon(args.serve).await;
+    }
+    cli::service::run_start_systemd().await.map_err(|e| -> Box<dyn std::error::Error> {
+        eprintln!("safeclaw start: {}", e);
+        e.into()
+    })
+}
+
 async fn run_daemon(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -135,10 +175,10 @@ async fn run_daemon(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let state = Arc::new(AppState::new(config.clone()));
 
-    let bind: std::net::IpAddr = config.bind.parse().unwrap_or_else(|_| "127.0.0.1".parse().unwrap());
+    let listen_ip: std::net::IpAddr = config.listen.parse().unwrap_or_else(|_| "127.0.0.1".parse().unwrap());
 
-    let admin_addr = SocketAddr::new(bind, config.port);
-    let proxy_addr = SocketAddr::new(bind, config.proxy_port);
+    let admin_addr = SocketAddr::new(listen_ip, config.port);
+    let proxy_addr = SocketAddr::new(listen_ip, config.proxy_port);
 
     let admin = admin_router(state.clone());
     let proxy = proxy_router(state.clone());

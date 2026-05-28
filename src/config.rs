@@ -1,17 +1,17 @@
 use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand};
 
-/// Top-level CLI shape. `safeclaw` is one binary in two modes:
+/// Top-level CLI shape. `safeclaw` (with short alias `sc`) is one
+/// binary in two modes:
 ///
-///   - `safeclaw serve` — long-running daemon (HTTP server). Today's
-///     production usage; what systemd executes.
-///   - `safeclaw <cmd>` — short-lived CLI commands that talk to a
-///     daemon over HTTP. Today: login / status / unlock / lock / ls /
-///     read / doctor / vault / stores / version.
+///   - `sc start [--foreground]` — long-running daemon. Default installs
+///     and starts a user-level systemd unit (Linux). `--foreground`/`-f`
+///     runs in the current process; that's what Docker, dev, and the
+///     production systemd unit (system-level) execute.
+///   - `sc <cmd>` — short-lived CLI commands talking to the daemon over
+///     HTTP. status, unlock, lock, ls, get/set/rm, vault, doctor, …
 ///
-/// Bare `safeclaw` (no subcommand) prints help. This matches mainstream
-/// CLI conventions (git, docker, gh, kubectl). The systemd unit on
-/// safeclaw-daemon-dev runs the explicit `safeclaw serve` form.
+/// Bare `safeclaw` (no subcommand) prints help.
 #[derive(Debug, Parser)]
 #[command(name = "safeclaw", version, about = "SafeClaw — passkey-gated credential broker")]
 pub struct Cli {
@@ -21,7 +21,23 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Run the daemon (HTTP server on admin + proxy ports).
+    /// Start the daemon. Default: install + enable a user-level systemd
+    /// unit (Linux only) so the daemon survives logout/reboot. Use
+    /// `--foreground`/`-f` to run in the current process (Docker, dev,
+    /// non-Linux). Config: prefer SAFECLAW_* env vars — they're embedded
+    /// into the systemd unit. Flags only take effect in --foreground.
+    Start(StartArgs),
+    /// Stop the user-level systemd unit (Linux). Has no effect on a
+    /// foreground process; Ctrl-C to stop that.
+    Stop,
+    /// Restart the user-level systemd unit (Linux).
+    Restart,
+    /// Tail the user-level systemd unit's logs via journalctl (Linux).
+    Logs(LogsArgs),
+    /// (Hidden, deprecated) Old daemon entry point. Equivalent to
+    /// `sc start --foreground`. Kept for one migration cycle so existing
+    /// systemd units don't break on upgrade.
+    #[command(hide = true)]
     Serve(ServeArgs),
     /// Print the current vault's status: which one, locked/unlocked,
     /// key count. For custodian-level info use `sc custodian status`.
@@ -277,31 +293,67 @@ pub enum StoreSubcommand {
 }
 
 #[derive(Debug, Args)]
+pub struct StartArgs {
+    /// Run the daemon in the current process instead of installing a
+    /// systemd unit. Required on non-Linux, Docker, and dev workflows.
+    #[arg(long, short = 'f')]
+    pub foreground: bool,
+
+    #[command(flatten)]
+    pub serve: ServeArgs,
+}
+
+#[derive(Debug, Args)]
+pub struct LogsArgs {
+    /// Follow new log lines (like `tail -f`).
+    #[arg(long, short = 'f')]
+    pub follow: bool,
+    /// Show only the last N lines (passed to journalctl as -n).
+    #[arg(long, short = 'n', default_value = "200")]
+    pub lines: u32,
+}
+
+#[derive(Debug, Args)]
 pub struct ServeArgs {
     /// Top-level state directory. Vaults live at <state-dir>/vaults/<id>/.
     #[arg(long, env = "SAFECLAW_STATE_DIR", default_value = "./state")]
     pub state_dir: PathBuf,
 
-    /// Admin port (clients submit grants here).
+    /// Main API port. CLI, browser approval pages, dashboard, and
+    /// reverse proxies talk to the daemon here. (Not "admin port" — the
+    /// admin surface is the `/admin/*` subset, gated by --admin-key.)
     #[arg(long, env = "SAFECLAW_PORT", default_value = "23294")]
     pub port: u16,
 
-    /// Proxy port (agent transparent HTTP for env virtual service).
+    /// HTTPS proxy port for AI agents. Configure your agent with
+    /// `HTTPS_PROXY=http://localhost:<this-port>` and SafeClaw will
+    /// transparently inject credentials into outbound requests.
     #[arg(long, env = "SAFECLAW_PROXY_PORT", default_value = "23295")]
     pub proxy_port: u16,
 
-    /// Bind address for both ports.
-    #[arg(long, env = "SAFECLAW_BIND", default_value = "127.0.0.1")]
-    pub bind: String,
+    /// Network interface to listen on for both ports. `127.0.0.1` =
+    /// localhost only (default, safe). `0.0.0.0` = all interfaces;
+    /// only do that behind a reverse proxy or inside a private network.
+    #[arg(long, env = "SAFECLAW_LISTEN", default_value = "127.0.0.1")]
+    pub listen: String,
 
-    /// Expected WebAuthn origin. Defaults to http://localhost:{port} so
-    /// OSS self-host works out of the box. SaaS overrides via env.
+    /// Public hostname this daemon is reachable at (no scheme, no path).
+    /// Sets sensible defaults for --origin (`https://<host>`) and --rp-id
+    /// (`<host>`) so most self-hosted deployments need only this flag.
+    /// Leave unset for local dev (defaults work via localhost). Override
+    /// with --origin/--rp-id for advanced cases (eTLD+1 rp-id, etc.).
+    #[arg(long, env = "SAFECLAW_HOST")]
+    pub host: Option<String>,
+
+    /// Expected WebAuthn origin (overrides --host derivation). When
+    /// neither is set, defaults to `http://localhost:<port>`.
     #[arg(long, env = "SAFECLAW_ORIGIN")]
     pub origin: Option<String>,
 
-    /// WebAuthn relying party ID. Defaults to "localhost" for self-host.
-    #[arg(long, env = "SAFECLAW_RP_ID", default_value = "localhost")]
-    pub rp_id: String,
+    /// WebAuthn relying party ID (overrides --host derivation). When
+    /// neither is set, defaults to `localhost`.
+    #[arg(long, env = "SAFECLAW_RP_ID")]
+    pub rp_id: Option<String>,
 
     /// Shared secret gating the `/admin/*` surface (today: vault
     /// deletion for SaaS demo-cleanup). When unset, `/admin/*` is
@@ -441,7 +493,7 @@ pub struct Config {
     pub state_dir: PathBuf,
     pub port: u16,
     pub proxy_port: u16,
-    pub bind: String,
+    pub listen: String,
     pub origin: String,
     pub rp_id: String,
     pub admin_key: Option<String>,
@@ -449,14 +501,25 @@ pub struct Config {
 
 impl Config {
     pub fn from_serve_args(args: ServeArgs) -> Self {
-        let origin = args.origin.unwrap_or_else(|| format!("http://localhost:{}", args.port));
+        // Resolution order for origin/rp_id:
+        //   1. explicit --origin / --rp-id wins
+        //   2. otherwise derive from --host if set
+        //   3. otherwise localhost dev defaults
+        let origin = args.origin.unwrap_or_else(|| match &args.host {
+            Some(h) => format!("https://{}", h),
+            None => format!("http://localhost:{}", args.port),
+        });
+        let rp_id = args.rp_id.unwrap_or_else(|| match &args.host {
+            Some(h) => h.clone(),
+            None => "localhost".to_string(),
+        });
         Self {
             state_dir: args.state_dir,
             port: args.port,
             proxy_port: args.proxy_port,
-            bind: args.bind,
+            listen: args.listen,
             origin,
-            rp_id: args.rp_id,
+            rp_id,
             admin_key: args.admin_key,
         }
     }

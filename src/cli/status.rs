@@ -21,18 +21,34 @@ pub enum VaultState {
     Unlocked { passkeys: usize, secrets: usize },
 }
 
-/// Cheap probe: does a local safeclaw daemon answer on the default port?
-/// Used to specialize "no daemon" vs "no vault" hints. ~400ms timeout.
-pub async fn local_daemon_up() -> bool {
+/// Snapshot of the local daemon: is it up, and (if so) how many vaults
+/// does it know about? Lets us give precise post-`sc start` guidance
+/// like "daemon is up with 0 vaults — run `sc vault create`". ~400ms.
+pub struct LocalDaemon {
+    pub up: bool,
+    pub vault_count: Option<u64>,
+}
+
+pub async fn probe_local_daemon() -> LocalDaemon {
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_millis(400))
         .build()
     {
         Ok(c) => c,
-        Err(_) => return false,
+        Err(_) => return LocalDaemon { up: false, vault_count: None },
     };
-    client.get("http://localhost:23294/c/health").send().await
-        .map(|r| r.status().is_success()).unwrap_or(false)
+    let resp = match client.get("http://localhost:23294/health").send().await {
+        Ok(r) if r.status().is_success() => r,
+        _ => return LocalDaemon { up: false, vault_count: None },
+    };
+    let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+    let vault_count = body.get("vault_count").and_then(|v| v.as_u64());
+    LocalDaemon { up: true, vault_count }
+}
+
+/// Shorthand for callers that only care about reachability.
+pub async fn local_daemon_up() -> bool {
+    probe_local_daemon().await.up
 }
 
 pub async fn fetch_status(custodian: &str, vault: &str) -> VaultStatus {
@@ -86,14 +102,23 @@ pub async fn run(args: StatusArgs) -> Result<(), String> {
             Ok(())
         }
         _ => {
-            let up = local_daemon_up().await;
+            let cfg2 = load_config().unwrap_or_default();
+            let d = probe_local_daemon().await;
             println!("safeclaw — no active vault");
-            if up {
-                println!("  hint: `safeclaw vault use` to select one, or");
-                println!("        `safeclaw vault create` to make a new one");
-            } else {
-                println!("  hint: no local daemon on :23294 — start one with `safeclaw serve`,");
-                println!("        then `safeclaw vault create` for your first vault");
+            match (d.up, d.vault_count, cfg2.known_vaults.is_empty()) {
+                (false, _, _) => {
+                    println!("  hint: no local daemon on :23294 — start one with `safeclaw start`,");
+                    println!("        then `safeclaw vault create` for your first vault");
+                }
+                (true, Some(0), _) => {
+                    println!("  hint: local daemon is up with no vaults yet — run `safeclaw vault create`");
+                }
+                (true, _, true) => {
+                    println!("  hint: pick a vault with `safeclaw vault use`, or `safeclaw vault create`");
+                }
+                (true, _, false) => {
+                    println!("  hint: pick one with `safeclaw vault use` (`safeclaw vault ls` to list)");
+                }
             }
             Ok(())
         }
@@ -106,7 +131,7 @@ pub fn print_status(s: &VaultStatus) {
     match &s.state {
         VaultState::Unreachable => {
             if s.url.contains("//localhost") || s.url.contains("//127.0.0.1") {
-                println!("  state: unreachable — start daemon with `safeclaw serve`");
+                println!("  state: unreachable — start daemon with `safeclaw start`");
             } else {
                 println!("  state: unreachable (is the daemon running?)");
             }
