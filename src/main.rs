@@ -4,24 +4,14 @@ use std::sync::Arc;
 use clap::Parser;
 use safeclaw::cli;
 use safeclaw::config::{Cli, Command, Config, ServeArgs, StartArgs};
+// ServeArgs reused inside StartArgs via #[command(flatten)]; the standalone
+// Serve subcommand is gone.
 use safeclaw::proxy::proxy_router;
 use safeclaw::server::admin_router;
 use safeclaw::state::AppState;
 
-/// One-cycle migration shim: accept the old SAFECLAW_BIND env var as
-/// an alias for SAFECLAW_LISTEN. Remove after VM units are migrated.
-fn migrate_legacy_env_vars() {
-    if std::env::var_os("SAFECLAW_LISTEN").is_none() {
-        if let Ok(legacy) = std::env::var("SAFECLAW_BIND") {
-            std::env::set_var("SAFECLAW_LISTEN", &legacy);
-            eprintln!("warning: SAFECLAW_BIND is deprecated; rename to SAFECLAW_LISTEN.");
-        }
-    }
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    migrate_legacy_env_vars();
     let cli = Cli::parse();
     match cli.command {
         Command::Start(args) => run_start(args).await,
@@ -37,12 +27,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("safeclaw logs: {}", e);
             e.into()
         }),
-        Command::Serve(args) => {
-            // Deprecated alias for `start --foreground`. One migration
-            // cycle, then delete (along with the VM unit's old ExecStart).
-            eprintln!("warning: `safeclaw serve` is deprecated. Use `safeclaw start --foreground`.");
-            run_daemon(args).await
-        }
         Command::Status(args) => {
             // CLI commands log to stderr; don't initialise the tracing
             // subscriber here (it'd pollute the user-facing output of a

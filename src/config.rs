@@ -34,11 +34,6 @@ pub enum Command {
     Restart,
     /// Tail the user-level systemd unit's logs via journalctl (Linux).
     Logs(LogsArgs),
-    /// (Hidden, deprecated) Old daemon entry point. Equivalent to
-    /// `sc start --foreground`. Kept for one migration cycle so existing
-    /// systemd units don't break on upgrade.
-    #[command(hide = true)]
-    Serve(ServeArgs),
     /// Print the current vault's status: which one, locked/unlocked,
     /// key count. For custodian-level info use `sc custodian status`.
     Status(StatusArgs),
@@ -337,21 +332,15 @@ pub struct ServeArgs {
     #[arg(long, env = "SAFECLAW_LISTEN", default_value = "127.0.0.1")]
     pub listen: String,
 
-    /// Public hostname this daemon is reachable at (no scheme, no path).
-    /// Sets sensible defaults for --origin (`https://<host>`) and --rp-id
-    /// (`<host>`) so most self-hosted deployments need only this flag.
-    /// Leave unset for local dev (defaults work via localhost). Override
-    /// with --origin/--rp-id for advanced cases (eTLD+1 rp-id, etc.).
-    #[arg(long, env = "SAFECLAW_HOST")]
-    pub host: Option<String>,
-
-    /// Expected WebAuthn origin (overrides --host derivation). When
-    /// neither is set, defaults to `http://localhost:<port>`.
+    /// Expected WebAuthn origin — the full URL the browser sees, e.g.
+    /// `https://custodian.example.com`. Defaults to `http://localhost:<port>`
+    /// for local dev.
     #[arg(long, env = "SAFECLAW_ORIGIN")]
     pub origin: Option<String>,
 
-    /// WebAuthn relying party ID (overrides --host derivation). When
-    /// neither is set, defaults to `localhost`.
+    /// WebAuthn relying party ID. Defaults to the host part of --origin
+    /// (e.g. `custodian.example.com`), which is what 99% of deployments
+    /// want. Override only for eTLD+1 sharing across subdomains.
     #[arg(long, env = "SAFECLAW_RP_ID")]
     pub rp_id: Option<String>,
 
@@ -501,18 +490,12 @@ pub struct Config {
 
 impl Config {
     pub fn from_serve_args(args: ServeArgs) -> Self {
-        // Resolution order for origin/rp_id:
-        //   1. explicit --origin / --rp-id wins
-        //   2. otherwise derive from --host if set
-        //   3. otherwise localhost dev defaults
-        let origin = args.origin.unwrap_or_else(|| match &args.host {
-            Some(h) => format!("https://{}", h),
-            None => format!("http://localhost:{}", args.port),
-        });
-        let rp_id = args.rp_id.unwrap_or_else(|| match &args.host {
-            Some(h) => h.clone(),
-            None => "localhost".to_string(),
-        });
+        let origin = args.origin.unwrap_or_else(|| format!("http://localhost:{}", args.port));
+        // rp_id defaults to origin's host: cheaper than depending on a URL
+        // crate, and we already require origin to be well-formed for WebAuthn
+        // to work. Strips scheme, path, and :port. Falls back to "localhost"
+        // if origin is somehow unparseable.
+        let rp_id = args.rp_id.unwrap_or_else(|| host_from_origin(&origin).unwrap_or_else(|| "localhost".into()));
         Self {
             state_dir: args.state_dir,
             port: args.port,
@@ -523,4 +506,13 @@ impl Config {
             admin_key: args.admin_key,
         }
     }
+}
+
+fn host_from_origin(origin: &str) -> Option<String> {
+    let after_scheme = origin
+        .strip_prefix("https://")
+        .or_else(|| origin.strip_prefix("http://"))?;
+    let host_port = after_scheme.split('/').next()?;
+    let host = host_port.split(':').next()?;
+    if host.is_empty() { None } else { Some(host.to_string()) }
 }

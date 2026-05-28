@@ -85,8 +85,8 @@ pub async fn run_start_systemd() -> Result<(), String> {
         eprintln!("  env:      {} SAFECLAW_* var(s) embedded", env_lines.len());
     }
     eprintln!();
-    eprintln!("  next: `sc vault create` to make your first vault");
-    eprintln!("        `sc logs -f` to tail, `sc stop` to stop, `sc restart` to reload");
+    eprintln!("  next: `safeclaw vault create` to make your first vault");
+    eprintln!("        `safeclaw logs -f` to tail, `safeclaw stop` to stop, `safeclaw restart` to reload");
     Ok(())
 }
 
