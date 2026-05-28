@@ -150,11 +150,13 @@ struct VaultOverlay<'a> {
 }
 
 fn endpoint_for_api(id: &str, api: &crate::service::ApiDef) -> RegistryEndpoint {
+    // Paths are relative to proxy_base so agents can prepend it without
+    // knowing whether they're hitting OSS (proxy port) or SaaS (/api/use).
     let rest = api.path.trim_start_matches('/');
     let (path, wildcard) = if rest == "*" {
-        (format!("/api/use/{}", id), true)
+        (format!("/{}", id), true)
     } else {
-        (format!("/api/use/{}/{}", id, rest), false)
+        (format!("/{}/{}", id, rest), false)
     };
     RegistryEndpoint {
         method: api.method.clone().unwrap_or_else(|| "ANY".to_string()),
@@ -277,8 +279,31 @@ fn build_service(
     }
 }
 
+/// Replace the port in a URL with `new_port`.
+/// "http://localhost:23294" -> "http://localhost:23295".
+/// URLs with no explicit port (SaaS behind a reverse proxy) are returned unchanged.
+fn swap_port(url: &str, new_port: u16) -> String {
+    let url = url.trim_end_matches('/');
+    if let Some(colon) = url.rfind(':') {
+        let after = &url[colon + 1..];
+        if !after.is_empty() && after.chars().all(|c| c.is_ascii_digit()) {
+            return format!("{}:{}", &url[..colon], new_port);
+        }
+    }
+    url.to_string()
+}
+
+/// `proxy_base` for `/menu` (no vault in path). Used by SaaS pro-backend
+/// which routes `/api/use/*` → daemon; not called directly by OSS agents.
 fn proxy_base(state: &AppState) -> String {
     format!("{}/api/use", state.config.origin.trim_end_matches('/'))
+}
+
+/// `proxy_base` for `/v/{vid}/registry`. Points at the actual proxy port
+/// with the vault baked in — this is the URL agents call for Use requests.
+fn vault_proxy_base(state: &AppState, vault_id: &str) -> String {
+    let proxy_origin = swap_port(&state.config.origin, state.config.proxy_port);
+    format!("{}/v/{}/use", proxy_origin, vault_id)
 }
 
 fn console_url(state: &AppState, vault_id: &str) -> String {
@@ -365,7 +390,7 @@ pub async fn vault_registry(
     // demo vaults, /vault for everyone else.
     let body = RegistryResponse {
         version: 2,
-        proxy_base: proxy_base(&state),
+        proxy_base: vault_proxy_base(&state, &vault_id),
         services,
         policy_defaults: serde_json::to_value(crate::core::policy::PolicyDefaults::default())?,
         vault_locked: Some(locked),

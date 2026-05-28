@@ -74,14 +74,17 @@ on safeclaw.pro).
 
 ## Call shape
 
+Use `proxy_base` from the registry response as the base URL — it is
+already set to the correct host and path for your deployment.
+
 ```
-POST $SAFECLAW_VAULT_URL/use/<service>[/<path>]
+POST <proxy_base>/<service>[/<path>]
 Authorization: Bearer $SAFECLAW_API_KEY
 ```
 
-`<path>` is optional — services like `demo` that catch any path work with
-or without one. Multi-segment paths (`v1/chat/completions`) pass straight
-through to the upstream.
+`<path>` is optional — services that catch any path work with or without
+one. Multi-segment paths (`v1/chat/completions`) pass straight through
+to the upstream.
 
 Every response (initial call and follow-up polls) has the same shape:
 
