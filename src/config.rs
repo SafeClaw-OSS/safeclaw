@@ -218,8 +218,9 @@ pub struct VaultUseArgs {
 
 #[derive(Debug, Args)]
 pub struct VaultForgetArgs {
-    /// SAFECLAW_VAULT_URL or numeric index from `sc vault ls`.
-    pub url_or_idx: String,
+    /// SAFECLAW_VAULT_URL or numeric index from `sc vault ls`. If
+    /// omitted, an interactive prompt lists known vaults.
+    pub url_or_idx: Option<String>,
 }
 
 #[derive(Debug, Args)]

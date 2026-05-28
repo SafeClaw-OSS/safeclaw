@@ -61,7 +61,8 @@ async fn run_use(args: VaultUseArgs) -> Result<(), String> {
     } else if let Some(arg) = args.url_or_idx {
         resolve_url_or_idx(&arg)?
     } else {
-        let url = interactive_pick()?;
+        let url = interactive_pick("Choose: index, SAFECLAW_VAULT_URL, or Enter for local default: ", OnEmpty::UseLocalDefault)?
+            .expect("UseLocalDefault never returns None");
         split_vault_url(&url)
             .ok_or_else(|| format!("not a valid SAFECLAW_VAULT_URL: {}", url))?
     };
@@ -88,7 +89,18 @@ async fn run_use(args: VaultUseArgs) -> Result<(), String> {
 }
 
 async fn run_forget(args: VaultForgetArgs) -> Result<(), String> {
-    let (custodian, vault) = resolve_url_or_idx(&args.url_or_idx)?;
+    let (custodian, vault) = if let Some(arg) = args.url_or_idx {
+        resolve_url_or_idx(&arg)?
+    } else {
+        let cfg = load_config()?;
+        if cfg.known_vaults.is_empty() {
+            return Err("no vaults in known list — nothing to forget".into());
+        }
+        let url = interactive_pick("Choose: index or SAFECLAW_VAULT_URL (Enter to cancel): ", OnEmpty::Abort)?
+            .ok_or("cancelled")?;
+        split_vault_url(&url)
+            .ok_or_else(|| format!("not a valid SAFECLAW_VAULT_URL: {}", url))?
+    };
     let removed = forget_vault(&custodian, &vault)?;
     if !removed {
         return Err(format!("vault not in known list: {}", join_vault_url(&custodian, &vault)));
@@ -97,7 +109,16 @@ async fn run_forget(args: VaultForgetArgs) -> Result<(), String> {
     Ok(())
 }
 
-fn interactive_pick() -> Result<String, String> {
+/// What `interactive_pick` does when the user just hits Enter.
+enum OnEmpty {
+    /// Return the local-default URL (`use` semantics).
+    UseLocalDefault,
+    /// Return `Ok(None)` so the caller can treat it as a cancel
+    /// (`forget` semantics).
+    Abort,
+}
+
+fn interactive_pick(prompt: &str, on_empty: OnEmpty) -> Result<Option<String>, String> {
     let cfg = load_config().unwrap_or_default();
     let active = (cfg.custodian.as_deref(), cfg.vault.as_deref());
     if !cfg.known_vaults.is_empty() {
@@ -108,22 +129,25 @@ fn interactive_pick() -> Result<String, String> {
         }
         eprintln!();
     }
-    eprint!("Choose: index, SAFECLAW_VAULT_URL, or Enter for local default: ");
+    eprint!("{}", prompt);
     io::stderr().flush().ok();
     let mut buf = String::new();
     io::stdin().read_line(&mut buf).map_err(|e| e.to_string())?;
     let trimmed = buf.trim();
     if trimmed.is_empty() {
-        return Ok(join_vault_url(LOCAL_CUSTODIAN, LOCAL_VAULT_ID));
+        return match on_empty {
+            OnEmpty::UseLocalDefault => Ok(Some(join_vault_url(LOCAL_CUSTODIAN, LOCAL_VAULT_ID))),
+            OnEmpty::Abort => Ok(None),
+        };
     }
     if let Ok(idx) = trimmed.parse::<usize>() {
         if idx < 1 || idx > cfg.known_vaults.len() {
             return Err(format!("index {} out of range [1-{}]", idx, cfg.known_vaults.len()));
         }
         let kv = &cfg.known_vaults[idx - 1];
-        return Ok(join_vault_url(&kv.custodian, &kv.vault));
+        return Ok(Some(join_vault_url(&kv.custodian, &kv.vault)));
     }
-    Ok(trimmed.to_string())
+    Ok(Some(trimmed.to_string()))
 }
 
 async fn run_create(args: VaultCreateArgs) -> Result<(), String> {

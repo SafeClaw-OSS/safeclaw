@@ -6,6 +6,17 @@ description = "SafeClaw daemon — multi-vault passkey-gated credential vault fo
 license = "Apache-2.0"
 repository = "https://github.com/xhyumiracle/safeclaw"
 
+# Two bin targets share the same main.rs:
+#   `safeclaw` — canonical name (discoverable via brew/cargo install)
+#   `sc`       — short alias for daily use (cf. `op`, `gh`, `bw`)
+[[bin]]
+name = "safeclaw"
+path = "src/main.rs"
+
+[[bin]]
+name = "sc"
+path = "src/main.rs"
+
 [dependencies]
 # HTTP
 axum = "0.8"
