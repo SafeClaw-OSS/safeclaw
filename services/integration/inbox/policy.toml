@@ -2,6 +2,17 @@
 write = "ask"
 read = "ask"
 
+# Self-verify read: agents need to be able to confirm "did my POST
+# land?" without dragging a human into an approval loop for each
+# check. /recent only ever surfaces the caller's OWN bucket (keyed
+# by SHA256 of the injected Authorization), so there's no
+# cross-tenant exfiltration risk — `allow` is safe.
+[[rule]]
+id = "inbox-read-recent"
+label = "List recent messages in your own inbox bucket"
+match = "GET /recent"
+level = "allow"
+
 [[rule]]
 id = "inbox-any"
 label = "Any call to the inbox service"
