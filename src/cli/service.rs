@@ -86,13 +86,13 @@ pub async fn run_start_systemd() -> Result<(), String> {
     }
     eprintln!();
     eprintln!("  next: `safeclaw vault create` to make your first vault");
-    eprintln!("        `safeclaw logs -f` to tail, `safeclaw stop` to stop, `safeclaw restart` to reload");
+    eprintln!("        `safeclaw c logs -f` to tail, `safeclaw c stop` to stop, `safeclaw c restart` to reload");
     Ok(())
 }
 
 #[cfg(not(target_os = "linux"))]
 pub async fn run_start_systemd() -> Result<(), String> {
-    Err("`sc start` (systemd mode) is Linux-only. Use `sc start --foreground` to run in this process.".into())
+    Err("`sc c start` (systemd mode) is Linux-only. Use `sc c start --foreground` to run in this process.".into())
 }
 
 #[cfg(target_os = "linux")]
@@ -105,7 +105,7 @@ pub fn run_stop() -> Result<(), String> {
 
 #[cfg(not(target_os = "linux"))]
 pub fn run_stop() -> Result<(), String> {
-    Err("`sc stop` (systemd mode) is Linux-only.".into())
+    Err("`sc c stop` (systemd mode) is Linux-only.".into())
 }
 
 #[cfg(target_os = "linux")]
@@ -118,7 +118,7 @@ pub fn run_restart() -> Result<(), String> {
 
 #[cfg(not(target_os = "linux"))]
 pub fn run_restart() -> Result<(), String> {
-    Err("`sc restart` (systemd mode) is Linux-only.".into())
+    Err("`sc c restart` (systemd mode) is Linux-only.".into())
 }
 
 #[cfg(target_os = "linux")]
@@ -141,7 +141,7 @@ pub fn run_logs(args: LogsArgs) -> Result<(), String> {
 
 #[cfg(not(target_os = "linux"))]
 pub fn run_logs(_args: LogsArgs) -> Result<(), String> {
-    Err("`sc logs` (systemd mode) is Linux-only.".into())
+    Err("`sc c logs` (systemd mode) is Linux-only.".into())
 }
 
 #[cfg(target_os = "linux")]
@@ -152,7 +152,7 @@ fn ensure_unit_installed() -> Result<(), String> {
         .join(UNIT_BASENAME);
     if !unit_path.exists() {
         return Err(format!(
-            "no systemd unit at {} — run `sc start` first to install it",
+            "no systemd unit at {} — run `sc c start` first to install it",
             unit_path.display()
         ));
     }

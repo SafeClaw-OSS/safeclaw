@@ -1,15 +1,17 @@
 use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand};
 
-/// Top-level CLI shape. `safeclaw` (with short alias `sc`) is one
-/// binary in two modes:
+/// Top-level CLI shape. `safeclaw` (short alias `sc`) is one binary
+/// with two roles:
 ///
-///   - `sc start [--foreground]` — long-running daemon. Default installs
-///     and starts a user-level systemd unit (Linux). `--foreground`/`-f`
-///     runs in the current process; that's what Docker, dev, and the
-///     production systemd unit (system-level) execute.
-///   - `sc <cmd>` — short-lived CLI commands talking to the daemon over
-///     HTTP. status, unlock, lock, ls, get/set/rm, vault, doctor, …
+///   - **Daemon ops** live under `sc custodian` (alias `sc c`):
+///     start / stop / restart / logs (Linux user-systemd lifecycle) and
+///     status / pubkey / menu (read-only, local or remote). Run with
+///     `sc c start --foreground` in Docker/dev/non-Linux.
+///   - **Vault ops** are short-lived CLI commands talking to the daemon
+///     over HTTP: `sc status`, `sc vault ...` (alias `sc v`), `sc unlock`,
+///     `sc lock`, `sc ls / get / set / rm`, `sc passkey` (alias `sc p`),
+///     `sc store`, `sc doctor`, …
 ///
 /// Bare `safeclaw` (no subcommand) prints help.
 #[derive(Debug, Parser)]
@@ -21,24 +23,13 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Start the daemon. Default: install + enable a user-level systemd
-    /// unit (Linux only) so the daemon survives logout/reboot. Use
-    /// `--foreground`/`-f` to run in the current process (Docker, dev,
-    /// non-Linux). Config: prefer SAFECLAW_* env vars — they're embedded
-    /// into the systemd unit. Flags only take effect in --foreground.
-    Start(StartArgs),
-    /// Stop the user-level systemd unit (Linux). Has no effect on a
-    /// foreground process; Ctrl-C to stop that.
-    Stop,
-    /// Restart the user-level systemd unit (Linux).
-    Restart,
-    /// Tail the user-level systemd unit's logs via journalctl (Linux).
-    Logs(LogsArgs),
     /// Print the current vault's status: which one, locked/unlocked,
-    /// key count. For custodian-level info use `sc custodian status`.
+    /// key count. For daemon lifecycle use `sc custodian` (`sc c`).
     Status(StatusArgs),
-    /// Read-only info about the custodian (daemon) hosting the active
-    /// vault. Sub: status / pubkey / menu.
+    /// Daemon (custodian) ops: start / stop / restart / logs / status /
+    /// pubkey / menu. Local daemon or any remote custodian — same
+    /// commands. Short alias: `sc c`.
+    #[command(alias = "c")]
     Custodian(CustodianArgs),
     /// Bring the vault from Locked → Unlocked. Opens a browser to the
     /// custodian's `/cli/auth` page; the page runs the passkey ceremony
@@ -54,11 +45,13 @@ pub enum Command {
     /// Alias for `sc secret get`.
     Get(GetArgs),
     /// Per-vault lifecycle ops. Today: `vault delete` to nuke a vault's
-    /// daemon-side state (irreversible, passkey-gated).
+    /// daemon-side state (irreversible, passkey-gated). Short: `sc v`.
+    #[command(alias = "v")]
     Vault(VaultArgs),
     /// Manage the active vault's enrolled passkeys. `ls` is read-only;
     /// `add` / `remove` / `rename` need crypto ceremonies and are deferred
-    /// to a later session.
+    /// to a later session. Short: `sc p`.
+    #[command(alias = "p")]
     Passkey(PasskeyArgs),
     /// Operator-only commands. Each subcommand requires `$SAFECLAW_ADMIN_KEY`
     /// to be set on the CLI side AND match the daemon's `SAFECLAW_ADMIN_KEY`
@@ -372,7 +365,21 @@ pub struct CustodianArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum CustodianSubcommand {
-    /// Custodian health + version + vault count.
+    /// Start the local daemon. Default: install + enable a user-level
+    /// systemd unit (Linux) so it survives logout/reboot. Use
+    /// `--foreground` / `-f` to run in the current process (Docker, dev,
+    /// non-Linux). Config: prefer SAFECLAW_* env vars — they're embedded
+    /// into the systemd unit. Flags only take effect in --foreground.
+    Start(StartArgs),
+    /// Stop the local daemon (user-level systemd unit). No effect on a
+    /// foreground process; Ctrl-C to stop that.
+    Stop,
+    /// Restart the local daemon (user-level systemd unit).
+    Restart,
+    /// Tail the local daemon's logs via journalctl.
+    Logs(LogsArgs),
+    /// Custodian health + version + vault count (works on local or
+    /// remote — pass --custodian for remote).
     Status(CommonArgs),
     /// HPKE outer-envelope public key.
     Pubkey(CommonArgs),

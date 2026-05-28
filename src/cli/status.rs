@@ -107,7 +107,7 @@ pub async fn run(args: StatusArgs) -> Result<(), String> {
             println!("safeclaw — no active vault");
             match (d.up, d.vault_count, cfg2.known_vaults.is_empty()) {
                 (false, _, _) => {
-                    println!("  hint: no local daemon on :23294 — start one with `safeclaw start`,");
+                    println!("  hint: no local daemon on :23294 — start one with `safeclaw c start`,");
                     println!("        then `safeclaw vault create` for your first vault");
                 }
                 (true, Some(0), _) => {
@@ -131,7 +131,7 @@ pub fn print_status(s: &VaultStatus) {
     match &s.state {
         VaultState::Unreachable => {
             if s.url.contains("//localhost") || s.url.contains("//127.0.0.1") {
-                println!("  state: unreachable — start daemon with `safeclaw start`");
+                println!("  state: unreachable — start daemon with `safeclaw c start`");
             } else {
                 println!("  state: unreachable (is the daemon running?)");
             }

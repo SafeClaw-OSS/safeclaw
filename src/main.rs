@@ -3,9 +3,7 @@ use std::sync::Arc;
 
 use clap::Parser;
 use safeclaw::cli;
-use safeclaw::config::{Cli, Command, Config, ServeArgs, StartArgs};
-// ServeArgs reused inside StartArgs via #[command(flatten)]; the standalone
-// Serve subcommand is gone.
+use safeclaw::config::{Cli, Command, Config, CustodianSubcommand, ServeArgs};
 use safeclaw::proxy::proxy_router;
 use safeclaw::server::admin_router;
 use safeclaw::state::AppState;
@@ -14,19 +12,6 @@ use safeclaw::state::AppState;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Start(args) => run_start(args).await,
-        Command::Stop => cli::service::run_stop().map_err(|e| -> Box<dyn std::error::Error> {
-            eprintln!("safeclaw stop: {}", e);
-            e.into()
-        }),
-        Command::Restart => cli::service::run_restart().map_err(|e| -> Box<dyn std::error::Error> {
-            eprintln!("safeclaw restart: {}", e);
-            e.into()
-        }),
-        Command::Logs(args) => cli::service::run_logs(args).map_err(|e| -> Box<dyn std::error::Error> {
-            eprintln!("safeclaw logs: {}", e);
-            e.into()
-        }),
         Command::Status(args) => {
             // CLI commands log to stderr; don't initialise the tracing
             // subscriber here (it'd pollute the user-facing output of a
@@ -37,10 +22,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             })
         }
         Command::Custodian(args) => {
-            cli::custodian::run(args.sub).await.map_err(|e| -> Box<dyn std::error::Error> {
-                eprintln!("safeclaw custodian: {}", e);
-                e.into()
-            })
+            // Foreground daemon special-case: it bootstraps tracing,
+            // owns the runtime, and runs forever — keep that at the top
+            // level rather than threading it through the CLI dispatch.
+            match args.sub {
+                CustodianSubcommand::Start(start) if start.foreground => {
+                    run_daemon(start.serve).await
+                }
+                sub => cli::custodian::run(sub).await.map_err(|e| -> Box<dyn std::error::Error> {
+                    eprintln!("safeclaw custodian: {}", e);
+                    e.into()
+                }),
+            }
         }
         Command::Unlock(args) => {
             cli::unlock::run_unlock(args).await.map_err(|e| -> Box<dyn std::error::Error> {
@@ -132,16 +125,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
     }
-}
-
-async fn run_start(args: StartArgs) -> Result<(), Box<dyn std::error::Error>> {
-    if args.foreground {
-        return run_daemon(args.serve).await;
-    }
-    cli::service::run_start_systemd().await.map_err(|e| -> Box<dyn std::error::Error> {
-        eprintln!("safeclaw start: {}", e);
-        e.into()
-    })
 }
 
 async fn run_daemon(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {

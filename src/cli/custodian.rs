@@ -1,11 +1,22 @@
-//! `safeclaw custodian ...` — read-only info about the daemon hosting
-//! the active vault. No passkey gestures here.
+//! `safeclaw custodian ...` — daemon ops. Lifecycle (start / stop /
+//! restart / logs, Linux user systemd) plus read-only info (status /
+//! pubkey / menu, works on local or remote custodian).
 
-use crate::cli::active::resolve_active;
+use crate::cli::{active::resolve_active, service};
 use crate::config::{CommonArgs, CustodianSubcommand};
 
 pub async fn run(sub: CustodianSubcommand) -> Result<(), String> {
     match sub {
+        CustodianSubcommand::Start(args) => {
+            // Foreground daemon path is special-cased in main.rs (it
+            // initialises tracing and runs forever). The dispatch in
+            // main.rs intercepts before we get here when foreground=true.
+            debug_assert!(!args.foreground, "foreground daemon should be handled in main.rs");
+            service::run_start_systemd().await
+        }
+        CustodianSubcommand::Stop => service::run_stop(),
+        CustodianSubcommand::Restart => service::run_restart(),
+        CustodianSubcommand::Logs(args) => service::run_logs(args),
         CustodianSubcommand::Status(a) => status(a).await,
         CustodianSubcommand::Pubkey(a) => fetch_print(a, "/pubkey").await,
         CustodianSubcommand::Menu(a) => fetch_print(a, "/menu").await,

@@ -15,7 +15,7 @@ const LOCAL_VAULT_ID: &str = "default";
 
 /// True if the custodian URL points at this machine. Used to specialize
 /// "daemon down" hints — a remote daemon being unreachable is a network
-/// problem; a local one almost always means `safeclaw start` isn't running.
+/// problem; a local one almost always means `safeclaw c start` isn't running.
 fn is_localhost(custodian: &str) -> bool {
     let after_scheme = custodian
         .trim_start_matches("http://")
@@ -92,7 +92,7 @@ async fn run_use(args: VaultUseArgs) -> Result<(), String> {
         }
         VaultState::Unreachable => {
             if is_localhost(&custodian) {
-                eprintln!("warning: no local daemon at {} — start one with `safeclaw start`", custodian);
+                eprintln!("warning: no local daemon at {} — start one with `safeclaw c start`", custodian);
                 eprintln!("  (saving anyway; `safeclaw status` will recheck once the daemon is up)");
             } else {
                 eprintln!("warning: couldn't reach custodian; saving anyway");
