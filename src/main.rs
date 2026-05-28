@@ -22,9 +22,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 e.into()
             })
         }
-        Command::Login(args) => {
-            cli::login::run(args).await.map_err(|e| -> Box<dyn std::error::Error> {
-                eprintln!("safeclaw login: {}", e);
+        Command::Custodian(args) => {
+            cli::custodian::run(args.sub).await.map_err(|e| -> Box<dyn std::error::Error> {
+                eprintln!("safeclaw custodian: {}", e);
                 e.into()
             })
         }

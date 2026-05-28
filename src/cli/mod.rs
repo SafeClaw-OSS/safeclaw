@@ -4,16 +4,16 @@
 //! because handlers are the daemon's HTTP request side; this is the
 //! client side. Same binary, different mode.
 
+pub mod active;
 pub mod admin;
+pub mod custodian;
 pub mod doctor;
 pub mod env;
-pub mod webauthn;
-pub mod login;
 pub mod ls;
 pub mod passkey;
-pub mod active;
+pub mod secret;
 pub mod status;
 pub mod store;
 pub mod unlock;
 pub mod vault;
-pub mod secret;
+pub mod webauthn;

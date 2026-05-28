@@ -6,69 +6,69 @@ use base64::Engine;
 use serde_json::json;
 
 use crate::cli::webauthn::*;
-use crate::cli::active::resolve_active;
-use crate::config::{CommonArgs, VaultCreateArgs, VaultDeleteArgs, VaultSubcommand};
+use crate::cli::active::{join_vault_url, load as load_config, put_active, resolve_active, split_vault_url};
+use crate::config::{VaultCreateArgs, VaultDeleteArgs, VaultSubcommand, VaultUseArgs};
+
+const LOCAL_CUSTODIAN: &str = "http://localhost:23294";
+const LOCAL_VAULT_ID: &str = "default";
 
 pub async fn run(sub: VaultSubcommand) -> Result<(), String> {
     match sub {
-        VaultSubcommand::Ls(a) => run_ls(a).await,
+        VaultSubcommand::Ls => run_ls().await,
+        VaultSubcommand::Use(a) => run_use(a).await,
         VaultSubcommand::Create(a) => run_create(a).await,
         VaultSubcommand::Delete(a) => run_delete(a).await,
     }
 }
 
-async fn run_ls(args: CommonArgs) -> Result<(), String> {
-    let custodian = match args.custodian.as_deref() {
-        Some(c) => c.to_string(),
-        None => resolve_active(None, args.vault.as_deref())
-            .map(|(c, _)| c)
-            .unwrap_or_else(|_| "http://localhost:23294".to_string()),
-    };
-    let admin_key = std::env::var("SAFECLAW_ADMIN_KEY").map_err(|_| {
-        "vault ls needs $SAFECLAW_ADMIN_KEY".to_string()
-    })?;
-    let url = format!("{}/admin/vaults", custodian.trim_end_matches('/'));
-    let client = http_client()?;
-    let resp = client.get(&url).header("X-Admin-Key", admin_key)
-        .send().await.map_err(|e| format!("reach custodian: {}", e))?;
-    let status = resp.status();
-    if status.as_u16() == 403 {
-        return Err("403 — admin key mismatch or admin endpoints disabled".into());
-    }
-    if !status.is_success() {
-        return Err(format!("HTTP {}: {}", status, resp.text().await.unwrap_or_default()));
-    }
-    #[derive(serde::Deserialize)]
-    struct Body { vaults: Vec<String> }
-    let body: Body = resp.json().await.map_err(|e| format!("parse: {}", e))?;
-    if body.vaults.is_empty() {
-        println!("(no vaults on {})", custodian);
+async fn run_ls() -> Result<(), String> {
+    let cfg = load_config()?;
+    if cfg.known_vaults.is_empty() {
+        println!("(no vaults yet — `safeclaw vault create` or `safeclaw vault use`)");
         return Ok(());
     }
-    let active = match args.vault.as_deref() {
-        Some(v) => Some(v.to_string()),
-        None => resolve_active(Some(&custodian), None).ok().map(|(_, v)| v),
-    };
-    println!("vaults on {}", custodian);
-    for v in &body.vaults {
-        let m = if active.as_deref() == Some(v.as_str()) { "*" } else { " " };
-        println!("  {} {}", m, v);
+    let active = (cfg.custodian.as_deref(), cfg.vault.as_deref());
+    for kv in &cfg.known_vaults {
+        let marker = if active == (Some(&kv.custodian), Some(&kv.vault)) { "*" } else { " " };
+        println!("  {} {}", marker, join_vault_url(&kv.custodian, &kv.vault));
     }
+    Ok(())
+}
+
+async fn run_use(args: VaultUseArgs) -> Result<(), String> {
+    let url = if args.local {
+        join_vault_url(LOCAL_CUSTODIAN, LOCAL_VAULT_ID)
+    } else if let Some(u) = args.url {
+        u
+    } else {
+        // Interactive prompt
+        eprint!("Paste a SAFECLAW_VAULT_URL (or press Enter for local default): ");
+        io::stderr().flush().ok();
+        let mut buf = String::new();
+        io::stdin().read_line(&mut buf).map_err(|e| e.to_string())?;
+        let trimmed = buf.trim();
+        if trimmed.is_empty() {
+            join_vault_url(LOCAL_CUSTODIAN, LOCAL_VAULT_ID)
+        } else {
+            trimmed.to_string()
+        }
+    };
+
+    let (custodian, vault) = split_vault_url(&url)
+        .ok_or_else(|| format!("not a valid SAFECLAW_VAULT_URL: {} (expected <custodian>/v/<id>)", url))?;
+    put_active(&custodian, &vault).map_err(|e| format!("save config: {}", e))?;
+    println!("active vault: {}", join_vault_url(&custodian, &vault));
     Ok(())
 }
 
 async fn run_create(args: VaultCreateArgs) -> Result<(), String> {
     use crate::crypto::kdf::WRAP_VERSION;
 
-    let custodian = args.custodian.as_deref()
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| {
-            resolve_active(None, None)
-                .map(|(c, _)| c)
-                .unwrap_or_else(|_| "http://localhost:23294".to_string())
-        });
-    let vault_id = uuid::Uuid::new_v4().to_string();
-    eprintln!("safeclaw vault create — new vault {} on {}", vault_id, custodian);
+    let (custodian, vault_id) = match args.remote.as_deref() {
+        Some(remote) => (remote.trim_end_matches('/').to_string(), uuid::Uuid::new_v4().to_string()),
+        None => (LOCAL_CUSTODIAN.to_string(), LOCAL_VAULT_ID.to_string()),
+    };
+    eprintln!("safeclaw vault create — new vault at {}", join_vault_url(&custodian, &vault_id));
 
     // ── Step 1: register passkey (WebAuthn create()) ───────────────────
     // PRF eval salt for the create ceremony. Some authenticators support
@@ -198,13 +198,11 @@ async fn run_create(args: VaultCreateArgs) -> Result<(), String> {
         return Err(format!("approve HTTP {}: {}", resp.status(), resp.text().await.unwrap_or_default()));
     }
 
-    // ── Save to config ────────────────────────────────────────────────
-    crate::cli::active::put_active(&custodian, &vault_id)
-        .map_err(|e| format!("save config: {}", e))?;
-    eprintln!("safeclaw vault create — done!");
-    eprintln!("  vault:     {}", vault_id);
-    eprintln!("  custodian: {}", custodian);
-    eprintln!("  config saved to ~/.safeclaw/config.toml");
+    put_active(&custodian, &vault_id).map_err(|e| format!("save config: {}", e))?;
+    let url = join_vault_url(&custodian, &vault_id);
+    eprintln!("safeclaw vault create — done");
+    eprintln!("  active vault: {}", url);
+    eprintln!("  share with other machines: SAFECLAW_VAULT_URL={}", url);
     Ok(())
 }
 

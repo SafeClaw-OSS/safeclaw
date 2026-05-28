@@ -23,13 +23,12 @@ pub struct Cli {
 pub enum Command {
     /// Run the daemon (HTTP server on admin + proxy ports).
     Serve(ServeArgs),
-    /// Print custodian health and version.
+    /// Print the current vault's status: which one, locked/unlocked,
+    /// key count. For custodian-level info use `sc custodian status`.
     Status(StatusArgs),
-    /// Save a custodian URL + vault id to ~/.safeclaw/config.toml so
-    /// later commands can omit `--custodian` / `--vault`. Does NOT unlock
-    /// the vault — passkey gestures happen per-operation. For SaaS the
-    /// apiKey lives in $SAFECLAW_API_KEY (never on disk).
-    Login(LoginArgs),
+    /// Read-only info about the custodian (daemon) hosting the active
+    /// vault. Sub: status / pubkey / menu.
+    Custodian(CustodianArgs),
     /// Bring the vault from Locked → Unlocked. Opens a browser to the
     /// custodian's `/cli/auth` page; the page runs the passkey ceremony
     /// and redirects back to a localhost callback this command spawns.
@@ -170,32 +169,42 @@ pub struct AdminAuditLsArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum VaultSubcommand {
-    /// List vaults known to the active custodian. Hits the admin
-    /// endpoint `GET /admin/vaults` — requires `SAFECLAW_ADMIN_KEY` to
-    /// be set on the daemon (typical OSS self-host) and exposed to the
-    /// CLI via `$SAFECLAW_ADMIN_KEY`.
-    Ls(CommonArgs),
-    /// Create a new vault. Hits `POST /v/new` to bootstrap an Enroll op,
-    /// then opens the browser for a WebAuthn `create()` ceremony
-    /// (passkey registration). The CLI handles initial key generation
-    /// and seal after the ceremony completes.
+    /// List vaults this CLI has used (from local config) + mark the
+    /// active one with `*`.
+    Ls,
+    /// Switch the active vault. Pass a SAFECLAW_VAULT_URL, --local for
+    /// the localhost default vault, or nothing for an interactive
+    /// prompt.
+    Use(VaultUseArgs),
+    /// Create a new vault. Default = local (http://localhost:23294,
+    /// vault id "default"). Pass --remote <URL> to create on a remote
+    /// custodian (auto-generates a UUID). Saves to config and makes
+    /// the new vault active.
     Create(VaultCreateArgs),
-    /// Irreversibly delete a vault's daemon-side state. Passkey-gated via
-    /// the standard `/op/{op_id}` browser-callback ceremony. Requires a
-    /// typed `--yes-i-mean-it` flag to bypass the confirmation prompt;
-    /// without it, refuses to proceed.
+    /// Irreversibly delete a vault's daemon-side state. Passkey-gated
+    /// via the standard `/op/{op_id}` browser-callback ceremony.
     Delete(VaultDeleteArgs),
 }
 
 #[derive(Debug, Args)]
+pub struct VaultUseArgs {
+    /// SAFECLAW_VAULT_URL form: `<custodian>/v/<vault_id>`. If omitted
+    /// and `--local` is also omitted, an interactive prompt asks.
+    pub url: Option<String>,
+    /// Shortcut for `http://localhost:23294/v/default`.
+    #[arg(long, conflicts_with = "url")]
+    pub local: bool,
+}
+
+#[derive(Debug, Args)]
 pub struct VaultCreateArgs {
-    #[arg(long, env = "SAFECLAW_CUSTODIAN")]
-    pub custodian: Option<String>,
+    /// Create on a remote custodian (default is local). Pass the
+    /// custodian root URL like `https://custodian.dev.safeclaw.pro`.
+    #[arg(long)]
+    pub remote: Option<String>,
     #[arg(long)]
     pub no_browser: bool,
-    /// Fixed port for the localhost callback server. When set, the CLI
-    /// always binds to this port (useful for SSH port-forwarding).
-    /// Default: random OS-assigned port.
+    /// Fixed port for the localhost callback server (for SSH forwarding).
     #[arg(long, env = "SAFECLAW_CB_PORT")]
     pub cb_port: Option<u16>,
     #[arg(long, default_value = "120")]
@@ -288,21 +297,19 @@ pub struct StatusArgs {
 }
 
 #[derive(Debug, Args)]
-pub struct LoginArgs {
-    /// Custodian URL to save. Defaults to local. For SaaS pass
-    /// `https://api.safeclaw.pro`.
-    #[arg(long, default_value = "http://127.0.0.1:23294")]
-    pub custodian: String,
+pub struct CustodianArgs {
+    #[command(subcommand)]
+    pub sub: CustodianSubcommand,
+}
 
-    /// Vault id to save as the active vault. Required. Self-hosted
-    /// single-user setups conventionally use `default`.
-    #[arg(long)]
-    pub vault: String,
-
-    /// Skip the `/health` probe before writing config. Useful when
-    /// initialising against a custodian that's intentionally offline.
-    #[arg(long)]
-    pub no_probe: bool,
+#[derive(Debug, Subcommand)]
+pub enum CustodianSubcommand {
+    /// Custodian health + version + vault count.
+    Status(CommonArgs),
+    /// HPKE outer-envelope public key.
+    Pubkey(CommonArgs),
+    /// Public service catalog.
+    Menu(CommonArgs),
 }
 
 #[derive(Debug, Args)]
