@@ -61,6 +61,10 @@ pub struct ServiceMeta {
     /// Absent/None = requires user "connect" (provide API key / OAuth).
     #[serde(default)]
     pub activation: Option<String>,
+    /// If true, exclude from /menu and /v/{vid}/registry. Use for services
+    /// that are defined but not yet ready for agent discovery.
+    #[serde(default)]
+    pub hidden: bool,
 }
 
 fn default_category() -> String { "integration".to_string() }

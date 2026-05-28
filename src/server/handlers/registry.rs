@@ -300,6 +300,7 @@ pub async fn menu(
         .services
         .iter_sorted()
         .into_iter()
+        .filter(|(_, def)| !def.service.hidden)
         .map(|(id, def)| build_service(&state, id, def, None, include_policy_rules))
         .collect();
     let body = RegistryResponse {
@@ -338,6 +339,7 @@ pub async fn vault_registry(
         .services
         .iter_sorted()
         .into_iter()
+        .filter(|(_, def)| !def.service.hidden)
         .map(|(id, def)| {
             let overlay = if locked {
                 None
