@@ -281,8 +281,13 @@ fn proxy_base(state: &AppState) -> String {
     format!("{}/api/use", state.config.origin.trim_end_matches('/'))
 }
 
-fn console_url(state: &AppState) -> String {
-    format!("{}/vault", state.config.origin.trim_end_matches('/'))
+fn console_url(state: &AppState, vault_id: &str) -> String {
+    // Demo vaults minted by /try (`demo-<user.id>` prefix) live on the
+    // /try page, not the full /vault console. Pointing the agent at
+    // /vault for a demo user shows them a "create a vault" CTA instead
+    // of the unlock surface they actually need.
+    let path = if vault_id.starts_with("demo-") { "/try" } else { "/vault" };
+    format!("{}{}", state.config.origin.trim_end_matches('/'), path)
 }
 
 /// `GET /menu` — static service catalog.
@@ -353,8 +358,9 @@ pub async fn vault_registry(
         Some(Some(entries))
     };
 
-    // vault_id intentionally NOT returned — see RegistryResponse comment.
-    let _ = vault_id;
+    // vault_id intentionally NOT returned in the body (see RegistryResponse
+    // comment) — but it IS used to pick the right console URL: /try for
+    // demo vaults, /vault for everyone else.
     let body = RegistryResponse {
         version: 2,
         proxy_base: proxy_base(&state),
@@ -362,7 +368,7 @@ pub async fn vault_registry(
         policy_defaults: serde_json::to_value(crate::core::policy::PolicyDefaults::default())?,
         vault_locked: Some(locked),
         vault_entries,
-        console_url: Some(console_url(&state)),
+        console_url: Some(console_url(&state, &vault_id)),
     };
     Ok(Json(serde_json::to_value(body)?))
 }
