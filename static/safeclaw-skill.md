@@ -88,6 +88,21 @@ it if you need structured fields.
 **Critical:** after a `pending` reply, NEVER re-POST the original URL —
 that mints a fresh approval each time. Use `approval.poll_url` instead.
 
+## Raw secret export (high-risk)
+
+`/use/<service>` is the default — broker injects credentials server-side,
+agent never holds them. Only reach for `/export/<key>` when no
+`/use/<service>` route fits the task.
+
+```
+POST $SAFECLAW_VAULT_URL/export/<key>
+```
+
+`<key>` is a `vault_entries` item from `/registry`. Same `pending` → `ok`
+lifecycle as `/use/`. On `ok`, `value` is the plaintext secret as a string —
+the agent becomes its custodian. Treat every successful export as the
+user deliberately handing you raw material.
+
 ## Polling
 
 Two patterns. Try A first; fall back to B if your runtime can't hold a
