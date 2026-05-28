@@ -70,22 +70,28 @@ pub async fn run(args: CommonArgs) -> Result<(), String> {
     }
     let body: KeysKnown = resp.json().await.map_err(|e| format!("parse: {}", e))?;
 
-    let mut rows: Vec<(String, String)> = Vec::new();
-    for k in &body.native_keys {
-        rows.push((k.clone(), "native".into()));
-    }
-    for s in &body.stores {
-        for k in &s.keys {
-            rows.push((k.clone(), format!("{} ({})", s.id, s.kind)));
-        }
-    }
+    // Layout: native keys at top (no header — they're the default
+    // source for this vault). Each connected external store gets its
+    // own labelled section. Avoids the previous two-column form where
+    // "native" read like a value sitting in a phantom "type" column.
+    let any_native = !body.native_keys.is_empty();
+    let any_store = body.stores.iter().any(|s| !s.keys.is_empty());
 
-    if rows.is_empty() {
+    if !any_native && !any_store {
         println!("(no keys — vault is empty or no external stores connected)");
     } else {
-        let name_w = rows.iter().map(|(k, _)| k.len()).max().unwrap_or(0).max(8);
-        for (k, src) in &rows {
-            println!("  {:<width$}  {}", k, src, width = name_w);
+        for k in &body.native_keys {
+            println!("  {}", k);
+        }
+        let mut printed_anything = any_native;
+        for s in &body.stores {
+            if s.keys.is_empty() { continue; }
+            if printed_anything { println!(); }
+            println!("[{}: {}]", s.kind, s.id);
+            for k in &s.keys {
+                println!("  {}", k);
+            }
+            printed_anything = true;
         }
     }
 
