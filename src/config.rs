@@ -196,7 +196,7 @@ pub struct VaultCreateArgs {
     /// Fixed port for the localhost callback server. When set, the CLI
     /// always binds to this port (useful for SSH port-forwarding).
     /// Default: random OS-assigned port.
-    #[arg(long)]
+    #[arg(long, env = "SAFECLAW_CB_PORT")]
     pub cb_port: Option<u16>,
     #[arg(long, default_value = "120")]
     pub timeout: u64,
@@ -221,7 +221,7 @@ pub struct VaultDeleteArgs {
     /// Fixed port for the localhost callback server. When set, the CLI
     /// always binds to this port (useful for SSH port-forwarding).
     /// Default: random OS-assigned port.
-    #[arg(long)]
+    #[arg(long, env = "SAFECLAW_CB_PORT")]
     pub cb_port: Option<u16>,
     #[arg(long, default_value = "120")]
     pub timeout: u64,
@@ -322,7 +322,7 @@ pub struct UnlockArgs {
     pub no_browser: bool,
 
     /// Fixed port for the localhost callback server (for SSH port-forwarding).
-    #[arg(long)]
+    #[arg(long, env = "SAFECLAW_CB_PORT")]
     pub cb_port: Option<u16>,
 
     /// How long (seconds) to wait for the browser-callback before giving up.
@@ -356,7 +356,7 @@ pub struct ReadArgs {
     /// Fixed port for the localhost callback server. When set, the CLI
     /// always binds to this port (useful for SSH port-forwarding).
     /// Default: random OS-assigned port.
-    #[arg(long)]
+    #[arg(long, env = "SAFECLAW_CB_PORT")]
     pub cb_port: Option<u16>,
     #[arg(long, default_value = "120")]
     pub timeout: u64,
@@ -377,7 +377,7 @@ pub struct WriteArgs {
     /// Fixed port for the localhost callback server. When set, the CLI
     /// always binds to this port (useful for SSH port-forwarding).
     /// Default: random OS-assigned port.
-    #[arg(long)]
+    #[arg(long, env = "SAFECLAW_CB_PORT")]
     pub cb_port: Option<u16>,
     #[arg(long, default_value = "120")]
     pub timeout: u64,
@@ -396,7 +396,7 @@ pub struct DeleteArgs {
     /// Fixed port for the localhost callback server. When set, the CLI
     /// always binds to this port (useful for SSH port-forwarding).
     /// Default: random OS-assigned port.
-    #[arg(long)]
+    #[arg(long, env = "SAFECLAW_CB_PORT")]
     pub cb_port: Option<u16>,
     #[arg(long, default_value = "120")]
     pub timeout: u64,
