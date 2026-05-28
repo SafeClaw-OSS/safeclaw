@@ -172,10 +172,13 @@ pub enum VaultSubcommand {
     /// List vaults this CLI has used (from local config) + mark the
     /// active one with `*`.
     Ls,
-    /// Switch the active vault. Pass a SAFECLAW_VAULT_URL, --local for
-    /// the localhost default vault, or nothing for an interactive
-    /// prompt.
+    /// Switch the active vault. Pass a SAFECLAW_VAULT_URL, an index
+    /// from `sc vault ls`, --local for the localhost default vault,
+    /// or nothing for an interactive prompt.
     Use(VaultUseArgs),
+    /// Remove a vault from the local known list (does NOT touch the
+    /// daemon — for that use `sc vault delete`). Pass URL or index.
+    Forget(VaultForgetArgs),
     /// Create a new vault. Default = local (http://localhost:23294,
     /// vault id "default"). Pass --remote <URL> to create on a remote
     /// custodian (auto-generates a UUID). Saves to config and makes
@@ -188,12 +191,19 @@ pub enum VaultSubcommand {
 
 #[derive(Debug, Args)]
 pub struct VaultUseArgs {
-    /// SAFECLAW_VAULT_URL form: `<custodian>/v/<vault_id>`. If omitted
-    /// and `--local` is also omitted, an interactive prompt asks.
-    pub url: Option<String>,
+    /// Either a SAFECLAW_VAULT_URL (`<custodian>/v/<vault_id>`) or a
+    /// numeric index from `sc vault ls`. If omitted and `--local` is
+    /// also omitted, an interactive prompt lists known vaults.
+    pub url_or_idx: Option<String>,
     /// Shortcut for `http://localhost:23294/v/default`.
-    #[arg(long, conflicts_with = "url")]
+    #[arg(long, conflicts_with = "url_or_idx")]
     pub local: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct VaultForgetArgs {
+    /// SAFECLAW_VAULT_URL or numeric index from `sc vault ls`.
+    pub url_or_idx: String,
 }
 
 #[derive(Debug, Args)]

@@ -6,8 +6,8 @@ use base64::Engine;
 use serde_json::json;
 
 use crate::cli::webauthn::*;
-use crate::cli::active::{join_vault_url, load as load_config, put_active, resolve_active, split_vault_url};
-use crate::config::{VaultCreateArgs, VaultDeleteArgs, VaultSubcommand, VaultUseArgs};
+use crate::cli::active::{forget as forget_vault, join_vault_url, load as load_config, put_active, resolve_active, split_vault_url};
+use crate::config::{VaultCreateArgs, VaultDeleteArgs, VaultForgetArgs, VaultSubcommand, VaultUseArgs};
 
 const LOCAL_CUSTODIAN: &str = "http://localhost:23294";
 const LOCAL_VAULT_ID: &str = "default";
@@ -16,6 +16,7 @@ pub async fn run(sub: VaultSubcommand) -> Result<(), String> {
     match sub {
         VaultSubcommand::Ls => run_ls().await,
         VaultSubcommand::Use(a) => run_use(a).await,
+        VaultSubcommand::Forget(a) => run_forget(a).await,
         VaultSubcommand::Create(a) => run_create(a).await,
         VaultSubcommand::Delete(a) => run_delete(a).await,
     }
@@ -28,26 +29,52 @@ async fn run_ls() -> Result<(), String> {
         return Ok(());
     }
     let active = (cfg.custodian.as_deref(), cfg.vault.as_deref());
-    for kv in &cfg.known_vaults {
+    for (i, kv) in cfg.known_vaults.iter().enumerate() {
         let marker = if active == (Some(&kv.custodian), Some(&kv.vault)) { "*" } else { " " };
-        println!("  {} {}", marker, join_vault_url(&kv.custodian, &kv.vault));
+        println!("  {} {}) {}", marker, i + 1, join_vault_url(&kv.custodian, &kv.vault));
     }
     Ok(())
 }
 
-async fn run_use(args: VaultUseArgs) -> Result<(), String> {
-    let url = if args.local {
-        join_vault_url(LOCAL_CUSTODIAN, LOCAL_VAULT_ID)
-    } else if let Some(u) = args.url {
-        u
-    } else {
-        interactive_pick()?
-    };
+/// Parse a `url_or_idx` arg into (custodian, vault). Accepts:
+/// - SAFECLAW_VAULT_URL (`<custodian>/v/<id>`)
+/// - numeric index (1-based) into the known_vaults list
+fn resolve_url_or_idx(arg: &str) -> Result<(String, String), String> {
+    if let Ok(idx) = arg.parse::<usize>() {
+        let cfg = load_config()?;
+        if idx < 1 || idx > cfg.known_vaults.len() {
+            return Err(format!("index {} out of range [1-{}]", idx, cfg.known_vaults.len()));
+        }
+        let kv = &cfg.known_vaults[idx - 1];
+        return Ok((kv.custodian.clone(), kv.vault.clone()));
+    }
+    split_vault_url(arg).ok_or_else(|| {
+        format!("not a valid SAFECLAW_VAULT_URL or index: {}", arg)
+    })
+}
 
-    let (custodian, vault) = split_vault_url(&url)
-        .ok_or_else(|| format!("not a valid SAFECLAW_VAULT_URL: {} (expected <custodian>/v/<id>)", url))?;
+async fn run_use(args: VaultUseArgs) -> Result<(), String> {
+    let (custodian, vault) = if args.local {
+        (LOCAL_CUSTODIAN.to_string(), LOCAL_VAULT_ID.to_string())
+    } else if let Some(arg) = args.url_or_idx {
+        resolve_url_or_idx(&arg)?
+    } else {
+        let url = interactive_pick()?;
+        split_vault_url(&url)
+            .ok_or_else(|| format!("not a valid SAFECLAW_VAULT_URL: {}", url))?
+    };
     put_active(&custodian, &vault).map_err(|e| format!("save config: {}", e))?;
     println!("active vault: {}", join_vault_url(&custodian, &vault));
+    Ok(())
+}
+
+async fn run_forget(args: VaultForgetArgs) -> Result<(), String> {
+    let (custodian, vault) = resolve_url_or_idx(&args.url_or_idx)?;
+    let removed = forget_vault(&custodian, &vault)?;
+    if !removed {
+        return Err(format!("vault not in known list: {}", join_vault_url(&custodian, &vault)));
+    }
+    println!("forgot: {}", join_vault_url(&custodian, &vault));
     Ok(())
 }
 
@@ -56,22 +83,28 @@ fn interactive_pick() -> Result<String, String> {
     let active = (cfg.custodian.as_deref(), cfg.vault.as_deref());
     if !cfg.known_vaults.is_empty() {
         eprintln!("Known vaults:");
-        for kv in &cfg.known_vaults {
+        for (i, kv) in cfg.known_vaults.iter().enumerate() {
             let marker = if active == (Some(&kv.custodian), Some(&kv.vault)) { " (active)" } else { "" };
-            eprintln!("  {}{}", join_vault_url(&kv.custodian, &kv.vault), marker);
+            eprintln!("  {}) {}{}", i + 1, join_vault_url(&kv.custodian, &kv.vault), marker);
         }
         eprintln!();
     }
-    eprint!("Paste a SAFECLAW_VAULT_URL (or press Enter for local default): ");
+    eprint!("Choose: index, SAFECLAW_VAULT_URL, or Enter for local default: ");
     io::stderr().flush().ok();
     let mut buf = String::new();
     io::stdin().read_line(&mut buf).map_err(|e| e.to_string())?;
     let trimmed = buf.trim();
     if trimmed.is_empty() {
-        Ok(join_vault_url(LOCAL_CUSTODIAN, LOCAL_VAULT_ID))
-    } else {
-        Ok(trimmed.to_string())
+        return Ok(join_vault_url(LOCAL_CUSTODIAN, LOCAL_VAULT_ID));
     }
+    if let Ok(idx) = trimmed.parse::<usize>() {
+        if idx < 1 || idx > cfg.known_vaults.len() {
+            return Err(format!("index {} out of range [1-{}]", idx, cfg.known_vaults.len()));
+        }
+        let kv = &cfg.known_vaults[idx - 1];
+        return Ok(join_vault_url(&kv.custodian, &kv.vault));
+    }
+    Ok(trimmed.to_string())
 }
 
 async fn run_create(args: VaultCreateArgs) -> Result<(), String> {

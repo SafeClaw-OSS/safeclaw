@@ -65,6 +65,23 @@ pub fn save(cfg: &CliConfig) -> Result<PathBuf, String> {
     Ok(path)
 }
 
+/// Remove a vault from known_vaults. If it was active, clears active.
+/// Returns true if something was removed.
+pub fn forget(custodian: &str, vault: &str) -> Result<bool, String> {
+    let mut cfg = load().unwrap_or_default();
+    let before = cfg.known_vaults.len();
+    cfg.known_vaults.retain(|kv| !(kv.custodian == custodian && kv.vault == vault));
+    if cfg.known_vaults.len() == before {
+        return Ok(false);
+    }
+    if cfg.custodian.as_deref() == Some(custodian) && cfg.vault.as_deref() == Some(vault) {
+        cfg.custodian = None;
+        cfg.vault = None;
+    }
+    save(&cfg)?;
+    Ok(true)
+}
+
 /// Set the active vault and dedupe-add to known_vaults.
 pub fn put_active(custodian: &str, vault: &str) -> Result<PathBuf, String> {
     let mut cfg = load().unwrap_or_default();
