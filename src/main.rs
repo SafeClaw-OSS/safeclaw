@@ -70,6 +70,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 e.into()
             })
         }
+        Command::Config(args) => {
+            cli::config::run(args.sub).map_err(|e| -> Box<dyn std::error::Error> {
+                eprintln!("safeclaw config: {}", e);
+                e.into()
+            })
+        }
         Command::Store(args) => {
             cli::store::run(args.sub).await.map_err(|e| -> Box<dyn std::error::Error> {
                 eprintln!("safeclaw store: {}", e);

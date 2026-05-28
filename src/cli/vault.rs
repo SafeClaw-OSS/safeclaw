@@ -317,7 +317,6 @@ async fn run_create(args: VaultCreateArgs) -> Result<(), String> {
     let url = join_vault_url(&custodian, &vault_id);
     eprintln!("safeclaw vault create — done");
     eprintln!("  active vault: {}", url);
-    eprintln!("  share with other machines: SAFECLAW_VAULT_URL={}", url);
     Ok(())
 }
 

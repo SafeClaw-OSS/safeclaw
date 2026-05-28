@@ -22,6 +22,35 @@ pub struct CliConfig {
     /// create`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub known_vaults: Vec<KnownVault>,
+    /// Persistent user preferences. Set via `sc config set <key> <value>`.
+    /// Resolution chain for any setting: flag > env > this > built-in
+    /// default.
+    #[serde(default, skip_serializing_if = "Settings::is_empty")]
+    pub settings: Settings,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize, Clone)]
+pub struct Settings {
+    /// Localhost callback port for browser-gesture commands (`unlock`,
+    /// `vault create`, etc.). The CLI binds this to receive WebAuthn
+    /// redirects. Useful with SSH `-L` forwarding when the browser
+    /// lives on a different machine than the daemon. Env override:
+    /// `SAFECLAW_CB_PORT`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cb_port: Option<u16>,
+}
+
+impl Settings {
+    fn is_empty(&self) -> bool {
+        self.cb_port.is_none()
+    }
+}
+
+/// Resolve the effective `cb_port`: flag override wins, otherwise read
+/// the persisted setting. (Env is handled by clap's `env = ...` and is
+/// already folded into the flag value.)
+pub fn settings_cb_port() -> Option<u16> {
+    load().ok().and_then(|c| c.settings.cb_port)
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]

@@ -6,6 +6,7 @@
 
 pub mod active;
 pub mod admin;
+pub mod config;
 pub mod custodian;
 pub mod doctor;
 pub mod env;

@@ -64,6 +64,18 @@ pub async fn do_browser_gesture(
     enroll: bool,
     cb_port: Option<u16>,
 ) -> Result<GestureResult, String> {
+    // Resolution: flag (already includes SAFECLAW_CB_PORT via clap)
+    //   → ~/.safeclaw/config.toml [settings] cb_port → None (random).
+    let cb_port = cb_port.or_else(crate::cli::active::settings_cb_port);
+
+    // SSH session + browser flow + no cb_port configured = the browser
+    // callback can't tunnel back. Print the fix-it recipe (both halves
+    // of the tunnel) before continuing, so the user sees it once before
+    // the URL prompt scrolls past.
+    if !no_browser && cb_port.is_none() && ssh_session_detected() {
+        print_ssh_tunnel_hint();
+    }
+
     let bind_addr = format!("127.0.0.1:{}", cb_port.unwrap_or(0));
     let listener = TcpListener::bind(&bind_addr).await
         .map_err(|e| format!("bind {}: {}", bind_addr, e))?;
@@ -228,6 +240,54 @@ async fn handle_done(
         let _ = tx.send(params);
     }
     (StatusCode::OK, "OK — you can close this tab.\n")
+}
+
+/// True if the shell looks like an SSH session — set by sshd in any
+/// non-trivial Linux/macOS deployment. False positives (X11 forwarding,
+/// remote browser plumbing) are harmless: we only print a hint, never block.
+fn ssh_session_detected() -> bool {
+    std::env::var_os("SSH_CONNECTION").is_some()
+        || std::env::var_os("SSH_CLIENT").is_some()
+}
+
+/// Read hostname from /proc or /etc/hostname (no `hostname` dep). Falls
+/// back to "your-server" so the printed SSH command is still copy-able
+/// (user fills in the host manually).
+fn read_hostname() -> String {
+    for path in &["/proc/sys/kernel/hostname", "/etc/hostname"] {
+        if let Ok(s) = std::fs::read_to_string(path) {
+            let trimmed = s.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+    }
+    "your-server".to_string()
+}
+
+/// Default port to suggest in the SSH-tunnel hint. Adjacent to the
+/// daemon's 23294/23295 so it's recognisable as "safeclaw-related".
+const SUGGESTED_CB_PORT: u16 = 23394;
+
+fn print_ssh_tunnel_hint() {
+    let cb = SUGGESTED_CB_PORT;
+    let user = std::env::var("USER").unwrap_or_else(|_| "user".into());
+    let host = read_hostname();
+    eprintln!();
+    eprintln!("note: looks like you're SSH'd in. The browser callback runs on this");
+    eprintln!("      server but your browser lives on your laptop — you need a tunnel.");
+    eprintln!();
+    eprintln!("Do both, once:");
+    eprintln!();
+    eprintln!("  1. On your laptop, leave this running in another terminal:");
+    eprintln!("       ssh -N -L {cb}:localhost:{cb} {user}@{host}");
+    eprintln!();
+    eprintln!("  2. On this server, set the matching port (persists):");
+    eprintln!("       safeclaw config set cb-port {cb}");
+    eprintln!();
+    eprintln!("Then re-run the command. (Continuing now with a random port; the URL");
+    eprintln!("below probably won't open through SSH unless you've already tunneled.)");
+    eprintln!();
 }
 
 fn open_browser(url: &str) -> Result<(), String> {

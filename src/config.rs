@@ -48,6 +48,11 @@ pub enum Command {
     /// daemon-side state (irreversible, passkey-gated). Short: `sc v`.
     #[command(alias = "v")]
     Vault(VaultArgs),
+    /// Read/write persistent CLI preferences in `~/.safeclaw/config.toml`.
+    /// Settings here are the lowest-priority fallback in the resolution
+    /// chain (flag > env > config > default). Subs: set / get / unset /
+    /// list.
+    Config(ConfigArgs),
     /// Manage the active vault's enrolled passkeys. `ls` is read-only;
     /// `add` / `remove` / `rename` need crypto ceremonies and are deferred
     /// to a later session. Short: `sc p`.
@@ -278,6 +283,25 @@ pub enum StoreSubcommand {
     /// List external stores connected to the active vault. Needs the
     /// vault unlocked (we read from daemon's cache snapshot).
     Ls(CommonArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ConfigArgs {
+    #[command(subcommand)]
+    pub sub: ConfigSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ConfigSubcommand {
+    /// Set a persistent CLI preference, e.g. `sc config set cb-port 23394`.
+    /// Known keys: cb-port.
+    Set { key: String, value: String },
+    /// Print the value of one preference. Exit code is nonzero when unset.
+    Get { key: String },
+    /// Clear a preference.
+    Unset { key: String },
+    /// Print all preferences (key = value, one per line).
+    List,
 }
 
 #[derive(Debug, Args)]
