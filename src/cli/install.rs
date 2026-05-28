@@ -38,19 +38,22 @@ pub fn run(args: InstallArgs) -> Result<(), String> {
     // API key: read from caller's env (SaaS users set this; OSS leave empty).
     let api_key = std::env::var("SAFECLAW_API_KEY").unwrap_or_default();
 
-    // Two-sentence prompt. Omit SAFECLAW_API_KEY when empty (OSS users don't
-    // need it — daemon ignores the Authorization header).
-    if api_key.is_empty() {
-        println!(
+    let prompt = if api_key.is_empty() {
+        format!(
             "Install the SafeClaw skill from {}. Set these env vars: SAFECLAW_VAULT_URL={}. Persist the install so future sessions load it automatically.",
             skill_url, vault_url
-        );
+        )
     } else {
-        println!(
+        format!(
             "Install the SafeClaw skill from {}. Set these env vars: SAFECLAW_VAULT_URL={} and SAFECLAW_API_KEY={}. Persist the install so future sessions load it automatically.",
             skill_url, vault_url, api_key
-        );
-    }
+        )
+    };
+
+    println!("Copy and send to your agent:\n");
+    println!("```");
+    println!("{}", prompt);
+    println!("```");
 
     Ok(())
 }
