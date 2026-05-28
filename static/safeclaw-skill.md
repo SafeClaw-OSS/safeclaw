@@ -48,13 +48,31 @@ Authorization: Bearer $SAFECLAW_API_KEY
 }
 ```
 
-Use `connected: true` services freely. If the user asks for a service
-that's `connected: false` (or absent from `services`), tell them and
-share `console_url` — they finish the connect/OAuth there. Never offer
-to type credentials yourself.
+Use `connected: true` services freely.
 
-If `vault_locked: true`, the user must unlock at `console_url` before
-any call will succeed.
+If a service is `connected: false` (or absent from `services`), the user
+needs to add credentials. How to guide them depends on the deployment:
+
+- **SaaS / cloud vault** (`$SAFECLAW_VAULT_URL` host is not `localhost` /
+  `127.0.0.1`): direct the user to open `console_url` from the registry
+  response — they add credentials in the browser UI there.
+- **Self-hosted / localhost**: there is no web console. Use the CLI
+  instead. Look up the service's `vault_fields` array in the registry
+  response — each entry's `name` is the key to set:
+
+  ```
+  sc set <vault_fields[n].name> <value>
+  # example: sc set github_api_key ghp_xxxxx
+  ```
+
+  This opens a browser passkey gesture to seal the value into the vault.
+  After it succeeds, the service will show `connected: true`.
+
+Never offer to enter credentials yourself. Never echo a credential back.
+
+If `vault_locked: true`, the user must unlock first:
+- SaaS: open `console_url`
+- Self-hosted: run `sc unlock`
 
 ## Call shape
 
