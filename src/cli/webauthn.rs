@@ -66,14 +66,21 @@ pub async fn do_browser_gesture(
 ) -> Result<GestureResult, String> {
     // Resolution: flag (already includes SAFECLAW_CB_PORT via clap)
     //   → ~/.safeclaw/config.toml [settings] cb_port → None (random).
+    let cb_port_from_flag = cb_port;
     let cb_port = cb_port.or_else(crate::cli::active::settings_cb_port);
+    let cb_port_from_config = cb_port_from_flag.is_none() && cb_port.is_some();
 
-    // SSH session + browser flow + no cb_port configured = the browser
-    // callback can't tunnel back. Print the fix-it recipe (both halves
-    // of the tunnel) before continuing, so the user sees it once before
-    // the URL prompt scrolls past.
-    if !no_browser && cb_port.is_none() && ssh_session_detected() {
-        print_ssh_tunnel_hint(custodian);
+    // Show the SSH tunnel hint when:
+    //   (a) SSH env vars are present (SSH_CONNECTION / SSH_CLIENT), OR
+    //   (b) cb_port came from the persisted config — the user explicitly ran
+    //       `sc config set cb-port` which is a reliable signal they set this
+    //       up for SSH, even if SSH env vars weren't forwarded to this shell.
+    //
+    // Detail level:
+    //   - cb_port known (either case): compact one-liner with the actual port.
+    //   - cb_port unknown (first-time SSH detection): full two-step guide.
+    if !no_browser && (ssh_session_detected() || cb_port_from_config) {
+        print_ssh_tunnel_hint(custodian, cb_port);
     }
 
     let bind_addr = format!("127.0.0.1:{}", cb_port.unwrap_or(0));
@@ -270,43 +277,47 @@ fn local_custodian_port(url: &str) -> Option<u16> {
     Some(port)
 }
 
-fn print_ssh_tunnel_hint(custodian: &str) {
-    let cb = SUGGESTED_CB_PORT;
-    // USER is reliably the server-side login name — safe to fill in.
-    // Hostname is *not*: the server's internal hostname (e.g.
-    // "openclaw-developer") usually isn't what the user SSH'd to (they
-    // used a DNS name, IP, or `~/.ssh/config` alias). Leave a placeholder
-    // so they paste their own.
+fn print_ssh_tunnel_hint(custodian: &str, cb_port: Option<u16>) {
     let user = std::env::var("USER").unwrap_or_else(|_| "<user>".into());
-
-    // Tunnel layout:
-    //   - cb-port: ALWAYS needed (laptop browser → server CLI callback).
-    //   - daemon port: ONLY needed when custodian is localhost (laptop
-    //     browser → server daemon for the `/op/<id>` auth page). When
-    //     custodian is remote (e.g. https://custodian.dev.safeclaw.pro)
-    //     the laptop reaches the daemon over the public internet.
     let daemon_port = local_custodian_port(custodian);
-    let tunnel_flags = match daemon_port {
-        Some(dp) => format!("-L {cb}:localhost:{cb} -L {dp}:localhost:{dp}"),
-        None => format!("-L {cb}:localhost:{cb}"),
-    };
 
-    eprintln!();
-    eprintln!("note: looks like you're SSH'd in. The browser callback runs on this");
-    eprintln!("      server but your browser lives on your laptop — you need a tunnel.");
-    eprintln!();
-    eprintln!("Do both, once:");
-    eprintln!();
-    eprintln!("  1. On your laptop, leave this running in another terminal");
-    eprintln!("     (replace <your-host> with how you SSH to this server):");
-    eprintln!("       ssh -N {tunnel_flags} {user}@<your-host>");
-    eprintln!();
-    eprintln!("  2. On this server, set the matching port (persists):");
-    eprintln!("       safeclaw config set cb-port {cb}");
-    eprintln!();
-    eprintln!("Then re-run the command. (Continuing now with a random port; the URL");
-    eprintln!("below probably won't open through SSH unless you've already tunneled.)");
-    eprintln!();
+    match cb_port {
+        Some(cb) => {
+            // Port already configured — compact reminder in case the tunnel dropped.
+            let tunnel_flags = match daemon_port {
+                Some(dp) => format!("-L {cb}:localhost:{cb} -L {dp}:localhost:{dp}"),
+                None => format!("-L {cb}:localhost:{cb}"),
+            };
+            eprintln!();
+            eprintln!("note: SSH session detected. If your tunnel dropped, restart it:");
+            eprintln!("       ssh -N {tunnel_flags} {user}@<your-host>");
+            eprintln!();
+        }
+        None => {
+            // First time: full two-step setup guide.
+            let cb = SUGGESTED_CB_PORT;
+            let tunnel_flags = match daemon_port {
+                Some(dp) => format!("-L {cb}:localhost:{cb} -L {dp}:localhost:{dp}"),
+                None => format!("-L {cb}:localhost:{cb}"),
+            };
+            eprintln!();
+            eprintln!("note: looks like you're SSH'd in. The browser callback runs on this");
+            eprintln!("      server but your browser lives on your laptop — you need a tunnel.");
+            eprintln!();
+            eprintln!("Do both, once:");
+            eprintln!();
+            eprintln!("  1. On your laptop, leave this running in another terminal");
+            eprintln!("     (replace <your-host> with how you SSH to this server):");
+            eprintln!("       ssh -N {tunnel_flags} {user}@<your-host>");
+            eprintln!();
+            eprintln!("  2. On this server, set the matching port (persists):");
+            eprintln!("       safeclaw config set cb-port {cb}");
+            eprintln!();
+            eprintln!("Then re-run the command. (Continuing now with a random port; the URL");
+            eprintln!("below probably won't open through SSH unless you've already tunneled.)");
+            eprintln!();
+        }
+    }
 }
 
 fn open_browser(url: &str) -> Result<(), String> {
