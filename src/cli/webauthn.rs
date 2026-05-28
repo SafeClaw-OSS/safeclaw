@@ -73,7 +73,7 @@ pub async fn do_browser_gesture(
     // of the tunnel) before continuing, so the user sees it once before
     // the URL prompt scrolls past.
     if !no_browser && cb_port.is_none() && ssh_session_detected() {
-        print_ssh_tunnel_hint();
+        print_ssh_tunnel_hint(custodian);
     }
 
     let bind_addr = format!("127.0.0.1:{}", cb_port.unwrap_or(0));
@@ -250,37 +250,56 @@ fn ssh_session_detected() -> bool {
         || std::env::var_os("SSH_CLIENT").is_some()
 }
 
-/// Read hostname from /proc or /etc/hostname (no `hostname` dep). Falls
-/// back to "your-server" so the printed SSH command is still copy-able
-/// (user fills in the host manually).
-fn read_hostname() -> String {
-    for path in &["/proc/sys/kernel/hostname", "/etc/hostname"] {
-        if let Ok(s) = std::fs::read_to_string(path) {
-            let trimmed = s.trim();
-            if !trimmed.is_empty() {
-                return trimmed.to_string();
-            }
-        }
+/// Default port to suggest in the SSH-tunnel hint. Sits one above the
+/// daemon's 23294/23295 pair so the three safeclaw ports cluster together
+/// and the tunnel command stays compact.
+const SUGGESTED_CB_PORT: u16 = 23296;
+
+/// If `url` points at this machine, return the port. Used to decide
+/// whether the SSH-tunnel hint needs to forward the daemon port too
+/// (laptop browser → server daemon) on top of the callback port.
+fn local_custodian_port(url: &str) -> Option<u16> {
+    let after = url.strip_prefix("http://").or_else(|| url.strip_prefix("https://"))?;
+    let host_port = after.split('/').next()?;
+    let mut parts = host_port.splitn(2, ':');
+    let host = parts.next()?;
+    if !matches!(host, "localhost" | "127.0.0.1" | "::1") {
+        return None;
     }
-    "your-server".to_string()
+    let port = parts.next().and_then(|p| p.parse().ok()).unwrap_or(80);
+    Some(port)
 }
 
-/// Default port to suggest in the SSH-tunnel hint. Adjacent to the
-/// daemon's 23294/23295 so it's recognisable as "safeclaw-related".
-const SUGGESTED_CB_PORT: u16 = 23394;
-
-fn print_ssh_tunnel_hint() {
+fn print_ssh_tunnel_hint(custodian: &str) {
     let cb = SUGGESTED_CB_PORT;
-    let user = std::env::var("USER").unwrap_or_else(|_| "user".into());
-    let host = read_hostname();
+    // USER is reliably the server-side login name — safe to fill in.
+    // Hostname is *not*: the server's internal hostname (e.g.
+    // "openclaw-developer") usually isn't what the user SSH'd to (they
+    // used a DNS name, IP, or `~/.ssh/config` alias). Leave a placeholder
+    // so they paste their own.
+    let user = std::env::var("USER").unwrap_or_else(|_| "<user>".into());
+
+    // Tunnel layout:
+    //   - cb-port: ALWAYS needed (laptop browser → server CLI callback).
+    //   - daemon port: ONLY needed when custodian is localhost (laptop
+    //     browser → server daemon for the `/op/<id>` auth page). When
+    //     custodian is remote (e.g. https://custodian.dev.safeclaw.pro)
+    //     the laptop reaches the daemon over the public internet.
+    let daemon_port = local_custodian_port(custodian);
+    let tunnel_flags = match daemon_port {
+        Some(dp) => format!("-L {cb}:localhost:{cb} -L {dp}:localhost:{dp}"),
+        None => format!("-L {cb}:localhost:{cb}"),
+    };
+
     eprintln!();
     eprintln!("note: looks like you're SSH'd in. The browser callback runs on this");
     eprintln!("      server but your browser lives on your laptop — you need a tunnel.");
     eprintln!();
     eprintln!("Do both, once:");
     eprintln!();
-    eprintln!("  1. On your laptop, leave this running in another terminal:");
-    eprintln!("       ssh -N -L {cb}:localhost:{cb} {user}@{host}");
+    eprintln!("  1. On your laptop, leave this running in another terminal");
+    eprintln!("     (replace <your-host> with how you SSH to this server):");
+    eprintln!("       ssh -N {tunnel_flags} {user}@<your-host>");
     eprintln!();
     eprintln!("  2. On this server, set the matching port (persists):");
     eprintln!("       safeclaw config set cb-port {cb}");
