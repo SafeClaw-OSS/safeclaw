@@ -123,10 +123,12 @@ async fn run_create(args: VaultCreateArgs) -> Result<(), String> {
         as sudp::primitives::KeyWrap>::wrap(&wrapping_key, &state_key, &binding)
         .map_err(|e| format!("wrap K: {}", e))?;
 
+    let aux = serde_json::to_value(crate::storage::plaintext::VaultAux::initial())
+        .map_err(|e| format!("serialize aux: {}", e))?;
     let empty_state = json!({
         "targets": {},
         "peers": { &cred_id: STANDARD.encode(&wrapping_key) },
-        "aux": null
+        "aux": aux,
     });
     let canonical_m = sudp::canonical::canonicalize_strict(&empty_state)
         .map_err(|e| format!("canonicalize: {}", e))?;
