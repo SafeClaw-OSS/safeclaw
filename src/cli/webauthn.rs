@@ -185,9 +185,23 @@ pub fn prf_to_user_key(prf_first: &[u8]) -> Result<Vec<u8>, String> {
 pub struct PasskeyMeta {
     pub credential_id: String,
     pub prf_salt: String,
+    pub public_key_x: Option<String>,
+    pub public_key_y: Option<String>,
 }
 
 pub async fn fetch_passkey_meta(custodian: &str, vault: &str) -> Result<PasskeyMeta, String> {
+    let passkeys = fetch_passkeys_json(custodian, vault).await?;
+    let p = &passkeys[0];
+    Ok(PasskeyMeta {
+        credential_id: p["credential_id"].as_str().ok_or("no credential_id")?.to_string(),
+        prf_salt: p["prf_salt"].as_str().ok_or("no prf_salt")?.to_string(),
+        public_key_x: p["public_key_x"].as_str().map(|s| s.to_string()),
+        public_key_y: p["public_key_y"].as_str().map(|s| s.to_string()),
+    })
+}
+
+/// Fetch the raw passkeys array from GET /v/{vault}/passkeys.
+pub async fn fetch_passkeys_json(custodian: &str, vault: &str) -> Result<Vec<Value>, String> {
     let client = http_client()?;
     let url = format!("{}/v/{}/passkeys", custodian.trim_end_matches('/'), urlencoding::encode(vault));
     let resp = client.get(&url).send().await.map_err(|e| format!("passkeys: {}", e))?;
@@ -199,15 +213,11 @@ pub async fn fetch_passkey_meta(custodian: &str, vault: &str) -> Result<PasskeyM
     if !vault_exists {
         return Err("vault not found on this custodian — run `safeclaw vault create`".into());
     }
-    let passkeys = body["passkeys"].as_array().ok_or("no passkeys array")?;
+    let passkeys = body["passkeys"].as_array().ok_or("no passkeys array")?.clone();
     if passkeys.is_empty() {
         return Err("vault has no enrolled passkeys".into());
     }
-    let p = &passkeys[0];
-    Ok(PasskeyMeta {
-        credential_id: p["credential_id"].as_str().ok_or("no credential_id")?.to_string(),
-        prf_salt: p["prf_salt"].as_str().ok_or("no prf_salt")?.to_string(),
-    })
+    Ok(passkeys)
 }
 
 pub fn http_client() -> Result<reqwest::Client, String> {

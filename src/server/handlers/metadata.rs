@@ -35,6 +35,12 @@ pub struct PasskeyMeta {
     pub created_at: u64,
     /// Base64 of the credential's prf_salt — needed by the client for PRF eval.
     pub prf_salt: String,
+    /// P-256 public key X coordinate (base64). Used by --reuse to skip create().
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub public_key_x: Option<String>,
+    /// P-256 public key Y coordinate (base64). Used by --reuse to skip create().
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub public_key_y: Option<String>,
 }
 
 pub async fn passkeys(
@@ -81,6 +87,8 @@ pub async fn passkeys(
                 device_name: pk.as_ref().map(|p| p.device_name.clone()).unwrap_or_default(),
                 created_at: 0, // sudp Registry doesn't track this; future: aux side-store.
                 prf_salt: STANDARD.encode(&c.prf_salt),
+                public_key_x: pk.as_ref().map(|p| p.x.clone()),
+                public_key_y: pk.as_ref().map(|p| p.y.clone()),
             }
         })
         .collect();

@@ -185,48 +185,72 @@ async fn run_create(args: VaultCreateArgs) -> Result<(), String> {
     };
     eprintln!("safeclaw vault create — new vault at {}", join_vault_url(&custodian, &vault_id));
 
-    // ── Step 1: register passkey (WebAuthn create()) ───────────────────
-    // PRF eval salt for the create ceremony. Some authenticators support
-    // PRF on create; others need a separate get(). We try PRF here and
-    // fall back to a second get() below if needed.
     let prf_eval_salt_js = b"safeclaw-prf-v1";
-    eprintln!("  step 1/3: register a passkey in your browser…");
-    let create_result = do_browser_gesture(
-        &custodian, &vault_id, &[0u8; 32],
-        Some(prf_eval_salt_js), "",
-        "Create vault (register passkey)",
-        args.no_browser, args.timeout, true, args.cb_port,
-    ).await?;
 
-    let cred_id = create_result.credential_id.clone()
-        .ok_or("browser didn't return credential_id")?;
-    let pub_x = create_result.public_key_x.clone()
-        .ok_or("browser didn't return public_key_x")?;
-    let pub_y = create_result.public_key_y.clone()
-        .ok_or("browser didn't return public_key_y")?;
-    let cred_id_raw = URL_SAFE_NO_PAD.decode(&cred_id)
-        .map_err(|e| format!("decode cred_id: {}", e))?;
-
-    // ── Step 2: get PRF output (from create if available, else second gesture) ─
-    let prf_first_b64 = if let Some(ref pf) = create_result.prf_first {
-        pf.clone()
-    } else {
-        eprintln!("  step 2/3: PRF not available on create — doing a second passkey gesture…");
+    // ── Obtain cred_id, pub_x/y, and prf_first ───────────────────────
+    // --reuse: pick an existing passkey from another vault on this custodian,
+    //   skip the create() ceremony, do a single get() with PRF instead.
+    // default: register a new passkey (create()), fall back to get() if PRF
+    //   wasn't available on create.
+    let (cred_id, pub_x, pub_y, prf_first_b64) = if args.reuse {
+        let meta = pick_reuse_passkey(&custodian, &vault_id).await?;
+        let cred_id = meta.credential_id;
+        let pub_x = meta.public_key_x
+            .ok_or("passkeys endpoint didn't return public_key_x — upgrade daemon and retry")?;
+        let pub_y = meta.public_key_y
+            .ok_or("passkeys endpoint didn't return public_key_y — upgrade daemon and retry")?;
+        eprintln!("  step 1/2: touch passkey to confirm reuse (PRF)…");
         let dummy_beta = [0u8; 32];
         let get_result = do_browser_gesture(
             &custodian, &vault_id, &dummy_beta,
             Some(prf_eval_salt_js), &cred_id,
-            "Vault setup (PRF)",
+            "Reuse passkey (PRF)",
             args.no_browser, args.timeout, false, args.cb_port,
         ).await?;
-        get_result.prf_first.ok_or("PRF still unavailable — authenticator may not support PRF extension")?
+        let prf = get_result.prf_first
+            .ok_or("PRF unavailable on this authenticator — use `sc vault create` without --reuse")?;
+        (cred_id, pub_x, pub_y, prf)
+    } else {
+        // ── Step 1: register passkey (WebAuthn create()) ─────────────────
+        eprintln!("  step 1/3: register a passkey in your browser…");
+        let create_result = do_browser_gesture(
+            &custodian, &vault_id, &[0u8; 32],
+            Some(prf_eval_salt_js), "",
+            "Create vault (register passkey)",
+            args.no_browser, args.timeout, true, args.cb_port,
+        ).await?;
+        let cred_id = create_result.credential_id.clone()
+            .ok_or("browser didn't return credential_id")?;
+        let pub_x = create_result.public_key_x.clone()
+            .ok_or("browser didn't return public_key_x")?;
+        let pub_y = create_result.public_key_y.clone()
+            .ok_or("browser didn't return public_key_y")?;
+        // ── Step 2: get PRF output ────────────────────────────────────
+        let prf = if let Some(ref pf) = create_result.prf_first {
+            pf.clone()
+        } else {
+            eprintln!("  step 2/3: PRF not available on create — doing a second passkey gesture…");
+            let dummy_beta = [0u8; 32];
+            let get_result = do_browser_gesture(
+                &custodian, &vault_id, &dummy_beta,
+                Some(prf_eval_salt_js), &cred_id,
+                "Vault setup (PRF)",
+                args.no_browser, args.timeout, false, args.cb_port,
+            ).await?;
+            get_result.prf_first
+                .ok_or("PRF still unavailable — authenticator may not support PRF extension")?
+        };
+        (cred_id, pub_x, pub_y, prf)
     };
     let prf_first_bytes = URL_SAFE_NO_PAD.decode(&prf_first_b64)
         .map_err(|e| format!("decode prf_first: {}", e))?;
     let user_key = prf_to_user_key(&prf_first_bytes)?;
+    let cred_id_raw = URL_SAFE_NO_PAD.decode(&cred_id)
+        .map_err(|e| format!("decode cred_id: {}", e))?;
 
-    // ── Step 3: seal initial vault state ──────────────────────────────
-    eprintln!("  step 3/3: sealing initial vault state…");
+    // ── Seal initial vault state ──────────────────────────────────────
+    let seal_step = if args.reuse { "step 2/2" } else { "step 3/3" };
+    eprintln!("  {}: sealing initial vault state…", seal_step);
     let prf_salt = random_bytes(32);
     let state_key = random_bytes(32); // K
     let wrapping_key = crate::crypto::kdf::derive_wrapping_key(
@@ -392,6 +416,44 @@ async fn run_delete(args: VaultDeleteArgs) -> Result<(), String> {
     }
     eprintln!("safeclaw vault delete — ok (vault {} wiped)", vault);
     Ok(())
+}
+
+/// For `--reuse`: pick a passkey from an existing vault on the same custodian.
+///
+/// If only one other vault exists → use it automatically.
+/// If multiple → prompt the user to pick.
+/// Returns the first enrolled passkey's meta (cred_id + pub_x/y).
+async fn pick_reuse_passkey(new_custodian: &str, new_vault_id: &str) -> Result<crate::cli::webauthn::PasskeyMeta, String> {
+    let cfg = load_config().unwrap_or_default();
+    let candidates: Vec<_> = cfg.known_vaults.iter()
+        .filter(|kv| kv.custodian.trim_end_matches('/') == new_custodian.trim_end_matches('/')
+            && kv.vault != new_vault_id)
+        .collect();
+    if candidates.is_empty() {
+        return Err(format!(
+            "no other vaults on {} to reuse a passkey from\n  run `sc vault create` (without --reuse) first",
+            new_custodian
+        ));
+    }
+    let source_vault = if candidates.len() == 1 {
+        eprintln!("  reusing passkey from: {}", join_vault_url(&candidates[0].custodian, &candidates[0].vault));
+        &candidates[0].vault
+    } else {
+        eprintln!("Pick a vault to reuse a passkey from:");
+        for (i, kv) in candidates.iter().enumerate() {
+            eprintln!("  {}) {}", i + 1, join_vault_url(&kv.custodian, &kv.vault));
+        }
+        eprint!("Enter index: ");
+        io::stderr().flush().ok();
+        let mut buf = String::new();
+        io::stdin().read_line(&mut buf).map_err(|e| e.to_string())?;
+        let idx: usize = buf.trim().parse().map_err(|_| "invalid index")?;
+        if idx < 1 || idx > candidates.len() {
+            return Err(format!("index {} out of range [1-{}]", idx, candidates.len()));
+        }
+        &candidates[idx - 1].vault
+    };
+    crate::cli::webauthn::fetch_passkey_meta(new_custodian, source_vault).await
 }
 
 fn atty_isatty_stdin() -> bool {

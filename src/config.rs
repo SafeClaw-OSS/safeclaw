@@ -251,6 +251,11 @@ pub struct VaultCreateArgs {
     pub cb_port: Option<u16>,
     #[arg(long, default_value = "120")]
     pub timeout: u64,
+    /// Reuse an existing registered passkey instead of registering a new one.
+    /// Skips the create() ceremony; uses get() PRF from an already-enrolled
+    /// vault. Saves a browser gesture when the hardware key is already set up.
+    #[arg(long)]
+    pub reuse: bool,
 }
 
 #[derive(Debug, Args)]
