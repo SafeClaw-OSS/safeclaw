@@ -668,6 +668,16 @@ pub async fn approve_op(
                 if existing_vault.is_none() {
                     return Err(AppError::Conflict("vault not initialized".into()));
                 }
+                // Close the cached AuditStore SQLite handle BEFORE removing
+                // the directory. On Linux, unlinking a file that still has
+                // an open fd leaves the inode alive: any subsequent
+                // `state.audits.for_vault(vid)` call returns the cached
+                // Arc<AuditStore> and reads/writes against the now-orphan
+                // inode. Recreating the same vault_id (deterministic from
+                // user_id, so very common after delete) then sees the old
+                // approvals "from 50 minutes ago" instead of an empty log.
+                // Matches the admin DELETE path's ordering (admin.rs).
+                state.audits.forget(&vault_id);
                 state.vaults.remove(&vault_id).map_err(|e| {
                     AppError::Internal(format!("vault dir remove: {}", e))
                 })?;
