@@ -38,13 +38,9 @@ pub enum Command {
     /// requires a fresh grant so a stolen session token can't DOS-lock
     /// the vault).
     Lock(UnlockArgs),
-    /// List secret names this vault can resolve (native + each external
-    /// store). Does NOT print values — just names + their source. Requires
-    /// the vault to be unlocked.
+    /// Alias for `sc secret ls`.
     Ls(CommonArgs),
-    /// Read a single native secret to stdout. Drives the custodian's
-    /// `/cli/auth` page for the passkey ceremony; the value comes back via
-    /// GET `/op/{op_id}` (never via the browser URL).
+    /// Alias for `sc secret get`.
     Get(GetArgs),
     /// Per-vault lifecycle ops. Today: `vault delete` to nuke a vault's
     /// daemon-side state (irreversible, passkey-gated).
@@ -65,13 +61,12 @@ pub enum Command {
     /// Connect / disconnect are deferred until the Write op lands in the
     /// CLI (they rewrite vault.dat).
     Store(StoreArgs),
-    /// Write a native secret to the vault. Two passkey gestures: unlock
-    /// (to read current state) then write (to seal modified state). All
-    /// crypto happens locally; the browser page is a minimal passkey proxy.
+    /// Secrets in the active vault. Subcommands: set / get / rm / ls.
+    /// Top-level shortcuts `sc set/get/rm/ls` are aliases for these.
+    Secret(SecretArgs),
+    /// Alias for `sc secret set`.
     Set(SetArgs),
-    /// Delete a native secret from the vault. Same two-gesture flow as
-    /// write — the deletion is a Write op with the key removed from the
-    /// sealed protected state.
+    /// Alias for `sc secret rm`.
     Rm(RmArgs),
     /// Print the safeclaw binary version.
     Version,
@@ -84,6 +79,24 @@ pub enum Command {
 pub struct VaultArgs {
     #[command(subcommand)]
     pub sub: VaultSubcommand,
+}
+
+#[derive(Debug, Args)]
+pub struct SecretArgs {
+    #[command(subcommand)]
+    pub sub: SecretSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SecretSubcommand {
+    /// Write a native secret. Two passkey gestures (unlock + write).
+    Set(SetArgs),
+    /// Read a native secret to stdout. One passkey gesture.
+    Get(GetArgs),
+    /// Delete a native secret. Two passkey gestures.
+    Rm(RmArgs),
+    /// List secret names this vault can resolve.
+    Ls(CommonArgs),
 }
 
 #[derive(Debug, Args)]
@@ -169,6 +182,9 @@ pub struct AdminAuditLsArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum VaultSubcommand {
+    /// Show current vault: URL, state (locked/unlocked/not-enrolled),
+    /// passkey count, secret count. Top-level alias: `sc status`.
+    Status(StatusArgs),
     /// List vaults this CLI has used (from local config) + mark the
     /// active one with `*`.
     Ls,

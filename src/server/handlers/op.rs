@@ -124,7 +124,7 @@ fn reject_broker_kind(kind: &ActType) -> Result<()> {
 
 pub fn validate_vault_id(id: &str) -> Result<()> {
     if id.is_empty() || id.len() > 128 {
-        return Err(AppError::BadRequest("invalid vault_id".into()));
+        return Err(AppError::BadRequest("invalid vault_id (1-128 chars)".into()));
     }
     if !id
         .chars()

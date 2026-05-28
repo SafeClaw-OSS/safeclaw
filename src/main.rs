@@ -88,6 +88,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 e.into()
             })
         }
+        Command::Secret(args) => {
+            use safeclaw::config::SecretSubcommand;
+            let r = match args.sub {
+                SecretSubcommand::Set(a) => cli::secret::run_set(a).await,
+                SecretSubcommand::Get(a) => cli::secret::run_get(a).await,
+                SecretSubcommand::Rm(a) => cli::secret::run_rm(a).await,
+                SecretSubcommand::Ls(a) => cli::ls::run(a).await,
+            };
+            r.map_err(|e| -> Box<dyn std::error::Error> {
+                eprintln!("safeclaw secret: {}", e);
+                e.into()
+            })
+        }
         Command::Set(args) => {
             cli::secret::run_set(args).await.map_err(|e| -> Box<dyn std::error::Error> {
                 eprintln!("safeclaw set: {}", e);
