@@ -7,7 +7,7 @@
 //! `~/.safeclaw/config.toml`, then `localhost:23294`. Exit code is
 //! non-zero on transport / parse failure so shell scripts can gate on it.
 
-use crate::cli::profile::load as load_config;
+use crate::cli::active::load as load_config;
 use crate::config::StatusArgs;
 
 const LOCAL_DEFAULT: &str = "http://localhost:23294";

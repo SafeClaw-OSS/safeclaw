@@ -17,7 +17,7 @@
 //! written yet — `eval "$(safeclaw env)"` then no-ops safely instead of
 //! exporting empty strings.
 
-use crate::cli::profile::load as load_config;
+use crate::cli::active::load as load_config;
 
 pub fn run() -> Result<(), String> {
     let cfg = load_config()?;

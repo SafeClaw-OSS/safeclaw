@@ -11,7 +11,7 @@ pub mod webauthn;
 pub mod login;
 pub mod ls;
 pub mod passkey;
-pub mod profile;
+pub mod active;
 pub mod read;
 pub mod status;
 pub mod store;

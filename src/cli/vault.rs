@@ -6,8 +6,8 @@ use base64::Engine;
 use serde_json::json;
 
 use crate::cli::webauthn::*;
-use crate::cli::profile::resolve_active;
-use crate::config::{ProfileSelectArgs, VaultCreateArgs, VaultDeleteArgs, VaultSubcommand};
+use crate::cli::active::resolve_active;
+use crate::config::{CommonArgs, VaultCreateArgs, VaultDeleteArgs, VaultSubcommand};
 
 pub async fn run(sub: VaultSubcommand) -> Result<(), String> {
     match sub {
@@ -17,7 +17,7 @@ pub async fn run(sub: VaultSubcommand) -> Result<(), String> {
     }
 }
 
-async fn run_ls(args: ProfileSelectArgs) -> Result<(), String> {
+async fn run_ls(args: CommonArgs) -> Result<(), String> {
     let custodian = match args.custodian.as_deref() {
         Some(c) => c.to_string(),
         None => resolve_active(None, args.vault.as_deref())
@@ -199,7 +199,7 @@ async fn run_create(args: VaultCreateArgs) -> Result<(), String> {
     }
 
     // ── Save to config ────────────────────────────────────────────────
-    crate::cli::profile::put_active(&custodian, &vault_id)
+    crate::cli::active::put_active(&custodian, &vault_id)
         .map_err(|e| format!("save config: {}", e))?;
     eprintln!("safeclaw vault create — done!");
     eprintln!("  vault:     {}", vault_id);

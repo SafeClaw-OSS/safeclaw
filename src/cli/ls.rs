@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
-use crate::cli::profile::resolve_active;
-use crate::config::ProfileSelectArgs;
+use crate::cli::active::resolve_active;
+use crate::config::CommonArgs;
 
 #[derive(Debug, Deserialize)]
 struct KeysKnown {
@@ -37,7 +37,7 @@ struct StoreError {
     error: String,
 }
 
-pub async fn run(args: ProfileSelectArgs) -> Result<(), String> {
+pub async fn run(args: CommonArgs) -> Result<(), String> {
     let (custodian, vault) = resolve_active(
         args.custodian.as_deref(),
         args.vault.as_deref(),

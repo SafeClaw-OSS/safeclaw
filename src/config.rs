@@ -42,7 +42,7 @@ pub enum Command {
     /// List secret names this vault can resolve (native + each external
     /// store). Does NOT print values — just names + their source. Requires
     /// the vault to be unlocked.
-    Ls(ProfileSelectArgs),
+    Ls(CommonArgs),
     /// Read a single native secret to stdout. Drives the custodian's
     /// `/cli/auth` page for the passkey ceremony; the value comes back via
     /// GET `/op/{op_id}` (never via the browser URL).
@@ -78,7 +78,7 @@ pub enum Command {
     Version,
     /// Health + reachability checks: custodian connectivity, active
     /// profile, API key presence. Read-only; no vault state mutation.
-    Doctor(ProfileSelectArgs),
+    Doctor(CommonArgs),
 }
 
 #[derive(Debug, Args)]
@@ -98,11 +98,11 @@ pub enum PasskeySubcommand {
     /// List passkeys enrolled on the active vault (public metadata only:
     /// credential id, device name, transports, timestamps). No vault
     /// unlock or passkey gesture required.
-    Ls(ProfileSelectArgs),
+    Ls(CommonArgs),
     /// Add a new passkey (cross-device or same-device). NOT YET
     /// IMPLEMENTED — needs the daemon-side `/cli/auth?op=enroll-passkey`
     /// page and the same crypto vendoring as `sc setup`.
-    Add(ProfileSelectArgs),
+    Add(CommonArgs),
     /// Remove an enrolled passkey by credential id. NOT YET IMPLEMENTED.
     Remove(PasskeyRemoveArgs),
     /// Rename an enrolled passkey's `device_name`. NOT YET IMPLEMENTED —
@@ -174,7 +174,7 @@ pub enum VaultSubcommand {
     /// endpoint `GET /admin/vaults` — requires `SAFECLAW_ADMIN_KEY` to
     /// be set on the daemon (typical OSS self-host) and exposed to the
     /// CLI via `$SAFECLAW_ADMIN_KEY`.
-    Ls(ProfileSelectArgs),
+    Ls(CommonArgs),
     /// Create a new vault. Hits `POST /v/new` to bootstrap an Enroll op,
     /// then opens the browser for a WebAuthn `create()` ceremony
     /// (passkey registration). The CLI handles initial key generation
@@ -237,7 +237,7 @@ pub struct StoreArgs {
 pub enum StoreSubcommand {
     /// List external stores connected to the active vault. Needs the
     /// vault unlocked (we read from daemon's cache snapshot).
-    Ls(ProfileSelectArgs),
+    Ls(CommonArgs),
 }
 
 #[derive(Debug, Args)]
@@ -334,7 +334,7 @@ pub struct UnlockArgs {
 /// pick a daemon URL + vault id (from the active config or explicit
 /// flags). No subcommand-specific options.
 #[derive(Debug, Args)]
-pub struct ProfileSelectArgs {
+pub struct CommonArgs {
     #[arg(long, env = "SAFECLAW_CUSTODIAN")]
     pub custodian: Option<String>,
     #[arg(long)]

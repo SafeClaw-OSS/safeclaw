@@ -12,8 +12,8 @@
 
 use std::time::Duration;
 
-use crate::cli::profile::{config_path, resolve_active};
-use crate::config::ProfileSelectArgs;
+use crate::cli::active::{config_path, resolve_active};
+use crate::config::CommonArgs;
 
 #[derive(Debug, Clone, Copy)]
 enum Mark {
@@ -51,7 +51,7 @@ impl Report {
     }
 }
 
-pub async fn run(args: ProfileSelectArgs) -> Result<(), String> {
+pub async fn run(args: CommonArgs) -> Result<(), String> {
     let mut report = Report::new();
 
     // Config file

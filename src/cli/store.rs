@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
-use crate::cli::profile::resolve_active;
+use crate::cli::active::resolve_active;
 use crate::config::StoreSubcommand;
 
 pub async fn run(sub: StoreSubcommand) -> Result<(), String> {

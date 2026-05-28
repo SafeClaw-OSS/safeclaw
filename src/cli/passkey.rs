@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
-use crate::cli::profile::resolve_active;
-use crate::config::{PasskeyRemoveArgs, PasskeyRenameArgs, PasskeySubcommand, ProfileSelectArgs};
+use crate::cli::active::resolve_active;
+use crate::config::{PasskeyRemoveArgs, PasskeyRenameArgs, PasskeySubcommand, CommonArgs};
 
 pub async fn run(sub: PasskeySubcommand) -> Result<(), String> {
     match sub {
@@ -51,7 +51,7 @@ struct PasskeyMeta {
     created_at: Option<String>,
 }
 
-async fn run_ls(args: ProfileSelectArgs) -> Result<(), String> {
+async fn run_ls(args: CommonArgs) -> Result<(), String> {
     let (custodian, vault) = resolve_active(args.custodian.as_deref(), args.vault.as_deref())?;
     let url = format!(
         "{}/v/{}/passkeys",

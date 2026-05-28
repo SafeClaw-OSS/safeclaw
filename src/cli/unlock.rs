@@ -6,7 +6,7 @@ use base64::Engine;
 use serde_json::json;
 
 use crate::cli::webauthn::*;
-use crate::cli::profile::resolve_active;
+use crate::cli::active::resolve_active;
 use crate::config::UnlockArgs;
 
 pub async fn run_unlock(args: UnlockArgs) -> Result<(), String> {

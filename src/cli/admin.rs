@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
-use crate::cli::profile::resolve_active;
+use crate::cli::active::resolve_active;
 use crate::config::{AdminAuditLsArgs, AdminAuditSubcommand, AdminSubcommand};
 
 pub async fn run(sub: AdminSubcommand) -> Result<(), String> {

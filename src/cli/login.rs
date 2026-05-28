@@ -6,7 +6,7 @@
 //! commands ergonomic (`safeclaw status` instead of
 //! `safeclaw status --custodian https://...`).
 
-use crate::cli::profile::put_active;
+use crate::cli::active::put_active;
 use crate::config::LoginArgs;
 
 pub async fn run(args: LoginArgs) -> Result<(), String> {
