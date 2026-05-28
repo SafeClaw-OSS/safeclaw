@@ -281,17 +281,6 @@ pub enum StoreSubcommand {
 }
 
 #[derive(Debug, Args)]
-pub struct StartArgs {
-    /// Run the daemon in the current process instead of installing a
-    /// systemd unit. Required on non-Linux, Docker, and dev workflows.
-    #[arg(long, short = 'f')]
-    pub foreground: bool,
-
-    #[command(flatten)]
-    pub serve: ServeArgs,
-}
-
-#[derive(Debug, Args)]
 pub struct LogsArgs {
     /// Follow new log lines (like `tail -f`).
     #[arg(long, short = 'f')]
@@ -365,14 +354,17 @@ pub struct CustodianArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum CustodianSubcommand {
-    /// Start the local daemon. Default: install + enable a user-level
-    /// systemd unit (Linux) so it survives logout/reboot. Use
-    /// `--foreground` / `-f` to run in the current process (Docker, dev,
-    /// non-Linux). Config: prefer SAFECLAW_* env vars — they're embedded
-    /// into the systemd unit. Flags only take effect in --foreground.
-    Start(StartArgs),
+    /// Run the daemon in the current process (foreground). Use this in
+    /// Docker / dev / when you write your own systemd unit. Config via
+    /// SAFECLAW_* env vars and flags. Ctrl-C to stop.
+    Run(ServeArgs),
+    /// Install + enable a user-level systemd unit (Linux) so the daemon
+    /// survives logout/reboot, then start it. SAFECLAW_* env vars from
+    /// the calling shell are embedded into the unit. Re-run to refresh
+    /// config.
+    Start,
     /// Stop the local daemon (user-level systemd unit). No effect on a
-    /// foreground process; Ctrl-C to stop that.
+    /// `sc c run` foreground process; Ctrl-C to stop that.
     Stop,
     /// Restart the local daemon (user-level systemd unit).
     Restart,

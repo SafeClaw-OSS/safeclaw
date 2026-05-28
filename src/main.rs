@@ -22,13 +22,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             })
         }
         Command::Custodian(args) => {
-            // Foreground daemon special-case: it bootstraps tracing,
-            // owns the runtime, and runs forever — keep that at the top
-            // level rather than threading it through the CLI dispatch.
+            // `sc c run` is the foreground daemon entry — it bootstraps
+            // tracing, owns the runtime, and runs forever, so handle it
+            // here instead of threading it through the short-lived CLI
+            // dispatcher.
             match args.sub {
-                CustodianSubcommand::Start(start) if start.foreground => {
-                    run_daemon(start.serve).await
-                }
+                CustodianSubcommand::Run(serve) => run_daemon(serve).await,
                 sub => cli::custodian::run(sub).await.map_err(|e| -> Box<dyn std::error::Error> {
                     eprintln!("safeclaw custodian: {}", e);
                     e.into()

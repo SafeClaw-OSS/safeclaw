@@ -48,7 +48,7 @@ pub async fn run_start_systemd() -> Result<(), String> {
          [Service]\n\
          Type=simple\n\
          {env_block}\
-         ExecStart={bin} start --foreground\n\
+         ExecStart={bin} custodian run\n\
          Restart=on-failure\n\
          RestartSec=5\n\
          \n\
@@ -92,7 +92,7 @@ pub async fn run_start_systemd() -> Result<(), String> {
 
 #[cfg(not(target_os = "linux"))]
 pub async fn run_start_systemd() -> Result<(), String> {
-    Err("`sc c start` (systemd mode) is Linux-only. Use `sc c start --foreground` to run in this process.".into())
+    Err("`sc c start` (systemd mode) is Linux-only. Use `sc c run` to run in this process.".into())
 }
 
 #[cfg(target_os = "linux")]

@@ -7,13 +7,11 @@ use crate::config::{CommonArgs, CustodianSubcommand};
 
 pub async fn run(sub: CustodianSubcommand) -> Result<(), String> {
     match sub {
-        CustodianSubcommand::Start(args) => {
-            // Foreground daemon path is special-cased in main.rs (it
-            // initialises tracing and runs forever). The dispatch in
-            // main.rs intercepts before we get here when foreground=true.
-            debug_assert!(!args.foreground, "foreground daemon should be handled in main.rs");
-            service::run_start_systemd().await
+        // `sc c run` (foreground daemon) is intercepted in main.rs.
+        CustodianSubcommand::Run(_) => {
+            Err("internal: foreground daemon should be handled in main.rs".into())
         }
+        CustodianSubcommand::Start => service::run_start_systemd().await,
         CustodianSubcommand::Stop => service::run_stop(),
         CustodianSubcommand::Restart => service::run_restart(),
         CustodianSubcommand::Logs(args) => service::run_logs(args),
