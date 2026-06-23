@@ -24,7 +24,7 @@ use hpke::{
     aead::ChaCha20Poly1305,
     kdf::HkdfSha256,
     kem::X25519HkdfSha256,
-    Deserializable, Kem, OpModeR, Serializable,
+    Deserializable, Kem, OpModeR, OpModeS, Serializable,
 };
 use rand::rngs::OsRng;
 
@@ -33,6 +33,49 @@ use crate::error::{AppError, Result};
 pub type SuiteKem = X25519HkdfSha256;
 pub type SuiteAead = ChaCha20Poly1305;
 pub type SuiteKdf = HkdfSha256;
+
+/// HPKE `info` prefix for sealing a grant's wrapping key `W_c` to `sc_pk`.
+///
+/// The browser seals `W_c` with `info = GRANT_SEAL_INFO_PREFIX ‖ 0x1f ‖ op_id`,
+/// binding the seal to exactly one op so a captured seal can't be replayed
+/// against a different op. Mirrors the pending-passkey info-binding precedent
+/// (`approve.rs` cross-device deposit). The daemon opens with the same `info`.
+pub const GRANT_SEAL_INFO_PREFIX: &[u8] = b"safeclaw/v1/grant-seal";
+
+/// Build the grant-seal HPKE `info` bound to `op_id`. Seal and open MUST use
+/// byte-identical `info` or the AEAD open fails.
+pub fn grant_seal_info(op_id: &str) -> Vec<u8> {
+    let mut v = Vec::with_capacity(GRANT_SEAL_INFO_PREFIX.len() + 1 + op_id.len());
+    v.extend_from_slice(GRANT_SEAL_INFO_PREFIX);
+    v.push(0x1f);
+    v.extend_from_slice(op_id.as_bytes());
+    v
+}
+
+/// HPKE single-shot seal to a recipient public key. Returns
+/// `(encapped_key, ciphertext)`, both raw bytes. The daemon never needs to
+/// seal in production (it only `open`s the browser's seal); this exists for
+/// round-trip tests and for tooling that produces material the daemon opens.
+pub fn seal_to(
+    recipient_pk: &[u8],
+    plaintext: &[u8],
+    info: &[u8],
+    aad: &[u8],
+) -> Result<(Vec<u8>, Vec<u8>)> {
+    let pk = <<SuiteKem as Kem>::PublicKey as Deserializable>::from_bytes(recipient_pk)
+        .map_err(|e| AppError::BadRequest(format!("recipient pk deserialize: {}", e)))?;
+    let (encapped, mut ctx) = hpke::setup_sender::<SuiteAead, SuiteKdf, SuiteKem, _>(
+        &OpModeS::Base,
+        &pk,
+        info,
+        &mut OsRng,
+    )
+    .map_err(|e| AppError::Internal(format!("hpke setup_sender: {}", e)))?;
+    let ct = ctx
+        .seal(plaintext, aad)
+        .map_err(|e| AppError::Internal(format!("hpke seal: {}", e)))?;
+    Ok((encapped.to_bytes().to_vec(), ct))
+}
 
 /// Daemon's static HPKE keypair, loaded once at startup.
 pub struct ScKeyPair {
@@ -90,6 +133,51 @@ fn sk_path() -> Result<PathBuf> {
     let home = dirs::home_dir()
         .ok_or_else(|| AppError::Internal("no home dir".into()))?;
     Ok(home.join(".safeclaw").join("crypto").join("sc_sk.bin"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ephemeral() -> ScKeyPair {
+        let (sk, pk) = <SuiteKem as Kem>::gen_keypair(&mut OsRng);
+        ScKeyPair { sk, pk }
+    }
+
+    #[test]
+    fn grant_seal_roundtrip() {
+        let kp = ephemeral();
+        let w_c = [7u8; 32];
+        let info = grant_seal_info("op-abc-123");
+        let (enc, ct) = seal_to(&kp.pk_bytes(), &w_c, &info, b"").unwrap();
+        let opened = kp.open(&enc, &ct, &info, b"").unwrap();
+        assert_eq!(opened, w_c);
+    }
+
+    #[test]
+    fn grant_seal_wrong_op_id_fails() {
+        // A seal bound to one op must not open under another op's info.
+        let kp = ephemeral();
+        let (enc, ct) = seal_to(&kp.pk_bytes(), &[9u8; 32], &grant_seal_info("op-A"), b"").unwrap();
+        assert!(kp.open(&enc, &ct, &grant_seal_info("op-B"), b"").is_err());
+    }
+
+    #[test]
+    fn grant_seal_wrong_key_fails() {
+        let kp1 = ephemeral();
+        let kp2 = ephemeral();
+        let info = grant_seal_info("op-x");
+        let (enc, ct) = seal_to(&kp1.pk_bytes(), &[3u8; 32], &info, b"").unwrap();
+        assert!(kp2.open(&enc, &ct, &info, b"").is_err());
+    }
+
+    #[test]
+    fn grant_seal_info_shape() {
+        let info = grant_seal_info("zz");
+        assert_eq!(&info[..GRANT_SEAL_INFO_PREFIX.len()], GRANT_SEAL_INFO_PREFIX);
+        assert_eq!(info[GRANT_SEAL_INFO_PREFIX.len()], 0x1f);
+        assert_eq!(&info[GRANT_SEAL_INFO_PREFIX.len() + 1..], b"zz");
+    }
 }
 
 fn write_secret<B: AsRef<[u8]>>(path: &PathBuf, bytes: B) -> Result<()> {

@@ -25,8 +25,22 @@ pub struct Grant {
     pub r: String,
     /// Acting credential id (base64).
     pub credential_id: String,
-    /// `W*` — wrapping key for the acting credential (base64, 32B raw).
-    pub wrapping_key: String,
+    /// `W*` — wrapping key for the acting credential (base64 STANDARD, 32B raw),
+    /// in **plaintext**. Transitional: the legacy local op-page (served over
+    /// localhost, no intermediary) ships W* here. When `wk_enc`/`wk_ct` are
+    /// present, W* is HPKE-sealed instead and the approve handler populates
+    /// this field after opening the seal. Exactly one form must be present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wrapping_key: Option<String>,
+    /// HPKE-sealed `W*` encapped key (base64url-no-pad). Paired with `wk_ct`.
+    /// Sealed by the browser to the daemon's `sc_pk` with
+    /// `info = grant_seal_info(op_id)`, so a cloud op-relay carrying the grant
+    /// never sees `W*`. The approve handler opens it before validation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wk_enc: Option<String>,
+    /// HPKE-sealed `W*` ciphertext + tag (base64url-no-pad). Paired with `wk_enc`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wk_ct: Option<String>,
     /// WebAuthn assertion.
     pub assertion: AssertionData,
     /// TLS-bound side payload — sealed bytes that depend on `W*` and so
@@ -160,22 +174,27 @@ pub fn validate_grant(
     )?;
 
     // 7. Decode wrapping_key + credential_id raw bytes.
+    //
+    // By this point W* must be present as plaintext base64 in `wrapping_key`:
+    // either the legacy local op-page shipped it directly, or the approve
+    // handler HPKE-opened `wk_enc`/`wk_ct` and populated this field. A grant
+    // with neither is malformed.
     let credential_id_bytes = decode_credential_id(&grant.credential_id)?;
+    let wrapping_key_b64 = grant.wrapping_key.as_deref().ok_or_else(|| {
+        AppError::BadRequest("grant carries no wrapping_key (and no opened seal)".into())
+    })?;
     let wrapping_key = STANDARD
-        .decode(&grant.wrapping_key)
+        .decode(wrapping_key_b64)
         .map_err(|_| AppError::BadRequest("wrapping_key not base64".into()))?;
     if wrapping_key.len() != 32 {
         return Err(AppError::BadRequest("wrapping_key must be 32 bytes".into()));
     }
     // F-04: zeroize the source base64 String so W* doesn't linger on the heap.
-    // SAFETY: We treat the String bytes as a mutable byte slice and overwrite
-    // them with zeros. This is sound because (a) we own the String and don't
-    // use it again, and (b) all-zero bytes are valid UTF-8.
-    // We can't call grant.wrapping_key directly because validate_grant takes
-    // `&Grant` — clone a local copy, zeroize it, then drop it.
-    let mut wk_str = grant.wrapping_key.clone();
+    // We can't mutate grant (it's `&Grant`) — clone a local copy, zeroize it,
+    // then drop it.
     // SAFETY: zeroing valid UTF-8 bytes with 0x00; the String is immediately
     // dropped after this block and never used as a &str again.
+    let mut wk_str = wrapping_key_b64.to_string();
     unsafe { wk_str.as_bytes_mut().zeroize() };
     drop(wk_str);
 

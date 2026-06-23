@@ -110,7 +110,7 @@ async fn get_op_json(
 pub async fn approve_op(
     State(state): State<Arc<AppState>>,
     Path(op_id): Path<String>,
-    Json(grant): Json<Grant>,
+    Json(mut grant): Json<Grant>,
 ) -> Result<Json<Value>> {
     // 1. Look up the pending op.
     let (vault_id, approval_op) = {
@@ -159,6 +159,33 @@ pub async fn approve_op(
     let lookup_credential = |cred_id_b64: &str| -> Option<PasskeyEntry> {
         existing_vault.as_ref().and_then(|v| find_pubkey(v, cred_id_b64))
     };
+    // 3c. HPKE-unseal W_c if the grant carries a sealed wrapping key (the web /
+    // op-relay path). The browser sealed W* to our `sc_pk` with
+    // `info = grant_seal_info(op_id)` so any cloud intermediary carrying the
+    // grant never saw W*. Populate `grant.wrapping_key` with the opened bytes
+    // so the rest of validation is identical to the legacy plaintext path.
+    // (Legacy local op-page ships plaintext `wrapping_key` and skips this.)
+    if grant.wk_enc.is_some() || grant.wk_ct.is_some() {
+        let enc_b64 = grant.wk_enc.as_deref().ok_or_else(|| {
+            AppError::BadRequest("wk_enc present without wk_ct".into())
+        })?;
+        let ct_b64 = grant.wk_ct.as_deref().ok_or_else(|| {
+            AppError::BadRequest("wk_ct present without wk_enc".into())
+        })?;
+        let enc = URL_SAFE_NO_PAD
+            .decode(enc_b64)
+            .map_err(|_| AppError::BadRequest("wk_enc not base64url".into()))?;
+        let ct = URL_SAFE_NO_PAD
+            .decode(ct_b64)
+            .map_err(|_| AppError::BadRequest("wk_ct not base64url".into()))?;
+        let info = crate::crypto::envelope::grant_seal_info(&op_id);
+        let wk = state.sc.open(&enc, &ct, &info, b"")?;
+        if wk.len() != 32 {
+            return Err(AppError::BadRequest("sealed wrapping_key must be 32 bytes".into()));
+        }
+        grant.wrapping_key = Some(STANDARD.encode(&wk));
+    }
+
     let mut validated = {
         let result = {
             let mut chs = state.challenges.lock().unwrap();
