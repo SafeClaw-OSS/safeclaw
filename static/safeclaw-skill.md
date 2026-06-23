@@ -69,8 +69,8 @@ user can alternatively add credentials via the web console there.
 
 Never offer to enter credentials yourself. Never echo a credential back.
 
-If `vault_locked: true`, run `sc unlock` first (or open `console_url` if
-on safeclaw.pro).
+If `vault_locked: true`, run `sc unlock` first. Do not suggest a browser
+URL unless `console_url` contains `safeclaw.pro`.
 
 ## Call shape
 
@@ -144,6 +144,8 @@ for i in $(seq 1 100); do
   esac
 done
 ```
+
+If poll returns HTTP 404, the op expired or the daemon restarted. Do NOT keep polling — re-POST the original request to get a fresh op.
 
 ### B — 2-step (runtimes that can't block, e.g. Telegram cron-style)
 

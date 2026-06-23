@@ -134,6 +134,7 @@ impl ApprovalStore {
         self.inner.get(id).filter(|r| !r.is_expired())
     }
 
+
     pub fn approve(&mut self, id: &str, value: Option<String>) -> Option<&ApprovalRecord> {
         if let Some(rec) = self.inner.get_mut(id) {
             if !matches!(rec.status, ApprovalStatus::Pending) || rec.is_expired() {

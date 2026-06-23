@@ -84,7 +84,7 @@ pub async fn execute_use_forward(
         .resolve_value_async(&op.act.target)
         .await?
         .ok_or_else(|| {
-            AppError::NotFound
+            AppError::BadRequest(format!("secret '{}' not found in vault", op.act.target))
         })?;
 
     // Extract request payload from the operation's scope.
