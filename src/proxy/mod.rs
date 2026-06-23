@@ -42,6 +42,14 @@ pub fn proxy_router(state: Arc<AppState>) -> Router {
         .route("/v/{vid}/export/{key}", post(env::handle))
         .route("/v/{vid}/use/{service}", any(use_broker::handle_no_rest))
         .route("/v/{vid}/use/{service}/{*rest}", any(use_broker::handle))
+        // Local-bearer gate: when a token is provisioned (config.local_bearer),
+        // every broker request must carry `Authorization: Bearer <token>`.
+        // No-op when unset (auth-free self-host default). Admin plane (registry/
+        // op/approve) is gated by op_id + passkey signature, not this.
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::local_bearer::require_bearer,
+        ))
         .with_state(state);
     router.layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
 }

@@ -7,6 +7,7 @@ pub mod core;
 pub mod crypto;
 pub mod error;
 mod generated_services;
+pub mod local_bearer;
 pub mod passkey;
 pub mod protocol;
 pub mod proxy;

@@ -125,10 +125,11 @@ mod tests {
             state_dir: PathBuf::from("/tmp/safeclaw-admin-test"),
             port: 0,
             proxy_port: 0,
-            bind: "127.0.0.1".into(),
+            listen: "127.0.0.1".into(),
             origin: "http://localhost".into(),
             rp_id: "localhost".into(),
             admin_key: key.map(|s| s.to_string()),
+            local_bearer: None,
         };
         let _ = std::fs::create_dir_all(&cfg.state_dir);
         let _ = std::fs::create_dir_all(cfg.state_dir.join("vaults"));

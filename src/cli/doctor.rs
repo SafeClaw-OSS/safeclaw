@@ -59,7 +59,7 @@ pub async fn run(args: CommonArgs) -> Result<(), String> {
         Ok(p) if p.exists() => report.push(Mark::Ok, format!("config: {}", p.display())),
         Ok(p) => report.push(
             Mark::Warn,
-            format!("config: {} (missing — run `safeclaw login`)", p.display()),
+            format!("config: {} (missing — run `safeclaw vault create`)", p.display()),
         ),
         Err(e) => report.push(Mark::Fail, format!("config path: {}", e)),
     }

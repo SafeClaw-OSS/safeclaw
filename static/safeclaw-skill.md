@@ -5,6 +5,21 @@ it; SafeClaw injects the user's stored credentials server-side and
 forwards. The user signs each release with their passkey in a browser
 tab.
 
+## Daemon startup (self-host only)
+
+If `$SAFECLAW_VAULT_URL` points at `localhost` / `127.0.0.1`, the daemon
+runs on this machine — make sure it's up before the first call:
+
+```bash
+curl -s -o /dev/null --connect-timeout 1 "$SAFECLAW_VAULT_URL/registry" \
+  || safeclaw custodian ensure-running
+```
+
+`ensure-running` is idempotent — it starts the daemon's user service only
+if it isn't already running, and never rewrites config. For a SaaS vault
+(host is `api.safeclaw.pro` etc.) skip this: the daemon is hosted, so if
+`/registry` is unreachable, just tell the user.
+
 ## Auth
 
 SafeClaw expects two env vars in the user's shell:
@@ -14,8 +29,11 @@ SafeClaw expects two env vars in the user's shell:
   `http://localhost:23294/v/abc-def` (self-host). Vault id is baked
   into the URL.
 - **`$SAFECLAW_API_KEY`** — bearer token. Required on SaaS. On a
-  self-hosted daemon the user may leave it empty; the daemon ignores
-  the Authorization header.
+  self-hosted daemon, set it to the token printed by `sc install`
+  (provisioned when the daemon is started via `sc custodian start`). The
+  daemon enforces it on the broker plane (`/use`, `/export`); a daemon
+  started without a local bearer leaves it auth-free and the key may be
+  empty.
 
 ```
 Authorization: Bearer $SAFECLAW_API_KEY
@@ -78,18 +96,21 @@ Use `proxy_base` from the registry response as the base URL — it is
 already set to the correct host and path for your deployment.
 
 ```
-POST <proxy_base>/<service>[/<path>]
+<METHOD> <proxy_base>/<service>[/<path>]
 Authorization: Bearer $SAFECLAW_API_KEY
 ```
 
-`<path>` is optional — services that catch any path work with or without
-one. Multi-segment paths (`v1/chat/completions`) pass straight through
-to the upstream.
+Use the **upstream's natural HTTP method** — `GET` for reads
+(`GET <proxy_base>/openai/v1/models`), `POST`/`PUT`/`PATCH`/`DELETE` for
+writes. The daemon forwards your method, path, and body verbatim to the
+upstream. `<path>` is optional — services that catch any path work with
+or without one. Multi-segment paths (`v1/chat/completions`) pass straight
+through.
 
 Every response (initial call and follow-up polls) has the same shape:
 
 ```jsonc
-{ "status": "ok" | "pending" | "rejected" | "consumed", ... }
+{ "status": "ok" | "pending" | "rejected", ... }
 ```
 
 | HTTP | status | extra fields | meaning |
@@ -97,8 +118,10 @@ Every response (initial call and follow-up polls) has the same shape:
 | 200 | `ok` | `value` | done; use `value` |
 | 202 | `pending` | `approval: {id, approve_url, poll_url, expires_at}` | needs user approve |
 | 403 | `rejected` | — | user denied; do not retry |
-| 410 | `consumed` | — | already redeemed once |
 | 404 | (none) | — | expired or unknown |
+
+(HTTP 410 is reserved for a future single-use semantic; the daemon does
+not emit it today.)
 
 `value` for a Use call is the upstream's full response:
 `{ status, headers, body, body_base64? }`. `body` is a string — JSON-parse
@@ -138,9 +161,9 @@ for i in $(seq 1 100); do
   RESP=$(curl -sS -H "Authorization: Bearer $SAFECLAW_API_KEY" "$POLL_URL")
   STATUS=$(echo "$RESP" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("status",""))')
   case "$STATUS" in
-    ok)                 echo "$RESP"; break;;
-    rejected|consumed)  echo "ended: $STATUS"; exit 0;;
-    pending|*)          sleep 3;;
+    ok)         echo "$RESP"; break;;
+    rejected)   echo "ended: $STATUS"; exit 0;;
+    pending|*)  sleep 3;;
   esac
 done
 ```

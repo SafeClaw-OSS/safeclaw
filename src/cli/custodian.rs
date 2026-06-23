@@ -11,7 +11,8 @@ pub async fn run(sub: CustodianSubcommand) -> Result<(), String> {
         CustodianSubcommand::Run(_) => {
             Err("internal: foreground daemon should be handled in main.rs".into())
         }
-        CustodianSubcommand::Start => service::run_start_systemd().await,
+        CustodianSubcommand::Start(args) => service::run_start_systemd(args.force).await,
+        CustodianSubcommand::EnsureRunning => service::run_ensure_running(),
         CustodianSubcommand::Stop => service::run_stop(),
         CustodianSubcommand::Restart => service::run_restart(),
         CustodianSubcommand::Logs(args) => service::run_logs(args),

@@ -24,22 +24,23 @@ pub fn run() -> Result<(), String> {
     let custodian = match cfg.custodian {
         Some(c) => c,
         None => {
-            println!("# safeclaw: no active config — run `safeclaw login` first");
+            println!("# safeclaw: no active config — run `safeclaw vault create` first");
             return Ok(());
         }
     };
     let vault = match cfg.vault {
         Some(v) => v,
         None => {
-            println!("# safeclaw: active config has no vault — run `safeclaw login` first");
+            println!("# safeclaw: active config has no vault — run `safeclaw vault create` first");
             return Ok(());
         }
     };
     let vault_url = format!("{}/v/{}", custodian.trim_end_matches('/'), vault);
     println!("export SAFECLAW_VAULT_URL={}", shell_quote(&vault_url));
-    // Pass through current env value (or empty), so `eval "$(safeclaw env)"`
-    // doesn't wipe a key the user set manually.
-    let api_key = std::env::var("SAFECLAW_API_KEY").unwrap_or_default();
+    // SaaS: pass through a manually-set $SAFECLAW_API_KEY. Self-hosted
+    // localhost: emit the provisioned local bearer so a locally-launched
+    // agent satisfies the daemon's broker gate.
+    let api_key = crate::cli::active::resolve_api_key(&custodian);
     println!("export SAFECLAW_API_KEY={}", shell_quote(&api_key));
     Ok(())
 }

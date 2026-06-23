@@ -487,10 +487,11 @@ mod tests {
             state_dir: PathBuf::from(format!("/tmp/safeclaw-test-{}", std::process::id())),
             port: 0,
             proxy_port: 0,
-            bind: "127.0.0.1".into(),
+            listen: "127.0.0.1".into(),
             origin: "http://localhost".into(),
             rp_id: "localhost".into(),
             admin_key: None,
+            local_bearer: None,
         };
         AppState::new(cfg)
     }

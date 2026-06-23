@@ -35,8 +35,10 @@ pub fn run(args: InstallArgs) -> Result<(), String> {
         _ => format!("{}/skill.md", custodian),
     };
 
-    // API key: read from caller's env (SaaS users set this; OSS leave empty).
-    let api_key = std::env::var("SAFECLAW_API_KEY").unwrap_or_default();
+    // API key: SaaS users set $SAFECLAW_API_KEY; a self-hosted localhost
+    // daemon uses the provisioned local bearer (~/.safeclaw/bearer.token) so
+    // the agent satisfies the broker gate. Empty when neither applies.
+    let api_key = crate::cli::active::resolve_api_key(custodian);
 
     let prompt = if api_key.is_empty() {
         format!(

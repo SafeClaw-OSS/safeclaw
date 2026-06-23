@@ -138,6 +138,49 @@ pub fn join_vault_url(custodian: &str, vault: &str) -> String {
     format!("{}/v/{}", custodian.trim_end_matches('/'), vault)
 }
 
+/// True if the custodian URL points at this machine (self-hosted daemon).
+pub fn is_local_custodian(custodian: &str) -> bool {
+    let host = custodian
+        .trim_end_matches('/')
+        .strip_prefix("https://")
+        .or_else(|| custodian.strip_prefix("http://"))
+        .unwrap_or(custodian)
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .split(':')
+        .next()
+        .unwrap_or("");
+    matches!(host, "localhost" | "127.0.0.1" | "[::1]" | "::1")
+}
+
+/// Resolve the bearer the agent should send for this custodian.
+///
+/// - SaaS (`$SAFECLAW_API_KEY` set in the caller's env): pass it through.
+/// - Self-hosted localhost daemon: use the provisioned local bearer
+///   (`~/.safeclaw/bearer.token`) if one exists, so the agent satisfies the
+///   daemon's broker gate. We read the existing token but do not generate one
+///   here — provisioning is the daemon's job (`sc custodian start`).
+/// - Otherwise empty (auth-free self-host, or not yet provisioned).
+pub fn resolve_api_key(custodian: &str) -> String {
+    if let Ok(k) = std::env::var("SAFECLAW_API_KEY") {
+        if !k.is_empty() {
+            return k;
+        }
+    }
+    if is_local_custodian(custodian) {
+        if let Some(path) = crate::local_bearer::token_path() {
+            if let Ok(tok) = fs::read_to_string(&path) {
+                let tok = tok.trim().to_string();
+                if !tok.is_empty() {
+                    return tok;
+                }
+            }
+        }
+    }
+    String::new()
+}
+
 /// Resolve the active `(custodian, vault)` pair for short-lived CLI
 /// commands. Precedence: flags > $SAFECLAW_VAULT_URL > config file.
 pub fn resolve_active(
