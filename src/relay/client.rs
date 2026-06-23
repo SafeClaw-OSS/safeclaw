@@ -62,8 +62,13 @@ async fn run(
 
     // 1. Register the pending op. op_summary is the full op JSON (the page
     //    renders it AND uses it + r to recompute the WebAuthn binding β).
+    //    We also include the vault's passkey public material (cid + prf_salt)
+    //    so the browser — which can't reach this localhost daemon's
+    //    /v/{vid}/passkeys — can pick the credential and derive W_c. cid and
+    //    prf_salt are public per PROTOCOL.md §4.3.
     let daemon_pubkey = URL_SAFE_NO_PAD.encode(state.sc.pk_bytes());
     let op_summary = STANDARD.encode(serde_json::to_vec(op).unwrap_or_default());
+    let passkeys = fetch_passkeys(&client, state.config.port, vault_id).await;
     let reg_url = format!("{}/v/{}/op/relay/register", base, vault_id);
     let reg = client
         .post(&reg_url)
@@ -72,6 +77,7 @@ async fn run(
             "op_id": op_id,
             "daemon_pubkey": daemon_pubkey,
             "op_summary": op_summary,
+            "passkeys": passkeys,
             "r": r,
             "expires_at": expires_at,
         }))
@@ -153,6 +159,20 @@ async fn apply_reject(state: Arc<AppState>, op_id: &str) {
     if let Ok(client) = reqwest::Client::builder().timeout(Duration::from_secs(10)).build() {
         let _ = client.post(&url).send().await;
         tracing::info!(op = %op_id, "relay grant rejected via loopback");
+    }
+}
+
+/// Loopback-fetch the vault's passkey public material (cid + prf_salt + pubkey)
+/// so the relay can hand it to the browser. Returns `[]` on any failure — the
+/// page then reports "no passkeys" rather than the whole op failing.
+async fn fetch_passkeys(client: &reqwest::Client, port: u16, vault_id: &str) -> Value {
+    let url = format!("http://127.0.0.1:{}/v/{}/passkeys", port, vault_id);
+    match client.get(&url).send().await {
+        Ok(resp) if resp.status().is_success() => match resp.json::<Value>().await {
+            Ok(v) => v.get("passkeys").cloned().unwrap_or_else(|| json!([])),
+            Err(_) => json!([]),
+        },
+        _ => json!([]),
     }
 }
 
