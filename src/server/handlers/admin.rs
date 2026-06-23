@@ -130,6 +130,7 @@ mod tests {
             rp_id: "localhost".into(),
             admin_key: key.map(|s| s.to_string()),
             local_bearer: None,
+            relay_url: None,
         };
         let _ = std::fs::create_dir_all(&cfg.state_dir);
         let _ = std::fs::create_dir_all(cfg.state_dir.join("vaults"));

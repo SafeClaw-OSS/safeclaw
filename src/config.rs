@@ -383,6 +383,14 @@ pub struct ServeArgs {
     /// Distinct from per-service upstream bearers (`crate::auth::bearer`).
     #[arg(long, env = "SAFECLAW_LOCAL_BEARER")]
     pub local_bearer: Option<String>,
+
+    /// Cloud op-relay base URL (e.g. `https://api.dev.safeclaw.pro`). When set,
+    /// the daemon registers each pending op with the relay and polls for the
+    /// browser-deposited (HPKE-sealed) grant — this is what enables web
+    /// approval for a zero-inbound localhost daemon. When unset, the daemon is
+    /// local-only (legacy embedded op-page). Auth uses `--admin-key`.
+    #[arg(long, env = "SAFECLAW_RELAY_URL")]
+    pub relay_url: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -561,6 +569,7 @@ pub struct Config {
     pub rp_id: String,
     pub admin_key: Option<String>,
     pub local_bearer: Option<String>,
+    pub relay_url: Option<String>,
 }
 
 impl Config {
@@ -588,6 +597,7 @@ impl Config {
             rp_id,
             admin_key: args.admin_key,
             local_bearer: args.local_bearer,
+            relay_url: args.relay_url,
         }
     }
 }

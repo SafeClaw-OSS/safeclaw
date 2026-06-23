@@ -492,6 +492,7 @@ mod tests {
             rp_id: "localhost".into(),
             admin_key: None,
             local_bearer: None,
+            relay_url: None,
         };
         AppState::new(cfg)
     }

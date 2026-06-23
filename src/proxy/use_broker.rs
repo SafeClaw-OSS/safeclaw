@@ -302,6 +302,18 @@ async fn handle_impl(
         }
     }
 
+    // Slice-2 web approval: register this Use op with the cloud op-relay (if
+    // configured) and poll for the browser-deposited sealed grant. No-op when
+    // relay_url is unset (purely local daemon).
+    crate::relay::client::spawn_register_and_poll(
+        state.clone(),
+        vault_id.clone(),
+        op_id.clone(),
+        serde_json::to_value(&op).unwrap_or(Value::Null),
+        r.clone(),
+        expires_at,
+    );
+
     state.emit_event(ApprovalEvent {
         vault_id: vault_id,
         approval_id: op_id.clone(),

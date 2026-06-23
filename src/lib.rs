@@ -11,6 +11,7 @@ pub mod local_bearer;
 pub mod passkey;
 pub mod protocol;
 pub mod proxy;
+pub mod relay;
 pub mod server;
 pub mod service;
 pub mod state;
