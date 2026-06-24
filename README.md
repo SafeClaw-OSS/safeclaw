@@ -24,9 +24,11 @@ Your AI Agent → SafeClaw Proxy (localhost:23295) → OpenAI / Anthropic / Goog
 ## Quick start
 
 ```bash
-# Download
-curl -fsSL https://github.com/SafeClaw-OSS/safeclaw/releases/latest/download/safeclaw-linux-x86_64.tar.gz \
-  | tar xz
+# Download the binary for your platform from the latest release.
+# Each release ships SHA256SUMS + a sigstore build-provenance attestation
+# (verify with: gh attestation verify safeclaw --repo SafeClaw-OSS/safeclaw).
+curl -fsSL -o safeclaw \
+  https://github.com/SafeClaw-OSS/safeclaw/releases/latest/download/safeclaw-linux-x86_64
 chmod +x safeclaw
 
 # Start
@@ -59,6 +61,14 @@ services:
 # Or just set the base URL
 export OPENAI_BASE_URL=http://localhost:23295/openai/v1
 ```
+
+### Hosted option
+
+SafeClaw is fully self-hostable (above) — the daemon runs locally and injects your
+keys locally. If you'd rather not run your own backend, **[safeclaw.pro](https://safeclaw.pro)**
+is a managed control plane on top of this same open-source daemon: encrypted vault
+backup & cross-device sync, web-based approvals, and multi-vault management. Pair an
+agent from the dashboard and it installs this CLI for you.
 
 ## Daily workflow
 
@@ -352,7 +362,7 @@ src/
 </details>
 
 <details>
-<summary>Crypto protocol</summary>
+<summary>Crypto primitives</summary>
 
 - **Key exchange**: P-256 ECDH + HKDF-SHA256 + AES-256-GCM
 - **Vault encryption**: AES-256-GCM with KEK derived from WebAuthn PRF output
