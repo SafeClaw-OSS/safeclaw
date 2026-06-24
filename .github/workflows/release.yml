@@ -7,6 +7,8 @@ on:
 
 permissions:
   contents: write
+  id-token: write       # sigstore OIDC — build-provenance attestation
+  attestations: write   # publish the attestation to the GitHub/sigstore log
 
 jobs:
   build:
@@ -75,6 +77,17 @@ jobs:
         with:
           path: artifacts
           merge-multiple: true
+
+      - name: Generate SHA256SUMS
+        run: |
+          cd artifacts
+          sha256sum safeclaw-* > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: 'artifacts/safeclaw-*'
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
