@@ -1,3 +1,4 @@
+pub mod api_key;
 pub mod approval;
 pub mod audit;
 pub mod auth;
@@ -7,7 +8,6 @@ pub mod core;
 pub mod crypto;
 pub mod error;
 mod generated_services;
-pub mod local_bearer;
 pub mod passkey;
 pub mod protocol;
 pub mod proxy;

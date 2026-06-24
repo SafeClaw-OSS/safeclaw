@@ -1,0 +1,198 @@
+//! `sc login --pair-token <X>` — exchange a one-shot pair-token (minted by
+//! safeclaw.pro's "Connect a new agent" modal) for this host's persistent
+//! cloud-side daemon credential.
+//!
+//! The CLI POSTs the token to `<custodian>/api/pair-token/exchange`. The
+//! pro-backend validates+single-uses the token (10-min TTL) and returns
+//! `{ account_id, vault_id, device_key, pro_backend_url }`. We then:
+//!
+//!   1. Persist `device_key` (a `sc_device_<rand>` token) to
+//!      `~/.safeclaw/device-key` (mode 0600). This is the daemon→cloud auth
+//!      token — Token 2 — distinct from `~/.safeclaw/api-key`, which is the
+//!      local agent→daemon broker key (Token 1). The agent never sees the
+//!      device-key.
+//!   2. Persist `(pro_backend_url, account_id)` as the active CLI vault via
+//!      `active::put_active(...)`. account_id doubles as the vault id under
+//!      the V1 §12.2 account-bound model.
+//!
+//! Idempotent: re-running with a fresh token simply overwrites both files.
+//! `sc up` reads the credential at start time.
+
+use std::time::Duration;
+
+use serde::Deserialize;
+use serde_json::json;
+
+use crate::cli::active::put_active;
+use crate::config::LoginArgs;
+
+/// Default cloud custodian when `--custodian` and `$SAFECLAW_CUSTODIAN_URL`
+/// are both unset. Matches V1 plan §13.3 (dev SaaS).
+const DEFAULT_CUSTODIAN: &str = "https://dev.safeclaw.pro";
+
+#[derive(Debug, Deserialize)]
+struct ExchangeResp {
+    account_id: String,
+    vault_id: String,
+    device_key: String,
+    pro_backend_url: String,
+}
+
+pub async fn run(args: LoginArgs) -> Result<(), String> {
+    // ── Resolve custodian: flag > env > default ──────────────────────────
+    let custodian = args
+        .custodian
+        .clone()
+        .or_else(|| std::env::var("SAFECLAW_CUSTODIAN_URL").ok().filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| DEFAULT_CUSTODIAN.to_string());
+    let custodian = custodian.trim_end_matches('/').to_string();
+
+    // ── Enforce HTTPS for the custodian URL ──────────────────────────────
+    // The pair-token is single-use but high-value (POSTing it returns the
+    // device_key), and the response carries `pro_backend_url` +
+    // `device_key` which we persist and trust on subsequent runs. An
+    // `http://` custodian leaks the token on the wire AND lets an on-path
+    // attacker swap the response for an attacker-controlled daemon. Reject
+    // by default; the only legitimate cleartext case is dev-loopback.
+    if !args.insecure_http
+        && !custodian.starts_with("https://")
+        && !is_localhost_http(&custodian)
+    {
+        return Err(format!(
+            "custodian URL must use HTTPS ({} is plaintext); \
+             pass --insecure-http to override (test-only)",
+            custodian
+        ));
+    }
+
+    // ── Resolve device name: flag > $HOSTNAME / $COMPUTERNAME > literal ──
+    let device_name = args
+        .device_name
+        .clone()
+        .or_else(|| std::env::var("HOSTNAME").ok().filter(|s| !s.is_empty()))
+        .or_else(|| std::env::var("COMPUTERNAME").ok().filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| "agent-device".to_string());
+
+    // ── POST <custodian>/api/pair-token/exchange ─────────────────────────
+    // Dedicated 10s timeout; this is a single round-trip and we don't want
+    // it to inherit the longer browser-gesture timeouts other CLI calls use.
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("http client init: {}", e))?;
+
+    let body = json!({
+        "pair_token": args.pair_token,
+        "device_name": device_name,
+    });
+
+    let url = format!("{}/api/pair-token/exchange", custodian);
+    let resp = client
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("reach {}: {}", custodian, e))?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let detail = resp.text().await.unwrap_or_default();
+        let detail_trimmed = detail.trim();
+        return Err(match status.as_u16() {
+            401 => format!(
+                "pair-token invalid or unknown. Generate a new one at {}/dashboard (\"Connect a new agent\").",
+                custodian
+            ),
+            409 => format!(
+                "pair-token already used. Generate a new one at {}/dashboard (\"Connect a new agent\").",
+                custodian
+            ),
+            410 => format!(
+                "pair-token expired (10-min TTL). Generate a new one at {}/dashboard (\"Connect a new agent\").",
+                custodian
+            ),
+            other => {
+                if detail_trimmed.is_empty() {
+                    format!("custodian returned HTTP {}", other)
+                } else {
+                    format!("custodian returned HTTP {}: {}", other, detail_trimmed)
+                }
+            }
+        });
+    }
+
+    let parsed: ExchangeResp = resp
+        .json()
+        .await
+        .map_err(|e| format!("parse exchange response: {}", e))?;
+
+    // ── Persist the device-key to ~/.safeclaw/device-key (0600) ──────────
+    let key_path = device_key_path()?;
+    write_device_key(&key_path, &parsed.device_key)?;
+
+    // ── Persist active vault via the existing CliConfig writer ───────────
+    // Use the returned pro_backend_url (server's source of truth) rather
+    // than the request custodian — they normally match, but the server can
+    // redirect (e.g. canonical host normalization).
+    let pro_backend_url = parsed.pro_backend_url.trim_end_matches('/').to_string();
+    put_active(&pro_backend_url, &parsed.vault_id)
+        .map_err(|e| format!("save active config: {}", e))?;
+
+    eprintln!(
+        "Paired to {}. Vault: {}. Run `sc up` to start the daemon.",
+        pro_backend_url, parsed.vault_id
+    );
+    // account_id is currently equal to vault_id under V1 §12.2's
+    // account-bound model, but both fields are accepted from the server in
+    // case that ever diverges. Surface it once for operator clarity without
+    // committing to a separate persistence slot.
+    if parsed.account_id != parsed.vault_id {
+        eprintln!("  account: {}", parsed.account_id);
+    }
+
+    Ok(())
+}
+
+/// Loopback-exemption check for the HTTPS gate: `http://localhost[:PORT]`
+/// and `http://127.0.0.1[:PORT]` (with optional trailing path) are allowed
+/// without `--insecure-http` because the traffic never leaves the host. We
+/// intentionally do NOT exempt `0.0.0.0`, `[::1]`, or arbitrary RFC1918
+/// addresses — those can be reachable from off-host on misconfigured nets,
+/// and the gate is the conservative call.
+fn is_localhost_http(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("http://") else {
+        return false;
+    };
+    // host[:port] is everything before the first '/'
+    let host_port = rest.split('/').next().unwrap_or("");
+    let host = host_port.split(':').next().unwrap_or("");
+    host == "localhost" || host == "127.0.0.1"
+}
+
+/// `~/.safeclaw/device-key` — the cloud-side device key (Token 2,
+/// a `sc_device_...` token) persisted after `sc login`. Distinct from
+/// `~/.safeclaw/api-key` (the local agent→daemon broker key, Token 1):
+/// this one is used by the daemon itself to authenticate against the SaaS
+/// op-relay once Slice C wires daemon→cloud registration. The agent never
+/// sees it.
+fn device_key_path() -> Result<std::path::PathBuf, String> {
+    let home = dirs::home_dir().ok_or_else(|| "cannot locate home dir".to_string())?;
+    Ok(home.join(".safeclaw").join("device-key"))
+}
+
+fn write_device_key(path: &std::path::Path, device_key: &str) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("mkdir {}: {}", parent.display(), e))?;
+    }
+    std::fs::write(path, device_key)
+        .map_err(|e| format!("write {}: {}", path.display(), e))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // Best-effort chmod; matches `api_key::ensure_key` policy —
+        // we don't fail the login if perms can't be tightened on exotic FS.
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
+}

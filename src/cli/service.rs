@@ -35,20 +35,22 @@ pub async fn run_start_systemd(force: bool) -> Result<(), String> {
     // (they'd be invisible after install, which is worse).
     let mut env_lines = Vec::new();
     for (k, v) in std::env::vars() {
-        // SAFECLAW_LOCAL_BEARER is provisioned below; skip any inherited
-        // copy so it isn't emitted twice.
-        if k.starts_with("SAFECLAW_") && k != "SAFECLAW_LOCAL_BEARER" {
+        // Don't leak the agent-facing SAFECLAW_API_KEY into the daemon's
+        // env — the daemon reads its api-key from the FILE `~/.safeclaw/api-key`
+        // (provisioned below), and a stray/foreign value in the operator's
+        // shell must not be adopted as the broker key.
+        if k.starts_with("SAFECLAW_") && k != "SAFECLAW_API_KEY" {
             // systemd unit syntax: quote the value to allow spaces/=.
             // Escape any " inside.
             let v_escaped = v.replace('"', "\\\"");
             env_lines.push(format!("Environment=\"{}={}\"", k, v_escaped));
         }
     }
-    // Provision (or reuse) the machine-local bearer token and embed it, so the
-    // daemon enforces it on the broker plane. The same token is printed to the
-    // agent by `sc install` as SAFECLAW_API_KEY.
-    let bearer = crate::local_bearer::ensure_token()?;
-    env_lines.push(format!("Environment=\"SAFECLAW_LOCAL_BEARER={}\"", bearer));
+    // Provision (or reuse) the machine-local api-key FILE so the daemon can
+    // read it at startup and enforce it on the broker plane. The same value
+    // is printed to the agent by `sc install` as SAFECLAW_API_KEY. We do NOT
+    // embed it as an Environment= line — file-read avoids the env collision.
+    let _api_key = crate::api_key::ensure_key()?;
     let env_block = if env_lines.is_empty() { String::new() } else { format!("{}\n", env_lines.join("\n")) };
 
     let unit = format!(
@@ -109,12 +111,12 @@ pub async fn run_start_systemd(force: bool) -> Result<(), String> {
     eprintln!("✓ daemon enabled and running ({})", unit_path.display());
     eprintln!("  binary:   {}", bin_str);
     if !env_lines.is_empty() {
-        eprintln!("  env:      {} SAFECLAW_* var(s) embedded (incl. local bearer)", env_lines.len());
+        eprintln!("  env:      {} SAFECLAW_* var(s) embedded", env_lines.len());
     }
-    eprintln!("  bearer:   broker plane now requires the token; agents get it via `sc install`");
+    eprintln!("  api-key:  broker plane now requires the key (~/.safeclaw/api-key); agents get it via `sc install`");
     eprintln!();
     eprintln!("  next: `safeclaw vault create` to make your first vault");
-    eprintln!("        `safeclaw install` to print the agent setup prompt (incl. the bearer)");
+    eprintln!("        `safeclaw install` to print the agent setup prompt (incl. the api-key)");
     eprintln!("        `safeclaw c logs -f` to tail, `safeclaw c stop` to stop, `safeclaw c restart` to reload");
     Ok(())
 }

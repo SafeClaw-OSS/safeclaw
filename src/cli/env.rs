@@ -38,8 +38,8 @@ pub fn run() -> Result<(), String> {
     let vault_url = format!("{}/v/{}", custodian.trim_end_matches('/'), vault);
     println!("export SAFECLAW_VAULT_URL={}", shell_quote(&vault_url));
     // SaaS: pass through a manually-set $SAFECLAW_API_KEY. Self-hosted
-    // localhost: emit the provisioned local bearer so a locally-launched
-    // agent satisfies the daemon's broker gate.
+    // localhost: emit the provisioned api-key (~/.safeclaw/api-key) so a
+    // locally-launched agent satisfies the daemon's broker gate.
     let api_key = crate::cli::active::resolve_api_key(&custodian);
     println!("export SAFECLAW_API_KEY={}", shell_quote(&api_key));
     Ok(())

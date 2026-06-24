@@ -157,9 +157,9 @@ pub fn is_local_custodian(custodian: &str) -> bool {
 /// Resolve the bearer the agent should send for this custodian.
 ///
 /// - SaaS (`$SAFECLAW_API_KEY` set in the caller's env): pass it through.
-/// - Self-hosted localhost daemon: use the provisioned local bearer
-///   (`~/.safeclaw/bearer.token`) if one exists, so the agent satisfies the
-///   daemon's broker gate. We read the existing token but do not generate one
+/// - Self-hosted localhost daemon: use the provisioned api-key
+///   (`~/.safeclaw/api-key`) if one exists, so the agent satisfies the
+///   daemon's broker gate. We read the existing key but do not generate one
 ///   here — provisioning is the daemon's job (`sc custodian start`).
 /// - Otherwise empty (auth-free self-host, or not yet provisioned).
 pub fn resolve_api_key(custodian: &str) -> String {
@@ -169,13 +169,8 @@ pub fn resolve_api_key(custodian: &str) -> String {
         }
     }
     if is_local_custodian(custodian) {
-        if let Some(path) = crate::local_bearer::token_path() {
-            if let Ok(tok) = fs::read_to_string(&path) {
-                let tok = tok.trim().to_string();
-                if !tok.is_empty() {
-                    return tok;
-                }
-            }
+        if let Some(key) = crate::api_key::load_key() {
+            return key;
         }
     }
     String::new()

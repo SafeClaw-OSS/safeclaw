@@ -129,7 +129,7 @@ mod tests {
             origin: "http://localhost".into(),
             rp_id: "localhost".into(),
             admin_key: key.map(|s| s.to_string()),
-            local_bearer: None,
+            api_key: None,
             relay_url: None,
         };
         let _ = std::fs::create_dir_all(&cfg.state_dir);
