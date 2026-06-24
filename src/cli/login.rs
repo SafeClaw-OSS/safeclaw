@@ -23,8 +23,11 @@ use std::time::Duration;
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::cli::active::put_active;
+use crate::cli::active::put_active_with_cloud;
 use crate::config::LoginArgs;
+
+/// Default daemon admin port (matches `ServeArgs` `SAFECLAW_PORT`).
+const DEFAULT_DAEMON_PORT: u16 = 23294;
 
 /// Default cloud custodian when `--custodian` and `$SAFECLAW_CUSTODIAN_URL`
 /// are both unset. Matches V1 plan §13.3 (dev SaaS).
@@ -130,17 +133,27 @@ pub async fn run(args: LoginArgs) -> Result<(), String> {
     let key_path = device_key_path()?;
     write_device_key(&key_path, &parsed.device_key)?;
 
-    // ── Persist active vault via the existing CliConfig writer ───────────
-    // Use the returned pro_backend_url (server's source of truth) rather
-    // than the request custodian — they normally match, but the server can
-    // redirect (e.g. canonical host normalization).
+    // ── Persist active vault + cloud sync coordinates ────────────────────
+    // The AGENT talks to the LOCAL daemon (active `custodian`), not the
+    // cloud — the daemon brokers locally and only the daemon reaches the
+    // cloud, for sealed-blob sync (Slice 3). So active custodian = the
+    // localhost daemon URL, and we record `pro_backend_url` separately as
+    // `cloud_backend` for the daemon's pull/push. Use the server-returned
+    // pro_backend_url (source of truth) over the request custodian — they
+    // normally match, but the server can canonicalize the host.
     let pro_backend_url = parsed.pro_backend_url.trim_end_matches('/').to_string();
-    put_active(&pro_backend_url, &parsed.vault_id)
+    let daemon_port = std::env::var("SAFECLAW_PORT")
+        .ok()
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(DEFAULT_DAEMON_PORT);
+    let local_custodian = format!("http://127.0.0.1:{}", daemon_port);
+    put_active_with_cloud(&local_custodian, &parsed.vault_id, &pro_backend_url)
         .map_err(|e| format!("save active config: {}", e))?;
 
     eprintln!(
-        "Paired to {}. Vault: {}. Run `sc up` to start the daemon.",
-        pro_backend_url, parsed.vault_id
+        "Paired to {} (vault {}). The daemon will sync this vault from the cloud.\n\
+         Run `sc up` to start it; your agent talks to {}.",
+        pro_backend_url, parsed.vault_id, local_custodian
     );
     // account_id is currently equal to vault_id under V1 §12.2's
     // account-bound model, but both fields are accepted from the server in

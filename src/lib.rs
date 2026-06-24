@@ -3,6 +3,7 @@ pub mod approval;
 pub mod audit;
 pub mod auth;
 pub mod cli;
+pub mod cloud_sync;
 pub mod config;
 pub mod core;
 pub mod crypto;

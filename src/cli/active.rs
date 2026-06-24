@@ -22,6 +22,12 @@ pub struct CliConfig {
     /// create`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub known_vaults: Vec<KnownVault>,
+    /// Cloud pro-backend origin for sealed-blob sync (Slice 3). Set by
+    /// `sc login`; the daemon pulls `{cloud_backend}/v/{vault}/blob` on
+    /// start. Distinct from `custodian`, which after login points at the
+    /// LOCAL daemon the agent talks to. See [[project_slice3_design]].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cloud_backend: Option<String>,
     /// Persistent user preferences. Set via `sc config set <key> <value>`.
     /// Resolution chain for any setting: flag > env > this > built-in
     /// default.
@@ -120,6 +126,26 @@ pub fn put_active(custodian: &str, vault: &str) -> Result<PathBuf, String> {
     }
     cfg.custodian = Some(custodian.to_string());
     cfg.vault = Some(vault.to_string());
+    save(&cfg)
+}
+
+/// Set the active vault to a LOCAL daemon custodian AND record the cloud
+/// pro-backend for sealed-blob sync. Used by `sc login`: the agent talks to
+/// the local daemon (`custodian`), while the daemon syncs against the cloud
+/// (`cloud_backend`). Dedupe-adds to known_vaults like `put_active`.
+pub fn put_active_with_cloud(
+    custodian: &str,
+    vault: &str,
+    cloud_backend: &str,
+) -> Result<PathBuf, String> {
+    let mut cfg = load().unwrap_or_default();
+    let new = KnownVault { custodian: custodian.to_string(), vault: vault.to_string() };
+    if !cfg.known_vaults.contains(&new) {
+        cfg.known_vaults.push(new);
+    }
+    cfg.custodian = Some(custodian.to_string());
+    cfg.vault = Some(vault.to_string());
+    cfg.cloud_backend = Some(cloud_backend.to_string());
     save(&cfg)
 }
 

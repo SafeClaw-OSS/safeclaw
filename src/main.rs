@@ -168,6 +168,12 @@ async fn run_daemon(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(&config.state_dir)?;
     std::fs::create_dir_all(config.state_dir.join("vaults"))?;
 
+    // Slice 3: pull the active vault's sealed blob from the cloud before
+    // serving, so a freshly-paired device serves a vault sealed in the
+    // browser. Best-effort — a local-only or offline daemon serves whatever
+    // vault.dat is already on disk.
+    safeclaw::cloud_sync::pull_on_start(&config.state_dir).await;
+
     let state = Arc::new(AppState::new(config.clone()));
 
     let listen_ip: std::net::IpAddr = config.listen.parse().unwrap_or_else(|_| "127.0.0.1".parse().unwrap());
