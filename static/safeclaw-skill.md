@@ -12,10 +12,10 @@ runs on this machine — make sure it's up before the first call:
 
 ```bash
 curl -s -o /dev/null --connect-timeout 1 "$SAFECLAW_VAULT_URL/registry" \
-  || safeclaw custodian ensure-running
+  || safeclaw up
 ```
 
-`ensure-running` is idempotent — it starts the daemon's user service only
+`sc up` is idempotent — it starts the daemon's user service only
 if it isn't already running, and never rewrites config. For a SaaS vault
 (host is `api.safeclaw.pro` etc.) skip this: the daemon is hosted, so if
 `/registry` is unreachable, just tell the user.

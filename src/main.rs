@@ -34,6 +34,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }),
             }
         }
+        Command::Up => {
+            // `sc up` = idempotent ensure-running. Reuses the custodian
+            // dispatcher's EnsureRunning impl verbatim; the rename is a
+            // surface-only promotion to a top-level verb (§13.4).
+            cli::custodian::run(CustodianSubcommand::EnsureRunning).await.map_err(
+                |e| -> Box<dyn std::error::Error> {
+                    eprintln!("safeclaw up: {}", e);
+                    e.into()
+                },
+            )
+        }
         Command::Unlock(args) => {
             cli::unlock::run_unlock(args).await.map_err(|e| -> Box<dyn std::error::Error> {
                 eprintln!("safeclaw unlock: {}", e);

@@ -31,6 +31,12 @@ pub enum Command {
     /// commands. Short alias: `sc c`.
     #[command(alias = "c")]
     Custodian(CustodianArgs),
+    /// Ensure this host's daemon is running (idempotent): start the
+    /// user-level systemd unit only if it isn't already active; never
+    /// rewrites the unit. The `docker compose up` / `tailscale up` idiom —
+    /// the skill preamble's lazy-start target. (`sc custodian start` is the
+    /// one-time install/provision; `sc up` is the light everyday one.)
+    Up,
     /// Bring the vault from Locked → Unlocked. Opens a browser to the
     /// custodian's `/cli/auth` page; the page runs the passkey ceremony
     /// and redirects back to a localhost callback this command spawns.
@@ -421,9 +427,10 @@ pub enum CustodianSubcommand {
     /// the calling shell are embedded into the unit, and a local bearer
     /// token is provisioned. Re-run to refresh config.
     Start(StartArgs),
-    /// Ensure the daemon is running (idempotent): start the user-level
-    /// systemd unit only if it isn't already active. Does NOT rewrite the
-    /// unit. Safe to call repeatedly — this is the skill's lazy-start target.
+    /// Deprecated back-compat alias for top-level `sc up` (renamed
+    /// 2026-06-24). Hidden from help; kept so already-deployed skill text
+    /// (`safeclaw custodian ensure-running`) keeps working. Same impl.
+    #[command(hide = true)]
     EnsureRunning,
     /// Stop the local daemon (user-level systemd unit). No effect on a
     /// `sc c run` foreground process; Ctrl-C to stop that.
