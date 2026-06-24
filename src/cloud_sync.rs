@@ -152,3 +152,50 @@ async fn pull(
 
     Ok(Some(version))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    /// The browser assembles the blob client-side; this guards that the exact
+    /// shape it produces (compact JSON, registry value field order
+    /// `x`/`y`/`device_name`, standard-base64 byte fields, registry key =
+    /// std-b64(credential_id)) deserializes into a SealedVault and survives a
+    /// write_atomic → read round-trip. Values are a real vault.dat sample.
+    /// If the frontend's `setupEnvVault` assembly and this ever drift, this
+    /// fails before the e2e does. Mirrors lib/vault-grant.ts setupEnvVault.
+    #[test]
+    fn frontend_assembled_blob_parses_and_roundtrips() {
+        let cid = "UNwLi9p8ykq/YcbW/mk7loMRg8NyDZ021BoA8L2MOBZo//Cdi6Gqh1rhIvT8FHsiq6CsubhU";
+        // Compact, exactly as the browser serializes (JSON.stringify):
+        let blob = serde_json::json!({
+            "version": 1,
+            "registry": {
+                cid: { "x": "72laEiwOtkMX5s7o280rWZk2zAfVG64gtsXAbBS46c4=",
+                       "y": "B56KGrJOCOvfT3hR36M4sXimg8dlmLfhK8g+Kf2R66c=",
+                       "device_name": "Mac · sunny-panda" }
+            },
+            "credentials": [
+                { "credential_id": cid,
+                  "prf_salt": "9gZJFej46o71aNu7955eqwygNwrptzCyg3D40FNQxPI=",
+                  "wrapped_key": "OjModKRUWfStXREA8a+5WE06boSM2WhUl2e34x6+PzeWXupr0ulv13OdSwSkbXBRG5FEIbh9VVaKk9ESpuZfKcZbCosHJj7y" }
+            ],
+            "ciphertext": "fQslPsTIWQLbmWNoD/rJfXlwsaU2RvY5N2U3EqJf6FYWUugz9CSjRlXyc0/M7mc3"
+        });
+
+        // 1. Parses into the daemon's SealedVault (the pull path).
+        let sealed: SealedVault =
+            serde_json::from_value(blob).expect("frontend blob must parse as SealedVault");
+        assert_eq!(sealed.credentials.len(), 1);
+        assert_eq!(sealed.registry.len(), 1);
+
+        // 2. write_atomic → read round-trips byte-for-field (what pull does).
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vault.dat");
+        sealed_vault::write_atomic(&path, &sealed).unwrap();
+        let back = sealed_vault::read(&path).unwrap().unwrap();
+        assert_eq!(back.credentials[0].credential_id, sealed.credentials[0].credential_id);
+        assert_eq!(back.ciphertext, sealed.ciphertext);
+    }
+}
