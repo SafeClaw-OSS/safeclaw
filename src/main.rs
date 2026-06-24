@@ -1,189 +1,213 @@
-mod auth;
-mod cli;
-mod config;
-mod cooker;
-mod core;
-mod crypto;
-mod error;
-mod generated_services;
-mod notify;
-mod passkey;
-mod service;
-mod server;
-mod state;
-mod vault;
-#[cfg(test)]
-mod tests;
-
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::sync::Arc;
 
-use axum::serve;
-use tokio::net::TcpListener;
-use tracing::{info, warn};
-
-use core::approval::ApprovalManager;
-use core::audit::AuditLog;
-use config::Config;
-use crypto::keys::load_or_create_keypair;
-use state::{AppState, RateLimiter};
-use vault::Vault;
+use clap::Parser;
+use safeclaw::cli;
+use safeclaw::config::{Cli, Command, Config, CustodianSubcommand, ServeArgs};
+use safeclaw::proxy::proxy_router;
+use safeclaw::server::admin_router;
+use safeclaw::state::AppState;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Handle subcommands before anything else
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() >= 2 && args[1] == "update" {
-        return cli::update::run(&args[2..]).map_err(Into::into);
-    }
-    if args.len() >= 2 && args[1] == "connect" {
-        return cli::connect::run(&args[2..]).map_err(Into::into);
-    }
-    if args.len() >= 2 && args[1] == "install" {
-        return cli::install::run_install(&args[2..]).map_err(Into::into);
-    }
-    if args.len() >= 2 && args[1] == "uninstall" {
-        return cli::install::run_uninstall(&args[2..]).map_err(Into::into);
-    }
-    if args.len() >= 2 && args[1] == "enable" {
-        return cli::install::run_enable(&args[2..]).map_err(Into::into);
-    }
-    if args.len() >= 2 && args[1] == "disable" {
-        return cli::install::run_disable(&args[2..]).map_err(Into::into);
-    }
-    if args.len() >= 2 && args[1] == "services" {
-        return cli::install::run_list(&args[2..]).map_err(Into::into);
-    }
-
-    // Initialize tracing subscriber
-    tracing_subscriber::fmt::init();
-
-    let config = Config::parse();
-
-    info!(
-        "SafeClaw v{} starting — data_dir={} port={} proxy_port={}",
-        env!("CARGO_PKG_VERSION"),
-        config.data_dir.display(),
-        config.port,
-        config.proxy_port,
-    );
-
-    // Warn if SAFECLAW_ORIGIN/SAFECLAW_RP_ID are not set
-    if config.origin.is_none() {
-        warn!(
-            "SAFECLAW_ORIGIN not set — defaulting to http://localhost:{}. Set this for production.",
-            config.port
-        );
-    }
-    if config.rp_id.is_none() {
-        warn!("SAFECLAW_RP_ID not set — defaulting to 'localhost'. Set this for production.");
-    }
-
-    // Load or create server keypair
-    let keypair = load_or_create_keypair(&config.data_dir)?;
-    info!(
-        "Server keypair loaded (pk.x={}...)",
-        &keypair.pk.x[..8.min(keypair.pk.x.len())]
-    );
-
-    // --init: generate keypair and exit (for deployment scripts)
-    if config.init {
-        info!(
-            "--init: keypair ready at {}/sc_pk.jwk, exiting",
-            config.data_dir.display()
-        );
-        return Ok(());
-    }
-
-    // Ensure data directory exists
-    std::fs::create_dir_all(&config.data_dir)?;
-
-    // Initialize audit log (SQLite)
-    let audit_log = Arc::new(
-        AuditLog::open(&config.data_dir.join("audit.db"))
-            .map_err(|e| format!("Failed to open audit log: {}", e))?,
-    );
-    info!("Audit log open: {}", config.data_dir.join("audit.db").display());
-
-    // Initialize approval manager
-    let approval_manager = Arc::new(ApprovalManager::new(audit_log.clone()));
-
-    // Build shared vault state
-    let vault = Arc::new(Vault::new());
-
-    // Load service definitions
-    let services = service::ServiceRegistry::load();
-
-    // Build app state
-    let state = Arc::new(AppState {
-        keypair,
-        vault: vault.clone(),
-        services,
-        nonces: Arc::new(Mutex::new(passkey::nonce::NonceStore::new())),
-        challenges: Arc::new(Mutex::new(passkey::challenge::ChallengeStore::new())),
-        start_time: Instant::now(),
-        started_at_ms: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64,
-        rate_limiter: Arc::new(Mutex::new(RateLimiter::new(config.rate_limit))),
-        config: config.clone(),
-        approval_manager: approval_manager.clone(),
-        audit_log: audit_log.clone(),
-    });
-
-    // Periodic cleanup: rate limiter + expired approval sessions
-    {
-        let state_clone = state.clone();
-        let vault_clone = vault.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
-            loop {
-                interval.tick().await;
-                state_clone.rate_limiter.lock().unwrap().cleanup();
-                state_clone.challenges.lock().unwrap().cleanup();
-                // Zeroize expired approval credentials from cache
-                vault_clone.cleanup_expired_sessions();
+    let cli = Cli::parse();
+    match cli.command {
+        Command::Status(args) => {
+            // CLI commands log to stderr; don't initialise the tracing
+            // subscriber here (it'd pollute the user-facing output of a
+            // short-lived command). The daemon path enables it below.
+            cli::status::run(args).await.map_err(|e| -> Box<dyn std::error::Error> {
+                eprintln!("safeclaw status: {}", e);
+                e.into()
+            })
+        }
+        Command::Custodian(args) => {
+            // `sc c run` is the foreground daemon entry — it bootstraps
+            // tracing, owns the runtime, and runs forever, so handle it
+            // here instead of threading it through the short-lived CLI
+            // dispatcher.
+            match args.sub {
+                CustodianSubcommand::Run(serve) => run_daemon(serve).await,
+                sub => cli::custodian::run(sub).await.map_err(|e| -> Box<dyn std::error::Error> {
+                    eprintln!("safeclaw custodian: {}", e);
+                    e.into()
+                }),
             }
-        });
+        }
+        Command::Up => {
+            // `sc up` = idempotent ensure-running. Reuses the custodian
+            // dispatcher's EnsureRunning impl verbatim; the rename is a
+            // surface-only promotion to a top-level verb (§13.4).
+            cli::custodian::run(CustodianSubcommand::EnsureRunning).await.map_err(
+                |e| -> Box<dyn std::error::Error> {
+                    eprintln!("safeclaw up: {}", e);
+                    e.into()
+                },
+            )
+        }
+        Command::Unlock(args) => {
+            cli::unlock::run_unlock(args).await.map_err(|e| -> Box<dyn std::error::Error> {
+                eprintln!("safeclaw unlock: {}", e);
+                e.into()
+            })
+        }
+        Command::Lock(args) => {
+            cli::unlock::run_lock(args).await.map_err(|e| -> Box<dyn std::error::Error> {
+                eprintln!("safeclaw lock: {}", e);
+                e.into()
+            })
+        }
+        Command::Ls(args) => {
+            cli::ls::run(args).await.map_err(|e| -> Box<dyn std::error::Error> {
+                eprintln!("safeclaw ls: {}", e);
+                e.into()
+            })
+        }
+        Command::Get(args) => {
+            cli::secret::run_get(args).await.map_err(|e| -> Box<dyn std::error::Error> {
+                eprintln!("safeclaw get: {}", e);
+                e.into()
+            })
+        }
+        Command::Doctor(args) => {
+            cli::doctor::run(args).await.map_err(|e| -> Box<dyn std::error::Error> {
+                eprintln!("safeclaw doctor: {}", e);
+                e.into()
+            })
+        }
+        Command::Vault(args) => {
+            cli::vault::run(args.sub).await.map_err(|e| -> Box<dyn std::error::Error> {
+                eprintln!("safeclaw vault: {}", e);
+                e.into()
+            })
+        }
+        Command::Config(args) => {
+            cli::config::run(args.sub).map_err(|e| -> Box<dyn std::error::Error> {
+                eprintln!("safeclaw config: {}", e);
+                e.into()
+            })
+        }
+        Command::Store(args) => {
+            cli::store::run(args.sub).await.map_err(|e| -> Box<dyn std::error::Error> {
+                eprintln!("safeclaw store: {}", e);
+                e.into()
+            })
+        }
+        Command::Passkey(args) => {
+            cli::passkey::run(args.sub).await.map_err(|e| -> Box<dyn std::error::Error> {
+                eprintln!("safeclaw passkey: {}", e);
+                e.into()
+            })
+        }
+        Command::Admin(args) => {
+            cli::admin::run(args.sub).await.map_err(|e| -> Box<dyn std::error::Error> {
+                eprintln!("safeclaw admin: {}", e);
+                e.into()
+            })
+        }
+        Command::Env => {
+            cli::env::run().map_err(|e| -> Box<dyn std::error::Error> {
+                eprintln!("safeclaw env: {}", e);
+                e.into()
+            })
+        }
+        Command::Install(args) => {
+            cli::install::run(args).map_err(|e| -> Box<dyn std::error::Error> {
+                eprintln!("safeclaw install: {}", e);
+                e.into()
+            })
+        }
+        Command::Login(args) => {
+            cli::login::run(args).await.map_err(|e| -> Box<dyn std::error::Error> {
+                eprintln!("safeclaw login: {}", e);
+                e.into()
+            })
+        }
+        Command::Secret(args) => {
+            use safeclaw::config::SecretSubcommand;
+            let r = match args.sub {
+                SecretSubcommand::Set(a) => cli::secret::run_set(a).await,
+                SecretSubcommand::Get(a) => cli::secret::run_get(a).await,
+                SecretSubcommand::Rm(a) => cli::secret::run_rm(a).await,
+                SecretSubcommand::Ls(a) => cli::ls::run(a).await,
+            };
+            r.map_err(|e| -> Box<dyn std::error::Error> {
+                eprintln!("safeclaw secret: {}", e);
+                e.into()
+            })
+        }
+        Command::Set(args) => {
+            cli::secret::run_set(args).await.map_err(|e| -> Box<dyn std::error::Error> {
+                eprintln!("safeclaw set: {}", e);
+                e.into()
+            })
+        }
+        Command::Rm(args) => {
+            cli::secret::run_rm(args).await.map_err(|e| -> Box<dyn std::error::Error> {
+                eprintln!("safeclaw rm: {}", e);
+                e.into()
+            })
+        }
+        Command::Version => {
+            println!("safeclaw {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
     }
+}
 
-    // Build proxy state and router
-    let proxy_state = Arc::new(core::router::ProxyState {
-        vault: vault.clone(),
-        config: config.clone(),
-        approval_manager: approval_manager.clone(),
-        audit_log: audit_log.clone(),
-        services: service::ServiceRegistry::load(),
+async fn run_daemon(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "info,safeclaw=debug,tower_http=info".into()),
+        )
+        .init();
+
+    let config = Config::from_serve_args(args);
+
+    std::fs::create_dir_all(&config.state_dir)?;
+    std::fs::create_dir_all(config.state_dir.join("vaults"))?;
+
+    let state = Arc::new(AppState::new(config.clone()));
+
+    let listen_ip: std::net::IpAddr = config.listen.parse().unwrap_or_else(|_| "127.0.0.1".parse().unwrap());
+
+    let admin_addr = SocketAddr::new(listen_ip, config.port);
+    let proxy_addr = SocketAddr::new(listen_ip, config.proxy_port);
+
+    let admin = admin_router(state.clone());
+    let proxy = proxy_router(state.clone());
+
+    tracing::info!(
+        admin = %admin_addr,
+        proxy = %proxy_addr,
+        state_dir = %config.state_dir.display(),
+        rp_id = %config.rp_id,
+        origin = %config.origin,
+        "safeclaw daemon starting"
+    );
+
+    let admin_listener = tokio::net::TcpListener::bind(admin_addr).await?;
+    let proxy_listener = tokio::net::TcpListener::bind(proxy_addr).await?;
+
+    let admin_task = tokio::spawn(async move {
+        axum::serve(
+            admin_listener,
+            admin.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
     });
-    let proxy_router = core::router::build_proxy_router(proxy_state);
+    let proxy_task = tokio::spawn(async move {
+        axum::serve(
+            proxy_listener,
+            proxy.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+    });
 
-    // Bind proxy first (127.0.0.1)
-    let proxy_addr: SocketAddr = format!("{}:{}", config.proxy_bind, config.proxy_port)
-        .parse()
-        .map_err(|e| format!("Invalid proxy bind address: {}", e))?;
-    let proxy_listener = TcpListener::bind(proxy_addr).await?;
-    info!("Proxy listening on http://{}", proxy_addr);
-
-    // Bind server
-    let server_addr: SocketAddr = format!("{}:{}", config.bind, config.port)
-        .parse()
-        .map_err(|e| format!("Invalid server address: {}", e))?;
-    let server_listener = TcpListener::bind(server_addr).await?;
-    info!("Server listening on http://{}", server_addr);
-
-    // Build server router
-    let server_router = server::build_router(state);
-
-    // Run both servers concurrently
-    tokio::try_join!(
-        serve(
-            server_listener,
-            server_router.into_make_service_with_connect_info::<SocketAddr>()
-        ),
-        serve(proxy_listener, proxy_router.into_make_service()),
-    )?;
-
+    tokio::select! {
+        r = admin_task => { r??; },
+        r = proxy_task => { r??; },
+    }
     Ok(())
 }

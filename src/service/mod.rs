@@ -61,6 +61,10 @@ pub struct ServiceMeta {
     /// Absent/None = requires user "connect" (provide API key / OAuth).
     #[serde(default)]
     pub activation: Option<String>,
+    /// If true, exclude from /menu and /v/{vid}/registry. Use for services
+    /// that are defined but not yet ready for agent discovery.
+    #[serde(default)]
+    pub hidden: bool,
 }
 
 fn default_category() -> String { "integration".to_string() }
@@ -70,10 +74,37 @@ fn default_category() -> String { "integration".to_string() }
 pub struct UpstreamDef {
     pub id: String,
     pub url: String,
+    /// Legacy auth block. When present, drives the daemon's hardcoded
+    /// bearer-style injection: `Authorization: Bearer {{auth.env}}`.
+    /// New services SHOULD prefer the explicit `[upstream.headers]` /
+    /// `[upstream.query]` template blocks below — `auth` stays compiled
+    /// for the existing 18+ services that still declare it.
     #[serde(default)]
     pub auth: Option<AuthDef>,
+    /// Static header values to attach to every outbound request to this
+    /// upstream. Values may reference `{{auth_value}}` which the daemon
+    /// substitutes with the resolved secret bytes (via store_order
+    /// lookup of `auth.env`). When the map is non-empty, it OVERRIDES
+    /// the legacy auth-block's hardcoded `Authorization: Bearer …`
+    /// injection — pick one or the other per upstream, not both.
+    ///
+    /// Example (Stripe-style basic auth — the canonical "weird case"):
+    ///   ```toml
+    ///   [[upstream]]
+    ///   id  = "default"
+    ///   url = "https://api.stripe.com"
+    ///   auth = { type = "bearer", env = "stripe_secret_key" }
+    ///
+    ///   [upstream.headers]
+    ///   Authorization = "Basic {{auth_value_basic}}"
+    ///   ```
+    /// `{{auth_value_basic}}` is `base64(s_o + ':')`, the Stripe shape.
     #[serde(default)]
     pub headers: HashMap<String, String>,
+    /// Query-string params to attach to every outbound request. Same
+    /// template semantics as `headers`.
+    #[serde(default)]
+    pub query: HashMap<String, String>,
     #[serde(default)]
     pub locked: Option<LockedResponseDef>,
 }
@@ -121,8 +152,23 @@ fn default_retry_interval() -> u64 { 500 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct AuthDef {
-    #[serde(rename = "type")]
-    pub auth_type: String,
+    /// Legacy auth-style discriminator (`bearer` / `header` / `query` /
+    /// `basic` / `oauth2` / `path`). Optional in the new template-driven
+    /// shape — services that declare `[upstream.headers]` / `[upstream.query]`
+    /// instead drop this field; the daemon's injection logic reads the
+    /// templates directly. Still required for `oauth2`-flow services.
+    #[serde(rename = "type", default)]
+    pub auth_type: Option<String>,
+    /// Vault entry key feeding this credential (just the key name, no `env.`
+    /// prefix). Replaces the older `placeholder = "{{ env.X }}"` templating
+    /// convention. `placeholder` continues to mean "UI input hint" only.
+    ///
+    /// For oauth2 services, this names the native-secrets item holding the
+    /// long-lived refresh_token. The short-lived access_token derived from
+    /// it lives in-memory only (per the design: only the immutable refresh
+    /// token enters the vault).
+    #[serde(default)]
+    pub env: Option<String>,
     #[serde(default)]
     pub header: Option<String>,
     #[serde(default)]
@@ -131,10 +177,31 @@ pub struct AuthDef {
     pub param: Option<String>,
     #[serde(default)]
     pub placeholder: Option<String>,
+    /// oauth2: body style for the refresh /token call. `form` (default) or
+    /// `json` (Anthropic). Reused by `auth::oauth2::refresh_token`.
     #[serde(default)]
     pub oauth_style: Option<String>,
+    /// oauth2: identity-provider key (`google` / `openai` / `anthropic`).
+    /// Used by the consent-flow side of the OAuth ceremony to pick the
+    /// right provider config; daemon doesn't read it at refresh time.
     #[serde(default)]
     pub provider: Option<String>,
+    /// oauth2: provider's token endpoint, e.g.
+    /// `https://oauth2.googleapis.com/token`. Public info, baked into
+    /// service.toml.
+    #[serde(default)]
+    pub token_url: Option<String>,
+    /// oauth2: name of the daemon-startup env var holding the OAuth client_id
+    /// (public but kept off the binary so self-hosters can register their own
+    /// OAuth app). e.g. `SAFECLAW_GOOGLE_CLIENT_ID`.
+    #[serde(default)]
+    pub client_id_env: Option<String>,
+    /// oauth2: name of the daemon-startup env var holding the OAuth
+    /// client_secret. Required for confidential clients (Google) and absent
+    /// for PKCE clients (OpenAI Codex / Anthropic). e.g.
+    /// `SAFECLAW_GOOGLE_CLIENT_SECRET`.
+    #[serde(default)]
+    pub client_secret_env: Option<String>,
     #[serde(default)]
     pub username_label: Option<String>,
 }
@@ -462,11 +529,78 @@ impl ServiceRegistry {
         self.services.get(service_name)
     }
 
+    /// Iterate all loaded service definitions, sorted by id for stable ordering.
+    /// Used by the `/v/{vid}/registry` endpoint.
+    pub fn iter_sorted(&self) -> Vec<(&str, &ServiceDef)> {
+        let mut entries: Vec<(&str, &ServiceDef)> = self
+            .services
+            .iter()
+            .map(|(k, v)| (k.as_str(), v))
+            .collect();
+        entries.sort_by_key(|(k, _)| *k);
+        entries
+    }
+
     /// Get default category for a service, falling back to "service".
     pub fn default_category(&self, service_name: &str) -> &str {
         self.services.get(service_name)
             .map(|d| d.service.category.as_str())
             .unwrap_or("service")
+    }
+
+    /// Default-read AccessLevel for a service (H3 unlock bootstrap predicate).
+    /// Priority: standalone policy.toml `[default] read` > service.toml inline
+    /// `policy.levels.read` > safe default (AskAlways). Per-rule overrides
+    /// (e.g. github's `delete-branch ask-always`) are NOT consulted here —
+    /// they're evaluated per request at /use time. This helper answers only
+    /// "is this service's bulk default `allow`?", i.e. "should its auth value
+    /// be bootstrapped into secrets_cache at unlock?".
+    pub fn default_read_level(&self, service_id: &str) -> crate::core::policy::AccessLevel {
+        if let Some(policy) = self.policies.get(service_id) {
+            if let Some(default) = policy.default.as_ref() {
+                if let Some(read) = default.get("read") {
+                    if let Some(level) = parse_access_level(Some(read)) {
+                        return level;
+                    }
+                }
+            }
+        }
+        if let Some(svc) = self.services.get(service_id) {
+            if let Some(policy) = svc.policy.as_ref() {
+                if let Some(levels) = policy.to_service_levels() {
+                    if let Some(read) = levels.read {
+                        return read;
+                    }
+                }
+            }
+        }
+        crate::core::policy::AccessLevel::AskAlways
+    }
+
+    /// Resolve the env vault key that backs a service's first upstream's auth,
+    /// if any. Preferred path: `auth.env = "key"`. Legacy fallback: parse
+    /// `auth.placeholder = "{{ env.key }}"`. Returns `None` if the service has
+    /// no upstream, no auth, or an unparseable placeholder.
+    pub fn service_env_key(&self, service_id: &str) -> Option<String> {
+        let svc = self.services.get(service_id)?;
+        let upstream = svc.upstream.first()?;
+        let auth = upstream.auth.as_ref()?;
+        if let Some(k) = auth.env.as_deref() {
+            let trimmed = k.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+        // Legacy `placeholder = "{{ env.X }}"` template.
+        let placeholder = auth.placeholder.as_deref()?;
+        let start = placeholder.find("{{")?;
+        let end = placeholder[start..].find("}}")?;
+        let inner = placeholder[start + 2..start + end].trim();
+        let key = inner.strip_prefix("env.")?.trim();
+        if key.is_empty() {
+            return None;
+        }
+        Some(key.to_string())
     }
 
     /// Get OAuth style for a service (if oauth2 with custom style).
@@ -1103,5 +1237,50 @@ kind = "secret"
         assert_eq!(fields.len(), 1);
         assert_eq!(fields[0].name, "token");
         assert!(reg.vault_fields("nonexistent").is_empty());
+    }
+
+    #[test]
+    fn oauth2_env_field_drives_service_env_key() {
+        // OAuth services in the SaaS schema declare their refresh_token
+        // vault item via `auth.env`, same as API-key services. service_env_key
+        // must pick this up so registry surfaces a vault_field and the
+        // unlock-time cache bootstrap loads the refresh_token (when policy
+        // is allow).
+        let toml_str = r#"
+[service]
+id = "gmail"
+name = "Gmail"
+category = "integration"
+
+[[upstream]]
+id = "default"
+url = "https://gmail.googleapis.com"
+
+[upstream.auth]
+type = "oauth2"
+provider = "google"
+env = "gmail_refresh_token"
+token_url = "https://oauth2.googleapis.com/token"
+client_id_env = "SAFECLAW_GOOGLE_CLIENT_ID"
+client_secret_env = "SAFECLAW_GOOGLE_CLIENT_SECRET"
+"#;
+        let def: ServiceDef = toml::from_str(toml_str).unwrap();
+        let upstream = def.upstream.first().unwrap();
+        let auth = upstream.auth.as_ref().unwrap();
+        assert_eq!(auth.auth_type.as_deref(), Some("oauth2"));
+        assert_eq!(auth.env.as_deref(), Some("gmail_refresh_token"));
+        assert_eq!(auth.token_url.as_deref(), Some("https://oauth2.googleapis.com/token"));
+        assert_eq!(auth.client_id_env.as_deref(), Some("SAFECLAW_GOOGLE_CLIENT_ID"));
+        assert_eq!(auth.client_secret_env.as_deref(), Some("SAFECLAW_GOOGLE_CLIENT_SECRET"));
+
+        // service_env_key uses auth.env first, so OAuth services now resolve
+        // to their refresh_token item — exactly like API-key services.
+        let mut services = HashMap::new();
+        services.insert("gmail".into(), def);
+        let reg = ServiceRegistry { services, policies: HashMap::new() };
+        assert_eq!(
+            reg.service_env_key("gmail").as_deref(),
+            Some("gmail_refresh_token"),
+        );
     }
 }

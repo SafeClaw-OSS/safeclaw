@@ -1,0 +1,30 @@
+# `read = "allow"` here isn't the per-request grant — that's the role
+# of the per-rule `inbox-read-recent` below. This is the unlock-time
+# hint: it tells the daemon to bootstrap `inbox_api_key` into the
+# secrets_cache, so that when a GET /recent hits the Allow rule the
+# fast-path has bytes to forward. Without this, Allow-with-cache-miss
+# falls through to a pending op even when policy said no approval
+# needed — defeating the self-verify story.
+#
+# Writes still default to `ask`; the catch-all `inbox-any` rule below
+# enforces that for all non-/recent traffic.
+[default]
+write = "ask"
+read = "allow"
+
+# Self-verify read: agents need to be able to confirm "did my POST
+# land?" without dragging a human into an approval loop for each
+# check. /recent only ever surfaces the caller's OWN bucket (keyed
+# by SHA256 of the injected Authorization), so there's no
+# cross-tenant exfiltration risk — `allow` is safe.
+[[rule]]
+id = "inbox-read-recent"
+label = "List recent messages in your own inbox bucket"
+match = "GET /recent"
+level = "allow"
+
+[[rule]]
+id = "inbox-any"
+label = "Any call to the inbox service"
+match = "*"
+level = "ask"

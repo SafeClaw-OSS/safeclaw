@@ -10,7 +10,7 @@ run = "openclaw config set gateway.controlUi.enabled true --strict-json"
 [[steps]]
 title = "Allow embedding from SafeClaw Pro and self-origin"
 target = "openclaw"
-run = """openclaw config set gateway.controlUi.allowedOrigins '["{{safeclaw.origin}}","https://{{safeclaw.instance_id}}.v.safeclaw.pro"]' --strict-json"""
+run = """openclaw config set gateway.controlUi.allowedOrigins '["https://www.safeclaw.pro","https://{{safeclaw.instance_id}}.v.safeclaw.pro"]' --strict-json"""
 
 [[steps]]
 title = "Trust local Caddy reverse proxy"

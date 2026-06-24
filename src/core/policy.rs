@@ -91,6 +91,27 @@ pub struct RuleOverride {
     pub ask_ttl: Option<u64>,
 }
 
+/// Field-wise merge of two ServiceLevels with user > registry precedence.
+/// Returns `None` only if both inputs are absent. Each field independently
+/// takes the user's value when set, otherwise falls back to the registry's.
+/// Lets the user override just one of (read, write) without forcing them
+/// to restate the other.
+pub fn merge_service_levels(
+    user: Option<&ServiceLevels>,
+    registry: Option<&ServiceLevels>,
+) -> Option<ServiceLevels> {
+    match (user, registry) {
+        (None, None) => None,
+        (Some(u), None) => Some(u.clone()),
+        (None, Some(r)) => Some(r.clone()),
+        (Some(u), Some(r)) => Some(ServiceLevels {
+            read: u.read.clone().or_else(|| r.read.clone()),
+            write: u.write.clone().or_else(|| r.write.clone()),
+            ask_ttl: u.ask_ttl.or(r.ask_ttl),
+        }),
+    }
+}
+
 /// Apply sparse overrides onto built-in rules, matching by `id`.
 /// Rules without an `id`, or whose `id` has no override, are left unchanged.
 pub fn merge_rule_overrides(
@@ -259,6 +280,27 @@ pub fn evaluate_policy(
     defaults: &PolicyDefaults,
     service_category: Option<&str>,
 ) -> AccessLevel {
+    evaluate_policy_with_match(method, path, body, rules, service_levels, defaults, service_category).0
+}
+
+/// Same as [`evaluate_policy`] but also returns the matching rule (if any)
+/// and its TTL. The matched-rule reference lets callers identify the exact
+/// scope of an approval — e.g. caching `ask` decisions by rule id so the
+/// TTL applies to the specific scope the user said "yes" to, not every
+/// request to the service.
+///
+/// Returned tuple: `(level, matched_rule_id, ttl_seconds)`. Both extras are
+/// `None` when no rule matched (level came from category / global default);
+/// the caller should still cache under `(service, None)` in that case.
+pub fn evaluate_policy_with_match(
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+    rules: Option<&Vec<PolicyRule>>,
+    service_levels: Option<&ServiceLevels>,
+    defaults: &PolicyDefaults,
+    service_category: Option<&str>,
+) -> (AccessLevel, Option<String>, Option<u64>) {
     // 1. Check service rules — most specific match wins (nginx-style)
     if let Some(rules) = rules {
         let mut best: Option<(u32, &PolicyRule)> = None;
@@ -271,7 +313,7 @@ pub fn evaluate_policy(
             }
         }
         if let Some((_, rule)) = best {
-            return rule.level.clone();
+            return (rule.level.clone(), rule.id.clone(), rule.ask_ttl);
         }
     }
 
@@ -283,7 +325,7 @@ pub fn evaluate_policy(
             &levels.read
         };
         if let Some(l) = level {
-            return l.clone();
+            return (l.clone(), None, levels.ask_ttl);
         }
     }
 
@@ -296,7 +338,7 @@ pub fn evaluate_policy(
                 &type_def.read
             };
             if let Some(l) = level {
-                return l.clone();
+                return (l.clone(), None, type_def.ask_ttl);
             }
         }
     }
@@ -309,12 +351,12 @@ pub fn evaluate_policy(
             &def_levels.read
         };
         if let Some(l) = level {
-            return l.clone();
+            return (l.clone(), None, def_levels.ask_ttl);
         }
     }
 
     // 5. Safe default
-    AccessLevel::AskAlways
+    (AccessLevel::AskAlways, None, None)
 }
 
 /// Find the ask_ttl for the best matching rule.
@@ -358,6 +400,44 @@ mod tests {
 
     fn defaults() -> PolicyDefaults {
         PolicyDefaults::default()
+    }
+
+    fn levels(read: Option<AccessLevel>, write: Option<AccessLevel>, ask_ttl: Option<u64>) -> ServiceLevels {
+        ServiceLevels { read, write, ask_ttl }
+    }
+
+    #[test]
+    fn merge_service_levels_both_absent_returns_none() {
+        assert!(merge_service_levels(None, None).is_none());
+    }
+
+    #[test]
+    fn merge_service_levels_user_only_passes_through() {
+        let u = levels(Some(AccessLevel::Allow), None, Some(60));
+        let m = merge_service_levels(Some(&u), None).unwrap();
+        assert!(matches!(m.read, Some(AccessLevel::Allow)));
+        assert!(m.write.is_none());
+        assert_eq!(m.ask_ttl, Some(60));
+    }
+
+    #[test]
+    fn merge_service_levels_registry_only_passes_through() {
+        let r = levels(Some(AccessLevel::Ask), Some(AccessLevel::Deny), None);
+        let m = merge_service_levels(None, Some(&r)).unwrap();
+        assert!(matches!(m.read, Some(AccessLevel::Ask)));
+        assert!(matches!(m.write, Some(AccessLevel::Deny)));
+    }
+
+    #[test]
+    fn merge_service_levels_user_wins_fieldwise() {
+        // User sets only read; registry sets both. Result: user's read,
+        // registry's write — proves the merge is field-wise, not all-or-nothing.
+        let u = levels(Some(AccessLevel::Allow), None, None);
+        let r = levels(Some(AccessLevel::Ask), Some(AccessLevel::Deny), Some(30));
+        let m = merge_service_levels(Some(&u), Some(&r)).unwrap();
+        assert!(matches!(m.read, Some(AccessLevel::Allow)));
+        assert!(matches!(m.write, Some(AccessLevel::Deny)));
+        assert_eq!(m.ask_ttl, Some(30));
     }
 
     fn rule(match_pat: &str, level: AccessLevel) -> PolicyRule {

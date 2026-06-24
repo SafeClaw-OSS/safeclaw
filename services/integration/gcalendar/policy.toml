@@ -1,34 +1,15 @@
 [default]
 read = "allow"
-write = "ask-always"
-
-# ── Routine writes: downgrade from ask-always to ask ────────────────
-[[rule]]
-id = "create-event"
-label = "Create event"
-match = "POST /calendars/*/events"
-level = "ask"
+write = "ask"
 
 [[rule]]
-id = "quickadd-event"
-label = "Quick-add event"
-match = "POST /calendars/*/events/quickAdd"
-level = "ask"
+id = "list-events"
+label = "List events"
+match = "GET /calendar/v3/calendars/*/events"
+level = "allow"
 
 [[rule]]
-id = "move-event"
-label = "Move event to another calendar"
-match = "POST /calendars/*/events/*/move"
-level = "ask"
-
-[[rule]]
-id = "edit-event"
-label = "Edit event"
-match = "PATCH /calendars/*/events/*"
-level = "ask"
-
-[[rule]]
-id = "replace-event"
-label = "Replace event"
-match = "PUT /calendars/*/events/*"
-level = "ask"
+id = "delete-event"
+label = "Delete event"
+match = "DELETE /calendar/v3/calendars/*/events/*"
+level = "ask-always"

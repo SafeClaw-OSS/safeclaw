@@ -9,21 +9,28 @@ use serde_json::json;
 pub enum AppError {
     BadRequest(String),
     Unauthorized(String),
+    Forbidden(String),
     NotFound,
+    Conflict(String),
     TooManyRequests,
     Internal(String),
 }
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        let (status, message) = match &self {
-            AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
-            AppError::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, msg.clone()),
-            AppError::NotFound => (StatusCode::NOT_FOUND, "Not found".to_string()),
-            AppError::TooManyRequests => (StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded".to_string()),
-            AppError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone()),
+        let (status, message, code) = match &self {
+            AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone(), "bad_request"),
+            AppError::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, msg.clone(), "unauthorized"),
+            AppError::Forbidden(msg) => (StatusCode::FORBIDDEN, msg.clone(), "forbidden"),
+            AppError::NotFound => (StatusCode::NOT_FOUND, "Not found".to_string(), "not_found"),
+            AppError::Conflict(msg) => (StatusCode::CONFLICT, msg.clone(), "conflict"),
+            AppError::TooManyRequests => (StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded".to_string(), "rate_limited"),
+            AppError::Internal(msg) => {
+                tracing::error!("internal error: {}", msg);
+                (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error".to_string(), "internal")
+            }
         };
-        (status, Json(json!({ "error": message }))).into_response()
+        (status, Json(json!({ "error": code, "message": message }))).into_response()
     }
 }
 
@@ -34,7 +41,9 @@ impl std::fmt::Display for AppError {
         match self {
             AppError::BadRequest(msg) => write!(f, "Bad request: {}", msg),
             AppError::Unauthorized(msg) => write!(f, "Unauthorized: {}", msg),
+            AppError::Forbidden(msg) => write!(f, "Forbidden: {}", msg),
             AppError::NotFound => write!(f, "Not found"),
+            AppError::Conflict(msg) => write!(f, "Conflict: {}", msg),
             AppError::TooManyRequests => write!(f, "Rate limit exceeded"),
             AppError::Internal(msg) => write!(f, "Internal error: {}", msg),
         }

@@ -2,61 +2,14 @@
 read = "ask"
 write = "ask-always"
 
-# ── Discover: downgrade reads to allow ──────────────────────────────
 [[rule]]
 id = "list-files"
 label = "List files"
-match = "GET /files"
+match = "GET /drive/v3/files"
 level = "allow"
 
-[[rule]]
-id = "list-drives"
-label = "List shared drives"
-match = "GET /drives"
-level = "allow"
-
-[[rule]]
-id = "get-drive"
-label = "Get shared drive info"
-match = "GET /drives/*"
-level = "allow"
-
-[[rule]]
-id = "about"
-label = "Get Drive account info"
-match = "GET /about"
-level = "allow"
-
-[[rule]]
-id = "changes"
-label = "Read changes feed"
-match = "GET /changes"
-level = "allow"
-
-# ── Routine writes: downgrade from ask-always to ask ────────────────
-# Note: no edit-file rule — drive.file scope doesn't permit modifying
-# files the app didn't create, so Google will 403 anyway.
-[[rule]]
-id = "create-file"
-label = "Create file"
-match = "POST /files"
-level = "ask"
-
-[[rule]]
-id = "copy-file"
-label = "Copy file"
-match = "POST /files/*/copy"
-level = "ask"
-
-[[rule]]
-id = "remove-share"
-label = "Remove file sharing"
-match = "DELETE /files/*/permissions/*"
-level = "ask"
-
-# ── Destructive: deny ───────────────────────────────────────────────
 [[rule]]
 id = "delete-file"
-label = "Permanently delete file"
-match = "DELETE /files/*"
+label = "Delete file"
+match = "DELETE /drive/v3/files/*"
 level = "deny"

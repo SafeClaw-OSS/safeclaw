@@ -7,7 +7,17 @@ category = "integration"
 [[upstream]]
 id = "default"
 url = "https://www.googleapis.com/drive/v3"
-auth = { type = "oauth2", provider = "google" }
+auth = {
+  type = "oauth2",
+  provider = "google",
+  env = "gdrive_refresh_token",
+  token_url = "https://oauth2.googleapis.com/token",
+  client_id_env = "GOOGLE_CLIENT_ID",
+  client_secret_env = "GOOGLE_CLIENT_SECRET",
+}
+
+  [upstream.headers]
+  Authorization = "Bearer {{auth_value}}"
 
 [[api]]
 path = "*"
