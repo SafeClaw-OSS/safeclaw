@@ -167,10 +167,10 @@ pub async fn approve_op(
     // (Legacy local op-page ships plaintext `wrapping_key` and skips this.)
     if grant.wk_enc.is_some() || grant.wk_ct.is_some() {
         let enc_b64 = grant.wk_enc.as_deref().ok_or_else(|| {
-            AppError::BadRequest("wk_enc present without wk_ct".into())
+            AppError::BadRequest("sealed wrapping key needs both wk_enc and wk_ct (wk_enc missing)".into())
         })?;
         let ct_b64 = grant.wk_ct.as_deref().ok_or_else(|| {
-            AppError::BadRequest("wk_ct present without wk_enc".into())
+            AppError::BadRequest("sealed wrapping key needs both wk_enc and wk_ct (wk_ct missing)".into())
         })?;
         let enc = URL_SAFE_NO_PAD
             .decode(enc_b64)
