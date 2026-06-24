@@ -150,6 +150,12 @@ pub enum VaultState {
     Locked,
     Unlocked {
         cache: SecretsCache,
+        /// Retained state key `K` (zeroized on drop). Held for the unlocked
+        /// session so a sealed blob pulled from cloud sync can be re-decrypted
+        /// and the cache refreshed WITHOUT another passkey (Slice 3 realtime
+        /// sync — matches 1Password's "vault key resident while unlocked").
+        /// Dropped (wiped) on lock/delete along with the rest of this variant.
+        state_key: zeroize::Zeroizing<Vec<u8>>,
         /// Unix epoch seconds when this Unlocked state began. Informational
         /// only today (no auto-lock); kept for future audit / debug.
         #[allow(dead_code)]
@@ -223,16 +229,32 @@ impl AppState {
         !matches!(states.get(vault_id), Some(VaultState::Unlocked { .. }))
     }
 
-    /// Transition a vault to Unlocked with the given bootstrap cache.
-    /// Overwrites any prior state (a fresh unlock invalidates the previous
-    /// cache).
-    pub fn unlock_vault(&self, vault_id: String, cache: SecretsCache) {
+    /// Transition a vault to Unlocked with the given bootstrap cache and the
+    /// retained state key `K`. Overwrites any prior state (a fresh unlock
+    /// invalidates the previous cache + key).
+    pub fn unlock_vault(
+        &self,
+        vault_id: String,
+        cache: SecretsCache,
+        state_key: zeroize::Zeroizing<Vec<u8>>,
+    ) {
         let unlocked_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
         let mut states = self.vault_states.lock().unwrap();
-        states.insert(vault_id, VaultState::Unlocked { cache, unlocked_at });
+        states.insert(vault_id, VaultState::Unlocked { cache, state_key, unlocked_at });
+    }
+
+    /// Clone the retained state key `K` for an Unlocked vault, or `None` when
+    /// the vault is Locked. Used by the cloud-sync refresh to re-decrypt a
+    /// freshly-pulled sealed blob without a passkey.
+    pub fn cloned_state_key(&self, vault_id: &str) -> Option<zeroize::Zeroizing<Vec<u8>>> {
+        let states = self.vault_states.lock().unwrap();
+        match states.get(vault_id) {
+            Some(VaultState::Unlocked { state_key, .. }) => Some(state_key.clone()),
+            _ => None,
+        }
     }
 
     /// Transition a vault to Locked, zeroing any cached secrets.
@@ -498,7 +520,11 @@ mod tests {
     }
 
     fn unlock_with_empty_cache(state: &AppState, vault_id: &str) {
-        state.unlock_vault(vault_id.to_string(), SecretsCache::default());
+        state.unlock_vault(
+            vault_id.to_string(),
+            SecretsCache::default(),
+            zeroize::Zeroizing::new(Vec::new()),
+        );
     }
 
     #[test]

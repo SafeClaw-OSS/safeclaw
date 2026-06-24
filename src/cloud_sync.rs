@@ -17,9 +17,11 @@
 //! serves whatever `vault.dat` is on disk. See [[project_slice3_design]].
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::cli::active;
+use crate::state::AppState;
 use crate::storage::sealed_vault::{self, SealedVault};
 
 /// Read the persisted device-key (`~/.safeclaw/device-key`, written by
@@ -136,21 +138,156 @@ async fn pull(
         .get("blob")
         .ok_or_else(|| "blob missing in cloud response".to_string())?;
 
-    // Validate it parses as a SealedVault BEFORE touching disk — never
-    // persist garbage over a working vault.dat.
+    persist_blob(state_dir, vault, blob, version)?;
+    Ok(Some(version))
+}
+
+/// Validate a pulled blob as a `SealedVault`, write it to `vault.dat`
+/// atomically, and record the version sidecar. Shared by the start-time pull
+/// and the runtime watch loop. Validates BEFORE touching disk — never persist
+/// garbage over a working vault.dat.
+fn persist_blob(
+    state_dir: &Path,
+    vault: &str,
+    blob: &serde_json::Value,
+    version: u64,
+) -> Result<(), String> {
     let sealed: SealedVault = serde_json::from_value(blob.clone())
         .map_err(|e| format!("cloud blob is not a valid SealedState: {}", e))?;
-
     let vault_path = state_dir.join("vaults").join(vault).join("vault.dat");
     sealed_vault::write_atomic(&vault_path, &sealed)
         .map_err(|e| format!("write vault.dat: {}", e))?;
-
-    // Record the version so the next start can `?since=` short-circuit.
     if let Err(e) = std::fs::write(version_sidecar(state_dir, vault), version.to_string()) {
         tracing::warn!(vault = %vault, "cloud sync: wrote vault.dat but failed to record version: {}", e);
     }
+    Ok(())
+}
 
-    Ok(Some(version))
+/// After a runtime pull wrote a new `vault.dat`, refresh the in-memory cache
+/// for an UNLOCKED vault using the retained state key `K` — no passkey. If the
+/// vault is Locked (no retained `K`), nothing is cached to refresh; the next
+/// unlock reads the new file. If the new ciphertext was sealed under a ROTATED
+/// `K`, `K` can't open it — leave the cache and log (graceful: lock+unlock to
+/// see new state), mirroring the post-write refresh path.
+fn refresh_after_pull(state: &Arc<AppState>, vault: &str) {
+    let Some(k) = state.cloned_state_key(vault) else {
+        return; // Locked — no retained K
+    };
+    let vault_path = state.config.state_dir.join("vaults").join(vault).join("vault.dat");
+    let sealed = match sealed_vault::read(&vault_path) {
+        Ok(Some(v)) => v,
+        _ => return,
+    };
+    match crate::server::handlers::metadata::decrypt_vault_view_with_key(&k, &sealed) {
+        Ok(view) => {
+            let cache = crate::server::handlers::approve::bootstrap_cache_from_view(&view, state);
+            state.unlock_vault(vault.to_string(), cache, k);
+            tracing::info!(vault = %vault, "cloud sync: cache refreshed after pull (no re-unlock)");
+        }
+        Err(_) => {
+            tracing::warn!(
+                vault = %vault,
+                "cloud sync: retained key can't open pulled ciphertext (rotated K?); lock+unlock to see new state"
+            );
+        }
+    }
+}
+
+/// Long-lived background sync watcher. Long-polls the cloud blob-version
+/// endpoint (`/v/{vid}/blob/wait?since=<local>`, server holds ~25s and
+/// responds the instant the version bumps); on a change, pulls the new sealed
+/// blob into `vault.dat` (under the per-vault write lock, serialized against
+/// approve's writes) and refreshes the unlocked cache with the retained `K`.
+/// Best-effort + detached: a local-only/unpaired/offline daemon just no-ops or
+/// backs off, and any failure here NEVER affects serving. See
+/// [[project_realtime_sync_v1_decision]].
+pub async fn watch_loop(state: Arc<AppState>) {
+    let cfg = match active::load() {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let Some(cloud) = cfg.cloud_backend.clone().filter(|s| !s.is_empty()) else {
+        tracing::debug!("cloud sync watch: no cloud_backend; not started (local-only daemon)");
+        return;
+    };
+    let Some(vault) = cfg.vault.clone().filter(|s| !s.is_empty()) else {
+        return;
+    };
+    let Some(dk) = device_key() else {
+        tracing::debug!("cloud sync watch: no device-key (unpaired); not started");
+        return;
+    };
+    let state_dir = state.config.state_dir.clone();
+    // Read-timeout MUST exceed the server's long-poll hold (~25s) plus slack.
+    let client = match reqwest::Client::builder().timeout(Duration::from_secs(40)).build() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("cloud sync watch: client init failed: {}", e);
+            return;
+        }
+    };
+    let cloud = cloud.trim_end_matches('/').to_string();
+    tracing::info!(vault = %vault, "cloud sync watch loop started");
+
+    let mut backoff = Duration::from_secs(2);
+    loop {
+        let local_ver = read_local_version(&state_dir, &vault);
+        let url = format!("{}/v/{}/blob/wait?since={}", cloud, vault, local_ver);
+        match client.get(&url).bearer_auth(&dk).send().await {
+            Ok(resp) => match resp.status().as_u16() {
+                200 => {
+                    backoff = Duration::from_secs(2);
+                    let body: serde_json::Value = match resp.json().await {
+                        Ok(b) => b,
+                        Err(_) => {
+                            tokio::time::sleep(backoff).await;
+                            continue;
+                        }
+                    };
+                    if body.get("unchanged").and_then(|v| v.as_bool()).unwrap_or(false) {
+                        // Long-poll window elapsed with no change — re-poll.
+                        continue;
+                    }
+                    let Some(blob) = body.get("blob") else { continue };
+                    let version = body.get("version").and_then(|v| v.as_u64()).unwrap_or(0);
+                    // Serialize against approve.rs's vault.dat writes.
+                    let lock = {
+                        let mut locks = state.vault_write_locks.lock().unwrap();
+                        Arc::clone(
+                            locks
+                                .entry(vault.clone())
+                                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+                        )
+                    };
+                    let _guard = lock.lock().await;
+                    if let Err(e) = persist_blob(&state_dir, &vault, blob, version) {
+                        tracing::warn!(vault = %vault, "cloud sync watch: persist failed: {}", e);
+                        continue;
+                    }
+                    refresh_after_pull(&state, &vault);
+                    tracing::info!(vault = %vault, version, "cloud sync watch: applied pulled blob");
+                }
+                404 => {
+                    // No blob in the cloud yet — gentle retry.
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
+                401 | 403 => {
+                    tracing::warn!(vault = %vault, "cloud sync watch: auth rejected (HTTP {}); stopping", resp.status());
+                    return;
+                }
+                _ => {
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(60));
+                }
+            },
+            Err(_) => {
+                // Transient (timeout/offline). The 40s read-timeout exceeds the
+                // 25s server hold, so a clean long-poll return shouldn't error here.
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_secs(60));
+            }
+        }
+    }
 }
 
 #[cfg(test)]

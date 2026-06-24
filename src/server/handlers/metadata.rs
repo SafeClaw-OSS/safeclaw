@@ -155,6 +155,105 @@ pub fn decrypt_vault_view(
     Ok(view)
 }
 
+/// Like [`decrypt_vault_view`] but also returns the unwrapped state key `K`
+/// (zeroized on drop) so the caller can RETAIN it for the unlocked session.
+/// Used by the unlock + write paths so a later cloud-sync pull can refresh the
+/// cache with `K` instead of forcing another passkey ([`decrypt_vault_view_with_key`]).
+pub fn decrypt_vault_view_keep_key(
+    op: &Operation,
+    wrapping_key: &[u8],
+    credential_id_bytes: &[u8],
+    vault: &crate::storage::SealedVault,
+) -> Result<(VaultPlaintextView, zeroize::Zeroizing<Vec<u8>>)> {
+    let redeemed = RedeemedGrant {
+        o: op.clone(),
+        credential_id: credential_id_bytes.to_vec(),
+        wrapping_key: WrappingKey::from_bytes(wrapping_key.to_vec()),
+        opt: GrantOpt::default(),
+    };
+    let opened = sudp::phases::consumption::open::<StdPrimitives>(&redeemed, vault)
+        .map_err(|e| AppError::Unauthorized(format!("vault open: {}", e)))?;
+    let view = VaultPlaintextView::from_protected_state(&opened.m)?;
+    let _ = redeemed_zeroize_marker();
+    Ok((view, opened.k))
+}
+
+/// Decrypt the vault's body ciphertext with a RETAINED state key `K` — no
+/// grant, no passkey. The body is sealed under `K` with AAD `DS_SEAL ‖ ver`,
+/// independent of any credential, so a held `K` opens it directly. Returns
+/// `Unauthorized` if `K` can't open it (e.g. the writer rotated `K`), which
+/// callers treat as graceful "lock+unlock to see new state". Used by the
+/// cloud-sync refresh after a runtime pull. Reconstructs `seal_ad` from sudp's
+/// public `DS_SEAL` (sudp's own `seal_ad` is crate-private).
+pub fn decrypt_vault_view_with_key(
+    k: &[u8],
+    vault: &crate::storage::SealedVault,
+) -> Result<VaultPlaintextView> {
+    use sudp::primitives::domain::DS_SEAL;
+    use sudp::primitives::{Aead, ChaCha20Poly1305};
+    use sudp::state::ProtectedState;
+
+    let mut ad = Vec::with_capacity(DS_SEAL.len() + 2);
+    ad.extend_from_slice(DS_SEAL);
+    ad.extend_from_slice(&vault.version.to_be_bytes());
+
+    let m_bytes = ChaCha20Poly1305::open(k, &vault.ciphertext, &ad)
+        .map_err(|e| AppError::Unauthorized(format!("vault open (retained key): {}", e)))?;
+    let m = ProtectedState::from_canonical(&m_bytes)
+        .map_err(|e| AppError::Internal(format!("protected-state parse: {}", e)))?;
+    VaultPlaintextView::from_protected_state(&m)
+}
+
 fn redeemed_zeroize_marker() -> std::marker::PhantomData<WebAuthn> {
     std::marker::PhantomData
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::plaintext::VaultAux;
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use sudp::primitives::domain::DS_SEAL;
+    use sudp::primitives::{Aead, ChaCha20Poly1305};
+    use sudp::state::{ProtectedState, CURRENT_VERSION};
+
+    /// The retained-K refresh path: a vault's body is K-sealed with AAD
+    /// `DS_SEAL ‖ ver`, independent of any credential, so a held `K` opens it
+    /// with NO grant/passkey. This builds a real v3 ProtectedState, seals it
+    /// under K exactly as the vault does, and asserts `decrypt_vault_view_with_key`
+    /// recovers the target with the right K and rejects a wrong K (the graceful
+    /// "rotated K → lock+unlock" path). Guards the seal_ad reconstruction.
+    #[test]
+    fn retained_key_opens_body_without_credential() {
+        let k = vec![9u8; 32];
+        let version: u16 = CURRENT_VERSION;
+
+        let mut ps = ProtectedState::new();
+        ps.aux = serde_json::to_value(VaultAux::initial()).unwrap();
+        ps.put_target("openai_key", b"sk-test-123".to_vec());
+        let canonical = ps.to_canonical().unwrap();
+
+        let mut ad = Vec::new();
+        ad.extend_from_slice(DS_SEAL);
+        ad.extend_from_slice(&version.to_be_bytes());
+        let ciphertext = ChaCha20Poly1305::seal(&k, &canonical[..], &ad).unwrap();
+
+        // Empty registry/credentials — the body opens independent of any cred.
+        let vault: crate::storage::SealedVault = serde_json::from_value(serde_json::json!({
+            "version": version,
+            "registry": {},
+            "credentials": [],
+            "ciphertext": STANDARD.encode(&ciphertext),
+        }))
+        .unwrap();
+
+        let view = decrypt_vault_view_with_key(&k, &vault).expect("retained-K open");
+        assert_eq!(
+            view.native_secrets.get("openai_key").map(|v| v.as_slice()),
+            Some(b"sk-test-123".as_ref())
+        );
+
+        // Wrong K (the rotated-K case) → AEAD open fails → Err (graceful).
+        assert!(decrypt_vault_view_with_key(&vec![1u8; 32], &vault).is_err());
+    }
 }

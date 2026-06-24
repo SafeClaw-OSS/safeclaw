@@ -176,6 +176,12 @@ async fn run_daemon(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let state = Arc::new(AppState::new(config.clone()));
 
+    // Slice 3 realtime sync: long-lived, detached background watcher that
+    // long-polls the cloud for blob-version bumps and refreshes the unlocked
+    // vault in place (no re-unlock). Best-effort — NOT in the serve select!,
+    // so a sync-loop exit never takes the daemon down.
+    tokio::spawn(safeclaw::cloud_sync::watch_loop(state.clone()));
+
     let listen_ip: std::net::IpAddr = config.listen.parse().unwrap_or_else(|_| "127.0.0.1".parse().unwrap());
 
     let admin_addr = SocketAddr::new(listen_ip, config.port);

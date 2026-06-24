@@ -35,7 +35,7 @@ use crate::protocol::operation::{
     discriminator, ActType,
 };
 use crate::protocol::{render_operation, validate_grant, Grant};
-use crate::server::handlers::metadata::decrypt_vault_view;
+use crate::server::handlers::metadata::{decrypt_vault_view, decrypt_vault_view_keep_key};
 use crate::storage::plaintext::VaultPlaintextView;
 use crate::state::{ApprovalEvent, AppState, SecretsCache};
 use crate::storage::sealed_vault::{
@@ -394,7 +394,7 @@ pub async fn approve_op(
             // ceremony before the agent's first /use call. Best-effort — a
             // bootstrap failure leaves the vault Locked (user can manually
             // unlock later) rather than failing the enroll.
-            if let Ok(view) = decrypt_vault_view(
+            if let Ok((view, k)) = decrypt_vault_view_keep_key(
                 &validated.op,
                 &validated.wrapping_key,
                 &validated.credential_id_bytes,
@@ -406,7 +406,7 @@ pub async fn approve_op(
                     cached_services = cache.entries.len(),
                     "vault auto-unlocked after enroll"
                 );
-                state.unlock_vault(vault_id.clone(), cache);
+                state.unlock_vault(vault_id.clone(), cache, k);
             }
             (
                 json!({ "ok": true, "vault_id": vault_id, "act": "enroll" }),
@@ -450,7 +450,7 @@ pub async fn approve_op(
                 // Vault was Locked when this Write arrived. Don't
                 // auto-unlock from a Write — the user expects unlock
                 // to be a deliberate ceremony.
-            } else if let Ok(view) = decrypt_vault_view(
+            } else if let Ok((view, k)) = decrypt_vault_view_keep_key(
                 &validated.op,
                 &validated.wrapping_key,
                 &validated.credential_id_bytes,
@@ -463,7 +463,7 @@ pub async fn approve_op(
                     external_stores = cache.external_stores.len(),
                     "vault cache re-bootstrapped after write"
                 );
-                state.unlock_vault(vault_id.clone(), cache);
+                state.unlock_vault(vault_id.clone(), cache, k);
             } else {
                 tracing::warn!(
                     vault = %vault_id,
@@ -641,7 +641,7 @@ pub async fn approve_op(
                 let vault = existing_vault
                     .clone()
                     .ok_or_else(|| AppError::Conflict("vault not initialized".into()))?;
-                let view = decrypt_vault_view(
+                let (view, unlock_key) = decrypt_vault_view_keep_key(
                     &validated.op,
                     &validated.wrapping_key,
                     &validated.credential_id_bytes,
@@ -667,7 +667,7 @@ pub async fn approve_op(
                     cached_services = cache.entries.len(),
                     "vault unlocked"
                 );
-                state.unlock_vault(vault_id.clone(), cache);
+                state.unlock_vault(vault_id.clone(), cache, unlock_key);
                 let value = json!({ "kv": Value::Object(kv), "aux": aux_json });
                 let resp = json!({
                     "ok": true, "act": "vault-unlock",
@@ -924,7 +924,7 @@ pub async fn reject_op(
 ///   3. `policy_defaults` — verbatim snapshot of `aux.policy_defaults` so
 ///      the evaluator can layer user globals on top of the compiled-in
 ///      `PolicyDefaults::default()` without re-decrypting the vault.
-fn bootstrap_cache_from_view(
+pub(crate) fn bootstrap_cache_from_view(
     view: &VaultPlaintextView,
     state: &AppState,
 ) -> SecretsCache {
