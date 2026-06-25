@@ -33,6 +33,8 @@ pub async fn run(sub: VaultSubcommand) -> Result<(), String> {
         VaultSubcommand::Forget(a) => run_forget(a).await,
         VaultSubcommand::Create(a) => run_create(a).await,
         VaultSubcommand::Delete(a) => run_delete(a).await,
+        VaultSubcommand::Unlock(a) => crate::cli::unlock::run_unlock(a).await,
+        VaultSubcommand::Lock(a) => crate::cli::unlock::run_lock(a).await,
     }
 }
 

@@ -4,13 +4,12 @@ use clap::{Args, Parser, Subcommand};
 /// Top-level CLI shape. `safeclaw` (short alias `sc`) is one binary
 /// with two roles:
 ///
-///   - **Daemon ops** live under `sc custodian` (alias `sc c`):
-///     start / stop / restart / logs (Linux user-systemd lifecycle) and
-///     status / pubkey / menu (read-only, local or remote). Run with
-///     `sc c start --foreground` in Docker/dev/non-Linux.
+///   - **Daemon lifecycle** (Linux user-systemd): `sc up` (install + start +
+///     unlock), `sc down`, `sc restart`, `sc logs`, and `sc serve` to run it
+///     in the foreground (Docker / dev / non-Linux).
 ///   - **Vault ops** are short-lived CLI commands talking to the daemon
-///     over HTTP: `sc status`, `sc vault ...` (alias `sc v`), `sc unlock`,
-///     `sc lock`, `sc ls / get / set / rm`, `sc passkey` (alias `sc p`),
+///     over HTTP: `sc status`, `sc vault ...` (alias `sc v`, incl. `unlock` /
+///     `lock`), `sc ls / get / set / rm`, `sc passkey` (alias `sc p`),
 ///     `sc store`, `sc doctor`, …
 ///
 /// Bare `safeclaw` (no subcommand) prints help.
@@ -23,28 +22,42 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Print the current vault's status: which one, locked/unlocked,
-    /// key count. For daemon lifecycle use `sc custodian` (`sc c`).
+    /// Print SafeClaw's status: the daemon (running? version) and the active
+    /// vault (which one, locked/unlocked, key count).
     Status(StatusArgs),
-    /// Daemon (custodian) ops: start / stop / restart / logs / status /
-    /// pubkey / menu. Local daemon or any remote custodian — same
-    /// commands. Short alias: `sc c`.
-    #[command(alias = "c")]
-    Custodian(CustodianArgs),
-    /// Ensure an ALREADY-INSTALLED daemon is running (idempotent): starts the
-    /// user-level systemd unit only if it isn't active; never installs or
-    /// rewrites the unit. First-time setup is `sc custodian start` (installs
-    /// the unit); `sc up` is the light everyday ensure-running afterwards (the
-    /// `docker compose up` / `tailscale up` idiom; the skill's lazy-start).
+    /// Get SafeClaw running and ready: install + start the daemon if needed,
+    /// then unlock the vault (one passkey tap). Idempotent — the everyday
+    /// "make sure it's up" command (the `tailscale up` idiom; the skill's
+    /// lazy-start). This is the single setup entrypoint after `sc login`.
     Up,
-    /// Bring the vault from Locked → Unlocked. Opens a browser to the
-    /// custodian's `/cli/auth` page; the page runs the passkey ceremony
-    /// and redirects back to a localhost callback this command spawns.
+    /// Stop the local daemon (user-level systemd unit).
+    Down,
+    /// Restart the local daemon (user-level systemd unit).
+    Restart,
+    /// Tail the local daemon's logs (journalctl).
+    Logs(LogsArgs),
+    /// Run the daemon in the FOREGROUND (this process). For Docker / dev / a
+    /// hand-written systemd unit. Config via SAFECLAW_* env + flags; Ctrl-C to
+    /// stop. The installed background service runs this under the hood.
+    Serve(ServeArgs),
+    /// HPKE outer-envelope public key (diagnostic).
+    #[command(hide = true)]
+    Pubkey(CommonArgs),
+    /// Public service catalog (diagnostic).
+    #[command(hide = true)]
+    Menu(CommonArgs),
+    /// DEPRECATED (renamed 2026-06-25): use `sc up`/`down`/`restart`/`logs`/
+    /// `serve`/`status`. Hidden but still functional so already-installed
+    /// systemd units (`ExecStart=… custodian run`) keep working across the
+    /// upgrade; removed in a later release. Short alias: `sc c`.
+    #[command(alias = "c", hide = true)]
+    Custodian(CustodianArgs),
+    /// DEPRECATED top-level alias for `sc vault unlock` — kept hidden; `sc up`
+    /// unlocks for you, so you rarely need this directly.
+    #[command(hide = true)]
     Unlock(UnlockArgs),
-    /// Drop the custodian's in-memory secrets cache and flip back to
-    /// Locked. Also a passkey-gated ceremony (PROTOCOL.md §6.3 — H3
-    /// requires a fresh grant so a stolen session token can't DOS-lock
-    /// the vault).
+    /// DEPRECATED top-level alias for `sc vault lock` — kept hidden.
+    #[command(hide = true)]
     Lock(UnlockArgs),
     /// Alias for `sc secret ls`.
     Ls(CommonArgs),
@@ -84,7 +97,8 @@ pub enum Command {
     /// safeclaw.pro's "Connect a new agent" modal) for this host's persistent
     /// cloud-side daemon credential. Writes `~/.safeclaw/device-key` (0600) and
     /// sets the active vault. Run once per host (re-run to repair/re-pair).
-    /// Next, start the daemon with `sc custodian start`.
+    /// `sc login` then brings the daemon up and unlocks for you; `sc up` is the
+    /// everyday "make sure it's running" afterwards.
     Login(LoginArgs),
     /// Manage external stores connected to the active vault. Today: list.
     /// Connect / disconnect are deferred until the Write op lands in the
@@ -99,7 +113,7 @@ pub enum Command {
     Rm(RmArgs),
     /// Print the safeclaw binary version.
     Version,
-    /// Health + reachability checks: custodian connectivity, active
+    /// Health + reachability checks: daemon connectivity, active
     /// profile, API key presence. Read-only; no vault state mutation.
     Doctor(CommonArgs),
 }
@@ -257,6 +271,12 @@ pub enum VaultSubcommand {
     /// Irreversibly delete a vault's daemon-side state. Passkey-gated
     /// via the standard `/op/{op_id}` browser-callback ceremony.
     Delete(VaultDeleteArgs),
+    /// Bring the vault Locked → Unlocked (one passkey tap). Normally `sc up`
+    /// does this for you; use this to unlock explicitly.
+    Unlock(UnlockArgs),
+    /// Drop the in-memory secrets cache and flip back to Locked (passkey-gated
+    /// per PROTOCOL.md §6.3 so a stolen session can't DOS-lock the vault).
+    Lock(UnlockArgs),
 }
 
 #[derive(Debug, Args)]

@@ -15,7 +15,6 @@ use std::time::Duration;
 
 use crate::config::UpgradeArgs;
 
-const REPO: &str = "SafeClaw-OSS/safeclaw";
 const BASE: &str = "https://github.com/SafeClaw-OSS/safeclaw/releases/latest/download";
 
 /// Map the build target to the release asset name (matches install.sh + CI).
@@ -126,11 +125,16 @@ pub async fn run(args: UpgradeArgs) -> Result<(), String> {
         ));
     }
 
-    eprintln!(
-        "Upgraded {} ({}). Restart the daemon to run the new build:  sc c restart",
-        current.display(),
-        &actual[..12]
-    );
-    eprintln!("Verify provenance (optional):  gh attestation verify {} --repo {}", current.display(), REPO);
+    eprintln!("Upgraded {} ({}).", current.display(), &actual[..12]);
+    // Take effect now: restart the running daemon onto the new binary so the
+    // user isn't left on the old build. Best-effort — a foreground / non-systemd
+    // daemon just keeps running until it's restarted by hand.
+    if crate::cli::service::unit_installed() {
+        if let Err(e) = crate::cli::service::run_restart() {
+            eprintln!("  couldn't auto-restart the daemon ({e}); run `sc restart`.");
+        }
+    } else {
+        eprintln!("  Start it with `sc up`.");
+    }
     Ok(())
 }

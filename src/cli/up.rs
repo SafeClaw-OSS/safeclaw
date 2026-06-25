@@ -15,9 +15,15 @@ use crate::cli::status::{fetch_status, VaultState};
 use crate::cli::{service, unlock};
 use crate::config::UnlockArgs;
 
-/// `sc up`: ensure the daemon is running, then ensure the vault is unlocked.
+/// `sc up`: get SafeClaw ready — install the daemon service on first run (so
+/// there's no separate setup step), make sure it's running, then unlock.
 pub async fn run() -> Result<(), String> {
-    service::run_ensure_running()?;
+    if service::unit_installed() {
+        service::run_ensure_running()?;
+    } else {
+        // First `sc up` on this host: install + enable + start the user service.
+        service::run_start_systemd(false).await?;
+    }
     ensure_unlocked().await
 }
 

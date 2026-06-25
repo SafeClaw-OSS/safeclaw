@@ -21,17 +21,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 e.into()
             })
         }
+        // `serve` (and the deprecated `custodian run`) is the foreground daemon
+        // entry — it bootstraps tracing, owns the runtime, and runs forever, so
+        // handle it here, not through the short-lived CLI dispatcher.
+        Command::Serve(serve) => run_daemon(serve).await,
+        Command::Down => cli::custodian::run(CustodianSubcommand::Stop).await.map_err(daemon_err),
+        Command::Restart => cli::custodian::run(CustodianSubcommand::Restart).await.map_err(daemon_err),
+        Command::Logs(args) => cli::custodian::run(CustodianSubcommand::Logs(args)).await.map_err(daemon_err),
+        Command::Pubkey(args) => cli::custodian::run(CustodianSubcommand::Pubkey(args)).await.map_err(daemon_err),
+        Command::Menu(args) => cli::custodian::run(CustodianSubcommand::Menu(args)).await.map_err(daemon_err),
         Command::Custodian(args) => {
-            // `sc c run` is the foreground daemon entry — it bootstraps
-            // tracing, owns the runtime, and runs forever, so handle it
-            // here instead of threading it through the short-lived CLI
-            // dispatcher.
+            // Deprecated namespace, kept hidden for unit/muscle-memory migration.
             match args.sub {
                 CustodianSubcommand::Run(serve) => run_daemon(serve).await,
-                sub => cli::custodian::run(sub).await.map_err(|e| -> Box<dyn std::error::Error> {
-                    eprintln!("safeclaw custodian: {}", e);
-                    e.into()
-                }),
+                sub => cli::custodian::run(sub).await.map_err(daemon_err),
             }
         }
         Command::Up => {
@@ -158,6 +161,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
     }
+}
+
+/// Shared error adapter for the daemon-lifecycle verbs (down/restart/logs/…):
+/// print to stderr and box the error for `main`'s return.
+fn daemon_err(e: String) -> Box<dyn std::error::Error> {
+    eprintln!("safeclaw: {}", e);
+    e.into()
 }
 
 async fn run_daemon(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {

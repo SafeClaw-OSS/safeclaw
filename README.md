@@ -51,9 +51,8 @@ mints a one-time pair token and an install prompt you paste to your agent. The
 flow the agent runs on your machine:
 
 ```bash
-sc login --pair-token spt_…   # pair this machine to your vault (one-time token)
-sc c start                    # start the local daemon (pulls your vault, syncs keys)
-sc unlock                     # passkey ceremony — prints a link you approve in the browser
+sc login --pair-token spt_…   # pair this machine; brings the daemon up + unlocks
+                              #   (prints a passkey-approval link you open in a browser)
 eval "$(sc env)"              # exports SAFECLAW_VAULT_URL (your local daemon)
 ```
 
@@ -71,17 +70,18 @@ your passkey. The agent gets the response, never the key.
 
 ## Daily use
 
-- **Unlock** (`sc unlock`) — tap your passkey to decrypt the vault for this session.
+- **Up** (`sc up`) — get the daemon running and the vault unlocked (one passkey tap). Idempotent.
 - **Work** — your agent calls services through the proxy; you approve each use.
-- **Lock** (`sc lock`) — wipe keys from the daemon's memory (or just stop the daemon).
+- **Lock** (`sc vault lock`) — wipe keys from the daemon's memory (or `sc down` to stop it).
 
 ## CLI
 
 ```bash
-sc login --pair-token <spt>   # pair this machine to your vault
-sc c start | stop | restart   # daemon lifecycle (Linux user-systemd)
-sc up                         # ensure the daemon is running (idempotent)
-sc unlock | sc lock           # decrypt / wipe the vault (passkey-gated)
+sc login --pair-token <spt>   # pair this machine (then brings the daemon up + unlocks)
+sc up                         # get the daemon running + vault unlocked (idempotent)
+sc down | restart | logs      # daemon lifecycle (Linux user-systemd)
+sc serve                      # run the daemon in the foreground (Docker / dev)
+sc vault unlock | lock        # decrypt / wipe the vault (passkey-gated; `sc up` unlocks for you)
 sc env                        # print `export SAFECLAW_VAULT_URL=…` for your shell
 sc agent add | ls | rm        # manage agent keys (one per agent, account-level)
 sc ls | get | set | rm        # native secrets in the active vault
@@ -90,7 +90,7 @@ sc status | sc doctor         # status + reachability checks
 sc upgrade                    # self-update to the latest release
 ```
 
-`sc <cmd> --help` for details. Daemon ops live under `sc custodian` (alias `sc c`).
+`sc <cmd> --help` for details. Daemon lifecycle: `sc up | down | restart | logs | serve`.
 
 ## Configuration
 
@@ -103,7 +103,7 @@ The two env vars an agent uses:
 | `SAFECLAW_API_KEY`   | The agent's bearer token for that vault (`sc agent add` or the dashboard). |
 
 Daemon ports default to `23294` (API) and `23295` (HTTPS proxy). See
-`sc c run --help` for the full set (`SAFECLAW_PORT`, `SAFECLAW_LISTEN`, …).
+`sc serve --help` for the full set (`SAFECLAW_PORT`, `SAFECLAW_LISTEN`, …).
 
 ## How it works
 
