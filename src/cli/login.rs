@@ -194,6 +194,14 @@ pub async fn run(args: LoginArgs) -> Result<(), String> {
         eprintln!("  couldn't auto-start the daemon ({e}); run `sc up` to finish.");
         return Ok(());
     }
+    // Force a restart so a daemon that was ALREADY running (re-pair / post-
+    // upgrade) reloads the just-persisted pairing config. Critical for the
+    // WebAuthn origin/rpId: `from_serve_args` reads `frontend_origin` ONCE at
+    // startup, so a stale daemon would still validate grants against localhost
+    // and reject the web-gestured unlock. Best-effort — a fresh start above
+    // already has the right config, and a non-Linux host has no service to
+    // bounce.
+    let _ = crate::cli::service::run_restart();
     if let Err(e) = crate::cli::up::ensure_unlocked().await {
         eprintln!("  couldn't auto-unlock ({e}); run `sc up` to finish.");
     }
