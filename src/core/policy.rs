@@ -145,6 +145,16 @@ pub struct PolicyDefaults {
 
 impl Default for PolicyDefaults {
     fn default() -> Self {
+        // Design stance: SafeClaw is *first* a credential-separating proxy —
+        // the agent never holds the secret, the daemon injects it — and only
+        // *secondly* an approval gate for high-risk operations. So the
+        // baseline is `allow` (inject + forward, no per-call friction);
+        // tightening to `ask` / `ask-always` / `deny` is opt-in per-service
+        // via `[policy] rules` on genuinely risky paths. This matches how
+        // people actually use API keys: you don't passkey-approve every call,
+        // you approve the dangerous ones. (The llm/channel entries below are
+        // now redundant with the global default but kept explicit so a future
+        // stricter global default doesn't silently re-gate them.)
         let mut type_levels = std::collections::HashMap::new();
         type_levels.insert("llm".into(), ServiceLevels {
             write: Some(AccessLevel::Allow),
@@ -159,8 +169,8 @@ impl Default for PolicyDefaults {
         Self {
             timeout: Some(300),
             levels: Some(ServiceLevels {
-                write: Some(AccessLevel::AskAlways),
-                read: Some(AccessLevel::AskAlways),
+                write: Some(AccessLevel::Allow),
+                read: Some(AccessLevel::Allow),
                 ask_ttl: None,
             }),
             type_levels: Some(type_levels),
@@ -546,9 +556,11 @@ mod tests {
     // ── evaluate_policy ────────────────────────────────────────────────────
 
     #[test]
-    fn default_no_category_is_ask_always() {
+    fn default_no_category_is_allow() {
+        // Baseline with nothing configured is `allow` — SafeClaw is a
+        // credential-separating proxy first; gating is opt-in per risky path.
         let level = evaluate_policy("GET", "/foo", None, None, None, &defaults(), None);
-        assert_eq!(level, AccessLevel::AskAlways);
+        assert_eq!(level, AccessLevel::Allow);
     }
 
     #[test]
@@ -581,9 +593,11 @@ mod tests {
 
     #[test]
     fn method_mismatch_falls_through() {
+        // A DELETE rule does not apply to a GET → fall through to the default
+        // (now `allow`).
         let rules = vec![rule("DELETE /foo", AccessLevel::Deny)];
         let level = evaluate_policy("GET", "/foo", None, Some(&rules), None, &defaults(), None);
-        assert_eq!(level, AccessLevel::AskAlways);
+        assert_eq!(level, AccessLevel::Allow);
     }
 
     #[test]
