@@ -30,11 +30,15 @@ use crate::config::LoginArgs;
 const DEFAULT_DAEMON_PORT: u16 = 23294;
 
 /// The baked cloud endpoint the daemon pairs with. Device→cloud is FIXED (not
-/// user config): a release build targets the production SaaS; a debug build
-/// targets dev. CI can pin it explicitly at build time via
-/// `SAFECLAW_BAKED_CLOUD_URL`. An undocumented `SAFECLAW_CLOUD_URL` runtime env
-/// overrides it for self-host / pointing a release binary at the dev stack —
-/// deliberately NOT a `--flag`. Domain changes ship via `sc upgrade`, not config.
+/// user config): `SAFECLAW_CLOUD_URL` (undocumented runtime override, for
+/// self-host) > `SAFECLAW_BAKED_CLOUD_URL` (CI-pinned at build time) > the
+/// hardcoded default below. Domain changes ship via `sc upgrade`, not config.
+///
+/// PRE-LAUNCH: prod (`https://safeclaw.pro`) is NOT deployed — it's a marketing
+/// page with no pairing API — so EVERY build (debug AND release) pairs with dev
+/// for now. When prod goes live, switch the default to the build-profile split:
+///   `if cfg!(debug_assertions) { dev } else { "https://safeclaw.pro" }`
+/// (and bump + re-release so install.sh serves a prod-pointing binary).
 fn baked_cloud_url() -> String {
     if let Ok(u) = std::env::var("SAFECLAW_CLOUD_URL") {
         if !u.is_empty() {
@@ -46,11 +50,7 @@ fn baked_cloud_url() -> String {
             return u.to_string();
         }
     }
-    if cfg!(debug_assertions) {
-        "https://dev.safeclaw.pro".to_string()
-    } else {
-        "https://safeclaw.pro".to_string()
-    }
+    "https://dev.safeclaw.pro".to_string()
 }
 
 #[derive(Debug, Deserialize)]

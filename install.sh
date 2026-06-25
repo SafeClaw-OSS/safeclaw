@@ -5,10 +5,6 @@
 #   * Only downloads the prebuilt `sc` binary for your platform from the
 #     project's LATEST GitHub Release, verifies its sha256, and installs it
 #     to ~/.local/bin. No sudo. No system changes. No telemetry.
-#   * The binaries are built by this repo's PUBLIC CI from the PUBLIC source
-#     you can read here. Each release also carries a keyless sigstore
-#     build-provenance attestation — verify it independently of the download:
-#         gh attestation verify ~/.local/bin/sc --repo SafeClaw-OSS/safeclaw
 set -eu
 
 REPO="SafeClaw-OSS/safeclaw"
@@ -52,7 +48,6 @@ else
 fi
 
 echo "Installed: ${DEST}/sc"
-echo "Verify provenance (optional):  gh attestation verify ${DEST}/sc --repo ${REPO}"
 case ":${PATH}:" in
   *":${DEST}:"*) ;;
   *) echo "Add it to PATH:  export PATH=\"${DEST}:\$PATH\"" ;;
