@@ -603,7 +603,19 @@ pub struct Config {
 
 impl Config {
     pub fn from_serve_args(args: ServeArgs) -> Self {
-        let origin = args.origin.unwrap_or_else(|| format!("http://localhost:{}", args.port));
+        // WebAuthn origin/rpId. When the daemon is cloud-paired, the vault's
+        // passkeys were enrolled on the cloud FRONTEND (e.g. dev.safeclaw.pro)
+        // and every web approval happens there — so the assertions the daemon
+        // must verify carry the frontend origin/rpId, NOT localhost. Validate
+        // against the frontend origin for a paired daemon; localhost for a
+        // self-host / unpaired one. (The local op-page ceremony — the only
+        // thing that'd want a localhost rpId — isn't used when paired: all
+        // approvals route to the cloud /grant page.) An explicit --origin /
+        // SAFECLAW_ORIGIN always wins.
+        let origin = args.origin.unwrap_or_else(|| {
+            crate::cli::active::frontend_origin()
+                .unwrap_or_else(|| format!("http://localhost:{}", args.port))
+        });
         // rp_id defaults to origin's host: cheaper than depending on a URL
         // crate, and we already require origin to be well-formed for WebAuthn
         // to work. Strips scheme, path, and :port. Falls back to "localhost"

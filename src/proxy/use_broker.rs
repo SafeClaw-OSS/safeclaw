@@ -330,7 +330,11 @@ async fn handle_impl(
             "op_id": op_id,
             "r": r,
             "expires_at": expires_at,
-            "approve_url": format!("/op/{}", op_id),
+            // Human taps their passkey here. Absolute cloud `/grant/{id}` page
+            // when paired (the remote agent's user can't reach this localhost
+            // daemon); relative local op-page for self-host. See active::grant_url.
+            "approve_url": crate::cli::active::grant_url(&op_id),
+            // Agent polls the LOCAL daemon (relative; resolves against VAULT_URL).
             "poll_url": format!("/op/{}", op_id),
         })),
     ))

@@ -22,12 +22,20 @@ pub struct CliConfig {
     /// create`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub known_vaults: Vec<KnownVault>,
-    /// Cloud pro-backend origin for sealed-blob sync (Slice 3). Set by
-    /// `sc login`; the daemon pulls `{cloud_backend}/v/{vault}/blob` on
-    /// start. Distinct from `custodian`, which after login points at the
-    /// LOCAL daemon the agent talks to. See [[project_slice3_design]].
+    /// Cloud pro-backend origin for sealed-blob sync (Slice 3) AND the
+    /// op-relay (web approval). Set by `sc login`; the daemon pulls
+    /// `{cloud_backend}/v/{vault}/blob` and registers pending ops at
+    /// `{cloud_backend}/v/{vault}/op/relay/*`. Distinct from `custodian`,
+    /// which after login points at the LOCAL daemon the agent talks to.
+    /// See [[project_slice3_design]].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cloud_backend: Option<String>,
+    /// Cloud FRONTEND origin (where the human taps their passkey: the web
+    /// approval page at `{frontend_origin}/grant/{op_id}`). Returned by the
+    /// pair-token exchange as `console_url`. Distinct from `cloud_backend`
+    /// (the API host, typically `api.<frontend>`). Set by `sc login`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frontend_origin: Option<String>,
     /// Persistent user preferences. Set via `sc config set <key> <value>`.
     /// Resolution chain for any setting: flag > env > this > built-in
     /// default.
@@ -137,6 +145,7 @@ pub fn put_active_with_cloud(
     custodian: &str,
     vault: &str,
     cloud_backend: &str,
+    frontend_origin: Option<&str>,
 ) -> Result<PathBuf, String> {
     let mut cfg = load().unwrap_or_default();
     let new = KnownVault { custodian: custodian.to_string(), vault: vault.to_string() };
@@ -146,7 +155,58 @@ pub fn put_active_with_cloud(
     cfg.custodian = Some(custodian.to_string());
     cfg.vault = Some(vault.to_string());
     cfg.cloud_backend = Some(cloud_backend.to_string());
+    cfg.frontend_origin = frontend_origin
+        .filter(|s| !s.is_empty())
+        .map(|s| s.trim_end_matches('/').to_string());
     save(&cfg)
+}
+
+/// Resolve the cloud FRONTEND origin (for the human web-approval link
+/// `{origin}/grant/{op_id}`). Prefers the `console_url` persisted at login;
+/// falls back to deriving it from `cloud_backend` by dropping a leading
+/// `api.` label (the deployment convention is `api.<frontend>`). Returns
+/// `None` for a local-only / self-host daemon (no cloud pairing).
+pub fn frontend_origin() -> Option<String> {
+    let cfg = load().ok()?;
+    if let Some(fo) = cfg.frontend_origin.as_deref().filter(|s| !s.is_empty()) {
+        return Some(fo.trim_end_matches('/').to_string());
+    }
+    let backend = cfg.cloud_backend.as_deref().filter(|s| !s.is_empty())?;
+    Some(derive_frontend_from_backend(backend))
+}
+
+/// Human web-approval link for an op. When the daemon is cloud-paired this is
+/// the absolute cloud page `{frontend_origin}/grant/{op_id}` — the only
+/// approval surface a remote user can actually reach (the daemon is
+/// zero-inbound localhost). For a local-only / self-host daemon it's the
+/// relative `/op/{op_id}` page the daemon serves itself. Single source of
+/// truth for both the broker's `approve_url` and the CLI's remote-approve arm.
+pub fn grant_url(op_id: &str) -> String {
+    match frontend_origin() {
+        Some(origin) => format!("{}/grant/{}", origin, op_id),
+        None => format!("/op/{}", op_id),
+    }
+}
+
+/// `https://api.dev.safeclaw.pro` → `https://dev.safeclaw.pro`. Only strips a
+/// leading `api.` on the host; everything else (scheme, port, path) is kept.
+/// A backend host without an `api.` prefix is returned unchanged (self-host
+/// where frontend == backend).
+fn derive_frontend_from_backend(backend: &str) -> String {
+    let trimmed = backend.trim_end_matches('/');
+    let (scheme, rest) = match trimmed.split_once("://") {
+        Some((s, r)) => (s, r),
+        None => return trimmed.to_string(),
+    };
+    let (host_port, path) = match rest.split_once('/') {
+        Some((h, p)) => (h, Some(p)),
+        None => (rest, None),
+    };
+    let host_port = host_port.strip_prefix("api.").unwrap_or(host_port);
+    match path {
+        Some(p) => format!("{}://{}/{}", scheme, host_port, p),
+        None => format!("{}://{}", scheme, host_port),
+    }
 }
 
 /// Split a combined URL like `http://host:port/v/<vid>` into
@@ -209,5 +269,27 @@ mod tests {
     fn split_vault_url_no_vid_returns_none() {
         assert_eq!(split_vault_url("http://localhost:23294"), None);
         assert_eq!(split_vault_url("http://localhost:23294/v/"), None);
+    }
+
+    #[test]
+    fn derive_frontend_strips_api_label() {
+        assert_eq!(
+            derive_frontend_from_backend("https://api.dev.safeclaw.pro"),
+            "https://dev.safeclaw.pro"
+        );
+        assert_eq!(
+            derive_frontend_from_backend("https://api.safeclaw.pro/"),
+            "https://safeclaw.pro"
+        );
+        // No api. prefix (self-host) → unchanged.
+        assert_eq!(
+            derive_frontend_from_backend("http://localhost:8787"),
+            "http://localhost:8787"
+        );
+        // Only the leading label is stripped; a path is preserved.
+        assert_eq!(
+            derive_frontend_from_backend("https://api.example.com/base"),
+            "https://example.com/base"
+        );
     }
 }

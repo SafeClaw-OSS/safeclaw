@@ -26,28 +26,45 @@ pub fn spawn_register_and_poll(
     r: String,
     expires_at: u64,
 ) {
-    let relay_url = match state.config.relay_url.clone() {
-        Some(u) if !u.is_empty() => u,
-        _ => return, // local-only daemon; nothing to do
-    };
-    let admin_key = match state.config.admin_key.clone() {
-        Some(k) if !k.is_empty() => k,
-        _ => {
-            tracing::warn!(op = %op_id, "relay configured but SAFECLAW_ADMIN_KEY unset — skipping relay registration");
-            return;
-        }
+    let (relay_url, auth_token) = match resolve_relay(&state) {
+        Some(v) => v,
+        None => return, // local-only daemon (no cloud pairing); nothing to do
     };
     tokio::spawn(async move {
-        if let Err(e) = run(state, &relay_url, &admin_key, &vault_id, &op_id, &op, &r, expires_at).await {
+        if let Err(e) = run(state, &relay_url, &auth_token, &vault_id, &op_id, &op, &r, expires_at).await {
             tracing::warn!(op = %op_id, "relay register/poll ended: {}", e);
         }
     });
 }
 
+/// Resolve `(relay_base, auth_token)` for op-relay registration.
+///
+/// Primary (the local-daemon pivot): a paired daemon dials its cloud backend
+/// (`cloud_backend`, persisted at `sc login`) and authenticates as itself with
+/// the `sc_device_` device-key — exactly the channel the Slice-3 blob sync
+/// already uses. Backend gate: `resolveAuth` + `isOwnedVaultId`.
+///
+/// Fallback: an operator-supplied `SAFECLAW_RELAY_URL` + `SAFECLAW_ADMIN_KEY`
+/// (self-host / SaaS-custodian deployments that pre-date pairing).
+///
+/// `None` ⇒ no relay ⇒ purely local daemon; the local op-page ceremony stands.
+fn resolve_relay(state: &AppState) -> Option<(String, String)> {
+    if let Ok(cfg) = crate::cli::active::load() {
+        if let Some(base) = cfg.cloud_backend.as_deref().filter(|s| !s.is_empty()) {
+            if let Some(dk) = crate::sync::device_key() {
+                return Some((base.trim_end_matches('/').to_string(), dk));
+            }
+        }
+    }
+    let base = state.config.relay_url.clone().filter(|s| !s.is_empty())?;
+    let key = state.config.admin_key.clone().filter(|s| !s.is_empty())?;
+    Some((base.trim_end_matches('/').to_string(), key))
+}
+
 async fn run(
     state: Arc<AppState>,
     relay_url: &str,
-    admin_key: &str,
+    auth_token: &str,
     vault_id: &str,
     op_id: &str,
     op: &Value,
@@ -72,7 +89,7 @@ async fn run(
     let reg_url = format!("{}/v/{}/op/relay/register", base, vault_id);
     let reg = client
         .post(&reg_url)
-        .bearer_auth(admin_key)
+        .bearer_auth(auth_token)
         .json(&json!({
             "op_id": op_id,
             "daemon_pubkey": daemon_pubkey,
@@ -95,7 +112,7 @@ async fn run(
         if now() > expires_at + 5 {
             return Ok(()); // op expired; stop quietly
         }
-        let resp = match client.get(&poll_url).bearer_auth(admin_key).send().await {
+        let resp = match client.get(&poll_url).bearer_auth(auth_token).send().await {
             Ok(r) => r,
             Err(e) => {
                 tracing::debug!(op = %op_id, "relay poll transient error: {}", e);

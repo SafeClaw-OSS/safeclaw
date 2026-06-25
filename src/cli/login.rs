@@ -59,6 +59,11 @@ struct ExchangeResp {
     vault_id: String,
     device_key: String,
     pro_backend_url: String,
+    /// Cloud FRONTEND origin (web approval page host). Optional for forward-
+    /// compat with older backends; the daemon derives it from
+    /// `pro_backend_url` when absent.
+    #[serde(default)]
+    console_url: Option<String>,
 }
 
 pub async fn run(args: LoginArgs) -> Result<(), String> {
@@ -163,8 +168,13 @@ pub async fn run(args: LoginArgs) -> Result<(), String> {
         .and_then(|s| s.parse::<u16>().ok())
         .unwrap_or(DEFAULT_DAEMON_PORT);
     let local_custodian = format!("http://127.0.0.1:{}", daemon_port);
-    put_active_with_cloud(&local_custodian, &parsed.vault_id, &pro_backend_url)
-        .map_err(|e| format!("save active config: {}", e))?;
+    put_active_with_cloud(
+        &local_custodian,
+        &parsed.vault_id,
+        &pro_backend_url,
+        parsed.console_url.as_deref(),
+    )
+    .map_err(|e| format!("save active config: {}", e))?;
 
     eprintln!(
         "Paired to {} (vault {}); your agent talks to {}.",
