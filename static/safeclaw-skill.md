@@ -24,16 +24,13 @@ if it isn't already running, and never rewrites config. For a SaaS vault
 
 SafeClaw expects two env vars in the user's shell:
 
-- **`$SAFECLAW_VAULT_URL`** — the base URL for the user's vault, e.g.
-  `https://api.safeclaw.pro/v/abc-def` (SaaS) or
-  `http://localhost:23294/v/abc-def` (self-host). Vault id is baked
-  into the URL.
-- **`$SAFECLAW_API_KEY`** — bearer token. Required on SaaS. On a
-  self-hosted daemon, set it to the token printed by `sc install`
-  (provisioned when the daemon is started via `sc custodian start`). The
-  daemon enforces it on the broker plane (`/use`, `/export`); a daemon
-  started without a local bearer leaves it auth-free and the key may be
-  empty.
+- **`$SAFECLAW_VAULT_URL`** — the base URL of the user's SafeClaw daemon,
+  e.g. `http://localhost:23294/v/abc-def` (the local daemon on this
+  machine). If unset, get it from `sc env`. Vault id is baked into the URL.
+- **`$SAFECLAW_API_KEY`** — your bearer token for this vault (always
+  required). The user provides one from the dashboard's "Connect a new
+  agent" flow or `sc agent add`. The daemon enforces it on the broker
+  plane (`/use`, `/export`).
 
 ```
 Authorization: Bearer $SAFECLAW_API_KEY
