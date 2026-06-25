@@ -3,6 +3,9 @@ id = "nodpay"
 name = "NodPay"
 sub = "Web3 agent wallet"
 category = "integration"
+# Hidden for now (per-service call): vault-native web3 signing exists + works,
+# but isn't surfaced in the catalog until we decide how/whether to expose it.
+hidden = true
 help = """
 A shared on-chain wallet is configured and ready. **Skip the NodPay SKILL.md setup section** — \
 keygen and wallet creation are already done by SafeClaw.

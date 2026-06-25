@@ -289,12 +289,16 @@ fn build_service(
 }
 
 /// True iff "no declared vault_field" legitimately means "connected" — i.e.
-/// the service has a usable upstream that requires NO credential. A service
-/// with no upstream at all (internal/infra) or whose upstream declares an auth
-/// block (env / oauth2 / …) does NOT qualify: the former isn't callable, the
-/// latter needs a credential we just couldn't resolve to a field.
+/// the service requires NO credential at all. Two cases qualify: a callable
+/// vault-native service with no upstream (e.g. encrypted files — usable the
+/// moment the vault unlocks) and a public upstream that declares no auth. A
+/// service whose upstream declares an auth block (env / oauth2 / …) does NOT
+/// qualify: it needs a credential we couldn't resolve to a field, so an
+/// unconfigured oauth2 service reads as not-connected (not a false ✅). Only
+/// consulted when `vault_fields` is empty; non-callable markers never reach
+/// here (filtered out of the registry by api-presence).
 fn service_needs_no_auth(def: &ServiceDef) -> bool {
-    !def.upstream.is_empty() && def.upstream.iter().all(|u| u.auth.is_none())
+    def.upstream.iter().all(|u| u.auth.is_none())
 }
 
 /// Replace the port in a URL with `new_port`.
@@ -382,13 +386,14 @@ pub async fn vault_registry(
         .services
         .iter_sorted()
         .into_iter()
-        // Agents can only act on services they can actually call — i.e. ones
-        // with an upstream the daemon can forward to. Drop `hidden` services
-        // AND internal/infra services with no upstream (e.g. openclaw-runtime,
-        // agent-identity): listing them just invited the agent to present
-        // non-callable infra as "connected ✅". Mirrors the web console's
-        // `isProxyService` (upstream-presence) filter.
-        .filter(|(_, def)| !def.service.hidden && !def.upstream.is_empty())
+        // Agents can only act on services they can actually CALL — i.e. ones
+        // with `[[api]]` endpoints (whether backed by an upstream HTTP API or
+        // an internal `target=safeclaw`/`run` step). Drop `hidden` services AND
+        // pure markers with no callable endpoint (e.g. an agent-runtime flag):
+        // listing those just invited the agent to present non-callable infra as
+        // "connected ✅". (api-presence, NOT upstream-presence, so vault-native
+        // services like encrypted files / on-chain signing still count.)
+        .filter(|(_, def)| !def.service.hidden && !def.api.is_empty())
         .map(|(id, def)| {
             let overlay = if locked {
                 None
