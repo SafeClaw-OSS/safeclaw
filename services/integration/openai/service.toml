@@ -17,7 +17,7 @@ url = "https://api.openai.com/v1"
 auth = { env = "openai_api_key", placeholder = "sk-..." }
 
   [upstream.headers]
-  Authorization = "Bearer {{auth_value}}"
+  Authorization = "Bearer {{secret.openai_api_key}}"
 
 [[api]]
 path = "*"

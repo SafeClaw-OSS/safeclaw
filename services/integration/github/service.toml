@@ -10,7 +10,7 @@ url = "https://api.github.com"
 auth = { env = "github_token", placeholder = "github_pat_..." }
 
   [upstream.headers]
-  Authorization = "Bearer {{auth_value}}"
+  Authorization = "Bearer {{secret.github_token}}"
 
 [[api]]
 path = "*"

@@ -12,7 +12,7 @@ auth = { env = "openai_api_key", placeholder = "sk-..." }
 locked = { response = "Please unlock the SafeClaw vault to use this service." }
 
   [upstream.headers]
-  Authorization = "Bearer {{auth_value}}"
+  Authorization = "Bearer {{secret.openai_api_key}}"
 
 [[api]]
 path = "*"

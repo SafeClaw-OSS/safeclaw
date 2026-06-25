@@ -1239,6 +1239,70 @@ kind = "secret"
         assert!(reg.vault_fields("nonexistent").is_empty());
     }
 
+    // ── Compiled-in recipe sanity (v3 token vocabulary) ────────────────────
+
+    /// Every compiled-in service.toml must parse, and every `{{…}}` token in
+    /// its upstream URL / headers / query must be a token the broker engine
+    /// actually understands. Guards against a recipe shipping a typo'd or
+    /// stale (`{{auth_value}}`) placeholder that would only fail at runtime.
+    #[test]
+    fn compiled_recipes_parse_and_use_known_tokens() {
+        // openai-codex is a legacy ChatGPT-oauth proxy carrying `{{auth.*}}`
+        // account-bundle tokens; it is non-functional via the broker path
+        // (no `auth.env`) and intentionally exempt from the v3 vocabulary.
+        const LEGACY_EXEMPT: &[&str] = &["openai-codex"];
+
+        fn token_is_known(tok: &str) -> bool {
+            let tok = tok.trim();
+            if tok == "uuid_v4" || tok == "oauth.access_token" {
+                return true;
+            }
+            matches!(
+                tok.split_once('.').map(|(ns, _)| ns),
+                Some("secret") | Some("secret_b64") | Some("secret_basic")
+            )
+        }
+
+        fn tokens(s: &str) -> Vec<String> {
+            let mut out = Vec::new();
+            let mut rest = s;
+            while let Some(start) = rest.find("{{") {
+                let after = &rest[start + 2..];
+                if let Some(end) = after.find("}}") {
+                    out.push(after[..end].trim().to_string());
+                    rest = &after[end + 2..];
+                } else {
+                    break;
+                }
+            }
+            out
+        }
+
+        for (id, toml_str) in crate::generated_services::compiled_service_tomls() {
+            let def: ServiceDef = toml::from_str(toml_str)
+                .unwrap_or_else(|e| panic!("service '{}' failed to parse: {}", id, e));
+            if LEGACY_EXEMPT.contains(id) {
+                continue;
+            }
+            for u in &def.upstream {
+                let mut surfaces: Vec<&str> = vec![u.url.as_str()];
+                surfaces.extend(u.headers.values().map(|v| v.as_str()));
+                surfaces.extend(u.query.values().map(|v| v.as_str()));
+                for surface in surfaces {
+                    for tok in tokens(surface) {
+                        assert!(
+                            token_is_known(&tok),
+                            "service '{}' uses unknown template token '{{{{{}}}}}' in '{}'",
+                            id,
+                            tok,
+                            surface
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn oauth2_env_field_drives_service_env_key() {
         // OAuth services in the SaaS schema declare their refresh_token

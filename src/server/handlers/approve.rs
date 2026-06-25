@@ -1002,6 +1002,35 @@ pub(crate) fn bootstrap_cache_from_view(
                     );
                 }
             }
+
+            // v3 multi-secret: resolve every `{{secret.NAME}}` the recipe's
+            // upstream templates (URL + headers + query) reference so the
+            // allow fast-path can render multi-secret recipes without a vault
+            // view. Single-secret recipes yield a one-entry map; oauth recipes
+            // reference no `{{secret.*}}` and so populate nothing here (their
+            // token is minted from the refresh_token at forward time).
+            if let Some(svc) = state.services.get(service_id) {
+                if let Some(u) = svc.upstream.first() {
+                    let mut names = crate::server::broker::referenced_secrets(&u.url);
+                    for v in u.headers.values().chain(u.query.values()) {
+                        for n in crate::server::broker::referenced_secrets(v) {
+                            if !names.contains(&n) {
+                                names.push(n);
+                            }
+                        }
+                    }
+                    let mut map: std::collections::HashMap<String, Vec<u8>> =
+                        std::collections::HashMap::new();
+                    for name in names {
+                        if let Some(val) = view.resolve_value_native(&name) {
+                            map.insert(name, val.to_vec());
+                        }
+                    }
+                    if !map.is_empty() {
+                        cache.allow_secrets.insert(service_id.to_string(), map);
+                    }
+                }
+            }
         }
 
         // Policy rule lists are runtime metadata, not raw secrets — load

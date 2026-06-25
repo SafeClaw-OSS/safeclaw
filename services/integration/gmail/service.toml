@@ -7,17 +7,17 @@ category = "integration"
 [[upstream]]
 id = "default"
 url = "https://gmail.googleapis.com"
-auth = {
-  type = "oauth2",
-  provider = "google",
-  env = "gmail_refresh_token",
-  token_url = "https://oauth2.googleapis.com/token",
-  client_id_env = "GOOGLE_CLIENT_ID",
-  client_secret_env = "GOOGLE_CLIENT_SECRET",
-}
 
-  [upstream.headers]
-  Authorization = "Bearer {{auth_value}}"
+[upstream.auth]
+type = "oauth2"
+provider = "google"
+env = "gmail_refresh_token"
+token_url = "https://oauth2.googleapis.com/token"
+client_id_env = "GOOGLE_CLIENT_ID"
+client_secret_env = "GOOGLE_CLIENT_SECRET"
+
+[upstream.headers]
+Authorization = "Bearer {{oauth.access_token}}"
 
 [[api]]
 path = "*"

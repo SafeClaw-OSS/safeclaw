@@ -51,16 +51,21 @@ Additional fields available only in API steps: `returns`, `retry`, `method` (inh
 
 ### Template substitution
 
-String values in `[upstream.headers]`, `[upstream.query]`, `[upstream.path_params]`, the URL itself, and step `run` / `env` fields support `{{...}}` template expressions:
+String values in `[upstream.headers]`, `[upstream.query]`, and the upstream `url` itself support `{{...}}` template expressions. The broker's v3 engine renders these at forward time; **every token is namespaced by its first segment** so a vault item can never collide with a builtin, and an unknown/unresolvable token is a **hard error** (the broker never forwards a literal `{{…}}`).
 
 | Form | Resolves to | Notes |
 |------|-------------|-------|
-| `{{X}}` | item X's string value | item resolved via `store_order`; see STORES_AND_ITEMS.md §5 |
-| `{{b64:X}}` | item X's value, base64-encoded | useful for Basic auth |
+| `{{secret.NAME}}` | vault item NAME's bytes (UTF-8) | the common case — bearer tokens, API keys |
+| `{{secret_b64.NAME}}` | `base64(item NAME)` | |
+| `{{secret_basic.NAME}}` | `base64(item NAME + ':')` | key-as-username HTTP Basic (Stripe shape) |
+| `{{oauth.access_token}}` | the minted OAuth access token | only on oauth2 upstreams (see `[upstream.auth]`) |
 | `{{uuid_v4}}` | a fresh UUID v4 | generated per request |
-| `{{auth.access_token}}` / `{{auth.account_id}}` / ... | OAuth-managed token bundle fields | only when `[upstream.auth] provider = "oauth2"` |
 
-If an item referenced by `{{X}}` is unresolvable (no store provides it), the request errors. Required items are derived by scanning `{{X}}` occurrences across service.toml — see [the `[items]` block](#items--optional-ui-descriptions) for optional descriptions.
+Multiple `{{secret.*}}` references in one recipe are fully supported (e.g. a Twilio-style `account_sid` + `auth_token` pair) — the grant opens the whole vault once and every referenced item is resolved from that one view. The full released set is recorded on the operation's `scope.secrets` and shown at approval / in the audit log.
+
+The set of items a recipe needs is derived by scanning `{{secret.*}}` occurrences across the upstream URL + header + query templates. The **primary** item is declared explicitly via `auth.env` (see below) — it drives `op.act.target` (the credential the grant is bound to) and is what gets bootstrapped into the allow-fast-path cache at unlock.
+
+> **Implemented vocabulary (this build).** The five tokens above are exactly what the broker engine renders today. The bare `{{X}}` / `{{b64:X}}` store-order forms, `[upstream.path_params]` `:placeholder` substitution, and the separate `recipe.toml` / NL-Cooker flow described later in this doc are the **broader roadmap**, not yet wired into the runtime broker. Recipes in-tree use the namespaced `{{secret.*}}` / `{{oauth.access_token}}` forms.
 
 ---
 
@@ -123,10 +128,16 @@ Zero or more upstream blocks. Each defines a remote HTTP endpoint that API steps
 ```toml
 [[upstream]]
 id   = "default"                # Unique identifier, referenced by target = "upstream:<id>". Required.
-url  = "https://api.openai.com" # Base URL. Required. Keep clean — no auth in the URL.
+url  = "https://api.openai.com" # Base URL. Required.
+auth = { env = "openai_api_key" } # Primary-secret declaration (see below).
 ```
 
-`url` may contain `:placeholder` path parameters (Express/OpenAPI style), substituted via `[upstream.path_params]`.
+The `auth` inline table declares the **primary** vault item this upstream needs:
+
+- `auth.env` — the bare vault item name of the primary credential. It drives `op.act.target` (the credential the passkey grant is bound to) and is the item bootstrapped into the allow-fast-path cache at unlock. For oauth2 services it names the long-lived **refresh_token** item.
+- `auth.type` — `"oauth2"` marks a stateful-auth upstream (see `[upstream.auth]` fields below). Omit for plain API-key/bearer services; the credential is injected purely via the `{{secret.*}}` templates in `[upstream.headers]` / `[upstream.query]`.
+
+The **host portion of `url` must be a literal** (no `{{…}}` in scheme+authority) — the broker refuses to forward otherwise (anti-SSRF). A template in the *path* is fine (e.g. Telegram's `/bot{{secret.telegram_bot_token}}`).
 
 #### `[upstream.headers]` — Headers injected on every forward
 
@@ -148,38 +159,45 @@ api_key = "{{some_service_key}}"
 
 Same replace-all-matching semantics as headers. Query keys present here are stripped from the incoming agent request and replaced.
 
-#### `[upstream.path_params]` — URL `:placeholder` substitution
+#### URL path templates
 
-Used with `:name`-style placeholders in `url`:
+The token can live in the URL path itself (Telegram's Bot API: `/bot<TOKEN>/<method>`). Put a `{{secret.*}}` in the path portion of `url` — the host stays literal:
 
 ```toml
 [[upstream]]
-url = "https://api.telegram.org/:bot_token"
-
-[upstream.path_params]
-bot_token = "{{telegram_bot_token}}"
+url  = "https://api.telegram.org/bot{{secret.telegram_bot_token}}"
+auth = { env = "telegram_bot_token" }
 ```
 
-Only declared placeholders are substituted. Undeclared `:placeholder` in URL → error at registration time.
+The agent's relative path (`/sendMessage`, …) is appended after the rendered base URL.
 
-#### `[upstream.auth]` — Stateful auth (reserved)
+> `[upstream.path_params]` `:placeholder` substitution is roadmap, not in the current broker engine — use a path template as above.
 
-Used **only** for auth that cannot be expressed as a simple template (OAuth refresh cycles, SigV4 signing, HMAC). In v3.0, `provider = "oauth2"` is the only supported value:
+#### `[upstream.auth]` — OAuth2 stateful auth
+
+For oauth2 services, the `auth` block (inline or `[upstream.auth]`) carries the refresh-cycle config. The broker mints a fresh access_token from the stored refresh_token at forward time and exposes it as `{{oauth.access_token}}`:
 
 ```toml
+[[upstream]]
+id  = "default"
+url = "https://gmail.googleapis.com"
+
 [upstream.auth]
-provider = "oauth2"             # discriminator; only "oauth2" supported in v3.0
-# Provider-specific tuning fields go here. For oauth2:
-#   style = "json" | "form"     # request encoding when refreshing
-#
-# OAuth tokens are managed by the OAuth subsystem (refresh, rotation).
-# Templates reference fields from the managed token bundle:
-#   {{auth.access_token}}, {{auth.account_id}}, ...
+type              = "oauth2"
+provider          = "google"                         # IdP key (consent-flow side)
+env               = "gmail_refresh_token"            # vault item holding the refresh_token (primary)
+token_url         = "https://oauth2.googleapis.com/token"
+client_id_env     = "GOOGLE_CLIENT_ID"               # daemon-startup env var
+client_secret_env = "GOOGLE_CLIENT_SECRET"           # omit for PKCE clients
+oauth_style       = "form"                           # "form" (default) | "json" (Anthropic)
+
+[upstream.headers]
+Authorization = "Bearer {{oauth.access_token}}"
 ```
 
-Service.toml without `[upstream.auth]` is valid and common (most services use only `[upstream.headers]` / `.query` / `.path_params`).
+Only the immutable refresh_token enters the vault; the short-lived access_token is derived state held in memory (re-minted after lock / restart). Non-oauth services omit the `type`/`token_url`/`client_*` fields and just declare `auth = { env = "..." }`.
 
-Other providers (`aws-sigv4`, `hmac-sha256`, ...) are reserved for the future and not implemented.
+Other stateful providers (`aws-sigv4`, `hmac-sha256`, ...) are reserved for the future and not implemented.
 
 #### `[upstream.locked]` — Response when vault is locked
 
@@ -272,17 +290,20 @@ A markdown string under `[service]`. Serves two purposes:
 
 Template variables resolve via items lookup. Optional.
 
-### `[items]` — Optional UI descriptions
+### `[[vault]]` — Item field declarations (UI / masking)
 
-Pure UI hint for the connect-service flow. Required items are derived from scanning `{{X}}` template occurrences across service.toml (no need to declare them here). This block is **only** for human-readable descriptions used by the connect-service form:
+Declares the vault items a service uses, for the connect-service form and value masking. `kind = "secret"` masks the value in the UI and keeps it out of logs; `kind = "config"` (default) is for non-sensitive values.
 
 ```toml
-[items]
-openai_api_key = "Your OpenAI API key from platform.openai.com"
-github_app_pem = "GitHub App private key (PEM file)"
+[[vault]]
+name        = "openai_api_key"
+kind        = "secret"
+description = "Your OpenAI API key from platform.openai.com"
 ```
 
-Optional. Absent entries fall back to the bare item name in the UI.
+Optional — the required `{{secret.*}}` set is still derived from the template scan, so a service works without `[[vault]]` blocks; they exist for UI labels + masking.
+
+> The flatter `[items]` descriptions-only block is roadmap; the implemented form is `[[vault]]`.
 
 ---
 
@@ -402,11 +423,12 @@ category = "llm"
 group    = "openai"
 
 [[upstream]]
-id  = "default"
-url = "https://api.openai.com"
+id   = "default"
+url  = "https://api.openai.com"
+auth = { env = "openai_api_key" }
 
 [upstream.headers]
-Authorization = "Bearer {{openai_api_key}}"
+Authorization = "Bearer {{secret.openai_api_key}}"
 
 [upstream.locked]
 response = "Please unlock the SafeClaw vault to use this service."
@@ -422,8 +444,10 @@ path = "*"
 read  = "allow"
 write = "allow"
 
-[items]
-openai_api_key = "Your OpenAI API key from platform.openai.com"
+[[vault]]
+name        = "openai_api_key"
+kind        = "secret"
+description = "Your OpenAI API key from platform.openai.com"
 ```
 
 ```toml
@@ -546,11 +570,9 @@ sub      = "Bot API"
 category = "channel"
 
 [[upstream]]
-id  = "default"
-url = "https://api.telegram.org/:bot_token"
-
-[upstream.path_params]
-bot_token = "{{telegram_bot_token}}"
+id   = "default"
+url  = "https://api.telegram.org/bot{{secret.telegram_bot_token}}"
+auth = { env = "telegram_bot_token" }
 
 [[api]]
 path = "*"
@@ -563,8 +585,10 @@ path = "*"
 read  = "allow"
 write = "allow"
 
-[items]
-telegram_bot_token = "Bot token from @BotFather"
+[[vault]]
+name        = "telegram_bot_token"
+kind        = "secret"
+description = "Bot token from @BotFather"
 ```
 
 ```toml
@@ -708,9 +732,9 @@ Agent → GET /proxy/{service_id}/wallets
 - **Step is the universal primitive.** Both recipe setup and runtime APIs are sequences of steps with the same `target` vocabulary.
 - **CLI first.** Recipe steps prefer `openclaw config set` / `openclaw plugins install` over direct file manipulation.
 - **Declarative over imperative.** TOML definitions, not Rust code per service.
-- **Templates over typed auth.** Common auth flows (bearer, header, query, basic, path-token) are expressed as `{{X}}` template substitutions in `[upstream.headers]` / `.query` / `.path_params`. Stateful auth (OAuth refresh, signing) uses `[upstream.auth] provider = "..."`.
+- **Templates over typed auth.** Common auth flows (bearer, header, query, basic, path-token) are expressed as `{{secret.NAME}}` template substitutions in `[upstream.headers]` / `.query` / the URL path. Stateful auth (OAuth refresh, signing) uses `auth = { type = "oauth2", … }` + `{{oauth.access_token}}`.
 - **Replace-all-matching is the auth contract.** For every name set by upstream config, broker strips agent's matching entries first, then writes upstream's value. Agent cannot pollute.
-- **Single items namespace.** Templates reference items by bare name (`{{openai_api_key}}`), resolved across all stores per `store_order`. Service authors don't see store boundaries.
+- **Namespaced item references.** Templates reference vault items by namespaced name (`{{secret.openai_api_key}}`) so an item never collides with a builtin (`{{oauth.*}}`, `{{uuid_v4}}`). The flat bare-`{{X}}` store_order model is the broader roadmap.
 - **Explicit over implicit.** Every `[[api]]` declares its steps and target. No default forwarding; catch-all requires `path = "*"`.
 - **SafeClaw manages openclaw lifecycle.** Recipe steps use `openclaw config set` with `gateway.reload.mode off` to batch config changes, then explicitly `restart = true` at the end.
 
@@ -722,17 +746,17 @@ Pre-launch — no user data migration. In-tree service definitions migrate mecha
 
 ### Field-by-field changes
 
-| v2 | v3 |
+| v2 | v3 (as implemented) |
 |----|-----|
-| `auth = { type = "bearer", env = "X" }` | Removed. Use `[upstream.headers] Authorization = "Bearer {{X}}"` |
-| `auth = { type = "header", header = "X-Key", env = "X" }` | Removed. Use `[upstream.headers] X-Key = "{{X}}"` |
-| `auth = { type = "query", param = "key", env = "X" }` | Removed. Use `[upstream.query] key = "{{X}}"` |
-| `auth = { type = "path", env = "X" }` | Removed. URL with `:placeholder` + `[upstream.path_params]` |
-| `auth = { type = "basic", env = "X" }` | Removed. Use `[upstream.headers] Authorization = "Basic {{b64:X}}"` |
-| `auth = { type = "oauth2" }` | Repurposed as `[upstream.auth] provider = "oauth2"`; templates reference `{{auth.access_token}}` etc. |
-| `[[vault]]` schema declarations | Removed. Required items derived from template scan; optional `[items]` block for descriptions |
-| `{{ env.X }}` / `{{service.vault.X}}` template prefixes | Removed. Just `{{X}}` |
-| `placeholder = "sk-..."` (legacy UI hint via template-parsing) | Removed. Use `[items]` for descriptions |
+| `auth = { type = "bearer", env = "X" }` | `auth = { env = "X" }` + `[upstream.headers] Authorization = "Bearer {{secret.X}}"` |
+| `auth = { type = "header", header = "X-Key", env = "X" }` | `auth = { env = "X" }` + `[upstream.headers] X-Key = "{{secret.X}}"` |
+| `auth = { type = "query", param = "key", env = "X" }` | `auth = { env = "X" }` + `[upstream.query] key = "{{secret.X}}"` |
+| `auth = { type = "path", env = "X" }` | `auth = { env = "X" }` + URL path template `…/bot{{secret.X}}` |
+| `auth = { type = "basic", env = "X" }` | `auth = { env = "X" }` + `[upstream.headers] Authorization = "Basic {{secret_basic.X}}"` |
+| `{{auth_value}}` magic single-secret token | Named `{{secret.X}}` (multi-secret capable) |
+| `auth = { type = "oauth2", … }` | Kept. `auth.env` names the refresh_token; templates reference `{{oauth.access_token}}` |
+| `[[vault]]` schema declarations | Kept — UI labels + `kind = "secret"` masking. Required set still derived from template scan |
+| `{{ env.X }}` / `{{service.vault.X}}` template prefixes | `{{secret.X}}` (namespaced, no `env.` prefix) |
 
 ### Conceptual changes
 

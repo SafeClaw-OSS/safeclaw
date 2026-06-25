@@ -41,7 +41,7 @@ url = "https://inbox.dev.safeclaw.pro"
 auth = { env = "inbox_api_key" }
 
   [upstream.headers]
-  Authorization = "Bearer {{auth_value}}"
+  Authorization = "Bearer {{secret.inbox_api_key}}"
 
 [[api]]
 path = "*"

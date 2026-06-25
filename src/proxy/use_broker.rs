@@ -83,9 +83,25 @@ async fn handle_impl(
         AppError::Conflict(format!("service '{}' has no upstream defined", service))
     })?;
 
+    // Host-literal guard (anti-SSRF). The scheme+authority of an upstream URL
+    // must be a constant: a `{{…}}` there could let a captured request — or a
+    // malicious recipe — repoint the egress host. Templates are allowed only
+    // in the path (e.g. Telegram's `/bot{{secret.telegram_bot_token}}`).
+    if upstream_host_has_template(&upstream.url) {
+        return Err(AppError::Conflict(format!(
+            "service '{}' upstream host is templated — refusing to forward",
+            service
+        )));
+    }
+
     // Resolve the bare item name this upstream needs (v3 store-order
     // resolution happens daemon-side at execute-use time).
     let target = resolve_vault_target(upstream).unwrap_or_else(|| "unknown".to_string());
+
+    // Honesty: the full set of vault items this operation will release, so the
+    // approval UI and audit show every secret — not just the primary `target`.
+    // Scanned from the recipe's URL + header + query templates.
+    let released_secrets = referenced_secret_names(upstream);
 
     // Capture request headers (excluding hop-by-hop) for replay or cache fast-path.
     let mut headers_map = serde_json::Map::new();
@@ -160,16 +176,45 @@ async fn handle_impl(
             .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
             .collect();
         let body_vec = body.to_vec();
-        // OAuth2 services: `cached_secret` is the refresh_token (not the
-        // access_token the upstream wants). Resolve to a fresh
-        // access_token via the provider's /token endpoint, using the
-        // per-vault in-memory oauth_access cache to avoid hammering the
-        // provider on every request. No-op for non-oauth services.
-        let auth_value =
-            crate::server::broker::resolve_auth_value(&state, &vault_id, &service, &cached_secret)
-                .await?;
+        // Build the v3 render inputs. OAuth2 services mint a fresh
+        // access_token from the cached refresh_token (`cached_secret`) and
+        // expose it as `{{oauth.access_token}}`. Non-oauth services render
+        // their `{{secret.NAME}}` placeholders from the bootstrapped
+        // allow-secrets map (full multi-secret set), falling back to a
+        // one-entry map keyed by the primary item for recipes resolved
+        // post-approval (no bootstrap entry).
+        let is_oauth = upstream
+            .auth
+            .as_ref()
+            .and_then(|a| a.auth_type.as_deref())
+            == Some("oauth2");
+        let (secrets_map, oauth_token) = if is_oauth {
+            let access = crate::server::broker::resolve_auth_value(
+                &state,
+                &vault_id,
+                &service,
+                &cached_secret,
+            )
+            .await?;
+            let token = String::from_utf8(access)
+                .map_err(|_| AppError::Internal("oauth access_token not utf8".into()))?;
+            (std::collections::HashMap::new(), Some(token))
+        } else {
+            let map = state
+                .cache_lookup_secrets(&vault_id, &service)
+                .unwrap_or_else(|| {
+                    let mut m = std::collections::HashMap::new();
+                    m.insert(target.clone(), cached_secret.clone());
+                    m
+                });
+            (map, None)
+        };
+        let inputs = crate::server::broker::RenderInputs {
+            secrets: &secrets_map,
+            oauth_access_token: oauth_token.as_deref(),
+        };
         let response = crate::server::broker::forward_to_upstream_with_extras(
-            &auth_value,
+            &inputs,
             &upstream.url,
             method.as_str(),
             &path_str,
@@ -235,6 +280,10 @@ async fn handle_impl(
         "path": format!("/{}", rest),
         "headers": Value::Object(headers_map),
         "body": body_b64,
+        // Full set of vault items this Use will release (for approval UI /
+        // audit). Empty for oauth recipes (they release a minted access token
+        // derived from the `target` refresh_token, not a `{{secret.*}}` item).
+        "secrets": released_secrets,
     });
 
     let now = SystemTime::now()
@@ -340,6 +389,30 @@ async fn handle_impl(
     ))
 }
 
+/// Every distinct vault item the recipe's templates reference, scanned across
+/// the upstream URL + header values + query values. Drives `scope.secrets`
+/// (approval/audit honesty) — the full released set, not just the primary.
+fn referenced_secret_names(upstream: &UpstreamDef) -> Vec<String> {
+    let mut names = crate::server::broker::referenced_secrets(&upstream.url);
+    for v in upstream.headers.values().chain(upstream.query.values()) {
+        for n in crate::server::broker::referenced_secrets(v) {
+            if !names.contains(&n) {
+                names.push(n);
+            }
+        }
+    }
+    names
+}
+
+/// True if the scheme+authority of `url` carries a `{{…}}` template. The
+/// authority is everything between `://` and the first `/` (or end-of-string).
+/// Templates in the *path* are fine; templates in the host are an SSRF risk.
+fn upstream_host_has_template(url: &str) -> bool {
+    let after_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
+    let authority = after_scheme.split('/').next().unwrap_or(after_scheme);
+    authority.contains("{{")
+}
+
 fn resolve_vault_target(upstream: &UpstreamDef) -> Option<String> {
     let auth = upstream.auth.as_ref()?;
     // Preferred path: explicit `auth.env = "key"` in service.toml. In v3
@@ -386,6 +459,62 @@ fn is_hop_by_hop(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_template_guard_allows_path_templates() {
+        // Telegram carries its token in the *path* — host stays literal.
+        assert!(!upstream_host_has_template(
+            "https://api.telegram.org/bot{{secret.telegram_bot_token}}"
+        ));
+        assert!(!upstream_host_has_template("https://api.github.com"));
+        assert!(!upstream_host_has_template(
+            "https://www.googleapis.com/calendar/v3"
+        ));
+    }
+
+    #[test]
+    fn host_template_guard_blocks_authority_templates() {
+        // A template in the scheme+authority could repoint the egress host.
+        assert!(upstream_host_has_template("https://{{secret.x}}.evil.com"));
+        assert!(upstream_host_has_template(
+            "https://api.example.com.{{secret.x}}/v1"
+        ));
+        assert!(upstream_host_has_template("{{secret.host}}/path"));
+    }
+
+    #[test]
+    fn referenced_secret_names_scans_all_template_surfaces() {
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("Authorization".into(), "Bearer {{secret.tok}}".into());
+        let mut query = std::collections::HashMap::new();
+        query.insert("key".into(), "{{secret.qk}}".into());
+        let upstream = UpstreamDef {
+            id: "default".into(),
+            url: "https://api.example.com/bot{{secret.url_tok}}".into(),
+            auth: None,
+            headers,
+            query,
+            locked: None,
+        };
+        let mut names = referenced_secret_names(&upstream);
+        names.sort();
+        assert_eq!(names, vec!["qk", "tok", "url_tok"]);
+    }
+
+    #[test]
+    fn referenced_secret_names_empty_for_oauth_recipe() {
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("Authorization".into(), "Bearer {{oauth.access_token}}".into());
+        let upstream = UpstreamDef {
+            id: "default".into(),
+            url: "https://gmail.googleapis.com".into(),
+            auth: None,
+            headers,
+            query: std::collections::HashMap::new(),
+            locked: None,
+        };
+        assert!(referenced_secret_names(&upstream).is_empty());
+    }
 
     #[test]
     fn extract_env_simple() {

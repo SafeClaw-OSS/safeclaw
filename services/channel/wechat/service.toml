@@ -10,7 +10,7 @@ url = "https://ilinkai.weixin.qq.com"
 auth = { env = "wechat_api_key" }
 
   [upstream.headers]
-  Authorization = "Bearer {{auth_value}}"
+  Authorization = "Bearer {{secret.wechat_api_key}}"
 
 [[api]]
 path = "*"

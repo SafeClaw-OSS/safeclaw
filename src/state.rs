@@ -83,6 +83,14 @@ pub struct SecretsCache {
     /// `ask-always` services are deliberately absent (PROTOCOL.md §6.2
     /// "ask-always 服务: 永不进 cache").
     pub entries: HashMap<String, CacheEntry>,
+    /// service_id → { secret_name → bytes } for every `{{secret.NAME}}` an
+    /// `allow`-level recipe references. Populated at unlock bootstrap so the
+    /// allow fast-path can render *multi-secret* recipes (e.g. a Twilio-style
+    /// `account_sid` + `auth_token` pair) without a vault view — which only
+    /// exists behind a fresh grant. Single-secret recipes get a one-entry
+    /// map; oauth recipes get no entry (their token comes from `oauth_access`).
+    /// Lives the whole unlocked session (allow semantics); wiped on lock.
+    pub allow_secrets: HashMap<String, HashMap<String, Vec<u8>>>,
     /// service_id → effective ordered rule list. Built at unlock time by
     /// merging the service's built-in rules with the user's sparse
     /// `aux.service_state.<svc>.rule_overrides`. The /use handler walks
@@ -317,6 +325,25 @@ impl AppState {
             }
         }
         Some(entry.value.clone())
+    }
+
+    /// Look up the full `{ secret_name → bytes }` map an allow-level recipe
+    /// needs to render its templates. Returns `None` if the vault is locked
+    /// or the service wasn't bootstrapped with a named-secret set (e.g. an
+    /// oauth recipe, or one resolved post-approval). The allow fast-path
+    /// falls back to a single-secret map keyed by the primary in that case.
+    pub fn cache_lookup_secrets(
+        &self,
+        vault_id: &str,
+        service_id: &str,
+    ) -> Option<HashMap<String, Vec<u8>>> {
+        let states = self.vault_states.lock().unwrap();
+        match states.get(vault_id) {
+            Some(VaultState::Unlocked { cache, .. }) => {
+                cache.allow_secrets.get(service_id).cloned()
+            }
+            _ => None,
+        }
     }
 
     /// Insert (or overwrite) a cached auth value with optional TTL.

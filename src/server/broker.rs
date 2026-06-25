@@ -15,6 +15,7 @@
 //! github/openai/anthropic). Phase 3b.M follow-up will add basic / custom-
 //! header / query-param variants by reading the service registry.
 
+use std::collections::HashMap;
 use std::str::FromStr;
 
 use base64::{engine::general_purpose::STANDARD, Engine};
@@ -80,6 +81,11 @@ pub async fn execute_use_forward(
     let opened = open::<StdPrimitives>(&redeemed, vault)
         .map_err(|e| AppError::Unauthorized(format!("vault open: {}", e)))?;
     let view = VaultPlaintextView::from_protected_state(&opened.m)?;
+
+    // Primary secret (op.act.target). For oauth2 services this is the
+    // long-lived refresh_token; for API-key services it's the bearer/key
+    // itself. Returned to the caller so the secrets_cache can fast-path
+    // subsequent requests within the policy TTL.
     let s_o = view
         .resolve_value_async(&op.act.target)
         .await?
@@ -113,28 +119,67 @@ pub async fn execute_use_forward(
         })
         .unwrap_or_default();
 
-    // Look up the upstream config (headers/query templates) from the
-    // service registry — these are the "modern" injection shape. Falls
-    // back to bearer-only injection inside `forward_to_upstream_with_extras`
-    // when the maps are empty.
+    // Look up the upstream config (header / query templates) from the
+    // service registry. These carry the v3 `{{secret.NAME}}` /
+    // `{{oauth.access_token}}` placeholders the engine renders.
     let service_id = scope.get("service").and_then(|v| v.as_str()).unwrap_or("");
     let upstream_id = scope
         .get("upstream_id")
         .and_then(|v| v.as_str())
         .unwrap_or("default");
-    let (tpl_headers, tpl_query) = services
-        .get(service_id)
+    let svc_def = services.get(service_id);
+    let (tpl_headers, tpl_query) = svc_def
         .and_then(|svc| svc.upstream.iter().find(|u| u.id == upstream_id))
         .map(|u| (u.headers.clone(), u.query.clone()))
         .unwrap_or_default();
 
-    // OAuth2 services: exchange the refresh_token (`s_o`) for a fresh
-    // access_token via the provider's /token endpoint before forwarding.
-    // No-op for non-oauth services (returns s_o unchanged).
-    let auth_value = resolve_auth_value(state, vault_id, service_id, &s_o).await?;
+    // v3 multi-secret resolution: scan every template the recipe will
+    // render (the upstream URL plus header / query values) for
+    // `{{secret*.NAME}}` references, and resolve each NAME from the same
+    // open vault view. Multi-secret is just "more than one name from one
+    // open view" — no cryptographic change. An unresolvable reference is a
+    // hard error (we never forward a literal `{{…}}`).
+    let mut referenced = referenced_secrets(upstream_url);
+    for v in tpl_headers.values().chain(tpl_query.values()) {
+        for n in referenced_secrets(v) {
+            if !referenced.contains(&n) {
+                referenced.push(n);
+            }
+        }
+    }
+    let mut secrets: HashMap<String, Vec<u8>> = HashMap::new();
+    for name in &referenced {
+        let bytes = view
+            .resolve_value_async(name)
+            .await?
+            .ok_or_else(|| AppError::BadRequest(format!("secret '{}' not found in vault", name)))?;
+        secrets.insert(name.clone(), bytes);
+    }
 
+    // OAuth2 services: mint a fresh access_token from the refresh_token
+    // (`s_o`) so templates can reference `{{oauth.access_token}}`. No-op
+    // (and no minting cost) for non-oauth services.
+    let is_oauth = svc_def
+        .and_then(|s| s.upstream.first())
+        .and_then(|u| u.auth.as_ref())
+        .and_then(|a| a.auth_type.as_deref())
+        == Some("oauth2");
+    let oauth_token = if is_oauth {
+        let access = resolve_auth_value(state, vault_id, service_id, &s_o).await?;
+        Some(
+            String::from_utf8(access)
+                .map_err(|_| AppError::Internal("oauth access_token not utf8".into()))?,
+        )
+    } else {
+        None
+    };
+
+    let inputs = RenderInputs {
+        secrets: &secrets,
+        oauth_access_token: oauth_token.as_deref(),
+    };
     let response = forward_to_upstream_with_extras(
-        &auth_value,
+        &inputs,
         upstream_url,
         method_str,
         path,
@@ -145,47 +190,10 @@ pub async fn execute_use_forward(
         if tpl_query.is_empty() { None } else { Some(&tpl_query) },
     )
     .await?;
-    // Return the raw `s_o` (refresh_token for oauth2 services, the
-    // bearer for others) so the caller can cache it per policy TTL —
-    // the access_token is cached separately in `state.oauth_access`.
+    // Return the primary `s_o` (refresh_token for oauth2 services, the
+    // bearer/key for others) so the caller can cache it per policy TTL —
+    // the minted access_token is cached separately in `state.oauth_access`.
     Ok(UseForwardOutcome { response, s_o })
-}
-
-/// Render an upstream-config template string by substituting the supported
-/// `{{…}}` placeholders with values derived from `s_o`. Supported tokens:
-///   - `{{auth_value}}`           — `s_o` as UTF-8
-///   - `{{auth_value_b64}}`       — `base64(s_o)`
-///   - `{{auth_value_basic}}`     — `base64(s_o + ':')`, the Stripe basic-auth shape
-/// Unknown tokens pass through unchanged so future extensions stay safe.
-fn render_upstream_template(tpl: &str, s_o: &[u8]) -> String {
-    let mut out = String::with_capacity(tpl.len());
-    let mut i = 0;
-    let bytes = tpl.as_bytes();
-    while i < bytes.len() {
-        if i + 2 <= bytes.len() && &bytes[i..i + 2] == b"{{" {
-            if let Some(end) = tpl[i + 2..].find("}}") {
-                let key = tpl[i + 2..i + 2 + end].trim();
-                let replacement: Option<String> = match key {
-                    "auth_value" => String::from_utf8(s_o.to_vec()).ok(),
-                    "auth_value_b64" => Some(STANDARD.encode(s_o)),
-                    "auth_value_basic" => {
-                        let mut buf = s_o.to_vec();
-                        buf.push(b':');
-                        Some(STANDARD.encode(&buf))
-                    }
-                    _ => None,
-                };
-                if let Some(v) = replacement {
-                    out.push_str(&v);
-                    i += 2 + end + 2;
-                    continue;
-                }
-            }
-        }
-        out.push(bytes[i] as char);
-        i += 1;
-    }
-    out
 }
 
 // ── v3 multi-secret template engine ──────────────────────────────────────────
@@ -241,7 +249,6 @@ pub fn referenced_secrets(tpl: &str) -> Vec<String> {
 ///   `{{oauth.access_token}}` the minted OAuth access token
 ///   `{{uuid_v4}}`            a fresh UUID v4
 /// Unknown/unterminated/unresolvable token → hard error.
-#[allow(dead_code)] // wired into execute_use_forward in the next slice
 fn render_template(tpl: &str, inputs: &RenderInputs) -> Result<String> {
     let mut out = String::with_capacity(tpl.len());
     let bytes = tpl.as_bytes();
@@ -262,7 +269,6 @@ fn render_template(tpl: &str, inputs: &RenderInputs) -> Result<String> {
     Ok(out)
 }
 
-#[allow(dead_code)]
 fn resolve_token(key: &str, inputs: &RenderInputs) -> Result<String> {
     if key == "uuid_v4" {
         return Ok(uuid::Uuid::new_v4().to_string());
@@ -482,39 +488,17 @@ pub async fn resolve_auth_value(
     Ok(access_token.into_bytes())
 }
 
-/// Forward an agent request to an upstream service with `s_o` injected
-/// according to the service's auth shape. Default (no template config)
-/// stays at the historical bearer-only injection; `extra_headers` and
-/// `extra_query` come from `UpstreamDef.headers` / `UpstreamDef.query` —
-/// the escape hatch for non-bearer shapes (Stripe basic, AWS signed
-/// query, GitHub `token`, etc.). Either path runs after the request-level
-/// hop-by-hop scrub.
-pub async fn forward_to_upstream<'a>(
-    s_o: &[u8],
-    upstream_url: &str,
-    method_str: &str,
-    path: &str,
-    headers_iter: impl IntoIterator<Item = (&'a str, &'a str)>,
-    body_bytes: Vec<u8>,
-    target_for_log: Option<&str>,
-) -> Result<BrokerResponse> {
-    forward_to_upstream_with_extras(
-        s_o,
-        upstream_url,
-        method_str,
-        path,
-        headers_iter,
-        body_bytes,
-        target_for_log,
-        None,
-        None,
-    )
-    .await
-}
-
+/// Forward an agent request to an upstream service, injecting the resolved
+/// secrets according to the recipe's `[upstream.headers]` / `[upstream.query]`
+/// templates (and any `{{secret*.NAME}}` / `{{oauth.access_token}}` in the
+/// upstream URL itself). Every placeholder is rendered by the v3 engine
+/// ([`render_template`]); an unresolvable reference is a hard error rather
+/// than a silent literal `{{…}}` leak. Recipes with no auth template inject
+/// no credential — there is no implicit bearer fallback. Runs after the
+/// request-level hop-by-hop scrub.
 #[allow(clippy::too_many_arguments)]
 pub async fn forward_to_upstream_with_extras<'a>(
-    s_o: &[u8],
+    inputs: &RenderInputs<'_>,
     upstream_url: &str,
     method_str: &str,
     path: &str,
@@ -529,18 +513,16 @@ pub async fn forward_to_upstream_with_extras<'a>(
     // caller is responsible for not double-supplying.
     let path_with_query = match extra_query.filter(|m| !m.is_empty()) {
         Some(q) => {
-            let extra = q
-                .iter()
-                .map(|(k, v)| {
-                    let rendered = render_upstream_template(v, s_o);
-                    format!(
-                        "{}={}",
-                        urlencoding::encode(k),
-                        urlencoding::encode(&rendered)
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("&");
+            let mut parts = Vec::with_capacity(q.len());
+            for (k, v) in q {
+                let rendered = render_template(v, inputs)?;
+                parts.push(format!(
+                    "{}={}",
+                    urlencoding::encode(k),
+                    urlencoding::encode(&rendered)
+                ));
+            }
+            let extra = parts.join("&");
             if path.contains('?') {
                 format!("{}&{}", path, extra)
             } else {
@@ -550,10 +532,10 @@ pub async fn forward_to_upstream_with_extras<'a>(
         _ => path.to_string(),
     };
     // URL itself may carry a template — e.g. Telegram's Bot API puts the
-    // token in the URL path: `https://api.telegram.org/bot{{auth_value}}`.
-    // Render with the same engine that handles headers/query templates so
-    // the user/service author has one consistent placeholder vocabulary.
-    let url_rendered = render_upstream_template(upstream_url, s_o);
+    // token in the URL path: `https://api.telegram.org/bot{{secret.telegram_bot_token}}`.
+    // Render with the same engine that handles header/query templates so
+    // the recipe author has one consistent placeholder vocabulary.
+    let url_rendered = render_template(upstream_url, inputs)?;
     let full_url = format!(
         "{}{}",
         url_rendered.trim_end_matches('/'),
@@ -591,26 +573,20 @@ pub async fn forward_to_upstream_with_extras<'a>(
         }
     }
 
-    // Auth injection. New shape: per-upstream header templates win when
-    // present (escape hatch for non-bearer schemes). Legacy fallback:
-    // hardcoded `Authorization: Bearer s_o`.
+    // Auth injection. The recipe's `[upstream.headers]` templates carry the
+    // credential placeholders; each value is rendered by the v3 engine. No
+    // implicit bearer fallback — a recipe with no auth header (e.g. Telegram,
+    // which carries its token in the URL, or Google AI, which uses a query
+    // param) simply injects no header here.
     if let Some(tpl_headers) = extra_headers.filter(|m| !m.is_empty()) {
         for (k, v) in tpl_headers {
-            let rendered = render_upstream_template(v, s_o);
+            let rendered = render_template(v, inputs)?;
             if let (Ok(hn), Ok(hv)) = (
                 reqwest::header::HeaderName::from_str(k),
                 reqwest::header::HeaderValue::from_str(&rendered),
             ) {
                 headers.insert(hn, hv);
             }
-        }
-    } else {
-        let bearer_token = String::from_utf8(s_o.to_vec())
-            .map_err(|_| AppError::Internal("s_o not utf8".into()))?;
-        if let Ok(hv) =
-            reqwest::header::HeaderValue::from_str(&format!("Bearer {}", bearer_token))
-        {
-            headers.insert(reqwest::header::AUTHORIZATION, hv);
         }
     }
 
