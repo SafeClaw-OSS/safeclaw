@@ -65,28 +65,24 @@ Authorization: Bearer $SAFECLAW_API_KEY
 
 Use `connected: true` services freely.
 
-If a service is `connected: false` (or absent from `services`), the user
-needs to add its credential. **Hand them a link — don't run commands and
-don't walk them through provider menus.** Use `console_url` from the registry
-(it points at this exact vault) and send them to its Connections tab:
+If a service is `connected: false` (or absent), the user must add its
+credential. **Hand them a link — don't run commands or walk them through
+provider menus.** `console_url` points at this vault; send them to its
+Connections tab:
 
 ```
-To connect <service name>, open:  <console_url>#connections
-— find <service name>, paste your credential, and approve with your passkey.
+Connect <service name>: open <console_url>#connections, paste your
+credential there, approve with your passkey.
 ```
 
-You never see or handle the credential; the user pastes it straight into the
-web console. After they confirm, re-GET the registry — the service will show
-`connected: true`. (If they ask where to GET the credential, you can briefly
-point at the provider's side — e.g. a GitHub token at github.com → Settings →
-Developer settings — but keep the SafeClaw step to just: open the link, paste,
-approve. Don't reproduce the provider's whole UI unless asked.)
+You never see or handle it. After they confirm, re-GET the registry for
+`connected: true`. (Where to *get* the credential is the provider's side —
+mention it only if asked.)
 
-Headless / power-user alternative (only when the user is on the daemon's own
-machine and prefers the terminal): `sc set <vault_fields[n].name> <value>`
-seals it via a passkey gesture. Prefer the link for everyone else.
+Headless fallback, user at the daemon's own terminal: `sc set
+<vault_fields[n].name> <value>` (passkey-gated).
 
-Never offer to enter credentials yourself. Never echo a credential back.
+Never enter credentials yourself. Never echo one back.
 
 If `vault_locked: true`, run `sc up` — it brings SafeClaw up and unlocks
 the vault, printing an approval link; surface that link to the user (they
