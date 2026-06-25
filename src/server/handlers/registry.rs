@@ -386,14 +386,13 @@ pub async fn vault_registry(
         .services
         .iter_sorted()
         .into_iter()
-        // Agents can only act on services they can actually CALL — i.e. ones
-        // with `[[api]]` endpoints (whether backed by an upstream HTTP API or
-        // an internal `target=safeclaw`/`run` step). Drop `hidden` services AND
-        // pure markers with no callable endpoint (e.g. an agent-runtime flag):
-        // listing those just invited the agent to present non-callable infra as
-        // "connected ✅". (api-presence, NOT upstream-presence, so vault-native
-        // services like encrypted files / on-chain signing still count.)
-        .filter(|(_, def)| !def.service.hidden && !def.api.is_empty())
+        // Non-hidden catalog services. The catalog is curated to hold only
+        // real, callable services — the agent-product markers that had no
+        // endpoints were REMOVED from it (archived on the
+        // `agent-product-services` branch), not papered over with a runtime
+        // filter — and deliberate per-service hiding uses `hidden = true`
+        // (e.g. files, nodpay). So `!hidden` is the whole rule.
+        .filter(|(_, def)| !def.service.hidden)
         .map(|(id, def)| {
             let overlay = if locked {
                 None
