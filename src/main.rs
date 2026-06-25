@@ -172,7 +172,7 @@ async fn run_daemon(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     // serving, so a freshly-paired device serves a vault sealed in the
     // browser. Best-effort — a local-only or offline daemon serves whatever
     // vault.dat is already on disk.
-    safeclaw::cloud_sync::pull_on_start(&config.state_dir).await;
+    safeclaw::sync::pull_on_start(&config.state_dir).await;
 
     let state = Arc::new(AppState::new(config.clone()));
 
@@ -180,7 +180,7 @@ async fn run_daemon(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     // long-polls the cloud for blob-version bumps and refreshes the unlocked
     // vault in place (no re-unlock). Best-effort — NOT in the serve select!,
     // so a sync-loop exit never takes the daemon down.
-    tokio::spawn(safeclaw::cloud_sync::watch_loop(state.clone()));
+    tokio::spawn(safeclaw::sync::watch_loop(state.clone()));
 
     let listen_ip: std::net::IpAddr = config.listen.parse().unwrap_or_else(|_| "127.0.0.1".parse().unwrap());
 
