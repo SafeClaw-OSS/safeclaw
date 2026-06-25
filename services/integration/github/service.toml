@@ -7,7 +7,7 @@ category = "integration"
 [[upstream]]
 id = "default"
 url = "https://api.github.com"
-auth = { env = "github_api_key", placeholder = "ghp_..." }
+auth = { env = "github_token", placeholder = "github_pat_..." }
 
   [upstream.headers]
   Authorization = "Bearer {{auth_value}}"
