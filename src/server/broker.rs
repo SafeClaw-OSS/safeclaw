@@ -188,6 +188,188 @@ fn render_upstream_template(tpl: &str, s_o: &[u8]) -> String {
     out
 }
 
+// ── v3 multi-secret template engine ──────────────────────────────────────────
+//
+// The grant's wrapping key opens the WHOLE vault into a plaintext view, so a
+// single approved operation can resolve any number of named items. Multi-secret
+// is therefore just "resolve more than one name from the same open view" — no
+// cryptographic change. Every token is namespaced by its first segment so a
+// vault item can never be confused with a builtin, and an unknown/unresolvable
+// token is a HARD ERROR (we never forward a literal `{{…}}` as if it were auth).
+
+/// Inputs for [`render_template`]: every secret the recipe references, plus an
+/// optional minted OAuth access token (for `[upstream.auth]` upstreams).
+pub struct RenderInputs<'a> {
+    /// vault-item-name -> resolved secret bytes
+    pub secrets: &'a std::collections::HashMap<String, Vec<u8>>,
+    pub oauth_access_token: Option<&'a str>,
+}
+
+/// Names of vault items a template references via `{{secret*.NAME}}`. Used to
+/// know which items to resolve from the open view, and to derive the set of
+/// secrets a recipe requires (connect flow / required-items).
+pub fn referenced_secrets(tpl: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let bytes = tpl.as_bytes();
+    let mut i = 0;
+    while i + 2 <= bytes.len() {
+        if &bytes[i..i + 2] == b"{{" {
+            if let Some(end) = tpl[i + 2..].find("}}") {
+                let key = tpl[i + 2..i + 2 + end].trim();
+                for prefix in ["secret.", "secret_b64.", "secret_basic."] {
+                    if let Some(name) = key.strip_prefix(prefix) {
+                        let name = name.trim();
+                        if !name.is_empty() && !names.iter().any(|n: &String| n == name) {
+                            names.push(name.to_string());
+                        }
+                    }
+                }
+                i += 2 + end + 2;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    names
+}
+
+/// Substitute `{{…}}` tokens in an upstream template (header / query /
+/// path-param value):
+///   `{{secret.NAME}}`        raw bytes of vault item NAME (utf-8)
+///   `{{secret_b64.NAME}}`    base64(item NAME)
+///   `{{secret_basic.NAME}}`  base64(item NAME + ':')  — key-as-username basic
+///   `{{oauth.access_token}}` the minted OAuth access token
+///   `{{uuid_v4}}`            a fresh UUID v4
+/// Unknown/unterminated/unresolvable token → hard error.
+#[allow(dead_code)] // wired into execute_use_forward in the next slice
+fn render_template(tpl: &str, inputs: &RenderInputs) -> Result<String> {
+    let mut out = String::with_capacity(tpl.len());
+    let bytes = tpl.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if i + 2 <= bytes.len() && &bytes[i..i + 2] == b"{{" {
+            let end = tpl[i + 2..]
+                .find("}}")
+                .ok_or_else(|| AppError::BadRequest("unterminated '{{' in upstream template".into()))?;
+            let key = tpl[i + 2..i + 2 + end].trim();
+            out.push_str(&resolve_token(key, inputs)?);
+            i += 2 + end + 2;
+            continue;
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    Ok(out)
+}
+
+#[allow(dead_code)]
+fn resolve_token(key: &str, inputs: &RenderInputs) -> Result<String> {
+    if key == "uuid_v4" {
+        return Ok(uuid::Uuid::new_v4().to_string());
+    }
+    let undeclared =
+        |n: &str| AppError::BadRequest(format!("template references undeclared secret '{}'", n));
+    let (ns, arg) = key
+        .split_once('.')
+        .ok_or_else(|| AppError::BadRequest(format!("unknown template token '{{{{{}}}}}'", key)))?;
+    let arg = arg.trim();
+    match ns {
+        "secret" => {
+            let b = inputs.secrets.get(arg).ok_or_else(|| undeclared(arg))?;
+            String::from_utf8(b.clone())
+                .map_err(|_| AppError::BadRequest(format!("secret '{}' is not valid UTF-8", arg)))
+        }
+        "secret_b64" => {
+            let b = inputs.secrets.get(arg).ok_or_else(|| undeclared(arg))?;
+            Ok(STANDARD.encode(b))
+        }
+        "secret_basic" => {
+            let b = inputs.secrets.get(arg).ok_or_else(|| undeclared(arg))?;
+            let mut buf = b.clone();
+            buf.push(b':');
+            Ok(STANDARD.encode(&buf))
+        }
+        "oauth" if arg == "access_token" => inputs
+            .oauth_access_token
+            .map(|t| t.to_string())
+            .ok_or_else(|| AppError::BadRequest("{{oauth.access_token}} on a non-oauth upstream".into())),
+        _ => Err(AppError::BadRequest(format!("unknown template token '{{{{{}}}}}'", key))),
+    }
+}
+
+#[cfg(test)]
+mod render_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn secrets(pairs: &[(&str, &str)]) -> HashMap<String, Vec<u8>> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.as_bytes().to_vec())).collect()
+    }
+
+    #[test]
+    fn single_secret_substitutes() {
+        let s = secrets(&[("github_token", "ghp_xyz")]);
+        let inp = RenderInputs { secrets: &s, oauth_access_token: None };
+        assert_eq!(render_template("Bearer {{secret.github_token}}", &inp).unwrap(), "Bearer ghp_xyz");
+    }
+
+    #[test]
+    fn multi_secret_substitutes_both() {
+        let s = secrets(&[("twilio_sid", "AC123"), ("twilio_token", "tok")]);
+        let inp = RenderInputs { secrets: &s, oauth_access_token: None };
+        assert_eq!(
+            render_template("{{secret.twilio_sid}}:{{secret.twilio_token}}", &inp).unwrap(),
+            "AC123:tok"
+        );
+    }
+
+    #[test]
+    fn b64_and_basic_variants() {
+        let s = secrets(&[("k", "user")]);
+        let inp = RenderInputs { secrets: &s, oauth_access_token: None };
+        assert_eq!(render_template("{{secret_b64.k}}", &inp).unwrap(), STANDARD.encode(b"user"));
+        assert_eq!(render_template("{{secret_basic.k}}", &inp).unwrap(), STANDARD.encode(b"user:"));
+    }
+
+    #[test]
+    fn oauth_access_token_substitutes() {
+        let s = secrets(&[]);
+        let inp = RenderInputs { secrets: &s, oauth_access_token: Some("at_live") };
+        assert_eq!(render_template("Bearer {{oauth.access_token}}", &inp).unwrap(), "Bearer at_live");
+    }
+
+    #[test]
+    fn unknown_token_hard_fails() {
+        let s = secrets(&[]);
+        let inp = RenderInputs { secrets: &s, oauth_access_token: None };
+        assert!(render_template("{{bogus}}", &inp).is_err());
+        assert!(render_template("{{secret.missing}}", &inp).is_err());
+    }
+
+    #[test]
+    fn missing_secret_never_leaks_literal() {
+        let s = secrets(&[]);
+        let inp = RenderInputs { secrets: &s, oauth_access_token: None };
+        // A typo'd reference must error, never forward the literal `{{…}}`.
+        assert!(render_template("Bearer {{secret.typo}}", &inp).is_err());
+    }
+
+    #[test]
+    fn static_text_unchanged() {
+        let s = secrets(&[]);
+        let inp = RenderInputs { secrets: &s, oauth_access_token: None };
+        assert_eq!(render_template("application/json", &inp).unwrap(), "application/json");
+    }
+
+    #[test]
+    fn referenced_secrets_dedups_and_extracts() {
+        let names = referenced_secrets(
+            "{{secret.a}} {{secret_basic.b}} {{oauth.access_token}} {{secret.a}} {{uuid_v4}}",
+        );
+        assert_eq!(names, vec!["a".to_string(), "b".to_string()]);
+    }
+}
+
 /// Resolve the auth value for a service before forwarding. For most
 /// services this is a no-op (returns the input bytes — the bearer
 /// stored in `cache.entries`). For oauth2 services, the `raw` bytes
