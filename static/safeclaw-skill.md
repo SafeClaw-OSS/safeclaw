@@ -52,7 +52,7 @@ Authorization: Bearer $SAFECLAW_API_KEY
 {
   "version": 2,
   "vault_locked": false,
-  "console_url": "https://.../vault",
+  "console_url": "https://.../vault/<your-vault-id>",  // deep link to this vault
   "vault_entries": ["openai_api_key", "gmail_refresh_token"],  // null when locked
   "services": [
     { "id": "openai", "name": "OpenAI", "category": "llm",
@@ -66,21 +66,25 @@ Authorization: Bearer $SAFECLAW_API_KEY
 Use `connected: true` services freely.
 
 If a service is `connected: false` (or absent from `services`), the user
-needs to add credentials. Default to the CLI path:
-
-Look up the service's `vault_fields` array in the registry response —
-each entry's `name` is the key to set:
+needs to add its credential. **Hand them a link — don't run commands and
+don't walk them through provider menus.** Use `console_url` from the registry
+(it points at this exact vault) and send them to its Connections tab:
 
 ```
-sc set <vault_fields[n].name> <value>
-# example: sc set github_api_key ghp_xxxxx
+To connect <service name>, open:  <console_url>#connections
+— find <service name>, paste your credential, and approve with your passkey.
 ```
 
-This opens a browser passkey gesture to seal the value into the vault.
-After it succeeds, the service will show `connected: true`.
+You never see or handle the credential; the user pastes it straight into the
+web console. After they confirm, re-GET the registry — the service will show
+`connected: true`. (If they ask where to GET the credential, you can briefly
+point at the provider's side — e.g. a GitHub token at github.com → Settings →
+Developer settings — but keep the SafeClaw step to just: open the link, paste,
+approve. Don't reproduce the provider's whole UI unless asked.)
 
-If `console_url` in the registry response points to `safeclaw.pro`, the
-user can alternatively add credentials via the web console there.
+Headless / power-user alternative (only when the user is on the daemon's own
+machine and prefers the terminal): `sc set <vault_fields[n].name> <value>`
+seals it via a passkey gesture. Prefer the link for everyone else.
 
 Never offer to enter credentials yourself. Never echo a credential back.
 

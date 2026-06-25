@@ -333,8 +333,15 @@ fn console_url(state: &AppState, vault_id: &str) -> String {
     // /try page, not the full /vault console. Pointing the agent at
     // /vault for a demo user shows them a "create a vault" CTA instead
     // of the unlock surface they actually need.
-    let path = if vault_id.starts_with("demo-") { "/try" } else { "/vault" };
-    format!("{}{}", state.config.origin.trim_end_matches('/'), path)
+    // Deep-link to THIS vault (not the bare /vault picker) so the agent can
+    // hand the user a link that lands straight on their vault — append
+    // `#connections` for the add-credential flow. Demo vaults live on /try.
+    let origin = state.config.origin.trim_end_matches('/');
+    if vault_id.starts_with("demo-") {
+        format!("{}/try", origin)
+    } else {
+        format!("{}/vault/{}", origin, vault_id)
+    }
 }
 
 /// `GET /menu` — static service catalog.
