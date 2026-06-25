@@ -31,11 +31,11 @@ pub enum Command {
     /// commands. Short alias: `sc c`.
     #[command(alias = "c")]
     Custodian(CustodianArgs),
-    /// Ensure this host's daemon is running (idempotent): start the
-    /// user-level systemd unit only if it isn't already active; never
-    /// rewrites the unit. The `docker compose up` / `tailscale up` idiom —
-    /// the skill preamble's lazy-start target. (`sc custodian start` is the
-    /// one-time install/provision; `sc up` is the light everyday one.)
+    /// Ensure an ALREADY-INSTALLED daemon is running (idempotent): starts the
+    /// user-level systemd unit only if it isn't active; never installs or
+    /// rewrites the unit. First-time setup is `sc custodian start` (installs
+    /// the unit); `sc up` is the light everyday ensure-running afterwards (the
+    /// `docker compose up` / `tailscale up` idiom; the skill's lazy-start).
     Up,
     /// Bring the vault from Locked → Unlocked. Opens a browser to the
     /// custodian's `/cli/auth` page; the page runs the passkey ceremony
@@ -80,10 +80,11 @@ pub enum Command {
     /// verify its sha256, and replace the running binary in place. No-op when
     /// already current. This is also how the baked cloud domain changes ship.
     Upgrade(UpgradeArgs),
-    /// Exchange a one-shot pair-token (minted by safeclaw.pro's "Connect a
-    /// new agent" modal) for this host's persistent cloud-side daemon
-    /// credential. Writes `~/.safeclaw/device-key` (0600) and sets
-    /// the active vault. Run once per host; re-run to repair or re-pair.
+    /// Pair this host to your vault: exchange a one-shot pair-token (from
+    /// safeclaw.pro's "Connect a new agent" modal) for this host's persistent
+    /// cloud-side daemon credential. Writes `~/.safeclaw/device-key` (0600) and
+    /// sets the active vault. Run once per host (re-run to repair/re-pair).
+    /// Next, start the daemon with `sc custodian start`.
     Login(LoginArgs),
     /// Manage external stores connected to the active vault. Today: list.
     /// Connect / disconnect are deferred until the Write op lands in the
@@ -437,10 +438,12 @@ pub enum CustodianSubcommand {
     /// Docker / dev / when you write your own systemd unit. Config via
     /// SAFECLAW_* env vars and flags. Ctrl-C to stop.
     Run(ServeArgs),
-    /// Install + enable a user-level systemd unit (Linux) so the daemon
-    /// survives logout/reboot, then start it. SAFECLAW_* env vars from
-    /// the calling shell are embedded into the unit, and a local bearer
-    /// token is provisioned. Re-run to refresh config.
+    /// First-time daemon setup — run this ONCE, after `sc login`. Installs +
+    /// enables a user-level systemd unit (Linux) so the daemon survives
+    /// logout/reboot, then starts it; the daemon then pulls your vault + agent
+    /// keys from the cloud. SAFECLAW_* env vars from the calling shell are
+    /// embedded into the unit. Re-run to refresh config. (For everyday
+    /// "is it running?" use the lighter `sc up`.)
     Start(StartArgs),
     /// Deprecated back-compat alias for top-level `sc up` (renamed
     /// 2026-06-24). Hidden from help; kept so already-deployed skill text
