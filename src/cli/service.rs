@@ -111,11 +111,10 @@ pub async fn run_start_systemd(force: bool) -> Result<(), String> {
     if !env_lines.is_empty() {
         eprintln!("  env:      {} SAFECLAW_* var(s) embedded", env_lines.len());
     }
-    eprintln!("  api-key:  broker plane now requires the key (~/.safeclaw/api-key); agents get it via `sc install`");
+    eprintln!("  broker:   requires an agent key (synced from your account); mint one with `sc agent add` or the dashboard's \"Connect a new agent\"");
     eprintln!();
-    eprintln!("  next: `safeclaw vault create` to make your first vault");
-    eprintln!("        `safeclaw install` to print the agent setup prompt (incl. the api-key)");
-    eprintln!("        `safeclaw c logs -f` to tail, `safeclaw c stop` to stop, `safeclaw c restart` to reload");
+    eprintln!("  next: `sc login --pair-token <token>` to connect this daemon to your vault (token from the dashboard)");
+    eprintln!("        `sc c logs -f` to tail, `sc c stop` to stop, `sc c restart` to reload");
     Ok(())
 }
 
