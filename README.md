@@ -391,4 +391,10 @@ src/
 
 ## License
 
-Apache 2.0 — see [LICENSE](LICENSE)
+[Functional Source License 1.1 (Apache-2.0 future)](LICENSE) — **FSL-1.1-ALv2**.
+
+You can download, run, study, modify, and self-host SafeClaw freely for any
+purpose **except a Competing Use** — i.e. offering it (or a derivative) to
+others as a commercial product or service that substitutes for SafeClaw. Each
+release converts to Apache-2.0 two years after it ships. SafeClaw is the open
+**client** of a cloud-connected product; the cloud service stays proprietary.

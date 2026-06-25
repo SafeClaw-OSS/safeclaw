@@ -3,8 +3,12 @@ name = "safeclaw"
 version = "0.0.1"
 edition = "2021"
 description = "SafeClaw daemon — multi-vault passkey-gated credential vault for AI agents"
-license = "Apache-2.0"
-repository = "https://github.com/xhyumiracle/safeclaw"
+# Functional Source License 1.1 (Apache-2.0 future). FSL is not an SPDX id,
+# so we point at the LICENSE file. Use is unrestricted EXCEPT "Competing Use"
+# (offering a substitute commercial product/service); converts to Apache-2.0
+# two years after each release. See LICENSE.
+license-file = "LICENSE"
+repository = "https://github.com/SafeClaw-OSS/safeclaw"
 
 # Two bin targets share the same main.rs:
 #   `safeclaw` — canonical name (discoverable via brew/cargo install)
