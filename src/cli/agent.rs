@@ -54,7 +54,6 @@ struct ListResp {
 struct ListKey {
     id: String,
     prefix: String,
-    tier: String,
     label: Option<String>,
     last_used_at: Option<String>,
 }
@@ -62,7 +61,7 @@ struct ListKey {
 async fn add(args: AgentAddArgs) -> Result<(), String> {
     let (cloud, key) = cloud_and_key()?;
     let resp = client()?
-        .post(format!("{}/api/vault/api-keys", cloud))
+        .post(format!("{}/api/vault/agents", cloud))
         .bearer_auth(&key)
         .json(&serde_json::json!({ "label": args.name, "tier": "agent" }))
         .send()
@@ -84,8 +83,10 @@ async fn add(args: AgentAddArgs) -> Result<(), String> {
 }
 
 async fn fetch_agents(cloud: &str, key: &str) -> Result<Vec<ListKey>, String> {
+    // `/api/vault/agents` is already tier-scoped server-side (agent|demo);
+    // device-keys live under `/api/vault/devices`.
     let resp = client()?
-        .get(format!("{}/api/vault/api-keys", cloud))
+        .get(format!("{}/api/vault/agents", cloud))
         .bearer_auth(key)
         .send()
         .await
@@ -94,8 +95,7 @@ async fn fetch_agents(cloud: &str, key: &str) -> Result<Vec<ListKey>, String> {
         return Err(format!("list agents failed: HTTP {}", resp.status()));
     }
     let r: ListResp = resp.json().await.map_err(|e| format!("parse response: {}", e))?;
-    // Only broker-authorizing tiers are "agents"; device-keys are excluded.
-    Ok(r.keys.into_iter().filter(|k| k.tier == "agent" || k.tier == "demo").collect())
+    Ok(r.keys)
 }
 
 async fn ls() -> Result<(), String> {
@@ -135,7 +135,7 @@ async fn rm(args: AgentRmArgs) -> Result<(), String> {
         }
     };
     let resp = client()?
-        .delete(format!("{}/api/vault/api-keys/{}", cloud, id))
+        .delete(format!("{}/api/vault/agents/{}", cloud, id))
         .bearer_auth(&key)
         .send()
         .await

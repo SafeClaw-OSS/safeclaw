@@ -22,8 +22,8 @@ pub async fn run(sub: CustodianSubcommand) -> Result<(), String> {
     }
 }
 
-async fn status(args: CommonArgs) -> Result<(), String> {
-    let custodian = resolve_custodian(args.custodian.as_deref())?;
+async fn status(_args: CommonArgs) -> Result<(), String> {
+    let custodian = resolve_custodian()?;
     let url = format!("{}/health", custodian.trim_end_matches('/'));
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
@@ -46,8 +46,8 @@ async fn status(args: CommonArgs) -> Result<(), String> {
     Ok(())
 }
 
-async fn fetch_print(args: CommonArgs, path: &str) -> Result<(), String> {
-    let custodian = resolve_custodian(args.custodian.as_deref())?;
+async fn fetch_print(_args: CommonArgs, path: &str) -> Result<(), String> {
+    let custodian = resolve_custodian()?;
     let url = format!("{}{}", custodian.trim_end_matches('/'), path);
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(8))
@@ -64,12 +64,10 @@ async fn fetch_print(args: CommonArgs, path: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn resolve_custodian(custodian_override: Option<&str>) -> Result<String, String> {
-    if let Some(c) = custodian_override {
-        return Ok(c.to_string());
-    }
-    // Reuse vault resolver; ignore vault, take custodian half.
-    if let Ok((c, _)) = resolve_active(None, None) {
+fn resolve_custodian() -> Result<String, String> {
+    // Reuse the vault resolver; ignore vault, take the daemon-URL half. The
+    // daemon URL comes from `$SAFECLAW_VAULT_URL` / active config (no flag).
+    if let Ok((c, _)) = resolve_active(None) {
         return Ok(c);
     }
     Ok("http://localhost:23294".to_string())

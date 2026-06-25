@@ -232,7 +232,7 @@ fn refresh_after_pull(state: &Arc<AppState>, vault: &str) {
     }
 }
 
-/// Fetch the account-level agent-key hash-set (`/api/vault/agent-keys`,
+/// Fetch the account-level agent-key hash-set (`/api/vault/agents/hashes`,
 /// device-key authed). Returns None on any failure (caller keeps the prior
 /// set). The hashes are sha256(token) hex — the broker validates a presented
 /// key by re-hashing and checking membership; the cloud never sees plaintext.
@@ -241,7 +241,7 @@ async fn fetch_agent_key_hashes(
     cloud: &str,
     device_key: &str,
 ) -> Option<std::collections::HashSet<String>> {
-    let url = format!("{}/api/vault/agent-keys", cloud.trim_end_matches('/'));
+    let url = format!("{}/api/vault/agents/hashes", cloud.trim_end_matches('/'));
     let resp = client.get(&url).bearer_auth(device_key).send().await.ok()?;
     if !resp.status().is_success() {
         return None;

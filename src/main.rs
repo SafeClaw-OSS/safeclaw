@@ -117,9 +117,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 e.into()
             })
         }
-        Command::Install(args) => {
-            cli::install::run(args).map_err(|e| -> Box<dyn std::error::Error> {
-                eprintln!("safeclaw install: {}", e);
+        Command::Upgrade(args) => {
+            cli::upgrade::run(args).await.map_err(|e| -> Box<dyn std::error::Error> {
+                eprintln!("safeclaw upgrade: {}", e);
                 e.into()
             })
         }

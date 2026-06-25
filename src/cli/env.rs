@@ -6,12 +6,15 @@
 //! eval "$(safeclaw env)"
 //! ```
 //!
-//! Two env vars are emitted, matching the deployment-agnostic skill
-//! template (see [[architecture-final-2026-05-27]] §"Skill template"):
+//! One env var is emitted — the active vault URL:
 //!
 //! - `SAFECLAW_VAULT_URL` — `${custodian_root}/v/${vid}` from active config
-//! - `SAFECLAW_API_KEY`   — pass-through from caller's env (so re-eval
-//!                          doesn't clobber a manually-set key)
+//!
+//! The agent's broker bearer (`SAFECLAW_API_KEY`) is NOT emitted here: agent ≡
+//! api-key, account-level, so each agent gets its own key from `sc agent add`
+//! (shown once) and the user sets it in that agent's environment. `sc env` only
+//! resolves which vault to point at. See
+//! [[project_vault_agent_architecture_2026_06_25]].
 //!
 //! Falls back to printing comments + a clear hint if no config has been
 //! written yet — `eval "$(safeclaw env)"` then no-ops safely instead of
@@ -37,11 +40,6 @@ pub fn run() -> Result<(), String> {
     };
     let vault_url = format!("{}/v/{}", custodian.trim_end_matches('/'), vault);
     println!("export SAFECLAW_VAULT_URL={}", shell_quote(&vault_url));
-    // SaaS: pass through a manually-set $SAFECLAW_API_KEY. Self-hosted
-    // localhost: emit the provisioned api-key (~/.safeclaw/api-key) so a
-    // locally-launched agent satisfies the daemon's broker gate.
-    let api_key = crate::cli::active::resolve_api_key(&custodian);
-    println!("export SAFECLAW_API_KEY={}", shell_quote(&api_key));
     Ok(())
 }
 

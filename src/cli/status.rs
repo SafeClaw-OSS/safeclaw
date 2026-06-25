@@ -90,9 +90,10 @@ pub async fn fetch_status(custodian: &str, vault: &str) -> VaultStatus {
 
 pub async fn run(args: StatusArgs) -> Result<(), String> {
     let cfg = load_config()?;
-    let custodian = args.custodian.as_deref()
-        .map(String::from)
-        .or_else(|| cfg.custodian.clone());
+    // Daemon URL comes from the active vault (`$SAFECLAW_VAULT_URL` is folded
+    // into config by `sc vault use`); no per-command override flag.
+    let _ = &args;
+    let custodian = cfg.custodian.clone();
     let vault = cfg.vault.clone();
 
     match (custodian.as_deref(), vault.as_deref()) {

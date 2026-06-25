@@ -17,7 +17,7 @@ use crate::crypto::kdf::WRAP_VERSION;
 const DS_SEAL: &[u8] = b"sudp/v1/seal";
 
 pub async fn run_set(args: SetArgs) -> Result<(), String> {
-    let (custodian, vault) = resolve_active(args.custodian.as_deref(), args.vault.as_deref())?;
+    let (custodian, vault) = resolve_active(args.vault.as_deref())?;
     let key = args.key.clone();
     let value = args.value.clone();
     eprintln!("safeclaw set {} — two passkey gestures (unlock + write)", key);
@@ -34,7 +34,7 @@ pub async fn run_set(args: SetArgs) -> Result<(), String> {
 }
 
 pub async fn run_rm(args: RmArgs) -> Result<(), String> {
-    let (custodian, vault) = resolve_active(args.custodian.as_deref(), args.vault.as_deref())?;
+    let (custodian, vault) = resolve_active(args.vault.as_deref())?;
     let key = args.key.clone();
     eprintln!("safeclaw rm {} — two passkey gestures (unlock + write)", key);
 
@@ -185,7 +185,7 @@ fn decode_prf_salt(s: &str) -> Result<Vec<u8>, String> {
 }
 
 pub async fn run_get(args: GetArgs) -> Result<(), String> {
-    let (custodian, vault) = resolve_active(args.custodian.as_deref(), args.vault.as_deref())?;
+    let (custodian, vault) = resolve_active(args.vault.as_deref())?;
     let key = args.key.trim().to_string();
     if key.is_empty() {
         return Err("key cannot be empty".into());

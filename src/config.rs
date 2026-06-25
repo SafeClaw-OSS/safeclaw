@@ -72,14 +72,14 @@ pub enum Command {
     /// to be set on the CLI side AND match the daemon's `SAFECLAW_ADMIN_KEY`
     /// env. In SaaS deployments only the SafeClaw team holds this key.
     Admin(AdminArgs),
-    /// Print the active vault as shell `export` lines so agents see
-    /// `SAFECLAW_VAULT_URL` + `SAFECLAW_API_KEY` from the env. Run as
-    /// `eval "$(safeclaw env)"`.
+    /// Print the active vault as a shell `export` line so agents see
+    /// `SAFECLAW_VAULT_URL` from the env. Run as `eval "$(safeclaw env)"`.
+    /// The per-agent broker key (`SAFECLAW_API_KEY`) comes from `sc agent add`.
     Env,
-    /// Print the agent install prompt for THIS already-paired host. Use
-    /// after `sc login` has run. First-time setup goes through the
-    /// safeclaw.pro "Connect a new agent" modal instead — see `--first-time`.
-    Install(InstallArgs),
+    /// Self-update: download the latest release binary for this platform,
+    /// verify its sha256, and replace the running binary in place. No-op when
+    /// already current. This is also how the baked cloud domain changes ship.
+    Upgrade(UpgradeArgs),
     /// Exchange a one-shot pair-token (minted by safeclaw.pro's "Connect a
     /// new agent" modal) for this host's persistent cloud-side daemon
     /// credential. Writes `~/.safeclaw/device-key` (0600) and sets
@@ -185,8 +185,6 @@ pub enum PasskeySubcommand {
 pub struct PasskeyRemoveArgs {
     /// base64url credential id (as shown in `passkeys ls`).
     pub credential_id: String,
-    #[arg(long, env = "SAFECLAW_CUSTODIAN_URL")]
-    pub custodian: Option<String>,
     #[arg(long)]
     pub vault: Option<String>,
 }
@@ -195,8 +193,6 @@ pub struct PasskeyRemoveArgs {
 pub struct PasskeyRenameArgs {
     pub credential_id: String,
     pub new_name: String,
-    #[arg(long, env = "SAFECLAW_CUSTODIAN_URL")]
-    pub custodian: Option<String>,
     #[arg(long)]
     pub vault: Option<String>,
 }
@@ -231,8 +227,6 @@ pub struct AdminAuditLsArgs {
     /// Vault id to inspect. Defaults to the active vault from config.
     #[arg(long)]
     pub vault: Option<String>,
-    #[arg(long, env = "SAFECLAW_CUSTODIAN_URL")]
-    pub custodian: Option<String>,
     /// Max rows to print. Daemon caps at 200 — bigger values silently
     /// truncate.
     #[arg(long, default_value = "50")]
@@ -308,8 +302,6 @@ pub struct VaultDeleteArgs {
     /// no implicit "current vault" for destructive ops.
     pub vault: String,
 
-    #[arg(long, env = "SAFECLAW_CUSTODIAN_URL")]
-    pub custodian: Option<String>,
 
     /// Bypass the interactive confirmation. Without this flag the command
     /// refuses to proceed (since deletion is irreversible).
@@ -427,16 +419,11 @@ pub struct ServeArgs {
     pub relay_url: Option<String>,
 }
 
+/// `sc status` takes no flags — the daemon URL comes from the active vault
+/// (`$SAFECLAW_VAULT_URL` or `~/.safeclaw/config.toml`), defaulting to the
+/// localhost daemon. Point at another device's daemon via `$SAFECLAW_VAULT_URL`.
 #[derive(Debug, Args)]
-pub struct StatusArgs {
-    /// Custodian URL. Falls back to the active config's custodian (then
-    /// to the root parsed out of `$SAFECLAW_VAULT_URL`), then to
-    /// `http://127.0.0.1:23294` if nothing is configured. Override with
-    /// `--custodian https://custodian.safeclaw.pro` for the Pro
-    /// custodian or any self-hosted URL.
-    #[arg(long, env = "SAFECLAW_CUSTODIAN_URL")]
-    pub custodian: Option<String>,
-}
+pub struct StatusArgs {}
 
 #[derive(Debug, Args)]
 pub struct CustodianArgs {
@@ -467,8 +454,8 @@ pub enum CustodianSubcommand {
     Restart,
     /// Tail the local daemon's logs via journalctl.
     Logs(LogsArgs),
-    /// Custodian health + version + vault count (works on local or
-    /// remote — pass --custodian for remote).
+    /// Custodian health + version + vault count. Targets the local daemon by
+    /// default; set `$SAFECLAW_VAULT_URL` to point at a remote one.
     Status(CommonArgs),
     /// HPKE outer-envelope public key.
     Pubkey(CommonArgs),
@@ -487,11 +474,6 @@ pub struct StartArgs {
 
 #[derive(Debug, Args)]
 pub struct UnlockArgs {
-    /// Override the custodian URL (otherwise loaded from
-    /// `$SAFECLAW_VAULT_URL` or `~/.safeclaw/config.toml`).
-    #[arg(long, env = "SAFECLAW_CUSTODIAN_URL")]
-    pub custodian: Option<String>,
-
     /// Override the vault id (otherwise loaded from
     /// `$SAFECLAW_VAULT_URL` or `~/.safeclaw/config.toml`).
     #[arg(long)]
@@ -510,22 +492,13 @@ pub struct UnlockArgs {
     pub timeout: u64,
 }
 
-/// Args for `sc install`.
+/// Args for `sc upgrade`.
 #[derive(Debug, Args)]
-pub struct InstallArgs {
-    /// Agent variant — controls the `?agent=` query param on the skill URL
-    /// and thus the frontmatter in the downloaded skill file.
-    /// Supported: claude (YAML name+desc), cursor (YAML desc+globs),
-    /// codex (no frontmatter, filename AGENTS.md), openclaw, other/omitted
-    /// (no frontmatter, filename safeclaw.md).
+pub struct UpgradeArgs {
+    /// Re-download and reinstall even when the running binary already matches
+    /// the latest release (otherwise `sc upgrade` is a no-op when current).
     #[arg(long)]
-    pub agent: Option<String>,
-    /// First-time install on a brand-new host? Print a redirect to the
-    /// safeclaw.pro "Connect a new agent" modal instead of the per-agent
-    /// install prompt. `sc install` proper is for adding another agent on
-    /// a host that has already run `sc login --pair-token`.
-    #[arg(long)]
-    pub first_time: bool,
+    pub force: bool,
 }
 
 /// Args for `sc login`.
@@ -539,10 +512,6 @@ pub struct LoginArgs {
     /// Defaults to `$HOSTNAME` / `$COMPUTERNAME`, else `agent-device`.
     #[arg(long)]
     pub device_name: Option<String>,
-    /// Override the cloud custodian URL. Defaults to
-    /// `$SAFECLAW_CUSTODIAN_URL`, else `https://dev.safeclaw.pro`.
-    #[arg(long, env = "SAFECLAW_CUSTODIAN_URL")]
-    pub custodian: Option<String>,
     /// Test-only: allow a plaintext `http://` custodian URL. Without this,
     /// `sc login` refuses non-HTTPS URLs to keep the pair-token off the wire
     /// in cleartext (a malicious skill prompt could otherwise smuggle in an
@@ -553,13 +522,11 @@ pub struct LoginArgs {
     pub insecure_http: bool,
 }
 
-/// Reusable arg set for read-only short-lived commands that only need to
-/// pick a daemon URL + vault id (from the active config or explicit
-/// flags). No subcommand-specific options.
+/// Reusable arg set for read-only short-lived commands. The daemon URL comes
+/// from `$SAFECLAW_VAULT_URL` / the active config; `--vault` only reselects the
+/// vault id on that daemon.
 #[derive(Debug, Args)]
 pub struct CommonArgs {
-    #[arg(long, env = "SAFECLAW_CUSTODIAN_URL")]
-    pub custodian: Option<String>,
     #[arg(long)]
     pub vault: Option<String>,
 }
@@ -569,8 +536,6 @@ pub struct GetArgs {
     /// Native-secrets key name to reveal (`safeclaw read OPENAI_API_KEY`).
     pub key: String,
 
-    #[arg(long, env = "SAFECLAW_CUSTODIAN_URL")]
-    pub custodian: Option<String>,
     #[arg(long)]
     pub vault: Option<String>,
 
@@ -591,8 +556,6 @@ pub struct SetArgs {
     pub key: String,
     /// The secret value. Shell quoting recommended for special chars.
     pub value: String,
-    #[arg(long, env = "SAFECLAW_CUSTODIAN_URL")]
-    pub custodian: Option<String>,
     #[arg(long)]
     pub vault: Option<String>,
     #[arg(long)]
@@ -610,8 +573,6 @@ pub struct SetArgs {
 pub struct RmArgs {
     /// Native-secrets key name to remove from the vault.
     pub key: String,
-    #[arg(long, env = "SAFECLAW_CUSTODIAN_URL")]
-    pub custodian: Option<String>,
     #[arg(long)]
     pub vault: Option<String>,
     #[arg(long)]
@@ -634,11 +595,6 @@ pub struct Config {
     pub origin: String,
     pub rp_id: String,
     pub admin_key: Option<String>,
-    /// Agent→daemon API key gating the broker plane (Token 1). Populated by
-    /// the daemon at startup from the file `~/.safeclaw/api-key` (NOT from an
-    /// env var — `SAFECLAW_API_KEY` is the agent-facing name and must not be
-    /// adopted here; see `crate::api_key`). `None` = auth-free self-host.
-    pub api_key: Option<String>,
     pub relay_url: Option<String>,
 }
 
@@ -666,12 +622,6 @@ impl Config {
             origin,
             rp_id,
             admin_key: args.admin_key,
-            // Token 1 (agent→daemon api-key) is read from the FILE
-            // `~/.safeclaw/api-key`, never from an env var. This avoids
-            // colliding with the agent-facing `SAFECLAW_API_KEY` (which may
-            // carry a stray/foreign value in the operator's shell). `None`
-            // when unprovisioned → auth-free self-host broker plane.
-            api_key: crate::api_key::load_key(),
             relay_url: args.relay_url,
         }
     }

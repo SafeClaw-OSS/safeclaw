@@ -29,9 +29,29 @@ use crate::config::LoginArgs;
 /// Default daemon admin port (matches `ServeArgs` `SAFECLAW_PORT`).
 const DEFAULT_DAEMON_PORT: u16 = 23294;
 
-/// Default cloud custodian when `--custodian` and `$SAFECLAW_CUSTODIAN_URL`
-/// are both unset. Matches V1 plan §13.3 (dev SaaS).
-const DEFAULT_CUSTODIAN: &str = "https://dev.safeclaw.pro";
+/// The baked cloud endpoint the daemon pairs with. Device→cloud is FIXED (not
+/// user config): a release build targets the production SaaS; a debug build
+/// targets dev. CI can pin it explicitly at build time via
+/// `SAFECLAW_BAKED_CLOUD_URL`. An undocumented `SAFECLAW_CLOUD_URL` runtime env
+/// overrides it for self-host / pointing a release binary at the dev stack —
+/// deliberately NOT a `--flag`. Domain changes ship via `sc upgrade`, not config.
+fn baked_cloud_url() -> String {
+    if let Ok(u) = std::env::var("SAFECLAW_CLOUD_URL") {
+        if !u.is_empty() {
+            return u;
+        }
+    }
+    if let Some(u) = option_env!("SAFECLAW_BAKED_CLOUD_URL") {
+        if !u.is_empty() {
+            return u.to_string();
+        }
+    }
+    if cfg!(debug_assertions) {
+        "https://dev.safeclaw.pro".to_string()
+    } else {
+        "https://safeclaw.pro".to_string()
+    }
+}
 
 #[derive(Debug, Deserialize)]
 struct ExchangeResp {
@@ -42,12 +62,8 @@ struct ExchangeResp {
 }
 
 pub async fn run(args: LoginArgs) -> Result<(), String> {
-    // ── Resolve custodian: flag > env > default ──────────────────────────
-    let custodian = args
-        .custodian
-        .clone()
-        .or_else(|| std::env::var("SAFECLAW_CUSTODIAN_URL").ok().filter(|s| !s.is_empty()))
-        .unwrap_or_else(|| DEFAULT_CUSTODIAN.to_string());
+    // ── Cloud endpoint is baked (device→cloud is fixed .pro) ─────────────
+    let custodian = baked_cloud_url();
     let custodian = custodian.trim_end_matches('/').to_string();
 
     // ── Enforce HTTPS for the custodian URL ──────────────────────────────
@@ -203,8 +219,8 @@ fn write_device_key(path: &std::path::Path, device_key: &str) -> Result<(), Stri
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        // Best-effort chmod; matches `api_key::ensure_key` policy —
-        // we don't fail the login if perms can't be tightened on exotic FS.
+        // Best-effort chmod — we don't fail the login if perms can't be
+        // tightened on exotic filesystems.
         let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
     }
     Ok(())

@@ -65,10 +65,7 @@ pub async fn run(args: CommonArgs) -> Result<(), String> {
     }
 
     // Active config resolution
-    let resolved = resolve_active(
-        args.custodian.as_deref(),
-        args.vault.as_deref(),
-    );
+    let resolved = resolve_active(args.vault.as_deref());
     let (custodian, vault) = match resolved {
         Ok(pair) => {
             report.push(

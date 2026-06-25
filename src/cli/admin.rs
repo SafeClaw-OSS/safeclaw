@@ -49,7 +49,7 @@ struct ApprovalRow {
 
 async fn audit_ls(args: AdminAuditLsArgs) -> Result<(), String> {
     let key = admin_key()?;
-    let (custodian, vault) = resolve_active(args.custodian.as_deref(), args.vault.as_deref())?;
+    let (custodian, vault) = resolve_active(args.vault.as_deref())?;
     let limit = args.limit.min(200);
     let url = format!(
         "{}/v/{}/approvals?limit={}",

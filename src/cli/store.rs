@@ -14,10 +14,7 @@ use crate::config::StoreSubcommand;
 pub async fn run(sub: StoreSubcommand) -> Result<(), String> {
     match sub {
         StoreSubcommand::Ls(args) => {
-            let (custodian, vault) = resolve_active(
-                args.custodian.as_deref(),
-                args.vault.as_deref(),
-            )?;
+            let (custodian, vault) = resolve_active(args.vault.as_deref())?;
             ls(&custodian, &vault).await
         }
     }

@@ -164,53 +164,13 @@ pub fn join_vault_url(custodian: &str, vault: &str) -> String {
     format!("{}/v/{}", custodian.trim_end_matches('/'), vault)
 }
 
-/// True if the custodian URL points at this machine (self-hosted daemon).
-pub fn is_local_custodian(custodian: &str) -> bool {
-    let host = custodian
-        .trim_end_matches('/')
-        .strip_prefix("https://")
-        .or_else(|| custodian.strip_prefix("http://"))
-        .unwrap_or(custodian)
-        .split('/')
-        .next()
-        .unwrap_or("")
-        .split(':')
-        .next()
-        .unwrap_or("");
-    matches!(host, "localhost" | "127.0.0.1" | "[::1]" | "::1")
-}
-
-/// Resolve the bearer the agent should send for this custodian.
-///
-/// - SaaS (`$SAFECLAW_API_KEY` set in the caller's env): pass it through.
-/// - Self-hosted localhost daemon: use the provisioned api-key
-///   (`~/.safeclaw/api-key`) if one exists, so the agent satisfies the
-///   daemon's broker gate. We read the existing key but do not generate one
-///   here — provisioning is the daemon's job (`sc custodian start`).
-/// - Otherwise empty (auth-free self-host, or not yet provisioned).
-pub fn resolve_api_key(custodian: &str) -> String {
-    if let Ok(k) = std::env::var("SAFECLAW_API_KEY") {
-        if !k.is_empty() {
-            return k;
-        }
-    }
-    if is_local_custodian(custodian) {
-        if let Some(key) = crate::api_key::load_key() {
-            return key;
-        }
-    }
-    String::new()
-}
-
-/// Resolve the active `(custodian, vault)` pair for short-lived CLI
-/// commands. Precedence: flags > $SAFECLAW_VAULT_URL > config file.
-pub fn resolve_active(
-    custodian_override: Option<&str>,
-    vault_override: Option<&str>,
-) -> Result<(String, String), String> {
-    if let (Some(c), Some(v)) = (custodian_override, vault_override) {
-        return Ok((c.to_string(), v.to_string()));
-    }
+/// Resolve the active `(daemon_url, vault)` pair for short-lived CLI commands.
+/// The daemon URL comes from `$SAFECLAW_VAULT_URL` (or the active config),
+/// defaulting via config — point the agent/CLI at another device's daemon by
+/// setting `$SAFECLAW_VAULT_URL`. `vault_override` (the `--vault` flag) only
+/// reselects the vault id on that daemon. Precedence: $SAFECLAW_VAULT_URL >
+/// config; `--vault` overrides just the vault id.
+pub fn resolve_active(vault_override: Option<&str>) -> Result<(String, String), String> {
     let (env_custodian, env_vault) = match std::env::var("SAFECLAW_VAULT_URL") {
         Ok(url) if !url.is_empty() => split_vault_url(&url)
             .map(|(c, v)| (Some(c), Some(v)))
@@ -218,9 +178,7 @@ pub fn resolve_active(
         _ => (None, None),
     };
     let cfg = load()?;
-    let custodian = custodian_override
-        .map(str::to_string)
-        .or(env_custodian)
+    let custodian = env_custodian
         .or(cfg.custodian.clone())
         .ok_or_else(|| {
             "no vault selected — run `safeclaw vault use` or set $SAFECLAW_VAULT_URL".to_string()

@@ -192,10 +192,10 @@ pub struct AppState {
     /// stream drops the permit, automatically releasing the slot.
     pub sse_semaphores: Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>,
     /// Account-level set of broker-authorizing agent-key HASHES (sha256 hex),
-    /// synced from the cloud (`/api/vault/agent-keys`). When non-empty it is
-    /// the authoritative broker auth (agent ≡ api-key): a presented key is
-    /// valid iff sha256(key) is a member. Empty = fall back to the single
-    /// provisioned `config.api_key` (local/unpaired daemon). See
+    /// synced from the cloud (`/api/vault/agents/hashes`). This is the SOLE
+    /// broker auth (agent ≡ api-key): a presented key is valid iff sha256(key)
+    /// is a member. Empty ⇒ reject (a paired daemon requires an agent key; an
+    /// unpaired/local-only daemon has no broker plane to gate). See
     /// [[project_vault_agent_architecture_2026_06_25]].
     pub agent_key_hashes: Mutex<std::collections::HashSet<String>>,
 }
@@ -526,7 +526,6 @@ mod tests {
             origin: "http://localhost".into(),
             rp_id: "localhost".into(),
             admin_key: None,
-            api_key: None,
             relay_url: None,
         };
         AppState::new(cfg)

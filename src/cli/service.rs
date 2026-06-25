@@ -46,11 +46,9 @@ pub async fn run_start_systemd(force: bool) -> Result<(), String> {
             env_lines.push(format!("Environment=\"{}={}\"", k, v_escaped));
         }
     }
-    // Provision (or reuse) the machine-local api-key FILE so the daemon can
-    // read it at startup and enforce it on the broker plane. The same value
-    // is printed to the agent by `sc install` as SAFECLAW_API_KEY. We do NOT
-    // embed it as an Environment= line — file-read avoids the env collision.
-    let _api_key = crate::api_key::ensure_key()?;
+    // Broker auth is the cloud-synced agent-key hash-set (agent ≡ api-key),
+    // refreshed at runtime by `crate::sync` — there's no machine-local key file
+    // to provision here. See [[project_vault_agent_architecture_2026_06_25]].
     let env_block = if env_lines.is_empty() { String::new() } else { format!("{}\n", env_lines.join("\n")) };
 
     let unit = format!(

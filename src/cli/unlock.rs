@@ -17,7 +17,7 @@ pub async fn run_lock(args: UnlockArgs) -> Result<(), String> {
 }
 
 async fn drive(custom_op: &str, label: &str, args: UnlockArgs) -> Result<(), String> {
-    let (custodian, vault) = resolve_active(args.custodian.as_deref(), args.vault.as_deref())?;
+    let (custodian, vault) = resolve_active(args.vault.as_deref())?;
     let meta = fetch_passkey_meta(&custodian, &vault).await?;
 
     let op = json!({

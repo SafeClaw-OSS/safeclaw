@@ -8,7 +8,7 @@ use serde_json::json;
 use crate::cli::status::{fetch_status, print_status, VaultState};
 use crate::cli::webauthn::*;
 use crate::cli::active::{forget as forget_vault, join_vault_url, load as load_config, put_active, resolve_active, split_vault_url};
-use crate::config::{StatusArgs, VaultCreateArgs, VaultDeleteArgs, VaultForgetArgs, VaultSubcommand, VaultUseArgs};
+use crate::config::{VaultCreateArgs, VaultDeleteArgs, VaultForgetArgs, VaultSubcommand, VaultUseArgs};
 
 const LOCAL_CUSTODIAN: &str = "http://localhost:23294";
 const LOCAL_VAULT_ID: &str = "default";
@@ -348,7 +348,7 @@ async fn run_delete(args: VaultDeleteArgs) -> Result<(), String> {
     if !args.yes_i_mean_it {
         return Err("destructive — pass --yes-i-mean-it to confirm vault deletion".into());
     }
-    let (custodian, _) = resolve_active(args.custodian.as_deref(), Some(args.vault.as_str()))?;
+    let (custodian, _) = resolve_active(Some(args.vault.as_str()))?;
     let vault = args.vault.trim().to_string();
     if vault.is_empty() {
         return Err("vault id cannot be empty".into());
