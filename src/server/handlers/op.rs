@@ -170,4 +170,89 @@ mod tests {
             assert!(reject_broker_kind(&kind).is_ok(), "kind {:?} should pass", kind);
         }
     }
+
+    fn test_state() -> AppState {
+        let cfg = crate::config::Config {
+            state_dir: std::path::PathBuf::from(format!(
+                "/tmp/safeclaw-test-op-{}",
+                std::process::id()
+            )),
+            port: 0,
+            proxy_port: 0,
+            listen: "127.0.0.1".into(),
+            origin: "http://localhost".into(),
+            rp_id: "localhost".into(),
+            admin_key: None,
+            relay_url: None,
+        };
+        AppState::new(cfg)
+    }
+
+    /// RED LINE (verified invariant — see the export/allow discussion): an
+    /// `Export` hands over the RAW secret (irreversible ownership transfer),
+    /// so it MUST always require a passkey grant and must NEVER be
+    /// auto-executed by the read/write `allow` policy default (cb124ca).
+    ///
+    /// The protection is architectural, not a policy line: `Use` (the only
+    /// kind the `allow` fast-path can run) is forced onto the broker path by
+    /// `reject_broker_kind`, while the control-plane `/op` endpoint consults
+    /// NO policy for ANY kind — it always parks a pending op needing
+    /// `/op/{id}/approve`. This test locks that: an Export on an UNLOCKED,
+    /// default-`allow` vault still returns a pending `{op_id, r}` and reveals
+    /// no secret inline. If someone ever wires policy-allow auto-execution
+    /// into the Export path, this goes red.
+    #[tokio::test]
+    async fn export_is_always_pending_never_auto_executed_under_allow_default() {
+        use crate::protocol::operation::{Act, Bind, Valid};
+
+        let state = Arc::new(test_state());
+        // Unlock with the default cache → the read/write `allow` default is
+        // in force. This is the exact regime that must NOT reach Export.
+        state.unlock_vault(
+            "v1".into(),
+            crate::state::SecretsCache::default(),
+            zeroize::Zeroizing::new(Vec::new()),
+        );
+
+        let op = Operation {
+            act: Act {
+                kind: ActType::Export,
+                target: "native-secrets.github_token".into(),
+                scope: Value::Null,
+            },
+            bind: Bind {
+                redeemer: "v1".into(),
+                recipient: None,
+            },
+            valid: Valid::single_use(0, Some(300)),
+        };
+
+        let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let resp = create(
+            State(state.clone()),
+            ConnectInfo(addr),
+            Path("v1".into()),
+            Json(op),
+        )
+        .await
+        .expect("Export op-create should succeed (and park a pending op)");
+
+        let body = resp.0;
+        // Pending: an op_id + challenge were issued, awaiting a passkey grant.
+        assert!(
+            body.get("op_id").and_then(|v| v.as_str()).is_some(),
+            "Export must return a pending op_id, got {body}"
+        );
+        assert!(
+            body.get("r").is_some(),
+            "pending Export must carry a challenge `r`, got {body}"
+        );
+        // Nothing executed inline: no raw secret / reveal payload leaked.
+        for leak in ["value", "secret", "plaintext", "revealed"] {
+            assert!(
+                body.get(leak).is_none(),
+                "Export create must NOT reveal '{leak}' inline (allow default leaked into Export!): {body}"
+            );
+        }
+    }
 }
