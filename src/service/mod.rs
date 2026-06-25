@@ -4,6 +4,7 @@
 /// No Rust code is needed per service — upstream, API steps, and policies are declarative.
 
 pub mod locked;
+pub mod validate;
 
 use std::collections::HashMap;
 use axum::response::Response;
