@@ -257,13 +257,22 @@ fn build_service(
     let vault_fields = vault_fields_for(def);
     let policy = policy_for(state, id, include_policy_rules);
 
-    // `connected` derivation: a service is connected iff every declared
-    // vault_field is present in the overlay's native_keys. Empty
-    // vault_fields = no credential needed → always connected.
+    // `connected` = "ready for the agent to call": every credential the
+    // service needs is present in the vault. With declared vault_fields,
+    // that's "all present in native_keys". With NO derivable field we must
+    // NOT blindly say connected — `.all([]) == true` would mark every
+    // undeclared-credential service connected, which is how an unconfigured
+    // oauth2 service (e.g. openai-codex: `auth.type = oauth2`, no `env`) showed
+    // a false ✅. Empty fields is "connected" ONLY when the service genuinely
+    // needs no credential (a usable upstream that declares no auth).
     let connected = overlay.map(|o| {
-        vault_fields
-            .iter()
-            .all(|vf| o.native_keys.contains(&vf.name))
+        if vault_fields.is_empty() {
+            service_needs_no_auth(def)
+        } else {
+            vault_fields
+                .iter()
+                .all(|vf| o.native_keys.contains(&vf.name))
+        }
     });
 
     RegistryService {
@@ -277,6 +286,15 @@ fn build_service(
         policy,
         connected,
     }
+}
+
+/// True iff "no declared vault_field" legitimately means "connected" — i.e.
+/// the service has a usable upstream that requires NO credential. A service
+/// with no upstream at all (internal/infra) or whose upstream declares an auth
+/// block (env / oauth2 / …) does NOT qualify: the former isn't callable, the
+/// latter needs a credential we just couldn't resolve to a field.
+fn service_needs_no_auth(def: &ServiceDef) -> bool {
+    !def.upstream.is_empty() && def.upstream.iter().all(|u| u.auth.is_none())
 }
 
 /// Replace the port in a URL with `new_port`.
@@ -364,7 +382,13 @@ pub async fn vault_registry(
         .services
         .iter_sorted()
         .into_iter()
-        .filter(|(_, def)| !def.service.hidden)
+        // Agents can only act on services they can actually call — i.e. ones
+        // with an upstream the daemon can forward to. Drop `hidden` services
+        // AND internal/infra services with no upstream (e.g. openclaw-runtime,
+        // agent-identity): listing them just invited the agent to present
+        // non-callable infra as "connected ✅". Mirrors the web console's
+        // `isProxyService` (upstream-presence) filter.
+        .filter(|(_, def)| !def.service.hidden && !def.upstream.is_empty())
         .map(|(id, def)| {
             let overlay = if locked {
                 None
