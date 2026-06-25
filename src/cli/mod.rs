@@ -19,6 +19,7 @@ pub mod service;
 pub mod status;
 pub mod store;
 pub mod unlock;
+pub mod up;
 pub mod upgrade;
 pub mod vault;
 pub mod webauthn;

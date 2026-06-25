@@ -167,16 +167,25 @@ pub async fn run(args: LoginArgs) -> Result<(), String> {
         .map_err(|e| format!("save active config: {}", e))?;
 
     eprintln!(
-        "Paired to {} (vault {}). The daemon will sync this vault from the cloud.\n\
-         Run `sc up` to start it; your agent talks to {}.",
+        "Paired to {} (vault {}); your agent talks to {}.",
         pro_backend_url, parsed.vault_id, local_custodian
     );
-    // account_id is currently equal to vault_id under V1 §12.2's
-    // account-bound model, but both fields are accepted from the server in
-    // case that ever diverges. Surface it once for operator clarity without
-    // committing to a separate persistence slot.
     if parsed.account_id != parsed.vault_id {
         eprintln!("  account: {}", parsed.account_id);
+    }
+
+    // Bring SafeClaw to a ready state right after pairing: start the daemon (so
+    // it pulls this vault), then unlock via the single chokepoint — so the agent
+    // never has to run a separate up/unlock and the user just taps a passkey.
+    // Best-effort: pairing already succeeded; if bring-up can't run here (e.g. a
+    // non-Linux host with no service manager), point the user at `sc up`.
+    eprintln!("Starting SafeClaw and unlocking your vault…");
+    if let Err(e) = crate::cli::service::run_start_systemd(false).await {
+        eprintln!("  couldn't auto-start the daemon ({e}); run `sc up` to finish.");
+        return Ok(());
+    }
+    if let Err(e) = crate::cli::up::ensure_unlocked().await {
+        eprintln!("  couldn't auto-unlock ({e}); run `sc up` to finish.");
     }
 
     Ok(())

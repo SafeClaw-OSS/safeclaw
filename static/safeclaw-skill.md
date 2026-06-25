@@ -84,8 +84,10 @@ user can alternatively add credentials via the web console there.
 
 Never offer to enter credentials yourself. Never echo a credential back.
 
-If `vault_locked: true`, run `sc unlock` first. Do not suggest a browser
-URL unless `console_url` contains `safeclaw.pro`.
+If `vault_locked: true`, run `sc up` — it brings SafeClaw up and unlocks
+the vault, printing an approval link; surface that link to the user (they
+tap their passkey) and retry once it's done. Don't tell the user to
+"unlock" or suggest a browser URL of your own.
 
 ## Call shape
 
