@@ -26,7 +26,7 @@ use crate::storage::sealed_vault::{self, SealedVault};
 
 /// Read the persisted device-key (`~/.safeclaw/device-key`, written by
 /// `sc login`). Returns None when the device hasn't been paired.
-fn device_key() -> Option<String> {
+pub fn device_key() -> Option<String> {
     let home = dirs::home_dir()?;
     let raw = std::fs::read_to_string(home.join(".safeclaw").join("device-key")).ok()?;
     let trimmed = raw.trim().to_string();
@@ -190,6 +190,63 @@ fn refresh_after_pull(state: &Arc<AppState>, vault: &str) {
                 "cloud sync: retained key can't open pulled ciphertext (rotated K?); lock+unlock to see new state"
             );
         }
+    }
+}
+
+/// Fetch the account-level agent-key hash-set (`/api/vault/agent-keys`,
+/// device-key authed). Returns None on any failure (caller keeps the prior
+/// set). The hashes are sha256(token) hex — the broker validates a presented
+/// key by re-hashing and checking membership; the cloud never sees plaintext.
+async fn fetch_agent_key_hashes(
+    client: &reqwest::Client,
+    cloud: &str,
+    device_key: &str,
+) -> Option<std::collections::HashSet<String>> {
+    let url = format!("{}/api/vault/agent-keys", cloud.trim_end_matches('/'));
+    let resp = client.get(&url).bearer_auth(device_key).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let body: serde_json::Value = resp.json().await.ok()?;
+    let keys = body.get("keys")?.as_array()?;
+    Some(
+        keys.iter()
+            .filter_map(|k| k.get("hash").and_then(|h| h.as_str()).map(|s| s.to_string()))
+            .collect(),
+    )
+}
+
+/// One-shot refresh of the broker's agent-key hash-set. Best-effort + gated
+/// like the blob sync (no-op for a local-only/unpaired daemon). Call once
+/// before serving so the broker accepts account agent-keys from the start.
+pub async fn sync_agent_keys_once(state: &Arc<AppState>) {
+    let cfg = match active::load() {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let Some(cloud) = cfg.cloud_backend.as_deref().filter(|s| !s.is_empty()) else {
+        return;
+    };
+    let Some(dk) = device_key() else {
+        return;
+    };
+    let client = match reqwest::Client::builder().timeout(Duration::from_secs(15)).build() {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    if let Some(hashes) = fetch_agent_key_hashes(&client, cloud, &dk).await {
+        let n = hashes.len();
+        state.set_agent_key_hashes(hashes);
+        tracing::debug!(count = n, "synced agent-key hash-set");
+    }
+}
+
+/// Periodically refresh the agent-key hash-set so a dashboard revoke / a newly
+/// added agent takes effect within ~30s on this daemon. Detached, best-effort.
+pub async fn sync_agent_keys_loop(state: Arc<AppState>) {
+    loop {
+        sync_agent_keys_once(&state).await;
+        tokio::time::sleep(Duration::from_secs(30)).await;
     }
 }
 

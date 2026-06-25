@@ -64,6 +64,10 @@ pub enum Command {
     /// to a later session. Short: `sc p`.
     #[command(alias = "p")]
     Passkey(PasskeyArgs),
+    /// Manage this account's agents (agent ≡ api-key). `add` mints a key
+    /// (works on any paired device), `ls` lists them, `rm` revokes. Short: `sc a`.
+    #[command(alias = "a")]
+    Agent(AgentArgs),
     /// Operator-only commands. Each subcommand requires `$SAFECLAW_ADMIN_KEY`
     /// to be set on the CLI side AND match the daemon's `SAFECLAW_ADMIN_KEY`
     /// env. In SaaS deployments only the SafeClaw team holds this key.
@@ -127,6 +131,37 @@ pub enum SecretSubcommand {
 pub struct PasskeyArgs {
     #[command(subcommand)]
     pub sub: PasskeySubcommand,
+}
+
+/// `sc agent` — manage this account's agent api-keys (agent ≡ api-key).
+#[derive(Debug, Args)]
+pub struct AgentArgs {
+    #[command(subcommand)]
+    pub sub: AgentSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AgentSubcommand {
+    /// Mint a new agent key (printed ONCE). Account-level: works on any of
+    /// your paired devices. Put it in the agent's `SAFECLAW_API_KEY`.
+    Add(AgentAddArgs),
+    /// List this account's agents (name, key prefix, last-used).
+    Ls,
+    /// Revoke an agent by name (or key prefix / id). Stops working on every
+    /// device after each device's next sync.
+    Rm(AgentRmArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct AgentAddArgs {
+    /// Friendly name for the agent (e.g. "Claude Code", "deploy-bot").
+    pub name: String,
+}
+
+#[derive(Debug, Args)]
+pub struct AgentRmArgs {
+    /// Agent name, key prefix, or id (see `sc agent ls`).
+    pub name: String,
 }
 
 #[derive(Debug, Subcommand)]

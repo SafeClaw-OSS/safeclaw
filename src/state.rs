@@ -191,6 +191,13 @@ pub struct AppState {
     /// OwnedSemaphorePermit is stored in each live stream; dropping the
     /// stream drops the permit, automatically releasing the slot.
     pub sse_semaphores: Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>,
+    /// Account-level set of broker-authorizing agent-key HASHES (sha256 hex),
+    /// synced from the cloud (`/api/vault/agent-keys`). When non-empty it is
+    /// the authoritative broker auth (agent ≡ api-key): a presented key is
+    /// valid iff sha256(key) is a member. Empty = fall back to the single
+    /// provisioned `config.api_key` (local/unpaired daemon). See
+    /// [[project_vault_agent_architecture_2026_06_25]].
+    pub agent_key_hashes: Mutex<std::collections::HashSet<String>>,
 }
 
 impl AppState {
@@ -212,7 +219,13 @@ impl AppState {
             sc,
             vault_write_locks: Mutex::new(HashMap::new()),
             sse_semaphores: Mutex::new(HashMap::new()),
+            agent_key_hashes: Mutex::new(std::collections::HashSet::new()),
         }
+    }
+
+    /// Replace the synced account-level agent-key hash-set (sha256 hex).
+    pub fn set_agent_key_hashes(&self, hashes: std::collections::HashSet<String>) {
+        *self.agent_key_hashes.lock().unwrap() = hashes;
     }
 
     /// Emit an event into the broadcast channel. Silently swallows the "no

@@ -99,6 +99,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 e.into()
             })
         }
+        Command::Agent(args) => {
+            cli::agent::run(args.sub).await.map_err(|e| -> Box<dyn std::error::Error> {
+                eprintln!("safeclaw agent: {}", e);
+                e.into()
+            })
+        }
         Command::Admin(args) => {
             cli::admin::run(args.sub).await.map_err(|e| -> Box<dyn std::error::Error> {
                 eprintln!("safeclaw admin: {}", e);
@@ -175,6 +181,12 @@ async fn run_daemon(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     safeclaw::sync::pull_on_start(&config.state_dir).await;
 
     let state = Arc::new(AppState::new(config.clone()));
+
+    // Agent-centric auth: sync the account-level agent-key hash-set once
+    // before serving (so account agent-keys are accepted from the start),
+    // then keep it fresh in the background (revokes/new agents land in ~30s).
+    safeclaw::sync::sync_agent_keys_once(&state).await;
+    tokio::spawn(safeclaw::sync::sync_agent_keys_loop(state.clone()));
 
     // Slice 3 realtime sync: long-lived, detached background watcher that
     // long-polls the cloud for blob-version bumps and refreshes the unlocked

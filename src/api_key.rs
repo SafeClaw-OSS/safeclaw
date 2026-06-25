@@ -101,29 +101,91 @@ fn generate() -> String {
     format!("{}{}", API_KEY_PREFIX, hex)
 }
 
-/// Verify `Authorization: Bearer <key>` against the configured api-key.
-/// Returns `Ok(())` immediately when no key is provisioned (auth-free
-/// mode). Constant-time compare mirrors the admin-key path.
+fn sha256_hex(s: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let d = Sha256::digest(s.as_bytes());
+    d.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+/// Verify `Authorization: Bearer <key>` against the broker auth.
+///
+/// Two-tier (agent ≡ api-key): if the cloud-synced account-level agent-key
+/// hash-set is non-empty it is authoritative — a presented key is valid iff
+/// `sha256(key)` is a member (so any of the account's agent keys works on this
+/// daemon, and a dashboard revoke takes effect on the next sync). Otherwise
+/// fall back to the single provisioned `config.api_key` (local/unpaired
+/// daemon), or auth-free when neither is set.
 pub fn check(state: &AppState, headers: &HeaderMap) -> Result<()> {
-    let expected = match state.config.api_key.as_deref() {
-        None => return Ok(()),
-        Some(e) => e,
-    };
     let provided = headers
         .get(AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| {
             v.strip_prefix("Bearer ")
                 .or_else(|| v.strip_prefix("bearer "))
-        })
-        .ok_or_else(|| {
+        });
+    let hashes = state.agent_key_hashes.lock().unwrap();
+    check_token(&hashes, state.config.api_key.as_deref(), provided)
+}
+
+/// Pure broker-auth decision (testable). Tier 1: non-empty `hashes` is
+/// authoritative (`sha256(provided)` must be a member). Tier 2: single
+/// `expected_key` constant-time compare, or auth-free when both are unset.
+fn check_token(
+    hashes: &std::collections::HashSet<String>,
+    expected_key: Option<&str>,
+    provided: Option<&str>,
+) -> Result<()> {
+    if !hashes.is_empty() {
+        let token = provided.ok_or_else(|| {
             AppError::Unauthorized("missing or malformed Authorization: Bearer header".into())
         })?;
-    let matched: bool = expected.as_bytes().ct_eq(provided.as_bytes()).into();
+        return if hashes.contains(&sha256_hex(token)) {
+            Ok(())
+        } else {
+            Err(AppError::Unauthorized("invalid api key".into()))
+        };
+    }
+    let expected = match expected_key {
+        None => return Ok(()),
+        Some(e) => e,
+    };
+    let token = provided.ok_or_else(|| {
+        AppError::Unauthorized("missing or malformed Authorization: Bearer header".into())
+    })?;
+    let matched: bool = expected.as_bytes().ct_eq(token.as_bytes()).into();
     if matched {
         Ok(())
     } else {
         Err(AppError::Unauthorized("invalid api key".into()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn broker_auth_two_tier() {
+        // Tier 2 — auth-free when nothing provisioned.
+        let empty = HashSet::new();
+        assert!(check_token(&empty, None, None).is_ok());
+        assert!(check_token(&empty, None, Some("anything")).is_ok());
+
+        // Tier 2 — single provisioned key.
+        assert!(check_token(&empty, Some("sc_api_good"), Some("sc_api_good")).is_ok());
+        assert!(check_token(&empty, Some("sc_api_good"), Some("sc_api_bad")).is_err());
+        assert!(check_token(&empty, Some("sc_api_good"), None).is_err());
+
+        // Tier 1 — synced hash-set is authoritative; sha256(key) must be a member.
+        let mut hashes = HashSet::new();
+        hashes.insert(sha256_hex("sc_agent_alice"));
+        assert!(check_token(&hashes, None, Some("sc_agent_alice")).is_ok());
+        assert!(check_token(&hashes, None, Some("sc_agent_eve")).is_err());
+        assert!(check_token(&hashes, None, None).is_err());
+        // A non-empty set OVERRIDES the single key (revoked agents can't slip
+        // through via the legacy fallback).
+        assert!(check_token(&hashes, Some("sc_agent_eve"), Some("sc_agent_eve")).is_err());
     }
 }
 
