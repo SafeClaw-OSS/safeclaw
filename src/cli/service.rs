@@ -234,6 +234,36 @@ pub fn unit_installed() -> bool {
     }
 }
 
+/// Migrate a stale unit whose ExecStart still calls the removed `custodian run`
+/// subcommand to the new `serve` entrypoint, in place (preserving the embedded
+/// env block), then daemon-reload. Returns Ok(true) if it rewrote anything;
+/// no-op when the unit is missing or already current. Called by `sc up` and
+/// `sc upgrade` BEFORE they (re)start the daemon, so removing `custodian`
+/// doesn't break a unit installed by an older build.
+#[cfg(target_os = "linux")]
+pub fn reconcile_unit_execstart() -> Result<bool, String> {
+    let unit_path = dirs::config_dir()
+        .ok_or("can't locate user config dir")?
+        .join("systemd/user")
+        .join(UNIT_BASENAME);
+    let Ok(contents) = std::fs::read_to_string(&unit_path) else {
+        return Ok(false);
+    };
+    if !contents.contains(" custodian run") {
+        return Ok(false);
+    }
+    let fixed = contents.replace(" custodian run", " serve");
+    std::fs::write(&unit_path, &fixed)
+        .map_err(|e| format!("rewrite unit {}: {}", unit_path.display(), e))?;
+    let _ = run_systemctl(&["daemon-reload"], "daemon-reload");
+    Ok(true)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn reconcile_unit_execstart() -> Result<bool, String> {
+    Ok(false)
+}
+
 #[cfg(target_os = "linux")]
 fn run_systemctl(args: &[&str], action: &str) -> Result<(), String> {
     let mut cmd = ProcCommand::new("systemctl");

@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use clap::Parser;
 use safeclaw::cli;
-use safeclaw::config::{Cli, Command, Config, CustodianSubcommand, ServeArgs};
+use safeclaw::config::{Cli, Command, Config, ServeArgs};
 use safeclaw::proxy::proxy_router;
 use safeclaw::server::admin_router;
 use safeclaw::state::AppState;
@@ -21,22 +21,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 e.into()
             })
         }
-        // `serve` (and the deprecated `custodian run`) is the foreground daemon
-        // entry — it bootstraps tracing, owns the runtime, and runs forever, so
-        // handle it here, not through the short-lived CLI dispatcher.
+        // `serve` is the foreground daemon entry — it bootstraps tracing, owns
+        // the runtime, and runs forever, so handle it here, not through the
+        // short-lived CLI dispatcher.
         Command::Serve(serve) => run_daemon(serve).await,
-        Command::Down => cli::custodian::run(CustodianSubcommand::Stop).await.map_err(daemon_err),
-        Command::Restart => cli::custodian::run(CustodianSubcommand::Restart).await.map_err(daemon_err),
-        Command::Logs(args) => cli::custodian::run(CustodianSubcommand::Logs(args)).await.map_err(daemon_err),
-        Command::Pubkey(args) => cli::custodian::run(CustodianSubcommand::Pubkey(args)).await.map_err(daemon_err),
-        Command::Menu(args) => cli::custodian::run(CustodianSubcommand::Menu(args)).await.map_err(daemon_err),
-        Command::Custodian(args) => {
-            // Deprecated namespace, kept hidden for unit/muscle-memory migration.
-            match args.sub {
-                CustodianSubcommand::Run(serve) => run_daemon(serve).await,
-                sub => cli::custodian::run(sub).await.map_err(daemon_err),
-            }
-        }
+        Command::Down => cli::service::run_stop().map_err(daemon_err),
+        Command::Restart => cli::service::run_restart().map_err(daemon_err),
+        Command::Logs(args) => cli::service::run_logs(args).map_err(daemon_err),
+        Command::Pubkey(args) => cli::custodian::pubkey(args).await.map_err(daemon_err),
+        Command::Menu(args) => cli::custodian::menu(args).await.map_err(daemon_err),
         Command::Up => {
             // `sc up` = make SafeClaw ready: ensure the daemon is running, then
             // ensure the vault is unlocked (the single auto-unlock chokepoint;
@@ -44,18 +37,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // route through here, so the user never runs a bare "unlock".
             cli::up::run().await.map_err(|e| -> Box<dyn std::error::Error> {
                 eprintln!("safeclaw up: {}", e);
-                e.into()
-            })
-        }
-        Command::Unlock(args) => {
-            cli::unlock::run_unlock(args).await.map_err(|e| -> Box<dyn std::error::Error> {
-                eprintln!("safeclaw unlock: {}", e);
-                e.into()
-            })
-        }
-        Command::Lock(args) => {
-            cli::unlock::run_lock(args).await.map_err(|e| -> Box<dyn std::error::Error> {
-                eprintln!("safeclaw lock: {}", e);
                 e.into()
             })
         }

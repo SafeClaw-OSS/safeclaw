@@ -26,6 +26,7 @@ pub enum VaultState {
 /// like "daemon is up with 0 vaults — run `sc vault create`". ~400ms.
 pub struct LocalDaemon {
     pub up: bool,
+    pub version: Option<String>,
     pub vault_count: Option<u64>,
 }
 
@@ -35,15 +36,16 @@ pub async fn probe_local_daemon() -> LocalDaemon {
         .build()
     {
         Ok(c) => c,
-        Err(_) => return LocalDaemon { up: false, vault_count: None },
+        Err(_) => return LocalDaemon { up: false, version: None, vault_count: None },
     };
     let resp = match client.get("http://localhost:23294/health").send().await {
         Ok(r) if r.status().is_success() => r,
-        _ => return LocalDaemon { up: false, vault_count: None },
+        _ => return LocalDaemon { up: false, version: None, vault_count: None },
     };
     let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+    let version = body.get("version").and_then(|v| v.as_str()).map(|s| s.to_string());
     let vault_count = body.get("vault_count").and_then(|v| v.as_u64());
-    LocalDaemon { up: true, vault_count }
+    LocalDaemon { up: true, version, vault_count }
 }
 
 /// Shorthand for callers that only care about reachability.
@@ -89,41 +91,44 @@ pub async fn fetch_status(custodian: &str, vault: &str) -> VaultStatus {
 }
 
 pub async fn run(args: StatusArgs) -> Result<(), String> {
+    let _ = &args; // no per-command override flag; daemon URL comes from config
     let cfg = load_config()?;
-    // Daemon URL comes from the active vault (`$SAFECLAW_VAULT_URL` is folded
-    // into config by `sc vault use`); no per-command override flag.
-    let _ = &args;
-    let custodian = cfg.custodian.clone();
-    let vault = cfg.vault.clone();
 
-    match (custodian.as_deref(), vault.as_deref()) {
+    // ── Daemon ──────────────────────────────────────────────────────────
+    let d = probe_local_daemon().await;
+    println!("daemon");
+    if d.up {
+        println!("  state:   running");
+        if let Some(v) = &d.version {
+            println!("  version: {}", v);
+        }
+        if let Some(n) = d.vault_count {
+            println!("  vaults:  {}", n);
+        }
+    } else {
+        println!("  state:   not running — bring it up with `sc up`");
+    }
+    println!();
+
+    // ── Active vault ────────────────────────────────────────────────────
+    match (cfg.custodian.as_deref(), cfg.vault.as_deref()) {
         (Some(c), Some(v)) => {
             let s = fetch_status(c, v).await;
             print_status(&s);
-            Ok(())
         }
         _ => {
-            let cfg2 = load_config().unwrap_or_default();
-            let d = probe_local_daemon().await;
-            println!("safeclaw — no active vault");
-            match (d.up, d.vault_count, cfg2.known_vaults.is_empty()) {
-                (false, _, _) => {
-                    println!("  hint: no local daemon on :23294 — start one with `safeclaw c start`,");
-                    println!("        then `safeclaw vault create` for your first vault");
-                }
-                (true, Some(0), _) => {
-                    println!("  hint: local daemon is up with no vaults yet — run `safeclaw vault create`");
-                }
-                (true, _, true) => {
-                    println!("  hint: pick a vault with `safeclaw vault use`, or `safeclaw vault create`");
-                }
-                (true, _, false) => {
-                    println!("  hint: pick one with `safeclaw vault use` (`safeclaw vault ls` to list)");
-                }
+            println!("active vault");
+            println!("  state: none selected");
+            if d.vault_count == Some(0) {
+                println!("  hint:  no vaults yet — seal one on the web, then `sc login`");
+            } else if cfg.known_vaults.is_empty() {
+                println!("  hint:  pick one with `sc vault use`, or `sc vault create`");
+            } else {
+                println!("  hint:  pick one with `sc vault use` (`sc vault ls` to list)");
             }
-            Ok(())
         }
     }
+    Ok(())
 }
 
 pub fn print_status(s: &VaultStatus) {
@@ -132,16 +137,16 @@ pub fn print_status(s: &VaultStatus) {
     match &s.state {
         VaultState::Unreachable => {
             if s.url.contains("//localhost") || s.url.contains("//127.0.0.1") {
-                println!("  state: unreachable — start daemon with `safeclaw c start`");
+                println!("  state: unreachable — bring the daemon up with `sc up`");
             } else {
                 println!("  state: unreachable (is the daemon running?)");
             }
         }
         VaultState::NotFound => {
-            println!("  state: not found (run `safeclaw vault create`, or pick a different URL with `safeclaw vault use`)");
+            println!("  state: not found (run `sc vault create`, or pick a different URL with `sc vault use`)");
         }
         VaultState::Locked { passkeys } => {
-            println!("  state: locked (run `safeclaw unlock`)");
+            println!("  state: locked (run `sc up` to unlock)");
             println!("  passkeys: {}", passkeys);
         }
         VaultState::Unlocked { passkeys, secrets } => {

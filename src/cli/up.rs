@@ -19,6 +19,9 @@ use crate::config::UnlockArgs;
 /// there's no separate setup step), make sure it's running, then unlock.
 pub async fn run() -> Result<(), String> {
     if service::unit_installed() {
+        // Migrate a unit installed by an older build (ExecStart=… custodian run)
+        // to `serve` before starting it — `custodian` no longer exists.
+        let _ = service::reconcile_unit_execstart();
         service::run_ensure_running()?;
     } else {
         // First `sc up` on this host: install + enable + start the user service.
