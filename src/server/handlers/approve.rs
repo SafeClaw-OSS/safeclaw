@@ -837,8 +837,24 @@ pub async fn approve_op(
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            if !svc.is_empty() {
-                state.record_ask_approval(&rec_vault_id, &svc, pc.rule_id, pc.ttl_seconds);
+            // Method scopes the grant (a read-approval can't fast-path a
+            // later write). Pulled off the op's scope, same as `service`.
+            let req_method = validated
+                .op
+                .act
+                .scope
+                .get("method")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if !svc.is_empty() && !req_method.is_empty() {
+                state.record_ask_approval(
+                    &rec_vault_id,
+                    &svc,
+                    pc.rule_id,
+                    &req_method,
+                    pc.ttl_seconds,
+                );
             }
         }
     }

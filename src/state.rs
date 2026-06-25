@@ -98,19 +98,23 @@ pub struct SecretsCache {
     /// opportunistically prune old rows before listing.
     pub audit_retention_days: Option<u32>,
     /// Honors the `ask` (vs `ask-always`) semantic: after the user approves
-    /// an Ask-level op, the daemon caches `(service, matched_rule_id) →
-    /// expires_at` so subsequent requests within the TTL fast-path without
+    /// an Ask-level op, the daemon caches the approval so subsequent
+    /// requests *of the same scope* within the TTL fast-path without
     /// re-prompting. `ask-always` never lands here; `allow` doesn't need it.
     ///
-    /// Key shape: `(service_id, Option<rule_id>)`. `None` covers the case
-    /// where no per-rule matched and the approval was driven by category-
-    /// default Ask — the cache covers that whole category-default decision
-    /// for the service. Value: Unix-epoch-second expiry.
+    /// Key shape: `(service_id, rule_id, method)`. The grant is bound to:
+    ///   - the matched **policy rule** — which carries the path scope, so a
+    ///     grant can never reach beyond the rule the user's approval matched;
+    ///   - the **HTTP method** — so approving a read (GET) never silently
+    ///     authorizes a later write (POST/DELETE) inside the window.
+    /// A category-/service-default Ask (no rule matched) is deliberately
+    /// **not cached** — it has no author-defined path scope to bound a grant,
+    /// so it re-prompts every request. Value: Unix-epoch-second expiry.
     ///
     /// Lives in the same memory window as the rest of the cache: dropped on
     /// lock (which zero-outs the entire cache via Default drop). Daemon
     /// restart also blows it away (vaults boot Locked, cache starts empty).
-    pub rule_approvals: HashMap<(String, Option<String>), u64>,
+    pub rule_approvals: HashMap<(String, String, String), u64>,
     /// User-authored per-service basic R/W. Snapshot of every populated
     /// `aux.service_state.<svc>.levels` at unlock. Layered above the
     /// service's registry-declared default in `evaluate` so a user pick
@@ -395,9 +399,10 @@ impl AppState {
     ///   - user global policy_defaults (per-category + legacy `levels`)
     ///   - service's compiled-in [policy] levels
     ///   - safe compiled-in defaults at the very end
-    ///   - **active `ask` approvals** — if the decision is `Ask` AND the
-    ///     `(service, rule_id)` pair is in the unexpired rule_approvals
-    ///     cache, downgrades to `Allow` so the request fast-paths.
+    ///   - **active `ask` approvals** — if the decision is `Ask`, a rule
+    ///     matched, AND the `(service, rule_id, method)` triple is in the
+    ///     unexpired rule_approvals cache, downgrades to `Allow` so the
+    ///     request fast-paths. Category-default Ask (no rule) never caches.
     pub fn evaluate_request_policy(
         &self,
         vault_id: &str,
@@ -459,23 +464,31 @@ impl AppState {
             Some(category),
         );
 
-        // Cache hit honors the `ask`-with-TTL semantic: a prior approval at
-        // the same (service, rule) scope, not yet expired, downgrades this
-        // Ask to Allow so the request fast-paths without a passkey prompt.
-        // Passive cleanup: if expired, drop the entry instead of returning
-        // a hit. `ask-always` and `deny` never consult or write the cache;
+        // Cache hit honors the `ask`-with-TTL semantic, but the grant is
+        // scoped to the matched rule AND the HTTP method: a prior approval
+        // for the same (service, rule, method), not yet expired, downgrades
+        // this Ask to Allow so the request fast-paths without a passkey
+        // prompt. Two deliberate bounds keep a window from over-reaching:
+        //   - No rule matched (category-/service-default Ask) → never a hit:
+        //     there is no author-defined path scope to bound the grant.
+        //   - Method is part of the key → approving a GET cannot fast-path a
+        //     later POST/DELETE inside the window.
+        // Passive cleanup: if expired, drop the entry instead of returning a
+        // hit. `ask-always` and `deny` never consult or write the cache;
         // `allow` doesn't need to.
         if level == crate::core::policy::AccessLevel::Ask {
-            let key = (service_id.to_string(), matched_rule.clone());
-            if let Some(&exp) = cache.rule_approvals.get(&key) {
-                if exp > now {
-                    return Some((
-                        crate::core::policy::AccessLevel::Allow,
-                        matched_rule,
-                        ttl,
-                    ));
-                } else {
-                    cache.rule_approvals.remove(&key);
+            if let Some(rule_id) = matched_rule.clone() {
+                let key = (service_id.to_string(), rule_id, method.to_string());
+                if let Some(&exp) = cache.rule_approvals.get(&key) {
+                    if exp > now {
+                        return Some((
+                            crate::core::policy::AccessLevel::Allow,
+                            matched_rule,
+                            ttl,
+                        ));
+                    } else {
+                        cache.rule_approvals.remove(&key);
+                    }
                 }
             }
         }
@@ -488,6 +501,13 @@ impl AppState {
     /// created it was Ask (not AskAlways). `ttl_seconds` is the level's
     /// `ask_ttl` falling back to `policy.timeout` or a safe 300s default.
     ///
+    /// The grant is scoped to `(service, rule_id, method)`. Two bounds:
+    ///   - `rule_id == None` (category-/service-default Ask, no rule matched)
+    ///     is **not recorded** — without an author-defined path scope a grant
+    ///     would blanket the whole service, so such ops re-prompt every time.
+    ///   - `method` is part of the key, so approving one verb never lets a
+    ///     different verb fast-path inside the window.
+    ///
     /// No-op when the vault is locked at the moment of the call — that
     /// shouldn't happen in practice (the approve happens while the
     /// vault is unlocked) but we don't want to panic if it does.
@@ -496,17 +516,21 @@ impl AppState {
         vault_id: &str,
         service_id: &str,
         rule_id: Option<String>,
+        method: &str,
         ttl_seconds: u64,
     ) {
+        // No rule scope → not cacheable (see doc above).
+        let Some(rule_id) = rule_id else { return };
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
         let mut states = self.vault_states.lock().unwrap();
         if let Some(VaultState::Unlocked { cache, .. }) = states.get_mut(vault_id) {
-            cache
-                .rule_approvals
-                .insert((service_id.to_string(), rule_id), now + ttl_seconds);
+            cache.rule_approvals.insert(
+                (service_id.to_string(), rule_id, method.to_string()),
+                now + ttl_seconds,
+            );
         }
     }
 }
@@ -575,5 +599,63 @@ mod tests {
         // Insert into a locked vault should be a no-op too.
         state.cache_insert("v1", "svc", b"x".to_vec(), None);
         assert_eq!(state.cache_lookup("v1", "svc"), None);
+    }
+
+    /// Security regression: an `ask` approval is scoped to (service, rule,
+    /// method). Approving a GET must NOT silently fast-path a later POST,
+    /// even within the TTL window — closes the standing-authority hole where
+    /// a single approval blanket-authorized every verb on a service.
+    #[test]
+    fn ask_grant_is_scoped_to_method_and_rule() {
+        use crate::core::policy::{AccessLevel, PolicyRule};
+
+        let ask_rule = |id: &str, pat: &str| PolicyRule {
+            id: Some(id.to_string()),
+            label: None,
+            match_pattern: Some(pat.to_string()),
+            body: None,
+            level: AccessLevel::Ask,
+            ask_ttl: Some(60),
+        };
+
+        let state = test_state();
+        let vid = "v-scope";
+        let mut cache = SecretsCache::default();
+        cache.policy_rules.insert(
+            "gh".to_string(),
+            vec![ask_rule("read", "GET /x"), ask_rule("write", "POST /x")],
+        );
+        state.unlock_vault(vid.to_string(), cache, zeroize::Zeroizing::new(Vec::new()));
+
+        // Baseline: GET resolves to Ask under the "read" rule.
+        let (lvl, rule, _) = state
+            .evaluate_request_policy(vid, "gh", "GET", "/x", None)
+            .unwrap();
+        assert_eq!(lvl, AccessLevel::Ask);
+        assert_eq!(rule.as_deref(), Some("read"));
+
+        // User approves that GET.
+        state.record_ask_approval(vid, "gh", Some("read".to_string()), "GET", 60);
+
+        // The same GET now fast-paths (the feature still works).
+        let (lvl, _, _) = state
+            .evaluate_request_policy(vid, "gh", "GET", "/x", None)
+            .unwrap();
+        assert_eq!(lvl, AccessLevel::Allow, "approved GET should fast-path");
+
+        // A POST is a DIFFERENT verb/rule — the GET approval must not cover it.
+        let (lvl, rule, _) = state
+            .evaluate_request_policy(vid, "gh", "POST", "/x", None)
+            .unwrap();
+        assert_eq!(
+            lvl,
+            AccessLevel::Ask,
+            "approving a GET must never fast-path a POST"
+        );
+        assert_eq!(rule.as_deref(), Some("write"));
+
+        // A category-default Ask (no rule) is never recorded, so it can never
+        // produce a fast-path — record is a no-op for rule_id == None.
+        state.record_ask_approval(vid, "gh", None, "GET", 60);
     }
 }
