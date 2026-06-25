@@ -188,11 +188,11 @@ async fn run_daemon(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     safeclaw::sync::sync_agent_keys_once(&state).await;
     tokio::spawn(safeclaw::sync::sync_agent_keys_loop(state.clone()));
 
-    // Slice 3 realtime sync: long-lived, detached background watcher that
-    // long-polls the cloud for blob-version bumps and refreshes the unlocked
-    // vault in place (no re-unlock). Best-effort — NOT in the serve select!,
-    // so a sync-loop exit never takes the daemon down.
-    tokio::spawn(safeclaw::sync::watch_loop(state.clone()));
+    // Slice 3 realtime sync: one detached long-poll watcher PER synced vault
+    // (active ∪ known_vaults — all vaults stay live, not just the active one).
+    // Best-effort — NOT in the serve select!, so a sync-loop exit never takes
+    // the daemon down.
+    safeclaw::sync::spawn_watchers(state.clone());
 
     let listen_ip: std::net::IpAddr = config.listen.parse().unwrap_or_else(|_| "127.0.0.1".parse().unwrap());
 

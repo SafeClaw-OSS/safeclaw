@@ -65,24 +65,63 @@ pub async fn pull_on_start(state_dir: &Path) {
         tracing::debug!("cloud sync: no cloud_backend configured; local-only daemon");
         return;
     };
-    let Some(vault) = cfg.vault.as_deref().filter(|s| !s.is_empty()) else {
-        tracing::debug!("cloud sync: no active vault; skipping pull");
-        return;
-    };
     let Some(dk) = device_key() else {
         tracing::debug!("cloud sync: no device-key (unpaired); skipping pull");
         return;
     };
-    match pull(state_dir, cloud, vault, &dk).await {
-        Ok(Some(version)) => {
-            tracing::info!(vault = %vault, version, "cloud sync: pulled vault.dat from cloud");
+    // All vaults this device knows (active ∪ known_vaults) are kept online —
+    // the agent addresses any of them by vid, no "switch vault" needed (1P
+    // model). See [[project_vault_agent_architecture_2026_06_25]].
+    let ids = synced_vault_ids(&cfg);
+    if ids.is_empty() {
+        tracing::debug!("cloud sync: no vaults to pull");
+        return;
+    }
+    for vault in &ids {
+        match pull(state_dir, cloud, vault, &dk).await {
+            Ok(Some(version)) => tracing::info!(vault = %vault, version, "cloud sync: pulled vault.dat from cloud"),
+            Ok(None) => tracing::debug!(vault = %vault, "cloud sync: local vault.dat already current"),
+            Err(e) => tracing::warn!(vault = %vault, "cloud sync pull failed (serving local state): {}", e),
         }
-        Ok(None) => {
-            tracing::debug!(vault = %vault, "cloud sync: local vault.dat already current");
+    }
+}
+
+/// Vault ids this device keeps synced: the active vault plus every vault in
+/// `known_vaults` (added by `sc vault use` / `sc vault create`), deduped. The
+/// agent reaches any of them by vid; `sc vault use` is only the CLI default.
+fn synced_vault_ids(cfg: &crate::cli::active::CliConfig) -> Vec<String> {
+    let mut ids: Vec<String> = Vec::new();
+    if let Some(v) = cfg.vault.as_deref().filter(|s| !s.is_empty()) {
+        ids.push(v.to_string());
+    }
+    for kv in &cfg.known_vaults {
+        if !kv.vault.is_empty() && !ids.iter().any(|x| x == &kv.vault) {
+            ids.push(kv.vault.clone());
         }
-        Err(e) => {
-            tracing::warn!(vault = %vault, "cloud sync pull failed (serving local state): {}", e);
-        }
+    }
+    ids
+}
+
+/// Spawn one `watch_loop` per synced vault (active ∪ known_vaults), so every
+/// vault is kept live, not just the active one. Gated like the rest of sync —
+/// no-op for a local-only/unpaired daemon. Vaults added after start are picked
+/// up on the next daemon (re)start.
+pub fn spawn_watchers(state: Arc<AppState>) {
+    let cfg = match active::load() {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let Some(cloud) = cfg.cloud_backend.clone().filter(|s| !s.is_empty()) else {
+        tracing::debug!("cloud sync watch: no cloud_backend; not started (local-only daemon)");
+        return;
+    };
+    let Some(dk) = device_key() else {
+        tracing::debug!("cloud sync watch: no device-key (unpaired); not started");
+        return;
+    };
+    let cloud = cloud.trim_end_matches('/').to_string();
+    for vault in synced_vault_ids(&cfg) {
+        tokio::spawn(watch_loop(state.clone(), vault, cloud.clone(), dk.clone()));
     }
 }
 
@@ -258,22 +297,7 @@ pub async fn sync_agent_keys_loop(state: Arc<AppState>) {
 /// Best-effort + detached: a local-only/unpaired/offline daemon just no-ops or
 /// backs off, and any failure here NEVER affects serving. See
 /// [[project_realtime_sync_v1_decision]].
-pub async fn watch_loop(state: Arc<AppState>) {
-    let cfg = match active::load() {
-        Ok(c) => c,
-        Err(_) => return,
-    };
-    let Some(cloud) = cfg.cloud_backend.clone().filter(|s| !s.is_empty()) else {
-        tracing::debug!("cloud sync watch: no cloud_backend; not started (local-only daemon)");
-        return;
-    };
-    let Some(vault) = cfg.vault.clone().filter(|s| !s.is_empty()) else {
-        return;
-    };
-    let Some(dk) = device_key() else {
-        tracing::debug!("cloud sync watch: no device-key (unpaired); not started");
-        return;
-    };
+pub async fn watch_loop(state: Arc<AppState>, vault: String, cloud: String, dk: String) {
     let state_dir = state.config.state_dir.clone();
     // Read-timeout MUST exceed the server's long-poll hold (~25s) plus slack.
     let client = match reqwest::Client::builder().timeout(Duration::from_secs(40)).build() {
@@ -283,7 +307,6 @@ pub async fn watch_loop(state: Arc<AppState>) {
             return;
         }
     };
-    let cloud = cloud.trim_end_matches('/').to_string();
     tracing::info!(vault = %vault, "cloud sync watch loop started");
 
     let mut backoff = Duration::from_secs(2);
