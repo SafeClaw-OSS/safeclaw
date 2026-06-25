@@ -15,6 +15,7 @@ pub mod env;
 pub mod login;
 pub mod ls;
 pub mod passkey;
+pub mod recipe;
 pub mod secret;
 pub mod service;
 pub mod status;

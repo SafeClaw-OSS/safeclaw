@@ -103,6 +103,10 @@ pub enum Command {
     /// Health + reachability checks: daemon connectivity, active
     /// profile, API key presence. Read-only; no vault state mutation.
     Doctor(CommonArgs),
+    /// Work with service.toml recipes. Today: `recipe validate <path>` runs
+    /// the static safety checks the console upload editor enforces. Offline,
+    /// no daemon needed.
+    Recipe(RecipeArgs),
 }
 
 #[derive(Debug, Args)]
@@ -127,6 +131,30 @@ pub enum SecretSubcommand {
     Rm(RmArgs),
     /// List secret names this vault can resolve.
     Ls(CommonArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct RecipeArgs {
+    #[command(subcommand)]
+    pub sub: RecipeSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum RecipeSubcommand {
+    /// Validate a service.toml recipe against the broker's safety rules.
+    /// Prints each problem and exits non-zero on failure.
+    Validate(RecipeValidateArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct RecipeValidateArgs {
+    /// Path to the service.toml to validate.
+    pub path: std::path::PathBuf,
+    /// Validate as a first-party (trusted) recipe — allows exec / non-upstream
+    /// steps. Default: validate as an UPLOADED recipe (exec forbidden), i.e.
+    /// the same strict checks the console upload editor applies.
+    #[arg(long)]
+    pub first_party: bool,
 }
 
 #[derive(Debug, Args)]
