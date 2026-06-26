@@ -1,0 +1,17 @@
+# Shared OAuth template for all Google services (gmail, gdrive, gcalendar).
+# = Nango providers.yaml entry. CONNECTIONS_AND_AUTH.md §2/§8.
+#
+# This ships the PUBLIC Desktop client (client_type = "public"). Google's
+# Desktop-app design treats this client_secret as non-confidential
+# ("the client secret is obviously not treated as a secret"), so it is safe to
+# commit. The CONFIDENTIAL Web-app client_secret must NEVER appear in any recipe.
+# Refresh/code-exchange happen on the daemon with these public creds.
+[provider.google]
+auth_mode         = "oauth2"
+flow              = "authorization_code"
+authorization_url = "https://accounts.google.com/o/oauth2/v2/auth"
+token_url         = "https://oauth2.googleapis.com/token"
+pkce              = true
+client_id         = "499410884315-6m6vu98ls61i0e0cn38663mm573nu87a.apps.googleusercontent.com"
+client_secret     = "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"
+client_type       = "public"

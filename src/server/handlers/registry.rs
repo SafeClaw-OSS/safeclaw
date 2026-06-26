@@ -178,12 +178,12 @@ fn vault_fields_for(def: &ServiceDef) -> Vec<RegistryVaultField> {
             })
             .collect();
     }
-    // Single-field synthesis from `auth.env` for the common API-key case.
+    // Single-field synthesis from `auth.secret` for the common API-key case.
     let Some(env_name) = def
         .upstream
         .first()
         .and_then(|u| u.auth.as_ref())
-        .and_then(|a| a.env.as_ref())
+        .and_then(|a| a.secret.as_ref())
         .filter(|s| !s.trim().is_empty())
     else {
         return vec![];

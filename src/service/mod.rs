@@ -6,7 +6,7 @@
 pub mod locked;
 pub mod validate;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use axum::response::Response;
 use crate::auth::AuthConfig;
 use crate::auth::oauth2::OAuthStyle;
@@ -23,6 +23,27 @@ pub struct ServiceDef {
     #[serde(default)]
     pub vault: Vec<VaultField>,
     pub policy: Option<PolicyDef>,
+    /// Optional `[setup]` block: the agent-facing tool/runtime config hint
+    /// (CONNECTIONS_AND_AUTH.md §6). Parsed only — never executed here.
+    #[serde(default)]
+    pub setup: Option<SetupDef>,
+}
+
+/// `[setup]` — the single, declarative, agent-facing setup mechanism
+/// (CONNECTIONS_AND_AUTH.md §6). Free-form string fields: a goal, a route,
+/// an auth line, and a canonical example the agent adapts to the user's real
+/// config (per the iron rule: goal + building blocks, not a rigid script).
+/// Parse-only — no execution.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct SetupDef {
+    #[serde(default)]
+    pub goal: Option<String>,
+    #[serde(default)]
+    pub route: Option<String>,
+    #[serde(default)]
+    pub auth: Option<String>,
+    #[serde(default)]
+    pub example: Option<String>,
 }
 
 /// Declares a field stored in the vault for this service.
@@ -177,8 +198,24 @@ pub struct AuthDef {
     /// long-lived refresh_token. The short-lived access_token derived from
     /// it lives in-memory only (per the design: only the immutable refresh
     /// token enters the vault).
+    ///
+    /// Renamed from `env` (CONNECTIONS_AND_AUTH.md §1). The `env` alias keeps
+    /// every existing in-tree recipe + already-stored connection parsing
+    /// unchanged. A recipe never holds a secret VALUE — only the *key*.
+    #[serde(alias = "env", default)]
+    pub secret: Option<String>,
+    /// Multi-secret form (rare): role → vault-entry key, e.g.
+    /// `refresh_token = "gmail_refresh_token"`, `webhook_key = "gmail_webhook"`
+    /// (CONNECTIONS_AND_AUTH.md §3). The single `secret` string stays the
+    /// common case; this table is for services that inject more than one
+    /// vault item.
     #[serde(default)]
-    pub env: Option<String>,
+    pub secrets: Option<BTreeMap<String, String>>,
+    /// OAuth scopes requested at consent time (= Nango `default_scopes`).
+    /// Audit/visibility only at the recipe layer; the consent screen is the
+    /// provider's. (CONNECTIONS_AND_AUTH.md §3.)
+    #[serde(default)]
+    pub scopes: Vec<String>,
     #[serde(default)]
     pub header: Option<String>,
     #[serde(default)]
@@ -212,8 +249,71 @@ pub struct AuthDef {
     /// `SAFECLAW_GOOGLE_CLIENT_SECRET`.
     #[serde(default)]
     pub client_secret_env: Option<String>,
+    /// RFC 6749 §2.1 client type (`"public"` | `"confidential"`). Mirrors the
+    /// provider's `client_type` for inline auth that declares a literal
+    /// `client_id`/`client_secret` locally. Usually inherited from the
+    /// referenced `[provider.<name>]` rather than set here.
+    #[serde(default)]
+    pub client_type: Option<String>,
     #[serde(default)]
     pub username_label: Option<String>,
+}
+
+// ── ProviderDef: parsed from services/_providers/<name>.toml ─────────────────
+
+/// A `[provider.<name>]` block — the shared OAuth template reused by every
+/// service on that provider (= Nango `providers.yaml`).
+/// CONNECTIONS_AND_AUTH.md §2. Lives in `services/_providers/<name>.toml`.
+///
+/// A service's `[upstream.auth]` with `provider = "<name>"` inherits
+/// `auth_mode` (= the service's `type`), the endpoints, and the client app
+/// from here, declaring only what's unique (scopes, the secret slot, the
+/// injection). Inline auth without a `provider` keeps declaring `type` +
+/// endpoints locally.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ProviderFileDef {
+    /// Wraps the single `[provider.<name>]` table. The map key is the provider
+    /// name (`google`), the value is the template.
+    pub provider: HashMap<String, ProviderDef>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ProviderDef {
+    /// = Nango `auth_mode`; the service's `type` inherits this (`oauth2`).
+    #[serde(default)]
+    pub auth_mode: Option<String>,
+    /// OAuth grant flow, e.g. `authorization_code`.
+    #[serde(default)]
+    pub flow: Option<String>,
+    /// CONNECT step endpoint (user consent).
+    #[serde(default)]
+    pub authorization_url: Option<String>,
+    /// REFRESH + code-exchange endpoint.
+    #[serde(default)]
+    pub token_url: Option<String>,
+    /// Whether the connect flow uses PKCE (RFC 7636).
+    #[serde(default)]
+    pub pkce: bool,
+    /// OAuth client_id (a public Desktop client may ship its id here).
+    #[serde(default)]
+    pub client_id: Option<String>,
+    /// OAuth client_secret. A LITERAL `client_secret` is allowed in a recipe
+    /// ONLY for a `client_type = "public"` client (a confidential Web-app
+    /// secret must never be committed). The validator enforces this.
+    #[serde(default)]
+    pub client_secret: Option<String>,
+    /// RFC 6749 §2.1: `"public"` | `"confidential"`.
+    #[serde(default)]
+    pub client_type: Option<String>,
+}
+
+/// The OAuth client/endpoint config a service's auth resolves to after
+/// provider inheritance — see `ServiceRegistry::resolve_oauth_config`.
+#[derive(Debug, Clone)]
+pub struct ResolvedOAuthConfig {
+    pub token_url: Option<String>,
+    pub client_id: Option<String>,
+    pub client_secret: Option<String>,
 }
 
 /// Inline policy in service.toml (legacy, still supported as fallback).
@@ -353,6 +453,10 @@ pub struct ServiceRegistry {
     services: HashMap<String, ServiceDef>,
     /// Parsed policy.toml files (service_id → PolicyFileDef).
     policies: HashMap<String, PolicyFileDef>,
+    /// Parsed `[provider.<name>]` blocks (provider name → ProviderDef), loaded
+    /// from `services/_providers/*.toml`. A service's `auth.provider` inherits
+    /// `auth_mode`/endpoints/client from here.
+    providers: HashMap<String, ProviderDef>,
 }
 
 impl ServiceRegistry {
@@ -363,9 +467,10 @@ impl ServiceRegistry {
     pub fn load() -> Self {
         let mut services = HashMap::new();
         let mut policies = HashMap::new();
+        let mut providers = HashMap::new();
 
         // Layer 1: compiled-in defaults (always loaded as base)
-        Self::load_compiled_defaults(&mut services, &mut policies);
+        Self::load_compiled_defaults(&mut services, &mut policies, &mut providers);
 
         // Layer 2: $SAFECLAW_DATA/services/ override
         let dirs = Self::discover_service_dirs();
@@ -391,8 +496,51 @@ impl ServiceRegistry {
         // Layer 3: ~/.safeclaw/services/ (user-installed, overrides everything)
         Self::load_user_services(&mut services, &mut policies);
 
-        tracing::info!("Loaded {} service definitions, {} policy files", services.len(), policies.len());
-        Self { services, policies }
+        // Providers: runtime `services/_providers/*.toml` override the
+        // compiled-in defaults (same precedence intent as services).
+        Self::load_runtime_providers(&mut providers);
+
+        tracing::info!(
+            "Loaded {} service definitions, {} policy files, {} providers",
+            services.len(), policies.len(), providers.len()
+        );
+        Self { services, policies, providers }
+    }
+
+    /// Discover and parse `services/_providers/*.toml` from the same roots as
+    /// `discover_service_dirs` ($SAFECLAW_DATA/services first, then beside the
+    /// binary). Each file holds one or more `[provider.<name>]` blocks.
+    fn load_runtime_providers(providers: &mut HashMap<String, ProviderDef>) {
+        let mut roots: Vec<std::path::PathBuf> = Vec::new();
+        if let Ok(data) = std::env::var("SAFECLAW_DATA") {
+            roots.push(std::path::Path::new(&data).join("services"));
+        }
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(parent) = exe.parent() {
+                roots.push(parent.join("services"));
+            }
+        }
+        for root in roots {
+            let dir = root.join("_providers");
+            let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+                    continue;
+                }
+                let Ok(content) = std::fs::read_to_string(&path) else { continue };
+                match toml::from_str::<ProviderFileDef>(&content) {
+                    Ok(def) => {
+                        for (name, p) in def.provider {
+                            providers.insert(name, p);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to parse provider {}: {}", path.display(), e);
+                    }
+                }
+            }
+        }
     }
 
     /// Returns (service_id, service_toml_content, optional_policy_toml_content).
@@ -519,7 +667,11 @@ impl ServiceRegistry {
 
     /// Compiled-in service definitions for when filesystem discovery fails.
     /// Uses the auto-generated registry from build.rs.
-    fn load_compiled_defaults(services: &mut HashMap<String, ServiceDef>, policies: &mut HashMap<String, PolicyFileDef>) {
+    fn load_compiled_defaults(
+        services: &mut HashMap<String, ServiceDef>,
+        policies: &mut HashMap<String, PolicyFileDef>,
+        providers: &mut HashMap<String, ProviderDef>,
+    ) {
         let defaults = crate::generated_services::compiled_service_tomls();
         for (id, toml_str) in defaults {
             if let Ok(def) = toml::from_str::<ServiceDef>(toml_str) {
@@ -530,6 +682,14 @@ impl ServiceRegistry {
         for (id, toml_str) in policy_defaults {
             if let Ok(def) = toml::from_str::<PolicyFileDef>(toml_str) {
                 policies.insert(id.to_string(), def);
+            }
+        }
+        let provider_defaults = crate::generated_services::compiled_provider_tomls();
+        for (_file, toml_str) in provider_defaults {
+            if let Ok(def) = toml::from_str::<ProviderFileDef>(toml_str) {
+                for (name, p) in def.provider {
+                    providers.insert(name, p);
+                }
             }
         }
     }
@@ -595,7 +755,7 @@ impl ServiceRegistry {
         let svc = self.services.get(service_id)?;
         let upstream = svc.upstream.first()?;
         let auth = upstream.auth.as_ref()?;
-        if let Some(k) = auth.env.as_deref() {
+        if let Some(k) = auth.secret.as_deref() {
             let trimmed = k.trim();
             if !trimmed.is_empty() {
                 return Some(trimmed.to_string());
@@ -623,6 +783,59 @@ impl ServiceRegistry {
             Some("json") => Some(OAuthStyle::Json),
             _ => None,
         }
+    }
+
+    /// Look up a `[provider.<name>]` template by name.
+    pub fn provider(&self, name: &str) -> Option<&ProviderDef> {
+        self.providers.get(name)
+    }
+
+    /// True if this auth resolves its `auth_mode` to `oauth2`, accounting for
+    /// provider inheritance: a service may carry `provider = "google"` and omit
+    /// `type` entirely, inheriting `auth_mode = "oauth2"` from the provider.
+    pub fn auth_is_oauth2(&self, auth: &AuthDef) -> bool {
+        if matches!(auth.auth_type.as_deref(), Some("oauth2")) {
+            return true;
+        }
+        auth.provider
+            .as_deref()
+            .and_then(|p| self.providers.get(p))
+            .and_then(|p| p.auth_mode.as_deref())
+            == Some("oauth2")
+    }
+
+    /// Resolve the OAuth client/endpoint config for a service's auth, honoring
+    /// `provider =` inheritance. When the auth references a provider, the
+    /// literal `client_id`/`client_secret`/`token_url` come from the provider
+    /// (public Desktop client). When no provider literal exists, falls back to
+    /// the legacy env-var path (`client_id_env`/`client_secret_env`/`token_url`)
+    /// so self-hosted confidential clients keep working.
+    ///
+    /// Returns `(token_url, client_id, client_secret)`. Any field the caller
+    /// can't satisfy is `None` (caller decides whether it's fatal).
+    pub fn resolve_oauth_config(&self, auth: &AuthDef) -> ResolvedOAuthConfig {
+        let provider = auth
+            .provider
+            .as_deref()
+            .and_then(|p| self.providers.get(p));
+
+        // token_url: provider literal first, then the service's own literal.
+        let token_url = provider
+            .and_then(|p| p.token_url.clone())
+            .or_else(|| auth.token_url.clone());
+
+        // client_id: provider literal first, then env-var lookup.
+        let client_id = provider
+            .and_then(|p| p.client_id.clone())
+            .or_else(|| auth.client_id_env.as_deref().and_then(|n| std::env::var(n).ok()));
+
+        // client_secret: provider literal first, then env-var lookup (optional
+        // for PKCE/public flows).
+        let client_secret = provider
+            .and_then(|p| p.client_secret.clone())
+            .or_else(|| auth.client_secret_env.as_deref().and_then(|n| std::env::var(n).ok()));
+
+        ResolvedOAuthConfig { token_url, client_id, client_secret }
     }
 
     /// Generate locked response for a service when vault is locked.
@@ -1116,7 +1329,7 @@ path = "*"
         let def: ServiceDef = toml::from_str(toml_str).unwrap();
         let mut services = HashMap::new();
         services.insert("openai".into(), def);
-        let reg = ServiceRegistry { services, policies: HashMap::new() };
+        let reg = ServiceRegistry { services, policies: HashMap::new(), providers: HashMap::new() };
         assert!(!reg.is_local("openai"));
     }
 
@@ -1140,7 +1353,7 @@ path = "/access"
         let def: ServiceDef = toml::from_str(toml_str).unwrap();
         let mut services = HashMap::new();
         services.insert("dashboard".into(), def);
-        let reg = ServiceRegistry { services, policies: HashMap::new() };
+        let reg = ServiceRegistry { services, policies: HashMap::new(), providers: HashMap::new() };
         assert!(reg.is_local("dashboard"));
     }
 
@@ -1164,7 +1377,7 @@ path = "/access"
         let def: ServiceDef = toml::from_str(toml_str).unwrap();
         let mut services = HashMap::new();
         services.insert("dash".into(), def);
-        let reg = ServiceRegistry { services, policies: HashMap::new() };
+        let reg = ServiceRegistry { services, policies: HashMap::new(), providers: HashMap::new() };
         let api = reg.find_local_api("dash", "POST", "/access").unwrap();
         assert_eq!(api.steps.len(), 2);
     }
@@ -1185,7 +1398,7 @@ path = "/do"
         let def: ServiceDef = toml::from_str(toml_str).unwrap();
         let mut services = HashMap::new();
         services.insert("x".into(), def);
-        let reg = ServiceRegistry { services, policies: HashMap::new() };
+        let reg = ServiceRegistry { services, policies: HashMap::new(), providers: HashMap::new() };
         assert!(reg.find_local_api("x", "GET", "/do").is_none());
     }
 
@@ -1242,7 +1455,7 @@ kind = "secret"
         let def: ServiceDef = toml::from_str(toml_str).unwrap();
         let mut services = HashMap::new();
         services.insert("dash".into(), def);
-        let reg = ServiceRegistry { services, policies: HashMap::new() };
+        let reg = ServiceRegistry { services, policies: HashMap::new(), providers: HashMap::new() };
         let fields = reg.vault_fields("dash");
         assert_eq!(fields.len(), 1);
         assert_eq!(fields[0].name, "token");
@@ -1267,10 +1480,19 @@ kind = "secret"
             if tok == "uuid_v4" || tok == "oauth.access_token" {
                 return true;
             }
-            matches!(
-                tok.split_once('.').map(|(ns, _)| ns),
-                Some("secret") | Some("secret_b64") | Some("secret_basic")
-            )
+            // Secret tokens may carry a pipe filter: `secret.X | b64` /
+            // `secret.X | basic`. Parse `source.key | filter` and validate the
+            // namespace + filter independently (mirrors
+            // `crate::service::validate::token_is_known`).
+            let (source_key, filter) = match tok.split_once('|') {
+                Some((src, f)) => (src.trim(), Some(f.trim())),
+                None => (tok, None),
+            };
+            match source_key.split_once('.').map(|(ns, _)| ns) {
+                Some("secret") => matches!(filter, None | Some("b64") | Some("basic")),
+                Some("secret_b64") | Some("secret_basic") => filter.is_none(),
+                _ => false,
+            }
         }
 
         fn tokens(s: &str) -> Vec<String> {
@@ -1314,12 +1536,13 @@ kind = "secret"
     }
 
     #[test]
-    fn oauth2_env_field_drives_service_env_key() {
-        // OAuth services in the SaaS schema declare their refresh_token
-        // vault item via `auth.env`, same as API-key services. service_env_key
-        // must pick this up so registry surfaces a vault_field and the
-        // unlock-time cache bootstrap loads the refresh_token (when policy
-        // is allow).
+    fn oauth2_secret_field_drives_service_env_key() {
+        // OAuth services declare their refresh_token vault item via
+        // `auth.secret` (renamed from `env`), same as API-key services.
+        // service_env_key must pick this up so registry surfaces a vault_field
+        // and the unlock-time cache bootstrap loads the refresh_token (when
+        // policy is allow). This is the new provider-inheriting shape: no
+        // `type`/endpoints/client on the service — they come from the provider.
         let toml_str = r#"
 [service]
 id = "gmail"
@@ -1331,30 +1554,242 @@ id = "default"
 url = "https://gmail.googleapis.com"
 
 [upstream.auth]
-type = "oauth2"
 provider = "google"
-env = "gmail_refresh_token"
-token_url = "https://oauth2.googleapis.com/token"
-client_id_env = "SAFECLAW_GOOGLE_CLIENT_ID"
-client_secret_env = "SAFECLAW_GOOGLE_CLIENT_SECRET"
+scopes = [
+  "https://www.googleapis.com/auth/gmail.send",
+  "https://www.googleapis.com/auth/gmail.readonly",
+  "https://www.googleapis.com/auth/gmail.modify",
+]
+secret = "gmail_refresh_token"
 "#;
         let def: ServiceDef = toml::from_str(toml_str).unwrap();
         let upstream = def.upstream.first().unwrap();
         let auth = upstream.auth.as_ref().unwrap();
-        assert_eq!(auth.auth_type.as_deref(), Some("oauth2"));
-        assert_eq!(auth.env.as_deref(), Some("gmail_refresh_token"));
-        assert_eq!(auth.token_url.as_deref(), Some("https://oauth2.googleapis.com/token"));
-        assert_eq!(auth.client_id_env.as_deref(), Some("SAFECLAW_GOOGLE_CLIENT_ID"));
-        assert_eq!(auth.client_secret_env.as_deref(), Some("SAFECLAW_GOOGLE_CLIENT_SECRET"));
+        // No inline `type` — auth_mode is inherited from the provider.
+        assert_eq!(auth.auth_type, None);
+        assert_eq!(auth.provider.as_deref(), Some("google"));
+        assert_eq!(auth.secret.as_deref(), Some("gmail_refresh_token"));
+        assert_eq!(auth.scopes.len(), 3);
 
-        // service_env_key uses auth.env first, so OAuth services now resolve
-        // to their refresh_token item — exactly like API-key services.
+        // service_env_key uses auth.secret first, so OAuth services resolve to
+        // their refresh_token item — exactly like API-key services.
         let mut services = HashMap::new();
         services.insert("gmail".into(), def);
-        let reg = ServiceRegistry { services, policies: HashMap::new() };
+        let reg = ServiceRegistry {
+            services,
+            policies: HashMap::new(),
+            providers: HashMap::new(),
+        };
         assert_eq!(
             reg.service_env_key("gmail").as_deref(),
             Some("gmail_refresh_token"),
         );
+    }
+
+    #[test]
+    fn secret_field_accepts_env_alias_for_backcompat() {
+        // Existing recipes (and stored connections) still write `env = "..."`.
+        // The serde alias keeps them parsing into `secret` unchanged.
+        let toml_str = r#"
+[service]
+id = "github"
+name = "GitHub"
+category = "integration"
+[[upstream]]
+id = "default"
+url = "https://api.github.com"
+auth = { env = "github_token" }
+"#;
+        let def: ServiceDef = toml::from_str(toml_str).unwrap();
+        let auth = def.upstream[0].auth.as_ref().unwrap();
+        assert_eq!(auth.secret.as_deref(), Some("github_token"));
+    }
+
+    #[test]
+    fn multi_secret_table_parses() {
+        let toml_str = r#"
+[service]
+id = "gmail"
+name = "Gmail"
+category = "integration"
+[[upstream]]
+id = "default"
+url = "https://gmail.googleapis.com"
+[upstream.auth]
+provider = "google"
+[upstream.auth.secrets]
+refresh_token = "gmail_refresh_token"
+webhook_key = "gmail_webhook"
+"#;
+        let def: ServiceDef = toml::from_str(toml_str).unwrap();
+        let auth = def.upstream[0].auth.as_ref().unwrap();
+        let secrets = auth.secrets.as_ref().unwrap();
+        assert_eq!(secrets.get("refresh_token").map(String::as_str), Some("gmail_refresh_token"));
+        assert_eq!(secrets.get("webhook_key").map(String::as_str), Some("gmail_webhook"));
+    }
+
+    #[test]
+    fn setup_block_parses() {
+        let toml_str = r#"
+[service]
+id = "github-git"
+name = "GitHub Git"
+category = "integration"
+
+[setup]
+goal = "Route the user's git remotes through SafeClaw"
+route = "{{proxy_base}}/stream/github-git/"
+auth = "Authorization: Bearer {{api_key}}"
+example = "git config --global url.\"{{route}}\".insteadOf \"https://github.com/\""
+"#;
+        let def: ServiceDef = toml::from_str(toml_str).unwrap();
+        let setup = def.setup.as_ref().unwrap();
+        assert_eq!(setup.goal.as_deref(), Some("Route the user's git remotes through SafeClaw"));
+        assert_eq!(setup.route.as_deref(), Some("{{proxy_base}}/stream/github-git/"));
+        assert!(setup.auth.as_deref().unwrap().contains("{{api_key}}"));
+        assert!(setup.example.as_deref().unwrap().contains("insteadOf"));
+    }
+
+    #[test]
+    fn provider_file_parses() {
+        let toml_str = r#"
+[provider.google]
+auth_mode = "oauth2"
+flow = "authorization_code"
+authorization_url = "https://accounts.google.com/o/oauth2/v2/auth"
+token_url = "https://oauth2.googleapis.com/token"
+pkce = true
+client_id = "499410884315-x.apps.googleusercontent.com"
+client_secret = "GOCSPX-public"
+client_type = "public"
+"#;
+        let file: ProviderFileDef = toml::from_str(toml_str).unwrap();
+        let p = file.provider.get("google").unwrap();
+        assert_eq!(p.auth_mode.as_deref(), Some("oauth2"));
+        assert_eq!(p.flow.as_deref(), Some("authorization_code"));
+        assert!(p.pkce);
+        assert_eq!(p.client_type.as_deref(), Some("public"));
+        assert_eq!(p.token_url.as_deref(), Some("https://oauth2.googleapis.com/token"));
+    }
+
+    #[test]
+    fn provider_inheritance_resolves_oauth_config() {
+        // A service with `provider = "google"` and no inline type/endpoints
+        // inherits auth_mode + token_url + client from the provider literal.
+        let svc_toml = r#"
+[service]
+id = "gmail"
+name = "Gmail"
+category = "integration"
+[[upstream]]
+id = "default"
+url = "https://gmail.googleapis.com"
+[upstream.auth]
+provider = "google"
+secret = "gmail_refresh_token"
+"#;
+        let prov_toml = r#"
+[provider.google]
+auth_mode = "oauth2"
+token_url = "https://oauth2.googleapis.com/token"
+client_id = "public-client-id"
+client_secret = "public-secret"
+client_type = "public"
+"#;
+        let def: ServiceDef = toml::from_str(svc_toml).unwrap();
+        let pfile: ProviderFileDef = toml::from_str(prov_toml).unwrap();
+
+        let mut services = HashMap::new();
+        services.insert("gmail".into(), def);
+        let mut providers = HashMap::new();
+        for (name, p) in pfile.provider {
+            providers.insert(name, p);
+        }
+        let reg = ServiceRegistry {
+            services,
+            policies: HashMap::new(),
+            providers,
+        };
+
+        let auth = reg.get("gmail").unwrap().upstream[0].auth.as_ref().unwrap();
+        // Inherited auth_mode → recognized as oauth2 despite no inline `type`.
+        assert!(reg.auth_is_oauth2(auth));
+        let cfg = reg.resolve_oauth_config(auth);
+        assert_eq!(cfg.token_url.as_deref(), Some("https://oauth2.googleapis.com/token"));
+        assert_eq!(cfg.client_id.as_deref(), Some("public-client-id"));
+        assert_eq!(cfg.client_secret.as_deref(), Some("public-secret"));
+    }
+
+    #[test]
+    fn inline_auth_without_provider_still_oauth2() {
+        // Self-hosted confidential clients keep declaring type + endpoints
+        // locally with env-var client refs (no provider literal).
+        let toml_str = r#"
+[service]
+id = "selfhosted"
+name = "Self Hosted"
+category = "integration"
+[[upstream]]
+id = "default"
+url = "https://api.example.com"
+[upstream.auth]
+type = "oauth2"
+secret = "selfhosted_refresh_token"
+token_url = "https://api.example.com/token"
+client_id_env = "SELFHOSTED_CLIENT_ID"
+client_secret_env = "SELFHOSTED_CLIENT_SECRET"
+"#;
+        let def: ServiceDef = toml::from_str(toml_str).unwrap();
+        let reg = ServiceRegistry {
+            services: HashMap::new(),
+            policies: HashMap::new(),
+            providers: HashMap::new(),
+        };
+        let auth = def.upstream[0].auth.as_ref().unwrap();
+        assert!(reg.auth_is_oauth2(auth));
+        // No provider literal → falls back to the env-var path. token_url is
+        // the service's own literal.
+        let cfg = reg.resolve_oauth_config(auth);
+        assert_eq!(cfg.token_url.as_deref(), Some("https://api.example.com/token"));
+    }
+
+    #[test]
+    fn compiled_google_services_inherit_provider() {
+        // The shipped gmail/gdrive/gcalendar recipes must resolve oauth2 via
+        // the compiled-in google provider after the recipe rewrite.
+        let mut providers = HashMap::new();
+        for (_f, toml_str) in crate::generated_services::compiled_provider_tomls() {
+            let pfile: ProviderFileDef = toml::from_str(toml_str).unwrap();
+            for (name, p) in pfile.provider {
+                providers.insert(name, p);
+            }
+        }
+        assert!(providers.contains_key("google"), "google provider must be compiled in");
+
+        let mut services = HashMap::new();
+        for (id, toml_str) in crate::generated_services::compiled_service_tomls() {
+            if let Ok(def) = toml::from_str::<ServiceDef>(toml_str) {
+                services.insert(id.to_string(), def);
+            }
+        }
+        let reg = ServiceRegistry {
+            services,
+            policies: HashMap::new(),
+            providers,
+        };
+        for id in ["gmail", "gdrive", "gcalendar"] {
+            let auth = reg.get(id).unwrap().upstream[0].auth.as_ref()
+                .unwrap_or_else(|| panic!("{} missing auth", id));
+            assert_eq!(auth.provider.as_deref(), Some("google"), "{}", id);
+            assert!(reg.auth_is_oauth2(auth), "{} should be oauth2 via provider", id);
+            let cfg = reg.resolve_oauth_config(auth);
+            assert_eq!(
+                cfg.token_url.as_deref(),
+                Some("https://oauth2.googleapis.com/token"),
+                "{}", id
+            );
+            assert!(cfg.client_id.is_some(), "{} client_id", id);
+            assert!(!auth.scopes.is_empty(), "{} scopes", id);
+        }
     }
 }

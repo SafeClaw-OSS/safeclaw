@@ -80,7 +80,7 @@ pub async fn handle(
     let primary = upstream
         .auth
         .as_ref()
-        .and_then(|a| a.env.as_deref())
+        .and_then(|a| a.secret.as_deref())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "unknown".to_string());

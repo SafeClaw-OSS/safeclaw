@@ -339,12 +339,21 @@ pub async fn watch_loop(state: Arc<AppState>, vault: String, cloud: String, dk: 
                                 .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
                         )
                     };
-                    let _guard = lock.lock().await;
-                    if let Err(e) = persist_blob(&state_dir, &vault, blob, version) {
-                        tracing::warn!(vault = %vault, "cloud sync watch: persist failed: {}", e);
-                        continue;
+                    {
+                        let _guard = lock.lock().await;
+                        if let Err(e) = persist_blob(&state_dir, &vault, blob, version) {
+                            tracing::warn!(vault = %vault, "cloud sync watch: persist failed: {}", e);
+                            continue;
+                        }
+                        refresh_after_pull(&state, &vault);
                     }
-                    refresh_after_pull(&state, &vault);
+                    // A freshly-pulled blob may carry a passkey-sealed
+                    // `<conn>_oauth_pending` from a browser "Connect" — complete
+                    // the OAuth code→token exchange and persist the refresh_token
+                    // (CONNECTIONS_AND_AUTH.md §4a). Best-effort; acquires the
+                    // per-vault write lock itself, so it runs AFTER the guard
+                    // above drops (the lock is not reentrant).
+                    crate::auth::connect::process_vault_connects(&state, &vault).await;
                     tracing::info!(vault = %vault, version, "cloud sync watch: applied pulled blob");
                 }
                 404 => {

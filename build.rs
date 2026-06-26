@@ -2,8 +2,8 @@
 ///
 /// Generates src/generated_services.rs with:
 ///   - compiled_service_tomls() -> &[(&str, &str)]
-///   - compiled_recipe_tomls() -> &[(&str, &str)]
 ///   - compiled_policy_tomls() -> &[(&str, &str)]
+///   - compiled_provider_tomls() -> &[(&str, &str)]  (services/_providers/*.toml)
 ///
 /// This eliminates hand-written include_str! lists — adding a new service
 /// just requires creating a TOML file in services/.
@@ -16,18 +16,34 @@ fn main() {
     let out_path = Path::new("src").join("generated_services.rs");
 
     let mut service_entries = Vec::new();
-    let mut recipe_entries = Vec::new();
     let mut policy_entries = Vec::new();
+    let mut provider_entries = Vec::new();
 
     // Scan services/{category}/{id}/ layout
     if services_dir.is_dir() {
-        scan_services(services_dir, &mut service_entries, &mut recipe_entries, &mut policy_entries);
+        scan_services(services_dir, &mut service_entries, &mut policy_entries);
+    }
+
+    // Scan services/_providers/*.toml — shared [provider.<name>] templates.
+    let providers_dir = services_dir.join("_providers");
+    if providers_dir.is_dir() {
+        if let Ok(entries) = fs::read_dir(&providers_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+                    continue;
+                }
+                let name = path.file_stem().unwrap().to_str().unwrap().to_string();
+                let rel = path.to_str().unwrap().to_string();
+                provider_entries.push((name, rel));
+            }
+        }
     }
 
     // Sort for deterministic output
     service_entries.sort();
-    recipe_entries.sort();
     policy_entries.sort();
+    provider_entries.sort();
 
     // Generate Rust source
     let mut code = String::new();
@@ -41,19 +57,20 @@ fn main() {
     }
     code.push_str("    ]\n}\n\n");
 
-    code.push_str("/// Compiled-in recipe.toml definitions.\n");
-    code.push_str("pub fn compiled_recipe_tomls() -> &'static [(&'static str, &'static str)] {\n");
-    code.push_str("    &[\n");
-    for (id, rel_path) in &recipe_entries {
-        code.push_str(&format!("        (\"{}\", include_str!(\"../{}\") ),\n", id, rel_path));
-    }
-    code.push_str("    ]\n}\n\n");
-
     code.push_str("/// Compiled-in policy.toml definitions.\n");
     code.push_str("pub fn compiled_policy_tomls() -> &'static [(&'static str, &'static str)] {\n");
     code.push_str("    &[\n");
     for (id, rel_path) in &policy_entries {
         code.push_str(&format!("        (\"{}\", include_str!(\"../{}\") ),\n", id, rel_path));
+    }
+    code.push_str("    ]\n}\n\n");
+
+    code.push_str("/// Compiled-in provider TOML definitions (services/_providers/*.toml).\n");
+    code.push_str("/// Tuple is (provider_file_stem, toml_content).\n");
+    code.push_str("pub fn compiled_provider_tomls() -> &'static [(&'static str, &'static str)] {\n");
+    code.push_str("    &[\n");
+    for (name, rel_path) in &provider_entries {
+        code.push_str(&format!("        (\"{}\", include_str!(\"../{}\") ),\n", name, rel_path));
     }
     code.push_str("    ]\n}\n");
 
@@ -66,7 +83,6 @@ fn main() {
 fn scan_services(
     base: &Path,
     service_entries: &mut Vec<(String, String)>,
-    recipe_entries: &mut Vec<(String, String)>,
     policy_entries: &mut Vec<(String, String)>,
 ) {
     let Ok(categories) = fs::read_dir(base) else { return };
@@ -82,11 +98,6 @@ fn scan_services(
             let id = cat_path.file_name().unwrap().to_str().unwrap().to_string();
             let rel = service_toml.to_str().unwrap().to_string();
             service_entries.push((id.clone(), rel));
-
-            let recipe_toml = cat_path.join("recipe.toml");
-            if recipe_toml.exists() {
-                recipe_entries.push((id.clone(), recipe_toml.to_str().unwrap().to_string()));
-            }
 
             let policy_toml = cat_path.join("policy.toml");
             if policy_toml.exists() {
@@ -106,11 +117,6 @@ fn scan_services(
             let st = svc_path.join("service.toml");
             if st.exists() {
                 service_entries.push((id.clone(), st.to_str().unwrap().to_string()));
-            }
-
-            let rt = svc_path.join("recipe.toml");
-            if rt.exists() {
-                recipe_entries.push((id.clone(), rt.to_str().unwrap().to_string()));
             }
 
             let pt = svc_path.join("policy.toml");
