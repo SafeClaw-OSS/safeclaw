@@ -48,6 +48,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 e.into()
             })
         }
+        Command::Unlock(args) => cli::unlock::run_unlock(args).await.map_err(daemon_err),
+        Command::Lock(args) => cli::unlock::run_lock(args).await.map_err(daemon_err),
         Command::Ls(args) => {
             cli::ls::run(args).await.map_err(|e| -> Box<dyn std::error::Error> {
                 eprintln!("safeclaw ls: {}", e);

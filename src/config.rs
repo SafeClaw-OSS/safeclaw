@@ -4,12 +4,13 @@ use clap::{Args, Parser, Subcommand};
 /// Top-level CLI shape. `safeclaw` (short alias `sc`) is one binary
 /// with two roles:
 ///
-///   - **Daemon lifecycle** (Linux user-systemd): `sc up` (install + start +
-///     unlock), `sc down`, `sc restart`, `sc logs`, and `sc serve` to run it
-///     in the foreground (Docker / dev / non-Linux).
+///   - **Daemon + vault lifecycle** (Linux user-systemd): `sc up` (install +
+///     start + unlock), `sc down`, `sc restart`, `sc unlock` / `sc lock` (the
+///     active vault), `sc logs`, and `sc serve` to run it in the foreground
+///     (Docker / dev / non-Linux).
 ///   - **Vault ops** are short-lived CLI commands talking to the daemon
-///     over HTTP: `sc status`, `sc vault ...` (alias `sc v`, incl. `unlock` /
-///     `lock`), `sc ls / get / set / rm`, `sc passkey` (alias `sc p`),
+///     over HTTP: `sc status`, `sc vault ...` (alias `sc v`, manage the set of
+///     vaults), `sc ls / get / set / rm`, `sc passkey` (alias `sc p`),
 ///     `sc store`, `sc doctor`, …
 ///
 /// Bare `safeclaw` (no subcommand) prints help.
@@ -36,6 +37,15 @@ pub enum Command {
     /// A bounce wipes the in-memory keys, so `restart` converges back to the
     /// same running+unlocked state as `sc up` — never leaves you silently locked.
     Restart,
+    /// Bring the active vault Locked → Unlocked (one passkey tap). Normally
+    /// `sc up` does this for you; use this to unlock explicitly. A vault-level
+    /// lifecycle op — sits next to `sc up`, not under `sc vault` (which manages
+    /// the *set* of vaults). Pass `--vault` to target a non-active vault.
+    Unlock(UnlockArgs),
+    /// Drop the active vault's in-memory secrets cache and flip it back to
+    /// Locked (passkey-gated per PROTOCOL.md §6.3 so a stolen session can't
+    /// DOS-lock the vault). Pass `--vault` to target a non-active vault.
+    Lock(UnlockArgs),
     /// Tail the local daemon's logs (journalctl).
     Logs(LogsArgs),
     /// Run the daemon in the FOREGROUND (this process). For Docker / dev / a
@@ -295,11 +305,13 @@ pub enum VaultSubcommand {
     /// Irreversibly delete a vault's daemon-side state. Passkey-gated
     /// via the standard `/op/{op_id}` browser-callback ceremony.
     Delete(VaultDeleteArgs),
-    /// Bring the vault Locked → Unlocked (one passkey tap). Normally `sc up`
-    /// does this for you; use this to unlock explicitly.
+    /// Back-compat alias for top-level `sc unlock`. Lock/unlock are vault-level
+    /// lifecycle ops (they sit next to `sc up`), so the canonical spelling is
+    /// top-level; this is kept hidden so existing `sc vault unlock` calls work.
+    #[command(hide = true)]
     Unlock(UnlockArgs),
-    /// Drop the in-memory secrets cache and flip back to Locked (passkey-gated
-    /// per PROTOCOL.md §6.3 so a stolen session can't DOS-lock the vault).
+    /// Back-compat alias for top-level `sc lock`. See `Unlock` above.
+    #[command(hide = true)]
     Lock(UnlockArgs),
 }
 
