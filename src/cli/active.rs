@@ -225,31 +225,26 @@ pub fn join_vault_url(custodian: &str, vault: &str) -> String {
 }
 
 /// Resolve the active `(daemon_url, vault)` pair for short-lived CLI commands.
-/// The daemon URL comes from `$SAFECLAW_VAULT_URL` (or the active config),
-/// defaulting via config — point the agent/CLI at another device's daemon by
-/// setting `$SAFECLAW_VAULT_URL`. `vault_override` (the `--vault` flag) only
-/// reselects the vault id on that daemon. Precedence: $SAFECLAW_VAULT_URL >
-/// config; `--vault` overrides just the vault id.
+/// Resolve the `(custodian, vault)` the **human's** `sc` command operates on.
+/// Source = `config.toml` (set by `sc login` / `sc vault use`) + the explicit
+/// `--vault` flag (`vault_override`, which reselects just the vault id).
+///
+/// We deliberately do NOT read `$SAFECLAW_VAULT_URL` here. That env var is the
+/// AGENT's broker endpoint (the install-prompt persists it for the agent
+/// process). A human's `sc` command must never inherit the agent's vault
+/// choice — if it did, a stale agent env would hijack the human's commands
+/// (it did: a real unlock bug). The rule we keep:
+///   env          = process config (daemon-serve params, the agent's broker URL)
+///   active vault = user state → config.toml
 pub fn resolve_active(vault_override: Option<&str>) -> Result<(String, String), String> {
-    let (env_custodian, env_vault) = match std::env::var("SAFECLAW_VAULT_URL") {
-        Ok(url) if !url.is_empty() => split_vault_url(&url)
-            .map(|(c, v)| (Some(c), Some(v)))
-            .unwrap_or((None, None)),
-        _ => (None, None),
-    };
     let cfg = load()?;
-    let custodian = env_custodian
-        .or(cfg.custodian.clone())
-        .ok_or_else(|| {
-            "no vault selected — run `safeclaw vault use` or set $SAFECLAW_VAULT_URL".to_string()
-        })?;
+    let custodian = cfg.custodian.clone().ok_or_else(|| {
+        "no vault selected — run `sc login` or `sc vault use`".to_string()
+    })?;
     let vault = vault_override
         .map(str::to_string)
-        .or(env_vault)
         .or(cfg.vault.clone())
-        .ok_or_else(|| {
-            "no vault selected — run `safeclaw vault use` or set $SAFECLAW_VAULT_URL".to_string()
-        })?;
+        .ok_or_else(|| "no vault selected — run `sc login` or `sc vault use`".to_string())?;
     Ok((custodian, vault))
 }
 

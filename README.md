@@ -105,6 +105,29 @@ The two env vars an agent uses:
 Daemon ports default to `23294` (API) and `23295` (HTTPS proxy). See
 `sc serve --help` for the full set (`SAFECLAW_PORT`, `SAFECLAW_LISTEN`, …).
 
+### Env vs config — who picks the vault
+
+Those two env vars belong to the **agent process**. They are *not* how the `sc`
+CLI decides which vault you're working in:
+
+- **Agent** → reads `SAFECLAW_VAULT_URL` + `SAFECLAW_API_KEY` from its env; the
+  vault it touches is the `/v/<id>` in that URL.
+- **`sc` CLI (you)** → reads the active vault from `~/.safeclaw/config.toml`
+  (set by `sc login` / `sc vault use`) plus an explicit `--vault` flag. It does
+  **not** read `$SAFECLAW_VAULT_URL`, so a stale agent env can never hijack your
+  CLI commands.
+
+The rule: **env = process config** (daemon-serve params, the agent's broker
+URL); **active vault = user state → `config.toml`**.
+
+Two facts that follow:
+
+- `SAFECLAW_API_KEY` is **account-level** — orthogonal to vaults. One key works
+  for any of your vaults; the vault is chosen by the URL, not the key.
+- The daemon hosts **all** your vaults at once — there is no global "active
+  vault" on the daemon. Which vault a request hits is the `/v/<id>` in that
+  request (a per-request choice), not daemon state.
+
 ## How it works
 
 The agent→daemon and daemon→cloud surfaces speak **SUDP**, a passkey-signed
