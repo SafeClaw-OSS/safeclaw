@@ -316,6 +316,25 @@ pub struct ResolvedOAuthConfig {
     pub client_secret: Option<String>,
 }
 
+/// The PUBLIC OAuth consent parameters a frontend needs to START a connect for
+/// a service: where to send the user (authorization_url), as whom (client_id),
+/// for what (scopes), and whether to use PKCE. CONNECTIONS_AND_AUTH.md §4a.
+///
+/// **Cloud-blind by construction:** the confidential half — `client_secret` and
+/// `token_url` — is deliberately NOT here. The browser only drives consent and
+/// seals the resulting `{code, verifier}` into the vault; the daemon holds the
+/// secret and does the code→token exchange locally. So this struct is safe to
+/// serialize into the public `/registry` response.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ConnectDescriptor {
+    pub provider: String,
+    pub auth_mode: String,
+    pub authorization_url: String,
+    pub client_id: String,
+    pub scopes: Vec<String>,
+    pub pkce: bool,
+}
+
 /// Inline policy in service.toml (legacy, still supported as fallback).
 /// Prefer standalone policy.toml for new services.
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -836,6 +855,29 @@ impl ServiceRegistry {
             .or_else(|| auth.client_secret_env.as_deref().and_then(|n| std::env::var(n).ok()));
 
         ResolvedOAuthConfig { token_url, client_id, client_secret }
+    }
+
+    /// The PUBLIC OAuth consent parameters for `service_id` — what a frontend
+    /// needs to start a cloud-blind connect (CONNECTIONS_AND_AUTH.md §4a). The
+    /// confidential half (client_secret/token_url) is intentionally omitted; the
+    /// daemon does the exchange. Returns `None` when the service isn't oauth2,
+    /// declares no `provider`, or the provider lacks an authorization_url/client_id.
+    pub fn connect_descriptor(&self, service_id: &str) -> Option<ConnectDescriptor> {
+        let def = self.services.get(service_id)?;
+        let auth = def.upstream.first()?.auth.as_ref()?;
+        if !self.auth_is_oauth2(auth) {
+            return None;
+        }
+        let provider_name = auth.provider.as_deref()?;
+        let p = self.providers.get(provider_name)?;
+        Some(ConnectDescriptor {
+            provider: provider_name.to_string(),
+            auth_mode: p.auth_mode.clone().unwrap_or_else(|| "oauth2".to_string()),
+            authorization_url: p.authorization_url.clone()?,
+            client_id: p.client_id.clone()?,
+            scopes: auth.scopes.clone(),
+            pkce: p.pkce,
+        })
     }
 
     /// Generate locked response for a service when vault is locked.
@@ -1791,5 +1833,35 @@ client_secret_env = "SELFHOSTED_CLIENT_SECRET"
             assert!(cfg.client_id.is_some(), "{} client_id", id);
             assert!(!auth.scopes.is_empty(), "{} scopes", id);
         }
+    }
+
+    #[test]
+    fn connect_descriptor_for_gmail_exposes_public_consent_only() {
+        let reg = ServiceRegistry::load();
+        let d = reg
+            .connect_descriptor("gmail")
+            .expect("gmail is oauth2 with a google provider");
+        assert_eq!(d.provider, "google");
+        assert_eq!(d.auth_mode, "oauth2");
+        assert!(d.authorization_url.starts_with("https://accounts.google.com/"));
+        assert!(d.client_id.ends_with(".apps.googleusercontent.com"));
+        assert!(d.pkce);
+        assert!(d.scopes.iter().any(|s| s.contains("gmail.send")));
+
+        // CLOUD-BLIND: the descriptor that ships to the browser must NEVER carry
+        // the confidential half — no client_secret, no token endpoint.
+        let json = serde_json::to_string(&d).unwrap();
+        assert!(!json.contains("GOCSPX"), "client_secret leaked: {json}");
+        assert!(
+            !json.contains("oauth2.googleapis.com/token"),
+            "token_url leaked: {json}"
+        );
+    }
+
+    #[test]
+    fn connect_descriptor_none_for_non_oauth_service() {
+        let reg = ServiceRegistry::load();
+        // openai is a bearer/api-key service — no oauth2 consent to start.
+        assert!(reg.connect_descriptor("openai").is_none());
     }
 }
