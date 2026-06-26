@@ -244,6 +244,22 @@ no decoy token, no concealed interception.**
 
 ### 5.1 Persist the inputs, derive the config each session (NOT per-session-set, NOT persisted-render)
 
+> **🟡 OPEN DECISION (settle 2026-06-27 AM): how the api_key reaches git.** Two
+> candidates, both keep the key off disk:
+> - **(A) env projection** — the agent sets `GIT_CONFIG_*` from its own env
+>   (optionally emitted by `sc env`). Described below. Simplest; ideal in the
+>   dedicated-agent-VM model. Weaker on shared boxes (`GIT_CONFIG_COUNT` is a
+>   single global counter) and across non-shell git execution contexts.
+> - **(B) git credential helper** — persist a stable `credential.<broker>.helper
+>   = !sc git-credential`; git invokes it at run-time and it returns the live key
+>   from env. Git-native (like `gh`), no `GIT_CONFIG_COUNT` collisions, works in
+>   every git context, "persisted feel + fresh resolution." Costs a small
+>   `sc git-credential` subcommand + the broker accepting the key via HTTP Basic.
+>
+> Leaning **(B)** for product breadth; **not yet built** — the shipped `[setup]`
+> blocks currently show form (A), which works for v1. **Decide, then update the
+> `[setup]` blocks + skill accordingly.** Until then everything below describes (A).
+
 The git config is a **projection of the environment**, not a piece of state to
 either re-type every session or write to disk. Split by sensitivity:
 
@@ -312,7 +328,7 @@ the streaming protocol non-interrupting — it's to **move the gate before the
 stream**, `sudo`-style: approve a **time-boxed window**, not each request.
 
 ```
-1. before git runs, the agent calls a normal BUFFERED endpoint:
+1. before git runs, the AGENT calls a normal BUFFERED endpoint:
    "request git access to <connection> for N minutes"
 2. → returns { op_id, approve_url }   ← a normal response, so the link IS deliverable
                                          (it is NOT a stuck stream)
@@ -321,21 +337,33 @@ stream**, `sudo`-style: approve a **time-boxed window**, not each request.
 5. window expires → the next git op requests a fresh grant
 ```
 
+It reuses machinery we already have — the time-boxed approval grant-cache
+(`state.rs`, commit `769f79b` / `ask_grant_is_scoped_to_method_and_rule`), keyed
+by `(vault, service)` instead of `(service, rule, method)`. Three small pieces:
+the request endpoint (a new act-kind on the existing op flow), recording
+`(vault, service, expires_at)` on approve, and one extra condition in
+`stream.rs`. **Not a rewrite.**
+
+> **DECIDED (2026-06-27): agent-initiated only.** The window, if/when built, is
+> **agent-initiated** (the agent asks when it needs access). A user-initiated
+> "offline pre-authorize" flavor (e.g. `sc grant github 30m`) was considered and
+> **rejected** — keep the agent in the loop, no out-of-band grant CLI.
+
 This reconciles both constraints: the stream never pauses (approval happened
 *before* it), and the approve-link rides the buffered pre-grant call. UX is also
 *better* than per-request — one tap per session, not per `git fetch`.
 
-**Where the allow-only constraint must be surfaced** (so a user choosing "ask" on a
+**Where the allow-only constraint is surfaced** (so a user choosing "ask" on a
 git service isn't silently ignored):
 
-1. **Recipe validation** — reject `stream = true` + non-allow policy **at
-   load/validate time** (today [stream.rs](../src/proxy/stream.rs) rejects only at
-   request time → a late 403). Message: "streaming services are allow-only;
-   per-request approval is unsupported — use a pre-grant window (roadmap)."
-2. **[PROTOCOL.md](./PROTOCOL.md)** policy section — state the invariant: streaming
-   routes require allow-level; ask/ask-always/deny are incompatible with streaming.
+1. **Recipe validation — ✅ IMPLEMENTED.** `validate_recipe` rejects
+   `stream = true` + a declared non-allow `read`/`write` level at load time
+   (`validate.rs`, test `streaming_requires_allow_policy`). Message: *"streaming
+   requires \"allow\" (a live stream can't be gated by per-request approval)."*
+   (Previously [stream.rs](../src/proxy/stream.rs) only rejected at request time.)
+2. **[PROTOCOL.md](./PROTOCOL.md)** policy section — state the invariant (TODO).
 3. **Console UI** — when a user sets a streaming/git service to "ask," explain it
-   and (when built) offer the window model instead.
+   (TODO).
 4. **This doc** — §1.3 / §7 / §7.1.
 
 ## 8. Build checklist

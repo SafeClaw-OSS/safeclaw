@@ -219,6 +219,28 @@ pub fn validate_recipe(toml_str: &str, first_party: bool) -> Result<(), Vec<Stri
         }
     }
 
+    // Streaming services must be allow-policy. A streamed body (e.g. a git
+    // packfile) is live — it can't be paused to run the per-request passkey
+    // ceremony — so `stream.rs` only serves allow-level streaming services.
+    // Reject a declared non-allow level at LOAD time rather than failing
+    // opaquely at request time. (Approval-gated streaming is a future pre-grant
+    // *window*, not per-request — GIT_INTEGRATION.md §7.1.)
+    if def.upstream.iter().any(|u| u.stream) {
+        if let Some(levels) = def.policy.as_ref().and_then(|p| p.levels.as_ref()) {
+            for key in ["read", "write"] {
+                if let Some(level) = levels.get(key) {
+                    if level != "allow" {
+                        errs.push(format!(
+                            "streaming service declares {} = \"{}\"; streaming requires \"allow\" \
+                             (a live stream can't be gated by per-request approval)",
+                            key, level
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
     if errs.is_empty() {
         Ok(())
     } else {
@@ -366,6 +388,36 @@ auth = { env = "telegram_bot_token" }
         // validates clean.
         let toml = GITHUB.replace("{{secret.github_token}}", "{{secret.github_token | b64}}");
         assert!(validate_recipe(&toml, true).is_ok());
+    }
+
+    #[test]
+    fn streaming_requires_allow_policy() {
+        const STREAM: &str = r#"
+[service]
+id = "git-host"
+name = "Git host"
+category = "integration"
+[[upstream]]
+id = "git"
+url = "https://github.com"
+stream = true
+auth = { secret = "github_token" }
+[upstream.headers]
+Authorization = "Basic {{secret.github_token | basic}}"
+"#;
+        // No policy block → defaults to allow at runtime → OK.
+        assert!(validate_recipe(STREAM, true).is_ok());
+        // Explicit allow → OK.
+        let ok = format!("{}\n[policy.levels]\nread = \"allow\"\nwrite = \"allow\"\n", STREAM);
+        assert!(validate_recipe(&ok, true).is_ok());
+        // A non-allow level on a streaming service is rejected at load time.
+        let bad = format!("{}\n[policy.levels]\nread = \"ask\"\nwrite = \"allow\"\n", STREAM);
+        let errs = validate_recipe(&bad, true).unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.contains("streaming requires \"allow\"")),
+            "{:?}",
+            errs
+        );
     }
 
     #[test]
