@@ -78,7 +78,7 @@ your passkey. The agent gets the response, never the key.
 
 ```bash
 sc login --pair-token <spt>   # pair this machine (then brings the daemon up + unlocks)
-sc logout [--revoke]          # unpair this machine (inverse of login); --revoke also cuts it cloud-side
+sc logout [--keep-remote]     # unpair this machine (inverse of login); revokes the device-key cloud-side too
 sc up                         # get the daemon running + vault unlocked (idempotent)
 sc down | restart | logs      # daemon lifecycle (`restart` re-unlocks; Linux user-systemd)
 sc serve                      # run the daemon in the foreground (Docker / dev)

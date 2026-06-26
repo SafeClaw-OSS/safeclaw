@@ -6,9 +6,11 @@
 //! undoes all of it and stops the daemon, so a re-pair starts clean and the
 //! daemon stops syncing / log-spamming on now-orphaned vaults.
 //!
-//! By default it's a LOCAL unpair: the cloud-side device-key row is left (it
-//! just goes unused once the local file is gone). `--revoke` also deletes it
-//! server-side — for a lost or decommissioned machine.
+//! By default it revokes the cloud-side device-key row too: once the local
+//! file is gone its plaintext is unrecoverable, so the server row could never
+//! be matched again — leaving it would just accumulate dead "paired devices"
+//! in the dashboard. `--keep-remote` skips the cloud revoke (rare; only when
+//! something external still manages that key).
 //!
 //! What we deliberately DON'T touch: the agent's `SAFECLAW_VAULT_URL` /
 //! `SAFECLAW_API_KEY` env in the user's shell profile. That's the user's file
@@ -24,10 +26,10 @@ pub async fn run(args: LogoutArgs) -> Result<(), String> {
     let was_paired =
         cfg.custodian.is_some() || cfg.cloud_backend.is_some() || crate::sync::device_key().is_some();
 
-    // 1. Optionally revoke the device-key cloud-side — BEFORE we drop the local
+    // 1. Revoke the device-key cloud-side (default) — BEFORE we drop the local
     //    credential we'd need to authenticate the revoke. Best-effort: a failure
-    //    here must not block the local unpair.
-    if args.revoke {
+    //    (e.g. offline) must not block the local unpair. `--keep-remote` skips it.
+    if !args.keep_remote {
         match revoke_device_cloud(&cfg).await {
             Ok(Some(label)) => eprintln!("✓ revoked this device cloud-side ({label})"),
             Ok(None) => eprintln!("  (no matching device found cloud-side — nothing to revoke)"),

@@ -90,10 +90,11 @@ pub enum Command {
     /// everyday "make sure it's running" afterwards.
     Login(LoginArgs),
     /// Unpair this host: the inverse of `sc login`. Stops the daemon, clears the
-    /// local pairing (active vault, cloud backend, known vaults) and removes the
-    /// `~/.safeclaw/device-key`. By default the cloud-side device key is left
-    /// (unused); `--revoke` deletes it server-side too. Your agent's
-    /// `SAFECLAW_*` shell env is yours to remove (we can't edit your profile).
+    /// local pairing (active vault, cloud backend, known vaults), removes the
+    /// `~/.safeclaw/device-key`, and revokes that device-key cloud-side (its
+    /// plaintext is gone locally, so the server row is dead weight otherwise).
+    /// `--keep-remote` skips the cloud revoke. Your agent's `SAFECLAW_*` shell
+    /// env is yours to remove (we can't edit your profile).
     Logout(LogoutArgs),
     /// Manage external stores connected to the active vault. Today: list.
     /// Connect / disconnect are deferred until the Write op lands in the
@@ -522,11 +523,14 @@ pub struct LoginArgs {
 /// Args for `sc logout`.
 #[derive(Debug, Args)]
 pub struct LogoutArgs {
-    /// Also revoke this host's device-key on the server (delete it cloud-side),
-    /// not just locally. Use this when the machine is lost/decommissioned. By
-    /// default logout is local-only: the key simply goes unused.
+    /// Keep this host's device-key registered on the server (don't revoke it
+    /// cloud-side). By default logout DELETES the cloud-side key too: once the
+    /// local `device-key` file is gone its plaintext is unrecoverable, so the
+    /// server row could never be used again — leaving it just clutters your
+    /// dashboard's device list. Use `--keep-remote` only if something external
+    /// still manages that key.
     #[arg(long)]
-    pub revoke: bool,
+    pub keep_remote: bool,
 }
 
 /// Reusable arg set for read-only short-lived commands. The daemon URL comes
