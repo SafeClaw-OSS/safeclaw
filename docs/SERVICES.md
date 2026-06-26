@@ -199,6 +199,31 @@ Only the immutable refresh_token enters the vault; the short-lived access_token 
 
 Other stateful providers (`aws-sigv4`, `hmac-sha256`, ...) are reserved for the future and not implemented.
 
+#### `stream = true` — Streaming passthrough (raw transports like git)
+
+```toml
+[[upstream]]
+id     = "default"
+url    = "https://github.com"
+stream = true
+auth   = { env = "github_token" }
+
+[upstream.headers]
+Authorization = "Basic {{secret_basic.github_token}}"
+
+[policy.levels]
+read  = "allow"
+write = "allow"
+```
+
+A `stream = true` upstream opts the service into the generic **streaming-passthrough** route `ANY /v/{vid}/stream/{service}/{*rest}` (distinct from the buffered `/use/` broker). Request and response bodies are proxied as **byte streams with no buffering**, and the route's body-size limit is lifted — for transports like git's smart-HTTP where a single packfile can be hundreds of MB. The daemon does **not** interpret the wire protocol: it injects the recipe's auth header(s) and forwards verbatim, so one route serves git and any future raw transport.
+
+Constraints (enforced at request time):
+- **allow-policy only.** Streaming bypasses the per-request passkey ceremony (the agent reaches it transparently, e.g. via a `git insteadOf` it configured at connect time), so the service must be `allow` and its credential already resident in the unlocked cache. ask / ask-always / deny are rejected.
+- Same **host-literal** + **replace-all-matching** auth stance as the broker.
+
+This is the one recipe shape that is deliberately **not OpenAPI-describable** (git is a binary transport, not a REST API); normal `[[api]]` recipes stay OpenAPI-mappable. The in-tree `github-git` recipe (hidden, reuses the `github_token` secret, HTTP Basic — the `https://<token>@github.com` form) is the reference.
+
 #### `[upstream.locked]` — Response when vault is locked
 
 ```toml
