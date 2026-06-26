@@ -130,12 +130,12 @@ pub async fn run(args: UpgradeArgs) -> Result<(), String> {
     // user isn't left on the old build. Best-effort — a foreground / non-systemd
     // daemon just keeps running until it's restarted by hand.
     if crate::cli::service::unit_installed() {
-        // Migrate a stale `custodian run` unit to `serve` BEFORE restarting —
-        // the new binary has no `custodian` subcommand, so the old ExecStart
-        // would fail to start.
-        let _ = crate::cli::service::reconcile_unit_execstart();
-        if let Err(e) = crate::cli::service::run_restart() {
-            eprintln!("  couldn't auto-restart the daemon ({e}); run `sc restart`.");
+        // Bounce onto the new binary AND re-unlock — `restart` reconciles a
+        // stale `custodian run` ExecStart, restarts, then converges through the
+        // same unlock chokepoint as `sc up`, so an upgrade never leaves the
+        // user on a freshly-started-but-Locked daemon.
+        if let Err(e) = crate::cli::up::restart().await {
+            eprintln!("  couldn't auto-restart the daemon ({e}); run `sc up`.");
         }
     } else {
         eprintln!("  Start it with `sc up`.");

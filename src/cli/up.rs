@@ -30,6 +30,21 @@ pub async fn run() -> Result<(), String> {
     ensure_unlocked().await
 }
 
+/// `sc restart`: force a fresh daemon process, then converge back to ready.
+///
+/// A process bounce wipes the in-memory vault keys, so a bare `systemctl
+/// restart` would leave the vault Locked — a *different* end-state than `sc up`.
+/// To keep the verb taxonomy honest (every "make it run" verb lands you ready),
+/// `restart` reconciles a stale unit first (like `up`), bounces, then routes
+/// through the same `ensure_unlocked` chokepoint. `sc upgrade` (and, going
+/// forward, `sc login`) reuse this so they can't silently leave you locked
+/// onto a freshly-started daemon either.
+pub async fn restart() -> Result<(), String> {
+    let _ = service::reconcile_unit_execstart();
+    service::run_restart()?;
+    ensure_unlocked().await
+}
+
 /// The single unlock chokepoint. If the active vault is Locked, run the passkey
 /// unlock; otherwise no-op (already unlocked, or no vault selected). Waits
 /// briefly for the daemon to finish pulling the vault on a fresh start.
@@ -50,7 +65,7 @@ pub async fn ensure_unlocked() -> Result<(), String> {
         status = fetch_status(&custodian, &vault).await;
     }
 
-    if matches!(status.state, VaultState::Locked { .. }) {
+    if should_attempt_unlock(&status.state) {
         let args = UnlockArgs {
             vault: None,
             no_browser: false,
@@ -60,4 +75,27 @@ pub async fn ensure_unlocked() -> Result<(), String> {
         unlock::run_unlock(args).await?;
     }
     Ok(())
+}
+
+/// Whether `ensure_unlocked` should attempt a passkey unlock for this state.
+/// Only a Locked vault needs it: Unlocked is a no-op, and Unreachable/NotFound
+/// mean there's nothing here to unlock (the caller already waited for the
+/// daemon to come up). Pulled out so the convergence decision is unit-testable
+/// — the regression we guard is that `up`/`restart`/`upgrade` all still
+/// re-unlock after a bounce instead of leaving the vault silently Locked.
+fn should_attempt_unlock(state: &VaultState) -> bool {
+    matches!(state, VaultState::Locked { .. })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unlock_only_when_locked() {
+        assert!(should_attempt_unlock(&VaultState::Locked { passkeys: 1 }));
+        assert!(!should_attempt_unlock(&VaultState::Unlocked { passkeys: 1, secrets: 3 }));
+        assert!(!should_attempt_unlock(&VaultState::Unreachable));
+        assert!(!should_attempt_unlock(&VaultState::NotFound));
+    }
 }

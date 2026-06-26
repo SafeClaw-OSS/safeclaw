@@ -26,7 +26,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // short-lived CLI dispatcher.
         Command::Serve(serve) => run_daemon(serve).await,
         Command::Down => cli::service::run_stop().map_err(daemon_err),
-        Command::Restart => cli::service::run_restart().map_err(daemon_err),
+        // `sc restart` = bounce the daemon AND converge back to ready (re-unlock).
+        // A process restart wipes the in-memory keys, so it routes through the
+        // same `ensure_unlocked` chokepoint as `sc up` (see cli/up.rs::restart).
+        Command::Restart => {
+            cli::up::restart().await.map_err(|e| -> Box<dyn std::error::Error> {
+                eprintln!("safeclaw restart: {}", e);
+                e.into()
+            })
+        }
         Command::Logs(args) => cli::service::run_logs(args).map_err(daemon_err),
         Command::Pubkey(args) => cli::custodian::pubkey(args).await.map_err(daemon_err),
         Command::Menu(args) => cli::custodian::menu(args).await.map_err(daemon_err),

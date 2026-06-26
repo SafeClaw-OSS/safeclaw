@@ -32,7 +32,9 @@ pub enum Command {
     Up,
     /// Stop the local daemon (user-level systemd unit).
     Down,
-    /// Restart the local daemon (user-level systemd unit).
+    /// Restart the local daemon, then re-unlock the vault (one passkey tap).
+    /// A bounce wipes the in-memory keys, so `restart` converges back to the
+    /// same running+unlocked state as `sc up` — never leaves you silently locked.
     Restart,
     /// Tail the local daemon's logs (journalctl).
     Logs(LogsArgs),
