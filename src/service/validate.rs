@@ -38,11 +38,24 @@ fn token_is_known(tok: &str) -> bool {
         None => return false,
     };
     match ns {
-        // Canonical secret form: only `b64` / `basic` filters (or none).
-        "secret" => matches!(filter, None | Some("b64") | Some("basic")),
+        // Canonical secret form: `b64` / `basic` / `basic:<user>` filters (or none).
+        "secret" => is_known_secret_filter(filter),
         // Deprecated aliases carry their encoding in the prefix — no filter.
         "secret_b64" | "secret_basic" => filter.is_none(),
         _ => false,
+    }
+}
+
+/// A secret token's pipe filter is known iff it is absent, `b64`, `basic`, or
+/// `basic:<user>` with a non-empty, colon-free username. Shared by the recipe
+/// validator and the compiled-recipe guard (keep in lockstep with
+/// `broker::apply_secret_filter`).
+fn is_known_secret_filter(filter: Option<&str>) -> bool {
+    match filter {
+        None | Some("b64") | Some("basic") => true,
+        Some(f) => f
+            .strip_prefix("basic:")
+            .map_or(false, |u| !u.is_empty() && !u.contains(':')),
     }
 }
 
@@ -338,11 +351,14 @@ auth = { env = "telegram_bot_token" }
         // The canonical filter grammar is a known token.
         assert!(token_is_known("secret.k | b64"));
         assert!(token_is_known("secret.k | basic"));
+        assert!(token_is_known("secret.k | basic:oauth2"));
         assert!(token_is_known("secret.k"));
         assert!(token_is_known("secret_b64.k"));
         assert!(token_is_known("secret_basic.k"));
-        // Unknown filter / alias-with-filter are NOT known.
+        // Unknown filter / alias-with-filter / malformed basic:user are NOT known.
         assert!(!token_is_known("secret.k | urlenc"));
+        assert!(!token_is_known("secret.k | basic:"));
+        assert!(!token_is_known("secret.k | basic:a:b"));
         assert!(!token_is_known("secret_b64.k | basic"));
         assert!(!token_is_known("auth_value"));
 

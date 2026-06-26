@@ -1,20 +1,65 @@
 [service]
 id = "github"
 name = "GitHub"
-sub = "REST API"
+sub = "REST API + git"
 category = "integration"
 
+# One GitHub connection (one PAT) backs BOTH the REST API and the git transport.
+# `rest` is reached at /v/{vid}/use/github (buffered broker); `git` is reached at
+# /v/{vid}/stream/github (unbuffered smart-HTTP). They share `github_token`.
+
+# A. REST API  →  /v/{vid}/use/github
 [[upstream]]
-id = "default"
+id = "rest"
 url = "https://api.github.com"
-auth = { env = "github_token", placeholder = "github_pat_..." }
+auth = { secret = "github_token", placeholder = "github_pat_..." }
 
   [upstream.headers]
   Authorization = "Bearer {{secret.github_token}}"
+
+# B. git smart-HTTP  →  /v/{vid}/stream/github
+[[upstream]]
+id = "git"
+url = "https://github.com"
+# Opt into the generic streaming passthrough (the /stream/ route).
+stream = true
+auth = { secret = "github_token" }
+
+  [upstream.headers]
+  # GitHub PAT over git smart-HTTP = HTTP Basic with the token as the username and
+  # an empty password — i.e. `https://<token>@github.com/…` = base64(token + ':'),
+  # which `{{secret.NAME | basic}}` produces.
+  Authorization = "Basic {{secret.github_token | basic}}"
 
 [[api]]
 path = "*"
 
   [[api.steps]]
-  target = "upstream:default"
+  target = "upstream:rest"
   returns = true
+
+# Tool-config: let the agent point git at the broker. Iron rule — goal + building
+# blocks + a canonical example; the agent inspects the real remotes and adapts.
+[setup]
+goal = "Route the user's git remotes through SafeClaw so the GitHub PAT never enters git or the agent process."
+route = "{{proxy_base}}/stream/github/"
+auth = "Authorization: Bearer {{api_key}}"
+example = """
+# Inspect first — don't assume github.com:
+git remote -v ; git config --get-regexp '^url\\.'
+
+# Off-disk config (preferred for agents): the key stays in the environment.
+export GIT_CONFIG_COUNT=2
+export GIT_CONFIG_KEY_0="url.{{route}}.insteadOf"     GIT_CONFIG_VALUE_0="https://github.com/"
+export GIT_CONFIG_KEY_1="http.{{route}}.extraHeader"  GIT_CONFIG_VALUE_1="{{auth}}"
+
+# SSH remotes? Rewrite them too (then the SSH key is no longer needed):
+#   url.{{route}}.insteadOf = "git@github.com:"
+#   url.{{route}}.insteadOf = "ssh://git@github.com/"
+"""
+
+# Allow-policy: git streams without a per-request passkey (the user opted in by
+# configuring `insteadOf`); the token never enters git. Streaming requires allow.
+[policy.levels]
+read = "allow"
+write = "allow"

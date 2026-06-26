@@ -292,20 +292,42 @@ pub(crate) fn render_template(tpl: &str, inputs: &RenderInputs) -> Result<String
 }
 
 /// Apply a secret encoding filter to raw vault bytes. `None` = no filter
-/// (raw UTF-8); `Some("b64")` = base64; `Some("basic")` = base64(value + ':').
+/// (raw UTF-8); `Some("b64")` = base64; `Some("basic")` = base64(value + ':')
+/// (token-as-username, e.g. GitHub); `Some("basic:USER")` = base64("USER:" +
+/// value) (token-as-password with a fixed username, e.g. GitLab's `oauth2`).
 /// Unknown filter → hard error.
 fn apply_secret_filter(name: &str, bytes: &[u8], filter: Option<&str>) -> Result<String> {
     match filter {
         None => String::from_utf8(bytes.to_vec())
             .map_err(|_| AppError::BadRequest(format!("secret '{}' is not valid UTF-8", name))),
         Some("b64") => Ok(STANDARD.encode(bytes)),
+        // `basic` (no arg): base64(value + ':') — the token is the username and
+        // the password is empty (GitHub git smart-HTTP, Stripe).
         Some("basic") => {
             let mut buf = bytes.to_vec();
             buf.push(b':');
             Ok(STANDARD.encode(&buf))
         }
+        // `basic:USER`: base64("USER:" + value) — a fixed username with the token
+        // as the password (GitLab uses `oauth2`; any forge that requires a
+        // non-empty Basic username). USER must be non-empty and colon-free (a
+        // colon would corrupt the user/pass split at the server).
+        Some(f) if f.starts_with("basic:") => {
+            let user = &f["basic:".len()..];
+            if user.is_empty() || user.contains(':') {
+                return Err(AppError::BadRequest(format!(
+                    "invalid basic filter username in '{}' (must be non-empty, no colon)",
+                    f
+                )));
+            }
+            let mut buf = Vec::with_capacity(user.len() + 1 + bytes.len());
+            buf.extend_from_slice(user.as_bytes());
+            buf.push(b':');
+            buf.extend_from_slice(bytes);
+            Ok(STANDARD.encode(&buf))
+        }
         Some(other) => Err(AppError::BadRequest(format!(
-            "unknown template filter '{}' (expected b64 | basic)",
+            "unknown template filter '{}' (expected b64 | basic | basic:<user>)",
             other
         ))),
     }
@@ -472,6 +494,26 @@ mod render_tests {
         let s = secrets(&[("k", "user")]);
         let inp = RenderInputs { secrets: &s, oauth_access_token: None };
         assert_eq!(render_template("{{secret.k | basic}}", &inp).unwrap(), STANDARD.encode(b"user:"));
+    }
+
+    #[test]
+    fn pipe_filter_basic_user() {
+        // `basic:USER` = base64("USER:" + value) — token-as-password (GitLab's
+        // `oauth2`), distinct from bare `basic` = base64(value + ':').
+        let s = secrets(&[("tok", "glpat_xyz")]);
+        let inp = RenderInputs { secrets: &s, oauth_access_token: None };
+        assert_eq!(
+            render_template("{{secret.tok | basic:oauth2}}", &inp).unwrap(),
+            STANDARD.encode(b"oauth2:glpat_xyz"),
+        );
+        // Whitespace around the pipe is tolerated.
+        assert_eq!(
+            render_template("{{ secret.tok|basic:oauth2 }}", &inp).unwrap(),
+            STANDARD.encode(b"oauth2:glpat_xyz"),
+        );
+        // Empty or colon-bearing username is a hard error.
+        assert!(render_template("{{secret.tok | basic:}}", &inp).is_err());
+        assert!(render_template("{{secret.tok | basic:a:b}}", &inp).is_err());
     }
 
     #[test]

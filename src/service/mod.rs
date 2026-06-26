@@ -1531,7 +1531,13 @@ kind = "secret"
                 None => (tok, None),
             };
             match source_key.split_once('.').map(|(ns, _)| ns) {
-                Some("secret") => matches!(filter, None | Some("b64") | Some("basic")),
+                Some("secret") => match filter {
+                    None | Some("b64") | Some("basic") => true,
+                    // `basic:<user>` — non-empty, colon-free username (GitLab `oauth2`).
+                    Some(f) => f
+                        .strip_prefix("basic:")
+                        .map_or(false, |u| !u.is_empty() && !u.contains(':')),
+                },
                 Some("secret_b64") | Some("secret_basic") => filter.is_none(),
                 _ => false,
             }
