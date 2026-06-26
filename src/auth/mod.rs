@@ -8,6 +8,7 @@ pub mod header;
 pub mod query;
 pub mod path;
 pub mod oauth2;
+pub mod connect;
 
 use std::collections::HashMap;
 use crate::core::policy::{PolicyRule, RuleOverride, ServiceLevels};

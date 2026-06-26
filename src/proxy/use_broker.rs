@@ -186,8 +186,8 @@ async fn handle_impl(
         let is_oauth = upstream
             .auth
             .as_ref()
-            .and_then(|a| a.auth_type.as_deref())
-            == Some("oauth2");
+            .map(|a| state.services.auth_is_oauth2(a))
+            .unwrap_or(false);
         let (secrets_map, oauth_token) = if is_oauth {
             let access = crate::server::broker::resolve_auth_value(
                 &state,
@@ -415,9 +415,10 @@ fn upstream_host_has_template(url: &str) -> bool {
 
 fn resolve_vault_target(upstream: &UpstreamDef) -> Option<String> {
     let auth = upstream.auth.as_ref()?;
-    // Preferred path: explicit `auth.env = "key"` in service.toml. In v3
-    // the value of this field IS the bare item name (no `env.` prefix).
-    if let Some(key) = auth.env.as_deref() {
+    // Preferred path: explicit `auth.secret = "key"` in service.toml (the
+    // field formerly named `env`). The value IS the bare item name (no
+    // `env.` prefix).
+    if let Some(key) = auth.secret.as_deref() {
         let trimmed = key.trim();
         if !trimmed.is_empty() {
             return Some(trimmed.to_string());

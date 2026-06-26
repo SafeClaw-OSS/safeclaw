@@ -9,12 +9,11 @@ id = "default"
 url = "https://www.googleapis.com/calendar/v3"
 
 [upstream.auth]
-type = "oauth2"
 provider = "google"
-env = "gcalendar_refresh_token"
-token_url = "https://oauth2.googleapis.com/token"
-client_id_env = "GOOGLE_CLIENT_ID"
-client_secret_env = "GOOGLE_CLIENT_SECRET"
+scopes = [
+  "https://www.googleapis.com/auth/calendar.events",
+]
+secret = "gcalendar_refresh_token"
 
 [upstream.headers]
 Authorization = "Bearer {{oauth.access_token}}"

@@ -208,6 +208,61 @@ fn redeemed_zeroize_marker() -> std::marker::PhantomData<WebAuthn> {
     std::marker::PhantomData
 }
 
+/// Open the vault body to the RAW [`sudp::state::ProtectedState`] with a
+/// RETAINED state key `K` — no grant, no passkey. Unlike
+/// [`decrypt_vault_view_with_key`] (which projects to a read-only
+/// `VaultPlaintextView`), this returns the full mutable `ProtectedState` so a
+/// caller can edit `targets` and re-seal it with [`reseal_body_with_key`]
+/// while preserving `peers`/`aux` byte-for-byte. Used by the OAuth-connect
+/// processor (CONNECTIONS_AND_AUTH.md §4a), which writes
+/// `<conn>_refresh_token` into the open vault and deletes the pending item —
+/// the daemon's own connect-completion, no approval op (it holds `K` while
+/// unlocked; an agent can't forge a Google login + a passkey-sealed code).
+pub fn open_protected_state_with_key(
+    k: &[u8],
+    vault: &crate::storage::SealedVault,
+) -> Result<sudp::state::ProtectedState> {
+    use sudp::primitives::domain::DS_SEAL;
+    use sudp::primitives::{Aead, ChaCha20Poly1305};
+    use sudp::state::ProtectedState;
+
+    let mut ad = Vec::with_capacity(DS_SEAL.len() + 2);
+    ad.extend_from_slice(DS_SEAL);
+    ad.extend_from_slice(&vault.version.to_be_bytes());
+
+    let m_bytes = ChaCha20Poly1305::open(k, &vault.ciphertext, &ad)
+        .map_err(|e| AppError::Unauthorized(format!("vault open (retained key): {}", e)))?;
+    ProtectedState::from_canonical(&m_bytes)
+        .map_err(|e| AppError::Internal(format!("protected-state parse: {}", e)))
+}
+
+/// Re-seal a (possibly mutated) [`sudp::state::ProtectedState`] under the same
+/// retained `K` and write the new body ciphertext into `vault.ciphertext`,
+/// leaving `registry`/`credentials`/`wrapped_key` untouched (the body is
+/// sealed under `K` with AAD `DS_SEAL ‖ ver`, independent of any credential —
+/// see [`decrypt_vault_view_with_key`]). The caller persists the updated
+/// `vault` via `write_atomic`. Companion to [`open_protected_state_with_key`].
+pub fn reseal_body_with_key(
+    k: &[u8],
+    vault: &mut crate::storage::SealedVault,
+    m: &sudp::state::ProtectedState,
+) -> Result<()> {
+    use sudp::primitives::domain::DS_SEAL;
+    use sudp::primitives::{Aead, ChaCha20Poly1305};
+
+    let mut ad = Vec::with_capacity(DS_SEAL.len() + 2);
+    ad.extend_from_slice(DS_SEAL);
+    ad.extend_from_slice(&vault.version.to_be_bytes());
+
+    let canonical = m
+        .to_canonical()
+        .map_err(|e| AppError::Internal(format!("protected-state canonicalize: {}", e)))?;
+    let ciphertext = ChaCha20Poly1305::seal(k, &canonical[..], &ad)
+        .map_err(|e| AppError::Internal(format!("vault re-seal: {}", e)))?;
+    vault.ciphertext = ciphertext;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -162,8 +162,8 @@ pub async fn execute_use_forward(
     let is_oauth = svc_def
         .and_then(|s| s.upstream.first())
         .and_then(|u| u.auth.as_ref())
-        .and_then(|a| a.auth_type.as_deref())
-        == Some("oauth2");
+        .map(|a| state.services.auth_is_oauth2(a))
+        .unwrap_or(false);
     let oauth_token = if is_oauth {
         let access = resolve_auth_value(state, vault_id, service_id, &s_o).await?;
         Some(
@@ -213,9 +213,32 @@ pub struct RenderInputs<'a> {
     pub oauth_access_token: Option<&'a str>,
 }
 
-/// Names of vault items a template references via `{{secret*.NAME}}`. Used to
-/// know which items to resolve from the open view, and to derive the set of
-/// secrets a recipe requires (connect flow / required-items).
+/// The vault-item name a single `{{…}}` token body references, if it is a
+/// secret token. Handles all three secret forms:
+///   - the filter grammar `secret.NAME | b64` / `secret.NAME | basic` /
+///     bare `secret.NAME` (whitespace-tolerant around the pipe);
+///   - the deprecated prefix aliases `secret_b64.NAME` / `secret_basic.NAME`.
+/// Returns `None` for non-secret tokens (`oauth.*`, `uuid_v4`, unknown).
+fn secret_name_of(key: &str) -> Option<String> {
+    // Strip an optional `| filter` suffix; the source.key is the part before
+    // the pipe. (Only `secret.*` takes a filter; the bare-prefix aliases never
+    // carry one, but stripping is harmless.)
+    let source_key = key.split('|').next().unwrap_or(key).trim();
+    for prefix in ["secret.", "secret_b64.", "secret_basic."] {
+        if let Some(name) = source_key.strip_prefix(prefix) {
+            let name = name.trim();
+            if !name.is_empty() {
+                return Some(name.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Names of vault items a template references via `{{secret.NAME [| filter]}}`
+/// (or the deprecated `{{secret_b64.NAME}}` / `{{secret_basic.NAME}}` aliases).
+/// Used to know which items to resolve from the open view, and to derive the
+/// set of secrets a recipe requires (connect flow / required-items).
 pub fn referenced_secrets(tpl: &str) -> Vec<String> {
     let mut names = Vec::new();
     let bytes = tpl.as_bytes();
@@ -224,12 +247,9 @@ pub fn referenced_secrets(tpl: &str) -> Vec<String> {
         if &bytes[i..i + 2] == b"{{" {
             if let Some(end) = tpl[i + 2..].find("}}") {
                 let key = tpl[i + 2..i + 2 + end].trim();
-                for prefix in ["secret.", "secret_b64.", "secret_basic."] {
-                    if let Some(name) = key.strip_prefix(prefix) {
-                        let name = name.trim();
-                        if !name.is_empty() && !names.iter().any(|n: &String| n == name) {
-                            names.push(name.to_string());
-                        }
+                if let Some(name) = secret_name_of(key) {
+                    if !names.iter().any(|n: &String| n == &name) {
+                        names.push(name);
                     }
                 }
                 i += 2 + end + 2;
@@ -243,12 +263,14 @@ pub fn referenced_secrets(tpl: &str) -> Vec<String> {
 
 /// Substitute `{{…}}` tokens in an upstream template (header / query /
 /// path-param value):
-///   `{{secret.NAME}}`        raw bytes of vault item NAME (utf-8)
-///   `{{secret_b64.NAME}}`    base64(item NAME)
-///   `{{secret_basic.NAME}}`  base64(item NAME + ':')  — key-as-username basic
-///   `{{oauth.access_token}}` the minted OAuth access token
-///   `{{uuid_v4}}`            a fresh UUID v4
-/// Unknown/unterminated/unresolvable token → hard error.
+///   `{{secret.NAME}}`          raw bytes of vault item NAME (utf-8)
+///   `{{secret.NAME | b64}}`    base64(item NAME)
+///   `{{secret.NAME | basic}}`  base64(item NAME + ':')  — key-as-username basic
+///   `{{secret_b64.NAME}}`      DEPRECATED alias of `secret.NAME | b64`
+///   `{{secret_basic.NAME}}`    DEPRECATED alias of `secret.NAME | basic`
+///   `{{oauth.access_token}}`   the minted OAuth access token
+///   `{{uuid_v4}}`              a fresh UUID v4
+/// Unknown/unterminated/unresolvable token (or unknown filter) → hard error.
 pub(crate) fn render_template(tpl: &str, inputs: &RenderInputs) -> Result<String> {
     let mut out = String::with_capacity(tpl.len());
     let bytes = tpl.as_bytes();
@@ -269,38 +291,137 @@ pub(crate) fn render_template(tpl: &str, inputs: &RenderInputs) -> Result<String
     Ok(out)
 }
 
+/// Apply a secret encoding filter to raw vault bytes. `None` = no filter
+/// (raw UTF-8); `Some("b64")` = base64; `Some("basic")` = base64(value + ':').
+/// Unknown filter → hard error.
+fn apply_secret_filter(name: &str, bytes: &[u8], filter: Option<&str>) -> Result<String> {
+    match filter {
+        None => String::from_utf8(bytes.to_vec())
+            .map_err(|_| AppError::BadRequest(format!("secret '{}' is not valid UTF-8", name))),
+        Some("b64") => Ok(STANDARD.encode(bytes)),
+        Some("basic") => {
+            let mut buf = bytes.to_vec();
+            buf.push(b':');
+            Ok(STANDARD.encode(&buf))
+        }
+        Some(other) => Err(AppError::BadRequest(format!(
+            "unknown template filter '{}' (expected b64 | basic)",
+            other
+        ))),
+    }
+}
+
 fn resolve_token(key: &str, inputs: &RenderInputs) -> Result<String> {
     if key == "uuid_v4" {
         return Ok(uuid::Uuid::new_v4().to_string());
     }
     let undeclared =
         |n: &str| AppError::BadRequest(format!("template references undeclared secret '{}'", n));
-    let (ns, arg) = key
-        .split_once('.')
-        .ok_or_else(|| AppError::BadRequest(format!("unknown template token '{{{{{}}}}}'", key)))?;
+
+    // Split off an optional `| filter`. The part before the pipe is the
+    // `source.key`; the part after (trimmed) is the filter name. Only the
+    // `secret.*` source takes a filter; the deprecated `secret_b64`/
+    // `secret_basic` prefixes carry their encoding in the source itself.
+    let (source_key, pipe_filter) = match key.split_once('|') {
+        Some((src, f)) => (src.trim(), Some(f.trim())),
+        None => (key, None),
+    };
+
+    let (ns, arg) = source_key.split_once('.').ok_or_else(|| {
+        AppError::BadRequest(format!("unknown template token '{{{{{}}}}}'", key))
+    })?;
     let arg = arg.trim();
     match ns {
+        // Canonical secret form with the pipe-filter grammar.
         "secret" => {
             let b = inputs.secrets.get(arg).ok_or_else(|| undeclared(arg))?;
-            String::from_utf8(b.clone())
-                .map_err(|_| AppError::BadRequest(format!("secret '{}' is not valid UTF-8", arg)))
+            apply_secret_filter(arg, b, pipe_filter)
         }
+        // DEPRECATED alias: `secret_b64.X` == `secret.X | b64`.
         "secret_b64" => {
+            if pipe_filter.is_some() {
+                return Err(AppError::BadRequest(
+                    "deprecated 'secret_b64' alias does not take a filter — use 'secret.X | b64'".into(),
+                ));
+            }
             let b = inputs.secrets.get(arg).ok_or_else(|| undeclared(arg))?;
-            Ok(STANDARD.encode(b))
+            apply_secret_filter(arg, b, Some("b64"))
         }
+        // DEPRECATED alias: `secret_basic.X` == `secret.X | basic`.
         "secret_basic" => {
+            if pipe_filter.is_some() {
+                return Err(AppError::BadRequest(
+                    "deprecated 'secret_basic' alias does not take a filter — use 'secret.X | basic'".into(),
+                ));
+            }
             let b = inputs.secrets.get(arg).ok_or_else(|| undeclared(arg))?;
-            let mut buf = b.clone();
-            buf.push(b':');
-            Ok(STANDARD.encode(&buf))
+            apply_secret_filter(arg, b, Some("basic"))
         }
-        "oauth" if arg == "access_token" => inputs
+        "oauth" if arg == "access_token" && pipe_filter.is_none() => inputs
             .oauth_access_token
             .map(|t| t.to_string())
             .ok_or_else(|| AppError::BadRequest("{{oauth.access_token}} on a non-oauth upstream".into())),
         _ => Err(AppError::BadRequest(format!("unknown template token '{{{{{}}}}}'", key))),
     }
+}
+
+// ── setup template context (agent-facing, NO vault secrets) ──────────────────
+//
+// CONNECTIONS_AND_AUTH.md §7, second row. The `[setup]` block (git `insteadOf`,
+// runtime base_url hints, …) is rendered for the AGENT, in its own env. It must
+// NOT touch any vault secret: `api_key` here is the agent's OWN broker key, not
+// a vault item. The only tokens are `{{proxy_base}}`, `{{api_key}}`, `{{route}}`,
+// `{{vault}}` — a strictly disjoint, builtin-only vocabulary from the auth
+// engine above. An unknown token is still a hard error (never forward `{{…}}`).
+
+/// Builtin values for the setup template context. All agent-facing — none of
+/// these is a vault secret.
+pub struct SetupInputs<'a> {
+    /// The daemon's broker base URL the agent calls (e.g. `http://127.0.0.1:8787`).
+    pub proxy_base: &'a str,
+    /// The agent's own broker API key (its bearer to the daemon — NOT a vault item).
+    pub api_key: &'a str,
+    /// The fully-formed route for this service (often itself derived from
+    /// `proxy_base`, pre-rendered by the caller).
+    pub route: &'a str,
+    /// The active vault id / slug.
+    pub vault: &'a str,
+}
+
+/// Render a `[setup]` string (goal / route / auth / example) for the agent.
+/// Tokens: `{{proxy_base}}`, `{{api_key}}`, `{{route}}`, `{{vault}}`. This
+/// context has NO access to vault secrets — using a `secret.*` / `oauth.*`
+/// token here is an unknown-token hard error by construction.
+pub fn render_setup_template(tpl: &str, inputs: &SetupInputs) -> Result<String> {
+    let mut out = String::with_capacity(tpl.len());
+    let bytes = tpl.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if i + 2 <= bytes.len() && &bytes[i..i + 2] == b"{{" {
+            let end = tpl[i + 2..]
+                .find("}}")
+                .ok_or_else(|| AppError::BadRequest("unterminated '{{' in setup template".into()))?;
+            let key = tpl[i + 2..i + 2 + end].trim();
+            let val = match key {
+                "proxy_base" => inputs.proxy_base,
+                "api_key" => inputs.api_key,
+                "route" => inputs.route,
+                "vault" => inputs.vault,
+                _ => {
+                    return Err(AppError::BadRequest(format!(
+                        "unknown setup template token '{{{{{}}}}}'",
+                        key
+                    )))
+                }
+            };
+            out.push_str(val);
+            i += 2 + end + 2;
+            continue;
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -335,6 +456,64 @@ mod render_tests {
         let inp = RenderInputs { secrets: &s, oauth_access_token: None };
         assert_eq!(render_template("{{secret_b64.k}}", &inp).unwrap(), STANDARD.encode(b"user"));
         assert_eq!(render_template("{{secret_basic.k}}", &inp).unwrap(), STANDARD.encode(b"user:"));
+    }
+
+    #[test]
+    fn pipe_filter_b64() {
+        let s = secrets(&[("k", "user")]);
+        let inp = RenderInputs { secrets: &s, oauth_access_token: None };
+        // whitespace-tolerant around the pipe
+        assert_eq!(render_template("{{secret.k | b64}}", &inp).unwrap(), STANDARD.encode(b"user"));
+        assert_eq!(render_template("{{ secret.k|b64 }}", &inp).unwrap(), STANDARD.encode(b"user"));
+    }
+
+    #[test]
+    fn pipe_filter_basic() {
+        let s = secrets(&[("k", "user")]);
+        let inp = RenderInputs { secrets: &s, oauth_access_token: None };
+        assert_eq!(render_template("{{secret.k | basic}}", &inp).unwrap(), STANDARD.encode(b"user:"));
+    }
+
+    #[test]
+    fn pipe_filter_none_is_raw() {
+        let s = secrets(&[("k", "ghp_xyz")]);
+        let inp = RenderInputs { secrets: &s, oauth_access_token: None };
+        assert_eq!(render_template("{{secret.k}}", &inp).unwrap(), "ghp_xyz");
+    }
+
+    #[test]
+    fn alias_equivalence_b64_and_basic() {
+        // The deprecated prefix aliases must produce byte-identical output to
+        // the canonical pipe form.
+        let s = secrets(&[("k", "user")]);
+        let inp = RenderInputs { secrets: &s, oauth_access_token: None };
+        assert_eq!(
+            render_template("{{secret_b64.k}}", &inp).unwrap(),
+            render_template("{{secret.k | b64}}", &inp).unwrap(),
+        );
+        assert_eq!(
+            render_template("{{secret_basic.k}}", &inp).unwrap(),
+            render_template("{{secret.k | basic}}", &inp).unwrap(),
+        );
+    }
+
+    #[test]
+    fn unknown_filter_hard_fails() {
+        let s = secrets(&[("k", "user")]);
+        let inp = RenderInputs { secrets: &s, oauth_access_token: None };
+        let err = render_template("{{secret.k | urlenc}}", &inp).unwrap_err();
+        assert!(format!("{:?}", err).contains("unknown template filter"), "{:?}", err);
+        // A missing secret under a valid filter is still a hard error (never literal).
+        assert!(render_template("{{secret.missing | b64}}", &inp).is_err());
+    }
+
+    #[test]
+    fn deprecated_alias_rejects_filter() {
+        // `secret_b64.X | basic` is incoherent — reject rather than silently
+        // double-apply.
+        let s = secrets(&[("k", "user")]);
+        let inp = RenderInputs { secrets: &s, oauth_access_token: None };
+        assert!(render_template("{{secret_b64.k | basic}}", &inp).is_err());
     }
 
     #[test]
@@ -374,6 +553,54 @@ mod render_tests {
         );
         assert_eq!(names, vec!["a".to_string(), "b".to_string()]);
     }
+
+    #[test]
+    fn referenced_secrets_sees_pipe_filter_form() {
+        // `secret.X | filter` references the same vault item `X` as `secret.X`.
+        let names = referenced_secrets("{{secret.a | b64}} {{ secret.c|basic }} {{secret.a}}");
+        assert_eq!(names, vec!["a".to_string(), "c".to_string()]);
+    }
+
+    #[test]
+    fn setup_template_renders_builtins() {
+        let inp = SetupInputs {
+            proxy_base: "http://127.0.0.1:8787",
+            api_key: "sk_agent_123",
+            route: "http://127.0.0.1:8787/stream/github-git/",
+            vault: "v_abc",
+        };
+        assert_eq!(
+            render_setup_template(
+                r#"git config url."{{route}}".insteadOf "https://github.com/""#,
+                &inp
+            )
+            .unwrap(),
+            r#"git config url."http://127.0.0.1:8787/stream/github-git/".insteadOf "https://github.com/""#,
+        );
+        assert_eq!(
+            render_setup_template("Authorization: Bearer {{api_key}}", &inp).unwrap(),
+            "Authorization: Bearer sk_agent_123",
+        );
+        assert_eq!(
+            render_setup_template("{{proxy_base}}/openai/v1 vault={{vault}}", &inp).unwrap(),
+            "http://127.0.0.1:8787/openai/v1 vault=v_abc",
+        );
+    }
+
+    #[test]
+    fn setup_template_rejects_vault_secret_tokens() {
+        // The setup context must NEVER resolve a vault secret — `secret.*` /
+        // `oauth.*` are unknown tokens here, hard-erroring rather than leaking.
+        let inp = SetupInputs {
+            proxy_base: "http://127.0.0.1:8787",
+            api_key: "sk_agent_123",
+            route: "r",
+            vault: "v",
+        };
+        assert!(render_setup_template("{{secret.github_token}}", &inp).is_err());
+        assert!(render_setup_template("{{oauth.access_token}}", &inp).is_err());
+        assert!(render_setup_template("{{bogus}}", &inp).is_err());
+    }
 }
 
 /// Resolve the auth value for a service before forwarding. For most
@@ -403,7 +630,7 @@ pub async fn resolve_auth_value(
     let auth = svc
         .and_then(|s| s.upstream.first())
         .and_then(|u| u.auth.as_ref());
-    let is_oauth = matches!(auth.and_then(|a| a.auth_type.as_deref()), Some("oauth2"));
+    let is_oauth = auth.map(|a| state.services.auth_is_oauth2(a)).unwrap_or(false);
     if !is_oauth {
         return Ok(raw.to_vec());
     }
@@ -414,32 +641,28 @@ pub async fn resolve_auth_value(
         return Ok(cached);
     }
 
-    // Cache miss → call provider's /token endpoint to mint a fresh
-    // access_token from our refresh_token.
-    let token_url = auth.token_url.as_deref().ok_or_else(|| {
+    // Cache miss → call the provider's /token endpoint to mint a fresh
+    // access_token from our refresh_token. Endpoints + client come from the
+    // resolved provider (literal public Desktop client) when `auth.provider`
+    // is set, falling back to the legacy env-var path for self-hosted
+    // confidential clients.
+    let oauth = state.services.resolve_oauth_config(auth);
+    let token_url = oauth.token_url.as_deref().ok_or_else(|| {
         AppError::Internal(format!(
-            "service '{}' is oauth2 but missing auth.token_url",
+            "service '{}' is oauth2 but no token_url (provider or auth.token_url)",
             service_id
         ))
     })?;
-    let client_id_env = auth.client_id_env.as_deref().ok_or_else(|| {
+    let client_id = oauth.client_id.clone().ok_or_else(|| {
         AppError::Internal(format!(
-            "service '{}' is oauth2 but missing auth.client_id_env",
+            "service '{}' is oauth2 but no client_id (provider or client_id_env)",
             service_id
-        ))
-    })?;
-    let client_id = std::env::var(client_id_env).map_err(|_| {
-        AppError::Internal(format!(
-            "oauth2 client_id env var '{}' not set (required by service '{}')",
-            client_id_env, service_id
         ))
     })?;
     // client_secret is optional — PKCE flows (OpenAI Codex / Anthropic)
-    // omit `client_secret_env`; confidential clients (Google) supply it.
-    let client_secret = auth
-        .client_secret_env
-        .as_deref()
-        .and_then(|n| std::env::var(n).ok());
+    // omit it; public Desktop clients (Google) and confidential clients
+    // supply it.
+    let client_secret = oauth.client_secret.clone();
 
     let refresh_token_str = std::str::from_utf8(raw).map_err(|_| {
         AppError::Internal(format!(

@@ -668,6 +668,20 @@ pub async fn approve_op(
                     "vault unlocked"
                 );
                 state.unlock_vault(vault_id.clone(), cache, unlock_key);
+                // On unlock, complete any pending OAuth connect: a
+                // browser "Connect" may have sealed `<conn>_oauth_pending`
+                // into the vault while it was locked (or before this device
+                // synced). Run it detached — it acquires the per-vault write
+                // lock itself, so it must start AFTER this handler's
+                // `_vault_write_guard` drops (the lock is not reentrant).
+                // Best-effort + never fatal (CONNECTIONS_AND_AUTH.md §4a).
+                {
+                    let state = state.clone();
+                    let vid = vault_id.clone();
+                    tokio::spawn(async move {
+                        crate::auth::connect::process_vault_connects(&state, &vid).await;
+                    });
+                }
                 let value = json!({ "kv": Value::Object(kv), "aux": aux_json });
                 let resp = json!({
                     "ok": true, "act": "vault-unlock",

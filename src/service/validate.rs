@@ -18,15 +18,32 @@ use super::ServiceDef;
 
 /// Tokens the broker render engine understands. Mirrors
 /// `crate::server::broker::resolve_token` — keep in sync.
+///
+/// Secret tokens may carry a pipe filter: `secret.X | b64` / `secret.X | basic`
+/// (whitespace-tolerant). The deprecated `secret_b64.X` / `secret_basic.X`
+/// prefix aliases are still recognized (they take no filter).
 fn token_is_known(tok: &str) -> bool {
     let tok = tok.trim();
     if tok == "uuid_v4" || tok == "oauth.access_token" {
         return true;
     }
-    matches!(
-        tok.split_once('.').map(|(ns, _)| ns),
-        Some("secret") | Some("secret_b64") | Some("secret_basic")
-    )
+    // Split off an optional `| filter`; validate the source.key and the filter
+    // independently.
+    let (source_key, filter) = match tok.split_once('|') {
+        Some((src, f)) => (src.trim(), Some(f.trim())),
+        None => (tok, None),
+    };
+    let ns = match source_key.split_once('.').map(|(ns, _)| ns) {
+        Some(ns) => ns,
+        None => return false,
+    };
+    match ns {
+        // Canonical secret form: only `b64` / `basic` filters (or none).
+        "secret" => matches!(filter, None | Some("b64") | Some("basic")),
+        // Deprecated aliases carry their encoding in the prefix — no filter.
+        "secret_b64" | "secret_basic" => filter.is_none(),
+        _ => false,
+    }
 }
 
 /// Extract the inner text of every `{{…}}` occurrence in `s`.
@@ -116,6 +133,21 @@ fn validate_url(upstream_id: &str, url: &str, errs: &mut Vec<String>) {
     }
 }
 
+/// A recipe / provider / connection id slug: `^[a-z0-9][a-z0-9_-]{0,63}$`
+/// (CONNECTIONS_AND_AUTH.md §1/§5). No `:`, `/`, `.` — so a namespaced
+/// `<connection_id>:<role>` vault key can never be forged from an id, and an id
+/// can never traverse paths.
+fn is_valid_slug(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_lowercase() || c.is_ascii_digit() => {}
+        _ => return false,
+    }
+    s.len() <= 64
+        && s.chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+}
+
 /// Validate one recipe's `service.toml` source.
 ///
 /// `first_party = true` for in-tree / trusted recipes (which may use `run` /
@@ -130,6 +162,13 @@ pub fn validate_recipe(toml_str: &str, first_party: bool) -> Result<(), Vec<Stri
     };
 
     let mut errs = Vec::new();
+
+    if !is_valid_slug(&def.service.id) {
+        errs.push(format!(
+            "service id '{}' is not a valid slug (^[a-z0-9][a-z0-9_-]{{0,63}}$)",
+            def.service.id
+        ));
+    }
 
     for u in &def.upstream {
         validate_url(&u.id, &u.url, &mut errs);
@@ -164,6 +203,45 @@ pub fn validate_recipe(toml_str: &str, first_party: bool) -> Result<(), Vec<Stri
                     ));
                 }
             }
+        }
+    }
+
+    if errs.is_empty() {
+        Ok(())
+    } else {
+        Err(errs)
+    }
+}
+
+/// Validate a `services/_providers/<name>.toml` source (a `[provider.<name>]`
+/// template). The OSS-recipe safety rule (CONNECTIONS_AND_AUTH.md §2): a LITERAL
+/// `client_secret` may appear ONLY for a `client_type = "public"` client — a
+/// confidential Web-app secret must never be committed to a public recipe. Also
+/// checks the provider name is a slug and the OAuth endpoints are https
+/// literals to a public host.
+pub fn validate_provider(toml_str: &str) -> Result<(), Vec<String>> {
+    let def: super::ProviderFileDef = match toml::from_str(toml_str) {
+        Ok(d) => d,
+        Err(e) => return Err(vec![format!("parse error: {}", e)]),
+    };
+
+    let mut errs = Vec::new();
+    for (name, p) in &def.provider {
+        if !is_valid_slug(name) {
+            errs.push(format!("provider '{}': name is not a valid slug", name));
+        }
+        if p.client_secret.is_some() && p.client_type.as_deref() != Some("public") {
+            errs.push(format!(
+                "provider '{}': a literal client_secret requires client_type = \"public\" \
+                 (a confidential Web-app secret must never be committed to a recipe)",
+                name
+            ));
+        }
+        if let Some(u) = &p.authorization_url {
+            validate_url(&format!("provider '{}' authorization_url", name), u, &mut errs);
+        }
+        if let Some(u) = &p.token_url {
+            validate_url(&format!("provider '{}' token_url", name), u, &mut errs);
         }
     }
 
@@ -256,6 +334,25 @@ auth = { env = "telegram_bot_token" }
     }
 
     #[test]
+    fn accepts_pipe_filter_tokens() {
+        // The canonical filter grammar is a known token.
+        assert!(token_is_known("secret.k | b64"));
+        assert!(token_is_known("secret.k | basic"));
+        assert!(token_is_known("secret.k"));
+        assert!(token_is_known("secret_b64.k"));
+        assert!(token_is_known("secret_basic.k"));
+        // Unknown filter / alias-with-filter are NOT known.
+        assert!(!token_is_known("secret.k | urlenc"));
+        assert!(!token_is_known("secret_b64.k | basic"));
+        assert!(!token_is_known("auth_value"));
+
+        // End to end through validate_recipe: a header using the pipe form
+        // validates clean.
+        let toml = GITHUB.replace("{{secret.github_token}}", "{{secret.github_token | b64}}");
+        assert!(validate_recipe(&toml, true).is_ok());
+    }
+
+    #[test]
     fn rejects_private_and_loopback_and_metadata_hosts() {
         for bad in [
             "https://10.0.0.5",
@@ -302,5 +399,79 @@ path = "/sign"
     fn parse_error_is_reported() {
         let errs = validate_recipe("this is not toml = = =", false).unwrap_err();
         assert!(errs.iter().any(|e| e.contains("parse error")), "{:?}", errs);
+    }
+
+    // ── provider validation: literal client_secret ⇒ client_type="public" ───
+
+    const GOOGLE_PROVIDER: &str = r#"
+[provider.google]
+auth_mode = "oauth2"
+flow = "authorization_code"
+authorization_url = "https://accounts.google.com/o/oauth2/v2/auth"
+token_url = "https://oauth2.googleapis.com/token"
+pkce = true
+client_id = "499410884315-x.apps.googleusercontent.com"
+client_secret = "GOCSPX-public-desktop"
+client_type = "public"
+"#;
+
+    #[test]
+    fn public_desktop_provider_with_secret_ok() {
+        assert!(validate_provider(GOOGLE_PROVIDER).is_ok());
+    }
+
+    #[test]
+    fn confidential_secret_in_recipe_rejected() {
+        // A literal client_secret with a non-public client_type is the exact
+        // mistake the rule guards against (committing a confidential secret).
+        let bad = GOOGLE_PROVIDER.replace("client_type = \"public\"", "client_type = \"confidential\"");
+        let errs = validate_provider(&bad).unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("client_type = \"public\"")), "{:?}", errs);
+
+        // Omitting client_type entirely is also rejected (no default to public).
+        let bad2 = GOOGLE_PROVIDER.replace("client_type = \"public\"\n", "");
+        let errs2 = validate_provider(&bad2).unwrap_err();
+        assert!(errs2.iter().any(|e| e.contains("client_type = \"public\"")), "{:?}", errs2);
+    }
+
+    #[test]
+    fn confidential_provider_without_committed_secret_ok() {
+        // A confidential client that does NOT ship its secret in the recipe is
+        // fine (the daemon/self-hoster supplies it out of band).
+        let conf = GOOGLE_PROVIDER
+            .replace("client_secret = \"GOCSPX-public-desktop\"\n", "")
+            .replace("client_type = \"public\"", "client_type = \"confidential\"");
+        assert!(validate_provider(&conf).is_ok());
+    }
+
+    #[test]
+    fn rejects_bad_service_id_slug() {
+        let bad = GITHUB.replace("id = \"github\"", "id = \"Git Hub\"");
+        let errs = validate_recipe(&bad, true).unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("not a valid slug")), "{:?}", errs);
+    }
+
+    #[test]
+    fn slug_rules() {
+        for ok in ["gmail", "openclaw-dashboard", "openai-codex", "a1_b-2"] {
+            assert!(is_valid_slug(ok), "{ok} should be a valid slug");
+        }
+        for bad in ["", "-leading", "Upper", "has:colon", "has/slash", "has.dot"] {
+            assert!(!is_valid_slug(bad), "{bad} should be rejected");
+        }
+    }
+
+    #[test]
+    fn compiled_providers_pass_validator() {
+        // The shipped services/_providers/*.toml must pass — a guard so a future
+        // edit that drops client_type="public" while keeping the literal secret
+        // fails CI instead of silently shipping a leak.
+        let mut checked = 0;
+        for (_name, toml_str) in crate::generated_services::compiled_provider_tomls() {
+            validate_provider(toml_str)
+                .unwrap_or_else(|e| panic!("compiled provider failed validator: {:?}", e));
+            checked += 1;
+        }
+        assert!(checked >= 1, "expected at least the google provider compiled in");
     }
 }

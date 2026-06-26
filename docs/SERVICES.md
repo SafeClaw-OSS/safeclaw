@@ -10,6 +10,7 @@ This document defines the declarative service protocol used by SafeClaw. Each se
 Both files share a common execution primitive: **step**. A step is a single action with a `target` specifying where it runs.
 
 **Related docs**:
+- **[CONNECTIONS_AND_AUTH.md](./CONNECTIONS_AND_AUTH.md) — ⭐ finalized auth / OAuth / connection-layer spec (to implement).** Supersedes the `[upstream.auth]`, OAuth, and `recipe.toml`-setup material below for new work: `[provider.<name>]` blocks, `secret` (renamed `env`), the cloud-blind OAuth connect flow, the connection layer (recipe = type, connection = instance), the light `[setup]` block, and the `{{secret.X | filter}}` template grammar.
 - [STORES_AND_ITEMS.md](./STORES_AND_ITEMS.md) — vault schema, stores, items, adapter contract (referenced by `{{X}}` templates in this doc)
 - [PROTOCOL.md](./PROTOCOL.md) — wire protocol, sealed-state mechanics
 

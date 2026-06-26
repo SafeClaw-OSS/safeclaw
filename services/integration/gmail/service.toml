@@ -9,12 +9,13 @@ id = "default"
 url = "https://gmail.googleapis.com"
 
 [upstream.auth]
-type = "oauth2"
 provider = "google"
-env = "gmail_refresh_token"
-token_url = "https://oauth2.googleapis.com/token"
-client_id_env = "GOOGLE_CLIENT_ID"
-client_secret_env = "GOOGLE_CLIENT_SECRET"
+scopes = [
+  "https://www.googleapis.com/auth/gmail.send",
+  "https://www.googleapis.com/auth/gmail.readonly",
+  "https://www.googleapis.com/auth/gmail.modify",
+]
+secret = "gmail_refresh_token"
 
 [upstream.headers]
 Authorization = "Bearer {{oauth.access_token}}"
