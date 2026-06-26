@@ -74,6 +74,12 @@ pub struct RegistryService {
     /// service has no vault_fields = no credential needed).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub connected: Option<bool>,
+    /// Public OAuth consent params (authorization_url / client_id / scopes /
+    /// pkce) for an oauth2 service — what a frontend needs to START a
+    /// cloud-blind connect. The confidential half (client_secret / token_url)
+    /// is never exposed; the daemon does the exchange. Absent for non-oauth2.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connect: Option<crate::service::ConnectDescriptor>,
 }
 
 #[derive(Debug, Serialize)]
@@ -285,6 +291,7 @@ fn build_service(
         vault_fields,
         policy,
         connected,
+        connect: state.services.connect_descriptor(id),
     }
 }
 
