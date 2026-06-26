@@ -13,6 +13,7 @@ pub mod custodian;
 pub mod doctor;
 pub mod env;
 pub mod login;
+pub mod logout;
 pub mod ls;
 pub mod passkey;
 pub mod recipe;

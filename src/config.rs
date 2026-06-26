@@ -89,6 +89,12 @@ pub enum Command {
     /// `sc login` then brings the daemon up and unlocks for you; `sc up` is the
     /// everyday "make sure it's running" afterwards.
     Login(LoginArgs),
+    /// Unpair this host: the inverse of `sc login`. Stops the daemon, clears the
+    /// local pairing (active vault, cloud backend, known vaults) and removes the
+    /// `~/.safeclaw/device-key`. By default the cloud-side device key is left
+    /// (unused); `--revoke` deletes it server-side too. Your agent's
+    /// `SAFECLAW_*` shell env is yours to remove (we can't edit your profile).
+    Logout(LogoutArgs),
     /// Manage external stores connected to the active vault. Today: list.
     /// Connect / disconnect are deferred until the Write op lands in the
     /// CLI (they rewrite vault.dat).
@@ -511,6 +517,16 @@ pub struct LoginArgs {
     /// common dev-loopback case and is on-host plaintext.
     #[arg(long)]
     pub insecure_http: bool,
+}
+
+/// Args for `sc logout`.
+#[derive(Debug, Args)]
+pub struct LogoutArgs {
+    /// Also revoke this host's device-key on the server (delete it cloud-side),
+    /// not just locally. Use this when the machine is lost/decommissioned. By
+    /// default logout is local-only: the key simply goes unused.
+    #[arg(long)]
+    pub revoke: bool,
 }
 
 /// Reusable arg set for read-only short-lived commands. The daemon URL comes

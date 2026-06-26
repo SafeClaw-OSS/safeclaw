@@ -78,8 +78,9 @@ your passkey. The agent gets the response, never the key.
 
 ```bash
 sc login --pair-token <spt>   # pair this machine (then brings the daemon up + unlocks)
+sc logout [--revoke]          # unpair this machine (inverse of login); --revoke also cuts it cloud-side
 sc up                         # get the daemon running + vault unlocked (idempotent)
-sc down | restart | logs      # daemon lifecycle (Linux user-systemd)
+sc down | restart | logs      # daemon lifecycle (`restart` re-unlocks; Linux user-systemd)
 sc serve                      # run the daemon in the foreground (Docker / dev)
 sc vault unlock | lock        # decrypt / wipe the vault (passkey-gated; `sc up` unlocks for you)
 sc env                        # print `export SAFECLAW_VAULT_URL=…` for your shell

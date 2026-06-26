@@ -184,26 +184,35 @@ pub async fn run(args: LoginArgs) -> Result<(), String> {
         eprintln!("  account: {}", parsed.account_id);
     }
 
-    // Bring SafeClaw to a ready state right after pairing: start the daemon (so
-    // it pulls this vault), then unlock via the single chokepoint — so the agent
-    // never has to run a separate up/unlock and the user just taps a passkey.
-    // Best-effort: pairing already succeeded; if bring-up can't run here (e.g. a
+    // Bring SafeClaw to a ready state right after pairing: get the daemon
+    // running on the just-persisted pairing config, then unlock via the single
+    // chokepoint — so the agent never runs a separate up/unlock and the user
+    // just taps a passkey. `login` ⊃ `restart` ⊃ `unlock`: we reuse the same
+    // bring-up verbs rather than re-implementing them here.
+    // Best-effort: pairing already succeeded; if bring-up can't run (e.g. a
     // non-Linux host with no service manager), point the user at `sc up`.
     eprintln!("Starting SafeClaw and unlocking your vault…");
-    if let Err(e) = crate::cli::service::run_start_systemd(false).await {
-        eprintln!("  couldn't auto-start the daemon ({e}); run `sc up` to finish.");
-        return Ok(());
-    }
-    // Force a restart so a daemon that was ALREADY running (re-pair / post-
-    // upgrade) reloads the just-persisted pairing config. Critical for the
-    // WebAuthn origin/rpId: `from_serve_args` reads `frontend_origin` ONCE at
-    // startup, so a stale daemon would still validate grants against localhost
-    // and reject the web-gestured unlock. Best-effort — a fresh start above
-    // already has the right config, and a non-Linux host has no service to
-    // bounce.
-    let _ = crate::cli::service::run_restart();
-    if let Err(e) = crate::cli::up::ensure_unlocked().await {
-        eprintln!("  couldn't auto-unlock ({e}); run `sc up` to finish.");
+    if crate::cli::service::unit_installed() {
+        // Re-pair / post-upgrade: a daemon may already be running on the OLD
+        // pairing config. Bounce it so it reloads the just-persisted config,
+        // then unlock — exactly `sc restart`. Critical for the WebAuthn
+        // origin/rpId, which `from_serve_args` reads ONCE at startup: a stale
+        // daemon would validate grants against localhost and reject the
+        // web-gestured unlock. Routing through `restart` (not a unit rewrite)
+        // also avoids re-baking a stale `SAFECLAW_*` env into the unit.
+        if let Err(e) = crate::cli::up::restart().await {
+            eprintln!("  couldn't finish bring-up ({e}); run `sc up` to finish.");
+        }
+    } else {
+        // First pairing on this host: install + start the service (its fresh
+        // config is already correct, so no bounce needed), then unlock.
+        if let Err(e) = crate::cli::service::run_start_systemd(false).await {
+            eprintln!("  couldn't auto-start the daemon ({e}); run `sc up` to finish.");
+            return Ok(());
+        }
+        if let Err(e) = crate::cli::up::ensure_unlocked().await {
+            eprintln!("  couldn't auto-unlock ({e}); run `sc up` to finish.");
+        }
     }
 
     Ok(())
