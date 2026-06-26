@@ -242,6 +242,40 @@ Iron-rule compliant: daemon supplies routing facts, the agent brings its own key
 runs the commands, and adapts to the real remotes. **No canned `sc git connect`,
 no decoy token, no concealed interception.**
 
+### 5.1 Persist the inputs, derive the config each session (NOT per-session-set, NOT persisted-render)
+
+The git config is a **projection of the environment**, not a piece of state to
+either re-type every session or write to disk. Split by sensitivity:
+
+| Piece | Sensitivity | Source | On disk? |
+|-------|-------------|--------|----------|
+| `insteadOf` (route rewrite) | non-secret | vault-derived — **`sc env` knows it** | doesn't matter |
+| `extraHeader` (the api_key) | the agent's own key | the agent's environment (set once in its profile) | **no** |
+
+**Mechanism — `sc env` emits the git routing too**, riding the pattern the agent
+already uses (`eval "$(sc env)"`). `sc env` renders the `route`, and emits the
+api_key line as the **literal text `$SAFECLAW_API_KEY`** (unexpanded) — the
+agent's shell expands it from *its own* profile at `eval` time, so **`sc env`
+never handles the key** (preserving its current "does not emit `SAFECLAW_API_KEY`"
+design, see [src/cli/env.rs](../src/cli/env.rs)):
+
+```bash
+# added to `sc env` output, for each connected git service:
+export GIT_CONFIG_COUNT=2
+export GIT_CONFIG_KEY_0="url.<route>.insteadOf"     GIT_CONFIG_VALUE_0="https://github.com/"
+export GIT_CONFIG_KEY_1="http.<route>.extraHeader"  GIT_CONFIG_VALUE_1="Authorization: Bearer $SAFECLAW_API_KEY"
+```
+
+So the answer to "per-session or one-time?": **inputs persist once** (the profile's
+`SAFECLAW_API_KEY` + `eval "$(sc env)"`), the **config re-derives every session**
+with zero manual work, nothing secret on disk, no stale state. The `[setup]` block
+in `/registry` stays the canonical declaration; `sc env` is its shell projection.
+
+> **Caveat — `GIT_CONFIG_COUNT` is a single global counter**, not composable with a
+> user's own `GIT_CONFIG_*`. In the dedicated-agent-VM product line nothing else
+> uses it → non-issue. On a shared human box, `sc env` must continue the existing
+> count (read it, append) rather than overwrite.
+
 ## 6. Usage scenarios
 
 - **New clone** — set the env-config, then `git clone https://github.com/o/r`
@@ -261,12 +295,48 @@ no decoy token, no concealed interception.**
 
 ## 7. Boundaries (own these)
 
-- **Allow-only** (§1.3) — no per-push approval; credential still protected.
+- **Allow-only** (§1.3) — no *per-request* approval. Not a security hole
+  (non-possession holds either way); a **feature gap** for "human-gate before
+  push," closed by the pre-grant window (§7.1).
 - **Unlock required** — git works only while the vault is unlocked (`sc up`).
-- **api_key placement** — keep it in env via `GIT_CONFIG_*` (§2); the only footgun
-  is `git config --global …extraHeader`, which we don't use.
+- **api_key placement** — keep it in env via `GIT_CONFIG_*` (§2/§5.1); the only
+  footgun is `git config --global …extraHeader`, which we don't use.
 - **Large packfiles** — streamed unbuffered (body limit disabled on the route);
   fine. Network interruptions behave like normal git over a proxy.
+
+### 7.1 Approval-gated git (future) — the pre-grant *window*, not a non-interrupting protocol
+
+You **cannot** pause a live packfile to collect a passkey tap, and a held-open
+stream has no clean way to hand the approve-link back. The fix is **not** to make
+the streaming protocol non-interrupting — it's to **move the gate before the
+stream**, `sudo`-style: approve a **time-boxed window**, not each request.
+
+```
+1. before git runs, the agent calls a normal BUFFERED endpoint:
+   "request git access to <connection> for N minutes"
+2. → returns { op_id, approve_url }   ← a normal response, so the link IS deliverable
+                                         (it is NOT a stuck stream)
+3. user taps passkey → grants a time-boxed window for that connection
+4. agent runs git; /stream/ checks "is there a live grant window?" → allow → streams
+5. window expires → the next git op requests a fresh grant
+```
+
+This reconciles both constraints: the stream never pauses (approval happened
+*before* it), and the approve-link rides the buffered pre-grant call. UX is also
+*better* than per-request — one tap per session, not per `git fetch`.
+
+**Where the allow-only constraint must be surfaced** (so a user choosing "ask" on a
+git service isn't silently ignored):
+
+1. **Recipe validation** — reject `stream = true` + non-allow policy **at
+   load/validate time** (today [stream.rs](../src/proxy/stream.rs) rejects only at
+   request time → a late 403). Message: "streaming services are allow-only;
+   per-request approval is unsupported — use a pre-grant window (roadmap)."
+2. **[PROTOCOL.md](./PROTOCOL.md)** policy section — state the invariant: streaming
+   routes require allow-level; ask/ask-always/deny are incompatible with streaming.
+3. **Console UI** — when a user sets a streaming/git service to "ask," explain it
+   and (when built) offer the window model instead.
+4. **This doc** — §1.3 / §7 / §7.1.
 
 ## 8. Build checklist
 
@@ -278,21 +348,25 @@ no decoy token, no concealed interception.**
    + the `secret_basic` alias.
 3. **gitlab recipe** (§3) — new service. Verify the REST PAT header
    (`PRIVATE-TOKEN` vs `Bearer`) against a live GitLab at impl time.
-4. **`[setup]` parsing + `/registry` rendering** of `proxy_base`/`route`/
-   `connection_id` (§5). Per CONNECTIONS_AND_AUTH §9 this is shared with the
-   broader setup work.
-5. **Validator**: `allow_private_host` honored only in first-party/trusted mode
-   (§1.6, option a).
-6. **Skill**: promote [git-streaming-skill-draft.md](./git-streaming-skill-draft.md)
+4. **`[setup]` → `/registry` rendering** of `proxy_base`/`route`/`connection_id`
+   (§5); parser already landed. Per CONNECTIONS_AND_AUTH §9 the registry-render is
+   shared with the broader setup work.
+5. **`sc env` git projection** (§5.1): emit `GIT_CONFIG_*` for connected git
+   services (route rendered; api_key as the literal `$SAFECLAW_API_KEY`); continue
+   any existing `GIT_CONFIG_COUNT`.
+6. **Validator**: (a) reject `stream = true` + non-allow at validate time (§7.1);
+   (b) `allow_private_host` honored only in first-party/trusted mode (§1.6, opt a).
+7. **Skill**: promote [git-streaming-skill-draft.md](./git-streaming-skill-draft.md)
    into the live skill, with `GIT_TERMINAL_PROMPT=0`, the env-config form, and the
    SSH-rewrite note.
-7. **Smoke test** (still outstanding): real `git clone` + `git push` (large
+8. **Smoke test** (still outstanding): real `git clone` + `git push` (large
    packfile) through `/v/{vid}/stream/github/`.
 
 ## 9. Deferred / out of scope
 
 - OAuth connect for github/gitlab (onboarding nicety; not a simplification).
-- Approval-gated git (incompatible with streaming).
+- Approval-gated git — feasible via the pre-grant window (§7.1); deferred, v1 is
+  allow-only.
 - Native SSH transport (we migrate SSH → HTTPS-through-broker instead).
 - `grant.rs:29` HPKE plaintext fallback — unrelated to git but must close before
   any "cloud-blind" claim.
