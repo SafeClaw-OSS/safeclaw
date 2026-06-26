@@ -494,6 +494,7 @@ mod tests {
             auth: None,
             headers,
             query,
+            stream: false,
             locked: None,
         };
         let mut names = referenced_secret_names(&upstream);
@@ -511,6 +512,7 @@ mod tests {
             auth: None,
             headers,
             query: std::collections::HashMap::new(),
+            stream: false,
             locked: None,
         };
         assert!(referenced_secret_names(&upstream).is_empty());

@@ -1,0 +1,29 @@
+[service]
+id = "github-git"
+name = "GitHub (git)"
+sub = "git smart-HTTP"
+category = "integration"
+# Not a catalog card — this backs the streaming `git` transport, reached by the
+# agent via `git insteadOf` pointing at /v/{vid}/stream/github-git/. Hidden so
+# it doesn't show up as a normal connectable service.
+hidden = true
+
+[[upstream]]
+id = "default"
+url = "https://github.com"
+# Opt into the generic streaming passthrough (the /stream/ route).
+stream = true
+# Reuses the SAME native secret as the REST `github` service.
+auth = { env = "github_token" }
+
+  [upstream.headers]
+  # GitHub PAT over git smart-HTTP = HTTP Basic with the token as the username
+  # and an empty password — i.e. `https://<token>@github.com/…`. That is exactly
+  # base64(token + ':'), which `{{secret_basic.NAME}}` produces.
+  Authorization = "Basic {{secret_basic.github_token}}"
+
+# Allow-policy: git operations stream without a per-request passkey (the user
+# opted in by configuring `insteadOf`). The token never enters git.
+[policy.levels]
+read = "allow"
+write = "allow"

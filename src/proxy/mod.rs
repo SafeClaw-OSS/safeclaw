@@ -14,6 +14,7 @@
 //! via `GET /op/{op_id}`.
 
 pub mod env;
+pub mod stream;
 pub mod use_broker;
 
 use std::sync::Arc;
@@ -42,6 +43,13 @@ pub fn proxy_router(state: Arc<AppState>) -> Router {
         .route("/v/{vid}/export/{key}", post(env::handle))
         .route("/v/{vid}/use/{service}", any(use_broker::handle_no_rest))
         .route("/v/{vid}/use/{service}/{*rest}", any(use_broker::handle))
+        // Streaming passthrough (git smart-HTTP, etc.). Body limit DISABLED on
+        // this route only — packfiles can be hundreds of MB and are streamed,
+        // not buffered. Still behind the agent-key gate below.
+        .route(
+            "/v/{vid}/stream/{service}/{*rest}",
+            any(stream::handle).layer(DefaultBodyLimit::disable()),
+        )
         // Agent-key gate: every broker request must carry `Authorization:
         // Bearer <agent-key>` whose sha256 is in the cloud-synced account
         // hash-set (agent ≡ api-key). Empty set ⇒ reject. Admin plane

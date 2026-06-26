@@ -249,7 +249,7 @@ pub fn referenced_secrets(tpl: &str) -> Vec<String> {
 ///   `{{oauth.access_token}}` the minted OAuth access token
 ///   `{{uuid_v4}}`            a fresh UUID v4
 /// Unknown/unterminated/unresolvable token → hard error.
-fn render_template(tpl: &str, inputs: &RenderInputs) -> Result<String> {
+pub(crate) fn render_template(tpl: &str, inputs: &RenderInputs) -> Result<String> {
     let mut out = String::with_capacity(tpl.len());
     let bytes = tpl.as_bytes();
     let mut i = 0;

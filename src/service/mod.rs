@@ -106,6 +106,15 @@ pub struct UpstreamDef {
     /// template semantics as `headers`.
     #[serde(default)]
     pub query: HashMap<String, String>,
+    /// Opt into the generic **streaming passthrough** transport (the
+    /// `/v/{vid}/stream/{service}/…` route): request and response bodies are
+    /// proxied as byte streams with no buffering, for transports like git's
+    /// smart-HTTP where a packfile can be hundreds of MB. The daemon does NOT
+    /// interpret the protocol — it injects auth and forwards verbatim. This is
+    /// the one recipe shape that is *not* OpenAPI-describable (git is a binary
+    /// transport, not a REST API); normal `[[api]]` recipes stay OpenAPI-mappable.
+    #[serde(default)]
+    pub stream: bool,
     #[serde(default)]
     pub locked: Option<LockedResponseDef>,
 }
