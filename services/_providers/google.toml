@@ -1,11 +1,24 @@
 # Shared OAuth template for all Google services (gmail, gdrive, gcalendar).
 # = Nango providers.yaml entry. CONNECTIONS_AND_AUTH.md §2/§8.
 #
-# This ships the PUBLIC Desktop client (client_type = "public"). Google's
-# Desktop-app design treats this client_secret as non-confidential
-# ("the client secret is obviously not treated as a secret"), so it is safe to
-# commit. The CONFIDENTIAL Web-app client_secret must NEVER appear in any recipe.
-# Refresh/code-exchange happen on the daemon with these public creds.
+# This ships the PUBLIC Desktop OAuth client. Google's Desktop-app design treats
+# this client_secret as NON-confidential — "the client secret is obviously not
+# treated as a secret"
+# (developers.google.com/identity/protocols/oauth2/native-app) — because an
+# installed app lives on the user's machine and cannot keep secrets. The real
+# security is PKCE + the user's live Google login, not this string.
+#
+# Why it's committed, and why it CANNOT be dropped in favor of pure PKCE:
+#  - Google's Desktop client REQUIRES client_secret at the token endpoint even
+#    WITH PKCE. Verified empirically (2026-06): omitting it returns
+#    `invalid_request: "client_secret is missing."`. The docs' "Optional" does
+#    NOT apply to the Desktop client type — so the secret must ship here.
+#  - GitHub push-protection flags the `GOCSPX-` pattern; this specific value is
+#    allow-listed as a public Desktop client (non-confidential), NOT a leak.
+#
+# The CONFIDENTIAL Web-app client_secret (our cloud asset) must NEVER appear in
+# any recipe — the validator requires client_type = "public" precisely to keep
+# that line from ever being crossed.
 [provider.google]
 auth_mode         = "oauth2"
 flow              = "authorization_code"
