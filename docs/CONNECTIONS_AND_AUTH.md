@@ -62,6 +62,12 @@ client_type       = "public"          # RFC 6749 §2.1: "confidential" | "public
   ([OAuth for Desktop apps] — "the client secret is obviously not treated as a
   secret"), so it ships in the recipe. Refresh/exchange happen **on the daemon**
   with these public creds — the confidential Web-app secret never leaves the cloud.
+- **The public secret can't be dropped for pure PKCE.** Empirically (2026-06),
+  Google's *Desktop* client **requires `client_secret` at the token endpoint even
+  with PKCE** — omitting it returns `invalid_request: "client_secret is missing."`.
+  "Optional" in the spec doesn't apply to the Desktop client type, so the public
+  secret must ship. (GitHub push-protection flags the `GOCSPX-` pattern; this
+  value is allow-listed as a public Desktop client, not a leak.)
 
 ## 3. `[upstream.auth]` — a service's auth
 
