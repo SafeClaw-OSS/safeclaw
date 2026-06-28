@@ -59,9 +59,12 @@ fn emit_get(input: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// True iff git's request host (the `host=` line on stdin) equals the SafeClaw
-/// broker host from `$SAFECLAW_VAULT_URL`. Fail closed: a missing host on either
-/// side returns false, so the key is never emitted toward an unknown host.
+/// True iff git's request host (the `host=` line on stdin) is the SafeClaw
+/// daemon's host, taken from `$SAFECLAW_VAULT_URL`. Compared **host-only** (the
+/// port is stripped): the daemon's admin port (`SAFECLAW_VAULT_URL`) and its
+/// broker/`/stream/` port differ, but share the same host — and matching the
+/// host alone still blocks a *different* host (e.g. github.com) from ever
+/// receiving the key. Fail closed: a missing host on either side returns false.
 fn host_is_broker(input: &str) -> bool {
     let req_host = match input
         .lines()
@@ -77,7 +80,7 @@ fn host_is_broker(input: &str) -> bool {
         .as_deref()
         .and_then(url_host)
     {
-        Some(broker) => broker == req_host,
+        Some(broker) => bare_host(&broker) == bare_host(req_host),
         None => false,
     }
 }
@@ -87,6 +90,15 @@ fn host_is_broker(input: &str) -> bool {
 fn url_host(url: &str) -> Option<String> {
     let after_scheme = url.split("://").nth(1)?;
     Some(after_scheme.split('/').next().unwrap_or(after_scheme).to_string())
+}
+
+/// Drop a trailing `:<port>` from an authority, leaving the host
+/// (`127.0.0.1:23295` → `127.0.0.1`). Leaves IPv6/hostless forms untouched.
+fn bare_host(authority: &str) -> &str {
+    match authority.rsplit_once(':') {
+        Some((host, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => host,
+        _ => authority,
+    }
 }
 
 #[cfg(test)]
@@ -101,17 +113,28 @@ mod tests {
     }
 
     #[test]
+    fn bare_host_strips_port() {
+        assert_eq!(bare_host("127.0.0.1:23295"), "127.0.0.1");
+        assert_eq!(bare_host("localhost"), "localhost");
+        assert_eq!(bare_host("api.safeclaw.pro"), "api.safeclaw.pro");
+    }
+
+    #[test]
     fn host_is_broker_matches_only_the_broker() {
         // SAFECLAW_VAULT_URL is process-global; guard the test behind it being set
         // to the value we expect (other tests don't touch it).
-        std::env::set_var("SAFECLAW_VAULT_URL", "http://localhost:23295/v/abc");
-        assert!(host_is_broker("protocol=http\nhost=localhost:23295\n"));
+        // NB: it points at the ADMIN port (23294); git talks to the BROKER port
+        // (23295). Same host, different port → must still match (host-only).
+        std::env::set_var("SAFECLAW_VAULT_URL", "http://127.0.0.1:23294/v/abc");
+        assert!(host_is_broker("protocol=http\nhost=127.0.0.1:23295\n"));
+        // Same host, no port given → still matches.
+        assert!(host_is_broker("protocol=http\nhost=127.0.0.1\n"));
         // A different host (e.g. github.com directly) is refused — no key leak.
         assert!(!host_is_broker("protocol=https\nhost=github.com\n"));
         // No host line → fail closed.
         assert!(!host_is_broker("protocol=http\n"));
         std::env::remove_var("SAFECLAW_VAULT_URL");
         // No broker URL → fail closed.
-        assert!(!host_is_broker("host=localhost:23295\n"));
+        assert!(!host_is_broker("host=127.0.0.1:23295\n"));
     }
 }
