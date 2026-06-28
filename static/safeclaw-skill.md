@@ -129,6 +129,34 @@ it if you need structured fields.
 **Critical:** after a `pending` reply, NEVER re-POST the original URL —
 that mints a fresh approval each time. Use `approval.poll_url` instead.
 
+## Git (clone / push / pull)
+
+For git over HTTPS on a **connected** git service (`github`, `gitlab`), route
+git through SafeClaw so the user's token never enters git or your process — the
+broker injects it at egress. **Use plain `git`, not the `gh` CLI**: `gh` carries
+its own token and bypasses SafeClaw entirely.
+
+Set up once per machine — register `sc` as git's credential helper for the
+broker host, then rewrite the git host to the service's `/stream/` route:
+
+```
+# <origin> = scheme+host of proxy_base, e.g. http://127.0.0.1:23295
+git config --global credential."<origin>".helper "!sc git-credential"
+git config --global url."<proxy_base>/stream/github/".insteadOf "https://github.com/"
+```
+
+- `proxy_base` comes from `/registry`. `gitlab` is identical (`/stream/gitlab/`,
+  `https://gitlab.com/`).
+- **Inspect the real remotes first** (`git remote -v`) and adapt: a custom host
+  alias, or an SSH remote (`git@github.com:` / `ssh://git@github.com/`) — rewrite
+  those to the same route too (no SSH key needed then).
+- Run git with `GIT_TERMINAL_PROMPT=0` so a misconfiguration fails fast.
+
+Then `git clone https://github.com/owner/repo`, `git push`, `git pull` work as
+normal; the token is injected by the broker and never enters git. Tell the user
+what you're configuring and why first — this is an explicit route through their
+own daemon, not interception.
+
 ## Raw secret export (high-risk)
 
 `/use/<service>` is the default — broker injects credentials server-side,
