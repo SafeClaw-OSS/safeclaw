@@ -295,6 +295,21 @@ pub async fn process_vault_connects(state: &Arc<AppState>, vault_id: &str) {
         let cache = crate::server::handlers::approve::bootstrap_cache_from_view(&view, state);
         state.unlock_vault(vault_id.to_string(), cache, k);
     }
+
+    // Propagate to OTHER devices: push the re-sealed blob back to the cloud.
+    // A Google authorization code is single-use, so only THIS daemon could
+    // redeem the pending connect — every other device's daemon must PULL the
+    // resulting refresh_token rather than re-exchange (which fails
+    // `invalid_grant`). Cloud-blind preserved: the pushed blob is ciphertext.
+    // Detached + best-effort, after the write lock drops (push only reads
+    // vault.dat + does HTTP).
+    {
+        let state = state.clone();
+        let vid = vault_id.to_string();
+        tokio::spawn(async move {
+            crate::sync::push_blob_best_effort(&state, &vid).await;
+        });
+    }
 }
 
 #[cfg(test)]

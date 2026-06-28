@@ -271,6 +271,80 @@ fn refresh_after_pull(state: &Arc<AppState>, vault: &str) {
     }
 }
 
+/// Push the local `vault.dat` (sealed blob) back up to the cloud so OTHER
+/// devices' daemons pull it. Used after a daemon-side mutation the browser
+/// didn't make — notably an OAuth connect's exchange: Google authorization
+/// codes are SINGLE-USE, so only one daemon can redeem a pending connect; the
+/// resulting refresh_token must propagate to every device via the cloud blob
+/// (otherwise other daemons forever sync only the stale `*_oauth_pending`).
+///
+/// **Cloud-blind preserved:** the pushed blob is ciphertext (passkey-sealed,
+/// `W_c` not in it) — the cloud stores it blind, never decrypts. Best-effort:
+/// a local-only/unpaired daemon or any network error just logs; the
+/// refresh_token is already durable in the local `vault.dat` either way.
+pub async fn push_blob_best_effort(state: &Arc<AppState>, vault_id: &str) {
+    let Ok(cfg) = active::load() else { return };
+    let Some(cloud) = cfg.cloud_backend.as_deref().filter(|s| !s.is_empty()) else {
+        return; // local-only daemon — nothing to push to
+    };
+    let Some(dk) = device_key() else {
+        return; // unpaired — no device-key to authenticate the push
+    };
+    let vault_path = state
+        .config
+        .state_dir
+        .join("vaults")
+        .join(vault_id)
+        .join("vault.dat");
+    let sealed = match sealed_vault::read(&vault_path) {
+        Ok(Some(v)) => v,
+        _ => return,
+    };
+    let blob = match serde_json::to_value(&sealed) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(vault = %vault_id, "push-back: serialize failed: {}", e);
+            return;
+        }
+    };
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let url = format!("{}/v/{}/blob", cloud.trim_end_matches('/'), vault_id);
+    let resp = match client
+        .put(&url)
+        .bearer_auth(dk)
+        .json(&serde_json::json!({ "blob": blob }))
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(vault = %vault_id, "push-back: PUT failed: {}", e);
+            return;
+        }
+    };
+    if !resp.status().is_success() {
+        tracing::warn!(vault = %vault_id, "push-back: cloud rejected (HTTP {})", resp.status());
+        return;
+    }
+    // Record the version the cloud assigned, so our OWN watcher doesn't treat
+    // the blob we just pushed as a newer remote change and re-pull it.
+    if let Ok(body) = resp.json::<serde_json::Value>().await {
+        if let Some(version) = body.get("version").and_then(|v| v.as_u64()) {
+            let _ = std::fs::write(
+                version_sidecar(&state.config.state_dir, vault_id),
+                version.to_string(),
+            );
+        }
+    }
+    tracing::info!(vault = %vault_id, "push-back: pushed refreshed sealed blob to cloud");
+}
+
 /// Fetch the account-level agent-key hash-set (`/api/vault/agents/hashes`,
 /// device-key authed). Returns None on any failure (caller keeps the prior
 /// set). The hashes are sha256(token) hex — the broker validates a presented
