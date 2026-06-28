@@ -35,6 +35,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 e.into()
             })
         }
+        Command::Sync(args) => {
+            cli::sync::run(args).await.map_err(|e| -> Box<dyn std::error::Error> {
+                eprintln!("safeclaw sync: {}", e);
+                e.into()
+            })
+        }
         Command::Logs(args) => cli::service::run_logs(args).map_err(daemon_err),
         Command::Pubkey(args) => cli::custodian::pubkey(args).await.map_err(daemon_err),
         Command::Menu(args) => cli::custodian::menu(args).await.map_err(daemon_err),

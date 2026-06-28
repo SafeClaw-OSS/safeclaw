@@ -37,6 +37,10 @@ pub enum Command {
     /// A bounce wipes the in-memory keys, so `restart` converges back to the
     /// same running+unlocked state as `sc up` — never leaves you silently locked.
     Restart,
+    /// Pull the latest vault state from the cloud now and finish any pending
+    /// connect (e.g. a Gmail "Connect" sealed from the web that hasn't completed
+    /// yet). Normally automatic via the background watcher; use this to force it.
+    Sync(SyncArgs),
     /// Bring the active vault Locked → Unlocked (one passkey tap). Normally
     /// `sc up` does this for you; use this to unlock explicitly. A vault-level
     /// lifecycle op — sits next to `sc up`, not under `sc vault` (which manages
@@ -481,6 +485,13 @@ pub struct ServeArgs {
 /// localhost daemon. Point at another device's daemon via `$SAFECLAW_VAULT_URL`.
 #[derive(Debug, Args)]
 pub struct StatusArgs {}
+
+#[derive(Debug, Args)]
+pub struct SyncArgs {
+    /// Vault id (defaults to the active vault).
+    #[arg(long)]
+    pub vault: Option<String>,
+}
 
 #[derive(Debug, Args)]
 pub struct UnlockArgs {

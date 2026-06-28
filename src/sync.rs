@@ -86,6 +86,45 @@ pub async fn pull_on_start(state_dir: &Path) {
     }
 }
 
+/// One-shot, on-demand sync of `vault_id`, backing `POST /v/{vid}/sync`
+/// (`sc sync`): pull the latest blob from the cloud (if any), refresh the
+/// in-memory cache, and complete any pending OAuth connect
+/// (`<conn>_oauth_pending` → exchange → `<conn>_refresh_token`). Returns
+/// `Ok(true)` when a newer blob was pulled. Never needs a passkey — it only
+/// moves already-sealed state forward: the pull is device-key-authed, and the
+/// connect re-seal uses the retained `K` from a prior unlock (no-ops if locked).
+pub async fn sync_vault_now(state: &Arc<AppState>, vault_id: &str) -> Result<bool, String> {
+    let cfg = active::load().map_err(|_| {
+        "not set up yet — run `sc login` to pair this daemon with the cloud".to_string()
+    })?;
+    // `sc sync` only makes sense for a cloud-paired daemon. Distinguish the two
+    // not-logged-in shapes so the message guides the user (mainstream: gcloud /
+    // gh both point you at the login command rather than printing a raw error).
+    let cloud = cfg
+        .cloud_backend
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            "local-only daemon (no cloud backend) — nothing to sync from the cloud; \
+             run `sc login` to pair"
+                .to_string()
+        })?;
+    let dk = device_key().ok_or_else(|| {
+        "this daemon isn't paired with the cloud — run `sc login` first".to_string()
+    })?;
+    let pulled = match pull(&state.config.state_dir, cloud, vault_id, &dk).await? {
+        Some(_version) => {
+            refresh_after_pull(state, vault_id);
+            true
+        }
+        None => false,
+    };
+    // Complete a pending connect even when the blob was unchanged — the pending
+    // item may have synced earlier (background watcher) but never been processed.
+    crate::auth::connect::process_vault_connects(state, vault_id).await;
+    Ok(pulled)
+}
+
 /// Vault ids this device keeps synced: the active vault plus every vault in
 /// `known_vaults` (added by `sc vault use` / `sc vault create`), deduped. The
 /// agent reaches any of them by vid; `sc vault use` is only the CLI default.

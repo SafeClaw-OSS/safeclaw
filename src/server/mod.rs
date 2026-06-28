@@ -53,6 +53,7 @@ pub fn admin_router(state: Arc<AppState>) -> Router {
         .route("/skill.md", get(handlers::skill::skill_md))
         // Vault-scoped.
         .route("/v/{vid}/op", post(handlers::op::create))
+        .route("/v/{vid}/sync", post(handlers::metadata::sync_now))
         .route("/v/{vid}/passkeys", get(handlers::metadata::passkeys))
         .route("/v/{vid}/pending-passkeys", post(handlers::pending_passkey::create))
         .route("/v/{vid}/events", get(handlers::events::stream))

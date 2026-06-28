@@ -132,6 +132,24 @@ pub async fn pubkey(State(state): State<Arc<AppState>>) -> Json<Value> {
     }))
 }
 
+/// `POST /v/{vid}/sync` — on-demand cloud pull + complete-pending-connect
+/// (backs `sc sync`). No passkey: it only advances already-sealed state (the
+/// pull is device-key-authed; the connect re-seal uses the retained K and
+/// no-ops if the vault is locked). The vault id is validated; the rest is
+/// handled inside `sync::sync_vault_now`.
+pub async fn sync_now(
+    State(state): State<Arc<AppState>>,
+    Path(vault_id): Path<String>,
+) -> Json<Value> {
+    if let Err(e) = validate_vault_id(&vault_id) {
+        return Json(json!({ "ok": false, "error": e.to_string() }));
+    }
+    match crate::sync::sync_vault_now(&state, &vault_id).await {
+        Ok(pulled) => Json(json!({ "ok": true, "pulled": pulled })),
+        Err(e) => Json(json!({ "ok": false, "error": e })),
+    }
+}
+
 /// Decrypt vault and return a parsed v3 view of the plaintext. Used by
 /// `approve.rs` for Export/Use act dispatch and by the unlock-bootstrap
 /// path. Hard-fails on `version != 3` (callers should treat this as

@@ -21,6 +21,7 @@ pub mod secret;
 pub mod service;
 pub mod status;
 pub mod store;
+pub mod sync;
 pub mod unlock;
 pub mod up;
 pub mod upgrade;

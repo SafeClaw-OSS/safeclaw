@@ -470,6 +470,21 @@ pub async fn approve_op(
                     "post-write cache refresh skipped — decrypt failed (rotation?); user must lock+unlock to see new state",
                 );
             }
+            // A Write may have sealed a `<conn>_oauth_pending` from a browser
+            // "Connect" — complete the OAuth code→token exchange NOW instead of
+            // waiting for the next unlock or cloud-sync pull (the symptom this
+            // fixes: the web UI sticks on "Connecting…" after paste because the
+            // Write path never kicked the exchange). CONNECTIONS_AND_AUTH.md §4a.
+            // Detached + best-effort: process_vault_connects acquires the
+            // per-vault write lock itself (not reentrant, so it must run AFTER
+            // this handler's guard drops) and no-ops if the vault is locked.
+            {
+                let state = state.clone();
+                let vid = vault_id.clone();
+                tokio::spawn(async move {
+                    crate::auth::connect::process_vault_connects(&state, &vid).await;
+                });
+            }
             (json!({ "ok": true, "act": "write" }), None)
         }
         ActType::Revoke => {
