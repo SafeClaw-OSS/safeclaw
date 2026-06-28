@@ -242,23 +242,53 @@ Iron-rule compliant: daemon supplies routing facts, the agent brings its own key
 runs the commands, and adapts to the real remotes. **No canned `sc git connect`,
 no decoy token, no concealed interception.**
 
-### 5.1 Persist the inputs, derive the config each session (NOT per-session-set, NOT persisted-render)
+### 5.1 How the api_key reaches git — ✅ DECIDED + BUILT: a git credential helper
 
-> **🟡 OPEN DECISION (settle 2026-06-27 AM): how the api_key reaches git.** Two
-> candidates, both keep the key off disk:
-> - **(A) env projection** — the agent sets `GIT_CONFIG_*` from its own env
->   (optionally emitted by `sc env`). Described below. Simplest; ideal in the
->   dedicated-agent-VM model. Weaker on shared boxes (`GIT_CONFIG_COUNT` is a
->   single global counter) and across non-shell git execution contexts.
-> - **(B) git credential helper** — persist a stable `credential.<broker>.helper
->   = !sc git-credential`; git invokes it at run-time and it returns the live key
->   from env. Git-native (like `gh`), no `GIT_CONFIG_COUNT` collisions, works in
->   every git context, "persisted feel + fresh resolution." Costs a small
->   `sc git-credential` subcommand + the broker accepting the key via HTTP Basic.
->
-> Leaning **(B)** for product breadth; **not yet built** — the shipped `[setup]`
-> blocks currently show form (A), which works for v1. **Decide, then update the
-> `[setup]` blocks + skill accordingly.** Until then everything below describes (A).
+> **✅ DECIDED (2026-06-27): the git credential helper (option B), `!`-command
+> form.** Two non-secret config lines are persisted; the volatile key is resolved
+> live at git-time by `sc`, never on disk.
+
+**Why B over the env-projection (A):** B is git-native (same shape `gh` uses),
+has no `GIT_CONFIG_COUNT` single-counter collision, and works in *every* git
+execution context (IDE, subprocess, tool) — not just shells that sourced the
+env. It is persisted (no per-session step) yet fresh (resolves the live key), so
+it survives key rotation and vault churn with zero reconfiguration.
+
+**Why the `!sc git-credential` form over a named `git-credential-safeclaw`
+binary — from the agent's view:** (1) **maximally transparent** — the exact
+command is visible right in the config, so the agent can audit precisely what
+runs, vs an opaque binary name it must trust; (2) **zero install footprint** —
+no extra helper binary to ship/vet, the setup is pure git-config; (3) it's the
+**`gh`-blessed pattern** (`!gh auth git-credential`), so it's familiar, not a
+red flag; (4) the `!`-shell concern is **not incremental** — git config already
+has command-exec vectors (`core.pager`, …) and an agent setting its *own* global
+config is not an untrusted-source injection. The helper is **host-scoped** to the
+broker, so it never fires for other remotes.
+
+**Mechanism (built):**
+1. `git config --global credential."{{proxy_base}}".helper "!sc git-credential"`
+   — registers `sc` as the credential helper for the broker host (one-time).
+2. `git config --global url."{{route}}".insteadOf "https://github.com/"` — routes
+   GitHub through the broker (the `git`-stream upstream).
+3. git hits the broker → the auth middleware 401s **with `WWW-Authenticate:
+   Basic`** (added on the `/stream/` route only, [api_key.rs](../src/api_key.rs))
+   → git invokes `sc git-credential get` → `sc` reads `$SAFECLAW_API_KEY` and
+   returns it as the Basic **password** → git retries with Basic → the broker
+   accepts the key via Basic (`extract_key`), scrubs it, injects the PAT.
+4. **Fail-closed safety:** `sc git-credential`
+   ([cli/git_credential.rs](../src/cli/git_credential.rs)) emits the key **only**
+   when git's request host equals the broker host from `$SAFECLAW_VAULT_URL` — so
+   a misconfigured global helper can never leak the key to github.com directly.
+
+The key lives only in the agent's env (where it already is); rotation is picked
+up on the next git command. Nothing of the key is written to disk.
+
+---
+
+The **env-projection alternative (A)** is kept below for reference — it derives
+the same config from `GIT_CONFIG_*` env each session. Simpler in a dedicated
+agent VM, but the single-counter collision + env-context dependence made B the
+better default.
 
 The git config is a **projection of the environment**, not a piece of state to
 either re-type every session or write to disk. Split by sensitivity:

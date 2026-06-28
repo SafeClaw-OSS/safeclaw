@@ -43,19 +43,23 @@ path = "*"
 [setup]
 goal = "Route the user's git remotes through SafeClaw so the GitHub PAT never enters git or the agent process."
 route = "{{proxy_base}}/stream/github/"
-auth = "Authorization: Bearer {{api_key}}"
+auth = "credential.helper = !sc git-credential  (git fetches your SAFECLAW_API_KEY from the env at run-time — nothing on disk)"
 example = """
 # Inspect first — don't assume github.com:
 git remote -v ; git config --get-regexp '^url\\.'
 
-# Off-disk config (preferred for agents): the key stays in the environment.
-export GIT_CONFIG_COUNT=2
-export GIT_CONFIG_KEY_0="url.{{route}}.insteadOf"     GIT_CONFIG_VALUE_0="https://github.com/"
-export GIT_CONFIG_KEY_1="http.{{route}}.extraHeader"  GIT_CONFIG_VALUE_1="{{auth}}"
+# 1) one-time per machine: let git get the broker key from sc. Scoped to the broker
+#    host; sc reads $SAFECLAW_API_KEY at git-time, so the key is never written to disk:
+git config --global credential."{{proxy_base}}".helper "!sc git-credential"
 
-# SSH remotes? Rewrite them too (then the SSH key is no longer needed):
-#   url.{{route}}.insteadOf = "git@github.com:"
-#   url.{{route}}.insteadOf = "ssh://git@github.com/"
+# 2) route GitHub through SafeClaw — the PAT is injected by the broker, never enters git:
+git config --global url."{{route}}".insteadOf "https://github.com/"
+
+# SSH remotes? rewrite them too (then the SSH key is no longer needed):
+#   git config --global url."{{route}}".insteadOf "git@github.com:"
+#   git config --global url."{{route}}".insteadOf "ssh://git@github.com/"
+
+# Tip: run git with GIT_TERMINAL_PROMPT=0 so a misconfig fails fast instead of prompting.
 """
 
 # Allow-policy: git streams without a per-request passkey (the user opted in by

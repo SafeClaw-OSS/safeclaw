@@ -27,6 +27,7 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
+use base64::{engine::general_purpose::STANDARD, Engine};
 
 use crate::error::{AppError, Result};
 use crate::state::AppState;
@@ -37,17 +38,40 @@ fn sha256_hex(s: &str) -> String {
     d.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
-/// Verify `Authorization: Bearer <key>` against the synced agent-key hash-set.
+/// Pull the agent key out of an `Authorization` header. Two transports carry the
+/// same key:
+///   - `Bearer <key>` — the agent's normal broker call.
+///   - `Basic base64("<user>:<key>")` — git's credential helper hands git a
+///     username/password, which git sends as Basic; the username is ignored and
+///     the **password** is the key. This is what lets `git` authenticate to the
+///     broker for the streaming (smart-HTTP) route without the key on disk.
+fn extract_key(auth: Option<&str>) -> Option<String> {
+    let auth = auth?;
+    if let Some(t) = auth
+        .strip_prefix("Bearer ")
+        .or_else(|| auth.strip_prefix("bearer "))
+    {
+        return Some(t.to_string());
+    }
+    if let Some(b64) = auth
+        .strip_prefix("Basic ")
+        .or_else(|| auth.strip_prefix("basic "))
+    {
+        let decoded = STANDARD.decode(b64.trim()).ok()?;
+        let creds = String::from_utf8(decoded).ok()?;
+        // The password is everything after the first ':' (a password may itself
+        // contain ':', the username never does).
+        return creds.split_once(':').map(|(_, pass)| pass.to_string());
+    }
+    None
+}
+
+/// Verify the `Authorization` header (Bearer or Basic) against the synced
+/// agent-key hash-set.
 pub fn check(state: &AppState, headers: &HeaderMap) -> Result<()> {
-    let provided = headers
-        .get(AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| {
-            v.strip_prefix("Bearer ")
-                .or_else(|| v.strip_prefix("bearer "))
-        });
+    let provided = extract_key(headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()));
     let hashes = state.agent_key_hashes.lock().unwrap();
-    check_token(&hashes, provided)
+    check_token(&hashes, provided.as_deref())
 }
 
 /// Pure broker-auth decision (testable). Valid iff a Bearer token is present
@@ -86,6 +110,22 @@ mod tests {
         assert!(check_token(&hashes, Some("sc_agent_eve")).is_err());
         assert!(check_token(&hashes, None).is_err());
     }
+
+    #[test]
+    fn extract_key_bearer_and_basic() {
+        // Bearer: the token is the key.
+        assert_eq!(extract_key(Some("Bearer sc_agent_x")).as_deref(), Some("sc_agent_x"));
+        assert_eq!(extract_key(Some("bearer sc_agent_x")).as_deref(), Some("sc_agent_x"));
+        // Basic: base64("<user>:<key>") — username ignored, password is the key.
+        let basic = format!("Basic {}", STANDARD.encode(b"safeclaw:sc_agent_x"));
+        assert_eq!(extract_key(Some(&basic)).as_deref(), Some("sc_agent_x"));
+        // A key containing ':' survives (split on the FIRST colon only).
+        let weird = format!("Basic {}", STANDARD.encode(b"git:sc:agent:x"));
+        assert_eq!(extract_key(Some(&weird)).as_deref(), Some("sc:agent:x"));
+        // Junk / absent → None.
+        assert_eq!(extract_key(Some("Basic !!notb64")), None);
+        assert_eq!(extract_key(None), None);
+    }
 }
 
 /// Axum middleware gating the broker plane. Apply to the proxy router only.
@@ -96,7 +136,19 @@ pub async fn require_api_key(
     next: Next,
 ) -> Response {
     if let Err(e) = check(&state, &headers) {
-        return e.into_response();
+        let mut resp = e.into_response();
+        // On the streaming route, advertise HTTP Basic so git's credential
+        // machinery engages: git only consults a credential helper after a 401
+        // carrying `WWW-Authenticate`. The helper then supplies the agent key as
+        // the Basic password (see `extract_key`). Scoped to `/stream/` so the
+        // `/use/` + `/export/` API surface keeps its plain JSON 401.
+        if request.uri().path().contains("/stream/") {
+            if let Ok(v) = axum::http::HeaderValue::from_str("Basic realm=\"safeclaw\"") {
+                resp.headers_mut()
+                    .insert(axum::http::header::WWW_AUTHENTICATE, v);
+            }
+        }
+        return resp;
     }
     next.run(request).await
 }

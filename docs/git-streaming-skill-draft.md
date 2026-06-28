@@ -19,12 +19,13 @@ TLS to GitHub.
 
 ## Building blocks (facts, not a fixed recipe)
 
-- Local broker: `http://localhost:23295/v/<VID>/stream/github-git/`
+- Local broker: `http://localhost:23295/v/<VID>/stream/github/`
   - `<VID>` = your vault id (from `SAFECLAW_VAULT_URL`).
-  - The route is **agent-key gated**, so git must send your `SAFECLAW_API_KEY`
-    as a Bearer header (git won't do this by itself → use `http.extraHeader`).
+  - The route is **agent-key gated**. You don't wire the key in by hand — you
+    register `sc` as a git **credential helper** for the broker host, and git
+    fetches your `SAFECLAW_API_KEY` from `sc` at run-time (never on disk).
 - Preconditions: the GitHub PAT is in the vault as `github_token`, and the
-  `github-git` service is connected (allow-policy). If not, set it up first.
+  `github` service is connected (allow-policy). If not, set it up first.
 
 ## Setup (you run it — but inspect the user's REAL config first)
 
@@ -38,17 +39,24 @@ git config --get-regexp '^url\.'        # existing insteadOf rules
 For a standard `github.com` remote:
 
 ```bash
-B="http://localhost:23295/v/<VID>/stream/github-git/"
+B="http://localhost:23295/v/<VID>/stream/github/"
+# 1) register sc as the credential helper for the broker host (one-time per machine):
+git config --global credential."http://localhost:23295".helper "!sc git-credential"
+# 2) route GitHub through SafeClaw:
 git config --global url."$B".insteadOf "https://github.com/"
-git config --global http."$B".extraHeader "Authorization: Bearer <SAFECLAW_API_KEY>"
 ```
+
+git then 401s on the broker, calls `sc git-credential`, gets your key, and
+authenticates — the GitHub PAT is injected by the broker and never enters git.
+Run git with `GIT_TERMINAL_PROMPT=0` so a misconfig fails fast instead of prompting.
 
 Adapt, don't force:
 - If the user uses a **custom alias** (e.g. `https://v2.github.com/` for a
-  second account), rewrite THAT base to the same `github-git` stream URL.
-- If they use **GitLab / Bitbucket / self-hosted**, that needs its own SafeClaw
-  recipe (only `github-git` ships today) — tell the user, don't point it at
-  `github-git`.
+  second account / connection), rewrite THAT base to the matching connection's
+  stream URL (`/stream/<connection_id>/`).
+- **GitLab** ships too (`/stream/gitlab/`, vault item `gitlab_token`). **Bitbucket
+  / self-hosted / enterprise** need their own SafeClaw recipe (a per-vault custom
+  recipe) — tell the user, don't point them at `github`.
 - **Scope:** `--global` only if the user wants *all* their GitHub through
   SafeClaw; otherwise set it per-repo or in a dedicated `GIT_CONFIG`.
 
