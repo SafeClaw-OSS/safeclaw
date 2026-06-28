@@ -78,6 +78,56 @@ pub struct ServiceState {
     pub rule_overrides: HashMap<String, RuleOverride>,
 }
 
+/// The browser-captured OAuth handshake, relayed to the daemon *through the
+/// sealed vault* to stay cloud-blind (the cloud only ever stores ciphertext;
+/// the daemon, not the backend, performs the code→token exchange). Mirrors the
+/// frontend `lib/oauth-connect.ts` pending payload byte-for-byte.
+///
+/// Transient by design: present only while a connect awaits the daemon's
+/// exchange. The `code` inside is single-use with a ~10-min TTL; once the
+/// daemon redeems it and writes `<conn>_refresh_token`, this is cleared.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OAuthPending {
+    /// The single-use authorization code from the loopback redirect.
+    pub code: String,
+    /// The PKCE code_verifier (RFC 7636) the browser generated for this flow.
+    pub verifier: String,
+    /// The redirect_uri registered for the consent (loopback for Desktop).
+    pub redirect_uri: String,
+}
+
+/// Explicit per-connection state for OAuth-style services
+/// (CONNECTIONS_AND_AUTH §4a). Replaces the implicit "scan `targets` for a
+/// `<conn>_oauth_pending` key-name suffix" convention with a first-class
+/// structured field: the daemon reads an explicit connection record, not a
+/// name pattern.
+///
+/// Keyed (in `VaultAux.connections`) by `connection_id` — `== service_id` for
+/// the default connection today; the general re-map / `:`-namespacing is a
+/// later slice (item5), and this struct is its storage foundation.
+///
+/// Deliberately thin: the **durable** credential (`<conn>_refresh_token`)
+/// stays a flat native-secret so the broker's `secret = "<conn>_refresh_token"`
+/// lookup is unchanged, and a connection's *status* is **derived** (pending
+/// present → connecting; the flat refresh_token present → connected) rather
+/// than stored here — so there is no status field to drift out of sync.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Connection {
+    /// In-flight connect handshake; `None` once the exchange completes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth_pending: Option<OAuthPending>,
+}
+
+impl Connection {
+    /// A connection record with no live state — safe to drop from `aux`
+    /// (its "connected" status is derived from the flat refresh_token, so an
+    /// empty record carries no information). As more fields land (re-map
+    /// bindings, label), extend this predicate so cleanup stays correct.
+    pub fn is_empty(&self) -> bool {
+        self.oauth_pending.is_none()
+    }
+}
+
 /// `aux` payload — everything inside `ProtectedState.aux` for v3 vaults.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VaultAux {
@@ -93,6 +143,11 @@ pub struct VaultAux {
     /// authored state appear here.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub service_state: BTreeMap<String, ServiceState>,
+    /// Per-connection OAuth state, keyed by `connection_id` (== service_id for
+    /// the default connection). Sparse — only connections mid-handshake (an
+    /// `oauth_pending`) appear; cleared records are dropped. See [`Connection`].
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub connections: BTreeMap<String, Connection>,
     /// Audit log retention in days. `None` = keep forever; integer = drop
     /// rows older than this on the next `GET /v/{vid}/approvals` call.
     /// Frontend offers 7 / 30 / 90 / forever; the daemon clamps to a
@@ -131,6 +186,7 @@ impl VaultAux {
             store_order: vec![NATIVE_SECRETS_ID.to_string(), NATIVE_FILES_ID.to_string()],
             policy_defaults: None,
             service_state: BTreeMap::new(),
+            connections: BTreeMap::new(),
             audit_retention_days: None,
         }
     }
