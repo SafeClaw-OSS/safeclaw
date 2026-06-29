@@ -1,0 +1,59 @@
+[service]
+id = "cratesio"
+name = "crates.io"
+sub = "cargo publish"
+category = "integration"
+
+# Publishing a crate is a single token-authenticated HTTPS request
+# (`PUT /api/v1/crates/new`) — the same shape as git-over-HTTPS, so it rides the
+# generic streaming passthrough (/stream/). cargo runs locally (it has the crate
+# source); only the authenticated upload egress is routed through SafeClaw, which
+# injects the real crates.io token. cargo never sees the token.
+
+[[upstream]]
+id = "publish"
+url = "https://crates.io"
+# Opt into the generic streaming passthrough (the /stream/ route).
+stream = true
+auth = { secret = "CARGO_REGISTRY_TOKEN", placeholder = "cio..." }
+
+  [upstream.headers]
+  # crates.io's publish API authenticates with the RAW token value in the
+  # Authorization header (no "Bearer " prefix).
+  Authorization = "{{secret.CARGO_REGISTRY_TOKEN}}"
+
+# Publishing is IRREVERSIBLE (crates.io only yanks, never deletes) → require a
+# passkey for EVERY publish. ask-always + the streaming captive-portal
+# (docs/STREAMING_APPROVAL.md): the agent runs `cargo publish`, the broker
+# rejects-before-forward with an approve link (also pushed over SSE), the user
+# taps their passkey, and the retried publish is authorized single-use.
+[policy.levels]
+read = "ask-always"
+write = "ask-always"
+
+[setup]
+goal = "Route `cargo publish` through SafeClaw so the crates.io token never enters cargo's config, env, or the agent process."
+route = "{{proxy_base}}/stream/cratesio/"
+auth = "feed the broker key (NOT the real token) as the registry token: CARGO_REGISTRIES_SAFECLAW_TOKEN=$SAFECLAW_API_KEY"
+example = """
+# Define an alternative registry whose API routes through SafeClaw, then publish
+# to it. cargo builds/packages locally; only the final authenticated upload
+# (PUT /api/v1/crates/new) is proxied — SafeClaw swaps in the real crates.io
+# token and forwards to https://crates.io. cargo never sees the real token.
+#
+# ~/.cargo/config.toml:
+#   [registries.safeclaw]
+#   index = "sparse+{{route}}index/"
+#
+# The broker key authenticates cargo to SafeClaw (the real token is injected
+# server-side); export it at run time so nothing lands on disk:
+export CARGO_REGISTRIES_SAFECLAW_TOKEN="$SAFECLAW_API_KEY"
+cargo publish --registry safeclaw
+
+# When SafeClaw asks for approval, you'll get a link (in the agent's prompt and
+# in cargo's error output) — tap your passkey, then re-run the same command.
+#
+# NOTE: cargo first reads the registry's `config.json` (for the `api` endpoint)
+# from the index, so the broker must serve/forward that handshake for the
+# alternative registry. (npm publish is a pure passthrough and needs no index.)
+"""

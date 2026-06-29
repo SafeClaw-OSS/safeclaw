@@ -420,6 +420,31 @@ impl AppState {
         }
     }
 
+    /// Look up AND remove a cached auth value for `(vault, connection)` —
+    /// single-use consumption. The streaming captive-portal path uses this for
+    /// `ask-always` services so each streamed operation (e.g. a `cargo publish`)
+    /// burns its approval and the next one re-prompts for a fresh passkey.
+    /// Honors TTL expiry like [`Self::cache_lookup`]; `None` when locked /
+    /// absent / expired.
+    pub fn cache_take(&self, vault_id: &str, conn_id: &str) -> Option<Vec<u8>> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let mut states = self.vault_states.lock().unwrap();
+        let cache = match states.get_mut(vault_id) {
+            Some(VaultState::Unlocked { cache, .. }) => cache,
+            _ => return None,
+        };
+        let entry = cache.entries.remove(conn_id)?;
+        if let Some(exp) = entry.expires_at {
+            if now >= exp {
+                return None;
+            }
+        }
+        Some(entry.value)
+    }
+
     /// Look up a cached OAuth `access_token` for `(vault, service)`.
     /// Returns `None` if locked, never minted, or past its expiry.
     /// Lazily evicts expired entries (same shape as `cache_lookup`).
@@ -653,6 +678,29 @@ mod tests {
         assert_eq!(state.cache_lookup("v1", "svc"), Some(b"secret".to_vec()));
         // Multiple lookups still hit (no eviction without expiry).
         assert_eq!(state.cache_lookup("v1", "svc"), Some(b"secret".to_vec()));
+    }
+
+    #[test]
+    fn cache_take_consumes_single_use() {
+        // Backs the streaming captive-portal `ask-always` path: each stream
+        // burns its approval so the next one re-prompts for a fresh passkey.
+        let state = test_state();
+        unlock_with_empty_cache(&state, "v1");
+        state.cache_insert("v1", "svc", b"tok".to_vec(), None);
+        // First take returns the value …
+        assert_eq!(state.cache_take("v1", "svc"), Some(b"tok".to_vec()));
+        // … and removes it: a second take and a plain lookup both miss.
+        assert_eq!(state.cache_take("v1", "svc"), None);
+        assert_eq!(state.cache_lookup("v1", "svc"), None);
+    }
+
+    #[test]
+    fn cache_take_honors_expiry() {
+        let state = test_state();
+        unlock_with_empty_cache(&state, "v1");
+        state.cache_insert("v1", "svc", b"stale".to_vec(), Some(0));
+        // Expired entry is not returned (and is consumed/dropped).
+        assert_eq!(state.cache_take("v1", "svc"), None);
     }
 
     #[test]

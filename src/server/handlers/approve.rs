@@ -583,6 +583,54 @@ pub async fn approve_op(
             let vault = existing_vault
                 .clone()
                 .ok_or_else(|| AppError::Conflict("vault not initialized".into()))?;
+            // Streaming captive-portal authorize (`/stream/` ask path): resolve
+            // and stash the secret for the agent's *retried* stream to consume;
+            // do NOT forward — there is no buffered request here (the real one
+            // rides the retry stream). use_broker sets scope.authorize_only.
+            if validated
+                .op
+                .act
+                .scope
+                .get("authorize_only")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
+                let s_o = crate::server::broker::resolve_use_primary(
+                    &validated.op,
+                    &validated.wrapping_key,
+                    &validated.credential_id_bytes,
+                    &vault,
+                )
+                .await?;
+                let conn = validated
+                    .op
+                    .act
+                    .scope
+                    .get("connection_id")
+                    .or_else(|| validated.op.act.scope.get("service"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let ttl = state
+                    .approvals
+                    .lock()
+                    .unwrap()
+                    .get(&op_id)
+                    .and_then(|r| r.policy_context.clone())
+                    .map(|p| p.ttl_seconds)
+                    .unwrap_or(300);
+                if !conn.is_empty() {
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    state.cache_insert(&vault_id, &conn, s_o, Some(now + ttl));
+                }
+                (
+                    json!({ "ok": true, "act": "use", "authorized": true, "stream": true }),
+                    None,
+                )
+            } else {
             let outcome = crate::server::broker::execute_use_forward(
                 &validated.op,
                 &validated.wrapping_key,
@@ -650,6 +698,7 @@ pub async fn approve_op(
                 json!({ "ok": true, "act": "use", "response": serde_json::from_str::<Value>(&body).unwrap_or(Value::Null) }),
                 Some(body),
             )
+            }
         }
         ActType::Custom(name) => match name.as_str() {
             // Lifecycle op (H3 / PROTOCOL.md §6.3): decrypt vault, bootstrap
