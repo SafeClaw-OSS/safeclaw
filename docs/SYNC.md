@@ -114,10 +114,16 @@ Changes from today:
    no-op".)
 3. **newer `version`, `status:"live"`** → pull the blob; open with retained `K`.
    - opens → apply (current behavior: refresh cache, run `process_vault_connects`).
-   - **does NOT open** → with the one-K-per-id rule this should be impossible for
-     a live id. If seen, it means a stale local copy of a *retired* id (pre-fix
-     churn) → treat as case 2 (drop local), do **not** loop forever on
-     `rotated K?`. Log once.
+   - **does NOT open** → **log only; do NOT auto-drop on can't-open — only an
+     explicit tombstone drops local state.** With the one-K-per-id rule this
+     should be impossible for a live id, but auto-destroying local vault state on
+     a decrypt failure is far too dangerous (a transient/partial blob, a future
+     format skew, or a Locked vault must never nuke `vault.dat`). So a
+     live-but-undecryptable blob keeps `refresh_after_pull`'s existing `warn!`
+     (lock+unlock to retry) and changes nothing on disk. The ONLY signal that
+     destroys local state is an explicit `status:"deleted"` tombstone (case 2).
+     (A genuinely stale copy of a *retired* id is reached via that tombstone, not
+     via a decrypt failure.)
 
 Push (after any daemon-side mutation, e.g. an OAuth exchange): `PUT {blob,
 base_version=local}`. On `409`, pull → re-apply → re-seal → retry (bounded).
@@ -165,12 +171,19 @@ base_version=local}`. On `409`, pull → re-apply → re-seal → retry (bounded
 - **[SHIPPED]** cloud-blind blob, monotonic `version`, pull (`watch_loop` +
   `pull_on_start`), push-back (OAuth-connect re-seal), `.blob_version` sidecar,
   `sc sync`.
-- **[PROPOSED] this redesign:** `status` tombstone end-to-end, daemon delete-
-  propagation, `base_version` CAS, new-id-on-recreate, the clear-vs-delete split.
-- **Rollout:** pre-launch, no migration. Land backend envelope + daemon state
+- **[BUILT — code complete + reviewed, pending rollout] this redesign:** `status`
+  tombstone end-to-end, daemon delete-propagation, `base_version` CAS,
+  new-id-on-recreate (server-minted uuid — no code change needed), the
+  clear-vs-delete split. All three layers implemented + adversarially reviewed +
+  locally verified (daemon `cargo test --lib` 209 green; frontend `tsc` +
+  `next build` green; backend `node --check` green). §4 case-3 was tightened to
+  **log-only** — a live-but-undecryptable blob never auto-drops; ONLY an explicit
+  tombstone drops local state.
+- **Rollout (NOT done):** pre-launch, no data migration. Apply the
+  `vault_blobs.status` column migration **before** the backend serves the new code
+  (an unapplied column makes every PUT 500). Land backend envelope + daemon state
   machine + frontend lifecycle together; wipe existing dev vaults and re-enroll.
-  Touches the crypto/`K` boundary — `PROTOCOL.md §6` is ground truth; read before
-  editing.
+  Touches the crypto/`K` boundary — `PROTOCOL.md §6` is ground truth.
 
 ## 9. Open decisions
 

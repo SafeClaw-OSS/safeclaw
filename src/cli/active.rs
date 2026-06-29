@@ -125,6 +125,29 @@ pub fn forget(custodian: &str, vault: &str) -> Result<bool, String> {
     Ok(true)
 }
 
+/// Remove a vault from `known_vaults` by **vault id alone** (any custodian),
+/// and clear the active selection if it pointed at that vault. Used by the
+/// cloud-sync delete-propagation path, which only knows the vid (a tombstone
+/// carries no custodian). Returns true if anything was removed. Idempotent: a
+/// vault not present is `Ok(false)`, never an error. Load → retain != vault →
+/// save (atomic via the tmp-rename in `save`).
+pub fn forget_vault(vault: &str) -> Result<bool, String> {
+    let mut cfg = load().unwrap_or_default();
+    let before = cfg.known_vaults.len();
+    cfg.known_vaults.retain(|kv| kv.vault != vault);
+    let removed_known = cfg.known_vaults.len() != before;
+    let cleared_active = cfg.vault.as_deref() == Some(vault);
+    if cleared_active {
+        cfg.custodian = None;
+        cfg.vault = None;
+    }
+    if !removed_known && !cleared_active {
+        return Ok(false);
+    }
+    save(&cfg)?;
+    Ok(true)
+}
+
 /// Set the active vault and dedupe-add to known_vaults.
 pub fn put_active(custodian: &str, vault: &str) -> Result<PathBuf, String> {
     let mut cfg = load().unwrap_or_default();

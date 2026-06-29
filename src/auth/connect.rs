@@ -229,8 +229,35 @@ where
 /// serializes against approve.rs's writes and the cloud-sync pull (same lock).
 /// Never panics; any error logs and returns.
 pub async fn process_vault_connects(state: &Arc<AppState>, vault_id: &str) {
+    // Apply any pending connects (open → exchange → re-seal → persist). On a
+    // completion, fan the re-sealed blob out to OTHER devices via the cloud.
+    if apply_pending_connects(state, vault_id).await {
+        // Propagate to OTHER devices: push the re-sealed blob back to the cloud.
+        // A Google authorization code is single-use, so only THIS daemon could
+        // redeem the pending connect — every other device's daemon must PULL the
+        // resulting refresh_token rather than re-exchange (which fails
+        // `invalid_grant`). Cloud-blind preserved: the pushed blob is ciphertext.
+        // Detached + best-effort, after the write lock drops (push only reads
+        // vault.dat + HTTP).
+        let state = state.clone();
+        let vid = vault_id.to_string();
+        tokio::spawn(async move {
+            crate::sync::push_blob_best_effort(&state, &vid).await;
+        });
+    }
+}
+
+/// Apply pending connects WITHOUT the cloud push-back. Returns `true` iff at
+/// least one connect completed (and thus `vault.dat` was re-sealed). The push
+/// fan-out lives in the public `process_vault_connects` wrapper, NOT here — that
+/// split is load-bearing: the cloud-sync CAS-conflict recovery
+/// (`sync::recover_after_conflict`) calls this inner fn to re-apply its mutation
+/// on a freshly-pulled blob; routing it through the push-spawning wrapper would
+/// form an async-recursion cycle (push → recover → process → push) the compiler
+/// can't prove `Send`. Keeping the push out of the recursive edge breaks it.
+pub(crate) async fn apply_pending_connects(state: &Arc<AppState>, vault_id: &str) -> bool {
     let Some(k) = state.cloned_state_key(vault_id) else {
-        return; // Locked — no retained K; next unlock retries.
+        return false; // Locked — no retained K; next unlock retries.
     };
 
     let lock = {
@@ -251,10 +278,10 @@ pub async fn process_vault_connects(state: &Arc<AppState>, vault_id: &str) {
         .join("vault.dat");
     let mut vault = match crate::storage::sealed_vault::read(&vault_path) {
         Ok(Some(v)) => v,
-        Ok(None) => return,
+        Ok(None) => return false,
         Err(e) => {
             tracing::warn!(vault = %vault_id, "oauth connect: read vault.dat failed: {}", e);
-            return;
+            return false;
         }
     };
 
@@ -262,13 +289,13 @@ pub async fn process_vault_connects(state: &Arc<AppState>, vault_id: &str) {
         Ok(m) => m,
         Err(_) => {
             // Retained K can't open (rotated) — graceful skip, lock+unlock retries.
-            return;
+            return false;
         }
     };
 
     // Cheap pre-check: nothing to do if there are no in-flight connects.
     if collect_pending(&m).is_empty() {
-        return;
+        return false;
     }
 
     let services = &state.services;
@@ -288,7 +315,7 @@ pub async fn process_vault_connects(state: &Arc<AppState>, vault_id: &str) {
 
     if completed == 0 {
         // Nothing persisted (all failed/left pending) — don't rewrite the blob.
-        return;
+        return false;
     }
 
     // Re-seal the mutated body under the same K (registry/credentials/wrapped_key
@@ -297,11 +324,11 @@ pub async fn process_vault_connects(state: &Arc<AppState>, vault_id: &str) {
         crate::server::handlers::metadata::reseal_body_with_key(&k, &mut vault, &m)
     {
         tracing::warn!(vault = %vault_id, "oauth connect: re-seal failed: {}", e);
-        return;
+        return false;
     }
     if let Err(e) = crate::storage::sealed_vault::write_atomic(&vault_path, &vault) {
         tracing::warn!(vault = %vault_id, "oauth connect: write vault.dat failed: {}", e);
-        return;
+        return false;
     }
     tracing::info!(
         vault = %vault_id,
@@ -319,19 +346,8 @@ pub async fn process_vault_connects(state: &Arc<AppState>, vault_id: &str) {
         state.unlock_vault(vault_id.to_string(), cache, k);
     }
 
-    // Propagate to OTHER devices: push the re-sealed blob back to the cloud. A
-    // Google authorization code is single-use, so only THIS daemon could redeem
-    // the pending connect — every other device's daemon must PULL the resulting
-    // refresh_token rather than re-exchange (which fails `invalid_grant`).
-    // Cloud-blind preserved: the pushed blob is ciphertext. Detached +
-    // best-effort, after the write lock drops (push only reads vault.dat + HTTP).
-    {
-        let state = state.clone();
-        let vid = vault_id.to_string();
-        tokio::spawn(async move {
-            crate::sync::push_blob_best_effort(&state, &vid).await;
-        });
-    }
+    // A connect completed and vault.dat was re-sealed → caller fans it out.
+    true
 }
 
 #[cfg(test)]
