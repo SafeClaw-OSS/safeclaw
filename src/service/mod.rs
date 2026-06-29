@@ -138,6 +138,23 @@ pub struct UpstreamDef {
     pub stream: bool,
     #[serde(default)]
     pub locked: Option<LockedResponseDef>,
+    /// Per-connection config slots this upstream exposes (CONNECTION_SCHEMA.md
+    /// §4). A connection may fill ONLY these via its `config`, surfaced in
+    /// templates as `{{connection.<param>}}`. Absent = no connection-fillable
+    /// slots (the common case). The host SSRF guard grants `{{connection.host}}`
+    /// its narrow exception only for a param declared here.
+    #[serde(default)]
+    pub connection: Option<ConnectionSlots>,
+}
+
+/// The per-connection re-map slots an upstream declares — the ONLY fields a
+/// connection's `config` may fill (anti-SSRF; a connection can never re-point an
+/// audited recipe's host or token endpoint). e.g. `params = ["host"]` lets a
+/// self-hosted connection set `{{connection.host}}`; nothing else is fillable.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct ConnectionSlots {
+    #[serde(default)]
+    pub params: Vec<String>,
 }
 
 /// API endpoint definition containing steps.
@@ -305,7 +322,19 @@ pub struct ProviderDef {
     /// RFC 6749 §2.1: `"public"` | `"confidential"`.
     #[serde(default)]
     pub client_type: Option<String>,
+    /// The OAuth client's fixed `redirect_uri` (CONNECTION_SCHEMA.md §5). A
+    /// constant of the client, NOT part of each handshake — used in both the
+    /// consent URL (frontend, via the connect descriptor) and the daemon's
+    /// code→token exchange, so the two always match. Loopback for a Desktop
+    /// client. Falls back to [`DEFAULT_LOOPBACK_REDIRECT`] when omitted.
+    #[serde(default)]
+    pub redirect_uri: Option<String>,
 }
+
+/// The loopback redirect for desktop/PKCE OAuth clients when a provider doesn't
+/// pin its own `redirect_uri`. Matches the frontend `DEFAULT_LOOPBACK_REDIRECT`
+/// so the consent request and the code→token exchange always agree.
+pub const DEFAULT_LOOPBACK_REDIRECT: &str = "http://127.0.0.1:8765/safeclaw/oauth/callback";
 
 /// The OAuth client/endpoint config a service's auth resolves to after
 /// provider inheritance — see `ServiceRegistry::resolve_oauth_config`.
@@ -314,6 +343,10 @@ pub struct ResolvedOAuthConfig {
     pub token_url: Option<String>,
     pub client_id: Option<String>,
     pub client_secret: Option<String>,
+    /// The OAuth client's fixed redirect_uri (provider literal, or the loopback
+    /// default). Sent in the daemon's code→token exchange so it matches the
+    /// consent request the browser made.
+    pub redirect_uri: String,
 }
 
 /// The PUBLIC OAuth consent parameters a frontend needs to START a connect for
@@ -333,6 +366,10 @@ pub struct ConnectDescriptor {
     pub client_id: String,
     pub scopes: Vec<String>,
     pub pkce: bool,
+    /// The OAuth client's fixed redirect_uri — the frontend builds the consent
+    /// URL from this (not a hardcoded constant) so it always matches what the
+    /// daemon sends at code→token exchange (CONNECTION_SCHEMA.md §5).
+    pub redirect_uri: String,
 }
 
 /// Inline policy in service.toml (legacy, still supported as fallback).
@@ -854,7 +891,13 @@ impl ServiceRegistry {
             .and_then(|p| p.client_secret.clone())
             .or_else(|| auth.client_secret_env.as_deref().and_then(|n| std::env::var(n).ok()));
 
-        ResolvedOAuthConfig { token_url, client_id, client_secret }
+        // redirect_uri: provider literal, else the loopback default. A constant
+        // of the client (not per-handshake), so the exchange matches consent.
+        let redirect_uri = provider
+            .and_then(|p| p.redirect_uri.clone())
+            .unwrap_or_else(|| DEFAULT_LOOPBACK_REDIRECT.to_string());
+
+        ResolvedOAuthConfig { token_url, client_id, client_secret, redirect_uri }
     }
 
     /// The PUBLIC OAuth consent parameters for `service_id` — what a frontend
@@ -877,6 +920,10 @@ impl ServiceRegistry {
             client_id: p.client_id.clone()?,
             scopes: auth.scopes.clone(),
             pkce: p.pkce,
+            redirect_uri: p
+                .redirect_uri
+                .clone()
+                .unwrap_or_else(|| DEFAULT_LOOPBACK_REDIRECT.to_string()),
         })
     }
 

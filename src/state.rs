@@ -154,7 +154,22 @@ pub struct SecretsCache {
     /// safety margin baked in at insert time). `cache_lookup`'s
     /// generic eviction doesn't apply here — `oauth_access_lookup`
     /// has its own lazy eviction below.
+    ///
+    /// Keyed by **connection_id** (not service): two Gmail accounts mint and
+    /// cache independent access tokens.
     pub oauth_access: HashMap<String, CacheEntry>,
+    /// Routing snapshot: `connection_id → { service, config }`, taken from
+    /// `aux.connections` at unlock (CONNECTION_SCHEMA.md §6). A request at
+    /// `/use/<conn>` resolves its service through this map (falling back to
+    /// `conn` itself when absent — an unconnected service IS its own default
+    /// connection). `config` feeds `{{connection.<param>}}` slots. Wiped on lock.
+    ///
+    /// NOTE on the maps above (`entries`, `allow_secrets`, `oauth_access`,
+    /// `rule_approvals`): for connection-routed `/use`/`/stream` the daemon keys
+    /// them by **connection_id**, so two connections of one service never share a
+    /// cache slot. (`policy_rules` / `service_levels` stay **service**-keyed —
+    /// policy is a property of the service type, shared by all its connections.)
+    pub connections: HashMap<String, crate::storage::plaintext::Connection>,
 }
 
 #[derive(Debug)]
@@ -300,11 +315,48 @@ impl AppState {
         }
     }
 
-    /// Look up a cached auth value for `(vault, service)`. Returns None if
-    /// the vault is Locked, the service isn't bootstrapped/cached, the
+    /// Resolve a `connection_id` to its service (recipe) for an Unlocked vault
+    /// (CONNECTION_SCHEMA.md §6). An explicit `aux.connections` entry names its
+    /// `service`; otherwise the connection IS its own default — `conn == service`
+    /// — which keeps `/use/<service>` working for unconnected/API-key services
+    /// and the default OAuth connection. Locked vault → falls back to `conn`
+    /// (the caller's locked-gate rejects before any real use).
+    pub fn resolve_connection_service(&self, vault_id: &str, conn: &str) -> String {
+        let states = self.vault_states.lock().unwrap();
+        match states.get(vault_id) {
+            Some(VaultState::Unlocked { cache, .. }) => cache
+                .connections
+                .get(conn)
+                .map(|c| c.service.clone())
+                .unwrap_or_else(|| conn.to_string()),
+            _ => conn.to_string(),
+        }
+    }
+
+    /// The per-connection config slot values (`{{connection.<param>}}` sources)
+    /// for an Unlocked vault, or `None` when the connection has no explicit
+    /// record / no config (the common default case).
+    pub fn connection_config(
+        &self,
+        vault_id: &str,
+        conn: &str,
+    ) -> Option<std::collections::BTreeMap<String, String>> {
+        let states = self.vault_states.lock().unwrap();
+        match states.get(vault_id) {
+            Some(VaultState::Unlocked { cache, .. }) => cache
+                .connections
+                .get(conn)
+                .map(|c| c.config.clone())
+                .filter(|m| !m.is_empty()),
+            _ => None,
+        }
+    }
+
+    /// Look up a cached auth value for `(vault, connection)`. Returns None if
+    /// the vault is Locked, the connection isn't bootstrapped/cached, the
     /// vault has never been unlocked, OR the entry's `expires_at` is in
     /// the past (lazy eviction).
-    pub fn cache_lookup(&self, vault_id: &str, service_id: &str) -> Option<Vec<u8>> {
+    pub fn cache_lookup(&self, vault_id: &str, conn_id: &str) -> Option<Vec<u8>> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -314,13 +366,13 @@ impl AppState {
             Some(VaultState::Unlocked { cache, .. }) => cache,
             _ => return None,
         };
-        let entry = cache.entries.get(service_id)?;
+        let entry = cache.entries.get(conn_id)?;
         if let Some(exp) = entry.expires_at {
             if now >= exp {
                 // Lazy eviction: TTL-expired entries are dropped here so
-                // ask services correctly fall back to the pending-op flow
+                // ask connections correctly fall back to the pending-op flow
                 // once their cache window closes.
-                cache.entries.remove(service_id);
+                cache.entries.remove(conn_id);
                 return None;
             }
         }
@@ -335,12 +387,12 @@ impl AppState {
     pub fn cache_lookup_secrets(
         &self,
         vault_id: &str,
-        service_id: &str,
+        conn_id: &str,
     ) -> Option<HashMap<String, Vec<u8>>> {
         let states = self.vault_states.lock().unwrap();
         match states.get(vault_id) {
             Some(VaultState::Unlocked { cache, .. }) => {
-                cache.allow_secrets.get(service_id).cloned()
+                cache.allow_secrets.get(conn_id).cloned()
             }
             _ => None,
         }
@@ -355,14 +407,14 @@ impl AppState {
     pub fn cache_insert(
         &self,
         vault_id: &str,
-        service_id: &str,
+        conn_id: &str,
         value: Vec<u8>,
         expires_at: Option<u64>,
     ) {
         let mut states = self.vault_states.lock().unwrap();
         if let Some(VaultState::Unlocked { cache, .. }) = states.get_mut(vault_id) {
             cache.entries.insert(
-                service_id.to_string(),
+                conn_id.to_string(),
                 CacheEntry { value, expires_at },
             );
         }
@@ -371,7 +423,7 @@ impl AppState {
     /// Look up a cached OAuth `access_token` for `(vault, service)`.
     /// Returns `None` if locked, never minted, or past its expiry.
     /// Lazily evicts expired entries (same shape as `cache_lookup`).
-    pub fn oauth_access_lookup(&self, vault_id: &str, service_id: &str) -> Option<Vec<u8>> {
+    pub fn oauth_access_lookup(&self, vault_id: &str, conn_id: &str) -> Option<Vec<u8>> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -381,10 +433,10 @@ impl AppState {
             Some(VaultState::Unlocked { cache, .. }) => cache,
             _ => return None,
         };
-        let entry = cache.oauth_access.get(service_id)?;
+        let entry = cache.oauth_access.get(conn_id)?;
         if let Some(exp) = entry.expires_at {
             if now >= exp {
-                cache.oauth_access.remove(service_id);
+                cache.oauth_access.remove(conn_id);
                 return None;
             }
         }
@@ -399,14 +451,14 @@ impl AppState {
     pub fn oauth_access_insert(
         &self,
         vault_id: &str,
-        service_id: &str,
+        conn_id: &str,
         value: Vec<u8>,
         expires_at: u64,
     ) {
         let mut states = self.vault_states.lock().unwrap();
         if let Some(VaultState::Unlocked { cache, .. }) = states.get_mut(vault_id) {
             cache.oauth_access.insert(
-                service_id.to_string(),
+                conn_id.to_string(),
                 CacheEntry {
                     value,
                     expires_at: Some(expires_at),
@@ -433,6 +485,7 @@ impl AppState {
     pub fn evaluate_request_policy(
         &self,
         vault_id: &str,
+        connection_id: &str,
         service_id: &str,
         method: &str,
         path: &str,
@@ -505,7 +558,9 @@ impl AppState {
         // `allow` doesn't need to.
         if level == crate::core::policy::AccessLevel::Ask {
             if let Some(rule_id) = matched_rule.clone() {
-                let key = (service_id.to_string(), rule_id, method.to_string());
+                // The grant is scoped to the **connection** (not the service):
+                // approving account A's send never fast-paths account B's.
+                let key = (connection_id.to_string(), rule_id, method.to_string());
                 if let Some(&exp) = cache.rule_approvals.get(&key) {
                     if exp > now {
                         return Some((
@@ -541,7 +596,7 @@ impl AppState {
     pub fn record_ask_approval(
         &self,
         vault_id: &str,
-        service_id: &str,
+        connection_id: &str,
         rule_id: Option<String>,
         method: &str,
         ttl_seconds: u64,
@@ -555,7 +610,7 @@ impl AppState {
         let mut states = self.vault_states.lock().unwrap();
         if let Some(VaultState::Unlocked { cache, .. }) = states.get_mut(vault_id) {
             cache.rule_approvals.insert(
-                (service_id.to_string(), rule_id, method.to_string()),
+                (connection_id.to_string(), rule_id, method.to_string()),
                 now + ttl_seconds,
             );
         }
@@ -654,9 +709,10 @@ mod tests {
         );
         state.unlock_vault(vid.to_string(), cache, zeroize::Zeroizing::new(Vec::new()));
 
-        // Baseline: GET resolves to Ask under the "read" rule.
+        // Baseline: GET resolves to Ask under the "read" rule. (Default
+        // connection: connection_id == service_id == "gh".)
         let (lvl, rule, _) = state
-            .evaluate_request_policy(vid, "gh", "GET", "/x", None)
+            .evaluate_request_policy(vid, "gh", "gh", "GET", "/x", None)
             .unwrap();
         assert_eq!(lvl, AccessLevel::Ask);
         assert_eq!(rule.as_deref(), Some("read"));
@@ -666,13 +722,13 @@ mod tests {
 
         // The same GET now fast-paths (the feature still works).
         let (lvl, _, _) = state
-            .evaluate_request_policy(vid, "gh", "GET", "/x", None)
+            .evaluate_request_policy(vid, "gh", "gh", "GET", "/x", None)
             .unwrap();
         assert_eq!(lvl, AccessLevel::Allow, "approved GET should fast-path");
 
         // A POST is a DIFFERENT verb/rule — the GET approval must not cover it.
         let (lvl, rule, _) = state
-            .evaluate_request_policy(vid, "gh", "POST", "/x", None)
+            .evaluate_request_policy(vid, "gh", "gh", "POST", "/x", None)
             .unwrap();
         assert_eq!(
             lvl,

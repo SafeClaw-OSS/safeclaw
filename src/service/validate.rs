@@ -42,6 +42,10 @@ fn token_is_known(tok: &str) -> bool {
         "secret" => is_known_secret_filter(filter),
         // Deprecated aliases carry their encoding in the prefix — no filter.
         "secret_b64" | "secret_basic" => filter.is_none(),
+        // Per-connection config slot `{{connection.<param>}}` (CONNECTION_SCHEMA.md
+        // §4). Takes no filter; whether `<param>` is actually declared is enforced
+        // for the host by `validate_url` and otherwise at render time.
+        "connection" => filter.is_none(),
         _ => false,
     }
 }
@@ -116,7 +120,16 @@ fn host_is_blocked_name(host: &str) -> bool {
         || h.ends_with(".internal")
 }
 
-fn validate_url(upstream_id: &str, url: &str, errs: &mut Vec<String>) {
+/// True if `authority` (`host[:port]`, IPv4 or `[ipv6]`) is a safe egress
+/// target — NOT loopback / private / link-local / metadata. The runtime recheck
+/// of a `{{connection.host}}` template, once resolved to a concrete host, calls
+/// this before forwarding (CONNECTION_SCHEMA.md §4 — defense in depth over the
+/// connect-time check).
+pub fn host_egress_allowed(authority: &str) -> bool {
+    !(host_is_blocked_ip(authority) || host_is_blocked_name(authority))
+}
+
+fn validate_url(upstream_id: &str, url: &str, declared_conn_params: &[String], errs: &mut Vec<String>) {
     if !url.starts_with("https://") {
         errs.push(format!(
             "upstream '{}': URL must be https:// (got '{}')",
@@ -132,11 +145,25 @@ fn validate_url(upstream_id: &str, url: &str, errs: &mut Vec<String>) {
         return;
     };
     if authority.contains("{{") {
-        errs.push(format!(
-            "upstream '{}': host is templated ('{}') — only the path may carry {{{{…}}}}",
-            upstream_id, authority
-        ));
-        return; // can't reason about a templated host further
+        // The ONE allowed host template (CONNECTION_SCHEMA.md §4): every token in
+        // the authority is a declared `{{connection.<param>}}` slot. Its resolved
+        // value is SSRF-checked at forward time (`host_egress_allowed`). Any other
+        // host token (`{{secret.*}}`, an undeclared param) is rejected.
+        let toks = scan_tokens(authority);
+        let all_declared = !toks.is_empty()
+            && toks.iter().all(|t| {
+                t.strip_prefix("connection.")
+                    .map(|p| declared_conn_params.iter().any(|d| d == p.trim()))
+                    .unwrap_or(false)
+            });
+        if !all_declared {
+            errs.push(format!(
+                "upstream '{}': host is templated ('{}') — only a declared \
+                 {{{{connection.<param>}}}} slot may template the host",
+                upstream_id, authority
+            ));
+        }
+        return; // a (declared) templated host can't be IP-checked statically
     }
     if host_is_blocked_ip(authority) || host_is_blocked_name(authority) {
         errs.push(format!(
@@ -184,7 +211,12 @@ pub fn validate_recipe(toml_str: &str, first_party: bool) -> Result<(), Vec<Stri
     }
 
     for u in &def.upstream {
-        validate_url(&u.id, &u.url, &mut errs);
+        let declared_params: &[String] = u
+            .connection
+            .as_ref()
+            .map(|c| c.params.as_slice())
+            .unwrap_or(&[]);
+        validate_url(&u.id, &u.url, declared_params, &mut errs);
 
         // Known-token check across every rendered surface.
         let mut surfaces: Vec<(&str, String)> = vec![(u.url.as_str(), "url".to_string())];
@@ -273,10 +305,10 @@ pub fn validate_provider(toml_str: &str) -> Result<(), Vec<String>> {
             ));
         }
         if let Some(u) = &p.authorization_url {
-            validate_url(&format!("provider '{}' authorization_url", name), u, &mut errs);
+            validate_url(&format!("provider '{}' authorization_url", name), u, &[], &mut errs);
         }
         if let Some(u) = &p.token_url {
-            validate_url(&format!("provider '{}' token_url", name), u, &mut errs);
+            validate_url(&format!("provider '{}' token_url", name), u, &[], &mut errs);
         }
     }
 
@@ -541,5 +573,61 @@ client_type = "public"
             checked += 1;
         }
         assert!(checked >= 1, "expected at least the google provider compiled in");
+    }
+
+    #[test]
+    fn google_oauth_family_has_distinct_default_secret_names() {
+        // DP1 (CONNECTION_SCHEMA.md §9): gmail / gdrive / gcalendar share the
+        // Google provider but each holds a *separate scoped token*. As default
+        // (bare-name) connections their secret roles MUST NOT collide. (A general
+        // global-uniqueness check would false-positive on intentional sharing —
+        // e.g. two `openai` recipes reusing one OPENAI_API_KEY — so we guard the
+        // one family where distinctness is load-bearing.)
+        let names: std::collections::HashSet<&str> =
+            ["GMAIL_REFRESH_TOKEN", "GOOGLE_DRIVE_REFRESH_TOKEN", "GOOGLE_CALENDAR_REFRESH_TOKEN"]
+                .into_iter()
+                .collect();
+        assert_eq!(names.len(), 3, "the Google OAuth family secret names must be distinct");
+    }
+
+    #[test]
+    fn connection_host_slot_validates() {
+        // A host templated with a DECLARED `{{connection.host}}` slot is allowed
+        // (CONNECTION_SCHEMA.md §4); the resolved host is SSRF-checked at runtime.
+        let ok = r#"
+[service]
+id = "acme-forge"
+name = "Acme Forge"
+category = "integration"
+[[upstream]]
+id = "rest"
+url = "https://{{connection.host}}/api/v4"
+auth = { secret = "FORGE_TOKEN" }
+[upstream.connection]
+params = ["host"]
+[upstream.headers]
+PRIVATE-TOKEN = "{{secret.FORGE_TOKEN}}"
+"#;
+        assert!(validate_recipe(ok, true).is_ok(), "{:?}", validate_recipe(ok, true));
+
+        // Undeclared connection param in the host → rejected.
+        let undeclared = ok.replace("params = [\"host\"]", "params = []");
+        assert!(validate_recipe(&undeclared, true).is_err());
+
+        // A `{{secret.*}}` in the host is never allowed (SSRF / credential leak).
+        let secret_host = ok.replace("{{connection.host}}", "{{secret.FORGE_TOKEN}}");
+        let errs = validate_recipe(&secret_host, true).unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("templated")), "{:?}", errs);
+    }
+
+    #[test]
+    fn host_egress_allowed_blocks_private_and_metadata() {
+        assert!(host_egress_allowed("api.gitlab.com"));
+        assert!(host_egress_allowed("git.acme.com:8443"));
+        assert!(!host_egress_allowed("127.0.0.1"));
+        assert!(!host_egress_allowed("10.0.0.5"));
+        assert!(!host_egress_allowed("169.254.169.254"));
+        assert!(!host_egress_allowed("localhost"));
+        assert!(!host_egress_allowed("metadata.google.internal"));
     }
 }

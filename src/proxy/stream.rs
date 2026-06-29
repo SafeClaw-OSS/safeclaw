@@ -34,7 +34,7 @@ use crate::state::AppState;
 pub async fn handle(
     State(state): State<Arc<AppState>>,
     method: Method,
-    Path((vault_id, service, rest)): Path<(String, String, String)>,
+    Path((vault_id, connection, rest)): Path<(String, String, String)>,
     headers: HeaderMap,
     OriginalUri(uri): OriginalUri,
     body: Body,
@@ -45,6 +45,9 @@ pub async fn handle(
         return Err(AppError::Conflict("vault locked — unlock first".into()));
     }
 
+    // Resolve the connection → its service (recipe); for the default connection
+    // `connection == service` (CONNECTION_SCHEMA.md §6).
+    let service = state.resolve_connection_service(&vault_id, &connection);
     let svc = state.services.get(&service).ok_or(AppError::NotFound)?;
     // Pick the streaming upstream. A service may carry several upstreams — e.g.
     // `github` has a `rest` upstream (REST API, /use/) and a `git` upstream
@@ -71,10 +74,10 @@ pub async fn handle(
             service
         )));
     }
-    let cached = state.cache_lookup(&vault_id, &service).ok_or_else(|| {
+    let cached = state.cache_lookup(&vault_id, &connection).ok_or_else(|| {
         AppError::Conflict(format!(
             "no resident credential for '{}' — set it and unlock first",
-            service
+            connection
         ))
     })?;
 
@@ -89,21 +92,45 @@ pub async fn handle(
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "unknown".to_string());
     let secrets_map = state
-        .cache_lookup_secrets(&vault_id, &service)
+        .cache_lookup_secrets(&vault_id, &connection)
         .unwrap_or_else(|| {
             let mut m = HashMap::new();
             m.insert(primary.clone(), cached.clone());
             m
         });
+    // Runtime host-template guard (parity with the broker): the host may template
+    // ONLY a declared `{{connection.<param>}}`; a `{{secret.*}}` in the authority
+    // would leak a credential into the egress host. Defense in depth over the
+    // load-time validator.
+    if crate::proxy::use_broker::upstream_host_has_unsafe_template(upstream) {
+        return Err(AppError::Conflict(format!(
+            "service '{}' streaming upstream host is templated with a non-connection token — refusing to forward",
+            service
+        )));
+    }
+    let conn_config = state.connection_config(&vault_id, &connection);
     let inputs = RenderInputs {
         secrets: &secrets_map,
         oauth_access_token: None,
+        connection: conn_config.as_ref(),
     };
 
-    // Compose the upstream URL: <upstream.url>/<rest>[?query]. The upstream host
-    // is a recipe literal (no templating in the authority — same SSRF stance as
-    // the broker), so we don't re-render it here.
-    let base = upstream.url.trim_end_matches('/');
+    // Compose the upstream URL: <upstream.url>/<rest>[?query]. The host is a
+    // recipe literal OR a declared `{{connection.host}}` slot (self-hosted forge);
+    // render it with the same engine and SSRF-recheck the resolved host before
+    // egress (CONNECTION_SCHEMA.md §4).
+    let base = render_template(upstream.url.trim_end_matches('/'), &inputs)?;
+    if let Some(authority) = base
+        .split_once("://")
+        .map(|(_, r)| r.split('/').next().unwrap_or(r))
+    {
+        if !crate::service::validate::host_egress_allowed(authority) {
+            return Err(AppError::Forbidden(format!(
+                "resolved egress host '{}' is loopback / private / link-local — refusing to forward",
+                authority
+            )));
+        }
+    }
     let mut full_url = format!("{}/{}", base, rest);
     if let Some(q) = uri.query() {
         full_url.push('?');

@@ -13,7 +13,7 @@ provider = "google"
 scopes = [
   "https://www.googleapis.com/auth/calendar.events",
 ]
-secret = "gcalendar_refresh_token"
+secret = "GOOGLE_CALENDAR_REFRESH_TOKEN"
 
 [upstream.headers]
 Authorization = "Bearer {{oauth.access_token}}"

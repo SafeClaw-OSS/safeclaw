@@ -8,11 +8,11 @@ group = "openai"
 [[upstream]]
 id = "default"
 url = "https://api.openai.com"
-auth = { env = "openai_api_key", placeholder = "sk-..." }
+auth = { env = "OPENAI_API_KEY", placeholder = "sk-..." }
 locked = { response = "Please unlock the SafeClaw vault to use this service." }
 
   [upstream.headers]
-  Authorization = "Bearer {{secret.openai_api_key}}"
+  Authorization = "Bearer {{secret.OPENAI_API_KEY}}"
 
 [[api]]
 path = "*"

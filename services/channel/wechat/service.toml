@@ -7,10 +7,10 @@ category = "channel"
 [[upstream]]
 id = "default"
 url = "https://ilinkai.weixin.qq.com"
-auth = { env = "wechat_api_key" }
+auth = { env = "WECHAT_API_KEY" }
 
   [upstream.headers]
-  Authorization = "Bearer {{secret.wechat_api_key}}"
+  Authorization = "Bearer {{secret.WECHAT_API_KEY}}"
 
 [[api]]
 path = "*"

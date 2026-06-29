@@ -123,6 +123,12 @@ pub async fn execute_use_forward(
     // service registry. These carry the v3 `{{secret.NAME}}` /
     // `{{oauth.access_token}}` placeholders the engine renders.
     let service_id = scope.get("service").and_then(|v| v.as_str()).unwrap_or("");
+    // The connection this op belongs to (CONNECTION_SCHEMA.md §6). Falls back to
+    // the service for the default connection (conn == service) / legacy ops.
+    let connection_id = scope
+        .get("connection_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or(service_id);
     let upstream_id = scope
         .get("upstream_id")
         .and_then(|v| v.as_str())
@@ -149,10 +155,13 @@ pub async fn execute_use_forward(
     }
     let mut secrets: HashMap<String, Vec<u8>> = HashMap::new();
     for name in &referenced {
+        // Resolve at the §3 namespaced address (`[<conn>:]<name>`) but key the
+        // render map by the BARE name so `{{secret.<name>}}` matches.
+        let addr = crate::storage::plaintext::secret_address(connection_id, service_id, name);
         let bytes = view
-            .resolve_value_async(name)
+            .resolve_value_async(&addr)
             .await?
-            .ok_or_else(|| AppError::BadRequest(format!("secret '{}' not found in vault", name)))?;
+            .ok_or_else(|| AppError::BadRequest(format!("secret '{}' not found in vault", addr)))?;
         secrets.insert(name.clone(), bytes);
     }
 
@@ -165,7 +174,7 @@ pub async fn execute_use_forward(
         .map(|a| state.services.auth_is_oauth2(a))
         .unwrap_or(false);
     let oauth_token = if is_oauth {
-        let access = resolve_auth_value(state, vault_id, service_id, &s_o).await?;
+        let access = resolve_auth_value(state, vault_id, connection_id, service_id, &s_o).await?;
         Some(
             String::from_utf8(access)
                 .map_err(|_| AppError::Internal("oauth access_token not utf8".into()))?,
@@ -174,9 +183,13 @@ pub async fn execute_use_forward(
         None
     };
 
+    // Per-connection config slots (`{{connection.<param>}}`) from the open vault
+    // view's `aux.connections` (CONNECTION_SCHEMA.md §4).
+    let conn_config = view.aux.connections.get(connection_id).map(|c| &c.config);
     let inputs = RenderInputs {
         secrets: &secrets,
         oauth_access_token: oauth_token.as_deref(),
+        connection: conn_config,
     };
     let response = forward_to_upstream_with_extras(
         &inputs,
@@ -211,6 +224,11 @@ pub struct RenderInputs<'a> {
     /// vault-item-name -> resolved secret bytes
     pub secrets: &'a std::collections::HashMap<String, Vec<u8>>,
     pub oauth_access_token: Option<&'a str>,
+    /// Per-connection config slot values (`{{connection.<param>}}`), from the
+    /// active connection's `config` (CONNECTION_SCHEMA.md §4). `None` for a
+    /// default connection with no slots. The recipe may template the host ONLY
+    /// with a declared slot; the resolved host is SSRF-rechecked before forward.
+    pub connection: Option<&'a std::collections::BTreeMap<String, String>>,
 }
 
 /// The vault-item name a single `{{…}}` token body references, if it is a
@@ -383,6 +401,16 @@ fn resolve_token(key: &str, inputs: &RenderInputs) -> Result<String> {
             .oauth_access_token
             .map(|t| t.to_string())
             .ok_or_else(|| AppError::BadRequest("{{oauth.access_token}} on a non-oauth upstream".into())),
+        // Per-connection config slot (`{{connection.<param>}}`, CONNECTION_SCHEMA.md
+        // §4). Resolved from the active connection's `config`; an undeclared slot
+        // is a hard error (never a literal leak). Takes no filter.
+        "connection" if pipe_filter.is_none() => inputs
+            .connection
+            .and_then(|c| c.get(arg))
+            .map(|v| v.to_string())
+            .ok_or_else(|| {
+                AppError::BadRequest(format!("template references undeclared connection slot '{}'", arg))
+            }),
         _ => Err(AppError::BadRequest(format!("unknown template token '{{{{{}}}}}'", key))),
     }
 }
@@ -458,14 +486,14 @@ mod render_tests {
     #[test]
     fn single_secret_substitutes() {
         let s = secrets(&[("github_token", "ghp_xyz")]);
-        let inp = RenderInputs { secrets: &s, oauth_access_token: None };
+        let inp = RenderInputs { secrets: &s, oauth_access_token: None, connection: None };
         assert_eq!(render_template("Bearer {{secret.github_token}}", &inp).unwrap(), "Bearer ghp_xyz");
     }
 
     #[test]
     fn multi_secret_substitutes_both() {
         let s = secrets(&[("twilio_sid", "AC123"), ("twilio_token", "tok")]);
-        let inp = RenderInputs { secrets: &s, oauth_access_token: None };
+        let inp = RenderInputs { secrets: &s, oauth_access_token: None, connection: None };
         assert_eq!(
             render_template("{{secret.twilio_sid}}:{{secret.twilio_token}}", &inp).unwrap(),
             "AC123:tok"
@@ -475,7 +503,7 @@ mod render_tests {
     #[test]
     fn b64_and_basic_variants() {
         let s = secrets(&[("k", "user")]);
-        let inp = RenderInputs { secrets: &s, oauth_access_token: None };
+        let inp = RenderInputs { secrets: &s, oauth_access_token: None, connection: None };
         assert_eq!(render_template("{{secret_b64.k}}", &inp).unwrap(), STANDARD.encode(b"user"));
         assert_eq!(render_template("{{secret_basic.k}}", &inp).unwrap(), STANDARD.encode(b"user:"));
     }
@@ -483,7 +511,7 @@ mod render_tests {
     #[test]
     fn pipe_filter_b64() {
         let s = secrets(&[("k", "user")]);
-        let inp = RenderInputs { secrets: &s, oauth_access_token: None };
+        let inp = RenderInputs { secrets: &s, oauth_access_token: None, connection: None };
         // whitespace-tolerant around the pipe
         assert_eq!(render_template("{{secret.k | b64}}", &inp).unwrap(), STANDARD.encode(b"user"));
         assert_eq!(render_template("{{ secret.k|b64 }}", &inp).unwrap(), STANDARD.encode(b"user"));
@@ -492,7 +520,7 @@ mod render_tests {
     #[test]
     fn pipe_filter_basic() {
         let s = secrets(&[("k", "user")]);
-        let inp = RenderInputs { secrets: &s, oauth_access_token: None };
+        let inp = RenderInputs { secrets: &s, oauth_access_token: None, connection: None };
         assert_eq!(render_template("{{secret.k | basic}}", &inp).unwrap(), STANDARD.encode(b"user:"));
     }
 
@@ -501,7 +529,7 @@ mod render_tests {
         // `basic:USER` = base64("USER:" + value) — token-as-password (GitLab's
         // `oauth2`), distinct from bare `basic` = base64(value + ':').
         let s = secrets(&[("tok", "glpat_xyz")]);
-        let inp = RenderInputs { secrets: &s, oauth_access_token: None };
+        let inp = RenderInputs { secrets: &s, oauth_access_token: None, connection: None };
         assert_eq!(
             render_template("{{secret.tok | basic:oauth2}}", &inp).unwrap(),
             STANDARD.encode(b"oauth2:glpat_xyz"),
@@ -519,7 +547,7 @@ mod render_tests {
     #[test]
     fn pipe_filter_none_is_raw() {
         let s = secrets(&[("k", "ghp_xyz")]);
-        let inp = RenderInputs { secrets: &s, oauth_access_token: None };
+        let inp = RenderInputs { secrets: &s, oauth_access_token: None, connection: None };
         assert_eq!(render_template("{{secret.k}}", &inp).unwrap(), "ghp_xyz");
     }
 
@@ -528,7 +556,7 @@ mod render_tests {
         // The deprecated prefix aliases must produce byte-identical output to
         // the canonical pipe form.
         let s = secrets(&[("k", "user")]);
-        let inp = RenderInputs { secrets: &s, oauth_access_token: None };
+        let inp = RenderInputs { secrets: &s, oauth_access_token: None, connection: None };
         assert_eq!(
             render_template("{{secret_b64.k}}", &inp).unwrap(),
             render_template("{{secret.k | b64}}", &inp).unwrap(),
@@ -542,7 +570,7 @@ mod render_tests {
     #[test]
     fn unknown_filter_hard_fails() {
         let s = secrets(&[("k", "user")]);
-        let inp = RenderInputs { secrets: &s, oauth_access_token: None };
+        let inp = RenderInputs { secrets: &s, oauth_access_token: None, connection: None };
         let err = render_template("{{secret.k | urlenc}}", &inp).unwrap_err();
         assert!(format!("{:?}", err).contains("unknown template filter"), "{:?}", err);
         // A missing secret under a valid filter is still a hard error (never literal).
@@ -554,21 +582,21 @@ mod render_tests {
         // `secret_b64.X | basic` is incoherent — reject rather than silently
         // double-apply.
         let s = secrets(&[("k", "user")]);
-        let inp = RenderInputs { secrets: &s, oauth_access_token: None };
+        let inp = RenderInputs { secrets: &s, oauth_access_token: None, connection: None };
         assert!(render_template("{{secret_b64.k | basic}}", &inp).is_err());
     }
 
     #[test]
     fn oauth_access_token_substitutes() {
         let s = secrets(&[]);
-        let inp = RenderInputs { secrets: &s, oauth_access_token: Some("at_live") };
+        let inp = RenderInputs { secrets: &s, oauth_access_token: Some("at_live"), connection: None };
         assert_eq!(render_template("Bearer {{oauth.access_token}}", &inp).unwrap(), "Bearer at_live");
     }
 
     #[test]
     fn unknown_token_hard_fails() {
         let s = secrets(&[]);
-        let inp = RenderInputs { secrets: &s, oauth_access_token: None };
+        let inp = RenderInputs { secrets: &s, oauth_access_token: None, connection: None };
         assert!(render_template("{{bogus}}", &inp).is_err());
         assert!(render_template("{{secret.missing}}", &inp).is_err());
     }
@@ -576,7 +604,7 @@ mod render_tests {
     #[test]
     fn missing_secret_never_leaks_literal() {
         let s = secrets(&[]);
-        let inp = RenderInputs { secrets: &s, oauth_access_token: None };
+        let inp = RenderInputs { secrets: &s, oauth_access_token: None, connection: None };
         // A typo'd reference must error, never forward the literal `{{…}}`.
         assert!(render_template("Bearer {{secret.typo}}", &inp).is_err());
     }
@@ -584,8 +612,25 @@ mod render_tests {
     #[test]
     fn static_text_unchanged() {
         let s = secrets(&[]);
-        let inp = RenderInputs { secrets: &s, oauth_access_token: None };
+        let inp = RenderInputs { secrets: &s, oauth_access_token: None, connection: None };
         assert_eq!(render_template("application/json", &inp).unwrap(), "application/json");
+    }
+
+    #[test]
+    fn connection_slot_substitutes_and_undeclared_fails() {
+        let s = secrets(&[]);
+        let mut cfg = std::collections::BTreeMap::new();
+        cfg.insert("host".to_string(), "git.acme.com".to_string());
+        let inp = RenderInputs { secrets: &s, oauth_access_token: None, connection: Some(&cfg) };
+        assert_eq!(
+            render_template("https://{{connection.host}}/api/v4", &inp).unwrap(),
+            "https://git.acme.com/api/v4",
+        );
+        // An undeclared / missing slot is a hard error, never a literal leak.
+        assert!(render_template("https://{{connection.region}}/x", &inp).is_err());
+        // No connection config at all → also a hard error.
+        let inp2 = RenderInputs { secrets: &s, oauth_access_token: None, connection: None };
+        assert!(render_template("https://{{connection.host}}/x", &inp2).is_err());
     }
 
     #[test]
@@ -665,6 +710,7 @@ mod render_tests {
 pub async fn resolve_auth_value(
     state: &crate::state::AppState,
     vault_id: &str,
+    conn_id: &str,
     service_id: &str,
     raw: &[u8],
 ) -> Result<Vec<u8>> {
@@ -678,8 +724,9 @@ pub async fn resolve_auth_value(
     }
     let auth = auth.expect("oauth2 branch implies auth present");
 
-    // Cache hit — return the cached access_token directly.
-    if let Some(cached) = state.oauth_access_lookup(vault_id, service_id) {
+    // Cache hit — return the cached access_token directly. Keyed by the
+    // **connection** (not service) so two accounts of one service don't collide.
+    if let Some(cached) = state.oauth_access_lookup(vault_id, conn_id) {
         return Ok(cached);
     }
 
@@ -742,11 +789,11 @@ pub async fn resolve_auth_value(
     })?;
 
     // Cache with 60s safety margin so the next request mid-window
-    // doesn't grab a near-expired token.
+    // doesn't grab a near-expired token. Keyed by connection.
     let safe_expires_at = expires_at.saturating_sub(60);
     state.oauth_access_insert(
         vault_id,
-        service_id,
+        conn_id,
         access_token.as_bytes().to_vec(),
         safe_expires_at,
     );
@@ -801,6 +848,21 @@ pub async fn forward_to_upstream_with_extras<'a>(
     // Render with the same engine that handles header/query templates so
     // the recipe author has one consistent placeholder vocabulary.
     let url_rendered = render_template(upstream_url, inputs)?;
+    // SSRF recheck: a `{{connection.host}}` slot may have resolved to a concrete
+    // host above — re-validate the resolved authority before egress (defense in
+    // depth over the connect-time check; CONNECTION_SCHEMA.md §4). A literal host
+    // already passed the load-time validator, so this is a cheap no-op for it.
+    if let Some(authority) = url_rendered
+        .split_once("://")
+        .map(|(_, r)| r.split('/').next().unwrap_or(r))
+    {
+        if !crate::service::validate::host_egress_allowed(authority) {
+            return Err(AppError::Forbidden(format!(
+                "resolved egress host '{}' is loopback / private / link-local — refusing to forward",
+                authority
+            )));
+        }
+    }
     let full_url = format!(
         "{}{}",
         url_rendered.trim_end_matches('/'),

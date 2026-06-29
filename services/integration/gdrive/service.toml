@@ -14,7 +14,7 @@ scopes = [
   "https://www.googleapis.com/auth/drive.readonly",
   "https://www.googleapis.com/auth/drive.file",
 ]
-secret = "gdrive_refresh_token"
+secret = "GOOGLE_DRIVE_REFRESH_TOKEN"
 
 [upstream.headers]
 Authorization = "Bearer {{oauth.access_token}}"

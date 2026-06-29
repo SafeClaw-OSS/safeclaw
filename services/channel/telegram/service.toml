@@ -11,8 +11,8 @@ category = "channel"
 # appended verbatim after.
 [[upstream]]
 id = "default"
-url = "https://api.telegram.org/bot{{secret.telegram_bot_token}}"
-auth = { env = "telegram_bot_token", placeholder = "123456:ABC-DEF1234..." }
+url = "https://api.telegram.org/bot{{secret.TELEGRAM_BOT_TOKEN}}"
+auth = { env = "TELEGRAM_BOT_TOKEN", placeholder = "123456:ABC-DEF1234..." }
 
 [[api]]
 path = "*"

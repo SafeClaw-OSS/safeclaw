@@ -5,7 +5,7 @@ sub = "REST API + git"
 category = "integration"
 
 # One GitLab connection (one PAT) backs BOTH the REST API and the git transport,
-# sharing `gitlab_token`. Mirrors the `github` recipe; the differences are the
+# sharing `GITLAB_TOKEN`. Mirrors the `github` recipe; the differences are the
 # REST host/header and the git Basic-auth shape (GitLab needs a non-empty
 # username, conventionally `oauth2`, with the token as the password).
 
@@ -13,25 +13,25 @@ category = "integration"
 [[upstream]]
 id = "rest"
 url = "https://gitlab.com/api/v4"
-auth = { secret = "gitlab_token", placeholder = "glpat-..." }
+auth = { secret = "GITLAB_TOKEN", placeholder = "glpat-..." }
 
   [upstream.headers]
   # Canonical PAT header for the GitLab REST API. (GitLab also accepts
   # `Authorization: Bearer <token>`; PRIVATE-TOKEN is the unambiguous PAT form.)
-  PRIVATE-TOKEN = "{{secret.gitlab_token}}"
+  PRIVATE-TOKEN = "{{secret.GITLAB_TOKEN}}"
 
 # B. git smart-HTTP  →  /v/{vid}/stream/gitlab
 [[upstream]]
 id = "git"
 url = "https://gitlab.com"
 stream = true
-auth = { secret = "gitlab_token" }
+auth = { secret = "GITLAB_TOKEN" }
 
   [upstream.headers]
   # GitLab git smart-HTTP = HTTP Basic with a non-empty username (`oauth2`) and
   # the token as the password = base64("oauth2:" + token), which
   # `{{secret.NAME | basic:oauth2}}` produces.
-  Authorization = "Basic {{secret.gitlab_token | basic:oauth2}}"
+  Authorization = "Basic {{secret.GITLAB_TOKEN | basic:oauth2}}"
 
 [[api]]
 path = "*"

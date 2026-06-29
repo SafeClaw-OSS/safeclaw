@@ -78,53 +78,64 @@ pub struct ServiceState {
     pub rule_overrides: HashMap<String, RuleOverride>,
 }
 
-/// The browser-captured OAuth handshake, relayed to the daemon *through the
-/// sealed vault* to stay cloud-blind (the cloud only ever stores ciphertext;
-/// the daemon, not the backend, performs the code→token exchange). Mirrors the
-/// frontend `lib/oauth-connect.ts` pending payload byte-for-byte.
+/// An **established** connection — an instance of a service (TYPE) the user has
+/// connected. Keyed (in `VaultAux.connections`) by `connection_id`: a slug that
+/// is the user's handle AND the routing/cache/audit unit. `== service_id` for
+/// the default (unprefixed) connection; a distinct slug for a named one
+/// (see `docs/CONNECTION_SCHEMA.md` §2).
 ///
-/// Transient by design: present only while a connect awaits the daemon's
-/// exchange. The `code` inside is single-use with a ~10-min TTL; once the
-/// daemon redeems it and writes `<conn>_refresh_token`, this is cleared.
+/// Status is **DERIVED**, never stored: present in `connections` with its
+/// required secret(s) present → Connected; a required secret missing → Partly
+/// configured. There is no status field to drift out of sync.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Connection {
+    /// Which recipe (TYPE) this instantiates. Decouples `connection_id` from
+    /// the service so there can be many connections per service.
+    pub service: String,
+    /// Per-connection values for the recipe-declared re-map slots only (e.g.
+    /// `host` for a self-hosted upstream — §4). A connection can fill ONLY the
+    /// slots the recipe declares (anti-SSRF). Omitted when none.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub config: BTreeMap<String, String>,
+}
+
+/// An **in-flight** connect handshake — everything the daemon needs to redeem
+/// the OAuth code and produce the durable secret. On a successful exchange the
+/// daemon writes the secret and **MOVES** the entry into `connections` (dropping
+/// it here) — there is never a partial/duplicate record.
+///
+/// Relayed to the daemon *through the sealed vault* to stay cloud-blind: the
+/// browser drives consent, seals `{ service, config, code, verifier }` here, and
+/// the daemon (not the backend) performs the code→token exchange. The `code` is
+/// single-use with a ~10-min TTL. `redirect_uri` is NOT here — it's a fixed
+/// property of the OAuth client, held in the provider config. Mirrors the
+/// frontend `lib/vault-grant.ts` `Connecting` shape.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OAuthPending {
+pub struct Connecting {
+    /// The recipe (TYPE) being instantiated.
+    pub service: String,
+    /// Per-connection re-map slot values, carried through to the established
+    /// [`Connection`] on exchange. Omitted when none.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub config: BTreeMap<String, String>,
     /// The single-use authorization code from the loopback redirect.
     pub code: String,
     /// The PKCE code_verifier (RFC 7636) the browser generated for this flow.
     pub verifier: String,
-    /// The redirect_uri registered for the consent (loopback for Desktop).
-    pub redirect_uri: String,
 }
 
-/// Explicit per-connection state for OAuth-style services
-/// (CONNECTIONS_AND_AUTH §4a). Replaces the implicit "scan `targets` for a
-/// `<conn>_oauth_pending` key-name suffix" convention with a first-class
-/// structured field: the daemon reads an explicit connection record, not a
-/// name pattern.
-///
-/// Keyed (in `VaultAux.connections`) by `connection_id` — `== service_id` for
-/// the default connection today; the general re-map / `:`-namespacing is a
-/// later slice (item5), and this struct is its storage foundation.
-///
-/// Deliberately thin: the **durable** credential (`<conn>_refresh_token`)
-/// stays a flat native-secret so the broker's `secret = "<conn>_refresh_token"`
-/// lookup is unchanged, and a connection's *status* is **derived** (pending
-/// present → connecting; the flat refresh_token present → connected) rather
-/// than stored here — so there is no status field to drift out of sync.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct Connection {
-    /// In-flight connect handshake; `None` once the exchange completes.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub oauth_pending: Option<OAuthPending>,
-}
-
-impl Connection {
-    /// A connection record with no live state — safe to drop from `aux`
-    /// (its "connected" status is derived from the flat refresh_token, so an
-    /// empty record carries no information). As more fields land (re-map
-    /// bindings, label), extend this predicate so cleanup stays correct.
-    pub fn is_empty(&self) -> bool {
-        self.oauth_pending.is_none()
+/// The vault address of a connection's secret role (CONNECTION_SCHEMA.md §3):
+/// the **bare** mainstream name for the default connection (`conn_id ==
+/// service_id`, 1:1 with env/GCP import), or `<conn_id>:<ROLE>` for a **named**
+/// one. The `:` delimiter is invalid in env-var names, so a namespaced key can
+/// never masquerade as an env var. One rule, applied everywhere a connection's
+/// secret is written (connect) or read (broker / cache bootstrap), so the two
+/// can't drift.
+pub fn secret_address(conn_id: &str, service_id: &str, role: &str) -> String {
+    if conn_id == service_id {
+        role.to_string()
+    } else {
+        format!("{conn_id}:{role}")
     }
 }
 
@@ -143,9 +154,14 @@ pub struct VaultAux {
     /// authored state appear here.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub service_state: BTreeMap<String, ServiceState>,
-    /// Per-connection OAuth state, keyed by `connection_id` (== service_id for
-    /// the default connection). Sparse — only connections mid-handshake (an
-    /// `oauth_pending`) appear; cleared records are dropped. See [`Connection`].
+    /// In-flight connects, keyed by `connection_id`. Each carries everything the
+    /// daemon needs to redeem the OAuth code; on exchange the entry MOVEs to
+    /// `connections`. Sparse — empty when nothing is mid-handshake. See
+    /// [`Connecting`].
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub connecting: BTreeMap<String, Connecting>,
+    /// Established connections, keyed by `connection_id`. Sparse. Status is
+    /// derived (see [`Connection`]).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub connections: BTreeMap<String, Connection>,
     /// Audit log retention in days. `None` = keep forever; integer = drop
@@ -186,6 +202,7 @@ impl VaultAux {
             store_order: vec![NATIVE_SECRETS_ID.to_string(), NATIVE_FILES_ID.to_string()],
             policy_defaults: None,
             service_state: BTreeMap::new(),
+            connecting: BTreeMap::new(),
             connections: BTreeMap::new(),
             audit_retention_days: None,
         }

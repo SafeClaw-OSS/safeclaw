@@ -6,16 +6,16 @@ category = "integration"
 
 # One GitHub connection (one PAT) backs BOTH the REST API and the git transport.
 # `rest` is reached at /v/{vid}/use/github (buffered broker); `git` is reached at
-# /v/{vid}/stream/github (unbuffered smart-HTTP). They share `github_token`.
+# /v/{vid}/stream/github (unbuffered smart-HTTP). They share `GITHUB_TOKEN`.
 
 # A. REST API  →  /v/{vid}/use/github
 [[upstream]]
 id = "rest"
 url = "https://api.github.com"
-auth = { secret = "github_token", placeholder = "github_pat_..." }
+auth = { secret = "GITHUB_TOKEN", placeholder = "github_pat_..." }
 
   [upstream.headers]
-  Authorization = "Bearer {{secret.github_token}}"
+  Authorization = "Bearer {{secret.GITHUB_TOKEN}}"
 
 # B. git smart-HTTP  →  /v/{vid}/stream/github
 [[upstream]]
@@ -23,13 +23,13 @@ id = "git"
 url = "https://github.com"
 # Opt into the generic streaming passthrough (the /stream/ route).
 stream = true
-auth = { secret = "github_token" }
+auth = { secret = "GITHUB_TOKEN" }
 
   [upstream.headers]
   # GitHub PAT over git smart-HTTP = HTTP Basic with the token as the username and
   # an empty password — i.e. `https://<token>@github.com/…` = base64(token + ':'),
   # which `{{secret.NAME | basic}}` produces.
-  Authorization = "Basic {{secret.github_token | basic}}"
+  Authorization = "Basic {{secret.GITHUB_TOKEN | basic}}"
 
 [[api]]
 path = "*"

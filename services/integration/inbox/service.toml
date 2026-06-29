@@ -6,7 +6,7 @@ category = "integration"
 help = """
 A live target that receives broker-forwarded requests so you can see
 SafeClaw's contract end-to-end. The daemon injects your
-`env.inbox_api_key` into the Authorization header and forwards to
+`env.INBOX_API_KEY` into the Authorization header and forwards to
 inbox.dev.safeclaw.pro; the /try page tails the inbox over SSE so
 you can see exactly what the receiver saw, without the agent ever
 holding the raw value.
@@ -38,10 +38,10 @@ check doesn't require a human in the loop.
 [[upstream]]
 id = "default"
 url = "https://inbox.dev.safeclaw.pro"
-auth = { env = "inbox_api_key" }
+auth = { env = "INBOX_API_KEY" }
 
   [upstream.headers]
-  Authorization = "Bearer {{secret.inbox_api_key}}"
+  Authorization = "Bearer {{secret.INBOX_API_KEY}}"
 
 [[api]]
 path = "*"

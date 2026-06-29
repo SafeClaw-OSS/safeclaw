@@ -7,11 +7,11 @@ category = "llm"
 [[upstream]]
 id = "default"
 url = "https://generativelanguage.googleapis.com"
-auth = { env = "google_api_key", placeholder = "AIza..." }
+auth = { env = "GEMINI_API_KEY", placeholder = "AIza..." }
 locked = { response = "Please unlock the SafeClaw vault to use this service." }
 
   [upstream.query]
-  key = "{{secret.google_api_key}}"
+  key = "{{secret.GEMINI_API_KEY}}"
 
 [[api]]
 path = "*"

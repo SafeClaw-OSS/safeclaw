@@ -35,22 +35,22 @@ pub async fn handle_no_rest(
     state: State<Arc<AppState>>,
     addr: ConnectInfo<std::net::SocketAddr>,
     method: Method,
-    Path((vault_id, service)): Path<(String, String)>,
+    Path((vault_id, connection)): Path<(String, String)>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<(StatusCode, Json<Value>)> {
-    handle_impl(state, addr, method, vault_id, service, String::new(), headers, body).await
+    handle_impl(state, addr, method, vault_id, connection, String::new(), headers, body).await
 }
 
 pub async fn handle(
     state: State<Arc<AppState>>,
     addr: ConnectInfo<std::net::SocketAddr>,
     method: Method,
-    Path((vault_id, service, rest)): Path<(String, String, String)>,
+    Path((vault_id, connection, rest)): Path<(String, String, String)>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<(StatusCode, Json<Value>)> {
-    handle_impl(state, addr, method, vault_id, service, rest, headers, body).await
+    handle_impl(state, addr, method, vault_id, connection, rest, headers, body).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -59,7 +59,10 @@ async fn handle_impl(
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     method: Method,
     vault_id: String,
-    service: String,
+    // The URL path segment. CONNECTION_SCHEMA.md §6: this is a `connection_id`,
+    // which resolves to its `service` (recipe) via the unlocked cache; for the
+    // default connection / an unconnected service `connection == service`.
+    connection: String,
     rest: String,
     headers: HeaderMap,
     body: Bytes,
@@ -74,6 +77,11 @@ async fn handle_impl(
         return Err(AppError::Conflict("vault locked — unlock first".into()));
     }
 
+    // Resolve the connection → its service (recipe). CONNECTION_SCHEMA.md §6:
+    // an explicit `aux.connections` entry names the service; otherwise the
+    // connection IS its own default (`connection == service`).
+    let service = state.resolve_connection_service(&vault_id, &connection);
+
     // Service lookup.
     let svc = state
         .services
@@ -84,23 +92,27 @@ async fn handle_impl(
     })?;
 
     // Host-literal guard (anti-SSRF). The scheme+authority of an upstream URL
-    // must be a constant: a `{{…}}` there could let a captured request — or a
-    // malicious recipe — repoint the egress host. Templates are allowed only
-    // in the path (e.g. Telegram's `/bot{{secret.telegram_bot_token}}`).
-    if upstream_host_has_template(&upstream.url) {
+    // must be a constant OR a declared `{{connection.<param>}}` slot (resolved to
+    // a vetted host at forward time): a `{{secret.*}}` there could let a captured
+    // request repoint the egress host. Templates are otherwise allowed only in
+    // the path (e.g. Telegram's `/bot{{secret.telegram_bot_token}}`).
+    if upstream_host_has_unsafe_template(upstream) {
         return Err(AppError::Conflict(format!(
-            "service '{}' upstream host is templated — refusing to forward",
+            "service '{}' upstream host is templated with a non-connection token — refusing to forward",
             service
         )));
     }
 
-    // Resolve the bare item name this upstream needs (v3 store-order
-    // resolution happens daemon-side at execute-use time).
-    let target = resolve_vault_target(upstream).unwrap_or_else(|| "unknown".to_string());
+    // The recipe's bare secret role + its namespaced vault address (§3): bare for
+    // the default connection (`conn == service`), `<conn>:<ROLE>` for a named one.
+    // `target` is the vault item the op resolves; `role` (bare) keys the render
+    // map so `{{secret.<role>}}` matches.
+    let role = resolve_vault_target(upstream).unwrap_or_else(|| "unknown".to_string());
+    let target = crate::storage::plaintext::secret_address(&connection, &service, &role);
 
-    // Honesty: the full set of vault items this operation will release, so the
-    // approval UI and audit show every secret — not just the primary `target`.
-    // Scanned from the recipe's URL + header + query templates.
+    // Honesty: the full set of `{{secret.*}}` items this operation will release,
+    // so the approval UI and audit show every secret. Bare role names — the
+    // render map is keyed by bare name, namespaced per-connection at resolve.
     let released_secrets = referenced_secret_names(upstream);
 
     // Capture request headers (excluding hop-by-hop) for replay or cache fast-path.
@@ -126,6 +138,7 @@ async fn handle_impl(
     let (level, matched_rule_id, level_ask_ttl) = state
         .evaluate_request_policy(
             &vault_id,
+            &connection,
             &service,
             method.as_str(),
             &path_for_eval,
@@ -169,7 +182,7 @@ async fn handle_impl(
     // op flow below — typical when the auth lives in an external store
     // that wasn't pre-resolved at unlock (e.g. GCP Secret Manager).
     if level == AccessLevel::Allow {
-        if let Some(cached_secret) = state.cache_lookup(&vault_id, &service) {
+        if let Some(cached_secret) = state.cache_lookup(&vault_id, &connection) {
         let path_str = format!("/{}", rest);
         let header_pairs: Vec<(String, String)> = headers_map
             .iter()
@@ -192,6 +205,7 @@ async fn handle_impl(
             let access = crate::server::broker::resolve_auth_value(
                 &state,
                 &vault_id,
+                &connection,
                 &service,
                 &cached_secret,
             )
@@ -201,17 +215,22 @@ async fn handle_impl(
             (std::collections::HashMap::new(), Some(token))
         } else {
             let map = state
-                .cache_lookup_secrets(&vault_id, &service)
+                .cache_lookup_secrets(&vault_id, &connection)
                 .unwrap_or_else(|| {
+                    // Fallback (single-secret recipe, no bootstrap map): key by the
+                    // BARE role so `{{secret.<role>}}` matches; the bytes are the
+                    // namespaced primary the cache already resolved.
                     let mut m = std::collections::HashMap::new();
-                    m.insert(target.clone(), cached_secret.clone());
+                    m.insert(role.clone(), cached_secret.clone());
                     m
                 });
             (map, None)
         };
+        let conn_config = state.connection_config(&vault_id, &connection);
         let inputs = crate::server::broker::RenderInputs {
             secrets: &secrets_map,
             oauth_access_token: oauth_token.as_deref(),
+            connection: conn_config.as_ref(),
         };
         let response = crate::server::broker::forward_to_upstream_with_extras(
             &inputs,
@@ -273,6 +292,9 @@ async fn handle_impl(
     let body_b64 = STANDARD.encode(&body);
 
     let scope = json!({
+        // The routing/cache/audit unit (CONNECTION_SCHEMA.md §6). `service` is
+        // the resolved recipe; for the default connection the two are equal.
+        "connection_id": connection,
         "service": service,
         "upstream_id": upstream.id,
         "upstream_url": upstream.url,
@@ -407,10 +429,55 @@ fn referenced_secret_names(upstream: &UpstreamDef) -> Vec<String> {
 /// True if the scheme+authority of `url` carries a `{{…}}` template. The
 /// authority is everything between `://` and the first `/` (or end-of-string).
 /// Templates in the *path* are fine; templates in the host are an SSRF risk.
+/// Superseded at the call site by [`upstream_host_has_unsafe_template`] (which
+/// permits a declared `{{connection.<param>}}` host); retained as the primitive
+/// its unit tests exercise.
+#[allow(dead_code)]
 fn upstream_host_has_template(url: &str) -> bool {
     let after_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
     let authority = after_scheme.split('/').next().unwrap_or(after_scheme);
     authority.contains("{{")
+}
+
+/// True if the upstream's host carries a `{{…}}` template that is NOT a declared
+/// `{{connection.<param>}}` slot — i.e. an SSRF-risky host template
+/// (CONNECTION_SCHEMA.md §4). A declared connection slot is the one allowed host
+/// template (its resolved value is re-checked against the SSRF rules at forward
+/// time); anything else (`{{secret.*}}`, an undeclared connection param, an
+/// `{{oauth.*}}`) is rejected before any pending op is created.
+pub(crate) fn upstream_host_has_unsafe_template(upstream: &UpstreamDef) -> bool {
+    let after_scheme = upstream
+        .url
+        .split_once("://")
+        .map(|(_, r)| r)
+        .unwrap_or(&upstream.url);
+    let authority = after_scheme.split('/').next().unwrap_or(after_scheme);
+    if !authority.contains("{{") {
+        return false;
+    }
+    let declared: std::collections::HashSet<&str> = upstream
+        .connection
+        .as_ref()
+        .map(|c| c.params.iter().map(|s| s.as_str()).collect())
+        .unwrap_or_default();
+    // Every `{{…}}` in the authority must be a declared `connection.<param>`.
+    let mut rest = authority;
+    while let Some(start) = rest.find("{{") {
+        let after = &rest[start + 2..];
+        let Some(end) = after.find("}}") else {
+            return true; // unterminated → treat as unsafe
+        };
+        let tok = after[..end].trim();
+        let ok = tok
+            .strip_prefix("connection.")
+            .map(|p| declared.contains(p.trim()))
+            .unwrap_or(false);
+        if !ok {
+            return true;
+        }
+        rest = &after[end + 2..];
+    }
+    false
 }
 
 fn resolve_vault_target(upstream: &UpstreamDef) -> Option<String> {
@@ -497,6 +564,7 @@ mod tests {
             query,
             stream: false,
             locked: None,
+            connection: None,
         };
         let mut names = referenced_secret_names(&upstream);
         names.sort();
@@ -515,6 +583,7 @@ mod tests {
             query: std::collections::HashMap::new(),
             stream: false,
             locked: None,
+            connection: None,
         };
         assert!(referenced_secret_names(&upstream).is_empty());
     }

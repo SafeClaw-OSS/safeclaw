@@ -1,21 +1,19 @@
-//! OAuth CONNECT completion on the daemon (CONNECTIONS_AND_AUTH.md §4a).
+//! OAuth CONNECT completion on the daemon (CONNECTION_SCHEMA.md §5).
 //!
 //! The browser drives Google consent with the **public Desktop client + PKCE**
-//! and seals `{code, verifier, redirect_uri}` into the vault as a transient
-//! item `<connection_id>_oauth_pending`. To stay **cloud-blind**, the code is
-//! relayed to the daemon *through the sealed vault* (the cloud only ever stores
-//! ciphertext) — never through the backend. This module is the daemon side of
-//! that handshake:
+//! and seals `{ service, config, code, verifier }` into `aux.connecting[<id>]`
+//! (CONNECTION_SCHEMA.md §2). To stay **cloud-blind**, the code is relayed to the
+//! daemon *through the sealed vault* (the cloud only ever stores ciphertext) —
+//! never through the backend. This module is the daemon side of that handshake:
 //!
-//! 1. with the vault **open** (retained `K` from an unlocked session), read
-//!    every pending handshake — the explicit `aux.connections[*].oauth_pending`
-//!    records (the v3 form) plus, for backward-compat, any legacy flat
-//!    `<conn>_oauth_pending` native-secret;
-//! 2. for each, resolve the service's provider (client_id/secret/token_url
-//!    from the public Desktop literal) and exchange the code at `token_url`;
-//! 3. WRITE `<connection_id>_refresh_token` and CLEAR the pending from both
-//!    places it could live (the `aux.connections` record and the legacy flat
-//!    item); re-seal the body under the same `K` and persist `vault.dat`.
+//! 1. with the vault **open** (retained `K` from an unlocked session), read every
+//!    in-flight connect from `aux.connecting`;
+//! 2. for each, resolve the connection's *service* recipe → its provider
+//!    (client_id / secret / token_url + the fixed redirect_uri, all from the
+//!    public Desktop literal) and exchange the code at `token_url`;
+//! 3. WRITE the durable refresh_token at the §3 address `[<conn>:]<ROLE>` and
+//!    **MOVE** the entry from `aux.connecting` into `aux.connections`; re-seal the
+//!    body under the same `K` and persist `vault.dat`.
 //!
 //! **No approval op.** This is the completion of a *user-initiated*,
 //! passkey-sealed, Google-authenticated connect; the daemon holds `K` while
@@ -23,57 +21,51 @@
 //! daemon's own connect-completion. An agent cannot forge a Google login plus a
 //! passkey-sealed code.
 //!
-//! **Default connection only.** `connection_id == service_id` here (the general
-//! `connection_id` addressing / `:` namespacing is a separate slice), so
-//! `gmail_oauth_pending` → service `gmail` → `gmail_refresh_token` (matching the
-//! recipe's `secret`).
+//! **Multi-connection.** `connection_id` is independent of `service_id`: each
+//! `connecting`/`connections` entry names its `service` explicitly, so two Gmail
+//! accounts (`gmail`, `gmail-work`) connect side-by-side. The refresh_token
+//! address is bare for the default (`conn == service`) and `<conn>:<ROLE>` for a
+//! named one (see [`secret_address`]).
 //!
-//! **Best-effort, never fatal.** Anything that goes wrong logs and is skipped;
-//! a malformed/unresolvable pending or an exchange failure (e.g. an expired
-//! code) leaves the pending item in place so the user can retry within the code
+//! **Best-effort, never fatal.** Anything that goes wrong logs and is skipped; a
+//! malformed/unresolvable pending or an exchange failure (e.g. an expired code)
+//! leaves the `connecting` entry in place so the user can retry within the code
 //! TTL (~10 min). It never panics the daemon and never blocks serving.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use serde::{de::DeserializeOwned, Serialize};
 use sudp::state::ProtectedState;
 
 use crate::auth::oauth2::{ExchangedTokens, OAuthStyle};
 use crate::state::AppState;
-use crate::storage::plaintext::{Connection, OAuthPending};
+use crate::storage::plaintext::{secret_address, Connecting, Connection};
 
-/// Suffix of the *legacy* flat `<conn>_oauth_pending` native-secret. Still
-/// honored for backward-compat — vaults sealed before `aux.connections`, or a
-/// frontend that hasn't migrated — but new connects use the explicit
-/// `aux.connections[conn].oauth_pending` form (see [`collect_pending`]).
-const PENDING_SUFFIX: &str = "_oauth_pending";
-/// Suffix of the durable item the connect writes back.
-const REFRESH_SUFFIX: &str = "_refresh_token";
-
-/// The OAuth client/endpoint a pending connect resolves to before exchange.
-/// (= the public Desktop client for Google, from the provider literal.)
+/// The OAuth client/endpoint a pending connect resolves to before exchange, plus
+/// the recipe's secret role (so we know where to write the result).
 #[derive(Debug, Clone)]
 pub struct ExchangeConfig {
     pub token_url: String,
     pub client_id: String,
     pub client_secret: Option<String>,
     pub style: OAuthStyle,
+    /// The OAuth client's fixed redirect_uri (provider config), echoed at the
+    /// token call so it matches the browser's consent request.
+    pub redirect_uri: String,
+    /// The recipe's mainstream secret role, e.g. `GMAIL_REFRESH_TOKEN` — the base
+    /// name the refresh_token is written under (namespaced per `conn`).
+    pub secret_role: String,
 }
 
-/// Map a `<conn>_oauth_pending` item key to its connection id (== service id,
-/// default connection). Returns `None` for keys that don't carry the suffix.
-fn conn_from_pending_key(key: &str) -> Option<&str> {
-    key.strip_suffix(PENDING_SUFFIX).filter(|c| !c.is_empty())
-}
-
-/// Resolve the exchange config for a connection (default: `conn == service_id`)
-/// from the service registry. `None` when the service is unknown, isn't oauth2,
-/// or is missing a token_url/client_id (e.g. a provider literal we can't load).
+/// Resolve the exchange config for a connection's **service** recipe from the
+/// registry. `None` when the service is unknown, isn't oauth2, or is missing a
+/// token_url / client_id / secret role (e.g. a provider literal we can't load).
 pub fn resolve_exchange_config(
     services: &crate::service::ServiceRegistry,
-    conn: &str,
+    service: &str,
 ) -> Option<ExchangeConfig> {
-    let svc = services.get(conn)?;
+    let svc = services.get(service)?;
     let auth = svc.upstream.first().and_then(|u| u.auth.as_ref())?;
     if !services.auth_is_oauth2(auth) {
         return None;
@@ -81,6 +73,7 @@ pub fn resolve_exchange_config(
     let resolved = services.resolve_oauth_config(auth);
     let token_url = resolved.token_url?;
     let client_id = resolved.client_id?;
+    let secret_role = services.service_env_key(service)?;
     let style = match auth.oauth_style.as_deref() {
         Some("json") => OAuthStyle::Json,
         _ => OAuthStyle::Form,
@@ -90,109 +83,82 @@ pub fn resolve_exchange_config(
         client_id,
         client_secret: resolved.client_secret,
         style,
+        redirect_uri: resolved.redirect_uri,
+        secret_role,
     })
 }
 
-/// Read the `aux.connections` map from an open state. Empty when the key is
-/// absent or the sub-value doesn't parse (forward-compat: a newer schema we
-/// can't read just yields no pending here — never an error).
-fn aux_connections(m: &ProtectedState) -> BTreeMap<String, Connection> {
+/// Read a `connection_id → T` map out of `m.aux[<key>]`. Empty when the key is
+/// absent or doesn't parse (forward-compat: a newer schema we can't read yields
+/// no entries — never an error).
+fn aux_map<T: DeserializeOwned>(m: &ProtectedState, key: &str) -> BTreeMap<String, T> {
     m.aux
-        .get("connections")
+        .get(key)
         .and_then(|v| serde_json::from_value(v.clone()).ok())
         .unwrap_or_default()
 }
 
-/// Write `connections` back into `m.aux`, dropping the `connections` key
-/// entirely when the map is empty (matching the `skip_serializing_if` shape
-/// the rest of the aux schema round-trips with). Leaves all other aux fields
-/// untouched.
-fn set_aux_connections(m: &mut ProtectedState, conns: BTreeMap<String, Connection>) {
+/// Write a `connection_id → T` map back into `m.aux[<key>]`, dropping the key
+/// entirely when the map is empty (matching the `skip_serializing_if` shape the
+/// rest of the aux schema round-trips with). Leaves all other aux fields intact.
+fn set_aux_map<T: Serialize>(m: &mut ProtectedState, key: &str, map: BTreeMap<String, T>) {
     if !m.aux.is_object() {
         // A v3 vault's aux is always an object; tolerate a malformed one by
         // starting fresh rather than panicking.
         m.aux = serde_json::json!({});
     }
     let obj = m.aux.as_object_mut().expect("aux normalized to object");
-    if conns.is_empty() {
-        obj.remove("connections");
-    } else if let Ok(v) = serde_json::to_value(&conns) {
-        obj.insert("connections".to_string(), v);
+    if map.is_empty() {
+        obj.remove(key);
+    } else if let Ok(v) = serde_json::to_value(&map) {
+        obj.insert(key.to_string(), v);
     }
 }
 
 /// Apply one successful exchange to the open `ProtectedState`: write the durable
-/// `<conn>_refresh_token` (overwriting any prior one — a re-connect supersedes)
-/// and CLEAR the consumed pending from BOTH places it can live: the
-/// `aux.connections[conn]` record (dropped when it's left empty) and the legacy
-/// flat `<conn>_oauth_pending` native-secret. Pure state transition (no I/O) so
-/// it's unit-testable against a mocked `ProtectedState`.
-pub fn apply_exchange_result(m: &mut ProtectedState, conn: &str, tokens: &ExchangedTokens) {
+/// refresh_token at the §3 address (`secret_address(conn, service, role)`,
+/// overwriting any prior one — a re-connect supersedes) and **MOVE** the entry
+/// from `aux.connecting` into `aux.connections` (no partial/duplicate record).
+/// Pure state transition (no I/O) so it's unit-testable against a mocked
+/// `ProtectedState`.
+pub fn apply_exchange_result(
+    m: &mut ProtectedState,
+    conn: &str,
+    service: &str,
+    config: &BTreeMap<String, String>,
+    role: &str,
+    tokens: &ExchangedTokens,
+) {
     if let Some(rt) = &tokens.refresh_token {
-        m.put_target(format!("{}{}", conn, REFRESH_SUFFIX), rt.as_bytes().to_vec());
+        m.put_target(secret_address(conn, service, role), rt.as_bytes().to_vec());
     }
-    // Legacy flat pending (harmless no-op if it isn't there).
-    m.remove_target(&format!("{}{}", conn, PENDING_SUFFIX));
-    // Explicit aux pending: clear the field and drop the record if now empty.
-    let mut conns = aux_connections(m);
-    if conns.contains_key(conn) {
-        if let Some(c) = conns.get_mut(conn) {
-            c.oauth_pending = None;
-        }
-        if conns.get(conn).is_some_and(Connection::is_empty) {
-            conns.remove(conn);
-        }
-        set_aux_connections(m, conns);
-    }
+    // MOVE: drop from `connecting`, add to `connections`.
+    let mut connecting = aux_map::<Connecting>(m, "connecting");
+    connecting.remove(conn);
+    set_aux_map(m, "connecting", connecting);
+
+    let mut connections = aux_map::<Connection>(m, "connections");
+    connections.insert(
+        conn.to_string(),
+        Connection { service: service.to_string(), config: config.clone() },
+    );
+    set_aux_map(m, "connections", connections);
 }
 
-/// Collect every pending OAuth-connect handshake in an open `ProtectedState`,
-/// from BOTH sources: the explicit `aux.connections[*].oauth_pending` (the v3
-/// form) and the legacy flat `<conn>_oauth_pending` native-secret. De-duped by
-/// connection id — the explicit aux form wins when a conn appears in both (e.g.
-/// a re-connect that migrated to aux while a stale flat item lingers). Malformed
-/// legacy payloads are logged and skipped (a stale one is harmless ciphertext).
-/// Pure (no network) for testability.
-fn collect_pending(m: &ProtectedState) -> Vec<(String, OAuthPending)> {
-    let mut out: Vec<(String, OAuthPending)> = Vec::new();
-
-    // 1. Explicit aux.connections — the canonical v3 form.
-    for (conn, c) in aux_connections(m) {
-        if let Some(p) = c.oauth_pending {
-            out.push((conn, p));
-        }
-    }
-
-    // 2. Legacy flat `<conn>_oauth_pending` targets, skipping conns already
-    //    covered by the aux form.
-    for (key, val) in m.targets.iter() {
-        let Some(conn) = conn_from_pending_key(key) else {
-            continue;
-        };
-        if out.iter().any(|(c, _)| c == conn) {
-            continue;
-        }
-        match serde_json::from_slice::<OAuthPending>(val.as_bytes()) {
-            Ok(p) => out.push((conn.to_string(), p)),
-            Err(e) => {
-                tracing::warn!(
-                    item = %key,
-                    "oauth connect: malformed legacy pending payload, skipping: {}", e
-                );
-            }
-        }
-    }
-    out
+/// Collect every in-flight connect from `aux.connecting`. Pure (no network) for
+/// testability.
+fn collect_pending(m: &ProtectedState) -> Vec<(String, Connecting)> {
+    aux_map::<Connecting>(m, "connecting").into_iter().collect()
 }
 
-/// Drive the pending→refresh→delete state machine over an open
-/// `ProtectedState`, given an async `exchange` closure (injected so tests can
-/// avoid real network calls). Mutates `m` in place; returns the number of
-/// connects that completed (a refresh_token was written). On a per-connect
-/// failure it logs and **leaves the pending in place** (the user retries within
-/// the code TTL) — it never aborts the whole batch.
+/// Drive the connecting→refresh→move state machine over an open `ProtectedState`,
+/// given an async `exchange` closure (injected so tests can avoid real network
+/// calls). Mutates `m` in place; returns the number of connects that completed (a
+/// refresh_token was written). On a per-connect failure it logs and **leaves the
+/// `connecting` entry in place** (the user retries within the code TTL) — it never
+/// aborts the whole batch.
 ///
-/// `exchange(conn, cfg, pending)` performs the code→token call and returns the
+/// `exchange(conn, cfg, connecting)` performs the code→token call and returns the
 /// tokens (or an error string to log + skip).
 pub async fn run_pending<F, Fut>(
     services: &crate::service::ServiceRegistry,
@@ -200,54 +166,62 @@ pub async fn run_pending<F, Fut>(
     mut exchange: F,
 ) -> usize
 where
-    F: FnMut(String, ExchangeConfig, OAuthPending) -> Fut,
+    F: FnMut(String, ExchangeConfig, Connecting) -> Fut,
     Fut: std::future::Future<Output = Result<ExchangedTokens, String>>,
 {
     let pending = collect_pending(m);
     let mut completed = 0usize;
     for (conn, p) in pending {
-        let Some(cfg) = resolve_exchange_config(services, &conn) else {
+        let Some(cfg) = resolve_exchange_config(services, &p.service) else {
             tracing::warn!(
                 conn = %conn,
-                "oauth connect: no oauth2 exchange config for connection (unknown/ \
-                 non-oauth2 service or missing provider creds); leaving pending"
+                service = %p.service,
+                "oauth connect: no oauth2 exchange config for the connection's service \
+                 (unknown/non-oauth2 service or missing provider creds); leaving connecting"
             );
             continue;
         };
+        // Capture what the post-exchange MOVE needs before `p` is consumed.
+        let service = p.service.clone();
+        let config = p.config.clone();
+        let role = cfg.secret_role.clone();
         match exchange(conn.clone(), cfg, p).await {
             Ok(tokens) => {
                 if tokens.refresh_token.is_none() {
-                    // No durable credential came back (consent without
-                    // offline access). Nothing to persist; leave pending so
-                    // the user can redo the consent with offline access.
+                    // No durable credential came back (consent without offline
+                    // access). Leave connecting so the user can redo consent.
                     tracing::warn!(
                         conn = %conn,
-                        "oauth connect: exchange returned no refresh_token; leaving pending"
+                        "oauth connect: exchange returned no refresh_token; leaving connecting"
                     );
                     continue;
                 }
-                apply_exchange_result(m, &conn, &tokens);
+                apply_exchange_result(m, &conn, &service, &config, &role, &tokens);
                 completed += 1;
-                tracing::info!(conn = %conn, "oauth connect: refresh_token persisted");
+                tracing::info!(
+                    conn = %conn,
+                    "oauth connect: refresh_token persisted; moved to connections"
+                );
             }
             Err(e) => {
                 // `invalid_grant` ⇒ the code is expired/consumed; leave the
-                // pending so a fresh connect can replace it. Other errors are
-                // transient (network/provider) — also leave + retry.
-                tracing::warn!(conn = %conn, "oauth connect: exchange failed, leaving pending: {}", e);
+                // connecting entry so a fresh connect can replace it. Other errors
+                // are transient (network/provider) — also leave + retry.
+                tracing::warn!(conn = %conn, "oauth connect: exchange failed, leaving connecting: {}", e);
             }
         }
     }
     completed
 }
 
-/// Process all `*_oauth_pending` items for one vault: open the body with the
-/// retained `K`, exchange each pending code, write the refresh_tokens, delete
-/// the pending items, re-seal under the same `K`, and persist `vault.dat`.
+/// Process all in-flight connects (`aux.connecting`) for one vault: open the body
+/// with the retained `K`, exchange each pending code, write the refresh_tokens,
+/// MOVE each entry to `aux.connections`, re-seal under the same `K`, and persist
+/// `vault.dat`.
 ///
 /// Best-effort end-to-end:
 /// - Locked vault (no retained `K`) → skip (the next unlock re-runs this).
-/// - No pending items → no-op (no disk write).
+/// - No pending connects → no-op (no disk write).
 /// - A retained `K` that can't open the body (rotated `K`) → log + skip.
 /// - Per-connect failures are handled by [`run_pending`] (leave + retry).
 ///
@@ -292,8 +266,7 @@ pub async fn process_vault_connects(state: &Arc<AppState>, vault_id: &str) {
         }
     };
 
-    // Cheap pre-check: nothing to do if there are no pending handshakes at all
-    // (checks both the aux.connections form and the legacy flat targets).
+    // Cheap pre-check: nothing to do if there are no in-flight connects.
     if collect_pending(&m).is_empty() {
         return;
     }
@@ -306,7 +279,7 @@ pub async fn process_vault_connects(state: &Arc<AppState>, vault_id: &str) {
             cfg.client_secret.as_deref(),
             &p.code,
             &p.verifier,
-            &p.redirect_uri,
+            &cfg.redirect_uri,
             cfg.style,
         )
         .await
@@ -319,7 +292,7 @@ pub async fn process_vault_connects(state: &Arc<AppState>, vault_id: &str) {
     }
 
     // Re-seal the mutated body under the same K (registry/credentials/wrapped_key
-    // untouched) and persist. No approval op — direct daemon re-seal (§4a).
+    // untouched) and persist. No approval op — direct daemon re-seal (§5).
     if let Err(e) =
         crate::server::handlers::metadata::reseal_body_with_key(&k, &mut vault, &m)
     {
@@ -346,13 +319,12 @@ pub async fn process_vault_connects(state: &Arc<AppState>, vault_id: &str) {
         state.unlock_vault(vault_id.to_string(), cache, k);
     }
 
-    // Propagate to OTHER devices: push the re-sealed blob back to the cloud.
-    // A Google authorization code is single-use, so only THIS daemon could
-    // redeem the pending connect — every other device's daemon must PULL the
-    // resulting refresh_token rather than re-exchange (which fails
-    // `invalid_grant`). Cloud-blind preserved: the pushed blob is ciphertext.
-    // Detached + best-effort, after the write lock drops (push only reads
-    // vault.dat + does HTTP).
+    // Propagate to OTHER devices: push the re-sealed blob back to the cloud. A
+    // Google authorization code is single-use, so only THIS daemon could redeem
+    // the pending connect — every other device's daemon must PULL the resulting
+    // refresh_token rather than re-exchange (which fails `invalid_grant`).
+    // Cloud-blind preserved: the pushed blob is ciphertext. Detached +
+    // best-effort, after the write lock drops (push only reads vault.dat + HTTP).
     {
         let state = state.clone();
         let vid = vault_id.to_string();
@@ -366,13 +338,20 @@ pub async fn process_vault_connects(state: &Arc<AppState>, vault_id: &str) {
 mod tests {
     use super::*;
 
-    fn pending_json(code: &str) -> Vec<u8> {
-        serde_json::to_vec(&serde_json::json!({
-            "code": code,
-            "verifier": "verif-xyz",
-            "redirect_uri": "http://127.0.0.1:8765/callback",
-        }))
-        .unwrap()
+    /// A `ProtectedState` whose `aux.connecting` carries one in-flight connect.
+    /// The rest of the aux is a minimal valid v3 shell (only `connecting` matters
+    /// to these functions).
+    fn with_connecting(conn: &str, service: &str, code: &str) -> ProtectedState {
+        let mut m = ProtectedState::new();
+        m.aux = serde_json::json!({
+            "version": 3,
+            "stores": {},
+            "store_order": [],
+            "connecting": {
+                conn: { "service": service, "code": code, "verifier": "verif-xyz" }
+            }
+        });
+        m
     }
 
     fn tokens(rt: Option<&str>) -> ExchangedTokens {
@@ -383,207 +362,144 @@ mod tests {
         }
     }
 
-    #[test]
-    fn conn_from_pending_key_strips_suffix() {
-        assert_eq!(conn_from_pending_key("gmail_oauth_pending"), Some("gmail"));
-        assert_eq!(conn_from_pending_key("gmail_refresh_token"), None);
-        assert_eq!(conn_from_pending_key("_oauth_pending"), None); // empty conn
-        assert_eq!(conn_from_pending_key("plain"), None);
+    /// The compiled-in defaults include the gmail service + the google provider
+    /// literal, so resolve_exchange_config finds a real config.
+    fn gmail_registry() -> crate::service::ServiceRegistry {
+        crate::service::ServiceRegistry::load()
+    }
+
+    fn empty_config() -> BTreeMap<String, String> {
+        BTreeMap::new()
     }
 
     #[test]
-    fn collect_pending_parses_and_skips_malformed() {
-        let mut m = ProtectedState::new();
-        m.put_target("gmail_oauth_pending", pending_json("code-A"));
-        m.put_target("gdrive_oauth_pending", b"{not json".to_vec());
-        m.put_target("unrelated_key", b"value".to_vec());
-
-        let got = collect_pending(&m);
-        assert_eq!(got.len(), 1, "malformed pending must be skipped");
-        assert_eq!(got[0].0, "gmail");
-        assert_eq!(got[0].1.code, "code-A");
-    }
-
-    // ── aux.connections path (the v3 explicit form) ─────────────────────────
-
-    /// Build a ProtectedState whose `aux.connections` carries one connection
-    /// with an `oauth_pending`. The rest of the aux is a minimal valid v3 shell
-    /// (only the `connections` sub-value matters to these functions).
-    fn with_aux_pending(conn: &str, code: &str) -> ProtectedState {
-        let mut m = ProtectedState::new();
-        m.aux = serde_json::json!({
-            "version": 3,
-            "stores": {},
-            "store_order": [],
-            "connections": {
-                conn: { "oauth_pending": {
-                    "code": code,
-                    "verifier": "verif-xyz",
-                    "redirect_uri": "http://127.0.0.1:8765/callback",
-                }}
-            }
-        });
-        m
-    }
-
-    #[test]
-    fn collect_pending_reads_aux_connections() {
-        let m = with_aux_pending("gmail", "code-AUX");
+    fn collect_pending_reads_aux_connecting() {
+        let m = with_connecting("gmail", "gmail", "code-AUX");
         let got = collect_pending(&m);
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].0, "gmail");
+        assert_eq!(got[0].1.service, "gmail");
         assert_eq!(got[0].1.code, "code-AUX");
     }
 
     #[test]
-    fn collect_pending_aux_wins_over_legacy_duplicate() {
-        // Same conn in BOTH the aux record and a stale legacy flat target →
-        // exactly one entry, carrying the aux code.
-        let mut m = with_aux_pending("gmail", "code-AUX");
-        m.put_target("gmail_oauth_pending", pending_json("code-LEGACY"));
-        let got = collect_pending(&m);
-        assert_eq!(got.len(), 1, "a conn in both sources must de-dupe");
-        assert_eq!(got[0].1.code, "code-AUX", "the aux form wins");
-    }
-
-    #[test]
-    fn collect_pending_unions_aux_and_distinct_legacy() {
-        // Distinct conns from each source both surface.
-        let mut m = with_aux_pending("gmail", "code-AUX");
-        m.put_target("gdrive_oauth_pending", pending_json("code-DRIVE"));
-        let mut got = collect_pending(&m);
-        got.sort_by(|a, b| a.0.cmp(&b.0));
-        assert_eq!(got.len(), 2);
-        assert_eq!(got[0].0, "gdrive");
-        assert_eq!(got[1].0, "gmail");
-    }
-
-    #[test]
-    fn apply_exchange_result_clears_aux_pending_and_drops_record() {
-        let mut m = with_aux_pending("gmail", "code-AUX");
-        apply_exchange_result(&mut m, "gmail", &tokens(Some("rt-NEW")));
-        assert_eq!(m.target("gmail_refresh_token").unwrap(), b"rt-NEW");
-        assert!(
-            aux_connections(&m).is_empty(),
-            "an emptied connection record must be dropped from aux"
-        );
-    }
-
-    #[test]
-    fn apply_exchange_result_clears_both_aux_and_legacy_for_conn() {
-        let mut m = with_aux_pending("gmail", "code-AUX");
-        m.put_target("gmail_oauth_pending", pending_json("code-LEGACY"));
-        apply_exchange_result(&mut m, "gmail", &tokens(Some("rt-NEW")));
-        assert!(
-            m.targets.get("gmail_oauth_pending").is_none(),
-            "legacy flat pending must be cleared"
-        );
-        assert!(aux_connections(&m).is_empty(), "aux pending must be cleared");
-        assert_eq!(m.target("gmail_refresh_token").unwrap(), b"rt-NEW");
-    }
-
-    #[tokio::test]
-    async fn run_pending_success_from_aux_mutates_aux() {
-        let services = gmail_registry();
-        let mut m = with_aux_pending("gmail", "code-AUX");
-
-        let n = run_pending(&services, &mut m, |conn, _cfg, p| {
-            assert_eq!(conn, "gmail");
-            assert_eq!(p.code, "code-AUX");
-            async move { Ok(tokens(Some("rt-NEW"))) }
-        })
-        .await;
-
-        assert_eq!(n, 1);
-        assert!(
-            aux_connections(&m).is_empty(),
-            "aux pending cleared after a successful exchange"
-        );
-        assert_eq!(m.target("gmail_refresh_token").unwrap(), b"rt-NEW");
-    }
-
-    #[tokio::test]
-    async fn run_pending_failure_leaves_aux_pending() {
-        let services = gmail_registry();
-        let mut m = with_aux_pending("gmail", "code-EXPIRED");
-
-        let n = run_pending(&services, &mut m, |_conn, _cfg, _p| async move {
-            Err("oauth2 code-exchange returned HTTP 400 — invalid_grant".to_string())
-        })
-        .await;
-
-        assert_eq!(n, 0);
-        assert!(
-            aux_connections(&m).get("gmail").and_then(|c| c.oauth_pending.as_ref()).is_some(),
-            "aux pending must survive a failed exchange (user retries within TTL)"
-        );
-        assert!(m.targets.get("gmail_refresh_token").is_none());
-    }
-
-    #[test]
-    fn apply_exchange_result_writes_refresh_and_deletes_pending() {
+    fn collect_pending_empty_when_none() {
         let mut m = ProtectedState::new();
-        m.put_target("gmail_oauth_pending", pending_json("code-A"));
-        apply_exchange_result(&mut m, "gmail", &tokens(Some("rt-NEW")));
+        m.aux = serde_json::json!({ "version": 3, "stores": {}, "store_order": [] });
+        assert!(collect_pending(&m).is_empty());
+    }
 
-        assert!(
-            m.targets.get("gmail_oauth_pending").is_none(),
-            "pending must be deleted after exchange"
+    #[test]
+    fn apply_exchange_default_writes_bare_and_moves() {
+        // Default connection: conn == service → bare refresh_token name.
+        let mut m = with_connecting("gmail", "gmail", "code-AUX");
+        apply_exchange_result(
+            &mut m,
+            "gmail",
+            "gmail",
+            &empty_config(),
+            "GMAIL_REFRESH_TOKEN",
+            &tokens(Some("rt-NEW")),
         );
+        assert_eq!(m.target("GMAIL_REFRESH_TOKEN").unwrap(), b"rt-NEW");
+        assert!(
+            aux_map::<Connecting>(&m, "connecting").is_empty(),
+            "connecting entry must be dropped after exchange"
+        );
+        let conns = aux_map::<Connection>(&m, "connections");
+        assert_eq!(conns.get("gmail").map(|c| c.service.as_str()), Some("gmail"));
+    }
+
+    #[test]
+    fn apply_exchange_named_writes_prefixed_address() {
+        // Named connection: conn != service → `<conn>:<ROLE>` address.
+        let mut m = with_connecting("gmail-work", "gmail", "code-AUX");
+        apply_exchange_result(
+            &mut m,
+            "gmail-work",
+            "gmail",
+            &empty_config(),
+            "GMAIL_REFRESH_TOKEN",
+            &tokens(Some("rt-NEW")),
+        );
+        assert_eq!(m.target("gmail-work:GMAIL_REFRESH_TOKEN").unwrap(), b"rt-NEW");
+        assert!(m.targets.get("GMAIL_REFRESH_TOKEN").is_none(), "named conn must not write the bare name");
+        let conns = aux_map::<Connection>(&m, "connections");
+        assert_eq!(conns.get("gmail-work").map(|c| c.service.as_str()), Some("gmail"));
+    }
+
+    #[test]
+    fn apply_exchange_carries_config_into_connection() {
+        let mut cfg = BTreeMap::new();
+        cfg.insert("host".to_string(), "git.acme.com".to_string());
+        let mut m = with_connecting("acme-gitlab", "gitlab", "code-AUX");
+        apply_exchange_result(
+            &mut m,
+            "acme-gitlab",
+            "gitlab",
+            &cfg,
+            "GITLAB_TOKEN",
+            &tokens(Some("rt-NEW")),
+        );
+        let conns = aux_map::<Connection>(&m, "connections");
         assert_eq!(
-            m.target("gmail_refresh_token").unwrap(),
-            b"rt-NEW",
-            "refresh_token must be written under <conn>_refresh_token"
+            conns.get("acme-gitlab").and_then(|c| c.config.get("host")).map(String::as_str),
+            Some("git.acme.com"),
         );
     }
 
     #[test]
-    fn apply_exchange_result_overwrites_existing_refresh_token() {
-        let mut m = ProtectedState::new();
-        m.put_target("gmail_refresh_token", b"rt-OLD".to_vec());
-        m.put_target("gmail_oauth_pending", pending_json("code-A"));
-        apply_exchange_result(&mut m, "gmail", &tokens(Some("rt-NEW")));
-        assert_eq!(m.target("gmail_refresh_token").unwrap(), b"rt-NEW");
-    }
-
-    // ── run_pending state machine, with a mocked exchange (no network) ──────
-
-    fn gmail_registry() -> crate::service::ServiceRegistry {
-        // The compiled-in defaults include the gmail service + the google
-        // provider literal, so resolve_exchange_config finds a real config.
-        crate::service::ServiceRegistry::load()
+    fn apply_exchange_overwrites_existing_refresh_token() {
+        let mut m = with_connecting("gmail", "gmail", "code-A");
+        m.put_target("GMAIL_REFRESH_TOKEN", b"rt-OLD".to_vec());
+        apply_exchange_result(
+            &mut m,
+            "gmail",
+            "gmail",
+            &empty_config(),
+            "GMAIL_REFRESH_TOKEN",
+            &tokens(Some("rt-NEW")),
+        );
+        assert_eq!(m.target("GMAIL_REFRESH_TOKEN").unwrap(), b"rt-NEW");
     }
 
     #[tokio::test]
-    async fn run_pending_success_completes_and_mutates() {
+    async fn run_pending_success_moves_and_writes() {
         let services = gmail_registry();
-        let mut m = ProtectedState::new();
-        m.put_target("gmail_oauth_pending", pending_json("code-A"));
+        let role = services.service_env_key("gmail").expect("gmail has a secret role");
+        let mut m = with_connecting("gmail", "gmail", "code-AUX");
 
-        let mut seen_grant = None;
+        let mut seen = None;
         let n = run_pending(&services, &mut m, |conn, cfg, p| {
-            seen_grant = Some((conn.clone(), cfg.token_url.clone(), p.code.clone()));
+            seen = Some((conn.clone(), cfg.token_url.clone(), cfg.redirect_uri.clone(), p.code.clone()));
             async move { Ok(tokens(Some("rt-NEW"))) }
         })
         .await;
 
         assert_eq!(n, 1);
-        assert!(m.targets.get("gmail_oauth_pending").is_none());
-        assert_eq!(m.target("gmail_refresh_token").unwrap(), b"rt-NEW");
-        let (conn, token_url, code) = seen_grant.expect("exchange called");
+        assert!(aux_map::<Connecting>(&m, "connecting").is_empty(), "connecting cleared");
+        assert_eq!(
+            aux_map::<Connection>(&m, "connections").get("gmail").map(|c| c.service.clone()),
+            Some("gmail".to_string()),
+        );
+        assert_eq!(m.target(&role).unwrap(), b"rt-NEW");
+        let (conn, token_url, redirect_uri, code) = seen.expect("exchange called");
         assert_eq!(conn, "gmail");
-        assert_eq!(code, "code-A");
+        assert_eq!(code, "code-AUX");
         assert!(
             token_url.starts_with("https://oauth2.googleapis.com/token"),
             "token_url must come from the google provider literal, got {token_url}"
         );
+        assert!(
+            redirect_uri.starts_with("http://127.0.0.1"),
+            "redirect_uri must come from the provider/loopback default, got {redirect_uri}"
+        );
     }
 
     #[tokio::test]
-    async fn run_pending_failure_leaves_pending() {
+    async fn run_pending_failure_leaves_connecting() {
         let services = gmail_registry();
-        let mut m = ProtectedState::new();
-        m.put_target("gmail_oauth_pending", pending_json("code-EXPIRED"));
+        let mut m = with_connecting("gmail", "gmail", "code-EXPIRED");
 
         let n = run_pending(&services, &mut m, |_conn, _cfg, _p| async move {
             Err("oauth2 code-exchange returned HTTP 400 — invalid_grant".to_string())
@@ -592,20 +508,16 @@ mod tests {
 
         assert_eq!(n, 0, "a failed exchange completes nothing");
         assert!(
-            m.targets.get("gmail_oauth_pending").is_some(),
-            "pending must survive a failed exchange (user retries within TTL)"
+            aux_map::<Connecting>(&m, "connecting").contains_key("gmail"),
+            "connecting must survive a failed exchange (user retries within TTL)"
         );
-        assert!(
-            m.targets.get("gmail_refresh_token").is_none(),
-            "no refresh_token on a failed exchange"
-        );
+        assert!(aux_map::<Connection>(&m, "connections").is_empty());
     }
 
     #[tokio::test]
-    async fn run_pending_no_refresh_token_leaves_pending() {
+    async fn run_pending_no_refresh_token_leaves_connecting() {
         let services = gmail_registry();
-        let mut m = ProtectedState::new();
-        m.put_target("gmail_oauth_pending", pending_json("code-A"));
+        let mut m = with_connecting("gmail", "gmail", "code-A");
 
         let n = run_pending(&services, &mut m, |_conn, _cfg, _p| async move {
             Ok(tokens(None)) // consent without offline access → no refresh_token
@@ -614,16 +526,15 @@ mod tests {
 
         assert_eq!(n, 0);
         assert!(
-            m.targets.get("gmail_oauth_pending").is_some(),
-            "no durable token ⇒ leave pending"
+            aux_map::<Connecting>(&m, "connecting").contains_key("gmail"),
+            "no durable token ⇒ leave connecting"
         );
     }
 
     #[tokio::test]
-    async fn run_pending_unknown_service_leaves_pending() {
+    async fn run_pending_unknown_service_leaves_connecting() {
         let services = gmail_registry();
-        let mut m = ProtectedState::new();
-        m.put_target("nosuchservice_oauth_pending", pending_json("code-A"));
+        let mut m = with_connecting("whatever", "nosuchservice", "code-A");
 
         let mut called = false;
         let n = run_pending(&services, &mut m, |_conn, _cfg, _p| {
@@ -634,7 +545,7 @@ mod tests {
 
         assert_eq!(n, 0);
         assert!(!called, "exchange must not run when no config resolves");
-        assert!(m.targets.get("nosuchservice_oauth_pending").is_some());
+        assert!(aux_map::<Connecting>(&m, "connecting").contains_key("whatever"));
     }
 
     #[test]
@@ -650,6 +561,8 @@ mod tests {
         // The public Desktop client ships a (non-confidential) secret.
         assert!(cfg.client_secret.is_some());
         assert!(matches!(cfg.style, OAuthStyle::Form));
+        assert!(cfg.redirect_uri.starts_with("http://127.0.0.1"));
+        assert!(!cfg.secret_role.is_empty(), "gmail recipe declares a secret role");
     }
 
     #[test]

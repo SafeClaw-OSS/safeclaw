@@ -610,15 +610,20 @@ pub async fn approve_op(
                     .get(&op_id)
                     .and_then(|r| r.policy_context.clone());
                 if let Some(pc) = pc_for_cache {
-                    let svc = validated
+                    // Key the resolved-secret cache by the **connection**
+                    // (CONNECTION_SCHEMA.md §6) so two accounts of one service
+                    // never share a slot. Falls back to `service` for the default
+                    // connection (conn == service).
+                    let conn = validated
                         .op
                         .act
                         .scope
-                        .get("service")
+                        .get("connection_id")
+                        .or_else(|| validated.op.act.scope.get("service"))
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string();
-                    if !svc.is_empty() {
+                    if !conn.is_empty() {
                         let now = SystemTime::now()
                             .duration_since(UNIX_EPOCH)
                             .map(|d| d.as_secs())
@@ -631,7 +636,7 @@ pub async fn approve_op(
                         if expires_at != Some(0) {
                             state.cache_insert(
                                 &vault_id,
-                                &svc,
+                                &conn,
                                 outcome.s_o.clone(),
                                 expires_at,
                             );
@@ -858,16 +863,20 @@ pub async fn approve_op(
     //     is a no-op then)
     if let Some(pc) = policy_ctx_for_cache {
         if pc.level == crate::core::policy::AccessLevel::Ask {
-            let svc = validated
+            // The grant is scoped to the **connection** (CONNECTION_SCHEMA.md §6):
+            // approving account A's request never fast-paths account B. Falls back
+            // to `service` for the default connection (conn == service).
+            let conn = validated
                 .op
                 .act
                 .scope
-                .get("service")
+                .get("connection_id")
+                .or_else(|| validated.op.act.scope.get("service"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
             // Method scopes the grant (a read-approval can't fast-path a
-            // later write). Pulled off the op's scope, same as `service`.
+            // later write). Pulled off the op's scope, same as `connection_id`.
             let req_method = validated
                 .op
                 .act
@@ -876,10 +885,10 @@ pub async fn approve_op(
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            if !svc.is_empty() && !req_method.is_empty() {
+            if !conn.is_empty() && !req_method.is_empty() {
                 state.record_ask_approval(
                     &rec_vault_id,
-                    &svc,
+                    &conn,
                     pc.rule_id,
                     &req_method,
                     pc.ttl_seconds,
@@ -976,6 +985,15 @@ pub(crate) fn bootstrap_cache_from_view(
     let mut cache = SecretsCache::default();
     cache.policy_defaults = view.aux.policy_defaults.clone();
     cache.audit_retention_days = view.aux.audit_retention_days;
+    // Routing snapshot (CONNECTION_SCHEMA.md §6): `connection_id → {service,
+    // config}`. The per-service loop below bootstraps every *default* connection
+    // (conn == service); a second pass after it covers *named* connections.
+    cache.connections = view
+        .aux
+        .connections
+        .iter()
+        .map(|(c, conn)| (c.clone(), conn.clone()))
+        .collect();
     // Snapshot native-store item names (names only, never values). Surface
     // for GET /v/{vid}/keys-known so the frontend can compute "which
     // services are reachable" without re-walking the kv map.
@@ -1083,6 +1101,57 @@ pub(crate) fn bootstrap_cache_from_view(
         cache
             .policy_rules
             .insert(service_id.to_string(), merged);
+    }
+
+    // Named connections (`conn_id != service_id`) carry namespaced secrets
+    // `<conn>:<ROLE>` (CONNECTION_SCHEMA.md §3). The per-service loop above
+    // already covered every default connection (conn == service, bare name);
+    // here we add the named ones, keyed by connection_id, resolving each role at
+    // its §3 address but storing the multi-secret map under the BARE name so the
+    // render path matches `{{secret.<role>}}`. (Allow-level only — ask-level
+    // connections resolve lazily from the op's namespaced `target` at approve.)
+    for (conn, c) in view.aux.connections.iter() {
+        let service = &c.service;
+        if conn == service {
+            continue; // default — already bootstrapped above
+        }
+        if state.services.default_read_level(service)
+            != crate::core::policy::AccessLevel::Allow
+        {
+            continue;
+        }
+        if let Some(role) = state.services.service_env_key(service) {
+            let addr = crate::storage::plaintext::secret_address(conn, service, &role);
+            if let Some(val) = view.resolve_value_native(&addr) {
+                cache.entries.insert(
+                    conn.clone(),
+                    crate::state::CacheEntry { value: val.to_vec(), expires_at: None },
+                );
+            }
+        }
+        if let Some(svc) = state.services.get(service) {
+            if let Some(u) = svc.upstream.first() {
+                let mut names = crate::server::broker::referenced_secrets(&u.url);
+                for v in u.headers.values().chain(u.query.values()) {
+                    for n in crate::server::broker::referenced_secrets(v) {
+                        if !names.contains(&n) {
+                            names.push(n);
+                        }
+                    }
+                }
+                let mut map: std::collections::HashMap<String, Vec<u8>> =
+                    std::collections::HashMap::new();
+                for name in names {
+                    let addr = crate::storage::plaintext::secret_address(conn, service, &name);
+                    if let Some(val) = view.resolve_value_native(&addr) {
+                        map.insert(name, val.to_vec()); // bare name → render match
+                    }
+                }
+                if !map.is_empty() {
+                    cache.allow_secrets.insert(conn.clone(), map);
+                }
+            }
+        }
     }
     cache
 }

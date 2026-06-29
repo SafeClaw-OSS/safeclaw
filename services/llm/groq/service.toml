@@ -7,11 +7,11 @@ category = "llm"
 [[upstream]]
 id = "default"
 url = "https://api.groq.com/openai/v1"
-auth = { env = "groq_api_key", placeholder = "gsk_..." }
+auth = { env = "GROQ_API_KEY", placeholder = "gsk_..." }
 locked = { response = "Please unlock the SafeClaw vault to use this service." }
 
   [upstream.headers]
-  Authorization = "Bearer {{secret.groq_api_key}}"
+  Authorization = "Bearer {{secret.GROQ_API_KEY}}"
 
 [[api]]
 path = "*"
