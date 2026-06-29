@@ -4,7 +4,7 @@ use std::sync::Arc;
 use clap::Parser;
 use safeclaw::cli;
 use safeclaw::config::{Cli, Command, Config, ServeArgs};
-use safeclaw::server::admin_router;
+use safeclaw::server::app_router;
 use safeclaw::state::AppState;
 
 #[tokio::main]
@@ -228,9 +228,9 @@ async fn run_daemon(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     // Single port (2026-06-23 zero-inbound pivot): control + broker planes
     // share one listener. The broker routes (use/stream/export) carry the
     // agent-key gate inside the router; control routes (op/approve/passkeys/
-    // admin) keep their passkey / X-Admin-Key gating. See server::admin_router.
+    // admin) keep their passkey / X-Admin-Key gating. See server::app_router.
     let addr = SocketAddr::new(listen_ip, config.port);
-    let app = admin_router(state.clone());
+    let app = app_router(state.clone());
 
     tracing::info!(
         listen = %addr,

@@ -136,7 +136,7 @@ ActType vocabulary 跟随 `sudp` 上游：`Enroll / Write / Rotate / Revoke / Ex
 
 **`reveal` 已废弃。** 历史的 "reveal = plaintext export to R" mode 已并入 `export` + "custodian-as-recipient" 部署模式：当 R 无 KEM 能力时，custodian 自己生成 ephemeral keypair、自己充当 recipient、execute_export → decap → 业务层用明文（如转给 agent over TLS）。custodian 显式承担"我把 secret 给出去了"的安全责任，paper 不打折，footgun 在 [[approve-ui-ownership-transfer]] UI 警告里显式化。
 
-**Use op** 不再走 `proxy port :23295`（已废弃）；直接走 `POST /v/{vid}/use/<svc>/<rest>` R-side sugar（§4.1），内部 compile 成 Use op 后 redemption 阶段汇流到 `POST /op/{op_id}/approve`。
+**Use op** 走 `ANY /v/{vid}/use/<svc>/<rest>` R-side sugar（§4.1，单端口 `:23294`；独立 proxy port `:23295` 已**移除**），内部 compile 成 Use op 后 redemption 阶段汇流到 `POST /op/{op_id}/approve`。
 
 ### 3.3 Type-specific `act.scope` schemas
 
@@ -444,7 +444,9 @@ Response: 200 OK, body = { value: <s as plaintext string> }
 
 **不适用**：跨 trust boundary 投递严格 secret（用 export）；migration 跨设备的 self-import（用 export with U's own pk）。
 
-### 4.6 Proxy port (separate)
+### 4.6 Proxy port (separate) — ⚠️ REMOVED (2026-06-29)
+
+> **此节(含 §4.6.1)描述的设计已移除。** 2026-06-23 pivot 后 daemon **单端口**(`:23294`)——独立 proxy port `:23295` 已删;broker 现为 `ANY /v/{vid}/use/<svc>/<rest>`(REST,§4.1),审批为 `POST /op/{op_id}/approve`,审批 UI 在 safeclaw.pro(daemon 零公网入站)。下文的 `:23295`、`safeclaw-vault` 虚拟服务、`/approve`、`/grant` 均为 legacy 名 —— **以 §4.0/§4.1 + 代码为准**。
 
 Agent (R) 通过 `:23295/<service>/...` 发请求。Daemon 的处理流程（详 `src/core/router.rs::proxy_handler`）：
 

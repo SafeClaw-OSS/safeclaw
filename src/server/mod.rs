@@ -43,7 +43,7 @@ use crate::state::AppState;
 /// 256 KB is ample for any legitimate operation descriptor or grant.
 const MAX_BODY_BYTES: usize = 256 * 1024;
 
-pub fn admin_router(state: Arc<AppState>) -> Router {
+pub fn app_router(state: Arc<AppState>) -> Router {
     // ── Control plane ────────────────────────────────────────────────────
     // Vault lifecycle, op approval, passkeys, registry, admin. NOT agent-key
     // gated: op/approve is gated by the op_id + passkey signature (the passkey
@@ -97,7 +97,7 @@ pub fn admin_router(state: Arc<AppState>) -> Router {
 }
 
 /// The agent-key-gated broker sub-router. Split out so the gate is a layer on
-/// these four routes only — the control routes in `admin_router` keep their own
+/// these four routes only — the control routes in `app_router` keep their own
 /// (passkey / X-Admin-Key / auth-free-localhost) gating untouched.
 fn broker_router(state: Arc<AppState>) -> Router {
     use crate::proxy::{env, stream, use_broker};
