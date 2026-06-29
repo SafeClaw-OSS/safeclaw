@@ -209,6 +209,35 @@ pub async fn execute_use_forward(
     Ok(UseForwardOutcome { response, s_o })
 }
 
+/// Resolve a Use operation's primary secret WITHOUT forwarding — the streaming
+/// captive-portal authorize path (`/stream/` ask policy). Opens the vault with
+/// the already-verified grant, resolves `op.act.target`, and returns the bytes
+/// for the caller to stash (cache) so the agent's *retried* stream can consume
+/// them. No upstream call happens here: the real request rides the retry stream,
+/// not this op (which carries no body). Mirrors the open+resolve preamble of
+/// [`execute_use_forward`] minus the forward.
+pub async fn resolve_use_primary(
+    op: &Operation,
+    wrapping_key: &[u8],
+    credential_id_bytes: &[u8],
+    vault: &SealedVault,
+) -> Result<Vec<u8>> {
+    let redeemed = RedeemedGrant {
+        o: op.clone(),
+        credential_id: credential_id_bytes.to_vec(),
+        wrapping_key: WrappingKey::from_bytes(wrapping_key.to_vec()),
+        opt: GrantOpt::default(),
+    };
+    let opened = open::<StdPrimitives>(&redeemed, vault)
+        .map_err(|e| AppError::Unauthorized(format!("vault open: {}", e)))?;
+    let view = VaultPlaintextView::from_protected_state(&opened.m)?;
+    view.resolve_value_async(&op.act.target)
+        .await?
+        .ok_or_else(|| {
+            AppError::BadRequest(format!("secret '{}' not found in vault", op.act.target))
+        })
+}
+
 // ── v3 multi-secret template engine ──────────────────────────────────────────
 //
 // The grant's wrapping key opens the WHOLE vault into a plaintext view, so a

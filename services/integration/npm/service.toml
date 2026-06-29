@@ -1,0 +1,51 @@
+[service]
+id = "npm"
+name = "npm"
+sub = "npm publish"
+category = "integration"
+
+# `npm publish` is a single token-authenticated `PUT {registry}/{package}` — the
+# same shape as git-over-HTTPS, so it rides the generic streaming passthrough
+# (/stream/). npm runs locally (it has the package); only the authenticated
+# upload egress is routed through SafeClaw, which injects the real npm token. npm
+# never sees the token. Unlike cargo, npm needs no separate index handshake — a
+# pure `--registry` passthrough.
+
+[[upstream]]
+id = "publish"
+url = "https://registry.npmjs.org"
+stream = true
+auth = { secret = "NPM_TOKEN", placeholder = "npm_..." }
+
+  [upstream.headers]
+  Authorization = "Bearer {{secret.NPM_TOKEN}}"
+
+# Publishing is effectively irreversible (unpublish is restricted) → passkey for
+# EVERY publish. ask-always + the streaming captive-portal
+# (docs/STREAMING_APPROVAL.md).
+[policy.levels]
+read = "ask-always"
+write = "ask-always"
+
+[setup]
+goal = "Route `npm publish` through SafeClaw so the npm token never enters .npmrc, env, or the agent process."
+route = "{{proxy_base}}/stream/npm/"
+auth = "feed the broker key (NOT the real token) as the registry-scoped _authToken, value $SAFECLAW_API_KEY"
+example = """
+# Point npm at SafeClaw and it proxies the publish upload, injecting the real
+# npm token server-side. npm authenticates to SafeClaw with the broker key.
+#
+# .npmrc (project or ~/.npmrc) — set the registry and feed the broker key as its
+# scoped auth token (SafeClaw swaps in the real npm token):
+#   registry={{route}}
+#   //<broker-host:port>/stream/npm/:_authToken=${SAFECLAW_API_KEY}
+#
+# or per-invocation:
+npm publish --registry {{route}}
+
+# When SafeClaw asks for approval you'll get a link (agent prompt + npm error
+# output) — tap your passkey, then re-run.
+#
+# Use an npm *automation* token (it bypasses 2FA-on-publish; the broker can't
+# supply an interactive OTP).
+"""

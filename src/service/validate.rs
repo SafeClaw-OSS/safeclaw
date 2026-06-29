@@ -251,27 +251,11 @@ pub fn validate_recipe(toml_str: &str, first_party: bool) -> Result<(), Vec<Stri
         }
     }
 
-    // Streaming services must be allow-policy. A streamed body (e.g. a git
-    // packfile) is live — it can't be paused to run the per-request passkey
-    // ceremony — so `stream.rs` only serves allow-level streaming services.
-    // Reject a declared non-allow level at LOAD time rather than failing
-    // opaquely at request time. (Approval-gated streaming is a future pre-grant
-    // *window*, not per-request — GIT_INTEGRATION.md §7.1.)
-    if def.upstream.iter().any(|u| u.stream) {
-        if let Some(levels) = def.policy.as_ref().and_then(|p| p.levels.as_ref()) {
-            for key in ["read", "write"] {
-                if let Some(level) = levels.get(key) {
-                    if level != "allow" {
-                        errs.push(format!(
-                            "streaming service declares {} = \"{}\"; streaming requires \"allow\" \
-                             (a live stream can't be gated by per-request approval)",
-                            key, level
-                        ));
-                    }
-                }
-            }
-        }
-    }
+    // Streaming services may be allow OR ask / ask-always. A live stream can't
+    // be paused for the 202+poll dance, so for ask policies `stream.rs` uses the
+    // captive-portal pattern (reject-before-forward → approve link → user taps →
+    // retry, single-use for ask-always) — see docs/STREAMING_APPROVAL.md. So
+    // there is no level restriction at load time anymore.
 
     if errs.is_empty() {
         Ok(())
@@ -423,7 +407,7 @@ auth = { env = "telegram_bot_token" }
     }
 
     #[test]
-    fn streaming_requires_allow_policy() {
+    fn streaming_allows_ask_policy_via_captive_portal() {
         const STREAM: &str = r#"
 [service]
 id = "git-host"
@@ -442,13 +426,16 @@ Authorization = "Basic {{secret.github_token | basic}}"
         // Explicit allow → OK.
         let ok = format!("{}\n[policy.levels]\nread = \"allow\"\nwrite = \"allow\"\n", STREAM);
         assert!(validate_recipe(&ok, true).is_ok());
-        // A non-allow level on a streaming service is rejected at load time.
-        let bad = format!("{}\n[policy.levels]\nread = \"ask\"\nwrite = \"allow\"\n", STREAM);
-        let errs = validate_recipe(&bad, true).unwrap_err();
+        // ask / ask-always are now valid for streaming: the captive-portal path
+        // (docs/STREAMING_APPROVAL.md) gates them with a per-stream passkey.
+        let ask = format!(
+            "{}\n[policy.levels]\nread = \"ask-always\"\nwrite = \"ask-always\"\n",
+            STREAM
+        );
         assert!(
-            errs.iter().any(|e| e.contains("streaming requires \"allow\"")),
-            "{:?}",
-            errs
+            validate_recipe(&ask, true).is_ok(),
+            "ask-always streaming should validate: {:?}",
+            validate_recipe(&ask, true)
         );
     }
 

@@ -326,29 +326,18 @@ async fn handle_impl(
         valid: Valid::single_use(now, Some(now + 300)), // 5-minute pending TTL; matches ApprovalStore.
     };
 
-    let ip: IpAddr = addr.ip();
-    let r = {
-        let mut store = state.challenges.lock().unwrap();
-        store.issue(ip).ok_or(AppError::TooManyRequests)?
-    };
-    // Stamp the policy decision on the pending op so the approve handler
-    // can populate the secrets_cache per PROTOCOL.md §6.2:
+    // Stamp the policy decision on the pending op so the approve handler can
+    // populate the secrets_cache per PROTOCOL.md §6.2:
     //   - Ask: cache the resolved s_o for `ttl_seconds` after forward.
-    //   - Allow: cache forever (until lock). This branch only fires for
-    //     Allow + cache MISS (the fast-path above already covered cache
-    //     hits) — typical example: an `allow` service whose secret lives
-    //     in an external store (GCP) that wasn't pre-resolved at unlock.
-    //   - AskAlways: explicit None → no cache write (the bytes get
-    //     fresh-decrypted per request and dropped after forward).
+    //   - Allow: cache forever (until lock). This branch only fires for Allow +
+    //     cache MISS (the fast-path above already covered hits).
+    //   - AskAlways: explicit None → no cache write (fresh-decrypt per request).
     let policy_context = match level {
-        AccessLevel::Ask => {
-            let ttl = level_ask_ttl.unwrap_or(300);
-            Some(crate::approval::PolicyContext {
-                level: AccessLevel::Ask,
-                rule_id: matched_rule_id.clone(),
-                ttl_seconds: ttl,
-            })
-        }
+        AccessLevel::Ask => Some(crate::approval::PolicyContext {
+            level: AccessLevel::Ask,
+            rule_id: matched_rule_id.clone(),
+            ttl_seconds: level_ask_ttl.unwrap_or(300),
+        }),
         AccessLevel::Allow => Some(crate::approval::PolicyContext {
             level: AccessLevel::Allow,
             rule_id: matched_rule_id.clone(),
@@ -357,42 +346,8 @@ async fn handle_impl(
         _ => None,
     };
 
-    let (op_id, expires_at) = {
-        let mut store = state.approvals.lock().unwrap();
-        let id = store.create_with_policy(vault_id.clone(), op.clone(), r.clone(), policy_context);
-        let exp = store.get(&id).map(|r| r.expires_at_unix).unwrap_or(0);
-        (id, exp)
-    };
-
-    // Persist `pending` audit row (mirror of op.rs::create path; this is the
-    // /use sugar variant that wraps op-create internally).
-    if let Ok(audit_store) = state.audits.for_vault(&vault_id) {
-        let row = audit::row_from_op(&op_id, &op, now as i64, expires_at as i64);
-        if let Err(e) = audit_store.insert(&row) {
-            tracing::warn!(vault = %vault_id, op = %op_id, "audit insert pending (use) failed: {}", e);
-        }
-    }
-
-    // Slice-2 web approval: register this Use op with the cloud op-relay (if
-    // configured) and poll for the browser-deposited sealed grant. No-op when
-    // relay_url is unset (purely local daemon).
-    crate::relay::client::spawn_register_and_poll(
-        state.clone(),
-        vault_id.clone(),
-        op_id.clone(),
-        serde_json::to_value(&op).unwrap_or(Value::Null),
-        r.clone(),
-        expires_at,
-    );
-
-    state.emit_event(ApprovalEvent {
-        vault_id: vault_id,
-        approval_id: op_id.clone(),
-        kind: "pending".into(),
-        op_summary: Some(serde_json::to_value(&op).unwrap_or(Value::Null)),
-        response_preview: None,
-        reason: None,
-    });
+    let (op_id, r, expires_at) =
+        register_pending_use(&state, &vault_id, op, policy_context, addr.ip())?;
 
     Ok((
         StatusCode::ACCEPTED,
@@ -401,14 +356,79 @@ async fn handle_impl(
             "op_id": op_id,
             "r": r,
             "expires_at": expires_at,
-            // Human taps their passkey here. Absolute cloud `/grant/{id}` page
-            // when paired (the remote agent's user can't reach this localhost
-            // daemon); relative local op-page for self-host. See active::grant_url.
+            // Human taps their passkey here (cloud /grant page when paired;
+            // relative local op-page for self-host). See active::grant_url.
             "approve_url": crate::cli::active::grant_url(&op_id),
             // Agent polls the LOCAL daemon (relative; resolves against VAULT_URL).
             "poll_url": format!("/op/{}", op_id),
         })),
     ))
+}
+
+/// Shared tail of the Use pending-op flow, used by BOTH the buffered `/use/`
+/// handler and the streaming captive-portal (`/stream/` ask path): issue the
+/// challenge `r`, create the `ApprovalRecord` (stamped with the policy context
+/// the approve handler reads for its cache write), persist the `pending` audit
+/// row, register with the cloud op-relay, and emit the `pending` SSE event the
+/// agent watches. Returns `(op_id, r, expires_at)`.
+///
+/// Keeping this one function shared is what prevents the two planes' approval
+/// logic from drifting (the gap that left `/stream/` allow-only): both compile
+/// their own `Operation` (buffered carries the body; streaming sets
+/// `scope.authorize_only`), then funnel through here.
+pub(crate) fn register_pending_use(
+    state: &Arc<AppState>,
+    vault_id: &str,
+    op: Operation,
+    policy_context: Option<crate::approval::PolicyContext>,
+    ip: IpAddr,
+) -> Result<(String, String, u64)> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let r = {
+        let mut store = state.challenges.lock().unwrap();
+        store.issue(ip).ok_or(AppError::TooManyRequests)?
+    };
+
+    let (op_id, expires_at) = {
+        let mut store = state.approvals.lock().unwrap();
+        let id =
+            store.create_with_policy(vault_id.to_string(), op.clone(), r.clone(), policy_context);
+        let exp = store.get(&id).map(|rec| rec.expires_at_unix).unwrap_or(0);
+        (id, exp)
+    };
+
+    if let Ok(audit_store) = state.audits.for_vault(vault_id) {
+        let row = audit::row_from_op(&op_id, &op, now as i64, expires_at as i64);
+        if let Err(e) = audit_store.insert(&row) {
+            tracing::warn!(vault = %vault_id, op = %op_id, "audit insert pending (use) failed: {}", e);
+        }
+    }
+
+    // Slice-2 web approval: register with the cloud op-relay (if configured) and
+    // poll for the browser-deposited sealed grant. No-op when relay_url is unset.
+    crate::relay::client::spawn_register_and_poll(
+        state.clone(),
+        vault_id.to_string(),
+        op_id.clone(),
+        serde_json::to_value(&op).unwrap_or(Value::Null),
+        r.clone(),
+        expires_at,
+    );
+
+    state.emit_event(ApprovalEvent {
+        vault_id: vault_id.to_string(),
+        approval_id: op_id.clone(),
+        kind: "pending".into(),
+        op_summary: Some(serde_json::to_value(&op).unwrap_or(Value::Null)),
+        response_preview: None,
+        reason: None,
+    });
+
+    Ok((op_id, r, expires_at))
 }
 
 /// Every distinct vault item the recipe's templates reference, scanned across
