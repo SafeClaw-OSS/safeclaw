@@ -26,6 +26,11 @@
   authorization.
 - The **cloud** = blind blob storage + op-relay (approval) + an `audit_events`
   table + auth/billing. **No cloud daemon.**
+- **The cloud holds no `K`** — it stores the sealed blob but can neither read nor
+  **write** the vault's content (it can only withhold / roll back / garble the
+  ciphertext, which `version` + CAS + the daemon's retained-`K` bound). So "who can
+  change a vault" = **exactly the `K`-holding devices** (the daemon + an unlocked
+  browser). A compromised cloud cannot inject anything *into* a vault.
 - **Approvals** (an agent `/use` that needs a passkey) = the **op-relay**: the
   local daemon registers the op + polls; the user approves on `safeclaw.pro`; the
   grant is deposited; the daemon applies it. **[SHIPPED]** (`relay/client.rs` +
@@ -105,28 +110,33 @@ registry/connections/entries — is a blob-op any unlocked device performs.
   same append-only, rows become ciphertext. Add only if the "cloud sees nothing"
   story ever needs to be that hard.
 
-## 5. Passkey add / remove (the hard part)
+## 5. Passkey add / remove — reuse the existing scheme (NOT a big build)
+
+**The TS crypto already exists.** The frontend depends on `@sudp-protocol/authorizer`
+and `vault-grant.ts` enroll already **wraps `K` under a credential**:
+`freshDek()` → `deriveWrappingKey(passkey PRF) = W_c` → `aeadSeal(W_c, K) =
+wrapped_key`. Adding a passkey is the *same primitive* applied to a second cred —
+no Rust→TS port, minimal/no `@sudp-protocol` extend.
 
 - **LIST:** console reads credentials from the **decrypted blob.** No daemon.
-- **ADD (same unlocked session):** the unlocked browser has `K` → wraps `K` under
-  the new credential's pubkey (HPKE) → adds the `SealedCredential` to the blob →
-  re-seals → PUT (sync). The unlock **is** the authorization.
-- **ADD (a brand-new device that can't decrypt yet):** the new device drops its
-  pubkey into the blob as a `pending` entry; the next time an already-unlocked
-  device (browser OR daemon) syncs, it wraps `K` under that pending pubkey +
-  finalizes + re-seals.
-- 🔴 **SECURITY INVARIANT — wrapping `K` under a new key ALWAYS requires an
-  explicit, authenticated user action on an unlocked device:**
-  - same-session add → the user's unlock authorizes it;
-  - cross-device pending → the user must **explicitly confirm the join** on an
-    unlocked device ("a new device wants to join — approve?"). **NEVER auto-wrap a
-    pending on sync.** Otherwise a compromised cloud (or anyone who can write the
-    blob) injects a pending pubkey → auto-wrap → **full vault takeover.**
-  - This gate exists today in `approve.rs` (pending-passkey is an approval op).
-    **Preserve it** when moving to the blob-op model.
-- **Crypto:** porting "wrap `K` under a new cred" from Rust
-  (`pending_passkey.rs` / `approve.rs`) to TS (frontend) is the core build + the
-  main correctness risk. Verify byte-for-byte against the Rust path.
+- **ADD (same unlocked session):** the unlocked browser already holds `K` → derive
+  the new cred's `W_c` → `aeadSeal(W_c_new, K)` → add the `SealedCredential` to the
+  blob → re-seal → PUT (sync). The unlock **is** the authorization.
+  - *Today this instead POSTs a grant (`W_c`) to the daemon, which does the wrap —
+    a SaaS-model artifact from when the browser did NOT hold `K` (`K` lived on the
+    cloud daemon). In the local model the browser holds `K`, so it wraps directly.*
+- **ADD (a brand-new device that can't decrypt yet — no `K`):** the **existing
+  multi-passkey HPKE-deposit scheme** — the new device deposits its pubkey
+  HPKE-sealed (`hpkeSeal`, already in TS) via a deposit channel; an existing device
+  *with* `K` (the daemon, or an unlocked browser) processes it **after the user
+  approves the join** → wraps `K` → adds. **Keep this scheme unchanged; don't
+  reinvent it.**
+- **Security (corrected):** the cloud cannot write the sealed blob (no `K`, §1), so
+  it cannot inject a credential into a vault. The one invariant to **preserve** is
+  the existing scheme's approval gate: an existing device must **never auto-wrap a
+  cross-device deposit without the user OK-ing the new device** (else a bad deposit
+  on the separate channel → takeover). That gate lives in `approve.rs` today — keep
+  it. Plus daemon-pubkey pinning (§6.2).
 - **REMOVE a passkey:** blob-op (drop the `SealedCredential`, re-seal). Removing a
   passkey does **not** rotate `K` (1P model) — a removed device that retained `K`
   could still open an OLD blob copy; revoke is best-effort. (Already the model.)
@@ -159,13 +169,13 @@ registry/connections/entries — is a blob-op any unlocked device performs.
 |---|---|---|
 | **Backend** (前后端) | delete all §3 forwards + `DAEMON_URL`/`DAEMON_PROXY_URL`/`daemonAdmin`/`daemonProxy`; `handleSkillMd` delete; `/menu` static-or-delete; **add `audit_events`** (migration + RLS + retention + the daemon-push endpoint + console query) | mechanical + the audit table |
 | **Daemon** (Rust) | the **audit shipper** (local-first outbox → Supabase push, dedup, `synced` flag); single-port + op-page already in **v1.0.24** | the audit shipper = the new daemon work |
-| **Frontend** (console) | passkey add/remove + any residual vault ops → **client-side blob-ops** (the `K`-wrap port = the hard part); registry/passkeys/connections from the decrypted blob; pending-approvals + live state via Realtime | **the heavy build** |
+| **Frontend** (console) | passkey add/remove + residual vault ops → **client-side blob-ops** (the `K`-wrap TS primitive ALREADY exists — enroll uses it; mostly a *refactor*: wrap client-side + write blob, instead of POSTing a grant to the daemon); registry/passkeys/connections from the decrypted blob; pending-approvals + live state via Realtime | moderate (reuse, not new crypto) |
 | **Infra** (user) | retire the VM daemon services **LAST**; decide VM keep-as-Caddy-shell vs retire | user |
 
 **Sequence:** ① backend pure-deletes (registry/export/pubkey/skill/menu) — zero
-risk → ② `audit_events` table + daemon shipper → ③ frontend blob-ops (passkey-add
-`K`-wrap crypto) + Realtime → ④ delete the remaining forwards + `DAEMON_URL` → ⑤
-infra retire.
+risk → ② `audit_events` table + daemon shipper → ③ frontend blob-ops (reuse the
+enroll `K`-wrap; same-session client-side, cross-device via the existing deposit
+scheme) + Realtime → ④ delete the remaining forwards + `DAEMON_URL` → ⑤ infra retire.
 
 ## 8. Out of scope / open
 
