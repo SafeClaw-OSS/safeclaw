@@ -1,5 +1,6 @@
-//! Broker-plane auth — gates the agent BROKER plane (the proxy port,
-//! `/v/{vid}/use/*` + `/v/{vid}/export/*`).
+//! Broker-plane auth — gates the agent BROKER plane (the four broker routes
+//! `/v/{vid}/use/*`, `/v/{vid}/stream/*`, `/v/{vid}/export/*` on the daemon's
+//! single port, scoped via `server::broker_router`).
 //!
 //! This is the agent→daemon credential (Token 1): it authenticates the local
 //! AGENT to the daemon, so a random other process on the same machine can't
@@ -128,7 +129,8 @@ mod tests {
     }
 }
 
-/// Axum middleware gating the broker plane. Apply to the proxy router only.
+/// Axum middleware gating the broker plane. Layered on `server::broker_router`
+/// only (the four broker routes) — never on the control routes.
 pub async fn require_api_key(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
