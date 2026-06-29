@@ -1,237 +1,201 @@
 # Connection Data Schema
 
-> **What this is.** THE concrete data-schema reference for *connections* — the
-> exact shapes that live in a vault and how secrets, status, and routing derive
-> from them. Companion to [CONNECTIONS_AND_AUTH.md](CONNECTIONS_AND_AUTH.md)
-> (which covers the lifecycle + rationale); this doc is the schema of record.
+> THE data-schema reference for *connections* — the exact shapes in a vault and
+> how secrets, status, and routing derive from them. Companion to
+> [CONNECTIONS_AND_AUTH.md](CONNECTIONS_AND_AUTH.md) (lifecycle + rationale).
 >
-> **Status.** Everything below is **DECIDED** except §4 (recipe *defines* vs
-> *suggests* the secret keys), which is **OPEN** — pros/cons laid out for a call.
+> **Pre-launch: no migration.** This supersedes the minimal shape shipped in
+> v1.0.20/.21 (§8). Landing = **delete the vault, recreate, re-test.** No
+> back-compat, no dual-read.
 >
-> **Pre-launch, so: no migration.** When this lands it *replaces* the shipped
-> minimal shape (v1.0.20, see §8). There is **no back-compat path and no
-> dual-read**. Landing procedure = **wipe the vault, recreate it, re-test.**
+> **Vocabulary.** At the SafeClaw vault layer the sealed body has three pools:
+> **`secrets`**, **`passkeys`**, **`aux`**. (At the lower `sudp` protocol layer
+> these are still the abstract field names `targets` / `peers` / `aux` —
+> unchanged; this doc speaks the SafeClaw domain names.)
 
 ---
 
 ## 1. Where the data lives
 
-A vault's decrypted body is a `ProtectedState { targets, peers, aux }`, sealed
-under the per-vault key `K` (ciphertext at rest *and* in the cloud blob — the
-cloud never sees any of this in clear).
+The vault's decrypted body is sealed under the per-vault key `K` (ciphertext at
+rest *and* in the cloud blob):
 
-- **`aux.connections`** — the structured per-connection records (this doc's §2).
-- **`targets`** — the flat secret map; connection secrets live here under
-  namespaced keys (§3).
-
-Both pools are inside the same sealed body, so a connection record and its
-secrets have identical confidentiality.
+- **`secrets`** — flat `name → value` map (the native-secrets store). The
+  credential values (§3).
+- **`passkeys`** — each enrolled passkey's wrapped copy of `K`. Crypto plumbing,
+  not user data.
+- **`aux`** — structured metadata: stores, policy, and the two connection
+  collections **`connecting`** + **`connections`** (§2).
 
 ---
 
-## 2. The connection record
+## 2. Two collections — `connecting` (in-flight) and `connections` (established)
+
+Parallel maps, both keyed by **`connection_id`**. A connection sits in exactly
+one at a time (the only overlap is a transient re-auth of an already-connected
+service). `len(connecting)` = how many connects are in flight.
+
+### `aux.connecting[<connection_id>]` — in-flight
+
+Holds **everything** the connect needs. On a successful exchange the daemon
+writes the secret and **moves the whole entry into `connections`, dropping it
+from `connecting`** — there is never a partial/duplicate record.
 
 ```jsonc
 "aux": {
-  "connections": {
-    "<connection_id>": {
-      "service":      "<service_id>",        // the recipe (TYPE) this instantiates
-      "oauth_pending": {                     // transient — present only mid-connect
-        "code":         "<authorization code>",
-        "verifier":     "<PKCE code_verifier>",
-        "redirect_uri": "http://127.0.0.1:8765/safeclaw/oauth/callback"
-      },
-      "params": {                            // OPTIONAL — only recipe-declared re-map slots (§6)
-        "<declared_param>": "<value>"
-      }
+  "connecting": {
+    "gmail-work": {
+      "service":  "gmail",                 // the recipe (TYPE) being instantiated
+      "config":   { },                     // recipe-declared re-map slots (§4); usually empty
+      "code":     "<authorization code>",  // single-use; from the loopback redirect
+      "verifier": "<PKCE code_verifier>"   // browser-generated; the daemon needs it to exchange
     }
   }
 }
 ```
 
-| field | who sets it | notes |
-|---|---|---|
-| **`<connection_id>`** (the map key) | user | The connection's **handle** *and* its identity. A slug `^[a-z0-9][a-z0-9_-]{0,63}$`. Flows through routes / cache / op-scope / audit. |
-| **`service`** | user (at create) | The recipe/type this is an instance of. **Decouples id from type** → a vault can hold many connections of one service. |
-| **`oauth_pending`** | browser (connect), daemon clears it | The cloud-blind handshake relayed through the sealed vault; the daemon exchanges it, then deletes it. Transient. |
-| **`params`** | user, **only** for slots the recipe marked per-connection | Non-secret re-map values (e.g. a self-hosted `host`). Anti-SSRF: see §6. |
+`redirect_uri` is **not** here — it's a fixed property of the OAuth client, held
+in the provider config (§5).
 
-### Why `connection_id` is *also* the display name (no separate `label`)
-
-An earlier draft had both `"gmail-work"` (id) and `"label": "Work"`. That's the
-**same semantic stored twice** — drop one. We keep the **id as the handle**: the
-user names the connection, it slugifies to the id, and that string is what shows
-in the UI *and* what addresses it (`/use/gmail-work`). One field, one source of
-truth.
-
-- Trade-off (accepted): **renaming a connection = a new id** = re-keying its
-  secrets. Fine pre-launch; if rename-without-rekey ever matters, that's the
-  moment to add an opaque id + mutable label — not before.
-
----
-
-## 3. Secrets — uniform `<connection_id>:<secret_key>`
-
-Every connection secret is stored in `targets` under:
-
-```
-<connection_id>:<secret_key>
-```
-
-- **Delimiter `:`** — invalid in env-var names, so a namespaced secret key can
-  never masquerade as an env var the agent might pick up.
-- **Uniform. No "default connection" special case, no flat `<svc>_refresh_token`
-  legacy name, no migration.** Every connection — including the first/only one —
-  uses the namespaced form.
+### `aux.connections[<connection_id>]` — established
 
 ```jsonc
-"targets": {
-  "gmail:refresh_token":      "<bytes>",
-  "gmail-work:refresh_token": "<bytes>",
-  "acme-gitlab:token":        "<bytes>"
+"aux": {
+  "connections": {
+    "gmail":       { "service": "gmail" },
+    "gmail-work":  { "service": "gmail" },                              // 2nd instance, same type
+    "acme-gitlab": { "service": "gitlab", "config": { "host": "git.acme.com" } }
+  }
 }
 ```
 
-### Status is DERIVED, never stored
-
-There is no `status` field on a connection (nothing to drift out of sync):
-
-| condition | status |
+| field | notes |
 |---|---|
-| `aux.connections[id].oauth_pending` present | **Connecting** |
-| all of the recipe's required `<id>:<secret_key>` present | **Connected** |
-| some required keys present, some missing | **Partly configured** |
-| none present, no pending | **Not configured** |
-
-"Connected" wins over a lingering pending — the durable secret is the source of
-truth, so a row never sticks on "Connecting".
+| **`<connection_id>`** (map key) | The user's **handle** *and* its identity — a slug `^[a-z0-9][a-z0-9_-]{0,63}$`. The routing / cache / audit unit. No separate `label` (one field, no duplicated semantic; rename = new id = re-key, fine pre-launch). |
+| **`service`** | Which recipe (TYPE) this instantiates. Decouples id from type → many connections per service. |
+| **`config`** | Per-connection values for the recipe-declared re-map slots only (§4). Omitted when none. |
 
 ---
 
-## 4. ⚖️ OPEN DECISION — does the recipe **define** or **suggest** `<secret_key>`?
+## 3. Secrets — mainstream names, optional connection prefix
 
-The namespace half (`<connection_id>:`) is owned by the connection. The question
-is who owns the **`<secret_key>`** half — i.e. **does the connection have the
-right to define its own secret-key names, or are they fixed by the recipe?**
+- Secret keys are **mainstream, ALL-CAPS, community-standard** — `GITHUB_TOKEN`,
+  `OPENAI_API_KEY`, `GOOGLE_REFRESH_TOKEN`. **Never invented.** The recipe
+  **DEFINEs** them (§4).
+- A secret's address is **`[<connection_id>:]<MAINSTREAM_KEY>`**:
+  - **default / single** connection → **no prefix** → bare `GOOGLE_REFRESH_TOKEN`.
+  - **named** connection → `gmail-work:GOOGLE_REFRESH_TOKEN`.
+- The `:` delimiter is invalid in env-var names → a namespaced key can never
+  masquerade as an env var.
+- The address resolves through the normal **`store_order`** (native secrets →
+  GCP → …) exactly as any secret today — **no per-connection store binding, no
+  new mechanism.** The optional prefix is the only connection-specific part.
 
-(Note: this is *only* about secret keys. The non-secret re-map **params** in §6
-are recipe-declared either way — that part is decided.)
+```jsonc
+"secrets": {
+  "GOOGLE_REFRESH_TOKEN":            "<bytes>",   // default gmail connection — bare
+  "gmail-work:GOOGLE_REFRESH_TOKEN": "<bytes>",   // named connection — prefixed
+  "acme-gitlab:GITLAB_TOKEN":        "<bytes>"
+}
+```
 
-### Option A — **DEFINE** (recipe fixes the secret keys; connection cannot deviate)
-
-The `service.toml` declares the exact secret keys/roles it reads (e.g.
-`refresh_token`, or `token`). A connection of that type has *exactly* those
-keys; it can't add or rename. The daemon validates a connection's secrets
-against the recipe's declared set.
-
-| | |
-|---|---|
-| **Pro — audit** | The complete secret-key set of any connection is knowable from the recipe alone. The recipe *is* the contract. |
-| **Pro — resolution safety** | `{{secret.refresh_token}}` in the recipe always resolves to a key guaranteed present (or a clean "not connected") — never a typo'd/missing key. |
-| **Pro — uniformity** | Every connection of a type has identical key shape → console UI + tooling are trivial, no per-connection variance. |
-| **Pro — fewer footguns** | No silently-misnamed key that never gets read. |
-| **Con — rigidity** | A connection needing a variant/extra credential (e.g. one account's upstream wants an extra header token) can't express it without a new/custom recipe. |
-| **Con — recipe churn** | Small credential differences force new recipes. |
-
-### Option B — **SUGGEST** (recipe proposes defaults; connection may define/override)
-
-The `service.toml` proposes default secret keys, but a connection may define its
-own (add, rename, override).
-
-| | |
-|---|---|
-| **Pro — flexibility** | A connection carries extra/renamed secret keys without authoring a recipe (ad-hoc / power-user). |
-| **Pro — fewer recipes** | One recipe covers near-variants; the connection patches the difference. |
-| **Con — audit** | The secret-key set is no longer derivable from the recipe; you must inspect each connection. Weakens "the recipe is the audited contract" — SafeClaw's core pitch. |
-| **Con — resolution risk** | The recipe's `{{secret.X}}` may reference a key the connection renamed/omitted → runtime "missing secret", or worse, silently reads the wrong key. |
-| **Con — inconsistency** | Connections of one type diverge in shape → console/tooling must handle per-connection schemas. |
-
-### Neutral framing
-
-- **A** ties the credential vocabulary to the **audited recipe** (consistency &
-  review-first). **B** moves it to the **connection** (flexibility-first).
-- A middle path exists if wanted: recipe **defines required** roles (fixed
-  names) **and optionally allows** extra connection-defined keys — this gets B's
-  flexibility for the extras while keeping A's guarantee for what the recipe
-  actually injects. It inherits B's audit/resolution caveats for the extra keys
-  only.
-
-*No recommendation embedded — your call.*
+**Why default-bare (the asymmetry is principled).** It's the AWS-default-profile
+pattern. The bare mainstream name maps **1:1** to `env` import, GCP Secret
+Manager, and the wider ecosystem — **zero remap / translate**, which is the
+whole point of speaking mainstream names. A named connection's `:`-prefix is a
+**native-store-internal** detail (ecosystem-invisible); storing a *named*
+connection's secret in an external store is an edge case for later.
 
 ---
 
-## 5. Routing
+## 4. The recipe DEFINEs the roles + the config slots
 
-- A connection is addressed at **`/use/<connection_id>`** and
-  **`/stream/<connection_id>`**.
-- Per request, the daemon resolves **`connection_id → record.service → recipe`**
-  once, then injects using the recipe + that connection's namespaced secrets.
-- `connection_id` is the unit that flows through the **broker cache key
-  `(vault, connection_id)`**, the **op scope**, and the **audit log** — not the
-  service id.
+The `service.toml` (the TYPE) declares two things a connection may fill, and
+nothing else:
 
----
-
-## 6. Re-map slots (recipe-declared, **decided**)
-
-A connection can only fill the slots the **recipe explicitly marks** as
-per-connection — two kinds:
-
-- **credential roles** — the secret keys (§3/§4).
-- **dynamic params** — non-secret per-connection values, e.g. a `host` /
-  `subdomain` for a self-hosted upstream.
+- **secret roles** — by mainstream name (e.g. `GOOGLE_REFRESH_TOKEN`). A
+  connection supplies *values* for exactly these; it **cannot add or rename**
+  keys.
+- **config params** that are per-connection (e.g. `host` for a self-hosted
+  upstream).
 
 Everything else — endpoints, `auth_mode`, scopes, the egress host of a normal
 recipe — is **fixed by the type**. A connection can **never** re-point an
 audited recipe's host or token endpoint (that would be SSRF / hijack). This is
 the hard security boundary of the connection layer.
 
-> The exact `service.toml` syntax for marking a slot per-connection (e.g. a
-> `[[connection.params]]` block, or a `{{connection.host}}` template marker) is
-> a recipe-format detail to finalize alongside §4 — the *rule* (only declared
-> slots, host stays fixed) is settled.
+**Why DEFINE, not SUGGEST.** A credential's role name is a property of the
+upstream **type**, not the instance (`gmail` always needs `GOOGLE_REFRESH_TOKEN`
+regardless of which account). With mainstream names, letting a connection rename
+keys would break the very ecosystem-interop §3 buys — so the "flexibility" of
+suggest is a footgun here. A genuine variant (an upstream that needs an extra
+credential) is a **custom recipe**, not a per-connection key definition.
+
+---
+
+## 5. Status (DERIVED) + the connect handshake
+
+**Status is never stored — it's read off the two collections:**
+
+| condition | status |
+|---|---|
+| in `aux.connecting` | **Connecting** |
+| in `aux.connections`, required secret(s) present | **Connected** |
+| in `aux.connections`, some required secret missing | **Partly configured** |
+| in neither | **Not configured** |
+
+**Connect (cloud-blind).** The browser drives Google consent (public Desktop
+client + PKCE), captures the `code`, and seals `{ service, config, code,
+verifier }` into `aux.connecting[<id>]` → uploads (the cloud only ever stores
+ciphertext). The daemon syncs the blob, exchanges (`code` + `verifier` + the
+provider's fixed `client` / `token_url` / `redirect_uri`), writes the secret,
+and **moves the entry into `aux.connections`**. No backend ever sees the token.
+
+`redirect_uri` is a constant of the OAuth client → it lives in the **provider
+config**, not in each handshake.
+
+---
+
+## 6. Routing
+
+- A connection is addressed at **`/use/<connection_id>`** and
+  **`/stream/<connection_id>`**.
+- Per request the daemon resolves **`connection_id → connections[id].service →
+  recipe`** once, then injects using the recipe + that connection's secrets.
+- `connection_id` is the broker cache key `(vault, connection_id)`, the op
+  scope, and the audit unit.
 
 ---
 
 ## 7. Full example — two Gmail accounts + a self-hosted GitLab
 
 ```jsonc
-// ── aux.connections ────────────────────────────────────────────────
-"connections": {
-  "gmail":       { "service": "gmail" },
-  "gmail-work":  { "service": "gmail" },
-  "acme-gitlab": { "service": "gitlab", "params": { "host": "git.acme.com" } }
+"aux": {
+  "connecting": {
+    "gmail-work": { "service": "gmail", "config": {}, "code": "4/0Ab…", "verifier": "dBj…" }
+  },
+  "connections": {
+    "gmail":       { "service": "gmail" },
+    "acme-gitlab": { "service": "gitlab", "config": { "host": "git.acme.com" } }
+  }
+},
+"secrets": {
+  "GOOGLE_REFRESH_TOKEN":      "<bytes>",   // default gmail — Connected
+  "acme-gitlab:GITLAB_TOKEN":  "<bytes>"    // named gitlab  — Connected
 }
-
-// ── targets (flat secret map) ──────────────────────────────────────
-"targets": {
-  "gmail:refresh_token":      "<bytes>",
-  "gmail-work:refresh_token": "<bytes>",
-  "acme-gitlab:token":        "<bytes>"
-}
+// gmail-work is mid-connect (in `connecting`, no secret yet) → "Connecting".
 ```
 
-- `GET /use/gmail-work/...` → daemon resolves `gmail-work → gmail` recipe →
-  injects `Bearer {{oauth.access_token}}` minted from `gmail-work:refresh_token`.
-- `acme-gitlab` reuses the `gitlab` recipe but substitutes the declared `host`
-  slot (allowed — it's a marked param) while the auth shape stays fixed.
+Lifecycle of `gmail-work`: consent → `connecting["gmail-work"] = {service, config,
+code, verifier}` → daemon exchanges → writes `gmail-work:GOOGLE_REFRESH_TOKEN`
+→ moves to `connections["gmail-work"] = {service:"gmail"}` → status flips to
+Connected.
 
 ---
 
-## 8. Delta from the shipped minimal (v1.0.20)
+## 8. No migration
 
-v1.0.20 shipped a **deliberately minimal** `aux.connections`: `connection_id ==
-service_id`, **flat** secrets (`gmail_refresh_token`), and a legacy-flat read
-path. This doc supersedes that:
-
-| | v1.0.20 (minimal) | this schema (full) |
-|---|---|---|
-| connections per service | one (`id == service`) | many (`id` ≠ `service`) |
-| record fields | `oauth_pending` only | `service` + `oauth_pending` + `params` |
-| secret naming | flat `<svc>_refresh_token` | uniform `<conn>:<secret_key>` |
-| routing | by service id | by `connection_id` |
-| recipe owns secret keys | n/a | **§4 — open** |
-| compat path | reads legacy flat key | **none — removed** |
-
-**Landing = wipe + recreate.** No migration, no dual-read. The old flat-key
-read path is deleted; existing test vaults are recreated from scratch.
+Pre-launch. This replaces the v1.0.20/.21 minimal shape (`connection_id ==
+service_id`, flat `gmail_refresh_token`, a legacy-flat read path). The old read
+path is deleted; existing test vaults are recreated from scratch. **No dual-read,
+no compat layer.**
