@@ -1,3 +1,31 @@
+# Agent-facing setup (one blurb; the agent adapts it to the user's real config).
+setup = """
+Route `cargo publish` through SafeClaw so the crates.io token never enters cargo's
+config, env, or the agent process.
+
+# cargo decides where to upload by reading a registry's config.json "api" field —
+# there is no `--registry <url>` like npm. So point cargo at a tiny LOCAL git index
+# whose config.json sends the upload to SafeClaw; SafeClaw injects the real
+# crates.io token and forwards to https://crates.io. cargo never sees the token.
+# cargo builds/packages locally; only the final authenticated upload is proxied.
+#
+# 1) make a local index (a git repo with one file, config.json):
+#      mkdir -p ~/.safeclaw/cratesio-index && cd ~/.safeclaw/cratesio-index
+#      printf '{"dl":"https://static.crates.io/crates","api":"{{proxy_base}}/stream/cratesio"}' > config.json
+#      git init -q && git add -A && git commit -qm init
+# 2) ~/.cargo/config.toml — define the registry (a git index = an absolute file:// path):
+#      [registries.safeclaw]
+#      index = "file:///ABS/PATH/TO/.safeclaw/cratesio-index"
+# 3) publish, authenticating to SafeClaw with the broker key (NOT the real token):
+#      CARGO_REGISTRIES_SAFECLAW_TOKEN="$SAFECLAW_API_KEY" cargo publish --registry safeclaw
+#
+# Adapt to the user's existing ~/.cargo/config.toml (don't clobber other registries).
+# "Uploaded ... to registry `safeclaw`" = SUCCESS; a following "timed out waiting
+# ... to be available" is HARMLESS (cargo is polling the local index, which won't
+# list it) — ignore it. On an approval prompt you'll get a link (also in cargo's
+# error output) — surface it, the user taps a passkey, then re-run the same command.
+"""
+
 [service]
 id = "cratesio"
 name = "crates.io"
@@ -30,30 +58,3 @@ auth = { secret = "CARGO_REGISTRY_TOKEN", placeholder = "cio..." }
 [policy.levels]
 read = "ask-always"
 write = "ask-always"
-
-[setup]
-goal = "Route `cargo publish` through SafeClaw so the crates.io token never enters cargo's config, env, or the agent process."
-route = "{{proxy_base}}/stream/cratesio/"
-auth = "feed the broker key (NOT the real token) as the registry token: CARGO_REGISTRIES_SAFECLAW_TOKEN=$SAFECLAW_API_KEY"
-example = """
-# Define an alternative registry whose API routes through SafeClaw, then publish
-# to it. cargo builds/packages locally; only the final authenticated upload
-# (PUT /api/v1/crates/new) is proxied — SafeClaw swaps in the real crates.io
-# token and forwards to https://crates.io. cargo never sees the real token.
-#
-# ~/.cargo/config.toml:
-#   [registries.safeclaw]
-#   index = "sparse+{{route}}index/"
-#
-# The broker key authenticates cargo to SafeClaw (the real token is injected
-# server-side); export it at run time so nothing lands on disk:
-export CARGO_REGISTRIES_SAFECLAW_TOKEN="$SAFECLAW_API_KEY"
-cargo publish --registry safeclaw
-
-# When SafeClaw asks for approval, you'll get a link (in the agent's prompt and
-# in cargo's error output) — tap your passkey, then re-run the same command.
-#
-# NOTE: cargo first reads the registry's `config.json` (for the `api` endpoint)
-# from the index, so the broker must serve/forward that handshake for the
-# alternative registry. (npm publish is a pure passthrough and needs no index.)
-"""

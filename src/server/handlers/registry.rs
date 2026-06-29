@@ -81,14 +81,16 @@ pub struct RegistryService {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub connect: Option<crate::service::ConnectDescriptor>,
     /// Tool-config hint for a service that needs a **local tool** (a CLI/SDK)
-    /// pointed at SafeClaw — goal + ready-to-run config, with `{{proxy_base}}` /
-    /// `{{route}}` filled in. `{{proxy_base}}` renders to the literal
-    /// `$SAFECLAW_VAULT_URL` (the single broker base the agent already has in its
-    /// env), so the hint is deployment-agnostic and the agent's shell expands it.
-    /// Agent-facing only; carries NO vault secret. Present only on the per-vault
-    /// registry (the route is vault-scoped). The generic counterpart to `connect`.
+    /// pointed at SafeClaw — one rendered blurb (goal + ready-to-run config),
+    /// with `{{proxy_base}}` / `{{api_key}}` / `{{vault}}` filled in. The route
+    /// is inlined by the recipe as `{{proxy_base}}/stream/<upstream>/`.
+    /// `{{proxy_base}}` renders to the literal `$SAFECLAW_VAULT_URL` (the single
+    /// broker base the agent already has in its env), so the hint is
+    /// deployment-agnostic and the agent's shell expands it. Agent-facing only;
+    /// carries NO vault secret. Present only on the per-vault registry (the route
+    /// is vault-scoped). The generic counterpart to `connect`.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub setup: Option<crate::service::SetupDef>,
+    pub setup: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -259,33 +261,23 @@ fn policy_for(
     Some(RegistryServicePolicy { defaults, rules })
 }
 
-/// Render a service's `[setup]` hint for the registry, filling `{{proxy_base}}`
-/// / `{{route}}`. Agent-facing only — the setup context has no access to vault
-/// secrets by construction. Returns `None` if the service declares no `[setup]`.
+/// Render a service's `setup` hint for the registry, filling `{{proxy_base}}`
+/// / `{{api_key}}` / `{{vault}}`. Agent-facing only — the setup context has no
+/// access to vault secrets by construction. Returns `None` if the service
+/// declares no `setup` string.
 ///
 /// With the daemon collapsed to a single port, `{{proxy_base}}` renders to the
 /// literal `$SAFECLAW_VAULT_URL` (the broker base the agent already has in its
 /// env) — the agent's shell expands it. `{{api_key}}` (if any recipe uses it)
 /// renders to the literal `$SAFECLAW_API_KEY` the same way. So a setup hint is
-/// identical across deployments and never needs a request-derived host.
-fn render_setup(def: &ServiceDef) -> Option<crate::service::SetupDef> {
+/// identical across deployments and never needs a request-derived host. The
+/// route is inlined by the recipe as `{{proxy_base}}/stream/<upstream>/`.
+fn render_setup(def: &ServiceDef) -> Option<String> {
     use crate::server::broker::{render_setup_template, SetupInputs};
     const PROXY_BASE: &str = "$SAFECLAW_VAULT_URL";
-    let setup = def.setup.as_ref()?;
-    // `route` feeds `{{route}}` in the other fields, so render it first.
-    let pre = SetupInputs { proxy_base: PROXY_BASE, api_key: "$SAFECLAW_API_KEY", route: "", vault: "" };
-    let route = setup.route.as_deref().and_then(|t| render_setup_template(t, &pre).ok());
-    let inputs = SetupInputs {
-        proxy_base: PROXY_BASE,
-        api_key: "$SAFECLAW_API_KEY",
-        route: route.as_deref().unwrap_or(""),
-        vault: "",
-    };
-    let r = |s: &Option<String>| s.as_deref().and_then(|t| render_setup_template(t, &inputs).ok());
-    // Render all template fields first so `inputs`' borrow of `route` ends
-    // before `route` is moved into the struct.
-    let (goal, auth, example) = (r(&setup.goal), r(&setup.auth), r(&setup.example));
-    Some(crate::service::SetupDef { goal, route, auth, example })
+    let setup = def.setup.as_deref()?;
+    let inputs = SetupInputs { proxy_base: PROXY_BASE, api_key: "$SAFECLAW_API_KEY", vault: "" };
+    render_setup_template(setup, &inputs).ok()
 }
 
 fn build_service(
@@ -461,8 +453,13 @@ mod setup_tests {
     use super::*;
 
     #[test]
-    fn render_setup_fills_proxy_base_and_route() {
+    fn render_setup_fills_proxy_base() {
         let toml = r#"
+setup = '''
+Route git through SafeClaw. credential.helper = !sc git-credential
+git config --global url."{{proxy_base}}/stream/github/".insteadOf "https://github.com/"
+'''
+
 [service]
 id = "github"
 name = "GitHub"
@@ -474,27 +471,16 @@ stream = true
 auth = { secret = "github_token" }
 [upstream.headers]
 Authorization = "Basic {{secret.github_token | basic}}"
-[setup]
-goal = "Route git through SafeClaw"
-route = "{{proxy_base}}/stream/github/"
-auth = "credential.helper = !sc git-credential"
-example = '''
-git config --global url."{{route}}".insteadOf "https://github.com/"
-'''
 "#;
         let def: ServiceDef = toml::from_str(toml).unwrap();
         let s = render_setup(&def).expect("setup rendered");
         // {{proxy_base}} renders to the literal $SAFECLAW_VAULT_URL — the broker
-        // base the agent already holds; its shell expands it at apply time.
-        assert_eq!(
-            s.route.as_deref(),
-            Some("$SAFECLAW_VAULT_URL/stream/github/")
-        );
-        let ex = s.example.unwrap();
-        assert!(ex.contains("$SAFECLAW_VAULT_URL/stream/github/"), "{}", ex);
-        assert!(!ex.contains("{{"), "no leftover template tokens: {}", ex);
+        // base the agent already holds; its shell expands it at apply time. The
+        // route is inlined by the recipe as `{{proxy_base}}/stream/<upstream>/`.
+        assert!(s.contains("$SAFECLAW_VAULT_URL/stream/github/"), "{}", s);
+        assert!(!s.contains("{{"), "no leftover template tokens: {}", s);
 
-        // No [setup] → None.
+        // No `setup` → None.
         let no_setup: ServiceDef =
             toml::from_str("[service]\nid=\"x\"\nname=\"X\"\n[[upstream]]\nid=\"d\"\nurl=\"https://x.com\"\n")
                 .unwrap();

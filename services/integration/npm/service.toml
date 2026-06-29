@@ -1,3 +1,24 @@
+# Agent-facing setup (one blurb; the agent adapts it to the user's real config).
+setup = """
+Route `npm publish` through SafeClaw so the npm token never enters .npmrc, env, or
+the agent process.
+
+# npm CAN be pointed straight at a URL, so this is a pure passthrough: aim npm's
+# registry at SafeClaw and authenticate to it with the broker key (NOT the real
+# token) — SafeClaw injects the real npm token and forwards to registry.npmjs.org.
+#
+#   npm publish --registry {{proxy_base}}/stream/npm/
+#
+# Auth: set the broker key as the _authToken SCOPED to that registry (.npmrc or
+# env), value $SAFECLAW_API_KEY — e.g. in ~/.npmrc:
+#   //<host:port>/<…>/stream/npm/:_authToken=${SAFECLAW_API_KEY}
+# (derive the scope from {{proxy_base}}; adapt project vs ~/.npmrc.)
+#
+# Store an npm *automation* token in the vault (bypasses 2FA-on-publish; the broker
+# can't supply an interactive OTP). On an approval prompt you'll get a link (agent
+# prompt + npm error output) — surface it, user taps a passkey, then re-run.
+"""
+
 [service]
 id = "npm"
 name = "npm"
@@ -26,26 +47,3 @@ auth = { secret = "NPM_TOKEN", placeholder = "npm_..." }
 [policy.levels]
 read = "ask-always"
 write = "ask-always"
-
-[setup]
-goal = "Route `npm publish` through SafeClaw so the npm token never enters .npmrc, env, or the agent process."
-route = "{{proxy_base}}/stream/npm/"
-auth = "feed the broker key (NOT the real token) as the registry-scoped _authToken, value $SAFECLAW_API_KEY"
-example = """
-# Point npm at SafeClaw and it proxies the publish upload, injecting the real
-# npm token server-side. npm authenticates to SafeClaw with the broker key.
-#
-# .npmrc (project or ~/.npmrc) — set the registry and feed the broker key as its
-# scoped auth token (SafeClaw swaps in the real npm token):
-#   registry={{route}}
-#   //<broker-host:port>/stream/npm/:_authToken=${SAFECLAW_API_KEY}
-#
-# or per-invocation:
-npm publish --registry {{route}}
-
-# When SafeClaw asks for approval you'll get a link (agent prompt + npm error
-# output) — tap your passkey, then re-run.
-#
-# Use an npm *automation* token (it bypasses 2FA-on-publish; the broker can't
-# supply an interactive OTP).
-"""

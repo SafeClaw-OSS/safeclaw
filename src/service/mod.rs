@@ -23,27 +23,13 @@ pub struct ServiceDef {
     #[serde(default)]
     pub vault: Vec<VaultField>,
     pub policy: Option<PolicyDef>,
-    /// Optional `[setup]` block: the agent-facing tool/runtime config hint
-    /// (CONNECTIONS_AND_AUTH.md §6). Parsed only — never executed here.
+    /// Optional top-level `setup` string: the agent-facing tool/runtime config
+    /// hint (CONNECTIONS_AND_AUTH.md §6). One free-form blurb the agent adapts
+    /// to the user's real config (per the iron rule: goal + building blocks,
+    /// not a rigid script), with inline `{{proxy_base}}` / `{{api_key}}` /
+    /// `{{vault}}` tokens. Parsed only — never executed here.
     #[serde(default)]
-    pub setup: Option<SetupDef>,
-}
-
-/// `[setup]` — the single, declarative, agent-facing setup mechanism
-/// (CONNECTIONS_AND_AUTH.md §6). Free-form string fields: a goal, a route,
-/// an auth line, and a canonical example the agent adapts to the user's real
-/// config (per the iron rule: goal + building blocks, not a rigid script).
-/// Parse-only — no execution.
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
-pub struct SetupDef {
-    #[serde(default)]
-    pub goal: Option<String>,
-    #[serde(default)]
-    pub route: Option<String>,
-    #[serde(default)]
-    pub auth: Option<String>,
-    #[serde(default)]
-    pub example: Option<String>,
+    pub setup: Option<String>,
 }
 
 /// Declares a field stored in the vault for this service.
@@ -1725,24 +1711,24 @@ webhook_key = "gmail_webhook"
 
     #[test]
     fn setup_block_parses() {
+        // Top-level bare `setup` string (sibling to [service]/[[upstream]]/…),
+        // placed before any [section] as TOML requires for bare keys.
         let toml_str = r#"
+setup = """
+Route the user's git remotes through SafeClaw so the PAT never enters git.
+git config --global url."{{proxy_base}}/stream/github-git/".insteadOf "https://github.com/"
+"""
+
 [service]
 id = "github-git"
 name = "GitHub Git"
 category = "integration"
-
-[setup]
-goal = "Route the user's git remotes through SafeClaw"
-route = "{{proxy_base}}/stream/github-git/"
-auth = "Authorization: Bearer {{api_key}}"
-example = "git config --global url.\"{{route}}\".insteadOf \"https://github.com/\""
 "#;
         let def: ServiceDef = toml::from_str(toml_str).unwrap();
-        let setup = def.setup.as_ref().unwrap();
-        assert_eq!(setup.goal.as_deref(), Some("Route the user's git remotes through SafeClaw"));
-        assert_eq!(setup.route.as_deref(), Some("{{proxy_base}}/stream/github-git/"));
-        assert!(setup.auth.as_deref().unwrap().contains("{{api_key}}"));
-        assert!(setup.example.as_deref().unwrap().contains("insteadOf"));
+        let setup = def.setup.as_deref().unwrap();
+        assert!(setup.contains("Route the user's git remotes through SafeClaw"));
+        assert!(setup.contains("{{proxy_base}}/stream/github-git/"));
+        assert!(setup.contains("insteadOf"));
     }
 
     #[test]

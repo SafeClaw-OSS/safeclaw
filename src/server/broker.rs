@@ -446,12 +446,14 @@ fn resolve_token(key: &str, inputs: &RenderInputs) -> Result<String> {
 
 // ── setup template context (agent-facing, NO vault secrets) ──────────────────
 //
-// CONNECTIONS_AND_AUTH.md §7, second row. The `[setup]` block (git `insteadOf`,
+// CONNECTIONS_AND_AUTH.md §7, second row. The `setup` blurb (git `insteadOf`,
 // runtime base_url hints, …) is rendered for the AGENT, in its own env. It must
 // NOT touch any vault secret: `api_key` here is the agent's OWN broker key, not
-// a vault item. The only tokens are `{{proxy_base}}`, `{{api_key}}`, `{{route}}`,
-// `{{vault}}` — a strictly disjoint, builtin-only vocabulary from the auth
-// engine above. An unknown token is still a hard error (never forward `{{…}}`).
+// a vault item. The only tokens are `{{proxy_base}}`, `{{api_key}}`, `{{vault}}`
+// — a strictly disjoint, builtin-only vocabulary from the auth engine above.
+// Recipes inline the full route as `{{proxy_base}}/stream/<upstream>/` (the
+// upstream service name can differ from the recipe id, so there is no computed
+// `{{route}}` token). An unknown token is still a hard error (never forward `{{…}}`).
 
 /// Builtin values for the setup template context. All agent-facing — none of
 /// these is a vault secret.
@@ -460,17 +462,14 @@ pub struct SetupInputs<'a> {
     pub proxy_base: &'a str,
     /// The agent's own broker API key (its bearer to the daemon — NOT a vault item).
     pub api_key: &'a str,
-    /// The fully-formed route for this service (often itself derived from
-    /// `proxy_base`, pre-rendered by the caller).
-    pub route: &'a str,
     /// The active vault id / slug.
     pub vault: &'a str,
 }
 
-/// Render a `[setup]` string (goal / route / auth / example) for the agent.
-/// Tokens: `{{proxy_base}}`, `{{api_key}}`, `{{route}}`, `{{vault}}`. This
-/// context has NO access to vault secrets — using a `secret.*` / `oauth.*`
-/// token here is an unknown-token hard error by construction.
+/// Render the `setup` string for the agent. Tokens: `{{proxy_base}}`,
+/// `{{api_key}}`, `{{vault}}`. This context has NO access to vault secrets —
+/// using a `secret.*` / `oauth.*` token here is an unknown-token hard error by
+/// construction.
 pub fn render_setup_template(tpl: &str, inputs: &SetupInputs) -> Result<String> {
     let mut out = String::with_capacity(tpl.len());
     let bytes = tpl.as_bytes();
@@ -484,7 +483,6 @@ pub fn render_setup_template(tpl: &str, inputs: &SetupInputs) -> Result<String> 
             let val = match key {
                 "proxy_base" => inputs.proxy_base,
                 "api_key" => inputs.api_key,
-                "route" => inputs.route,
                 "vault" => inputs.vault,
                 _ => {
                     return Err(AppError::BadRequest(format!(
@@ -682,12 +680,13 @@ mod render_tests {
         let inp = SetupInputs {
             proxy_base: "http://127.0.0.1:8787",
             api_key: "sk_agent_123",
-            route: "http://127.0.0.1:8787/stream/github-git/",
             vault: "v_abc",
         };
+        // Recipes inline the full route as `{{proxy_base}}/stream/<upstream>/`
+        // (no computed `{{route}}` token — the upstream name can differ from id).
         assert_eq!(
             render_setup_template(
-                r#"git config url."{{route}}".insteadOf "https://github.com/""#,
+                r#"git config url."{{proxy_base}}/stream/github-git/".insteadOf "https://github.com/""#,
                 &inp
             )
             .unwrap(),
@@ -707,14 +706,15 @@ mod render_tests {
     fn setup_template_rejects_vault_secret_tokens() {
         // The setup context must NEVER resolve a vault secret — `secret.*` /
         // `oauth.*` are unknown tokens here, hard-erroring rather than leaking.
+        // `{{route}}` was dropped too, so it now hard-errors like any other.
         let inp = SetupInputs {
             proxy_base: "http://127.0.0.1:8787",
             api_key: "sk_agent_123",
-            route: "r",
             vault: "v",
         };
         assert!(render_setup_template("{{secret.github_token}}", &inp).is_err());
         assert!(render_setup_template("{{oauth.access_token}}", &inp).is_err());
+        assert!(render_setup_template("{{route}}", &inp).is_err());
         assert!(render_setup_template("{{bogus}}", &inp).is_err());
     }
 }
