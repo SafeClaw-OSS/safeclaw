@@ -137,9 +137,10 @@ registers a pending op, you sign an approval with your passkey, and only then do
 the daemon inject the credential and forward the call. The vault blob is sealed
 client-side under your passkey-derived key — the cloud stores and syncs it blind.
 
-See [docs/PROTOCOL.md](docs/PROTOCOL.md) for the cryptographic protocol and
+See [docs/PROTOCOL.md](docs/PROTOCOL.md) for the cryptographic protocol,
 [docs/SERVICES.md](docs/SERVICES.md) for the declarative service definitions
-(`services/*/service.toml`).
+(`services/*/service.toml`), and [docs/CONNECTION_SCHEMA.md](docs/CONNECTION_SCHEMA.md)
+for the connection data schema (`aux.connections`, namespaced secrets, routing).
 
 ## Remote / self-host
 
