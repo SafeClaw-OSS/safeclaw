@@ -20,6 +20,7 @@ use std::sync::Arc;
 
 use axum::{
     extract::{Path, Query, State},
+    http::HeaderMap,
     Json,
 };
 use serde::{Deserialize, Serialize};
@@ -361,10 +362,35 @@ fn proxy_base(state: &AppState) -> String {
     format!("{}/api/use", state.config.origin.trim_end_matches('/'))
 }
 
-/// `proxy_base` for `/v/{vid}/registry`. Points at the actual proxy port
-/// with the vault baked in — this is the URL agents call for Use requests.
-fn vault_proxy_base(state: &AppState, vault_id: &str) -> String {
-    let proxy_origin = swap_port(&state.config.origin, state.config.proxy_port);
+/// `proxy_base` for `/v/{vid}/registry` — the URL agents prepend for Use calls.
+///
+/// Built from the host the agent **actually reached this daemon at** (the
+/// registry request's `Host`), pointed at the proxy plane — NOT from
+/// `config.origin`. For a self-hosted daemon `config.origin` is the public
+/// WebAuthn/console domain (e.g. `dev.safeclaw.pro`), which is NOT where a local
+/// agent connects (`127.0.0.1:<proxy_port>`); advertising it sent agents to a
+/// remote host they couldn't authenticate against. Rules:
+///   - Host with an explicit port (direct self-host, e.g. `127.0.0.1:23294`) →
+///     same hostname at `proxy_port` (the proxy plane is a sibling port).
+///   - Host without a port (behind a TLS reverse proxy) → keep the host, no port
+///     (the proxy maps `/v/{vid}/use` to the daemon's proxy plane).
+///   - No `Host` header → fall back to the legacy `config.origin` form.
+/// The `/use` suffix is kept so agents prepend `proxy_base` uniformly across OSS
+/// (proxy port) and SaaS (`/api/use`) — see `endpoint_for_api`.
+fn vault_proxy_base(host: Option<&str>, proxy_port: u16, origin: &str, vault_id: &str) -> String {
+    let proxy_origin = match host.map(str::trim).filter(|h| !h.is_empty()) {
+        Some(h) if h.contains(':') && !h.starts_with('[') => {
+            let hostname = h.rsplit_once(':').map(|(host, _)| host).unwrap_or(h);
+            let scheme = if hostname == "127.0.0.1" || hostname == "localhost" {
+                "http"
+            } else {
+                "https"
+            };
+            format!("{}://{}:{}", scheme, hostname, proxy_port)
+        }
+        Some(h) => format!("https://{}", h),
+        None => swap_port(origin, proxy_port),
+    };
     format!("{}/v/{}/use", proxy_origin, vault_id)
 }
 
@@ -416,6 +442,7 @@ pub async fn vault_registry(
     State(state): State<Arc<AppState>>,
     Path(vault_id): Path<String>,
     Query(q): Query<RegistryQuery>,
+    headers: HeaderMap,
 ) -> Result<Json<Value>> {
     validate_vault_id(&vault_id)?;
     let include_policy_rules = q.include_policy_rules();
@@ -432,8 +459,12 @@ pub async fn vault_registry(
     };
 
     // Vault-scoped proxy_base — used both to render `[setup]` hints and on the
-    // response body.
-    let vpb = vault_proxy_base(&state, &vault_id);
+    // response body. Derived from the request Host so it points back at THIS
+    // daemon's proxy plane (local: 127.0.0.1:<proxy_port>), not the public origin.
+    let host = headers
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok());
+    let vpb = vault_proxy_base(host, state.config.proxy_port, &state.config.origin, &vault_id);
     let services: Vec<RegistryService> = state
         .services
         .iter_sorted()
@@ -480,6 +511,48 @@ pub async fn vault_registry(
     Ok(Json(serde_json::to_value(body)?))
 }
 
+
+#[cfg(test)]
+mod proxy_base_tests {
+    use super::*;
+
+    #[test]
+    fn local_host_uses_proxy_port_over_origin() {
+        // The agent reached the ADMIN plane at 127.0.0.1:23294; proxy_base must
+        // point at the SAME host on the PROXY port (23295), NOT config.origin
+        // (which for a self-host is the public WebAuthn domain). This was the bug
+        // that sent agents to a remote host → 401.
+        assert_eq!(
+            vault_proxy_base(Some("127.0.0.1:23294"), 23295, "https://dev.safeclaw.pro", "abc"),
+            "http://127.0.0.1:23295/v/abc/use"
+        );
+    }
+
+    #[test]
+    fn localhost_name_is_http() {
+        assert_eq!(
+            vault_proxy_base(Some("localhost:23294"), 23295, "https://x", "abc"),
+            "http://localhost:23295/v/abc/use"
+        );
+    }
+
+    #[test]
+    fn reverse_proxy_host_keeps_host_no_port() {
+        // Behind TLS termination (no explicit port) → keep the host, path-routed.
+        assert_eq!(
+            vault_proxy_base(Some("custodian.safeclaw.pro"), 23295, "https://x", "abc"),
+            "https://custodian.safeclaw.pro/v/abc/use"
+        );
+    }
+
+    #[test]
+    fn no_host_falls_back_to_origin() {
+        assert_eq!(
+            vault_proxy_base(None, 23295, "https://dev.safeclaw.pro", "abc"),
+            "https://dev.safeclaw.pro/v/abc/use"
+        );
+    }
+}
 
 #[cfg(test)]
 mod setup_tests {

@@ -57,7 +57,7 @@ Authorization: Bearer $SAFECLAW_API_KEY
   "services": [
     { "id": "openai", "name": "OpenAI", "category": "llm",
       "connected": true,
-      "endpoints": [{ "method": "ANY", "path": "/use/openai", "wildcard": true }],
+      "endpoints": [{ "method": "ANY", "path": "/openai", "wildcard": true }],
       "vault_fields": [{ "name": "openai_api_key", "kind": "secret" }] }
   ]
 }
@@ -91,20 +91,24 @@ tap their passkey) and retry once it's done. Don't tell the user to
 
 ## Call shape
 
-Use `proxy_base` from the registry response as the base URL — it is
-already set to the correct host and path for your deployment.
+Credential calls use **`proxy_base`** from the registry response as the base
+URL — **not** `$SAFECLAW_VAULT_URL`. They are different planes:
+`$SAFECLAW_VAULT_URL` is the **admin** plane (`/registry`, approvals);
+`proxy_base` is the **proxy** plane that injects credentials, and can be a
+different host/port. The registry already set `proxy_base` correctly for your
+deployment — use it verbatim; never build a Use URL from `$SAFECLAW_VAULT_URL`.
 
 ```
 <METHOD> <proxy_base>/<service>[/<path>]
 Authorization: Bearer $SAFECLAW_API_KEY
 ```
 
-Use the **upstream's natural HTTP method** — `GET` for reads
-(`GET <proxy_base>/openai/v1/models`), `POST`/`PUT`/`PATCH`/`DELETE` for
-writes. The daemon forwards your method, path, and body verbatim to the
-upstream. `<path>` is optional — services that catch any path work with
-or without one. Multi-segment paths (`v1/chat/completions`) pass straight
-through.
+`<service>` is a service `id`; `<path>` is the upstream's own path. The daemon
+forwards your method, path, and body verbatim, with the **upstream's natural
+method** — e.g. `GET <proxy_base>/openai/v1/models`,
+`GET <proxy_base>/gmail/gmail/v1/users/me/messages`,
+`POST <proxy_base>/openai/v1/chat/completions`. `<path>` is optional for
+catch-all services; multi-segment paths pass straight through.
 
 Every response (initial call and follow-up polls) has the same shape:
 
@@ -142,12 +146,13 @@ then apply it (adapt to the user's real config if it differs). The per-service
 ## Raw secret export (high-risk)
 
 `/use/<service>` is the default — broker injects credentials server-side,
-agent never holds them. Only reach for `/export/<key>` when no
-`/use/<service>` route fits the task.
+agent never holds them. Only reach for export when no `/use/<service>` route
+fits the task.
 
-```
-POST $SAFECLAW_VAULT_URL/export/<key>
-```
+Export is on the **proxy plane** (the `proxy_base` host/port, not
+`$SAFECLAW_VAULT_URL`): the route is `/export/<key>` on the same vault base as
+`proxy_base` — replace its trailing `/use` with `/export/<key>`. E.g.
+`proxy_base = …/v/abc/use` → `POST …/v/abc/export/<key>`.
 
 `<key>` is a `vault_entries` item from `/registry`. Same `pending` → `ok`
 lifecycle as `/use/`. On `ok`, `value` is the plaintext secret as a string —
