@@ -223,6 +223,12 @@ async fn run_daemon(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     // the daemon down.
     safeclaw::sync::spawn_watchers(state.clone());
 
+    // De-daemon (DE_DAEMON.md §4): local-first audit outbox. The daemon writes
+    // every op to its per-vault audit.db synchronously; this detached loop ships
+    // terminal Use-op rows to the cloud `audit_events` table so the console can
+    // show activity without a cloud daemon. Best-effort + gated like blob sync.
+    tokio::spawn(safeclaw::sync::ship_audit_loop(state.clone()));
+
     let listen_ip: std::net::IpAddr = config.listen.parse().unwrap_or_else(|_| "127.0.0.1".parse().unwrap());
 
     // Single port (2026-06-23 zero-inbound pivot): control + broker planes

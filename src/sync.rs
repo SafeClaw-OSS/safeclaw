@@ -634,6 +634,167 @@ pub async fn sync_agent_keys_loop(state: Arc<AppState>) {
     }
 }
 
+// ── Audit shipper (de-daemon, DE_DAEMON.md §4) ──────────────────────────────
+// Local-first outbox: the daemon already writes every op to its per-vault
+// `audit.db` synchronously (offline-safe). This loop is the DELIVERY half — it
+// pushes terminal Use-op rows (synced=0) to the cloud `audit_events` table so
+// the console can show activity WITHOUT a cloud daemon. Best-effort + gated
+// exactly like blob sync: a local-only / unpaired daemon never ships. The
+// backend UPSERTs on the daemon-minted `event_id`, so at-least-once delivery
+// (ship, then crash before marking) is idempotent.
+
+/// Max rows shipped per vault per backend round-trip. Bounds request size; a
+/// larger backlog drains across successive batches within one sweep.
+const AUDIT_SHIP_BATCH: u32 = 200;
+
+/// One audit event in the cloud-ingest wire shape. The backend stamps
+/// `vault_id` (from the URL path) and `account_id` (from the authenticated
+/// device-key) — the daemon never asserts ownership in the body. Secret values,
+/// query strings, and request/response bodies are NEVER included (audit.rs only
+/// ever records method / sanitized path / status / timestamps).
+#[derive(serde::Serialize)]
+struct AuditEventWire {
+    event_id: String, // daemon-minted op id; the backend's UPSERT key
+    ts: i64,          // event time (unix secs): decided_at, else created_at
+    decision: String, // allowed | approved | denied | rejected | expired
+    op_id: String,    // approval linkage (= event_id for Use ops)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    service: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    action: Option<String>, // "METHOD path", e.g. "POST /v1/chat/completions"
+}
+
+fn event_from_row(row: &crate::audit::ApprovalRow) -> AuditEventWire {
+    let action = match (&row.method, &row.path) {
+        (Some(m), Some(p)) => Some(format!("{} {}", m, p)),
+        (Some(m), None) => Some(m.clone()),
+        (None, Some(p)) => Some(p.clone()),
+        (None, None) => None,
+    };
+    AuditEventWire {
+        event_id: row.id.clone(),
+        ts: row.decided_at.unwrap_or(row.created_at),
+        decision: row.status.clone(),
+        op_id: row.id.clone(),
+        service: row.service.clone(),
+        action,
+    }
+}
+
+/// Periodically ship each synced vault's unshipped audit rows to the cloud.
+/// Detached + best-effort: any failure backs off to the next tick and never
+/// affects serving.
+pub async fn ship_audit_loop(state: Arc<AppState>) {
+    loop {
+        ship_audit_once(&state).await;
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    }
+}
+
+/// One sweep across all synced vaults (active ∪ known_vaults).
+pub async fn ship_audit_once(state: &Arc<AppState>) {
+    let Ok(cfg) = active::load() else {
+        return;
+    };
+    let Some(cloud) = cfg.cloud_backend.as_deref().filter(|s| !s.is_empty()) else {
+        return; // local-only daemon — nowhere to ship
+    };
+    let Some(dk) = device_key() else {
+        return; // unpaired — no device-key to authenticate the ingest
+    };
+    let cloud = cloud.trim_end_matches('/');
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    for vault in synced_vault_ids(&cfg) {
+        ship_vault_audit(state, &client, cloud, &dk, &vault).await;
+    }
+}
+
+async fn ship_vault_audit(
+    state: &Arc<AppState>,
+    client: &reqwest::Client,
+    cloud: &str,
+    device_key: &str,
+    vault: &str,
+) {
+    // `for_vault` only opens DBs for vaults that exist on disk; a known-but-not-
+    // yet-served vault just yields NotFound and is skipped this tick.
+    let store = match state.audits.for_vault(vault) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+
+    // Opportunistic retention: prune local rows past the vault's window so the
+    // outbox + audit.db don't grow unbounded. Cloud-side TTL is separate (§4).
+    if let Some(days) = state.audit_retention_days(vault) {
+        if let Some(cutoff) = retention_cutoff(days) {
+            let _ = store.prune_older_than(cutoff);
+        }
+    }
+
+    // Drain the backlog in batches; stop on the first error (retry next tick)
+    // or when a short page signals the queue is empty.
+    loop {
+        let rows = match store.list_unsynced(AUDIT_SHIP_BATCH) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::debug!(vault = %vault, "audit ship: list_unsynced failed: {}", e);
+                return;
+            }
+        };
+        if rows.is_empty() {
+            return;
+        }
+        let events: Vec<AuditEventWire> = rows.iter().map(event_from_row).collect();
+        let url = format!("{}/v/{}/audit", cloud, vault);
+        let resp = client
+            .post(&url)
+            .bearer_auth(device_key)
+            .json(&serde_json::json!({ "events": events }))
+            .send()
+            .await;
+        match resp {
+            Ok(r) if r.status().is_success() => {
+                let ids: Vec<String> = rows.iter().map(|r| r.id.clone()).collect();
+                let n = ids.len();
+                if let Err(e) = store.mark_synced(&ids) {
+                    tracing::warn!(vault = %vault, "audit ship: mark_synced failed: {}", e);
+                    return; // avoid re-shipping the same batch in a tight loop
+                }
+                tracing::debug!(vault = %vault, count = n, "audit shipped");
+                if (n as u32) < AUDIT_SHIP_BATCH {
+                    return; // drained
+                }
+            }
+            Ok(r) => {
+                tracing::debug!(
+                    vault = %vault, status = %r.status(),
+                    "audit ship: backend rejected batch; retrying next tick"
+                );
+                return;
+            }
+            Err(e) => {
+                tracing::debug!(vault = %vault, "audit ship: unreachable backend: {}", e);
+                return;
+            }
+        }
+    }
+}
+
+/// Unix-seconds cutoff for `days` of retention, or None on a clock error.
+fn retention_cutoff(days: u32) -> Option<i64> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs() as i64;
+    Some(now - (days as i64) * 86_400)
+}
+
 /// Long-lived background sync watcher. Long-polls the cloud blob-version
 /// endpoint (`/v/{vid}/blob/wait?since=<local>`, server holds ~25s and
 /// responds the instant the version bumps); on a change, pulls the new sealed

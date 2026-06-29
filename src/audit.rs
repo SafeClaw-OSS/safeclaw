@@ -55,7 +55,10 @@ CREATE TABLE IF NOT EXISTS approvals (
     target          TEXT,
     reason          TEXT,
     credential_id   TEXT,
-    upstream_status INTEGER
+    upstream_status INTEGER,
+    -- De-daemon (DE_DAEMON.md §4): cloud audit-shipper outbox flag.
+    -- 0 = not yet shipped to the cloud `audit_events` table; 1 = shipped.
+    synced          INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_approvals_status_created
     ON approvals(status, created_at DESC);
@@ -146,6 +149,22 @@ impl AuditStore {
         conn.pragma_update(None, "synchronous", "NORMAL").ok();
         conn.execute_batch(SCHEMA)
             .map_err(|e| AppError::Internal(format!("audit schema init: {}", e)))?;
+        // De-daemon: additive `synced` column for the cloud audit shipper.
+        // An audit.db created before the shipper lacks it; the ALTER adds it.
+        // On a fresh DB the column already exists (SCHEMA) and the
+        // "duplicate column" error is intentionally ignored — idempotent.
+        let _ = conn.execute(
+            "ALTER TABLE approvals ADD COLUMN synced INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        // Outbox scan index — created here (not in SCHEMA) so it always runs
+        // AFTER `synced` is guaranteed to exist on both fresh and migrated DBs.
+        // Partial: indexes only the unshipped rows the shipper actually scans.
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_approvals_unsynced
+                 ON approvals(created_at) WHERE synced = 0;",
+        )
+        .map_err(|e| AppError::Internal(format!("audit unsynced index: {}", e)))?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -206,6 +225,67 @@ impl AuditStore {
             .execute("DELETE FROM approvals WHERE created_at < ?1", params![cutoff])
             .map_err(|e| AppError::Internal(format!("audit prune: {}", e)))?;
         Ok(count as u64)
+    }
+
+    /// De-daemon outbox read (DE_DAEMON.md §4): terminal Use-op rows not yet
+    /// shipped to the cloud `audit_events` table. Pending rows (transient) and
+    /// control-plane ops (write/unlock/...) are out of v1 audit scope — only
+    /// agent broker activity ships (a forward happened, or an ask was decided
+    /// allowed/approved/denied/rejected/expired). Oldest-first so shipping
+    /// preserves event order and the batch boundary is stable across ticks.
+    pub fn list_unsynced(&self, limit: u32) -> Result<Vec<ApprovalRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, created_at, decided_at, expires_at, status, act_kind,
+                        service, method, path, target, reason, credential_id,
+                        upstream_status
+                 FROM approvals
+                 WHERE synced = 0 AND act_kind = 'use' AND status != 'pending'
+                 ORDER BY created_at ASC
+                 LIMIT ?1",
+            )
+            .map_err(|e| AppError::Internal(format!("audit unsynced prepare: {}", e)))?;
+        let rows = stmt
+            .query_map(params![limit], |row| {
+                Ok(ApprovalRow {
+                    id: row.get(0)?,
+                    created_at: row.get(1)?,
+                    decided_at: row.get(2)?,
+                    expires_at: row.get(3)?,
+                    status: row.get(4)?,
+                    act_kind: row.get(5)?,
+                    service: row.get(6)?,
+                    method: row.get(7)?,
+                    path: row.get(8)?,
+                    target: row.get(9)?,
+                    reason: row.get(10)?,
+                    credential_id: row.get(11)?,
+                    upstream_status: row.get(12)?,
+                })
+            })
+            .map_err(|e| AppError::Internal(format!("audit unsynced query: {}", e)))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(|e| AppError::Internal(format!("audit unsynced row: {}", e)))?);
+        }
+        Ok(out)
+    }
+
+    /// Mark shipped rows synced after the cloud `audit_events` upsert ACKs.
+    /// Idempotent: re-marking an already-synced id is a no-op. At-least-once
+    /// safe — a crash between ship and mark just re-ships (the backend upserts
+    /// on `event_id`).
+    pub fn mark_synced(&self, ids: &[String]) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let conn = self.conn.lock().unwrap();
+        for id in ids {
+            conn.execute("UPDATE approvals SET synced = 1 WHERE id = ?1", params![id])
+                .map_err(|e| AppError::Internal(format!("audit mark_synced: {}", e)))?;
+        }
+        Ok(())
     }
 
     /// Transition a pending row to a terminal status (approved | rejected
@@ -597,5 +677,47 @@ mod tests {
         let gh = s.list(None, Some("github"), None, 10).unwrap();
         assert_eq!(gh.len(), 1);
         assert_eq!(gh[0].id, "op1");
+    }
+
+    #[test]
+    fn unsynced_outbox_lifecycle() {
+        let (_tmp, s) = fresh_store();
+
+        // Two terminal Use rows — shippable.
+        let mut allowed = row("op1", STATUS_ALLOWED, 100);
+        allowed.decided_at = Some(100);
+        s.insert(&allowed).unwrap();
+        let mut approved = row("op2", STATUS_APPROVED, 200);
+        approved.decided_at = Some(210);
+        s.insert(&approved).unwrap();
+        // Pending = transient, NOT shipped.
+        s.insert(&row("op-pending", STATUS_PENDING, 300)).unwrap();
+        // Control-plane op (act_kind != 'use') = NOT shipped.
+        let mut write = row("op-write", STATUS_APPROVED, 400);
+        write.act_kind = "write".into();
+        s.insert(&write).unwrap();
+
+        let un = s.list_unsynced(100).unwrap();
+        assert_eq!(un.len(), 2, "only terminal Use rows ship");
+        assert_eq!(un[0].id, "op1", "oldest-first");
+        assert_eq!(un[1].id, "op2");
+
+        // Marking synced removes a row from the outbox.
+        s.mark_synced(&["op1".to_string()]).unwrap();
+        let un2 = s.list_unsynced(100).unwrap();
+        assert_eq!(un2.len(), 1);
+        assert_eq!(un2[0].id, "op2");
+
+        // Re-marking is idempotent (empty + already-synced ids are no-ops).
+        s.mark_synced(&[]).unwrap();
+        s.mark_synced(&["op1".to_string(), "op2".to_string()]).unwrap();
+        assert!(s.list_unsynced(100).unwrap().is_empty());
+
+        // A pending row that finalizes to a terminal Use status becomes shippable.
+        s.finalize("op-pending", STATUS_APPROVED, 350, None, None, Some(200))
+            .unwrap();
+        let un3 = s.list_unsynced(100).unwrap();
+        assert_eq!(un3.len(), 1);
+        assert_eq!(un3[0].id, "op-pending");
     }
 }
