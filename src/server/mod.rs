@@ -27,7 +27,6 @@
 //! SafeClaw pro-backend is the auth boundary).
 
 pub mod broker;
-pub mod cors;
 pub mod handlers;
 
 use std::sync::Arc;
@@ -45,6 +44,11 @@ use crate::state::AppState;
 const MAX_BODY_BYTES: usize = 256 * 1024;
 
 pub fn admin_router(state: Arc<AppState>) -> Router {
+    // ── Control plane ────────────────────────────────────────────────────
+    // Vault lifecycle, op approval, passkeys, registry, admin. NOT agent-key
+    // gated: op/approve is gated by the op_id + passkey signature (the passkey
+    // wall); admin by X-Admin-Key; registry/passkeys are auth-free localhost
+    // reads. This is exactly the surface the old admin port carried.
     let mut router = Router::new()
         // Custodian-level (no vault context).
         .route("/health", get(handlers::health::health))
@@ -62,22 +66,59 @@ pub fn admin_router(state: Arc<AppState>) -> Router {
         .route("/v/{vid}/registry", get(handlers::registry::vault_registry))
         .route("/v/{vid}/usage", get(handlers::usage::usage))
         // Op-flat (vault context lives on the approval record).
-        // GET /op/{id} content-negotiates: Accept text/html → passkey
-        // page (OSS auth page), else → JSON poll response.
+        // GET /op/{id} returns the JSON poll response (status + cached value).
+        // The agent / CLI polls this; the human approves on safeclaw.pro via
+        // the op-relay, so the daemon serves no approval HTML of its own.
         .route("/op/{op_id}", get(handlers::approve::get_op))
         .route("/op/{op_id}/approve", post(handlers::approve::approve_op))
         .route("/op/{op_id}/reject", post(handlers::approve::reject_op))
-        // Passkey page (minimal — assertion + PRF only, CLI does all crypto).
-        // GET /op/{id} with Accept: text/html serves the HTML; /op-page/main.js
-        // is the JS asset. All CLI commands use this unified page.
-        .route("/op-page/main.js", get(handlers::cli_auth::op_page_js))
         // Admin (X-Admin-Key gated; off when SAFECLAW_ADMIN_KEY unset).
         .route("/admin/vaults", get(handlers::admin::list_vaults))
         .route("/admin/vaults/{vid}", delete(handlers::admin::delete_vault))
-        .with_state(state);
+        .with_state(state.clone());
     router = router.layer(DefaultBodyLimit::max(MAX_BODY_BYTES));
-    if let Some(cors) = cors::build_cors() {
-        router = router.layer(cors);
-    }
+
+    // ── Broker plane ─────────────────────────────────────────────────────
+    // The four agent-facing routes (use / stream / export). These — and ONLY
+    // these — carry the agent-key gate (`require_api_key`): every request must
+    // present `Authorization: Bearer <agent-key>` whose sha256 is in the
+    // cloud-synced account hash-set. They formerly lived on a second port
+    // (:23295, now removed); merging them here keeps the gate scoped to the
+    // broker surface so control routes are unaffected.
+    let broker = broker_router(state);
+    router = router.merge(broker);
+
+    // CORS: the only browser inbound was the embedded op-page, now deleted —
+    // approval happens on safeclaw.pro, not against the daemon. With no browser
+    // flow left, no CorsLayer is added (the broker plane must stay off browsers
+    // anyway — F-25). Self-host dev that fronts the daemon with a browser can
+    // still terminate CORS at its reverse proxy.
     router
+}
+
+/// The agent-key-gated broker sub-router. Split out so the gate is a layer on
+/// these four routes only — the control routes in `admin_router` keep their own
+/// (passkey / X-Admin-Key / auth-free-localhost) gating untouched.
+fn broker_router(state: Arc<AppState>) -> Router {
+    use crate::proxy::{env, stream, use_broker};
+    use axum::routing::any;
+
+    Router::new()
+        .route("/v/{vid}/export/{key}", post(env::handle))
+        .route("/v/{vid}/use/{service}", any(use_broker::handle_no_rest))
+        .route("/v/{vid}/use/{service}/{*rest}", any(use_broker::handle))
+        // Streaming passthrough (git smart-HTTP, etc.). Body limit DISABLED on
+        // this route only — packfiles can be hundreds of MB and are streamed,
+        // not buffered. Still behind the agent-key gate below.
+        .route(
+            "/v/{vid}/stream/{service}/{*rest}",
+            any(stream::handle).layer(DefaultBodyLimit::disable()),
+        )
+        // Agent-key gate — scoped to exactly these broker routes.
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::api_key::require_api_key,
+        ))
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
+        .with_state(state)
 }

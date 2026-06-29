@@ -24,7 +24,7 @@ use crate::config::LogoutArgs;
 pub async fn run(args: LogoutArgs) -> Result<(), String> {
     let cfg = load().unwrap_or_default();
     let was_paired =
-        cfg.custodian.is_some() || cfg.cloud_backend.is_some() || crate::sync::device_key().is_some();
+        cfg.daemon.is_some() || cfg.cloud_backend.is_some() || crate::sync::device_key().is_some();
 
     // 1. Revoke the device-key cloud-side (default) — BEFORE we drop the local
     //    credential we'd need to authenticate the revoke. Best-effort: a failure
@@ -57,7 +57,7 @@ pub async fn run(args: LogoutArgs) -> Result<(), String> {
     //    frontend origin, and the known-vaults history (incl. any orphans).
     //    Preserve user `settings` (e.g. cb_port) — those aren't pairing state.
     let mut cleared = load().unwrap_or_default();
-    cleared.custodian = None;
+    cleared.daemon = None;
     cleared.vault = None;
     cleared.cloud_backend = None;
     cleared.frontend_origin = None;

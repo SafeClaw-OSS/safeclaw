@@ -111,7 +111,7 @@ pub async fn run(args: StatusArgs) -> Result<(), String> {
     println!();
 
     // ── Active vault ────────────────────────────────────────────────────
-    match (cfg.custodian.as_deref(), cfg.vault.as_deref()) {
+    match (cfg.daemon.as_deref(), cfg.vault.as_deref()) {
         (Some(c), Some(v)) => {
             let s = fetch_status(c, v).await;
             print_status(&s);

@@ -4,7 +4,6 @@ use std::sync::Arc;
 use clap::Parser;
 use safeclaw::cli;
 use safeclaw::config::{Cli, Command, Config, ServeArgs};
-use safeclaw::proxy::proxy_router;
 use safeclaw::server::admin_router;
 use safeclaw::state::AppState;
 
@@ -226,42 +225,27 @@ async fn run_daemon(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let listen_ip: std::net::IpAddr = config.listen.parse().unwrap_or_else(|_| "127.0.0.1".parse().unwrap());
 
-    let admin_addr = SocketAddr::new(listen_ip, config.port);
-    let proxy_addr = SocketAddr::new(listen_ip, config.proxy_port);
-
-    let admin = admin_router(state.clone());
-    let proxy = proxy_router(state.clone());
+    // Single port (2026-06-23 zero-inbound pivot): control + broker planes
+    // share one listener. The broker routes (use/stream/export) carry the
+    // agent-key gate inside the router; control routes (op/approve/passkeys/
+    // admin) keep their passkey / X-Admin-Key gating. See server::admin_router.
+    let addr = SocketAddr::new(listen_ip, config.port);
+    let app = admin_router(state.clone());
 
     tracing::info!(
-        admin = %admin_addr,
-        proxy = %proxy_addr,
+        listen = %addr,
         state_dir = %config.state_dir.display(),
         rp_id = %config.rp_id,
         origin = %config.origin,
         "safeclaw daemon starting"
     );
 
-    let admin_listener = tokio::net::TcpListener::bind(admin_addr).await?;
-    let proxy_listener = tokio::net::TcpListener::bind(proxy_addr).await?;
+    let listener = tokio::net::TcpListener::bind(addr).await?;
 
-    let admin_task = tokio::spawn(async move {
-        axum::serve(
-            admin_listener,
-            admin.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .await
-    });
-    let proxy_task = tokio::spawn(async move {
-        axum::serve(
-            proxy_listener,
-            proxy.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .await
-    });
-
-    tokio::select! {
-        r = admin_task => { r??; },
-        r = proxy_task => { r??; },
-    }
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }

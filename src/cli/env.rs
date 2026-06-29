@@ -24,7 +24,7 @@ use crate::cli::active::load as load_config;
 
 pub fn run() -> Result<(), String> {
     let cfg = load_config()?;
-    let custodian = match cfg.custodian {
+    let custodian = match cfg.daemon {
         Some(c) => c,
         None => {
             println!("# safeclaw: no active config — run `safeclaw vault create` first");

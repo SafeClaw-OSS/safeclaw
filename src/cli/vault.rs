@@ -44,10 +44,10 @@ async fn run_ls() -> Result<(), String> {
         println!("(no vaults yet — `safeclaw vault create` or `safeclaw vault use`)");
         return Ok(());
     }
-    let active = (cfg.custodian.as_deref(), cfg.vault.as_deref());
+    let active = (cfg.daemon.as_deref(), cfg.vault.as_deref());
     for (i, kv) in cfg.known_vaults.iter().enumerate() {
-        let marker = if active == (Some(&kv.custodian), Some(&kv.vault)) { "*" } else { " " };
-        println!("  {} {}) {}", marker, i + 1, join_vault_url(&kv.custodian, &kv.vault));
+        let marker = if active == (Some(&kv.daemon), Some(&kv.vault)) { "*" } else { " " };
+        println!("  {} {}) {}", marker, i + 1, join_vault_url(&kv.daemon, &kv.vault));
     }
     Ok(())
 }
@@ -62,7 +62,7 @@ fn resolve_url_or_idx(arg: &str) -> Result<(String, String), String> {
             return Err(format!("index {} out of range [1-{}]", idx, cfg.known_vaults.len()));
         }
         let kv = &cfg.known_vaults[idx - 1];
-        return Ok((kv.custodian.clone(), kv.vault.clone()));
+        return Ok((kv.daemon.clone(), kv.vault.clone()));
     }
     split_vault_url(arg).ok_or_else(|| {
         format!("not a valid SAFECLAW_VAULT_URL or index: {}", arg)
@@ -138,13 +138,13 @@ enum OnEmpty {
 
 fn interactive_pick(on_empty: OnEmpty) -> Result<Option<String>, String> {
     let cfg = load_config().unwrap_or_default();
-    let active = (cfg.custodian.as_deref(), cfg.vault.as_deref());
+    let active = (cfg.daemon.as_deref(), cfg.vault.as_deref());
     let has_known = !cfg.known_vaults.is_empty();
     if has_known {
         eprintln!("Known vaults:");
         for (i, kv) in cfg.known_vaults.iter().enumerate() {
-            let marker = if active == (Some(&kv.custodian), Some(&kv.vault)) { " (active)" } else { "" };
-            eprintln!("  {}) {}{}", i + 1, join_vault_url(&kv.custodian, &kv.vault), marker);
+            let marker = if active == (Some(&kv.daemon), Some(&kv.vault)) { " (active)" } else { "" };
+            eprintln!("  {}) {}{}", i + 1, join_vault_url(&kv.daemon, &kv.vault), marker);
         }
         eprintln!();
     }
@@ -173,7 +173,7 @@ fn interactive_pick(on_empty: OnEmpty) -> Result<Option<String>, String> {
             return Err(format!("index {} out of range [1-{}]", idx, cfg.known_vaults.len()));
         }
         let kv = &cfg.known_vaults[idx - 1];
-        return Ok(Some(join_vault_url(&kv.custodian, &kv.vault)));
+        return Ok(Some(join_vault_url(&kv.daemon, &kv.vault)));
     }
     Ok(Some(trimmed.to_string()))
 }
@@ -393,7 +393,7 @@ async fn run_delete(args: VaultDeleteArgs) -> Result<(), String> {
 async fn pick_reuse_passkey(new_custodian: &str, new_vault_id: &str) -> Result<crate::cli::webauthn::PasskeyMeta, String> {
     let cfg = load_config().unwrap_or_default();
     let candidates: Vec<_> = cfg.known_vaults.iter()
-        .filter(|kv| kv.custodian.trim_end_matches('/') == new_custodian.trim_end_matches('/')
+        .filter(|kv| kv.daemon.trim_end_matches('/') == new_custodian.trim_end_matches('/')
             && kv.vault != new_vault_id)
         .collect();
     if candidates.is_empty() {
@@ -403,12 +403,12 @@ async fn pick_reuse_passkey(new_custodian: &str, new_vault_id: &str) -> Result<c
         ));
     }
     let source_vault = if candidates.len() == 1 {
-        eprintln!("  reusing passkey from: {}", join_vault_url(&candidates[0].custodian, &candidates[0].vault));
+        eprintln!("  reusing passkey from: {}", join_vault_url(&candidates[0].daemon, &candidates[0].vault));
         &candidates[0].vault
     } else {
         eprintln!("Pick a vault to reuse a passkey from:");
         for (i, kv) in candidates.iter().enumerate() {
-            eprintln!("  {}) {}", i + 1, join_vault_url(&kv.custodian, &kv.vault));
+            eprintln!("  {}) {}", i + 1, join_vault_url(&kv.daemon, &kv.vault));
         }
         eprint!("Enter index: ");
         io::stderr().flush().ok();

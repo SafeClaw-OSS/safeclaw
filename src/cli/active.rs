@@ -1,9 +1,14 @@
 //! CLI-side config (`~/.safeclaw/config.toml`).
 //!
-//! Tracks the active `(custodian, vault)` pair plus a list of all
-//! vaults the user has used on this machine. Vaults are addressed via
-//! `SAFECLAW_VAULT_URL` (= custodian root + vault id baked into the
-//! path); the CLI splits/joins as needed.
+//! Tracks the active `(daemon, vault)` pair plus a list of all vaults the user
+//! has used on this machine. `daemon` is the local SafeClaw daemon URL the
+//! human's `sc` talks to (after `sc login` it's the loopback daemon, not the
+//! cloud). Vaults are addressed via `SAFECLAW_VAULT_URL` (= daemon root + vault
+//! id baked into the path); the CLI splits/joins as needed.
+//!
+//! On-disk field name: `daemon`. Configs written by an older build used
+//! `custodian`; `#[serde(alias = "custodian")]` keeps those loading (pre-launch
+//! is wipe+re-enroll, so the alias is belt-and-suspenders, not a migration).
 
 use std::fs;
 use std::io::Write as _;
@@ -13,8 +18,9 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
 pub struct CliConfig {
-    #[serde(default)]
-    pub custodian: Option<String>,
+    /// The local daemon URL the human's `sc` talks to (loopback after login).
+    #[serde(default, alias = "custodian")]
+    pub daemon: Option<String>,
     #[serde(default)]
     pub vault: Option<String>,
     /// History of vaults this CLI has used. `sc vault ls` displays
@@ -25,7 +31,7 @@ pub struct CliConfig {
     /// Cloud pro-backend origin for sealed-blob sync (Slice 3) AND the
     /// op-relay (web approval). Set by `sc login`; the daemon pulls
     /// `{cloud_backend}/v/{vault}/blob` and registers pending ops at
-    /// `{cloud_backend}/v/{vault}/op/relay/*`. Distinct from `custodian`,
+    /// `{cloud_backend}/v/{vault}/op/relay/*`. Distinct from `daemon`,
     /// which after login points at the LOCAL daemon the agent talks to.
     /// See [[project_slice3_design]].
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -69,7 +75,9 @@ pub fn settings_cb_port() -> Option<u16> {
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct KnownVault {
-    pub custodian: String,
+    /// The daemon URL this vault lives behind. (On-disk alias: `custodian`.)
+    #[serde(alias = "custodian")]
+    pub daemon: String,
     pub vault: String,
 }
 
@@ -113,12 +121,12 @@ pub fn save(cfg: &CliConfig) -> Result<PathBuf, String> {
 pub fn forget(custodian: &str, vault: &str) -> Result<bool, String> {
     let mut cfg = load().unwrap_or_default();
     let before = cfg.known_vaults.len();
-    cfg.known_vaults.retain(|kv| !(kv.custodian == custodian && kv.vault == vault));
+    cfg.known_vaults.retain(|kv| !(kv.daemon == custodian && kv.vault == vault));
     if cfg.known_vaults.len() == before {
         return Ok(false);
     }
-    if cfg.custodian.as_deref() == Some(custodian) && cfg.vault.as_deref() == Some(vault) {
-        cfg.custodian = None;
+    if cfg.daemon.as_deref() == Some(custodian) && cfg.vault.as_deref() == Some(vault) {
+        cfg.daemon = None;
         cfg.vault = None;
     }
     save(&cfg)?;
@@ -138,7 +146,7 @@ pub fn forget_vault(vault: &str) -> Result<bool, String> {
     let removed_known = cfg.known_vaults.len() != before;
     let cleared_active = cfg.vault.as_deref() == Some(vault);
     if cleared_active {
-        cfg.custodian = None;
+        cfg.daemon = None;
         cfg.vault = None;
     }
     if !removed_known && !cleared_active {
@@ -149,33 +157,33 @@ pub fn forget_vault(vault: &str) -> Result<bool, String> {
 }
 
 /// Set the active vault and dedupe-add to known_vaults.
-pub fn put_active(custodian: &str, vault: &str) -> Result<PathBuf, String> {
+pub fn put_active(daemon: &str, vault: &str) -> Result<PathBuf, String> {
     let mut cfg = load().unwrap_or_default();
-    let new = KnownVault { custodian: custodian.to_string(), vault: vault.to_string() };
+    let new = KnownVault { daemon: daemon.to_string(), vault: vault.to_string() };
     if !cfg.known_vaults.contains(&new) {
         cfg.known_vaults.push(new);
     }
-    cfg.custodian = Some(custodian.to_string());
+    cfg.daemon = Some(daemon.to_string());
     cfg.vault = Some(vault.to_string());
     save(&cfg)
 }
 
-/// Set the active vault to a LOCAL daemon custodian AND record the cloud
-/// pro-backend for sealed-blob sync. Used by `sc login`: the agent talks to
-/// the local daemon (`custodian`), while the daemon syncs against the cloud
-/// (`cloud_backend`). Dedupe-adds to known_vaults like `put_active`.
+/// Set the active vault to a LOCAL daemon URL AND record the cloud pro-backend
+/// for sealed-blob sync. Used by `sc login`: the agent talks to the local
+/// `daemon`, while the daemon syncs against the cloud (`cloud_backend`).
+/// Dedupe-adds to known_vaults like `put_active`.
 pub fn put_active_with_cloud(
-    custodian: &str,
+    daemon: &str,
     vault: &str,
     cloud_backend: &str,
     frontend_origin: Option<&str>,
 ) -> Result<PathBuf, String> {
     let mut cfg = load().unwrap_or_default();
-    let new = KnownVault { custodian: custodian.to_string(), vault: vault.to_string() };
+    let new = KnownVault { daemon: daemon.to_string(), vault: vault.to_string() };
     if !cfg.known_vaults.contains(&new) {
         cfg.known_vaults.push(new);
     }
-    cfg.custodian = Some(custodian.to_string());
+    cfg.daemon = Some(daemon.to_string());
     cfg.vault = Some(vault.to_string());
     cfg.cloud_backend = Some(cloud_backend.to_string());
     cfg.frontend_origin = frontend_origin
@@ -243,12 +251,12 @@ pub fn split_vault_url(url: &str) -> Option<(String, String)> {
     Some((root.to_string(), tail.to_string()))
 }
 
-pub fn join_vault_url(custodian: &str, vault: &str) -> String {
-    format!("{}/v/{}", custodian.trim_end_matches('/'), vault)
+pub fn join_vault_url(daemon: &str, vault: &str) -> String {
+    format!("{}/v/{}", daemon.trim_end_matches('/'), vault)
 }
 
-/// Resolve the active `(daemon_url, vault)` pair for short-lived CLI commands.
-/// Resolve the `(custodian, vault)` the **human's** `sc` command operates on.
+/// Resolve the active `(daemon_url, vault)` pair for short-lived CLI commands —
+/// the `(daemon, vault)` the **human's** `sc` command operates on.
 /// Source = `config.toml` (set by `sc login` / `sc vault use`) + the explicit
 /// `--vault` flag (`vault_override`, which reselects just the vault id).
 ///
@@ -261,14 +269,14 @@ pub fn join_vault_url(custodian: &str, vault: &str) -> String {
 ///   active vault = user state → config.toml
 pub fn resolve_active(vault_override: Option<&str>) -> Result<(String, String), String> {
     let cfg = load()?;
-    let custodian = cfg.custodian.clone().ok_or_else(|| {
+    let daemon = cfg.daemon.clone().ok_or_else(|| {
         "no vault selected — run `sc login` or `sc vault use`".to_string()
     })?;
     let vault = vault_override
         .map(str::to_string)
         .or(cfg.vault.clone())
         .ok_or_else(|| "no vault selected — run `sc login` or `sc vault use`".to_string())?;
-    Ok((custodian, vault))
+    Ok((daemon, vault))
 }
 
 #[cfg(test)]

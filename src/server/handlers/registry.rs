@@ -20,7 +20,6 @@ use std::sync::Arc;
 
 use axum::{
     extract::{Path, Query, State},
-    http::HeaderMap,
     Json,
 };
 use serde::{Deserialize, Serialize};
@@ -82,10 +81,12 @@ pub struct RegistryService {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub connect: Option<crate::service::ConnectDescriptor>,
     /// Tool-config hint for a service that needs a **local tool** (a CLI/SDK)
-    /// pointed at SafeClaw — goal + ready-to-run config, rendered for this
-    /// deployment (`{{proxy_base}}` / `{{route}}` filled in). Agent-facing only;
-    /// carries NO vault secret. Present only on the per-vault registry (the
-    /// route is vault-scoped). The generic counterpart to `connect`.
+    /// pointed at SafeClaw — goal + ready-to-run config, with `{{proxy_base}}` /
+    /// `{{route}}` filled in. `{{proxy_base}}` renders to the literal
+    /// `$SAFECLAW_VAULT_URL` (the single broker base the agent already has in its
+    /// env), so the hint is deployment-agnostic and the agent's shell expands it.
+    /// Agent-facing only; carries NO vault secret. Present only on the per-vault
+    /// registry (the route is vault-scoped). The generic counterpart to `connect`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub setup: Option<crate::service::SetupDef>,
 }
@@ -134,7 +135,6 @@ pub struct RegistryVaultField {
 #[derive(Debug, Serialize)]
 pub struct RegistryResponse {
     pub version: u32,
-    pub proxy_base: String,
     pub services: Vec<RegistryService>,
     pub policy_defaults: serde_json::Value,
     // ── Per-vault overlay — only set by /v/{vid}/registry ────────────
@@ -164,8 +164,8 @@ struct VaultOverlay<'a> {
 }
 
 fn endpoint_for_api(id: &str, api: &crate::service::ApiDef) -> RegistryEndpoint {
-    // Paths are relative to proxy_base so agents can prepend it without
-    // knowing whether they're hitting OSS (proxy port) or SaaS (/api/use).
+    // Paths are relative to the broker base the agent already holds
+    // (`$SAFECLAW_VAULT_URL/use`) so the agent can prepend it uniformly.
     let rest = api.path.trim_start_matches('/');
     let (path, wildcard) = if rest == "*" {
         (format!("/{}", id), true)
@@ -260,18 +260,23 @@ fn policy_for(
 }
 
 /// Render a service's `[setup]` hint for the registry, filling `{{proxy_base}}`
-/// / `{{route}}` for this deployment. Agent-facing only — the setup context has
-/// no access to vault secrets by construction. Returns `None` if the service
-/// declares no `[setup]`. `{{api_key}}` (if any recipe uses it) renders to the
-/// literal `$SAFECLAW_API_KEY` for the agent's shell to expand.
-fn render_setup(def: &ServiceDef, proxy_base: &str) -> Option<crate::service::SetupDef> {
+/// / `{{route}}`. Agent-facing only — the setup context has no access to vault
+/// secrets by construction. Returns `None` if the service declares no `[setup]`.
+///
+/// With the daemon collapsed to a single port, `{{proxy_base}}` renders to the
+/// literal `$SAFECLAW_VAULT_URL` (the broker base the agent already has in its
+/// env) — the agent's shell expands it. `{{api_key}}` (if any recipe uses it)
+/// renders to the literal `$SAFECLAW_API_KEY` the same way. So a setup hint is
+/// identical across deployments and never needs a request-derived host.
+fn render_setup(def: &ServiceDef) -> Option<crate::service::SetupDef> {
     use crate::server::broker::{render_setup_template, SetupInputs};
+    const PROXY_BASE: &str = "$SAFECLAW_VAULT_URL";
     let setup = def.setup.as_ref()?;
     // `route` feeds `{{route}}` in the other fields, so render it first.
-    let pre = SetupInputs { proxy_base, api_key: "$SAFECLAW_API_KEY", route: "", vault: "" };
+    let pre = SetupInputs { proxy_base: PROXY_BASE, api_key: "$SAFECLAW_API_KEY", route: "", vault: "" };
     let route = setup.route.as_deref().and_then(|t| render_setup_template(t, &pre).ok());
     let inputs = SetupInputs {
-        proxy_base,
+        proxy_base: PROXY_BASE,
         api_key: "$SAFECLAW_API_KEY",
         route: route.as_deref().unwrap_or(""),
         vault: "",
@@ -289,7 +294,7 @@ fn build_service(
     def: &ServiceDef,
     overlay: Option<&VaultOverlay<'_>>,
     include_policy_rules: bool,
-    setup_proxy_base: Option<&str>,
+    render_setup_hint: bool,
 ) -> RegistryService {
     let endpoints: Vec<RegistryEndpoint> =
         def.api.iter().map(|api| endpoint_for_api(id, api)).collect();
@@ -325,7 +330,7 @@ fn build_service(
         policy,
         connected,
         connect: state.services.connect_descriptor(id),
-        setup: setup_proxy_base.and_then(|pb| render_setup(def, pb)),
+        setup: if render_setup_hint { render_setup(def) } else { None },
     }
 }
 
@@ -340,58 +345,6 @@ fn build_service(
 /// here (filtered out of the registry by api-presence).
 fn service_needs_no_auth(def: &ServiceDef) -> bool {
     def.upstream.iter().all(|u| u.auth.is_none())
-}
-
-/// Replace the port in a URL with `new_port`.
-/// "http://localhost:23294" -> "http://localhost:23295".
-/// URLs with no explicit port (SaaS behind a reverse proxy) are returned unchanged.
-fn swap_port(url: &str, new_port: u16) -> String {
-    let url = url.trim_end_matches('/');
-    if let Some(colon) = url.rfind(':') {
-        let after = &url[colon + 1..];
-        if !after.is_empty() && after.chars().all(|c| c.is_ascii_digit()) {
-            return format!("{}:{}", &url[..colon], new_port);
-        }
-    }
-    url.to_string()
-}
-
-/// `proxy_base` for `/menu` (no vault in path). Used by SaaS pro-backend
-/// which routes `/api/use/*` → daemon; not called directly by OSS agents.
-fn proxy_base(state: &AppState) -> String {
-    format!("{}/api/use", state.config.origin.trim_end_matches('/'))
-}
-
-/// `proxy_base` for `/v/{vid}/registry` — the URL agents prepend for Use calls.
-///
-/// Built from the host the agent **actually reached this daemon at** (the
-/// registry request's `Host`), pointed at the proxy plane — NOT from
-/// `config.origin`. For a self-hosted daemon `config.origin` is the public
-/// WebAuthn/console domain (e.g. `dev.safeclaw.pro`), which is NOT where a local
-/// agent connects (`127.0.0.1:<proxy_port>`); advertising it sent agents to a
-/// remote host they couldn't authenticate against. Rules:
-///   - Host with an explicit port (direct self-host, e.g. `127.0.0.1:23294`) →
-///     same hostname at `proxy_port` (the proxy plane is a sibling port).
-///   - Host without a port (behind a TLS reverse proxy) → keep the host, no port
-///     (the proxy maps `/v/{vid}/use` to the daemon's proxy plane).
-///   - No `Host` header → fall back to the legacy `config.origin` form.
-/// The `/use` suffix is kept so agents prepend `proxy_base` uniformly across OSS
-/// (proxy port) and SaaS (`/api/use`) — see `endpoint_for_api`.
-fn vault_proxy_base(host: Option<&str>, proxy_port: u16, origin: &str, vault_id: &str) -> String {
-    let proxy_origin = match host.map(str::trim).filter(|h| !h.is_empty()) {
-        Some(h) if h.contains(':') && !h.starts_with('[') => {
-            let hostname = h.rsplit_once(':').map(|(host, _)| host).unwrap_or(h);
-            let scheme = if hostname == "127.0.0.1" || hostname == "localhost" {
-                "http"
-            } else {
-                "https"
-            };
-            format!("{}://{}:{}", scheme, hostname, proxy_port)
-        }
-        Some(h) => format!("https://{}", h),
-        None => swap_port(origin, proxy_port),
-    };
-    format!("{}/v/{}/use", proxy_origin, vault_id)
 }
 
 fn console_url(state: &AppState, vault_id: &str) -> String {
@@ -421,13 +374,13 @@ pub async fn menu(
         .iter_sorted()
         .into_iter()
         .filter(|(_, def)| !def.service.hidden)
-        // No setup rendering on /menu: the setup route is vault-scoped, and the
-        // catalog has no vault context (proxy_base here carries no `/v/{vid}`).
-        .map(|(id, def)| build_service(&state, id, def, None, include_policy_rules, None))
+        // No setup rendering on /menu: the setup hint is vault-scoped (the agent
+        // applies it against its own `$SAFECLAW_VAULT_URL`), and the catalog has
+        // no vault context.
+        .map(|(id, def)| build_service(&state, id, def, None, include_policy_rules, false))
         .collect();
     let body = RegistryResponse {
         version: 2,
-        proxy_base: proxy_base(&state),
         services,
         policy_defaults: serde_json::to_value(crate::core::policy::PolicyDefaults::default())?,
         vault_locked: None,
@@ -442,7 +395,6 @@ pub async fn vault_registry(
     State(state): State<Arc<AppState>>,
     Path(vault_id): Path<String>,
     Query(q): Query<RegistryQuery>,
-    headers: HeaderMap,
 ) -> Result<Json<Value>> {
     validate_vault_id(&vault_id)?;
     let include_policy_rules = q.include_policy_rules();
@@ -458,13 +410,6 @@ pub async fn vault_registry(
         }
     };
 
-    // Vault-scoped proxy_base — used both to render `[setup]` hints and on the
-    // response body. Derived from the request Host so it points back at THIS
-    // daemon's proxy plane (local: 127.0.0.1:<proxy_port>), not the public origin.
-    let host = headers
-        .get(axum::http::header::HOST)
-        .and_then(|v| v.to_str().ok());
-    let vpb = vault_proxy_base(host, state.config.proxy_port, &state.config.origin, &vault_id);
     let services: Vec<RegistryService> = state
         .services
         .iter_sorted()
@@ -484,7 +429,7 @@ pub async fn vault_registry(
                     native_keys: &native_keys,
                 })
             };
-            build_service(&state, id, def, overlay.as_ref(), include_policy_rules, Some(&vpb))
+            build_service(&state, id, def, overlay.as_ref(), include_policy_rules, true)
         })
         .collect();
 
@@ -501,7 +446,6 @@ pub async fn vault_registry(
     // demo vaults, /vault for everyone else.
     let body = RegistryResponse {
         version: 2,
-        proxy_base: vpb,
         services,
         policy_defaults: serde_json::to_value(crate::core::policy::PolicyDefaults::default())?,
         vault_locked: Some(locked),
@@ -511,48 +455,6 @@ pub async fn vault_registry(
     Ok(Json(serde_json::to_value(body)?))
 }
 
-
-#[cfg(test)]
-mod proxy_base_tests {
-    use super::*;
-
-    #[test]
-    fn local_host_uses_proxy_port_over_origin() {
-        // The agent reached the ADMIN plane at 127.0.0.1:23294; proxy_base must
-        // point at the SAME host on the PROXY port (23295), NOT config.origin
-        // (which for a self-host is the public WebAuthn domain). This was the bug
-        // that sent agents to a remote host → 401.
-        assert_eq!(
-            vault_proxy_base(Some("127.0.0.1:23294"), 23295, "https://dev.safeclaw.pro", "abc"),
-            "http://127.0.0.1:23295/v/abc/use"
-        );
-    }
-
-    #[test]
-    fn localhost_name_is_http() {
-        assert_eq!(
-            vault_proxy_base(Some("localhost:23294"), 23295, "https://x", "abc"),
-            "http://localhost:23295/v/abc/use"
-        );
-    }
-
-    #[test]
-    fn reverse_proxy_host_keeps_host_no_port() {
-        // Behind TLS termination (no explicit port) → keep the host, path-routed.
-        assert_eq!(
-            vault_proxy_base(Some("custodian.safeclaw.pro"), 23295, "https://x", "abc"),
-            "https://custodian.safeclaw.pro/v/abc/use"
-        );
-    }
-
-    #[test]
-    fn no_host_falls_back_to_origin() {
-        assert_eq!(
-            vault_proxy_base(None, 23295, "https://dev.safeclaw.pro", "abc"),
-            "https://dev.safeclaw.pro/v/abc/use"
-        );
-    }
-}
 
 #[cfg(test)]
 mod setup_tests {
@@ -581,19 +483,21 @@ git config --global url."{{route}}".insteadOf "https://github.com/"
 '''
 "#;
         let def: ServiceDef = toml::from_str(toml).unwrap();
-        let s = render_setup(&def, "http://127.0.0.1:23295/v/abc").expect("setup rendered");
+        let s = render_setup(&def).expect("setup rendered");
+        // {{proxy_base}} renders to the literal $SAFECLAW_VAULT_URL — the broker
+        // base the agent already holds; its shell expands it at apply time.
         assert_eq!(
             s.route.as_deref(),
-            Some("http://127.0.0.1:23295/v/abc/stream/github/")
+            Some("$SAFECLAW_VAULT_URL/stream/github/")
         );
         let ex = s.example.unwrap();
-        assert!(ex.contains("http://127.0.0.1:23295/v/abc/stream/github/"), "{}", ex);
+        assert!(ex.contains("$SAFECLAW_VAULT_URL/stream/github/"), "{}", ex);
         assert!(!ex.contains("{{"), "no leftover template tokens: {}", ex);
 
         // No [setup] → None.
         let no_setup: ServiceDef =
             toml::from_str("[service]\nid=\"x\"\nname=\"X\"\n[[upstream]]\nid=\"d\"\nurl=\"https://x.com\"\n")
                 .unwrap();
-        assert!(render_setup(&no_setup, "http://h").is_none());
+        assert!(render_setup(&no_setup).is_none());
     }
 }

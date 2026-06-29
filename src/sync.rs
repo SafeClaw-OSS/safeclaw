@@ -859,11 +859,11 @@ mod tests {
         std::env::set_var("HOME", home.path());
 
         let cfg = CliConfig {
-            custodian: Some("http://localhost:1".into()),
+            daemon: Some("http://localhost:1".into()),
             vault: Some("vid-A".into()),
             known_vaults: vec![
-                KnownVault { custodian: "http://localhost:1".into(), vault: "vid-A".into() },
-                KnownVault { custodian: "http://localhost:1".into(), vault: "vid-B".into() },
+                KnownVault { daemon: "http://localhost:1".into(), vault: "vid-A".into() },
+                KnownVault { daemon: "http://localhost:1".into(), vault: "vid-B".into() },
             ],
             ..Default::default()
         };
@@ -873,7 +873,7 @@ mod tests {
         assert_eq!(active::forget_vault("vid-A"), Ok(true));
         let after = active::load().unwrap();
         assert!(after.vault.is_none());
-        assert!(after.custodian.is_none());
+        assert!(after.daemon.is_none());
         assert_eq!(after.known_vaults.len(), 1);
         assert_eq!(after.known_vaults[0].vault, "vid-B");
 

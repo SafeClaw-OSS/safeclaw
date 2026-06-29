@@ -42,19 +42,17 @@ use crate::storage::sealed_vault::{
     build_initial, find_pubkey, read as read_vault, replace_after_write, write_atomic,
 };
 
-/// `GET /op/{op_id}` — content-negotiated.
+/// `GET /op/{op_id}` — JSON poll: status + cached value + render(o).
 ///
-/// Accept: text/html → returns the embedded passkey-ceremony HTML page.
-/// Otherwise → JSON with op details, status, cached value, etc.
+/// The agent (and the CLI's browser-callback flow) polls this for the op's
+/// state. There is no HTML branch: the human approves on safeclaw.pro (the
+/// op-relay carries the sealed grant back to the daemon), so the daemon serves
+/// no approval page of its own (2026-06-23 zero-inbound pivot).
 pub async fn get_op(
     State(state): State<Arc<AppState>>,
-    headers: axum::http::HeaderMap,
     Path(op_id): Path<String>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
-    if super::cli_auth::wants_html(&headers) {
-        return super::cli_auth::op_page_html().await.into_response();
-    }
     match get_op_json(state, op_id).await {
         Ok(j) => j.into_response(),
         Err(e) => e.into_response(),

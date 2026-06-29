@@ -448,19 +448,16 @@ pub struct ServeArgs {
     #[arg(long, env = "SAFECLAW_STATE_DIR")]
     pub state_dir: Option<PathBuf>,
 
-    /// Main API port. CLI, browser approval pages, dashboard, and
-    /// reverse proxies talk to the daemon here. (Not "admin port" — the
-    /// admin surface is the `/admin/*` subset, gated by --admin-key.)
+    /// The daemon's single port. The agent's broker calls (`/v/{vid}/use|
+    /// stream|export`, agent-key gated), the CLI, op-approval polling, and any
+    /// reverse proxy all talk to the daemon here. (Not "admin port" — the
+    /// admin surface is just the `/admin/*` subset, gated by --admin-key.)
+    /// The old separate agent proxy port (:23295) was folded in by the
+    /// 2026-06-23 zero-inbound pivot.
     #[arg(long, env = "SAFECLAW_PORT", default_value = "23294")]
     pub port: u16,
 
-    /// HTTPS proxy port for AI agents. Configure your agent with
-    /// `HTTPS_PROXY=http://localhost:<this-port>` and SafeClaw will
-    /// transparently inject credentials into outbound requests.
-    #[arg(long, env = "SAFECLAW_PROXY_PORT", default_value = "23295")]
-    pub proxy_port: u16,
-
-    /// Network interface to listen on for both ports. `127.0.0.1` =
+    /// Network interface to listen on. `127.0.0.1` =
     /// localhost only (default, safe). `0.0.0.0` = all interfaces;
     /// only do that behind a reverse proxy or inside a private network.
     #[arg(long, env = "SAFECLAW_LISTEN", default_value = "127.0.0.1")]
@@ -639,7 +636,6 @@ pub struct RmArgs {
 pub struct Config {
     pub state_dir: PathBuf,
     pub port: u16,
-    pub proxy_port: u16,
     pub listen: String,
     pub origin: String,
     pub rp_id: String,
@@ -678,7 +674,6 @@ impl Config {
         Self {
             state_dir,
             port: args.port,
-            proxy_port: args.proxy_port,
             listen: args.listen,
             origin,
             rp_id,
