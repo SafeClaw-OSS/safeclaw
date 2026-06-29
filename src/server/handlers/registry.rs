@@ -80,6 +80,13 @@ pub struct RegistryService {
     /// is never exposed; the daemon does the exchange. Absent for non-oauth2.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub connect: Option<crate::service::ConnectDescriptor>,
+    /// Tool-config hint for a service that needs a **local tool** (a CLI/SDK)
+    /// pointed at SafeClaw — goal + ready-to-run config, rendered for this
+    /// deployment (`{{proxy_base}}` / `{{route}}` filled in). Agent-facing only;
+    /// carries NO vault secret. Present only on the per-vault registry (the
+    /// route is vault-scoped). The generic counterpart to `connect`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub setup: Option<crate::service::SetupDef>,
 }
 
 #[derive(Debug, Serialize)]
@@ -251,12 +258,37 @@ fn policy_for(
     Some(RegistryServicePolicy { defaults, rules })
 }
 
+/// Render a service's `[setup]` hint for the registry, filling `{{proxy_base}}`
+/// / `{{route}}` for this deployment. Agent-facing only — the setup context has
+/// no access to vault secrets by construction. Returns `None` if the service
+/// declares no `[setup]`. `{{api_key}}` (if any recipe uses it) renders to the
+/// literal `$SAFECLAW_API_KEY` for the agent's shell to expand.
+fn render_setup(def: &ServiceDef, proxy_base: &str) -> Option<crate::service::SetupDef> {
+    use crate::server::broker::{render_setup_template, SetupInputs};
+    let setup = def.setup.as_ref()?;
+    // `route` feeds `{{route}}` in the other fields, so render it first.
+    let pre = SetupInputs { proxy_base, api_key: "$SAFECLAW_API_KEY", route: "", vault: "" };
+    let route = setup.route.as_deref().and_then(|t| render_setup_template(t, &pre).ok());
+    let inputs = SetupInputs {
+        proxy_base,
+        api_key: "$SAFECLAW_API_KEY",
+        route: route.as_deref().unwrap_or(""),
+        vault: "",
+    };
+    let r = |s: &Option<String>| s.as_deref().and_then(|t| render_setup_template(t, &inputs).ok());
+    // Render all template fields first so `inputs`' borrow of `route` ends
+    // before `route` is moved into the struct.
+    let (goal, auth, example) = (r(&setup.goal), r(&setup.auth), r(&setup.example));
+    Some(crate::service::SetupDef { goal, route, auth, example })
+}
+
 fn build_service(
     state: &AppState,
     id: &str,
     def: &ServiceDef,
     overlay: Option<&VaultOverlay<'_>>,
     include_policy_rules: bool,
+    setup_proxy_base: Option<&str>,
 ) -> RegistryService {
     let endpoints: Vec<RegistryEndpoint> =
         def.api.iter().map(|api| endpoint_for_api(id, api)).collect();
@@ -292,6 +324,7 @@ fn build_service(
         policy,
         connected,
         connect: state.services.connect_descriptor(id),
+        setup: setup_proxy_base.and_then(|pb| render_setup(def, pb)),
     }
 }
 
@@ -362,7 +395,9 @@ pub async fn menu(
         .iter_sorted()
         .into_iter()
         .filter(|(_, def)| !def.service.hidden)
-        .map(|(id, def)| build_service(&state, id, def, None, include_policy_rules))
+        // No setup rendering on /menu: the setup route is vault-scoped, and the
+        // catalog has no vault context (proxy_base here carries no `/v/{vid}`).
+        .map(|(id, def)| build_service(&state, id, def, None, include_policy_rules, None))
         .collect();
     let body = RegistryResponse {
         version: 2,
@@ -396,6 +431,9 @@ pub async fn vault_registry(
         }
     };
 
+    // Vault-scoped proxy_base — used both to render `[setup]` hints and on the
+    // response body.
+    let vpb = vault_proxy_base(&state, &vault_id);
     let services: Vec<RegistryService> = state
         .services
         .iter_sorted()
@@ -415,7 +453,7 @@ pub async fn vault_registry(
                     native_keys: &native_keys,
                 })
             };
-            build_service(&state, id, def, overlay.as_ref(), include_policy_rules)
+            build_service(&state, id, def, overlay.as_ref(), include_policy_rules, Some(&vpb))
         })
         .collect();
 
@@ -432,7 +470,7 @@ pub async fn vault_registry(
     // demo vaults, /vault for everyone else.
     let body = RegistryResponse {
         version: 2,
-        proxy_base: vault_proxy_base(&state, &vault_id),
+        proxy_base: vpb,
         services,
         policy_defaults: serde_json::to_value(crate::core::policy::PolicyDefaults::default())?,
         vault_locked: Some(locked),
@@ -442,3 +480,47 @@ pub async fn vault_registry(
     Ok(Json(serde_json::to_value(body)?))
 }
 
+
+#[cfg(test)]
+mod setup_tests {
+    use super::*;
+
+    #[test]
+    fn render_setup_fills_proxy_base_and_route() {
+        let toml = r#"
+[service]
+id = "github"
+name = "GitHub"
+category = "integration"
+[[upstream]]
+id = "git"
+url = "https://github.com"
+stream = true
+auth = { secret = "github_token" }
+[upstream.headers]
+Authorization = "Basic {{secret.github_token | basic}}"
+[setup]
+goal = "Route git through SafeClaw"
+route = "{{proxy_base}}/stream/github/"
+auth = "credential.helper = !sc git-credential"
+example = '''
+git config --global url."{{route}}".insteadOf "https://github.com/"
+'''
+"#;
+        let def: ServiceDef = toml::from_str(toml).unwrap();
+        let s = render_setup(&def, "http://127.0.0.1:23295/v/abc").expect("setup rendered");
+        assert_eq!(
+            s.route.as_deref(),
+            Some("http://127.0.0.1:23295/v/abc/stream/github/")
+        );
+        let ex = s.example.unwrap();
+        assert!(ex.contains("http://127.0.0.1:23295/v/abc/stream/github/"), "{}", ex);
+        assert!(!ex.contains("{{"), "no leftover template tokens: {}", ex);
+
+        // No [setup] → None.
+        let no_setup: ServiceDef =
+            toml::from_str("[service]\nid=\"x\"\nname=\"X\"\n[[upstream]]\nid=\"d\"\nurl=\"https://x.com\"\n")
+                .unwrap();
+        assert!(render_setup(&no_setup, "http://h").is_none());
+    }
+}
