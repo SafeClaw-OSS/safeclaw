@@ -116,6 +116,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 e.into()
             })
         }
+        Command::GitCredential(args) => {
+            // Invoked by git, not users. Never print to stderr on the happy path
+            // (git reads stdout); surface only hard errors.
+            cli::git_credential::run(args).map_err(|e| -> Box<dyn std::error::Error> {
+                eprintln!("safeclaw git-credential: {}", e);
+                e.into()
+            })
+        }
         Command::Upgrade(args) => {
             cli::upgrade::run(args).await.map_err(|e| -> Box<dyn std::error::Error> {
                 eprintln!("safeclaw upgrade: {}", e);

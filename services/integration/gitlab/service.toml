@@ -1,0 +1,63 @@
+[service]
+id = "gitlab"
+name = "GitLab"
+sub = "REST API + git"
+category = "integration"
+
+# One GitLab connection (one PAT) backs BOTH the REST API and the git transport,
+# sharing `gitlab_token`. Mirrors the `github` recipe; the differences are the
+# REST host/header and the git Basic-auth shape (GitLab needs a non-empty
+# username, conventionally `oauth2`, with the token as the password).
+
+# A. REST API  →  /v/{vid}/use/gitlab
+[[upstream]]
+id = "rest"
+url = "https://gitlab.com/api/v4"
+auth = { secret = "gitlab_token", placeholder = "glpat-..." }
+
+  [upstream.headers]
+  # Canonical PAT header for the GitLab REST API. (GitLab also accepts
+  # `Authorization: Bearer <token>`; PRIVATE-TOKEN is the unambiguous PAT form.)
+  PRIVATE-TOKEN = "{{secret.gitlab_token}}"
+
+# B. git smart-HTTP  →  /v/{vid}/stream/gitlab
+[[upstream]]
+id = "git"
+url = "https://gitlab.com"
+stream = true
+auth = { secret = "gitlab_token" }
+
+  [upstream.headers]
+  # GitLab git smart-HTTP = HTTP Basic with a non-empty username (`oauth2`) and
+  # the token as the password = base64("oauth2:" + token), which
+  # `{{secret.NAME | basic:oauth2}}` produces.
+  Authorization = "Basic {{secret.gitlab_token | basic:oauth2}}"
+
+[[api]]
+path = "*"
+
+  [[api.steps]]
+  target = "upstream:rest"
+  returns = true
+
+[setup]
+goal = "Route the user's git remotes through SafeClaw so the GitLab PAT never enters git or the agent process."
+route = "{{proxy_base}}/stream/gitlab/"
+auth = "credential.helper = !sc git-credential  (git fetches your SAFECLAW_API_KEY from the env at run-time — nothing on disk)"
+example = """
+# Inspect first — don't assume gitlab.com:
+git remote -v ; git config --get-regexp '^url\\.'
+
+# 1) one-time per machine: let git get the broker key from sc. Scoped to the broker
+#    host; sc reads $SAFECLAW_API_KEY at git-time, so the key is never written to disk:
+git config --global credential."{{proxy_base}}".helper "!sc git-credential"
+
+# 2) route GitLab through SafeClaw — the PAT is injected by the broker, never enters git:
+git config --global url."{{route}}".insteadOf "https://gitlab.com/"
+
+# Tip: run git with GIT_TERMINAL_PROMPT=0 so a misconfig fails fast instead of prompting.
+"""
+
+[policy.levels]
+read = "allow"
+write = "allow"

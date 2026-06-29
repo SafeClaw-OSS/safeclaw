@@ -46,16 +46,20 @@ pub async fn handle(
     }
 
     let svc = state.services.get(&service).ok_or(AppError::NotFound)?;
+    // Pick the streaming upstream. A service may carry several upstreams — e.g.
+    // `github` has a `rest` upstream (REST API, /use/) and a `git` upstream
+    // (smart-HTTP, /stream/) sharing one credential — so select by `stream`,
+    // not position. No streaming upstream ⇒ this service isn't reachable here.
     let upstream = svc
         .upstream
-        .first()
-        .ok_or_else(|| AppError::Conflict(format!("service '{}' has no upstream", service)))?;
-    if !upstream.stream {
-        return Err(AppError::Conflict(format!(
-            "service '{}' is not a streaming-passthrough service",
-            service
-        )));
-    }
+        .iter()
+        .find(|u| u.stream)
+        .ok_or_else(|| {
+            AppError::Conflict(format!(
+                "service '{}' has no streaming-passthrough upstream",
+                service
+            ))
+        })?;
 
     // Streaming bypasses the per-request approval ceremony, so it is gated to
     // allow-policy services only — the credential must already be resident in

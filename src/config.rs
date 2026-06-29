@@ -130,6 +130,21 @@ pub enum Command {
     /// the static safety checks the console upload editor enforces. Offline,
     /// no daemon needed.
     Recipe(RecipeArgs),
+    /// git credential helper — **invoked by git, not users**. Registered via
+    /// `git config credential.<broker>.helper "!sc git-credential"`. On `get`
+    /// it returns the agent's `$SAFECLAW_API_KEY` as the Basic password so git
+    /// can authenticate to the LOCAL broker for the streaming (smart-HTTP) git
+    /// route — the key is read from the environment at call time and never
+    /// written to disk. Only answers for the SafeClaw broker host.
+    #[command(name = "git-credential", hide = true)]
+    GitCredential(GitCredentialArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct GitCredentialArgs {
+    /// The operation git passes: `get` | `store` | `erase`. Only `get` does
+    /// anything (returns the key); `store`/`erase` are no-ops — we persist nothing.
+    pub operation: String,
 }
 
 #[derive(Debug, Args)]
