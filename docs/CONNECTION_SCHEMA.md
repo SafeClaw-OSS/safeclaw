@@ -193,7 +193,51 @@ Connected.
 
 ---
 
-## 8. No migration
+## 8. Recipe side (what drives this schema)
+
+The recipe (TYPE) DEFINEs everything a connection may fill:
+
+```toml
+# services/integration/gmail/service.toml
+[upstream.auth]
+provider = "google"
+scopes   = [ "…/gmail.send", "…/gmail.readonly", "…/gmail.modify" ]
+secret   = "GMAIL_REFRESH_TOKEN"     # mainstream role this recipe injects (DEFINEd)
+
+# services/_providers/google.toml — the OAuth client's fixed redirect_uri lives here,
+# not in each handshake:
+[provider.google]
+# … client_id / token_url / pkce …
+redirect_uri = "http://127.0.0.1:8765/safeclaw/oauth/callback"
+```
+
+A recipe with a per-connection slot (self-hosted host) marks ONLY that slot:
+
+```toml
+[[upstream]]
+url = "https://{{connection.host}}"   # templated from the connection's config
+
+[upstream.connection]
+params = ["host"]                      # the ONLY connection-fillable slots (anti-SSRF)
+```
+
+The daemon resolves `secret` → `[<connection_id>:]GMAIL_REFRESH_TOKEN` for the
+active connection, and substitutes `{{connection.host}}` from `config.host`.
+
+## 9. Open at implementation (settle in plan mode)
+
+- **DP1 — same-provider multi-service naming.** `gmail` / `gdrive` / `gcalendar`
+  are separate services sharing Google OAuth, each with its own scoped token. As
+  *default* (unprefixed) connections their secret names must not collide. **Lean:**
+  service-distinct mainstream names (`GMAIL_REFRESH_TOKEN`,
+  `GOOGLE_DRIVE_REFRESH_TOKEN`, `GOOGLE_CALENDAR_REFRESH_TOKEN`), with a validator
+  check that shipped recipes' default secret names are unique. *Alt:* always-prefix
+  (loses the bare-name 1:1), or one unified `google` connection (one token, breaks
+  separate-services).
+- **DP2 — config-slot TOML syntax.** The `{{connection.host}}` + `[upstream.connection].params`
+  shape above is the proposal; confirm or adjust.
+
+## 10. No migration
 
 Pre-launch. This replaces the v1.0.20/.21 minimal shape (`connection_id ==
 service_id`, flat `gmail_refresh_token`, a legacy-flat read path). The old read
