@@ -368,12 +368,12 @@ pub struct PolicyDef {
 }
 
 impl PolicyDef {
-    pub fn to_service_levels(&self) -> Option<crate::core::policy::ServiceLevels> {
+    pub fn to_levels(&self) -> Option<crate::core::policy::Levels> {
         let levels = self.levels.as_ref()?;
-        Some(crate::core::policy::ServiceLevels {
+        Some(crate::core::policy::Levels {
             write: parse_access_level(levels.get("write")),
             read: parse_access_level(levels.get("read")),
-            ask_ttl: None,
+            ttl: None,
         })
     }
 
@@ -395,9 +395,10 @@ pub struct TomlPolicyRule {
 }
 
 impl TomlPolicyRule {
-    /// Convert legacy method+path_exact+path_suffix to path pattern.
+    /// Convert legacy method+path_exact+path_suffix to a risk-classified rule.
+    /// The legacy `level` is mapped to the equivalent risk tier.
     fn to_core_rule(&self) -> Option<crate::core::policy::PolicyRule> {
-        let level = parse_access_level(Some(&self.level))?;
+        let risk = level_to_risk(&self.level)?;
 
         let path_part = if let Some(ref exact) = self.path_exact {
             exact.trim_end_matches('/').to_string()
@@ -416,9 +417,8 @@ impl TomlPolicyRule {
             label: None,
             match_pattern: Some(match_pattern),
             body: None,
-            risk: None,
-            level: Some(level),
-            ask_ttl: None,
+            risk: Some(risk),
+            ttl: None,
         })
     }
 }
@@ -442,46 +442,37 @@ pub struct PolicyFileRule {
     /// Regex matched against request body (optional).
     #[serde(default)]
     pub body: Option<String>,
-    /// Author-assigned risk tier (`low` | `medium` | `high`). Resolved to an
-    /// access level live via the vault's `risk_policy`. Prefer this over
-    /// `level` so the user can re-tune all same-tier rules at once.
+    /// Risk tier (`low` | `medium` | `high` | `critical`). The decision is
+    /// derived live via the vault's risk map. A rule with no `risk` is skipped.
     #[serde(default)]
     pub risk: Option<String>,
-    /// Explicit access level (pins, overriding `risk`). Optional: a risk-only
-    /// rule omits it. A rule with neither is skipped (it can never decide).
+    /// `ask`-cache TTL in seconds (PROTOCOL.md §6.1 `policy.rules[].ttl`).
     #[serde(default)]
-    pub level: Option<String>,
-    #[serde(default)]
-    pub ask_ttl: Option<u64>,
+    pub ttl: Option<u64>,
 }
 
 impl PolicyFileDef {
-    pub fn to_service_levels(&self) -> Option<crate::core::policy::ServiceLevels> {
+    pub fn to_levels(&self) -> Option<crate::core::policy::Levels> {
         let levels = self.default.as_ref()?;
-        Some(crate::core::policy::ServiceLevels {
+        Some(crate::core::policy::Levels {
             write: parse_access_level(levels.get("write")),
             read: parse_access_level(levels.get("read")),
-            ask_ttl: levels.get("ask_ttl").and_then(|v| v.parse().ok()),
+            ttl: levels.get("ttl").and_then(|v| v.parse().ok()),
         })
     }
 
     pub fn to_policy_rules(&self) -> Vec<crate::core::policy::PolicyRule> {
         self.rule.iter().filter_map(|r| {
-            let level = r.level.as_ref().and_then(|l| parse_access_level(Some(l)));
-            let risk = r.risk.as_deref().and_then(crate::core::policy::RiskTier::parse);
-            // Skip a rule that can never decide (neither tier nor explicit
-            // level) — it would only ever fall through, so it's noise.
-            if level.is_none() && risk.is_none() {
-                return None;
-            }
+            // A rule classifies by risk only; one with no parseable risk is
+            // skipped (it could never decide).
+            let risk = r.risk.as_deref().and_then(crate::core::policy::RiskTier::parse)?;
             Some(crate::core::policy::PolicyRule {
                 id: Some(r.id.clone()),
                 label: Some(r.label.clone()),
                 match_pattern: Some(r.match_pattern.clone()),
                 body: r.body.clone(),
-                risk,
-                level,
-                ask_ttl: r.ask_ttl,
+                risk: Some(risk),
+                ttl: r.ttl,
             })
         }).collect()
     }
@@ -493,6 +484,19 @@ fn parse_access_level(s: Option<&String>) -> Option<crate::core::policy::AccessL
         "ask" => Some(crate::core::policy::AccessLevel::Ask),
         "ask-always" => Some(crate::core::policy::AccessLevel::AskAlways),
         "deny" => Some(crate::core::policy::AccessLevel::Deny),
+        _ => None,
+    }
+}
+
+/// Map a legacy access-level string to the equivalent risk tier (for the
+/// deprecated inline `[[policy.rules]]` format, which still used `level`).
+fn level_to_risk(level: &str) -> Option<crate::core::policy::RiskTier> {
+    use crate::core::policy::RiskTier;
+    match level {
+        "allow" => Some(RiskTier::Low),
+        "ask" => Some(RiskTier::Medium),
+        "ask-always" => Some(RiskTier::High),
+        "deny" => Some(RiskTier::Critical),
         _ => None,
     }
 }
@@ -795,7 +799,7 @@ impl ServiceRegistry {
         }
         if let Some(svc) = self.services.get(service_id) {
             if let Some(policy) = svc.policy.as_ref() {
-                if let Some(levels) = policy.to_service_levels() {
+                if let Some(levels) = policy.to_levels() {
                     if let Some(read) = levels.read {
                         return read;
                     }
@@ -1008,16 +1012,16 @@ impl ServiceRegistry {
     }
 
     /// Get default policy levels: policy.toml > service.toml [policy.levels].
-    pub fn default_policy_levels(&self, service_name: &str) -> Option<crate::core::policy::ServiceLevels> {
+    pub fn default_policy_levels(&self, service_name: &str) -> Option<crate::core::policy::Levels> {
         // Prefer policy.toml [default]
         if let Some(policy) = self.policies.get(service_name) {
-            if let Some(levels) = policy.to_service_levels() {
+            if let Some(levels) = policy.to_levels() {
                 return Some(levels);
             }
         }
         // Fall back to service.toml [policy.levels]
         let def = self.services.get(service_name)?;
-        def.policy.as_ref()?.to_service_levels()
+        def.policy.as_ref()?.to_levels()
     }
 
     /// Get default policy rules: policy.toml [[rule]] > service.toml [[policy.rules]].
@@ -1201,7 +1205,7 @@ mod tests {
     use super::*;
     use crate::core::policy::AccessLevel;
 
-    // ── PolicyDef::to_service_levels ────────────────────────────────────────
+    // ── PolicyDef::to_levels ────────────────────────────────────────
 
     #[test]
     fn policy_def_converts_allow_levels() {
@@ -1209,7 +1213,7 @@ mod tests {
         levels.insert("read".into(), "allow".into());
         levels.insert("write".into(), "allow".into());
         let def = PolicyDef { levels: Some(levels), rules: vec![] };
-        let sl = def.to_service_levels().unwrap();
+        let sl = def.to_levels().unwrap();
         assert_eq!(sl.read, Some(AccessLevel::Allow));
         assert_eq!(sl.write, Some(AccessLevel::Allow));
     }
@@ -1220,7 +1224,7 @@ mod tests {
         levels.insert("read".into(), "allow".into());
         levels.insert("write".into(), "ask".into());
         let def = PolicyDef { levels: Some(levels), rules: vec![] };
-        let sl = def.to_service_levels().unwrap();
+        let sl = def.to_levels().unwrap();
         assert_eq!(sl.read, Some(AccessLevel::Allow));
         assert_eq!(sl.write, Some(AccessLevel::Ask));
     }
@@ -1231,7 +1235,7 @@ mod tests {
         levels.insert("read".into(), "deny".into());
         levels.insert("write".into(), "ask-always".into());
         let def = PolicyDef { levels: Some(levels), rules: vec![] };
-        let sl = def.to_service_levels().unwrap();
+        let sl = def.to_levels().unwrap();
         assert_eq!(sl.read, Some(AccessLevel::Deny));
         assert_eq!(sl.write, Some(AccessLevel::AskAlways));
     }
@@ -1239,7 +1243,7 @@ mod tests {
     #[test]
     fn policy_def_none_levels_returns_none() {
         let def = PolicyDef { levels: None, rules: vec![] };
-        assert!(def.to_service_levels().is_none());
+        assert!(def.to_levels().is_none());
     }
 
     #[test]
@@ -1248,7 +1252,7 @@ mod tests {
         levels.insert("read".into(), "allow".into());
         // No "write" key
         let def = PolicyDef { levels: Some(levels), rules: vec![] };
-        let sl = def.to_service_levels().unwrap();
+        let sl = def.to_levels().unwrap();
         assert_eq!(sl.read, Some(AccessLevel::Allow));
         assert_eq!(sl.write, None); // missing → None, falls through to defaults
     }
@@ -1258,7 +1262,7 @@ mod tests {
         let mut levels = HashMap::new();
         levels.insert("read".into(), "invalid-value".into());
         let def = PolicyDef { levels: Some(levels), rules: vec![] };
-        let sl = def.to_service_levels().unwrap();
+        let sl = def.to_levels().unwrap();
         assert_eq!(sl.read, None);
     }
 
@@ -1271,48 +1275,42 @@ mod tests {
         levels.insert("read".into(), "allow".into());
         levels.insert("write".into(), "allow".into());
         let def = PolicyDef { levels: Some(levels), rules: vec![] };
-        let toml_levels = def.to_service_levels();
+        let toml_levels = def.to_levels();
 
-        // vault_levels = None, so effective = toml_levels
-        let effective = None::<&crate::core::policy::ServiceLevels>
-            .or(toml_levels.as_ref());
-
-        let access = crate::core::policy::evaluate_policy(
+        // connection_levels = None, so the floor = toml_levels (the recipe default)
+        let access = crate::core::policy::evaluate(
             "POST", "/v1/chat",
             None,
             None,
-            effective,
-            &crate::core::policy::PolicyDefaults::default(),
-            Some("integration"), // not llm, so type defaults = ask-always
+            toml_levels.as_ref(),
+            &crate::core::policy::Policy::default(),
+            Some("integration"),
         );
-        // toml says allow → should win over type defaults
+        // toml says allow → should win
         assert_eq!(access, AccessLevel::Allow);
     }
 
     #[test]
     fn vault_policy_overrides_toml() {
-        // vault explicitly sets ask, toml says allow → vault wins
-        let vault_levels = crate::core::policy::ServiceLevels {
+        // user per-connection floor sets ask, toml says allow → user wins
+        let user = crate::core::policy::Levels {
             write: Some(AccessLevel::Ask),
             read: Some(AccessLevel::Ask),
-            ask_ttl: None,
+            ttl: None,
         };
-
         let mut toml_map = HashMap::new();
         toml_map.insert("read".into(), "allow".into());
         toml_map.insert("write".into(), "allow".into());
         let toml_def = PolicyDef { levels: Some(toml_map), rules: vec![] };
-        let toml_levels = toml_def.to_service_levels();
+        let recipe = toml_def.to_levels();
+        let effective = crate::core::policy::merge_levels(Some(&user), recipe.as_ref());
 
-        let effective = Some(&vault_levels)
-            .or(toml_levels.as_ref());
-
-        let access = crate::core::policy::evaluate_policy(
+        let access = crate::core::policy::evaluate(
             "POST", "/v1/chat",
             None,
             None,
-            effective,
-            &crate::core::policy::PolicyDefaults::default(),
+            effective.as_ref(),
+            &crate::core::policy::Policy::default(),
             Some("llm"),
         );
         assert_eq!(access, AccessLevel::Ask);
@@ -1353,7 +1351,7 @@ write = "allow"
         assert_eq!(def.api.len(), 1);
         assert_eq!(def.api[0].steps[0].target, "upstream:default");
         assert!(def.api[0].steps[0].returns);
-        let sl = def.policy.unwrap().to_service_levels().unwrap();
+        let sl = def.policy.unwrap().to_levels().unwrap();
         assert_eq!(sl.read, Some(AccessLevel::Allow));
     }
 
@@ -1929,14 +1927,14 @@ client_secret_env = "SELFHOSTED_CLIENT_SECRET"
     /// not two.
     #[test]
     fn compiled_gmail_policy_resolves_risk_tiers() {
-        use crate::core::policy::{evaluate_policy, AccessLevel, PolicyDefaults};
+        use crate::core::policy::{evaluate, AccessLevel, Policy};
         let reg = ServiceRegistry::load();
         let rules = reg
             .default_policy_rules("gmail")
             .expect("gmail policy.toml must parse and yield rules");
-        let defaults = PolicyDefaults::default();
+        let policy = Policy::default();
         let eval = |m: &str, p: &str| {
-            evaluate_policy(m, p, None, Some(&rules), None, &defaults, Some("integration"))
+            evaluate(m, p, None, Some(&rules), None, &policy, Some("integration"))
         };
         // low → allow (listing, no private body)
         assert_eq!(eval("GET", "/gmail/v1/users/me/messages"), AccessLevel::Allow);
@@ -1946,7 +1944,7 @@ client_secret_env = "SELFHOSTED_CLIENT_SECRET"
         // high → ask-always (outbound / mutating)
         assert_eq!(eval("POST", "/gmail/v1/users/me/messages/send"), AccessLevel::AskAlways);
         assert_eq!(eval("POST", "/gmail/v1/users/me/messages/abc123/modify"), AccessLevel::AskAlways);
-        // pinned deny (escape hatch, ignores risk_policy)
-        assert_eq!(eval("DELETE", "/gmail/v1/users/me/messages/abc123"), AccessLevel::Deny);
+        // critical → ask-always by default (deletion; user can tighten to deny)
+        assert_eq!(eval("DELETE", "/gmail/v1/users/me/messages/abc123"), AccessLevel::AskAlways);
     }
 }

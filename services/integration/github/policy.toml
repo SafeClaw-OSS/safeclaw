@@ -6,11 +6,11 @@ write = "ask"
 id = "delete-branch"
 label = "Delete branch"
 match = "DELETE /repos/*/*/git/refs/*"
-level = "ask-always"
+risk = "critical"
 
 [[rule]]
 id = "make-public"
 label = "Make repo public"
 match = "PATCH /repos/*/*"
 body = "\"private\"\\s*:\\s*false"
-level = "deny"
+risk = "critical"

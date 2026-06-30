@@ -6,10 +6,10 @@ write = "ask"
 id = "list-events"
 label = "List events"
 match = "GET /calendar/v3/calendars/*/events"
-level = "allow"
+risk = "low"
 
 [[rule]]
 id = "delete-event"
 label = "Delete event"
 match = "DELETE /calendar/v3/calendars/*/events/*"
-level = "ask-always"
+risk = "critical"

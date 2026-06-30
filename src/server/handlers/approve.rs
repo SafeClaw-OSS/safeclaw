@@ -1019,18 +1019,19 @@ pub async fn reject_op(
 ///      or block (Deny) — so we don't pre-filter to allow-default services
 ///      anymore: a rule-level Allow on a service whose default was Ask still
 ///      needs the bytes ready for fast-path forwarding.
-///   2. `policy_rules` — merged effective rule list per service (built-in
-///      rules with user `rule_overrides` applied by id). The /use handler
-///      walks this through `evaluate_policy`.
-///   3. `policy_defaults` — verbatim snapshot of `aux.policy_defaults` so
-///      the evaluator can layer user globals on top of the compiled-in
-///      `PolicyDefaults::default()` without re-decrypting the vault.
+///   2. `policy` — the effective policy tree (`aux.policy` overlaid on
+///      compiled defaults). Holds the risk map, default floors, per-category,
+///      and per-connection user policy. Built-in per-service rules are read
+///      live from the recipe at eval, not cached here.
 pub(crate) fn bootstrap_cache_from_view(
     view: &VaultPlaintextView,
     state: &AppState,
 ) -> SecretsCache {
     let mut cache = SecretsCache::default();
-    cache.policy_defaults = view.aux.policy_defaults.clone();
+    // Effective policy = the vault's sparse `aux.policy` overlaid on compiled
+    // defaults. Rebuilt here on every unlock/refresh, so a risk-map / per-
+    // connection edit is live on the next request (PROTOCOL.md §6.2/§6.4).
+    cache.policy = crate::core::policy::Policy::effective(view.aux.policy.as_ref());
     cache.audit_retention_days = view.aux.audit_retention_days;
     // Routing snapshot (CONNECTION_SCHEMA.md §6): `connection_id → {service,
     // config}`. The per-service loop below bootstraps every *default* connection
@@ -1046,14 +1047,6 @@ pub(crate) fn bootstrap_cache_from_view(
     // services are reachable" without re-walking the kv map.
     for name in view.native_secrets.keys() {
         cache.native_keys.insert(name.clone());
-    }
-    // Snapshot per-service user-authored basic R/W. Sparse — only services
-    // the user actually customized show up. Layered over the registry's
-    // service-default during evaluate.
-    for (svc, svc_state) in view.aux.service_state.iter() {
-        if let Some(levels) = svc_state.levels.as_ref() {
-            cache.service_levels.insert(svc.clone(), levels.clone());
-        }
     }
     // Snapshot external stores' adapter inputs so GET /v/{vid}/keys-known
     // can list() them later without re-decrypting the vault. Only kinds
@@ -1127,27 +1120,10 @@ pub(crate) fn bootstrap_cache_from_view(
             }
         }
 
-        // Policy rule lists are runtime metadata, not raw secrets — load
-        // for every service regardless of access level so the per-request
-        // evaluator can walk them. (PROTOCOL.md §6.2 lists policy rules
-        // under "Runtime metadata, 无 secret, 可一直驻留".)
-        let Some(policy_file) = state.services.policy_file(service_id) else {
-            continue;
-        };
-        let built_in = policy_file.to_policy_rules();
-        if built_in.is_empty() {
-            continue;
-        }
-        let user_overrides = view
-            .aux
-            .service_state
-            .get(service_id)
-            .map(|s| s.rule_overrides.clone())
-            .unwrap_or_default();
-        let merged = crate::core::policy::merge_rule_overrides(&built_in, &user_overrides);
-        cache
-            .policy_rules
-            .insert(service_id.to_string(), merged);
+        // Built-in policy rules are NOT cached: they're read live from the
+        // recipe registry at eval and merged with the connection's user rules
+        // (`aux.policy.connections.<id>.rules`). See
+        // `AppState::evaluate_request_policy`.
     }
 
     // Named connections (`conn_id != service_id`) carry namespaced secrets

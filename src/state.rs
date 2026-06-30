@@ -91,16 +91,14 @@ pub struct SecretsCache {
     /// map; oauth recipes get no entry (their token comes from `oauth_access`).
     /// Lives the whole unlocked session (allow semantics); wiped on lock.
     pub allow_secrets: HashMap<String, HashMap<String, Vec<u8>>>,
-    /// service_id → effective ordered rule list. Built at unlock time by
-    /// merging the service's built-in rules with the user's sparse
-    /// `aux.service_state.<svc>.rule_overrides`. The /use handler walks
-    /// this list (longest-match-wins per `core::policy::evaluate_policy`)
-    /// to decide the approval level for each incoming request.
-    pub policy_rules: HashMap<String, Vec<crate::core::policy::PolicyRule>>,
-    /// User's global policy defaults (per-category + global levels) snapshot.
-    /// Layered on top of the daemon's compiled-in `PolicyDefaults::default()`
-    /// during evaluation. Absent → fall back to compiled defaults.
-    pub policy_defaults: Option<crate::core::policy::PolicyDefaults>,
+    /// The effective policy tree — the vault's `aux.policy` overlaid on the
+    /// compiled-in `Policy::default()` at unlock/refresh (so unset parts use
+    /// safe defaults). Holds the risk map, default floors, per-category, and
+    /// per-connection user policy. Built-in per-service rules are NOT cached
+    /// here — they're read live from the recipe registry at eval and merged
+    /// with this tree's `connections.<id>.rules`. Rebuilt on every vault write
+    /// → a `risk` / map edit is realtime on the next request.
+    pub policy: crate::core::policy::Policy,
     /// Audit log retention in days. Snapshot of `aux.audit_retention_days`
     /// at unlock. `None` = keep forever. Used by `GET /v/{vid}/approvals` to
     /// opportunistically prune old rows before listing.
@@ -123,11 +121,6 @@ pub struct SecretsCache {
     /// lock (which zero-outs the entire cache via Default drop). Daemon
     /// restart also blows it away (vaults boot Locked, cache starts empty).
     pub rule_approvals: HashMap<(String, String, String), u64>,
-    /// User-authored per-service basic R/W. Snapshot of every populated
-    /// `aux.service_state.<svc>.levels` at unlock. Layered above the
-    /// service's registry-declared default in `evaluate` so a user pick
-    /// like "GitHub: R: Allow" takes effect even when no rule matches.
-    pub service_levels: HashMap<String, crate::core::policy::ServiceLevels>,
     /// Item names present in the decrypted `native-secrets` kv (names only,
     /// never values). Surface for `GET /v/{vid}/keys-known` so the frontend
     /// can decide which services are "reachable" without paying for an
@@ -525,54 +518,38 @@ impl AppState {
             Some(VaultState::Unlocked { cache, .. }) => cache,
             _ => return None,
         };
-        let rules = cache.policy_rules.get(service_id);
-        // Service-level basic R/W resolves as: user override (this vault's
-        // aux.service_state.<svc>.levels) field-wise over the registry-
-        // declared default. Either may be absent — `merge_service_levels`
-        // returns the meaningful intersection.
-        let registry_service_levels = self
+        // Built-in rules come from the connection's *service* recipe (static);
+        // the user's per-connection edits/additions (`aux.policy.connections.
+        // <id>.rules`) merge on top. The merge is per-connection so two
+        // connections of the same service can be policed independently.
+        let conn_policy = cache.policy.connections.get(connection_id);
+        let empty_rules = std::collections::HashMap::new();
+        let built_in = self
             .services
-            .get(service_id)
-            .and_then(|d| d.policy.as_ref())
-            .and_then(|p| p.to_service_levels());
-        let user_service_levels = cache.service_levels.get(service_id).cloned();
-        let service_levels = crate::core::policy::merge_service_levels(
-            user_service_levels.as_ref(),
-            registry_service_levels.as_ref(),
+            .default_policy_rules(service_id)
+            .unwrap_or_default();
+        let rules = crate::core::policy::merge_rules(
+            &built_in,
+            conn_policy.map(|c| &c.rules).unwrap_or(&empty_rules),
         );
-        // Layer user's global policy_defaults on top of compiled defaults so
-        // a per-category override (e.g. "Use AI models = Ask every time")
-        // affects evaluation even when no per-rule entry matches.
-        let mut defaults = crate::core::policy::PolicyDefaults::default();
-        if let Some(user) = cache.policy_defaults.as_ref() {
-            if user.timeout.is_some() {
-                defaults.timeout = user.timeout;
-            }
-            if user.levels.is_some() {
-                defaults.levels = user.levels.clone();
-            }
-            if let Some(user_type_levels) = user.type_levels.as_ref() {
-                let merged = defaults.type_levels.get_or_insert_with(Default::default);
-                for (k, v) in user_type_levels {
-                    merged.insert(k.clone(), v.clone());
-                }
-            }
-            // Risk-tier map: a user edit (e.g. "auto-allow low-risk") takes
-            // effect on the very next request because we read it live here —
-            // the matched rule's `risk` is mapped through this at eval time, so
-            // there is nothing to invalidate or re-merge into rule levels.
-            if user.risk_policy.is_some() {
-                defaults.risk_policy = user.risk_policy.clone();
-            }
-        }
+        // Connection default floor (when no rule matches): user's per-connection
+        // override field-wise over the recipe's `[default]`.
+        let recipe_levels = self.services.default_policy_levels(service_id);
+        let connection_levels = crate::core::policy::merge_levels(
+            conn_policy.and_then(|c| c.default.as_ref()),
+            recipe_levels.as_ref(),
+        );
+        // The risk map + category/global floors live in `cache.policy` (the
+        // user's `aux.policy` overlaid on compiled defaults at refresh). Read
+        // live here → a risk-map edit is realtime on the next request.
         let category = self.services.default_category(service_id);
-        let (level, matched_rule, ttl) = crate::core::policy::evaluate_policy_with_match(
+        let (level, matched_rule, ttl) = crate::core::policy::evaluate_with_match(
             method,
             path,
             body,
-            rules,
-            service_levels.as_ref(),
-            &defaults,
+            Some(&rules),
+            connection_levels.as_ref(),
+            &cache.policy,
             Some(category),
         );
 
@@ -743,25 +720,28 @@ mod tests {
     /// a single approval blanket-authorized every verb on a service.
     #[test]
     fn ask_grant_is_scoped_to_method_and_rule() {
-        use crate::core::policy::{AccessLevel, PolicyRule};
+        use crate::core::policy::{AccessLevel, ConnectionPolicy, Policy, RiskTier, RuleConfig};
 
-        let ask_rule = |id: &str, pat: &str| PolicyRule {
-            id: Some(id.to_string()),
-            label: None,
+        // Inject the test rules as the connection's user rules (medium → ask).
+        // "gh" has no recipe, so built-in is empty and these are the only rules.
+        let ask_rule = |pat: &str| RuleConfig {
             match_pattern: Some(pat.to_string()),
-            body: None,
-            risk: None,
-            level: Some(AccessLevel::Ask),
-            ask_ttl: Some(60),
+            risk: Some(RiskTier::Medium),
+            ttl: Some(60),
+            ..Default::default()
         };
+        let mut rules = std::collections::HashMap::new();
+        rules.insert("read".to_string(), ask_rule("GET /x"));
+        rules.insert("write".to_string(), ask_rule("POST /x"));
+        let mut policy = Policy::default();
+        policy
+            .connections
+            .insert("gh".to_string(), ConnectionPolicy { default: None, rules });
 
         let state = test_state();
         let vid = "v-scope";
         let mut cache = SecretsCache::default();
-        cache.policy_rules.insert(
-            "gh".to_string(),
-            vec![ask_rule("read", "GET /x"), ask_rule("write", "POST /x")],
-        );
+        cache.policy = policy;
         state.unlock_vault(vid.to_string(), cache, zeroize::Zeroizing::new(Vec::new()));
 
         // Baseline: GET resolves to Ask under the "read" rule. (Default

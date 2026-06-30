@@ -10,27 +10,17 @@ pub mod path;
 pub mod oauth2;
 pub mod connect;
 
-use std::collections::HashMap;
-use crate::core::policy::{PolicyRule, RuleOverride, ServiceLevels};
-
 // ── Vault Types ──────────────────────────────────────────────────────────────
 
-/// Per-service data stored in vault.enc (secrets + runtime auth state)
+/// Per-service data stored in vault.enc (secrets + runtime auth state).
+/// Policy is NOT here — it lives in `aux.policy` (SSoT); this struct carries
+/// only the upstream/auth/category needed to forward a request.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct ServiceVault {
     /// Upstream base URL. Required for proxy services; absent for local services.
     #[serde(default)]
     pub upstream: Option<String>,
     pub auth: Option<AuthConfig>,
-    /// Per-service access levels (optional; falls back to policy defaults)
-    pub levels: Option<ServiceLevels>,
-    /// Fully custom rule list — replaces built-in policy.toml rules when set.
-    /// For sparse per-rule level edits, prefer `rule_overrides` instead.
-    pub rules: Option<Vec<PolicyRule>>,
-    /// Sparse overrides applied on top of built-in policy.toml rules (keyed by rule id).
-    /// Only considered when `rules` is None.
-    #[serde(default)]
-    pub rule_overrides: Option<HashMap<String, RuleOverride>>,
     /// UI display category — "llm" | "channel" | "integration" (default: "integration").
     /// Pure metadata; not used by proxy routing or auth logic.
     #[serde(default)]

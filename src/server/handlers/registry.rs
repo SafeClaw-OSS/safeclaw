@@ -108,7 +108,7 @@ pub struct RegistryPolicyDefaults {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub write: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub ask_ttl: Option<u64>,
+    pub ttl: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -132,7 +132,7 @@ pub struct RegistryPolicyRule {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub level: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub ask_ttl: Option<u64>,
+    pub ttl: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -149,7 +149,9 @@ pub struct RegistryVaultField {
 pub struct RegistryResponse {
     pub version: u32,
     pub services: Vec<RegistryService>,
-    pub policy_defaults: serde_json::Value,
+    /// The policy tree baseline (risk map + default floors + categories). The
+    /// console reads the vault's live policy via `GET /v/{vid}/vault/policy`.
+    pub policy: serde_json::Value,
     // ── Per-vault overlay — only set by /v/{vid}/registry ────────────
     //
     // Deliberately no `vault_id` field. The agent's mental model is
@@ -245,12 +247,12 @@ fn policy_for(
         .map(|m| RegistryPolicyDefaults {
             read: m.get("read").cloned(),
             write: m.get("write").cloned(),
-            ask_ttl: m.get("ask_ttl").and_then(|v| v.parse().ok()),
+            ttl: m.get("ttl").and_then(|v| v.parse().ok()),
         })
         .unwrap_or(RegistryPolicyDefaults {
             read: None,
             write: None,
-            ask_ttl: None,
+            ttl: None,
         });
     let rules = if include_rules {
         Some(
@@ -258,17 +260,12 @@ fn policy_for(
                 .iter()
                 .map(|r| {
                     let risk = r.risk.as_deref().and_then(crate::core::policy::RiskTier::parse);
-                    // Effective level shown to agents: an explicit pin, else the
-                    // tier through the DEFAULT risk_policy (live per-vault values
-                    // are stamped on approval records, not surfaced here).
-                    let level = r
-                        .level
-                        .clone()
-                        .or_else(|| {
-                            risk.map(|t| {
-                                crate::core::policy::RiskPolicy::default().get(t).to_string()
-                            })
-                        });
+                    // Effective level shown to agents: the tier through the
+                    // DEFAULT risk map. The live per-vault value (after a user
+                    // risk-map edit) is computed by the daemon at request time;
+                    // the console recomputes it from `risk` + the policy tree.
+                    let level = risk
+                        .map(|t| crate::core::policy::RiskMap::default().get(t).to_string());
                     RegistryPolicyRule {
                         id: r.id.clone(),
                         label: r.label.clone(),
@@ -276,7 +273,7 @@ fn policy_for(
                         body: r.body.clone(),
                         risk: risk.map(|t| t.to_string()),
                         level,
-                        ask_ttl: r.ask_ttl,
+                        ttl: r.ttl,
                     }
                 })
                 .collect(),
@@ -400,7 +397,7 @@ pub async fn menu(
     let body = RegistryResponse {
         version: 2,
         services,
-        policy_defaults: serde_json::to_value(crate::core::policy::PolicyDefaults::default())?,
+        policy: serde_json::to_value(crate::core::policy::Policy::default())?,
         vault_locked: None,
         vault_entries: None,
         console_url: None,
@@ -465,7 +462,7 @@ pub async fn vault_registry(
     let body = RegistryResponse {
         version: 2,
         services,
-        policy_defaults: serde_json::to_value(crate::core::policy::PolicyDefaults::default())?,
+        policy: serde_json::to_value(crate::core::policy::Policy::default())?,
         vault_locked: Some(locked),
         vault_entries,
         console_url: Some(console_url(&state, &vault_id)),

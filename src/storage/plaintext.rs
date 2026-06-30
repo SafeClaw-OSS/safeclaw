@@ -15,12 +15,12 @@
 //! two physical pools; runtime code goes through [`VaultPlaintextView`]
 //! to query items by name with resolution-order semantics.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 use sudp::state::ProtectedState;
 
-use crate::core::policy::{PolicyDefaults, RuleOverride, ServiceLevels};
+use crate::core::policy::Policy;
 use crate::error::{AppError, Result};
 
 /// Current schema version. Hard-fail on any other value.
@@ -61,21 +61,6 @@ pub struct Store {
     /// Preserved verbatim on round-trip so unknown fields don't drop.
     #[serde(flatten, default, skip_serializing_if = "serde_json::Map::is_empty")]
     pub extra: serde_json::Map<String, serde_json::Value>,
-}
-
-/// Per-service user state. Two layers, both sparse:
-///   * `levels` — user-authored basic R/W for this one service. Beats
-///     the registry-declared service default and the global category
-///     default; loses to rule-level overrides for matching paths.
-///     Stays absent unless the user actually customized this service.
-///   * `rule_overrides` — per-rule overrides keyed by the built-in
-///     rule's `id`. Reverting to the built-in level drops the entry.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ServiceState {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub levels: Option<ServiceLevels>,
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub rule_overrides: HashMap<String, RuleOverride>,
 }
 
 /// An **established** connection — an instance of a service (TYPE) the user has
@@ -145,15 +130,12 @@ pub struct VaultAux {
     pub version: u32,
     pub stores: BTreeMap<String, Store>,
     pub store_order: Vec<String>,
-    /// Global access-level defaults. Absent on fresh vaults → daemon falls
-    /// back to `PolicyDefaults::default()` (the safe defaults compiled in).
+    /// The policy tree — risk map, default floors, per-category, and per-
+    /// connection user policy (PROTOCOL.md §5.2 / §6.4 `M.policy`). Absent on
+    /// fresh vaults → daemon uses `Policy::default()`. Replaces the old split
+    /// `policy_defaults` + `service_state`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub policy_defaults: Option<PolicyDefaults>,
-    /// Per-service user state (rule overrides today; per-service ask_ttl,
-    /// custom rule lists, etc. later). Sparse — only services with user-
-    /// authored state appear here.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub service_state: BTreeMap<String, ServiceState>,
+    pub policy: Option<Policy>,
     /// In-flight connects, keyed by `connection_id`. Each carries everything the
     /// daemon needs to redeem the OAuth code; on exchange the entry MOVEs to
     /// `connections`. Sparse — empty when nothing is mid-handshake. See
@@ -200,8 +182,7 @@ impl VaultAux {
             version: PLAINTEXT_VERSION,
             stores,
             store_order: vec![NATIVE_SECRETS_ID.to_string(), NATIVE_FILES_ID.to_string()],
-            policy_defaults: None,
-            service_state: BTreeMap::new(),
+            policy: None,
             connecting: BTreeMap::new(),
             connections: BTreeMap::new(),
             audit_retention_days: None,
