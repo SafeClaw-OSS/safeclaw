@@ -150,7 +150,8 @@ pub struct RegistryResponse {
     pub version: u32,
     pub services: Vec<RegistryService>,
     /// The policy tree baseline (risk map + default floors + categories). The
-    /// console reads the vault's live policy via `GET /v/{vid}/vault/policy`.
+    /// console reads the vault's live `aux.policy` client-side from the
+    /// decrypted `M` (de-daemon), then writes edits via a `write` op.
     pub policy: serde_json::Value,
     // ── Per-vault overlay — only set by /v/{vid}/registry ────────────
     //
