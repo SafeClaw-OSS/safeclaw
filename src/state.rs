@@ -55,7 +55,7 @@ const EVENT_CHANNEL_CAPACITY: usize = 128;
 ///   - `allow` services → `expires_at = None` (lives the whole unlocked
 ///     session, populated at unlock bootstrap)
 ///   - `ask` services → `expires_at = Some(unix_secs)`, filled after
-///     `approval-confirm` with the matched rule's `ask_ttl`
+///     `approval-confirm` with the matched rule's `ttl`
 ///   - `ask-always` services → never cached (entry simply absent)
 ///
 /// `cache_lookup` does lazy eviction: an entry past its `expires_at`
@@ -108,12 +108,13 @@ pub struct SecretsCache {
     /// requests *of the same scope* within the TTL fast-path without
     /// re-prompting. `ask-always` never lands here; `allow` doesn't need it.
     ///
-    /// Key shape: `(service_id, rule_id, method)`. The grant is bound to:
+    /// Key shape: `(connection_id, rule_id, method)`. The grant is bound to:
+    ///   - the **connection** — approving account A's send never fast-paths B;
     ///   - the matched **policy rule** — which carries the path scope, so a
     ///     grant can never reach beyond the rule the user's approval matched;
     ///   - the **HTTP method** — so approving a read (GET) never silently
     ///     authorizes a later write (POST/DELETE) inside the window.
-    /// A category-/service-default Ask (no rule matched) is deliberately
+    /// A category-/connection-default Ask (no rule matched) is deliberately
     /// **not cached** — it has no author-defined path scope to bound a grant,
     /// so it re-prompts every request. Value: Unix-epoch-second expiry.
     ///
@@ -160,8 +161,8 @@ pub struct SecretsCache {
     /// NOTE on the maps above (`entries`, `allow_secrets`, `oauth_access`,
     /// `rule_approvals`): for connection-routed `/use`/`/stream` the daemon keys
     /// them by **connection_id**, so two connections of one service never share a
-    /// cache slot. (`policy_rules` / `service_levels` stay **service**-keyed —
-    /// policy is a property of the service type, shared by all its connections.)
+    /// cache slot. Policy is likewise per-connection (`policy.connections.<id>`),
+    /// while the built-in rules it merges come from the shared service recipe.
     pub connections: HashMap<String, crate::storage::plaintext::Connection>,
 }
 
@@ -485,21 +486,22 @@ impl AppState {
         }
     }
 
-    /// Evaluate the per-request policy decision for `(vault, service,
-    /// method, path, body)`. Returns `None` when the vault is Locked or
-    /// never unlocked (caller should treat that as "vault locked").
+    /// Evaluate the per-request policy decision for `(vault, connection,
+    /// service, method, path, body)`. Returns `None` when the vault is Locked
+    /// or never unlocked (caller should treat that as "vault locked").
     ///
     /// Returned tuple: `(effective_level, matched_rule_id, ttl_seconds)`.
     ///
-    /// Honors:
-    ///   - user-overridden per-rule levels (`aux.service_state[svc].rule_overrides`)
-    ///   - user global policy_defaults (per-category + legacy `levels`)
-    ///   - service's compiled-in [policy] levels
-    ///   - safe compiled-in defaults at the very end
+    /// Resolution (PROTOCOL.md §6.4):
+    ///   - merge the service recipe's built-in rules with this connection's
+    ///     user rules (`cache.policy.connections[conn].rules`),
+    ///   - most-restrictive matching rule wins (deny-override), its `risk`
+    ///     resolved through the live risk map (`cache.policy.risk`),
+    ///   - else connection / category / global default floor, else ask-always,
     ///   - **active `ask` approvals** — if the decision is `Ask`, a rule
-    ///     matched, AND the `(service, rule_id, method)` triple is in the
+    ///     matched, AND the `(connection, rule_id, method)` triple is in the
     ///     unexpired rule_approvals cache, downgrades to `Allow` so the
-    ///     request fast-paths. Category-default Ask (no rule) never caches.
+    ///     request fast-paths. Connection-default Ask (no rule) never caches.
     pub fn evaluate_request_policy(
         &self,
         vault_id: &str,
@@ -590,7 +592,7 @@ impl AppState {
     /// Record an `ask`-level approval into the per-vault TTL cache. Called
     /// from approve.rs when a Use op was approved AND the decision that
     /// created it was Ask (not AskAlways). `ttl_seconds` is the level's
-    /// `ask_ttl` falling back to `policy.timeout` or a safe 300s default.
+    /// `ttl` falling back to `Policy.timeout` or a safe 300s default.
     ///
     /// The grant is scoped to `(service, rule_id, method)`. Two bounds:
     ///   - `rule_id == None` (category-/service-default Ask, no rule matched)

@@ -60,13 +60,13 @@ pub struct PolicyContext {
     /// debug. `AskAlways` is explicitly excluded — that's the whole
     /// point of the level.
     pub level: crate::core::policy::AccessLevel,
-    /// Matched rule id from `evaluate_policy_with_match`. `None` =
+    /// Matched rule id from `evaluate_with_match`. `None` =
     /// category / global default fired — which is **not** cached (a grant
     /// needs a rule's path scope to bound it; see `record_ask_approval`).
     pub rule_id: Option<String>,
     /// TTL in seconds the approval should remain cached. Threaded from
-    /// the matched rule's `ask_ttl`, the service / category default's
-    /// `ask_ttl`, or `PolicyDefaults::timeout` as last resort.
+    /// the matched rule's `ttl`, the service / category default's
+    /// `ask_ttl`, or `Policy.timeout` as last resort.
     pub ttl_seconds: u64,
 }
 

@@ -127,12 +127,13 @@ async fn handle_impl(
         }
     }
 
-    // Per-request policy evaluation. Walks the user's merged rule list
-    // (built-in policy.toml rules + sparse `rule_overrides` from
-    // `aux.service_state`) under longest-match semantics, then falls back
-    // to the user's category-level defaults, then to the daemon's safe
-    // compiled defaults. `None` only when the vault entry is gone between
-    // the lock check and here — should never happen but treat as locked.
+    // Per-request policy evaluation (PROTOCOL.md §6.4). Merges the service
+    // recipe's built-in rules with this connection's user rules
+    // (`aux.policy.connections.<conn>.rules`), resolves each rule's risk
+    // through the live risk map, and takes the most-restrictive match
+    // (deny-override), then falls back to the connection / category / global
+    // default floor. `None` only when the vault entry is gone between the lock
+    // check and here — should never happen but treat as locked.
     let path_for_eval = format!("/{}", rest);
     let body_text = std::str::from_utf8(&body).ok();
     let (level, matched_rule_id, level_ask_ttl) = state

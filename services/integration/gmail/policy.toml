@@ -1,9 +1,10 @@
-# Gmail policy — classified by risk tier (low/medium/high). The effective
-# access level is derived live from the vault's `risk_policy`
-# (default: low→allow, medium→ask, high→ask-always), so the user can re-tune
-# all same-tier actions at once without editing each rule.
+# Gmail policy — rules classified by risk tier (low/medium/high/critical).
+# The decision is derived live from the vault's risk map
+# (default: low→allow, medium→ask, high→ask-always, critical→ask-always), so
+# the user can re-tune all same-tier actions at once — and opt critical into
+# deny if they want deletes blocked. See docs/POLICY_RISK_TIERS.md.
 
-# Fallback for any Gmail request not matched by a rule below.
+# Fallback (a floor decision, not a classification) for unmatched requests.
 [default]
 read = "ask"
 write = "ask-always"

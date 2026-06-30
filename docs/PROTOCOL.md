@@ -143,7 +143,7 @@ ActType vocabulary 跟随 `sudp` 上游：`Enroll / Write / Rotate / Revoke / Ex
 | `act.type` | `act.target` | `act.scope` 必填字段 |
 |---|---|---|
 | `setup` | `"vault"` | `{ passkeys: [{cid, x, y, η_initial, user_key_initial, device_name, assertion}], initial_M: {...}, overwrite_proof?: {existing_cid, existing_assertion} }`<br>`overwrite_proof` 仅当 `vault.dat` 已存在时**必填**：旧 credential 对当前 grant 的 β 签名，证明授权摧毁旧 vault。详 §3.5。 |
-| `write` | `"services.<name>"` 或 `"policy"` 或 `"preferences.<key>"` | `{ patch: {...} }` (JSON Merge Patch on `M[target]`) |
+| `write` | `"policy"`（含 per-connection：merge-patch 打到 `policy.connections.<id>`）或 `"connections.<id>"` 或 `"stores.<id>"` | `{ patch: {...} }` (JSON Merge Patch on `M[target]`) |
 | `enroll` | `"passkeys"` | `{ new: { cid, x, y, η_initial, user_key_initial, device_name, assertion } }` |
 | `revoke` | `"passkeys.<cid>"` | `{}` |
 | `export` | M 内任意 dotted path（如 `"services.openai.api_key"`） | `{ recipient_epk: "<base64 P-256 pk>" }` |
@@ -559,8 +559,9 @@ Sketch:
   "stores":   { /* connected backends + their data; see STORES_AND_ITEMS.md */ },
   "store_order": [ "native-secrets", "prod-gcp", "...", "native-files" ],
 
-  "service_state":      { /* per-user enabled services + policy overrides */ },
-  "policy_defaults":    { /* global policy preferences */ },
+  "connecting":         { /* in-flight connects, keyed by connection_id */ },
+  "connections":        { /* established connections, keyed by connection_id */ },
+  "policy":             { /* the whole policy tree — see §6.4 / STORES_AND_ITEMS §7 */ },
   "push_subscriptions": [ /* web-push endpoints */ ],
   "vapid_private_key":  "...",
 
@@ -572,8 +573,8 @@ Sketch:
 
 **关键 sections**:
 - `stores` / `store_order` / per-store `items`: 见 STORES_AND_ITEMS.md（核心 vault 内容模型）
-- `service_state`: per-user 服务启用 + policy override（不含 service.toml 定义的字段——那些 runtime 从 registry 读）
-- `policy_defaults`: standing authorization 全局规则（SUDP §02 "Policy"）
+- `connecting` / `connections`: 连接抽象，keyed by `connection_id`（见 CONNECTION_SCHEMA.md）
+- `policy`: standing authorization（SUDP §02 "Policy"）= ONE tree `{ timeout, risk, default, categories, connections }` — risk→level 映射 + 默认 floor + per-category + **per-connection** 用户策略。替代旧的 `policy_defaults` + `service_state` 二分。详 §6.4
 - `push_subscriptions`: Web Push 订阅端点
 - `vapid_private_key`: Web Push 签名私钥
 - `peers`: SUDP rotation 的 in-state peer map（每次 write op 由 acting credential 更新自己的 entry，对其他 credentials 用缓存的 W_c 重新 wrap K'，详 SUDP paper §05-sudp-protocol/06-phase3-consumption.tex Default recoverability policy）
@@ -748,14 +749,15 @@ NOT in memory:
   - 任何 ask/ask-always 服务的 auth（未在 cache 时）
 ```
 
-**Default `memory_ttl`**（按 effective `policy.level` 派生）:
+**Default `memory_ttl`**（按 **effective level** 派生 —— 即 rule 的 `risk` 经 `M.policy.risk`
+映射后的决策，§6.4）:
 
-| `policy.level` | 默认 `memory_ttl` | secrets_cache 行为 |
+| effective level | 默认 `memory_ttl` | secrets_cache 行为 |
 |---|---|---|
 | `allow` | `-1` (∞，等于 unlocked 期间) | bootstrap 即填 |
 | `ask` | = `rule.ttl` | approval-confirm 后填，TTL 到 evict |
-| `ask-always` | `0` | 不进 cache |
-| `deny` | N/A | 永远拒 |
+| `ask-always` | `0` | 不进 cache（含默认下的 `high`/`critical`）|
+| `deny` | N/A | 永远拒（仅用户显式映射时出现）|
 
 User 可在 vault `services.<name>.memory_ttl` 显式覆盖。
 
@@ -784,26 +786,44 @@ User 可在 vault `services.<name>.memory_ttl` 显式覆盖。
 
 ### 6.4 Policy 形式化
 
+`M.policy` 是一棵树：`{ timeout, risk, default, categories, connections }`。一条 **rule
+只声明 `risk`**（`low|medium|high|critical`，分类）；**决策 `level`**（`allow|ask|ask-always|deny`）
+由 `M.policy.risk` 映射派生（risk→level），read live。两套词汇正交、永不在 rule 上共存。
+
+一个连接的有效 rule 集 = 该连接 *service* recipe 的内置 rule ⊕ 用户的
+`M.policy.connections.<conn>.rules`（按 id override，或带 `match` 的新增）。
+
 ```
 T.policy_state = {
-  approval_cache: HashMap<(cid_c, rule_id), (approved_at, ttl)>,
+  approval_cache: HashMap<(conn_id, rule_id, method), (approved_at, ttl)>,
   ...
 }
 
-Policy(cid_c, o):
-  rule = match_rule(o, M.policy.rules)  // specificity-scored matching
-  case rule.level:
+Policy(conn_id, o):
+  rules = merge(recipe_rules(service_of(conn_id)), M.policy.connections[conn_id].rules)
+  // Conflict resolution = DENY-OVERRIDE / most-restrictive wins (fail-safe,
+  // à la IAM/Cedar). Among ALL matching rules, pick the strictest effective
+  // level; specificity only tiebreaks (for a deterministic ask-cache scope).
+  level = max_by_restrictiveness( risk_map[r.risk] for r in rules if matches(r, o) )
+          ?? connection_default ?? category_default ?? global_default ?? "ask-always"
+  case level:
     "allow"       => admit
     "deny"        => reject
     "ask-always"  => not admitted (must trigger approval flow each time)
-    "ask"         => 
-       if approval_cache contains (cid_c, rule.id) and not expired:
+    "ask"         =>
+       if approval_cache contains (conn_id, rule.id, method) and not expired:
          admit
        else:
          not admitted (must trigger approval flow)
 ```
 
-**Specificity scoring** (`src/core/policy.rs`):
+**risk → level 默认映射**（`M.policy.risk`，sparse + 用户可改 + self-defaulting）：
+`low→allow, medium→ask, high→ask-always, critical→ask-always`. **deny 从不做默认**——
+SafeClaw 是 gate 非 block；用户显式把 `critical`（或某条 rule）设成 `deny` 才会拒。
+
+**Restrictiveness 全序**（deny-override 用）：`deny > ask-always > ask > allow`.
+
+**Specificity scoring**（仅作平手 tiebreak，`src/core/policy.rs`）:
 - `+1000` if rule has body regex
 - `+5` if method specified
 - `+10` per literal (non-wildcard) path segment

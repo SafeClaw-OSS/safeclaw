@@ -24,8 +24,10 @@ rest *and* in the cloud blob):
   credential values (§3).
 - **`passkeys`** — each enrolled passkey's wrapped copy of `K`. Crypto plumbing,
   not user data.
-- **`aux`** — structured metadata: stores, policy, and the two connection
-  collections **`connecting`** + **`connections`** (§2).
+- **`aux`** — structured metadata: stores, the **`policy`** tree, and the two
+  connection collections **`connecting`** + **`connections`** (§2). Per-connection
+  user policy lives under **`aux.policy.connections.<connection_id>`** (§5.1) —
+  the same `connection_id` keys the established connection in `aux.connections`.
 
 ---
 
@@ -153,6 +155,18 @@ and **moves the entry into `aux.connections`**. No backend ever sees the token.
 
 `redirect_uri` is a constant of the OAuth client → it lives in the **provider
 config**, not in each handshake.
+
+### 5.1 Per-connection policy
+
+A connection's policy is keyed by the same `connection_id` under
+**`aux.policy.connections.<connection_id>`** — NOT per-service. The built-in rule
+set comes from the connection's *service* recipe (`policy.toml`); the user's
+sparse edits/additions merge on top (`ConnectionPolicy { default?, rules }`). Two
+connections of the same service (`gmail`, `gmail-work`) therefore get independent
+policy overrides. The full policy model — risk tiers, the risk→level map, the
+default floors, deny-override resolution, `ttl` — is in
+[POLICY_RISK_TIERS.md](POLICY_RISK_TIERS.md); the whole `aux.policy` tree is in
+[STORES_AND_ITEMS.md §7](STORES_AND_ITEMS.md).
 
 ---
 

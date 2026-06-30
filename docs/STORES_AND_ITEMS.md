@@ -227,11 +227,30 @@ Adapter resolves the referenced item recursively (terminates at
     "native-files"
   ],
 
+  // ─── Connections (CONNECTION_SCHEMA.md) — orthogonal to this design ─
+  "connecting":  { /* in-flight OAuth handshakes, keyed by connection_id */ },
+  "connections": { /* established connections, keyed by connection_id */ },
+
+  // ─── Policy — ONE tree (POLICY_RISK_TIERS.md) ─────────────────
+  "policy": {
+    "timeout": 300,
+    "risk":    { /* sparse risk→level map; e.g. { "medium": "allow" } */ },
+    "default":    { "read": "allow", "write": "allow" },
+    "categories": { "llm": { "read": "allow", "write": "allow" } },
+    "connections": {
+      // per-CONNECTION user policy, keyed by connection_id; rules sourced
+      // from the connection's service recipe, merged with these edits
+      "gmail": {
+        "default": { "read": "ask" },
+        "rules":   { "read-email": { "risk": "low" } }
+      }
+    }
+  },
+
   // ─── Other vault state (orthogonal — not part of this design) ─
-  "service_state":      { /* per-user service flags + policy overrides */ },
-  "policy_defaults":    { /* global policy preferences */ },
-  "push_subscriptions": [ /* web-push endpoints */ ],
-  "vapid_private_key":  "..."
+  "audit_retention_days": 30,
+  "push_subscriptions":   [ /* web-push endpoints */ ],
+  "vapid_private_key":    "..."
 }
 ```
 
@@ -244,18 +263,44 @@ Every top-level field has a documented reason. No dead fields.
 | `version` | new (v3) | required | Schema-version negotiation |
 | `stores` | new (this design) | required | Connected backends + their data |
 | `store_order` | new (this design) | required | Resolution priority |
-| `service_state` | dev's `services` (renamed + slimmed) | required | Per-user enabled set + policy overrides. Renamed to disambiguate from the static Registry. v3 removes the registry-shadowing fields (upstream/auth) that dev's `services.X` carried — those come from service.toml at runtime. |
-| `policy_defaults` | dev (unchanged) | required | Per-user global policy preferences. Sensitive; stays encrypted. |
+| `connecting` | connections layer | sparse | In-flight OAuth handshakes, keyed by `connection_id`. See [CONNECTION_SCHEMA.md](CONNECTION_SCHEMA.md). |
+| `connections` | connections layer | sparse | Established connections, keyed by `connection_id`. Status is derived. See [CONNECTION_SCHEMA.md](CONNECTION_SCHEMA.md). |
+| `policy` | new (replaces split) | optional | The whole policy tree — `timeout`, the `risk`→level map, the read/write `default` floor, per-`category` floors, and per-`connection` user policy. Sparse; absent on fresh vaults → daemon uses `Policy::default()`. The canonical reference is [POLICY_RISK_TIERS.md](POLICY_RISK_TIERS.md). **Replaces the old split `service_state` + `policy_defaults`.** |
+| `audit_retention_days` | new | optional | Audit-log retention in days. `None` = keep forever. |
 | `push_subscriptions` | dev's `notifications.subscriptions` (flattened) | required | Per-user web-push endpoints; sensitive (deanonymizing). Renamed because dev's two-level nesting (`notifications.subscriptions`) carried no information. |
 | `vapid_private_key` | dev (unchanged) | required | Server-side push signing key |
 
+The `policy` tree (rust: `core::policy::Policy`) is sparse and self-defaulting at
+every layer:
+
+- `timeout` — approval hold, seconds.
+- `risk` — sparse `{low?, medium?, high?, critical?}` → `AccessLevel`. Unset tiers
+  fall to the built-in default `low→allow, medium→ask, high→ask-always,
+  critical→ask-always`. **deny is never a default** — the user opts into it.
+  Read live at eval, so a single edit re-tunes every same-tier rule on the next
+  request. See [POLICY_RISK_TIERS.md](POLICY_RISK_TIERS.md).
+- `default` — global read/write floor (`Levels { read?, write?, ttl? }`) when no
+  rule and no more-specific default matches. These are **decisions** (access
+  levels), not risk classifications.
+- `categories` — per-category floor (e.g. `llm`, `channel`); beats `default`.
+- `connections.<connection_id>` — per-**connection** user policy
+  (`ConnectionPolicy { default?, rules }`). The built-in rule set comes from the
+  connection's *service* recipe (`policy.toml`); `rules` is a sparse map keyed by
+  rule id where each `RuleConfig { match?, label?, body?, risk?, ttl? }` either
+  **overrides** a built-in rule by id, or (if it carries `match`) **adds** a new
+  rule. Connections are addressed by `connection_id`, NOT per-service —
+  see [CONNECTION_SCHEMA.md](CONNECTION_SCHEMA.md).
+
 ### 7.2 What's removed from v2/dev
 
-| v2 field | Replaced by |
+| v2/dev field | Replaced by |
 |----------|-------------|
 | Top-level service-defined keys (`wallet`, `gatewayToken`, ...) | items in `native-secrets.items` |
 | `files: [{id, name, size}]` | `native-files.items` |
 | `services.X.upstream` / `services.X.auth` (registry shadow) | Read live from service.toml at runtime |
+| `service_state` (per-service policy overrides) | folded into `policy.connections.<connection_id>` (per-connection, not per-service) |
+| `policy_defaults` (global preferences) | folded into the top-level `policy` tree (`timeout` / `risk` / `default` / `categories`) |
+| per-rule `level` pin, per-rule `ask_ttl` | rules carry `risk` only; the cache TTL field is `ttl` |
 
 ---
 
@@ -382,7 +427,7 @@ two of sudp's three fields:
 | sudp field | What we put there | Why |
 |------------|-------------------|-----|
 | `M.targets` | `native-secrets` item bytes, keyed by bare item name | sudp's `TargetValue` zero-on-drop + b64-binary-safe encoding gives byte-safe storage for the only store kind that holds authoritative bytes locally |
-| `M.aux` | `{ version, stores, store_order }` + every other store's items metadata (no native-secrets items here — they're in targets) | sudp's "deployment-specific auxiliary state, out-of-scope of the protocol" slot |
+| `M.aux` | `{ version, stores, store_order, policy, connecting, connections, … }` + every other store's items metadata (no native-secrets items here — they're in targets) | sudp's "deployment-specific auxiliary state, out-of-scope of the protocol" slot |
 | `M.peers` | (sudp-internal credential rewrap map — untouched by v3) | structural |
 
 Runtime code goes through `storage::plaintext::VaultPlaintextView` which
@@ -551,8 +596,9 @@ compat via the version handshake.
 
 Things I decided but flagged for re-review:
 
-1. **`service_state` naming** — renamed from dev's `services`. Better
-   name? (`service_instances`, `enabled_services`, ...)
+1. ~~**`service_state` naming**~~ — RESOLVED. `service_state` is gone; per-user
+   policy now lives in the `policy` tree, keyed per-**connection**
+   (`policy.connections.<connection_id>`), not per-service.
 2. **Default `store_order` for new vaults** — proposal:
    `[native-secrets, native-files]`. External stores appended at the
    bottom on connect. Reasonable?
