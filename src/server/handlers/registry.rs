@@ -119,7 +119,18 @@ pub struct RegistryPolicyRule {
     pub match_pattern: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub body: Option<String>,
-    pub level: String,
+    /// Author-assigned risk tier (`low`/`medium`/`high`), if classified by
+    /// risk. The console renders this as the (editable) risk column; `level`
+    /// is what it currently resolves to.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub risk: Option<String>,
+    /// Effective access level: an explicit pin, else the risk tier mapped
+    /// through the *default* `risk_policy`. The live per-vault value (after a
+    /// user `risk_policy` edit) is resolved by the daemon at request time and
+    /// stamped on the approval record; this registry view shows the baseline.
+    /// Absent only if the rule declares neither risk nor level.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub level: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ask_ttl: Option<u64>,
 }
@@ -245,13 +256,28 @@ fn policy_for(
         Some(
             p.rule
                 .iter()
-                .map(|r| RegistryPolicyRule {
-                    id: r.id.clone(),
-                    label: r.label.clone(),
-                    match_pattern: r.match_pattern.clone(),
-                    body: r.body.clone(),
-                    level: r.level.clone(),
-                    ask_ttl: r.ask_ttl,
+                .map(|r| {
+                    let risk = r.risk.as_deref().and_then(crate::core::policy::RiskTier::parse);
+                    // Effective level shown to agents: an explicit pin, else the
+                    // tier through the DEFAULT risk_policy (live per-vault values
+                    // are stamped on approval records, not surfaced here).
+                    let level = r
+                        .level
+                        .clone()
+                        .or_else(|| {
+                            risk.map(|t| {
+                                crate::core::policy::RiskPolicy::default().get(t).to_string()
+                            })
+                        });
+                    RegistryPolicyRule {
+                        id: r.id.clone(),
+                        label: r.label.clone(),
+                        match_pattern: r.match_pattern.clone(),
+                        body: r.body.clone(),
+                        risk: risk.map(|t| t.to_string()),
+                        level,
+                        ask_ttl: r.ask_ttl,
+                    }
                 })
                 .collect(),
         )

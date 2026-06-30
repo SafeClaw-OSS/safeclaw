@@ -41,6 +41,85 @@ impl std::fmt::Display for AccessLevel {
     }
 }
 
+// ── Risk Tier ──────────────────────────────────────────────────────────────────
+
+/// Author-assigned risk classification for a policy rule. Decouples *what the
+/// rule is* (a stable, recipe-author judgement) from *what it costs the user*
+/// (the `AccessLevel`, derived live via [`RiskPolicy`]). A rule declares a
+/// `risk` instead of a hard `level` so a single user-editable `risk_policy`
+/// map can re-tune every same-tier rule at once — e.g. "auto-allow everything
+/// low-risk" — without touching each rule. `risk` hangs on the *rule*
+/// (matcher + optional body predicate), not a fixed action enum, so future
+/// predicate rules (`amount > $100`) classify the same way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RiskTier {
+    Low,
+    Medium,
+    High,
+}
+
+impl std::fmt::Display for RiskTier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RiskTier::Low => write!(f, "low"),
+            RiskTier::Medium => write!(f, "medium"),
+            RiskTier::High => write!(f, "high"),
+        }
+    }
+}
+
+impl RiskTier {
+    /// Parse a kebab-case tier name. Returns `None` for anything else so
+    /// callers can treat an unknown/absent tier as "no risk declared".
+    pub fn parse(s: &str) -> Option<RiskTier> {
+        match s {
+            "low" => Some(RiskTier::Low),
+            "medium" => Some(RiskTier::Medium),
+            "high" => Some(RiskTier::High),
+            _ => None,
+        }
+    }
+}
+
+/// Maps each [`RiskTier`] to a concrete [`AccessLevel`]. This is the *only*
+/// user-editable knob between a rule's author-assigned risk and the approval
+/// behaviour: change `medium` here and every medium-risk rule across every
+/// service re-tunes on the next request. Lives in [`PolicyDefaults`] (vault
+/// `aux.policy_defaults`), so it is read live during evaluation — never
+/// snapshot into resolved rule levels — which is what keeps an edit realtime
+/// with zero cache invalidation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RiskPolicy {
+    pub low: AccessLevel,
+    pub medium: AccessLevel,
+    pub high: AccessLevel,
+}
+
+impl Default for RiskPolicy {
+    fn default() -> Self {
+        // Conservative author baseline: only read-only/no-side-effect (low)
+        // auto-passes; reading private content (medium) asks once; anything
+        // irreversible / outbound (high) asks every time. Users loosen this
+        // explicitly — never silently.
+        Self {
+            low: AccessLevel::Allow,
+            medium: AccessLevel::Ask,
+            high: AccessLevel::AskAlways,
+        }
+    }
+}
+
+impl RiskPolicy {
+    pub fn get(&self, tier: RiskTier) -> AccessLevel {
+        match tier {
+            RiskTier::Low => self.low.clone(),
+            RiskTier::Medium => self.medium.clone(),
+            RiskTier::High => self.high.clone(),
+        }
+    }
+}
+
 // ── Policy Types ───────────────────────────────────────────────────────────────
 
 /// Per-request policy rule.
@@ -66,10 +145,34 @@ pub struct PolicyRule {
     /// Regex matched against request body text. Omit to skip body matching.
     #[serde(default)]
     pub body: Option<String>,
-    pub level: AccessLevel,
+    /// Author-assigned risk tier. When set (and `level` is not), the effective
+    /// access level is derived live from the vault's `risk_policy` at
+    /// evaluation time. Most rules should set `risk` (tunable) rather than
+    /// `level` (pinned).
+    #[serde(default)]
+    pub risk: Option<RiskTier>,
+    /// Explicit access level. When set, it *pins* the decision and overrides
+    /// any `risk` (an escape hatch, e.g. a hard `deny` regardless of policy).
+    /// Optional: a `risk`-only rule leaves this `None` and resolves via
+    /// `risk_policy`. A rule with neither falls through to service levels.
+    #[serde(default)]
+    pub level: Option<AccessLevel>,
     /// Cache TTL in seconds after approval (for `ask` level only).
     #[serde(default)]
     pub ask_ttl: Option<u64>,
+}
+
+impl PolicyRule {
+    /// Resolve this rule's effective access level given the live `risk_policy`.
+    /// Precedence: explicit `level` (pin) > `risk_policy[risk]` (tunable) >
+    /// `None` (rule declared neither → caller falls through to service levels).
+    /// `risk_policy` is `None` only in legacy/default-less paths; a `risk`-only
+    /// rule then also yields `None` (fall through), never a silent decision.
+    pub fn effective_level(&self, risk_policy: Option<&RiskPolicy>) -> Option<AccessLevel> {
+        self.level
+            .clone()
+            .or_else(|| self.risk.and_then(|r| risk_policy.map(|rp| rp.get(r))))
+    }
 }
 
 /// Per-service read/write access levels
@@ -83,10 +186,17 @@ pub struct ServiceLevels {
 }
 
 /// Sparse override for a single built-in rule, keyed by rule id in the vault.
-/// Only the fields set here replace the built-in rule's equivalents.
+/// Only the fields set here replace the built-in rule's equivalents. A user
+/// may pin a `level` (highest precedence) OR reclassify `risk` (re-tunes via
+/// `risk_policy`); see [`merge_rule_overrides`] for how the two compose.
+/// `level` is `Option` for back-compat: pre-risk-tier vaults stored only
+/// `level`, which still deserializes and still pins.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuleOverride {
-    pub level: AccessLevel,
+    #[serde(default)]
+    pub level: Option<AccessLevel>,
+    #[serde(default)]
+    pub risk: Option<RiskTier>,
     #[serde(default)]
     pub ask_ttl: Option<u64>,
 }
@@ -114,6 +224,19 @@ pub fn merge_service_levels(
 
 /// Apply sparse overrides onto built-in rules, matching by `id`.
 /// Rules without an `id`, or whose `id` has no override, are left unchanged.
+///
+/// The merge bakes the user's intent into the rule's (`level`, `risk`) pair so
+/// that [`PolicyRule::effective_level`] alone — read live against `risk_policy`
+/// at eval — yields the full precedence:
+///
+/// - `override.level` → pin (the author's `risk` is kept only for display;
+///   `level` wins in `effective_level`).
+/// - `override.risk` (no `override.level`) → reclassify: supersede the author's
+///   `level` AND `risk` by clearing `level`, so the new tier governs.
+/// - neither → the author's rule is unchanged (modulo `ask_ttl`).
+///
+/// This keeps resolution itself a pure function of the (merged) rule + the live
+/// `risk_policy`, with no separate override lookup on the hot path.
 pub fn merge_rule_overrides(
     built_in: &[PolicyRule],
     overrides: &std::collections::HashMap<String, RuleOverride>,
@@ -121,11 +244,24 @@ pub fn merge_rule_overrides(
     built_in.iter().map(|rule| {
         let ov = rule.id.as_ref().and_then(|id| overrides.get(id));
         match ov {
-            Some(o) => PolicyRule {
-                level: o.level.clone(),
-                ask_ttl: o.ask_ttl.or(rule.ask_ttl),
-                ..rule.clone()
-            },
+            Some(o) => {
+                let (level, risk) = if o.level.is_some() {
+                    // Pin: keep the author's risk for display, but level wins.
+                    (o.level.clone(), o.risk.or(rule.risk))
+                } else if o.risk.is_some() {
+                    // Reclassify: the new tier supersedes the author's level too,
+                    // else a pinned author `level` would shadow the user's risk.
+                    (None, o.risk)
+                } else {
+                    (rule.level.clone(), rule.risk)
+                };
+                PolicyRule {
+                    level,
+                    risk,
+                    ask_ttl: o.ask_ttl.or(rule.ask_ttl),
+                    ..rule.clone()
+                }
+            }
             None => rule.clone(),
         }
     }).collect()
@@ -141,6 +277,13 @@ pub struct PolicyDefaults {
     /// Takes priority over `levels` when the service's category matches.
     #[serde(default)]
     pub type_levels: Option<std::collections::HashMap<String, ServiceLevels>>,
+    /// Risk-tier → access-level map. The one user-editable knob between a
+    /// rule's author-assigned `risk` and its approval behaviour; `None` falls
+    /// back to [`RiskPolicy::default`]. Read live at eval so an edit re-tunes
+    /// every same-tier rule on the next request. Rides the existing
+    /// `policy_defaults` GET/POST endpoints — no new surface, no migration.
+    #[serde(default)]
+    pub risk_policy: Option<RiskPolicy>,
 }
 
 impl Default for PolicyDefaults {
@@ -174,6 +317,7 @@ impl Default for PolicyDefaults {
                 ask_ttl: None,
             }),
             type_levels: Some(type_levels),
+            risk_policy: Some(RiskPolicy::default()),
         }
     }
 }
@@ -311,7 +455,12 @@ pub fn evaluate_policy_with_match(
     defaults: &PolicyDefaults,
     service_category: Option<&str>,
 ) -> (AccessLevel, Option<String>, Option<u64>) {
-    // 1. Check service rules — most specific match wins (nginx-style)
+    // 1. Check service rules — most specific match wins (nginx-style).
+    //    The matched rule's level is resolved live from `risk_policy`:
+    //    explicit `level` pins; otherwise `risk` maps through the tier table.
+    //    A rule that declares NEITHER yields no decision and falls through to
+    //    the service-level defaults below (step 2) — we do NOT invent a level
+    //    for it; the existing default chain already answers "nothing specific".
     if let Some(rules) = rules {
         let mut best: Option<(u32, &PolicyRule)> = None;
         for rule in rules {
@@ -323,7 +472,10 @@ pub fn evaluate_policy_with_match(
             }
         }
         if let Some((_, rule)) = best {
-            return (rule.level.clone(), rule.id.clone(), rule.ask_ttl);
+            if let Some(level) = rule.effective_level(defaults.risk_policy.as_ref()) {
+                return (level, rule.id.clone(), rule.ask_ttl);
+            }
+            // else: matched but undecided → fall through to service levels.
         }
     }
 
@@ -456,7 +608,21 @@ mod tests {
             label: None,
             match_pattern: Some(match_pat.to_string()),
             body: None,
-            level,
+            risk: None,
+            level: Some(level),
+            ask_ttl: None,
+        }
+    }
+
+    /// A risk-only rule (no explicit `level`) — resolves via `risk_policy`.
+    fn risk_rule(match_pat: &str, risk: RiskTier) -> PolicyRule {
+        PolicyRule {
+            id: None,
+            label: None,
+            match_pattern: Some(match_pat.to_string()),
+            body: None,
+            risk: Some(risk),
+            level: None,
             ask_ttl: None,
         }
     }
@@ -681,16 +847,17 @@ mod tests {
                 label: Some("Send email".into()),
                 match_pattern: Some("POST /gmail/v1/users/me/messages/send".into()),
                 body: None,
-                level: AccessLevel::AskAlways,
+                risk: None,
+                level: Some(AccessLevel::AskAlways),
                 ask_ttl: None,
             },
         ];
         let mut overrides = std::collections::HashMap::new();
         overrides.insert("send-email".into(), RuleOverride {
-            level: AccessLevel::Ask, ask_ttl: None,
+            level: Some(AccessLevel::Ask), risk: None, ask_ttl: None,
         });
         let merged = merge_rule_overrides(&built_in, &overrides);
-        assert_eq!(merged[0].level, AccessLevel::Ask);
+        assert_eq!(merged[0].level, Some(AccessLevel::Ask));
         // Match pattern / label preserved
         assert_eq!(merged[0].label.as_deref(), Some("Send email"));
     }
@@ -700,6 +867,165 @@ mod tests {
         let built_in = vec![rule("GET /foo", AccessLevel::Allow)];
         let overrides = std::collections::HashMap::new();
         let merged = merge_rule_overrides(&built_in, &overrides);
-        assert_eq!(merged[0].level, AccessLevel::Allow);
+        assert_eq!(merged[0].level, Some(AccessLevel::Allow));
+    }
+
+    /// Back-compat: a RuleOverride sealed by an OLD daemon (when `level` was a
+    /// required field, no `risk`) must still deserialize — existing vaults are
+    /// not migrated. And a new risk-only override round-trips. Guards the
+    /// "no migration" claim against an accidental future `deny_unknown_fields`
+    /// or a non-default field.
+    #[test]
+    fn rule_override_deserializes_old_and_new_shapes() {
+        // Old shape: just a level (what pre-risk-tier vaults stored).
+        let old: RuleOverride = serde_json::from_str(r#"{"level":"ask"}"#).unwrap();
+        assert_eq!(old.level, Some(AccessLevel::Ask));
+        assert_eq!(old.risk, None);
+        // Old shape with ttl.
+        let old2: RuleOverride = serde_json::from_str(r#"{"level":"ask-always","ask_ttl":1800}"#).unwrap();
+        assert_eq!(old2.level, Some(AccessLevel::AskAlways));
+        assert_eq!(old2.ask_ttl, Some(1800));
+        // New shape: reclassify by risk only.
+        let new: RuleOverride = serde_json::from_str(r#"{"risk":"low"}"#).unwrap();
+        assert_eq!(new.risk, Some(RiskTier::Low));
+        assert_eq!(new.level, None);
+        // Empty object is valid (all fields optional) — a no-op override.
+        let empty: RuleOverride = serde_json::from_str("{}").unwrap();
+        assert_eq!(empty.level, None);
+        assert_eq!(empty.risk, None);
+        // Round-trip the new shape.
+        let back: RuleOverride = serde_json::from_str(&serde_json::to_string(&new).unwrap()).unwrap();
+        assert_eq!(back.risk, Some(RiskTier::Low));
+    }
+
+    // ── Risk tiers ─────────────────────────────────────────────────────────
+
+    /// A risk-only rule resolves through the default risk_policy:
+    /// low→allow, medium→ask, high→ask-always. This is the headline behaviour
+    /// that turns "read one Gmail message" (list=low, get=medium) from two
+    /// approvals into one.
+    #[test]
+    fn risk_only_rule_resolves_via_default_risk_policy() {
+        let low = vec![risk_rule("GET /gmail/v1/users/me/messages", RiskTier::Low)];
+        assert_eq!(
+            evaluate_policy("GET", "/gmail/v1/users/me/messages", None, Some(&low), None, &defaults(), None),
+            AccessLevel::Allow
+        );
+        let medium = vec![risk_rule("GET /gmail/v1/users/me/messages/*", RiskTier::Medium)];
+        assert_eq!(
+            evaluate_policy("GET", "/gmail/v1/users/me/messages/abc", None, Some(&medium), None, &defaults(), None),
+            AccessLevel::Ask
+        );
+        let high = vec![risk_rule("POST /gmail/v1/users/me/messages/send", RiskTier::High)];
+        assert_eq!(
+            evaluate_policy("POST", "/gmail/v1/users/me/messages/send", None, Some(&high), None, &defaults(), None),
+            AccessLevel::AskAlways
+        );
+    }
+
+    /// Editing risk_policy globally re-tunes every same-tier rule at once —
+    /// the batch capability that motivated tiers over per-rule config.
+    #[test]
+    fn editing_risk_policy_retunes_all_same_tier_rules() {
+        let mut def = defaults();
+        def.risk_policy = Some(RiskPolicy {
+            low: AccessLevel::Allow,
+            medium: AccessLevel::Allow, // user loosens medium globally
+            high: AccessLevel::AskAlways,
+        });
+        let rules = vec![risk_rule("GET /x/*", RiskTier::Medium)];
+        assert_eq!(
+            evaluate_policy("GET", "/x/abc", None, Some(&rules), None, &def, None),
+            AccessLevel::Allow
+        );
+    }
+
+    /// An explicit `level` pins the decision regardless of `risk` / risk_policy
+    /// (the escape hatch, e.g. a hard deny).
+    #[test]
+    fn explicit_level_pins_over_risk() {
+        let mut r = risk_rule("DELETE /gmail/v1/users/me/messages/*", RiskTier::High);
+        r.level = Some(AccessLevel::Deny);
+        let rules = vec![r];
+        assert_eq!(
+            evaluate_policy("DELETE", "/gmail/v1/users/me/messages/abc", None, Some(&rules), None, &defaults(), None),
+            AccessLevel::Deny
+        );
+    }
+
+    /// override.risk reclassifies a single rule (user wants just THIS action
+    /// looser) — supersedes the author's level too, then maps via risk_policy.
+    #[test]
+    fn override_risk_reclassifies_single_rule() {
+        let built_in = vec![{
+            let mut r = risk_rule("GET /gmail/v1/users/me/messages/*", RiskTier::Medium);
+            r.id = Some("read-email".into());
+            r
+        }];
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert("read-email".into(), RuleOverride {
+            level: None, risk: Some(RiskTier::Low), ask_ttl: None,
+        });
+        let merged = merge_rule_overrides(&built_in, &overrides);
+        assert_eq!(merged[0].risk, Some(RiskTier::Low));
+        assert_eq!(merged[0].level, None);
+        assert_eq!(
+            evaluate_policy("GET", "/gmail/v1/users/me/messages/abc", None, Some(&merged), None, &defaults(), None),
+            AccessLevel::Allow
+        );
+    }
+
+    /// override.level pins even when the author classified by risk; the
+    /// author's risk is preserved for display but the pin wins at eval.
+    #[test]
+    fn override_level_pins_over_author_risk() {
+        let built_in = vec![{
+            let mut r = risk_rule("POST /x/send", RiskTier::High);
+            r.id = Some("send".into());
+            r
+        }];
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert("send".into(), RuleOverride {
+            level: Some(AccessLevel::Deny), risk: None, ask_ttl: None,
+        });
+        let merged = merge_rule_overrides(&built_in, &overrides);
+        assert_eq!(merged[0].level, Some(AccessLevel::Deny));
+        assert_eq!(merged[0].risk, Some(RiskTier::High)); // preserved for display
+        assert_eq!(
+            evaluate_policy("POST", "/x/send", None, Some(&merged), None, &defaults(), None),
+            AccessLevel::Deny
+        );
+    }
+
+    /// A matched rule that declares NEITHER risk nor level yields no decision
+    /// and falls through to the service-level defaults — we do not invent a
+    /// level for it (Q2: the existing default chain already answers this).
+    #[test]
+    fn rule_with_neither_risk_nor_level_falls_through() {
+        let bare = PolicyRule {
+            id: None, label: None,
+            match_pattern: Some("GET /x".into()),
+            body: None, risk: None, level: None, ask_ttl: None,
+        };
+        let svc = ServiceLevels { read: Some(AccessLevel::Ask), write: None, ask_ttl: None };
+        // Falls through to service levels (Ask), not the global allow default.
+        assert_eq!(
+            evaluate_policy("GET", "/x", None, Some(&vec![bare]), Some(&svc), &defaults(), None),
+            AccessLevel::Ask
+        );
+    }
+
+    /// With no risk_policy available at all (degenerate/legacy), a risk-only
+    /// rule produces no decision and falls through rather than guessing.
+    #[test]
+    fn risk_only_rule_without_risk_policy_falls_through() {
+        let mut def = defaults();
+        def.risk_policy = None;
+        let rules = vec![risk_rule("GET /x", RiskTier::Low)];
+        let svc = ServiceLevels { read: Some(AccessLevel::AskAlways), write: None, ask_ttl: None };
+        assert_eq!(
+            evaluate_policy("GET", "/x", None, Some(&rules), Some(&svc), &def, None),
+            AccessLevel::AskAlways
+        );
     }
 }

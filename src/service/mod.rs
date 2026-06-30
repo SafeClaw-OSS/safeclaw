@@ -416,7 +416,8 @@ impl TomlPolicyRule {
             label: None,
             match_pattern: Some(match_pattern),
             body: None,
-            level,
+            risk: None,
+            level: Some(level),
             ask_ttl: None,
         })
     }
@@ -441,7 +442,15 @@ pub struct PolicyFileRule {
     /// Regex matched against request body (optional).
     #[serde(default)]
     pub body: Option<String>,
-    pub level: String,
+    /// Author-assigned risk tier (`low` | `medium` | `high`). Resolved to an
+    /// access level live via the vault's `risk_policy`. Prefer this over
+    /// `level` so the user can re-tune all same-tier rules at once.
+    #[serde(default)]
+    pub risk: Option<String>,
+    /// Explicit access level (pins, overriding `risk`). Optional: a risk-only
+    /// rule omits it. A rule with neither is skipped (it can never decide).
+    #[serde(default)]
+    pub level: Option<String>,
     #[serde(default)]
     pub ask_ttl: Option<u64>,
 }
@@ -458,12 +467,19 @@ impl PolicyFileDef {
 
     pub fn to_policy_rules(&self) -> Vec<crate::core::policy::PolicyRule> {
         self.rule.iter().filter_map(|r| {
-            let level = parse_access_level(Some(&r.level))?;
+            let level = r.level.as_ref().and_then(|l| parse_access_level(Some(l)));
+            let risk = r.risk.as_deref().and_then(crate::core::policy::RiskTier::parse);
+            // Skip a rule that can never decide (neither tier nor explicit
+            // level) — it would only ever fall through, so it's noise.
+            if level.is_none() && risk.is_none() {
+                return None;
+            }
             Some(crate::core::policy::PolicyRule {
                 id: Some(r.id.clone()),
                 label: Some(r.label.clone()),
                 match_pattern: Some(r.match_pattern.clone()),
                 body: r.body.clone(),
+                risk,
                 level,
                 ask_ttl: r.ask_ttl,
             })
@@ -1902,5 +1918,35 @@ client_secret_env = "SELFHOSTED_CLIENT_SECRET"
         let reg = ServiceRegistry::load();
         // openai is a bearer/api-key service — no oauth2 consent to start.
         assert!(reg.connect_descriptor("openai").is_none());
+    }
+
+    /// End-to-end guard for the risk-tier rewrite of the gmail recipe: the
+    /// compiled-in `gmail/policy.toml` must PARSE (the loader silently drops a
+    /// policy that fails `toml::from_str`, so a typo wouldn't fail the build —
+    /// only this test would) AND each rule must resolve to the intended access
+    /// level through the default `risk_policy`. Also pins the headline win:
+    /// list (low→allow) + read (medium→ask) = one approval to read an email,
+    /// not two.
+    #[test]
+    fn compiled_gmail_policy_resolves_risk_tiers() {
+        use crate::core::policy::{evaluate_policy, AccessLevel, PolicyDefaults};
+        let reg = ServiceRegistry::load();
+        let rules = reg
+            .default_policy_rules("gmail")
+            .expect("gmail policy.toml must parse and yield rules");
+        let defaults = PolicyDefaults::default();
+        let eval = |m: &str, p: &str| {
+            evaluate_policy(m, p, None, Some(&rules), None, &defaults, Some("integration"))
+        };
+        // low → allow (listing, no private body)
+        assert_eq!(eval("GET", "/gmail/v1/users/me/messages"), AccessLevel::Allow);
+        assert_eq!(eval("GET", "/gmail/v1/users/me/labels"), AccessLevel::Allow);
+        // medium → ask (reads private content, once per TTL)
+        assert_eq!(eval("GET", "/gmail/v1/users/me/messages/abc123"), AccessLevel::Ask);
+        // high → ask-always (outbound / mutating)
+        assert_eq!(eval("POST", "/gmail/v1/users/me/messages/send"), AccessLevel::AskAlways);
+        assert_eq!(eval("POST", "/gmail/v1/users/me/messages/abc123/modify"), AccessLevel::AskAlways);
+        // pinned deny (escape hatch, ignores risk_policy)
+        assert_eq!(eval("DELETE", "/gmail/v1/users/me/messages/abc123"), AccessLevel::Deny);
     }
 }

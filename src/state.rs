@@ -557,6 +557,13 @@ impl AppState {
                     merged.insert(k.clone(), v.clone());
                 }
             }
+            // Risk-tier map: a user edit (e.g. "auto-allow low-risk") takes
+            // effect on the very next request because we read it live here —
+            // the matched rule's `risk` is mapped through this at eval time, so
+            // there is nothing to invalidate or re-merge into rule levels.
+            if user.risk_policy.is_some() {
+                defaults.risk_policy = user.risk_policy.clone();
+            }
         }
         let category = self.services.default_category(service_id);
         let (level, matched_rule, ttl) = crate::core::policy::evaluate_policy_with_match(
@@ -743,7 +750,8 @@ mod tests {
             label: None,
             match_pattern: Some(pat.to_string()),
             body: None,
-            level: AccessLevel::Ask,
+            risk: None,
+            level: Some(AccessLevel::Ask),
             ask_ttl: Some(60),
         };
 
