@@ -71,13 +71,16 @@ async fn add(args: AgentAddArgs) -> Result<(), String> {
         return Err(format!("create agent key failed: HTTP {}", resp.status()));
     }
     let r: CreateResp = resp.json().await.map_err(|e| format!("parse response: {}", e))?;
-    // Token to STDOUT (so `KEY=$(sc agent add x)` works); guidance to STDERR.
+    // Key to STDOUT ONLY (so `KEY=$(sc agent add x)` captures it); STDERR guidance
+    // carries NO key, so an agent can blind-capture stdout without the secret
+    // leaking into its transcript via a stderr copy.
     println!("{}", r.token);
     eprintln!(
-        "\nAgent '{}' created. This key is shown ONCE — set it in the agent's env:\n  \
-         SAFECLAW_API_KEY={}\n  SAFECLAW_VAULT_URL=$(sc env | grep VAULT_URL | cut -d= -f2-)\n\
-         It works on any of your paired devices. Revoke: `sc agent rm {}`.",
-        args.name, r.token, args.name
+        "\nAgent '{}' created. Its key was printed to stdout, shown ONCE — set it as \
+         SAFECLAW_API_KEY in the agent's env (capture stdout without echoing it). \
+         SAFECLAW_VAULT_URL comes from `sc env`. Works on any paired device; \
+         revoke: `sc agent rm {}`.",
+        args.name, args.name
     );
     Ok(())
 }
