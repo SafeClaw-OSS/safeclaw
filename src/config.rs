@@ -126,10 +126,10 @@ pub enum Command {
     /// Health + reachability checks: daemon connectivity, active
     /// profile, API key presence. Read-only; no vault state mutation.
     Doctor(CommonArgs),
-    /// Work with service.toml recipes. Today: `recipe validate <path>` runs
-    /// the static safety checks the console upload editor enforces. Offline,
-    /// no daemon needed.
-    Recipe(RecipeArgs),
+    /// Work with service.toml definitions. Today: `service validate <path>`
+    /// runs the static safety checks the console upload editor enforces.
+    /// Offline, no daemon needed.
+    Service(ServiceArgs),
     /// git credential helper — **invoked by git, not users**. Registered via
     /// `git config credential.<broker>.helper "!sc git-credential"`. On `get`
     /// it returns the agent's `$SAFECLAW_API_KEY` as the Basic password so git
@@ -180,25 +180,25 @@ pub enum SecretSubcommand {
 }
 
 #[derive(Debug, Args)]
-pub struct RecipeArgs {
+pub struct ServiceArgs {
     #[command(subcommand)]
-    pub sub: RecipeSubcommand,
+    pub sub: ServiceSubcommand,
 }
 
 #[derive(Debug, Subcommand)]
-pub enum RecipeSubcommand {
-    /// Validate a service.toml recipe against the broker's safety rules.
+pub enum ServiceSubcommand {
+    /// Validate a service.toml definition against the broker's safety rules.
     /// Prints each problem and exits non-zero on failure.
-    Validate(RecipeValidateArgs),
+    Validate(ServiceValidateArgs),
 }
 
 #[derive(Debug, Args)]
-pub struct RecipeValidateArgs {
+pub struct ServiceValidateArgs {
     /// Path to the service.toml to validate.
     pub path: std::path::PathBuf,
-    /// Validate as a first-party (trusted) recipe — allows exec / non-upstream
-    /// steps. Default: validate as an UPLOADED recipe (exec forbidden), i.e.
-    /// the same strict checks the console upload editor applies.
+    /// Validate as a first-party (trusted) definition — allows exec /
+    /// non-upstream steps. Default: validate as an UPLOADED definition (exec
+    /// forbidden), i.e. the same strict checks the console upload editor applies.
     #[arg(long)]
     pub first_party: bool,
 }

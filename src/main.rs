@@ -166,13 +166,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 e.into()
             })
         }
-        Command::Recipe(args) => {
-            use safeclaw::config::RecipeSubcommand;
+        Command::Service(args) => {
+            use safeclaw::config::ServiceSubcommand;
             let r = match args.sub {
-                RecipeSubcommand::Validate(a) => cli::recipe::run_validate(a).await,
+                ServiceSubcommand::Validate(a) => cli::service_def::run_validate(a).await,
             };
             r.map_err(|e| -> Box<dyn std::error::Error> {
-                eprintln!("safeclaw recipe: {}", e);
+                eprintln!("safeclaw service: {}", e);
                 e.into()
             })
         }

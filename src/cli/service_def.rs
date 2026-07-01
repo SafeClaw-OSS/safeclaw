@@ -1,11 +1,12 @@
-//! `sc recipe validate <path>` — run the static recipe safety validator
-//! offline (no daemon). Mirrors exactly what the console's custom-TOML upload
-//! editor will enforce, so authors can check a recipe before submitting it.
+//! `sc service validate <path>` — run the static service-definition safety
+//! validator offline (no daemon). Mirrors exactly what the console's custom-TOML
+//! upload editor will enforce, so authors can check a service.toml before
+//! submitting it.
 
-use crate::config::RecipeValidateArgs;
+use crate::config::ServiceValidateArgs;
 use crate::service::validate::validate_recipe;
 
-pub async fn run_validate(args: RecipeValidateArgs) -> Result<(), String> {
+pub async fn run_validate(args: ServiceValidateArgs) -> Result<(), String> {
     let path = &args.path;
     let toml_str = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read {}: {}", path.display(), e))?;
@@ -31,7 +32,7 @@ pub async fn run_validate(args: RecipeValidateArgs) -> Result<(), String> {
                 eprintln!("  • {}", p);
             }
             // Non-zero exit via the Err path (main prints + boxes it).
-            Err(format!("{}: recipe validation failed", path.display()))
+            Err(format!("{}: service validation failed", path.display()))
         }
     }
 }
