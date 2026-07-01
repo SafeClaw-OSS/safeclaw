@@ -22,6 +22,20 @@ use crate::protocol::operation::{Act, ActType, Bind, Operation, Valid};
 use crate::server::handlers::op::validate_vault_id;
 use crate::state::{ApprovalEvent, AppState};
 
+/// `/export/{key}` is DISABLED on the agent surface for v1.
+///
+/// Raw-secret export hands the agent custody of the plaintext — a silent-exfil
+/// path that contradicts the broker's v1 security claim (recipe-only: the daemon
+/// injects the credential server-side and the agent never holds the raw secret).
+/// The Export op-path (`handle` below) is preserved intact for a future opt-in
+/// re-enable; today the route points here and refuses.
+pub async fn disabled() -> Result<(StatusCode, Json<Value>)> {
+    Err(AppError::Forbidden(
+        "raw secret export is disabled in this version — use /use/<service> so the daemon injects the credential and the agent never holds the raw secret".into(),
+    ))
+}
+
+#[allow(dead_code)] // preserved for a future opt-in re-enable (see `disabled`)
 pub async fn handle(
     State(state): State<Arc<AppState>>,
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
@@ -84,6 +98,7 @@ pub async fn handle(
     ))
 }
 
+#[allow(dead_code)] // used only by the disabled `handle`
 fn validate_key(k: &str) -> Result<()> {
     if k.is_empty() || k.len() > 64 {
         return Err(AppError::BadRequest("invalid key".into()));

@@ -71,10 +71,12 @@ async fn handle_impl(
 
     // Locked-state gate (H3 / PROTOCOL.md §6.3). When the vault is Locked,
     // /use rejects without creating a pending op — agent must trigger an
-    // unlock ceremony first. Future: dispatch the service's `[upstream.locked]
-    // response` template here so the agent gets a service-shaped error.
+    // unlock ceremony first. Returns a DISTINCT 423 (`error:"vault_locked"`) so
+    // the agent tells "unlock needed → run `sc up`" apart from other 409s.
+    // (A future opt-in could dispatch the recipe's `[upstream.locked]` template
+    // for dumb tools pointed straight at /use.)
     if state.is_vault_locked(&vault_id) {
-        return Err(AppError::Conflict("vault locked — unlock first".into()));
+        return Err(AppError::VaultLocked);
     }
 
     // Resolve the connection → its service (recipe). CONNECTION_SCHEMA.md §6:
@@ -145,7 +147,7 @@ async fn handle_impl(
             &path_for_eval,
             body_text,
         )
-        .ok_or_else(|| AppError::Conflict("vault locked — unlock first".into()))?;
+        .ok_or(AppError::VaultLocked)?;
 
     // Deny short-circuits: no upstream call, no pending op, agent gets 403
     // immediately. Audit row carries the resolved level so reviewers can

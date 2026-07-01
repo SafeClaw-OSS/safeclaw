@@ -79,8 +79,9 @@ pub fn app_router(state: Arc<AppState>) -> Router {
     router = router.layer(DefaultBodyLimit::max(MAX_BODY_BYTES));
 
     // ── Broker plane ─────────────────────────────────────────────────────
-    // The four agent-facing routes (use / stream / export). These — and ONLY
-    // these — carry the agent-key gate (`require_api_key`): every request must
+    // The agent-facing broker routes (use / stream; /export is registered but
+    // disabled-stubbed for v1 — raw-secret exfil off the agent surface). These —
+    // and ONLY these — carry the agent-key gate (`require_api_key`): every request must
     // present `Authorization: Bearer <agent-key>` whose sha256 is in the
     // cloud-synced account hash-set. They formerly lived on a second port
     // (:23295, now removed); merging them here keeps the gate scoped to the
@@ -97,14 +98,15 @@ pub fn app_router(state: Arc<AppState>) -> Router {
 }
 
 /// The agent-key-gated broker sub-router. Split out so the gate is a layer on
-/// these four routes only — the control routes in `app_router` keep their own
+/// these broker routes only — the control routes in `app_router` keep their own
 /// (passkey / X-Admin-Key / auth-free-localhost) gating untouched.
 fn broker_router(state: Arc<AppState>) -> Router {
     use crate::proxy::{env, stream, use_broker};
     use axum::routing::any;
 
     Router::new()
-        .route("/v/{vid}/export/{key}", post(env::handle))
+        // /export → disabled stub for v1 (raw-secret export off the agent surface).
+        .route("/v/{vid}/export/{key}", post(env::disabled))
         .route("/v/{vid}/use/{service}", any(use_broker::handle_no_rest))
         .route("/v/{vid}/use/{service}/{*rest}", any(use_broker::handle))
         // Streaming passthrough (git smart-HTTP, etc.). Body limit DISABLED on
