@@ -496,6 +496,14 @@ pub async fn approve_op(
                 let state = state.clone();
                 let vid = vault_id.clone();
                 tokio::spawn(async move {
+                    // A daemon-side Write rotated the acting credential's
+                    // prf_salt/wrapped_key (replace_after_write) and re-sharded
+                    // the content. Propagate BOTH ahead of the cloud so OTHER
+                    // devices can still unwrap K and see the new content: the
+                    // keyset rides `/keys`, the content rides `/items`. Both are
+                    // best-effort + never clobber (409 → adopt cloud, stop).
+                    crate::sync::push_keys_best_effort(&state, &vid).await;
+                    crate::sync::push_items_best_effort(&state, &vid).await;
                     crate::auth::connect::process_vault_connects(&state, &vid).await;
                 });
             }
@@ -1073,11 +1081,12 @@ fn seed_per_item_store(
     };
     // Carry the keyset cursor forward if a per-item file already exists, so a
     // re-seed after a write doesn't reset the CAS cursors the sync layer tracks.
-    let (keyset_version, items_seq) = crate::storage::sealed_vault::read_per_item(&per_item_path)
-        .ok()
-        .flatten()
-        .map(|pv| (pv.keyset.keyset_version, pv.items_seq))
-        .unwrap_or((0, 0));
+    let (keyset_version, items_seq, keyset_seq) =
+        crate::storage::sealed_vault::read_per_item(&per_item_path)
+            .ok()
+            .flatten()
+            .map(|pv| (pv.keyset.keyset_version, pv.items_seq, pv.keyset_seq))
+            .unwrap_or((0, 0, 0));
     let mut pv = PerItemVault {
         keyset: Keyset {
             version: vault.version,
@@ -1087,6 +1096,7 @@ fn seed_per_item_store(
         },
         items: std::collections::BTreeMap::new(),
         items_seq,
+        keyset_seq,
     };
     if let Err(e) =
         pv.seed_items_from_view::<sudp::primitives::StdPrimitives>(k, vault_id, view)

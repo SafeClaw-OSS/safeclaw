@@ -111,6 +111,14 @@ pub async fn pull_on_start(state_dir: &Path) {
             }
             Err(e) => tracing::warn!(vault = %vault, "cloud sync pull failed (serving local state): {}", e),
         }
+        // PER-ITEM: pull the KEYSET (the passkey-wrap layer, now on `/keys`)
+        // BEFORE the content rows, so the folded view later sees a fresh K-wrap
+        // layer. Best-effort; a 404 / non-per-item vault is a no-op.
+        match pull_keys(state_dir, cloud, vault, &dk).await {
+            Ok(n) if n > 0 => tracing::info!(vault = %vault, adopted = n, "cloud sync: pulled keyset rows"),
+            Ok(_) => {}
+            Err(e) => tracing::debug!(vault = %vault, "cloud sync: keyset pull failed: {}", e),
+        }
         // PER-ITEM: pull content rows too (pre-serve, no cache to refresh yet —
         // the first unlock folds them). Best-effort; a 404 / non-per-item vault
         // is a no-op.
@@ -165,12 +173,19 @@ pub async fn sync_vault_now(state: &Arc<AppState>, vault_id: &str) -> Result<boo
             return Ok(false);
         }
     };
-    // PER-ITEM: also pull content item rows (keyset lifecycle rides `/blob`
-    // above; content rides `/items`). Best-effort — a 404 (endpoint not live) or
-    // a not-yet-per-item vault is a no-op. On adoption, refresh the cache from
+    // PER-ITEM: pull the KEYSET (`/keys`), then the content item rows (`/items`).
+    // The keyset now rides `/keys` (NOT the whole-blob `/blob`, which is a
+    // keyset-lifecycle marker only); pull it FIRST so the item fold below sees a
+    // fresh K-wrap layer. Best-effort — a 404 (endpoint not live) or a
+    // not-yet-per-item vault is a no-op. On item adoption, refresh the cache from
     // the folded item view so the new rows are served without a re-unlock.
     if let Some(cloud2) = cfg.cloud_backend.as_deref().filter(|s| !s.is_empty()) {
         if let Some(dk2) = device_key() {
+            match pull_keys(&state.config.state_dir, cloud2, vault_id, &dk2).await {
+                Ok(n) if n > 0 => tracing::info!(vault = %vault_id, adopted = n, "keyset pull: adopted rows"),
+                Ok(_) => {}
+                Err(e) => tracing::debug!(vault = %vault_id, "keyset pull failed: {}", e),
+            }
             match pull_items(&state.config.state_dir, cloud2, vault_id, &dk2).await {
                 Ok(n) if n > 0 => {
                     refresh_after_item_pull(state, vault_id);
@@ -327,11 +342,18 @@ fn classify_pull_body(
         return Ok(PullOutcome::Unchanged);
     }
 
-    let version = body.get("version").and_then(|v| v.as_u64()).unwrap_or(0);
-    let blob = body
-        .get("blob")
-        .ok_or_else(|| "blob missing in cloud response".to_string())?;
+    // PER-ITEM: a per-item vault's `/blob` row is now a keyset-lifecycle marker
+    // ONLY — the browser writes `{ lifecycle: "per-item-v3", version }` with NO
+    // `blob` field (setupEnvVault). The keyset itself rides `/keys`
+    // (`pull_keys`), not the whole-blob path. So a live 200 body with no `blob`
+    // (and not a tombstone — handled above) is NOT an error and must NOT be
+    // persisted to `vault.dat`: treat it as `Unchanged`. (A legacy whole-blob
+    // vault still sends a `blob`; that path is unchanged below.)
+    let Some(blob) = body.get("blob") else {
+        return Ok(PullOutcome::Unchanged);
+    };
 
+    let version = body.get("version").and_then(|v| v.as_u64()).unwrap_or(0);
     persist_blob(state_dir, vault, blob, version)?;
     Ok(PullOutcome::Updated(version))
 }
@@ -923,8 +945,14 @@ pub async fn watch_loop(state: Arc<AppState>, vault: String, cloud: String, dk: 
                     // above drops (the lock is not reentrant).
                     crate::auth::connect::process_vault_connects(&state, &vault).await;
                     // PER-ITEM: a keyset/blob change often coincides with content
-                    // changes; opportunistically pull item rows and refresh the
-                    // cache from the folded item view. Best-effort.
+                    // changes; pull the KEYSET (`/keys`) FIRST so the item fold
+                    // sees a fresh K-wrap layer, then pull item rows and refresh
+                    // the cache from the folded item view. Best-effort.
+                    match pull_keys(&state_dir, &cloud, &vault, &dk).await {
+                        Ok(n) if n > 0 => tracing::info!(vault = %vault, adopted = n, "cloud sync watch: pulled keyset rows"),
+                        Ok(_) => {}
+                        Err(e) => tracing::debug!(vault = %vault, "cloud sync watch: keyset pull failed: {}", e),
+                    }
                     match pull_items(&state_dir, &cloud, &vault, &dk).await {
                         Ok(n) if n > 0 => refresh_after_item_pull(&state, &vault),
                         Ok(_) => {}
@@ -1251,6 +1279,360 @@ pub async fn push_items_best_effort(state: &Arc<AppState>, vault_id: &str) {
     tracing::debug!(vault = %vault_id, "per-item push: all local items pushed");
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// PER-ITEM KEYSET SYNC  (the passkey-wrap layer now rides `/keys`, §7)
+//
+// The keyset (registry pubkeys + per-cred `prf_salt`/`wrapped_key` = what GIVES
+// you `K`) USED to ride the whole-blob `/blob` row. The frontend now writes it
+// to `/keys` instead (ONE `vault_keys` row per credential, cid-keyed), so the
+// daemon must sync it via `/keys` too, byte-compatible with the frontend:
+//
+//   GET /v/{vid}/keys?since=<seq> → { keys:[{cid,version,seq,data}], seq }
+//   PUT /v/{vid}/keys/{cid}       { base_version?, version, data } → CAS
+//                                 → 200 {version,seq} | 409 {currentVersion}
+//
+// `data = { x, y, device_name, x25519_pub?, prf_salt, wrapped_key }`. Encodings
+// (verified against lib/vault-grant.ts + lib/safeclaw-crypto.ts):
+//   - cid (row PK)              = base64url-nopad  (WebAuthn credential id)
+//   - x / y                     = STANDARD base64  (kept verbatim as strings)
+//   - prf_salt / wrapped_key    = STANDARD base64  (leniently decoded to bytes)
+//   - x25519_pub                = base64url        (NOT stored — no sudp field)
+//   - device_name               = plain string
+// The daemon decodes data fields with the LENIENT `decode_keys_data_field`
+// (mirrors the frontend's `fromBase64`: accept std OR url, padded or not) so the
+// std-base64 fields never break unwrap of `K`.
+//
+// The keyset must be pulled BEFORE the items each sync cycle so the view is
+// folded against a fresh `K`-wrap layer.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// One row of a `/keys` pull. `data` is the cloud-VISIBLE keyset material (it is
+/// what gives you `K`, so it can't be sealed under `K`).
+#[derive(Debug, Clone, serde::Deserialize)]
+struct KeyRow {
+    cid: String,
+    version: u64,
+    #[allow(dead_code)]
+    seq: u64,
+    data: KeyRowData,
+}
+
+/// The `data` blob of a `/keys` row — mirrors the frontend `VaultKeyData`.
+#[derive(Debug, Clone, serde::Deserialize)]
+struct KeyRowData {
+    x: String,
+    y: String,
+    #[serde(default)]
+    device_name: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    x25519_pub: Option<String>,
+    prf_salt: String,
+    wrapped_key: String,
+}
+
+/// Pull keyset rows changed since the local `.keyset_seq` cursor and adopt them
+/// into the keyset (registry + credentials), keyed by cid. Server-authoritative
+/// like `pull_items`: a row whose `version` is `<=` the version we already hold
+/// for that cid is skipped (we track the highest adopted version per cid via the
+/// pulled `version`, since the daemon keeps no on-disk per-cred version — the
+/// cursor advance + a fresh full pull on `keyset_seq=0` keep us convergent). The
+/// cursor advances to the response max `seq`; the store is persisted.
+///
+/// If no local `PerItemVault` exists yet, an EMPTY one is created first (a
+/// device that pulls keys before its first enroll/seed still lands a keyset).
+///
+/// Best-effort: a 404 (endpoint not live yet) is a no-op. Returns the number of
+/// rows adopted.
+pub async fn pull_keys(
+    state_dir: &Path,
+    cloud: &str,
+    vault: &str,
+    device_key: &str,
+) -> Result<usize, String> {
+    // Create an empty per-item store on demand so a device that pulls keys
+    // before it has ever seeded items still ends up with a keyset on disk.
+    let mut pv = read_per_item_store(state_dir, vault).unwrap_or_else(empty_keyset_store);
+
+    let url = format!(
+        "{}/v/{}/keys?since={}",
+        cloud.trim_end_matches('/'),
+        vault,
+        pv.keyset_seq
+    );
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|e| format!("http client init: {}", e))?;
+    let resp = client
+        .get(&url)
+        .bearer_auth(device_key)
+        .send()
+        .await
+        .map_err(|e| format!("reach {}: {}", cloud, e))?;
+    match resp.status().as_u16() {
+        200 => {}
+        404 => return Ok(0), // /keys not live yet — no-op
+        401 | 403 => return Err(format!("cloud auth rejected (HTTP {})", resp.status())),
+        other => return Err(format!("keys GET HTTP {}", other)),
+    }
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("parse keys response: {}", e))?;
+    let rows: Vec<KeyRow> = body
+        .get("keys")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|e| format!("parse keys array: {}", e))?
+        .unwrap_or_default();
+    let max_seq = body.get("seq").and_then(|v| v.as_u64()).unwrap_or(pv.keyset_seq);
+    let adopted = adopt_key_rows(&mut pv, &rows)?;
+    if max_seq > pv.keyset_seq {
+        pv.keyset_seq = max_seq;
+    }
+    // Persist even a zero-adopt pull so the advanced cursor sticks.
+    write_per_item_store(state_dir, vault, &pv)?;
+    Ok(adopted)
+}
+
+/// A fresh, EMPTY per-item store with an empty keyset — the on-demand target for
+/// `pull_keys` on a device that has no `vault.per-item.json` yet. It has NO
+/// credentials and NO items; `pull_keys` fills the keyset from the cloud rows.
+fn empty_keyset_store() -> PerItemVault {
+    use sudp::state::{Registry, CURRENT_VERSION};
+    PerItemVault {
+        keyset: pv_store::Keyset {
+            version: CURRENT_VERSION,
+            registry: Registry::new(),
+            credentials: Vec::new(),
+            keyset_version: 0,
+        },
+        items: std::collections::BTreeMap::new(),
+        items_seq: 0,
+        keyset_seq: 0,
+    }
+}
+
+/// Adopt a batch of pulled `/keys` rows into the keyset. A row whose `version`
+/// is `<=` the highest we've already adopted for that cid IN THIS BATCH is
+/// skipped (guards a stale replay within one response); across pulls, the
+/// `keyset_seq` cursor gates re-delivery. Each adopted row upserts the registry
+/// pubkey + the `SealedCredential`. Returns the count adopted.
+fn adopt_key_rows(pv: &mut PerItemVault, rows: &[KeyRow]) -> Result<usize, String> {
+    // Track the max version seen per cid in this batch so an out-of-order pair
+    // (same cid, v3 then v2) adopts only the newer.
+    let mut seen: std::collections::HashMap<&str, u64> = std::collections::HashMap::new();
+    let mut adopted = 0usize;
+    // Sort by version so a lower version can't overwrite a higher one when both
+    // appear in the same page (the cloud SHOULD send at most one row per cid,
+    // but defend in depth).
+    let mut ordered: Vec<&KeyRow> = rows.iter().collect();
+    ordered.sort_by_key(|r| r.version);
+    for row in ordered {
+        if let Some(&v) = seen.get(row.cid.as_str()) {
+            if row.version <= v {
+                continue;
+            }
+        }
+        pv.upsert_key_row(
+            &row.cid,
+            &row.data.x,
+            &row.data.y,
+            &row.data.device_name,
+            &row.data.prf_salt,
+            &row.data.wrapped_key,
+        )
+        .map_err(|e| format!("adopt key row {}: {}", row.cid, e))?;
+        seen.insert(row.cid.as_str(), row.version);
+        adopted += 1;
+    }
+    Ok(adopted)
+}
+
+/// Push the daemon's keyset credentials ahead of the cloud after a daemon-side
+/// mutation of the acting credential (a Write rotates its `prf_salt`/`wrapped_key`
+/// via `replace_after_write`; a connect re-seals through the same `K`). Mirrors
+/// `push_items_best_effort`'s 409/adopt handling — NEVER clobber: on a 409 we
+/// adopt the cloud's rows (via `pull_keys`) and stop rather than force-overwrite.
+///
+/// The daemon keeps no on-disk per-cred version, so we CAS with `base_version` =
+/// the row's current cloud version derived from `keyset_seq`-tracked pulls. In
+/// practice we PUT as an UPDATE (`base_version = <last pulled>`), falling back to
+/// a CREATE (base_version omitted) only when the row is unknown cloud-side. Since
+/// we can't cheaply know the cloud version per cid without a pull, we first
+/// `pull_keys` to refresh, read the freshest local keyset, and PUT each credential
+/// at `version = pulled+1` with `base_version = pulled` — a 409 means someone
+/// else moved it, so we re-pull and stop (best-effort; local keyset is durable).
+pub async fn push_keys_best_effort(state: &Arc<AppState>, vault_id: &str) {
+    let Ok(cfg) = active::load() else { return };
+    let Some(cloud) = cfg.cloud_backend.as_deref().filter(|s| !s.is_empty()) else {
+        return;
+    };
+    let Some(dk) = device_key() else { return };
+    let cloud = cloud.trim_end_matches('/');
+    let state_dir = &state.config.state_dir;
+
+    // Refresh from the cloud first so our `base_version` is current (never
+    // clobber a newer cloud keyset). Best-effort — a 404/offline just means we
+    // push against version 0 (create) which the backend rejects with 409 if the
+    // row exists, and we re-pull.
+    let cloud_versions = match fetch_key_versions(cloud, vault_id, &dk).await {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::debug!(vault = %vault_id, "keyset push: version probe failed: {}", e);
+            return;
+        }
+    };
+
+    let Some(pv) = read_per_item_store(state_dir, vault_id) else {
+        return;
+    };
+
+    // Snapshot the credentials (cid_b64, keyData) so we don't hold the store
+    // across awaits. Build each row's `data` byte-compatible with the frontend.
+    use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+    use base64::Engine;
+    let mut rows: Vec<(String, serde_json::Value)> = Vec::new();
+    for cred in &pv.keyset.credentials {
+        let cid_b64 = URL_SAFE_NO_PAD.encode(&cred.credential_id);
+        // Pull the registry pubkey for x/y/device_name; keep x/y verbatim (they
+        // are already the strings the frontend wrote — std-base64).
+        let pk = match pv.keyset.registry.get::<sudp::passkey::WebAuthn>(&cred.credential_id) {
+            Ok(Some(pk)) => pk,
+            _ => continue, // no registry entry — can't form a complete row
+        };
+        let data = serde_json::json!({
+            "x": pk.x,
+            "y": pk.y,
+            "device_name": pk.device_name,
+            // Encode wrap material as STANDARD base64 to match the frontend
+            // (`toBase64`); its `fromBase64` accepts either, but match for
+            // cleanliness. NEVER url here for these two.
+            "prf_salt": STANDARD.encode(&cred.prf_salt),
+            "wrapped_key": STANDARD.encode(&cred.wrapped_key),
+        });
+        rows.push((cid_b64, data));
+    }
+
+    for (cid_b64, data) in rows {
+        let cloud_ver = cloud_versions.get(&cid_b64).copied();
+        let (base_version, version) = match cloud_ver {
+            Some(v) => (Some(v), v + 1),         // UPDATE: CAS against cloud's version
+            None => (None, 1),                   // CREATE: omit base_version
+        };
+        match push_key(cloud, vault_id, &dk, &cid_b64, base_version, version, &data).await {
+            Ok(PushOutcome::Ok { .. }) => {}
+            Ok(PushOutcome::EndpointMissing) => return, // /keys not live — stop
+            Ok(PushOutcome::Conflict { current_version }) => {
+                // Someone moved this row cloud-side: adopt server truth (pull) and
+                // stop — NEVER last-writer-wins on the keyset (it gives you K).
+                tracing::info!(
+                    vault = %vault_id, cid = %cid_b64, current_version,
+                    "keyset push: 409 conflict; adopting cloud keyset row (no clobber)"
+                );
+                let _ = pull_keys(state_dir, cloud, vault_id, &dk).await;
+                return;
+            }
+            Err(e) => {
+                tracing::warn!(vault = %vault_id, cid = %cid_b64, "keyset push failed: {}", e);
+                return;
+            }
+        }
+    }
+    tracing::debug!(vault = %vault_id, "keyset push: all local credentials pushed");
+}
+
+/// Probe the cloud for the current `{cid → version}` of every keyset row, so
+/// `push_keys_best_effort` can CAS with the right `base_version`. Returns an
+/// empty map on a 404 (endpoint not live) so a first push becomes a CREATE.
+async fn fetch_key_versions(
+    cloud: &str,
+    vault: &str,
+    device_key: &str,
+) -> Result<std::collections::HashMap<String, u64>, String> {
+    let url = format!("{}/v/{}/keys?since=0", cloud.trim_end_matches('/'), vault);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|e| format!("http client init: {}", e))?;
+    let resp = client
+        .get(&url)
+        .bearer_auth(device_key)
+        .send()
+        .await
+        .map_err(|e| format!("reach {}: {}", cloud, e))?;
+    match resp.status().as_u16() {
+        200 => {}
+        404 => return Ok(std::collections::HashMap::new()),
+        401 | 403 => return Err(format!("cloud auth rejected (HTTP {})", resp.status())),
+        other => return Err(format!("keys GET HTTP {}", other)),
+    }
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("parse keys response: {}", e))?;
+    let rows: Vec<KeyRow> = body
+        .get("keys")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|e| format!("parse keys array: {}", e))?
+        .unwrap_or_default();
+    Ok(rows.into_iter().map(|r| (r.cid, r.version)).collect())
+}
+
+/// PUT one keyset row with CAS (§7). Mirrors `push_item`: a CREATE omits
+/// `base_version` (sending 0 → 409); an UPDATE includes it. On `200` returns the
+/// cloud-stamped `{version, seq}`; `409` → `Conflict{current_version}`; a `404`
+/// (endpoint not live) → `EndpointMissing`.
+async fn push_key(
+    cloud: &str,
+    vault: &str,
+    device_key: &str,
+    cid: &str,
+    base_version: Option<u64>,
+    version: u64,
+    data: &serde_json::Value,
+) -> Result<PushOutcome, String> {
+    let url = format!("{}/v/{}/keys/{}", cloud.trim_end_matches('/'), vault, cid);
+    let mut body = serde_json::json!({ "version": version, "data": data });
+    if let Some(bv) = base_version {
+        body["base_version"] = serde_json::json!(bv);
+    }
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|e| format!("http client init: {}", e))?;
+    let resp = client
+        .put(&url)
+        .bearer_auth(device_key)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("reach {}: {}", cloud, e))?;
+    match resp.status().as_u16() {
+        200 => {
+            let b: serde_json::Value = resp.json().await.map_err(|e| format!("parse put: {}", e))?;
+            Ok(PushOutcome::Ok {
+                version: b.get("version").and_then(|v| v.as_u64()).unwrap_or(version),
+                seq: b.get("seq").and_then(|v| v.as_u64()).unwrap_or(0),
+            })
+        }
+        409 => {
+            let b: serde_json::Value = resp.json().await.unwrap_or_default();
+            let current = b
+                .get("currentVersion")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(version);
+            Ok(PushOutcome::Conflict { current_version: current })
+        }
+        404 => Ok(PushOutcome::EndpointMissing),
+        other => Err(format!("key PUT HTTP {}", other)),
+    }
+}
+
 #[cfg(test)]
 mod peritem_tests {
     use super::*;
@@ -1302,6 +1684,105 @@ mod peritem_tests {
         assert_eq!(pv.get_item(&id).unwrap().version, 3);
         assert_eq!(pv.get_item(&id).unwrap().ct, vec![1u8, 2, 3, 4]);
         assert_eq!(pv.items_seq, 9);
+    }
+
+    /// A `/keys` row `data` JSON shaped EXACTLY as the frontend writes it
+    /// (`lib/vault-grant.ts` addPasskey / setupEnvVault via `toBase64`): x/y/
+    /// prf_salt/wrapped_key are STANDARD base64 (with `+`/`/`/`=`), x25519_pub is
+    /// base64url, cid is base64url-nopad. Adopting it must upsert the keyset with
+    /// the correctly-DECODED prf_salt/wrapped_key + a registry pubkey entry —
+    /// proving the LENIENT decoder handles the frontend's mixed encodings so the
+    /// daemon can still unwrap K.
+    #[test]
+    fn keys_row_roundtrips_frontend_std_base64_data() {
+        use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+        use base64::Engine;
+        use sudp::passkey::WebAuthn;
+
+        // Raw bytes the frontend would have encoded.
+        let cred_id_raw: Vec<u8> = vec![0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x11, 0x22, 0x33];
+        let prf_salt_raw: Vec<u8> = (0u8..32).collect();
+        // Pick wrap bytes whose STANDARD base64 contains `+` AND `/` (so a strict
+        // base64url decoder would REJECT them → the exact break this guards).
+        let wrapped_key_raw: Vec<u8> = vec![
+            0xFB, 0xFF, 0xBF, 0x00, 0x10, 0x83, 0x10, 0x51, 0x87, 0x20, 0x92, 0x8B,
+            0x30, 0xD3, 0x8F, 0x41, 0x14, 0x93, 0x51, 0x55, 0x97, 0x61, 0x96, 0x9B,
+        ];
+        let x_raw: Vec<u8> = vec![0xAAu8; 32];
+        let y_raw: Vec<u8> = vec![0xBBu8; 32];
+        let x25519_raw: Vec<u8> = vec![0xCCu8; 32];
+
+        // cid = base64url-nopad; data fields = STANDARD base64 (x/y/prf_salt/
+        // wrapped_key), x25519_pub = base64url (matches the frontend exactly).
+        let cid_b64 = URL_SAFE_NO_PAD.encode(&cred_id_raw);
+        let x_std = STANDARD.encode(&x_raw);
+        let wrapped_std = STANDARD.encode(&wrapped_key_raw);
+        assert!(
+            wrapped_std.contains('+') || wrapped_std.contains('/'),
+            "test fixture must exercise std-base64-only chars"
+        );
+        let data = serde_json::json!({
+            "x": x_std,
+            "y": STANDARD.encode(&y_raw),
+            "device_name": "Mac · sunny-panda",
+            "x25519_pub": URL_SAFE_NO_PAD.encode(&x25519_raw),
+            "prf_salt": STANDARD.encode(&prf_salt_raw),
+            "wrapped_key": wrapped_std,
+        });
+        let row_json = serde_json::json!({
+            "cid": cid_b64,
+            "version": 1u64,
+            "seq": 7u64,
+            "data": data,
+        });
+        let row: KeyRow = serde_json::from_value(row_json).unwrap();
+
+        // Adopt into a fresh empty keyset store (the on-demand pull_keys target).
+        let mut pv = empty_keyset_store();
+        let n = adopt_key_rows(&mut pv, std::slice::from_ref(&row)).unwrap();
+        assert_eq!(n, 1);
+
+        // 1. The SealedCredential has the correctly-DECODED prf_salt + wrapped_key.
+        let cred = pv
+            .keyset
+            .credentials
+            .iter()
+            .find(|c| c.credential_id == cred_id_raw)
+            .expect("credential adopted");
+        assert_eq!(cred.prf_salt, prf_salt_raw, "prf_salt lenient-decoded");
+        assert_eq!(cred.wrapped_key, wrapped_key_raw, "wrapped_key lenient-decoded");
+
+        // 2. The registry has the pubkey entry (x/y kept verbatim as the frontend
+        //    strings; sudp stores WebAuthnPublicKey.x/y as-is).
+        let pk = pv
+            .keyset
+            .registry
+            .get::<WebAuthn>(&cred_id_raw)
+            .unwrap()
+            .expect("registry pubkey adopted");
+        assert_eq!(pk.x, x_std, "x kept verbatim (std-base64 string)");
+        assert_eq!(pk.device_name, "Mac · sunny-panda");
+
+        // 3. Idempotent re-adopt of the SAME row (version 1) doesn't duplicate
+        //    the credential.
+        let _ = adopt_key_rows(&mut pv, std::slice::from_ref(&row)).unwrap();
+        assert_eq!(
+            pv.keyset.credentials.iter().filter(|c| c.credential_id == cred_id_raw).count(),
+            1,
+            "no duplicate credential on re-adopt"
+        );
+
+        // 4. Serialize the store and confirm the SealedCredential round-trips
+        //    through sudp's STANDARD `wire::b64bytes` codec (byte-stable on disk).
+        let bytes = serde_json::to_vec(&pv).unwrap();
+        let back: PerItemVault = serde_json::from_slice(&bytes).unwrap();
+        let back_cred = back
+            .keyset
+            .credentials
+            .iter()
+            .find(|c| c.credential_id == cred_id_raw)
+            .unwrap();
+        assert_eq!(back_cred.wrapped_key, wrapped_key_raw);
     }
 }
 
@@ -1383,6 +1864,29 @@ mod tests {
         let body_live = serde_json::json!({ "status": "live", "unchanged": true });
         assert_eq!(
             classify_pull_body(dir.path(), "v-unch", &body_live).unwrap(),
+            PullOutcome::Unchanged
+        );
+    }
+
+    /// PER-ITEM: a per-item vault's `/blob` GET now returns a keyset-lifecycle
+    /// marker with NO `blob` field (`{ lifecycle:"per-item-v3", version }`). The
+    /// classifier must treat it as `Unchanged` (the keyset rides `/keys` now) and
+    /// write NOTHING to `vault.dat` — NOT error, NOT persist.
+    #[test]
+    fn lifecycle_only_body_classifies_as_unchanged_and_writes_nothing() {
+        let dir = tempdir().unwrap();
+        let body = serde_json::json!({ "lifecycle": "per-item-v3", "version": 1u64 });
+        assert_eq!(
+            classify_pull_body(dir.path(), "v-life", &body).unwrap(),
+            PullOutcome::Unchanged
+        );
+        // No vault.dat written — a lifecycle marker is not content.
+        assert!(!dir.path().join("vaults").join("v-life").join("vault.dat").exists());
+        assert!(!version_sidecar(dir.path(), "v-life").exists());
+        // Even a bare `{}` (no blob, no status, no unchanged) is Unchanged, not
+        // an error (the old code returned Err "blob missing").
+        assert_eq!(
+            classify_pull_body(dir.path(), "v-empty", &serde_json::json!({})).unwrap(),
             PullOutcome::Unchanged
         );
     }

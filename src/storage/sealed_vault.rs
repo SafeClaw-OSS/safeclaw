@@ -195,6 +195,38 @@ mod b64url_bytes {
     }
 }
 
+/// LENIENT base64 decode for a `/keys` row `data` field, mirroring the
+/// frontend's `fromBase64` (lib/safeclaw-crypto.ts): the frontend writes these
+/// fields with MIXED encodings — `x`/`y`/`prf_salt`/`wrapped_key` are STANDARD
+/// base64 (`toBase64`, has `+`/`/`/`=`) while `x25519_pub` is base64url — and its
+/// reader accepts BOTH. So the daemon must NOT use a strict base64url decoder
+/// (it would reject `+`/`/`/`=` and fail to unwrap `K`). Normalize url→std
+/// (`-`→`+`, `_`→`/`), re-pad to a multiple of 4, then STANDARD-decode.
+/// This is EXCLUSIVELY for `/keys` data fields; the `cid` row PK stays strict
+/// base64url-nopad (`decode_credential_id`), and content item `ct`/id bytes stay
+/// strict base64url-nopad (the per-item stack, `b64url_bytes`).
+pub fn decode_keys_data_field(s: &str) -> Result<Vec<u8>> {
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+    let std: String = s.chars().map(|c| match c {
+        '-' => '+',
+        '_' => '/',
+        other => other,
+    }).collect();
+    let std = std.trim_end_matches('=');
+    let pad = std.len() % 4;
+    let padded = if pad == 0 {
+        std.to_string()
+    } else {
+        let mut t = std.to_string();
+        t.push_str(&"=".repeat(4 - pad));
+        t
+    };
+    STANDARD
+        .decode(padded.as_bytes())
+        .map_err(|e| AppError::BadRequest(format!("keys data field not base64: {}", e)))
+}
+
 /// One sealed content item at rest: the writer-assigned CAS `version` (plaintext,
 /// also AAD-bound inside `ct` so it can't lie) + the sudp sealed-record bytes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -235,6 +267,13 @@ pub struct PerItemVault {
     /// pull cursor — replaces the whole-blob `.blob_version`). `0` = full-resync.
     #[serde(default)]
     pub items_seq: u64,
+    /// Last cloud `vault_keys.seq` this local store has pulled (the incremental
+    /// keyset pull cursor — the `/keys` analogue of `items_seq`). The keyset now
+    /// syncs via `/keys` (one `vault_keys` row per credential), NOT the whole-blob
+    /// `/blob` path. `0` = full keyset resync. Pre-launch: serde-default'd so an
+    /// existing on-disk `vault.per-item.json` loads without migration.
+    #[serde(default)]
+    pub keyset_seq: u64,
 }
 
 impl PerItemVault {
@@ -270,6 +309,7 @@ impl PerItemVault {
             },
             items: BTreeMap::new(),
             items_seq: 0,
+            keyset_seq: 0,
         })
     }
 
@@ -287,6 +327,80 @@ impl PerItemVault {
     /// Drop a stored item outright (local GC of a fully-propagated tombstone).
     pub fn remove_item(&mut self, item_id_b64: &str) -> Option<StoredItem> {
         self.items.remove(item_id_b64)
+    }
+
+    /// Adopt one pulled `/keys` row into the keyset: upsert the credential's
+    /// WebAuthn registry entry (`x`/`y`/`device_name` — sudp's `WebAuthnPublicKey`
+    /// stores `x`/`y` as verbatim strings, exactly what the frontend sent) and the
+    /// `SealedCredential` (`credential_id` = decoded `cid`, `prf_salt`/`wrapped_key`
+    /// = lenient-decoded data fields, contract §7). `cid_b64` is the row PK
+    /// (base64url-nopad WebAuthn credential id). Returns `true` iff the keyset
+    /// changed. `x25519_pub` is intentionally NOT stored — sudp's
+    /// `WebAuthnPublicKey` has no field for it, and the daemon needs only
+    /// `x`/`y` (assertion verify) + `prf_salt`/`wrapped_key` (unwrap `K`).
+    ///
+    /// Byte-compatibility: `x`/`y` are kept as the exact strings the frontend
+    /// wrote (std-base64), and `prf_salt`/`wrapped_key` decode leniently
+    /// ([`decode_keys_data_field`]) so a std-base64 field round-trips through
+    /// sudp's own STANDARD `wire::b64bytes` codec on write.
+    pub fn upsert_key_row(
+        &mut self,
+        cid_b64: &str,
+        x_b64: &str,
+        y_b64: &str,
+        device_name: &str,
+        prf_salt_b64: &str,
+        wrapped_key_b64: &str,
+    ) -> Result<bool> {
+        let cid_bytes = decode_credential_id(cid_b64)?;
+        let prf_salt = decode_keys_data_field(prf_salt_b64)?;
+        let wrapped_key = decode_keys_data_field(wrapped_key_b64)?;
+
+        // Registry pubkey (x/y verbatim strings — sudp keeps them as-is).
+        let pk = sudp::passkey::WebAuthnPublicKey {
+            x: x_b64.to_string(),
+            y: y_b64.to_string(),
+            device_name: device_name.to_string(),
+        };
+        // `insert` overwrites an existing entry — idempotent.
+        self.keyset
+            .registry
+            .insert::<WebAuthn>(&cid_bytes, &pk)
+            .map_err(|e| AppError::Internal(format!("registry insert: {}", e)))?;
+
+        // SealedCredential (upsert by credential_id).
+        if let Some(cred) = self
+            .keyset
+            .credentials
+            .iter_mut()
+            .find(|c| c.credential_id == cid_bytes)
+        {
+            cred.prf_salt = prf_salt;
+            cred.wrapped_key = wrapped_key;
+        } else {
+            self.keyset.credentials.push(SealedCredential {
+                credential_id: cid_bytes,
+                prf_salt,
+                wrapped_key,
+            });
+        }
+        Ok(true)
+    }
+
+    /// The current keyset row version for `cid_b64` — the analogue of
+    /// [`item_version`] for the keyset (there is no per-row version stored today,
+    /// so this is a placeholder used only by tests / future CAS). The keyset row
+    /// version lives cloud-side (`vault_keys.version`); the daemon adopts a row
+    /// whenever its pulled version exceeds what it last saw for that cid, tracked
+    /// by the caller (see `sync::pull_keys`), not on-disk.
+    pub fn has_credential(&self, cid_b64: &str) -> bool {
+        let Ok(cid_bytes) = decode_credential_id(cid_b64) else {
+            return false;
+        };
+        self.keyset
+            .credentials
+            .iter()
+            .any(|c| c.credential_id == cid_bytes)
     }
 
     /// The current CAS version of item `(ns, name)`, or `0` if absent — i.e.
@@ -650,7 +764,7 @@ mod tests {
     // Test fixture encodes credential_id with base64url-no-pad to match
     // `decode_credential_id`'s wire format (the WebAuthn convention).
     use base64::Engine;
-    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
     use tempfile::tempdir;
 
     #[test]
@@ -675,6 +789,25 @@ mod tests {
         let pk = find_pubkey(&v, &URL_SAFE_NO_PAD.encode(b"cred-bytes")).unwrap();
         assert_eq!(pk.x, "x_b64");
         assert_eq!(pk.device_name, "Test Device");
+    }
+
+    #[test]
+    fn decode_keys_data_field_accepts_std_and_url() {
+        // The lenient decoder mirrors the frontend's `fromBase64`: accept both
+        // STANDARD base64 (frontend `toBase64` for x/y/prf_salt/wrapped_key) and
+        // base64url (x25519_pub), padded or not. All four spellings of the same
+        // bytes must decode identically.
+        let raw: Vec<u8> = vec![
+            0xFB, 0xFF, 0xBF, 0x00, 0x10, 0x83, 0x10, 0x51, 0x87, 0x20, 0x92, 0x8B,
+        ];
+        let std_pad = STANDARD.encode(&raw); // has +, /, and = padding
+        assert!(std_pad.contains('+') || std_pad.contains('/'));
+        let std_nopad = std_pad.trim_end_matches('=').to_string();
+        let url_pad = std_pad.replace('+', "-").replace('/', "_");
+        let url_nopad = url_pad.trim_end_matches('=').to_string();
+        for s in [&std_pad, &std_nopad, &url_pad, &url_nopad] {
+            assert_eq!(decode_keys_data_field(s).unwrap(), raw, "decode {}", s);
+        }
     }
 
     #[test]

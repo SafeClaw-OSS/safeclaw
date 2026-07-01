@@ -242,9 +242,11 @@ pub async fn process_vault_connects(state: &Arc<AppState>, vault_id: &str) {
         let state = state.clone();
         let vid = vault_id.to_string();
         tokio::spawn(async move {
-            // Keyset lifecycle rides the whole-blob push; content (the new
+            // Keyset lifecycle rides the whole-blob push (the `/blob` marker) AND
+            // the per-cred wrap material rides `/keys`; content (the new
             // refresh-token secret + connection MOVE) rides the per-item push.
             crate::sync::push_blob_best_effort(&state, &vid).await;
+            crate::sync::push_keys_best_effort(&state, &vid).await;
             crate::sync::push_items_best_effort(&state, &vid).await;
         });
     }
@@ -389,6 +391,7 @@ fn reconcile_per_item_after_connect(
             },
             items: std::collections::BTreeMap::new(),
             items_seq: 0,
+            keyset_seq: 0,
         },
     };
     match pv.reconcile_from_view::<sudp::primitives::StdPrimitives>(k, vault_id, view) {
