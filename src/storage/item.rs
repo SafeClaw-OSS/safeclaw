@@ -179,7 +179,7 @@ impl ItemCtx {
 }
 
 /// Namespace of a content item — selects how `body` is interpreted (contract §2).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ItemNs {
     /// `body` = the secret string.
@@ -373,6 +373,19 @@ mod tests {
         )
         .unwrap();
         assert!(unseal_item::<StdPrimitives>(&k, &ItemCtx::new("v", id, 2), &sealed).is_err());
+    }
+
+    /// THE pinned cross-language conflict-copy-id vector (build contract §7 /
+    /// §1 CANONICAL). `K = 0x42*32 ; ns = "secret" ; name = "GMAIL_REFRESH_TOKEN"
+    /// ; loser_version = 2`. Layout:
+    /// `base64url_nopad(HMAC-SHA256(K_id, lp(ns)‖lp(name)‖lp("conflict")‖lp(u64_be(2))))`.
+    /// The frontend TS conflict-copy id MUST produce this exact string; if it
+    /// ever drifts, do NOT edit the expected value — find why Rust ↔ TS diverged.
+    #[test]
+    fn pinned_conflict_copy_id_parity_vector() {
+        let k = [0x42u8; 32];
+        let id = conflict_copy_id::<StdPrimitives>(&k, "secret", "GMAIL_REFRESH_TOKEN", 2).unwrap();
+        assert_eq!(id, "hBVW1yFYQ9aIxjcB-PeisTpr_EYtjQFXysiLCq7bN6k");
     }
 
     /// A conflict-copy id is deterministic (idempotent retry) and distinct from

@@ -21,14 +21,9 @@ use std::str::FromStr;
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use sudp::grant::{GrantOpt, RedeemedGrant, WrappingKey};
-use sudp::phases::consumption::open;
-use sudp::primitives::StdPrimitives;
-
 use crate::core::forward::HTTP_CLIENT;
 use crate::error::{AppError, Result};
 use crate::protocol::Operation;
-use crate::storage::plaintext::VaultPlaintextView;
 use crate::storage::SealedVault;
 
 /// JSON-friendly upstream response packaged into the ApprovalRecord's
@@ -72,15 +67,17 @@ pub async fn execute_use_forward(
     vault_id: &str,
 ) -> Result<UseForwardOutcome> {
     let services = &state.services;
-    let redeemed = RedeemedGrant {
-        o: op.clone(),
-        credential_id: credential_id_bytes.to_vec(),
-        wrapping_key: WrappingKey::from_bytes(wrapping_key.to_vec()),
-        opt: GrantOpt::default(),
-    };
-    let opened = open::<StdPrimitives>(&redeemed, vault)
-        .map_err(|e| AppError::Unauthorized(format!("vault open: {}", e)))?;
-    let view = VaultPlaintextView::from_protected_state(&opened.m)?;
+    // PER-ITEM read seam: fold the item rows (if the per-item store exists) or
+    // fall back to the whole-blob open. One call site so both formats resolve a
+    // grant identically (metadata::open_view_for_grant).
+    let view = crate::server::handlers::metadata::open_view_for_grant(
+        state,
+        vault_id,
+        op,
+        wrapping_key,
+        credential_id_bytes,
+        vault,
+    )?;
 
     // Primary secret (op.act.target). For oauth2 services this is the
     // long-lived refresh_token; for API-key services it's the bearer/key
@@ -221,16 +218,18 @@ pub async fn resolve_use_primary(
     wrapping_key: &[u8],
     credential_id_bytes: &[u8],
     vault: &SealedVault,
+    state: &crate::state::AppState,
+    vault_id: &str,
 ) -> Result<Vec<u8>> {
-    let redeemed = RedeemedGrant {
-        o: op.clone(),
-        credential_id: credential_id_bytes.to_vec(),
-        wrapping_key: WrappingKey::from_bytes(wrapping_key.to_vec()),
-        opt: GrantOpt::default(),
-    };
-    let opened = open::<StdPrimitives>(&redeemed, vault)
-        .map_err(|e| AppError::Unauthorized(format!("vault open: {}", e)))?;
-    let view = VaultPlaintextView::from_protected_state(&opened.m)?;
+    // PER-ITEM read seam (see execute_use_forward).
+    let view = crate::server::handlers::metadata::open_view_for_grant(
+        state,
+        vault_id,
+        op,
+        wrapping_key,
+        credential_id_bytes,
+        vault,
+    )?;
     view.resolve_value_async(&op.act.target)
         .await?
         .ok_or_else(|| {

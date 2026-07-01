@@ -35,7 +35,7 @@ use crate::protocol::operation::{
     discriminator, ActType,
 };
 use crate::protocol::{render_operation, validate_grant, Grant};
-use crate::server::handlers::metadata::{decrypt_vault_view, decrypt_vault_view_keep_key};
+use crate::server::handlers::metadata::decrypt_vault_view_keep_key;
 use crate::storage::plaintext::VaultPlaintextView;
 use crate::state::{ApprovalEvent, AppState, SecretsCache};
 use crate::storage::sealed_vault::{
@@ -398,6 +398,14 @@ pub async fn approve_op(
                 &validated.credential_id_bytes,
                 &vault,
             ) {
+                // PER-ITEM: seed the local per-item store from the just-enrolled
+                // ProtectedState. The browser still hands ONE sealed ciphertext
+                // at enroll; the daemon re-shards it into N `seal_record` item
+                // rows under the SAME K, so the per-item read path (Use/Export/
+                // unlock) can serve from items. Best-effort: a failure leaves
+                // only the whole-blob vault.dat, which the read paths still fall
+                // back to (stubbed[]).
+                seed_per_item_store(&state, &vault_id, &vault, &view, &k);
                 let cache = bootstrap_cache_from_view(&view, &state);
                 tracing::info!(
                     vault = %vault_id,
@@ -454,6 +462,14 @@ pub async fn approve_op(
                 &validated.credential_id_bytes,
                 &vault,
             ) {
+                // PER-ITEM: re-shard the post-write ProtectedState into the local
+                // per-item store (same K). A browser Write still ships one sealed
+                // ciphertext; re-seeding keeps the item rows in step so a later
+                // per-item push/pull carries the change. Best-effort. NOTE: this
+                // re-derives EVERY item at version 1 rather than diffing to the
+                // changed item(s) + bumping only those — a proper per-item PUT
+                // diff (contract §3) is stubbed[] pending the browser cut-over.
+                seed_per_item_store(&state, &vault_id, &vault, &view, &k);
                 let cache = bootstrap_cache_from_view(&view, &state);
                 tracing::info!(
                     vault = %vault_id,
@@ -539,7 +555,11 @@ pub async fn approve_op(
             let vault = existing_vault
                 .clone()
                 .ok_or_else(|| AppError::Conflict("vault not initialized".into()))?;
-            let view = decrypt_vault_view(
+            // PER-ITEM read seam: resolve id → unseal_item → bytes via the item
+            // rows (folded to a view), falling back to whole-blob (stubbed[]).
+            let view = crate::server::handlers::metadata::open_view_for_grant(
+                &state,
+                &vault_id,
                 &validated.op,
                 &validated.wrapping_key,
                 &validated.credential_id_bytes,
@@ -598,6 +618,8 @@ pub async fn approve_op(
                     &validated.wrapping_key,
                     &validated.credential_id_bytes,
                     &vault,
+                    &state,
+                    &vault_id,
                 )
                 .await?;
                 let conn = validated
@@ -708,12 +730,17 @@ pub async fn approve_op(
                 let vault = existing_vault
                     .clone()
                     .ok_or_else(|| AppError::Conflict("vault not initialized".into()))?;
-                let (view, unlock_key) = decrypt_vault_view_keep_key(
-                    &validated.op,
-                    &validated.wrapping_key,
-                    &validated.credential_id_bytes,
-                    &vault,
-                )?;
+                // PER-ITEM read seam (keep K for the unlocked session), whole-
+                // blob fallback (stubbed[]).
+                let (view, unlock_key) =
+                    crate::server::handlers::metadata::open_view_for_grant_keep_key(
+                        &state,
+                        &vault_id,
+                        &validated.op,
+                        &validated.wrapping_key,
+                        &validated.credential_id_bytes,
+                        &vault,
+                    )?;
                 // Editor response: native-secrets items as utf8 strings + the
                 // full v3 aux so the editor can render the stores list and
                 // build a new aux when the user writes.
@@ -1023,6 +1050,61 @@ pub async fn reject_op(
 ///      compiled defaults). Holds the risk map, default floors, per-category,
 ///      and per-connection user policy. Built-in per-service rules are read
 ///      live from the recipe at eval, not cached here.
+/// Build + persist the local per-item store (`vault.per-item.json`) from a
+/// just-decrypted whole-blob vault + its view. The keyset (registry +
+/// credentials + wrapped_key) is copied verbatim from the whole-blob
+/// `SealedVault` (it's what gives you `K`); the content is re-sharded from
+/// `view` into N `seal_record` item rows under the same `K` (contract §2/§4).
+///
+/// Best-effort by design: a failure logs and leaves only `vault.dat`, which the
+/// per-item read path falls back to. This is the ADDITIVE landing seam — enroll
+/// and write call it so the daemon holds items alongside the whole blob until
+/// the browser cut-over retires the blob (stubbed[]).
+fn seed_per_item_store(
+    state: &AppState,
+    vault_id: &str,
+    vault: &crate::storage::SealedVault,
+    view: &VaultPlaintextView,
+    k: &[u8],
+) {
+    use crate::storage::sealed_vault::{Keyset, PerItemVault};
+    let Ok(per_item_path) = state.vaults.per_item_path(vault_id) else {
+        return;
+    };
+    // Carry the keyset cursor forward if a per-item file already exists, so a
+    // re-seed after a write doesn't reset the CAS cursors the sync layer tracks.
+    let (keyset_version, items_seq) = crate::storage::sealed_vault::read_per_item(&per_item_path)
+        .ok()
+        .flatten()
+        .map(|pv| (pv.keyset.keyset_version, pv.items_seq))
+        .unwrap_or((0, 0));
+    let mut pv = PerItemVault {
+        keyset: Keyset {
+            version: vault.version,
+            registry: vault.registry.clone(),
+            credentials: vault.credentials.clone(),
+            keyset_version,
+        },
+        items: std::collections::BTreeMap::new(),
+        items_seq,
+    };
+    if let Err(e) =
+        pv.seed_items_from_view::<sudp::primitives::StdPrimitives>(k, vault_id, view)
+    {
+        tracing::warn!(vault = %vault_id, "per-item seed from view failed: {}", e);
+        return;
+    }
+    if let Err(e) = crate::storage::sealed_vault::write_per_item_atomic(&per_item_path, &pv) {
+        tracing::warn!(vault = %vault_id, "per-item store write failed: {}", e);
+        return;
+    }
+    tracing::info!(
+        vault = %vault_id,
+        items = pv.items.len(),
+        "per-item store seeded"
+    );
+}
+
 pub(crate) fn bootstrap_cache_from_view(
     view: &VaultPlaintextView,
     state: &AppState,

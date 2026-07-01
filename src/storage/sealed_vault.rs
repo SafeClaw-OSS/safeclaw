@@ -289,6 +289,30 @@ impl PerItemVault {
         self.items.remove(item_id_b64)
     }
 
+    /// The current CAS version of item `(ns, name)`, or `0` if absent — i.e.
+    /// the `base_version` a new write should CAS against (contract §6).
+    pub fn item_version<S: PrimitiveSuite>(&self, k: &[u8], ns: ItemNs, name: &str) -> Result<u64> {
+        let id = item_id::<S>(k, ns.as_str(), name)?;
+        Ok(self.items.get(&id).map(|s| s.version).unwrap_or(0))
+    }
+
+    /// Seal `payload` for `(ns, name)` at the NEXT version (current + 1) under
+    /// `K` and upsert it — the monotonic-bump write the connect / write paths
+    /// use so an offline peer's CAS sees a strictly higher version (contract
+    /// §6). Returns `(item_id_b64, new_version)`.
+    pub fn seal_and_bump<S: PrimitiveSuite>(
+        &mut self,
+        k: &[u8],
+        vault_id: &str,
+        ns: ItemNs,
+        name: &str,
+        payload: &ItemPayload,
+    ) -> Result<(String, u64)> {
+        let next = self.item_version::<S>(k, ns, name)? + 1;
+        let id = self.seal_and_upsert::<S>(k, vault_id, ns, name, next, payload)?;
+        Ok((id, next))
+    }
+
     /// Seal `payload` for `(ns, name)` at `version` under `K` and upsert it,
     /// returning the base64url item id. Bridges the item.rs primitives
     /// (contract §1/§2) into the local store.
@@ -325,6 +349,179 @@ impl PerItemVault {
         let raw = item_id_bytes::<S>(k, ns.as_str(), name)?;
         let ctx = ItemCtx::new(vault_id, raw, stored.version);
         Ok(Some(unseal_item::<S>(k, &ctx, &stored.ct)?))
+    }
+
+    /// Seed / re-seed this vault's item rows from a decrypted
+    /// [`VaultPlaintextView`] (contract §2 `ns` split). Used by the per-item
+    /// cut-over of the whole-blob paths (enroll, write): the browser still
+    /// hands the daemon ONE sealed `ProtectedState` ciphertext, which the
+    /// daemon opens into a view and then re-shards into N sealed item records
+    /// under the SAME `K`.
+    ///
+    /// Each item's CAS `version` starts at `bump_from + 1` for a freshly-sealed
+    /// row, so re-seeding after a write monotonically advances the version an
+    /// offline peer will CAS against (the enroll case passes `0`). Aux subtrees
+    /// with their default/empty value are NOT sealed (they'd only add tombstone-
+    /// like noise); only `stores`, `store_order`, `policy`,
+    /// `audit_retention_days`, plus every connection/connecting entry and every
+    /// native secret, become their own item.
+    pub fn seed_items_from_view<S: PrimitiveSuite>(
+        &mut self,
+        k: &[u8],
+        vault_id: &str,
+        view: &crate::storage::plaintext::VaultPlaintextView,
+    ) -> Result<()> {
+        // native secrets → one `secret` item each.
+        for (name, bytes) in &view.native_secrets {
+            let value = String::from_utf8(bytes.clone())
+                .map_err(|_| AppError::Internal(format!("secret '{}' not utf8", name)))?;
+            let payload = ItemPayload::secret_live(name.clone(), &value);
+            self.seal_and_upsert::<S>(k, vault_id, ItemNs::Secret, name, 1, &payload)?;
+        }
+        // established connections → one `connection` item each.
+        for (conn_id, conn) in &view.aux.connections {
+            let body = serde_json::to_value(conn).map_err(AppError::from)?;
+            let payload = ItemPayload::live(ItemNs::Connection, conn_id.clone(), body);
+            self.seal_and_upsert::<S>(k, vault_id, ItemNs::Connection, conn_id, 1, &payload)?;
+        }
+        // in-flight connects → one `connecting` item each.
+        for (conn_id, c) in &view.aux.connecting {
+            let body = serde_json::to_value(c).map_err(AppError::from)?;
+            let payload = ItemPayload::live(ItemNs::Connecting, conn_id.clone(), body);
+            self.seal_and_upsert::<S>(k, vault_id, ItemNs::Connecting, conn_id, 1, &payload)?;
+        }
+        // aux subtrees → one `aux` item each (only the modeled names).
+        let stores = serde_json::to_value(&view.aux.stores).map_err(AppError::from)?;
+        self.seal_and_upsert::<S>(
+            k, vault_id, ItemNs::Aux, "stores", 1,
+            &ItemPayload::live(ItemNs::Aux, "stores", stores),
+        )?;
+        let store_order = serde_json::to_value(&view.aux.store_order).map_err(AppError::from)?;
+        self.seal_and_upsert::<S>(
+            k, vault_id, ItemNs::Aux, "store_order", 1,
+            &ItemPayload::live(ItemNs::Aux, "store_order", store_order),
+        )?;
+        if let Some(policy) = &view.aux.policy {
+            let body = serde_json::to_value(policy).map_err(AppError::from)?;
+            self.seal_and_upsert::<S>(
+                k, vault_id, ItemNs::Aux, "policy", 1,
+                &ItemPayload::live(ItemNs::Aux, "policy", body),
+            )?;
+        }
+        if let Some(days) = view.aux.audit_retention_days {
+            self.seal_and_upsert::<S>(
+                k, vault_id, ItemNs::Aux, "audit_retention_days", 1,
+                &ItemPayload::live(ItemNs::Aux, "audit_retention_days", serde_json::json!(days)),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Reconcile the item rows toward a freshly-decrypted [`VaultPlaintextView`]
+    /// (the post-connect / post-write state), applying ONLY the changes with a
+    /// monotonic version bump so the sync layer's per-item CAS sees a strictly
+    /// higher version (contract §4/§6). Unlike [`seed_items_from_view`] (which
+    /// resets every version to 1), this:
+    ///   - upserts a `secret`/`connection`/`connecting`/`aux` item whose sealed
+    ///     value changed, at `current + 1`;
+    ///   - writes a `tombstone` (also bumped) for a `secret`/`connection`/
+    ///     `connecting` item that the view no longer has (e.g. a completed
+    ///     connect MOVEs its `connecting` entry away → tombstone the old row).
+    ///
+    /// This is the daemon-side, single-writer equivalent of "PUT the changed
+    /// items" (contract §5 `writeVault` diff). Returns the ids that changed.
+    pub fn reconcile_from_view<S: PrimitiveSuite>(
+        &mut self,
+        k: &[u8],
+        vault_id: &str,
+        view: &crate::storage::plaintext::VaultPlaintextView,
+    ) -> Result<Vec<String>> {
+        let mut changed: Vec<String> = Vec::new();
+
+        // Build the desired (ns, name) → body set from the view.
+        let mut desired: BTreeMap<(ItemNs, String), serde_json::Value> = BTreeMap::new();
+        for (name, bytes) in &view.native_secrets {
+            let value = String::from_utf8(bytes.clone())
+                .map_err(|_| AppError::Internal(format!("secret '{}' not utf8", name)))?;
+            desired.insert((ItemNs::Secret, name.clone()), serde_json::Value::String(value));
+        }
+        for (id, conn) in &view.aux.connections {
+            desired.insert(
+                (ItemNs::Connection, id.clone()),
+                serde_json::to_value(conn).map_err(AppError::from)?,
+            );
+        }
+        for (id, c) in &view.aux.connecting {
+            desired.insert(
+                (ItemNs::Connecting, id.clone()),
+                serde_json::to_value(c).map_err(AppError::from)?,
+            );
+        }
+        for (name, body) in [
+            ("stores", serde_json::to_value(&view.aux.stores).map_err(AppError::from)?),
+            ("store_order", serde_json::to_value(&view.aux.store_order).map_err(AppError::from)?),
+        ] {
+            desired.insert((ItemNs::Aux, name.to_string()), body);
+        }
+        if let Some(policy) = &view.aux.policy {
+            desired.insert(
+                (ItemNs::Aux, "policy".to_string()),
+                serde_json::to_value(policy).map_err(AppError::from)?,
+            );
+        }
+        if let Some(days) = view.aux.audit_retention_days {
+            desired.insert((ItemNs::Aux, "audit_retention_days".to_string()), serde_json::json!(days));
+        }
+
+        // Upsert every desired item whose sealed body differs from what we hold.
+        for ((ns, name), body) in &desired {
+            let existing = self.open_item::<S>(k, vault_id, *ns, name)?;
+            let same = existing
+                .as_ref()
+                .map(|p| !p.is_tombstone() && &p.body == body)
+                .unwrap_or(false);
+            if same {
+                continue;
+            }
+            let payload = ItemPayload::live(*ns, name.clone(), body.clone());
+            let (id, _v) = self.seal_and_bump::<S>(k, vault_id, *ns, name, &payload)?;
+            changed.push(id);
+        }
+
+        // Tombstone secret/connection/connecting rows the view dropped. Our own
+        // folded view gives the currently-live (ns, name) set; tombstone any not
+        // in `desired` (a completed connect MOVEs its `connecting` entry, so the
+        // old connecting row must become a tombstone).
+        let mine = self.fold_view::<S>(k, vault_id)?;
+        for name in mine.native_secrets.keys() {
+            if !desired.contains_key(&(ItemNs::Secret, name.clone())) {
+                let (id, _v) = self.seal_and_bump::<S>(
+                    k, vault_id, ItemNs::Secret, name,
+                    &ItemPayload::tombstone(ItemNs::Secret, name.clone()),
+                )?;
+                changed.push(id);
+            }
+        }
+        for id in mine.aux.connections.keys() {
+            if !desired.contains_key(&(ItemNs::Connection, id.clone())) {
+                let (iid, _v) = self.seal_and_bump::<S>(
+                    k, vault_id, ItemNs::Connection, id,
+                    &ItemPayload::tombstone(ItemNs::Connection, id.clone()),
+                )?;
+                changed.push(iid);
+            }
+        }
+        for id in mine.aux.connecting.keys() {
+            if !desired.contains_key(&(ItemNs::Connecting, id.clone())) {
+                let (iid, _v) = self.seal_and_bump::<S>(
+                    k, vault_id, ItemNs::Connecting, id,
+                    &ItemPayload::tombstone(ItemNs::Connecting, id.clone()),
+                )?;
+                changed.push(iid);
+            }
+        }
+
+        Ok(changed)
     }
 
     /// Fold all **live** items into a [`VaultPlaintextView`] — the per-item

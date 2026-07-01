@@ -226,6 +226,145 @@ fn redeemed_zeroize_marker() -> std::marker::PhantomData<WebAuthn> {
     std::marker::PhantomData
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// PER-ITEM READ PATH  (PER_ITEM_SYNC.md §11.B step 2 / build contract §4)
+//
+// In the per-item world the KEYSET (registry + credentials + wrapped_key)
+// still hands you `K` via a grant's W_c — exactly the first half of sudp's
+// `open()` — but there is no whole-blob `ciphertext` to open; the content is
+// N sealed item rows instead. So the read path splits into two steps:
+//   1. `unwrap_k_from_keyset` — the credential-unwrap half of sudp's `open`
+//      (lines 34-51 of sudp `phases::consumption::open`), reproduced here so
+//      we get `K` WITHOUT needing a body ciphertext.
+//   2. `PerItemVault::fold_view(K)` — unseal every item row → the same
+//      `VaultPlaintextView` the whole-blob path produced, so every downstream
+//      consumer (bootstrap_cache_from_view, resolve_value_async, Export map)
+//      is byte-for-byte unchanged.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Unwrap the vault state key `K` from a keyset credential using a grant's
+/// `W_c` — the credential-unwrap half of sudp's [`open`](sudp::phases::consumption::open),
+/// with no body ciphertext required. `wrapping_key` = the 32-byte `W_c` the
+/// grant carries (already HPKE-opened by the caller for the web/op-relay path).
+///
+/// Returns `K` in a [`zeroize::Zeroizing`] so it wipes on drop. `Unauthorized`
+/// if the credential isn't in the keyset or `W_c` doesn't unwrap it.
+pub fn unwrap_k_from_keyset(
+    keyset: &crate::storage::sealed_vault::Keyset,
+    wrapping_key: &[u8],
+    credential_id_bytes: &[u8],
+) -> Result<zeroize::Zeroizing<Vec<u8>>> {
+    use sudp::primitives::{Aead, ChaCha20Poly1305, KeyWrap as _KeyWrap, WrapBinding};
+    type Wrap = <StdPrimitives as sudp::primitives::PrimitiveSuite>::Wrap;
+
+    let entry = keyset
+        .credentials
+        .iter()
+        .find(|c| c.credential_id == credential_id_bytes)
+        .ok_or_else(|| AppError::Unauthorized("unknown credential for keyset unwrap".into()))?;
+    let binding = WrapBinding {
+        credential_id: credential_id_bytes,
+        version: keyset.version,
+    };
+    let k_bytes = Wrap::unwrap(wrapping_key, &entry.wrapped_key, &binding)
+        .map_err(|_| AppError::Unauthorized("keyset K unwrap failed".into()))?;
+    if k_bytes.len() != ChaCha20Poly1305::KEY_LEN {
+        return Err(AppError::Unauthorized("unwrapped K wrong length".into()));
+    }
+    Ok(zeroize::Zeroizing::new(k_bytes))
+}
+
+/// Per-item analogue of [`decrypt_vault_view`]: unwrap `K` from the keyset via
+/// the grant, then fold all live item rows into a [`VaultPlaintextView`]. Used
+/// by the per-item Export path. Discards `K` after the fold (read-only).
+pub fn decrypt_vault_view_peritem(
+    wrapping_key: &[u8],
+    credential_id_bytes: &[u8],
+    vault: &crate::storage::sealed_vault::PerItemVault,
+    vault_id: &str,
+) -> Result<VaultPlaintextView> {
+    let k = unwrap_k_from_keyset(&vault.keyset, wrapping_key, credential_id_bytes)?;
+    vault.fold_view::<StdPrimitives>(&k, vault_id)
+}
+
+/// Per-item analogue of [`decrypt_vault_view_keep_key`]: like
+/// [`decrypt_vault_view_peritem`] but RETAINS `K` (zeroized on drop) so the
+/// caller can hold it for the unlocked session (cache refresh, later per-item
+/// writes) without a second passkey. Used by the per-item unlock / write /
+/// enroll auto-unlock paths.
+pub fn decrypt_vault_view_peritem_keep_key(
+    wrapping_key: &[u8],
+    credential_id_bytes: &[u8],
+    vault: &crate::storage::sealed_vault::PerItemVault,
+    vault_id: &str,
+) -> Result<(VaultPlaintextView, zeroize::Zeroizing<Vec<u8>>)> {
+    let k = unwrap_k_from_keyset(&vault.keyset, wrapping_key, credential_id_bytes)?;
+    let view = vault.fold_view::<StdPrimitives>(&k, vault_id)?;
+    Ok((view, k))
+}
+
+/// Fold a per-item vault into a [`VaultPlaintextView`] with a RETAINED `K`
+/// (no grant, no passkey) — the per-item analogue of
+/// [`decrypt_vault_view_with_key`], used by the cloud-sync post-pull refresh.
+/// `Err` if `K` can't unseal a row (rotated `K`), which callers treat as the
+/// graceful "lock+unlock to see new state".
+pub fn decrypt_vault_view_peritem_with_key(
+    k: &[u8],
+    vault: &crate::storage::sealed_vault::PerItemVault,
+    vault_id: &str,
+) -> Result<VaultPlaintextView> {
+    vault.fold_view::<StdPrimitives>(k, vault_id)
+}
+
+/// THE per-item read seam for the live grant paths (Export / Use / unlock).
+///
+/// Prefer the per-item store: if `vaults/{vid}/vault.per-item.json` exists,
+/// unwrap `K` from its keyset via the grant and [`fold_view`] the item rows.
+/// Otherwise fall back to the whole-blob open (the paths not yet cut over —
+/// notably a browser Write that only re-sealed `vault.dat`; stubbed[]).
+///
+/// One call site for every read so the two formats can't diverge in what a
+/// grant resolves. Returns the `VaultPlaintextView` the whole downstream
+/// (resolve_value_async, Export map, bootstrap_cache) already consumes.
+pub fn open_view_for_grant(
+    state: &AppState,
+    vault_id: &str,
+    op: &Operation,
+    wrapping_key: &[u8],
+    credential_id_bytes: &[u8],
+    vault: &crate::storage::SealedVault,
+) -> Result<VaultPlaintextView> {
+    if let Ok(path) = state.vaults.per_item_path(vault_id) {
+        if let Ok(Some(pv)) = crate::storage::sealed_vault::read_per_item(&path) {
+            return decrypt_vault_view_peritem(wrapping_key, credential_id_bytes, &pv, vault_id);
+        }
+    }
+    decrypt_vault_view(op, wrapping_key, credential_id_bytes, vault)
+}
+
+/// Like [`open_view_for_grant`] but RETAINS `K` for the unlocked session — the
+/// per-item seam for the unlock ceremony (which caches under the retained key).
+pub fn open_view_for_grant_keep_key(
+    state: &AppState,
+    vault_id: &str,
+    op: &Operation,
+    wrapping_key: &[u8],
+    credential_id_bytes: &[u8],
+    vault: &crate::storage::SealedVault,
+) -> Result<(VaultPlaintextView, zeroize::Zeroizing<Vec<u8>>)> {
+    if let Ok(path) = state.vaults.per_item_path(vault_id) {
+        if let Ok(Some(pv)) = crate::storage::sealed_vault::read_per_item(&path) {
+            return decrypt_vault_view_peritem_keep_key(
+                wrapping_key,
+                credential_id_bytes,
+                &pv,
+                vault_id,
+            );
+        }
+    }
+    decrypt_vault_view_keep_key(op, wrapping_key, credential_id_bytes, vault)
+}
+
 /// Open the vault body to the RAW [`sudp::state::ProtectedState`] with a
 /// RETAINED state key `K` — no grant, no passkey. Unlike
 /// [`decrypt_vault_view_with_key`] (which projects to a read-only

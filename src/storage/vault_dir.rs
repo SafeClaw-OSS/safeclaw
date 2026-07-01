@@ -45,6 +45,14 @@ impl VaultDir {
         Ok(self.dir_for(vault_id)?.join("vault.dat"))
     }
 
+    /// `vaults/{vid}/vault.per-item.json` — the per-item on-disk store
+    /// (`PerItemVault` = keyset blob + N sealed item records). Landing target
+    /// that supersedes `vault.dat` for content; see
+    /// `wt-merge-spec/docs/PER_ITEM_SYNC.md` §11.B.
+    pub fn per_item_path(&self, vault_id: &str) -> Result<PathBuf> {
+        Ok(self.dir_for(vault_id)?.join("vault.per-item.json"))
+    }
+
     pub fn audit_path(&self, vault_id: &str) -> Result<PathBuf> {
         Ok(self.dir_for(vault_id)?.join("audit.db"))
     }

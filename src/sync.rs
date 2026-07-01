@@ -111,6 +111,14 @@ pub async fn pull_on_start(state_dir: &Path) {
             }
             Err(e) => tracing::warn!(vault = %vault, "cloud sync pull failed (serving local state): {}", e),
         }
+        // PER-ITEM: pull content rows too (pre-serve, no cache to refresh yet —
+        // the first unlock folds them). Best-effort; a 404 / non-per-item vault
+        // is a no-op.
+        match pull_items(state_dir, cloud, vault, &dk).await {
+            Ok(n) if n > 0 => tracing::info!(vault = %vault, adopted = n, "cloud sync: pulled item rows"),
+            Ok(_) => {}
+            Err(e) => tracing::debug!(vault = %vault, "cloud sync: per-item pull failed: {}", e),
+        }
     }
 }
 
@@ -157,10 +165,51 @@ pub async fn sync_vault_now(state: &Arc<AppState>, vault_id: &str) -> Result<boo
             return Ok(false);
         }
     };
+    // PER-ITEM: also pull content item rows (keyset lifecycle rides `/blob`
+    // above; content rides `/items`). Best-effort — a 404 (endpoint not live) or
+    // a not-yet-per-item vault is a no-op. On adoption, refresh the cache from
+    // the folded item view so the new rows are served without a re-unlock.
+    if let Some(cloud2) = cfg.cloud_backend.as_deref().filter(|s| !s.is_empty()) {
+        if let Some(dk2) = device_key() {
+            match pull_items(&state.config.state_dir, cloud2, vault_id, &dk2).await {
+                Ok(n) if n > 0 => {
+                    refresh_after_item_pull(state, vault_id);
+                }
+                Ok(_) => {}
+                Err(e) => tracing::debug!(vault = %vault_id, "per-item pull failed: {}", e),
+            }
+        }
+    }
     // Complete a pending connect even when the blob was unchanged — the pending
     // item may have synced earlier (background watcher) but never been processed.
     crate::auth::connect::process_vault_connects(state, vault_id).await;
     Ok(pulled)
+}
+
+/// After a per-item pull adopted new rows, refresh the in-memory cache for an
+/// UNLOCKED vault by folding the per-item store with the retained `K` — no
+/// passkey. Locked vault (no K) → no-op (the next unlock folds the new rows). A
+/// rotated `K` that can't unseal → log + leave the cache (graceful).
+fn refresh_after_item_pull(state: &Arc<AppState>, vault: &str) {
+    let Some(k) = state.cloned_state_key(vault) else {
+        return;
+    };
+    let Some(pv) = read_per_item_store(&state.config.state_dir, vault) else {
+        return;
+    };
+    match crate::server::handlers::metadata::decrypt_vault_view_peritem_with_key(&k, &pv, vault) {
+        Ok(view) => {
+            let cache = crate::server::handlers::approve::bootstrap_cache_from_view(&view, state);
+            state.unlock_vault(vault.to_string(), cache, k);
+            tracing::info!(vault = %vault, "per-item pull: cache refreshed from item rows");
+        }
+        Err(_) => {
+            tracing::warn!(
+                vault = %vault,
+                "per-item pull: retained K can't unseal a row (rotated K?); lock+unlock to see new state"
+            );
+        }
+    }
 }
 
 /// Vault ids this device keeps synced: the active vault plus every vault in
@@ -873,6 +922,14 @@ pub async fn watch_loop(state: Arc<AppState>, vault: String, cloud: String, dk: 
                     // per-vault write lock itself, so it runs AFTER the guard
                     // above drops (the lock is not reentrant).
                     crate::auth::connect::process_vault_connects(&state, &vault).await;
+                    // PER-ITEM: a keyset/blob change often coincides with content
+                    // changes; opportunistically pull item rows and refresh the
+                    // cache from the folded item view. Best-effort.
+                    match pull_items(&state_dir, &cloud, &vault, &dk).await {
+                        Ok(n) if n > 0 => refresh_after_item_pull(&state, &vault),
+                        Ok(_) => {}
+                        Err(e) => tracing::debug!(vault = %vault, "cloud sync watch: per-item pull failed: {}", e),
+                    }
                     tracing::info!(vault = %vault, version, "cloud sync watch: applied pulled blob");
                 }
                 404 => {
@@ -895,6 +952,356 @@ pub async fn watch_loop(state: Arc<AppState>, vault: String, cloud: String, dk: 
                 backoff = (backoff * 2).min(Duration::from_secs(60));
             }
         }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// PER-ITEM SYNC  (PER_ITEM_SYNC.md §4/§5 / build contract §4 priority 3)
+//
+// The whole-blob `pull`/`push_blob_best_effort`/`watch_loop` above stay for the
+// KEYSET lifecycle (the `/blob` row is now keyset-only, §7). The functions here
+// are the CONTENT sync: the daemon holds N sealed item rows in
+// `vault.per-item.json` and pulls/pushes them against the backend `/items`
+// endpoints (contract §3):
+//
+//   GET  /v/{vid}/items?since=<seq> → { items:[{item_id,version,seq,ct}], seq }
+//   PUT  /v/{vid}/items/{item_id}   { base_version?, version, ct } → CAS
+//                                   → 200 {version,seq} | 409 {currentVersion}
+//   GET  /v/{vid}/items/wait?since=<seq> (daemon long-poll)
+//   DELETE /v/{vid}/items/{item_id}?gc_version=<v> (tombstone GC)
+//
+// PULL adopts server truth (§5): a newer version replaces the local row, a
+// tombstone is stored (fold_view drops it), the cursor advances to max(seq).
+// PUSH is per-item CAS (§4); 409 → reconcile — re-apply on the fresh item if the
+// edit is independent, else write a conflict-copy (never last-writer-wins).
+//
+// Backing HTTP is only exercised once the backend `/items` endpoints are live;
+// until then these are wired but a 404 leaves the local per-item store as the
+// authoritative content (stubbed[]).
+// ─────────────────────────────────────────────────────────────────────────
+
+use crate::storage::sealed_vault::{self as pv_store, PerItemVault};
+
+/// One row of a `/items` pull.
+#[derive(Debug, Clone, serde::Deserialize)]
+struct ItemRow {
+    item_id: String,
+    version: u64,
+    #[allow(dead_code)]
+    seq: u64,
+    /// base64url-nopad of `suite‖nonce‖ct‖tag`.
+    ct: String,
+}
+
+/// Load the per-item store for a vault, or `None` if it doesn't exist yet.
+fn read_per_item_store(state_dir: &Path, vault: &str) -> Option<PerItemVault> {
+    let path = state_dir.join("vaults").join(vault).join("vault.per-item.json");
+    pv_store::read_per_item(&path).ok().flatten()
+}
+
+fn write_per_item_store(state_dir: &Path, vault: &str, pv: &PerItemVault) -> Result<(), String> {
+    let path = state_dir.join("vaults").join(vault).join("vault.per-item.json");
+    pv_store::write_per_item_atomic(&path, pv).map_err(|e| format!("write per-item store: {}", e))
+}
+
+/// Adopt a batch of pulled item rows into the local store (server-authoritative,
+/// §5): a strictly-newer `version` replaces the local row; the cursor advances
+/// to the max `seq` seen. Tombstones are stored like any other row — `fold_view`
+/// drops them at read time, and a later GC hard-deletes them. Returns the number
+/// of rows adopted.
+fn adopt_item_rows(pv: &mut PerItemVault, rows: &[ItemRow], max_seq: u64) -> Result<usize, String> {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    let mut adopted = 0usize;
+    for row in rows {
+        // Only adopt a strictly-newer version (server is authoritative, but a
+        // stale replay must not clobber a fresher local row we already pushed).
+        let keep = pv
+            .get_item(&row.item_id)
+            .map(|s| row.version > s.version)
+            .unwrap_or(true);
+        if !keep {
+            continue;
+        }
+        let ct = URL_SAFE_NO_PAD
+            .decode(row.ct.as_bytes())
+            .map_err(|e| format!("item ct not base64url: {}", e))?;
+        pv.put_raw(row.item_id.clone(), row.version, ct);
+        adopted += 1;
+    }
+    if max_seq > pv.items_seq {
+        pv.items_seq = max_seq;
+    }
+    Ok(adopted)
+}
+
+/// Pull item rows changed since the local `.items_seq` cursor and adopt them.
+/// Best-effort: a 404 (endpoint not live yet) or a missing local store is a
+/// no-op. Returns the number of rows adopted.
+pub async fn pull_items(
+    state_dir: &Path,
+    cloud: &str,
+    vault: &str,
+    device_key: &str,
+) -> Result<usize, String> {
+    let Some(mut pv) = read_per_item_store(state_dir, vault) else {
+        return Ok(0); // no per-item store yet (vault not enrolled per-item)
+    };
+    let url = format!(
+        "{}/v/{}/items?since={}",
+        cloud.trim_end_matches('/'),
+        vault,
+        pv.items_seq
+    );
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|e| format!("http client init: {}", e))?;
+    let resp = client
+        .get(&url)
+        .bearer_auth(device_key)
+        .send()
+        .await
+        .map_err(|e| format!("reach {}: {}", cloud, e))?;
+    match resp.status().as_u16() {
+        200 => {}
+        404 => return Ok(0), // /items not live yet — no-op (stubbed[])
+        401 | 403 => return Err(format!("cloud auth rejected (HTTP {})", resp.status())),
+        other => return Err(format!("items GET HTTP {}", other)),
+    }
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("parse items response: {}", e))?;
+    let rows: Vec<ItemRow> = body
+        .get("items")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|e| format!("parse items array: {}", e))?
+        .unwrap_or_default();
+    let max_seq = body.get("seq").and_then(|v| v.as_u64()).unwrap_or(pv.items_seq);
+    let adopted = adopt_item_rows(&mut pv, &rows, max_seq)?;
+    if adopted > 0 || max_seq > 0 {
+        write_per_item_store(state_dir, vault, &pv)?;
+    }
+    Ok(adopted)
+}
+
+/// Push a single item to the cloud with per-item CAS (§4). `base_version` is the
+/// version the writer last read (absent → create). On `200` returns the cloud-
+/// stamped `{version, seq}`; on `409` returns the conflict's `currentVersion` so
+/// the caller can reconcile (re-apply on fresh, or conflict-copy — NEVER LWW).
+///
+/// `PushOutcome::EndpointMissing` (a 404) means the backend `/items` route isn't
+/// live yet — the caller treats it as a no-op (stubbed[]).
+pub enum PushOutcome {
+    Ok { version: u64, seq: u64 },
+    Conflict { current_version: u64 },
+    EndpointMissing,
+}
+
+pub async fn push_item(
+    cloud: &str,
+    vault: &str,
+    device_key: &str,
+    item_id: &str,
+    base_version: Option<u64>,
+    version: u64,
+    ct_b64: &str,
+) -> Result<PushOutcome, String> {
+    let url = format!(
+        "{}/v/{}/items/{}",
+        cloud.trim_end_matches('/'),
+        vault,
+        item_id
+    );
+    // CREATE omits base_version entirely (sending 0 → 409); only include it on
+    // update (contract "BACKEND WIRE": a CREATE omits base_version).
+    let mut body = serde_json::json!({ "version": version, "ct": ct_b64 });
+    if let Some(bv) = base_version {
+        body["base_version"] = serde_json::json!(bv);
+    }
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|e| format!("http client init: {}", e))?;
+    let resp = client
+        .put(&url)
+        .bearer_auth(device_key)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("reach {}: {}", cloud, e))?;
+    match resp.status().as_u16() {
+        200 => {
+            let b: serde_json::Value = resp.json().await.map_err(|e| format!("parse put: {}", e))?;
+            Ok(PushOutcome::Ok {
+                version: b.get("version").and_then(|v| v.as_u64()).unwrap_or(version),
+                seq: b.get("seq").and_then(|v| v.as_u64()).unwrap_or(0),
+            })
+        }
+        409 => {
+            let b: serde_json::Value = resp.json().await.unwrap_or_default();
+            let current = b
+                .get("currentVersion")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(version);
+            Ok(PushOutcome::Conflict { current_version: current })
+        }
+        404 => Ok(PushOutcome::EndpointMissing),
+        other => Err(format!("item PUT HTTP {}", other)),
+    }
+}
+
+/// Hard-delete a tombstone row that has fully propagated (GC, §6): DELETE
+/// `/items/{id}?gc_version=<v>`. Idempotent; only removes the exact version the
+/// caller saw so it never drops a newer row that replaced the tombstone.
+pub async fn gc_item(
+    cloud: &str,
+    vault: &str,
+    device_key: &str,
+    item_id: &str,
+    gc_version: u64,
+) -> Result<(), String> {
+    let url = format!(
+        "{}/v/{}/items/{}?gc_version={}",
+        cloud.trim_end_matches('/'),
+        vault,
+        item_id,
+        gc_version
+    );
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|e| format!("http client init: {}", e))?;
+    let resp = client
+        .delete(&url)
+        .bearer_auth(device_key)
+        .send()
+        .await
+        .map_err(|e| format!("reach {}: {}", cloud, e))?;
+    if resp.status().is_success() || resp.status().as_u16() == 404 {
+        Ok(())
+    } else {
+        Err(format!("item GC DELETE HTTP {}", resp.status()))
+    }
+}
+
+/// Push every LOCAL item whose version is ahead of what the cloud last confirmed
+/// (tracked by the per-item store's own rows). Each row is pushed with CAS; a
+/// 409 is reconciled per §4:
+///   - independent edit (the cloud's newer row is a DIFFERENT logical item, i.e.
+///     our push targeted a row the cloud doesn't have or has at a lower version)
+///     → adopt the cloud row and retry with the fresh base;
+///   - genuine same-item conflict (both wrote the same id) → leave theirs, write
+///     OURS as a conflict-copy (deterministic id via `conflict_copy_id`, so a
+///     retry can't spawn a second) — needs `K`, so it runs only for an UNLOCKED
+///     vault; a locked vault defers the conflict-copy to the next unlock.
+///
+/// NOTE: the full conflict-copy branch requires K + the item's (ns,name), which
+/// we recover by unsealing the local row. Where the vault is locked, the row is
+/// left ahead and retried next unlock (documented in stubbed[]).
+pub async fn push_items_best_effort(state: &Arc<AppState>, vault_id: &str) {
+    let Ok(cfg) = active::load() else { return };
+    let Some(cloud) = cfg.cloud_backend.as_deref().filter(|s| !s.is_empty()) else {
+        return;
+    };
+    let Some(dk) = device_key() else { return };
+    let cloud = cloud.trim_end_matches('/');
+    let state_dir = &state.config.state_dir;
+
+    let Some(pv) = read_per_item_store(state_dir, vault_id) else {
+        return;
+    };
+    // Snapshot (id, version, ct_b64) so we don't hold the store across awaits.
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    let rows: Vec<(String, u64, String)> = pv
+        .items
+        .iter()
+        .map(|(id, s)| (id.clone(), s.version, URL_SAFE_NO_PAD.encode(&s.ct)))
+        .collect();
+
+    for (id, version, ct_b64) in rows {
+        // base_version = version-1 for an update; a version-1 row is a create.
+        let base_version = if version > 1 { Some(version - 1) } else { None };
+        match push_item(cloud, vault_id, &dk, &id, base_version, version, &ct_b64).await {
+            Ok(PushOutcome::Ok { .. }) => {}
+            Ok(PushOutcome::EndpointMissing) => return, // /items not live — stop (stubbed[])
+            Ok(PushOutcome::Conflict { current_version }) => {
+                // Pull the current rows (adopt server truth) so a subsequent
+                // resolve/retry sees the winner. The conflict-copy branch (a
+                // genuine same-item conflict) requires K + (ns,name); it runs at
+                // unlock time via `reconcile_conflicts_after_pull`. Here we only
+                // adopt + log so we never last-writer-wins.
+                tracing::info!(
+                    vault = %vault_id, item = %id, current_version,
+                    "per-item push: 409 conflict; adopting server row (conflict-copy deferred to unlock)"
+                );
+                let _ = pull_items(state_dir, cloud, vault_id, &dk).await;
+                return;
+            }
+            Err(e) => {
+                tracing::warn!(vault = %vault_id, item = %id, "per-item push failed: {}", e);
+                return;
+            }
+        }
+    }
+    tracing::debug!(vault = %vault_id, "per-item push: all local items pushed");
+}
+
+#[cfg(test)]
+mod peritem_tests {
+    use super::*;
+    use crate::storage::item::ItemNs;
+    use crate::storage::sealed_vault::PerItemVault;
+    use sudp::primitives::StdPrimitives;
+
+    fn empty_pv() -> PerItemVault {
+        PerItemVault::build_initial(
+            b"c".to_vec(),
+            "x".into(),
+            "y".into(),
+            "Dev".into(),
+            vec![0u8; 32],
+            vec![0u8; 48],
+        )
+        .unwrap()
+    }
+
+    /// Adopt replaces a strictly-newer version and advances the cursor; a stale
+    /// (<= local) version is ignored (no clobber of a fresher local push).
+    #[test]
+    fn adopt_replaces_newer_and_advances_cursor() {
+        let k = [0x42u8; 32];
+        let vid = "v";
+        let mut pv = empty_pv();
+        // Local row at version 2.
+        let id = pv
+            .seal_and_upsert::<StdPrimitives>(
+                &k, vid, ItemNs::Secret, "A", 2,
+                &crate::storage::item::ItemPayload::secret_live("A", "local"),
+            )
+            .unwrap();
+
+        // A stale row (version 1) must NOT replace it.
+        let stale = ItemRow { item_id: id.clone(), version: 1, seq: 5, ct: "AAAA".into() };
+        let n = adopt_item_rows(&mut pv, std::slice::from_ref(&stale), 5).unwrap();
+        assert_eq!(n, 0, "stale version ignored");
+        assert_eq!(pv.get_item(&id).unwrap().version, 2);
+        assert_eq!(pv.items_seq, 5, "cursor still advances to max seq");
+
+        // A newer row (version 3) replaces it (raw ct adopted verbatim).
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        let newer_ct = URL_SAFE_NO_PAD.encode([1u8, 2, 3, 4]);
+        let newer = ItemRow { item_id: id.clone(), version: 3, seq: 9, ct: newer_ct };
+        let n = adopt_item_rows(&mut pv, std::slice::from_ref(&newer), 9).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(pv.get_item(&id).unwrap().version, 3);
+        assert_eq!(pv.get_item(&id).unwrap().ct, vec![1u8, 2, 3, 4]);
+        assert_eq!(pv.items_seq, 9);
     }
 }
 

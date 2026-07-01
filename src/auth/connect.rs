@@ -242,7 +242,10 @@ pub async fn process_vault_connects(state: &Arc<AppState>, vault_id: &str) {
         let state = state.clone();
         let vid = vault_id.to_string();
         tokio::spawn(async move {
+            // Keyset lifecycle rides the whole-blob push; content (the new
+            // refresh-token secret + connection MOVE) rides the per-item push.
             crate::sync::push_blob_best_effort(&state, &vid).await;
+            crate::sync::push_items_best_effort(&state, &vid).await;
         });
     }
 }
@@ -342,12 +345,73 @@ pub(crate) async fn apply_pending_connects(state: &Arc<AppState>, vault_id: &str
     if let Ok(view) =
         crate::server::handlers::metadata::decrypt_vault_view_with_key(&k, &vault)
     {
+        // PER-ITEM: this is the original clobber bug's home. Write the new
+        // refresh-token secret + the connecting→connections MOVE as per-item
+        // upserts/tombstones (each version-bumped for CAS) rather than a
+        // whole-blob re-seal, so a concurrent browser edit to a DIFFERENT item
+        // no longer collides (contract §4 / connect.rs priority 4). Best-effort;
+        // a failure leaves the whole-blob vault.dat (which is still authoritative
+        // for the paths not yet cut over — stubbed[]).
+        reconcile_per_item_after_connect(state, vault_id, &vault, &view, &k);
         let cache = crate::server::handlers::approve::bootstrap_cache_from_view(&view, state);
         state.unlock_vault(vault_id.to_string(), cache, k);
     }
 
     // A connect completed and vault.dat was re-sealed → caller fans it out.
     true
+}
+
+/// Apply the post-connect state (new refresh-token secret + connecting→
+/// connections MOVE) to the local per-item store as version-bumped item
+/// upserts/tombstones, then persist it. Best-effort; logs and returns on any
+/// error (the whole-blob vault.dat already holds the durable state).
+fn reconcile_per_item_after_connect(
+    state: &Arc<AppState>,
+    vault_id: &str,
+    vault: &crate::storage::SealedVault,
+    view: &crate::storage::plaintext::VaultPlaintextView,
+    k: &[u8],
+) {
+    use crate::storage::sealed_vault::{Keyset, PerItemVault};
+    let Ok(path) = state.vaults.per_item_path(vault_id) else {
+        return;
+    };
+    // Reuse the existing per-item store if present (so versions/cursors are
+    // preserved); otherwise bootstrap one from the whole-blob keyset.
+    let mut pv = match crate::storage::sealed_vault::read_per_item(&path) {
+        Ok(Some(pv)) => pv,
+        _ => PerItemVault {
+            keyset: Keyset {
+                version: vault.version,
+                registry: vault.registry.clone(),
+                credentials: vault.credentials.clone(),
+                keyset_version: 0,
+            },
+            items: std::collections::BTreeMap::new(),
+            items_seq: 0,
+        },
+    };
+    match pv.reconcile_from_view::<sudp::primitives::StdPrimitives>(k, vault_id, view) {
+        Ok(changed) => {
+            if changed.is_empty() {
+                return;
+            }
+            if let Err(e) =
+                crate::storage::sealed_vault::write_per_item_atomic(&path, &pv)
+            {
+                tracing::warn!(vault = %vault_id, "per-item connect reconcile write failed: {}", e);
+                return;
+            }
+            tracing::info!(
+                vault = %vault_id,
+                changed = changed.len(),
+                "per-item store updated after connect (refresh-token + connection MOVE)"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(vault = %vault_id, "per-item connect reconcile failed: {}", e);
+        }
+    }
 }
 
 #[cfg(test)]
