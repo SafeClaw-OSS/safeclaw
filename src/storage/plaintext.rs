@@ -215,7 +215,7 @@ impl VaultPlaintextView {
             )));
         }
         let mut native_secrets = BTreeMap::new();
-        for (name, val) in m.targets.iter() {
+        for (name, val) in m.secrets.iter() {
             native_secrets.insert(name.clone(), val.as_bytes().to_vec());
         }
         Ok(VaultPlaintextView { aux, native_secrets })
@@ -276,7 +276,7 @@ mod tests {
         let mut m = ProtectedState::new();
         m.aux = aux_json;
         for (k, v) in targets {
-            m.put_target(k.to_string(), v.to_vec());
+            m.put_secret(k.to_string(), v.to_vec());
         }
         m
     }

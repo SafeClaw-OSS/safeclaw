@@ -130,7 +130,7 @@ pub fn apply_exchange_result(
     tokens: &ExchangedTokens,
 ) {
     if let Some(rt) = &tokens.refresh_token {
-        m.put_target(secret_address(conn, service, role), rt.as_bytes().to_vec());
+        m.put_secret(secret_address(conn, service, role), rt.as_bytes().to_vec());
     }
     // MOVE: drop from `connecting`, add to `connections`.
     let mut connecting = aux_map::<Connecting>(m, "connecting");
@@ -417,7 +417,7 @@ mod tests {
             "GMAIL_REFRESH_TOKEN",
             &tokens(Some("rt-NEW")),
         );
-        assert_eq!(m.target("GMAIL_REFRESH_TOKEN").unwrap(), b"rt-NEW");
+        assert_eq!(m.secret("GMAIL_REFRESH_TOKEN").unwrap(), b"rt-NEW");
         assert!(
             aux_map::<Connecting>(&m, "connecting").is_empty(),
             "connecting entry must be dropped after exchange"
@@ -438,8 +438,8 @@ mod tests {
             "GMAIL_REFRESH_TOKEN",
             &tokens(Some("rt-NEW")),
         );
-        assert_eq!(m.target("gmail-work:GMAIL_REFRESH_TOKEN").unwrap(), b"rt-NEW");
-        assert!(m.targets.get("GMAIL_REFRESH_TOKEN").is_none(), "named conn must not write the bare name");
+        assert_eq!(m.secret("gmail-work:GMAIL_REFRESH_TOKEN").unwrap(), b"rt-NEW");
+        assert!(m.secrets.get("GMAIL_REFRESH_TOKEN").is_none(), "named conn must not write the bare name");
         let conns = aux_map::<Connection>(&m, "connections");
         assert_eq!(conns.get("gmail-work").map(|c| c.service.as_str()), Some("gmail"));
     }
@@ -467,7 +467,7 @@ mod tests {
     #[test]
     fn apply_exchange_overwrites_existing_refresh_token() {
         let mut m = with_connecting("gmail", "gmail", "code-A");
-        m.put_target("GMAIL_REFRESH_TOKEN", b"rt-OLD".to_vec());
+        m.put_secret("GMAIL_REFRESH_TOKEN", b"rt-OLD".to_vec());
         apply_exchange_result(
             &mut m,
             "gmail",
@@ -476,7 +476,7 @@ mod tests {
             "GMAIL_REFRESH_TOKEN",
             &tokens(Some("rt-NEW")),
         );
-        assert_eq!(m.target("GMAIL_REFRESH_TOKEN").unwrap(), b"rt-NEW");
+        assert_eq!(m.secret("GMAIL_REFRESH_TOKEN").unwrap(), b"rt-NEW");
     }
 
     #[tokio::test]
@@ -498,7 +498,7 @@ mod tests {
             aux_map::<Connection>(&m, "connections").get("gmail").map(|c| c.service.clone()),
             Some("gmail".to_string()),
         );
-        assert_eq!(m.target(&role).unwrap(), b"rt-NEW");
+        assert_eq!(m.secret(&role).unwrap(), b"rt-NEW");
         let (conn, token_url, redirect_uri, code) = seen.expect("exchange called");
         assert_eq!(conn, "gmail");
         assert_eq!(code, "code-AUX");

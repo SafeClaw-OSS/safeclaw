@@ -303,7 +303,7 @@ mod tests {
 
         let mut ps = ProtectedState::new();
         ps.aux = serde_json::to_value(VaultAux::initial()).unwrap();
-        ps.put_target("openai_key", b"sk-test-123".to_vec());
+        ps.put_secret("openai_key", b"sk-test-123".to_vec());
         let canonical = ps.to_canonical().unwrap();
 
         let mut ad = Vec::new();
