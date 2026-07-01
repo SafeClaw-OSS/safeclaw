@@ -48,7 +48,7 @@ pub async fn handle(
     validate_vault_id(&vault_id)?;
 
     if state.is_vault_locked(&vault_id) {
-        return Err(AppError::Conflict("vault locked — unlock first".into()));
+        return Err(AppError::VaultLocked);
     }
 
     // Resolve the connection → its service (recipe); for the default connection

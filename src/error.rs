@@ -12,6 +12,9 @@ pub enum AppError {
     Forbidden(String),
     NotFound,
     Conflict(String),
+    /// Vault is locked (no in-memory key). Distinct from `Conflict` so the agent
+    /// can tell "unlock needed → run `sc up`" apart from other 409s. HTTP 423.
+    VaultLocked,
     TooManyRequests,
     Internal(String),
 }
@@ -24,6 +27,11 @@ impl IntoResponse for AppError {
             AppError::Forbidden(msg) => (StatusCode::FORBIDDEN, msg.clone(), "forbidden"),
             AppError::NotFound => (StatusCode::NOT_FOUND, "Not found".to_string(), "not_found"),
             AppError::Conflict(msg) => (StatusCode::CONFLICT, msg.clone(), "conflict"),
+            AppError::VaultLocked => (
+                StatusCode::LOCKED,
+                "vault locked — run `sc up` to unlock, then retry".to_string(),
+                "vault_locked",
+            ),
             AppError::TooManyRequests => (StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded".to_string(), "rate_limited"),
             AppError::Internal(msg) => {
                 tracing::error!("internal error: {}", msg);
@@ -44,6 +52,7 @@ impl std::fmt::Display for AppError {
             AppError::Forbidden(msg) => write!(f, "Forbidden: {}", msg),
             AppError::NotFound => write!(f, "Not found"),
             AppError::Conflict(msg) => write!(f, "Conflict: {}", msg),
+            AppError::VaultLocked => write!(f, "Vault locked"),
             AppError::TooManyRequests => write!(f, "Rate limit exceeded"),
             AppError::Internal(msg) => write!(f, "Internal error: {}", msg),
         }

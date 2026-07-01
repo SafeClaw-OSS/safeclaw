@@ -30,7 +30,7 @@ SafeClaw expects two env vars in the user's shell:
 - **`$SAFECLAW_API_KEY`** — your bearer token for this vault (always
   required). The user provides one from the dashboard's "Connect a new
   agent" flow or `sc agent add`. The daemon enforces it on the broker
-  plane (`/use`, `/export`).
+  plane (`/use`).
 
 ```
 Authorization: Bearer $SAFECLAW_API_KEY
@@ -53,12 +53,12 @@ Authorization: Bearer $SAFECLAW_API_KEY
   "version": 2,
   "vault_locked": false,
   "console_url": "https://.../vault/<your-vault-id>",  // deep link to this vault
-  "vault_entries": ["openai_api_key", "gmail_refresh_token"],  // null when locked
+  "vault_entries": ["OPENAI_API_KEY", "GMAIL_REFRESH_TOKEN"],  // null when locked
   "services": [
     { "id": "openai", "name": "OpenAI", "category": "llm",
       "connected": true,
       "endpoints": [{ "method": "ANY", "path": "/openai", "wildcard": true }],
-      "vault_fields": [{ "name": "openai_api_key", "kind": "secret" }] }
+      "vault_fields": [{ "name": "OPENAI_API_KEY", "kind": "secret" }] }
   ]
 }
 ```
@@ -138,24 +138,6 @@ hint — a goal plus ready-to-run config commands, already filled in for your
 deployment. Read it, **tell the user what you're configuring and why first**,
 then apply it (adapt to the user's real config if it differs). The per-service
 `setup` hint is the source of truth; nothing tool-specific lives in this skill.
-
-## Raw secret export (high-risk)
-
-`/use/<service>` is the default — broker injects credentials server-side,
-agent never holds them. Only reach for export when no `/use/<service>` route
-fits the task.
-
-Export uses the same base:
-
-```
-POST $SAFECLAW_VAULT_URL/export/<key>
-Authorization: Bearer $SAFECLAW_API_KEY
-```
-
-`<key>` is a `vault_entries` item from `/registry`. Same `pending` → `ok`
-lifecycle as `/use/`. On `ok`, `value` is the plaintext secret as a string —
-the agent becomes its custodian. Treat every successful export as the
-user deliberately handing you raw material.
 
 ## Polling
 

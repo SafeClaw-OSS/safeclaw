@@ -46,7 +46,7 @@ pub async fn create(
     let is_lifecycle_bypass = matches!(&op.act.kind, ActType::Enroll)
         || matches!(&op.act.kind, ActType::Custom(name) if name == "vault-unlock");
     if !is_lifecycle_bypass && state.is_vault_locked(&vault_id) {
-        return Err(AppError::Conflict("vault locked — unlock first".into()));
+        return Err(AppError::VaultLocked);
     }
     let ip: IpAddr = addr.ip();
     let r = {
