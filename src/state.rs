@@ -219,6 +219,12 @@ pub struct AppState {
     /// unpaired/local-only daemon has no broker plane to gate). See
     /// [[project_vault_agent_architecture_2026_06_25]].
     pub agent_key_hashes: Mutex<std::collections::HashSet<String>>,
+    /// OAuth connections whose refresh_token was rejected (`invalid_grant`) at
+    /// /use — surfaced via `/registry` as `needs_reauth` so the console prompts a
+    /// reconnect. Keyed by `(vault_id, connection_id)`. In-memory + self-healing:
+    /// cleared on a successful refresh or a fresh connect; a still-dead token
+    /// re-marks on the next use.
+    pub oauth_reauth_needed: Mutex<std::collections::HashSet<(String, String)>>,
 }
 
 impl AppState {
@@ -241,6 +247,7 @@ impl AppState {
             vault_write_locks: Mutex::new(HashMap::new()),
             sse_semaphores: Mutex::new(HashMap::new()),
             agent_key_hashes: Mutex::new(std::collections::HashSet::new()),
+            oauth_reauth_needed: Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -484,6 +491,40 @@ impl AppState {
                 },
             );
         }
+    }
+
+    /// Mark an OAuth connection's refresh_token as dead (invalid_grant at /use).
+    /// Surfaced via `/registry` as `needs_reauth` so the console prompts reconnect.
+    pub fn oauth_mark_reauth(&self, vault_id: &str, conn_id: &str) {
+        self.oauth_reauth_needed
+            .lock()
+            .unwrap()
+            .insert((vault_id.to_string(), conn_id.to_string()));
+    }
+
+    /// Clear a connection's reauth flag (a refresh succeeded).
+    pub fn oauth_clear_reauth(&self, vault_id: &str, conn_id: &str) {
+        self.oauth_reauth_needed
+            .lock()
+            .unwrap()
+            .remove(&(vault_id.to_string(), conn_id.to_string()));
+    }
+
+    /// True iff `(vault, conn)`'s refresh_token was flagged dead.
+    pub fn oauth_needs_reauth(&self, vault_id: &str, conn_id: &str) -> bool {
+        self.oauth_reauth_needed
+            .lock()
+            .unwrap()
+            .contains(&(vault_id.to_string(), conn_id.to_string()))
+    }
+
+    /// Clear ALL reauth flags for a vault (a fresh connect just landed; any
+    /// still-dead token re-marks on the next /use).
+    pub fn oauth_clear_reauth_vault(&self, vault_id: &str) {
+        self.oauth_reauth_needed
+            .lock()
+            .unwrap()
+            .retain(|(v, _)| v != vault_id);
     }
 
     /// Evaluate the per-request policy decision for `(vault, connection,

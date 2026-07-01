@@ -232,6 +232,9 @@ pub async fn process_vault_connects(state: &Arc<AppState>, vault_id: &str) {
     // Apply any pending connects (open → exchange → re-seal → persist). On a
     // completion, fan the re-sealed blob out to OTHER devices via the cloud.
     if apply_pending_connects(state, vault_id).await {
+        // A fresh connect landed → clear any stale needs-reauth flag for this
+        // vault (a still-dead token re-marks on the next /use).
+        state.oauth_clear_reauth_vault(vault_id);
         // Propagate to OTHER devices: push the re-sealed blob back to the cloud.
         // A Google authorization code is single-use, so only THIS daemon could
         // redeem the pending connect — every other device's daemon must PULL the

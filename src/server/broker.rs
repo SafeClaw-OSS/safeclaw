@@ -808,13 +808,18 @@ pub async fn resolve_auth_value(
         // `invalid_grant` means refresh_token itself is dead — needs
         // user re-consent. Propagate as Unauthorized so the agent's
         // 4xx response cleanly distinguishes "auth gone" from
-        // "upstream down".
+        // "upstream down", and flag the connection so the console shows
+        // "needs re-auth".
         if e.contains("invalid_grant") {
+            state.oauth_mark_reauth(vault_id, conn_id);
             AppError::Unauthorized(format!("oauth2 refresh_token invalid — reconnect {}", service_id))
         } else {
             AppError::Internal(format!("oauth2 refresh failed: {}", e))
         }
     })?;
+
+    // Refresh succeeded — clear any stale needs-reauth flag for this connection.
+    state.oauth_clear_reauth(vault_id, conn_id);
 
     // Cache with 60s safety margin so the next request mid-window
     // doesn't grab a near-expired token. Keyed by connection.

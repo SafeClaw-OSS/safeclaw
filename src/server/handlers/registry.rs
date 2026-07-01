@@ -73,6 +73,11 @@ pub struct RegistryService {
     /// service has no vault_fields = no credential needed).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub connected: Option<bool>,
+    /// Per-vault only. `true` = this OAuth connection's refresh_token was rejected
+    /// (invalid_grant) at /use — user must reconnect. Absent for healthy / non-OAuth
+    /// services. Distinct from `connected`: a dead refresh_token is still PRESENT.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub needs_reauth: Option<bool>,
     /// Public OAuth consent params (authorization_url / client_id / scopes /
     /// pkce) for an oauth2 service — what a frontend needs to START a
     /// cloud-blind connect. The confidential half (client_secret / token_url)
@@ -339,6 +344,7 @@ fn build_service(
         vault_fields,
         policy,
         connected,
+        needs_reauth: None,
         connect: services.connect_descriptor(id),
         setup: if render_setup_hint { render_setup(def) } else { None },
     }
@@ -448,7 +454,13 @@ pub async fn vault_registry(
                     native_keys: &native_keys,
                 })
             };
-            build_service(&state.services, id, def, overlay.as_ref(), include_policy_rules, true)
+            let mut svc = build_service(&state.services, id, def, overlay.as_ref(), include_policy_rules, true);
+            // Surface a dead OAuth refresh_token (flagged at /use) so the console
+            // shows "needs re-auth". Default connection: conn_id == service id.
+            if !locked && svc.connected == Some(true) && state.oauth_needs_reauth(&vault_id, id) {
+                svc.needs_reauth = Some(true);
+            }
+            svc
         })
         .collect();
 
