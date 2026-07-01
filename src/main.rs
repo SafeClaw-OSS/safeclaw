@@ -42,7 +42,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::Logs(args) => cli::service::run_logs(args).map_err(daemon_err),
         Command::Pubkey(args) => cli::custodian::pubkey(args).await.map_err(daemon_err),
-        Command::Menu(args) => cli::custodian::menu(args).await.map_err(daemon_err),
+        Command::Registry(args) => cli::custodian::registry(args).map_err(daemon_err),
         Command::Up => {
             // `sc up` = make SafeClaw ready: ensure the daemon is running, then
             // ensure the vault is unlocked (the single auto-unlock chokepoint;
@@ -166,13 +166,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 e.into()
             })
         }
-        Command::Recipe(args) => {
-            use safeclaw::config::RecipeSubcommand;
+        Command::Service(args) => {
+            use safeclaw::config::ServiceSubcommand;
             let r = match args.sub {
-                RecipeSubcommand::Validate(a) => cli::recipe::run_validate(a).await,
+                ServiceSubcommand::Validate(a) => cli::service_def::run_validate(a).await,
             };
             r.map_err(|e| -> Box<dyn std::error::Error> {
-                eprintln!("safeclaw recipe: {}", e);
+                eprintln!("safeclaw service: {}", e);
                 e.into()
             })
         }

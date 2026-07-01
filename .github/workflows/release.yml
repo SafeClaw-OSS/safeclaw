@@ -78,6 +78,16 @@ jobs:
           path: artifacts
           merge-multiple: true
 
+      # The service catalog is a pure function of the compiled-in recipes, so
+      # the released binary itself renders it offline (no daemon). This ships
+      # `registry.json` as a per-release asset the console fetches — the catalog
+      # can never drift from what this daemon version actually supports.
+      - name: Render service catalog (registry.json)
+        run: |
+          chmod +x artifacts/safeclaw-linux-x86_64
+          ./artifacts/safeclaw-linux-x86_64 registry --json > artifacts/registry.json
+          echo "registry.json services: $(grep -c '\"id\"' artifacts/registry.json)"
+
       - name: Generate SHA256SUMS
         run: |
           cd artifacts

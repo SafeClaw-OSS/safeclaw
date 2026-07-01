@@ -7,7 +7,7 @@
 //! POST /v/{vid}/op              R-side op creation (or U-direct: Enroll/Write/Export)
 //! GET  /v/{vid}/passkeys        list enrolled credentials for this vault
 //! GET  /v/{vid}/events          SSE lifecycle stream
-//! GET  /menu                    static service catalog (no vault contents)
+//! GET  /registry                static service catalog (no vault contents)
 //! GET  /v/{vid}/registry        per-vault live view (catalog + connected state)
 //! GET  /op/{op_id}              poll op status + cached value
 //! POST /op/{op_id}/approve      U submits grant G → T validates, dispatches act
@@ -18,7 +18,7 @@
 //! GET  /skill.md                skill file for agents (?agent=claude|cursor|codex)
 //! ```
 //!
-//! Public root paths (`/health`, `/menu`, `/pubkey`, `/skill.md`) were originally
+//! Public root paths (`/health`, `/registry`, `/pubkey`, `/skill.md`) were originally
 //! prefixed `/c/*`; the prefix was dropped 2026-05-27 to align with the
 //! "zero remapping" backend story (SaaS proxy forwards the same URLs).
 //!
@@ -53,7 +53,7 @@ pub fn app_router(state: Arc<AppState>) -> Router {
         // Custodian-level (no vault context).
         .route("/health", get(handlers::health::health))
         .route("/pubkey", get(handlers::metadata::pubkey))
-        .route("/menu", get(handlers::registry::menu))
+        .route("/registry", get(handlers::registry::catalog))
         .route("/skill.md", get(handlers::skill::skill_md))
         // Vault-scoped.
         .route("/v/{vid}/op", post(handlers::op::create))
