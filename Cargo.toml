@@ -33,9 +33,7 @@ tower = "0.5"
 # implementation; sudp provides the abstract protocol + standard cryptographic
 # profile (Hash/Kdf/Aead/KeyWrap, β computation, grant validation, WebAuthn
 # Authenticator). We keep p256 direct only for places sudp doesn't yet cover.
-# PER-ITEM (tonight): local sudp 0.2.0 via path — has seal_record/unseal_record/SealCtx.
-# TOMORROW after the eng publishes: revert to `version = "0.2", features = [...]`.
-sudp = { path = "../sudp/custodian/rust", features = ["std-primitives", "webauthn", "json-canonical"] }
+sudp = { version = "0.2", features = ["std-primitives", "webauthn", "json-canonical"] }
 hmac = "0.12"
 p256 = { version = "0.13", features = ["ecdh", "ecdsa", "jwk"] }
 sha2 = "0.10"
