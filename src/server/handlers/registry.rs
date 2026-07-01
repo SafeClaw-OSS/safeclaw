@@ -60,8 +60,6 @@ pub struct RegistryEndpoint {
 pub struct RegistryService {
     pub id: String,
     pub name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub sub: Option<String>,
     pub category: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -228,11 +226,7 @@ fn vault_fields_for(def: &ServiceDef) -> Vec<RegistryVaultField> {
     vec![RegistryVaultField {
         name: env_name.clone(),
         kind: "secret".to_string(),
-        description: def
-            .service
-            .sub
-            .clone()
-            .or_else(|| Some(format!("{} credential", def.service.name))),
+        description: Some(format!("{} credential", def.service.name)),
         placeholder,
     }]
 }
@@ -339,7 +333,6 @@ fn build_service(
     RegistryService {
         id: id.to_string(),
         name: def.service.name.clone(),
-        sub: def.service.sub.clone(),
         category: def.service.category.clone(),
         description: def.service.help.clone(),
         endpoints,

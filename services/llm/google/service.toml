@@ -1,8 +1,6 @@
 [service]
 id = "google"
 name = "Google AI"
-sub = "Gemini"
-category = "llm"
 
 [[upstream]]
 id = "default"

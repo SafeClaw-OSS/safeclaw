@@ -1,8 +1,6 @@
 [service]
 id = "anthropic"
 name = "Anthropic"
-sub = "API Key"
-category = "llm"
 group = "anthropic"
 
 [[upstream]]

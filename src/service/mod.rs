@@ -53,8 +53,10 @@ fn default_vault_kind() -> String { "config".to_string() }
 pub struct ServiceMeta {
     pub id: String,
     pub name: String,
-    #[serde(default)]
-    pub sub: Option<String>,
+    /// Category is NOT a toml field — it's derived from the
+    /// services/{category}/{id}/ directory at build time and injected by the
+    /// loader (see `load_compiled_defaults`). The serde default only applies to
+    /// per-vault custom recipes / tests that construct a bare `[service]`.
     #[serde(default = "default_category")]
     pub category: String,
     /// If set, this service is grouped with the service whose id matches this value.
@@ -748,8 +750,11 @@ impl ServiceRegistry {
         providers: &mut HashMap<String, ProviderDef>,
     ) {
         let defaults = crate::generated_services::compiled_service_tomls();
-        for (id, toml_str) in defaults {
-            if let Ok(def) = toml::from_str::<ServiceDef>(toml_str) {
+        for (id, category, toml_str) in defaults {
+            if let Ok(mut def) = toml::from_str::<ServiceDef>(toml_str) {
+                // Category is the SSoT-from-directory value (build.rs), not a
+                // toml field — inject it over the serde default.
+                def.service.category = category.to_string();
                 services.insert(id.to_string(), def);
             }
         }
@@ -1618,7 +1623,7 @@ kind = "secret"
             out
         }
 
-        for (id, toml_str) in crate::generated_services::compiled_service_tomls() {
+        for (id, _category, toml_str) in crate::generated_services::compiled_service_tomls() {
             let def: ServiceDef = toml::from_str(toml_str)
                 .unwrap_or_else(|e| panic!("service '{}' failed to parse: {}", id, e));
             if LEGACY_EXEMPT.contains(id) {
@@ -1875,7 +1880,7 @@ client_secret_env = "SELFHOSTED_CLIENT_SECRET"
         assert!(providers.contains_key("google"), "google provider must be compiled in");
 
         let mut services = HashMap::new();
-        for (id, toml_str) in crate::generated_services::compiled_service_tomls() {
+        for (id, _category, toml_str) in crate::generated_services::compiled_service_tomls() {
             if let Ok(def) = toml::from_str::<ServiceDef>(toml_str) {
                 services.insert(id.to_string(), def);
             }

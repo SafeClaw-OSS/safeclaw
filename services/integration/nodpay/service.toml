@@ -1,8 +1,6 @@
 [service]
 id = "nodpay"
 name = "NodPay"
-sub = "Web3 agent wallet"
-category = "integration"
 # Hidden for now (per-service call): vault-native web3 signing exists + works,
 # but isn't surfaced in the catalog until we decide how/whether to expose it.
 hidden = true

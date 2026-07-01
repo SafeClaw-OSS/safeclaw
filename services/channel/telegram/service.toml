@@ -1,8 +1,6 @@
 [service]
 id = "telegram"
 name = "Telegram"
-sub = "Bot API"
-category = "channel"
 
 # Telegram's Bot API embeds the token in the URL path itself
 # (`/bot<TOKEN>/<method>`), so the upstream URL carries a template

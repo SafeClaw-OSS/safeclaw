@@ -23,8 +23,6 @@ git config --global url."{{proxy_base}}/stream/gitlab/".insteadOf "https://gitla
 [service]
 id = "gitlab"
 name = "GitLab"
-sub = "REST API + git"
-category = "integration"
 
 # One GitLab connection (one PAT) backs BOTH the REST API and the git transport,
 # sharing `GITLAB_TOKEN`. Mirrors the `github` recipe; the differences are the
@@ -61,7 +59,3 @@ path = "*"
   [[api.steps]]
   target = "upstream:rest"
   returns = true
-
-[policy.levels]
-read = "allow"
-write = "allow"

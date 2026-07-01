@@ -27,8 +27,6 @@ git config --global url."{{proxy_base}}/stream/github/".insteadOf "https://githu
 [service]
 id = "github"
 name = "GitHub"
-sub = "REST API + git"
-category = "integration"
 
 # One GitHub connection (one PAT) backs BOTH the REST API and the git transport.
 # `rest` is reached at /v/{vid}/use/github (buffered broker); `git` is reached at
@@ -63,9 +61,3 @@ path = "*"
   [[api.steps]]
   target = "upstream:rest"
   returns = true
-
-# Allow-policy: git streams without a per-request passkey (the user opted in by
-# configuring `insteadOf`); the token never enters git. Streaming requires allow.
-[policy.levels]
-read = "allow"
-write = "allow"

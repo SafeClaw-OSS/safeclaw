@@ -1,8 +1,6 @@
 [service]
 id = "deepseek"
 name = "DeepSeek"
-sub = "DeepSeek API"
-category = "llm"
 
 [[upstream]]
 id = "default"

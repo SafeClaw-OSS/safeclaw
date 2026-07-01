@@ -1,8 +1,6 @@
 [service]
 id = "gmail"
 name = "Gmail"
-sub = "Google"
-category = "integration"
 
 [[upstream]]
 id = "default"

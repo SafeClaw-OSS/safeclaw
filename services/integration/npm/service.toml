@@ -22,8 +22,6 @@ the agent process.
 [service]
 id = "npm"
 name = "npm"
-sub = "npm publish"
-category = "integration"
 
 # `npm publish` is a single token-authenticated `PUT {registry}/{package}` — the
 # same shape as git-over-HTTPS, so it rides the generic streaming passthrough
@@ -42,8 +40,5 @@ auth = { secret = "NPM_TOKEN", placeholder = "npm_..." }
   Authorization = "Bearer {{secret.NPM_TOKEN}}"
 
 # Publishing is effectively irreversible (unpublish is restricted) → passkey for
-# EVERY publish. ask-always + the streaming captive-portal
-# (docs/STREAMING_APPROVAL.md).
-[policy.levels]
-read = "ask-always"
-write = "ask-always"
+# EVERY publish. No policy.toml: this rides the safe global default (ask-always)
+# + the streaming captive-portal (docs/STREAMING_APPROVAL.md).

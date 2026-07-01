@@ -29,8 +29,6 @@ config, env, or the agent process.
 [service]
 id = "cratesio"
 name = "crates.io"
-sub = "cargo publish"
-category = "integration"
 
 # Publishing a crate is a single token-authenticated HTTPS request
 # (`PUT /api/v1/crates/new`) — the same shape as git-over-HTTPS, so it rides the
@@ -51,10 +49,8 @@ auth = { secret = "CARGO_REGISTRY_TOKEN", placeholder = "cio..." }
   Authorization = "{{secret.CARGO_REGISTRY_TOKEN}}"
 
 # Publishing is IRREVERSIBLE (crates.io only yanks, never deletes) → require a
-# passkey for EVERY publish. ask-always + the streaming captive-portal
-# (docs/STREAMING_APPROVAL.md): the agent runs `cargo publish`, the broker
-# rejects-before-forward with an approve link (also pushed over SSE), the user
-# taps their passkey, and the retried publish is authorized single-use.
-[policy.levels]
-read = "ask-always"
-write = "ask-always"
+# passkey for EVERY publish. No policy.toml: this rides the safe global default
+# (ask-always) + the streaming captive-portal (docs/STREAMING_APPROVAL.md): the
+# agent runs `cargo publish`, the broker rejects-before-forward with an approve
+# link (also pushed over SSE), the user taps their passkey, and the retried
+# publish is authorized single-use.

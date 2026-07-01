@@ -1,8 +1,6 @@
 [service]
 id = "openai-codex"
 name = "OpenAI Codex"
-sub = "ChatGPT"
-category = "llm"
 group = "openai"
 
 [[upstream]]

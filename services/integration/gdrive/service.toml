@@ -1,8 +1,6 @@
 [service]
 id = "gdrive"
 name = "Google Drive"
-sub = "Google"
-category = "integration"
 
 [[upstream]]
 id = "default"

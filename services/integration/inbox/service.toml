@@ -1,8 +1,6 @@
 [service]
 id = "inbox"
 name = "Inbox"
-sub = "demo target"
-category = "integration"
 help = """
 A live target that receives broker-forwarded requests so you can see
 SafeClaw's contract end-to-end. The daemon injects your

@@ -1,8 +1,6 @@
 [service]
 id = "openai"
 name = "OpenAI"
-sub = "REST API"
-category = "integration"
 help = """
 Broker for the OpenAI REST API (api.openai.com/v1). Put your `sk-…`
 key into `env.OPENAI_API_KEY`, then have your agent call

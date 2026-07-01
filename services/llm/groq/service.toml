@@ -1,8 +1,6 @@
 [service]
 id = "groq"
 name = "Groq"
-sub = "Fast inference"
-category = "llm"
 
 [[upstream]]
 id = "default"

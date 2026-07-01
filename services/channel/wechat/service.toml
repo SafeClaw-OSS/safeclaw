@@ -1,8 +1,6 @@
 [service]
 id = "wechat"
 name = "WeChat iLink"
-sub = "Messaging"
-category = "channel"
 
 [[upstream]]
 id = "default"
