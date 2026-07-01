@@ -69,8 +69,8 @@ pub struct ServiceMeta {
     /// Absent/None = requires user "connect" (provide API key / OAuth).
     #[serde(default)]
     pub activation: Option<String>,
-    /// If true, exclude from /menu and /v/{vid}/registry. Use for services
-    /// that are defined but not yet ready for agent discovery.
+    /// If true, exclude from `/registry` and `/v/{vid}/registry`. Use for
+    /// services that are defined but not yet ready for agent discovery.
     #[serde(default)]
     pub hidden: bool,
 }
@@ -566,6 +566,19 @@ impl ServiceRegistry {
             "Loaded {} service definitions, {} policy files, {} providers",
             services.len(), policies.len(), providers.len()
         );
+        Self { services, policies, providers }
+    }
+
+    /// Build a registry from ONLY the compiled-in (in-tree) recipes — no
+    /// `$SAFECLAW_DATA` / user-installed overrides, no filesystem I/O. Used by
+    /// offline tooling (`sc registry`) and CI to render the exact catalog a
+    /// freshly-built daemon serves, without booting a server or reading any
+    /// deployment state.
+    pub fn compiled_only() -> Self {
+        let mut services = HashMap::new();
+        let mut policies = HashMap::new();
+        let mut providers = HashMap::new();
+        Self::load_compiled_defaults(&mut services, &mut policies, &mut providers);
         Self { services, policies, providers }
     }
 

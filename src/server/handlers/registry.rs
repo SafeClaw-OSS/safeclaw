@@ -1,8 +1,9 @@
 //! Service discovery — two endpoints, one shared catalog.
 //!
-//! - `GET /menu` — static service catalog. What SafeClaw *supports*,
+//! - `GET /registry` — static service catalog. What SafeClaw *supports*,
 //!   vault-agnostic. Drives /try landing, docs, public browse. No vault
-//!   state — no `connected`, `vault_entries`, `console_url`.
+//!   state — no `connected`, `vault_entries`, `console_url`. Also produced
+//!   offline (no server) via `sc registry` / [`render_catalog`] for CI.
 //!
 //! - `GET /v/{vid}/registry` — live, per-vault view. Same catalog with
 //!   per-service `connected` flag (derived from `cache.native_keys`),
@@ -27,7 +28,7 @@ use serde_json::Value;
 
 use crate::error::Result;
 use crate::server::handlers::op::validate_vault_id;
-use crate::service::ServiceDef;
+use crate::service::{ServiceDef, ServiceRegistry};
 use crate::state::{AppState, VaultState};
 
 #[derive(Debug, Deserialize)]
@@ -171,7 +172,7 @@ pub struct RegistryResponse {
 }
 
 /// Per-vault overlay fed into `build_service` so a single rendering path
-/// covers both `/menu` (overlay=None) and `/v/{vid}/registry`.
+/// covers both `/registry` (overlay=None) and `/v/{vid}/registry`.
 struct VaultOverlay<'a> {
     /// Item names available to satisfy a service's vault_fields. Includes
     /// native-secrets only — external stores (GCP etc.) require an async
@@ -237,11 +238,11 @@ fn vault_fields_for(def: &ServiceDef) -> Vec<RegistryVaultField> {
 }
 
 fn policy_for(
-    state: &AppState,
+    services: &ServiceRegistry,
     id: &str,
     include_rules: bool,
 ) -> Option<RegistryServicePolicy> {
-    let p = state.services.policy_file(id)?;
+    let p = services.policy_file(id)?;
     let defaults = p
         .default
         .as_ref()
@@ -305,7 +306,7 @@ fn render_setup(def: &ServiceDef) -> Option<String> {
 }
 
 fn build_service(
-    state: &AppState,
+    services: &ServiceRegistry,
     id: &str,
     def: &ServiceDef,
     overlay: Option<&VaultOverlay<'_>>,
@@ -315,7 +316,7 @@ fn build_service(
     let endpoints: Vec<RegistryEndpoint> =
         def.api.iter().map(|api| endpoint_for_api(id, api)).collect();
     let vault_fields = vault_fields_for(def);
-    let policy = policy_for(state, id, include_policy_rules);
+    let policy = policy_for(services, id, include_policy_rules);
 
     // `connected` = "ready for the agent to call": every credential the
     // service needs is present in the vault. With declared vault_fields,
@@ -345,7 +346,7 @@ fn build_service(
         vault_fields,
         policy,
         connected,
-        connect: state.services.connect_descriptor(id),
+        connect: services.connect_descriptor(id),
         setup: if render_setup_hint { render_setup(def) } else { None },
     }
 }
@@ -379,30 +380,39 @@ fn console_url(state: &AppState, vault_id: &str) -> String {
     }
 }
 
-/// `GET /menu` — static service catalog.
-pub async fn menu(
-    State(state): State<Arc<AppState>>,
-    Query(q): Query<RegistryQuery>,
-) -> Result<Json<Value>> {
-    let include_policy_rules = q.include_policy_rules();
-    let services: Vec<RegistryService> = state
-        .services
+/// Render the static, vault-agnostic service catalog from a `ServiceRegistry`.
+///
+/// Pure — no `AppState`, no vault, no I/O — so the exact catalog the daemon
+/// serves at `GET /registry` can also be produced offline (`sc registry`, CI)
+/// from `ServiceRegistry::compiled_only()`. No setup rendering: the setup hint
+/// is vault-scoped (the agent applies it against its own `$SAFECLAW_VAULT_URL`),
+/// and the catalog has no vault context.
+pub fn render_catalog(
+    services: &ServiceRegistry,
+    include_policy_rules: bool,
+) -> Result<RegistryResponse> {
+    let rendered: Vec<RegistryService> = services
         .iter_sorted()
         .into_iter()
         .filter(|(_, def)| !def.service.hidden)
-        // No setup rendering on /menu: the setup hint is vault-scoped (the agent
-        // applies it against its own `$SAFECLAW_VAULT_URL`), and the catalog has
-        // no vault context.
-        .map(|(id, def)| build_service(&state, id, def, None, include_policy_rules, false))
+        .map(|(id, def)| build_service(services, id, def, None, include_policy_rules, false))
         .collect();
-    let body = RegistryResponse {
+    Ok(RegistryResponse {
         version: 2,
-        services,
+        services: rendered,
         policy: serde_json::to_value(crate::core::policy::Policy::default())?,
         vault_locked: None,
         vault_entries: None,
         console_url: None,
-    };
+    })
+}
+
+/// `GET /registry` — static service catalog.
+pub async fn catalog(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<RegistryQuery>,
+) -> Result<Json<Value>> {
+    let body = render_catalog(&state.services, q.include_policy_rules())?;
     Ok(Json(serde_json::to_value(body)?))
 }
 
@@ -445,7 +455,7 @@ pub async fn vault_registry(
                     native_keys: &native_keys,
                 })
             };
-            build_service(&state, id, def, overlay.as_ref(), include_policy_rules, true)
+            build_service(&state.services, id, def, overlay.as_ref(), include_policy_rules, true)
         })
         .collect();
 

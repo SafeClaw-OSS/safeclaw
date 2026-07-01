@@ -1,16 +1,36 @@
-//! Daemon read-only diagnostics: `sc pubkey` (HPKE outer-envelope key) and
-//! `sc menu` (public service catalog). Daemon lifecycle (up / down / restart /
-//! logs / serve) lives in `service` + `up`; vault/daemon status in `status`.
+//! Daemon read-only diagnostics: `sc pubkey` (HPKE outer-envelope key, fetched
+//! from a running daemon) and `sc registry` (public service catalog, rendered
+//! OFFLINE from the compiled-in recipes — no daemon needed). Daemon lifecycle
+//! (up / down / restart / logs / serve) lives in `service` + `up`; vault/daemon
+//! status in `status`.
 
 use crate::cli::active::resolve_active;
-use crate::config::CommonArgs;
+use crate::config::{CommonArgs, RegistryArgs};
 
 pub async fn pubkey(args: CommonArgs) -> Result<(), String> {
     fetch_print(args, "/pubkey").await
 }
 
-pub async fn menu(args: CommonArgs) -> Result<(), String> {
-    fetch_print(args, "/menu").await
+/// `sc registry` — render the static service catalog from the compiled-in
+/// recipes, no running daemon. This is the exact shape `GET /registry` serves;
+/// CI runs `sc registry --json` to publish the catalog artifact the console
+/// reads. Offline by construction (`ServiceRegistry::compiled_only()`).
+pub fn registry(args: RegistryArgs) -> Result<(), String> {
+    let reg = crate::service::ServiceRegistry::compiled_only();
+    let catalog = crate::server::handlers::registry::render_catalog(&reg, false)
+        .map_err(|e| e.to_string())?;
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&catalog).map_err(|e| e.to_string())?
+        );
+    } else {
+        println!("{:<24} {:<30} CATEGORY", "ID", "NAME");
+        for s in &catalog.services {
+            println!("{:<24} {:<30} {}", s.id, s.name, s.category);
+        }
+    }
+    Ok(())
 }
 
 async fn fetch_print(_args: CommonArgs, path: &str) -> Result<(), String> {

@@ -59,9 +59,9 @@ pub enum Command {
     /// HPKE outer-envelope public key (diagnostic).
     #[command(hide = true)]
     Pubkey(CommonArgs),
-    /// Public service catalog (diagnostic).
-    #[command(hide = true)]
-    Menu(CommonArgs),
+    /// Public service catalog. Renders the compiled-in recipes offline (no
+    /// running daemon), the exact shape `GET /registry` serves. `--json` for CI.
+    Registry(RegistryArgs),
     /// Alias for `sc secret ls`.
     Ls(CommonArgs),
     /// Alias for `sc secret get`.
@@ -145,6 +145,14 @@ pub struct GitCredentialArgs {
     /// The operation git passes: `get` | `store` | `erase`. Only `get` does
     /// anything (returns the key); `store`/`erase` are no-ops — we persist nothing.
     pub operation: String,
+}
+
+#[derive(Debug, Args)]
+pub struct RegistryArgs {
+    /// Emit the catalog as JSON (the same shape `GET /registry` serves) instead
+    /// of a human-readable table. Used by CI to publish the catalog artifact.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]
