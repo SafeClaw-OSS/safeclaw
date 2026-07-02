@@ -198,6 +198,14 @@ pub async fn sync_vault_now(state: &Arc<AppState>, vault_id: &str) -> Result<boo
     // Complete a pending connect even when the blob was unchanged — the pending
     // item may have synced earlier (background watcher) but never been processed.
     crate::auth::connect::process_vault_connects(state, vault_id).await;
+    // PER-ITEM (bidirectional): flush any LOCAL-ahead keys/items to the cloud.
+    // Sync used to only PULL, so a daemon-side change that never got pushed —
+    // e.g. a completed OAuth connect whose push was stranded behind a conflicting
+    // row — would stay local-only, and other devices / the web console would
+    // never see it (the connection sits "connecting" forever). Best-effort;
+    // already-synced rows 409-skip without blocking the rest.
+    push_keys_best_effort(state, vault_id).await;
+    push_items_best_effort(state, vault_id).await;
     Ok(pulled)
 }
 
@@ -1268,30 +1276,44 @@ pub async fn push_items_best_effort(state: &Arc<AppState>, vault_id: &str) {
         .map(|(id, s)| (id.clone(), s.version, URL_SAFE_NO_PAD.encode(&s.ct)))
         .collect();
 
+    // A conflict/error on ONE item says nothing about the others (each item_id
+    // is independent), so we NEVER stop the loop early — doing so would strand
+    // every item ordered after the first conflict. The classic trap: an
+    // already-synced version-1 row (e.g. a setup secret) is re-offered as a
+    // create every push and 409s; a naive early-return then blocks a freshly
+    // written OAuth connection/secret ordered after it from EVER reaching the
+    // cloud (the "connect completes on the daemon but web stays connecting"
+    // bug). We push what we can, adopt server truth for the conflicting items
+    // with a single pull afterward, and leave any genuine same-item conflict to
+    // `reconcile_conflicts_after_pull` at unlock (needs K + (ns,name)).
+    let mut conflicted = false;
+    let mut endpoint_missing = false;
     for (id, version, ct_b64) in rows {
         // base_version = version-1 for an update; a version-1 row is a create.
         let base_version = if version > 1 { Some(version - 1) } else { None };
         match push_item(cloud, vault_id, &dk, &id, base_version, version, &ct_b64).await {
             Ok(PushOutcome::Ok { .. }) => {}
-            Ok(PushOutcome::EndpointMissing) => return, // /items not live — stop (stubbed[])
+            Ok(PushOutcome::EndpointMissing) => {
+                endpoint_missing = true;
+                break; // the whole /items endpoint is down — nothing more to try
+            }
             Ok(PushOutcome::Conflict { current_version }) => {
-                // Pull the current rows (adopt server truth) so a subsequent
-                // resolve/retry sees the winner. The conflict-copy branch (a
-                // genuine same-item conflict) requires K + (ns,name); it runs at
-                // unlock time via `reconcile_conflicts_after_pull`. Here we only
-                // adopt + log so we never last-writer-wins.
-                tracing::info!(
+                // Often just an already-synced row (cloud == our version); skip
+                // it and keep pushing the rest. Server truth is adopted below.
+                tracing::debug!(
                     vault = %vault_id, item = %id, current_version,
-                    "per-item push: 409 conflict; adopting server row (conflict-copy deferred to unlock)"
+                    "per-item push: 409 conflict; skipping item, adopting server truth after loop"
                 );
-                let _ = pull_items(state_dir, cloud, vault_id, &dk).await;
-                return;
+                conflicted = true;
             }
             Err(e) => {
+                // Transient — skip this item, keep trying the others.
                 tracing::warn!(vault = %vault_id, item = %id, "per-item push failed: {}", e);
-                return;
             }
         }
+    }
+    if conflicted && !endpoint_missing {
+        let _ = pull_items(state_dir, cloud, vault_id, &dk).await;
     }
     tracing::debug!(vault = %vault_id, "per-item push: all local items pushed");
 }
