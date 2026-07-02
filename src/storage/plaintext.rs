@@ -107,6 +107,14 @@ pub struct Connecting {
     pub code: String,
     /// The PKCE code_verifier (RFC 7636) the browser generated for this flow.
     pub verifier: String,
+    /// Terminal exchange failure — set by the daemon when the code→token
+    /// exchange fails non-recoverably (`invalid_grant`: the authorization code
+    /// expired or was already used). The console renders "connection failed,
+    /// reconnect" instead of a perpetual "connecting". Absent while the connect
+    /// is still in flight (transient errors leave this unset so the next sync
+    /// retries). Cleared when a fresh connect overwrites the entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// The vault address of a connection's secret role (CONNECTION_SCHEMA.md §3):

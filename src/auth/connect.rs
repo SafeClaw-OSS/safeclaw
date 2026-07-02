@@ -158,19 +158,26 @@ fn collect_pending(m: &ProtectedState) -> Vec<(String, Connecting)> {
 /// `connecting` entry in place** (the user retries within the code TTL) — it never
 /// aborts the whole batch.
 ///
+/// Returns `(completed, failed)`: `completed` = connects that got a refresh_token
+/// (MOVEd to `connections`); `failed` = connects whose code was TERMINALLY
+/// rejected (`invalid_grant`) — those get an `error` stamped on their `connecting`
+/// entry so the console can render "reconnect". Transient errors bump neither (the
+/// next sync retries). The caller persists + pushes whenever either is non-zero.
+///
 /// `exchange(conn, cfg, connecting)` performs the code→token call and returns the
 /// tokens (or an error string to log + skip).
 pub async fn run_pending<F, Fut>(
     services: &crate::service::ServiceRegistry,
     m: &mut ProtectedState,
     mut exchange: F,
-) -> usize
+) -> (usize, usize)
 where
     F: FnMut(String, ExchangeConfig, Connecting) -> Fut,
     Fut: std::future::Future<Output = Result<ExchangedTokens, String>>,
 {
     let pending = collect_pending(m);
     let mut completed = 0usize;
+    let mut failed = 0usize;
     for (conn, p) in pending {
         let Some(cfg) = resolve_exchange_config(services, &p.service) else {
             tracing::warn!(
@@ -204,14 +211,34 @@ where
                 );
             }
             Err(e) => {
-                // `invalid_grant` ⇒ the code is expired/consumed; leave the
-                // connecting entry so a fresh connect can replace it. Other errors
-                // are transient (network/provider) — also leave + retry.
-                tracing::warn!(conn = %conn, "oauth connect: exchange failed, leaving connecting: {}", e);
+                if e.contains("invalid_grant") {
+                    // Terminal: the code expired or was already used. Stamp the
+                    // connecting entry so the console shows "failed — reconnect"
+                    // instead of a perpetual "connecting". Only a fresh consent
+                    // (new code) recovers — it overwrites this entry (clearing
+                    // the error).
+                    mark_connecting_failed(m, &conn, "authorization expired or already used");
+                    failed += 1;
+                    tracing::warn!(conn = %conn, "oauth connect: invalid_grant (code expired/used) — marked failed");
+                } else {
+                    // Transient (network / provider 5xx) — leave connecting + retry
+                    // on the next sync.
+                    tracing::warn!(conn = %conn, "oauth connect: exchange failed (transient), will retry: {}", e);
+                }
             }
         }
     }
-    completed
+    (completed, failed)
+}
+
+/// Stamp a terminal `error` on one `connecting` entry (leaving code/verifier so
+/// the console still knows which connection it is). No-op if the entry is gone.
+fn mark_connecting_failed(m: &mut ProtectedState, conn: &str, reason: &str) {
+    let mut connecting = aux_map::<Connecting>(m, "connecting");
+    if let Some(entry) = connecting.get_mut(conn) {
+        entry.error = Some(reason.to_string());
+    }
+    set_aux_map(m, "connecting", connecting);
 }
 
 /// Process all in-flight connects (`aux.connecting`) for one vault: open the body
@@ -329,7 +356,7 @@ pub(crate) async fn apply_pending_connects(state: &Arc<AppState>, vault_id: &str
     }
 
     let services = &state.services;
-    let completed = run_pending(services, &mut m, |_conn, cfg, p| async move {
+    let (completed, failed) = run_pending(services, &mut m, |_conn, cfg, p| async move {
         crate::auth::oauth2::exchange_code(
             &cfg.token_url,
             &cfg.client_id,
@@ -343,10 +370,13 @@ pub(crate) async fn apply_pending_connects(state: &Arc<AppState>, vault_id: &str
     })
     .await;
 
-    if completed == 0 {
-        // Nothing persisted (all failed/left pending) — don't rewrite the blob.
+    if completed == 0 && failed == 0 {
+        // Nothing changed (all left pending / transient) — don't rewrite or push.
         return false;
     }
+    // A terminal failure (invalid_grant) with no completion still MUTATED the
+    // state (stamped `error` on the connecting entry) — fall through so it's
+    // persisted + pushed, surfacing "reconnect" in the console.
 
     // Post-connect view: the new refresh_token secret + connecting→connections
     // MOVE, folded from the mutated M.
@@ -379,7 +409,7 @@ pub(crate) async fn apply_pending_connects(state: &Arc<AppState>, vault_id: &str
     } else {
         reconcile_per_item_after_connect(state, vault_id, None, &view, &k);
     }
-    tracing::info!(vault = %vault_id, connects = completed, "oauth connect: completed");
+    tracing::info!(vault = %vault_id, connects = completed, failed, "oauth connect: processed");
 
     // Refresh the in-memory cache so /use sees the new refresh_token without a
     // manual lock/unlock. Best-effort.
@@ -600,7 +630,7 @@ mod tests {
         let mut m = with_connecting("gmail", "gmail", "code-AUX");
 
         let mut seen = None;
-        let n = run_pending(&services, &mut m, |conn, cfg, p| {
+        let (n, _) = run_pending(&services, &mut m, |conn, cfg, p| {
             seen = Some((conn.clone(), cfg.token_url.clone(), cfg.redirect_uri.clone(), p.code.clone()));
             async move { Ok(tokens(Some("rt-NEW"))) }
         })
@@ -631,7 +661,7 @@ mod tests {
         let services = gmail_registry();
         let mut m = with_connecting("gmail", "gmail", "code-EXPIRED");
 
-        let n = run_pending(&services, &mut m, |_conn, _cfg, _p| async move {
+        let (n, _) = run_pending(&services, &mut m, |_conn, _cfg, _p| async move {
             Err("oauth2 code-exchange returned HTTP 400 — invalid_grant".to_string())
         })
         .await;
@@ -649,7 +679,7 @@ mod tests {
         let services = gmail_registry();
         let mut m = with_connecting("gmail", "gmail", "code-A");
 
-        let n = run_pending(&services, &mut m, |_conn, _cfg, _p| async move {
+        let (n, _) = run_pending(&services, &mut m, |_conn, _cfg, _p| async move {
             Ok(tokens(None)) // consent without offline access → no refresh_token
         })
         .await;
@@ -667,7 +697,7 @@ mod tests {
         let mut m = with_connecting("whatever", "nosuchservice", "code-A");
 
         let mut called = false;
-        let n = run_pending(&services, &mut m, |_conn, _cfg, _p| {
+        let (n, _) = run_pending(&services, &mut m, |_conn, _cfg, _p| {
             called = true;
             async move { Ok(tokens(Some("rt"))) }
         })
