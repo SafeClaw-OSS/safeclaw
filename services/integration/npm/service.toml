@@ -1,4 +1,3 @@
-# Agent-facing setup (one blurb; the agent adapts it to the user's real config).
 setup = """
 Route `npm publish` through SafeClaw so the npm token never enters .npmrc, env, or
 the agent process.

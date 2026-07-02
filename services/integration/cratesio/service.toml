@@ -1,4 +1,3 @@
-# Agent-facing setup (one blurb; the agent adapts it to the user's real config).
 setup = """
 Route `cargo publish` through SafeClaw so the crates.io token never enters cargo's
 config, env, or the agent process.
@@ -39,7 +38,6 @@ name = "crates.io"
 [[upstream]]
 id = "publish"
 url = "https://crates.io"
-# Opt into the generic streaming passthrough (the /stream/ route).
 stream = true
 auth = { secret = "CARGO_REGISTRY_TOKEN", placeholder = "cio..." }
 
