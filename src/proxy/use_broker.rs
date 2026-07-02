@@ -118,10 +118,14 @@ async fn handle_impl(
     let released_secrets = referenced_secret_names(upstream);
 
     // Capture request headers (excluding hop-by-hop) for replay or cache fast-path.
+    // Drop `Authorization` — it carries the agent's broker key (consumed by the
+    // api-key middleware, never forwarded upstream, where the recipe injects the
+    // real credential). Persisting it in the op would echo the key back on
+    // `/op/{id}` polls (and any op dump), so scrub it here.
     let mut headers_map = serde_json::Map::new();
     for (k, v) in headers.iter() {
         let name = k.as_str();
-        if is_hop_by_hop(name) {
+        if is_hop_by_hop(name) || name.eq_ignore_ascii_case("authorization") {
             continue;
         }
         if let Ok(s) = v.to_str() {
