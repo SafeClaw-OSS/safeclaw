@@ -352,6 +352,15 @@ fn classify_pull_body(
     let Some(blob) = body.get("blob") else {
         return Ok(PullOutcome::Unchanged);
     };
+    // PER-ITEM: `putBlob` wraps the lifecycle marker, so it arrives as
+    // `{ blob: { lifecycle: "per-item-v3", version } }` — the marker DOES sit
+    // under `blob` (the no-`blob` case above only covers a bare row). It is NOT a
+    // whole SealedState: the keyset rides `/keys`, content rides `/items`. Never
+    // persist it as vault.dat — treat as Unchanged so `sc sync` doesn't choke
+    // trying to parse a lifecycle marker as a SealedState (missing `registry`).
+    if blob.get("lifecycle").is_some() {
+        return Ok(PullOutcome::Unchanged);
+    }
 
     let version = body.get("version").and_then(|v| v.as_u64()).unwrap_or(0);
     persist_blob(state_dir, vault, blob, version)?;
@@ -1889,6 +1898,21 @@ mod tests {
             classify_pull_body(dir.path(), "v-empty", &serde_json::json!({})).unwrap(),
             PullOutcome::Unchanged
         );
+        // THE REAL WIRE SHAPE: `putBlob` wraps the marker, and handleBlobGet
+        // returns `{ blob: { lifecycle, version }, version, status:"live" }`. The
+        // marker sits UNDER `blob`, so this must be Unchanged (not parsed as a
+        // SealedState). This is the shape `sc sync` actually receives — the case
+        // the top-level-`lifecycle` body above never exercised.
+        let wrapped = serde_json::json!({
+            "blob": { "lifecycle": "per-item-v3", "version": 1u64 },
+            "version": 1u64,
+            "status": "live"
+        });
+        assert_eq!(
+            classify_pull_body(dir.path(), "v-wrap", &wrapped).unwrap(),
+            PullOutcome::Unchanged
+        );
+        assert!(!dir.path().join("vaults").join("v-wrap").join("vault.dat").exists());
     }
 
     /// A live blob (status absent → treated live, backward-compatible with the
