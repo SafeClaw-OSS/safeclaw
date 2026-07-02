@@ -145,10 +145,21 @@ pub fn apply_exchange_result(
     set_aux_map(m, "connections", connections);
 }
 
-/// Collect every in-flight connect from `aux.connecting`. Pure (no network) for
-/// testability.
+/// Collect the in-flight connects worth exchanging from `aux.connecting`. Pure
+/// (no network) for testability.
+///
+/// A connect that already carries a terminal `error` (its code was
+/// `invalid_grant` — expired/used) is DONE, not pending: it stays in
+/// `connecting` only so the console can render "reconnect". Re-exchanging it is
+/// futile AND harmful — the re-mark re-pushes the entry, which the cloud-sync
+/// watcher sees as a change and re-processes, forming a self-perpetuating retry
+/// storm against the token endpoint. So skip error'd entries; only a fresh
+/// connect (no `error`) or a transient failure (never stamped one) is retried.
 fn collect_pending(m: &ProtectedState) -> Vec<(String, Connecting)> {
-    aux_map::<Connecting>(m, "connecting").into_iter().collect()
+    aux_map::<Connecting>(m, "connecting")
+        .into_iter()
+        .filter(|(_, c)| c.error.is_none())
+        .collect()
 }
 
 /// Drive the connecting→refresh→move state machine over an open `ProtectedState`,
@@ -547,6 +558,21 @@ mod tests {
         let mut m = ProtectedState::new();
         m.aux = serde_json::json!({ "version": 3, "stores": {}, "store_order": [] });
         assert!(collect_pending(&m).is_empty());
+    }
+
+    #[test]
+    fn collect_pending_skips_terminally_failed() {
+        // A connect whose code was invalid_grant carries a terminal `error`.
+        // It must NOT be re-collected (else we re-exchange a dead code every
+        // sync tick + re-push it, forming a retry storm). It stays in the aux so
+        // the console can show "reconnect" — just isn't retried.
+        let mut m = with_connecting("gmail", "gmail", "code-DEAD");
+        m.aux["connecting"]["gmail"]["error"] =
+            serde_json::json!("authorization expired or already used");
+        assert!(
+            collect_pending(&m).is_empty(),
+            "an error-stamped connect must not be treated as pending"
+        );
     }
 
     #[test]
