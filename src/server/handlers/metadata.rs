@@ -24,7 +24,7 @@ use crate::protocol::Operation;
 use crate::server::handlers::op::validate_vault_id;
 use crate::state::AppState;
 use crate::storage::plaintext::VaultPlaintextView;
-use crate::storage::sealed_vault::find_pubkey;
+use crate::storage::sealed_vault::find_pubkey_in_registry;
 
 #[derive(Debug, Serialize)]
 pub struct PasskeyMeta {
@@ -48,10 +48,22 @@ pub async fn passkeys(
     Path(vault_id): Path<String>,
 ) -> Result<Json<serde_json::Value>> {
     validate_vault_id(&vault_id)?;
+    // Per-item vault (vault.per-item.json) is the current keyset home; fall back
+    // to the legacy vault.dat for vaults predating the per-item rework. This
+    // handler used to read ONLY vault.dat, so a per-item-enrolled vault (keyset
+    // synced into vault.per-item.json via pull_keys, with no vault.dat) reported
+    // vault_exists:false — surfacing as `sc status` "not found" for a real,
+    // enrolled vault that simply had no secrets yet.
+    let per_item_path = state.vaults.per_item_path(&vault_id)?;
     let vault_path = state.vaults.vault_path(&vault_id)?;
-    let Some(vault) = crate::storage::sealed_vault::read(&vault_path)? else {
-        return Ok(Json(json!({ "vault_exists": false, "passkeys": [] })));
-    };
+    let (registry, credentials) =
+        if let Some(pv) = crate::storage::sealed_vault::read_per_item(&per_item_path)? {
+            (pv.keyset.registry, pv.keyset.credentials)
+        } else if let Some(v) = crate::storage::sealed_vault::read(&vault_path)? {
+            (v.registry, v.credentials)
+        } else {
+            return Ok(Json(json!({ "vault_exists": false, "passkeys": [] })));
+        };
     // F-24: prf_salt exposure mitigation.
     //
     // Protocol constraint: prf_salt IS required by the client to run WebAuthn
@@ -70,8 +82,7 @@ pub async fn passkeys(
     if state.is_vault_locked(&vault_id) {
         tracing::debug!(vault = %vault_id, "GET /passkeys while vault locked — prf_salt returned; TODO: gate on session token (F-24)");
     }
-    let metas: Vec<PasskeyMeta> = vault
-        .credentials
+    let metas: Vec<PasskeyMeta> = credentials
         .iter()
         .map(|c| {
             // Emit credential_id as base64url-no-pad. credentialId is the one
@@ -81,7 +92,7 @@ pub async fn passkeys(
             // stays strict-STANDARD — those don't have the same cross-system
             // / URL-safety pressure.
             let cid_b64 = URL_SAFE_NO_PAD.encode(&c.credential_id);
-            let pk = find_pubkey(&vault, &cid_b64);
+            let pk = find_pubkey_in_registry(&registry, &cid_b64);
             PasskeyMeta {
                 credential_id: cid_b64,
                 device_name: pk.as_ref().map(|p| p.device_name.clone()).unwrap_or_default(),
