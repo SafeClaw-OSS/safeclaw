@@ -927,24 +927,31 @@ pub async fn watch_loop(state: Arc<AppState>, vault: String, cloud: String, dk: 
                         // Long-poll window elapsed with no change — re-poll.
                         continue;
                     }
-                    let Some(blob) = body.get("blob") else { continue };
-                    let version = body.get("version").and_then(|v| v.as_u64()).unwrap_or(0);
-                    // Serialize against approve.rs's vault.dat writes.
-                    let lock = {
-                        let mut locks = state.vault_write_locks.lock().unwrap();
-                        Arc::clone(
-                            locks
-                                .entry(vault.clone())
-                                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
-                        )
-                    };
-                    {
+                    // Persist the whole-blob body to vault.dat ONLY when it's a real
+                    // SealedState. A per-item vault's /blob is a lifecycle marker
+                    // ({lifecycle, version}), NOT a SealedState — so skip persist for
+                    // it (this was the bug that spammed "not a valid SealedState")
+                    // and, crucially, DON'T `continue`: fall through to the per-item
+                    // keyset/item pulls below, since the content lives in /keys +
+                    // /items, not the blob. A persist error on a real blob is now
+                    // logged but also doesn't starve the per-item pulls.
+                    if let Some(blob) = body.get("blob").filter(|b| b.get("lifecycle").is_none()) {
+                        let version = body.get("version").and_then(|v| v.as_u64()).unwrap_or(0);
+                        // Serialize against approve.rs's vault.dat writes.
+                        let lock = {
+                            let mut locks = state.vault_write_locks.lock().unwrap();
+                            Arc::clone(
+                                locks
+                                    .entry(vault.clone())
+                                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+                            )
+                        };
                         let _guard = lock.lock().await;
                         if let Err(e) = persist_blob(&state_dir, &vault, blob, version) {
                             tracing::warn!(vault = %vault, "cloud sync watch: persist failed: {}", e);
-                            continue;
+                        } else {
+                            refresh_after_pull(&state, &vault);
                         }
-                        refresh_after_pull(&state, &vault);
                     }
                     // A freshly-pulled blob may carry a passkey-sealed
                     // `<conn>_oauth_pending` from a browser "Connect" — complete
@@ -967,7 +974,7 @@ pub async fn watch_loop(state: Arc<AppState>, vault: String, cloud: String, dk: 
                         Ok(_) => {}
                         Err(e) => tracing::debug!(vault = %vault, "cloud sync watch: per-item pull failed: {}", e),
                     }
-                    tracing::info!(vault = %vault, version, "cloud sync watch: applied pulled blob");
+                    tracing::debug!(vault = %vault, "cloud sync watch: poll processed (blob + per-item)");
                 }
                 404 => {
                     // No blob in the cloud yet — gentle retry.
