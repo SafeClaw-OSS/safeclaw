@@ -671,6 +671,10 @@ impl PerItemVault {
         let mut native_secrets: BTreeMap<String, Vec<u8>> = BTreeMap::new();
 
         for (id_b64, stored) in &self.items {
+            // Fold each item independently: a single unreadable/unparseable item
+            // (seal-parity mismatch, a body shape from a newer client, a rotated
+            // K) must NOT hide EVERY other secret. Skip + log it; keep the rest.
+            let one: crate::error::Result<()> = (|| {
             let raw_vec = URL_SAFE_NO_PAD
                 .decode(id_b64.as_bytes())
                 .map_err(|e| AppError::Internal(format!("item id base64url decode: {}", e)))?;
@@ -681,7 +685,7 @@ impl PerItemVault {
             let ctx = ItemCtx::new(vault_id, raw, stored.version);
             let payload = unseal_item::<S>(k, &ctx, &stored.ct)?;
             if payload.is_tombstone() {
-                continue;
+                return Ok(());
             }
             let name = payload.name;
             match payload.ns {
@@ -727,6 +731,11 @@ impl PerItemVault {
                         _ => {}
                     }
                 }
+            }
+            Ok(())
+            })();
+            if let Err(e) = one {
+                tracing::warn!(item = %id_b64, "fold: skipping unreadable item: {}", e);
             }
         }
 
