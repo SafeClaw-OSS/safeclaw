@@ -75,7 +75,7 @@ pub async fn run(args: CommonArgs) -> Result<(), String> {
     let any_store = body.stores.iter().any(|s| !s.keys.is_empty());
 
     if !any_native && !any_store {
-        println!("(no keys — vault is empty or no external stores connected)");
+        println!("(no keys — vault is empty and no external stores connected)");
     } else {
         for k in &body.native_keys {
             println!("  {}", k);
