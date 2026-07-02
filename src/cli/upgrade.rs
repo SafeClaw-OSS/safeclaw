@@ -93,7 +93,11 @@ pub async fn run(args: UpgradeArgs) -> Result<(), String> {
     let current = std::env::current_exe().map_err(|e| format!("locate current binary: {}", e))?;
     let current_hash = std::fs::read(&current).ok().map(|b| sha256_hex(&b));
     if current_hash.as_deref() == Some(actual.as_str()) && !args.force {
-        eprintln!("Already up to date ({}).", &actual[..12]);
+        eprintln!(
+            "Already up to date — safeclaw {} ({}).",
+            env!("CARGO_PKG_VERSION"),
+            &actual[..12]
+        );
         return Ok(());
     }
 
@@ -125,7 +129,20 @@ pub async fn run(args: UpgradeArgs) -> Result<(), String> {
         ));
     }
 
-    eprintln!("Upgraded {} ({}).", current.display(), &actual[..12]);
+    // Report the version we just installed. The running process is still the OLD
+    // build (its compiled-in CARGO_PKG_VERSION is stale), so ask the freshly
+    // written binary for its own version rather than parse the release tag.
+    let new_version = std::process::Command::new(&current)
+        .arg("version")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty());
+    match &new_version {
+        Some(v) => eprintln!("Upgraded to {} ({}).", v, &actual[..12]),
+        None => eprintln!("Upgraded {} ({}).", current.display(), &actual[..12]),
+    }
     // Take effect now: restart the running daemon onto the new binary so the
     // user isn't left on the old build. Best-effort — a foreground / non-systemd
     // daemon just keeps running until it's restarted by hand.
