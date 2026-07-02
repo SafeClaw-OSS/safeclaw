@@ -16,9 +16,9 @@ curl -s -o /dev/null --connect-timeout 1 "$SAFECLAW_VAULT_URL/registry" \
 ```
 
 `sc up` is idempotent — it starts the daemon's user service only
-if it isn't already running, and never rewrites config. For a SaaS vault
-(host is `api.safeclaw.pro` etc.) skip this: the daemon is hosted, so if
-`/registry` is unreachable, just tell the user.
+if it isn't already running, and never rewrites config (`sc down` stops it).
+For a SaaS vault (host is `api.safeclaw.pro` etc.) skip this: the daemon is
+hosted, so if `/registry` is unreachable, just tell the user.
 
 ## Auth
 

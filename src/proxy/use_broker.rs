@@ -279,15 +279,15 @@ async fn handle_impl(
             }
         }
         // Same response shape the agent sees when polling /op/{id} after a
-        // cache-miss approval — `{ status, ok, response: BrokerResponse }`
-        // — so the skill can handle 200-immediate and 202-then-poll uniformly.
+        // cache-miss approval — `{ status: "ok", value: <upstream envelope> }`
+        // — so the skill handles 200-immediate and 202-then-poll uniformly.
         return Ok((
             StatusCode::OK,
             Json(json!({
                 "status": "ok",
                 "ok": true,
                 "act": "use",
-                "response": serde_json::to_value(&response).unwrap_or(Value::Null),
+                "value": serde_json::to_value(&response).unwrap_or(Value::Null),
             })),
         ));
         }
@@ -357,18 +357,23 @@ async fn handle_impl(
     let (op_id, r, expires_at) =
         register_pending_use(&state, &vault_id, op, policy_context, addr.ip())?;
 
+    // Wire shape per the skill contract: `status: "pending"` + a nested
+    // `approval{}` the agent reads its URLs from.
     Ok((
         StatusCode::ACCEPTED,
         Json(json!({
-            "status": "pending_approval",
+            "status": "pending",
             "op_id": op_id,
             "r": r,
-            "expires_at": expires_at,
-            // Human taps their passkey here (cloud /grant page when paired;
-            // relative local op-page for self-host). See active::grant_url.
-            "approve_url": crate::cli::active::grant_url(&op_id),
-            // Agent polls the LOCAL daemon (relative; resolves against VAULT_URL).
-            "poll_url": format!("/op/{}", op_id),
+            "approval": {
+                "id": op_id,
+                // Human taps their passkey here (cloud /grant page when paired;
+                // relative local op-page for self-host). See active::grant_url.
+                "approve_url": crate::cli::active::grant_url(&op_id),
+                // Agent polls the LOCAL daemon (relative; resolves against VAULT_URL).
+                "poll_url": format!("/op/{}", op_id),
+                "expires_at": expires_at,
+            },
         })),
     ))
 }

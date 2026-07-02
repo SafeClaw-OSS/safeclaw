@@ -90,7 +90,21 @@ async fn get_op_json(
         // "ok" is the skill-documented terminal (done — result in `value`). The
         // internal enum stays `Approved`; only the wire status is normalized so
         // the agent's poll loop (`ok`/`pending`/`rejected`) recognizes completion.
-        ApprovalStatus::Approved => ("ok", rec.cached_value.clone()),
+        //
+        // `value` shape by act: a Use caches the upstream envelope as a JSON
+        // string — emit it as the OBJECT the skill documents ({status, headers,
+        // body}), matching the allow fast-path, instead of a double-encoded
+        // string agents must re-parse. Export stays a raw string (the plaintext
+        // secret is opaque — never parse it, even when it happens to be JSON).
+        ApprovalStatus::Approved => {
+            let v = rec.cached_value.clone().map(|s| match &rec.op.act.kind {
+                ActType::Use => {
+                    serde_json::from_str::<Value>(&s).unwrap_or(Value::String(s))
+                }
+                _ => Value::String(s),
+            });
+            ("ok", v)
+        }
         ApprovalStatus::Rejected { .. } => ("rejected", None),
         ApprovalStatus::Consumed => unreachable!("handled above"),
     };

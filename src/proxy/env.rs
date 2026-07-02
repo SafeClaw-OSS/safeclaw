@@ -85,15 +85,20 @@ pub async fn handle(
         reason: None,
     });
 
+    // Wire shape per the skill contract (same as /use/): `status: "pending"`
+    // + a nested `approval{}` the agent reads its URLs from.
     Ok((
         StatusCode::ACCEPTED,
         Json(json!({
-            "status": "pending_approval",
+            "status": "pending",
             "op_id": op_id,
             "r": r,
-            "expires_at": expires_at,
-            "approve_url": format!("/op/{}", op_id),
-            "poll_url": format!("/op/{}", op_id),
+            "approval": {
+                "id": op_id,
+                "approve_url": crate::cli::active::grant_url(&op_id),
+                "poll_url": format!("/op/{}", op_id),
+                "expires_at": expires_at,
+            },
         })),
     ))
 }
