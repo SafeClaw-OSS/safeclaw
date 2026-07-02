@@ -76,8 +76,9 @@ impl ApprovalRecord {
     }
 }
 
-/// Default TTL for approvals. Demo v0 = 5 minutes.
-pub const DEFAULT_TTL: Duration = Duration::from_secs(300);
+/// Default TTL for a pending approval — how long the user has to walk over and
+/// tap their passkey before it expires. 30 minutes.
+pub const DEFAULT_TTL: Duration = Duration::from_secs(1800);
 
 /// Maximum consecutive failed approve attempts before the op is auto-rejected.
 /// Generous enough that a legitimate user never hits it, but blocks brute-force

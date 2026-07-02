@@ -326,7 +326,8 @@ async fn handle_impl(
             redeemer: vault_id.clone(),
             recipient: None,
         },
-        valid: Valid::single_use(now, Some(now + 300)), // 5-minute pending TTL; matches ApprovalStore.
+        // Pending TTL — kept in sync with the ApprovalStore's DEFAULT_TTL.
+        valid: Valid::single_use(now, Some(now + crate::approval::store::DEFAULT_TTL.as_secs())),
     };
 
     // Stamp the policy decision on the pending op so the approve handler can

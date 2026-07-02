@@ -12,7 +12,7 @@ use crate::state::AppState;
 /// Poll cadence + safety cap. The relay also enforces a TTL; this is the
 /// daemon-side bound so a never-approved op's task can't run forever.
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
-const MAX_POLLS: u32 = 200; // 200 × 2s ≈ 400s, just past the 300s op TTL
+const MAX_POLLS: u32 = 920; // 920 × 2s ≈ 1840s, just past the 1800s (30 min) op TTL
 
 /// Fire-and-forget: register `op_id` with the relay and drive it to
 /// completion in a background task. No-op (returns immediately) when no relay

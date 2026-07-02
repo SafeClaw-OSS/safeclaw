@@ -162,6 +162,10 @@ for i in $(seq 1 100); do
 done
 ```
 
+If the loop finishes and it's still `pending` (the user is just taking their
+time), don't abandon it — the op stays valid ~30 min. Switch to B: ask them to
+reply once they've tapped, then poll once more.
+
 If poll returns HTTP 404, the op expired or the daemon restarted. Do NOT keep polling — re-POST the original request to get a fresh op.
 
 ### B — 2-step (runtimes that can't block, e.g. Telegram cron-style)
