@@ -155,9 +155,9 @@ for i in $(seq 1 100); do
   RESP=$(curl -sS -H "Authorization: Bearer $SAFECLAW_API_KEY" "$POLL_URL")
   STATUS=$(echo "$RESP" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("status",""))')
   case "$STATUS" in
-    ok|approved) echo "$RESP"; break;;   # done — the result is in `value`
-    rejected)    echo "ended: $STATUS"; exit 0;;
-    pending|*)   sleep 3;;
+    ok)         echo "$RESP"; break;;   # done — the result is in `value`
+    rejected)   echo "ended: $STATUS"; exit 0;;
+    pending|*)  sleep 3;;
   esac
 done
 ```
