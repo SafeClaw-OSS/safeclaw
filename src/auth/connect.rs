@@ -284,20 +284,42 @@ pub(crate) async fn apply_pending_connects(state: &Arc<AppState>, vault_id: &str
         .join("vaults")
         .join(vault_id)
         .join("vault.dat");
-    let mut vault = match crate::storage::sealed_vault::read(&vault_path) {
-        Ok(Some(v)) => v,
-        Ok(None) => return false,
+    // Open the vault body from whichever store backs it. A daemon-side
+    // Enroll/Write vault has a whole-blob vault.dat; a WEB-enrolled vault has
+    // ONLY the per-item store (vault.per-item.json) — for that we fold the item
+    // rows into a view and rebuild the ProtectedState M the connect machine runs
+    // on (inverse of VaultPlaintextView::from_protected_state).
+    let vault_dat = match crate::storage::sealed_vault::read(&vault_path) {
+        Ok(v) => v,
         Err(e) => {
             tracing::warn!(vault = %vault_id, "oauth connect: read vault.dat failed: {}", e);
-            return false;
+            None
         }
     };
-
-    let mut m = match crate::server::handlers::metadata::open_protected_state_with_key(&k, &vault) {
-        Ok(m) => m,
-        Err(_) => {
-            // Retained K can't open (rotated) — graceful skip, lock+unlock retries.
+    let mut m = if let Some(vault) = &vault_dat {
+        match crate::server::handlers::metadata::open_protected_state_with_key(&k, vault) {
+            Ok(m) => m,
+            Err(_) => return false, // rotated K — lock+unlock retries
+        }
+    } else {
+        let Ok(pi_path) = state.vaults.per_item_path(vault_id) else {
             return false;
+        };
+        let Ok(Some(pv)) = crate::storage::sealed_vault::read_per_item(&pi_path) else {
+            return false; // neither vault.dat nor a per-item store — nothing to do
+        };
+        let view = match crate::server::handlers::metadata::decrypt_vault_view_peritem_with_key(
+            &k, &pv, vault_id,
+        ) {
+            Ok(v) => v,
+            Err(_) => return false, // rotated K
+        };
+        match build_m_from_view(&view) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(vault = %vault_id, "oauth connect: rebuild M from per-item failed: {}", e);
+                return false;
+            }
         }
     };
 
@@ -326,44 +348,61 @@ pub(crate) async fn apply_pending_connects(state: &Arc<AppState>, vault_id: &str
         return false;
     }
 
-    // Re-seal the mutated body under the same K (registry/credentials/wrapped_key
-    // untouched) and persist. No approval op — direct daemon re-seal (§5).
-    if let Err(e) =
-        crate::server::handlers::metadata::reseal_body_with_key(&k, &mut vault, &m)
-    {
-        tracing::warn!(vault = %vault_id, "oauth connect: re-seal failed: {}", e);
-        return false;
-    }
-    if let Err(e) = crate::storage::sealed_vault::write_atomic(&vault_path, &vault) {
-        tracing::warn!(vault = %vault_id, "oauth connect: write vault.dat failed: {}", e);
-        return false;
-    }
-    tracing::info!(
-        vault = %vault_id,
-        connects = completed,
-        "oauth connect: completed; refreshed vault.dat (direct re-seal, no approval op)"
-    );
+    // Post-connect view: the new refresh_token secret + connecting→connections
+    // MOVE, folded from the mutated M.
+    let view = match crate::storage::plaintext::VaultPlaintextView::from_protected_state(&m) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(vault = %vault_id, "oauth connect: view rebuild failed: {}", e);
+            return false;
+        }
+    };
 
-    // Refresh the in-memory cache so the newly written refresh_token (and any
-    // allow-level fast-path) reflects the post-connect state without a manual
-    // lock/unlock. Best-effort: a decrypt failure just leaves the cache as-is.
-    if let Ok(view) =
-        crate::server::handlers::metadata::decrypt_vault_view_with_key(&k, &vault)
-    {
-        // PER-ITEM: this is the original clobber bug's home. Write the new
-        // refresh-token secret + the connecting→connections MOVE as per-item
-        // upserts/tombstones (each version-bumped for CAS) rather than a
-        // whole-blob re-seal, so a concurrent browser edit to a DIFFERENT item
-        // no longer collides (contract §4 / connect.rs priority 4). Best-effort;
-        // a failure leaves the whole-blob vault.dat (which is still authoritative
-        // for the paths not yet cut over — stubbed[]).
-        reconcile_per_item_after_connect(state, vault_id, &vault, &view, &k);
-        let cache = crate::server::handlers::approve::bootstrap_cache_from_view(&view, state);
-        state.unlock_vault(vault_id.to_string(), cache, k);
+    // Persist. If a whole-blob vault.dat backs this vault, re-seal + write it so
+    // the legacy path stays authoritative. EITHER way, write the change to the
+    // per-item store (the content that syncs via /items) — for a web-enrolled
+    // per-item vault this is the ONLY durable write. Per-item upserts are
+    // version-bumped for CAS, so a concurrent browser edit to a DIFFERENT item
+    // never collides (contract §4).
+    if let Some(mut vault) = vault_dat {
+        if let Err(e) =
+            crate::server::handlers::metadata::reseal_body_with_key(&k, &mut vault, &m)
+        {
+            tracing::warn!(vault = %vault_id, "oauth connect: re-seal failed: {}", e);
+            return false;
+        }
+        if let Err(e) = crate::storage::sealed_vault::write_atomic(&vault_path, &vault) {
+            tracing::warn!(vault = %vault_id, "oauth connect: write vault.dat failed: {}", e);
+            return false;
+        }
+        reconcile_per_item_after_connect(state, vault_id, Some(&vault), &view, &k);
+    } else {
+        reconcile_per_item_after_connect(state, vault_id, None, &view, &k);
     }
+    tracing::info!(vault = %vault_id, connects = completed, "oauth connect: completed");
 
-    // A connect completed and vault.dat was re-sealed → caller fans it out.
+    // Refresh the in-memory cache so /use sees the new refresh_token without a
+    // manual lock/unlock. Best-effort.
+    let cache = crate::server::handlers::approve::bootstrap_cache_from_view(&view, state);
+    state.unlock_vault(vault_id.to_string(), cache, k);
+
     true
+}
+
+/// Rebuild a [`ProtectedState`] `M` from a folded per-item view — the inverse of
+/// [`VaultPlaintextView::from_protected_state`]. Lets the connect state machine
+/// (which reads/writes `M`'s aux + secrets) run against a web-enrolled per-item
+/// vault that has no whole-blob `vault.dat`.
+fn build_m_from_view(
+    view: &crate::storage::plaintext::VaultPlaintextView,
+) -> Result<ProtectedState, String> {
+    let mut m = ProtectedState::new();
+    m.aux = serde_json::to_value(&view.aux)
+        .map_err(|e| format!("aux to json: {}", e))?;
+    for (name, bytes) in &view.native_secrets {
+        m.put_secret(name.clone(), bytes.clone());
+    }
+    Ok(m)
 }
 
 /// Apply the post-connect state (new refresh-token secret + connecting→
@@ -373,7 +412,7 @@ pub(crate) async fn apply_pending_connects(state: &Arc<AppState>, vault_id: &str
 fn reconcile_per_item_after_connect(
     state: &Arc<AppState>,
     vault_id: &str,
-    vault: &crate::storage::SealedVault,
+    vault: Option<&crate::storage::SealedVault>,
     view: &crate::storage::plaintext::VaultPlaintextView,
     k: &[u8],
 ) {
@@ -382,20 +421,25 @@ fn reconcile_per_item_after_connect(
         return;
     };
     // Reuse the existing per-item store if present (so versions/cursors are
-    // preserved); otherwise bootstrap one from the whole-blob keyset.
+    // preserved); otherwise bootstrap one from the whole-blob keyset. A
+    // web-enrolled per-item vault ALWAYS has a store, so `vault` is `None` there
+    // and the bootstrap branch is only reached on the vault.dat path.
     let mut pv = match crate::storage::sealed_vault::read_per_item(&path) {
         Ok(Some(pv)) => pv,
-        _ => PerItemVault {
-            keyset: Keyset {
-                version: vault.version,
-                registry: vault.registry.clone(),
-                credentials: vault.credentials.clone(),
-                keyset_version: 0,
-            },
-            items: std::collections::BTreeMap::new(),
-            items_seq: 0,
-            keyset_seq: 0,
-        },
+        _ => {
+            let Some(vault) = vault else { return };
+            PerItemVault {
+                keyset: Keyset {
+                    version: vault.version,
+                    registry: vault.registry.clone(),
+                    credentials: vault.credentials.clone(),
+                    keyset_version: 0,
+                },
+                items: std::collections::BTreeMap::new(),
+                items_seq: 0,
+                keyset_seq: 0,
+            }
+        }
     };
     match pv.reconcile_from_view::<sudp::primitives::StdPrimitives>(k, vault_id, view) {
         Ok(changed) => {

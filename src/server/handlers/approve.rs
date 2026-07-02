@@ -620,9 +620,9 @@ pub async fn approve_op(
             }
         }
         ActType::Use => {
-            let vault = existing_vault
-                .clone()
-                .ok_or_else(|| AppError::Conflict("vault not initialized".into()))?;
+            // Read seam (per-item first, whole-blob Option fallback) lives inside
+            // the broker resolve/forward calls — so a web-enrolled per-item vault
+            // (no vault.dat) resolves without the old "vault not initialized" bail.
             // Streaming captive-portal authorize (`/stream/` ask path): resolve
             // and stash the secret for the agent's *retried* stream to consume;
             // do NOT forward — there is no buffered request here (the real one
@@ -639,7 +639,7 @@ pub async fn approve_op(
                     &validated.op,
                     &validated.wrapping_key,
                     &validated.credential_id_bytes,
-                    &vault,
+                    existing_vault.as_ref(),
                     &state,
                     &vault_id,
                 )
@@ -677,7 +677,7 @@ pub async fn approve_op(
                 &validated.op,
                 &validated.wrapping_key,
                 &validated.credential_id_bytes,
-                &vault,
+                existing_vault.as_ref(),
                 &state,
                 &vault_id,
             )

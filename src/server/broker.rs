@@ -62,7 +62,7 @@ pub async fn execute_use_forward(
     op: &Operation,
     wrapping_key: &[u8],
     credential_id_bytes: &[u8],
-    vault: &SealedVault,
+    vault: Option<&SealedVault>,
     state: &crate::state::AppState,
     vault_id: &str,
 ) -> Result<UseForwardOutcome> {
@@ -76,7 +76,7 @@ pub async fn execute_use_forward(
         op,
         wrapping_key,
         credential_id_bytes,
-        Some(vault),
+        vault,
     )?;
 
     // Primary secret (op.act.target). For oauth2 services this is the
@@ -217,7 +217,7 @@ pub async fn resolve_use_primary(
     op: &Operation,
     wrapping_key: &[u8],
     credential_id_bytes: &[u8],
-    vault: &SealedVault,
+    vault: Option<&SealedVault>,
     state: &crate::state::AppState,
     vault_id: &str,
 ) -> Result<Vec<u8>> {
@@ -228,7 +228,7 @@ pub async fn resolve_use_primary(
         op,
         wrapping_key,
         credential_id_bytes,
-        Some(vault),
+        vault,
     )?;
     view.resolve_value_async(&op.act.target)
         .await?
