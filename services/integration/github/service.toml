@@ -1,22 +1,24 @@
 setup = """
-Route the user's git remotes through SafeClaw so the GitHub PAT never enters git
-or your process. git authenticates to the broker with a credential helper that
-reads $SAFECLAW_API_KEY at run-time — nothing lands on disk.
+Route the user's git through SafeClaw so the GitHub PAT never enters git or your
+process. Register the broker credential helper — host-scoped (only ever fires for
+the broker), reads $SAFECLAW_API_KEY at run-time, nothing on disk:
 
-# Inspect first — don't assume github.com:
-git remote -v ; git config --get-regexp '^url\\.'
+  git config --global credential."{{proxy_base}}".helper "!sc git-credential"
 
-# 1) one-time per machine — register sc as the credential helper for the broker host:
-git config --global credential."{{proxy_base}}".helper "!sc git-credential"
+Then route github → broker. DEFAULT to non-invasive (the user's own git unaffected):
+#   • per repo — use the broker URL as the remote:
+#       git clone {{proxy_base}}/stream/github/<owner>/<repo>.git
+#   • transparent for YOUR session — put the rewrite in your OWN git env, so plain
+#     github.com URLs auto-route and the user's config stays untouched (no restart):
+#       export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="url.{{proxy_base}}/stream/github/.insteadOf" GIT_CONFIG_VALUE_0="https://github.com/"
 
-# 2) route GitHub through the broker (PAT injected at egress, never enters git):
-git config --global url."{{proxy_base}}/stream/github/".insteadOf "https://github.com/"
+# Route the USER's own git too (writes their global config) only if they want it —
+# OFFER it (e.g. after repeated use), don't require an answer; stay on the default otherwise:
+#   git config --global url."{{proxy_base}}/stream/github/".insteadOf "https://github.com/"
+#   (add "git@github.com:" for SSH remotes — no SSH key needed then)
 
-# SSH remotes? rewrite them to the same route too (no SSH key needed):
-#   git config --global url."{{proxy_base}}/stream/github/".insteadOf "git@github.com:"
-
-# Run git with GIT_TERMINAL_PROMPT=0 so a misconfig fails fast. If an operation
-# needs approval you'll get a link — surface it, the user taps a passkey, re-run.
+# GIT_TERMINAL_PROMPT=0 so a misconfig fails fast. An op needing approval returns a
+# link — surface it, the user taps a passkey, re-run.
 """
 
 [service]

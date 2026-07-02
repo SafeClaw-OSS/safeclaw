@@ -1,19 +1,23 @@
 setup = """
-Route the user's git remotes through SafeClaw so the GitLab PAT never enters git
-or your process. git authenticates to the broker with a credential helper that
-reads $SAFECLAW_API_KEY at run-time — nothing lands on disk.
+Route the user's git through SafeClaw so the GitLab PAT never enters git or your
+process. Register the broker credential helper — host-scoped (only ever fires for
+the broker), reads $SAFECLAW_API_KEY at run-time, nothing on disk:
 
-# Inspect first — don't assume gitlab.com:
-git remote -v ; git config --get-regexp '^url\\.'
+  git config --global credential."{{proxy_base}}".helper "!sc git-credential"
 
-# 1) one-time per machine — register sc as the credential helper for the broker host:
-git config --global credential."{{proxy_base}}".helper "!sc git-credential"
+Then route gitlab → broker. DEFAULT to non-invasive (the user's own git unaffected):
+#   • per repo — use the broker URL as the remote:
+#       git clone {{proxy_base}}/stream/gitlab/<owner>/<repo>.git
+#   • transparent for YOUR session — put the rewrite in your OWN git env, so plain
+#     gitlab.com URLs auto-route and the user's config stays untouched (no restart):
+#       export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="url.{{proxy_base}}/stream/gitlab/.insteadOf" GIT_CONFIG_VALUE_0="https://gitlab.com/"
 
-# 2) route GitLab through the broker (PAT injected at egress, never enters git):
-git config --global url."{{proxy_base}}/stream/gitlab/".insteadOf "https://gitlab.com/"
+# Route the USER's own git too (writes their global config) only if they want it —
+# OFFER it (e.g. after repeated use), don't require an answer; stay on the default otherwise:
+#   git config --global url."{{proxy_base}}/stream/gitlab/".insteadOf "https://gitlab.com/"
 
-# Run git with GIT_TERMINAL_PROMPT=0 so a misconfig fails fast. If an operation
-# needs approval you'll get a link — surface it, the user taps a passkey, re-run.
+# GIT_TERMINAL_PROMPT=0 so a misconfig fails fast. An op needing approval returns a
+# link — surface it, the user taps a passkey, re-run.
 """
 
 [service]
