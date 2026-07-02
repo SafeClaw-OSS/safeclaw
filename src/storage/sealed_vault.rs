@@ -83,8 +83,15 @@ pub fn write_atomic(path: &Path, vault: &SealedVault) -> Result<()> {
 /// `(x, y, device_name)` for binding verification don't need to know the
 /// sudp Registry shape.
 pub fn find_pubkey(vault: &SealedVault, credential_id_b64: &str) -> Option<PasskeyEntry> {
+    find_pubkey_in_registry(&vault.registry, credential_id_b64)
+}
+
+/// Same as [`find_pubkey`] but against a bare [`Registry`] — used by callers
+/// that hold a per-item [`Keyset`] (which carries its own `registry`) rather
+/// than a whole [`SealedVault`].
+pub fn find_pubkey_in_registry(registry: &Registry, credential_id_b64: &str) -> Option<PasskeyEntry> {
     let cid_bytes = decode_credential_id(credential_id_b64).ok()?;
-    let pk = vault.registry.get::<WebAuthn>(&cid_bytes).ok().flatten()?;
+    let pk = registry.get::<WebAuthn>(&cid_bytes).ok().flatten()?;
     Some(PasskeyEntry {
         x: pk.x,
         y: pk.y,
