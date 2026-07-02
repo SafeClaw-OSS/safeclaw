@@ -225,6 +225,12 @@ pub struct AppState {
     /// cleared on a successful refresh or a fresh connect; a still-dead token
     /// re-marks on the next use.
     pub oauth_reauth_needed: Mutex<std::collections::HashSet<(String, String)>>,
+    /// Most-recent lifecycle-ceremony op this daemon has open, keyed by
+    /// `(vault_id, ceremony_name)` (e.g. `vault-unlock`). When a new ceremony op
+    /// is created it supersedes the prior one — the daemon withdraws the stale
+    /// op from the relay so the console stops showing "1 approval waiting" after
+    /// a `sc unlock` was abandoned + retried. See requester-cancel design.
+    pub live_ceremony_ops: Mutex<HashMap<(String, String), String>>,
 }
 
 impl AppState {
@@ -248,6 +254,7 @@ impl AppState {
             sse_semaphores: Mutex::new(HashMap::new()),
             agent_key_hashes: Mutex::new(std::collections::HashSet::new()),
             oauth_reauth_needed: Mutex::new(std::collections::HashSet::new()),
+            live_ceremony_ops: Mutex::new(HashMap::new()),
         }
     }
 

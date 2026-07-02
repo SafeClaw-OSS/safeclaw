@@ -31,6 +31,8 @@ use crate::storage::VaultDir;
 //   approved  — user approved a pending ask (terminal)
 //   denied    — deny-policy auto-blocked; no user gesture (terminal)
 //   rejected  — user rejected a pending ask (terminal)
+//   cancelled — the REQUESTER withdrew its own pending op; no credential
+//               accessed (terminal). Distinct from `rejected` (approver-side).
 //   expired   — ask-policy op TTL elapsed without user action (terminal)
 pub const STATUS_PENDING: &str = "pending";
 pub const STATUS_ALLOWED: &str = "allowed";
@@ -38,6 +40,11 @@ pub const STATUS_APPROVED: &str = "approved";
 #[allow(dead_code)] // wired once policy auto-deny lands
 pub const STATUS_DENIED: &str = "denied";
 pub const STATUS_REJECTED: &str = "rejected";
+/// Requester withdrew its own still-pending op (e.g. a `sc unlock` abandoned +
+/// retried, the new op superseding the stale one). A NON-access outcome — no
+/// credential or W_c is touched — so it is logged for transparency but never
+/// reads as a security event.
+pub const STATUS_CANCELLED: &str = "cancelled";
 #[allow(dead_code)] // wired once op TTL sweep lands
 pub const STATUS_EXPIRED: &str = "expired";
 

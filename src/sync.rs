@@ -953,13 +953,6 @@ pub async fn watch_loop(state: Arc<AppState>, vault: String, cloud: String, dk: 
                             refresh_after_pull(&state, &vault);
                         }
                     }
-                    // A freshly-pulled blob may carry a passkey-sealed
-                    // `<conn>_oauth_pending` from a browser "Connect" — complete
-                    // the OAuth code→token exchange and persist the refresh_token
-                    // (CONNECTIONS_AND_AUTH.md §4a). Best-effort; acquires the
-                    // per-vault write lock itself, so it runs AFTER the guard
-                    // above drops (the lock is not reentrant).
-                    crate::auth::connect::process_vault_connects(&state, &vault).await;
                     // PER-ITEM: a keyset/blob change often coincides with content
                     // changes; pull the KEYSET (`/keys`) FIRST so the item fold
                     // sees a fresh K-wrap layer, then pull item rows and refresh
@@ -974,6 +967,14 @@ pub async fn watch_loop(state: Arc<AppState>, vault: String, cloud: String, dk: 
                         Ok(_) => {}
                         Err(e) => tracing::debug!(vault = %vault, "cloud sync watch: per-item pull failed: {}", e),
                     }
+                    // A freshly-pulled connecting item (from a browser "Connect")
+                    // needs the OAuth code→token exchange completed + the
+                    // refresh_token persisted. Run this AFTER the pulls so it acts
+                    // on the just-synced state — otherwise a connect lands one tick
+                    // late (or never, absent a further change). Matches the explicit
+                    // `sc sync` path. Best-effort; takes the write lock itself
+                    // (not reentrant), so it runs after the guard above drops.
+                    crate::auth::connect::process_vault_connects(&state, &vault).await;
                     tracing::debug!(vault = %vault, "cloud sync watch: poll processed (blob + per-item)");
                 }
                 404 => {

@@ -98,6 +98,25 @@ pub async fn create(
         expires_at,
     );
 
+    // Requester-side supersede: a lifecycle ceremony (unlock/lock) is a
+    // singleton — at most one should be live per vault. When a new one is
+    // created (e.g. the user Ctrl-C'd `sc unlock` and retried), withdraw the
+    // stale prior op so the console stops showing "1 approval waiting". Only
+    // ceremonies supersede; Use/Export ops can legitimately be concurrent.
+    if let ActType::Custom(name) = &op.act.kind {
+        if name == "vault-unlock" || name == "vault-lock" {
+            let prev = {
+                let mut live = state.live_ceremony_ops.lock().unwrap();
+                live.insert((vault_id.clone(), name.clone()), op_id.clone())
+            };
+            if let Some(prev_id) = prev {
+                if prev_id != op_id {
+                    cancel_superseded(&state, &vault_id, &prev_id, now);
+                }
+            }
+        }
+    }
+
     state.emit_event(ApprovalEvent {
         vault_id: vault_id,
         approval_id: op_id.clone(),
@@ -112,6 +131,36 @@ pub async fn create(
         "r": r,
         "expires_at": expires_at,
     })))
+}
+
+/// Withdraw a ceremony op that a newer one just superseded. Local: flip the
+/// stale in-memory record terminal + stamp its audit row `cancelled`. Cloud:
+/// withdraw it from the relay (device-key auth, no passkey — no credential is
+/// touched). All best-effort; the backend cancel only affects a `pending` op.
+fn cancel_superseded(state: &Arc<AppState>, vault_id: &str, op_id: &str, now: i64) {
+    const REASON: &str = "superseded by a newer request";
+    let was_pending = {
+        let mut store = state.approvals.lock().unwrap();
+        store.reject(op_id, REASON).is_some()
+    };
+    if was_pending {
+        if let Ok(store) = state.audits.for_vault(vault_id) {
+            if let Err(e) =
+                store.finalize(op_id, audit::STATUS_CANCELLED, now, None, Some(REASON), None)
+            {
+                tracing::warn!(vault = %vault_id, op = %op_id, "audit finalize cancelled failed: {}", e);
+            }
+        }
+        state.emit_event(ApprovalEvent {
+            vault_id: vault_id.to_string(),
+            approval_id: op_id.to_string(),
+            kind: "cancelled".into(),
+            op_summary: None,
+            response_preview: None,
+            reason: Some(REASON.into()),
+        });
+    }
+    crate::relay::client::spawn_cancel(state.clone(), vault_id.to_string(), op_id.to_string());
 }
 
 /// Reject op kinds that are broker-plane primitives. Today: `Use`.

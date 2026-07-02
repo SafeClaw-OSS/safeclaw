@@ -37,6 +37,39 @@ pub fn spawn_register_and_poll(
     });
 }
 
+/// Fire-and-forget: withdraw a still-pending op from the relay (device-key
+/// auth). Called when a new ceremony op supersedes a stale one — the requester
+/// voids its OWN prior request. No passkey/W_c involved (nothing was granted).
+/// The backend only flips `pending → cancelled`, so an already-approved op is
+/// untouched. No-op when there's no cloud relay configured.
+pub fn spawn_cancel(state: Arc<AppState>, vault_id: String, op_id: String) {
+    let (base, auth_token) = match resolve_relay(&state) {
+        Some(v) => v,
+        None => return,
+    };
+    let daemon_pubkey = URL_SAFE_NO_PAD.encode(state.sc.pk_bytes());
+    tokio::spawn(async move {
+        let url = format!("{}/v/{}/op/relay/{}/cancel", base, vault_id, op_id);
+        let client = match reqwest::Client::builder().timeout(Duration::from_secs(10)).build() {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        match client
+            .post(&url)
+            .bearer_auth(&auth_token)
+            .json(&json!({ "daemon_pubkey": daemon_pubkey }))
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => {
+                tracing::info!(op = %op_id, "superseded op withdrawn from relay");
+            }
+            Ok(r) => tracing::debug!(op = %op_id, "relay cancel HTTP {}", r.status()),
+            Err(e) => tracing::debug!(op = %op_id, "relay cancel error: {}", e),
+        }
+    });
+}
+
 /// Resolve `(relay_base, auth_token)` for op-relay registration.
 ///
 /// Primary (the local-daemon pivot): a paired daemon dials its cloud backend
@@ -137,6 +170,12 @@ async fn run(
                 tokio::time::sleep(POLL_INTERVAL).await;
             }
             404 => return Ok(()), // unknown/expired on the relay side
+            409 => {
+                // Cancelled: the requester (this daemon, via a superseding op)
+                // withdrew it. Stop polling — nothing more will arrive.
+                tracing::info!(op = %op_id, "relay op cancelled by requester; poll stopping");
+                return Ok(());
+            }
             other => {
                 tracing::debug!(op = %op_id, "relay poll HTTP {}", other);
                 tokio::time::sleep(POLL_INTERVAL).await;
