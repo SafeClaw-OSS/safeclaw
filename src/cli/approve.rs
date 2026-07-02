@@ -115,7 +115,9 @@ async fn remote_approve(custodian: &str, op_id: &str, label: &str) -> Result<Val
             // The daemon flips the op to approved once it applies the relayed
             // grant; "consumed" can win if something polled it first. Both mean
             // the gesture landed and the act ran.
-            "approved" | "consumed" => {
+            // "ok" is the normalized wire terminal; "approved" kept for
+            // back-compat during rollout. Both mean the gesture landed + act ran.
+            "ok" | "approved" | "consumed" => {
                 eprintln!("  approved ✓");
                 return Ok(body);
             }

@@ -87,7 +87,10 @@ async fn get_op_json(
     let op_json = serde_json::to_value(&rec.op)?;
     let (status, value) = match &rec.status {
         ApprovalStatus::Pending => ("pending", None),
-        ApprovalStatus::Approved => ("approved", rec.cached_value.clone()),
+        // "ok" is the skill-documented terminal (done — result in `value`). The
+        // internal enum stays `Approved`; only the wire status is normalized so
+        // the agent's poll loop (`ok`/`pending`/`rejected`) recognizes completion.
+        ApprovalStatus::Approved => ("ok", rec.cached_value.clone()),
         ApprovalStatus::Rejected { .. } => ("rejected", None),
         ApprovalStatus::Consumed => unreachable!("handled above"),
     };
