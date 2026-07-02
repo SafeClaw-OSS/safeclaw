@@ -1,46 +1,38 @@
-# Agent-facing setup. Iron rule — goal + building blocks + a canonical example;
-# the agent inspects the real remotes and adapts (don't blindly paste).
 setup = """
 Route the user's git remotes through SafeClaw so the GitLab PAT never enters git
-or the agent process. Auth: credential.helper = !sc git-credential — git fetches
-your SAFECLAW_API_KEY from the env at run-time, so nothing lands on disk.
+or your process. git authenticates to the broker with a credential helper that
+reads $SAFECLAW_API_KEY at run-time — nothing lands on disk.
 
 # Inspect first — don't assume gitlab.com:
 git remote -v ; git config --get-regexp '^url\\.'
 
-# 1) one-time per machine: let git get the broker key from sc. Scoped to the broker
-#    host; sc reads $SAFECLAW_API_KEY at git-time, so the key is never written to disk:
+# 1) one-time per machine — register sc as the credential helper for the broker host:
 git config --global credential."{{proxy_base}}".helper "!sc git-credential"
 
-# 2) route GitLab through SafeClaw — the PAT is injected by the broker, never enters git:
+# 2) route GitLab through the broker (PAT injected at egress, never enters git):
 git config --global url."{{proxy_base}}/stream/gitlab/".insteadOf "https://gitlab.com/"
 
-# Tip: run git with GIT_TERMINAL_PROMPT=0 so a misconfig fails fast instead of prompting.
-# On an approval prompt you'll get a link (agent prompt + git's error output) —
-# surface it, the user taps a passkey, then re-run the same command.
+# Run git with GIT_TERMINAL_PROMPT=0 so a misconfig fails fast. If an operation
+# needs approval you'll get a link — surface it, the user taps a passkey, re-run.
 """
 
 [service]
 id = "gitlab"
 name = "GitLab"
 
-# One GitLab connection (one PAT) backs BOTH the REST API and the git transport,
-# sharing `GITLAB_TOKEN`. Mirrors the `github` recipe; the differences are the
-# REST host/header and the git Basic-auth shape (GitLab needs a non-empty
-# username, conventionally `oauth2`, with the token as the password).
+# One GitLab connection (one PAT) backs both the REST API and git: `rest` at
+# /use/gitlab (buffered), `git` at /stream/gitlab (streamed smart-HTTP); both use
+# GITLAB_TOKEN.
 
-# A. REST API  →  /v/{vid}/use/gitlab
 [[upstream]]
 id = "rest"
 url = "https://gitlab.com/api/v4"
 auth = { secret = "GITLAB_TOKEN", placeholder = "glpat-..." }
 
   [upstream.headers]
-  # Canonical PAT header for the GitLab REST API. (GitLab also accepts
-  # `Authorization: Bearer <token>`; PRIVATE-TOKEN is the unambiguous PAT form.)
+  # PRIVATE-TOKEN is the unambiguous PAT header (Bearer also works).
   PRIVATE-TOKEN = "{{secret.GITLAB_TOKEN}}"
 
-# B. git smart-HTTP  →  /v/{vid}/stream/gitlab
 [[upstream]]
 id = "git"
 url = "https://gitlab.com"
@@ -48,9 +40,8 @@ stream = true
 auth = { secret = "GITLAB_TOKEN" }
 
   [upstream.headers]
-  # GitLab git smart-HTTP = HTTP Basic with a non-empty username (`oauth2`) and
-  # the token as the password = base64("oauth2:" + token), which
-  # `{{secret.NAME | basic:oauth2}}` produces.
+  # GitLab needs a non-empty Basic username (`oauth2`) with the token as password:
+  # base64("oauth2:" + token), via `{{secret.X | basic:oauth2}}`.
   Authorization = "Basic {{secret.GITLAB_TOKEN | basic:oauth2}}"
 
 [[api]]

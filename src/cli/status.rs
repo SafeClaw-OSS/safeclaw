@@ -75,7 +75,7 @@ pub async fn fetch_status(custodian: &str, vault: &str) -> VaultStatus {
     }
     let passkeys = pk_body.get("passkeys").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
 
-    let kk_url = format!("{}/v/{}/keys-known", custodian.trim_end_matches('/'), urlencoding::encode(vault));
+    let kk_url = format!("{}/v/{}/secret-keys", custodian.trim_end_matches('/'), urlencoding::encode(vault));
     match client.get(&kk_url).send().await {
         Ok(r) if r.status().is_success() => {
             let n = r.json::<serde_json::Value>().await.ok()

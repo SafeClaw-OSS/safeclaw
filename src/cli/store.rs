@@ -43,7 +43,7 @@ struct StoreError {
 
 async fn ls(custodian: &str, vault: &str) -> Result<(), String> {
     let url = format!(
-        "{}/v/{}/keys-known",
+        "{}/v/{}/secret-keys",
         custodian.trim_end_matches('/'),
         urlencoding::encode(vault)
     );

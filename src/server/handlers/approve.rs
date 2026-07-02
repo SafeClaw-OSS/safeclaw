@@ -466,7 +466,7 @@ pub async fn approve_op(
             // snapshots stay stuck on the pre-Write state until the
             // user manually locks + unlocks — most visible symptom is
             // a freshly-Connected GCP store whose `list()` keys never
-            // surface in /v/{vid}/keys-known. Best-effort: a rotation-
+            // surface in /v/{vid}/secret-keys. Best-effort: a rotation-
             // case decrypt failure leaves the cache stale but doesn't
             // fail the Write.
             if state.is_vault_locked(&vault_id) {
@@ -1146,12 +1146,12 @@ pub(crate) fn bootstrap_cache_from_view(
         .map(|(c, conn)| (c.clone(), conn.clone()))
         .collect();
     // Snapshot native-store item names (names only, never values). Surface
-    // for GET /v/{vid}/keys-known so the frontend can compute "which
+    // for GET /v/{vid}/secret-keys so the frontend can compute "which
     // services are reachable" without re-walking the kv map.
     for name in view.native_secrets.keys() {
         cache.native_keys.insert(name.clone());
     }
-    // Snapshot external stores' adapter inputs so GET /v/{vid}/keys-known
+    // Snapshot external stores' adapter inputs so GET /v/{vid}/secret-keys
     // can list() them later without re-decrypting the vault. Only kinds
     // we have an adapter for today — others are skipped (they live in
     // store_order but never resolve).

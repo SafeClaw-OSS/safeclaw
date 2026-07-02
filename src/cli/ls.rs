@@ -1,6 +1,6 @@
 //! `safeclaw ls` — list secret names known to the active vault.
 //!
-//! Hits the custodian's `GET /v/{vid}/keys-known` (cache-driven; no passkey
+//! Hits the custodian's `GET /v/{vid}/secret-keys` (cache-driven; no passkey
 //! ceremony). Vault must be Unlocked — the custodian returns 409 otherwise,
 //! which we map to a "run `safeclaw unlock` first" hint.
 //!
@@ -41,7 +41,7 @@ pub async fn run(args: CommonArgs) -> Result<(), String> {
     let (custodian, vault) = resolve_active(args.vault.as_deref())?;
 
     let url = format!(
-        "{}/v/{}/keys-known",
+        "{}/v/{}/secret-keys",
         custodian.trim_end_matches('/'),
         urlencoding::encode(&vault)
     );

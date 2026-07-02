@@ -1,38 +1,32 @@
-# Agent-facing setup. Iron rule — goal + building blocks + a canonical example;
-# the agent inspects the real remotes and adapts (don't blindly paste).
 setup = """
 Route the user's git remotes through SafeClaw so the GitHub PAT never enters git
-or the agent process. Auth: credential.helper = !sc git-credential — git fetches
-your SAFECLAW_API_KEY from the env at run-time, so nothing lands on disk.
+or your process. git authenticates to the broker with a credential helper that
+reads $SAFECLAW_API_KEY at run-time — nothing lands on disk.
 
 # Inspect first — don't assume github.com:
 git remote -v ; git config --get-regexp '^url\\.'
 
-# 1) one-time per machine: let git get the broker key from sc. Scoped to the broker
-#    host; sc reads $SAFECLAW_API_KEY at git-time, so the key is never written to disk:
+# 1) one-time per machine — register sc as the credential helper for the broker host:
 git config --global credential."{{proxy_base}}".helper "!sc git-credential"
 
-# 2) route GitHub through SafeClaw — the PAT is injected by the broker, never enters git:
+# 2) route GitHub through the broker (PAT injected at egress, never enters git):
 git config --global url."{{proxy_base}}/stream/github/".insteadOf "https://github.com/"
 
-# SSH remotes? rewrite them too (then the SSH key is no longer needed):
+# SSH remotes? rewrite them to the same route too (no SSH key needed):
 #   git config --global url."{{proxy_base}}/stream/github/".insteadOf "git@github.com:"
-#   git config --global url."{{proxy_base}}/stream/github/".insteadOf "ssh://git@github.com/"
 
-# Tip: run git with GIT_TERMINAL_PROMPT=0 so a misconfig fails fast instead of prompting.
-# On an approval prompt you'll get a link (agent prompt + git's error output) —
-# surface it, the user taps a passkey, then re-run the same command.
+# Run git with GIT_TERMINAL_PROMPT=0 so a misconfig fails fast. If an operation
+# needs approval you'll get a link — surface it, the user taps a passkey, re-run.
 """
 
 [service]
 id = "github"
 name = "GitHub"
 
-# One GitHub connection (one PAT) backs BOTH the REST API and the git transport.
-# `rest` is reached at /v/{vid}/use/github (buffered broker); `git` is reached at
-# /v/{vid}/stream/github (unbuffered smart-HTTP). They share `GITHUB_TOKEN`.
+# One GitHub connection (one PAT) backs both the REST API and git: `rest` at
+# /use/github (buffered), `git` at /stream/github (streamed smart-HTTP); both use
+# GITHUB_TOKEN.
 
-# A. REST API  →  /v/{vid}/use/github
 [[upstream]]
 id = "rest"
 url = "https://api.github.com"
@@ -41,18 +35,15 @@ auth = { secret = "GITHUB_TOKEN", placeholder = "github_pat_..." }
   [upstream.headers]
   Authorization = "Bearer {{secret.GITHUB_TOKEN}}"
 
-# B. git smart-HTTP  →  /v/{vid}/stream/github
 [[upstream]]
 id = "git"
 url = "https://github.com"
-# Opt into the generic streaming passthrough (the /stream/ route).
 stream = true
 auth = { secret = "GITHUB_TOKEN" }
 
   [upstream.headers]
-  # GitHub PAT over git smart-HTTP = HTTP Basic with the token as the username and
-  # an empty password — i.e. `https://<token>@github.com/…` = base64(token + ':'),
-  # which `{{secret.NAME | basic}}` produces.
+  # git smart-HTTP wants the PAT as the Basic username with an empty password —
+  # base64(token + ':'), which `{{secret.X | basic}}` produces.
   Authorization = "Basic {{secret.GITHUB_TOKEN | basic}}"
 
 [[api]]

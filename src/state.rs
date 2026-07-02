@@ -123,12 +123,12 @@ pub struct SecretsCache {
     /// restart also blows it away (vaults boot Locked, cache starts empty).
     pub rule_approvals: HashMap<(String, String, String), u64>,
     /// Item names present in the decrypted `native-secrets` kv (names only,
-    /// never values). Surface for `GET /v/{vid}/keys-known` so the frontend
+    /// never values). Surface for `GET /v/{vid}/secret-keys` so the frontend
     /// can decide which services are "reachable" without paying for an
     /// external-store roundtrip. Populated at unlock; cleared on lock.
     pub native_keys: HashSet<String>,
     /// External stores' adapter inputs, snapshotted at unlock so live
-    /// `list()` calls from `GET /v/{vid}/keys-known` can rebuild adapters
+    /// `list()` calls from `GET /v/{vid}/secret-keys` can rebuild adapters
     /// without re-decrypting the vault. Value: (store record from aux,
     /// resolved credential bytes from native-secrets). Sparse — only
     /// kinds with an adapter (today: gcp-secret-manager) populate.

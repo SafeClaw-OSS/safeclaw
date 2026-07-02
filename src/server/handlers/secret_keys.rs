@@ -1,4 +1,4 @@
-//! `GET /v/{vid}/keys-known` — per-store breakdown of what this vault can resolve.
+//! `GET /v/{vid}/secret-keys` — per-store breakdown of what this vault can resolve.
 //!
 //! Returns native-secrets item names + each external store's `list()` output
 //! tagged with the store id. Frontend uses this to render the unified Entries
@@ -43,7 +43,7 @@ use crate::store::adapters::gcp::GcpSecretManagerAdapter;
 /// listSecrets completes (typical ~300-800ms).
 const LIST_TIMEOUT: Duration = Duration::from_secs(3);
 
-pub async fn keys_known(
+pub async fn secret_keys(
     State(state): State<Arc<AppState>>,
     Path(vault_id): Path<String>,
 ) -> Result<Json<Value>> {
@@ -97,7 +97,7 @@ pub async fn keys_known(
             Ok(a) => a,
             Err(e) => {
                 // F-20: log full error server-side; return sanitised message to caller.
-                tracing::warn!(store = %store_id, "keys-known adapter init error: {}", e);
+                tracing::warn!(store = %store_id, "secret-keys adapter init error: {}", e);
                 store_errors.push(json!({
                     "store_id": store_id,
                     "error": format!("store '{}' unavailable", store_id),
@@ -118,7 +118,7 @@ pub async fn keys_known(
                 // F-20: log the full error (may contain project id / GCP response body)
                 // server-side only; return a sanitised summary to the caller so we
                 // don't leak GCP project identifiers or raw API responses.
-                tracing::warn!(store = %store_id, "keys-known list error: {}", e);
+                tracing::warn!(store = %store_id, "secret-keys list error: {}", e);
                 store_errors.push(json!({
                     "store_id": store_id,
                     "error": format!("store '{}' unavailable", store_id),

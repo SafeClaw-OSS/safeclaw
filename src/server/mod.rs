@@ -62,7 +62,7 @@ pub fn app_router(state: Arc<AppState>) -> Router {
         .route("/v/{vid}/pending-passkeys", post(handlers::pending_passkey::create))
         .route("/v/{vid}/events", get(handlers::events::stream))
         .route("/v/{vid}/approvals", get(handlers::approvals::list))
-        .route("/v/{vid}/keys-known", get(handlers::keys_known::keys_known))
+        .route("/v/{vid}/secret-keys", get(handlers::secret_keys::secret_keys))
         .route("/v/{vid}/registry", get(handlers::registry::vault_registry))
         .route("/v/{vid}/usage", get(handlers::usage::usage))
         // Op-flat (vault context lives on the approval record).
