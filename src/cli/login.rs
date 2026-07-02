@@ -132,7 +132,7 @@ pub async fn run(args: LoginArgs) -> Result<(), String> {
                 custodian
             ),
             410 => format!(
-                "pair-token expired (10-min TTL). Generate a new one at {}/dashboard (\"Connect a new agent\").",
+                "pair-token expired. Generate a new one at {}/dashboard (\"Connect a new agent\").",
                 custodian
             ),
             other => {
