@@ -76,7 +76,7 @@ pub async fn execute_use_forward(
         op,
         wrapping_key,
         credential_id_bytes,
-        vault,
+        Some(vault),
     )?;
 
     // Primary secret (op.act.target). For oauth2 services this is the
@@ -228,7 +228,7 @@ pub async fn resolve_use_primary(
         op,
         wrapping_key,
         credential_id_bytes,
-        vault,
+        Some(vault),
     )?;
     view.resolve_value_async(&op.act.target)
         .await?

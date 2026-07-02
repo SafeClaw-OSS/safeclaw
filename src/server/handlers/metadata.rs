@@ -343,13 +343,16 @@ pub fn open_view_for_grant(
     op: &Operation,
     wrapping_key: &[u8],
     credential_id_bytes: &[u8],
-    vault: &crate::storage::SealedVault,
+    vault: Option<&crate::storage::SealedVault>,
 ) -> Result<VaultPlaintextView> {
     if let Ok(path) = state.vaults.per_item_path(vault_id) {
         if let Ok(Some(pv)) = crate::storage::sealed_vault::read_per_item(&path) {
             return decrypt_vault_view_peritem(wrapping_key, credential_id_bytes, &pv, vault_id);
         }
     }
+    // Whole-blob fallback — only vaults that still have a vault.dat (daemon-side
+    // Enroll/Write) reach here; a web-enrolled per-item vault is served above.
+    let vault = vault.ok_or_else(|| AppError::Conflict("vault not initialized".into()))?;
     decrypt_vault_view(op, wrapping_key, credential_id_bytes, vault)
 }
 
@@ -361,7 +364,7 @@ pub fn open_view_for_grant_keep_key(
     op: &Operation,
     wrapping_key: &[u8],
     credential_id_bytes: &[u8],
-    vault: &crate::storage::SealedVault,
+    vault: Option<&crate::storage::SealedVault>,
 ) -> Result<(VaultPlaintextView, zeroize::Zeroizing<Vec<u8>>)> {
     if let Ok(path) = state.vaults.per_item_path(vault_id) {
         if let Ok(Some(pv)) = crate::storage::sealed_vault::read_per_item(&path) {
@@ -373,6 +376,8 @@ pub fn open_view_for_grant_keep_key(
             );
         }
     }
+    // Whole-blob fallback — see open_view_for_grant.
+    let vault = vault.ok_or_else(|| AppError::Conflict("vault not initialized".into()))?;
     decrypt_vault_view_keep_key(op, wrapping_key, credential_id_bytes, vault)
 }
 

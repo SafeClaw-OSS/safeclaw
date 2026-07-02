@@ -39,7 +39,8 @@ use crate::server::handlers::metadata::decrypt_vault_view_keep_key;
 use crate::storage::plaintext::VaultPlaintextView;
 use crate::state::{ApprovalEvent, AppState, SecretsCache};
 use crate::storage::sealed_vault::{
-    build_initial, find_pubkey, read as read_vault, replace_after_write, write_atomic,
+    build_initial, find_pubkey, find_pubkey_in_registry, read as read_vault, read_per_item,
+    replace_after_write, write_atomic,
 };
 
 /// `GET /op/{op_id}` — JSON poll: status + cached value + render(o).
@@ -154,8 +155,24 @@ pub async fn approve_op(
     // already enrolled — look it up in the existing vault.
     let vault_path = state.vaults.vault_path(&vault_id)?;
     let existing_vault = read_vault(&vault_path)?;
+    // A web-enrolled vault synced down as per-item rows (vault.per-item.json)
+    // has NO vault.dat — its keyset (credential pubkeys) lives in the per-item
+    // store. Read it once so credential lookup + the read grants (Unlock / Use /
+    // Export) below work for those vaults too.
+    let existing_per_item = state
+        .vaults
+        .per_item_path(&vault_id)
+        .ok()
+        .and_then(|p| read_per_item(&p).ok().flatten());
     let lookup_credential = |cred_id_b64: &str| -> Option<PasskeyEntry> {
-        existing_vault.as_ref().and_then(|v| find_pubkey(v, cred_id_b64))
+        existing_vault
+            .as_ref()
+            .and_then(|v| find_pubkey(v, cred_id_b64))
+            .or_else(|| {
+                existing_per_item
+                    .as_ref()
+                    .and_then(|pv| find_pubkey_in_registry(&pv.keyset.registry, cred_id_b64))
+            })
     };
     // 3c. HPKE-unseal W_c if the grant carries a sealed wrapping key (the web /
     // op-relay path). The browser sealed W* to our `sc_pk` with
@@ -560,18 +577,15 @@ pub async fn approve_op(
                 ));
             }
             let path = as_export_path(&validated.op)?;
-            let vault = existing_vault
-                .clone()
-                .ok_or_else(|| AppError::Conflict("vault not initialized".into()))?;
-            // PER-ITEM read seam: resolve id → unseal_item → bytes via the item
-            // rows (folded to a view), falling back to whole-blob (stubbed[]).
+            // Read seam: per-item store first, whole-blob vault.dat as fallback
+            // (Option — a web-enrolled per-item vault has no vault.dat).
             let view = crate::server::handlers::metadata::open_view_for_grant(
                 &state,
                 &vault_id,
                 &validated.op,
                 &validated.wrapping_key,
                 &validated.credential_id_bytes,
-                &vault,
+                existing_vault.as_ref(),
             )?;
 
             // Editor reveal-all: target = "env" (legacy alias) or "" surfaces
@@ -735,11 +749,8 @@ pub async fn approve_op(
             // shape Export-with-target="env" returned, so /try's editor
             // doesn't need a separate reveal call).
             "vault-unlock" => {
-                let vault = existing_vault
-                    .clone()
-                    .ok_or_else(|| AppError::Conflict("vault not initialized".into()))?;
-                // PER-ITEM read seam (keep K for the unlocked session), whole-
-                // blob fallback (stubbed[]).
+                // Read seam: per-item store first (a web-enrolled vault has only
+                // vault.per-item.json, no vault.dat), whole-blob as Option fallback.
                 let (view, unlock_key) =
                     crate::server::handlers::metadata::open_view_for_grant_keep_key(
                         &state,
@@ -747,7 +758,7 @@ pub async fn approve_op(
                         &validated.op,
                         &validated.wrapping_key,
                         &validated.credential_id_bytes,
-                        &vault,
+                        existing_vault.as_ref(),
                     )?;
                 // Editor response: native-secrets items as utf8 strings + the
                 // full v3 aux so the editor can render the stores list and
