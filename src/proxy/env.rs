@@ -15,7 +15,7 @@ use axum::{
     http::StatusCode,
     Json,
 };
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use crate::error::{AppError, Result};
 use crate::protocol::operation::{Act, ActType, Bind, Operation, Valid};
@@ -40,7 +40,7 @@ pub async fn handle(
     State(state): State<Arc<AppState>>,
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Path((vault_id, key)): Path<(String, String)>,
-) -> Result<(StatusCode, Json<Value>)> {
+) -> Result<axum::response::Response> {
     validate_vault_id(&vault_id)?;
     validate_key(&key)?;
 
@@ -85,22 +85,8 @@ pub async fn handle(
         reason: None,
     });
 
-    // Wire shape per the skill contract (same as /use/): `status: "pending"`
-    // + a nested `approval{}` the agent reads its URLs from.
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(json!({
-            "status": "pending",
-            "op_id": op_id,
-            "r": r,
-            "approval": {
-                "id": op_id,
-                "approve_url": crate::cli::active::grant_url(&op_id),
-                "poll_url": format!("/op/{}", op_id),
-                "expires_at": expires_at,
-            },
-        })),
-    ))
+    // Same 202 shape + async signals as /use/ (Location, Retry-After, interval).
+    Ok(crate::proxy::use_broker::pending_202(&op_id, &r, expires_at))
 }
 
 #[allow(dead_code)] // used only by the disabled `handle`

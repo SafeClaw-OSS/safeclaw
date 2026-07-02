@@ -38,7 +38,7 @@ pub async fn handle_no_rest(
     Path((vault_id, connection)): Path<(String, String)>,
     headers: HeaderMap,
     body: Bytes,
-) -> Result<(StatusCode, Json<Value>)> {
+) -> Result<axum::response::Response> {
     handle_impl(state, addr, method, vault_id, connection, String::new(), headers, body).await
 }
 
@@ -49,7 +49,7 @@ pub async fn handle(
     Path((vault_id, connection, rest)): Path<(String, String, String)>,
     headers: HeaderMap,
     body: Bytes,
-) -> Result<(StatusCode, Json<Value>)> {
+) -> Result<axum::response::Response> {
     handle_impl(state, addr, method, vault_id, connection, rest, headers, body).await
 }
 
@@ -66,7 +66,7 @@ async fn handle_impl(
     rest: String,
     headers: HeaderMap,
     body: Bytes,
-) -> Result<(StatusCode, Json<Value>)> {
+) -> Result<axum::response::Response> {
     validate_vault_id(&vault_id)?;
 
     // Locked-state gate (H3 / PROTOCOL.md §6.3). When the vault is Locked,
@@ -281,6 +281,7 @@ async fn handle_impl(
         // Same response shape the agent sees when polling /op/{id} after a
         // cache-miss approval — `{ status: "ok", value: <upstream envelope> }`
         // — so the skill handles 200-immediate and 202-then-poll uniformly.
+        use axum::response::IntoResponse;
         return Ok((
             StatusCode::OK,
             Json(json!({
@@ -289,7 +290,8 @@ async fn handle_impl(
                 "act": "use",
                 "value": serde_json::to_value(&response).unwrap_or(Value::Null),
             })),
-        ));
+        )
+            .into_response());
         }
         // Allow + cache miss falls through: pending op below will lazily
         // resolve via execute_use_forward (which walks store_order through
@@ -356,10 +358,22 @@ async fn handle_impl(
 
     let (op_id, r, expires_at) =
         register_pending_use(&state, &vault_id, op, policy_context, addr.ip())?;
+    Ok(pending_202(&op_id, &r, expires_at))
+}
 
-    // Wire shape per the skill contract: `status: "pending"` + a nested
-    // `approval{}` the agent reads its URLs from.
-    Ok((
+/// The 202 pending-approval response, with the async-request-reply signals
+/// generic HTTP tooling understands (`Location` → the pollable op resource,
+/// `Retry-After` = the poll pacing, mirrored as `approval.interval`; relative
+/// `expires_in` alongside absolute `expires_at` — RFC 8628 conventions).
+/// Wire shape per the skill contract: `status: "pending"` + nested `approval{}`.
+pub(crate) fn pending_202(op_id: &str, r: &str, expires_at: u64) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let interval = crate::approval::store::POLL_INTERVAL_HINT_SECS;
+    let mut resp = (
         StatusCode::ACCEPTED,
         Json(json!({
             "status": "pending",
@@ -369,13 +383,24 @@ async fn handle_impl(
                 "id": op_id,
                 // Human taps their passkey here (cloud /grant page when paired;
                 // relative local op-page for self-host). See active::grant_url.
-                "approve_url": crate::cli::active::grant_url(&op_id),
+                "approve_url": crate::cli::active::grant_url(op_id),
                 // Agent polls the LOCAL daemon (relative; resolves against VAULT_URL).
                 "poll_url": format!("/op/{}", op_id),
                 "expires_at": expires_at,
+                "expires_in": expires_at.saturating_sub(now),
+                "interval": interval,
             },
         })),
-    ))
+    )
+        .into_response();
+    let h = resp.headers_mut();
+    if let Ok(v) = axum::http::HeaderValue::from_str(&format!("/op/{}", op_id)) {
+        h.insert(axum::http::header::LOCATION, v);
+    }
+    if let Ok(v) = axum::http::HeaderValue::from_str(&interval.to_string()) {
+        h.insert(axum::http::header::RETRY_AFTER, v);
+    }
+    resp
 }
 
 /// Shared tail of the Use pending-op flow, used by BOTH the buffered `/use/`

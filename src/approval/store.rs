@@ -80,6 +80,11 @@ impl ApprovalRecord {
 /// tap their passkey before it expires. 30 minutes.
 pub const DEFAULT_TTL: Duration = Duration::from_secs(1800);
 
+/// Suggested agent poll pacing for a pending op, surfaced as `Retry-After` and
+/// `approval.interval` (the RFC 8628 / async-request-reply convention) so
+/// agents don't invent their own loop cadence.
+pub const POLL_INTERVAL_HINT_SECS: u64 = 3;
+
 /// Maximum consecutive failed approve attempts before the op is auto-rejected.
 /// Generous enough that a legitimate user never hits it, but blocks brute-force
 /// on the computationally-expensive ECDSA verify + AEAD decrypt path.

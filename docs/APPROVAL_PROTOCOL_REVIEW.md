@@ -34,19 +34,16 @@ approval + poll-to-resume is the *standard* way to do human-gated agent
 actions in 2026 — including for payments (Stripe, x402) and step-up auth
 (RFC 9470). Not 闭门造车.
 
-## 2. Where we deviate from convention → adopt (cheap)
+## 2. Where we deviated from convention → ✅ ADOPTED (2026-07-03, rides the release after v1.0.41)
 
-1. **No pacing signal.** RFC 8628/CIBA have `interval` (+ `slow_down`); Azure
-   uses `Retry-After`. → Add **`Retry-After: 3`** header on the 202 AND on
-   pending polls; add `"interval": 3` in `approval{}`. Kills guess-loops like
-   the agent's improvised 60×1s.
-2. **No `Location`.** The async-request-reply convention is a
-   `Location`/`Operation-Location` header pointing at the pollable resource.
-   → Add `Location: /op/{id}` on the 202. Generic HTTP tooling then
-   understands the flow without reading our docs.
-3. **Relative expiry.** Standards use `expires_in` (seconds, clock-skew-proof);
-   we ship absolute `expires_at` (unix). → Add `"expires_in"` alongside
-   (keep `expires_at`).
+1. **Pacing signal** (RFC 8628/CIBA `interval`; Azure `Retry-After`):
+   `Retry-After` header on the 202 AND on pending polls; `approval.interval`.
+   Kills guess-loops like the agent's improvised 60×1s.
+   (`approval/store.rs POLL_INTERVAL_HINT_SECS`, `use_broker.rs pending_202`.)
+2. **`Location: /op/{id}`** on the 202 — the async-request-reply convention;
+   generic HTTP tooling understands the flow without reading our docs.
+3. **`approval.expires_in`** (relative seconds, clock-skew-proof) alongside the
+   absolute `expires_at`.
 
 ## 3. Considered, deliberately NOT adopted
 
@@ -66,12 +63,11 @@ actions in 2026 — including for payments (Stripe, x402) and step-up auth
 
 ## 4. Status quo of the wire contract (post v1.0.41)
 
-- 202: `{status: "pending", op_id, r, approval: {id, approve_url, poll_url, expires_at}}`
+- 202: `{status: "pending", op_id, r, approval: {id, approve_url, poll_url,
+  expires_at, expires_in, interval}}` + `Location` + `Retry-After` headers.
 - poll: `{status: "pending" | "ok" | "rejected" | "consumed", value?, ...}`;
-  404 = expired/unknown → re-POST the original request.
+  pending carries `Retry-After`; 404 = expired/unknown → re-POST the original
+  request.
 - `value` for Use = the upstream envelope **as an object** `{status, headers,
   body, body_base64?}`; for Export = the raw secret string (never parsed).
 - Pending-op TTL 30 min (`approval/store.rs DEFAULT_TTL`); relay poll covers it.
-
-§2's three items are the remaining gap. Each is additive (headers + one field)
-— no breaking change.

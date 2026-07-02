@@ -115,7 +115,7 @@ Every response (initial call and follow-up polls) has the same shape:
 | HTTP | status | extra fields | meaning |
 |------|--------|--------------|---------|
 | 200 | `ok` | `value` | done; use `value` |
-| 202 | `pending` | `approval: {id, approve_url, poll_url, expires_at}` | needs user approve |
+| 202 | `pending` | `approval: {id, approve_url, poll_url, expires_at, expires_in, interval}` | needs user approve; poll every `interval`s (also sent as `Retry-After`) |
 | 403 | `rejected` | — | user denied; do not retry |
 | 404 | (none) | — | expired or unknown |
 

@@ -55,7 +55,7 @@ pub async fn get_op(
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
     match get_op_json(state, op_id).await {
-        Ok(j) => j.into_response(),
+        Ok(resp) => resp,
         Err(e) => e.into_response(),
     }
 }
@@ -63,7 +63,8 @@ pub async fn get_op(
 async fn get_op_json(
     state: Arc<AppState>,
     op_id: String,
-) -> Result<Json<Value>> {
+) -> Result<axum::response::Response> {
+    use axum::response::IntoResponse;
     let store = state.approvals.lock().unwrap();
     let rec = store.get(&op_id).ok_or(AppError::NotFound)?;
     // Consumed ops: the approve window is closed. Return a minimal tombstone
@@ -75,7 +76,8 @@ async fn get_op_json(
         return Ok(Json(json!({
             "op_id": rec.id,
             "status": "consumed",
-        })));
+        }))
+        .into_response());
     }
 
     let act_kind = discriminator(&rec.op.act);
@@ -108,7 +110,7 @@ async fn get_op_json(
         ApprovalStatus::Rejected { .. } => ("rejected", None),
         ApprovalStatus::Consumed => unreachable!("handled above"),
     };
-    Ok(Json(json!({
+    let mut resp = Json(json!({
         "op_id": rec.id,
         "r": rec.r,
         "status": status,
@@ -118,7 +120,18 @@ async fn get_op_json(
         "op": op_json,
         "value": value,
         "expires_at": rec.expires_at_unix,
-    })))
+    }))
+    .into_response();
+    // Pending → advertise the poll pacing (Retry-After, matching the 202's
+    // `approval.interval`) so agents keep a standard cadence.
+    if matches!(rec.status, ApprovalStatus::Pending) {
+        if let Ok(v) = axum::http::HeaderValue::from_str(
+            &crate::approval::store::POLL_INTERVAL_HINT_SECS.to_string(),
+        ) {
+            resp.headers_mut().insert(axum::http::header::RETRY_AFTER, v);
+        }
+    }
+    Ok(resp)
 }
 
 /// `POST /op/{op_id}/approve` — U submits the signed grant. T validates and
