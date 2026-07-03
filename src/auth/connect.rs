@@ -66,18 +66,12 @@ pub fn resolve_exchange_config(
     service: &str,
 ) -> Option<ExchangeConfig> {
     let svc = services.get(service)?;
-    let auth = svc.upstream.first().and_then(|u| u.auth.as_ref())?;
-    if !services.auth_is_oauth2(auth) {
-        return None;
-    }
-    let resolved = services.resolve_oauth_config(auth);
+    let oauth = svc.oauth2.as_ref()?;
+    let resolved = services.resolve_oauth_config(oauth);
     let token_url = resolved.token_url?;
     let client_id = resolved.client_id?;
-    let secret_role = services.service_env_key(service)?;
-    let style = match auth.oauth_style.as_deref() {
-        Some("json") => OAuthStyle::Json,
-        _ => OAuthStyle::Form,
-    };
+    let secret_role = oauth.secret.clone();
+    let style = services.provider_oauth_style(&oauth.provider);
     Some(ExchangeConfig {
         token_url,
         client_id,
@@ -119,13 +113,14 @@ fn set_aux_map<T: Serialize>(m: &mut ProtectedState, key: &str, map: BTreeMap<St
 /// refresh_token at the §3 address (`secret_address(conn, service, role)`,
 /// overwriting any prior one — a re-connect supersedes) and **MOVE** the entry
 /// from `aux.connecting` into `aux.connections` (no partial/duplicate record).
+/// `hosts` carries any exact FQDNs pinned at connect for a wildcard service.
 /// Pure state transition (no I/O) so it's unit-testable against a mocked
 /// `ProtectedState`.
 pub fn apply_exchange_result(
     m: &mut ProtectedState,
     conn: &str,
     service: &str,
-    config: &BTreeMap<String, String>,
+    hosts: Option<Vec<String>>,
     role: &str,
     tokens: &ExchangedTokens,
 ) {
@@ -140,7 +135,7 @@ pub fn apply_exchange_result(
     let mut connections = aux_map::<Connection>(m, "connections");
     connections.insert(
         conn.to_string(),
-        Connection { service: service.to_string(), config: config.clone() },
+        Connection { service: Some(service.to_string()), hosts },
     );
     set_aux_map(m, "connections", connections);
 }
@@ -201,7 +196,7 @@ where
         };
         // Capture what the post-exchange MOVE needs before `p` is consumed.
         let service = p.service.clone();
-        let config = p.config.clone();
+        let hosts = p.hosts.clone();
         let role = cfg.secret_role.clone();
         match exchange(conn.clone(), cfg, p).await {
             Ok(tokens) => {
@@ -214,7 +209,7 @@ where
                     );
                     continue;
                 }
-                apply_exchange_result(m, &conn, &service, &config, &role, &tokens);
+                apply_exchange_result(m, &conn, &service, hosts, &role, &tokens);
                 completed += 1;
                 tracing::info!(
                     conn = %conn,
@@ -539,9 +534,6 @@ mod tests {
         crate::service::ServiceRegistry::load()
     }
 
-    fn empty_config() -> BTreeMap<String, String> {
-        BTreeMap::new()
-    }
 
     #[test]
     fn collect_pending_reads_aux_connecting() {
@@ -583,7 +575,7 @@ mod tests {
             &mut m,
             "gmail",
             "gmail",
-            &empty_config(),
+            None,
             "GMAIL_REFRESH_TOKEN",
             &tokens(Some("rt-NEW")),
         );
@@ -593,7 +585,7 @@ mod tests {
             "connecting entry must be dropped after exchange"
         );
         let conns = aux_map::<Connection>(&m, "connections");
-        assert_eq!(conns.get("gmail").map(|c| c.service.as_str()), Some("gmail"));
+        assert_eq!(conns.get("gmail").and_then(|c| c.service.as_deref()), Some("gmail"));
     }
 
     #[test]
@@ -604,33 +596,31 @@ mod tests {
             &mut m,
             "gmail-work",
             "gmail",
-            &empty_config(),
+            None,
             "GMAIL_REFRESH_TOKEN",
             &tokens(Some("rt-NEW")),
         );
         assert_eq!(m.secret("gmail-work:GMAIL_REFRESH_TOKEN").unwrap(), b"rt-NEW");
         assert!(m.secrets.get("GMAIL_REFRESH_TOKEN").is_none(), "named conn must not write the bare name");
         let conns = aux_map::<Connection>(&m, "connections");
-        assert_eq!(conns.get("gmail-work").map(|c| c.service.as_str()), Some("gmail"));
+        assert_eq!(conns.get("gmail-work").and_then(|c| c.service.as_deref()), Some("gmail"));
     }
 
     #[test]
-    fn apply_exchange_carries_config_into_connection() {
-        let mut cfg = BTreeMap::new();
-        cfg.insert("host".to_string(), "git.acme.com".to_string());
-        let mut m = with_connecting("acme-gitlab", "gitlab", "code-AUX");
+    fn apply_exchange_carries_pinned_hosts_into_connection() {
+        let mut m = with_connecting("acme-forge", "acme", "code-AUX");
         apply_exchange_result(
             &mut m,
-            "acme-gitlab",
-            "gitlab",
-            &cfg,
-            "GITLAB_TOKEN",
+            "acme-forge",
+            "acme",
+            Some(vec!["tenant.acme.dev".to_string()]),
+            "ACME_TOKEN",
             &tokens(Some("rt-NEW")),
         );
         let conns = aux_map::<Connection>(&m, "connections");
         assert_eq!(
-            conns.get("acme-gitlab").and_then(|c| c.config.get("host")).map(String::as_str),
-            Some("git.acme.com"),
+            conns.get("acme-forge").and_then(|c| c.hosts.clone()),
+            Some(vec!["tenant.acme.dev".to_string()]),
         );
     }
 
@@ -642,7 +632,7 @@ mod tests {
             &mut m,
             "gmail",
             "gmail",
-            &empty_config(),
+            None,
             "GMAIL_REFRESH_TOKEN",
             &tokens(Some("rt-NEW")),
         );
@@ -665,7 +655,7 @@ mod tests {
         assert_eq!(n, 1);
         assert!(aux_map::<Connecting>(&m, "connecting").is_empty(), "connecting cleared");
         assert_eq!(
-            aux_map::<Connection>(&m, "connections").get("gmail").map(|c| c.service.clone()),
+            aux_map::<Connection>(&m, "connections").get("gmail").and_then(|c| c.service.clone()),
             Some("gmail".to_string()),
         );
         assert_eq!(m.secret(&role).unwrap(), b"rt-NEW");

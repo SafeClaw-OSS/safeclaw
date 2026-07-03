@@ -5,7 +5,7 @@
 //! This is the agent→daemon credential (Token 1): it authenticates the local
 //! AGENT to the daemon, so a random other process on the same machine can't
 //! drive the broker (and exfiltrate credentials) just by reaching `127.0.0.1`.
-//! Deliberately **distinct from `crate::auth::bearer`** (which injects a bearer
+//! Deliberately **distinct from the upstream OAuth bearer** (which injects a bearer
 //! into the *upstream* request) and from the daemon→cloud `device-key` written
 //! by `sc login`.
 //!

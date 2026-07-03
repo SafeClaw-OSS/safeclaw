@@ -152,11 +152,11 @@ pub struct SecretsCache {
     /// Keyed by **connection_id** (not service): two Gmail accounts mint and
     /// cache independent access tokens.
     pub oauth_access: HashMap<String, CacheEntry>,
-    /// Routing snapshot: `connection_id → { service, config }`, taken from
+    /// Routing snapshot: `connection_id → { service, hosts }`, taken from
     /// `aux.connections` at unlock (CONNECTION_SCHEMA.md §6). A request at
     /// `/use/<conn>` resolves its service through this map (falling back to
     /// `conn` itself when absent — an unconnected service IS its own default
-    /// connection). `config` feeds `{{connection.<param>}}` slots. Wiped on lock.
+    /// connection). Wiped on lock.
     ///
     /// NOTE on the maps above (`entries`, `allow_secrets`, `oauth_access`,
     /// `rule_approvals`): for connection-routed `/use`/`/stream` the daemon keys
@@ -164,6 +164,10 @@ pub struct SecretsCache {
     /// cache slot. Policy is likewise per-connection (`policy.connections.<id>`),
     /// while the built-in rules it merges come from the shared service recipe.
     pub connections: HashMap<String, crate::storage::plaintext::Connection>,
+    /// Custom (per-vault `aux.services`) service definitions, validated at
+    /// unlock. Wiped on lock (Default drop). A custom service folds into
+    /// discovery like a compiled one and never shadows a built-in id.
+    pub custom_services: HashMap<String, crate::service::ServiceDef>,
 }
 
 #[derive(Debug)]
@@ -335,27 +339,25 @@ impl AppState {
             Some(VaultState::Unlocked { cache, .. }) => cache
                 .connections
                 .get(conn)
-                .map(|c| c.service.clone())
+                .and_then(|c| c.service.clone())
                 .unwrap_or_else(|| conn.to_string()),
             _ => conn.to_string(),
         }
     }
 
-    /// The per-connection config slot values (`{{connection.<param>}}` sources)
-    /// for an Unlocked vault, or `None` when the connection has no explicit
-    /// record / no config (the common default case).
-    pub fn connection_config(
+    /// A custom (per-vault `aux.services`) service definition, cloned out so no
+    /// state lock is held across a forward. `None` when the vault is locked or
+    /// the id isn't a custom service.
+    pub fn custom_service(
         &self,
         vault_id: &str,
-        conn: &str,
-    ) -> Option<std::collections::BTreeMap<String, String>> {
+        service_id: &str,
+    ) -> Option<crate::service::ServiceDef> {
         let states = self.vault_states.lock().unwrap();
         match states.get(vault_id) {
-            Some(VaultState::Unlocked { cache, .. }) => cache
-                .connections
-                .get(conn)
-                .map(|c| c.config.clone())
-                .filter(|m| !m.is_empty()),
+            Some(VaultState::Unlocked { cache, .. }) => {
+                cache.custom_services.get(service_id).cloned()
+            }
             _ => None,
         }
     }
@@ -686,6 +688,7 @@ mod tests {
         let cfg = Config {
             state_dir: PathBuf::from(format!("/tmp/safeclaw-test-{}", std::process::id())),
             port: 0,
+            proxy_port: 0,
             listen: "127.0.0.1".into(),
             origin: "http://localhost".into(),
             rp_id: "localhost".into(),

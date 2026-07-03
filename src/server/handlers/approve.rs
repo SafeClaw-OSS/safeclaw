@@ -268,7 +268,7 @@ pub async fn approve_op(
     // 4. Act dispatch — same logic that previously lived in grant.rs.
     // Captured here for the audit row finalize at the bottom (Use's upstream
     // status code; None for all other act kinds).
-    let mut audit_upstream_status: Option<i64> = None;
+    let audit_upstream_status: Option<i64> = None;
     let (response, cached_value) = match &validated.op.act.kind {
         ActType::Enroll if validated.op.act.target == "passkeys" => {
             // Add-passkey-to-existing-vault path. PROTOCOL.md §3.4 maps
@@ -657,53 +657,12 @@ pub async fn approve_op(
             // and stash the secret for the agent's *retried* stream to consume;
             // do NOT forward — there is no buffered request here (the real one
             // rides the retry stream). use_broker sets scope.authorize_only.
-            if validated
-                .op
-                .act
-                .scope
-                .get("authorize_only")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false)
-            {
-                let s_o = crate::server::broker::resolve_use_primary(
-                    &validated.op,
-                    &validated.wrapping_key,
-                    &validated.credential_id_bytes,
-                    existing_vault.as_ref(),
-                    &state,
-                    &vault_id,
-                )
-                .await?;
-                let conn = validated
-                    .op
-                    .act
-                    .scope
-                    .get("connection_id")
-                    .or_else(|| validated.op.act.scope.get("service"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let ttl = state
-                    .approvals
-                    .lock()
-                    .unwrap()
-                    .get(&op_id)
-                    .and_then(|r| r.policy_context.clone())
-                    .map(|p| p.ttl_seconds)
-                    .unwrap_or(300);
-                if !conn.is_empty() {
-                    let now = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
-                    state.cache_insert(&vault_id, &conn, s_o, Some(now + ttl));
-                }
-                (
-                    json!({ "ok": true, "act": "use", "authorized": true, "stream": true }),
-                    None,
-                )
-            } else {
-            let outcome = crate::server::broker::execute_use_forward(
+// Phantom-only: an approved Use op is ALWAYS authorize_only — the
+            // resident proxy serves live traffic and retries the real request
+            // after approval. Resolve the connection's primary secret with the
+            // verified grant and stash it so the retry fast-paths; never forward
+            // here (there is no buffered request on the op plane).
+            let s_o = crate::server::broker::resolve_use_primary(
                 &validated.op,
                 &validated.wrapping_key,
                 &validated.credential_id_bytes,
@@ -712,65 +671,34 @@ pub async fn approve_op(
                 &vault_id,
             )
             .await?;
-            // Cache the resolved s_o per PROTOCOL.md §6.2 — but ONLY if
-            // the policy decision that drove this op was allow or ask
-            // (with TTL). ask-always explicitly never caches (the bytes
-            // go out of scope here and Rust drops them; we don't
-            // re-export them anywhere).
-            //
-            // The `policy_context` was stamped on the ApprovalRecord at
-            // /use time; we read it here without mutating state. Cache
-            // write happens *after* a successful forward, so a failed
-            // upstream call doesn't pollute the cache.
-            {
-                let pc_for_cache = state
-                    .approvals
-                    .lock()
-                    .unwrap()
-                    .get(&op_id)
-                    .and_then(|r| r.policy_context.clone());
-                if let Some(pc) = pc_for_cache {
-                    // Key the resolved-secret cache by the **connection**
-                    // (CONNECTION_SCHEMA.md §6) so two accounts of one service
-                    // never share a slot. Falls back to `service` for the default
-                    // connection (conn == service).
-                    let conn = validated
-                        .op
-                        .act
-                        .scope
-                        .get("connection_id")
-                        .or_else(|| validated.op.act.scope.get("service"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    if !conn.is_empty() {
-                        let now = SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .map(|d| d.as_secs())
-                            .unwrap_or(0);
-                        let expires_at = match pc.level {
-                            crate::core::policy::AccessLevel::Allow => None, // ∞ until lock
-                            crate::core::policy::AccessLevel::Ask => Some(now + pc.ttl_seconds),
-                            _ => Some(0), // sentinel: don't cache (shouldn't be reached)
-                        };
-                        if expires_at != Some(0) {
-                            state.cache_insert(
-                                &vault_id,
-                                &conn,
-                                outcome.s_o.clone(),
-                                expires_at,
-                            );
-                        }
-                    }
-                }
+            let conn = validated
+                .op
+                .act
+                .scope
+                .get("connection_id")
+                .or_else(|| validated.op.act.scope.get("service"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let ttl = state
+                .approvals
+                .lock()
+                .unwrap()
+                .get(&op_id)
+                .and_then(|r| r.policy_context.clone())
+                .map(|p| p.ttl_seconds)
+                .unwrap_or(300);
+            if !conn.is_empty() {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                state.cache_insert(&vault_id, &conn, s_o, Some(now + ttl));
             }
-            audit_upstream_status = Some(outcome.response.status as i64);
-            let body = serde_json::to_string(&outcome.response)?;
             (
-                json!({ "ok": true, "act": "use", "response": serde_json::from_str::<Value>(&body).unwrap_or(Value::Null) }),
-                Some(body),
+                json!({ "ok": true, "act": "use", "authorized": true, "stream": true }),
+                None,
             )
-            }
         }
         ActType::Custom(name) => match name.as_str() {
             // Lifecycle op (H3 / PROTOCOL.md §6.3): decrypt vault, bootstrap
@@ -1223,32 +1151,20 @@ pub(crate) fn bootstrap_cache_from_view(
                 }
             }
 
-            // v3 multi-secret: resolve every `{{secret.NAME}}` the recipe's
-            // upstream templates (URL + headers + query) reference so the
-            // allow fast-path can render multi-secret recipes without a vault
-            // view. Single-secret recipes yield a one-entry map; oauth recipes
-            // reference no `{{secret.*}}` and so populate nothing here (their
-            // token is minted from the refresh_token at forward time).
+            // v4 multi-secret: resolve each declared `secrets` role so the
+            // allow fast-path can inject multi-secret services without a vault
+            // view. oauth services declare no injectable direct secret here
+            // (their access token is minted from the refresh_token at forward).
             if let Some(svc) = state.services.get(service_id) {
-                if let Some(u) = svc.upstream.first() {
-                    let mut names = crate::server::broker::referenced_secrets(&u.url);
-                    for v in u.headers.values().chain(u.query.values()) {
-                        for n in crate::server::broker::referenced_secrets(v) {
-                            if !names.contains(&n) {
-                                names.push(n);
-                            }
-                        }
+                let mut map: std::collections::HashMap<String, Vec<u8>> =
+                    std::collections::HashMap::new();
+                for name in &svc.service.secrets {
+                    if let Some(val) = view.resolve_value_native(name) {
+                        map.insert(name.clone(), val.to_vec());
                     }
-                    let mut map: std::collections::HashMap<String, Vec<u8>> =
-                        std::collections::HashMap::new();
-                    for name in names {
-                        if let Some(val) = view.resolve_value_native(&name) {
-                            map.insert(name, val.to_vec());
-                        }
-                    }
-                    if !map.is_empty() {
-                        cache.allow_secrets.insert(service_id.to_string(), map);
-                    }
+                }
+                if !map.is_empty() {
+                    cache.allow_secrets.insert(service_id.to_string(), map);
                 }
             }
         }
@@ -1267,7 +1183,10 @@ pub(crate) fn bootstrap_cache_from_view(
     // render path matches `{{secret.<role>}}`. (Allow-level only — ask-level
     // connections resolve lazily from the op's namespaced `target` at approve.)
     for (conn, c) in view.aux.connections.iter() {
-        let service = &c.service;
+        // Raw connections (service: None) have no recipe to bootstrap from; their
+        // bytes resolve lazily at approve. Only service-backed named connections
+        // are pre-bootstrapped here.
+        let Some(service) = c.service.as_deref() else { continue };
         if conn == service {
             continue; // default — already bootstrapped above
         }
@@ -1286,26 +1205,39 @@ pub(crate) fn bootstrap_cache_from_view(
             }
         }
         if let Some(svc) = state.services.get(service) {
-            if let Some(u) = svc.upstream.first() {
-                let mut names = crate::server::broker::referenced_secrets(&u.url);
-                for v in u.headers.values().chain(u.query.values()) {
-                    for n in crate::server::broker::referenced_secrets(v) {
-                        if !names.contains(&n) {
-                            names.push(n);
-                        }
-                    }
+            let mut map: std::collections::HashMap<String, Vec<u8>> =
+                std::collections::HashMap::new();
+            for name in &svc.service.secrets {
+                let addr = crate::storage::plaintext::secret_address(conn, service, name);
+                if let Some(val) = view.resolve_value_native(&addr) {
+                    map.insert(name.clone(), val.to_vec());
                 }
-                let mut map: std::collections::HashMap<String, Vec<u8>> =
-                    std::collections::HashMap::new();
-                for name in names {
-                    let addr = crate::storage::plaintext::secret_address(conn, service, &name);
-                    if let Some(val) = view.resolve_value_native(&addr) {
-                        map.insert(name, val.to_vec()); // bare name → render match
-                    }
-                }
-                if !map.is_empty() {
-                    cache.allow_secrets.insert(conn.clone(), map);
-                }
+            }
+            if !map.is_empty() {
+                cache.allow_secrets.insert(conn.clone(), map);
+            }
+        }
+    }
+
+    // Custom (per-vault `aux.services`) definitions: validate before they can
+    // broker (defense in depth — never trust the stored blob), never shadow a
+    // built-in id, load only if valid. Wiped on lock with the rest of the cache.
+    let known_providers = state.services.provider_names();
+    for (service_id, toml_src) in view.aux.services.iter() {
+        if state.services.get(service_id).is_some() {
+            tracing::warn!(service = %service_id, "custom service shadows a built-in id — skipped");
+            continue;
+        }
+        if let Err(e) = crate::service::validate::validate_service(toml_src, &known_providers) {
+            tracing::warn!(service = %service_id, "custom service failed validation: {:?} — skipped", e);
+            continue;
+        }
+        match toml::from_str::<crate::service::ServiceDef>(toml_src) {
+            Ok(def) => {
+                cache.custom_services.insert(service_id.clone(), def);
+            }
+            Err(e) => {
+                tracing::warn!(service = %service_id, "custom service parse failed: {} — skipped", e)
             }
         }
     }
