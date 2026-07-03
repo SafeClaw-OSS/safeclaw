@@ -33,9 +33,10 @@ use serde_json::Value;
 
 use crate::error::Result;
 use crate::server::handlers::op::validate_vault_id;
-use crate::core::host::phantoms_for;
+use crate::core::host::{phantoms_for, phantoms_for_raw, resolved_hosts};
 use crate::service::{ServiceDef, ServiceRegistry};
 use crate::state::{AppState, VaultState};
+use crate::storage::plaintext::Connection;
 
 #[derive(Debug, Deserialize)]
 pub struct RegistryQuery {
@@ -212,6 +213,63 @@ fn required_keys(def: &ServiceDef) -> Vec<String> {
     }
 }
 
+/// The injectable secret role KEYs a raw connection (`service: None`) owns:
+/// the bare key whose lowercase equals `conn_id` (its sole secret), plus any
+/// `<conn_id>:<ROLE>` namespaced keys. Case-insensitive — conn ids are lowercase
+/// while a stored key is usually upper-case. Mirrors the unlock bootstrap's
+/// reverse-index so discovery advertises exactly what the proxy will resolve.
+fn raw_secret_roles(conn_id: &str, native_keys: &HashSet<String>) -> Vec<String> {
+    let conn_lc = conn_id.to_ascii_lowercase();
+    let prefix = format!("{conn_lc}:");
+    let mut roles: Vec<String> = Vec::new();
+    for k in native_keys {
+        let k_lc = k.to_ascii_lowercase();
+        if k_lc == conn_lc {
+            roles.push(k.clone());
+        } else if let Some(r) = k_lc.strip_prefix(&prefix) {
+            roles.push(r.to_string());
+        }
+    }
+    roles.sort();
+    roles
+}
+
+/// The discovery `phantoms` map + `connected` flag for one connection.
+/// Service-backed → the service def's phantoms (oauth ACCESS + exposes, or the
+/// declared direct secrets), connected when every required secret is present at
+/// its §3 address. Raw → the reverse-indexed native keys, connected when it owns
+/// at least one.
+fn connection_phantoms(
+    conn_id: &str,
+    conn: &Connection,
+    def: Option<&ServiceDef>,
+    native_keys: &HashSet<String>,
+) -> (std::collections::BTreeMap<String, String>, bool) {
+    match &conn.service {
+        Some(service_id) => {
+            let phantoms = def.map(|d| phantoms_for(conn_id, d)).unwrap_or_default();
+            let connected = def
+                .map(|d| {
+                    let required = required_keys(d);
+                    required.is_empty()
+                        || required.iter().all(|role| {
+                            let addr = crate::storage::plaintext::secret_address(
+                                conn_id, service_id, role,
+                            );
+                            native_keys.iter().any(|k| k.eq_ignore_ascii_case(&addr))
+                        })
+                })
+                .unwrap_or(false);
+            (phantoms, connected)
+        }
+        None => {
+            let roles = raw_secret_roles(conn_id, native_keys);
+            let connected = !roles.is_empty();
+            (phantoms_for_raw(conn_id, &roles), connected)
+        }
+    }
+}
+
 fn policy_for(
     services: &ServiceRegistry,
     id: &str,
@@ -307,14 +365,11 @@ fn build_service(
     }
 
     let policy = policy_for(services, id, include_policy_rules);
-    // Phantoms are meaningful per-vault (they name a connection). On the static
-    // catalog face (`overlay: None`) we omit them; on the per-vault face we emit
-    // the default connection's phantoms (conn == service id).
-    let phantoms = if overlay.is_some() {
-        phantoms_for(id, def)
-    } else {
-        std::collections::BTreeMap::new()
-    };
+    // A phantom names a CONNECTION, not a service. Service rows are the browse
+    // catalog ("what SafeClaw supports"); the agent-usable phantoms live on the
+    // per-connection rows appended in `vault_registry` (one per aux.connections
+    // entry — the only records the proxy will resolve). A catalog row carrying a
+    // phantom the proxy can't resolve is exactly the mismatch we avoid here.
 
     RegistryService {
         id: id.to_string(),
@@ -322,7 +377,7 @@ fn build_service(
         category: def.service.category.clone(),
         description: def.service.help.clone(),
         hosts: def.service.hosts.clone(),
-        phantoms,
+        phantoms: std::collections::BTreeMap::new(),
         policy,
         connected,
         needs_reauth: None,
@@ -411,16 +466,22 @@ pub async fn vault_registry(
     // Snapshot native_keys + lock state under the mutex, then drop it
     // before doing per-service rendering. Cheap copy — typically <20
     // keys.
-    let (native_keys, custom_services, locked): (HashSet<String>, Vec<(String, ServiceDef)>, bool) = {
+    #[allow(clippy::type_complexity)]
+    let (native_keys, custom_services, connections, locked): (
+        HashSet<String>,
+        Vec<(String, ServiceDef)>,
+        std::collections::HashMap<String, Connection>,
+        bool,
+    ) = {
         let states = state.vault_states.lock().unwrap();
         match states.get(&vault_id) {
             Some(VaultState::Unlocked { cache, .. }) => {
                 let mut custom: Vec<(String, ServiceDef)> =
                     cache.custom_services.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
                 custom.sort_by(|a, b| a.0.cmp(&b.0));
-                (cache.native_keys.clone(), custom, false)
+                (cache.native_keys.clone(), custom, cache.connections.clone(), false)
             }
-            _ => (HashSet::new(), Vec::new(), true),
+            _ => (HashSet::new(), Vec::new(), std::collections::HashMap::new(), true),
         }
     };
 
@@ -471,6 +532,47 @@ pub async fn vault_registry(
         }
         services.push(svc);
     }
+
+    // ── connection rows ──────────────────────────────────────────────────
+    // A phantom names a CONNECTION, not a service. One row per aux.connections
+    // entry carries the agent-usable phantom(s) + anchored hosts — the ONLY ids
+    // the proxy resolves, so discovery and resolution can't drift. Covers raw
+    // connections (`sc set --host` / `sc connect`, previously invisible to
+    // discovery) and service-backed (default + named) connections alike.
+    if !locked {
+        for (conn_id, conn) in &connections {
+            if ids_filter.as_ref().map_or(false, |set| !set.contains(conn_id)) {
+                continue;
+            }
+            let def: Option<ServiceDef> = conn.service.as_deref().and_then(|s| {
+                state
+                    .services
+                    .get(s)
+                    .cloned()
+                    .or_else(|| custom_services.iter().find(|(k, _)| k == s).map(|(_, d)| d.clone()))
+            });
+            let (phantoms, connected) =
+                connection_phantoms(conn_id, conn, def.as_ref(), &native_keys);
+            let mut svc = RegistryService {
+                id: conn_id.clone(),
+                name: conn_id.clone(),
+                category: "connection".to_string(),
+                description: None,
+                hosts: if summary { Vec::new() } else { resolved_hosts(conn, def.as_ref()) },
+                phantoms: if summary { std::collections::BTreeMap::new() } else { phantoms },
+                policy: None,
+                connected: Some(connected),
+                needs_reauth: None,
+                connect: None,
+                setup: None,
+            };
+            if connected && state.oauth_needs_reauth(&vault_id, conn_id) {
+                svc.needs_reauth = Some(true);
+            }
+            services.push(svc);
+        }
+    }
+
     services.sort_by(|a, b| a.id.cmp(&b.id));
 
     let vault_entries = if locked {

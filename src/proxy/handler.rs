@@ -223,13 +223,32 @@ impl BrokerHandler {
         }
 
         // ── resolve the connection ───────────────────────────────────────────
-        let Some(conn_rec) = self.state.connection_snapshot(&vault_id, &conn) else {
-            return err_response(
-                StatusCode::BAD_REQUEST,
-                "unknown_connection",
-                &format!("unknown connection '{}'", conn),
-            )
-            .into();
+        // Resolve the connection record. An explicit aux.connections entry wins;
+        // otherwise, if <conn> names a known service (compiled or custom) we
+        // synthesize its DEFAULT connection (conn == service, hosts derived from
+        // the service) so a default-connection phantom `__sc__<service>__`
+        // resolves and the resident default-connection credential — bootstrapped
+        // into the cache under the service id — is reachable. Only a genuinely
+        // unknown id fails closed.
+        let conn_rec = match self.state.connection_snapshot(&vault_id, &conn) {
+            Some(rec) => rec,
+            None => {
+                let known_service = self.state.services.get(&conn).is_some()
+                    || self.state.custom_service(&vault_id, &conn).is_some();
+                if known_service {
+                    crate::storage::plaintext::Connection {
+                        service: Some(conn.clone()),
+                        hosts: None,
+                    }
+                } else {
+                    return err_response(
+                        StatusCode::BAD_REQUEST,
+                        "unknown_connection",
+                        &format!("unknown connection '{}'", conn),
+                    )
+                    .into();
+                }
+            }
         };
         let def = conn_rec.service.as_deref().and_then(|s| {
             self.state
@@ -242,10 +261,11 @@ impl BrokerHandler {
         // The service id policy/mint use; for a raw connection there is none so
         // the conn id stands in (registry lookups miss → global default floor).
         let service_id = conn_rec.service.clone().unwrap_or_else(|| conn.clone());
-        let resolved_hosts = self
-            .state
-            .resolved_hosts_for(&vault_id, &conn)
-            .unwrap_or_default();
+        // Compute hosts from the record we hold — NOT a second cache lookup,
+        // which would miss a synthesized default connection and wrongly empty the
+        // anchor (→ spurious widen-deny). For the synthesized default this
+        // derives the service's declared hosts.
+        let resolved_hosts = crate::core::host::resolved_hosts(&conn_rec, def.as_ref());
 
         // ── host anchor (exact FQDN, with the private/metadata floor beneath) ─
         if !crate::core::host::host_allowed(&dest_host, &resolved_hosts) {
