@@ -1,56 +1,21 @@
 setup = """
-Route the user's git through SafeClaw so the GitHub PAT never enters git or your
-process. Register the broker credential helper — host-scoped (only ever fires for
-the broker), reads $SAFECLAW_API_KEY at run-time, nothing on disk:
-
-  git config --global credential."{{proxy_base}}".helper "!sc git-credential"
-
-Then route github → broker. DEFAULT to non-invasive (the user's own git unaffected):
-#   • per repo — use the broker URL as the remote:
-#       git clone {{proxy_base}}/stream/github/<owner>/<repo>.git
-#   • transparent for YOUR session — put the rewrite in your OWN git env, so plain
-#     github.com URLs auto-route and the user's config stays untouched (no restart):
-#       export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="url.{{proxy_base}}/stream/github/.insteadOf" GIT_CONFIG_VALUE_0="https://github.com/"
-
-# Route the USER's own git too (writes their global config) only if they want it —
-# OFFER it (e.g. after repeated use), don't require an answer; stay on the default otherwise:
-#   git config --global url."{{proxy_base}}/stream/github/".insteadOf "https://github.com/"
-#   (add "git@github.com:" for SSH remotes — no SSH key needed then)
-
-# GIT_TERMINAL_PROMPT=0 so a misconfig fails fast. An op needing approval returns a
-# link — surface it, the user taps a passkey, re-run.
+Routed (under `sc run` / the env bundle)? Nothing to configure — $GITHUB_TOKEN is
+already the phantom; git resolves credentials via the safeclaw helper.
+Not routed? Prefix: `sc run -- git clone https://github.com/<owner>/<repo>`.
+Multi-account: switch the phantom value (GITHUB_TOKEN=__sc__github_work__ gh ...),
+or for git put the phantom in the URL username:
+https://__sc__github_work__@github.com/<owner>/<repo>.
+Use HTTPS remotes; SSH is outside the broker.
 """
 
 [service]
 id = "github"
 name = "GitHub"
 
-# One GitHub connection (one PAT) backs both the REST API and git: `rest` at
-# /use/github (buffered), `git` at /stream/github (streamed smart-HTTP); both use
-# GITHUB_TOKEN.
+# One GitHub connection (one PAT) backs both the REST API (api.github.com) and
+# git-over-HTTPS (github.com). Basic self-describes on the wire — no auth section.
+hosts = ["api.github.com", "github.com"]
+secrets = ["GITHUB_TOKEN"]
 
-[[upstream]]
-id = "rest"
-url = "https://api.github.com"
-auth = { secret = "GITHUB_TOKEN", placeholder = "github_pat_..." }
-
-  [upstream.headers]
-  Authorization = "Bearer {{secret.GITHUB_TOKEN}}"
-
-[[upstream]]
-id = "git"
-url = "https://github.com"
-stream = true
-auth = { secret = "GITHUB_TOKEN" }
-
-  [upstream.headers]
-  # git smart-HTTP wants the PAT as the Basic username with an empty password —
-  # base64(token + ':'), which `{{secret.X | basic}}` produces.
-  Authorization = "Basic {{secret.GITHUB_TOKEN | basic}}"
-
-[[api]]
-path = "*"
-
-  [[api.steps]]
-  target = "upstream:rest"
-  returns = true
+[placeholders]
+GITHUB_TOKEN = "github_pat_..."

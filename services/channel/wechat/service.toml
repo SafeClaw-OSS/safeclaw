@@ -2,18 +2,5 @@
 id = "wechat"
 name = "WeChat iLink"
 
-[[upstream]]
-id = "default"
-url = "https://ilinkai.weixin.qq.com"
-auth = { env = "WECHAT_API_KEY" }
-
-  [upstream.headers]
-  Authorization = "Bearer {{secret.WECHAT_API_KEY}}"
-
-[[api]]
-path = "*"
-
-  [[api.steps]]
-  target = "upstream:default"
-  returns = true
-
+hosts = ["ilinkai.weixin.qq.com"]
+secrets = ["WECHAT_API_KEY"]

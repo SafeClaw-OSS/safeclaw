@@ -2,19 +2,8 @@
 id = "deepseek"
 name = "DeepSeek"
 
-[[upstream]]
-id = "default"
-url = "https://api.deepseek.com"
-auth = { env = "DEEPSEEK_API_KEY", placeholder = "sk-..." }
-locked = { response = "Please unlock the SafeClaw vault to use this service." }
+hosts = ["api.deepseek.com"]
+secrets = ["DEEPSEEK_API_KEY"]
 
-  [upstream.headers]
-  Authorization = "Bearer {{secret.DEEPSEEK_API_KEY}}"
-
-[[api]]
-path = "*"
-
-  [[api.steps]]
-  target = "upstream:default"
-  returns = true
-
+[placeholders]
+DEEPSEEK_API_KEY = "sk-..."

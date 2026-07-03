@@ -2,19 +2,10 @@
 id = "google"
 name = "Google AI"
 
-[[upstream]]
-id = "default"
-url = "https://generativelanguage.googleapis.com"
-auth = { env = "GEMINI_API_KEY", placeholder = "AIza..." }
-locked = { response = "Please unlock the SafeClaw vault to use this service." }
+# Gemini takes the key as a query param (`?key=`); the agent writes the phantom
+# there — no declaration beyond host + secret.
+hosts = ["generativelanguage.googleapis.com"]
+secrets = ["GEMINI_API_KEY"]
 
-  [upstream.query]
-  key = "{{secret.GEMINI_API_KEY}}"
-
-[[api]]
-path = "*"
-
-  [[api.steps]]
-  target = "upstream:default"
-  returns = true
-
+[placeholders]
+GEMINI_API_KEY = "AIza..."

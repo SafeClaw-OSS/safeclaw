@@ -2,19 +2,8 @@
 id = "groq"
 name = "Groq"
 
-[[upstream]]
-id = "default"
-url = "https://api.groq.com/openai/v1"
-auth = { env = "GROQ_API_KEY", placeholder = "gsk_..." }
-locked = { response = "Please unlock the SafeClaw vault to use this service." }
+hosts = ["api.groq.com"]
+secrets = ["GROQ_API_KEY"]
 
-  [upstream.headers]
-  Authorization = "Bearer {{secret.GROQ_API_KEY}}"
-
-[[api]]
-path = "*"
-
-  [[api.steps]]
-  target = "upstream:default"
-  returns = true
-
+[placeholders]
+GROQ_API_KEY = "gsk_..."

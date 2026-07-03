@@ -1,9 +1,0 @@
-[default]
-write = "ask"
-read = "ask"
-
-[[rule]]
-id = "openai-any"
-label = "Any call to api.openai.com"
-match = "*"
-risk = "medium"

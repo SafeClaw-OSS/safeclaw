@@ -2,19 +2,11 @@
 id = "telegram"
 name = "Telegram"
 
-# Telegram's Bot API embeds the token in the URL path itself
-# (`/bot<TOKEN>/<method>`), so the upstream URL carries a template
-# that's substituted with the resolved item bytes at forward time.
-# The agent's relative path (`/sendMessage`, `/getUpdates`, …) is
-# appended verbatim after.
-[[upstream]]
-id = "default"
-url = "https://api.telegram.org/bot{{secret.TELEGRAM_BOT_TOKEN}}"
-auth = { env = "TELEGRAM_BOT_TOKEN", placeholder = "123456:ABC-DEF1234..." }
+# Telegram's Bot API carries the token in the URL path (`/bot<TOKEN>/<method>`).
+# The agent writes the phantom there; the proxy substitutes it at egress — no
+# declaration needed beyond the host + secret.
+hosts = ["api.telegram.org"]
+secrets = ["TELEGRAM_BOT_TOKEN"]
 
-[[api]]
-path = "*"
-
-  [[api.steps]]
-  target = "upstream:default"
-  returns = true
+[placeholders]
+TELEGRAM_BOT_TOKEN = "123456:ABC-DEF1234..."

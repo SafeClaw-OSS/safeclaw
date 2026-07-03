@@ -3,19 +3,8 @@ id = "anthropic"
 name = "Anthropic"
 group = "anthropic"
 
-[[upstream]]
-id = "default"
-url = "https://api.anthropic.com"
-auth = { env = "ANTHROPIC_API_KEY", placeholder = "sk-ant-api03-..." }
-locked = { response = "Please unlock the SafeClaw vault to use this service." }
+hosts = ["api.anthropic.com"]
+secrets = ["ANTHROPIC_API_KEY"]
 
-  [upstream.headers]
-  x-api-key = "{{secret.ANTHROPIC_API_KEY}}"
-
-[[api]]
-path = "*"
-
-  [[api.steps]]
-  target = "upstream:default"
-  returns = true
-
+[placeholders]
+ANTHROPIC_API_KEY = "sk-ant-api03-..."
