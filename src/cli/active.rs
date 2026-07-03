@@ -286,15 +286,15 @@ mod tests {
     #[test]
     fn split_vault_url_basic() {
         assert_eq!(
-            split_vault_url("http://localhost:23294/v/abc"),
-            Some(("http://localhost:23294".to_string(), "abc".to_string()))
+            split_vault_url("http://localhost:23295/v/abc"),
+            Some(("http://localhost:23295".to_string(), "abc".to_string()))
         );
     }
 
     #[test]
     fn split_vault_url_no_vid_returns_none() {
-        assert_eq!(split_vault_url("http://localhost:23294"), None);
-        assert_eq!(split_vault_url("http://localhost:23294/v/"), None);
+        assert_eq!(split_vault_url("http://localhost:23295"), None);
+        assert_eq!(split_vault_url("http://localhost:23295/v/"), None);
     }
 
     #[test]

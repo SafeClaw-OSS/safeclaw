@@ -10,7 +10,8 @@ use crate::cli::webauthn::*;
 use crate::cli::active::{forget as forget_vault, join_vault_url, load as load_config, put_active, resolve_active, split_vault_url};
 use crate::config::{VaultCreateArgs, VaultDeleteArgs, VaultForgetArgs, VaultSubcommand, VaultUseArgs};
 
-const LOCAL_CUSTODIAN: &str = "http://localhost:23294";
+// Port must equal `config::CONTROL_PORT` (the daemon's control/API plane).
+const LOCAL_CUSTODIAN: &str = "http://localhost:23295";
 const LOCAL_VAULT_ID: &str = "default";
 
 /// True if the custodian URL points at this machine. Used to specialize
