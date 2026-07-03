@@ -3,4 +3,5 @@
 //! for the SaaS multi-vault custodian.
 
 pub mod forward;
+pub mod host;
 pub mod policy;
