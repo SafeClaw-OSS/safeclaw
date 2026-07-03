@@ -45,8 +45,10 @@ pub fn run() -> Result<(), String> {
 
 /// POSIX-safe single-quote escaping. Wraps the value in `'...'` and
 /// turns inner `'` into the canonical `'\''` close-escape-reopen
-/// sequence. Empty strings stay as `''`.
-fn shell_quote(s: &str) -> String {
+/// sequence. Empty strings stay as `''`. Single-quoting also makes git's
+/// `!sc git-credential` helper marker literal (no history expansion). Shared
+/// with `sc run --export-env`.
+pub(crate) fn shell_quote(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('\'');
     for c in s.chars() {
