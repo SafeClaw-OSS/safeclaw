@@ -140,19 +140,36 @@ pub async fn run(args: UpgradeArgs) -> Result<(), String> {
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .filter(|s| !s.is_empty());
     match &new_version {
-        Some(v) => eprintln!("Upgraded to {} ({}).", v, &actual[..12]),
+        Some(v) => eprintln!(
+            "Upgraded safeclaw {} → {} ({}).",
+            env!("CARGO_PKG_VERSION"),
+            v.strip_prefix("safeclaw ").unwrap_or(v),
+            &actual[..12]
+        ),
         None => eprintln!("Upgraded {} ({}).", current.display(), &actual[..12]),
     }
-    // Take effect now: restart the running daemon onto the new binary so the
-    // user isn't left on the old build. Best-effort — a foreground / non-systemd
-    // daemon just keeps running until it's restarted by hand.
+    // Take effect now: restart the daemon onto the new binary and re-unlock.
+    // Hand the whole convergence to the NEW binary via exec — this process is
+    // still the old build, and driving a new daemon from an old client is a
+    // guaranteed version skew once per upgrade: one wire or unit-convention
+    // change and the convergence hangs or mis-reconciles (v1.0.40→42: the old
+    // poll loop didn't know the "ok" status and sat out its full timeout on an
+    // already-unlocked vault). `restart` reconciles a stale ExecStart, bounces,
+    // then unlocks — same chokepoint as `sc up`, now version-matched to the
+    // daemon by construction. The version probe above already proved the new
+    // binary executes; on success exec never returns.
     if crate::cli::service::unit_installed() {
-        // Bounce onto the new binary AND re-unlock — `restart` reconciles a
-        // stale `custodian run` ExecStart, restarts, then converges through the
-        // same unlock chokepoint as `sc up`, so an upgrade never leaves the
-        // user on a freshly-started-but-Locked daemon.
-        if let Err(e) = crate::cli::up::restart().await {
-            eprintln!("  couldn't auto-restart the daemon ({e}); run `sc up`.");
+        if new_version.is_some() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt;
+                let err = std::process::Command::new(&current).arg("restart").exec();
+                eprintln!("  couldn't hand off to the new binary ({err}); run `sc up`.");
+            }
+            #[cfg(not(unix))]
+            eprintln!("  Restart it with `sc up`.");
+        } else {
+            eprintln!("  couldn't probe the new binary; restart it with `sc up`.");
         }
     } else {
         eprintln!("  Start it with `sc up`.");
