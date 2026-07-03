@@ -1,6 +1,6 @@
 [package]
 name = "safeclaw"
-version = "1.0.44"
+version = "1.1.0"
 edition = "2021"
 description = "SafeClaw daemon — multi-vault passkey-gated credential vault for AI agents"
 # Functional Source License 1.1 (Apache-2.0 future). FSL is not an SPDX id,
@@ -71,6 +71,9 @@ urlencoding = "2"
 # Misc
 clap = { version = "4", features = ["derive", "env"] }
 uuid = { version = "1", features = ["v4", "serde"] }
+# Hidden value prompts for `sc set` / `sc connect` (keeps a secret out of shell
+# history / `ps`).
+rpassword = "7"
 once_cell = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

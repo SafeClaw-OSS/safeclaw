@@ -130,6 +130,20 @@ pub enum Command {
     Set(SetArgs),
     /// Alias for `sc secret rm`.
     Rm(RmArgs),
+    /// Run a command with the resident credential proxy pasted into its
+    /// environment — the everyday, zero-human way an agent routes one command's
+    /// traffic through SafeClaw. `sc run -- <cmd…>` execs the child with the
+    /// proxy + CA env bundle merged in; `sc run --export-env` prints the same
+    /// bundle as shell `export` lines for `eval "$(sc run --export-env)"`. No
+    /// plaintext secret ever enters the child's env — the agent writes the
+    /// phantom (`__sc__<conn>__`) itself; the proxy substitutes at egress.
+    Run(RunArgs),
+    /// Create a raw connection (a secret + its egress host anchor) in one step —
+    /// the CLI twin of the console's custom-connection form. Interactive: prompts
+    /// for host(s) then secret KEY(s) with hidden values. Non-interactive: pass
+    /// `--host <domain>` (repeatable) and `--secret KEY=VALUE` (repeatable) /
+    /// `--use-existing KEY`. The connection is reachable via `__sc__<name>__`.
+    Connect(ConnectArgs),
     /// Print the safeclaw binary version.
     Version,
     /// Health + reachability checks: daemon connectivity, active
@@ -139,14 +153,66 @@ pub enum Command {
     /// runs the static safety checks the console upload editor enforces.
     /// Offline, no daemon needed.
     Service(ServiceArgs),
-    /// git credential helper — **invoked by git, not users**. Registered via
-    /// `git config credential.<broker>.helper "!sc git-credential"`. On `get`
-    /// it returns the agent's `$SAFECLAW_API_KEY` as the Basic password so git
-    /// can authenticate to the LOCAL broker for the streaming (smart-HTTP) git
-    /// route — the key is read from the environment at call time and never
-    /// written to disk. Only answers for the SafeClaw broker host.
+    /// git credential helper — **invoked by git, not users**. Registered
+    /// per-process by `sc run` (`GIT_CONFIG_KEY_*=credential.helper`,
+    /// `GIT_CONFIG_VALUE_*=!sc git-credential`; no gitconfig writes). On `get` it
+    /// finds the connection anchored to git's request host and, when that
+    /// connection has exactly one injectable secret, emits `username=x` +
+    /// `password=<its phantom>`. The resident proxy substitutes the phantom for
+    /// the real credential at egress; git never sees it. Ambiguous / unknown host
+    /// → emits nothing (git falls through). Reads no vault secret — a phantom is
+    /// the only thing it ever prints.
     #[command(name = "git-credential", hide = true)]
     GitCredential(GitCredentialArgs),
+}
+
+/// `sc run` — paste the resident proxy + CA env bundle onto a child (or the
+/// current shell) so its HTTPS traffic is brokered and phantoms substitute.
+#[derive(Debug, Args)]
+pub struct RunArgs {
+    /// Print the env bundle as POSIX `export` lines instead of running a
+    /// command — for `eval "$(sc run --export-env)"` to cover the whole shell.
+    #[arg(long, conflicts_with = "cmd")]
+    pub export_env: bool,
+    /// Override the active vault id (whose phantoms this run resolves). Defaults
+    /// to the active vault from `~/.safeclaw/config.toml`.
+    #[arg(long)]
+    pub vault: Option<String>,
+    /// The command to run, after `--`. Everything past `--` is the child's
+    /// argv, passed through verbatim (`sc run -- git clone https://…`).
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    pub cmd: Vec<String>,
+}
+
+/// `sc connect` — create a raw connection (secret(s) + host anchor) in one
+/// unlock+write cycle.
+#[derive(Debug, Args)]
+pub struct ConnectArgs {
+    /// Connection id: `[a-z0-9_]`, starts alphanumeric, no `__`. Becomes the
+    /// phantom `__sc__<name>__` and the user-facing handle.
+    pub name: String,
+    /// Anchored egress host (exact domain, repeatable). Required for a
+    /// non-interactive create; prompted when omitted on a TTY.
+    #[arg(long)]
+    pub host: Vec<String>,
+    /// A secret to store on this connection: `KEY=VALUE` (non-interactive) or a
+    /// bare `KEY` (prompts for a hidden value on a TTY). Repeatable.
+    #[arg(long)]
+    pub secret: Vec<String>,
+    /// Back this connection with an EXISTING vault secret named KEY (no new
+    /// value). Only valid when that secret's name lowercases to `<name>` (the
+    /// raw single-secret reverse-index) — i.e. promoting a `--no-broker` item.
+    #[arg(long)]
+    pub use_existing: Vec<String>,
+    #[arg(long)]
+    pub vault: Option<String>,
+    #[arg(long)]
+    pub no_browser: bool,
+    /// Fixed port for the localhost callback server (for SSH port-forwarding).
+    #[arg(long, env = "SAFECLAW_CB_PORT")]
+    pub cb_port: Option<u16>,
+    #[arg(long, default_value = "120")]
+    pub timeout: u64,
 }
 
 #[derive(Debug, Args)]
@@ -199,6 +265,27 @@ pub enum ServiceSubcommand {
     /// Validate a service.toml definition against the broker's safety rules.
     /// Prints each problem and exits non-zero on failure.
     Validate(ServiceValidateArgs),
+    /// Store a validated custom service definition in the active vault
+    /// (`aux.services`), so its connections show up in the catalog and can be
+    /// added like any built-in. Validates the v4 schema first; the daemon
+    /// re-validates (provider ∈ shipped, no tool-named sections) at unlock
+    /// before it can broker. Two passkey gestures (unlock + write).
+    Add(ServiceAddArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ServiceAddArgs {
+    /// Path to the v4 service.toml to store in the vault.
+    pub path: std::path::PathBuf,
+    #[arg(long)]
+    pub vault: Option<String>,
+    #[arg(long)]
+    pub no_browser: bool,
+    /// Fixed port for the localhost callback server (for SSH port-forwarding).
+    #[arg(long, env = "SAFECLAW_CB_PORT")]
+    pub cb_port: Option<u16>,
+    #[arg(long, default_value = "120")]
+    pub timeout: u64,
 }
 
 #[derive(Debug, Args)]
@@ -518,7 +605,13 @@ pub struct ServeArgs {
 /// (`$SAFECLAW_VAULT_URL` or `~/.safeclaw/config.toml`), defaulting to the
 /// localhost daemon. Point at another device's daemon via `$SAFECLAW_VAULT_URL`.
 #[derive(Debug, Args)]
-pub struct StatusArgs {}
+pub struct StatusArgs {
+    /// Emit machine-readable JSON (daemon + vault state, the proxy address,
+    /// `routed`, and the agent-facing connections/phantoms) instead of the
+    /// human table.
+    #[arg(long)]
+    pub json: bool,
+}
 
 #[derive(Debug, Args)]
 pub struct SyncArgs {
@@ -622,8 +715,21 @@ pub struct GetArgs {
 pub struct SetArgs {
     /// Native-secrets key name to write (`safeclaw write OPENAI_API_KEY sk-...`).
     pub key: String,
-    /// The secret value. Shell quoting recommended for special chars.
-    pub value: String,
+    /// The secret value. When omitted on a TTY, `sc set` prompts for it hidden
+    /// (keeps it out of shell history / `ps`). Required as an argument when
+    /// stdin isn't a terminal.
+    pub value: Option<String>,
+    /// Anchor the secret to an egress host so the agent can broker it: creates a
+    /// raw connection `__sc__<key>__` → this exact domain (repeatable). Pass
+    /// `--host none` (or `--no-broker`) to store it for humans only. On a TTY a
+    /// host is prompted when neither is given; off a TTY the command errors
+    /// (naming both fixes) rather than storing an unusable item.
+    #[arg(long)]
+    pub host: Vec<String>,
+    /// Store the secret WITHOUT a host anchor — human-only, invisible to the
+    /// agent surface (`sc secret get` reveals it via the passkey ceremony).
+    #[arg(long, conflicts_with = "host")]
+    pub no_broker: bool,
     #[arg(long)]
     pub vault: Option<String>,
     #[arg(long)]
@@ -687,14 +793,8 @@ impl Config {
         // to work. Strips scheme, path, and :port. Falls back to "localhost"
         // if origin is somehow unparseable.
         let rp_id = args.rp_id.unwrap_or_else(|| host_from_origin(&origin).unwrap_or_else(|| "localhost".into()));
-        // state_dir default = ~/.safeclaw/state. Single ~/.safeclaw tree so
-        // the whole vault footprint is one dir to chmod/back up. Falls back
-        // to cwd-relative ./state only if the home dir is somehow unknown.
-        let state_dir = args.state_dir.unwrap_or_else(|| {
-            dirs::home_dir()
-                .map(|h| h.join(".safeclaw").join("state"))
-                .unwrap_or_else(|| PathBuf::from("./state"))
-        });
+        // state_dir default = ~/.safeclaw/state (see `default_state_dir`).
+        let state_dir = args.state_dir.unwrap_or_else(default_state_dir);
         Self {
             state_dir,
             port: args.port,
@@ -706,6 +806,21 @@ impl Config {
             relay_url: args.relay_url,
         }
     }
+}
+
+/// The daemon's state directory, resolved the SAME way `from_serve_args` does:
+/// `$SAFECLAW_STATE_DIR` else `~/.safeclaw/state` (single `~/.safeclaw` tree so
+/// the whole footprint is one dir to chmod/back up; cwd-relative `./state` only
+/// if the home dir is somehow unknown). Short-lived CLI verbs that need the
+/// resident CA path (`sc run`, `sc status`) share this so they never drift from
+/// where the daemon actually wrote `ca.pem`.
+pub fn default_state_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("SAFECLAW_STATE_DIR") {
+        return PathBuf::from(dir);
+    }
+    dirs::home_dir()
+        .map(|h| h.join(".safeclaw").join("state"))
+        .unwrap_or_else(|| PathBuf::from("./state"))
 }
 
 fn host_from_origin(origin: &str) -> Option<String> {
