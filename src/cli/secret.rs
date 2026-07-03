@@ -4,33 +4,141 @@
 //! then write (assertion only) to seal + submit. All crypto local.
 
 use std::collections::BTreeMap;
+use std::io::IsTerminal;
 
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
 use serde_json::{json, Value};
 
 use crate::cli::active::resolve_active;
+use crate::cli::conn::{insert_raw_connection, valid_conn_id, validate_raw_host};
 use crate::cli::webauthn::*;
 use crate::config::{GetArgs, RmArgs, SetArgs};
 use crate::crypto::kdf::WRAP_VERSION;
 
 const DS_SEAL: &[u8] = b"sudp/v1/seal";
 
+/// What `sc set` does with the item's broker binding.
+enum BrokerIntent {
+    /// Store the value with no host — human-only, invisible to the agent.
+    NoBroker,
+    /// Create a raw connection anchored to these exact FQDNs.
+    Host(Vec<String>),
+}
+
 pub async fn run_set(args: SetArgs) -> Result<(), String> {
     let (custodian, vault) = resolve_active(args.vault.as_deref())?;
     let key = args.key.clone();
-    let value = args.value.clone();
-    eprintln!("safeclaw set {} — two passkey gestures (unlock + write)", key);
 
+    // Value: explicit arg, else hidden TTY prompt, else (non-TTY) an error.
+    let value = match args.value.clone() {
+        Some(v) => v,
+        None => prompt_secret_value(&key)?,
+    };
+
+    // Broker intent: --no-broker | --host <h..> | (TTY) prompt | (non-TTY) error.
+    let intent = resolve_broker_intent(&key, &args.host, args.no_broker)?;
+
+    eprintln!("safeclaw set {} — two passkey gestures (unlock + write)", key);
     let meta = fetch_passkey_meta(&custodian, &vault).await?;
-    let (kv, aux, user_key) = do_unlock(&custodian, &vault, &meta, args.no_browser, args.timeout, args.cb_port).await?;
+    let (kv, mut aux, user_key) =
+        do_unlock(&custodian, &vault, &meta, args.no_browser, args.timeout, args.cb_port).await?;
 
     let mut new_kv = kv;
     new_kv.insert(key.clone(), value);
 
+    match intent {
+        BrokerIntent::NoBroker => {
+            eprintln!("  stored · no host anchored — agent cannot use this item (`sc secret get` reveals it for a human)");
+        }
+        BrokerIntent::Host(hosts) => {
+            // The single-secret sugar: the connection id IS the lowercased key
+            // (so the daemon's raw reverse-index matches the bare secret name),
+            // and it must be a valid phantom segment.
+            let conn = key.to_ascii_lowercase();
+            if !valid_conn_id(&conn) {
+                return Err(format!(
+                    "can't derive a connection id from '{}' — use `sc connect <name> --host {} --secret {}=<value>` instead",
+                    key,
+                    hosts.first().map(String::as_str).unwrap_or("<domain>"),
+                    key
+                ));
+            }
+            for h in &hosts {
+                validate_raw_host(h)?;
+            }
+            insert_raw_connection(&mut aux, &conn, &hosts);
+            eprintln!("  connection '{}' → {} · phantom __sc__{}__", conn, hosts.join(", "), conn);
+        }
+    }
+
     seal_and_submit_write(&custodian, &vault, &meta, &user_key, &new_kv, &aux, args.no_browser, args.timeout, args.cb_port).await?;
     eprintln!("safeclaw set — {} written", key);
     Ok(())
+}
+
+/// Decide the broker binding for `sc set`. Host is a REQUIRED answer (spec §11):
+/// `--no-broker` / `--host none` opt out explicitly; otherwise `--host` anchors;
+/// missing on a TTY → prompt; missing off a TTY → a clear error naming both
+/// fixes (never hang, never silently store an unusable item).
+fn resolve_broker_intent(key: &str, host: &[String], no_broker: bool) -> Result<BrokerIntent, String> {
+    if no_broker {
+        return Ok(BrokerIntent::NoBroker);
+    }
+    // `--host none` is the explicit opt-out sentinel.
+    if host.len() == 1 && host[0].eq_ignore_ascii_case("none") {
+        eprintln!("  --host none → stored without a host · agent cannot use this item");
+        return Ok(BrokerIntent::NoBroker);
+    }
+    if !host.is_empty() {
+        return Ok(BrokerIntent::Host(host.to_vec()));
+    }
+    if std::io::stdin().is_terminal() {
+        let entered = prompt_host(key)?;
+        if entered.eq_ignore_ascii_case("none") {
+            eprintln!("  stored without a host · agent cannot use this item");
+            return Ok(BrokerIntent::NoBroker);
+        }
+        Ok(BrokerIntent::Host(vec![entered]))
+    } else {
+        Err(format!(
+            "'{}' needs a host so the agent can use it — pass `--host <domain>` (the API's domain, e.g. api.stripe.com), or `--no-broker` to store it for humans only",
+            key
+        ))
+    }
+}
+
+/// Hidden value prompt (TTY only — keeps the secret out of shell history / `ps`).
+fn prompt_secret_value(key: &str) -> Result<String, String> {
+    if !std::io::stdin().is_terminal() {
+        return Err(format!(
+            "no value given for '{}' — pass it as an argument (non-interactive input isn't a terminal)",
+            key
+        ));
+    }
+    let v = rpassword::prompt_password(format!("Value for {} (hidden): ", key))
+        .map_err(|e| format!("read value: {}", e))?;
+    if v.is_empty() {
+        return Err("value cannot be empty".into());
+    }
+    Ok(v)
+}
+
+/// Required host prompt. Echoes the intent so an arg-order slip is visible.
+fn prompt_host(key: &str) -> Result<String, String> {
+    use std::io::Write as _;
+    eprintln!("'{}' needs an egress host so the agent can use it.", key);
+    eprint!("Host (the API's exact domain, e.g. api.stripe.com; 'none' = store for humans only): ");
+    std::io::stderr().flush().ok();
+    let mut line = String::new();
+    std::io::stdin()
+        .read_line(&mut line)
+        .map_err(|e| format!("read host: {}", e))?;
+    let h = line.trim().to_string();
+    if h.is_empty() {
+        return Err("a host is required (or `none` / `--no-broker` to store for humans only)".into());
+    }
+    Ok(h)
 }
 
 pub async fn run_rm(args: RmArgs) -> Result<(), String> {
@@ -51,7 +159,11 @@ pub async fn run_rm(args: RmArgs) -> Result<(), String> {
     Ok(())
 }
 
-async fn do_unlock(
+/// Unlock the vault (passkey gesture 1/2) and return `(kv, aux, user_key)` —
+/// the current native-secrets map, the raw `aux` value, and the derived user
+/// key. Shared by every CLI verb that mutates the vault (`sc set` / `sc rm` /
+/// `sc connect` / `sc service add`).
+pub(crate) async fn do_unlock(
     custodian: &str, vault: &str, meta: &PasskeyMeta,
     no_browser: bool, timeout: u64, cb_port: Option<u16>,
 ) -> Result<(BTreeMap<String, String>, Value, Vec<u8>), String> {
@@ -106,7 +218,9 @@ async fn do_unlock(
     Ok((kv, aux, user_key))
 }
 
-async fn seal_and_submit_write(
+/// Reseal `(kv, aux)` under a fresh K and submit the write (passkey gesture
+/// 2/2). Shared by every CLI verb that mutates the vault.
+pub(crate) async fn seal_and_submit_write(
     custodian: &str, vault: &str, meta: &PasskeyMeta,
     user_key: &[u8], kv: &BTreeMap<String, String>, aux: &Value,
     no_browser: bool, timeout: u64, cb_port: Option<u16>,
