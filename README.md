@@ -100,11 +100,13 @@ The two env vars an agent uses:
 
 | Env var | Meaning |
 |---------|---------|
-| `SAFECLAW_VAULT_URL` | Your local daemon's vault URL, e.g. `http://localhost:23294/v/<id>` (from `sc env`). |
+| `SAFECLAW_VAULT_URL` | Your local daemon's vault URL, e.g. `http://localhost:23295/v/<id>` (from `sc env`). |
 | `SAFECLAW_API_KEY`   | The agent's bearer token for that vault (`sc agent add` or the dashboard). |
 
-Daemon ports default to `23294` (API) and `23295` (HTTPS proxy). See
-`sc serve --help` for the full set (`SAFECLAW_PORT`, `SAFECLAW_LISTEN`, …).
+Daemon ports default to `23295` (control/API plane) and `23294` (the local
+HTTPS credential proxy that `sc run` routes traffic through). See
+`sc serve --help` for the full set (`SAFECLAW_PORT`, `SAFECLAW_PROXY_PORT`,
+`SAFECLAW_LISTEN`, …).
 
 ### Env vs config — who picks the vault
 
