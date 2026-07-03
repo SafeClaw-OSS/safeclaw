@@ -11,7 +11,7 @@ use base64::Engine;
 use serde_json::{json, Value};
 
 use crate::cli::active::resolve_active;
-use crate::cli::conn::{insert_raw_connection, valid_conn_id, validate_raw_host};
+use crate::cli::conn::{insert_raw_connection, remove_connection, valid_conn_id, validate_raw_host};
 use crate::cli::webauthn::*;
 use crate::config::{GetArgs, RmArgs, SetArgs};
 use crate::crypto::kdf::WRAP_VERSION;
@@ -39,6 +39,25 @@ pub async fn run_set(args: SetArgs) -> Result<(), String> {
     // Broker intent: --no-broker | --host <h..> | (TTY) prompt | (non-TTY) error.
     let intent = resolve_broker_intent(&key, &args.host, args.no_broker)?;
 
+    // The single-secret sugar: the connection id IS the lowercased key (so the
+    // daemon's raw reverse-index matches the bare secret name). Validate the id +
+    // anchor hosts BEFORE spending a passkey gesture — an invalid --host must not
+    // cost the user an unlock touch (mirrors `sc connect`'s pre-unlock check).
+    let conn = key.to_ascii_lowercase();
+    if let BrokerIntent::Host(hosts) = &intent {
+        if !valid_conn_id(&conn) {
+            return Err(format!(
+                "can't derive a connection id from '{}' — use `sc connect <name> --host {} --secret {}=<value>` instead",
+                key,
+                hosts.first().map(String::as_str).unwrap_or("<domain>"),
+                key
+            ));
+        }
+        for h in hosts {
+            validate_raw_host(h)?;
+        }
+    }
+
     eprintln!("safeclaw set {} — two passkey gestures (unlock + write)", key);
     let meta = fetch_passkey_meta(&custodian, &vault).await?;
     let (kv, mut aux, user_key) =
@@ -49,24 +68,15 @@ pub async fn run_set(args: SetArgs) -> Result<(), String> {
 
     match intent {
         BrokerIntent::NoBroker => {
+            // Opting out must actually un-broker: drop any raw connection a prior
+            // `sc set <key> --host …` created for this key, else the item stays
+            // agent-usable through that stale connection despite --no-broker.
+            if remove_connection(&mut aux, &conn) {
+                eprintln!("  removed the prior host anchor for '{}'", conn);
+            }
             eprintln!("  stored · no host anchored — agent cannot use this item (`sc secret get` reveals it for a human)");
         }
         BrokerIntent::Host(hosts) => {
-            // The single-secret sugar: the connection id IS the lowercased key
-            // (so the daemon's raw reverse-index matches the bare secret name),
-            // and it must be a valid phantom segment.
-            let conn = key.to_ascii_lowercase();
-            if !valid_conn_id(&conn) {
-                return Err(format!(
-                    "can't derive a connection id from '{}' — use `sc connect <name> --host {} --secret {}=<value>` instead",
-                    key,
-                    hosts.first().map(String::as_str).unwrap_or("<domain>"),
-                    key
-                ));
-            }
-            for h in &hosts {
-                validate_raw_host(h)?;
-            }
             insert_raw_connection(&mut aux, &conn, &hosts);
             eprintln!("  connection '{}' → {} · phantom __sc__{}__", conn, hosts.join(", "), conn);
         }
@@ -147,11 +157,16 @@ pub async fn run_rm(args: RmArgs) -> Result<(), String> {
     eprintln!("safeclaw rm {} — two passkey gestures (unlock + write)", key);
 
     let meta = fetch_passkey_meta(&custodian, &vault).await?;
-    let (kv, aux, user_key) = do_unlock(&custodian, &vault, &meta, args.no_browser, args.timeout, args.cb_port).await?;
+    let (kv, mut aux, user_key) = do_unlock(&custodian, &vault, &meta, args.no_browser, args.timeout, args.cb_port).await?;
 
     let mut new_kv = kv;
     if new_kv.remove(&key).is_none() {
         return Err(format!("key {} not found in vault", key));
+    }
+    // Drop the raw connection this key backed (id == lowercased key), if any, so
+    // no connection is left dangling at a now-missing secret.
+    if remove_connection(&mut aux, &key.to_ascii_lowercase()) {
+        eprintln!("  also removed its connection '{}'", key.to_ascii_lowercase());
     }
 
     seal_and_submit_write(&custodian, &vault, &meta, &user_key, &new_kv, &aux, args.no_browser, args.timeout, args.cb_port).await?;

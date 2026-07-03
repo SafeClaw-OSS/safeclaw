@@ -23,17 +23,19 @@ pub fn valid_conn_id(s: &str) -> bool {
     s.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
 }
 
-/// A secret role KEY on a connection: env-style `[A-Za-z0-9_]`, non-empty, not
-/// starting with a digit, no `__` (its lowercase becomes a phantom role
-/// segment).
+/// A secret role KEY on a connection: env-style `[A-Za-z0-9_]` starting with a
+/// letter. Because its lowercase becomes a phantom role segment
+/// (`__sc__<conn>__<role>__`), it may carry no `__` (the delimiter) and no
+/// trailing `_` (which would fuse into the delimiter as `___`, making the
+/// advertised phantom unparseable).
 pub fn valid_role(s: &str) -> bool {
-    if s.is_empty() || s.contains("__") {
+    if s.is_empty() || s.contains("__") || s.ends_with('_') {
         return false;
     }
     let first_ok = s
         .chars()
         .next()
-        .map(|c| c.is_ascii_alphabetic() || c == '_')
+        .map(|c| c.is_ascii_alphabetic())
         .unwrap_or(false);
     first_ok && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
@@ -99,6 +101,19 @@ pub fn insert_custom_service(aux: &mut Value, id: &str, toml_source: &str) {
         .insert(id.to_string(), Value::String(toml_source.to_string()));
 }
 
+/// Remove a connection from `aux.connections`, preserving every other aux key.
+/// Returns true if an entry was present. Used by `sc set --no-broker` and
+/// `sc rm` to un-broker / clean up the connection tied to a key.
+pub fn remove_connection(aux: &mut Value, conn_id: &str) -> bool {
+    let Some(obj) = aux.as_object_mut() else {
+        return false;
+    };
+    let Some(conns) = obj.get_mut("connections").and_then(|c| c.as_object_mut()) else {
+        return false;
+    };
+    conns.remove(conn_id).is_some()
+}
+
 fn ensure_object(aux: &mut Value) {
     if !aux.is_object() {
         *aux = json!({});
@@ -128,6 +143,18 @@ mod tests {
         assert!(!valid_role("1TOKEN")); // starts with digit
         assert!(!valid_role("A__B")); // double underscore
         assert!(!valid_role("A B")); // space
+        assert!(!valid_role("_X")); // leading underscore
+        assert!(!valid_role("X_")); // trailing underscore fuses the delimiter
+    }
+
+    #[test]
+    fn remove_connection_drops_entry_and_reports() {
+        let mut aux = json!({ "connections": { "stripe_key": { "hosts": ["api.stripe.com"] }, "keep": { "hosts": ["x.com"] } } });
+        assert!(remove_connection(&mut aux, "stripe_key"));
+        assert!(aux["connections"].get("stripe_key").is_none());
+        assert!(aux["connections"]["keep"].is_object());
+        // Idempotent: removing a missing conn reports false, leaves aux intact.
+        assert!(!remove_connection(&mut aux, "stripe_key"));
     }
 
     #[test]
