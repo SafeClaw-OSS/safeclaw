@@ -1,6 +1,15 @@
 use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand};
 
+/// Control/API plane port — the axum Router (op / approve / registry / health /
+/// events). The agent never addresses it by number; it reaches it only via
+/// `$SAFECLAW_VAULT_URL`, so the port is env-addressed and invisible.
+pub const CONTROL_PORT: u16 = 23295;
+
+/// Credential-proxy plane port (0x5AFE) — the phantom-only local HTTPS MITM the
+/// agent's tool traffic is routed through by `sc run`'s env bundle.
+pub const PROXY_PORT: u16 = 23294;
+
 /// Top-level CLI shape. `safeclaw` (short alias `sc`) is one binary
 /// with two roles:
 ///
@@ -348,7 +357,7 @@ pub struct VaultUseArgs {
     /// numeric index from `sc vault ls`. If omitted and `--local` is
     /// also omitted, an interactive prompt lists known vaults.
     pub url_or_idx: Option<String>,
-    /// Shortcut for `http://localhost:23294/v/default`.
+    /// Shortcut for the localhost control-plane vault (`/v/default`).
     #[arg(long, conflicts_with = "url_or_idx")]
     pub local: bool,
 }
@@ -456,14 +465,19 @@ pub struct ServeArgs {
     #[arg(long, env = "SAFECLAW_STATE_DIR")]
     pub state_dir: Option<PathBuf>,
 
-    /// The daemon's single port. The agent's broker calls (`/v/{vid}/use|
-    /// stream|export`, agent-key gated), the CLI, op-approval polling, and any
-    /// reverse proxy all talk to the daemon here. (Not "admin port" — the
-    /// admin surface is just the `/admin/*` subset, gated by --admin-key.)
-    /// The old separate agent proxy port (:23295) was folded in by the
-    /// 2026-06-23 zero-inbound pivot.
-    #[arg(long, env = "SAFECLAW_PORT", default_value = "23294")]
+    /// The control/API plane port (`CONTROL_PORT`). The CLI, op-approval
+    /// polling, `/registry`, `/health`, `/events`, and any reverse proxy talk
+    /// to the daemon here; the agent reaches it only through
+    /// `$SAFECLAW_VAULT_URL`. (Not "admin port" — the admin surface is just the
+    /// `/admin/*` subset, gated by --admin-key.)
+    #[arg(long, env = "SAFECLAW_PORT", default_value_t = CONTROL_PORT)]
     pub port: u16,
+
+    /// The credential-proxy plane port (`PROXY_PORT`). The resident local HTTPS
+    /// MITM the agent's tool traffic is routed through; addressed only by the
+    /// env bundle `sc run` pastes, never by number in agent-facing config.
+    #[arg(long, env = "SAFECLAW_PROXY_PORT", default_value_t = PROXY_PORT)]
+    pub proxy_port: u16,
 
     /// Network interface to listen on. `127.0.0.1` =
     /// localhost only (default, safe). `0.0.0.0` = all interfaces;
@@ -644,6 +658,8 @@ pub struct RmArgs {
 pub struct Config {
     pub state_dir: PathBuf,
     pub port: u16,
+    /// Credential-proxy plane bind port (the hudsucker MITM). S2 binds it.
+    pub proxy_port: u16,
     pub listen: String,
     pub origin: String,
     pub rp_id: String,
@@ -682,6 +698,7 @@ impl Config {
         Self {
             state_dir,
             port: args.port,
+            proxy_port: args.proxy_port,
             listen: args.listen,
             origin,
             rp_id,

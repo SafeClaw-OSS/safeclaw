@@ -124,6 +124,7 @@ mod tests {
         let mut cfg = Config {
             state_dir: PathBuf::from("/tmp/safeclaw-admin-test"),
             port: 0,
+            proxy_port: 0,
             listen: "127.0.0.1".into(),
             origin: "http://localhost".into(),
             rp_id: "localhost".into(),
