@@ -2,44 +2,31 @@
 
 SafeClaw is a passkey-gated credential broker. Send a request through
 it; SafeClaw injects the user's stored credentials server-side and
-forwards. The user signs each release with their passkey in a browser
-tab.
+forwards.
 
 ## Daemon startup (self-host only)
 
-If `$SAFECLAW_VAULT_URL` points at `localhost` / `127.0.0.1`, the daemon
-runs on this machine — make sure it's up before the first call:
+If `$SAFECLAW_VAULT_URL` points at `localhost` / `127.0.0.1`, make sure
+the daemon is up before the first call (`sc up` is idempotent):
 
 ```bash
 curl -s -o /dev/null --connect-timeout 1 "$SAFECLAW_VAULT_URL/registry" \
   || safeclaw up
 ```
 
-`sc up` is idempotent — it starts the daemon's user service only
-if it isn't already running, and never rewrites config (`sc down` stops it).
-For a SaaS vault (host is `api.safeclaw.pro` etc.) skip this: the daemon is
-hosted, so if `/registry` is unreachable, just tell the user.
-
 ## Auth
 
-SafeClaw expects two env vars in the user's shell:
+Two env vars:
 
-- **`$SAFECLAW_VAULT_URL`** — the base URL of the user's SafeClaw daemon,
-  e.g. `http://localhost:23294/v/abc-def` (the local daemon on this
-  machine). If unset, get it from `sc env`. Vault id is baked into the URL.
-- **`$SAFECLAW_API_KEY`** — your bearer token for this vault (always
-  required). The user provides one from the dashboard's "Connect a new
-  agent" flow or `sc agent add`. The daemon enforces it on the broker
-  plane (`/use`).
+- **`$SAFECLAW_VAULT_URL`** — base URL of the user's SafeClaw daemon,
+  e.g. `http://localhost:23294/v/abc-def`. If unset, get it from
+  `sc env`; don't guess or hardcode a value.
+- **`$SAFECLAW_API_KEY`** — your bearer token, from the dashboard's
+  "Connect a new agent" flow or `sc agent add`.
 
 ```
 Authorization: Bearer $SAFECLAW_API_KEY
 ```
-
-If `$SAFECLAW_VAULT_URL` is unset, stop and ask the user to set it.
-Don't guess or hardcode a value. The skill is identical for every user
-and every deployment — the user changes vaults by changing the env
-var, not by re-installing the skill.
 
 ## Discover what's available
 
@@ -69,44 +56,37 @@ Use `connected: true` services freely.
 
 If a service is `connected: false` (or absent), the user must add its
 credential. **Hand them a link — don't run commands or walk them through
-provider menus.** `console_url` points at this vault; send them to its
-Connections tab:
+provider menus:**
 
 ```
 Connect <service name>: open <console_url>#connections, paste your
 credential there, approve with your passkey.
 ```
 
-You never see or handle it. After they confirm, re-GET the registry for
-`connected: true`. (Where to *get* the credential is the provider's side —
-mention it only if asked.)
+After they confirm, re-GET the registry for `connected: true`. (Where to
+*get* the credential is the provider's side — mention it only if asked.)
 
 Headless fallback, user at the daemon's own terminal: `sc set
-<vault_fields[n].name> <value>` (passkey-gated).
+<vault_fields[n].name> <value>`.
 
 Never enter credentials yourself. Never echo one back.
 
-If `vault_locked: true`, run `sc up` — it brings SafeClaw up and unlocks
-the vault, printing an approval link; surface that link to the user (they
-tap their passkey) and retry once it's done. Don't tell the user to
-"unlock" or suggest a browser URL of your own.
+If `vault_locked: true`, run `sc up`, surface the approval link it
+prints to the user, and retry once they've tapped. Don't tell the user
+to "unlock" or suggest a browser URL of your own.
 
 ## Call shape
-
-Credential calls go to `$SAFECLAW_VAULT_URL/use/<service>` — the same base as
-everything else:
 
 ```
 <METHOD> $SAFECLAW_VAULT_URL/use/<service>[/<path>]
 Authorization: Bearer $SAFECLAW_API_KEY
 ```
 
-`<service>` is a service `id`; `<path>` is the upstream's own path. The daemon
-forwards your method, path, and body verbatim, with the **upstream's natural
-method** — e.g. `GET $SAFECLAW_VAULT_URL/use/openai/v1/models`,
+`<service>` is a service `id`; `<path>` is the upstream's own path
+(optional for catch-all services). The daemon forwards your method,
+path, and body verbatim, with the **upstream's natural method** — e.g.
 `GET $SAFECLAW_VAULT_URL/use/gmail/gmail/v1/users/me/messages`,
-`POST $SAFECLAW_VAULT_URL/use/openai/v1/chat/completions`. `<path>` is optional
-for catch-all services; multi-segment paths pass straight through.
+`POST $SAFECLAW_VAULT_URL/use/openai/v1/chat/completions`.
 
 Every response (initial call and follow-up polls) has the same shape:
 
@@ -120,9 +100,6 @@ Every response (initial call and follow-up polls) has the same shape:
 | 202 | `pending` | `approval: {id, approve_url, poll_url, expires_at, expires_in, interval}` | needs user approve; poll every `interval`s (also sent as `Retry-After`) |
 | 403 | `rejected` | — | user denied; do not retry |
 | 404 | (none) | — | expired or unknown |
-
-(HTTP 410 is reserved for a future single-use semantic; the daemon does
-not emit it today.)
 
 `value` for a Use call is the upstream's full response:
 `{ status, headers, body, body_base64? }`. `body` is a string — JSON-parse
@@ -138,8 +115,7 @@ of its real endpoint, so the tool's traffic is brokered and the credential never
 enters it. When a service needs this, its `/registry` entry carries a **`setup`**
 hint — a goal plus ready-to-run config commands, already filled in for your
 deployment. Read it, **tell the user what you're configuring and why first**,
-then apply it (adapt to the user's real config if it differs). The per-service
-`setup` hint is the source of truth; nothing tool-specific lives in this skill.
+then apply it (adapt to the user's real config if it differs).
 
 ## Polling
 
@@ -164,9 +140,9 @@ for i in $(seq 1 100); do
 done
 ```
 
-If the loop finishes and it's still `pending` (the user is just taking their
-time), don't abandon it — the op stays valid ~30 min. Switch to B: ask them to
-reply once they've tapped, then poll once more.
+If the loop finishes and it's still `pending`, don't abandon it — the op
+stays valid ~30 min. Switch to B: ask them to reply once they've tapped,
+then poll once more.
 
 If poll returns HTTP 404, the op expired or the daemon restarted. Do NOT keep polling — re-POST the original request to get a fresh op.
 
