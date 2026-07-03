@@ -1,5 +1,7 @@
 # Connections & Auth — finalized schema (the implementation spec)
 
+> **⚠️ PARTIALLY SUPERSEDED (2026-07-03 phantom-only pivot).** The `{{secret.X | filter}}` template grammar (§7) and `/use` addressing here are retired (no injection templates; phantom placement instead); `[provider.*]` blocks, the cloud-blind OAuth connect flow, and namespaced secret addressing remain valid. Canon = [CREDENTIAL_BROKER.md](./CREDENTIAL_BROKER.md); toml rules = [SERVICES.md](./SERVICES.md) v4.
+
 > **Status: DECIDED design, to be implemented.** This supersedes the auth/oauth
 > bits of [SERVICES.md](./SERVICES.md) and adds the **connection layer**. It is
 > grounded in mainstream prior art — **not invented here**:

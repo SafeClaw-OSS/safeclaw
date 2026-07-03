@@ -202,6 +202,8 @@ ActType vocabulary 跟随 `sudp` 上游：`Enroll / Write / Rotate / Revoke / Ex
 ─── Vault-scoped (creation / management) ─────────────────────────────────────
 
 POST  /v/{vid}/op                    R 创建 op            → { op_id, r, expires_at }    [HPKE: SHOULD]
+# NOTE (2026-07-03): the R-side sugar routes below are being replaced by the phantom-only local
+# HTTPS proxy (CREDENTIAL_BROKER.md) — op plane, ActType vocabulary, grant machinery UNCHANGED.
 POST  /v/{vid}/use/{service}         R-side sugar (Use, catch-all path = "*")           [HPKE: SHOULD]
 POST  /v/{vid}/use/{service}/{rest}  R-side sugar (Use, sub-path under service root)    [HPKE: SHOULD]
 POST  /v/{vid}/export/<key>          R-side sugar (Export)→ 同上                          [HPKE: SHOULD]

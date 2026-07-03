@@ -1,5 +1,7 @@
 # Connection Data Schema
 
+> **⚠️ PARTIALLY SUPERSEDED (2026-07-03 phantom-only pivot).** The `Connection{service, config}` struct described here becomes `Connection{service: Option, hosts: Option}` — `config` deleted, host promoted; `/use`/`/stream` routing retired; the connecting→connections OAuth lifecycle and aux layout remain valid. Canon = [CREDENTIAL_BROKER.md](./CREDENTIAL_BROKER.md); toml rules = [SERVICES.md](./SERVICES.md) v4.
+
 > THE data-schema reference for *connections* — the exact shapes in a vault and
 > how secrets, status, and routing derive from them. Companion to
 > [CONNECTIONS_AND_AUTH.md](CONNECTIONS_AND_AUTH.md) (lifecycle + rationale).

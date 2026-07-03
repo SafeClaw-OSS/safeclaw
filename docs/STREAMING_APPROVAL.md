@@ -1,5 +1,7 @@
 # Streaming / Transparent-Proxy Approval ("captive portal for secret-use")
 
+> **⚠️ PARTIALLY SUPERSEDED (2026-07-03 phantom-only pivot).** The `/stream` endpoint this doc anchors on is retired; the captive-portal approval mechanism itself (reject-before-forward + SSE link → passkey → retry) SURVIVES and moves onto the proxy path unchanged. Canon = [CREDENTIAL_BROKER.md](./CREDENTIAL_BROKER.md); toml rules = [SERVICES.md](./SERVICES.md) v4.
+
 Status: **implemented** on `feat/stream-ask-approval` (2026-06-29), 207 lib
 tests green; awaiting rebase onto `main` after the connection/sync work lands,
 then merge. Companion to [GIT_INTEGRATION.md](./GIT_INTEGRATION.md) and

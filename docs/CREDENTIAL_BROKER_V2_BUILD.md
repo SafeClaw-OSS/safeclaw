@@ -1,121 +1,427 @@
-# Credential Broker v2 — Build Plan (implements the LOCKED design)
+# Credential Broker — Build Plan (phantom-only proxy)
 
-> **Companion to [CREDENTIAL_BROKER.md](./CREDENTIAL_BROKER.md) (the LOCKED spec).** That doc is the *what* (frozen — don't re-litigate); this is the *how*: concrete, code-grounded, sequenced, testable. Every stage is **additive** over the shipped v1 (the connection layer + `/use`/`/stream` already exist). Passthrough is governed by the **§11 three-gate ordering rule** — encoded as the stage order below.
->
-> **v1 STATUS (shipped to `dev` 2026-07-01, v1.0.29, build-verified, LIVE-e2e pending):** `/export` off the agent surface (403 stub); distinct `423 vault_locked`; connect-agent modal → agent self-provisions its key; skill field-name casing; OAuth *needs-reauth* console signal (on the already-cloud-blind daemon refresh path — see §OAuth note). v2 builds on top of this.
-
----
-
-## 0. Code anchors — where v2 hooks in (verified on `dev`)
-
-| Concern | Location | v1 today | v2 change |
-|---|---|---|---|
-| Connection struct | `src/storage/plaintext.rs:76` `Connection{service,config}` | curated: `service`=recipe id | **add** raw: `service:""` + `config.host` |
-| Conn→service resolve | `src/state.rs:325` `resolve_connection_service` | `conn==service` default | raw conn resolves to "" (no recipe) |
-| Secret address | `src/storage/plaintext.rs` `secret_address(conn,svc,role)` | bare / `<conn>:<role>` | unchanged (phantom maps through it) |
-| Egress host guard | `src/service/validate.rs:128` `host_egress_allowed` | blocks private/metadata/localhost; **allows any public host** | **add** `resolved_hosts` exact-FQDN allowlist ON TOP (keep this as the private/metadata floor) |
-| Host-literal guard | `src/server/broker.rs` `upstream_host_has_unsafe_template` | rejects `{{secret.*}}` in authority | unchanged (still forbids raw phantom in a *recipe* authority) |
-| Approval cache | `src/state.rs:93,111` `allow_secrets`/`entries` keyed by `conn_id`; grant bound to `(connection_id, rule_id, method)` | host is recipe-fixed → not in key | **add** resolved host to the key on the passthrough path (gate 3) |
-| Forward core | `src/server/broker.rs:61` `execute_use_forward`, `:216` `resolve_use_primary`, `:738` `resolve_auth_value`, `:845` `forward_to_upstream_with_extras` | `/use`+`/stream` call these | `/proxy` reuses `execute`/`forward`; extract `Ingress::shape`+`decide`/`execute` (additive) |
-| Routes | `src/server/mod.rs:106` `broker_router` | `/use`,`/stream`,`/export`(403) | **add** `POST /v/{vid}/proxy` behind the same agent-key gate |
-| Template render | `src/server/broker.rs` `render_template` (`{{…}}`) | recipe fill | **add** `__conn.role__` phantom pass (disjoint delimiter) on the passthrough path only |
+> **Companion to [CREDENTIAL_BROKER.md](./CREDENTIAL_BROKER.md) (the LOCKED spec).**
+> That doc is the *what* (frozen); this is the *how*: code-grounded, testable.
+> **Build it all at once** — pre-launch, 0 users, wipe+re-enroll, nothing to be
+> back-compat with. The staged `v1→v2` ordering of the old plan is dropped.
 
 ---
 
-## 1. Stage order (the §11 gate rule, as a DAG)
+## 0. What changes vs shipped (`dev`, v1.0.42)
+
+Shipped today: the connection layer (`Connection{service,config}`), `/use` +
+`/stream` endpoints, `{{secret.X|filter}}` filters (built), per-connection policy
+tree (v1.0.27), captive-portal approval, `/export` agent-surface 403,
+OAuth-refresh cloud-blind on the daemon. The move to the phantom-only proxy:
+
+| Concern | Shipped | Target |
+|---|---|---|
+| Agent surface | `POST /use/<conn>/<path>`, `/stream/<conn>/<path>` | **one local HTTPS proxy (CONNECT)**; `/use` + `/stream` **retired** |
+| Intent carrier | URL connection + (partly) service toml | **phantom `__sc__<conn>__` only** |
+| Transport | agent learns our `/use` URL | agent uses the **real upstream URL**, routed via proxy env-bundle |
+| Injection trigger | URL-conn ⇒ service-template fill | phantom ⇒ resolve → produce → substitute |
+| CA / proxy | n/a | **resident** CA file + resident proxy; `sc run` = env-paster |
+
+The pure injection core is reused unchanged: `render_template`,
+`forward_to_upstream_with_extras` (auth-strip, broker.rs), `host_egress_allowed`
+floor, OAuth mint (`resolve_auth_value`). Ingress is what's rewritten.
+
+---
+
+## 1. Components
 
 ```
-A. resolved_hosts + exact-FQDN enforce   ─┐  (gates 1+2)
-B. host in passthrough approval-cache key ─┤  (gate 3)
-                                           ▼
-C. /proxy ingress + __conn.role__ phantom     (first passthrough surface — MUST follow A+B)
-   ▼
-D. additive Ingress/decide/execute refactor   (fold /use,/stream,/proxy into one core)
-   ▼
-E. MITM + `sc run` env-CA (escalation ladder) (second passthrough surface)
-   ▼
-F. sc status discovery · MCP · agent-authored recipes · deep-link
+A. Resident CA + resident local HTTPS proxy (CONNECT), selective MITM by SNI
+B. Phantom resolver: __sc__<conn>__[<role>__] → connection → secret value (or OAuth-minted token)
+C. Host anchor: resolved_hosts(conn), exact-FQDN enforce, host in approval-cache key
+D. sc run / --export-env: paste the env bundle onto a child / shell (thin)
+E. sc set: interactive host-required; --host creates raw connection; --no-broker
+F. git adaptor specials: Basic decode/re-encode in proxy; optional zero-schema sc git-credential
+G. Retire /use + /stream; skill → the one-proxy concept; sc status discovery shape
 ```
 
-**Hard rule:** no passthrough ingress (C, E) may reach users before A **and** B are enforced (not warn-mode). A and B are safe to land alone (they only tighten the recipe path, which is already host-safe). D can interleave with C. DNS-pin is an *optional* hardening, never a gate (§11).
+All land together. Order within the merge is mechanical, not a safety gate (the
+old three-gate ordering existed to protect a passthrough endpoint shipping ahead
+of the anchor; here there is one surface built whole).
 
----
+## 2. A — resident CA + proxy
 
-## 2. Stage A — `resolved_hosts` + exact-FQDN enforcement (foundation; no new ingress)
+- **Install:** generate `~/.safeclaw/ca.pem` (+ key `chmod 600`) once; never
+  installed into any system trust store, never leaves the machine.
+- **Proxy:** a localhost HTTPS MITM (HTTP CONNECT) owned by the daemon (resident;
+  see §Open for per-run vs resident — resolved to resident).
+- **Selective MITM:** on CONNECT, decrypt + substitute **only** when SNI ∈ union
+  of all connections' `resolved_hosts`; else **blind-tunnel** (relay bytes, no
+  decrypt). Privacy + perf + leaves unrelated pinned tools alone.
+- **Auth:** the proxy is localhost + session-associated; **no `<key>@proxy`
+  userinfo convention** (dropped). The agent key gate that guards vault ops
+  applies at the daemon boundary as today.
+- **Probe host:** the proxy self-answers a magic probe (e.g. `http://sc.probe/`)
+  so liveness is checkable *through* the proxy path — `sc status` uses it for
+  `routed` (env vars present but proxy dead ⇒ `routed:false`).
 
-**Goal:** one anchor function + tighten egress to an exact-FQDN allowlist per connection. Ships alone; gates 1+2.
+**Test:** a connection host is intercepted + substituted; a non-connection host
+tunnels untouched; CA absent from the system keychain; probe answers through the
+proxy only.
 
-1. **`resolved_hosts(conn) -> Vec<Host>`** (new, in `broker.rs` or `service/`):
-   - `conn.service` names a recipe → for each `upstream[*].url`, `render(url, conn.config)` and extract the authority (reuses the existing host-literal + `{{connection.x}}` render path). Multi-host recipes (github: `github.com`+`api.github.com`+`*.githubusercontent.com`→ **enumerate exact FQDNs**, no wildcard) yield all.
-   - `conn.service == ""` (raw, v2) → `[conn.config.host]` (single host).
-2. **Enforce at forward time:** in `forward_to_upstream_with_extras` (broker.rs:845), before the request goes out, assert `egress_authority ∈ resolved_hosts(conn)` by **exact FQDN** (case-insensitive, port-aware per existing `host_egress_allowed` which already handles `host:port`). `host_egress_allowed` **stays** as the private/metadata/localhost floor beneath it.
-3. **Allow raw connections:** `Connection` validation + `resolve_connection_service` accept `service:""` with a non-empty `config.host`; the console/`sc connect` (Stage F) can create them. `host_egress_allowed(config.host)` must pass at creation (reject private/metadata at anchor time too).
-4. **Rollout:** land in **warn/log mode** first (`resolved_hosts` computed, mismatch logged + audited, NOT denied) for one release, confirm zero false-positives on curated recipes (their multi-host lists are already exact FQDNs), then flip to **deny**.
+## 3. B — phantom resolver
 
-**Test:** unit `resolved_hosts` for single/multi-host curated + raw; curated `/use` still forwards (exact match); a synthetic mismatch is denied (post-flip); private/metadata still blocked by the floor.
+- **Syntax:** `__sc__<conn>__<role>__`, `<conn>`/`<role>` ∈ `[a-z0-9_]`, no `__`
+  inside; `__sc__<conn>__` = the connection's sole injectable secret. Charset is
+  round-trip-safe (env value / URL / JSON / base64-after-decode).
+- **Resolve:** phantom → `<conn>` → connection (single-ownership, §3 spec) →
+  secret at `secret_address(conn, svc, role)`. Bare `__sc__<conn>__` with >1
+  injectable secret → error listing keys. **Unknown conn in a syntactically-valid
+  phantom → fail-closed: proxy 4xx with the name** (never forwarded — inside
+  routing, phantom errors are our precise errors; spec §14).
+- **Scan sites:** request headers, query, **URL path** (telegram's
+  `/bot<token>/…` — never the authority), body, and inside
+  `Authorization: Basic` (decode → match → re-encode).
+- **Produce:** the stored value as-is (default) or the `[oauth2]`-minted access
+  token (mint machinery built); `[oauth2] exposes` values (e.g. codex
+  `account_id`) resolve via role-qualified phantoms. Egress filters
+  (`|b64`,`|basic`) are CUT (spec §9). Then `forward_to_upstream_with_extras` strips agent-supplied auth and
+  forwards; the agent never gets the value back.
 
-## 3. Stage B — host in the passthrough approval-cache key (gate 3)
+**Test:** `__sc__github__` in a header → substituted to `api.github.com`; same to
+`evil.com` → denied by C; ambiguous bare conn → error; Basic-embedded phantom in
+git → decoded, substituted, forwarded.
 
-**Goal:** an approval for host A must not authorize host B within the TTL on `/proxy`.
+## 4. C — host anchor
 
-- Today the grant is bound to `(connection_id, rule_id, method)` (state.rs:111) and the caches key by `conn_id` (`entries`/`allow_secrets`). Host isn't in the key — **safe for `/use`/`/stream`** (host is recipe-fixed per connection) but unsafe once `/proxy` makes host request-data.
-- **Change:** thread the **resolved egress host** into the cache key **for passthrough grants** (`cache_insert`/`cache_lookup*` at state.rs:360-440). Cleanest: extend the key to `(conn_id, rule_id, method, host)`; for recipe connections the host is constant so behavior is unchanged; for raw/multi-host it scopes the grant to the approved host.
-- Connection-scoping already bounds this to the connection's `resolved_hosts`; the key add matters mainly for **multi-host** connections.
+- **`resolved_hosts(conn)`** (new): `conn.service` set → exact service entries
+  ∪ conn-pinned exact FQDNs (each ⊆ a `*.suffix` service entry; single-label
+  leftmost wildcard, TLS-cert rule); raw (`service: None`) → `conn.hosts`.
+  Runtime enforcement always exact FQDN; wildcards never reach it; bare `*`
+  rejected.
+- **Struct change:** `Connection{service: Option<String>, hosts: Option<Vec<Host>>}`;
+  `config` deleted (spec §4). Wipe + re-enroll, no migration.
+- **Enforce** at forward time in `forward_to_upstream_with_extras`: destination
+  authority ∈ `resolved_hosts(conn)` by **exact FQDN** (case-insensitive,
+  port-aware). `host_egress_allowed` stays as the private/metadata/localhost floor
+  beneath it. **No wildcard host accepted at anchor creation.**
+- **Approval-cache key** gains the resolved host: `(conn_id, rule_id, method,
+  host)` (state.rs cache_insert/lookup). Single-host connections: unchanged
+  behaviour.
+- **Widen UX:** first unmatched host → higher-friction captive-portal one-tap that
+  writes an **exact FQDN** permanent grant. Ship **warn/log** first, then deny.
 
-**Test:** approve `/proxy` to host A → a within-TTL call to host B on the same connection misses the cache → re-approval required.
+**Test:** curated multi-host still forwards (exact match); synthetic mismatch
+denied; approve host A then call host B same conn/TTL → cache miss → re-approve.
 
-## 4. Stage C — `/proxy` ingress + connection-qualified `__conn.role__` phantom
+## 5. D — `sc run` (thin env-paster)
 
-**Goal:** the generic explicit-transport passthrough (top-right of the §3 matrix). MUST follow A+B.
+- `sc run -- <cmd>`: export the §6-spec bundle into the **child only**
+  (`HTTPS_PROXY`, `NO_PROXY`, `NODE_USE_ENV_PROXY=1`, the CA-path var family),
+  then exec. No phantom env pre-setting (the agent writes `VAR=__sc__conn__`
+  itself — tool contracts are the agent's knowledge). No per-process CA or
+  proxy — points at the resident ones.
+- `eval "$(sc run --export-env)"`: same bundle onto the current shell.
+- **Escalation ladder** (prefer residue-free): ① agent's own HTTP already carries
+  a phantom + proxy env → nothing; ② per-command adaptor (git cred / `npm
+  --registry`) → no `sc run`; ③ dumb env-reading CLI not under the proxy →
+  suggest `sc run` **once**, record in a per-project manifest, don't re-nag.
+- **Old plaintext-export `sc run` is removed** — not ported.
 
-1. **Route:** `POST /v/{vid}/proxy` in `broker_router` (mod.rs:106), behind the same `require_api_key` gate. Body `{ url, method, headers, body }` (== the future MCP tool schema).
-2. **Phantom parse:** scan `headers`/`body`/`url` for `__<conn>.<role>__` (delimiter **disjoint** from `{{…}}`; distinctive `sc__…__` breadcrumb for un-substituted-leak detection). Resolve `<conn>` → connection → `resolved_hosts` + the secret at `secret_address(conn, svc, role)`. **Reject a bare `__role__` when >1 connection could match** (ambiguity → 400 with the candidate list).
-3. **Enforce + substitute:** assert the request's `url` authority ∈ `resolved_hosts(conn)` (Stage A), substitute the phantom with the real secret, then hand to the **same** `decide`/`execute`/`forward` path as `/use` (policy eval, captive-portal approval with host in the key, egress). The agent never receives the substituted value back (residue-free, like `/stream`).
-4. **Audit/approval** render the resolved connection + host + role (not the raw value).
+**Test:** `sc run -- curl https://<conn-host>/… __sc__conn__ …` → substituted via
+the resident proxy; a sibling process (no env) unaffected.
 
-**Test:** `/proxy` with `__gh.token__` to `api.github.com` → substituted + forwarded; same phantom to `evil.com` → denied by Stage A; bare `__token__` with two github connections → 400 ambiguous.
+## 6. E — `sc set`
 
-## 5. Stage D — additive `Ingress`/`decide`/`execute` refactor
+Interactive + non-interactive (§11 spec). Host **required**; hidden value prompt;
+`--host` creates the raw connection (`service: None` + `hosts`, reject
+private/metadata/`*` at creation); `--no-broker` writes a broker-invisible
+item; non-TTY missing host → error with both fixes; every interactive prompt
+echoes the intent of args already supplied.
 
-**Goal:** fold `/use`,`/stream`,`/proxy` into one core without rewriting the 2-RTT ceremony or `approve.rs` (§4).
+**Test:** `sc set K` prompts value(hidden)+host; `sc set K v --host h` creates a
+raw connection reachable via `__sc__k__`; `sc set K v --no-broker` → agent 4xx
+"no-broker" on use; piped `sc set K v` (no host) → error, no hang.
 
-- `trait Ingress { fn shape(self) -> BrokerRequest }` — one impl per route (extract path/host/phantom/body shaping out of each handler).
-- `broker::decide(BrokerRequest) -> Decision` where `Decision = Forward(allow+cache-hit) | NeedsApproval(OpHandle) | Deny` — **leg 1** (what `/use` returns `202` from today).
-- `broker::execute(op, grant_ctx) -> BrokerResponse` — **leg 2**, post-passkey forward + one-shot `Consumed` + cache write. **Stays in `approve.rs`'s existing flow** — this refactor only *names* the seam, it does not move the ceremony.
-- Migrate `/use` first (behavior-preserving; existing tests are the oracle), then `/stream`, then `/proxy` drops in as a third `Ingress`.
+## 7. F — git adaptor specials
 
-**Test:** the full existing `/use` + `/stream` suites pass unchanged after each migration step (refactor is behavior-neutral).
+- **No `[basic]` section exists** (spec §4): the proxy decodes
+  `Authorization: Basic` natively and substitutes the phantom inside. Pair
+  construction = phantom placement: URL userinfo
+  (`https://x:__sc__github__@github.com/…`; Bitbucket-class real username typed
+  there — instance data). `sc git-credential` = OPTIONAL zero-schema
+  convenience, one documented global rule (emit `("x", <phantom of the host
+  connection's sole injectable secret>)`; multiple/none → decline). Not
+  load-bearing; docker needs no helper at all (`docker login -p <phantom>`).
+- Helper registration residue-free: `sc run` injects
+  `GIT_CONFIG_COUNT/KEY_0=credential.helper/VALUE_0="!sc git-credential"`
+  (git's native per-process config env) — no gitconfig writes.
+- Proxy decodes `Authorization: Basic`, substitutes the phantom, re-encodes (B).
+- Streaming (smart-HTTP) relays natively through CONNECT.
+- **Service-toml schema rewrite, retired UNIFORMLY** (all tomls, parser + validator;
+  spec §4): `[[upstream]]` → first-class `hosts = [...]` (exact FQDNs or `*.suffix`);
+  `[upstream.headers]` templates + declared-slot replace-all override + `[[api]]`
+  steps deleted; `secrets = [...]` list + auth-mechanism sections ONLY:
+  `[oauth2]` (= `[upstream.auth]` upgraded in place, same fields) as the SOLE
+  auth section (Basic: proxy-native decode, no section; the proxy never
+  classifies traffic by tool); tool-named sections forbidden;
+  **keep** wildcard-subset host validation, policy, provider mint. Future
+  `[sigv4]` when real.
+- **github service.toml target shape:**
 
-## 6. Stage E — MITM + `sc run` env-CA (escalation ladder)
+```toml
+[service]
+id = "github"
+name = "GitHub"
 
-**Goal:** cover dumb subprocess CLIs with hardcoded URLs. Silent, **child-scoped**, opt-in — never the default (§5, §15).
+hosts = ["api.github.com", "github.com"]
 
-- **Escalation ladder** (prefer residue-free; only descend when forced): ① agent HTTP → `/use`|`/proxy`; ② per-command override (`git clone <…/stream/…>`, `npm --registry`, `pip -i`) — **zero `sc run`**; ③ recipe/`/use`; ④ hardcoded-URL + env-cred CLI with no cheap route → suggest `sc run` **once**, record in a per-project manifest, don't re-nag.
-- **`sc run -- <cmd>`:** generate an **ephemeral, per-process CA**; start a localhost MITM proxy; export **into the child only** the CA trust env (`SSL_CERT_FILE`/`REQUESTS_CA_BUNDLE`/`NODE_EXTRA_CA_CERTS`/`CURL_CA_BUNDLE`/`GIT_SSL_CAINFO`/…) + `HTTPS_PROXY=127.0.0.1:<port>`. The proxy substitutes `__conn.role__` by connection (Stage A/C machinery), enforces `resolved_hosts`, forwards. **No system trust store touched; no sudo; CA dies with the process.** (Competitor teardown confirms child-scoped env-CA ≠ "whole-machine traffic" — see memory `reference_competitor_agent_vault`.)
-- **Clean removal = the per-project manifest**, not agent memory (§10).
+secrets = ["GITHUB_TOKEN"]
+# no auth section at all — Basic self-describes on the wire
 
-**Test:** `sc run -- curl https://api.x.com/...__conn.role__...` → substituted via the proxy; a sibling process (no env) is unaffected; CA absent after exit.
+setup = """
+Routed (under `sc run` / the env bundle)? Nothing to configure — $GITHUB_TOKEN is
+already the phantom; git resolves credentials via the safeclaw helper.
+Not routed? Prefix: `sc run -- git clone https://github.com/<owner>/<repo>`.
+Multi-account: switch the phantom value (GITHUB_TOKEN=__sc__github_work__ gh ...),
+or for git put the phantom in the URL username:
+https://__sc__github_work__@github.com/<owner>/<repo>.
+Use HTTPS remotes; SSH is outside the broker.
+"""
+```
 
-## 7. Stage F — discovery, MCP, agent-authored recipes, deep-link
+  (`policy.toml` unchanged — rules now match real (host, path, method); a rule
+  may carry an optional host qualifier for multi-host services. gitlab analog:
+  gitlab: identical two-liner. gmail = `hosts` + `[oauth2]`.)
 
-- **`sc status` agent-discovery shape** (§9): `{ secrets:[{name, anchored_host}], call_here, under_sc_run }`. **Preflight:** a phantom-dependent dumb CLI checks `under_sc_run` first; if not routed, explain ("needs `sc run`") instead of a mystery 401.
-- **MCP ingress:** one tool whose schema == the `/proxy` body; DX sugar, not the front door.
-- **Agent-authored recipes:** merge `feat/per-vault-custom-recipes` first (`aux.recipes`, 1 commit, absent from `dev`). Scope agent-authored to **insertion auth + human-anchored host** (verifiable); OAuth/signing stay **curated-only** — a non-expert can't audit a subtly-wrong OAuth recipe, and it keeps the `client_secret`-marked-public gate intact (`client_type=public` validator). See the OAuth note below.
-- **Deep-link handoff** (§8): `{{console}}/…/secrets/new?name=…&hosts=…` — hints prefilled, user pastes only the **value** + one passkey; **value never in the URL**.
+**Test:** `git clone https://github.com/<private>` under `sc run` → succeeds; the
+real token never appears in git config or process env; same clone NOT under the
+proxy + agent following setup → `sc run -- git clone …` succeeds.
 
----
+### 7.5 — in-tree toml sweep (2026-07-03; migration inventory)
 
-## OAuth note (why refresh is already cloud-blind — reconciles the "abandoned" memory)
+All 19 services classified — **no fifth auth shape exists** (full table:
+SERVICES.md v4 §6). Migration notes:
+- Direct-insertion variants (Bearer / custom header / raw / query / URL-path)
+  → `hosts` + `secrets` only. **URL-path scan required** (telegram).
+- github+gitlab → hosts+secrets only (Basic handled natively); gmail/gdrive/gcalendar → `[oauth2]`;
+  **openai-codex → `[oauth2] exposes = ["account_id"]`** (its
+  `chatgpt-account-id` header value; the static `openai-beta` header is the
+  agent's to write).
+- **nodpay + system/files: OUT of broker schema** — daemon-upstream (`system`
+  category, spec §13); keep `hidden`, don't contort.
+- Field deletions across all tomls: `auth.env` hints, `locked={response}`
+  (global 423), `stream=true`, `[[api]]`, header/query templates, `|basic`
+  filters. `setup` texts rewritten (npm loses `--registry` re-point; **cargo's
+  local-git-index workaround is deleted** — justification: cargo natively
+  honours proxy+CA env ⇒ the env bundle is its adaptor on EVERY routing path,
+  incl. per-command `sc run --` outside any wrapped session; nothing the index
+  carried is still needed. NOT "because MITM exists").
+- `_providers/*.toml` unchanged.
+- **v3 → v4 field migration (mechanical, per toml):**
 
-The current OAuth path is **cloud-blind by construction**, so v2 keeps OAuth **curated-only** rather than reopening it:
-- `services/_providers/google.toml` ships the **public Desktop OAuth client** (`client_type="public"`); Google explicitly treats a Desktop client's `client_secret` as **non-confidential** (installed-app design). It's committed in the recipe on purpose; the validator's `client_type="public"` gate keeps the *confidential Web-app* secret out of any recipe.
-- Refresh happens **in the daemon** (`broker.rs:738 resolve_auth_value` → `perform_refresh`, on the user's machine), calling Google's token endpoint directly with the shipped public client + the vault's refresh_token. **The `.pro` backend is never in the refresh path** → the cloud never sees the plaintext token.
-- So the earlier "abandoned OAuth because the cloud would see the token on refresh" applies to a **Web-client / backend-refresh** design, **not** this one. The live risk that remains is **Google production verification** for Gmail *restricted* scopes: in Google **test mode**, sensitive-scope refresh tokens **expire ~7 days** → periodic re-consent (the "copy-auth" grind). The `needs_reauth` signal shipped in v1 surfaces exactly that recurring state. Escapes if/when we want non-expiring production tokens **without** breaking cloud-blind: (a) get the **Desktop client verified** for the scopes (if Google permits), or (b) **BYO-OAuth-client** (user supplies their own client_id/secret → their secret in their vault → daemon-local refresh stays cloud-blind, at signup friction). Both keep refresh on the daemon; **never move it to the backend.** — strategic call, deferred.
+| v3 | v4 |
+|---|---|
+| `[[upstream]] url` | `hosts = [...]` (authorities only) |
+| `[upstream.auth] secret=`/`env=` + `placeholder` | `secrets = [...]` + `[placeholders]` (env-name hints deleted — tool contracts are the agent's knowledge) |
+| `[upstream.headers]` / `[upstream.query]` templates | deleted — phantom placement |
+| `{{secret.X \| basic[:user]}}` / `{{secret_b64.X}}` filters | deleted — proxy decodes Basic natively; b64 pre-encoding cut (YAGNI) |
+| `auth = { type = "oauth2" }` + provider | `[oauth2]` |
+| `{{auth.account_id}}` header template | `[oauth2] exposes` + role-qualified phantom |
+| `[[api]]` / steps / targets / `recipe.toml` | deleted — the route is in the traffic |
+| `stream = true` | deleted — streaming relays natively through CONNECT |
+| `locked = { response }` | deleted — global `423 vault_locked` is self-evident |
+| `setup` transport instructions (URL-rewrite / `--registry` / local-index) | rewritten: routed ⇒ nothing; unrouted ⇒ `sc run --` prefix |
 
----
+- **Format decision (kept: TOML authoring + JSON interchange):** author-vs-wire
+  split is the industry norm (Cargo.toml → crates.io API); serde_yaml archived
+  2024-03 (`v0.9.34+deprecated`, fragmented forks) — no unmaintained parser in
+  the security-critical service-toml parsing path; YAML implicit-typing/anchor footguns are
+  wrong for a security config; the v4 schema is flat, so TOML's one weakness
+  (deep nesting) died with `[[upstream]]`/`[[api]]`. `registry.json` + vault
+  JSON unchanged.
+- **SERVICES.md = lean EXTERNAL authoring reference** (what it is + how to
+  write, nothing else — decisions/rationale/migration/plans stay in THIS doc
+  and the spec); banners on CONNECTION_SCHEMA / CONNECTIONS_AND_AUTH /
+  GIT_INTEGRATION / STREAMING_APPROVAL; PROTOCOL.md endpoint table carries a
+  forward note (op plane unchanged).
 
-## Testing & rollout summary
+## 8. G — retire endpoints + discovery + skill
 
-- Each stage lands behind the existing test suites; **A and B ship in warn/log mode first**, then flip to deny once curated traffic shows zero false-positives.
-- Version-bump on each behavior change (`Cargo.toml`; the version double-gates frontend compat via `health.version`).
-- Distribute + validate via merge → tag → release → `sc upgrade` → real-machine e2e (per `feedback_e2e_user_perspective`).
+- Remove `/use`, `/stream` routes and their handlers (keep the pure core they
+  called). `/export` stays 403 on the agent surface.
+- Discovery = ONE projection, two faces: `GET /registry` (HTTP; keeps the
+  existing `?view=summary` / `?ids=` context filters UNCHANGED — only the row
+  shape changes: `hosts` + the **`phantoms` map (role → ready-made string)**
+  replace `endpoints`/`vault_fields`) and `sc status` (CLI; same rows **plus
+  `routed`**, which only the CLI can know — it inspects its own inherited env
+  + liveness-probes the proxy). Agents copy phantoms, never construct.
+- Skill delta = REPLACE the `/use` "Call shape" section with the phantom +
+  routed-discipline section (drafted in spec §14); connect-guidance, setup
+  hints, vault_locked, approval-polling sections stay (approval response shape
+  through the proxy re-verified at build).
+- Skill: one concept + the **routing discipline** (spec §14: phantom ⟺ routed;
+  preflight `sc status`; unroutable → tell the user, never fire a phantom
+  unrouted). Generic; no per-service specifics.
+- Version-bump `Cargo.toml` (protocol-level; double-gates frontend compat via
+  `health.version`).
+
+## 9. Frontend (console — coordinate with the console-refactor thread; core schema lands FIRST, UI after)
+
+- **One Connections list** (unify the two shipped tabs). A row = one
+  connection: name · service badge (or *raw*) · **anchored hosts** · **the
+  phantom string `__sc__<conn>__` with a copy button** (the agent-facing
+  currency — this replaces every `/use` URL the console ever showed) ·
+  status (connected / needs_reauth / *no-broker: stored · agent cannot
+  use · add host*). Secrets collapsed inside the row; OAuth-internal hidden.
+- **Add-connection = one flow, two paths**:
+  - *From catalog* (curated): existing flow — OAuth consent / paste the
+    service-declared secrets; wildcard hosts pinned here.
+  - *Custom raw*: **ONE form, one step, one passkey** — name (`[a-z0-9_]`,
+    live-validated) + hosts (required; reject `*`/private/metadata) + N secret
+    rows (KEY + hidden value). No auth selector, no toml textbox, no OAuth
+    here (that would force an `oauth` field onto the 2-field connection
+    record). No two-phase secret-then-connect. Folded explicit "no-broker (no
+    host)" escape, never the default. Phantom preview shown as a human aid.
+- **Customize service (separate LOW-frequency page — never inside
+  add-connection):** a v4 toml editor — whatever the schema supports is
+  writable — validated on submit (hosts rules; `[oauth2].provider` must be a
+  shipped `_providers/*` entry; `client_type=public` gate; no tool-named
+  sections) → stored per-vault (**`aux.services`** — absorb the useful parts of the built-unmerged `feat/per-vault-custom-recipes` branch, renamed; then DELETE the branch and remove the `wt-recipes-core` / `wt-recipes-frontend` worktrees, per the standing worktree-cleanup rule) → appears in the catalog → added like any curated service, so the
+  connection stays `{service, hosts}`. Provider-declared user params surface
+  as connect-form fields; values land as that connection's secrets. CLI twin:
+  `sc service add <file.toml>` (cli/service_def.rs). A NEW provider or auth
+  mechanism = repo issue/PR.
+  - Second entry point: a no-broker row's **"add host"** action promotes the
+    existing bare secret into a raw connection (same form, prefilled).
+- **`sc connect <name>`** (new verb) = the CLI twin of the Custom form:
+  interactive hosts → secret names → hidden values; non-TTY flags
+  (`--host … --secret KEY [--use-existing KEY]`); `sc set KEY --host h` stays
+  as the single-secret one-liner sugar (conn named after the key). Same
+  creation logic underneath.
+- **Wildcard pinning at connect**: a service with `*.suffix` hosts requires the
+  user to type the exact FQDN(s), validated ⊆ the pattern, confirmed with the
+  connect passkey.
+- **Approval pages**: proxy ops render connection + resolved host + method/path
+  (+ effective risk, v1.0.27). **One-tap-widen** (first unmatched host) is a
+  distinct, higher-friction approve variant: exact FQDN shown with its eTLD+1,
+  labeled as a PERMANENT grant — not the ordinary approve.
+- **Catalog/registry cards** consume the v4 `registry.json`: hosts + oauth
+  badge; env-var names and `/use` endpoints disappear from all copy.
+- **Kill in console**: connection `config`/`host` form fields (→ `hosts`),
+  the temp "Services" tab remnants, any `/use`/`/stream` URL rendering.
+  **Keep**: human `sc secret get`-equivalent reveal (passkey Export ceremony —
+  the op plane is untouched), vault-policy.tsx (policy tree unchanged).
+- Deep-link handoff (`…/secrets/new?name=…&hosts=…`; value never in URL) —
+  post-core, with agent-authored services.
+
+## 10. OAuth note (unchanged — cloud-blind by construction)
+
+Refresh runs in the daemon with the shipped **public Desktop client**
+(`client_type="public"`); the `.pro` backend is never in the refresh path. Live
+residual = Google production verification for Gmail *restricted* scopes (test mode
+→ ~7-day refresh expiry → periodic re-consent; surfaced by the `needs_reauth`
+signal). Escapes without breaking cloud-blind: verify the Desktop client, or
+BYO-OAuth-client. Never move refresh to the backend. Deferred.
+
+## 11. Open (resolve during build — no design decisions left, these are build-time verifications)
+
+- **Proxy listener placement**: CONNECT on the main port `:23294` vs an
+  internal localhost port. Agent-invisible either way (env carries the
+  address); pick whichever hyper makes cleaner.
+- **Proxy client trust — DECIDED, revisit-if**: localhost, no proxy auth
+  (the `<key>@proxy` convention was dropped as over-design). The real gates =
+  host anchor + policy tree + passkey approvals; trust level ≡ an agent key in
+  env. Revisit only if a concrete local-adversary scenario demands it.
+- **Captive-portal response shape through a dumb tool**: the
+  reject-before-forward + SSE + passkey mechanism survives as-is; verify at
+  build what git/curl actually SURFACE (401 body with the approve link) so the
+  agent/user sees the link, not a mystery failure.
+- **policy.toml path review**: rules move from `/use`-relative to real
+  `(host, path, method)` — mechanical per-service pass at migration time.
+- **openai-codex `exposes` mechanics**: where `account_id` comes from in the
+  token exchange — implementation detail of the mint, schema settled.
+- **Per-run vs resident proxy/CA — RESOLVED: resident.** `sc run` only pastes env.
+- **Parked by decision (not open)**: `system` category (spec §13), signing
+  family (`[web3sign]`/`[sigv4]`), MCP ingress, agent-authored services +
+  deep-link (absorb `feat/per-vault-custom-recipes` first), self-hosted+OAuth
+  combo, aux/connections whole-blob sync (per-item cutover's known remainder —
+  separate thread).
+
+## 12. Acceptance criteria (the definition of DONE for this wave)
+
+Unit level: the existing `/use`/`/stream` behavioural suites are the **oracle
+for the proxy path** (same core, new ingress) — port, don't rewrite. Anchor
+enforcement ships warn/log → flip to deny once curated traffic shows zero
+false positives.
+
+**E2E (user-perspective, per the iron rule: merge → tag → release →
+`sc upgrade` on the real box; wipe + re-enroll first). ALL must pass:**
+
+1. **Raw cold-start:** `sc set STRIPE_KEY` (interactive: hidden value + host
+   prompt) → `sc status` shows the connection + `phantoms` map + `routed` →
+   `sc run -- curl https://api.stripe.com/... -H "Authorization: Bearer
+   __sc__stripe_key__"` → substituted, forwarded; plaintext never in the
+   child's env or output.
+2. **Curated OAuth:** connect Gmail in the console (consent) → agent sends
+   `Authorization: Bearer __sc__gmail__` under the proxy → minted token
+   substituted; refresh secret never injectable/visible.
+3. **git:** `sc run -- git clone https://github.com/<private>` (helper path)
+   AND `git clone https://x:__sc__github__@github.com/<private>` (URL-userinfo
+   path, no helper) both succeed; token never lands in gitconfig/env/output.
+4. **Routing discipline:** outside the proxy `sc status` → `routed:false`;
+   the skill-driven agent does NOT fire the phantom, suggests `sc run --`
+   once. Under routing, `__sc__typo__` → proxy 4xx `unknown_connection`
+   (never forwarded).
+5. **Anchor:** same phantom toward `evil.com` → denied; wildcard service:
+   pinned tenant host forwards, un-pinned sibling tenant denied; approve
+   host A → call host B same conn within TTL → cache miss, re-approval.
+6. **Approval:** ask-level request → captive-portal link surfaces through the
+   dumb tool's error output → passkey → retry succeeds. One-tap-widen renders
+   as the distinct permanent-grant variant.
+7. **no-broker:** `sc set K v --no-broker` → invisible to `sc status`
+   connections / phantoms; agent use attempt → self-evident 4xx; human reveal
+   via `sc secret get` (passkey ceremony) still works.
+8. **Selective MITM:** a non-connection host under `sc run` blind-tunnels
+   (bytes relayed, not decrypted); CA absent from the system keychain;
+   `http://sc.probe/` answers only through the proxy.
+9. **Console:** one Connections list (phantom copy-button, hosts, states);
+   custom-raw one-form add works; **Customize service** page: paste a v4 toml
+   (validator rejects tool-named sections / bad hosts / unknown provider) →
+   appears in catalog → add → connection is `{service, hosts}`.
+10. **Discovery:** `GET /registry` rows carry `phantoms`/`hosts`;
+    `?view=summary` / `?ids=` behave as today; skill (new "Using a
+    connection" section) drives a fresh agent through 1–4 with no other
+    instruction.
+11. **`sc run` / CA / bundle (explicitly in-wave):** first daemon start
+    generates `~/.safeclaw/ca.pem` once (key `chmod 600`; regenerate = same
+    path, never system keychain); `sc run -- env` shows the FULL bundle
+    (`HTTPS_PROXY`/`HTTP_PROXY`, `NO_PROXY`, `NODE_USE_ENV_PROXY=1`,
+    `SSL_CERT_FILE`/`REQUESTS_CA_BUNDLE`/`CURL_CA_BUNDLE`/
+    `NODE_EXTRA_CA_CERTS`/`GIT_SSL_CAINFO`/`DENO_CERT`, `GIT_CONFIG_*`
+    helper registration) in the CHILD and none of it in a sibling shell;
+    `eval "$(sc run --export-env)"` covers the current shell the same way;
+    a Node-24 tool fetches through the proxy (NODE_USE_ENV_PROXY honoured);
+    old plaintext-export behaviour is nowhere (no `-k`/`--k-all` flags,
+    no plaintext in child env ever).
+12. **Version/compat:** `Cargo.toml` bumped; `health.version` gates the
+    frontend; `sc upgrade` prints X → Y and lands the new binary.
+
+## 13. Deletion inventory (leave no corpses)
+
+- **Core:** `/use` + `/stream` routes & handlers (`proxy/use_broker.rs`,
+  `proxy/stream.rs`), the `/export` 403 stub route file if superseded by
+  routing changes (keep the op-plane Export), header/query template rendering
+  + declared-slot replace-all override, `{{secret.X | b64|basic}}` filters,
+  `[[api]]`/steps/targets parsing, `[[upstream]]` parsing, `locked={response}`,
+  `auth.env` hints, `stream=true`, `Connection.config` field + all readers,
+  old plaintext-export `sc run` remnants (design-only — never shipped).
+- **Recipes-in-tree:** every `service.toml` migrated per the §7.5 table;
+  cratesio local-index + npm `--registry` + git insteadOf setup texts deleted.
+- **Skill:** the `/use` "Call shape" section (replaced); field-casing rows
+  stay.
+- **Branch/worktrees:** absorb `feat/per-vault-custom-recipes` → then DELETE
+  the branch and remove `wt-recipes-core` + `wt-recipes-frontend` worktrees.
+- **Docs at land time:** PROTOCOL.md R-side sugar table updated for real (the
+  forward note replaced by the actual endpoint state; op plane untouched);
+  CONNECTION_SCHEMA.md / CONNECTIONS_AND_AUTH.md / GIT_INTEGRATION.md /
+  STREAMING_APPROVAL.md banners resolved into updated text or the docs merged
+  into the canon; `CONNECTION_IMPL_PLAN.md` (checklist doc) deleted per its
+  own header once landed.
+- **Frontend:** temp "Services" tab, `config`/host form fields, any `/use`
+  URL rendering.

