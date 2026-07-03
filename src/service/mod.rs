@@ -63,7 +63,7 @@ pub struct ServiceMeta {
     /// Category is NOT a toml field — it's derived from the
     /// services/{category}/{id}/ directory at build time and injected by the
     /// loader (see `load_compiled_defaults`). The serde default only applies to
-    /// per-vault custom recipes / tests that construct a bare `[service]`.
+    /// per-vault custom services / tests that construct a bare `[service]`.
     #[serde(default = "default_category")]
     pub category: String,
     /// Anchored egress hosts — exact FQDNs or `*.suffix` wildcards (leftmost
@@ -135,7 +135,7 @@ pub struct ProviderDef {
     /// OAuth client_id (a public Desktop client may ship its id here).
     #[serde(default)]
     pub client_id: Option<String>,
-    /// OAuth client_secret. A LITERAL `client_secret` is allowed in a recipe
+    /// OAuth client_secret. A LITERAL `client_secret` is allowed in a service definition
     /// ONLY for a `client_type = "public"` client (a confidential Web-app
     /// secret must never be committed). The validator enforces this.
     #[serde(default)]
@@ -401,7 +401,7 @@ impl ServiceRegistry {
         Self { services, policies, providers }
     }
 
-    /// Build a registry from ONLY the compiled-in (in-tree) recipes — no
+    /// Build a registry from ONLY the compiled-in (in-tree) services — no
     /// `$SAFECLAW_DATA` / user-installed overrides, no filesystem I/O. Used by
     /// offline tooling (`sc registry`) and CI to render the exact catalog a
     /// freshly-built daemon serves, without booting a server or reading any

@@ -68,7 +68,7 @@ pub enum Command {
     /// HPKE outer-envelope public key (diagnostic).
     #[command(hide = true)]
     Pubkey(CommonArgs),
-    /// Public service catalog. Renders the compiled-in recipes offline (no
+    /// Public service catalog. Renders the compiled-in services offline (no
     /// running daemon), the exact shape `GET /registry` serves. `--json` for CI.
     Registry(RegistryArgs),
     /// Alias for `sc secret ls`.
@@ -420,7 +420,7 @@ pub enum VaultSubcommand {
     /// Remove a vault from the local known list (does NOT touch the
     /// daemon — for that use `sc vault delete`). Pass URL or index.
     Forget(VaultForgetArgs),
-    /// Create a new vault. Default = local (http://localhost:23294,
+    /// Create a new vault. Default = local (http://localhost:23295,
     /// vault id "default"). Pass --remote <URL> to create on a remote
     /// custodian (auto-generates a UUID). Saves to config and makes
     /// the new vault active.

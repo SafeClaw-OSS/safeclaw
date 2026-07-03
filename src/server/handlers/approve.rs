@@ -651,13 +651,9 @@ pub async fn approve_op(
         }
         ActType::Use => {
             // Read seam (per-item first, whole-blob Option fallback) lives inside
-            // the broker resolve/forward calls — so a web-enrolled per-item vault
+            // the broker resolve call — so a web-enrolled per-item vault
             // (no vault.dat) resolves without the old "vault not initialized" bail.
-            // Streaming captive-portal authorize (`/stream/` ask path): resolve
-            // and stash the secret for the agent's *retried* stream to consume;
-            // do NOT forward — there is no buffered request here (the real one
-            // rides the retry stream). use_broker sets scope.authorize_only.
-// Phantom-only: an approved Use op is ALWAYS authorize_only — the
+            // Phantom-only: an approved Use op is ALWAYS authorize_only — the
             // resident proxy serves live traffic and retries the real request
             // after approval. Resolve the connection's primary secret with the
             // verified grant and stash it so the retry fast-paths; never forward
@@ -942,7 +938,7 @@ pub async fn approve_op(
 
     // Cache write: an Ask-level approval scopes a TTL'd "next matching
     // request fast-paths" effect. Service id pulled off the op's scope
-    // (which `use_broker` populates verbatim). No-op when:
+    // (which the broker resolve path populates verbatim). No-op when:
     //   - The op wasn't a Use (policy_ctx_for_cache is None)
     //   - The level was Allow / AskAlways / Deny (not stored)
     //   - The vault relocked between approve and now (record_ask_approval
@@ -1077,7 +1073,7 @@ pub async fn reject_op(
 ///   2. `policy` — the effective policy tree (`aux.policy` overlaid on
 ///      compiled defaults). Holds the risk map, default floors, per-category,
 ///      and per-connection user policy. Built-in per-service rules are read
-///      live from the recipe at eval, not cached here.
+///      live from the service at eval, not cached here.
 /// Build + persist the local per-item store (`vault.per-item.json`) from a
 /// just-decrypted whole-blob vault + its view. The keyset (registry +
 /// credentials + wrapped_key) is copied verbatim from the whole-blob
@@ -1221,7 +1217,7 @@ pub(crate) fn bootstrap_cache_from_view(
         }
 
         // Built-in policy rules are NOT cached: they're read live from the
-        // recipe registry at eval and merged with the connection's user rules
+        // service registry at eval and merged with the connection's user rules
         // (`aux.policy.connections.<id>.rules`). See
         // `AppState::evaluate_request_policy`.
     }
@@ -1231,10 +1227,10 @@ pub(crate) fn bootstrap_cache_from_view(
     // already covered every default connection (conn == service, bare name);
     // here we add the named ones, keyed by connection_id, resolving each role at
     // its §3 address but storing the multi-secret map under the BARE name so the
-    // render path matches `{{secret.<role>}}`. (Allow-level only — ask-level
-    // connections resolve lazily from the op's namespaced `target` at approve.)
+    // proxy's phantom resolution finds each role's bytes. (Allow-level only —
+    // ask-level connections resolve lazily from the op's namespaced `target`.)
     for (conn, c) in view.aux.connections.iter() {
-        // Raw connections (service: None) have no recipe to bootstrap from; their
+        // Raw connections (service: None) have no service to bootstrap from; their
         // bytes resolve lazily at approve. Only service-backed named connections
         // are pre-bootstrapped here.
         let Some(service) = c.service.as_deref() else { continue };
@@ -1271,7 +1267,7 @@ pub(crate) fn bootstrap_cache_from_view(
     }
 
     // Raw connections (`service: None`, created by `sc set K --host h`) have no
-    // recipe, so the per-service loops above skip them. Their policy floor is
+    // service definition, so the per-service loops above skip them. Their policy floor is
     // the global default (`allow`), and the resident proxy resolves an allow
     // request straight from the session cache (no grant to open the vault), so
     // their secret bytes MUST be resident. Reverse-index the native-secrets

@@ -8,7 +8,7 @@
 //!
 //! 1. with the vault **open** (retained `K` from an unlocked session), read every
 //!    in-flight connect from `aux.connecting`;
-//! 2. for each, resolve the connection's *service* recipe → its provider
+//! 2. for each, resolve the connection's *service* → its provider
 //!    (client_id / secret / token_url + the fixed redirect_uri, all from the
 //!    public Desktop literal) and exchange the code at `token_url`;
 //! 3. WRITE the durable refresh_token at the §3 address `[<conn>:]<ROLE>` and
@@ -43,7 +43,7 @@ use crate::state::AppState;
 use crate::storage::plaintext::{secret_address, Connecting, Connection};
 
 /// The OAuth client/endpoint a pending connect resolves to before exchange, plus
-/// the recipe's secret role (so we know where to write the result).
+/// the service's secret role (so we know where to write the result).
 #[derive(Debug, Clone)]
 pub struct ExchangeConfig {
     pub token_url: String,
@@ -53,12 +53,12 @@ pub struct ExchangeConfig {
     /// The OAuth client's fixed redirect_uri (provider config), echoed at the
     /// token call so it matches the browser's consent request.
     pub redirect_uri: String,
-    /// The recipe's mainstream secret role, e.g. `GMAIL_REFRESH_TOKEN` — the base
+    /// The service's mainstream secret role, e.g. `GMAIL_REFRESH_TOKEN` — the base
     /// name the refresh_token is written under (namespaced per `conn`).
     pub secret_role: String,
 }
 
-/// Resolve the exchange config for a connection's **service** recipe from the
+/// Resolve the exchange config for a connection's **service** from the
 /// registry. `None` when the service is unknown, isn't oauth2, or is missing a
 /// token_url / client_id / secret role (e.g. a provider literal we can't load).
 pub fn resolve_exchange_config(
@@ -738,7 +738,7 @@ mod tests {
         assert!(cfg.client_secret.is_some());
         assert!(matches!(cfg.style, OAuthStyle::Form));
         assert!(cfg.redirect_uri.starts_with("http://127.0.0.1"));
-        assert!(!cfg.secret_role.is_empty(), "gmail recipe declares a secret role");
+        assert!(!cfg.secret_role.is_empty(), "gmail service declares a secret role");
     }
 
     #[test]

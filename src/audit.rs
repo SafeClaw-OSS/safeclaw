@@ -100,8 +100,7 @@ pub struct ApprovalRow {
 
 /// Derive an audit row from an `Operation` at the moment of op creation
 /// (status = pending). Scope keys `service` / `method` / `path` come from
-/// the broker's scope shape (set by `use_broker.rs`); other op types
-/// just leave them None.
+/// the broker's authorize-only scope shape; other op types just leave them None.
 pub fn row_from_op(
     id: &str,
     op: &crate::protocol::operation::Operation,

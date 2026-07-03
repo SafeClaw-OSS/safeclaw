@@ -51,7 +51,7 @@ pub struct RegistryQuery {
     pub ids: Option<String>,
     /// `summary` = thin per-service rows (id/name/category/connected/
     /// needs_reauth) + top-level vault state; drops the heavy fields
-    /// (endpoints/vault_fields/policy/connect/setup). Anything else (incl.
+    /// (hosts/phantoms/policy/connect/setup). Anything else (incl.
     /// absent) = full. The agent's orient step: pull a cheap list, then
     /// `?ids=<id>` for full detail on the one it wants.
     #[serde(default)]
@@ -102,13 +102,13 @@ pub struct RegistryService {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub policy: Option<RegistryServicePolicy>,
     /// Only present on the per-vault endpoint. `true` = every declared
-    /// vault field is present in the vault's native-secrets (or the
-    /// service has no vault_fields = no credential needed).
+    /// secret is present in the vault's native-secrets (or the service
+    /// declares none = no credential needed).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub connected: Option<bool>,
     /// Per-vault only. `true` = this OAuth connection's refresh_token was rejected
-    /// (invalid_grant) at /use — user must reconnect. Absent for healthy / non-OAuth
-    /// services. Distinct from `connected`: a dead refresh_token is still PRESENT.
+    /// (invalid_grant) at token mint — user must reconnect. Absent for healthy /
+    /// non-OAuth services. Distinct from `connected`: a dead refresh_token is still PRESENT.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub needs_reauth: Option<bool>,
     /// Public OAuth consent params (authorization_url / client_id / scopes /
@@ -117,15 +117,10 @@ pub struct RegistryService {
     /// is never exposed; the daemon does the exchange. Absent for non-oauth2.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub connect: Option<crate::service::ConnectDescriptor>,
-    /// Tool-config hint for a service that needs a **local tool** (a CLI/SDK)
-    /// pointed at SafeClaw — one rendered blurb (goal + ready-to-run config),
-    /// with `{{proxy_base}}` / `{{api_key}}` / `{{vault}}` filled in. The route
-    /// is inlined by the recipe as `{{proxy_base}}/stream/<upstream>/`.
-    /// `{{proxy_base}}` renders to the literal `$SAFECLAW_VAULT_URL` (the single
-    /// broker base the agent already has in its env), so the hint is
-    /// deployment-agnostic and the agent's shell expands it. Agent-facing only;
-    /// carries NO vault secret. Present only on the per-vault registry (the route
-    /// is vault-scoped). The generic counterpart to `connect`.
+    /// Plain agent-facing `setup` prose (v4): routed ⇒ nothing to configure;
+    /// unrouted ⇒ the `sc run --` prefix. No templates, carries NO vault
+    /// secret. Present only on the per-vault registry. The generic counterpart
+    /// to `connect`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub setup: Option<String>,
 }
@@ -200,7 +195,7 @@ pub struct RegistryResponse {
 /// Per-vault overlay fed into `build_service` so a single rendering path
 /// covers both `/registry` (overlay=None) and `/v/{vid}/registry`.
 struct VaultOverlay<'a> {
-    /// Item names available to satisfy a service's vault_fields. Includes
+    /// Item names available to satisfy a service's declared secrets. Includes
     /// native-secrets only — external stores (GCP etc.) require an async
     /// list call we don't want to pay for on every registry hit.
     native_keys: &'a HashSet<String>,

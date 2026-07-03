@@ -83,19 +83,19 @@ pub struct SecretsCache {
     /// `ask-always` services are deliberately absent (PROTOCOL.md §6.2
     /// "ask-always 服务: 永不进 cache").
     pub entries: HashMap<String, CacheEntry>,
-    /// service_id → { secret_name → bytes } for every `{{secret.NAME}}` an
-    /// `allow`-level recipe references. Populated at unlock bootstrap so the
-    /// allow fast-path can render *multi-secret* recipes (e.g. a Twilio-style
+    /// service_id → { secret_name → bytes } for every direct secret an
+    /// `allow`-level service references. Populated at unlock bootstrap so the
+    /// allow fast-path can resolve *multi-secret* services (e.g. a Twilio-style
     /// `account_sid` + `auth_token` pair) without a vault view — which only
-    /// exists behind a fresh grant. Single-secret recipes get a one-entry
-    /// map; oauth recipes get no entry (their token comes from `oauth_access`).
+    /// exists behind a fresh grant. Single-secret services get a one-entry
+    /// map; oauth services get no entry (their token comes from `oauth_access`).
     /// Lives the whole unlocked session (allow semantics); wiped on lock.
     pub allow_secrets: HashMap<String, HashMap<String, Vec<u8>>>,
     /// The effective policy tree — the vault's `aux.policy` overlaid on the
     /// compiled-in `Policy::default()` at unlock/refresh (so unset parts use
     /// safe defaults). Holds the risk map, default floors, per-category, and
     /// per-connection user policy. Built-in per-service rules are NOT cached
-    /// here — they're read live from the recipe registry at eval and merged
+    /// here — they're read live from the service registry at eval and merged
     /// with this tree's `connections.<id>.rules`. Rebuilt on every vault write
     /// → a `risk` / map edit is realtime on the next request.
     pub policy: crate::core::policy::Policy,
@@ -156,16 +156,16 @@ pub struct SecretsCache {
     /// cache independent access tokens.
     pub oauth_access: HashMap<String, CacheEntry>,
     /// Routing snapshot: `connection_id → { service, hosts }`, taken from
-    /// `aux.connections` at unlock (CONNECTION_SCHEMA.md §6). A request at
-    /// `/use/<conn>` resolves its service through this map (falling back to
+    /// `aux.connections` at unlock (CONNECTION_SCHEMA.md §6). A brokered request
+    /// resolves its connection's service through this map (falling back to
     /// `conn` itself when absent — an unconnected service IS its own default
     /// connection). Wiped on lock.
     ///
     /// NOTE on the maps above (`entries`, `allow_secrets`, `oauth_access`,
-    /// `rule_approvals`): for connection-routed `/use`/`/stream` the daemon keys
-    /// them by **connection_id**, so two connections of one service never share a
-    /// cache slot. Policy is likewise per-connection (`policy.connections.<id>`),
-    /// while the built-in rules it merges come from the shared service recipe.
+    /// `rule_approvals`): the daemon keys them by **connection_id**, so two
+    /// connections of one service never share a cache slot. Policy is likewise
+    /// per-connection (`policy.connections.<id>`), while the built-in rules it
+    /// merges come from the shared service definition.
     pub connections: HashMap<String, crate::storage::plaintext::Connection>,
     /// Custom (per-vault `aux.services`) service definitions, validated at
     /// unlock. Wiped on lock (Default drop). A custom service folds into
@@ -330,11 +330,11 @@ impl AppState {
         }
     }
 
-    /// Resolve a `connection_id` to its service (recipe) for an Unlocked vault
+    /// Resolve a `connection_id` to its service for an Unlocked vault
     /// (CONNECTION_SCHEMA.md §6). An explicit `aux.connections` entry names its
     /// `service`; otherwise the connection IS its own default — `conn == service`
-    /// — which keeps `/use/<service>` working for unconnected/API-key services
-    /// and the default OAuth connection. Locked vault → falls back to `conn`
+    /// — which keeps unconnected/API-key services and the default OAuth
+    /// connection resolvable. Locked vault → falls back to `conn`
     /// (the caller's locked-gate rejects before any real use).
     pub fn resolve_connection_service(&self, vault_id: &str, conn: &str) -> String {
         let states = self.vault_states.lock().unwrap();
@@ -392,10 +392,10 @@ impl AppState {
         Some(entry.value.clone())
     }
 
-    /// Look up the full `{ secret_name → bytes }` map an allow-level recipe
-    /// needs to render its templates. Returns `None` if the vault is locked
+    /// Look up the full `{ secret_name → bytes }` map an allow-level service
+    /// needs to resolve its phantoms. Returns `None` if the vault is locked
     /// or the service wasn't bootstrapped with a named-secret set (e.g. an
-    /// oauth recipe, or one resolved post-approval). The allow fast-path
+    /// oauth service, or one resolved post-approval). The allow fast-path
     /// falls back to a single-secret map keyed by the primary in that case.
     pub fn cache_lookup_secrets(
         &self,
@@ -546,7 +546,7 @@ impl AppState {
     /// Returned tuple: `(effective_level, matched_rule_id, ttl_seconds)`.
     ///
     /// Resolution (PROTOCOL.md §6.4):
-    ///   - merge the service recipe's built-in rules with this connection's
+    ///   - merge the service's built-in rules with this connection's
     ///     user rules (`cache.policy.connections[conn].rules`),
     ///   - most-restrictive matching rule wins (deny-override), its `risk`
     ///     resolved through the live risk map (`cache.policy.risk`),
@@ -574,7 +574,7 @@ impl AppState {
             Some(VaultState::Unlocked { cache, .. }) => cache,
             _ => return None,
         };
-        // Built-in rules come from the connection's *service* recipe (static);
+        // Built-in rules come from the connection's *service* definition (static);
         // the user's per-connection edits/additions (`aux.policy.connections.
         // <id>.rules`) merge on top. The merge is per-connection so two
         // connections of the same service can be policed independently.
@@ -589,11 +589,11 @@ impl AppState {
             conn_policy.map(|c| &c.rules).unwrap_or(&empty_rules),
         );
         // Connection default floor (when no rule matches): user's per-connection
-        // override field-wise over the recipe's `[default]`.
-        let recipe_levels = self.services.default_policy_levels(service_id);
+        // override field-wise over the service's `[default]`.
+        let builtin_levels = self.services.default_policy_levels(service_id);
         let connection_levels = crate::core::policy::merge_levels(
             conn_policy.and_then(|c| c.default.as_ref()),
-            recipe_levels.as_ref(),
+            builtin_levels.as_ref(),
         );
         // The risk map + category/global floors live in `cache.policy` (the
         // user's `aux.policy` overlaid on compiled defaults at refresh). Read
@@ -896,7 +896,7 @@ mod tests {
         use crate::core::policy::{AccessLevel, ConnectionPolicy, Policy, RiskTier, RuleConfig};
 
         // Inject the test rules as the connection's user rules (medium → ask).
-        // "gh" has no recipe, so built-in is empty and these are the only rules.
+        // "gh" has no service definition, so built-in is empty and these are the only rules.
         let ask_rule = |pat: &str| RuleConfig {
             match_pattern: Some(pat.to_string()),
             risk: Some(RiskTier::Medium),

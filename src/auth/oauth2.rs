@@ -170,13 +170,10 @@ pub async fn exchange_code(
     })
 }
 
-/// Multi-vault SaaS daemon's refresh-on-use entry point. Same wire
-/// behavior as `refresh_token` (which takes the legacy AuthConfig
-/// blob), but accepts inputs as primitive params so callers can mix
-/// per-vault state (the refresh_token, from `cache.entries`) with
-/// per-deployment config (token_url + client_id + optional
-/// client_secret, loaded from env vars at daemon startup and threaded
-/// through service.toml).
+/// OAuth refresh-on-use entry point. Accepts inputs as primitive params so
+/// callers can mix per-vault state (the refresh_token, from `cache.entries`)
+/// with per-deployment config (token_url + client_id + optional client_secret,
+/// resolved from the service definition + its provider).
 ///
 /// Returns `(access_token, absolute_expires_at_unix_secs)` on success.
 /// On refresh failure, returns an `Err(String)` with the provider's

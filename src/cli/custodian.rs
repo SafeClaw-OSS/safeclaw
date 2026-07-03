@@ -1,6 +1,6 @@
 //! Daemon read-only diagnostics: `sc pubkey` (HPKE outer-envelope key, fetched
 //! from a running daemon) and `sc registry` (public service catalog, rendered
-//! OFFLINE from the compiled-in recipes — no daemon needed). Daemon lifecycle
+//! OFFLINE from the compiled-in services — no daemon needed). Daemon lifecycle
 //! (up / down / restart / logs / serve) lives in `service` + `up`; vault/daemon
 //! status in `status`.
 
@@ -12,7 +12,7 @@ pub async fn pubkey(args: CommonArgs) -> Result<(), String> {
 }
 
 /// `sc registry` — render the static service catalog from the compiled-in
-/// recipes, no running daemon. This is the exact shape `GET /registry` serves;
+/// services, no running daemon. This is the exact shape `GET /registry` serves;
 /// CI runs `sc registry --json` to publish the catalog artifact the console
 /// reads. Offline by construction (`ServiceRegistry::compiled_only()`).
 pub fn registry(args: RegistryArgs) -> Result<(), String> {
@@ -62,5 +62,5 @@ fn resolve_daemon_url() -> Result<String, String> {
     if let Ok((c, _)) = resolve_active(None) {
         return Ok(c);
     }
-    Ok("http://localhost:23294".to_string())
+    Ok("http://localhost:23295".to_string())
 }

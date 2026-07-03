@@ -1,8 +1,8 @@
 # gitlab differs from the safe global default (ask-always): the git transport
-# over /stream must be `allow` so clone/fetch/push aren't gated per request (the
-# token never enters git; the user opted in by configuring `insteadOf`), and the
-# REST writes are `allow` too. Recorded here because it IS a deliberate,
-# non-default policy (SSoT — service.toml carries no policy).
+# must be `allow` so clone/fetch/push aren't gated per request (the token never
+# enters git — the proxy substitutes the phantom at egress), and the REST writes
+# are `allow` too. Recorded here because it IS a deliberate, non-default policy
+# (SSoT — service.toml carries no policy).
 [default]
 read = "allow"
 write = "allow"
