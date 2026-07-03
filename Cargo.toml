@@ -54,6 +54,15 @@ base64 = "0.22"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 futures-util = "0.3"
+
+# Resident credential proxy — the one agent-facing surface. hudsucker is a
+# localhost HTTPS MITM (HTTP CONNECT). Default features
+# (decoder/rcgen-ca/rustls-client) are pure-rustls (aws-lc-rs), NO OpenSSL. It
+# re-exports rcgen + rustls + tokio_rustls + hyper so our versions line up with
+# reqwest 0.12 (rustls 0.23 / tokio-rustls 0.26). http-body-util gives us
+# BodyExt::collect for the bounded body scan.
+hudsucker = "0.24"
+http-body-util = "0.1"
 toml = "0.8"
 dirs = "5"
 url = "2"
