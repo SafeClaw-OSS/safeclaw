@@ -1,7 +1,9 @@
 //! `safeclaw status` / `safeclaw vault status` — current vault status.
 
 use crate::cli::active::{join_vault_url, load as load_config};
-use crate::config::StatusArgs;
+use crate::cli::discovery::{self, ConnRow};
+use crate::cli::proxy_env::{is_routed, proxy_base};
+use crate::config::{StatusArgs, CONTROL_PORT};
 
 #[derive(Debug)]
 pub struct VaultStatus {
@@ -38,7 +40,11 @@ pub async fn probe_local_daemon() -> LocalDaemon {
         Ok(c) => c,
         Err(_) => return LocalDaemon { up: false, version: None, vault_count: None },
     };
-    let resp = match client.get("http://localhost:23294/health").send().await {
+    // The control/API plane (where /health lives) is CONTROL_PORT; the proxy
+    // owns the other port. Address it by the constant so the port swap can't
+    // drift this probe.
+    let health_url = format!("http://localhost:{}/health", CONTROL_PORT);
+    let resp = match client.get(&health_url).send().await {
         Ok(r) if r.status().is_success() => r,
         _ => return LocalDaemon { up: false, version: None, vault_count: None },
     };
@@ -91,11 +97,28 @@ pub async fn fetch_status(custodian: &str, vault: &str) -> VaultStatus {
 }
 
 pub async fn run(args: StatusArgs) -> Result<(), String> {
-    let _ = &args; // no per-command override flag; daemon URL comes from config
     let cfg = load_config()?;
+    let d = probe_local_daemon().await;
+
+    // The vault, its connections (agent-facing projection), and the routing
+    // preflight are only meaningful with an active vault selected.
+    let vault = match (cfg.daemon.as_deref(), cfg.vault.as_deref()) {
+        (Some(c), Some(v)) => Some(fetch_status(c, v).await),
+        _ => None,
+    };
+    let conns: Vec<ConnRow> = match (cfg.daemon.as_deref(), cfg.vault.as_deref()) {
+        (Some(c), Some(v)) => discovery::connections(c, v).await.unwrap_or_default(),
+        _ => Vec::new(),
+    };
+    let routed = is_routed().await;
+    let proxy = proxy_base();
+
+    if args.json {
+        print_json(&d, &vault, &conns, &proxy, routed);
+        return Ok(());
+    }
 
     // ── Daemon ──────────────────────────────────────────────────────────
-    let d = probe_local_daemon().await;
     println!("daemon");
     if d.up {
         println!("  state:   running");
@@ -111,12 +134,9 @@ pub async fn run(args: StatusArgs) -> Result<(), String> {
     println!();
 
     // ── Active vault ────────────────────────────────────────────────────
-    match (cfg.daemon.as_deref(), cfg.vault.as_deref()) {
-        (Some(c), Some(v)) => {
-            let s = fetch_status(c, v).await;
-            print_status(&s);
-        }
-        _ => {
+    match &vault {
+        Some(s) => print_status(s),
+        None => {
             println!("active vault");
             println!("  state: none selected");
             if d.vault_count == Some(0) {
@@ -128,7 +148,63 @@ pub async fn run(args: StatusArgs) -> Result<(), String> {
             }
         }
     }
+    println!();
+
+    // ── Proxy / routing (spec §14) ──────────────────────────────────────
+    println!("proxy");
+    println!("  address: {}", proxy);
+    if routed {
+        println!("  routed:  true — commands here go through SafeClaw; phantoms substitute");
+    } else {
+        println!("  routed:  false — prefix commands with `sc run -- <cmd>` (or `eval \"$(sc run --export-env)\"`)");
+    }
+    println!();
+
+    // ── Connections (what the agent can use) ────────────────────────────
+    println!("connections");
+    if conns.is_empty() {
+        println!("  (none — add one with `sc connect <name> --host <domain>`, or in the console)");
+    } else {
+        for c in &conns {
+            println!("  {}", c.name);
+            if !c.hosts.is_empty() {
+                println!("    hosts:    {}", c.hosts.join(", "));
+            }
+            for (role, ph) in &c.phantoms {
+                println!("    phantom:  {} = {}", role, ph);
+            }
+        }
+    }
     Ok(())
+}
+
+fn print_json(d: &LocalDaemon, vault: &Option<VaultStatus>, conns: &[ConnRow], proxy: &str, routed: bool) {
+    let vault_json = vault.as_ref().map(|s| {
+        let (state, passkeys, secrets) = match &s.state {
+            VaultState::Unreachable => ("unreachable", None, None),
+            VaultState::NotFound => ("not_found", None, None),
+            VaultState::Locked { passkeys } => ("locked", Some(*passkeys), None),
+            VaultState::Unlocked { passkeys, secrets } => ("unlocked", Some(*passkeys), Some(*secrets)),
+        };
+        serde_json::json!({
+            "url": s.url,
+            "state": state,
+            "passkeys": passkeys,
+            "secrets": secrets,
+        })
+    });
+    let conns_json: Vec<serde_json::Value> = conns
+        .iter()
+        .map(|c| serde_json::json!({ "name": c.name, "hosts": c.hosts, "phantoms": c.phantoms }))
+        .collect();
+    let out = serde_json::json!({
+        "daemon": { "up": d.up, "version": d.version, "vaults": d.vault_count },
+        "vault": vault_json,
+        "proxy": proxy,
+        "routed": routed,
+        "connections": conns_json,
+    });
+    println!("{}", serde_json::to_string_pretty(&out).unwrap_or_else(|_| out.to_string()));
 }
 
 pub fn print_status(s: &VaultStatus) {
