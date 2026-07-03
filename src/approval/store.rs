@@ -68,6 +68,11 @@ pub struct PolicyContext {
     /// the matched rule's `ttl`, the service / category default's
     /// `ask_ttl`, or `Policy.timeout` as last resort.
     pub ttl_seconds: u64,
+    /// Resolved destination host of the request that created this op. The
+    /// approval-cache key is host-scoped (an approval for host A must not
+    /// authorize host B in the TTL), so the approve handler reads this when it
+    /// writes `record_ask_approval`. Stamped by the proxy at op-create.
+    pub host: Option<String>,
 }
 
 impl ApprovalRecord {

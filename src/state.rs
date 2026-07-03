@@ -108,12 +108,15 @@ pub struct SecretsCache {
     /// requests *of the same scope* within the TTL fast-path without
     /// re-prompting. `ask-always` never lands here; `allow` doesn't need it.
     ///
-    /// Key shape: `(connection_id, rule_id, method)`. The grant is bound to:
+    /// Key shape: `(connection_id, rule_id, method, host)`. The grant is bound to:
     ///   - the **connection** — approving account A's send never fast-paths B;
     ///   - the matched **policy rule** — which carries the path scope, so a
     ///     grant can never reach beyond the rule the user's approval matched;
     ///   - the **HTTP method** — so approving a read (GET) never silently
-    ///     authorizes a later write (POST/DELETE) inside the window.
+    ///     authorizes a later write (POST/DELETE) inside the window;
+    ///   - the resolved **destination host** — an approval for host A must not
+    ///     authorize host B within the TTL (host is request data in the
+    ///     phantom-only model: one connection may anchor several hosts).
     /// A category-/connection-default Ask (no rule matched) is deliberately
     /// **not cached** — it has no author-defined path scope to bound a grant,
     /// so it re-prompts every request. Value: Unix-epoch-second expiry.
@@ -121,7 +124,7 @@ pub struct SecretsCache {
     /// Lives in the same memory window as the rest of the cache: dropped on
     /// lock (which zero-outs the entire cache via Default drop). Daemon
     /// restart also blows it away (vaults boot Locked, cache starts empty).
-    pub rule_approvals: HashMap<(String, String, String), u64>,
+    pub rule_approvals: HashMap<(String, String, String, String), u64>,
     /// Item names present in the decrypted `native-secrets` kv (names only,
     /// never values). Surface for `GET /v/{vid}/secret-keys` so the frontend
     /// can decide which services are "reachable" without paying for an
@@ -559,6 +562,7 @@ impl AppState {
         service_id: &str,
         method: &str,
         path: &str,
+        host: &str,
         body: Option<&str>,
     ) -> Option<(crate::core::policy::AccessLevel, Option<String>, Option<u64>)> {
         let now = SystemTime::now()
@@ -619,9 +623,15 @@ impl AppState {
         // `allow` doesn't need to.
         if level == crate::core::policy::AccessLevel::Ask {
             if let Some(rule_id) = matched_rule.clone() {
-                // The grant is scoped to the **connection** (not the service):
-                // approving account A's send never fast-paths account B's.
-                let key = (connection_id.to_string(), rule_id, method.to_string());
+                // The grant is scoped to the **connection** (not the service),
+                // the matched rule, the method, AND the resolved host: an
+                // approval for host A must not fast-path host B in the window.
+                let key = (
+                    connection_id.to_string(),
+                    rule_id,
+                    method.to_string(),
+                    host.to_ascii_lowercase(),
+                );
                 if let Some(&exp) = cache.rule_approvals.get(&key) {
                     if exp > now {
                         return Some((
@@ -660,6 +670,7 @@ impl AppState {
         connection_id: &str,
         rule_id: Option<String>,
         method: &str,
+        host: &str,
         ttl_seconds: u64,
     ) {
         // No rule scope → not cacheable (see doc above).
@@ -671,11 +682,120 @@ impl AppState {
         let mut states = self.vault_states.lock().unwrap();
         if let Some(VaultState::Unlocked { cache, .. }) = states.get_mut(vault_id) {
             cache.rule_approvals.insert(
-                (connection_id.to_string(), rule_id, method.to_string()),
+                (
+                    connection_id.to_string(),
+                    rule_id,
+                    method.to_string(),
+                    host.to_ascii_lowercase(),
+                ),
                 now + ttl_seconds,
             );
         }
     }
+
+    // ── Proxy-facing accessors (resident phantom-only proxy) ─────────────────
+
+    /// Clone a connection record out of the unlocked routing snapshot. `None`
+    /// when the vault is Locked or the connection id is unknown.
+    pub fn connection_snapshot(
+        &self,
+        vault_id: &str,
+        conn: &str,
+    ) -> Option<crate::storage::plaintext::Connection> {
+        let states = self.vault_states.lock().unwrap();
+        match states.get(vault_id) {
+            Some(VaultState::Unlocked { cache, .. }) => cache.connections.get(conn).cloned(),
+            _ => None,
+        }
+    }
+
+    /// The exact FQDNs a connection's credential may egress to, resolved
+    /// through the compiled registry and the vault's custom services. `None`
+    /// when the vault is Locked or the connection id is unknown.
+    pub fn resolved_hosts_for(&self, vault_id: &str, conn: &str) -> Option<Vec<String>> {
+        let states = self.vault_states.lock().unwrap();
+        let cache = match states.get(vault_id) {
+            Some(VaultState::Unlocked { cache, .. }) => cache,
+            _ => return None,
+        };
+        let conn_rec = cache.connections.get(conn)?;
+        let def = conn_rec.service.as_deref().and_then(|s| {
+            self.services
+                .get(s)
+                .cloned()
+                .or_else(|| cache.custom_services.get(s).cloned())
+        });
+        Some(crate::core::host::resolved_hosts(conn_rec, def.as_ref()))
+    }
+
+    /// True iff `host` is in the union of `resolved_hosts` over the connections
+    /// of ALL currently-unlocked vaults. Decides MITM-vs-blind-tunnel at CONNECT
+    /// time: only hosts a connection anchors are decrypted; everything else is a
+    /// blind tunnel. Not vid-scoped on purpose — we MITM (and can return a
+    /// precise error) even when the CONNECT's vid userinfo is wrong or absent.
+    pub fn host_in_any_unlocked_union(&self, host: &str) -> bool {
+        let states = self.vault_states.lock().unwrap();
+        for st in states.values() {
+            let VaultState::Unlocked { cache, .. } = st else {
+                continue;
+            };
+            for conn_rec in cache.connections.values() {
+                let def = conn_rec.service.as_deref().and_then(|s| {
+                    self.services
+                        .get(s)
+                        .cloned()
+                        .or_else(|| cache.custom_services.get(s).cloned())
+                });
+                for h in crate::core::host::resolved_hosts(conn_rec, def.as_ref()) {
+                    if crate::core::host::host_matches_exact(host, &h) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Session-level host widen (component C partial): append an exact FQDN to a
+    /// connection's anchored hosts in the unlocked routing snapshot so the
+    /// agent's retried request passes the anchor. Durable persistence into
+    /// `aux.connections` is a separate write (see BUILD_NOTES). No-op when the
+    /// vault is Locked or the connection is unknown.
+    pub fn widen_connection_host(&self, vault_id: &str, conn: &str, host: &str) {
+        let mut states = self.vault_states.lock().unwrap();
+        if let Some(VaultState::Unlocked { cache, .. }) = states.get_mut(vault_id) {
+            if let Some(conn_rec) = cache.connections.get_mut(conn) {
+                let hosts = conn_rec.hosts.get_or_insert_with(Vec::new);
+                if !hosts.iter().any(|h| h.eq_ignore_ascii_case(host)) {
+                    hosts.push(host.to_string());
+                }
+            }
+        }
+    }
+
+    /// How many vaults are currently unlocked — enough to resolve the CONNECT's
+    /// vid when the userinfo is absent (0 → nothing to broker; 1 → the common
+    /// single-vault machine; ≥2 → the agent must name the vault via `sc run`).
+    pub fn unlocked_vault(&self) -> UnlockedVaults {
+        let states = self.vault_states.lock().unwrap();
+        let mut it = states
+            .iter()
+            .filter(|(_, v)| matches!(v, VaultState::Unlocked { .. }))
+            .map(|(k, _)| k.clone());
+        match (it.next(), it.next()) {
+            (None, _) => UnlockedVaults::None,
+            (Some(id), None) => UnlockedVaults::One(id),
+            (Some(_), Some(_)) => UnlockedVaults::Many,
+        }
+    }
+}
+
+/// The unlocked-vault population, used to bind a proxied request to a vault
+/// when the CONNECT carries no vid userinfo.
+pub enum UnlockedVaults {
+    None,
+    One(String),
+    Many,
 }
 
 #[cfg(test)]
@@ -800,23 +920,34 @@ mod tests {
         // Baseline: GET resolves to Ask under the "read" rule. (Default
         // connection: connection_id == service_id == "gh".)
         let (lvl, rule, _) = state
-            .evaluate_request_policy(vid, "gh", "gh", "GET", "/x", None)
+            .evaluate_request_policy(vid, "gh", "gh", "GET", "/x", "api.gh.com", None)
             .unwrap();
         assert_eq!(lvl, AccessLevel::Ask);
         assert_eq!(rule.as_deref(), Some("read"));
 
-        // User approves that GET.
-        state.record_ask_approval(vid, "gh", Some("read".to_string()), "GET", 60);
+        // User approves that GET toward host A.
+        state.record_ask_approval(vid, "gh", Some("read".to_string()), "GET", "api.gh.com", 60);
 
-        // The same GET now fast-paths (the feature still works).
+        // The same GET toward the same host now fast-paths (the feature works).
         let (lvl, _, _) = state
-            .evaluate_request_policy(vid, "gh", "gh", "GET", "/x", None)
+            .evaluate_request_policy(vid, "gh", "gh", "GET", "/x", "api.gh.com", None)
             .unwrap();
         assert_eq!(lvl, AccessLevel::Allow, "approved GET should fast-path");
 
+        // Same GET/rule toward a DIFFERENT host must NOT fast-path — the grant
+        // is host-scoped (E2E-5 oracle: approve host A → call host B → re-ask).
+        let (lvl, _, _) = state
+            .evaluate_request_policy(vid, "gh", "gh", "GET", "/x", "evil.gh.com", None)
+            .unwrap();
+        assert_eq!(
+            lvl,
+            AccessLevel::Ask,
+            "approving host A must never fast-path host B"
+        );
+
         // A POST is a DIFFERENT verb/rule — the GET approval must not cover it.
         let (lvl, rule, _) = state
-            .evaluate_request_policy(vid, "gh", "gh", "POST", "/x", None)
+            .evaluate_request_policy(vid, "gh", "gh", "POST", "/x", "api.gh.com", None)
             .unwrap();
         assert_eq!(
             lvl,
@@ -827,6 +958,6 @@ mod tests {
 
         // A category-default Ask (no rule) is never recorded, so it can never
         // produce a fast-path — record is a no-op for rule_id == None.
-        state.record_ask_approval(vid, "gh", None, "GET", 60);
+        state.record_ask_approval(vid, "gh", None, "GET", "api.gh.com", 60);
     }
 }

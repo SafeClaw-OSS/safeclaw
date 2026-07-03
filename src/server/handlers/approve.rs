@@ -864,6 +864,41 @@ pub async fn approve_op(
                     None,
                 )
             }
+            // Component C — one-tap host widen. The agent hit a destination the
+            // connection doesn't anchor; the user approves adding that exact
+            // FQDN as a permanent grant. Session-level today (the in-memory
+            // routing snapshot is widened so the agent's retry passes the
+            // anchor); durable persistence into `aux.connections[conn].hosts`
+            // is the documented follow-up (see BUILD_NOTES: widen durable write).
+            "widen-host" => {
+                let conn = validated
+                    .op
+                    .act
+                    .scope
+                    .get("connection_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let host = validated
+                    .op
+                    .act
+                    .scope
+                    .get("host")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if conn.is_empty() || host.is_empty() {
+                    return Err(AppError::BadRequest(
+                        "widen-host scope needs connection_id + host".into(),
+                    ));
+                }
+                state.widen_connection_host(&vault_id, &conn, &host);
+                tracing::info!(vault = %vault_id, conn = %conn, host = %host, "host widened (session)");
+                (
+                    json!({ "ok": true, "act": "widen-host", "connection_id": conn, "host": host }),
+                    None,
+                )
+            }
             other => {
                 return Err(AppError::BadRequest(format!(
                     "unsupported Custom act: {}",
@@ -936,12 +971,28 @@ pub async fn approve_op(
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
+            // Host-scoped grant: read the resolved host the proxy stamped onto
+            // the policy context (falls back to the op scope for robustness).
+            let host = pc
+                .host
+                .clone()
+                .or_else(|| {
+                    validated
+                        .op
+                        .act
+                        .scope
+                        .get("host")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                })
+                .unwrap_or_default();
             if !conn.is_empty() && !req_method.is_empty() {
                 state.record_ask_approval(
                     &rec_vault_id,
                     &conn,
                     pc.rule_id,
                     &req_method,
+                    &host,
                     pc.ttl_seconds,
                 );
             }
@@ -1216,6 +1267,47 @@ pub(crate) fn bootstrap_cache_from_view(
             if !map.is_empty() {
                 cache.allow_secrets.insert(conn.clone(), map);
             }
+        }
+    }
+
+    // Raw connections (`service: None`, created by `sc set K --host h`) have no
+    // recipe, so the per-service loops above skip them. Their policy floor is
+    // the global default (`allow`), and the resident proxy resolves an allow
+    // request straight from the session cache (no grant to open the vault), so
+    // their secret bytes MUST be resident. Reverse-index the native-secrets
+    // namespace: a raw connection `c` owns the bare key `c` (sole secret) and/or
+    // `c:<ROLE>` keys (matches `secret_address`). Case-insensitive because the
+    // conn id is env-safe lowercase while the stored key may be upper-case.
+    for (conn, c) in view.aux.connections.iter() {
+        if c.service.is_some() {
+            continue; // service-backed — handled above
+        }
+        let conn_lc = conn.to_ascii_lowercase();
+        let prefix = format!("{conn_lc}:");
+        let mut map: std::collections::HashMap<String, Vec<u8>> =
+            std::collections::HashMap::new();
+        let mut primary: Option<Vec<u8>> = None;
+        for (name, bytes) in view.native_secrets.iter() {
+            let name_lc = name.to_ascii_lowercase();
+            if name_lc == conn_lc {
+                // Sole secret — role is the connection name.
+                primary = Some(bytes.clone());
+                map.insert(conn.clone(), bytes.clone());
+            } else if let Some(role) = name_lc.strip_prefix(&prefix) {
+                map.insert(role.to_string(), bytes.clone());
+            }
+        }
+        // A single namespaced role with no bare key is still the primary.
+        if primary.is_none() && map.len() == 1 {
+            primary = map.values().next().cloned();
+        }
+        if let Some(p) = primary {
+            cache
+                .entries
+                .insert(conn.clone(), crate::state::CacheEntry { value: p, expires_at: None });
+        }
+        if !map.is_empty() {
+            cache.allow_secrets.insert(conn.clone(), map);
         }
     }
 
