@@ -535,6 +535,13 @@ impl PerItemVault {
                 &ItemPayload::live(ItemNs::Aux, "audit_retention_days", serde_json::json!(days)),
             )?;
         }
+        if !view.aux.services.is_empty() {
+            let body = serde_json::to_value(&view.aux.services).map_err(AppError::from)?;
+            self.seal_and_upsert::<S>(
+                k, vault_id, ItemNs::Aux, "services", 1,
+                &ItemPayload::live(ItemNs::Aux, "services", body),
+            )?;
+        }
         Ok(())
     }
 
@@ -592,6 +599,12 @@ impl PerItemVault {
         }
         if let Some(days) = view.aux.audit_retention_days {
             desired.insert((ItemNs::Aux, "audit_retention_days".to_string()), serde_json::json!(days));
+        }
+        if !view.aux.services.is_empty() {
+            desired.insert(
+                (ItemNs::Aux, "services".to_string()),
+                serde_json::to_value(&view.aux.services).map_err(AppError::from)?,
+            );
         }
 
         // Upsert every desired item whose sealed body differs from what we hold.
@@ -727,6 +740,10 @@ impl PerItemVault {
                                 serde_json::from_value(payload.body).map_err(|e| {
                                     AppError::Internal(format!("aux.audit_retention_days parse: {}", e))
                                 })?;
+                        }
+                        "services" => {
+                            aux.services = serde_json::from_value(payload.body)
+                                .map_err(|e| AppError::Internal(format!("aux.services parse: {}", e)))?;
                         }
                         _ => {}
                     }
@@ -914,7 +931,7 @@ mod tests {
             &k, vid, ItemNs::Connection, "gmail", 1,
             &ItemPayload::live(
                 ItemNs::Connection, "gmail",
-                serde_json::json!({ "service": "gmail", "config": {} }),
+                serde_json::json!({ "service": "gmail" }),
             ),
         ).unwrap();
         pv.seal_and_upsert::<StdPrimitives>(
@@ -929,10 +946,10 @@ mod tests {
         assert_eq!(view.resolve_value_native("OPENAI_KEY"), Some(&b"sk-live"[..]));
         assert_eq!(view.native_secrets.get("GONE"), None, "tombstone must be dropped");
         assert_eq!(
-            view.aux.connections.get("gmail").map(|c| c.service.as_str()),
+            view.aux.connections.get("gmail").and_then(|c| c.service.as_deref()),
             Some("gmail")
         );
         assert_eq!(view.aux.store_order, vec!["native-secrets", "native-files", "gcp-1"]);
-        assert_eq!(view.aux.version, 3);
+        assert_eq!(view.aux.version, 4);
     }
 }
