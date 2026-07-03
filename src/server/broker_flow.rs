@@ -148,9 +148,25 @@ pub async fn resolve_auth_value(
     service_id: &str,
     raw: &[u8],
 ) -> Result<Vec<u8>> {
-    let oauth = state.services.get(service_id).and_then(|s| s.oauth2.clone());
+    // Resolve the oauth2 config from the SAME sources the pipeline used to decide
+    // this is an oauth connection: the compiled registry AND the vault's custom
+    // services (aux.services). A custom `[oauth2]` service lives only in the
+    // latter — looking only at the compiled registry would miss it and fall
+    // through to returning `raw`, i.e. the refresh token, straight to the
+    // upstream. That must never happen.
+    let oauth = state
+        .services
+        .get(service_id)
+        .and_then(|s| s.oauth2.clone())
+        .or_else(|| state.custom_service(vault_id, service_id).and_then(|s| s.oauth2.clone()));
     let Some(oauth) = oauth else {
-        return Ok(raw.to_vec());
+        // The pipeline only calls this for an oauth ACCESS phantom (is_oauth was
+        // true from the resolved def). Not finding a config here means the two
+        // disagree — fail closed, never leak the refresh token as a fallback.
+        return Err(AppError::Internal(format!(
+            "connection '{}' resolved as oauth2 but service '{}' exposes no oauth2 config",
+            conn_id, service_id
+        )));
     };
 
     // Cache hit — keyed by connection so two accounts of one service don't collide.

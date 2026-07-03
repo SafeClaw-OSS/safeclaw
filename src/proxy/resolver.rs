@@ -17,7 +17,11 @@ use regex::Regex;
 /// prefix like telegram's `/bot__sc__telegram__/…` — because a phantom is a
 /// value, not necessarily a whole word.
 static PHANTOM_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"__sc__[a-z0-9](?:[a-z0-9_]*[a-z0-9])?(?:__[a-z0-9](?:[a-z0-9_]*[a-z0-9])?)?__")
+    // A segment is alnum runs joined by SINGLE underscores — never `__` (the
+    // delimiter) and no leading/trailing `_`. This is what stops the scanner
+    // from fusing two directly-adjacent phantoms (`__sc__a____sc__b__`) into one
+    // over-long match that `parse_phantom` then rejects, silently dropping both.
+    Regex::new(r"__sc__[a-z0-9]+(?:_[a-z0-9]+)*(?:__[a-z0-9]+(?:_[a-z0-9]+)*)?__")
         .expect("phantom regex is valid")
 });
 
@@ -177,6 +181,14 @@ mod tests {
         let s = "a=__sc__github__ b=__sc__bb__username__ c=__sc__github__";
         let got = collect_phantoms(s);
         assert_eq!(got, vec![p("github", None), p("bb", Some("username"))]);
+    }
+
+    #[test]
+    fn collect_adjacent_phantoms_not_fused() {
+        // Two phantoms with no separator must both be found, not swallowed into
+        // one over-long match that parse rejects.
+        let got = collect_phantoms("__sc__a____sc__b__");
+        assert_eq!(got, vec![p("a", None), p("b", None)]);
     }
 
     #[test]

@@ -87,13 +87,15 @@ fn is_valid_service_id(s: &str) -> bool {
     s.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
 }
 
-/// A secret role key: env-style `[A-Z0-9_]`, non-empty, not starting with a
-/// digit. The phantom role segment is its lowercase form.
+/// A secret role key: env-style `[A-Z0-9_]`, starts with a letter, and — because
+/// its lowercase becomes a phantom role segment (`__sc__<conn>__<role>__`) — it
+/// must carry no `__` (the delimiter) and no trailing `_` (which would fuse into
+/// the delimiter as `___` and make the advertised phantom unparseable).
 fn is_valid_role(s: &str) -> bool {
-    if s.is_empty() {
+    if s.is_empty() || s.contains("__") || s.ends_with('_') {
         return false;
     }
-    let first_ok = s.chars().next().map(|c| c.is_ascii_uppercase() || c == '_').unwrap_or(false);
+    let first_ok = s.chars().next().map(|c| c.is_ascii_uppercase()).unwrap_or(false);
     first_ok && s.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
 }
 

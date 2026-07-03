@@ -26,12 +26,14 @@ pub use handler::BrokerHandler;
 /// the control plane even if it returns (a proxy exit must not kill the daemon).
 pub async fn serve(state: Arc<AppState>) -> Result<(), String> {
     let resident = ca::load_or_generate(&state.config.state_dir)?;
-    let ip: std::net::IpAddr = state
-        .config
-        .listen
-        .parse()
-        .unwrap_or_else(|_| "127.0.0.1".parse().unwrap());
-    let addr = SocketAddr::new(ip, state.config.proxy_port);
+    // The proxy injects real credentials and carries no auth of its own, so it
+    // MUST stay loopback-only — regardless of the control plane's `--listen`
+    // (which may legitimately be 0.0.0.0 behind a trusted reverse proxy). Binding
+    // it to config.listen would expose the auth-less injector on every interface.
+    let addr = SocketAddr::new(
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        state.config.proxy_port,
+    );
 
     let proxy = Proxy::builder()
         .with_addr(addr)
