@@ -52,4 +52,11 @@ case ":${PATH}:" in
   *":${DEST}:"*) ;;
   *) echo "Add it to PATH:  export PATH=\"${DEST}:\$PATH\"" ;;
 esac
-echo "Next:  sc login --pair-token <token>"
+echo
+echo "Next:"
+echo "  1. sc login --pair-token <token>     # pair this host to your vault"
+echo "  2. sc up                             # start SafeClaw + unlock (one passkey tap)"
+echo "  3. sc status                         # your connections, their phantoms, and 'routed'"
+echo
+echo "Then run a command through SafeClaw so a phantom (__sc__<name>__) resolves:"
+echo "  sc run -- <your command>"
