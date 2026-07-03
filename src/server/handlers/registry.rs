@@ -33,6 +33,7 @@ use serde_json::Value;
 
 use crate::error::Result;
 use crate::server::handlers::op::validate_vault_id;
+use crate::core::host::phantoms_for;
 use crate::service::{ServiceDef, ServiceRegistry};
 use crate::state::{AppState, VaultState};
 
@@ -83,25 +84,21 @@ impl RegistryQuery {
 }
 
 #[derive(Debug, Serialize)]
-pub struct RegistryEndpoint {
-    pub method: String,
-    pub path: String,
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    pub wildcard: bool,
-}
-
-#[derive(Debug, Serialize)]
 pub struct RegistryService {
     pub id: String,
     pub name: String,
     pub category: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    /// Omitted in `?view=summary` (empty). Full view always lists at least one.
+    /// Anchored egress hosts (service-declared exact FQDNs / `*.suffix`).
+    /// Omitted in `?view=summary`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub endpoints: Vec<RegistryEndpoint>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub vault_fields: Vec<RegistryVaultField>,
+    pub hosts: Vec<String>,
+    /// Injectable role → ready-made phantom string (`__sc__<conn>__[<role>__]`).
+    /// The agent copies these verbatim, never constructs them. Omitted in
+    /// `?view=summary`. Empty on the static catalog face (phantoms are per-vault).
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub phantoms: std::collections::BTreeMap<String, String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub policy: Option<RegistryServicePolicy>,
     /// Only present on the per-vault endpoint. `true` = every declared
@@ -176,16 +173,6 @@ pub struct RegistryPolicyRule {
 }
 
 #[derive(Debug, Serialize)]
-pub struct RegistryVaultField {
-    pub name: String,
-    pub kind: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub placeholder: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
 pub struct RegistryResponse {
     pub version: u32,
     pub services: Vec<RegistryService>,
@@ -219,57 +206,15 @@ struct VaultOverlay<'a> {
     native_keys: &'a HashSet<String>,
 }
 
-fn endpoint_for_api(id: &str, api: &crate::service::ApiDef) -> RegistryEndpoint {
-    // Paths are relative to the broker base the agent already holds
-    // (`$SAFECLAW_VAULT_URL/use`) so the agent can prepend it uniformly.
-    let rest = api.path.trim_start_matches('/');
-    let (path, wildcard) = if rest == "*" {
-        (format!("/{}", id), true)
+/// The secret roles that must be present in the vault for a service to be
+/// "connected": the oauth2 refresh-token role, else every declared direct
+/// secret. Empty ⇒ the service needs no credential.
+fn required_keys(def: &ServiceDef) -> Vec<String> {
+    if let Some(o) = &def.oauth2 {
+        vec![o.secret.clone()]
     } else {
-        (format!("/{}/{}", id, rest), false)
-    };
-    RegistryEndpoint {
-        method: api.method.clone().unwrap_or_else(|| "ANY".to_string()),
-        path,
-        wildcard,
+        def.service.secrets.clone()
     }
-}
-
-fn vault_fields_for(def: &ServiceDef) -> Vec<RegistryVaultField> {
-    if !def.vault.is_empty() {
-        return def
-            .vault
-            .iter()
-            .map(|vf| RegistryVaultField {
-                name: vf.name.clone(),
-                kind: vf.kind.clone(),
-                description: vf.description.clone(),
-                placeholder: None,
-            })
-            .collect();
-    }
-    // Single-field synthesis from `auth.secret` for the common API-key case.
-    let Some(env_name) = def
-        .upstream
-        .first()
-        .and_then(|u| u.auth.as_ref())
-        .and_then(|a| a.secret.as_ref())
-        .filter(|s| !s.trim().is_empty())
-    else {
-        return vec![];
-    };
-    let placeholder = def
-        .upstream
-        .first()
-        .and_then(|u| u.auth.as_ref())
-        .and_then(|a| a.placeholder.clone())
-        .filter(|p| !p.contains("{{"));
-    vec![RegistryVaultField {
-        name: env_name.clone(),
-        kind: "secret".to_string(),
-        description: Some(format!("{} credential", def.service.name)),
-        placeholder,
-    }]
 }
 
 fn policy_for(
@@ -321,23 +266,10 @@ fn policy_for(
     Some(RegistryServicePolicy { defaults, rules })
 }
 
-/// Render a service's `setup` hint for the registry, filling `{{proxy_base}}`
-/// / `{{api_key}}` / `{{vault}}`. Agent-facing only — the setup context has no
-/// access to vault secrets by construction. Returns `None` if the service
-/// declares no `setup` string.
-///
-/// With the daemon collapsed to a single port, `{{proxy_base}}` renders to the
-/// literal `$SAFECLAW_VAULT_URL` (the broker base the agent already has in its
-/// env) — the agent's shell expands it. `{{api_key}}` (if any recipe uses it)
-/// renders to the literal `$SAFECLAW_API_KEY` the same way. So a setup hint is
-/// identical across deployments and never needs a request-derived host. The
-/// route is inlined by the recipe as `{{proxy_base}}/stream/<upstream>/`.
+/// A service's `setup` hint — plain agent-facing prose in v4 (routed ⇒ nothing
+/// to configure; unrouted ⇒ `sc run -- <cmd>`). No template tokens.
 fn render_setup(def: &ServiceDef) -> Option<String> {
-    use crate::server::broker::{render_setup_template, SetupInputs};
-    const PROXY_BASE: &str = "$SAFECLAW_VAULT_URL";
-    let setup = def.setup.as_deref()?;
-    let inputs = SetupInputs { proxy_base: PROXY_BASE, api_key: "$SAFECLAW_API_KEY", vault: "" };
-    render_setup_template(setup, &inputs).ok()
+    def.setup.clone()
 }
 
 fn build_service(
@@ -349,37 +281,28 @@ fn build_service(
     render_setup_hint: bool,
     summary: bool,
 ) -> RegistryService {
-    let vault_fields = vault_fields_for(def);
+    let required = required_keys(def);
 
-    // `connected` = "ready for the agent to call": every credential the
-    // service needs is present in the vault. With declared vault_fields,
-    // that's "all present in native_keys". With NO derivable field we must
-    // NOT blindly say connected — `.all([]) == true` would mark every
-    // undeclared-credential service connected, which is how an unconfigured
-    // oauth2 service (e.g. openai-codex: `auth.type = oauth2`, no `env`) showed
-    // a false ✅. Empty fields is "connected" ONLY when the service genuinely
-    // needs no credential (a usable upstream that declares no auth).
+    // `connected` = "ready for the agent to call": every credential the service
+    // needs is present in the vault (bare address for the default connection).
+    // A service that needs no credential (empty `required`) is connected once
+    // the vault unlocks.
     let connected = overlay.map(|o| {
-        if vault_fields.is_empty() {
+        if required.is_empty() {
             service_needs_no_auth(def)
         } else {
-            vault_fields
-                .iter()
-                .all(|vf| o.native_keys.contains(&vf.name))
+            required.iter().all(|k| o.native_keys.contains(k))
         }
     });
 
-    // Summary: the orient row. Keep identity + the two connection-state
-    // flags; drop every heavy field (and skip computing them). `needs_reauth`
-    // is stamped by the caller and survives either way.
     if summary {
         return RegistryService {
             id: id.to_string(),
             name: def.service.name.clone(),
             category: def.service.category.clone(),
             description: None,
-            endpoints: vec![],
-            vault_fields: vec![],
+            hosts: vec![],
+            phantoms: std::collections::BTreeMap::new(),
             policy: None,
             connected,
             needs_reauth: None,
@@ -388,17 +311,23 @@ fn build_service(
         };
     }
 
-    let endpoints: Vec<RegistryEndpoint> =
-        def.api.iter().map(|api| endpoint_for_api(id, api)).collect();
     let policy = policy_for(services, id, include_policy_rules);
+    // Phantoms are meaningful per-vault (they name a connection). On the static
+    // catalog face (`overlay: None`) we omit them; on the per-vault face we emit
+    // the default connection's phantoms (conn == service id).
+    let phantoms = if overlay.is_some() {
+        phantoms_for(id, def)
+    } else {
+        std::collections::BTreeMap::new()
+    };
 
     RegistryService {
         id: id.to_string(),
         name: def.service.name.clone(),
         category: def.service.category.clone(),
         description: def.service.help.clone(),
-        endpoints,
-        vault_fields,
+        hosts: def.service.hosts.clone(),
+        phantoms,
         policy,
         connected,
         needs_reauth: None,
@@ -407,17 +336,10 @@ fn build_service(
     }
 }
 
-/// True iff "no declared vault_field" legitimately means "connected" — i.e.
-/// the service requires NO credential at all. Two cases qualify: a callable
-/// vault-native service with no upstream (e.g. encrypted files — usable the
-/// moment the vault unlocks) and a public upstream that declares no auth. A
-/// service whose upstream declares an auth block (env / oauth2 / …) does NOT
-/// qualify: it needs a credential we couldn't resolve to a field, so an
-/// unconfigured oauth2 service reads as not-connected (not a false ✅). Only
-/// consulted when `vault_fields` is empty; non-callable markers never reach
-/// here (filtered out of the registry by api-presence).
+/// True iff the service requires NO credential at all (no `secrets`, no
+/// `[oauth2]`) — so an empty `required_keys` legitimately reads as connected.
 fn service_needs_no_auth(def: &ServiceDef) -> bool {
-    def.upstream.iter().all(|u| u.auth.is_none())
+    def.service.secrets.is_empty() && def.oauth2.is_none()
 }
 
 fn console_url(state: &AppState, vault_id: &str) -> String {
@@ -457,7 +379,7 @@ pub fn render_catalog(
         .map(|(id, def)| build_service(services, id, def, None, include_policy_rules, false, summary))
         .collect();
     Ok(RegistryResponse {
-        version: 2,
+        version: 3,
         services: rendered,
         policy: serde_json::to_value(crate::core::policy::Policy::default())?,
         vault_locked: None,
@@ -494,15 +416,20 @@ pub async fn vault_registry(
     // Snapshot native_keys + lock state under the mutex, then drop it
     // before doing per-service rendering. Cheap copy — typically <20
     // keys.
-    let (native_keys, locked): (HashSet<String>, bool) = {
+    let (native_keys, custom_services, locked): (HashSet<String>, Vec<(String, ServiceDef)>, bool) = {
         let states = state.vault_states.lock().unwrap();
         match states.get(&vault_id) {
-            Some(VaultState::Unlocked { cache, .. }) => (cache.native_keys.clone(), false),
-            _ => (HashSet::new(), true),
+            Some(VaultState::Unlocked { cache, .. }) => {
+                let mut custom: Vec<(String, ServiceDef)> =
+                    cache.custom_services.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                custom.sort_by(|a, b| a.0.cmp(&b.0));
+                (cache.native_keys.clone(), custom, false)
+            }
+            _ => (HashSet::new(), Vec::new(), true),
         }
     };
 
-    let services: Vec<RegistryService> = state
+    let mut services: Vec<RegistryService> = state
         .services
         .iter_sorted()
         .into_iter()
@@ -532,6 +459,25 @@ pub async fn vault_registry(
         })
         .collect();
 
+    // Custom (aux.services) definitions fold in exactly like a built-in — same
+    // build_service path, an unlocked overlay, honoring ids/needs_reauth. Empty
+    // when locked (custom defs live in the sealed blob, like the credentials).
+    let overlay = VaultOverlay { native_keys: &native_keys };
+    for (id, def) in &custom_services {
+        if ids_filter.as_ref().map_or(false, |set| !set.contains(id)) {
+            continue;
+        }
+        if def.service.hidden {
+            continue;
+        }
+        let mut svc = build_service(&state.services, id, def, Some(&overlay), include_policy_rules, true, summary);
+        if svc.connected == Some(true) && state.oauth_needs_reauth(&vault_id, id) {
+            svc.needs_reauth = Some(true);
+        }
+        services.push(svc);
+    }
+    services.sort_by(|a, b| a.id.cmp(&b.id));
+
     let vault_entries = if locked {
         Some(None)
     } else {
@@ -544,7 +490,7 @@ pub async fn vault_registry(
     // comment) — but it IS used to pick the right console URL: /try for
     // demo vaults, /vault for everyone else.
     let body = RegistryResponse {
-        version: 2,
+        version: 3,
         services,
         policy: serde_json::to_value(crate::core::policy::Policy::default())?,
         vault_locked: Some(locked),
@@ -560,37 +506,24 @@ mod setup_tests {
     use super::*;
 
     #[test]
-    fn render_setup_fills_proxy_base() {
+    fn render_setup_is_plain_passthrough() {
         let toml = r#"
-setup = '''
-Route git through SafeClaw. credential.helper = !sc git-credential
-git config --global url."{{proxy_base}}/stream/github/".insteadOf "https://github.com/"
-'''
+setup = """
+Routed? Nothing to configure. Not routed? Prefix: sc run -- git clone ...
+"""
 
 [service]
 id = "github"
 name = "GitHub"
-category = "integration"
-[[upstream]]
-id = "git"
-url = "https://github.com"
-stream = true
-auth = { secret = "github_token" }
-[upstream.headers]
-Authorization = "Basic {{secret.github_token | basic}}"
+hosts = ["github.com"]
+secrets = ["GITHUB_TOKEN"]
 "#;
         let def: ServiceDef = toml::from_str(toml).unwrap();
-        let s = render_setup(&def).expect("setup rendered");
-        // {{proxy_base}} renders to the literal $SAFECLAW_VAULT_URL — the broker
-        // base the agent already holds; its shell expands it at apply time. The
-        // route is inlined by the recipe as `{{proxy_base}}/stream/<upstream>/`.
-        assert!(s.contains("$SAFECLAW_VAULT_URL/stream/github/"), "{}", s);
-        assert!(!s.contains("{{"), "no leftover template tokens: {}", s);
+        let s = render_setup(&def).expect("setup passthrough");
+        assert!(s.contains("sc run --"), "{}", s);
 
-        // No `setup` → None.
         let no_setup: ServiceDef =
-            toml::from_str("[service]\nid=\"x\"\nname=\"X\"\n[[upstream]]\nid=\"d\"\nurl=\"https://x.com\"\n")
-                .unwrap();
+            toml::from_str("[service]\nid=\"x\"\nname=\"X\"\nhosts=[\"x.com\"]\n").unwrap();
         assert!(render_setup(&no_setup).is_none());
     }
 
@@ -628,7 +561,7 @@ Authorization = "Basic {{secret.github_token | basic}}"
     fn summary_drops_heavy_fields_keeps_state() {
         let reg = ServiceRegistry::compiled_only();
         let (id, def) = reg.iter_sorted().into_iter().next().expect("a compiled service");
-        let native: HashSet<String> = def.vault.iter().map(|v| v.name.clone()).collect();
+        let native: HashSet<String> = required_keys(def).into_iter().collect();
         let overlay = VaultOverlay { native_keys: &native };
 
         let full = build_service(&reg, id, def, Some(&overlay), false, true, false);
@@ -640,11 +573,13 @@ Authorization = "Basic {{secret.github_token | basic}}"
         assert_eq!(sum.category, full.category);
         assert_eq!(sum.connected, full.connected);
         // Heavy fields are gone (skip_serializing_if drops them from the wire).
-        assert!(sum.endpoints.is_empty());
-        assert!(sum.vault_fields.is_empty());
+        assert!(sum.hosts.is_empty());
+        assert!(sum.phantoms.is_empty());
         assert!(sum.policy.is_none());
         assert!(sum.connect.is_none());
         assert!(sum.setup.is_none());
         assert!(sum.description.is_none());
+        // Full view carries the declared hosts.
+        assert_eq!(full.hosts, def.service.hosts);
     }
 }
