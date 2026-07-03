@@ -118,8 +118,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::GitCredential(args) => {
             // Invoked by git, not users. Never print to stderr on the happy path
             // (git reads stdout); surface only hard errors.
-            cli::git_credential::run(args).map_err(|e| -> Box<dyn std::error::Error> {
+            cli::git_credential::run(args).await.map_err(|e| -> Box<dyn std::error::Error> {
                 eprintln!("safeclaw git-credential: {}", e);
+                e.into()
+            })
+        }
+        Command::Run(args) => {
+            cli::run::run(args).await.map_err(|e| -> Box<dyn std::error::Error> {
+                eprintln!("safeclaw run: {}", e);
+                e.into()
+            })
+        }
+        Command::Connect(args) => {
+            cli::connect::run(args).await.map_err(|e| -> Box<dyn std::error::Error> {
+                eprintln!("safeclaw connect: {}", e);
                 e.into()
             })
         }
@@ -170,6 +182,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             use safeclaw::config::ServiceSubcommand;
             let r = match args.sub {
                 ServiceSubcommand::Validate(a) => cli::service_def::run_validate(a).await,
+                ServiceSubcommand::Add(a) => cli::service_def::run_add(a).await,
             };
             r.map_err(|e| -> Box<dyn std::error::Error> {
                 eprintln!("safeclaw service: {}", e);
