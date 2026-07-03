@@ -17,7 +17,7 @@ pub async fn pubkey(args: CommonArgs) -> Result<(), String> {
 /// reads. Offline by construction (`ServiceRegistry::compiled_only()`).
 pub fn registry(args: RegistryArgs) -> Result<(), String> {
     let reg = crate::service::ServiceRegistry::compiled_only();
-    let catalog = crate::server::handlers::registry::render_catalog(&reg, false)
+    let catalog = crate::server::handlers::registry::render_catalog(&reg, false, None, false)
         .map_err(|e| e.to_string())?;
     if args.json {
         println!(

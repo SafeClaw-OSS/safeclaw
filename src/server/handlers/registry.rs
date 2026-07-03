@@ -11,10 +11,15 @@
 //!   when locked), `console_url`, `vault_locked`, `vault_id`. This is
 //!   the endpoint the agent skill points at.
 //!
-//! Query: `?include=policy` adds the explicit `policy.rules` list back
-//! into each service (console UI). Default response omits it — the
-//! agent doesn't need rule details, only `policy.defaults` for a
-//! coarse "will this need approval" signal.
+//! Query params (all optional, compose):
+//! - `?include=policy` adds the explicit `policy.rules` list back into
+//!   each service (console UI). Default omits it — the agent needs only
+//!   `policy.defaults` for a coarse "will this need approval" signal.
+//! - `?ids=a,b` keeps only those services (unknown ids drop silently).
+//! - `?view=summary` returns thin rows (id/name/category/connected/
+//!   needs_reauth) + top-level vault state, dropping the heavy fields.
+//!   The agent's two-step: `?view=summary` to orient cheaply, then
+//!   `?ids=<id>` for full detail on the one it's about to call.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -37,6 +42,19 @@ pub struct RegistryQuery {
     /// expands `policy.rules` per service. Unknown values are ignored.
     #[serde(default)]
     pub include: Option<String>,
+    /// Comma-separated service ids to keep. Absent = all. Unknown ids are
+    /// silently dropped (asking for something that doesn't exist yields an
+    /// empty match, not a 404). Lets an agent point at just the service it
+    /// needs instead of paying for the whole catalog.
+    #[serde(default)]
+    pub ids: Option<String>,
+    /// `summary` = thin per-service rows (id/name/category/connected/
+    /// needs_reauth) + top-level vault state; drops the heavy fields
+    /// (endpoints/vault_fields/policy/connect/setup). Anything else (incl.
+    /// absent) = full. The agent's orient step: pull a cheap list, then
+    /// `?ids=<id>` for full detail on the one it wants.
+    #[serde(default)]
+    pub view: Option<String>,
 }
 
 impl RegistryQuery {
@@ -45,6 +63,22 @@ impl RegistryQuery {
             .as_deref()
             .map(|s| s.split(',').any(|t| t.trim() == "policy"))
             .unwrap_or(false)
+    }
+
+    fn is_summary(&self) -> bool {
+        self.view.as_deref() == Some("summary")
+    }
+
+    /// The `?ids=` allow-set, or `None` for "all". Blanks are trimmed out;
+    /// an all-blank list (`?ids=`) reads as an empty set → matches nothing.
+    fn ids_filter(&self) -> Option<HashSet<String>> {
+        self.ids.as_deref().map(|s| {
+            s.split(',')
+                .map(|t| t.trim())
+                .filter(|t| !t.is_empty())
+                .map(|t| t.to_string())
+                .collect()
+        })
     }
 }
 
@@ -63,6 +97,8 @@ pub struct RegistryService {
     pub category: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Omitted in `?view=summary` (empty). Full view always lists at least one.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub endpoints: Vec<RegistryEndpoint>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub vault_fields: Vec<RegistryVaultField>,
@@ -311,11 +347,9 @@ fn build_service(
     overlay: Option<&VaultOverlay<'_>>,
     include_policy_rules: bool,
     render_setup_hint: bool,
+    summary: bool,
 ) -> RegistryService {
-    let endpoints: Vec<RegistryEndpoint> =
-        def.api.iter().map(|api| endpoint_for_api(id, api)).collect();
     let vault_fields = vault_fields_for(def);
-    let policy = policy_for(services, id, include_policy_rules);
 
     // `connected` = "ready for the agent to call": every credential the
     // service needs is present in the vault. With declared vault_fields,
@@ -334,6 +368,29 @@ fn build_service(
                 .all(|vf| o.native_keys.contains(&vf.name))
         }
     });
+
+    // Summary: the orient row. Keep identity + the two connection-state
+    // flags; drop every heavy field (and skip computing them). `needs_reauth`
+    // is stamped by the caller and survives either way.
+    if summary {
+        return RegistryService {
+            id: id.to_string(),
+            name: def.service.name.clone(),
+            category: def.service.category.clone(),
+            description: None,
+            endpoints: vec![],
+            vault_fields: vec![],
+            policy: None,
+            connected,
+            needs_reauth: None,
+            connect: None,
+            setup: None,
+        };
+    }
+
+    let endpoints: Vec<RegistryEndpoint> =
+        def.api.iter().map(|api| endpoint_for_api(id, api)).collect();
+    let policy = policy_for(services, id, include_policy_rules);
 
     RegistryService {
         id: id.to_string(),
@@ -389,12 +446,15 @@ fn console_url(state: &AppState, vault_id: &str) -> String {
 pub fn render_catalog(
     services: &ServiceRegistry,
     include_policy_rules: bool,
+    ids: Option<&HashSet<String>>,
+    summary: bool,
 ) -> Result<RegistryResponse> {
     let rendered: Vec<RegistryService> = services
         .iter_sorted()
         .into_iter()
         .filter(|(_, def)| !def.service.hidden)
-        .map(|(id, def)| build_service(services, id, def, None, include_policy_rules, false))
+        .filter(|(id, _)| ids.map_or(true, |set| set.contains(*id)))
+        .map(|(id, def)| build_service(services, id, def, None, include_policy_rules, false, summary))
         .collect();
     Ok(RegistryResponse {
         version: 2,
@@ -411,7 +471,12 @@ pub async fn catalog(
     State(state): State<Arc<AppState>>,
     Query(q): Query<RegistryQuery>,
 ) -> Result<Json<Value>> {
-    let body = render_catalog(&state.services, q.include_policy_rules())?;
+    let body = render_catalog(
+        &state.services,
+        q.include_policy_rules(),
+        q.ids_filter().as_ref(),
+        q.is_summary(),
+    )?;
     Ok(Json(serde_json::to_value(body)?))
 }
 
@@ -423,6 +488,8 @@ pub async fn vault_registry(
 ) -> Result<Json<Value>> {
     validate_vault_id(&vault_id)?;
     let include_policy_rules = q.include_policy_rules();
+    let ids_filter = q.ids_filter();
+    let summary = q.is_summary();
 
     // Snapshot native_keys + lock state under the mutex, then drop it
     // before doing per-service rendering. Cheap copy — typically <20
@@ -446,6 +513,7 @@ pub async fn vault_registry(
         // filter — and deliberate per-service hiding uses `hidden = true`
         // (e.g. files, nodpay). So `!hidden` is the whole rule.
         .filter(|(_, def)| !def.service.hidden)
+        .filter(|(id, _)| ids_filter.as_ref().map_or(true, |set| set.contains(*id)))
         .map(|(id, def)| {
             let overlay = if locked {
                 None
@@ -454,7 +522,7 @@ pub async fn vault_registry(
                     native_keys: &native_keys,
                 })
             };
-            let mut svc = build_service(&state.services, id, def, overlay.as_ref(), include_policy_rules, true);
+            let mut svc = build_service(&state.services, id, def, overlay.as_ref(), include_policy_rules, true, summary);
             // Surface a dead OAuth refresh_token (flagged at /use) so the console
             // shows "needs re-auth". Default connection: conn_id == service id.
             if !locked && svc.connected == Some(true) && state.oauth_needs_reauth(&vault_id, id) {
@@ -524,5 +592,59 @@ Authorization = "Basic {{secret.github_token | basic}}"
             toml::from_str("[service]\nid=\"x\"\nname=\"X\"\n[[upstream]]\nid=\"d\"\nurl=\"https://x.com\"\n")
                 .unwrap();
         assert!(render_setup(&no_setup).is_none());
+    }
+
+    fn q(ids: Option<&str>, view: Option<&str>) -> RegistryQuery {
+        RegistryQuery {
+            include: None,
+            ids: ids.map(|s| s.to_string()),
+            view: view.map(|s| s.to_string()),
+        }
+    }
+
+    #[test]
+    fn ids_filter_parses_and_trims() {
+        assert!(q(None, None).ids_filter().is_none());
+        assert_eq!(
+            q(Some("gmail,github"), None).ids_filter().unwrap(),
+            ["gmail", "github"].iter().map(|s| s.to_string()).collect()
+        );
+        // Whitespace + empties trimmed; `?ids=` alone → empty set (matches nothing).
+        assert_eq!(
+            q(Some(" gmail , "), None).ids_filter().unwrap(),
+            ["gmail"].iter().map(|s| s.to_string()).collect()
+        );
+        assert!(q(Some(""), None).ids_filter().unwrap().is_empty());
+    }
+
+    #[test]
+    fn view_summary_toggle() {
+        assert!(!q(None, None).is_summary());
+        assert!(!q(None, Some("full")).is_summary());
+        assert!(q(None, Some("summary")).is_summary());
+    }
+
+    #[test]
+    fn summary_drops_heavy_fields_keeps_state() {
+        let reg = ServiceRegistry::compiled_only();
+        let (id, def) = reg.iter_sorted().into_iter().next().expect("a compiled service");
+        let native: HashSet<String> = def.vault.iter().map(|v| v.name.clone()).collect();
+        let overlay = VaultOverlay { native_keys: &native };
+
+        let full = build_service(&reg, id, def, Some(&overlay), false, true, false);
+        let sum = build_service(&reg, id, def, Some(&overlay), false, true, true);
+
+        // Identity + connection state survive the trim.
+        assert_eq!(sum.id, full.id);
+        assert_eq!(sum.name, full.name);
+        assert_eq!(sum.category, full.category);
+        assert_eq!(sum.connected, full.connected);
+        // Heavy fields are gone (skip_serializing_if drops them from the wire).
+        assert!(sum.endpoints.is_empty());
+        assert!(sum.vault_fields.is_empty());
+        assert!(sum.policy.is_none());
+        assert!(sum.connect.is_none());
+        assert!(sum.setup.is_none());
+        assert!(sum.description.is_none());
     }
 }

@@ -48,6 +48,8 @@ GET $SAFECLAW_VAULT_URL/registry
 Authorization: Bearer $SAFECLAW_API_KEY
 ```
 
+Filter to save context: `?view=summary` and/or `?ids=a,b`.
+
 ```jsonc
 {
   "version": 2,
