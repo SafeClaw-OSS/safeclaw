@@ -57,25 +57,29 @@ Filter to save context: `?view=summary` and/or `?ids=a,b`.
 
 ```jsonc
 {
-  "version": 3,
-  "vault_locked": false,
+  "version": 4,
+  "locked": false,
   "console_url": "https://.../vault/<your-vault-id>",  // deep link to this vault
   "vault_entries": ["OPENAI_API_KEY", "GMAIL_REFRESH_TOKEN"],  // null when locked
-  "services": [
-    { "id": "github", "name": "GitHub", "category": "dev",
-      "connected": true,
+  "services": [       // the catalog — what SafeClaw supports
+    { "id": "github", "name": "GitHub", "category": "integration",
+      "hosts": ["api.github.com", "github.com"], "secrets": ["GITHUB_TOKEN"] }
+  ],
+  "connections": [    // what's usable right now — copy phantoms verbatim
+    { "id": "github", "service": "github", "connected": true,
       "hosts": ["api.github.com", "github.com"],
-      "phantoms": { "GITHUB_TOKEN": "__sc__github__" } }
+      "phantoms": ["__sc__github__"] }
   ]
 }
 ```
 
-Each row carries its anchored **`hosts`** and a ready-made **`phantoms`** map
-(injectable role → the exact phantom string). Copy phantoms verbatim — never
-build one yourself. Use `connected: true` services freely.
+`services` is the catalog (what's supported); `connections` is what's usable
+now. Each connection carries its anchored **`hosts`** and a **`phantoms`** list
+— copy a phantom verbatim, never build one yourself. Use `connected: true`
+connections freely.
 
-If a service is `connected: false` (or absent), the user must add its
-credential. **Hand them a link — don't run commands or walk them through
+If the service you want has no `connected: true` connection, the user must add
+its credential. **Hand them a link — don't run commands or walk them through
 provider menus.** `console_url` points at this vault; send them to its
 Connections tab:
 
@@ -84,9 +88,9 @@ Connect <service name>: open <console_url>#connections, add your
 credential there, approve with your passkey.
 ```
 
-You never see or handle it. After they confirm, re-GET the registry for
-`connected: true`. (Where to *get* the credential is the provider's side —
-mention it only if asked.)
+You never see or handle it. After they confirm, re-GET the registry for a
+`connected: true` connection. (Where to *get* the credential is the provider's
+side — mention it only if asked.)
 
 Headless fallback, user at the daemon's own terminal (passkey-gated):
 
@@ -97,7 +101,7 @@ sc connect myapi --host api.example.com --secret API_TOKEN=<value>
 
 Never enter credentials yourself. Never echo one back.
 
-If `vault_locked: true`, run `sc up` — it brings SafeClaw up and unlocks the
+If `locked: true`, run `sc up` — it brings SafeClaw up and unlocks the
 vault, printing an approval link; surface that link to the user (they tap
 their passkey) and retry once it's done. Don't tell the user to "unlock" or
 suggest a browser URL of your own.
@@ -112,11 +116,13 @@ it for the real value on the way out — and only toward that connection's
 
 Phantoms only work when the traffic passes through SafeClaw. Check first:
 
-    sc status      # routed: true|false, plus each connection's phantom
+    sc status --json      # proxy.url, proxy.reachable, routing.https_proxy
 
-`routed: false` → run the command through SafeClaw (`sc run -- <cmd>`, or the
-service's `setup` hint). Don't send a phantom unrouted — the upstream just
-rejects it, indistinguishably from a bad key.
+Your traffic reaches SafeClaw when `routing.https_proxy` names the same
+authority as `proxy.url`. If it's `null` or a different proxy, run the command
+through SafeClaw (`sc run -- <cmd>`, or the service's `setup` hint). Don't send
+a phantom unrouted — the upstream just rejects it, indistinguishably from a bad
+key.
 
 Examples (the phantom goes wherever that tool expects the credential):
 
