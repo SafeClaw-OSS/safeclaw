@@ -144,10 +144,12 @@ the daemon **through the sealed vault**, not the cloud backend:
 ### 4b. Refresh (ongoing, invisible) — and it's **cached**
 
 The daemon mints an access_token from the refresh_token at `token_url`. **It is
-cached in memory keyed by (vault, service) with its expiry (~1 h)** — see
-`resolve_auth_value` ("Cache hit — return the cached access_token directly").
-1000 requests in an hour = **1 refresh + 999 cache hits**. Re-minted only after
-expiry / lock / restart. `oauth_style = "form" | "json"` parameterizes the body.
+cached in memory keyed by `sha256(refresh_token)` with its expiry (~1 h)** —
+keying on the refresh VALUE (not `(vault, service)`) auto-invalidates on reconnect
+/ token rotation and never collides across accounts; wiped on lock. See
+[CREDENTIAL_BROKER.md](./CREDENTIAL_BROKER.md) §9. 1000 requests in an hour =
+**1 refresh + 999 cache hits**. Re-minted only after expiry / lock / restart.
+`oauth_style = "form" | "json"` parameterizes the body.
 
 ### 4c. Inject (per request)
 

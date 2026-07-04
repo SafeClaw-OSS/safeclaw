@@ -91,11 +91,16 @@ security-relevant field, and the settled tuple already makes it first-class):
 // STORED — aux.connections[<conn_id>].  conn_id is the map key (not repeated in the value).
 // Minimal by construction: everything else is derived or lives elsewhere.
 {
-  "service": "github",          // string | null   (null = raw)
-  "hosts":   ["api.github.com"] // string[] | null  (see the SSOT invariant)
+  "service": "github",           // string | null   (null = raw)
+  "hosts":   ["api.github.com"], // string[] | null  (see the SSOT invariant)
+  "secrets": ["GITHUB_TOKEN"]    // string[] | null  — the UPPERCASE keys this conn uses
 }
-// secrets: NOT stored here — flat secrets pool, addressed [<conn_id>:]<KEY>; a
-//          connection's secrets are the reverse-index of that namespace.
+// secrets: REQUIRED for a RAW connection (service = null) — it answers "which
+//          secrets" DIRECTLY, so discovery / cache-bootstrap read it instead of
+//          reverse-indexing the flat pool by casing. OMITTED (null) for a
+//          service-backed connection: its keys derive from the service's declared
+//          `secrets` (incl. the oauth2 refresh key). Values still live in the flat
+//          pool, addressed [<conn_id>:]<KEY> (bare when conn_id == service_id).
 // policy:  NOT here — aux.policy.connections.<conn_id>.
 // phantom: NEVER stored — it is a DERIVED composite of (conn_id + a secret key);
 //          storing it would be redundant and ambiguous for multi-secret conns.
@@ -106,22 +111,35 @@ security-relevant field, and the settled tuple already makes it first-class):
 //   service with *.wildcards   ⇒ hosts required: exact FQDNs pinned ⊆ the wildcards
 ```
 
-**Phantom belongs to the DISCOVERY view, not the stored record.** `sc status`
-projects each connection into the agent-facing shape. `phantoms` is a **map
-(injectable role → ready-made phantom)** — one uniform type for sole- and
-multi-secret connections (no string-vs-list split), and its keys ARE the
-injectable roles, so no separate `secrets` field:
+**Phantom belongs to the DISCOVERY view, not the stored record.** The registry
+(`GET /v/{vid}/registry`, mirrored by `sc status`) projects into the agent-facing
+shape as **two arrays**: `services[]` — the browse catalog, 1:1 with the service
+tomls, carrying NO connection state — and `connections[]` — 1:1 with
+`aux.connections`, each row a DERIVED `connected` flag plus a ready-made
+`phantoms` **list**. A phantom names a CONNECTION, so it lives only on the
+connection row. `phantoms` is a **list** of ready-made strings the agent copies
+verbatim (form A: sole injectable → the short `__sc__<conn>__`; several →
+role-qualified `__sc__<conn>__<role>__` — one form per role, never both):
 
 ```jsonc
-// sc status (agent-facing projection — derived, not stored)
-{ "connections": [
-    { "name": "github",
+// GET /v/{vid}/registry  (agent-facing projection — derived, not stored)
+{ "version": 4,
+  "locked": false,                              // PER-VAULT (this vault, not the daemon)
+  "services":    [ /* browse catalog — no connected/phantoms */ ],
+  "connections": [
+    { "id": "github", "service": "github",
       "hosts": ["api.github.com", "github.com"],
-      "phantoms": { "GITHUB_TOKEN": "__sc__github__" } }   // sole role → the short form
-  ], "proxy": "http://127.0.0.1:23294", "routed": true }
-// multi-secret:  "phantoms": { "USERNAME": "__sc__bb__username__", "API_TOKEN": "__sc__bb__api_token__" }
-// oauth2:        "phantoms": { "ACCESS": "__sc__gmail__", "ACCOUNT_ID": "__sc__gmail__account_id__" }
+      "connected": true, "phantoms": ["__sc__github__"] },        // sole → short form
+    { "id": "stripe_key",                                          // RAW: no service…
+      "hosts": ["api.stripe.com"], "secrets": ["STRIPE_KEY"],     // …carries explicit secrets
+      "connected": true, "phantoms": ["__sc__stripe_key__"] }
+  ] }
+// multi-secret:  "phantoms": ["__sc__bb__username__", "__sc__bb__api_token__"]
+// oauth2:        "phantoms": ["__sc__gmail__", "__sc__gmail__account_id__"]  // ACCESS + exposes
 ```
+
+The routing preflight (`proxy` / `routing`) is a separate `sc status` block, not
+part of the registry — §14.
 
 **The service toml schema.** `[[upstream]]` is retired (it was `/use`-era
 routing; its essence was the host set). A service declares exactly what a
@@ -158,9 +176,9 @@ semantics), no variable system:
   raw connection** — insertion-auth self-hosting needs no service definition;
   self-hosted+OAuth is deferred until a real case appears.
 
-**Named sections are auth MECHANISMS, never tools.** OAuth2 (`[upstream.auth]`
-upgraded in place; fields unchanged; `oauth2` not `oauth` — precise,
-self-documents the parse semantics):
+**Named sections are auth MECHANISMS, never tools.** OAuth2 lives in an `[oauth2]`
+table (`oauth2` not `oauth` — precise, self-documents the parse semantics) whose
+token slots carry RFC 6749 response field names:
 
 ```toml
 [service]
@@ -168,15 +186,18 @@ id = "gmail"
 name = "Gmail"
 
 hosts = ["gmail.googleapis.com"]
+secrets = ["GMAIL_REFRESH_TOKEN"]            # uniform `secrets` — lists the refresh key too
 
 [oauth2]
 provider = "google"                          # -> _providers/google.toml
 scopes   = ["https://www.googleapis.com/auth/gmail.send", …]
-secret   = "GMAIL_REFRESH_TOKEN"             # the stored refresh secret feeding the mint
+refresh_token = "GMAIL_REFRESH_TOKEN"        # RFC 6749 field → the vault secret KEY the
+                                             # durable refresh token is stored under
+# id_token = "GMAIL_ID_TOKEN"                # only if the provider returns a stored id token
 # exposes = ["account_id"]                   # optional extra minted/derived values →
                                              # __sc__<conn>__account_id__ (openai-codex case)
-# __sc__<conn>__ resolves to the MINTED access token; the refresh secret is
-# referenced only by [oauth2] ⇒ internal by construction, no flag needed.
+# __sc__<conn>__ resolves to the MINTED access token; the refresh key is durable
+# storage for the mint ⇒ internal by construction, never an injectable phantom.
 ```
 
 *(`[[api]]` is deleted along with `[[upstream]]` — it was the `/use` routing
@@ -367,8 +388,13 @@ optional zero-schema convenience (§4).
   Basic — position is the agent's, via the phantom; no declaration needed). The
   vault always stores the **semantic** value, never a pre-encoded form.
 - **`[oauth2]`: the minted access token** (refresh→access in the daemon, [built]).
-  The one non-direct case; a future request-signer (SigV4/HMAC) would be another
-  named section when it becomes real.
+  The mint is cached **in memory keyed by `sha256(refresh_token)`** (never
+  persisted; wiped on lock): a hit reuses the unexpired access token and never
+  sends the refresh upstream. Keying on the refresh VALUE (not `(vault, conn)`)
+  auto-invalidates on reconnect / refresh-token rotation — a new refresh is a
+  natural cache miss → fresh mint — and never collides across accounts. The one
+  non-direct case; a future request-signer (SigV4/HMAC) would be another named
+  section when it becomes real.
 - The old `{{secret.X | b64|basic}}` egress filters are **cut** (they served the
   retired daemon-built-header path; no known pre-encoded-slot use case — YAGNI,
   revisit on a real one).
@@ -419,8 +445,17 @@ the reverse-intuitive trap):
 - **Non-interactive** (script / agent pipe): missing host → error listing the two
   fixes (`--host <h>` / `--no-broker`). Never hangs.
 
-`sc set --host` **creates the raw connection** (`service: None` + `hosts`);
-hostless `--no-broker` writes a no-broker item invisible to the broker.
+`sc set KEY [VALUE] --host H` **creates the raw connection** — id `= lower(KEY)`,
+`service: None`, `hosts: [H]`, and explicit `secrets: [KEY]` (KEY force-uppercased
+to the one canonical form; the value is stored bare in the flat pool). Hostless
+`--no-broker` (or `--host none`) writes a no-broker item invisible to the broker,
+and drops any raw connection a prior `sc set … --host` created for the key.
+
+`sc set --host` is the single-secret **shorthand of `sc connect`** (`connect ⊃
+set`): `sc connect <name> --host H… --secret KEY=VALUE…` builds a multi-secret raw
+connection, and `--service SVC` a service-backed one — where `--host` then only
+PINS an exact FQDN ⊆ the service's `*.suffix` hosts, and each `--secret KEY` must
+be a subset of the service's declared secrets.
 
 ## 12. Storage-only items (the "no upstream" family)
 
@@ -469,20 +504,27 @@ session `--export-env`) — or, if no routing is possible, **say so to the user*
 Never fire a phantom at a real server: the upstream 401 is indistinguishable from
 a bad token. Enforced from both sides:
 
-- **Preflight (unrouted side):** `sc status` reports `routed: true/false` by
-  inspecting its **own inherited env** (the same env any subprocess would get) for
-  the bundle **and liveness-probing the proxy** (vars present but proxy dead ⇒
-  `false`).
+- **Preflight (unrouted side):** `sc status --json` reports the routing FACTS,
+  not a coined verdict — `proxy: { url, reachable }` (our address + a liveness
+  probe) plus `routing: { https_proxy, ca_trust }`, where `https_proxy` is the RAW
+  `$HTTPS_PROXY` this process inherited (`null` if unset) and `ca_trust` lists the
+  resident-CA env vars that actually point at `ca.pem` (`[]` ⇒ TLS to intercepted
+  hosts fails). The agent compares `routing.https_proxy` to `proxy.url` itself:
+  equal + `reachable` + non-empty `ca_trust` ⇒ routed; `null` ⇒ unset; different ⇒
+  intercepted elsewhere. (Human `sc status` still prints a one-line `routing:
+  ready | not configured`.)
 - **Fail-closed (routed side):** a syntactically-valid phantom naming an unknown
   connection is **rejected by the proxy with a clear 4xx** ("unknown connection
   'githb'"), never forwarded. (Safe because the phantom marker makes accidental
   matches ~impossible — §5.) So inside routing, phantom errors are *our* precise
   errors; outside routing, the preflight prevents the ambiguous case entirely.
 
-Discovery shape: `sc status` → `{ connections:[{name, phantom, hosts}],
-proxy, routed }` — **discovery returns the ready-made phantom string**; the
-agent copies, never constructs (zero-derivation: malformed phantoms become
-impossible, and the format can evolve without breaking agents). The phantom
+Discovery shape: `GET /v/{vid}/registry` → `{ services[], connections:[{ id,
+hosts, connected, phantoms }] }`, mirrored by `sc status` (connection name /
+hosts / phantoms alongside the routing block above) — **discovery returns the
+ready-made phantom strings** (a list); the agent copies, never constructs
+(zero-derivation: malformed phantoms become impossible, and the format can evolve
+without breaking agents). The phantom
 FORMAT is mechanism knowledge and lives in the skill's one-concept sentence;
 per-connection INSTANCES live here; **toml `setup` never carries phantom
 mechanics** (that would be per-service prose smuggling in the generic
@@ -507,11 +549,13 @@ it for the real value on the way out — and only toward that connection's
 
 Phantoms only work when the traffic passes through SafeClaw. Check first:
 
-    sc status      # routed: true|false, plus each connection's phantom
+    sc status --json   # proxy.reachable + routing; compare routing.https_proxy
+                       # to proxy.url; each connection lists its phantom
 
-`routed: false` → run the command through SafeClaw (`sc run -- <cmd>`, or the
-service's `setup` hint). Don't send a phantom unrouted — the upstream just
-rejects it, indistinguishably from a bad key.
+Not routed (`routing.https_proxy` ≠ `proxy.url`, or empty `ca_trust`) → run the
+command through SafeClaw (`sc run -- <cmd>`, or the service's `setup` hint). Don't
+send a phantom unrouted — the upstream just rejects it, indistinguishably from a
+bad key.
 ``` Skill stays **generic**: the one concept + the routing discipline +
 "call discovery; never hold raw secrets" — per-service config → the service's `[setup]`
 + registry. Install prompt = one-time bootstrap (goal + anchors, not a command

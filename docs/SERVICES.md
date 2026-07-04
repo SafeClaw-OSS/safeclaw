@@ -18,20 +18,17 @@ Format: TOML (authored by humans/agents; CI publishes `registry.json`).
 
 ```toml
 [service]
-id = "github"            # required; [a-z0-9_], no "__"
+id = "github"            # required; [a-z0-9_], no "__". category = the {category}/ dir, not a field
 name = "GitHub"          # display name
 # optional: group, hidden, activation, help
 
 hosts = ["api.github.com", "github.com"]
 secrets = ["GITHUB_TOKEN"]
-
-[placeholders]           # optional UI paste hints
-GITHUB_TOKEN = "github_pat_..."
-
-setup = """..."""        # optional agent-facing setup notes
 ```
 
-That is a complete service. Add `[oauth2]` only if the service mints tokens.
+That is a complete service. An optional top-level `setup = """…"""` string
+(sibling of `[service]`, not inside it) carries agent-facing setup notes. Add
+`[oauth2]` only if the service mints tokens.
 
 ### `hosts`
 
@@ -48,10 +45,16 @@ The only destinations this service's secrets may ever be sent to.
 
 ### `secrets`
 
-The stored keys a connection of this type holds. Keys are `[A-Z0-9_]`.
+The durable stored keys a connection of this type holds. Keys are `[A-Z0-9_]`
+and are the same list for **every** service — an `[oauth2]` service lists its
+refresh-token key here too (whatever `[oauth2].refresh_token` names). Presence of
+all of them is what makes a connection "connected".
 
 - The phantom `__sc__<conn>__` resolves to the sole injectable secret; if a
   service declares several, agents use `__sc__<conn>__<key>__` (key lowercased).
+- For an `[oauth2]` service the phantom resolves to the **minted access token**,
+  not the listed refresh key — the refresh key is durable-storage only, internal
+  to the mint, and never injectable.
 - Insertion needs no declaration: the value replaces the phantom wherever the
   tool puts it — any header, query param, URL path, body, or inside a decoded
   `Authorization: Basic`. Never in the URL authority.
@@ -61,18 +64,29 @@ The stored keys a connection of this type holds. Keys are `[A-Z0-9_]`.
 Declare only when the service authenticates with minted OAuth2 access tokens.
 
 ```toml
+[service]
+# …
+secrets = ["GMAIL_REFRESH_TOKEN"]   # the refresh key is listed here too (uniform `secrets`)
+
 [oauth2]
 provider = "google"                 # -> services/_providers/<provider>.toml
 scopes   = ["https://www.googleapis.com/auth/gmail.send"]
-secret   = "GMAIL_REFRESH_TOKEN"    # stored refresh secret feeding the mint
+refresh_token = "GMAIL_REFRESH_TOKEN"  # RFC 6749 field name → the vault secret KEY the
+                                    #   durable refresh token is stored under
+# id_token = "GMAIL_ID_TOKEN"       # only when the provider returns a stored OIDC id token
 # exposes = ["account_id"]          # optional extra derived values →
                                     #   __sc__<conn>__account_id__
 ```
 
-The phantom resolves to the minted access token. The refresh secret is
-internal automatically (referenced only here). This is the only auth section;
-a signing family (`[sigv4]`, `[web3sign]`) may be added when real. Sections are
-named by auth mechanism, never by tool.
+The phantom resolves to the minted access token. Token slots use RFC 6749
+response field names: `refresh_token` (required) maps the durable refresh token
+to the vault secret KEY it lives under; `id_token` (optional) does the same for a
+stored OIDC id token. Naming the durable token explicitly keeps a multi-secret
+service unambiguous. The refresh key is internal to the mint — never injectable.
+`access_token` (minted, ephemeral, never stored) and the flow temps `code` /
+`code_verifier` are NOT in the toml. This is the only auth section; a signing
+family (`[sigv4]`, `[web3sign]`) may be added when real. Sections are named by
+auth mechanism, never by tool.
 
 ### Basic auth — nothing to declare
 
