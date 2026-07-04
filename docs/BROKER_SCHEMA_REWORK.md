@@ -83,11 +83,19 @@ refresh_token = "GMAIL_REFRESH_TOKEN"  # RFC 6749 response field `refresh_token`
   the named vault secret → MOVE the entry into `aux.connections`; drop code/code_verifier.
 
 ## 5. OAuth mint cache
-- In-memory only (never persisted; wiped on lock), keyed by **`(vault, conn)`** →
-  `(access_token, expires_at)`.
-- On an oauth phantom: cache hit + unexpired → use the cached access token (does NOT touch
-  the refresh secret); miss/expired → fetch the refresh secret, mint at the provider, cache
-  with `expires_at − 60s`, use. (Already built this way in `broker_flow.rs`; keep.)
+- In-memory only (never persisted; wiped on lock), keyed by **`sha256(refresh_token)`** →
+  `(access_token, expires_at)`. Key on the INPUT (the refresh token), not `(vault, conn)`:
+  the access token is a pure function of the refresh token, so refresh-value keying (a) auto-
+  invalidates on reconnect / refresh-token rotation (same conn, NEW refresh → natural cache
+  miss → fresh mint; a `(vault,conn)` key would serve the STALE access token until expiry),
+  and (b) two accounts never collide for free (different refresh → different key). Hash the
+  refresh so map keys are fixed-size and not raw secrets.
+- On an oauth phantom: fetch the refresh secret from the in-memory session cache (a cheap
+  LOCAL read — needed to compute the key), then look up `sha256(refresh)`: hit + unexpired →
+  use the cached access token (mints nothing, never sends the refresh upstream); miss/expired
+  → mint at the provider, cache with `expires_at − 60s`, use.
+- REWORK: the first build keyed by `(vault, conn)` in `broker_flow.rs` — re-key to
+  `sha256(refresh_token)`.
 
 ## 6. Registry = TWO separate arrays (kill `category:"connection"`)
 `GET /v/{vid}/registry` and `sc status` (shared projection):
@@ -132,14 +140,16 @@ refresh_token = "GMAIL_REFRESH_TOKEN"  # RFC 6749 response field `refresh_token`
 ```jsonc
 "proxy": { "url":"http://127.0.0.1:23294", "reachable":true },
 "routing": {
-  "https_proxy": "ok",   // "ok"=points at proxy.url | "unset" | "other" (set elsewhere = wrong)
+  "https_proxy": "reaches_safeclaw",   // SELF-EXPLAINING value | "unset" | "reaches_other_proxy" (wrong — traffic intercepted elsewhere)
   "ca_trust": ["SSL_CERT_FILE","NODE_EXTRA_CA_CERTS","CURL_CA_BUNDLE","GIT_SSL_CAINFO","REQUESTS_CA_BUNDLE","DENO_CERT"]
 }                        // which resident-CA vars actually point at ca.pem; [] = TLS to intercepted hosts fails
 ```
 - **No `routed` verdict.** Report the parts; the agent composes the judgment and self-queries
-  its env for raw values. Don't echo values (the agent can read its own env) — report the
-  JUDGMENT sc status can make and the agent can't (does https_proxy point at US; which CA vars
-  cover). Captures the wrong-value case (`https_proxy:"other"`). Skill teaches reading `--json`.
+  its env for the raw string when it needs it. Values are SELF-EXPLAINING (never a bare `"ok"`):
+  `https_proxy` says WHERE traffic goes (`reaches_safeclaw` / `unset` / `reaches_other_proxy`) —
+  the value carries the meaning, and the wrong-value case names itself. Don't echo the raw
+  proxy string (the agent can `echo $HTTPS_PROXY`); report the JUDGMENT sc status can make and
+  the agent can't (does it point at US; which CA vars cover). Skill teaches reading `--json`.
 
 ## 9. CLI: sc set vs sc connect  (`connect ⊃ set`)
 - `sc set KEY [VALUE] [--host H]` — quick. Store secret KEY (force uppercase). With `--host`,
