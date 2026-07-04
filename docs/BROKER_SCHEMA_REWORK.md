@@ -140,16 +140,15 @@ refresh_token = "GMAIL_REFRESH_TOKEN"  # RFC 6749 response field `refresh_token`
 ```jsonc
 "proxy": { "url":"http://127.0.0.1:23294", "reachable":true },
 "routing": {
-  "https_proxy": "reaches_safeclaw",   // SELF-EXPLAINING value | "unset" | "reaches_other_proxy" (wrong — traffic intercepted elsewhere)
+  "https_proxy": "http://127.0.0.1:23294",   // the RAW $HTTPS_PROXY value (null if unset); agent compares it to proxy.url
   "ca_trust": ["SSL_CERT_FILE","NODE_EXTRA_CA_CERTS","CURL_CA_BUNDLE","GIT_SSL_CAINFO","REQUESTS_CA_BUNDLE","DENO_CERT"]
 }                        // which resident-CA vars actually point at ca.pem; [] = TLS to intercepted hosts fails
 ```
-- **No `routed` verdict.** Report the parts; the agent composes the judgment and self-queries
-  its env for the raw string when it needs it. Values are SELF-EXPLAINING (never a bare `"ok"`):
-  `https_proxy` says WHERE traffic goes (`reaches_safeclaw` / `unset` / `reaches_other_proxy`) —
-  the value carries the meaning, and the wrong-value case names itself. Don't echo the raw
-  proxy string (the agent can `echo $HTTPS_PROXY`); report the JUDGMENT sc status can make and
-  the agent can't (does it point at US; which CA vars cover). Skill teaches reading `--json`.
+- **No `routed` verdict, no invented enum.** Give the RAW `$HTTPS_PROXY` value (null if unset)
+  next to `proxy.url` — the agent compares the two itself: equal → reaches us; null → unset;
+  different → intercepted elsewhere. Raw value + the reference is more faithful and less
+  invented than a coined `"ok"`/`"reaches_*"` status. `ca_trust` = which resident-CA vars point
+  at `ca.pem` ([] = TLS fails). Skill teaches reading `--json`.
 
 ## 9. CLI: sc set vs sc connect  (`connect ⊃ set`)
 - `sc set KEY [VALUE] [--host H]` — quick. Store secret KEY (force uppercase). With `--host`,
