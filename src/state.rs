@@ -152,8 +152,10 @@ pub struct SecretsCache {
     /// generic eviction doesn't apply here — `oauth_access_lookup`
     /// has its own lazy eviction below.
     ///
-    /// Keyed by **connection_id** (not service): two Gmail accounts mint and
-    /// cache independent access tokens.
+    /// Keyed by **`sha256(refresh_token)`** hex (§5): the access token is a pure
+    /// function of the refresh token, so keying on the INPUT auto-invalidates on
+    /// reconnect / refresh rotation (new refresh → natural miss → fresh mint) and
+    /// two accounts never collide for free (different refresh → different key).
     pub oauth_access: HashMap<String, CacheEntry>,
     /// Routing snapshot: `connection_id → { service, hosts }`, taken from
     /// `aux.connections` at unlock (CONNECTION_SCHEMA.md §6). A brokered request
@@ -458,10 +460,10 @@ impl AppState {
         Some(entry.value)
     }
 
-    /// Look up a cached OAuth `access_token` for `(vault, service)`.
-    /// Returns `None` if locked, never minted, or past its expiry.
-    /// Lazily evicts expired entries (same shape as `cache_lookup`).
-    pub fn oauth_access_lookup(&self, vault_id: &str, conn_id: &str) -> Option<Vec<u8>> {
+    /// Look up a cached OAuth `access_token` by `sha256(refresh_token)` hex (§5).
+    /// Returns `None` if locked, never minted, or past its expiry. Lazily evicts
+    /// expired entries (same shape as `cache_lookup`).
+    pub fn oauth_access_lookup(&self, vault_id: &str, refresh_hash: &str) -> Option<Vec<u8>> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -471,32 +473,32 @@ impl AppState {
             Some(VaultState::Unlocked { cache, .. }) => cache,
             _ => return None,
         };
-        let entry = cache.oauth_access.get(conn_id)?;
+        let entry = cache.oauth_access.get(refresh_hash)?;
         if let Some(exp) = entry.expires_at {
             if now >= exp {
-                cache.oauth_access.remove(conn_id);
+                cache.oauth_access.remove(refresh_hash);
                 return None;
             }
         }
         Some(entry.value.clone())
     }
 
-    /// Store a freshly-minted OAuth `access_token`. `expires_at` should
-    /// be the provider-reported absolute expiry minus a small safety
-    /// margin (the broker uses ~60s) so we refresh before the upstream
-    /// would reject. No-op when the vault is locked at the time of
+    /// Store a freshly-minted OAuth `access_token` under `sha256(refresh_token)`
+    /// hex (§5). `expires_at` should be the provider-reported absolute expiry
+    /// minus a small safety margin (the broker uses ~60s) so we refresh before
+    /// the upstream would reject. No-op when the vault is locked at the time of
     /// the call.
     pub fn oauth_access_insert(
         &self,
         vault_id: &str,
-        conn_id: &str,
+        refresh_hash: &str,
         value: Vec<u8>,
         expires_at: u64,
     ) {
         let mut states = self.vault_states.lock().unwrap();
         if let Some(VaultState::Unlocked { cache, .. }) = states.get_mut(vault_id) {
             cache.oauth_access.insert(
-                conn_id.to_string(),
+                refresh_hash.to_string(),
                 CacheEntry {
                     value,
                     expires_at: Some(expires_at),

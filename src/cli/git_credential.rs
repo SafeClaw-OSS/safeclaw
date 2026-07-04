@@ -66,7 +66,7 @@ async fn emit_get(input: &str) -> Result<(), String> {
     if conn.phantoms.len() != 1 {
         return Ok(());
     }
-    let phantom = conn.phantoms.values().next().unwrap();
+    let phantom = &conn.phantoms[0];
 
     // git credential reply. The username is a placeholder (the phantom carries
     // the real credential); it must be non-empty for git to use the password.

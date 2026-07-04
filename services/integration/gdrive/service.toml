@@ -3,6 +3,7 @@ id = "gdrive"
 name = "Google Drive"
 
 hosts = ["www.googleapis.com"]
+secrets = ["GOOGLE_DRIVE_REFRESH_TOKEN"]
 
 [oauth2]
 provider = "google"
@@ -10,4 +11,4 @@ scopes = [
   "https://www.googleapis.com/auth/drive.readonly",
   "https://www.googleapis.com/auth/drive.file",
 ]
-secret = "GOOGLE_DRIVE_REFRESH_TOKEN"
+refresh_token = "GOOGLE_DRIVE_REFRESH_TOKEN"

@@ -5,6 +5,3 @@ group = "anthropic"
 
 hosts = ["api.anthropic.com"]
 secrets = ["ANTHROPIC_API_KEY"]
-
-[placeholders]
-ANTHROPIC_API_KEY = "sk-ant-api03-..."

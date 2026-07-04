@@ -11,7 +11,7 @@ use base64::Engine;
 use serde_json::{json, Value};
 
 use crate::cli::active::resolve_active;
-use crate::cli::conn::{insert_raw_connection, remove_connection, valid_conn_id, validate_raw_host};
+use crate::cli::conn::{insert_raw_connection, remove_connection, valid_conn_id, valid_role, validate_raw_host};
 use crate::cli::webauthn::*;
 use crate::config::{GetArgs, RmArgs, SetArgs};
 use crate::crypto::kdf::WRAP_VERSION;
@@ -28,7 +28,16 @@ enum BrokerIntent {
 
 pub async fn run_set(args: SetArgs) -> Result<(), String> {
     let (custodian, vault) = resolve_active(args.vault.as_deref())?;
-    let key = args.key.clone();
+    // §1: secret KEYs are ALWAYS uppercase. Force-uppercase on input (a lowercase
+    // key is auto-converted, never stored lowercase) so there is one canonical
+    // form. Reject anything that isn't a valid env KEY even after uppercasing.
+    let key = args.key.trim().to_ascii_uppercase();
+    if !valid_role(&key) {
+        return Err(format!(
+            "'{}' is not a valid secret key — use UPPERCASE letters, digits and '_' (e.g. STRIPE_KEY)",
+            args.key.trim()
+        ));
+    }
 
     // Value: explicit arg, else hidden TTY prompt, else (non-TTY) an error.
     let value = match args.value.clone() {
@@ -39,10 +48,10 @@ pub async fn run_set(args: SetArgs) -> Result<(), String> {
     // Broker intent: --no-broker | --host <h..> | (TTY) prompt | (non-TTY) error.
     let intent = resolve_broker_intent(&key, &args.host, args.no_broker)?;
 
-    // The single-secret sugar: the connection id IS the lowercased key (so the
-    // daemon's raw reverse-index matches the bare secret name). Validate the id +
-    // anchor hosts BEFORE spending a passkey gesture — an invalid --host must not
-    // cost the user an unlock touch (mirrors `sc connect`'s pre-unlock check).
+    // The single-secret sugar: the connection id is the lowercased key — a plain
+    // handle (safe now that `secrets` is stored explicitly, no reverse-index
+    // coupling — §9). Validate the id + anchor hosts BEFORE spending a passkey
+    // gesture — an invalid --host must not cost the user an unlock touch.
     let conn = key.to_ascii_lowercase();
     if let BrokerIntent::Host(hosts) = &intent {
         if !valid_conn_id(&conn) {
@@ -77,7 +86,9 @@ pub async fn run_set(args: SetArgs) -> Result<(), String> {
             eprintln!("  stored · no host anchored — agent cannot use this item (`sc secret get` reveals it for a human)");
         }
         BrokerIntent::Host(hosts) => {
-            insert_raw_connection(&mut aux, &conn, &hosts);
+            // Raw single-secret connection: explicit `secrets = [KEY]`, id = the
+            // lowercased key handle, stored bare (§2/§9).
+            insert_raw_connection(&mut aux, &conn, &hosts, std::slice::from_ref(&key));
             eprintln!("  connection '{}' → {} · phantom __sc__{}__", conn, hosts.join(", "), conn);
         }
     }
@@ -153,7 +164,9 @@ fn prompt_host(key: &str) -> Result<String, String> {
 
 pub async fn run_rm(args: RmArgs) -> Result<(), String> {
     let (custodian, vault) = resolve_active(args.vault.as_deref())?;
-    let key = args.key.clone();
+    // §1: secret KEYs are canonical uppercase — normalize on input so `sc rm
+    // github_token` finds the stored `GITHUB_TOKEN`.
+    let key = args.key.trim().to_ascii_uppercase();
     eprintln!("safeclaw rm {} — two passkey gestures (unlock + write)", key);
 
     let meta = fetch_passkey_meta(&custodian, &vault).await?;
@@ -315,7 +328,9 @@ fn decode_prf_salt(s: &str) -> Result<Vec<u8>, String> {
 
 pub async fn run_get(args: GetArgs) -> Result<(), String> {
     let (custodian, vault) = resolve_active(args.vault.as_deref())?;
-    let key = args.key.trim().to_string();
+    // §1: secret KEYs are canonical uppercase — normalize on input so a human
+    // `sc get github_token` resolves the stored `GITHUB_TOKEN`.
+    let key = args.key.trim().to_ascii_uppercase();
     if key.is_empty() {
         return Err("key cannot be empty".into());
     }

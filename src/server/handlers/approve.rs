@@ -1266,41 +1266,37 @@ pub(crate) fn bootstrap_cache_from_view(
         }
     }
 
-    // Raw connections (`service: None`, created by `sc set K --host h`) have no
-    // service definition, so the per-service loops above skip them. Their policy floor is
-    // the global default (`allow`), and the resident proxy resolves an allow
-    // request straight from the session cache (no grant to open the vault), so
-    // their secret bytes MUST be resident. Reverse-index the native-secrets
-    // namespace: a raw connection `c` owns the bare key `c` (sole secret) and/or
-    // `c:<ROLE>` keys (matches `secret_address`). Case-insensitive because the
-    // conn id is env-safe lowercase while the stored key may be upper-case.
+    // Raw connections (`service: None`, created by `sc set K --host h` or
+    // `sc connect`) have no service definition, so the per-service loops above
+    // skip them. Their policy floor is the global default (`allow`), and the
+    // resident proxy resolves an allow request straight from the session cache
+    // (no grant to open the vault), so their secret bytes MUST be resident. §2:
+    // read the connection's EXPLICIT `secrets` (uppercase KEY names, stored bare)
+    // — no reverse-index-by-casing. Each KEY is resolved case-insensitively
+    // (canonical uppercase storage, but a legacy key may differ).
     for (conn, c) in view.aux.connections.iter() {
         if c.service.is_some() {
             continue; // service-backed — handled above
         }
-        let conn_lc = conn.to_ascii_lowercase();
-        let prefix = format!("{conn_lc}:");
+        let Some(keys) = &c.secrets else { continue };
         let mut map: std::collections::HashMap<String, Vec<u8>> =
             std::collections::HashMap::new();
-        let mut primary: Option<Vec<u8>> = None;
-        for (name, bytes) in view.native_secrets.iter() {
-            let name_lc = name.to_ascii_lowercase();
-            if name_lc == conn_lc {
-                // Sole secret — role is the connection name.
-                primary = Some(bytes.clone());
-                map.insert(conn.clone(), bytes.clone());
-            } else if let Some(role) = name_lc.strip_prefix(&prefix) {
-                map.insert(role.to_string(), bytes.clone());
+        for key in keys {
+            if let Some((_, bytes)) = view
+                .native_secrets
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(key))
+            {
+                map.insert(key.clone(), bytes.clone());
             }
         }
-        // A single namespaced role with no bare key is still the primary.
-        if primary.is_none() && map.len() == 1 {
-            primary = map.values().next().cloned();
-        }
-        if let Some(p) = primary {
+        // Sole secret → also the short-phantom `primary`; a multi-secret raw
+        // connection resolves each role from the map (role phantoms).
+        if map.len() == 1 {
+            let primary = map.values().next().cloned().unwrap();
             cache
                 .entries
-                .insert(conn.clone(), crate::state::CacheEntry { value: p, expires_at: None });
+                .insert(conn.clone(), crate::state::CacheEntry { value: primary, expires_at: None });
         }
         if !map.is_empty() {
             cache.allow_secrets.insert(conn.clone(), map);

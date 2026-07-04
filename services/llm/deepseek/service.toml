@@ -4,6 +4,3 @@ name = "DeepSeek"
 
 hosts = ["api.deepseek.com"]
 secrets = ["DEEPSEEK_API_KEY"]
-
-[placeholders]
-DEEPSEEK_API_KEY = "sk-..."

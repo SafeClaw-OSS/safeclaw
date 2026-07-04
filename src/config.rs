@@ -191,8 +191,15 @@ pub struct ConnectArgs {
     /// Connection id: `[a-z0-9_]`, starts alphanumeric, no `__`. Becomes the
     /// phantom `__sc__<name>__` and the user-facing handle.
     pub name: String,
-    /// Anchored egress host (exact domain, repeatable). Required for a
-    /// non-interactive create; prompted when omitted on a TTY.
+    /// Back this connection with a catalog SERVICE (id from `sc registry`): its
+    /// hosts and declared secrets. `--host` then only PINS an exact FQDN inside
+    /// one of the service's `*.suffix` wildcards. Omit for a raw connection
+    /// (anchor your own `--host` + `--secret`).
+    #[arg(long)]
+    pub service: Option<String>,
+    /// Anchored egress host (exact domain, repeatable). Required for a raw
+    /// non-interactive create; prompted when omitted on a TTY. For a
+    /// `--service` connection: optional, and each must be ⊆ the service's hosts.
     #[arg(long)]
     pub host: Vec<String>,
     /// A secret to store on this connection: `KEY=VALUE` (non-interactive) or a

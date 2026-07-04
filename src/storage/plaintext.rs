@@ -87,6 +87,14 @@ pub struct Connection {
     /// Enforced exact-FQDN at egress; never a bare `*`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hosts: Option<Vec<String>>,
+    /// The UPPERCASE secret KEY names this connection uses. **REQUIRED for a raw
+    /// connection** (`service: None`) — it answers "which secrets" directly, so
+    /// discovery and cache-bootstrap read it instead of reverse-indexing the
+    /// native-secrets namespace by casing. **OMITTED (`None`) for a service-backed
+    /// connection**: its secrets derive from the service's declared `secrets`
+    /// (including the oauth2 refresh-token KEY). One canonical answer, no drift.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secrets: Option<Vec<String>>,
 }
 
 /// An **in-flight** connect handshake — everything the daemon needs to redeem
@@ -95,11 +103,13 @@ pub struct Connection {
 /// it here) — there is never a partial/duplicate record.
 ///
 /// Relayed to the daemon *through the sealed vault* to stay cloud-blind: the
-/// browser drives consent, seals `{ service, config, code, verifier }` here, and
-/// the daemon (not the backend) performs the code→token exchange. The `code` is
-/// single-use with a ~10-min TTL. `redirect_uri` is NOT here — it's a fixed
-/// property of the OAuth client, held in the provider config. Mirrors the
-/// frontend `lib/vault-grant.ts` `Connecting` shape.
+/// browser drives consent, seals `{ service, hosts?, oauth2: { code, code_verifier } }`
+/// here, and the daemon (not the backend) performs the code→token exchange. The
+/// generic identity (`service`, `hosts`) is top-level; the mechanism handshake
+/// state nests under the mechanism key (`oauth2`) so a future auth mechanism
+/// nests under ITS key without the schema getting messy. `redirect_uri` is NOT
+/// here — it's a fixed property of the OAuth client, held in the provider config.
+/// Mirrors the frontend `lib/vault-grant.ts` `Connecting` shape.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Connecting {
     /// The service (TYPE) being instantiated.
@@ -109,10 +119,20 @@ pub struct Connecting {
     /// for an exact-hosts service.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hosts: Option<Vec<String>>,
-    /// The single-use authorization code from the loopback redirect.
+    /// OAuth2 (RFC 6749 authorization_code + RFC 7636 PKCE) handshake state.
+    /// Nested under the mechanism key — mirrors the service.toml `[oauth2]`.
+    pub oauth2: ConnectingOAuth2,
+}
+
+/// The oauth2 handshake temps of an in-flight connect (RFC 6749 / 7636). These
+/// are flow-standard, not per-service, so they live here rather than in the
+/// service.toml `[oauth2]`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConnectingOAuth2 {
+    /// The single-use authorization code from the loopback redirect (RFC 6749).
     pub code: String,
     /// The PKCE code_verifier (RFC 7636) the browser generated for this flow.
-    pub verifier: String,
+    pub code_verifier: String,
     /// Terminal exchange failure — set by the daemon when the code→token
     /// exchange fails non-recoverably (`invalid_grant`: the authorization code
     /// expired or was already used). The console renders "connection failed,

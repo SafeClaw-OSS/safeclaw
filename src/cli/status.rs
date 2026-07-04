@@ -2,8 +2,8 @@
 
 use crate::cli::active::{join_vault_url, load as load_config};
 use crate::cli::discovery::{self, ConnRow};
-use crate::cli::proxy_env::{is_routed, proxy_base};
-use crate::config::{StatusArgs, CONTROL_PORT};
+use crate::cli::proxy_env::{ca_trust_vars, proxy_base, proxy_reachable, raw_https_proxy};
+use crate::config::{StatusArgs, CONTROL_PORT, PROXY_PORT};
 
 #[derive(Debug)]
 pub struct VaultStatus {
@@ -110,11 +110,23 @@ pub async fn run(args: StatusArgs) -> Result<(), String> {
         (Some(c), Some(v)) => discovery::connections(c, v).await.unwrap_or_default(),
         _ => Vec::new(),
     };
-    let routed = is_routed().await;
+    // Routing facts — faithful WHAT, no coined verdict (§8). The agent reads the
+    // raw `$HTTPS_PROXY` and compares it to `proxy.url` itself.
     let proxy = proxy_base();
+    let reachable = proxy_reachable().await;
+    let https_proxy = raw_https_proxy();
+    let ca_trust = ca_trust_vars();
+    // Human-only convenience: does THIS shell route through us? (env points at our
+    // proxy port, a CA var trusts our leaf, and the proxy answers.)
+    let routing_ready = https_proxy
+        .as_deref()
+        .map(|h| h.contains(&format!(":{}", PROXY_PORT)))
+        .unwrap_or(false)
+        && !ca_trust.is_empty()
+        && reachable;
 
     if args.json {
-        print_json(&d, &vault, &conns, &proxy, routed);
+        print_json(&d, &vault, &conns, &proxy, reachable, https_proxy.as_deref(), &ca_trust);
         return Ok(());
     }
 
@@ -150,13 +162,14 @@ pub async fn run(args: StatusArgs) -> Result<(), String> {
     }
     println!();
 
-    // ── Proxy / routing (spec §14) ──────────────────────────────────────
+    // ── Proxy / routing (§8 — faithful WHAT) ────────────────────────────
     println!("proxy");
-    println!("  address: {}", proxy);
-    if routed {
-        println!("  routed:  true — commands here go through SafeClaw; phantoms substitute");
+    println!("  url:       {}", proxy);
+    println!("  reachable: {}", reachable);
+    if routing_ready {
+        println!("  routing:   ready — this shell goes through SafeClaw; phantoms substitute");
     } else {
-        println!("  routed:  false — prefix commands with `sc run -- <cmd>` (or `eval \"$(sc run --export-env)\"`)");
+        println!("  routing:   not configured — prefix commands with `sc run -- <cmd>` (or `eval \"$(sc env)\"`)");
     }
     println!();
 
@@ -170,15 +183,23 @@ pub async fn run(args: StatusArgs) -> Result<(), String> {
             if !c.hosts.is_empty() {
                 println!("    hosts:    {}", c.hosts.join(", "));
             }
-            for (role, ph) in &c.phantoms {
-                println!("    phantom:  {} = {}", role, ph);
+            for ph in &c.phantoms {
+                println!("    phantom:  {}", ph);
             }
         }
     }
     Ok(())
 }
 
-fn print_json(d: &LocalDaemon, vault: &Option<VaultStatus>, conns: &[ConnRow], proxy: &str, routed: bool) {
+fn print_json(
+    d: &LocalDaemon,
+    vault: &Option<VaultStatus>,
+    conns: &[ConnRow],
+    proxy: &str,
+    reachable: bool,
+    https_proxy: Option<&str>,
+    ca_trust: &[String],
+) {
     let vault_json = vault.as_ref().map(|s| {
         let (state, passkeys, secrets) = match &s.state {
             VaultState::Unreachable => ("unreachable", None, None),
@@ -200,8 +221,14 @@ fn print_json(d: &LocalDaemon, vault: &Option<VaultStatus>, conns: &[ConnRow], p
     let out = serde_json::json!({
         "daemon": { "up": d.up, "version": d.version, "vaults": d.vault_count },
         "vault": vault_json,
-        "proxy": proxy,
-        "routed": routed,
+        // §8: proxy = our address + whether it answers; routing = the RAW
+        // $HTTPS_PROXY value (null if unset — the agent compares it to proxy.url)
+        // plus which resident-CA vars point at ca.pem ([] ⇒ TLS would fail).
+        "proxy": { "url": proxy, "reachable": reachable },
+        "routing": {
+            "https_proxy": https_proxy,
+            "ca_trust": ca_trust,
+        },
         "connections": conns_json,
     });
     println!("{}", serde_json::to_string_pretty(&out).unwrap_or_else(|_| out.to_string()));

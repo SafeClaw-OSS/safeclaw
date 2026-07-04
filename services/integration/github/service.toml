@@ -16,6 +16,3 @@ name = "GitHub"
 # git-over-HTTPS (github.com). Basic self-describes on the wire — no auth section.
 hosts = ["api.github.com", "github.com"]
 secrets = ["GITHUB_TOKEN"]
-
-[placeholders]
-GITHUB_TOKEN = "github_pat_..."

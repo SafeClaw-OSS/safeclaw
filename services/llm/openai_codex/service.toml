@@ -8,8 +8,9 @@ group = "openai"
 # agent's to write. Provider `openai` is curated/PR-only and not yet shipped, so
 # this parses as valid v4 but stays non-functional until that provider lands.
 hosts = ["chatgpt.com", "api.openai.com"]
+secrets = ["OPENAI_CODEX_REFRESH_TOKEN"]
 
 [oauth2]
 provider = "openai"
-secret = "OPENAI_CODEX_REFRESH_TOKEN"
+refresh_token = "OPENAI_CODEX_REFRESH_TOKEN"
 exposes = ["account_id"]

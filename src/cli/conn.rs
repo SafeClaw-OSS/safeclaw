@@ -1,8 +1,9 @@
-//! Shared creation of RAW connections (`service: None` + anchored hosts) for
-//! `sc set --host` and `sc connect`, plus the `aux.services` write for
-//! `sc service add`. One place enforces the id + host rules so the two verbs
-//! can't drift, and one place mutates the sealed `aux` value in a way that
-//! preserves every other key.
+//! Shared creation of connections for `sc set --host` (raw single-secret) and
+//! `sc connect` (raw multi-secret, or service-backed via `--service`), plus the
+//! `aux.services` write for `sc service add`. One place enforces the id + host +
+//! role rules so the verbs can't drift, and one place mutates the sealed `aux`
+//! value in a way that preserves every other key. Raw connections carry explicit
+//! `secrets` (§2); service-backed connections omit them (derived from the service).
 
 use serde_json::{json, Value};
 
@@ -70,11 +71,13 @@ pub fn validate_raw_host(h: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Insert (or replace) a raw connection into the vault `aux` value, preserving
-/// every other aux key. `hosts` are the anchored exact FQDNs. The written shape
-/// (`{ "hosts": [...] }`, `service` omitted) deserializes to
-/// `Connection { service: None, hosts: Some(..) }`.
-pub fn insert_raw_connection(aux: &mut Value, conn_id: &str, hosts: &[String]) {
+/// Insert (or replace) a RAW connection into the vault `aux` value, preserving
+/// every other aux key. `hosts` are the anchored exact FQDNs; `secrets` are the
+/// UPPERCASE secret KEY names this connection uses (stored explicitly so
+/// discovery/bootstrap never reverse-index by casing — §2). The written shape
+/// (`{ "hosts": [...], "secrets": [...] }`, `service` omitted) deserializes to
+/// `Connection { service: None, hosts: Some(..), secrets: Some(..) }`.
+pub fn insert_raw_connection(aux: &mut Value, conn_id: &str, hosts: &[String], secrets: &[String]) {
     ensure_object(aux);
     let obj = aux.as_object_mut().unwrap();
     let conns = obj.entry("connections").or_insert_with(|| json!({}));
@@ -84,7 +87,36 @@ pub fn insert_raw_connection(aux: &mut Value, conn_id: &str, hosts: &[String]) {
     conns
         .as_object_mut()
         .unwrap()
-        .insert(conn_id.to_string(), json!({ "hosts": hosts }));
+        .insert(conn_id.to_string(), json!({ "hosts": hosts, "secrets": secrets }));
+}
+
+/// Insert (or replace) a SERVICE-backed connection into the vault `aux` value,
+/// preserving every other aux key. `hosts` is `Some(pins)` only when the user
+/// pinned exact FQDNs inside a service's `*.suffix` wildcard (else `None`, hosts
+/// derive from the service). `secrets` is omitted — a service-backed connection's
+/// secrets derive from the service's declared `secrets` (§2). The written shape
+/// deserializes to `Connection { service: Some(..), hosts, secrets: None }`.
+pub fn insert_service_connection(
+    aux: &mut Value,
+    conn_id: &str,
+    service: &str,
+    hosts: Option<&[String]>,
+) {
+    ensure_object(aux);
+    let obj = aux.as_object_mut().unwrap();
+    let conns = obj.entry("connections").or_insert_with(|| json!({}));
+    if !conns.is_object() {
+        *conns = json!({});
+    }
+    let mut rec = serde_json::Map::new();
+    rec.insert("service".to_string(), Value::String(service.to_string()));
+    if let Some(h) = hosts {
+        rec.insert("hosts".to_string(), json!(h));
+    }
+    conns
+        .as_object_mut()
+        .unwrap()
+        .insert(conn_id.to_string(), Value::Object(rec));
 }
 
 /// Store a custom service definition (verbatim v4 toml source) under
@@ -172,15 +204,36 @@ mod tests {
     #[test]
     fn insert_raw_preserves_other_aux_keys() {
         let mut aux = json!({ "version": 4, "stores": { "native-secrets": {} } });
-        insert_raw_connection(&mut aux, "stripe_key", &["api.stripe.com".to_string()]);
+        insert_raw_connection(
+            &mut aux,
+            "stripe_key",
+            &["api.stripe.com".to_string()],
+            &["STRIPE_KEY".to_string()],
+        );
         assert_eq!(aux["version"], 4);
         assert!(aux["stores"].is_object());
         assert_eq!(
             aux["connections"]["stripe_key"]["hosts"][0],
             "api.stripe.com"
         );
+        // Explicit secrets (§2), uppercase KEY.
+        assert_eq!(aux["connections"]["stripe_key"]["secrets"][0], "STRIPE_KEY");
         // No `service` key (None ⇒ raw).
         assert!(aux["connections"]["stripe_key"].get("service").is_none());
+    }
+
+    #[test]
+    fn insert_service_connection_omits_secrets_and_optional_hosts() {
+        let mut aux = json!({ "version": 4 });
+        // Default connection, hosts derived (None).
+        insert_service_connection(&mut aux, "gmail", "gmail", None);
+        assert_eq!(aux["connections"]["gmail"]["service"], "gmail");
+        assert!(aux["connections"]["gmail"].get("hosts").is_none());
+        assert!(aux["connections"]["gmail"].get("secrets").is_none());
+        // Named connection with a pinned wildcard host.
+        insert_service_connection(&mut aux, "acme_t1", "acme", Some(&["t1.acme.dev".to_string()]));
+        assert_eq!(aux["connections"]["acme_t1"]["service"], "acme");
+        assert_eq!(aux["connections"]["acme_t1"]["hosts"][0], "t1.acme.dev");
     }
 
     #[test]

@@ -201,10 +201,23 @@ fn validate_service_inner(
                 ));
             }
         }
-        if o.secret.trim().is_empty() {
-            errs.push("[oauth2] requires a secret (the refresh-token role)".into());
-        } else if !is_valid_role(&o.secret) {
-            errs.push(format!("[oauth2] secret '{}' is not a valid env key ([A-Z0-9_])", o.secret));
+        // Durable token slots use RFC 6749 field names; each must be a valid
+        // uppercase env KEY that is ALSO declared in the top-level `secrets` set
+        // (secrets is the uniform durable-credential contract — SERVICES.md §3).
+        let declared = |k: &str| def.service.secrets.iter().any(|s| s.eq_ignore_ascii_case(k));
+        if o.refresh_token.trim().is_empty() {
+            errs.push("[oauth2] requires a refresh_token (the vault secret KEY the refresh token is stored under)".into());
+        } else if !is_valid_role(&o.refresh_token) {
+            errs.push(format!("[oauth2] refresh_token '{}' is not a valid env key ([A-Z0-9_])", o.refresh_token));
+        } else if !declared(&o.refresh_token) {
+            errs.push(format!("[oauth2] refresh_token '{}' must be listed in the service's top-level secrets", o.refresh_token));
+        }
+        if let Some(idt) = &o.id_token {
+            if !is_valid_role(idt) {
+                errs.push(format!("[oauth2] id_token '{}' is not a valid env key ([A-Z0-9_])", idt));
+            } else if !declared(idt) {
+                errs.push(format!("[oauth2] id_token '{}' must be listed in the service's top-level secrets", idt));
+            }
         }
         for e in &o.exposes {
             if !is_valid_service_id(e) {
@@ -292,9 +305,10 @@ secrets = ["GITHUB_TOKEN"]
 id = "gmail"
 name = "Gmail"
 hosts = ["gmail.googleapis.com"]
+secrets = ["GMAIL_REFRESH_TOKEN"]
 [oauth2]
 provider = "google"
-secret = "GMAIL_REFRESH_TOKEN"
+refresh_token = "GMAIL_REFRESH_TOKEN"
 "#;
         assert!(validate_recipe(oauth, false).is_ok());
         // With a provider set that lacks google, the custom path rejects it.

@@ -206,6 +206,7 @@ mod tests {
         let conn = Connection {
             service: Some("acme".to_string()),
             hosts: Some(vec!["tenant1.acme.dev".to_string()]),
+            secrets: None,
         };
         let hosts = resolved_hosts(&conn, Some(&def));
         assert!(hosts.contains(&"api.acme.com".to_string()));
@@ -215,7 +216,7 @@ mod tests {
 
     #[test]
     fn resolved_hosts_raw_uses_own_hosts() {
-        let conn = Connection { service: None, hosts: Some(vec!["api.stripe.com".to_string()]) };
+        let conn = Connection { service: None, hosts: Some(vec!["api.stripe.com".to_string()]), secrets: Some(vec!["STRIPE_KEY".to_string()]) };
         assert_eq!(resolved_hosts(&conn, None), vec!["api.stripe.com".to_string()]);
     }
 
@@ -240,7 +241,7 @@ name = "Gmail"
 hosts = ["gmail.googleapis.com"]
 [oauth2]
 provider = "google"
-secret = "GMAIL_REFRESH_TOKEN"
+refresh_token = "GMAIL_REFRESH_TOKEN"
 exposes = ["account_id"]
 "#;
         let def: ServiceDef = toml::from_str(toml).unwrap();

@@ -3,10 +3,11 @@ id = "gcalendar"
 name = "Google Calendar"
 
 hosts = ["www.googleapis.com"]
+secrets = ["GOOGLE_CALENDAR_REFRESH_TOKEN"]
 
 [oauth2]
 provider = "google"
 scopes = [
   "https://www.googleapis.com/auth/calendar.events",
 ]
-secret = "GOOGLE_CALENDAR_REFRESH_TOKEN"
+refresh_token = "GOOGLE_CALENDAR_REFRESH_TOKEN"

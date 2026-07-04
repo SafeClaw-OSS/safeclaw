@@ -87,6 +87,46 @@ pub async fn probe_via(proxy_url: &str) -> bool {
     }
 }
 
+/// The list of resident-CA env var names the bundle sets, in bundle order.
+pub const CA_TRUST_VARS: [&str; 6] = [
+    "SSL_CERT_FILE",
+    "REQUESTS_CA_BUNDLE",
+    "CURL_CA_BUNDLE",
+    "NODE_EXTRA_CA_CERTS",
+    "GIT_SSL_CAINFO",
+    "DENO_CERT",
+];
+
+/// The RAW value of `$HTTPS_PROXY` (or lowercase `https_proxy`) as THIS process
+/// inherited it — `None` when unset/empty. `sc status --json` reports this
+/// verbatim next to `proxy.url` so the agent compares the two itself (equal
+/// authority ⇒ reaches us; `None` ⇒ unset; different ⇒ intercepted elsewhere).
+/// No coined verdict — the raw value is the faithful fact (§8).
+pub fn raw_https_proxy() -> Option<String> {
+    std::env::var("HTTPS_PROXY")
+        .or_else(|_| std::env::var("https_proxy"))
+        .ok()
+        .filter(|v| !v.is_empty())
+}
+
+/// Which resident-CA env vars are set AND point at the resident `ca.pem`. `[]`
+/// ⇒ TLS to intercepted hosts would fail (the child rejects our leaf cert). §8.
+pub fn ca_trust_vars() -> Vec<String> {
+    let ca = resident_ca_path();
+    let ca_str = ca.to_string_lossy();
+    CA_TRUST_VARS
+        .iter()
+        .filter(|k| std::env::var(k).map(|v| v == ca_str).unwrap_or(false))
+        .map(|k| k.to_string())
+        .collect()
+}
+
+/// Probe THIS daemon's resident proxy directly (no env dependency) — true iff our
+/// proxy answers the `sc.probe` liveness JSON. `sc status`'s `proxy.reachable`.
+pub async fn proxy_reachable() -> bool {
+    probe_via(&proxy_base()).await
+}
+
 /// Is the daemon's control plane answering on localhost `CONTROL_PORT`?
 pub async fn control_plane_up() -> bool {
     let client = match reqwest::Client::builder()

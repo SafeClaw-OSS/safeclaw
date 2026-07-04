@@ -1,12 +1,11 @@
 //! The agent-facing connection projection, shared by `sc status` (prints it)
 //! and `sc git-credential` (matches git's request host against it).
 //!
-//! Source is the daemon's per-vault registry (`GET /v/{vid}/registry`, auth-free
-//! localhost): the rows an agent can actually use — `connected` and carrying at
-//! least one ready-made phantom. We surface `{name, hosts, phantoms}` only; the
-//! phantom strings are copied verbatim, never constructed here.
+//! Source is the daemon's per-vault registry `connections` array
+//! (`GET /v/{vid}/registry`, auth-free localhost): the rows an agent can actually
+//! use — `connected` and carrying at least one ready-made phantom. We surface
+//! `{name, hosts, phantoms}` only; the phantom strings are copied verbatim.
 
-use std::collections::BTreeMap;
 use std::time::Duration;
 
 use serde_json::Value;
@@ -17,8 +16,8 @@ pub struct ConnRow {
     pub name: String,
     /// Anchored egress hosts (exact FQDNs).
     pub hosts: Vec<String>,
-    /// Injectable role → ready-made phantom string.
-    pub phantoms: BTreeMap<String, String>,
+    /// Ready-made phantom strings (a list — §6).
+    pub phantoms: Vec<String>,
 }
 
 /// Fetch + project the vault's usable connections. `daemon` is the control-plane
@@ -45,21 +44,17 @@ pub async fn connections(daemon: &str, vault: &str) -> Result<Vec<ConnRow>, Stri
     Ok(project(&body))
 }
 
-/// Pull `{name, hosts, phantoms}` out of a registry response body.
+/// Pull `{name, hosts, phantoms}` out of the registry `connections` array.
 fn project(body: &Value) -> Vec<ConnRow> {
     let mut out = Vec::new();
-    let Some(arr) = body.get("services").and_then(|v| v.as_array()) else {
+    let Some(arr) = body.get("connections").and_then(|v| v.as_array()) else {
         return out;
     };
     for s in arr {
-        let phantoms: BTreeMap<String, String> = s
+        let phantoms: Vec<String> = s
             .get("phantoms")
-            .and_then(|v| v.as_object())
-            .map(|o| {
-                o.iter()
-                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                    .collect()
-            })
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
             .unwrap_or_default();
         // Only rows an agent can use right now: connected + at least one phantom.
         let connected = s.get("connected").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -89,14 +84,14 @@ mod tests {
     #[test]
     fn projects_connected_rows_with_phantoms() {
         let body = json!({
-            "services": [
+            "connections": [
                 { "id": "github", "connected": true,
                   "hosts": ["api.github.com", "github.com"],
-                  "phantoms": { "GITHUB_TOKEN": "__sc__github__" } },
+                  "phantoms": ["__sc__github__"] },
                 // not connected → dropped
                 { "id": "stripe", "connected": false,
-                  "hosts": ["api.stripe.com"], "phantoms": { "K": "__sc__stripe__" } },
-                // connected but no phantoms (needs no cred) → dropped
+                  "hosts": ["api.stripe.com"], "phantoms": ["__sc__stripe__"] },
+                // connected but no phantoms → dropped
                 { "id": "public", "connected": true, "hosts": ["x.com"] },
             ]
         });
@@ -104,11 +99,13 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].name, "github");
         assert_eq!(rows[0].hosts, vec!["api.github.com", "github.com"]);
-        assert_eq!(rows[0].phantoms.get("GITHUB_TOKEN").unwrap(), "__sc__github__");
+        assert_eq!(rows[0].phantoms, vec!["__sc__github__".to_string()]);
     }
 
     #[test]
-    fn empty_on_missing_services() {
+    fn empty_on_missing_connections() {
         assert!(project(&json!({})).is_empty());
+        // A services-only (static catalog) body has no connections → empty.
+        assert!(project(&json!({ "services": [] })).is_empty());
     }
 }

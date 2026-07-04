@@ -70,7 +70,7 @@ pub fn resolve_exchange_config(
     let resolved = services.resolve_oauth_config(oauth);
     let token_url = resolved.token_url?;
     let client_id = resolved.client_id?;
-    let secret_role = oauth.secret.clone();
+    let secret_role = oauth.refresh_token.clone();
     let style = services.provider_oauth_style(&oauth.provider);
     Some(ExchangeConfig {
         token_url,
@@ -135,7 +135,8 @@ pub fn apply_exchange_result(
     let mut connections = aux_map::<Connection>(m, "connections");
     connections.insert(
         conn.to_string(),
-        Connection { service: Some(service.to_string()), hosts },
+        // Service-backed: secrets derive from the service def, never stored here.
+        Connection { service: Some(service.to_string()), hosts, secrets: None },
     );
     set_aux_map(m, "connections", connections);
 }
@@ -153,7 +154,7 @@ pub fn apply_exchange_result(
 fn collect_pending(m: &ProtectedState) -> Vec<(String, Connecting)> {
     aux_map::<Connecting>(m, "connecting")
         .into_iter()
-        .filter(|(_, c)| c.error.is_none())
+        .filter(|(_, c)| c.oauth2.error.is_none())
         .collect()
 }
 
@@ -237,12 +238,12 @@ where
     (completed, failed)
 }
 
-/// Stamp a terminal `error` on one `connecting` entry (leaving code/verifier so
-/// the console still knows which connection it is). No-op if the entry is gone.
+/// Stamp a terminal `error` on one `connecting` entry (leaving code/code_verifier
+/// so the console still knows which connection it is). No-op if the entry is gone.
 fn mark_connecting_failed(m: &mut ProtectedState, conn: &str, reason: &str) {
     let mut connecting = aux_map::<Connecting>(m, "connecting");
     if let Some(entry) = connecting.get_mut(conn) {
-        entry.error = Some(reason.to_string());
+        entry.oauth2.error = Some(reason.to_string());
     }
     set_aux_map(m, "connecting", connecting);
 }
@@ -367,8 +368,8 @@ pub(crate) async fn apply_pending_connects(state: &Arc<AppState>, vault_id: &str
             &cfg.token_url,
             &cfg.client_id,
             cfg.client_secret.as_deref(),
-            &p.code,
-            &p.verifier,
+            &p.oauth2.code,
+            &p.oauth2.code_verifier,
             &cfg.redirect_uri,
             cfg.style,
         )
@@ -514,7 +515,7 @@ mod tests {
             "stores": {},
             "store_order": [],
             "connecting": {
-                conn: { "service": service, "code": code, "verifier": "verif-xyz" }
+                conn: { "service": service, "oauth2": { "code": code, "code_verifier": "verif-xyz" } }
             }
         });
         m
@@ -542,7 +543,7 @@ mod tests {
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].0, "gmail");
         assert_eq!(got[0].1.service, "gmail");
-        assert_eq!(got[0].1.code, "code-AUX");
+        assert_eq!(got[0].1.oauth2.code, "code-AUX");
     }
 
     #[test]
@@ -559,7 +560,7 @@ mod tests {
         // sync tick + re-push it, forming a retry storm). It stays in the aux so
         // the console can show "reconnect" — just isn't retried.
         let mut m = with_connecting("gmail", "gmail", "code-DEAD");
-        m.aux["connecting"]["gmail"]["error"] =
+        m.aux["connecting"]["gmail"]["oauth2"]["error"] =
             serde_json::json!("authorization expired or already used");
         assert!(
             collect_pending(&m).is_empty(),
@@ -647,7 +648,7 @@ mod tests {
 
         let mut seen = None;
         let (n, _) = run_pending(&services, &mut m, |conn, cfg, p| {
-            seen = Some((conn.clone(), cfg.token_url.clone(), cfg.redirect_uri.clone(), p.code.clone()));
+            seen = Some((conn.clone(), cfg.token_url.clone(), cfg.redirect_uri.clone(), p.oauth2.code.clone()));
             async move { Ok(tokens(Some("rt-NEW"))) }
         })
         .await;

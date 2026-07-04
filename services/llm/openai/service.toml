@@ -5,6 +5,3 @@ group = "openai"
 
 hosts = ["api.openai.com"]
 secrets = ["OPENAI_API_KEY"]
-
-[placeholders]
-OPENAI_API_KEY = "sk-..."

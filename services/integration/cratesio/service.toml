@@ -13,6 +13,3 @@ name = "crates.io"
 
 hosts = ["crates.io"]
 secrets = ["CARGO_REGISTRY_TOKEN"]
-
-[placeholders]
-CARGO_REGISTRY_TOKEN = "cio..."

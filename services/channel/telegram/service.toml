@@ -7,6 +7,3 @@ name = "Telegram"
 # declaration needed beyond the host + secret.
 hosts = ["api.telegram.org"]
 secrets = ["TELEGRAM_BOT_TOKEN"]
-
-[placeholders]
-TELEGRAM_BOT_TOKEN = "123456:ABC-DEF1234..."

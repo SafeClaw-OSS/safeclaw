@@ -15,6 +15,3 @@ name = "GitLab"
 # git-over-HTTPS (gitlab.com). Both share GITLAB_TOKEN.
 hosts = ["gitlab.com"]
 secrets = ["GITLAB_TOKEN"]
-
-[placeholders]
-GITLAB_TOKEN = "glpat-..."

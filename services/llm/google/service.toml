@@ -6,6 +6,3 @@ name = "Google AI"
 # there — no declaration beyond host + secret.
 hosts = ["generativelanguage.googleapis.com"]
 secrets = ["GEMINI_API_KEY"]
-
-[placeholders]
-GEMINI_API_KEY = "AIza..."

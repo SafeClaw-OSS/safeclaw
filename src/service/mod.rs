@@ -8,7 +8,7 @@
 
 pub mod validate;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use crate::auth::oauth2::OAuthStyle;
 
 // ── ServiceDef: parsed from service.toml (v4) ───────────────────────────────
@@ -21,14 +21,10 @@ use crate::auth::oauth2::OAuthStyle;
 pub struct ServiceDef {
     pub service: ServiceMeta,
     /// The sole non-direct production. When present, the phantom resolves to a
-    /// minted OAuth access token; `oauth2.secret` (the refresh token) is
-    /// internal by construction and never injectable.
+    /// minted OAuth access token; the refresh token named by `oauth2.refresh_token`
+    /// is internal by construction and never injectable.
     #[serde(default)]
     pub oauth2: Option<OAuth2Def>,
-    /// Cosmetic per-role UI input hints (role → placeholder). Never shapes any
-    /// parse or security decision.
-    #[serde(default)]
-    pub placeholders: Option<BTreeMap<String, String>>,
     /// Optional agent-facing `setup` prose (routed ⇒ nothing to configure;
     /// unrouted ⇒ `sc run -- <cmd>`). Plain text — no template tokens.
     #[serde(default)]
@@ -41,17 +37,30 @@ pub struct ServiceDef {
 }
 
 /// The one named auth MECHANISM. `provider` names a shipped `_providers/*`
-/// entry (endpoints + public client); `secret` is the stored refresh-token
-/// role (internal — the mint reads it, no phantom exposes it); `exposes` lists
-/// extra minted/derived roles surfaced as role-qualified phantoms (e.g.
-/// openai-codex's `account_id`).
+/// entry (endpoints + public client). Token slots use the RFC 6749 response
+/// field names: `refresh_token` maps the durable refresh token to the vault
+/// secret KEY it is stored under (internal — the mint reads it, no phantom
+/// exposes it); optional `id_token` maps a stored OIDC id token likewise. The
+/// minted `access_token` is ephemeral (never stored, never named) — it is what
+/// the default phantom resolves to. `exposes` lists extra minted/derived roles
+/// surfaced as role-qualified phantoms (e.g. openai-codex's `account_id`). The
+/// flow temps `code`/`code_verifier` are standard, not per-service — they live
+/// in `aux.connecting.oauth2`, never here.
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OAuth2Def {
     pub provider: String,
     #[serde(default)]
     pub scopes: Vec<String>,
-    pub secret: String,
+    /// RFC 6749 `refresh_token` → the vault secret KEY the durable refresh token
+    /// is stored under (e.g. `GMAIL_REFRESH_TOKEN`). Named explicitly (not
+    /// derived) so a service declaring more than one secret is unambiguous.
+    pub refresh_token: String,
+    /// RFC 6749 `id_token` → the vault secret KEY a stored OIDC id token is
+    /// written under. Only for providers that return a durable id token; absent
+    /// for the common access+refresh flow.
+    #[serde(default)]
+    pub id_token: Option<String>,
     #[serde(default)]
     pub exposes: Vec<String>,
 }
@@ -663,7 +672,7 @@ impl ServiceRegistry {
     pub fn service_env_key(&self, service_id: &str) -> Option<String> {
         let svc = self.services.get(service_id)?;
         if let Some(o) = svc.oauth2.as_ref() {
-            let s = o.secret.trim();
+            let s = o.refresh_token.trim();
             if !s.is_empty() {
                 return Some(s.to_string());
             }
@@ -858,12 +867,12 @@ hosts = ["gmail.googleapis.com"]
 [oauth2]
 provider = "google"
 scopes = ["https://www.googleapis.com/auth/gmail.send"]
-secret = "GMAIL_REFRESH_TOKEN"
+refresh_token = "GMAIL_REFRESH_TOKEN"
 "#;
         let def: ServiceDef = toml::from_str(toml_str).unwrap();
         let o = def.oauth2.as_ref().unwrap();
         assert_eq!(o.provider, "google");
-        assert_eq!(o.secret, "GMAIL_REFRESH_TOKEN");
+        assert_eq!(o.refresh_token, "GMAIL_REFRESH_TOKEN");
         assert_eq!(o.scopes.len(), 1);
         assert!(o.exposes.is_empty());
     }
@@ -879,7 +888,7 @@ hosts = ["api.openai.com"]
 
 [oauth2]
 provider = "openai"
-secret = "OPENAI_CODEX_REFRESH_TOKEN"
+refresh_token = "OPENAI_CODEX_REFRESH_TOKEN"
 exposes = ["account_id"]
 "#;
         let def: ServiceDef = toml::from_str(toml_str).unwrap();
@@ -919,7 +928,7 @@ name = "Gmail"
 hosts = ["gmail.googleapis.com"]
 [oauth2]
 provider = "google"
-secret = "GMAIL_REFRESH_TOKEN"
+refresh_token = "GMAIL_REFRESH_TOKEN"
 "#;
         let def: ServiceDef = toml::from_str(toml_str).unwrap();
         let mut services = HashMap::new();
@@ -993,7 +1002,7 @@ name = "Gmail"
 hosts = ["gmail.googleapis.com"]
 [oauth2]
 provider = "google"
-secret = "GMAIL_REFRESH_TOKEN"
+refresh_token = "GMAIL_REFRESH_TOKEN"
 "#;
         let prov_toml = r#"
 [provider.google]
@@ -1054,7 +1063,7 @@ client_type = "public"
             // codex intentionally references a not-yet-shipped provider).
             if let Some(o) = &def.oauth2 {
                 let _ = &known_providers; // referenced for the custom-toml path
-                assert!(!o.secret.is_empty(), "service '{}' oauth2 has empty secret", id);
+                assert!(!o.refresh_token.is_empty(), "service '{}' oauth2 has empty refresh_token", id);
             }
         }
     }

@@ -3,6 +3,7 @@ id = "gmail"
 name = "Gmail"
 
 hosts = ["gmail.googleapis.com"]
+secrets = ["GMAIL_REFRESH_TOKEN"]
 
 [oauth2]
 provider = "google"
@@ -11,4 +12,4 @@ scopes = [
   "https://www.googleapis.com/auth/gmail.readonly",
   "https://www.googleapis.com/auth/gmail.modify",
 ]
-secret = "GMAIL_REFRESH_TOKEN"
+refresh_token = "GMAIL_REFRESH_TOKEN"

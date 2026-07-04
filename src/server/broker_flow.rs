@@ -22,6 +22,13 @@ use crate::state::{ApprovalEvent, AppState};
 /// here so the proxy pipeline has one obvious home for it.
 pub use crate::core::forward::HTTP_CLIENT;
 
+/// `sha256(bytes)` as lowercase hex — the oauth mint-cache key (§5). Hashing the
+/// refresh token keeps the map keys fixed-size and not raw secrets.
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes).iter().map(|b| format!("{:02x}", b)).collect()
+}
+
 /// A hop-by-hop header (RFC 7230 §6.1) that must never be forwarded verbatim.
 pub fn is_hop_by_hop(name_lc: &str) -> bool {
     matches!(
@@ -169,8 +176,13 @@ pub async fn resolve_auth_value(
         )));
     };
 
-    // Cache hit — keyed by connection so two accounts of one service don't collide.
-    if let Some(cached) = state.oauth_access_lookup(vault_id, conn_id) {
+    // §5: mint cache keyed by sha256(refresh_token). Keying on the INPUT means a
+    // reconnect / refresh-token rotation (a NEW refresh) is a natural cache miss →
+    // fresh mint, and two accounts never collide. The refresh is read LOCALLY only
+    // to compute the key; on a hit nothing is minted and the refresh never leaves
+    // the daemon.
+    let refresh_hash = sha256_hex(raw);
+    if let Some(cached) = state.oauth_access_lookup(vault_id, &refresh_hash) {
         return Ok(cached);
     }
 

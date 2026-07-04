@@ -4,6 +4,3 @@ name = "Groq"
 
 hosts = ["api.groq.com"]
 secrets = ["GROQ_API_KEY"]
-
-[placeholders]
-GROQ_API_KEY = "gsk_..."

@@ -239,6 +239,7 @@ impl BrokerHandler {
                     crate::storage::plaintext::Connection {
                         service: Some(conn.clone()),
                         hosts: None,
+                        secrets: None,
                     }
                 } else {
                     return err_response(
