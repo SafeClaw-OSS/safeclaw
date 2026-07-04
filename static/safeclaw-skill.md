@@ -1,56 +1,41 @@
 # SafeClaw
 
-SafeClaw is a passkey-gated credential broker. You never hold the real
-secret. Instead each connected service gives you a **phantom** — a
-placeholder like `__sc__github__`. Put the phantom where the credential
-belongs (an env var a tool reads, a request header, a config file) and route
-your traffic through SafeClaw; SafeClaw swaps the phantom for the real value
-on the way out, and only toward that connection's own `hosts`. The user
-approves anything sensitive with a passkey tap in a browser tab.
-
-One sentence: *put the phantom where the credential goes; run the command
-through SafeClaw.*
+SafeClaw is a passkey-gated credential broker. You never hold the real secret:
+each connected service gives you a **phantom** — a placeholder like
+`__sc__github__`. Put the phantom where the credential belongs (an env var a tool
+reads, a request header, a config file) and run your traffic through SafeClaw; it
+swaps the phantom for the real value on the way out, only toward that
+connection's own `hosts`. The user approves anything sensitive with a passkey tap.
 
 ## Daemon startup (self-host only)
 
-If `$SAFECLAW_VAULT_URL` points at `localhost` / `127.0.0.1`, the daemon
-runs on this machine — make sure it's up before the first call:
+If `$SAFECLAW_VAULT_URL` points at `localhost` / `127.0.0.1`, the daemon runs on
+this machine — make sure it's up before the first call:
 
 ```bash
 curl -s -o /dev/null --connect-timeout 1 "$SAFECLAW_VAULT_URL/registry" \
   || safeclaw up
 ```
 
-`sc up` is idempotent — it starts the daemon's user service only if it isn't
-already running, and never rewrites config (`sc down` stops it). For a SaaS
-vault (host is `api.safeclaw.pro` etc.) skip this: the daemon is hosted, so if
-`/registry` is unreachable, just tell the user.
+`sc up` is idempotent. For a hosted vault (`api.safeclaw.pro` etc.) the daemon is
+remote — skip this; if `/registry` is unreachable, tell the user.
 
 ## Auth
 
-SafeClaw expects two env vars in the user's shell:
+- **`$SAFECLAW_VAULT_URL`** — the vault's base URL, e.g.
+  `http://localhost:23295/v/abc-def`; the vault id is baked in. Get it from
+  `sc env`. If it's unset, stop and ask the user — never guess one.
+- **`$SAFECLAW_API_KEY`** — a bearer token for a **hosted** vault (a local daemon
+  is localhost-gated and needs none). Send it when set:
 
-- **`$SAFECLAW_VAULT_URL`** — the base URL of the user's SafeClaw daemon,
-  e.g. `http://localhost:23295/v/abc-def` (the local daemon on this machine).
-  If unset, get it from `sc env`. The vault id is baked into the URL.
-- **`$SAFECLAW_API_KEY`** — your bearer token, used only for the discovery
-  endpoint below. The user provides one from the dashboard's "Connect a new
-  agent" flow or `sc agent add`.
-
-```
-Authorization: Bearer $SAFECLAW_API_KEY
-```
-
-If `$SAFECLAW_VAULT_URL` is unset, stop and ask the user to set it. Don't
-guess or hardcode a value. The skill is identical for every user and every
-deployment — the user changes vaults by changing the env var, not by
-re-installing the skill.
+  ```
+  Authorization: Bearer $SAFECLAW_API_KEY
+  ```
 
 ## Discover what's available
 
 ```
 GET $SAFECLAW_VAULT_URL/registry
-Authorization: Bearer $SAFECLAW_API_KEY
 ```
 
 Filter to save context: `?view=summary` and/or `?ids=a,b`.
@@ -65,7 +50,7 @@ Filter to save context: `?view=summary` and/or `?ids=a,b`.
     { "id": "github", "name": "GitHub", "category": "integration",
       "hosts": ["api.github.com", "github.com"], "secrets": ["GITHUB_TOKEN"] }
   ],
-  "connections": [    // what's usable right now — copy phantoms verbatim
+  "connections": [    // what's usable now
     { "id": "github", "service": "github", "connected": true,
       "hosts": ["api.github.com", "github.com"],
       "phantoms": ["__sc__github__"] }
@@ -73,58 +58,42 @@ Filter to save context: `?view=summary` and/or `?ids=a,b`.
 }
 ```
 
-`services` is the catalog (what's supported); `connections` is what's usable
-now. Each connection carries its anchored **`hosts`** and a **`phantoms`** list
-— copy a phantom verbatim, never build one yourself. Use `connected: true`
-connections freely.
+Copy a phantom verbatim from a `connected: true` connection — never build one.
 
 If the service you want has no `connected: true` connection, the user must add
-its credential. **Hand them a link — don't run commands or walk them through
-provider menus.** `console_url` points at this vault; send them to its
-Connections tab:
+its credential. Hand them a link — don't run commands or walk them through
+provider menus:
 
 ```
-Connect <service name>: open <console_url>#connections, add your
-credential there, approve with your passkey.
+Connect <service name>: open <console_url>#connections, add your credential
+there, approve with your passkey.
 ```
 
-You never see or handle it. After they confirm, re-GET the registry for a
-`connected: true` connection. (Where to *get* the credential is the provider's
-side — mention it only if asked.)
+You never see or handle it; after they confirm, re-GET the registry. Where to
+*get* the credential is the provider's side — mention it only if asked.
 
-Headless fallback, user at the daemon's own terminal (passkey-gated):
+Headless fallback, the user at the daemon's own terminal (passkey-gated):
 
 ```
 sc set STRIPE_KEY --host api.stripe.com        # one secret + its host anchor
 sc connect myapi --host api.example.com --secret API_TOKEN=<value>
 ```
 
-Never enter credentials yourself. Never echo one back.
+Never enter a credential yourself; never echo one back.
 
-If `locked: true`, run `sc up` — it brings SafeClaw up and unlocks the
-vault, printing an approval link; surface that link to the user (they tap
-their passkey) and retry once it's done. Don't tell the user to "unlock" or
-suggest a browser URL of your own.
+If `locked: true`, run `sc up` — it unlocks the vault and prints an approval
+link; surface that link (the user taps their passkey) and retry.
 
 ## Using a connection
 
-Every connected service in `/registry` carries a ready-made **phantom** — a
-placeholder like `__sc__github__`. Put it exactly where the real credential
-would go (the env var a tool reads, a header, a config file). SafeClaw swaps
-it for the real value on the way out — and only toward that connection's
-`hosts`.
-
-Phantoms only work when the traffic passes through SafeClaw. Check first:
+Route the command through SafeClaw, or the phantom reaches the upstream as a
+literal string and is rejected. Check first:
 
     sc status --json      # proxy.url, proxy.reachable, routing.https_proxy
 
-Your traffic reaches SafeClaw when `routing.https_proxy` names the same
-authority as `proxy.url`. If it's `null` or a different proxy, run the command
-through SafeClaw (`sc run -- <cmd>`, or the service's `setup` hint). Don't send
-a phantom unrouted — the upstream just rejects it, indistinguishably from a bad
-key.
-
-Examples (the phantom goes wherever that tool expects the credential):
+You're routed when `routing.https_proxy` names the same authority as `proxy.url`;
+if it's `null` or a different proxy, prefix the command with `sc run --` (or apply
+the service's `setup` hint).
 
 ```bash
 sc run -- curl https://api.stripe.com/v1/charges \
@@ -133,26 +102,21 @@ GITHUB_TOKEN=__sc__github__ sc run -- gh pr list
 sc run -- git clone https://__sc__github__@github.com/<owner>/<repo>
 ```
 
-Multi-account is by phantom VALUE, never by env-var name: switch
-`__sc__github__` → `__sc__github_work__`. If a request names an unknown
-connection, SafeClaw rejects it with a clear message (it does not forward a
-bad phantom to the upstream).
+Multi-account is by phantom VALUE, not env-var name: switch `__sc__github__` →
+`__sc__github_work__`. One request carries one connection's phantom(s).
 
 ## Configuring a local tool (`setup` hints)
 
-Some services need a **local tool** (a CLI, an SDK) run through SafeClaw so its
-traffic is brokered and the credential never enters it. When a service needs
-this, its `/registry` entry carries a **`setup`** hint — a goal plus
-ready-to-run steps. Read it, **tell the user what you're configuring and why
-first**, then apply it (adapt to the user's real config if it differs). The
-per-service `setup` hint is the source of truth; nothing tool-specific lives
-in this skill.
+Some services need a local tool (a CLI, an SDK) run through SafeClaw so its
+traffic is brokered. Such a service's `/registry` entry carries a **`setup`**
+hint — a goal plus ready-to-run steps. Tell the user what you're configuring and
+why, then apply it (adapting to their real config). The `setup` hint is the
+source of truth.
 
 ## Approvals
 
-Some credentials are policy-gated: the first time you route a request that
-needs one, SafeClaw doesn't forward it — the command fails and its error output
-carries a SafeClaw approval line, e.g.:
+Some credentials are policy-gated: the first time you route a request that needs
+one, SafeClaw fails the command and its error output carries an approval line:
 
 ```
 SafeClaw approval needed to use this credential.
@@ -161,12 +125,11 @@ Approve with your passkey:
 Then re-run the same command.
 ```
 
-Surface that link to the user on its own line. Do NOT ask them to type "done"
-— their browser tap is the signal. Once they've approved, **re-run the exact
-same command**; the approval is cached, so it now goes through. A new
-destination host you haven't used before is a higher-friction, one-time
-*permanent grant* approval — same flow, surface the link.
+Surface that link on its own line — the user's browser tap is the signal, don't
+ask them to type "done". Once approved, re-run the exact same command; the
+approval is cached. A destination host you haven't used before is a one-time
+*permanent grant* — same flow.
 
-For a runtime that can't easily re-run, the approval JSON in that output also
-carries a `poll_url` (`$SAFECLAW_VAULT_URL/op/<op_id>`); GET it until
-`status` is `ok`, then re-run. The op stays valid ~30 min.
+If you can't easily re-run, the approval JSON also carries a `poll_url`
+(`$SAFECLAW_VAULT_URL/op/<op_id>`); GET it until `status` is `ok`, then re-run.
+The op stays valid ~30 min.
