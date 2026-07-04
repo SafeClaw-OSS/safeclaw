@@ -226,6 +226,8 @@ pub async fn resolve_auth_value(
 
     state.oauth_clear_reauth(vault_id, conn_id);
     let safe_expires_at = expires_at.saturating_sub(60);
-    state.oauth_access_insert(vault_id, conn_id, access_token.as_bytes().to_vec(), safe_expires_at);
+    // §5: cache under the SAME key the lookup uses — sha256(refresh_token) — so a
+    // subsequent request within the token's lifetime hits instead of re-minting.
+    state.oauth_access_insert(vault_id, &refresh_hash, access_token.as_bytes().to_vec(), safe_expires_at);
     Ok(access_token.into_bytes())
 }
