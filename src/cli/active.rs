@@ -255,18 +255,23 @@ pub fn join_vault_url(daemon: &str, vault: &str) -> String {
     format!("{}/v/{}", daemon.trim_end_matches('/'), vault)
 }
 
-/// Resolve the active `(daemon_url, vault)` pair for short-lived CLI commands —
-/// the `(daemon, vault)` the **human's** `sc` command operates on.
-/// Source = `config.toml` (set by `sc login` / `sc vault use`) + the explicit
-/// `--vault` flag (`vault_override`, which reselects just the vault id).
+/// Resolve the active `(daemon_url, vault)` pair every short-lived `sc` command
+/// routes through — the single choke point (AGENT_SURFACE §5).
 ///
-/// We deliberately do NOT read `$SAFECLAW_VAULT_URL` here. That env var is the
-/// AGENT's broker endpoint (the install-prompt persists it for the agent
-/// process). A human's `sc` command must never inherit the agent's vault
-/// choice — if it did, a stale agent env would hijack the human's commands
-/// (it did: a real unlock bug). The rule we keep:
-///   env          = process config (daemon-serve params, the agent's broker URL)
-///   active vault = user state → config.toml
+/// - **daemon (control root) ALWAYS comes from `config.toml`** (`:23295`, set by
+///   `sc login`). It is NEVER taken from env: `$SAFECLAW_DAEMON_URL` is the
+///   agent's API face (`:23294`, read-only), so using it to address control /
+///   ceremony ops (`sc up` / `op` / `approve` / `unlock`) would hit the wrong
+///   port and silently fail.
+/// - **vault precedence:** `--vault flag > $SAFECLAW_VAULT_ID (env pin) >
+///   config default > single-vault auto-select`. The env pin (VAULT_ID only) is
+///   what makes an agent's shelled-out `sc` target the SAME vault its own HTTP
+///   does — env overrides file for the VARYING axis, exactly like `AWS_PROFILE`
+///   (this REVISES the older "must NOT read env" rule, which was combined-URL-era
+///   and protected `sc vault use`; the clean split — vault in env, server in
+///   config — makes env>config correct for the vault axis without the old
+///   stale-daemon hijack). A fresh shell (no pin) still follows config +
+///   `sc vault use`.
 pub fn resolve_active(vault_override: Option<&str>) -> Result<(String, String), String> {
     let cfg = load()?;
     let daemon = cfg.daemon.clone().ok_or_else(|| {
@@ -274,9 +279,22 @@ pub fn resolve_active(vault_override: Option<&str>) -> Result<(String, String), 
     })?;
     let vault = vault_override
         .map(str::to_string)
-        .or(cfg.vault.clone())
+        .or_else(|| std::env::var("SAFECLAW_VAULT_ID").ok().filter(|s| !s.is_empty()))
+        .or_else(|| cfg.vault.clone())
+        .or_else(|| single_known_vault(&cfg))
         .ok_or_else(|| "no vault selected — run `sc login` or `sc vault use`".to_string())?;
     Ok((daemon, vault))
+}
+
+/// Single-vault auto-select (§5): a daemon with exactly one known vault defaults
+/// to it, so a fresh shell needs no `sc vault use` and the agent/human vault
+/// can't diverge in the common single-vault case. `None` for zero or many.
+fn single_known_vault(cfg: &CliConfig) -> Option<String> {
+    let mut it = cfg.known_vaults.iter().map(|kv| kv.vault.clone());
+    match (it.next(), it.next()) {
+        (Some(v), None) => Some(v),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
