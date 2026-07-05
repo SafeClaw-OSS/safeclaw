@@ -42,17 +42,19 @@ JSON") with proxy ceremony — rejected. So:
 `GET $SAFECLAW_DAEMON_URL/v/$SAFECLAW_VAULT_ID/registry` and `…/op/{id}` — plain, direct,
 to the 23294 API face. This is consistent with opt-in (no phantom ⇒ no proxy).
 
-## 4. Env vars — `sc env` emits all, agent copies VERBATIM (zero assembly)
+## 4. The agent's four env vars — delivered by its install prompt (§11), copied VERBATIM
 ```
 SAFECLAW_DAEMON_URL=http://127.0.0.1:23294               # API face: GET $DAEMON_URL/v/$VAULT_ID/registry, /op/<id>
 SAFECLAW_VAULT_ID=<vid>                                  # discovery path param + the proxy-auth username
 SAFECLAW_API_KEY=<key>                                   # agent identity — Bearer on the API face; §8
 SAFECLAW_PROXY_URL=http://<vid>:<key>@127.0.0.1:23294    # proxy face: vid=user, api-key=password (Proxy-Auth); §8
 ```
-Four vars (was three) — the api-key is the agent's auth to BOTH faces (§8), so it rides the
-API-face `Authorization: Bearer` AND the proxy-face `Proxy-Authorization` password. It
-appears in `API_KEY` + inside `PROXY_URL` (like vid appears in `VAULT_ID` + `PROXY_URL`);
-single source = config's paired key, `sc env` derives atomically.
+Four vars — the api-key is the agent's auth to BOTH faces (§8), riding the API-face
+`Authorization: Bearer` AND the proxy-face `Proxy-Authorization` password. **These four are
+the AGENT's config, delivered by its install prompt (§11) — NOT by `sc env`** (that is the
+device/human's tool). Whoever mints the connection (console / local CLI) knows the vid + the
+new key + the daemon address, so it pre-assembles all four; the agent copies each verbatim
+(incl. `PROXY_URL`, so the agent never does userinfo surgery).
 Two channels carry `(vid, key)` two different ways — this is the load-bearing distinction
 (don't conflate a REQUEST url with a PROXY url):
 
@@ -74,19 +76,17 @@ Hard constraints that force this shape (four single-purpose vars, zero assembly)
   `Proxy-Authorization: Basic base64("<vid>:<key>")` → vid (route) + key (verify, §8). No
   request url ever carries credentials.
 Soft principle: every agent-facing value is copied verbatim, never assembled (assembly =
-silent-error surface, same rule as "copy the phantom, never build it"). vid appears in
-`VAULT_ID` + inside `PROXY_URL`, but the single source is `config.toml` and `sc env` derives
-atomically (AWS's `ACCESS_KEY_ID`/`SECRET`/`REGION` model). `sc env` emits the port as
-`PROXY_PORT` (23294) — the agent's DAEMON_URL is the API face, NOT config's control root.
-`$SAFECLAW_VAULT_URL` (the combined URL) is RETIRED; **`$SAFECLAW_API_KEY` STAYS** (§8 — it's
-the agent's auth, not vestigial). `sc env` emits these four — NOT a global `HTTPS_PROXY`
-(that would route everything = the blast-radius model we rejected); `sc run` still sets
-`HTTPS_PROXY`+CA vars for the CHILD.
+silent-error surface, same rule as "copy the phantom, never build it") — hence the prompt
+pre-bakes `PROXY_URL` rather than making the agent splice userinfo. The port is `PROXY_PORT`
+(23294): the agent's `DAEMON_URL` is the API face, not the control root. `$SAFECLAW_VAULT_URL`
+(the combined URL) is RETIRED; **`$SAFECLAW_API_KEY` STAYS** (§8). The agent never sets a
+global `HTTPS_PROXY` (that would route everything = the rejected blast-radius model); `sc run`
+sets `HTTPS_PROXY`+CA on the CHILD from the agent's own `PROXY_URL`.
 
 ## 5. Vault selection — snapshot binding; `sc` and agent stay consistent via env-pin precedence
-- **Binding = SNAPSHOT, not live.** The agent pins its vault at env-materialization; the
-  human's `sc vault use` changes the durable DEFAULT (`config.toml`) → affects future
-  launches + fresh-shell CLI, NOT a running agent. Divergence is LEGITIMATE (stability >
+- **Binding = SNAPSHOT, not live.** The agent's vault is fixed by its env (from its install
+  prompt, §6/§11); the human's `sc vault use` changes the DEVICE's durable default
+  (`config.toml`) → affects the human's shell + future connections, NOT a running agent. Divergence is LEGITIMATE (stability >
   auto-follow), matching env-at-exec (`AWS_PROFILE`) + the canonical "agent⊥vault". **Do NOT
   live-resolve the vault from config in the proxy/discovery paths** — that would rebuild the
   rug-pull.
@@ -106,16 +106,19 @@ the agent's auth, not vestigial). `sc env` emits these four — NOT a global `HT
   the current shell's pinned vault, and flag a mismatch ("shell pinned to A; default is B;
   `eval \"$(sc env)\"` to move this shell").
 
-## 6. Install / bootstrap — vault identity enters ONCE, via the pairing token
-Steady state is generic (3 vars from `sc env`; agent reads `$SAFECLAW_VAULT_ID`, never
-hardcodes). The vault identity is public routing info (not a secret). It enters at bootstrap:
-- **local single vault** → `sc vault create` / web-enroll already wrote it to config →
-  nothing in the prompt.
-- **local multi vault** → `sc vault use <id>`.
-- **remote / connect-a-new-agent** → the console issues a **vault-scoped pair token** (bound
-  to THAT vault); redeeming writes `(daemon, vault)` to config. The prompt carries only the
-  token — the raw vault id never appears. (Same "key-out-of-prompt" slot as
-  [[project_install_prompt_onboarding_redesign]].)
+## 6. Install / bootstrap — the prompt IS the agent's config (all four vars, key included)
+The install prompt is the agent's self-contained config source (§4 / §11), generated per
+agent×vault connection. Whoever mints it (the console for a remote vault, local `sc` for
+self-host) knows the daemon URL + the vault id + a freshly-minted per-agent key, so it emits
+the four ready-to-paste vars (`SAFECLAW_DAEMON_URL` / `VAULT_ID` / `API_KEY` / `PROXY_URL`).
+The agent sets them in its OWN env/config and holds them — **the agent manages its own key**
+([[project_vault_agent_architecture]]). Per-agent by construction: a second agent gets its own
+prompt → its own key → `sc agent rm` revokes just that one. The key IS in the prompt (the
+intuitive place — it's per-agent, not device state); it's account-level, so treat a leaked
+prompt like a leaked key (revoke + re-issue). This RETIRES the earlier vault-scoped pair-token
+idea — the prompt carries the four vars directly, simpler. `config.toml` (the device/human's
+active vault + catalog) is a SEPARATE source, unaffected; `sc env` bridges it for the human's
+own shell, not the agent.
 
 ## 7. Egress floor — just mainstream SSRF hygiene, no name special-cases
 `host_is_blocked_name` over-reaches (blocks all `.internal` + special-cases
@@ -155,33 +158,39 @@ localhost process with the public vid can use an unlocked vault's allow-level cr
   `probe_via` routing use), and the §8 `sc status` routing block (`https_proxy` raw value +
   `ca_trust` introspection, and the `raw_https_proxy`/`ca_trust_vars`/`proxy_reachable`
   helpers). `sc status` keeps: daemon liveness via a DIRECT `GET $DAEMON_URL/health`, the
-  three vars, and the connections projection.
+  connections projection, and the pin-vs-config vault view (§5).
 - **No magic host at all** (probe retired) → `.internal` is purely §7's over-reach fix.
 - **`poll_url` absolute.** The captive-portal 401 currently returns a RELATIVE `poll_url`
   (`/op/<id>`) — emitted while proxying e.g. a gmail request, it resolves against gmail's
   domain. Make it absolute: `$SAFECLAW_DAEMON_URL/op/<id>` (the 23294 API face).
 
-## 11. Api-key persistence + the setup chain (design review found this — a real gap)
-`sc env` must emit `SAFECLAW_API_KEY` AND bake the key into `SAFECLAW_PROXY_URL` (`<vid>:<key>@`)
-— but today the agent key is **blind-captured** (`sc agent add` → cloud mints it, shows it
-ONCE, only the hash is stored; nothing is persisted locally). So `sc env` has no key to emit
-and the agent-assembling-`PROXY_URL` alternative is the assembly anti-pattern we reject.
-**Fix: persist the active agent key locally** (`~/.safeclaw/…`, `chmod 600`, exactly like
-`~/.aws/credentials` stores the secret) so `sc env` emits all four vars with zero assembly.
-This relaxes blind-capture → local-persist; it does NOT reintroduce a key in the install
-prompt (the prompt still carries only the vault-scoped pair token — key-out-of-prompt holds;
-the key is minted/stored on redemption). The threat model is unchanged: the key must live in
-the agent's env at runtime (same-user-readable via `/proc` regardless), so a `600` file on
-disk is no weaker — and it enables `sc env` + `sc run`/`sc status` (which also need it).
-One active agent key per device (multi-key-per-device is a rare edge; defer). The full setup
-chain, end to end:
+## 11. Who owns the key: the AGENT, not the device — the prompt delivers it, `sc env` never emits it
+The entity model settles this. **Routing (which daemon + vault) and principal (which agent =
+the key) are ORTHOGONAL, with different owners.** The key is per-agent (agent ≡ api-key,
+account-level revoke/audit — [[project_vault_agent_architecture]]), so it is the AGENT's:
+delivered by the AGENT's install prompt (§6), held in the agent's own env/config. It is NOT
+device state.
+- **`sc env` does NOT emit the key** (nor a key-bearing `PROXY_URL`). `sc env` / `config.toml`
+  are the DEVICE/human's config (the human's active vault + catalog). Baking a per-agent key
+  into a device-level `sc env` would collapse every agent on the device to ONE key — losing
+  per-agent revocation/audit. (This corrects an earlier draft of this section that proposed
+  local key-persistence + `sc env` emitting it — that conflated device and agent ownership.)
+- **The install prompt pre-bakes all four vars** (§4), incl. `PROXY_URL` with the key already
+  in the userinfo — the minter (console / local `sc`) knows vid+key+daemon, so the agent
+  copies verbatim, zero assembly. Blind-capture is dropped: the key IS in the prompt (the
+  intuitive, per-agent place). Minting registers the key's hash so the daemon accepts it
+  (cloud-synced, or locally seeded — §10).
+- **`sc run` / `sc status`, shelled by the agent, read the agent's OWN env** (via §5's env-pin
+  precedence): `sc run` propagates the agent's `PROXY_URL`+CA to the child; it never owns or
+  persists the key. The human's own control-plane `sc` (op / approve / passkey) needs no key.
+
+Setup chain, end to end:
 ```
-console "connect agent to THIS vault"  →  vault-scoped pair token (prompt carries only this)
-  → agent/device redeems  →  mint+persist agent key (600) + write (daemon, vault) to config
-  → daemon accepts the key (hash synced from cloud via /api/vault/agents/hashes, OR seeded
-    locally for an offline daemon — §10)
-  → `sc env` emits SAFECLAW_DAEMON_URL / VAULT_ID / API_KEY / PROXY_URL
-  → agent has all four (inherited env, or it runs `sc env` itself)  →  discover + use.
+mint a connection (console for a remote vault / local `sc` for self-host)
+  → prompt = the 4 pre-baked vars incl the per-agent key   [+ register the key's hash → daemon accepts it]
+  → agent pastes them into its own env/config, holds them (agent manages its own key)
+  → daemon: verify key ∈ agent_key_hashes (§8) + route by vid + policy   →  discover + use
+config.toml (device/human) is a SEPARATE source; `sc env` bridges it for the human's shell only.
 ```
 
 ## 10. Open / implementation notes (resolve during build, not design forks)
@@ -205,15 +214,17 @@ console "connect agent to THIS vault"  →  vault-scoped pair token (prompt carr
 ## Build order (post-compact, one pass on `feat/broker-phantom` + `-fe`)
 core: (a) proxy 23294 API face — dispatch origin-form → read-only `/v/{vid}/registry`,
 `/op/{id}`, `/health`; loop guard; share the projections. (b) retire routing-detection
-(is_routed / probe / §8 routing block + helpers) → `sc status` = direct health + 3 vars +
-connections. (c) persist the agent key locally (§11) + `sc env` → emit the FOUR vars
-`SAFECLAW_DAEMON_URL` / `VAULT_ID` / `API_KEY` / `PROXY_URL`(=`<vid>:<key>@`) (drop only
-`VAULT_URL`; no global HTTPS_PROXY). (d) `resolve_active` →
+(is_routed / probe / §8 routing block + helpers) → `sc status` = direct health + connections
++ the pin-vs-config vault view. (c) `sc env` = DEVICE/human config only — emit
+`SAFECLAW_DAEMON_URL` + `SAFECLAW_VAULT_ID` for the human's shell, NO key, no global
+`HTTPS_PROXY`; retire `$SAFECLAW_VAULT_URL`. The AGENT's four vars (incl `PROXY_URL`=`<vid>:<key>@`)
+are minted into its install prompt (§6/§11), NOT emitted by `sc env`. (d) `resolve_active` →
 `--vault > env pin > config`; single-vault auto-select; `sc status` pin-vs-config mismatch.
-(e) MOVE the api-key check onto the proxy (Proxy-Auth password) + the API face (Bearer);
-ensure a local/unpaired daemon has a working local api-key source. (f) egress floor =
-mainstream IP ranges + localhost names only (drop the `.internal`/metadata name blocks). (g)
-`poll_url` absolute. Then: skill (opt-in; discover = direct GET to `$DAEMON_URL`; use = phantom via
-`sc run` / `--proxy $PROXY_URL`; drop routing-preflight prose), console/backend (vault-scoped
-pair token; `sc env` 3-var; any `$SAFECLAW_VAULT_URL` references), tests, `cargo build`/`test`
-/console `tsc`, fold into canon + delete this file, then merge → e2e.
+(e) MOVE the api-key check onto the proxy (Proxy-Auth password) + the API face (Bearer); a
+local/unpaired daemon must accept a locally-issued key. (f) egress floor = mainstream IP
+ranges + localhost names only (drop the `.internal`/metadata name blocks). (g) `poll_url`
+absolute. Then: skill (opt-in; discover = direct `GET $DAEMON_URL/v/$VAULT_ID/registry` +
+Bearer; use = phantom via `sc run` / `--proxy $PROXY_URL`; drop routing-preflight; REVERT
+'local needs no api-key'), console/backend (the connect-agent install prompt emits the 4
+pre-baked vars incl the per-agent key + registers its hash; drop the pair-token; `sc env`
+device-only), tests, `cargo build`/`test`/console `tsc`, fold into canon + delete, then merge → e2e.
