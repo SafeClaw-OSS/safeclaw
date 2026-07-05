@@ -93,14 +93,21 @@ sets `HTTPS_PROXY`+CA on the CHILD from the agent's own `PROXY_URL`.
   live-resolve the vault from config in the proxy/discovery paths** — that would rebuild the
   rug-pull.
 - **`resolve_active` precedence (REVISES [[project_vault_selection_env_model]]'s "must NOT
-  read env"):** `--vault flag  >  $SAFECLAW_VAULT_ID / $SAFECLAW_DAEMON_URL (env pin)  >
-  config.toml`. Mainstream (env overrides file: `AWS_PROFILE`, `kubectl`). This is the ONE
-  choke point every `sc` command routes through → up/status/run/git-credential/env all honor
-  the agent's pin, so the agent's shelled-out `sc` calls match its own HTTP. The old "must
-  NOT read env" was combined-URL-era + protected `sc vault use`; the clean 3-var selector +
-  the agent-consistency principle make env>config correct. Human ergonomics preserved: fresh
-  shell (no env) → config → `sc vault use` works; pinned shell → its pin, switch via re-eval
-  or `--vault` (identical to exported `AWS_PROFILE`).
+  read env"):** the env pin overrides only the **VAULT** — `vault = --vault flag >
+  $SAFECLAW_VAULT_ID (env pin) > config.vault`; the **daemon CONTROL root ALWAYS comes from
+  config.toml**, never from env. Why the asymmetry (a real port trap): `$SAFECLAW_DAEMON_URL`
+  is the agent's API face (`:23294`, read-only), but shelled control/ceremony (`sc up` / `op` /
+  `approve` / `unlock`) lives ONLY on the control root (`:23295`) — feeding DAEMON_URL in as the
+  `daemon` would send `sc up` to the read-only face and silently fail. So the two worlds stay
+  separate: the agent's OWN http uses its env `DAEMON_URL` (`:23294`); the agent's shelled `sc`
+  control uses config's control root (`:23295`); the **VAULT_ID pin is the only bridge**, making
+  shelled `sc` target the SAME vault as the agent's http. Mainstream (env overrides file for the
+  VARYING axis — `AWS_PROFILE`, `kubectl` — while the server address stays in the config file).
+  This is the ONE choke point every `sc` command routes through → up/status/run/git-credential/env
+  all honor the agent's vault pin. The old "must NOT read env" was combined-URL-era + protected
+  `sc vault use`; the clean selector + agent-consistency make env>config correct for the vault
+  axis. Human ergonomics preserved: fresh shell (no env) → config → `sc vault use` works; pinned
+  shell → its VAULT_ID pin, switch via re-eval or `--vault` (identical to exported `AWS_PROFILE`).
 - **Single-vault auto-select:** a daemon with exactly one vault → `resolve_active` defaults
   to it (no `sc vault use`, nothing in the install prompt). Divergence can't even occur in
   the common single-vault case.
@@ -146,6 +153,17 @@ localhost process with the public vid can use an unlocked vault's allow-level cr
   `Proxy-Authorization: Basic base64("<vid>:<api-key>")` (today it's `<vid>:`, empty pw). The
   proxy verifies `sha256(key) ∈ agent_key_hashes` BEFORE substituting any phantom; miss → 407.
 - **API face (discovery/op):** `Authorization: Bearer <api-key>`; same check.
+- **Where the check lives (build — the infra ALREADY exists, this is just wiring):** the auth
+  primitives are done — `AppState.agent_key_hashes` is a BLOB-EXTERNAL in-memory set (works while
+  the vault is locked → no deadlock), populated by `sync_agent_keys_once` (pre-serve) + the 30s
+  `sync_agent_keys_loop` off the `.pro` `/api/vault/agents/hashes` endpoint, and `api_key::check` /
+  `check_token` are reusable. So: **API face reuses `api_key::check` (Bearer) AS-IS**; **proxy face**
+  adds a Proxy-Auth Basic decoder (extract the password beside the vid in `vid_from_proxy_auth`)
+  feeding the same `check_token`. The check runs in `handler.rs::pipeline` **before**
+  `resolve_values`/substitution — NOT in `should_intercept` (returns bool, can't 407). The keyless
+  `unlocked_vault()` fallback (pipeline, `vid==None`) is the exact hole → must NOT broker without a
+  verified key. **Absent** Proxy-Auth → BLIND-TUNNEL (non-participating: the phantom reaches
+  upstream literally → clean 401, preserves §1 blast-radius); **present-but-wrong** key → 407.
 - Keep `$SAFECLAW_API_KEY`; `$SAFECLAW_PROXY_URL` embeds it in the password. **Revert the
   skill's "local daemon needs no api-key"** (that was my error).
 - "localhost-only justifies it" still holds: the key needn't be a strong network secret
@@ -203,10 +221,13 @@ config.toml (device/human) is a SEPARATE source; `sc env` bridges it for the hum
   resident CA PEM — a public cert, unauthenticated, like mitmproxy's `mitm.it`); the agent
   fetches it and trusts it ADDITIVELY in its self-construct client (never replace the system
   bundle). Dumb tools keep using `sc run` (which sets the CA vars). `/ca` added to §2.
-- **Key-hash timing.** Minting a connection registers the key's hash; a cloud-paired daemon
-  learns it via periodic sync. If the agent uses the key before the daemon has synced → 407.
-  The minter should ensure the daemon has the hash (push / trigger a sync on mint), or the
-  daemon re-syncs on a hash miss.
+- **Key-hash timing (VERIFIED against code — NOT a blocker).** `agent_key_hashes` is in-memory /
+  blob-external, so the check works with the vault locked (agent can auth → see `locked:true` →
+  `sc up`; no deadlock). The plumbing exists: `.pro` `/api/vault/agents/hashes` +
+  `sync_agent_keys_once` (pre-serve) + a 30s `sync_agent_keys_loop`. A cloud-paired daemon accepts
+  account keys from startup; a key minted AFTER startup lands within ≤30s, and human-paced e2e
+  (add → copy prompt → paste → run) absorbs that window. OPTIONAL hardening (not required for e2e):
+  re-sync on a 407 miss so a just-minted key skips the wait.
 - **The agent must DURABLY hold its four vars** (from the prompt) in its own config, not a
   transient shell — `sc env` can't re-supply them (device-only, no key). The install prompt
   must say so.
@@ -214,10 +235,12 @@ config.toml (device/human) is a SEPARATE source; `sc env` bridges it for the hum
   local e2e): the MITM proxy must stay LOCAL even for a hosted vault — a remote proxy would
   see the substituted real credential. The e2e is local self-host, so daemon + proxy + CA are
   all on the device.
-- **Local api-key source (§8).** `agent_key_hashes` empty ⇒ reject everything (paired-cloud
-  model). A local/unpaired daemon must accept a locally-issued key (via `sc agent add`) so
-  the e2e agent can authenticate; confirm the daemon seeds its own hash set locally, not only
-  from cloud sync.
+- **No unpaired-daemon key source needed (was a worry, now MOOT).** There is no unpaired daemon
+  in the model: the broker plane needs agent-key management (lives in the backend), so a daemon is
+  either cloud-paired (`.pro` or a self-hosted backend → the sync path above) or has the broker
+  plane OFF (`state.rs`: "an unpaired/local-only daemon has no broker plane to gate"). The e2e
+  daemon is cloud-paired via `sc login`, so `sc agent add` → backend → sync just works — no
+  local-only key-seed path to build.
 - **Stale local `config.toml`** on the dev box has `daemon = …:23294` (pre-swap) — a fresh
   enroll writes the correct control root; not a code bug.
 - The registry/op projections currently live as axum handlers on 23295 — refactor the
