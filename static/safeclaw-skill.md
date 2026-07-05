@@ -3,39 +3,35 @@
 SafeClaw is a passkey-gated credential broker. You never hold the real secret:
 each connected service gives you a **phantom** — a placeholder like
 `__sc__github__`. Put the phantom where the credential belongs (an env var a tool
-reads, a request header, a config file) and run your traffic through SafeClaw; it
-swaps the phantom for the real value on the way out, only toward that
+reads, a request header, a config file) and run that command through `sc run --`;
+SafeClaw swaps the phantom for the real value on the way out, only toward that
 connection's own `hosts`. The user approves anything sensitive with a passkey tap.
 
-## Daemon startup (self-host only)
+Only traffic you deliberately route through `sc run` is touched — everything else
+goes straight out untouched. A phantom sent unrouted just reaches the upstream as
+a literal string (a clean 401), never a leak.
 
-If `$SAFECLAW_VAULT_URL` points at `localhost` / `127.0.0.1`, the daemon runs on
-this machine — make sure it's up before the first call:
+## Your config
+
+Your install prompt set these — use each verbatim, never construct one. If any is
+unset, stop and ask the user.
+
+- **`$SAFECLAW_DAEMON_URL`** — the daemon, e.g. `http://127.0.0.1:23294`.
+- **`$SAFECLAW_VAULT_ID`** — your vault id.
+- **`$SAFECLAW_API_KEY`** — your identity; send `Authorization: Bearer
+  $SAFECLAW_API_KEY` on every request below.
+
+Make sure the daemon is up before the first call (idempotent):
 
 ```bash
-curl -s -o /dev/null --connect-timeout 1 "$SAFECLAW_VAULT_URL/registry" \
-  || safeclaw up
+curl -s -o /dev/null --connect-timeout 1 "$SAFECLAW_DAEMON_URL/health" || sc up
 ```
-
-`sc up` is idempotent. For a hosted vault (`api.safeclaw.pro` etc.) the daemon is
-remote — skip this; if `/registry` is unreachable, tell the user.
-
-## Auth
-
-- **`$SAFECLAW_VAULT_URL`** — the vault's base URL, e.g.
-  `http://localhost:23295/v/abc-def`; the vault id is baked in. Get it from
-  `sc env`. If it's unset, stop and ask the user — never guess one.
-- **`$SAFECLAW_API_KEY`** — a bearer token for a **hosted** vault (a local daemon
-  is localhost-gated and needs none). Send it when set:
-
-  ```
-  Authorization: Bearer $SAFECLAW_API_KEY
-  ```
 
 ## Discover what's available
 
 ```
-GET $SAFECLAW_VAULT_URL/registry
+GET $SAFECLAW_DAEMON_URL/v/$SAFECLAW_VAULT_ID/registry
+Authorization: Bearer $SAFECLAW_API_KEY
 ```
 
 Filter to save context: `?view=summary` and/or `?ids=a,b`.
@@ -60,6 +56,9 @@ Filter to save context: `?view=summary` and/or `?ids=a,b`.
 
 Copy a phantom verbatim from a `connected: true` connection — never build one.
 
+If `locked: true`, run `sc up` — it unlocks the vault and prints an approval
+link; surface that link (the user taps their passkey) and retry.
+
 If the service you want has no `connected: true` connection, the user must add
 its credential. Hand them a link — don't run commands or walk them through
 provider menus:
@@ -81,19 +80,11 @@ sc connect myapi --host api.example.com --secret API_TOKEN=<value>
 
 Never enter a credential yourself; never echo one back.
 
-If `locked: true`, run `sc up` — it unlocks the vault and prints an approval
-link; surface that link (the user taps their passkey) and retry.
-
 ## Using a connection
 
-Route the command through SafeClaw, or the phantom reaches the upstream as a
-literal string and is rejected. Check first:
-
-    sc status --json      # proxy.url, proxy.reachable, routing.https_proxy
-
-You're routed when `routing.https_proxy` names the same authority as `proxy.url`;
-if it's `null` or a different proxy, prefix the command with `sc run --` (or apply
-the service's `setup` hint).
+Prefix the command with `sc run --` so its traffic is brokered; put the phantom
+where the credential belongs, or it reaches the upstream as a literal string and
+is rejected.
 
 ```bash
 sc run -- curl https://api.stripe.com/v1/charges \
@@ -130,6 +121,6 @@ ask them to type "done". Once approved, re-run the exact same command; the
 approval is cached. A destination host you haven't used before is a one-time
 *permanent grant* — same flow.
 
-If you can't easily re-run, the approval JSON also carries a `poll_url`
-(`$SAFECLAW_VAULT_URL/op/<op_id>`); GET it until `status` is `ok`, then re-run.
-The op stays valid ~30 min.
+If you can't easily re-run, the approval JSON also carries an absolute `poll_url`;
+GET it (with `Authorization: Bearer $SAFECLAW_API_KEY`) until `status` is `ok`,
+then re-run. The op stays valid ~30 min.
