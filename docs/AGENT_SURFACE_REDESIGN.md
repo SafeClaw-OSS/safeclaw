@@ -161,6 +161,29 @@ localhost process with the public vid can use an unlocked vault's allow-level cr
   (`/op/<id>`) — emitted while proxying e.g. a gmail request, it resolves against gmail's
   domain. Make it absolute: `$SAFECLAW_DAEMON_URL/op/<id>` (the 23294 API face).
 
+## 11. Api-key persistence + the setup chain (design review found this — a real gap)
+`sc env` must emit `SAFECLAW_API_KEY` AND bake the key into `SAFECLAW_PROXY_URL` (`<vid>:<key>@`)
+— but today the agent key is **blind-captured** (`sc agent add` → cloud mints it, shows it
+ONCE, only the hash is stored; nothing is persisted locally). So `sc env` has no key to emit
+and the agent-assembling-`PROXY_URL` alternative is the assembly anti-pattern we reject.
+**Fix: persist the active agent key locally** (`~/.safeclaw/…`, `chmod 600`, exactly like
+`~/.aws/credentials` stores the secret) so `sc env` emits all four vars with zero assembly.
+This relaxes blind-capture → local-persist; it does NOT reintroduce a key in the install
+prompt (the prompt still carries only the vault-scoped pair token — key-out-of-prompt holds;
+the key is minted/stored on redemption). The threat model is unchanged: the key must live in
+the agent's env at runtime (same-user-readable via `/proc` regardless), so a `600` file on
+disk is no weaker — and it enables `sc env` + `sc run`/`sc status` (which also need it).
+One active agent key per device (multi-key-per-device is a rare edge; defer). The full setup
+chain, end to end:
+```
+console "connect agent to THIS vault"  →  vault-scoped pair token (prompt carries only this)
+  → agent/device redeems  →  mint+persist agent key (600) + write (daemon, vault) to config
+  → daemon accepts the key (hash synced from cloud via /api/vault/agents/hashes, OR seeded
+    locally for an offline daemon — §10)
+  → `sc env` emits SAFECLAW_DAEMON_URL / VAULT_ID / API_KEY / PROXY_URL
+  → agent has all four (inherited env, or it runs `sc env` itself)  →  discover + use.
+```
+
 ## 10. Open / implementation notes (resolve during build, not design forks)
 - **CA trust for the self-construct case (gmail via the agent's own HTTP client).** A request
   the agent proxies to a MITM'd host gets our resident-CA leaf → the client must trust our
@@ -183,8 +206,9 @@ localhost process with the public vid can use an unlocked vault's allow-level cr
 core: (a) proxy 23294 API face — dispatch origin-form → read-only `/v/{vid}/registry`,
 `/op/{id}`, `/health`; loop guard; share the projections. (b) retire routing-detection
 (is_routed / probe / §8 routing block + helpers) → `sc status` = direct health + 3 vars +
-connections. (c) `sc env` → emit `SAFECLAW_DAEMON_URL` + `SAFECLAW_VAULT_ID` +
-`SAFECLAW_PROXY_URL` (drop VAULT_URL/API_KEY, no global HTTPS_PROXY). (d) `resolve_active` →
+connections. (c) persist the agent key locally (§11) + `sc env` → emit the FOUR vars
+`SAFECLAW_DAEMON_URL` / `VAULT_ID` / `API_KEY` / `PROXY_URL`(=`<vid>:<key>@`) (drop only
+`VAULT_URL`; no global HTTPS_PROXY). (d) `resolve_active` →
 `--vault > env pin > config`; single-vault auto-select; `sc status` pin-vs-config mismatch.
 (e) MOVE the api-key check onto the proxy (Proxy-Auth password) + the API face (Bearer);
 ensure a local/unpaired daemon has a working local api-key source. (f) egress floor =
