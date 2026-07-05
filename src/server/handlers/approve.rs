@@ -65,19 +65,38 @@ async fn get_op_json(
     op_id: String,
 ) -> Result<axum::response::Response> {
     use axum::response::IntoResponse;
+    let body = op_poll_value(&state, &op_id)?;
+    let pending = body.get("status").and_then(|s| s.as_str()) == Some("pending");
+    let mut resp = Json(body).into_response();
+    // Pending → advertise the poll pacing (Retry-After, matching the 202's
+    // `approval.interval`) so agents keep a standard cadence.
+    if pending {
+        if let Ok(v) = axum::http::HeaderValue::from_str(
+            &crate::approval::store::POLL_INTERVAL_HINT_SECS.to_string(),
+        ) {
+            resp.headers_mut().insert(axum::http::header::RETRY_AFTER, v);
+        }
+    }
+    Ok(resp)
+}
+
+/// The `/op/{id}` poll body as a plain `Value`. Shared by the axum handler
+/// (above) and the 23294 API face (`proxy::api_face`), so the agent's poll loop
+/// sees identical JSON whether it hit the control plane or the proxy port. Pure
+/// read — briefly locks `approvals`, no I/O.
+pub fn op_poll_value(state: &AppState, op_id: &str) -> Result<Value> {
     let store = state.approvals.lock().unwrap();
-    let rec = store.get(&op_id).ok_or(AppError::NotFound)?;
+    let rec = store.get(op_id).ok_or(AppError::NotFound)?;
     // Consumed ops: the approve window is closed. Return a minimal tombstone
     // — no op content — to limit the exposure window for the agent request
     // body and upstream URL that live in op.act.scope. The op_id's 122-bit
     // entropy is the access-control mechanism for in-flight ops; once the
     // op is consumed, that window should close.
     if matches!(rec.status, ApprovalStatus::Consumed) {
-        return Ok(Json(json!({
+        return Ok(json!({
             "op_id": rec.id,
             "status": "consumed",
-        }))
-        .into_response());
+        }));
     }
 
     let act_kind = discriminator(&rec.op.act);
@@ -110,7 +129,7 @@ async fn get_op_json(
         ApprovalStatus::Rejected { .. } => ("rejected", None),
         ApprovalStatus::Consumed => unreachable!("handled above"),
     };
-    let mut resp = Json(json!({
+    Ok(json!({
         "op_id": rec.id,
         "r": rec.r,
         "status": status,
@@ -121,17 +140,6 @@ async fn get_op_json(
         "value": value,
         "expires_at": rec.expires_at_unix,
     }))
-    .into_response();
-    // Pending → advertise the poll pacing (Retry-After, matching the 202's
-    // `approval.interval`) so agents keep a standard cadence.
-    if matches!(rec.status, ApprovalStatus::Pending) {
-        if let Ok(v) = axum::http::HeaderValue::from_str(
-            &crate::approval::store::POLL_INTERVAL_HINT_SECS.to_string(),
-        ) {
-            resp.headers_mut().insert(axum::http::header::RETRY_AFTER, v);
-        }
-    }
-    Ok(resp)
 }
 
 /// `POST /op/{op_id}/approve` — U submits the signed grant. T validates and

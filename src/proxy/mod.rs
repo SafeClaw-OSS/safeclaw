@@ -6,6 +6,7 @@
 //! for the real credential at egress, and never returns the value to the agent.
 //! The one HTTP route still on the control plane is the `/export` disabled stub.
 
+pub mod api_face;
 pub mod ca;
 pub mod env;
 pub mod handler;

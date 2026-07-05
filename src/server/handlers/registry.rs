@@ -82,6 +82,28 @@ impl RegistryQuery {
                 .collect()
         })
     }
+
+    /// Parse a raw URL query string (`include=..&ids=..&view=..`) — used by the
+    /// 23294 API face, which self-answers origin-form requests and so has no
+    /// axum `Query` extractor. Unknown keys are ignored.
+    pub fn from_query_str(raw: &str) -> Self {
+        let mut include = None;
+        let mut ids = None;
+        let mut view = None;
+        for pair in raw.split('&').filter(|s| !s.is_empty()) {
+            let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+            let val = urlencoding::decode(v)
+                .map(|c| c.into_owned())
+                .unwrap_or_else(|_| v.to_string());
+            match k {
+                "include" => include = Some(val),
+                "ids" => ids = Some(val),
+                "view" => view = Some(val),
+                _ => {}
+            }
+        }
+        RegistryQuery { include, ids, view }
+    }
 }
 
 /// A catalog SERVICE row — what SafeClaw supports. Carries NO `connected` /
@@ -427,7 +449,19 @@ pub async fn vault_registry(
     Path(vault_id): Path<String>,
     Query(q): Query<RegistryQuery>,
 ) -> Result<Json<Value>> {
-    validate_vault_id(&vault_id)?;
+    Ok(Json(vault_registry_value(&state, &vault_id, &q)?))
+}
+
+/// The `/v/{vid}/registry` projection as a plain `Value`. Shared by the axum
+/// control-plane handler (above) AND the 23294 API face (`proxy::api_face`), so
+/// discovery can't drift between the two ports. Pure read — briefly locks
+/// `vault_states`, no I/O.
+pub fn vault_registry_value(
+    state: &AppState,
+    vault_id: &str,
+    q: &RegistryQuery,
+) -> Result<Value> {
+    validate_vault_id(vault_id)?;
     let include_policy_rules = q.include_policy_rules();
     let ids_filter = q.ids_filter();
     let summary = q.is_summary();
@@ -442,7 +476,7 @@ pub async fn vault_registry(
         bool,
     ) = {
         let states = state.vault_states.lock().unwrap();
-        match states.get(&vault_id) {
+        match states.get(vault_id) {
             Some(VaultState::Unlocked { cache, .. }) => {
                 let mut custom: Vec<(String, ServiceDef)> =
                     cache.custom_services.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
@@ -488,7 +522,7 @@ pub async fn vault_registry(
                     .or_else(|| custom_services.iter().find(|(k, _)| k == s).map(|(_, d)| d.clone()))
             });
             let mut row = build_connection(conn_id, conn, def.as_ref(), &native_keys, summary);
-            if row.connected && state.oauth_needs_reauth(&vault_id, conn_id) {
+            if row.connected && state.oauth_needs_reauth(vault_id, conn_id) {
                 row.needs_reauth = Some(true);
             }
             conn_rows.push(row);
@@ -511,9 +545,9 @@ pub async fn vault_registry(
         policy: serde_json::to_value(crate::core::policy::Policy::default())?,
         locked: Some(locked),
         vault_entries,
-        console_url: Some(console_url(&state, &vault_id)),
+        console_url: Some(console_url(state, vault_id)),
     };
-    Ok(Json(serde_json::to_value(body)?))
+    Ok(serde_json::to_value(body)?)
 }
 
 #[cfg(test)]

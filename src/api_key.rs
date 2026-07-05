@@ -56,10 +56,13 @@ pub fn check(state: &AppState, headers: &HeaderMap) -> Result<()> {
     check_token(&hashes, provided.as_deref())
 }
 
-/// Pure broker-auth decision (testable). Valid iff a Bearer token is present
-/// and `sha256(token)` is a member of the synced hash-set. An empty set
-/// (unpaired / not-yet-synced) rejects everything.
-fn check_token(
+/// Pure broker-auth decision (testable). Valid iff a token is present and
+/// `sha256(token)` is a member of the synced hash-set. An empty set (unpaired /
+/// not-yet-synced) rejects everything. Shared by the control-plane middleware
+/// (Bearer, above) AND the 23294 proxy/API face (`proxy::api_face` reads the
+/// Bearer header, the proxy pipeline reads the Proxy-Auth Basic password) — both
+/// feed the extracted token here, so there is ONE membership check.
+pub(crate) fn check_token(
     hashes: &std::collections::HashSet<String>,
     provided: Option<&str>,
 ) -> Result<()> {

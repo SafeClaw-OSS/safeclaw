@@ -78,6 +78,15 @@ impl HttpHandler for BrokerHandler {
             return req.into();
         }
 
+        // API face (AGENT_SURFACE §2): an origin-form request (or an absolute-form
+        // one looped back at our own authority) is discovery / op-poll / health /
+        // ca — self-answered read-only here, never forwarded upstream. This is the
+        // agent's ONE port: the same listener serves the proxy face (below) and
+        // this read API.
+        if crate::proxy::api_face::is_api_face(&req, self.state.config.proxy_port) {
+            return crate::proxy::api_face::respond(&self.state, &req).into();
+        }
+
         // Liveness probe — answered directly, never forwarded.
         if req.uri().host() == Some(PROBE_HOST) {
             return probe_response().into();

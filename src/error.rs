@@ -19,25 +19,36 @@ pub enum AppError {
     Internal(String),
 }
 
-impl IntoResponse for AppError {
-    fn into_response(self) -> Response {
-        let (status, message, code) = match &self {
-            AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone(), "bad_request"),
-            AppError::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, msg.clone(), "unauthorized"),
-            AppError::Forbidden(msg) => (StatusCode::FORBIDDEN, msg.clone(), "forbidden"),
-            AppError::NotFound => (StatusCode::NOT_FOUND, "Not found".to_string(), "not_found"),
-            AppError::Conflict(msg) => (StatusCode::CONFLICT, msg.clone(), "conflict"),
+impl AppError {
+    /// `(http status u16, machine code, human message)` — the error's wire
+    /// projection. Shared by the axum `IntoResponse` below AND the hudsucker
+    /// 23294 API face (`proxy::api_face`), so both ports map an error identically
+    /// without depending on each other's `http`/`StatusCode` type.
+    pub fn parts(&self) -> (u16, &'static str, String) {
+        match self {
+            AppError::BadRequest(msg) => (400, "bad_request", msg.clone()),
+            AppError::Unauthorized(msg) => (401, "unauthorized", msg.clone()),
+            AppError::Forbidden(msg) => (403, "forbidden", msg.clone()),
+            AppError::NotFound => (404, "not_found", "Not found".to_string()),
+            AppError::Conflict(msg) => (409, "conflict", msg.clone()),
             AppError::VaultLocked => (
-                StatusCode::LOCKED,
-                "vault locked — run `sc up` to unlock, then retry".to_string(),
+                423,
                 "vault_locked",
+                "vault locked — run `sc up` to unlock, then retry".to_string(),
             ),
-            AppError::TooManyRequests => (StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded".to_string(), "rate_limited"),
+            AppError::TooManyRequests => (429, "rate_limited", "Rate limit exceeded".to_string()),
             AppError::Internal(msg) => {
                 tracing::error!("internal error: {}", msg);
-                (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error".to_string(), "internal")
+                (500, "internal", "Internal server error".to_string())
             }
-        };
+        }
+    }
+}
+
+impl IntoResponse for AppError {
+    fn into_response(self) -> Response {
+        let (status, code, message) = self.parts();
+        let status = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
         (status, Json(json!({ "error": code, "message": message }))).into_response()
     }
 }
