@@ -10,9 +10,7 @@ use std::path::Path;
 
 use crate::cli::active::resolve_active;
 use crate::cli::env::shell_quote;
-use crate::cli::proxy_env::{
-    build_bundle, control_plane_up, probe_via, proxy_base, resident_ca_path,
-};
+use crate::cli::proxy_env::{build_bundle, control_plane_up, proxy_url_for_vault, resident_ca_path};
 use crate::config::RunArgs;
 
 pub async fn run(args: RunArgs) -> Result<(), String> {
@@ -28,12 +26,23 @@ pub async fn run(args: RunArgs) -> Result<(), String> {
     let ca = resident_ca_path();
     preflight(&ca).await?;
 
+    let proxy_url = agent_proxy_url(&vid, args.vault.is_some());
+    // Friendly hint (user's request): a human shell has no agent identity, so
+    // credential substitution will 407. Say so once, up front — non-credential
+    // traffic is unaffected, so this is a note, not an error.
+    if !args.export_env && !agent_has_key() {
+        eprintln!(
+            "note: no SafeClaw agent key in this shell — credential substitution will 407 \
+             (run inside your agent, which holds its own key). Non-credential traffic is unaffected."
+        );
+    }
+
     let ca_str = ca.to_string_lossy().to_string();
     // Chain onto an already-configured git helper rather than clobber it.
     let parent_count = std::env::var("GIT_CONFIG_COUNT")
         .ok()
         .and_then(|v| v.parse::<u32>().ok());
-    let bundle = build_bundle(&vid, &ca_str, parent_count);
+    let bundle = build_bundle(&proxy_url, &ca_str, parent_count);
 
     if args.export_env {
         for (k, v) in &bundle {
@@ -45,9 +54,33 @@ pub async fn run(args: RunArgs) -> Result<(), String> {
     exec_child(&args.cmd, &bundle)
 }
 
-/// The CA must exist and SafeClaw must be reachable (proxy answers, else the
-/// control plane is at least up). Otherwise a friendly `sc up` hint — never a
-/// mystery TLS / connection error inside the child.
+/// The proxy URL the child's `HTTPS_PROXY` gets (AGENT_SURFACE §11). Preference:
+/// the agent's OWN `$SAFECLAW_PROXY_URL` (carries its vid + api-key) copied
+/// VERBATIM — zero assembly — unless `--vault` overrode the vault, in which case
+/// build one for the resolved vid, splicing the agent's `$SAFECLAW_API_KEY`.
+/// `sc run` never owns or persists the key; it only propagates the agent's own.
+fn agent_proxy_url(vid: &str, vault_overridden: bool) -> String {
+    if !vault_overridden {
+        if let Ok(u) = std::env::var("SAFECLAW_PROXY_URL") {
+            if !u.is_empty() {
+                return u;
+            }
+        }
+    }
+    let key = std::env::var("SAFECLAW_API_KEY").ok().filter(|s| !s.is_empty());
+    proxy_url_for_vault(vid, key.as_deref())
+}
+
+/// Does this shell carry an agent identity? A key rides either the agent's
+/// pre-baked `$SAFECLAW_PROXY_URL` (password slot) or a bare `$SAFECLAW_API_KEY`.
+fn agent_has_key() -> bool {
+    std::env::var("SAFECLAW_PROXY_URL").map(|s| !s.is_empty()).unwrap_or(false)
+        || std::env::var("SAFECLAW_API_KEY").map(|s| !s.is_empty()).unwrap_or(false)
+}
+
+/// The CA must exist and the daemon must be up (the proxy shares its process).
+/// Otherwise a friendly `sc up` hint — never a mystery TLS / connection error
+/// inside the child.
 async fn preflight(ca: &Path) -> Result<(), String> {
     if !ca.exists() {
         return Err(format!(
@@ -55,13 +88,7 @@ async fn preflight(ca: &Path) -> Result<(), String> {
             ca.display()
         ));
     }
-    if probe_via(&proxy_base()).await {
-        return Ok(());
-    }
     if control_plane_up().await {
-        // Daemon is up but the proxy probe didn't answer yet (just started, or a
-        // slow bind). Proceed — the child's first request will still route.
-        eprintln!("note: SafeClaw's proxy didn't answer the probe yet; continuing (the daemon is up).");
         return Ok(());
     }
     Err("SafeClaw isn't running — bring it up with `sc up`, then retry.".into())

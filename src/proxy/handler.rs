@@ -21,11 +21,7 @@ use hudsucker::{Body, HttpContext, HttpHandler, RequestOrResponse};
 use serde_json::json;
 
 use crate::proxy::resolver::{self, Phantom};
-use crate::state::{AppState, UnlockedVaults};
-
-/// The probe host the daemon self-answers so `sc status` can prove liveness
-/// *through* the proxy (env vars present but proxy dead ⇒ `routed:false`).
-const PROBE_HOST: &str = "sc.probe";
+use crate::state::AppState;
 
 /// Bodies larger than this (or non-text) pass through unscanned — phantoms live
 /// in headers / URL / Basic-auth in practice, never a multi-MiB upload.
@@ -47,24 +43,40 @@ pub struct AuditPending {
 #[derive(Clone)]
 pub struct BrokerHandler {
     pub state: Arc<AppState>,
-    /// Vault id captured from the CONNECT's `Proxy-Authorization`, inherited by
-    /// every inner-request clone of this handler.
+    /// Vault id captured from the CONNECT's `Proxy-Authorization` username,
+    /// inherited by every inner-request clone of this handler.
     pub vid: Option<String>,
+    /// Agent api-key captured from the CONNECT's `Proxy-Authorization` PASSWORD
+    /// (§8) — the agent's identity, verified in `pipeline` before any phantom
+    /// substitution. Inherited by inner-request clones alongside `vid`.
+    pub key: Option<String>,
     /// Set on the allow/forward path; consumed by `handle_response`.
     pub pending: Option<AuditPending>,
 }
 
 impl BrokerHandler {
     pub fn new(state: Arc<AppState>) -> Self {
-        Self { state, vid: None, pending: None }
+        Self { state, vid: None, key: None, pending: None }
     }
 }
 
 impl HttpHandler for BrokerHandler {
     async fn should_intercept(&mut self, _ctx: &HttpContext, req: &Request<Body>) -> bool {
-        // The vid rides the CONNECT's Proxy-Authorization userinfo; capture it
-        // here so inner-request clones inherit it (read-only).
-        self.vid = vid_from_proxy_auth(req);
+        // The agent's (vid, api-key) ride the CONNECT's Proxy-Authorization
+        // userinfo (`base64("<vid>:<key>")`); capture both so inner-request clones
+        // inherit them (read-only). The key is VERIFIED later in `pipeline`,
+        // before any substitution — here we only need vid PRESENCE.
+        let (vid, key) = creds_from_proxy_auth(req);
+        self.vid = vid;
+        self.key = key;
+        // Absent Proxy-Auth (no vid) → non-participating traffic: blind-tunnel it
+        // (§8; a stray phantom then reaches upstream literally → clean 401, never
+        // a leak). Only a request that NAMES a vault and targets a host some
+        // unlocked vault anchors is a MITM candidate — the precise per-vault
+        // anchor + the key check happen in `pipeline`.
+        if self.vid.is_none() {
+            return false;
+        }
         match req.uri().host() {
             Some(h) => self.state.host_in_any_unlocked_union(h),
             None => false,
@@ -87,11 +99,6 @@ impl HttpHandler for BrokerHandler {
             return crate::proxy::api_face::respond(&self.state, &req).into();
         }
 
-        // Liveness probe — answered directly, never forwarded.
-        if req.uri().host() == Some(PROBE_HOST) {
-            return probe_response().into();
-        }
-
         self.pipeline(ctx, req).await
     }
 
@@ -104,6 +111,15 @@ impl HttpHandler for BrokerHandler {
 }
 
 impl BrokerHandler {
+    /// Is the captured agent key (CONNECT Proxy-Auth password) a member of the
+    /// synced hash-set (§8)? The proxy authenticates the AGENT — not "localhost"
+    /// — before injecting any credential. Same membership check the control
+    /// plane + API face use, via the pure `check_token`.
+    fn key_is_valid(&self) -> bool {
+        let hashes = self.state.agent_key_hashes.lock().unwrap();
+        crate::api_key::check_token(&hashes, self.key.as_deref()).is_ok()
+    }
+
     async fn pipeline(&mut self, ctx: &HttpContext, req: Request<Body>) -> RequestOrResponse {
         let is_https = req.uri().scheme_str() == Some("https");
         let dest_host = match req.uri().host() {
@@ -199,28 +215,34 @@ impl BrokerHandler {
         }
         let conn = conns[0].to_string();
 
-        // ── bind the vault ───────────────────────────────────────────────────
+        // ── verify the agent key, then bind the vault (§8) ───────────────────
+        // A phantom-bearing request MUST present a valid agent api-key: the proxy
+        // is the credential injector and localhost is NOT a trust boundary, so
+        // verify the AGENT's identity BEFORE resolving/substituting. The key rode
+        // the CONNECT's Proxy-Auth password; `should_intercept` already
+        // blind-tunnels absent-auth, so reaching here means Proxy-Auth was present
+        // — a bad/missing key is an explicit 407, never a silent fallback.
+        if !self.key_is_valid() {
+            return err_response(
+                StatusCode::PROXY_AUTHENTICATION_REQUIRED,
+                "agent_key",
+                "invalid or missing SafeClaw agent api key",
+            )
+            .into();
+        }
         let vault_id = match self.vid.clone() {
             Some(v) => v,
-            None => match self.state.unlocked_vault() {
-                UnlockedVaults::One(v) => v,
-                UnlockedVaults::None => {
-                    return err_response(
-                        StatusCode::FORBIDDEN,
-                        "no_vault",
-                        "no vault is unlocked — run `sc up`",
-                    )
-                    .into()
-                }
-                UnlockedVaults::Many => {
-                    return err_response(
-                        StatusCode::BAD_REQUEST,
-                        "ambiguous_vault",
-                        "multiple vaults unlocked — run 'sc run' so SafeClaw knows which (the vault id rides the proxy address)",
-                    )
-                    .into()
-                }
-            },
+            // Unreachable in practice: `should_intercept` requires a vid to MITM,
+            // and a phantom over plain HTTP is refused above. Fail closed rather
+            // than guess a vault.
+            None => {
+                return err_response(
+                    StatusCode::FORBIDDEN,
+                    "no_vault",
+                    "no vault bound — route credential traffic with `sc run`",
+                )
+                .into()
+            }
         };
         if self.state.is_vault_locked(&vault_id) {
             return err_response(
@@ -670,23 +692,32 @@ fn merge_phantoms(acc: &mut Vec<Phantom>, more: Vec<Phantom>) {
     }
 }
 
-/// Read the vault id from a CONNECT's `Proxy-Authorization: Basic base64("<vid>:")`.
-fn vid_from_proxy_auth(req: &Request<Body>) -> Option<String> {
-    let h = req.headers().get(header::PROXY_AUTHORIZATION)?;
-    let s = h.to_str().ok()?;
-    let b64 = s
-        .strip_prefix("Basic ")
-        .or_else(|| s.strip_prefix("basic "))?;
-    let decoded = base64::engine::general_purpose::STANDARD
-        .decode(b64.trim())
-        .ok()?;
-    let text = String::from_utf8(decoded).ok()?;
-    let vid = text.split(':').next()?.trim();
-    if vid.is_empty() {
-        None
-    } else {
-        Some(vid.to_string())
-    }
+/// Read `(vid, api-key)` from a CONNECT's `Proxy-Authorization: Basic
+/// base64("<vid>:<key>")`. The vid (username) routes the request to a vault; the
+/// key (password) is the agent's identity (§8). Each is `None` when
+/// absent/empty. A `None` vid means no Proxy-Auth at all ⇒ non-participating
+/// traffic (`should_intercept` blind-tunnels it). The key is NOT trimmed (it's
+/// an opaque token hashed for the membership check); the vid is.
+fn creds_from_proxy_auth(req: &Request<Body>) -> (Option<String>, Option<String>) {
+    let Some(text) = req
+        .headers()
+        .get(header::PROXY_AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.strip_prefix("Basic ").or_else(|| s.strip_prefix("basic ")))
+        .and_then(|b64| {
+            base64::engine::general_purpose::STANDARD.decode(b64.trim()).ok()
+        })
+        .and_then(|d| String::from_utf8(d).ok())
+    else {
+        return (None, None);
+    };
+    let (vid, key) = match text.split_once(':') {
+        Some((v, k)) => (v.trim(), k),
+        None => (text.trim(), ""),
+    };
+    let vid = (!vid.is_empty()).then(|| vid.to_string());
+    let key = (!key.is_empty()).then(|| key.to_string());
+    (vid, key)
 }
 
 /// Decode `Authorization: Basic <b64>` to `user:pass`, if present.
@@ -814,15 +845,6 @@ fn etld1(host: &str) -> String {
     }
 }
 
-fn probe_response() -> Response<Body> {
-    let body = json!({ "safeclaw": env!("CARGO_PKG_VERSION"), "proxy": true }).to_string();
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(body))
-        .unwrap_or_else(|_| plain(StatusCode::OK, "ok"))
-}
-
 fn plain(status: StatusCode, msg: &str) -> Response<Body> {
     Response::builder()
         .status(status)
@@ -886,42 +908,49 @@ mod tests {
     }
 
     #[test]
-    fn vid_from_proxy_auth_decodes_userinfo() {
+    fn creds_from_proxy_auth_splits_vid_and_key() {
+        // vid:key → both captured (the key is the agent's identity, §8).
         let req = Request::builder()
             .uri("api.github.com:443")
             .header(
                 header::PROXY_AUTHORIZATION,
-                format!("Basic {}", b64(b"vault-abc:")),
+                format!("Basic {}", b64(b"vault-abc:sc_agent_k9")),
             )
             .body(Body::empty())
             .unwrap();
-        assert_eq!(vid_from_proxy_auth(&req), Some("vault-abc".to_string()));
+        assert_eq!(
+            creds_from_proxy_auth(&req),
+            (Some("vault-abc".to_string()), Some("sc_agent_k9".to_string()))
+        );
+
+        // Legacy empty password (`vid:`) → vid present, key None (→ 407 later,
+        // it's participating but unauthenticated).
+        let no_key = Request::builder()
+            .uri("api.github.com:443")
+            .header(header::PROXY_AUTHORIZATION, format!("Basic {}", b64(b"vault-abc:")))
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            creds_from_proxy_auth(&no_key),
+            (Some("vault-abc".to_string()), None)
+        );
     }
 
     #[test]
-    fn vid_absent_or_empty_is_none() {
+    fn creds_absent_or_empty_vid_is_none() {
+        // No Proxy-Auth at all → non-participating (blind-tunnel).
         let none = Request::builder()
             .uri("api.github.com:443")
             .body(Body::empty())
             .unwrap();
-        assert_eq!(vid_from_proxy_auth(&none), None);
-        // Empty vid (`:` only) is not a routing hint.
-        let empty = Request::builder()
+        assert_eq!(creds_from_proxy_auth(&none), (None, None));
+        // Empty vid (`:key`) is not a routing hint → vid None.
+        let empty_vid = Request::builder()
             .uri("api.github.com:443")
-            .header(header::PROXY_AUTHORIZATION, format!("Basic {}", b64(b":")))
+            .header(header::PROXY_AUTHORIZATION, format!("Basic {}", b64(b":sc_agent_k9")))
             .body(Body::empty())
             .unwrap();
-        assert_eq!(vid_from_proxy_auth(&empty), None);
-    }
-
-    #[test]
-    fn probe_answers_200_json() {
-        let r = probe_response();
-        assert_eq!(r.status(), StatusCode::OK);
-        assert_eq!(
-            r.headers().get(header::CONTENT_TYPE).unwrap(),
-            "application/json"
-        );
+        assert_eq!(creds_from_proxy_auth(&empty_vid).0, None);
     }
 
     #[test]

@@ -608,14 +608,14 @@ pub struct ServeArgs {
     pub relay_url: Option<String>,
 }
 
-/// `sc status` takes no flags — the daemon URL comes from the active vault
-/// (`$SAFECLAW_VAULT_URL` or `~/.safeclaw/config.toml`), defaulting to the
-/// localhost daemon. Point at another device's daemon via `$SAFECLAW_VAULT_URL`.
+/// `sc status` takes no flags — the daemon (control root) comes from
+/// `~/.safeclaw/config.toml`; the active vault is `$SAFECLAW_VAULT_ID` (env pin)
+/// else the config default (§5).
 #[derive(Debug, Args)]
 pub struct StatusArgs {
-    /// Emit machine-readable JSON (daemon + vault state, the proxy address,
-    /// `routed`, and the agent-facing connections/phantoms) instead of the
-    /// human table.
+    /// Emit machine-readable JSON (daemon + vault state, the vault selection —
+    /// env pin vs device default — and the agent-facing connections/phantoms)
+    /// instead of the human table.
     #[arg(long)]
     pub json: bool,
 }
@@ -629,8 +629,8 @@ pub struct SyncArgs {
 
 #[derive(Debug, Args)]
 pub struct UnlockArgs {
-    /// Override the vault id (otherwise loaded from
-    /// `$SAFECLAW_VAULT_URL` or `~/.safeclaw/config.toml`).
+    /// Override the vault id (otherwise `$SAFECLAW_VAULT_ID` env pin, else the
+    /// `~/.safeclaw/config.toml` default — §5).
     #[arg(long)]
     pub vault: Option<String>,
 

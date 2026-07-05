@@ -2,8 +2,7 @@
 
 use crate::cli::active::{join_vault_url, load as load_config};
 use crate::cli::discovery::{self, ConnRow};
-use crate::cli::proxy_env::{ca_trust_vars, proxy_base, proxy_reachable, raw_https_proxy};
-use crate::config::{StatusArgs, CONTROL_PORT, PROXY_PORT};
+use crate::config::{StatusArgs, CONTROL_PORT};
 
 #[derive(Debug)]
 pub struct VaultStatus {
@@ -100,33 +99,26 @@ pub async fn run(args: StatusArgs) -> Result<(), String> {
     let cfg = load_config()?;
     let d = probe_local_daemon().await;
 
-    // The vault, its connections (agent-facing projection), and the routing
-    // preflight are only meaningful with an active vault selected.
-    let vault = match (cfg.daemon.as_deref(), cfg.vault.as_deref()) {
+    // Vault resolution mirrors `resolve_active` (§5): `--vault` isn't a status
+    // arg, so it's env-pin > config default. Surface BOTH so a shell pinned to a
+    // different vault than the device default is legible (no coined verdict — the
+    // facts). Routing DETECTION is gone (§9): the broker is opt-in, the agent
+    // routes explicitly with `sc run`, so there's no "am I routed?" to report.
+    let env_pin = std::env::var("SAFECLAW_VAULT_ID").ok().filter(|s| !s.is_empty());
+    let config_default = cfg.vault.clone();
+    let active_vault = env_pin.clone().or_else(|| config_default.clone());
+
+    let vault = match (cfg.daemon.as_deref(), active_vault.as_deref()) {
         (Some(c), Some(v)) => Some(fetch_status(c, v).await),
         _ => None,
     };
-    let conns: Vec<ConnRow> = match (cfg.daemon.as_deref(), cfg.vault.as_deref()) {
+    let conns: Vec<ConnRow> = match (cfg.daemon.as_deref(), active_vault.as_deref()) {
         (Some(c), Some(v)) => discovery::connections(c, v).await.unwrap_or_default(),
         _ => Vec::new(),
     };
-    // Routing facts — faithful WHAT, no coined verdict (§8). The agent reads the
-    // raw `$HTTPS_PROXY` and compares it to `proxy.url` itself.
-    let proxy = proxy_base();
-    let reachable = proxy_reachable().await;
-    let https_proxy = raw_https_proxy();
-    let ca_trust = ca_trust_vars();
-    // Human-only convenience: does THIS shell route through us? (env points at our
-    // proxy port, a CA var trusts our leaf, and the proxy answers.)
-    let routing_ready = https_proxy
-        .as_deref()
-        .map(|h| h.contains(&format!(":{}", PROXY_PORT)))
-        .unwrap_or(false)
-        && !ca_trust.is_empty()
-        && reachable;
 
     if args.json {
-        print_json(&d, &vault, &conns, &proxy, reachable, https_proxy.as_deref(), &ca_trust);
+        print_json(&d, &vault, &conns, env_pin.as_deref(), config_default.as_deref());
         return Ok(());
     }
 
@@ -160,16 +152,13 @@ pub async fn run(args: StatusArgs) -> Result<(), String> {
             }
         }
     }
-    println!();
-
-    // ── Proxy / routing (§8 — faithful WHAT) ────────────────────────────
-    println!("proxy");
-    println!("  url:       {}", proxy);
-    println!("  reachable: {}", reachable);
-    if routing_ready {
-        println!("  routing:   ready — this shell goes through SafeClaw; phantoms substitute");
-    } else {
-        println!("  routing:   not configured — prefix commands with `sc run -- <cmd>` (or `eval \"$(sc env)\"`)");
+    // Pin-vs-config (§5): flag a shell pinned to a different vault than the device
+    // default so a surprising `sc` target is legible.
+    if let (Some(pin), Some(def)) = (env_pin.as_deref(), config_default.as_deref()) {
+        if pin != def {
+            println!("  note:  this shell is pinned to {} via $SAFECLAW_VAULT_ID; the device default is {}", pin, def);
+            println!("         unset SAFECLAW_VAULT_ID (or re-run `eval \"$(sc env)\"`) to follow the default");
+        }
     }
     println!();
 
@@ -195,10 +184,8 @@ fn print_json(
     d: &LocalDaemon,
     vault: &Option<VaultStatus>,
     conns: &[ConnRow],
-    proxy: &str,
-    reachable: bool,
-    https_proxy: Option<&str>,
-    ca_trust: &[String],
+    env_pin: Option<&str>,
+    config_default: Option<&str>,
 ) {
     let vault_json = vault.as_ref().map(|s| {
         let (state, passkeys, secrets) = match &s.state {
@@ -218,16 +205,17 @@ fn print_json(
         .iter()
         .map(|c| serde_json::json!({ "name": c.name, "hosts": c.hosts, "phantoms": c.phantoms }))
         .collect();
+    let mismatch = matches!((env_pin, config_default), (Some(p), Some(c)) if p != c);
     let out = serde_json::json!({
         "daemon": { "up": d.up, "version": d.version, "vaults": d.vault_count },
         "vault": vault_json,
-        // §8: proxy = our address + whether it answers; routing = the RAW
-        // $HTTPS_PROXY value (null if unset — the agent compares it to proxy.url)
-        // plus which resident-CA vars point at ca.pem ([] ⇒ TLS would fail).
-        "proxy": { "url": proxy, "reachable": reachable },
-        "routing": {
-            "https_proxy": https_proxy,
-            "ca_trust": ca_trust,
+        // §5: the active vault + WHERE it came from (env pin vs device default),
+        // so a mismatch is machine-detectable. No routing block — the broker is
+        // opt-in (§9), so there's no "routed" state to report.
+        "vault_selection": {
+            "env_pin": env_pin,
+            "config_default": config_default,
+            "mismatch": mismatch,
         },
         "connections": conns_json,
     });
