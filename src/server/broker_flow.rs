@@ -10,8 +10,7 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::{http::StatusCode, Json};
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use crate::audit;
 use crate::error::{AppError, Result};
@@ -43,42 +42,6 @@ pub fn is_hop_by_hop(name_lc: &str) -> bool {
             | "transfer-encoding"
             | "upgrade"
     )
-}
-
-/// The 202 "pending" body the proxy returns to a JSON-capable client: op id,
-/// challenge `r`, the human approve link, and the poll url + pacing hints.
-pub fn pending_202(op_id: &str, r: &str, expires_at: u64) -> axum::response::Response {
-    use axum::response::IntoResponse;
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let interval = crate::approval::store::POLL_INTERVAL_HINT_SECS;
-    let mut resp = (
-        StatusCode::ACCEPTED,
-        Json(json!({
-            "status": "pending",
-            "op_id": op_id,
-            "r": r,
-            "approval": {
-                "id": op_id,
-                "approve_url": crate::cli::active::grant_url(op_id),
-                "poll_url": format!("/op/{}", op_id),
-                "expires_at": expires_at,
-                "expires_in": expires_at.saturating_sub(now),
-                "interval": interval,
-            },
-        })),
-    )
-        .into_response();
-    let h = resp.headers_mut();
-    if let Ok(v) = axum::http::HeaderValue::from_str(&format!("/op/{}", op_id)) {
-        h.insert(axum::http::header::LOCATION, v);
-    }
-    if let Ok(v) = axum::http::HeaderValue::from_str(&interval.to_string()) {
-        h.insert(axum::http::header::RETRY_AFTER, v);
-    }
-    resp
 }
 
 /// Shared tail of the Use pending-op flow: issue the challenge `r`, create the

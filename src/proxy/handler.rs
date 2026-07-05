@@ -566,6 +566,12 @@ impl BrokerHandler {
         ) {
             Ok((op_id, _r, expires_at)) => {
                 let approve_url = crate::cli::active::grant_url(&op_id);
+                // §9: absolute poll_url. This 401 is emitted mid-proxy (e.g. while
+                // brokering a gmail request), so a relative `/op/<id>` would
+                // resolve against the UPSTREAM's domain. Point it at the daemon's
+                // API face (the agent's $SAFECLAW_DAEMON_URL) so the agent's poll
+                // (Bearer-gated) lands on us.
+                let poll_url = format!("http://127.0.0.1:{}/op/{}", self.state.config.proxy_port, op_id);
                 let body = format!(
                     "SafeClaw approval needed to use this credential.\n\
                      Approve with your passkey:\n  {}\n\
@@ -576,7 +582,7 @@ impl BrokerHandler {
                         "status": "pending",
                         "op_id": op_id,
                         "approve_url": approve_url,
-                        "poll_url": format!("/op/{}", op_id),
+                        "poll_url": poll_url,
                         "expires_at": expires_at,
                     })
                 );

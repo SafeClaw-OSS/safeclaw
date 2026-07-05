@@ -41,13 +41,17 @@ fn host_is_blocked_ip(host: &str) -> bool {
     }
 }
 
-/// True if `host` is a loopback / metadata hostname.
+/// True if `host` is an RFC-6761 loopback NAME. The SSRF floor is otherwise
+/// IP-range based (`host_is_blocked_ip`, which already covers the 169.254/16
+/// metadata IP) — mainstream forward-proxy hygiene. We add ONLY the loopback
+/// names here; NO `.internal` / `metadata.google.internal` name special-cases
+/// (AGENT_SURFACE §7): a credential only reaches a host a HUMAN deliberately
+/// anchored (curated PR / `sc connect` behind a passkey), we don't resolve DNS
+/// at egress, and blocking `.internal` would wrongly reject a user's legitimate
+/// self-hosted `*.internal` service.
 fn host_is_blocked_name(host: &str) -> bool {
     let h = host.split(':').next().unwrap_or(host).to_ascii_lowercase();
-    h == "localhost"
-        || h.ends_with(".localhost")
-        || h == "metadata.google.internal"
-        || h.ends_with(".internal")
+    h == "localhost" || h.ends_with(".localhost")
 }
 
 /// True if `authority` (`host[:port]`, IPv4 or `[ipv6]`) is a safe egress
@@ -361,8 +365,11 @@ secrets = ["ACME_TOKEN"]
     }
 
     #[test]
-    fn rejects_private_and_loopback_and_metadata_hosts() {
-        for bad in ["10.0.0.5", "192.168.1.1", "127.0.0.1", "169.254.169.254", "localhost", "metadata.google.internal"] {
+    fn rejects_private_and_loopback_hosts() {
+        // Literal private/loopback/link-local IPs (169.254.169.254 = the metadata
+        // IP, covered by the range, not a name special-case) + loopback names.
+        // `metadata.google.internal` / `*.internal` are NOT name-blocked (§7).
+        for bad in ["10.0.0.5", "192.168.1.1", "127.0.0.1", "169.254.169.254", "localhost"] {
             let toml = GITHUB.replace("\"api.github.com\"", &format!("\"{}\"", bad));
             let errs = validate_recipe(&toml, true).unwrap_err();
             assert!(
@@ -370,6 +377,17 @@ secrets = ["ACME_TOKEN"]
                 "{} should be blocked, got {:?}", bad, errs
             );
         }
+    }
+
+    #[test]
+    fn allows_internal_names_only_ip_floor_blocks() {
+        // §7: a `.internal` / metadata NAME is allowed at authoring (a legit
+        // self-hosted service may be `foo.internal`); the metadata IP is blocked
+        // by the range floor, so there's no name special-case to maintain.
+        let toml = GITHUB.replace("\"api.github.com\"", "\"metadata.google.internal\"");
+        assert!(validate_recipe(&toml, true).is_ok(), "{:?}", validate_recipe(&toml, true));
+        let internal = GITHUB.replace("\"api.github.com\"", "\"vault.corp.internal\"");
+        assert!(validate_recipe(&internal, true).is_ok());
     }
 
     #[test]
@@ -434,13 +452,16 @@ client_type = "public"
     }
 
     #[test]
-    fn host_egress_allowed_blocks_private_and_metadata() {
+    fn host_egress_allowed_blocks_private_ips_and_loopback_names() {
         assert!(host_egress_allowed("api.gitlab.com"));
         assert!(host_egress_allowed("git.acme.com:8443"));
         assert!(!host_egress_allowed("127.0.0.1"));
         assert!(!host_egress_allowed("10.0.0.5"));
+        // The metadata IP is blocked by the link-local RANGE (169.254/16)…
         assert!(!host_egress_allowed("169.254.169.254"));
         assert!(!host_egress_allowed("localhost"));
-        assert!(!host_egress_allowed("metadata.google.internal"));
+        // …but the metadata NAME is NOT name-blocked (§7 — no special-case).
+        assert!(host_egress_allowed("metadata.google.internal"));
+        assert!(host_egress_allowed("vault.corp.internal"));
     }
 }
