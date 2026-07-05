@@ -25,8 +25,10 @@ request-line form:
 - **proxy face** — `CONNECT host:443` or absolute-form `GET http://host/…` → MITM /
   blind-tunnel (existing behavior). Loop guard: an absolute-form request whose authority ==
   self is treated as a direct request (answer, never forward) — standard Squid/Privoxy move.
-- **API face** — origin-form `GET /v/{vid}/registry`, `GET /op/{id}`, `GET /health` →
-  self-answer a READ-ONLY subset. This is what the agent hits directly for discovery/poll.
+- **API face** — origin-form `GET /v/{vid}/registry`, `GET /op/{id}`, `GET /health`,
+  `GET /ca` → self-answer a READ-ONLY subset (discovery/poll + fetch the resident CA, §10).
+  `/health` + `/ca` are unauthenticated (liveness / public cert); `/registry` + `/op` require
+  the Bearer key (§8).
 `CONTROL_PORT` (23295) keeps every WRITE/ceremony route (op create/approve/reject, passkey,
 pending-passkey, events, approvals, secret-keys, usage, sync, admin, pubkey, skill.md, the
 static `/registry`) — CLI + human only, invisible to the agent. Precedent: Privoxy/Squid
@@ -194,12 +196,24 @@ config.toml (device/human) is a SEPARATE source; `sc env` bridges it for the hum
 ```
 
 ## 10. Open / implementation notes (resolve during build, not design forks)
-- **CA trust for the self-construct case (gmail via the agent's own HTTP client).** A request
-  the agent proxies to a MITM'd host gets our resident-CA leaf → the client must trust our
-  CA. `sc run` sets the CA vars for a child; for the agent's OWN client, confirm the path
-  (either the agent runs the request under `sc run`, or its client trusts `ca.pem`). Do NOT
-  emit a global `SSL_CERT_FILE` from `sc env` that would REPLACE the system bundle for
-  non-MITM'd hosts — prefer additive (`NODE_EXTRA_CA_CERTS`) or `sc run` scoping.
+- **CA trust for self-construct (gmail via the agent's own HTTP client) — RESOLVED via `/ca`.**
+  A request the agent proxies to a MITM'd host gets our resident-CA leaf → the client must
+  trust our CA. The CA is DEVICE-local (per-daemon `ca.pem`), so it can't ride the
+  (possibly remote-minted) prompt. Resolution: the API face serves `GET $DAEMON_URL/ca` (the
+  resident CA PEM — a public cert, unauthenticated, like mitmproxy's `mitm.it`); the agent
+  fetches it and trusts it ADDITIVELY in its self-construct client (never replace the system
+  bundle). Dumb tools keep using `sc run` (which sets the CA vars). `/ca` added to §2.
+- **Key-hash timing.** Minting a connection registers the key's hash; a cloud-paired daemon
+  learns it via periodic sync. If the agent uses the key before the daemon has synced → 407.
+  The minter should ensure the daemon has the hash (push / trigger a sync on mint), or the
+  daemon re-syncs on a hash miss.
+- **The agent must DURABLY hold its four vars** (from the prompt) in its own config, not a
+  transient shell — `sc env` can't re-supply them (device-only, no key). The install prompt
+  must say so.
+- **SaaS-proxy / cloud-blindness** is a separate deployment concern (out of scope for the
+  local e2e): the MITM proxy must stay LOCAL even for a hosted vault — a remote proxy would
+  see the substituted real credential. The e2e is local self-host, so daemon + proxy + CA are
+  all on the device.
 - **Local api-key source (§8).** `agent_key_hashes` empty ⇒ reject everything (paired-cloud
   model). A local/unpaired daemon must accept a locally-issued key (via `sc agent add`) so
   the e2e agent can authenticate; confirm the daemon seeds its own hash set locally, not only
@@ -213,7 +227,7 @@ config.toml (device/human) is a SEPARATE source; `sc env` bridges it for the hum
 
 ## Build order (post-compact, one pass on `feat/broker-phantom` + `-fe`)
 core: (a) proxy 23294 API face — dispatch origin-form → read-only `/v/{vid}/registry`,
-`/op/{id}`, `/health`; loop guard; share the projections. (b) retire routing-detection
+`/op/{id}`, `/health`, `/ca` (resident CA PEM); loop guard; share the projections. (b) retire routing-detection
 (is_routed / probe / §8 routing block + helpers) → `sc status` = direct health + connections
 + the pin-vs-config vault view. (c) `sc env` = DEVICE/human config only — emit
 `SAFECLAW_DAEMON_URL` + `SAFECLAW_VAULT_ID` for the human's shell, NO key, no global
