@@ -295,7 +295,14 @@ impl BrokerHandler {
                 .cloned()
                 .or_else(|| self.state.custom_service(&vault_id, s))
         });
-        let is_oauth = def.as_ref().and_then(|d| d.oauth2.as_ref()).is_some();
+        // Some(refresh KEY) ⇔ this is an oauth connection. The key rides along
+        // so the resolver can answer a phantom naming the REFRESH secret with
+        // the precise refusal (never-injectable), not a generic role error.
+        let oauth_refresh = def
+            .as_ref()
+            .and_then(|d| d.oauth2.as_ref())
+            .map(|o| o.refresh_token.clone());
+        let is_oauth = oauth_refresh.is_some();
         // The service id policy/mint use; for a raw connection there is none so
         // the conn id stands in (registry lookups miss → global default floor).
         let service_id = conn_rec.service.clone().unwrap_or_else(|| conn.clone());
@@ -375,7 +382,7 @@ impl BrokerHandler {
         };
 
         let values = match self
-            .resolve_values(&vault_id, &conn, &service_id, is_oauth, &phantoms, primary, secrets_map)
+            .resolve_values(&vault_id, &conn, &service_id, oauth_refresh.as_deref(), &phantoms, primary, secrets_map)
             .await
         {
             Ok(v) => v,
@@ -393,6 +400,16 @@ impl BrokerHandler {
                         "'{}' exposes several secrets — use a role phantom: {}",
                         conn, roles
                     ),
+                )
+                .into();
+            }
+            Err(ResolveErr::RefreshForbidden) => {
+                return err_response(
+                    StatusCode::FORBIDDEN,
+                    "refresh_forbidden",
+                    "a refresh token never leaves the vault — this connection injects a \
+                     minted access token (use its default phantom). To reveal the stored \
+                     secret, the user runs `sc secret get` (passkey ceremony)",
                 )
                 .into();
             }
@@ -469,13 +486,14 @@ impl BrokerHandler {
         vault_id: &str,
         conn: &str,
         service_id: &str,
-        is_oauth: bool,
+        oauth_refresh: Option<&str>,
         phantoms: &[Phantom],
         primary: Option<Vec<u8>>,
         secrets_map: Option<HashMap<String, Vec<u8>>>,
     ) -> Result<HashMap<String, String>, ResolveErr> {
         let mut out = HashMap::new();
         for ph in phantoms {
+            let is_oauth = oauth_refresh.is_some();
             let bytes: Vec<u8> = if is_oauth
                 && ph.role.as_deref().map(|r| r == "access").unwrap_or(true)
             {
@@ -490,9 +508,17 @@ impl BrokerHandler {
                     other => ResolveErr::Mint(format!("{:?}", other)),
                 })?
             } else if is_oauth {
+                let role = ph.role.clone().unwrap_or_default();
+                // Naming the REFRESH secret is a category error, not a missing
+                // feature: phantoms resolve to a connection's PRODUCED value
+                // (the minted access token), never a production INPUT. The
+                // refusal is precise so the boundary self-documents.
+                if oauth_refresh.is_some_and(|k| role.eq_ignore_ascii_case(k)) {
+                    return Err(ResolveErr::RefreshForbidden);
+                }
                 // A minted-derived `exposes` value (e.g. codex account_id) — the
                 // mint doesn't surface these yet.
-                return Err(ResolveErr::Exposes(ph.role.clone().unwrap_or_default()));
+                return Err(ResolveErr::Exposes(role));
             } else {
                 match &ph.role {
                     Some(r) => secrets_map
@@ -714,6 +740,9 @@ enum ResolveErr {
     Ambiguous,
     /// An oauth2 `exposes` role the mint doesn't surface yet.
     Exposes(String),
+    /// The phantom names the oauth REFRESH secret — never injectable (a
+    /// production input, not a produced value); egress would equal export.
+    RefreshForbidden,
     /// The oauth mint failed / the refresh token is dead.
     Mint(String),
     /// The resolved bytes aren't valid UTF-8.
