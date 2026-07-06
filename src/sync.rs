@@ -713,6 +713,25 @@ pub async fn sync_agent_keys_once(state: &Arc<AppState>) {
     }
 }
 
+/// One debounced refresh on an agent-key AUTH MISS. A key minted seconds ago
+/// (`sc agent add` prints the agent's env → the agent uses it immediately)
+/// would otherwise sit invalid for up to the 30s loop interval — the exact
+/// window the install flow now hits. Debounce (2s) keeps a bad-key flood from
+/// hammering the backend. Returns true when a refresh actually ran (the
+/// caller re-checks membership); false = debounced, the miss stands.
+pub async fn refresh_agent_keys_on_miss(state: &Arc<AppState>) -> bool {
+    const DEBOUNCE: Duration = Duration::from_secs(2);
+    {
+        let mut last = state.agent_key_resync.lock().unwrap();
+        if matches!(*last, Some(t) if t.elapsed() < DEBOUNCE) {
+            return false;
+        }
+        *last = Some(std::time::Instant::now());
+    }
+    sync_agent_keys_once(state).await;
+    true
+}
+
 /// Periodically refresh the agent-key hash-set so a dashboard revoke / a newly
 /// added agent takes effect within ~30s on this daemon. Detached, best-effort.
 pub async fn sync_agent_keys_loop(state: Arc<AppState>) {

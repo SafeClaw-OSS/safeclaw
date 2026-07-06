@@ -42,13 +42,14 @@ fn is_self_authority(host: &str, port: Option<u16>, proxy_port: u16) -> bool {
     loopback && port == Some(proxy_port)
 }
 
-/// Self-answer an API-face request. GET-only; unknown paths → 404. No `await`:
-/// every projection is a synchronous read.
-pub fn respond(state: &Arc<AppState>, req: &Request<Body>) -> Response<Body> {
+/// Self-answer an API-face request. GET-only; unknown paths → 404. Every
+/// projection is a synchronous read; the only await is the debounced hash
+/// refresh on an auth miss.
+pub async fn respond(state: &Arc<AppState>, req: &Request<Body>) -> Response<Body> {
     if req.method() != Method::GET {
         return json(StatusCode::METHOD_NOT_ALLOWED, &json!({ "error": "method_not_allowed" }));
     }
-    let path = req.uri().path();
+    let path = req.uri().path().to_string();
 
     // ── Unauthenticated: liveness + public CA ────────────────────────────────
     if path == "/health" {
@@ -60,7 +61,7 @@ pub fn respond(state: &Arc<AppState>, req: &Request<Body>) -> Response<Body> {
 
     // ── Bearer-gated reads (§8) ──────────────────────────────────────────────
     if let Some(op_id) = path.strip_prefix("/op/") {
-        if let Err(r) = require_key(state, req.headers()) {
+        if let Err(r) = require_key(state, req.headers()).await {
             return r;
         }
         return match crate::server::handlers::approve::op_poll_value(state, op_id) {
@@ -69,7 +70,7 @@ pub fn respond(state: &Arc<AppState>, req: &Request<Body>) -> Response<Body> {
         };
     }
     if let Some(vid) = path.strip_prefix("/v/").and_then(|r| r.strip_suffix("/registry")) {
-        if let Err(r) = require_key(state, req.headers()) {
+        if let Err(r) = require_key(state, req.headers()).await {
             return r;
         }
         let q = crate::server::handlers::registry::RegistryQuery::from_query_str(
@@ -85,16 +86,29 @@ pub fn respond(state: &Arc<AppState>, req: &Request<Body>) -> Response<Body> {
 }
 
 /// Gate a request on the agent Bearer key (§8): the same membership check the
-/// control plane uses, via the pure `check_token`. `Err` carries the ready 401.
-fn require_key(state: &AppState, headers: &HeaderMap) -> Result<(), Response<Body>> {
+/// control plane uses, via the pure `check_token`. On a miss with a key
+/// PRESENT, one debounced hash refresh (a just-minted `sc agent add` key must
+/// not 401 for the 30s sync loop), then re-check. `Err` carries the ready 401.
+async fn require_key(state: &Arc<AppState>, headers: &HeaderMap) -> Result<(), Response<Body>> {
     let token = bearer_token(headers);
+    if key_in_set(state, token.as_deref()) {
+        return Ok(());
+    }
+    if token.is_some()
+        && crate::sync::refresh_agent_keys_on_miss(state).await
+        && key_in_set(state, token.as_deref())
+    {
+        return Ok(());
+    }
+    Err(json(
+        StatusCode::UNAUTHORIZED,
+        &json!({ "error": "unauthorized", "message": "missing or invalid agent api key" }),
+    ))
+}
+
+fn key_in_set(state: &AppState, token: Option<&str>) -> bool {
     let hashes = state.agent_key_hashes.lock().unwrap();
-    crate::api_key::check_token(&hashes, token.as_deref()).map_err(|_| {
-        json(
-            StatusCode::UNAUTHORIZED,
-            &json!({ "error": "unauthorized", "message": "missing or invalid agent api key" }),
-        )
-    })
+    crate::api_key::check_token(&hashes, token).is_ok()
 }
 
 fn bearer_token(headers: &HeaderMap) -> Option<String> {

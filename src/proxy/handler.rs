@@ -96,7 +96,7 @@ impl HttpHandler for BrokerHandler {
         // agent's ONE port: the same listener serves the proxy face (below) and
         // this read API.
         if crate::proxy::api_face::is_api_face(&req, self.state.config.proxy_port) {
-            return crate::proxy::api_face::respond(&self.state, &req).into();
+            return crate::proxy::api_face::respond(&self.state, &req).await.into();
         }
 
         self.pipeline(ctx, req).await
@@ -221,14 +221,20 @@ impl BrokerHandler {
         // verify the AGENT's identity BEFORE resolving/substituting. The key rode
         // the CONNECT's Proxy-Auth password; `should_intercept` already
         // blind-tunnels absent-auth, so reaching here means Proxy-Auth was present
-        // — a bad/missing key is an explicit 407, never a silent fallback.
+        // — a bad/missing key is an explicit 407, never a silent fallback. On a
+        // miss with a key PRESENT, refresh the hash-set once (debounced): a key
+        // minted seconds ago by `sc agent add` must not 407 for the 30s loop.
         if !self.key_is_valid() {
-            return err_response(
-                StatusCode::PROXY_AUTHENTICATION_REQUIRED,
-                "agent_key",
-                "invalid or missing SafeClaw agent api key",
-            )
-            .into();
+            let refreshed = self.key.is_some()
+                && crate::sync::refresh_agent_keys_on_miss(&self.state).await;
+            if !refreshed || !self.key_is_valid() {
+                return err_response(
+                    StatusCode::PROXY_AUTHENTICATION_REQUIRED,
+                    "agent_key",
+                    "invalid or missing SafeClaw agent api key",
+                )
+                .into();
+            }
         }
         let vault_id = match self.vid.clone() {
             Some(v) => v,

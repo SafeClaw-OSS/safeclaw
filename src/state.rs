@@ -228,6 +228,11 @@ pub struct AppState {
     /// unpaired/local-only daemon has no broker plane to gate). See
     /// [[project_vault_agent_architecture_2026_06_25]].
     pub agent_key_hashes: Mutex<std::collections::HashSet<String>>,
+    /// Debounce stamp for the on-auth-miss hash refresh
+    /// (`sync::refresh_agent_keys_on_miss`): a key minted seconds ago
+    /// (`sc agent add` → immediate use) must not wait out the 30s sync loop,
+    /// but a bad-key flood must not hammer the backend either.
+    pub agent_key_resync: Mutex<Option<std::time::Instant>>,
     /// OAuth connections whose refresh_token was rejected (`invalid_grant`) at
     /// /use — surfaced via `/registry` as `needs_reauth` so the console prompts a
     /// reconnect. Keyed by `(vault_id, connection_id)`. In-memory + self-healing:
@@ -262,6 +267,7 @@ impl AppState {
             vault_write_locks: Mutex::new(HashMap::new()),
             sse_semaphores: Mutex::new(HashMap::new()),
             agent_key_hashes: Mutex::new(std::collections::HashSet::new()),
+            agent_key_resync: Mutex::new(None),
             oauth_reauth_needed: Mutex::new(std::collections::HashSet::new()),
             live_ceremony_ops: Mutex::new(HashMap::new()),
         }
