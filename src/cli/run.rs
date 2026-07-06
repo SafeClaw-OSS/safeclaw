@@ -42,7 +42,13 @@ pub async fn run(args: RunArgs) -> Result<(), String> {
     let parent_count = std::env::var("GIT_CONFIG_COUNT")
         .ok()
         .and_then(|v| v.parse::<u32>().ok());
-    let bundle = build_bundle(&proxy_url, &ca_str, parent_count);
+    let mut bundle = build_bundle(&proxy_url, &ca_str, parent_count);
+    // Pin the child (and any `sc` it shells — e.g. the git-credential helper) to
+    // the SAME vault the proxy is routed to. Without this, `sc run --vault B`
+    // routes the proxy to B but the child's `sc git-credential` would resolve the
+    // ambient/config vault (§5 env-pin) and look for the connection in the wrong
+    // vault — silently defeating the override for git flows.
+    bundle.push(("SAFECLAW_VAULT_ID".to_string(), vid.clone()));
 
     if args.export_env {
         for (k, v) in &bundle {

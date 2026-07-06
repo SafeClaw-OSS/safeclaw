@@ -64,7 +64,7 @@ pub fn respond(state: &Arc<AppState>, req: &Request<Body>) -> Response<Body> {
             return r;
         }
         return match crate::server::handlers::approve::op_poll_value(state, op_id) {
-            Ok(v) => json(StatusCode::OK, &v),
+            Ok(v) => op_poll_response(&v),
             Err(e) => app_err(e),
         };
     }
@@ -128,6 +128,25 @@ fn app_err(e: crate::error::AppError) -> Response<Body> {
     let (status, code, message) = e.parts();
     let status = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     json(status, &json!({ "error": code, "message": message }))
+}
+
+/// `/op/{id}` poll response — the shared `op_poll_value` body PLUS the same
+/// `Retry-After` pacing hint the control-plane poll sets on a pending op, so the
+/// agent (which polls THIS API face at the absolute poll_url, §9) keeps the
+/// standard cadence and the two faces stay byte-for-byte identical.
+fn op_poll_response(v: &Value) -> Response<Body> {
+    let pending = v.get("status").and_then(|s| s.as_str()) == Some("pending");
+    let body = serde_json::to_vec(v).unwrap_or_else(|_| b"{}".to_vec());
+    let mut b = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json");
+    if pending {
+        b = b.header(
+            header::RETRY_AFTER,
+            crate::approval::store::POLL_INTERVAL_HINT_SECS.to_string(),
+        );
+    }
+    b.body(Body::from(body)).unwrap_or_else(|_| plain_500())
 }
 
 fn json(status: StatusCode, v: &Value) -> Response<Body> {
