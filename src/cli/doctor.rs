@@ -4,8 +4,8 @@
 //!   - active profile (which custodian + vault)
 //!   - custodian reachability (`/health`)
 //!   - whether the vault dir exists on the custodian (vault id resolves)
-//!   - whether `$SAFECLAW_API_KEY` is set (informational only — local
-//!     daemons typically don't need it; SaaS does)
+//!   - whether `$SAFECLAW_API_KEY` is set (informational — the agent's
+//!     identity; required for credential substitution, §8)
 //!
 //! Each check prints a single line `[ok|warn|fail] message`. Exits with
 //! non-zero status if any line is `fail` — so CI scripts can gate on it.
@@ -151,28 +151,19 @@ pub async fn run(args: CommonArgs) -> Result<(), String> {
         Err(e) => report.push(Mark::Warn, format!("vault probe: {}", e)),
     }
 
-    // SAFECLAW_API_KEY (informational). Only matters for daemons that
-    // sit behind the SaaS auth boundary (typically https + non-localhost
-    // host). Local daemons accept any caller — the env var is moot.
-    let needs_api_key = match url::Url::parse(&custodian) {
-        Ok(u) => {
-            u.scheme() == "https"
-                && !matches!(u.host_str(), Some("localhost") | Some("127.0.0.1") | Some("[::1]"))
-        }
-        Err(_) => false,
-    };
+    // SAFECLAW_API_KEY (informational): the AGENT's identity. The proxy
+    // verifies it before any phantom substitution (§8) — localhost included —
+    // so an agent's env must carry one (minted by `sc agent add`); a human
+    // shell without it just can't broker credentials, everything else works.
     match std::env::var("SAFECLAW_API_KEY") {
         Ok(v) if !v.is_empty() => report.push(
             Mark::Ok,
             format!("$SAFECLAW_API_KEY: set ({} chars)", v.len()),
         ),
-        _ if needs_api_key => report.push(
-            Mark::Warn,
-            "$SAFECLAW_API_KEY: unset (SaaS daemons need this — export in your shell)",
-        ),
         _ => report.push(
             Mark::Ok,
-            "$SAFECLAW_API_KEY: unset (not required for local custodian)",
+            "$SAFECLAW_API_KEY: unset (fine for a human shell — credential \
+             substitution needs an agent env, minted by `sc agent add`)",
         ),
     }
 
