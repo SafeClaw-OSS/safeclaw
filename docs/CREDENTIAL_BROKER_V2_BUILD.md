@@ -343,6 +343,98 @@ BYO-OAuth-client. Never move refresh to the backend. Deferred.
   combo, aux/connections whole-blob sync (per-item cutover's known remainder —
   separate thread).
 
+### 11.1 Resolved during build (2026-07-03; folded in from BUILD_NOTES)
+
+Every §11 "open" item resolved as noted; the build-time decisions and
+coordination seams below are the record (one line each).
+
+**Ports / listeners.** `CONTROL_PORT=23295` (axum API), `PROXY_PORT=23294`
+(hudsucker MITM), both in `config.rs`. Daemon binds both: axum on 23295
+(foreground), proxy on 23294 (detached; a proxy exit logs and leaves the
+control plane up). Every "23294-means-API" straggler swept to 23295/CONTROL_PORT
+(CLI daemon-URL fallbacks in login/vault/custodian; PROTOCOL §4.1; doc port refs).
+
+**Storage v4.** `PLAINTEXT_VERSION 3→4` (old vaults hard-fail → re-enroll, no
+migration). `Connection{service:Option, hosts:Option}` — `config` deleted, host
+promoted. `VaultAux.services: BTreeMap<String,String>` = per-vault custom v4
+service tomls (`aux.services`), wired through sealed_vault seed/reconcile/fold.
+
+**Service v4 + host anchor.** v4 `ServiceDef` (`[service]` carries `hosts`+`secrets`;
+`[oauth2]`/`[placeholders]` top-level; `deny_unknown_fields`); UpstreamDef/ApiDef/
+AuthDef/VaultField/ConnectionSlots/LockedResponseDef + the header-template layer
+deleted; `src/service/locked.rs` deleted. `core::host::{resolved_hosts, host
+match exact+wildcard, host_union, phantoms_for/_raw}` new. `build.rs` skips
+`_`-prefixed dirs. TOML kept (author-vs-wire split; no YAML in the security path).
+
+**Op plane no longer forwards.** Every approved Use op is `authorize_only` (the
+resident proxy retries live traffic). `broker.rs` → `resolve_use_primary` only;
+the whole v3 template engine (`render_template`/`referenced_secrets`/
+`apply_secret_filter`/`resolve_token`/`RenderInputs`/`render_setup_template`) +
+`execute_use_forward`/`forward_to_upstream_with_extras`/`BrokerResponse` DELETED.
+`server::broker_flow` holds the survivors (`register_pending_use`, `pending_202`,
+`is_hop_by_hop`, `resolve_auth_value`, `HTTP_CLIENT`). Legacy auth injector layer
+(`auth/{bearer,basic,header,query,path}.rs`, `ServiceVault`/`AuthConfig`/
+`inject_auth`/`transform_url`) DELETED; `auth/oauth2.rs` refresh entry is now
+`perform_refresh` (primitive params).
+
+**Proxy stack (A/B/C/F-proxy).** hudsucker 0.24 default features (aws-lc-rs,
+no OpenSSL); crypto provider installed once in `run_daemon`; proxy has its own
+`with_rustls_connector` upstream client (no HTTPS_PROXY leaks into the daemon).
+`ca.rs` = resident load-or-generate `<state_dir>/ca.pem`+`ca.key` (0600), never a
+system trust store. `resolver.rs` = phantom parse/scan (1–2 `[a-z0-9_]` segments;
+scans headers/query/URL-path/body/Basic). `handler.rs` = full pipeline (probe,
+no-phantom passthrough, one-connection-per-request, vid binding via CONNECT
+`Proxy-Authorization`, 423 on lock, unknown-conn 4xx, exact-FQDN anchor + private/
+metadata floor + widen-deny, policy, cache/OAuth-mint resolve, substitute-
+everywhere + strip proxy/agent auth, forward; `handle_response` writes the audit
+row). h2/gRPC gap: client advertised `http/1.1` (documented, not blocking).
+
+**Host-scoped approval cache.** `rule_approvals` key = `(conn, rule, method, host)`;
+`host` threaded through `evaluate_request_policy`/`record_ask_approval`;
+`PolicyContext.host` stamped at op-create. Widen ceremony is SESSION-LEVEL
+(`widen_connection_host` appends to the in-memory routing snapshot); durable
+persistence into `aux.connections[<conn>].hosts` is DEFERRED (needs the daemon-
+side aux write parked with per-item; console connection-edit persists meanwhile).
+
+**Raw-connection allow bootstrap.** Raw connections (`service: None`) default to
+`allow` (global floor); their bytes are bootstrapped resident via a reverse-index
+of native_secrets (bare `<conn>` sole, or `<conn>:<ROLE>`, case-insensitive) so
+the proxy resolves them from the session cache. Contract with S3: `sc set K --host
+h` stores the raw secret at bare `<conn>=lower(K)` (sole) or `<conn>:<ROLE>`.
+
+**CLI (D/E/F-cli/G-cli).** `sc run` = thin env-paster: `HTTPS_PROXY=http://<vid>:@
+127.0.0.1:23294` (vid = active vault, explicit empty password), `NO_PROXY`,
+`NODE_USE_ENV_PROXY=1`, CA-path family = `<state_dir>/ca.pem`, git per-process
+helper (`GIT_CONFIG_*`, chained). `--` → exec; `--export-env` → shell export lines;
+preflight (CA + probe/health) else `sc up` hint; NO plaintext secret exported.
+CA-path SSoT = `config::default_state_dir()`. `sc set` host-required (hidden value
+prompt; `--host` creates raw conn; `--no-broker`/`none` explicit opt-out; off-TTY
+errors both fixes). `sc connect` = custom-form twin (`--host`/`--secret KEY=VALUE`/
+`--use-existing`). `sc git-credential` async zero-schema (host→sole-phantom, else
+decline; the retired `SAFECLAW_API_KEY`-as-Basic path deleted). `sc service add
+<file.toml>` validates v4 → `aux.services[<id>]`. `Cargo.toml` → 1.1.0 (+rpassword).
+
+**Deferred (record, not open).** OAuth `exposes` minting (role-qualified oauth
+phantom → `exposes_unsupported` 4xx); custom (`aux.services`) OAuth mint/portal
+(custom DIRECT services work); multi-secret ASK non-primary role (allow-level
+multi-secret works); durable widen persistence; registry per-CONNECTION expansion
+(still one-row-per-service → `sc status` won't list raw connections until it
+lands — blocks acceptance §12 #1). Body scan bound: text-ish content-type AND
+≤ 1 MiB, else streamed unscanned. Parked (moved to `services/_parked/`, excluded
+from build.rs): `system/files`, `integration/nodpay`. Dup `integration/openai`
+deleted; `openai-codex`→`openai_codex` (phantom charset `[a-z0-9_]`, no `-`).
+
+**Integrator sweep (this pass).** Port stragglers fixed; api_key gate reduced to
+Bearer-only guarding the `/export` stub (dead `/stream/` branch + Basic extraction
+removed); retired-mechanism comments (`/use`, `/stream`, `use_broker`, `{{secret.}}`,
+`vault_fields`, `{{proxy_base}}`, "recipe" term) rewritten across src + service
+tomls; PROTOCOL §4.1 table + §3.2 Use-op line updated to the phantom/port reality;
+`CONNECTION_IMPL_PLAN.md` deleted (landed); banners on the four superseded docs
+point at this canon. Survivors (legitimate): `[placeholders]` (valid v4 UI hint);
+negative tests asserting v3 `[[upstream]]` rejection; `merge_levels(user, built_in)`
+identifier; PROTOCOL §4.6/§4.6.1 (already-REMOVED historical section); `public/*`
+static HTML (unwired legacy, frontend-thread territory).
+
 ## 12. Acceptance criteria (the definition of DONE for this wave)
 
 Unit level: the existing `/use`/`/stream` behavioural suites are the **oracle

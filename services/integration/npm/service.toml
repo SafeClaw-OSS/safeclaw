@@ -1,43 +1,16 @@
 setup = """
-Route `npm publish` through SafeClaw so the npm token never enters .npmrc, env, or
-the agent process.
-
-# npm CAN be pointed straight at a URL, so this is a pure passthrough: aim npm's
-# registry at SafeClaw and authenticate to it with the broker key (NOT the real
-# token) — SafeClaw injects the real npm token and forwards to registry.npmjs.org.
-#
-#   npm publish --registry {{proxy_base}}/stream/npm/
-#
-# Auth: set the broker key as the _authToken SCOPED to that registry (.npmrc or
-# env), value $SAFECLAW_API_KEY — e.g. in ~/.npmrc:
-#   //<host:port>/<…>/stream/npm/:_authToken=${SAFECLAW_API_KEY}
-# (derive the scope from {{proxy_base}}; adapt project vs ~/.npmrc.)
-#
-# Store an npm *automation* token in the vault (bypasses 2FA-on-publish; the broker
-# can't supply an interactive OTP). On an approval prompt you'll get a link (agent
-# prompt + npm error output) — surface it, user taps a passkey, then re-run.
+Routed (under `sc run` / the env bundle)? Nothing to configure — npm honours the
+proxy + CA env directly, so the npm token never enters .npmrc, env, or the agent
+process.
+Not routed? Prefix the publish: `sc run -- npm publish`.
+Store an npm *automation* token in the vault (bypasses 2FA-on-publish; the broker
+can't supply an interactive OTP). Expect a passkey prompt on publish — tap the
+approve link (in npm's error output), then re-run.
 """
 
 [service]
 id = "npm"
 name = "npm"
 
-# `npm publish` is a single token-authenticated `PUT {registry}/{package}` — the
-# same shape as git-over-HTTPS, so it rides the generic streaming passthrough
-# (/stream/). npm runs locally (it has the package); only the authenticated
-# upload egress is routed through SafeClaw, which injects the real npm token. npm
-# never sees the token. Unlike cargo, npm needs no separate index handshake — a
-# pure `--registry` passthrough.
-
-[[upstream]]
-id = "publish"
-url = "https://registry.npmjs.org"
-stream = true
-auth = { secret = "NPM_TOKEN", placeholder = "npm_..." }
-
-  [upstream.headers]
-  Authorization = "Bearer {{secret.NPM_TOKEN}}"
-
-# Publishing is effectively irreversible (unpublish is restricted) → passkey for
-# EVERY publish. No policy.toml: this rides the safe global default (ask-always)
-# + the streaming captive-portal (docs/STREAMING_APPROVAL.md).
+hosts = ["registry.npmjs.org"]
+secrets = ["NPM_TOKEN"]

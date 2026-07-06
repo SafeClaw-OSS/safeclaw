@@ -1,54 +1,15 @@
 setup = """
-Route `cargo publish` through SafeClaw so the crates.io token never enters cargo's
+Routed (under `sc run` / the env bundle)? Nothing to configure — cargo honours the
+proxy + CA env directly on every path, so the crates.io token never enters cargo's
 config, env, or the agent process.
-
-# cargo decides where to upload by reading a registry's config.json "api" field —
-# there is no `--registry <url>` like npm. So point cargo at a tiny LOCAL git index
-# whose config.json sends the upload to SafeClaw; SafeClaw injects the real
-# crates.io token and forwards to https://crates.io. cargo never sees the token.
-# cargo builds/packages locally; only the final authenticated upload is proxied.
-#
-# 1) make a local index (a git repo with one file, config.json):
-#      mkdir -p ~/.safeclaw/cratesio-index && cd ~/.safeclaw/cratesio-index
-#      printf '{"dl":"https://static.crates.io/crates","api":"{{proxy_base}}/stream/cratesio"}' > config.json
-#      git init -q && git add -A && git commit -qm init
-# 2) ~/.cargo/config.toml — define the registry (a git index = an absolute file:// path):
-#      [registries.safeclaw]
-#      index = "file:///ABS/PATH/TO/.safeclaw/cratesio-index"
-# 3) publish, authenticating to SafeClaw with the broker key (NOT the real token):
-#      CARGO_REGISTRIES_SAFECLAW_TOKEN="$SAFECLAW_API_KEY" cargo publish --registry safeclaw
-#
-# Adapt to the user's existing ~/.cargo/config.toml (don't clobber other registries).
-# "Uploaded ... to registry `safeclaw`" = SUCCESS; a following "timed out waiting
-# ... to be available" is HARMLESS (cargo is polling the local index, which won't
-# list it) — ignore it. On an approval prompt you'll get a link (also in cargo's
-# error output) — surface it, the user taps a passkey, then re-run the same command.
+Not routed? Prefix the publish: `sc run -- cargo publish`.
+Publishing is irreversible (crates.io only yanks) — expect a passkey prompt; the
+approve link surfaces in cargo's error output. Tap it, then re-run the command.
 """
 
 [service]
 id = "cratesio"
 name = "crates.io"
 
-# Publishing a crate is a single token-authenticated HTTPS request
-# (`PUT /api/v1/crates/new`) — the same shape as git-over-HTTPS, so it rides the
-# generic streaming passthrough (/stream/). cargo runs locally (it has the crate
-# source); only the authenticated upload egress is routed through SafeClaw, which
-# injects the real crates.io token. cargo never sees the token.
-
-[[upstream]]
-id = "publish"
-url = "https://crates.io"
-stream = true
-auth = { secret = "CARGO_REGISTRY_TOKEN", placeholder = "cio..." }
-
-  [upstream.headers]
-  # crates.io's publish API authenticates with the RAW token value in the
-  # Authorization header (no "Bearer " prefix).
-  Authorization = "{{secret.CARGO_REGISTRY_TOKEN}}"
-
-# Publishing is IRREVERSIBLE (crates.io only yanks, never deletes) → require a
-# passkey for EVERY publish. No policy.toml: this rides the safe global default
-# (ask-always) + the streaming captive-portal (docs/STREAMING_APPROVAL.md): the
-# agent runs `cargo publish`, the broker rejects-before-forward with an approve
-# link (also pushed over SSE), the user taps their passkey, and the retried
-# publish is authorized single-use.
+hosts = ["crates.io"]
+secrets = ["CARGO_REGISTRY_TOKEN"]

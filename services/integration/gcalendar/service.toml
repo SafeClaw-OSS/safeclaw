@@ -2,23 +2,12 @@
 id = "gcalendar"
 name = "Google Calendar"
 
-[[upstream]]
-id = "default"
-url = "https://www.googleapis.com/calendar/v3"
+hosts = ["www.googleapis.com"]
+secrets = ["GOOGLE_CALENDAR_REFRESH_TOKEN"]
 
-[upstream.auth]
+[oauth2]
 provider = "google"
 scopes = [
   "https://www.googleapis.com/auth/calendar.events",
 ]
-secret = "GOOGLE_CALENDAR_REFRESH_TOKEN"
-
-[upstream.headers]
-Authorization = "Bearer {{oauth.access_token}}"
-
-[[api]]
-path = "*"
-
-  [[api.steps]]
-  target = "upstream:default"
-  returns = true
+refresh_token = "GOOGLE_CALENDAR_REFRESH_TOKEN"

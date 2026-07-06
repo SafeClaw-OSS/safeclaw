@@ -2,25 +2,14 @@
 id = "gmail"
 name = "Gmail"
 
-[[upstream]]
-id = "default"
-url = "https://gmail.googleapis.com"
+hosts = ["gmail.googleapis.com"]
+secrets = ["GMAIL_REFRESH_TOKEN"]
 
-[upstream.auth]
+[oauth2]
 provider = "google"
 scopes = [
   "https://www.googleapis.com/auth/gmail.send",
   "https://www.googleapis.com/auth/gmail.readonly",
   "https://www.googleapis.com/auth/gmail.modify",
 ]
-secret = "GMAIL_REFRESH_TOKEN"
-
-[upstream.headers]
-Authorization = "Bearer {{oauth.access_token}}"
-
-[[api]]
-path = "*"
-
-  [[api.steps]]
-  target = "upstream:default"
-  returns = true
+refresh_token = "GMAIL_REFRESH_TOKEN"

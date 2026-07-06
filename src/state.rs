@@ -83,19 +83,19 @@ pub struct SecretsCache {
     /// `ask-always` services are deliberately absent (PROTOCOL.md §6.2
     /// "ask-always 服务: 永不进 cache").
     pub entries: HashMap<String, CacheEntry>,
-    /// service_id → { secret_name → bytes } for every `{{secret.NAME}}` an
-    /// `allow`-level recipe references. Populated at unlock bootstrap so the
-    /// allow fast-path can render *multi-secret* recipes (e.g. a Twilio-style
+    /// service_id → { secret_name → bytes } for every direct secret an
+    /// `allow`-level service references. Populated at unlock bootstrap so the
+    /// allow fast-path can resolve *multi-secret* services (e.g. a Twilio-style
     /// `account_sid` + `auth_token` pair) without a vault view — which only
-    /// exists behind a fresh grant. Single-secret recipes get a one-entry
-    /// map; oauth recipes get no entry (their token comes from `oauth_access`).
+    /// exists behind a fresh grant. Single-secret services get a one-entry
+    /// map; oauth services get no entry (their token comes from `oauth_access`).
     /// Lives the whole unlocked session (allow semantics); wiped on lock.
     pub allow_secrets: HashMap<String, HashMap<String, Vec<u8>>>,
     /// The effective policy tree — the vault's `aux.policy` overlaid on the
     /// compiled-in `Policy::default()` at unlock/refresh (so unset parts use
     /// safe defaults). Holds the risk map, default floors, per-category, and
     /// per-connection user policy. Built-in per-service rules are NOT cached
-    /// here — they're read live from the recipe registry at eval and merged
+    /// here — they're read live from the service registry at eval and merged
     /// with this tree's `connections.<id>.rules`. Rebuilt on every vault write
     /// → a `risk` / map edit is realtime on the next request.
     pub policy: crate::core::policy::Policy,
@@ -108,12 +108,15 @@ pub struct SecretsCache {
     /// requests *of the same scope* within the TTL fast-path without
     /// re-prompting. `ask-always` never lands here; `allow` doesn't need it.
     ///
-    /// Key shape: `(connection_id, rule_id, method)`. The grant is bound to:
+    /// Key shape: `(connection_id, rule_id, method, host)`. The grant is bound to:
     ///   - the **connection** — approving account A's send never fast-paths B;
     ///   - the matched **policy rule** — which carries the path scope, so a
     ///     grant can never reach beyond the rule the user's approval matched;
     ///   - the **HTTP method** — so approving a read (GET) never silently
-    ///     authorizes a later write (POST/DELETE) inside the window.
+    ///     authorizes a later write (POST/DELETE) inside the window;
+    ///   - the resolved **destination host** — an approval for host A must not
+    ///     authorize host B within the TTL (host is request data in the
+    ///     phantom-only model: one connection may anchor several hosts).
     /// A category-/connection-default Ask (no rule matched) is deliberately
     /// **not cached** — it has no author-defined path scope to bound a grant,
     /// so it re-prompts every request. Value: Unix-epoch-second expiry.
@@ -121,7 +124,7 @@ pub struct SecretsCache {
     /// Lives in the same memory window as the rest of the cache: dropped on
     /// lock (which zero-outs the entire cache via Default drop). Daemon
     /// restart also blows it away (vaults boot Locked, cache starts empty).
-    pub rule_approvals: HashMap<(String, String, String), u64>,
+    pub rule_approvals: HashMap<(String, String, String, String), u64>,
     /// Item names present in the decrypted `native-secrets` kv (names only,
     /// never values). Surface for `GET /v/{vid}/secret-keys` so the frontend
     /// can decide which services are "reachable" without paying for an
@@ -149,21 +152,27 @@ pub struct SecretsCache {
     /// generic eviction doesn't apply here — `oauth_access_lookup`
     /// has its own lazy eviction below.
     ///
-    /// Keyed by **connection_id** (not service): two Gmail accounts mint and
-    /// cache independent access tokens.
+    /// Keyed by **`sha256(refresh_token)`** hex (§5): the access token is a pure
+    /// function of the refresh token, so keying on the INPUT auto-invalidates on
+    /// reconnect / refresh rotation (new refresh → natural miss → fresh mint) and
+    /// two accounts never collide for free (different refresh → different key).
     pub oauth_access: HashMap<String, CacheEntry>,
-    /// Routing snapshot: `connection_id → { service, config }`, taken from
-    /// `aux.connections` at unlock (CONNECTION_SCHEMA.md §6). A request at
-    /// `/use/<conn>` resolves its service through this map (falling back to
+    /// Routing snapshot: `connection_id → { service, hosts }`, taken from
+    /// `aux.connections` at unlock (CONNECTION_SCHEMA.md §6). A brokered request
+    /// resolves its connection's service through this map (falling back to
     /// `conn` itself when absent — an unconnected service IS its own default
-    /// connection). `config` feeds `{{connection.<param>}}` slots. Wiped on lock.
+    /// connection). Wiped on lock.
     ///
     /// NOTE on the maps above (`entries`, `allow_secrets`, `oauth_access`,
-    /// `rule_approvals`): for connection-routed `/use`/`/stream` the daemon keys
-    /// them by **connection_id**, so two connections of one service never share a
-    /// cache slot. Policy is likewise per-connection (`policy.connections.<id>`),
-    /// while the built-in rules it merges come from the shared service recipe.
+    /// `rule_approvals`): the daemon keys them by **connection_id**, so two
+    /// connections of one service never share a cache slot. Policy is likewise
+    /// per-connection (`policy.connections.<id>`), while the built-in rules it
+    /// merges come from the shared service definition.
     pub connections: HashMap<String, crate::storage::plaintext::Connection>,
+    /// Custom (per-vault `aux.services`) service definitions, validated at
+    /// unlock. Wiped on lock (Default drop). A custom service folds into
+    /// discovery like a compiled one and never shadows a built-in id.
+    pub custom_services: HashMap<String, crate::service::ServiceDef>,
 }
 
 #[derive(Debug)]
@@ -219,6 +228,13 @@ pub struct AppState {
     /// unpaired/local-only daemon has no broker plane to gate). See
     /// [[project_vault_agent_architecture_2026_06_25]].
     pub agent_key_hashes: Mutex<std::collections::HashSet<String>>,
+    /// Serializer + debounce stamp for the on-auth-miss hash refresh
+    /// (`sync::refresh_agent_keys_on_miss`): a key minted seconds ago
+    /// (`sc agent add` → immediate use) must not wait out the 30s sync loop,
+    /// but a bad-key flood must not hammer the backend either. tokio Mutex —
+    /// held ACROSS the refresh fetch so concurrent misses wait for the
+    /// in-flight result instead of being bounced to a reject.
+    pub agent_key_resync: tokio::sync::Mutex<Option<std::time::Instant>>,
     /// OAuth connections whose refresh_token was rejected (`invalid_grant`) at
     /// /use — surfaced via `/registry` as `needs_reauth` so the console prompts a
     /// reconnect. Keyed by `(vault_id, connection_id)`. In-memory + self-healing:
@@ -253,6 +269,7 @@ impl AppState {
             vault_write_locks: Mutex::new(HashMap::new()),
             sse_semaphores: Mutex::new(HashMap::new()),
             agent_key_hashes: Mutex::new(std::collections::HashSet::new()),
+            agent_key_resync: tokio::sync::Mutex::new(None),
             oauth_reauth_needed: Mutex::new(std::collections::HashSet::new()),
             live_ceremony_ops: Mutex::new(HashMap::new()),
         }
@@ -323,11 +340,11 @@ impl AppState {
         }
     }
 
-    /// Resolve a `connection_id` to its service (recipe) for an Unlocked vault
+    /// Resolve a `connection_id` to its service for an Unlocked vault
     /// (CONNECTION_SCHEMA.md §6). An explicit `aux.connections` entry names its
     /// `service`; otherwise the connection IS its own default — `conn == service`
-    /// — which keeps `/use/<service>` working for unconnected/API-key services
-    /// and the default OAuth connection. Locked vault → falls back to `conn`
+    /// — which keeps unconnected/API-key services and the default OAuth
+    /// connection resolvable. Locked vault → falls back to `conn`
     /// (the caller's locked-gate rejects before any real use).
     pub fn resolve_connection_service(&self, vault_id: &str, conn: &str) -> String {
         let states = self.vault_states.lock().unwrap();
@@ -335,27 +352,25 @@ impl AppState {
             Some(VaultState::Unlocked { cache, .. }) => cache
                 .connections
                 .get(conn)
-                .map(|c| c.service.clone())
+                .and_then(|c| c.service.clone())
                 .unwrap_or_else(|| conn.to_string()),
             _ => conn.to_string(),
         }
     }
 
-    /// The per-connection config slot values (`{{connection.<param>}}` sources)
-    /// for an Unlocked vault, or `None` when the connection has no explicit
-    /// record / no config (the common default case).
-    pub fn connection_config(
+    /// A custom (per-vault `aux.services`) service definition, cloned out so no
+    /// state lock is held across a forward. `None` when the vault is locked or
+    /// the id isn't a custom service.
+    pub fn custom_service(
         &self,
         vault_id: &str,
-        conn: &str,
-    ) -> Option<std::collections::BTreeMap<String, String>> {
+        service_id: &str,
+    ) -> Option<crate::service::ServiceDef> {
         let states = self.vault_states.lock().unwrap();
         match states.get(vault_id) {
-            Some(VaultState::Unlocked { cache, .. }) => cache
-                .connections
-                .get(conn)
-                .map(|c| c.config.clone())
-                .filter(|m| !m.is_empty()),
+            Some(VaultState::Unlocked { cache, .. }) => {
+                cache.custom_services.get(service_id).cloned()
+            }
             _ => None,
         }
     }
@@ -387,10 +402,10 @@ impl AppState {
         Some(entry.value.clone())
     }
 
-    /// Look up the full `{ secret_name → bytes }` map an allow-level recipe
-    /// needs to render its templates. Returns `None` if the vault is locked
+    /// Look up the full `{ secret_name → bytes }` map an allow-level service
+    /// needs to resolve its phantoms. Returns `None` if the vault is locked
     /// or the service wasn't bootstrapped with a named-secret set (e.g. an
-    /// oauth recipe, or one resolved post-approval). The allow fast-path
+    /// oauth service, or one resolved post-approval). The allow fast-path
     /// falls back to a single-secret map keyed by the primary in that case.
     pub fn cache_lookup_secrets(
         &self,
@@ -453,10 +468,10 @@ impl AppState {
         Some(entry.value)
     }
 
-    /// Look up a cached OAuth `access_token` for `(vault, service)`.
-    /// Returns `None` if locked, never minted, or past its expiry.
-    /// Lazily evicts expired entries (same shape as `cache_lookup`).
-    pub fn oauth_access_lookup(&self, vault_id: &str, conn_id: &str) -> Option<Vec<u8>> {
+    /// Look up a cached OAuth `access_token` by `sha256(refresh_token)` hex (§5).
+    /// Returns `None` if locked, never minted, or past its expiry. Lazily evicts
+    /// expired entries (same shape as `cache_lookup`).
+    pub fn oauth_access_lookup(&self, vault_id: &str, refresh_hash: &str) -> Option<Vec<u8>> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -466,32 +481,32 @@ impl AppState {
             Some(VaultState::Unlocked { cache, .. }) => cache,
             _ => return None,
         };
-        let entry = cache.oauth_access.get(conn_id)?;
+        let entry = cache.oauth_access.get(refresh_hash)?;
         if let Some(exp) = entry.expires_at {
             if now >= exp {
-                cache.oauth_access.remove(conn_id);
+                cache.oauth_access.remove(refresh_hash);
                 return None;
             }
         }
         Some(entry.value.clone())
     }
 
-    /// Store a freshly-minted OAuth `access_token`. `expires_at` should
-    /// be the provider-reported absolute expiry minus a small safety
-    /// margin (the broker uses ~60s) so we refresh before the upstream
-    /// would reject. No-op when the vault is locked at the time of
+    /// Store a freshly-minted OAuth `access_token` under `sha256(refresh_token)`
+    /// hex (§5). `expires_at` should be the provider-reported absolute expiry
+    /// minus a small safety margin (the broker uses ~60s) so we refresh before
+    /// the upstream would reject. No-op when the vault is locked at the time of
     /// the call.
     pub fn oauth_access_insert(
         &self,
         vault_id: &str,
-        conn_id: &str,
+        refresh_hash: &str,
         value: Vec<u8>,
         expires_at: u64,
     ) {
         let mut states = self.vault_states.lock().unwrap();
         if let Some(VaultState::Unlocked { cache, .. }) = states.get_mut(vault_id) {
             cache.oauth_access.insert(
-                conn_id.to_string(),
+                refresh_hash.to_string(),
                 CacheEntry {
                     value,
                     expires_at: Some(expires_at),
@@ -541,7 +556,7 @@ impl AppState {
     /// Returned tuple: `(effective_level, matched_rule_id, ttl_seconds)`.
     ///
     /// Resolution (PROTOCOL.md §6.4):
-    ///   - merge the service recipe's built-in rules with this connection's
+    ///   - merge the service's built-in rules with this connection's
     ///     user rules (`cache.policy.connections[conn].rules`),
     ///   - most-restrictive matching rule wins (deny-override), its `risk`
     ///     resolved through the live risk map (`cache.policy.risk`),
@@ -557,6 +572,7 @@ impl AppState {
         service_id: &str,
         method: &str,
         path: &str,
+        host: &str,
         body: Option<&str>,
     ) -> Option<(crate::core::policy::AccessLevel, Option<String>, Option<u64>)> {
         let now = SystemTime::now()
@@ -568,7 +584,7 @@ impl AppState {
             Some(VaultState::Unlocked { cache, .. }) => cache,
             _ => return None,
         };
-        // Built-in rules come from the connection's *service* recipe (static);
+        // Built-in rules come from the connection's *service* definition (static);
         // the user's per-connection edits/additions (`aux.policy.connections.
         // <id>.rules`) merge on top. The merge is per-connection so two
         // connections of the same service can be policed independently.
@@ -583,11 +599,11 @@ impl AppState {
             conn_policy.map(|c| &c.rules).unwrap_or(&empty_rules),
         );
         // Connection default floor (when no rule matches): user's per-connection
-        // override field-wise over the recipe's `[default]`.
-        let recipe_levels = self.services.default_policy_levels(service_id);
+        // override field-wise over the service's `[default]`.
+        let builtin_levels = self.services.default_policy_levels(service_id);
         let connection_levels = crate::core::policy::merge_levels(
             conn_policy.and_then(|c| c.default.as_ref()),
-            recipe_levels.as_ref(),
+            builtin_levels.as_ref(),
         );
         // The risk map + category/global floors live in `cache.policy` (the
         // user's `aux.policy` overlaid on compiled defaults at refresh). Read
@@ -617,9 +633,15 @@ impl AppState {
         // `allow` doesn't need to.
         if level == crate::core::policy::AccessLevel::Ask {
             if let Some(rule_id) = matched_rule.clone() {
-                // The grant is scoped to the **connection** (not the service):
-                // approving account A's send never fast-paths account B's.
-                let key = (connection_id.to_string(), rule_id, method.to_string());
+                // The grant is scoped to the **connection** (not the service),
+                // the matched rule, the method, AND the resolved host: an
+                // approval for host A must not fast-path host B in the window.
+                let key = (
+                    connection_id.to_string(),
+                    rule_id,
+                    method.to_string(),
+                    host.to_ascii_lowercase(),
+                );
                 if let Some(&exp) = cache.rule_approvals.get(&key) {
                     if exp > now {
                         return Some((
@@ -658,6 +680,7 @@ impl AppState {
         connection_id: &str,
         rule_id: Option<String>,
         method: &str,
+        host: &str,
         ttl_seconds: u64,
     ) {
         // No rule scope → not cacheable (see doc above).
@@ -669,11 +692,97 @@ impl AppState {
         let mut states = self.vault_states.lock().unwrap();
         if let Some(VaultState::Unlocked { cache, .. }) = states.get_mut(vault_id) {
             cache.rule_approvals.insert(
-                (connection_id.to_string(), rule_id, method.to_string()),
+                (
+                    connection_id.to_string(),
+                    rule_id,
+                    method.to_string(),
+                    host.to_ascii_lowercase(),
+                ),
                 now + ttl_seconds,
             );
         }
     }
+
+    // ── Proxy-facing accessors (resident phantom-only proxy) ─────────────────
+
+    /// Clone a connection record out of the unlocked routing snapshot. `None`
+    /// when the vault is Locked or the connection id is unknown.
+    pub fn connection_snapshot(
+        &self,
+        vault_id: &str,
+        conn: &str,
+    ) -> Option<crate::storage::plaintext::Connection> {
+        let states = self.vault_states.lock().unwrap();
+        match states.get(vault_id) {
+            Some(VaultState::Unlocked { cache, .. }) => cache.connections.get(conn).cloned(),
+            _ => None,
+        }
+    }
+
+    /// The exact FQDNs a connection's credential may egress to, resolved
+    /// through the compiled registry and the vault's custom services. `None`
+    /// when the vault is Locked or the connection id is unknown.
+    pub fn resolved_hosts_for(&self, vault_id: &str, conn: &str) -> Option<Vec<String>> {
+        let states = self.vault_states.lock().unwrap();
+        let cache = match states.get(vault_id) {
+            Some(VaultState::Unlocked { cache, .. }) => cache,
+            _ => return None,
+        };
+        let conn_rec = cache.connections.get(conn)?;
+        let def = conn_rec.service.as_deref().and_then(|s| {
+            self.services
+                .get(s)
+                .cloned()
+                .or_else(|| cache.custom_services.get(s).cloned())
+        });
+        Some(crate::core::host::resolved_hosts(conn_rec, def.as_ref()))
+    }
+
+    /// True iff `host` is in the union of `resolved_hosts` over the connections
+    /// of ALL currently-unlocked vaults. Decides MITM-vs-blind-tunnel at CONNECT
+    /// time: only hosts a connection anchors are decrypted; everything else is a
+    /// blind tunnel. Not vid-scoped on purpose — we MITM (and can return a
+    /// precise error) even when the CONNECT's vid userinfo is wrong or absent.
+    pub fn host_in_any_unlocked_union(&self, host: &str) -> bool {
+        let states = self.vault_states.lock().unwrap();
+        for st in states.values() {
+            let VaultState::Unlocked { cache, .. } = st else {
+                continue;
+            };
+            for conn_rec in cache.connections.values() {
+                let def = conn_rec.service.as_deref().and_then(|s| {
+                    self.services
+                        .get(s)
+                        .cloned()
+                        .or_else(|| cache.custom_services.get(s).cloned())
+                });
+                for h in crate::core::host::resolved_hosts(conn_rec, def.as_ref()) {
+                    if crate::core::host::host_matches_exact(host, &h) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Session-level host widen (component C partial): append an exact FQDN to a
+    /// connection's anchored hosts in the unlocked routing snapshot so the
+    /// agent's retried request passes the anchor. Durable persistence into
+    /// `aux.connections` is a separate write (see BUILD_NOTES). No-op when the
+    /// vault is Locked or the connection is unknown.
+    pub fn widen_connection_host(&self, vault_id: &str, conn: &str, host: &str) {
+        let mut states = self.vault_states.lock().unwrap();
+        if let Some(VaultState::Unlocked { cache, .. }) = states.get_mut(vault_id) {
+            if let Some(conn_rec) = cache.connections.get_mut(conn) {
+                let hosts = conn_rec.hosts.get_or_insert_with(Vec::new);
+                if !hosts.iter().any(|h| h.eq_ignore_ascii_case(host)) {
+                    hosts.push(host.to_string());
+                }
+            }
+        }
+    }
+
 }
 
 #[cfg(test)]
@@ -686,6 +795,7 @@ mod tests {
         let cfg = Config {
             state_dir: PathBuf::from(format!("/tmp/safeclaw-test-{}", std::process::id())),
             port: 0,
+            proxy_port: 0,
             listen: "127.0.0.1".into(),
             origin: "http://localhost".into(),
             rp_id: "localhost".into(),
@@ -773,7 +883,7 @@ mod tests {
         use crate::core::policy::{AccessLevel, ConnectionPolicy, Policy, RiskTier, RuleConfig};
 
         // Inject the test rules as the connection's user rules (medium → ask).
-        // "gh" has no recipe, so built-in is empty and these are the only rules.
+        // "gh" has no service definition, so built-in is empty and these are the only rules.
         let ask_rule = |pat: &str| RuleConfig {
             match_pattern: Some(pat.to_string()),
             risk: Some(RiskTier::Medium),
@@ -797,23 +907,34 @@ mod tests {
         // Baseline: GET resolves to Ask under the "read" rule. (Default
         // connection: connection_id == service_id == "gh".)
         let (lvl, rule, _) = state
-            .evaluate_request_policy(vid, "gh", "gh", "GET", "/x", None)
+            .evaluate_request_policy(vid, "gh", "gh", "GET", "/x", "api.gh.com", None)
             .unwrap();
         assert_eq!(lvl, AccessLevel::Ask);
         assert_eq!(rule.as_deref(), Some("read"));
 
-        // User approves that GET.
-        state.record_ask_approval(vid, "gh", Some("read".to_string()), "GET", 60);
+        // User approves that GET toward host A.
+        state.record_ask_approval(vid, "gh", Some("read".to_string()), "GET", "api.gh.com", 60);
 
-        // The same GET now fast-paths (the feature still works).
+        // The same GET toward the same host now fast-paths (the feature works).
         let (lvl, _, _) = state
-            .evaluate_request_policy(vid, "gh", "gh", "GET", "/x", None)
+            .evaluate_request_policy(vid, "gh", "gh", "GET", "/x", "api.gh.com", None)
             .unwrap();
         assert_eq!(lvl, AccessLevel::Allow, "approved GET should fast-path");
 
+        // Same GET/rule toward a DIFFERENT host must NOT fast-path — the grant
+        // is host-scoped (E2E-5 oracle: approve host A → call host B → re-ask).
+        let (lvl, _, _) = state
+            .evaluate_request_policy(vid, "gh", "gh", "GET", "/x", "evil.gh.com", None)
+            .unwrap();
+        assert_eq!(
+            lvl,
+            AccessLevel::Ask,
+            "approving host A must never fast-path host B"
+        );
+
         // A POST is a DIFFERENT verb/rule — the GET approval must not cover it.
         let (lvl, rule, _) = state
-            .evaluate_request_policy(vid, "gh", "gh", "POST", "/x", None)
+            .evaluate_request_policy(vid, "gh", "gh", "POST", "/x", "api.gh.com", None)
             .unwrap();
         assert_eq!(
             lvl,
@@ -824,6 +945,6 @@ mod tests {
 
         // A category-default Ask (no rule) is never recorded, so it can never
         // produce a fast-path — record is a no-op for rule_id == None.
-        state.record_ask_approval(vid, "gh", None, "GET", 60);
+        state.record_ask_approval(vid, "gh", None, "GET", "api.gh.com", 60);
     }
 }

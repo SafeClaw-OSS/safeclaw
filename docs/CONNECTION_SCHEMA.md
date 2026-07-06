@@ -1,6 +1,17 @@
 # Connection Data Schema
 
-> **⚠️ PARTIALLY SUPERSEDED (2026-07-03 phantom-only pivot).** The `Connection{service, config}` struct described here becomes `Connection{service: Option, hosts: Option}` — `config` deleted, host promoted; `/use`/`/stream` routing retired; the connecting→connections OAuth lifecycle and aux layout remain valid. Canon = [CREDENTIAL_BROKER.md](./CREDENTIAL_BROKER.md); toml rules = [SERVICES.md](./SERVICES.md) v4.
+> **⚠️ PARTIALLY SUPERSEDED (2026-07-03 phantom-only pivot; schema rework
+> 2026-07-04).** The `Connection{service, config}` struct described here is now
+> `Connection{service?, hosts?, secrets?}` — `config` deleted, `hosts` promoted,
+> and an explicit `secrets` list added (REQUIRED for a raw connection, omitted for
+> a service-backed one — §2/§3). `/use`/`/stream` routing is retired (phantom
+> placement instead); `aux.connecting[<id>]` now nests its OAuth temps under an
+> `oauth2` key (`{code, code_verifier, error?}`, was flat `code`/`verifier`). The
+> connecting→connections OAuth lifecycle and the cloud-blind connect stay valid.
+> The recipe **config-slot / `{{template}}`** mechanism (§4, §8) is retired — a
+> self-hosted upstream is now just a **raw connection**. Canon =
+> [CREDENTIAL_BROKER.md](./CREDENTIAL_BROKER.md); toml rules =
+> [SERVICES.md](./SERVICES.md) v4.
 
 > THE data-schema reference for *connections* — the exact shapes in a vault and
 > how secrets, status, and routing derive from them. Companion to
@@ -48,47 +59,61 @@ from `connecting`** — there is never a partial/duplicate record.
 ```jsonc
 "aux": {
   "connecting": {
-    "gmail-work": {
-      "service":  "gmail",                 // the recipe (TYPE) being instantiated
-      "config":   { },                     // recipe-declared re-map slots (§4); usually empty
-      "code":     "<authorization code>",  // single-use; from the loopback redirect
-      "verifier": "<PKCE code_verifier>"   // browser-generated; the daemon needs it to exchange
+    "gmail_work": {
+      "service": "gmail",                  // the service (TYPE) being instantiated
+      "hosts":   null,                     // pinned FQDNs for a *.suffix service, else absent
+      "oauth2": {                          // mechanism handshake state nests under its key
+        "code":          "<authorization code>",  // RFC 6749; single-use, from the loopback redirect
+        "code_verifier": "<PKCE verifier>",        // RFC 7636; browser-generated
+        "error":         null              // set by the daemon on terminal invalid_grant
+      }
     }
   }
 }
 ```
 
-`redirect_uri` is **not** here — it's a fixed property of the OAuth client, held
-in the provider config (§5).
+Generic identity (`service`, `hosts`) is top-level; mechanism handshake state
+nests under the mechanism key (`oauth2`), so a future auth mechanism nests under
+ITS key without the schema getting messy. `redirect_uri` is **not** here — it's a
+fixed property of the OAuth client, held in the provider config (§5).
 
 ### `aux.connections[<connection_id>]` — established
 
 ```jsonc
 "aux": {
   "connections": {
-    "gmail":       { "service": "gmail" },
-    "gmail-work":  { "service": "gmail" },                              // 2nd instance, same type
-    "acme-gitlab": { "service": "gitlab", "config": { "host": "git.acme.com" } }
+    "gmail":      { "service": "gmail" },                          // default: hosts+secrets derived
+    "gmail_work": { "service": "gmail" },                          // 2nd instance, same type
+    "stripe_key": { "hosts": ["api.stripe.com"], "secrets": ["STRIPE_KEY"] }  // RAW: no service
   }
 }
 ```
 
 | field | notes |
 |---|---|
-| **`<connection_id>`** (map key) | The user's **handle** *and* its identity — a slug `^[a-z0-9][a-z0-9_-]{0,63}$`. The routing / cache / audit unit. No separate `label` (one field, no duplicated semantic; rename = new id = re-key, fine pre-launch). |
-| **`service`** | Which recipe (TYPE) this instantiates. Decouples id from type → many connections per service. |
-| **`config`** | Per-connection values for the recipe-declared re-map slots only (§4). Omitted when none. |
+| **`<connection_id>`** (map key) | The user's **handle** *and* its identity — a lowercase slug `[a-z0-9_]`, starting alphanumeric, ≤64 chars, no `__` (the phantom delimiter). The routing / cache / audit unit. No separate `label` (one field, no duplicated semantic; rename = new id = re-key, fine pre-launch). |
+| **`service`** | Which service (TYPE) this instantiates, or **absent** for a **raw** connection. Decouples id from type → many connections per service. |
+| **`hosts`** | Anchored egress FQDNs. **Absent** when a service declares exact hosts (derived, no stored copy); the pinned exact FQDNs (⊆ the service's `*.suffix`) when the service is wildcard; **required** for a raw connection. Enforced exact-FQDN, case-insensitive; never a bare `*`. |
+| **`secrets`** | The UPPERCASE secret KEYs this connection uses. **Required for a raw connection** (answers "which secrets" directly, killing the reverse-index-by-casing hack); **omitted** for a service-backed one (derived from the service's declared `secrets`, incl. the oauth2 refresh key). |
 
 ---
 
 ## 3. Secrets — mainstream names, optional connection prefix
 
-- Secret keys are **mainstream, ALL-CAPS, community-standard** — `GITHUB_TOKEN`,
-  `OPENAI_API_KEY`, `GOOGLE_REFRESH_TOKEN`. **Never invented.** The recipe
-  **DEFINEs** them (§4).
-- A secret's address is **`[<connection_id>:]<MAINSTREAM_KEY>`**:
-  - **default / single** connection → **no prefix** → bare `GOOGLE_REFRESH_TOKEN`.
-  - **named** connection → `gmail-work:GOOGLE_REFRESH_TOKEN`.
+- Secret keys are **mainstream, UPPERCASE `[A-Z0-9_]`, community-standard** —
+  `GITHUB_TOKEN`, `OPENAI_API_KEY`, `GMAIL_REFRESH_TOKEN`. **Never invented.**
+  `sc set` / the console **force-uppercase** on input (a lowercase key is
+  auto-converted, never stored lowercase) — one canonical form. Connection ids and
+  secret roles are lowercase; **every key ↔ conn-id ↔ host comparison is
+  case-insensitive.** For a service-backed connection the service DEFINEs the keys
+  (§4); a raw connection names its own in `secrets` (§2).
+- A **raw** connection stores each secret **bare** at its UPPERCASE KEY (the flat
+  pool is an env namespace; two raw connections naming the same KEY share it).
+- A **service-backed** connection addresses each secret via `secret_address` =
+  **`[<connection_id>:]<ROLE>`**:
+  - **default** connection (`conn_id == service_id`) → **no prefix** → bare
+    `GMAIL_REFRESH_TOKEN`.
+  - **named** connection → `gmail_work:GMAIL_REFRESH_TOKEN`.
 - The `:` delimiter is invalid in env-var names → a namespaced key can never
   masquerade as an env var.
 - The address resolves through the normal **`store_order`** (native secrets →
@@ -97,9 +122,9 @@ in the provider config (§5).
 
 ```jsonc
 "secrets": {
-  "GOOGLE_REFRESH_TOKEN":            "<bytes>",   // default gmail connection — bare
-  "gmail-work:GOOGLE_REFRESH_TOKEN": "<bytes>",   // named connection — prefixed
-  "acme-gitlab:GITLAB_TOKEN":        "<bytes>"
+  "GMAIL_REFRESH_TOKEN":            "<bytes>",   // default gmail connection — bare
+  "gmail_work:GMAIL_REFRESH_TOKEN": "<bytes>",   // named service-backed connection — prefixed
+  "STRIPE_KEY":                     "<bytes>"    // raw stripe_key connection — bare
 }
 ```
 
@@ -112,28 +137,30 @@ connection's secret in an external store is an edge case for later.
 
 ---
 
-## 4. The recipe DEFINEs the roles + the config slots
+## 4. The service DEFINEs the secret roles
 
-The `service.toml` (the TYPE) declares two things a connection may fill, and
-nothing else:
+The `service.toml` (the TYPE) declares what a connection may fill, and nothing
+else:
 
-- **secret roles** — by mainstream name (e.g. `GOOGLE_REFRESH_TOKEN`). A
-  connection supplies *values* for exactly these; it **cannot add or rename**
-  keys.
-- **config params** that are per-connection (e.g. `host` for a self-hosted
-  upstream).
+- **secret roles** — by mainstream name (e.g. `GMAIL_REFRESH_TOKEN`). A
+  service-backed connection supplies *values* for exactly these; it **cannot add
+  or rename** keys.
+- The old per-connection **config slots** (`{{connection.host}}` for a
+  self-hosted upstream) are **retired** — a self-hosted upstream is now just a
+  **raw connection** (its own `hosts` + `secrets`, no service). A wildcard service
+  lets an instance only PIN an exact FQDN ⊆ its `*.suffix`, never re-point.
 
 Everything else — endpoints, `auth_mode`, scopes, the egress host of a normal
-recipe — is **fixed by the type**. A connection can **never** re-point an
-audited recipe's host or token endpoint (that would be SSRF / hijack). This is
+service — is **fixed by the type**. A connection can **never** re-point an
+audited service's host or token endpoint (that would be SSRF / hijack). This is
 the hard security boundary of the connection layer.
 
 **Why DEFINE, not SUGGEST.** A credential's role name is a property of the
-upstream **type**, not the instance (`gmail` always needs `GOOGLE_REFRESH_TOKEN`
+upstream **type**, not the instance (`gmail` always needs `GMAIL_REFRESH_TOKEN`
 regardless of which account). With mainstream names, letting a connection rename
 keys would break the very ecosystem-interop §3 buys — so the "flexibility" of
 suggest is a footgun here. A genuine variant (an upstream that needs an extra
-credential) is a **custom recipe**, not a per-connection key definition.
+credential) is a **custom service**, not a per-connection key definition.
 
 ---
 
@@ -149,11 +176,12 @@ credential) is a **custom recipe**, not a per-connection key definition.
 | in neither | **Not configured** |
 
 **Connect (cloud-blind).** The browser drives Google consent (public Desktop
-client + PKCE), captures the `code`, and seals `{ service, config, code,
-verifier }` into `aux.connecting[<id>]` → uploads (the cloud only ever stores
-ciphertext). The daemon syncs the blob, exchanges (`code` + `verifier` + the
-provider's fixed `client` / `token_url` / `redirect_uri`), writes the secret,
-and **moves the entry into `aux.connections`**. No backend ever sees the token.
+client + PKCE), captures the `code`, and seals `{ service, hosts?, oauth2: {
+code, code_verifier } }` into `aux.connecting[<id>]` → uploads (the cloud only
+ever stores ciphertext). The daemon syncs the blob, exchanges (`code` +
+`code_verifier` + the provider's fixed `client` / `token_url` / `redirect_uri`),
+writes the secret, and **moves the entry into `aux.connections`**. No backend
+ever sees the token.
 
 `redirect_uri` is a constant of the OAuth client → it lives in the **provider
 config**, not in each handshake.
@@ -164,7 +192,7 @@ A connection's policy is keyed by the same `connection_id` under
 **`aux.policy.connections.<connection_id>`** — NOT per-service. The built-in rule
 set comes from the connection's *service* recipe (`policy.toml`); the user's
 sparse edits/additions merge on top (`ConnectionPolicy { default?, rules }`). Two
-connections of the same service (`gmail`, `gmail-work`) therefore get independent
+connections of the same service (`gmail`, `gmail_work`) therefore get independent
 policy overrides. The full policy model — risk tiers, the risk→level map, the
 default floors, deny-override resolution, `ttl` — is in
 [POLICY_RISK_TIERS.md](POLICY_RISK_TIERS.md); the whole `aux.policy` tree is in
@@ -174,42 +202,53 @@ default floors, deny-override resolution, `ttl` — is in
 
 ## 6. Routing
 
-- A connection is addressed at **`/use/<connection_id>`** and
-  **`/stream/<connection_id>`**.
-- Per request the daemon resolves **`connection_id → connections[id].service →
-  recipe`** once, then injects using the recipe + that connection's secrets.
-- `connection_id` is the broker cache key `(vault, connection_id)`, the op
-  scope, and the audit unit.
+- A connection is **not addressed by URL** — the **phantom**
+  `__sc__<connection_id>__[<role>__]` carries the intent, and the traffic goes
+  through the local HTTPS proxy (`/use` / `/stream` endpoints are retired). See
+  [CREDENTIAL_BROKER.md](./CREDENTIAL_BROKER.md).
+- The proxy resolves **phantom → `connection_id` → its secret(s)**, validates the
+  destination host against the connection's `resolved_hosts`, then substitutes at
+  egress.
+- `connection_id` is the op scope and the audit unit. The OAuth mint cache keys on
+  **`sha256(refresh_token)`** (in-memory, wiped on lock) — not `(vault,
+  connection_id)`.
 
 ---
 
-## 7. Full example — two Gmail accounts + a self-hosted GitLab
+## 7. Full example — two Gmail accounts + a raw self-hosted GitLab
 
 ```jsonc
 "aux": {
   "connecting": {
-    "gmail-work": { "service": "gmail", "config": {}, "code": "4/0Ab…", "verifier": "dBj…" }
+    "gmail_work": { "service": "gmail", "oauth2": { "code": "4/0Ab…", "code_verifier": "dBj…" } }
   },
   "connections": {
-    "gmail":       { "service": "gmail" },
-    "acme-gitlab": { "service": "gitlab", "config": { "host": "git.acme.com" } }
+    "gmail":       { "service": "gmail" },                                   // default, service-backed
+    "acme_gitlab": { "hosts": ["git.acme.com"], "secrets": ["GITLAB_TOKEN"] } // RAW (self-hosted)
   }
 },
 "secrets": {
-  "GOOGLE_REFRESH_TOKEN":      "<bytes>",   // default gmail — Connected
-  "acme-gitlab:GITLAB_TOKEN":  "<bytes>"    // named gitlab  — Connected
+  "GMAIL_REFRESH_TOKEN": "<bytes>",   // default gmail — Connected
+  "GITLAB_TOKEN":        "<bytes>"    // raw acme_gitlab — Connected (bare)
 }
-// gmail-work is mid-connect (in `connecting`, no secret yet) → "Connecting".
+// gmail_work is mid-connect (in `connecting`, no secret yet) → "Connecting".
 ```
 
-Lifecycle of `gmail-work`: consent → `connecting["gmail-work"] = {service, config,
-code, verifier}` → daemon exchanges → writes `gmail-work:GOOGLE_REFRESH_TOKEN`
-→ moves to `connections["gmail-work"] = {service:"gmail"}` → status flips to
-Connected.
+Lifecycle of `gmail_work`: consent → `connecting["gmail_work"] = {service, oauth2:
+{code, code_verifier}}` → daemon exchanges → writes
+`gmail_work:GMAIL_REFRESH_TOKEN` → moves to `connections["gmail_work"] =
+{service:"gmail"}` → status flips to Connected.
 
 ---
 
 ## 8. Recipe side (what drives this schema)
+
+> **RETIRED shape — kept for history.** The `[upstream.auth] secret=` /
+> `{{oauth.access_token}}` / `{{connection.host}}` recipe-template toml below is
+> superseded by **service.toml v4** ([SERVICES.md](./SERVICES.md)): `[oauth2]` with
+> RFC field names (`refresh_token = "<KEY>"`), a uniform top-level `secrets`, no
+> `[upstream.*]`, no templates. A self-hosted upstream is a **raw connection**, not
+> a `{{connection.host}}` slot.
 
 The recipe (TYPE) DEFINEs everything a connection may fill:
 

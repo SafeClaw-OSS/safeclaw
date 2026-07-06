@@ -2,24 +2,13 @@
 id = "gdrive"
 name = "Google Drive"
 
-[[upstream]]
-id = "default"
-url = "https://www.googleapis.com/drive/v3"
+hosts = ["www.googleapis.com"]
+secrets = ["GOOGLE_DRIVE_REFRESH_TOKEN"]
 
-[upstream.auth]
+[oauth2]
 provider = "google"
 scopes = [
   "https://www.googleapis.com/auth/drive.readonly",
   "https://www.googleapis.com/auth/drive.file",
 ]
-secret = "GOOGLE_DRIVE_REFRESH_TOKEN"
-
-[upstream.headers]
-Authorization = "Bearer {{oauth.access_token}}"
-
-[[api]]
-path = "*"
-
-  [[api.steps]]
-  target = "upstream:default"
-  returns = true
+refresh_token = "GOOGLE_DRIVE_REFRESH_TOKEN"

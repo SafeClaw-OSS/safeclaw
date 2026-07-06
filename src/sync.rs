@@ -243,9 +243,9 @@ fn synced_vault_ids(cfg: &crate::cli::active::CliConfig) -> Vec<String> {
     if let Some(v) = cfg.vault.as_deref().filter(|s| !s.is_empty()) {
         ids.push(v.to_string());
     }
-    for kv in &cfg.known_vaults {
+    for kv in crate::cli::active::known_vaults() {
         if !kv.vault.is_empty() && !ids.iter().any(|x| x == &kv.vault) {
-            ids.push(kv.vault.clone());
+            ids.push(kv.vault);
         }
     }
     ids
@@ -692,6 +692,10 @@ async fn fetch_agent_key_hashes(
 /// like the blob sync (no-op for a local-only/unpaired daemon). Call once
 /// before serving so the broker accepts account agent-keys from the start.
 pub async fn sync_agent_keys_once(state: &Arc<AppState>) {
+    sync_agent_keys_with_timeout(state, Duration::from_secs(15)).await;
+}
+
+async fn sync_agent_keys_with_timeout(state: &Arc<AppState>, timeout: Duration) {
     let cfg = match active::load() {
         Ok(c) => c,
         Err(_) => return,
@@ -702,7 +706,7 @@ pub async fn sync_agent_keys_once(state: &Arc<AppState>) {
     let Some(dk) = device_key() else {
         return;
     };
-    let client = match reqwest::Client::builder().timeout(Duration::from_secs(15)).build() {
+    let client = match reqwest::Client::builder().timeout(timeout).build() {
         Ok(c) => c,
         Err(_) => return,
     };
@@ -711,6 +715,26 @@ pub async fn sync_agent_keys_once(state: &Arc<AppState>) {
         state.set_agent_key_hashes(hashes);
         tracing::debug!(count = n, "synced agent-key hash-set");
     }
+}
+
+/// One serialized refresh on an agent-key AUTH MISS. A key minted seconds ago
+/// (`sc agent add` prints the agent's env → the agent uses it immediately)
+/// would otherwise sit invalid for up to the 30s loop interval — the exact
+/// window the install flow now hits. The tokio Mutex is held ACROSS the fetch:
+/// a concurrent miss WAITS for the in-flight refresh (then sees the fresh
+/// stamp) instead of being bounced to a reject, and a bad-key flood is capped
+/// at one outstanding backend call per 2s window. The short 3s timeout bounds
+/// the reject path's latency when the backend is down. Always returns true =
+/// "the hash-set is now as fresh as it gets — re-check membership".
+pub async fn refresh_agent_keys_on_miss(state: &Arc<AppState>) -> bool {
+    const DEBOUNCE: Duration = Duration::from_secs(2);
+    let mut last = state.agent_key_resync.lock().await;
+    if matches!(*last, Some(t) if t.elapsed() < DEBOUNCE) {
+        return true;
+    }
+    *last = Some(std::time::Instant::now());
+    sync_agent_keys_with_timeout(state, Duration::from_secs(3)).await;
+    true
 }
 
 /// Periodically refresh the agent-key hash-set so a dashboard revoke / a newly
@@ -1995,19 +2019,23 @@ mod tests {
         };
         active::save(&cfg).unwrap();
 
-        // Remove the ACTIVE vault by vid: dropped from known_vaults AND cleared active.
+        // Remove the ACTIVE vault by vid: dropped from the catalog AND cleared
+        // active. The write also migrates the legacy config-field entries into
+        // the catalog file (`known_vaults.toml`) and clears the field.
         assert_eq!(active::forget_vault("vid-A"), Ok(true));
         let after = active::load().unwrap();
         assert!(after.vault.is_none());
         assert!(after.daemon.is_none());
-        assert_eq!(after.known_vaults.len(), 1);
-        assert_eq!(after.known_vaults[0].vault, "vid-B");
+        assert!(after.known_vaults.is_empty(), "legacy field migrated to the file");
+        let known = active::known_vaults();
+        assert_eq!(known.len(), 1);
+        assert_eq!(known[0].vault, "vid-B");
 
         // Idempotent: forgetting it again is a no-op (Ok(false)).
         assert_eq!(active::forget_vault("vid-A"), Ok(false));
         // A non-active known vault: removed, active untouched.
         assert_eq!(active::forget_vault("vid-B"), Ok(true));
-        assert!(active::load().unwrap().known_vaults.is_empty());
+        assert!(active::known_vaults().is_empty());
 
         match prev {
             Some(v) => std::env::set_var("HOME", v),

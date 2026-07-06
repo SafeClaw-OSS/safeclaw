@@ -1,10 +1,10 @@
 //! In-memory approval state.
 //!
-//! When the agent calls `:23295/env/<key>` and the daemon decides
-//! human approval is required, an `ApprovalRecord` is created. The user
-//! approves it via `/approve/{id}/confirm`, which validates a passkey-signed
-//! grant and caches the resulting plaintext value. The agent's next poll
-//! retrieves the cached value and the record is consumed.
+//! When a brokered request through the credential proxy needs human approval,
+//! an `ApprovalRecord` is created. The user approves it via the passkey-gated
+//! op ceremony, which validates a passkey-signed grant and caches the
+//! authorization. The agent's retry then resolves against that cached grant
+//! and the record is consumed.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -68,6 +68,11 @@ pub struct PolicyContext {
     /// the matched rule's `ttl`, the service / category default's
     /// `ask_ttl`, or `Policy.timeout` as last resort.
     pub ttl_seconds: u64,
+    /// Resolved destination host of the request that created this op. The
+    /// approval-cache key is host-scoped (an approval for host A must not
+    /// authorize host B in the TTL), so the approve handler reads this when it
+    /// writes `record_ask_approval`. Stamped by the proxy at op-create.
+    pub host: Option<String>,
 }
 
 impl ApprovalRecord {

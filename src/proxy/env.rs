@@ -1,104 +1,19 @@
-//! `POST /v/{vid}/export/{key}` — R-side sugar for Export-class operations.
+//! `POST /v/{vid}/export/{key}` — the agent-surface Export door, shut.
 //!
-//! Compiles `(vid, key)` into a sudp `Operation { act: Export, target: <key> }`
-//! and creates a pending approval via the shared op-creation helper. Returns
-//! `{ op_id, r, expires_at }` — same shape as `POST /v/{vid}/op`. R then polls
-//! `GET /op/{op_id}` until U approves. In v3 the target is the bare item
-//! name (no `env.` prefix); resolution goes through the v3 store_order.
+//! Raw-secret export hands the agent custody of the plaintext — the opposite
+//! shape of the phantom broker (inject-toward-upstream, never reveal). It has no
+//! upstream, so it doesn't fit the phantom model, and forcing it back in would
+//! reopen the raw-exfil hole. The human path is the op-plane Export ceremony
+//! (`sc secret get` → passkey "Reveal <key>"); only this agent door is closed.
 
-use std::net::IpAddr;
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
-
-use axum::{
-    extract::{ConnectInfo, Path, State},
-    http::StatusCode,
-    Json,
-};
+use axum::{http::StatusCode, Json};
 use serde_json::Value;
 
 use crate::error::{AppError, Result};
-use crate::protocol::operation::{Act, ActType, Bind, Operation, Valid};
-use crate::server::handlers::op::validate_vault_id;
-use crate::state::{ApprovalEvent, AppState};
 
-/// `/export/{key}` is DISABLED on the agent surface for v1.
-///
-/// Raw-secret export hands the agent custody of the plaintext — a silent-exfil
-/// path that contradicts the broker's v1 security claim (recipe-only: the daemon
-/// injects the credential server-side and the agent never holds the raw secret).
-/// The Export op-path (`handle` below) is preserved intact for a future opt-in
-/// re-enable; today the route points here and refuses.
+/// `/export/{key}` is DISABLED on the agent surface.
 pub async fn disabled() -> Result<(StatusCode, Json<Value>)> {
     Err(AppError::Forbidden(
-        "raw secret export is disabled in this version — use /use/<service> so the daemon injects the credential and the agent never holds the raw secret".into(),
+        "raw secret export is disabled on the agent surface — reveal a secret with a passkey via `sc secret get`; put a phantom (see `sc status`) where the credential goes for brokered calls".into(),
     ))
-}
-
-#[allow(dead_code)] // preserved for a future opt-in re-enable (see `disabled`)
-pub async fn handle(
-    State(state): State<Arc<AppState>>,
-    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
-    Path((vault_id, key)): Path<(String, String)>,
-) -> Result<axum::response::Response> {
-    validate_vault_id(&vault_id)?;
-    validate_key(&key)?;
-
-    let target = key.clone();
-    let op = Operation {
-        act: Act {
-            kind: ActType::Export,
-            target,
-            scope: serde_json::Value::Null,
-        },
-        bind: Bind {
-            redeemer: vault_id.clone(),
-            recipient: None,
-        },
-        valid: Valid::single_use(
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0),
-            None,
-        ),
-    };
-
-    let ip: IpAddr = addr.ip();
-    let r = {
-        let mut store = state.challenges.lock().unwrap();
-        store.issue(ip).ok_or(AppError::TooManyRequests)?
-    };
-    let (op_id, expires_at) = {
-        let mut store = state.approvals.lock().unwrap();
-        let id = store.create(vault_id.clone(), op.clone(), r.clone());
-        let exp = store.get(&id).map(|r| r.expires_at_unix).unwrap_or(0);
-        (id, exp)
-    };
-
-    state.emit_event(ApprovalEvent {
-        vault_id: vault_id,
-        approval_id: op_id.clone(),
-        kind: "pending".into(),
-        op_summary: Some(serde_json::to_value(&op).unwrap_or(Value::Null)),
-        response_preview: None,
-        reason: None,
-    });
-
-    // Same 202 shape + async signals as /use/ (Location, Retry-After, interval).
-    Ok(crate::proxy::use_broker::pending_202(&op_id, &r, expires_at))
-}
-
-#[allow(dead_code)] // used only by the disabled `handle`
-fn validate_key(k: &str) -> Result<()> {
-    if k.is_empty() || k.len() > 64 {
-        return Err(AppError::BadRequest("invalid key".into()));
-    }
-    if !k
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-    {
-        return Err(AppError::BadRequest("key has illegal chars".into()));
-    }
-    Ok(())
 }

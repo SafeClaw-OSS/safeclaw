@@ -1,14 +1,25 @@
-//! CLI-side config (`~/.safeclaw/config.toml`).
+//! CLI-side config (`~/.safeclaw/config.toml`) + the single derivation point
+//! for every daemon URL the CLI uses.
 //!
-//! Tracks the active `(daemon, vault)` pair plus a list of all vaults the user
-//! has used on this machine. `daemon` is the local SafeClaw daemon URL the
-//! human's `sc` talks to (after `sc login` it's the loopback daemon, not the
-//! cloud). Vaults are addressed via `SAFECLAW_VAULT_URL` (= daemon root + vault
-//! id baked into the path); the CLI splits/joins as needed.
+//! The DEVICE atoms live here: `daemon` (the daemon the human's `sc` talks to)
+//! and `vault` (the durable default), plus cloud pairing coordinates. URLs are
+//! DERIVED from the atoms, never stored (CREDENTIAL_BROKER.md §14: atoms are
+//! truth, `_url`s are projections):
+//!
+//! - control root  = daemon host + `CONTROL_PORT` (ceremony/write plane)
+//! - API-face root = daemon host + `PROXY_PORT`   (the agent's `DAEMON_URL`)
+//!
+//! THE self-consistency invariant: both planes derive from ONE daemon-host
+//! value. When `$SAFECLAW_DAEMON_URL` is set (an agent's env snapshot), its
+//! host wins — an agent's shelled `sc` then targets the SAME daemon the
+//! agent's own HTTP does, by construction; the two faces cannot split.
 //!
 //! On-disk field name: `daemon`. Configs written by an older build used
 //! `custodian`; `#[serde(alias = "custodian")]` keeps those loading (pre-launch
 //! is wipe+re-enroll, so the alias is belt-and-suspenders, not a migration).
+//! The vault-history catalog lives in its own file
+//! (`~/.safeclaw/known_vaults.toml`, ssh known_hosts-style — append-growing,
+//! harmless to delete), separate from the active selection.
 
 use std::fs;
 use std::io::Write as _;
@@ -23,9 +34,10 @@ pub struct CliConfig {
     pub daemon: Option<String>,
     #[serde(default)]
     pub vault: Option<String>,
-    /// History of vaults this CLI has used. `sc vault ls` displays
-    /// these; new entries get added by `sc vault use` and `sc vault
-    /// create`.
+    /// LEGACY location of the vault-history catalog — now lives in
+    /// `~/.safeclaw/known_vaults.toml` (see [`known_vaults`]). Still read (and
+    /// merged) so pre-split configs keep working; the first catalog WRITE
+    /// migrates entries over and clears this field.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub known_vaults: Vec<KnownVault>,
     /// Cloud pro-backend origin for sealed-blob sync (Slice 3) AND the
@@ -116,53 +128,151 @@ pub fn save(cfg: &CliConfig) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-/// Remove a vault from known_vaults. If it was active, clears active.
-/// Returns true if something was removed.
-pub fn forget(custodian: &str, vault: &str) -> Result<bool, String> {
-    let mut cfg = load().unwrap_or_default();
-    let before = cfg.known_vaults.len();
-    cfg.known_vaults.retain(|kv| !(kv.daemon == custodian && kv.vault == vault));
-    if cfg.known_vaults.len() == before {
-        return Ok(false);
-    }
-    if cfg.daemon.as_deref() == Some(custodian) && cfg.vault.as_deref() == Some(vault) {
-        cfg.daemon = None;
-        cfg.vault = None;
-    }
-    save(&cfg)?;
-    Ok(true)
+// ── known-vaults catalog (own file, design wave §E) ─────────────────────────
+
+pub fn known_vaults_path() -> Result<PathBuf, String> {
+    let base = dirs::home_dir().ok_or_else(|| "no home dir".to_string())?;
+    Ok(base.join(".safeclaw").join("known_vaults.toml"))
 }
 
-/// Remove a vault from `known_vaults` by **vault id alone** (any custodian),
-/// and clear the active selection if it pointed at that vault. Used by the
-/// cloud-sync delete-propagation path, which only knows the vid (a tombstone
-/// carries no custodian). Returns true if anything was removed. Idempotent: a
-/// vault not present is `Ok(false)`, never an error. Load → retain != vault →
-/// save (atomic via the tmp-rename in `save`).
-pub fn forget_vault(vault: &str) -> Result<bool, String> {
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct KnownVaultsFile {
+    #[serde(default)]
+    vaults: Vec<KnownVault>,
+}
+
+/// Every vault this machine has used: the catalog file, plus any entries still
+/// in the legacy `config.toml` field (pre-split configs). File order first;
+/// the next catalog WRITE migrates the legacy entries over.
+pub fn known_vaults() -> Vec<KnownVault> {
+    let mut list = read_known_file();
+    if let Ok(cfg) = load() {
+        for kv in cfg.known_vaults {
+            if !list.contains(&kv) {
+                list.push(kv);
+            }
+        }
+    }
+    list
+}
+
+fn read_known_file() -> Vec<KnownVault> {
+    // Reads are LENIENT (a corrupt catalog acts empty — like a deleted
+    // known_hosts); writes are not: `update_known_vaults` refuses to rewrite
+    // over a file it couldn't parse, so a hand-edit typo can't become silent
+    // data loss.
+    known_file_parse_error().ok().flatten().unwrap_or_default()
+}
+
+/// `Ok(Some(vaults))` = file parsed; `Ok(None)` = no file; `Err` = file exists
+/// but doesn't parse.
+fn known_file_parse_error() -> Result<Option<Vec<KnownVault>>, String> {
+    let Ok(path) = known_vaults_path() else {
+        return Ok(None);
+    };
+    let Ok(text) = fs::read_to_string(&path) else {
+        return Ok(None);
+    };
+    toml::from_str::<KnownVaultsFile>(&text)
+        .map(|f| Some(f.vaults))
+        .map_err(|e| format!("{} doesn't parse: {}", path.display(), e))
+}
+
+/// Rewrite the catalog with `mutate` applied to the MERGED view (file + legacy
+/// config field). Atomic tmp-rename write; completes the migration by clearing
+/// the legacy field afterwards. Refuses to clobber an unparseable file.
+fn update_known_vaults<F: FnOnce(&mut Vec<KnownVault>)>(mutate: F) -> Result<(), String> {
+    if let Err(e) = known_file_parse_error() {
+        return Err(format!(
+            "refusing to rewrite the vault catalog: {} — fix or delete the file, then retry",
+            e
+        ));
+    }
+    let mut list = known_vaults();
+    mutate(&mut list);
+    let path = known_vaults_path()?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("mkdir {}: {}", parent.display(), e))?;
+    }
+    let body = toml::to_string_pretty(&KnownVaultsFile { vaults: list })
+        .map_err(|e| format!("serialize known_vaults: {}", e))?;
+    let tmp = path.with_extension("toml.tmp");
+    fs::write(&tmp, body).map_err(|e| format!("write {}: {}", tmp.display(), e))?;
+    fs::rename(&tmp, &path)
+        .map_err(|e| format!("rename {} -> {}: {}", tmp.display(), path.display(), e))?;
+    if let Ok(mut cfg) = load() {
+        if !cfg.known_vaults.is_empty() {
+            cfg.known_vaults.clear();
+            let _ = save(&cfg);
+        }
+    }
+    Ok(())
+}
+
+/// Wipe the catalog (logout).
+pub fn clear_known_vaults() -> Result<(), String> {
+    update_known_vaults(|l| l.clear())
+}
+
+/// Dedupe-append one vault to the catalog.
+fn remember_vault(daemon: &str, vault: &str) -> Result<(), String> {
+    let new = KnownVault { daemon: daemon.to_string(), vault: vault.to_string() };
+    if known_vaults().contains(&new) {
+        return Ok(());
+    }
+    update_known_vaults(move |l| {
+        if !l.contains(&new) {
+            l.push(new);
+        }
+    })
+}
+
+/// Remove a vault from the catalog. If it was active, clears active — even
+/// when the pair is absent from the catalog (e.g. a hand-deleted catalog
+/// file), mirroring `forget_vault`. Returns true if anything changed.
+pub fn forget(custodian: &str, vault: &str) -> Result<bool, String> {
+    let removed_known = known_vaults()
+        .iter()
+        .any(|kv| kv.daemon == custodian && kv.vault == vault);
+    if removed_known {
+        update_known_vaults(|l| l.retain(|kv| !(kv.daemon == custodian && kv.vault == vault)))?;
+    }
     let mut cfg = load().unwrap_or_default();
-    let before = cfg.known_vaults.len();
-    cfg.known_vaults.retain(|kv| kv.vault != vault);
-    let removed_known = cfg.known_vaults.len() != before;
+    let cleared_active =
+        cfg.daemon.as_deref() == Some(custodian) && cfg.vault.as_deref() == Some(vault);
+    if cleared_active {
+        cfg.daemon = None;
+        cfg.vault = None;
+        save(&cfg)?;
+    }
+    Ok(removed_known || cleared_active)
+}
+
+/// Remove a vault from the catalog by **vault id alone** (any custodian), and
+/// clear the active selection if it pointed at that vault. Used by the
+/// cloud-sync delete-propagation path, which only knows the vid (a tombstone
+/// carries no custodian). Idempotent: a vault not present is `Ok(false)`,
+/// never an error.
+pub fn forget_vault(vault: &str) -> Result<bool, String> {
+    let removed_known = known_vaults().iter().any(|kv| kv.vault == vault);
+    if removed_known {
+        update_known_vaults(|l| l.retain(|kv| kv.vault != vault))?;
+    }
+    let mut cfg = load().unwrap_or_default();
     let cleared_active = cfg.vault.as_deref() == Some(vault);
     if cleared_active {
         cfg.daemon = None;
         cfg.vault = None;
+        save(&cfg)?;
     }
-    if !removed_known && !cleared_active {
-        return Ok(false);
-    }
-    save(&cfg)?;
-    Ok(true)
+    Ok(removed_known || cleared_active)
 }
 
-/// Set the active vault and dedupe-add to known_vaults.
+/// Set the active vault and dedupe-add it to the catalog.
 pub fn put_active(daemon: &str, vault: &str) -> Result<PathBuf, String> {
+    remember_vault(daemon, vault)?;
     let mut cfg = load().unwrap_or_default();
-    let new = KnownVault { daemon: daemon.to_string(), vault: vault.to_string() };
-    if !cfg.known_vaults.contains(&new) {
-        cfg.known_vaults.push(new);
-    }
     cfg.daemon = Some(daemon.to_string());
     cfg.vault = Some(vault.to_string());
     save(&cfg)
@@ -171,18 +281,15 @@ pub fn put_active(daemon: &str, vault: &str) -> Result<PathBuf, String> {
 /// Set the active vault to a LOCAL daemon URL AND record the cloud pro-backend
 /// for sealed-blob sync. Used by `sc login`: the agent talks to the local
 /// `daemon`, while the daemon syncs against the cloud (`cloud_backend`).
-/// Dedupe-adds to known_vaults like `put_active`.
+/// Dedupe-adds to the catalog like `put_active`.
 pub fn put_active_with_cloud(
     daemon: &str,
     vault: &str,
     cloud_backend: &str,
     frontend_origin: Option<&str>,
 ) -> Result<PathBuf, String> {
+    remember_vault(daemon, vault)?;
     let mut cfg = load().unwrap_or_default();
-    let new = KnownVault { daemon: daemon.to_string(), vault: vault.to_string() };
-    if !cfg.known_vaults.contains(&new) {
-        cfg.known_vaults.push(new);
-    }
     cfg.daemon = Some(daemon.to_string());
     cfg.vault = Some(vault.to_string());
     cfg.cloud_backend = Some(cloud_backend.to_string());
@@ -255,28 +362,135 @@ pub fn join_vault_url(daemon: &str, vault: &str) -> String {
     format!("{}/v/{}", daemon.trim_end_matches('/'), vault)
 }
 
-/// Resolve the active `(daemon_url, vault)` pair for short-lived CLI commands —
-/// the `(daemon, vault)` the **human's** `sc` command operates on.
-/// Source = `config.toml` (set by `sc login` / `sc vault use`) + the explicit
-/// `--vault` flag (`vault_override`, which reselects just the vault id).
+// ── Atom derivation (design wave §C/§D) ─────────────────────────────────────
+
+/// `scheme://host` of a URL — port and path stripped, `[::1]`-style bracketed
+/// hosts kept whole. `None` when there's no `scheme://` or no host.
+fn scheme_host(url: &str) -> Option<String> {
+    let (scheme, rest) = url.split_once("://")?;
+    let host_port = rest.split('/').next().unwrap_or("");
+    let host = if let Some(r) = host_port.strip_prefix('[') {
+        format!("[{}]", r.split_once(']')?.0)
+    } else {
+        host_port.split(':').next().unwrap_or("").to_string()
+    };
+    if host.is_empty() {
+        return None;
+    }
+    Some(format!("{}://{}", scheme, host))
+}
+
+fn env_daemon_host() -> Option<String> {
+    std::env::var("SAFECLAW_DAEMON_URL")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .and_then(|u| scheme_host(&u))
+}
+
+/// The DEVICE's daemon-host atom (`scheme://host`): config's `daemon` with its
+/// port stripped, else loopback. This is what the device-side projections
+/// (`sc env`, the `sc agent add` minter) derive from — deliberately NOT the
+/// process env: a tool that re-read its own output would freeze stale values.
+pub fn device_daemon_host(cfg: &CliConfig) -> String {
+    cfg.daemon
+        .as_deref()
+        .and_then(scheme_host)
+        .unwrap_or_else(|| "http://127.0.0.1".to_string())
+}
+
+/// The control root (`scheme://host:CONTROL_PORT`) every ceremony/write `sc`
+/// call targets. Env-first: `$SAFECLAW_DAEMON_URL`'s HOST wins when set (the
+/// invariant — shelled `sc` and the agent's own HTTP share one daemon); else
+/// config's `daemon` VERBATIM (it may carry a hand-edited custom control
+/// port); else the loopback default. The env value carries the PROXY port,
+/// never the control port, so the control port comes from the constant — a
+/// remote daemon on a non-default control port would need a config edit
+/// (that deployment doesn't exist yet).
+pub fn control_root(cfg: &CliConfig) -> String {
+    control_root_from(env_daemon_host(), cfg.daemon.as_deref())
+}
+
+fn control_root_from(env_host: Option<String>, config_daemon: Option<&str>) -> String {
+    if let Some(h) = env_host {
+        return format!("{}:{}", h, crate::config::CONTROL_PORT);
+    }
+    config_daemon
+        .filter(|s| !s.is_empty())
+        .map(|s| s.trim_end_matches('/').to_string())
+        .unwrap_or_else(|| format!("http://127.0.0.1:{}", crate::config::CONTROL_PORT))
+}
+
+/// The API-face root (`scheme://host:PROXY_PORT`) — the value an agent holds
+/// as `SAFECLAW_DAEMON_URL`. Env verbatim when set (the agent's snapshot,
+/// custom port included); else derived from the device atom. The env value
+/// passes the SAME `scheme_host` parse gate as `control_root` — a malformed
+/// value is ignored by BOTH faces, never honored by one and dropped by the
+/// other (that asymmetry would split the invariant).
+pub fn api_face_root(cfg: &CliConfig) -> String {
+    let env_url = std::env::var("SAFECLAW_DAEMON_URL").ok().filter(|s| !s.is_empty());
+    api_face_root_with(env_url, cfg)
+}
+
+fn api_face_root_with(env_url: Option<String>, cfg: &CliConfig) -> String {
+    match env_url.filter(|u| scheme_host(u).is_some()) {
+        Some(u) => u.trim_end_matches('/').to_string(),
+        None => format!("{}:{}", device_daemon_host(cfg), crate::config::PROXY_PORT),
+    }
+}
+
+/// The device-default vault (config default, else the single known vault) —
+/// the chain WITHOUT the env pin, for projections that mint fresh env output
+/// (`sc env`, `sc agent add`): reading the pin there would freeze a stale pin
+/// into new output.
+pub fn device_default_vault(cfg: &CliConfig) -> Option<String> {
+    cfg.vault.clone().or_else(single_known_vault)
+}
+
+/// Resolve the active `(control_root, vault)` pair every short-lived `sc`
+/// command routes through — the single choke point (CREDENTIAL_BROKER.md §14).
 ///
-/// We deliberately do NOT read `$SAFECLAW_VAULT_URL` here. That env var is the
-/// AGENT's broker endpoint (the install-prompt persists it for the agent
-/// process). A human's `sc` command must never inherit the agent's vault
-/// choice — if it did, a stale agent env would hijack the human's commands
-/// (it did: a real unlock bug). The rule we keep:
-///   env          = process config (daemon-serve params, the agent's broker URL)
-///   active vault = user state → config.toml
+/// - **control root:** see [`control_root`] — the env `DAEMON_URL` HOST wins
+///   (the single-host invariant), else config, else the loopback default.
+/// - **vault precedence:** `--vault flag > $SAFECLAW_VAULT_ID (env pin) >
+///   config default > single-vault auto-select`. The env pin is what makes an
+///   agent's shelled-out `sc` target the SAME vault its own HTTP does — env
+///   overrides file for the VARYING axis, exactly like `AWS_PROFILE`. A fresh
+///   shell (no pin) still follows config + `sc vault use`.
 pub fn resolve_active(vault_override: Option<&str>) -> Result<(String, String), String> {
     let cfg = load()?;
-    let daemon = cfg.daemon.clone().ok_or_else(|| {
-        "no vault selected — run `sc login` or `sc vault use`".to_string()
-    })?;
-    let vault = vault_override
+    let explicit = vault_override
         .map(str::to_string)
-        .or(cfg.vault.clone())
-        .ok_or_else(|| "no vault selected — run `sc login` or `sc vault use`".to_string())?;
-    Ok((daemon, vault))
+        .or_else(|| std::env::var("SAFECLAW_VAULT_ID").ok().filter(|s| !s.is_empty()))
+        .or_else(|| cfg.vault.clone());
+    if let Some(vault) = explicit {
+        return Ok((control_root(&cfg), vault));
+    }
+    // Single-vault auto-select: the catalog entry records WHICH daemon that
+    // vault lives behind — pair them, so a cleared active selection can't
+    // send the auto-selected vault to the default control root. The env host
+    // still wins (invariant).
+    if let Some(kv) = single_known_entry() {
+        return Ok((
+            control_root_from(env_daemon_host(), Some(&kv.daemon)),
+            kv.vault,
+        ));
+    }
+    Err("no vault selected — run `sc login` or `sc vault use`".to_string())
+}
+
+/// Single-vault auto-select (§5): exactly one known vault defaults to it, so a
+/// fresh shell needs no `sc vault use` and the agent/human vault can't diverge
+/// in the common single-vault case. `None` for zero or many.
+fn single_known_entry() -> Option<KnownVault> {
+    let mut it = known_vaults().into_iter();
+    match (it.next(), it.next()) {
+        (Some(kv), None) => Some(kv),
+        _ => None,
+    }
+}
+
+fn single_known_vault() -> Option<String> {
+    single_known_entry().map(|kv| kv.vault)
 }
 
 #[cfg(test)]
@@ -286,15 +500,70 @@ mod tests {
     #[test]
     fn split_vault_url_basic() {
         assert_eq!(
-            split_vault_url("http://localhost:23294/v/abc"),
-            Some(("http://localhost:23294".to_string(), "abc".to_string()))
+            split_vault_url("http://localhost:23295/v/abc"),
+            Some(("http://localhost:23295".to_string(), "abc".to_string()))
         );
     }
 
     #[test]
     fn split_vault_url_no_vid_returns_none() {
-        assert_eq!(split_vault_url("http://localhost:23294"), None);
-        assert_eq!(split_vault_url("http://localhost:23294/v/"), None);
+        assert_eq!(split_vault_url("http://localhost:23295"), None);
+        assert_eq!(split_vault_url("http://localhost:23295/v/"), None);
+    }
+
+    #[test]
+    fn scheme_host_strips_port_and_path() {
+        assert_eq!(scheme_host("http://127.0.0.1:23294"), Some("http://127.0.0.1".into()));
+        assert_eq!(
+            scheme_host("https://box.example.com:23294/x/y"),
+            Some("https://box.example.com".into())
+        );
+        assert_eq!(scheme_host("http://[::1]:23294"), Some("http://[::1]".into()));
+        assert_eq!(scheme_host("no-scheme"), None);
+        assert_eq!(scheme_host("http://"), None);
+    }
+
+    #[test]
+    fn control_root_env_host_wins_config_verbatim_else_default() {
+        // hand-edited custom control port in config
+        let cfg_daemon = Some("http://127.0.0.1:9999");
+        // Env host set (an agent's shell): its HOST + the control-port constant —
+        // the single-host invariant (proxy face and control face share a daemon).
+        assert_eq!(
+            control_root_from(Some("https://box.example.com".into()), cfg_daemon),
+            format!("https://box.example.com:{}", crate::config::CONTROL_PORT)
+        );
+        // No env: config's control root VERBATIM (custom port preserved).
+        assert_eq!(control_root_from(None, cfg_daemon), "http://127.0.0.1:9999");
+        // Bare machine: loopback default.
+        assert_eq!(
+            control_root_from(None, None),
+            format!("http://127.0.0.1:{}", crate::config::CONTROL_PORT)
+        );
+    }
+
+    #[test]
+    fn api_face_root_env_verbatim_else_derived() {
+        let cfg = CliConfig {
+            daemon: Some("http://box.example.com:23295".into()),
+            ..Default::default()
+        };
+        // The agent's snapshot wins untouched (custom proxy port included).
+        assert_eq!(
+            api_face_root_with(Some("http://box.example.com:9999/".into()), &cfg),
+            "http://box.example.com:9999"
+        );
+        // Derived: device daemon HOST + the proxy-port constant.
+        assert_eq!(
+            api_face_root_with(None, &cfg),
+            format!("http://box.example.com:{}", crate::config::PROXY_PORT)
+        );
+        // A malformed env value (no scheme) is ignored by BOTH faces — the
+        // same parse gate as control_root, so the two can't split on it.
+        assert_eq!(
+            api_face_root_with(Some("box.example.com:23294".into()), &cfg),
+            format!("http://box.example.com:{}", crate::config::PROXY_PORT)
+        );
     }
 
     #[test]

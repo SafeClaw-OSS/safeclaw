@@ -98,6 +98,11 @@ fn scan_services(
     for cat_entry in categories.flatten() {
         let cat_path = cat_entry.path();
         if !cat_path.is_dir() { continue; }
+        // Skip underscore-prefixed dirs: `_providers` (handled separately) and
+        // `_parked` (system-category / daemon-exec services excluded from v4).
+        if cat_path.file_name().and_then(|n| n.to_str()).map_or(false, |n| n.starts_with('_')) {
+            continue;
+        }
 
         // Check if this is a direct service dir (flat layout) or a category dir
         let service_toml = cat_path.join("service.toml");

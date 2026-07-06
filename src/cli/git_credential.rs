@@ -1,99 +1,92 @@
 //! `sc git-credential <op>` — a git credential helper. **git invokes this, not
-//! the user.** It is registered with:
+//! the user.** `sc run` registers it per-process (no gitconfig writes):
 //!
 //! ```text
-//! git config --global credential."http://localhost:23295".helper "!sc git-credential"
+//! GIT_CONFIG_COUNT=1
+//! GIT_CONFIG_KEY_0=credential.helper
+//! GIT_CONFIG_VALUE_0=!sc git-credential
 //! ```
 //!
-//! When git needs to authenticate to the SafeClaw broker (for the streaming
-//! smart-HTTP git route), it runs `sc git-credential get` and reads back the
-//! agent's broker key as the Basic password. The key is read from the
-//! environment (`$SAFECLAW_API_KEY`) **at call time** and never written to disk
-//! — so it lives exactly where it already does (the agent's env), and a key
-//! rotation is picked up on the next git command with no reconfiguration.
-//!
-//! The broker then validates the key, scrubs it, and injects the real upstream
-//! credential (the GitHub/GitLab PAT) at egress — so git never sees the PAT, and
-//! the broker never forwards the agent key upstream.
-//!
-//! **Defense in depth:** the key is emitted ONLY when git's request host matches
-//! the SafeClaw broker host (from `$SAFECLAW_VAULT_URL`). If the helper is ever
-//! misconfigured to fire for another host (e.g. github.com directly), it stays
-//! silent — the agent key can never leak to a non-broker host.
+//! On `get` it reads git's `host=` line, finds the connection whose anchored
+//! hosts contain that host (via the auth-free localhost registry projection),
+//! and — when that connection has exactly ONE injectable secret — emits
+//! `username=x` + `password=<its phantom>`. The resident proxy substitutes the
+//! phantom for the real credential at egress; git never sees it. Anything
+//! ambiguous (several matching connections, or a connection with several
+//! injectable secrets) or unknown → emits nothing, so git falls through to the
+//! next helper. This is a zero-schema PLACEMENT convenience: it reads no vault
+//! secret and emits only a phantom.
 
 use std::io::Read;
 
+use crate::cli::active::resolve_active;
+use crate::cli::discovery;
 use crate::config::GitCredentialArgs;
 
-pub fn run(args: GitCredentialArgs) -> Result<(), String> {
+pub async fn run(args: GitCredentialArgs) -> Result<(), String> {
     // git speaks the credential protocol on stdin as `key=value` lines
-    // (protocol=…, host=…, path=…). Read it; we use `host=` for the safety check.
+    // (protocol=…, host=…, path=…). Only `get` produces output.
     let mut input = String::new();
     let _ = std::io::stdin().read_to_string(&mut input);
 
-    match args.operation.as_str() {
-        "get" => emit_get(&input),
-        // We persist nothing, so storing/erasing is a no-op (git will fall back
-        // to any other configured helper for those).
-        _ => Ok(()),
-    }
-}
-
-fn emit_get(input: &str) -> Result<(), String> {
-    // The agent key lives in the environment — same place every other SafeClaw
-    // call reads it. Absent ⇒ emit nothing; git fails fast (with
-    // GIT_TERMINAL_PROMPT=0) instead of prompting.
-    let key = match std::env::var("SAFECLAW_API_KEY") {
-        Ok(k) if !k.trim().is_empty() => k,
-        _ => return Ok(()),
-    };
-
-    // Fail closed: only answer for the SafeClaw broker host.
-    if !host_is_broker(input) {
+    if args.operation != "get" {
+        // We persist nothing, so store/erase are no-ops (git falls back).
         return Ok(());
     }
+    emit_get(&input).await
+}
 
-    // git credential reply. The broker ignores the username (it validates the
-    // password against the agent-key hash-set), but it must be non-empty.
-    print!("username=safeclaw\npassword={}\n", key);
+async fn emit_get(input: &str) -> Result<(), String> {
+    // No host to match on → decline silently.
+    let Some(raw_host) = field(input, "host") else {
+        return Ok(());
+    };
+    let host = bare_host(&raw_host);
+
+    // Resolve the active vault from config (the human's `sc login` state). Any
+    // failure below MUST stay silent: a git credential helper that errors would
+    // break the git command, and declining just lets git try the next helper.
+    let Ok((daemon, vault)) = resolve_active(None) else {
+        return Ok(());
+    };
+    let Ok(conns) = discovery::connections(&daemon, &vault).await else {
+        return Ok(());
+    };
+
+    // Connections whose anchored hosts contain the asked host (exact FQDN).
+    let matches: Vec<&discovery::ConnRow> = conns
+        .iter()
+        .filter(|c| c.hosts.iter().any(|h| h.eq_ignore_ascii_case(host)))
+        .collect();
+    // Exactly one connection, with exactly one injectable secret → emit it.
+    if matches.len() != 1 {
+        return Ok(());
+    }
+    let conn = matches[0];
+    if conn.phantoms.len() != 1 {
+        return Ok(());
+    }
+    let phantom = &conn.phantoms[0];
+
+    // git credential reply. The username is a placeholder (the phantom carries
+    // the real credential); it must be non-empty for git to use the password.
+    print!("username=x\npassword={}\n", phantom);
     Ok(())
 }
 
-/// True iff git's request host (the `host=` line on stdin) is the SafeClaw
-/// daemon's host, taken from `$SAFECLAW_VAULT_URL`. Compared **host-only** (the
-/// port is stripped): the daemon's admin port (`SAFECLAW_VAULT_URL`) and its
-/// broker/`/stream/` port differ, but share the same host — and matching the
-/// host alone still blocks a *different* host (e.g. github.com) from ever
-/// receiving the key. Fail closed: a missing host on either side returns false.
-fn host_is_broker(input: &str) -> bool {
-    let req_host = match input
+/// The value of a `key=value` line on git's stdin, trimmed and non-empty.
+fn field(input: &str, key: &str) -> Option<String> {
+    let prefix = format!("{}=", key);
+    input
         .lines()
-        .find_map(|l| l.strip_prefix("host="))
+        .find_map(|l| l.strip_prefix(&prefix))
         .map(str::trim)
-        .filter(|h| !h.is_empty())
-    {
-        Some(h) => h,
-        None => return false,
-    };
-    match std::env::var("SAFECLAW_VAULT_URL")
-        .ok()
-        .as_deref()
-        .and_then(url_host)
-    {
-        Some(broker) => bare_host(&broker) == bare_host(req_host),
-        None => false,
-    }
-}
-
-/// The `host[:port]` authority of a URL (`http://localhost:23295/v/x` →
-/// `localhost:23295`).
-fn url_host(url: &str) -> Option<String> {
-    let after_scheme = url.split("://").nth(1)?;
-    Some(after_scheme.split('/').next().unwrap_or(after_scheme).to_string())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 /// Drop a trailing `:<port>` from an authority, leaving the host
-/// (`127.0.0.1:23295` → `127.0.0.1`). Leaves IPv6/hostless forms untouched.
+/// (`example.com:8443` → `example.com`). Leaves IPv6 / hostless forms untouched.
 fn bare_host(authority: &str) -> &str {
     match authority.rsplit_once(':') {
         Some((host, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => host,
@@ -106,35 +99,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn url_host_extracts_authority() {
-        assert_eq!(url_host("http://localhost:23295/v/abc").as_deref(), Some("localhost:23295"));
-        assert_eq!(url_host("https://api.github.com").as_deref(), Some("api.github.com"));
-        assert_eq!(url_host("not a url"), None);
+    fn field_reads_host() {
+        assert_eq!(
+            field("protocol=https\nhost=github.com\n", "host").as_deref(),
+            Some("github.com")
+        );
+        assert_eq!(field("protocol=https\n", "host"), None);
     }
 
     #[test]
     fn bare_host_strips_port() {
-        assert_eq!(bare_host("127.0.0.1:23295"), "127.0.0.1");
-        assert_eq!(bare_host("localhost"), "localhost");
-        assert_eq!(bare_host("api.safeclaw.pro"), "api.safeclaw.pro");
-    }
-
-    #[test]
-    fn host_is_broker_matches_only_the_broker() {
-        // SAFECLAW_VAULT_URL is process-global; guard the test behind it being set
-        // to the value we expect (other tests don't touch it).
-        // NB: it points at the ADMIN port (23294); git talks to the BROKER port
-        // (23295). Same host, different port → must still match (host-only).
-        std::env::set_var("SAFECLAW_VAULT_URL", "http://127.0.0.1:23294/v/abc");
-        assert!(host_is_broker("protocol=http\nhost=127.0.0.1:23295\n"));
-        // Same host, no port given → still matches.
-        assert!(host_is_broker("protocol=http\nhost=127.0.0.1\n"));
-        // A different host (e.g. github.com directly) is refused — no key leak.
-        assert!(!host_is_broker("protocol=https\nhost=github.com\n"));
-        // No host line → fail closed.
-        assert!(!host_is_broker("protocol=http\n"));
-        std::env::remove_var("SAFECLAW_VAULT_URL");
-        // No broker URL → fail closed.
-        assert!(!host_is_broker("host=127.0.0.1:23295\n"));
+        assert_eq!(bare_host("github.com:8443"), "github.com");
+        assert_eq!(bare_host("github.com"), "github.com");
     }
 }

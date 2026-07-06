@@ -26,8 +26,8 @@ use serde_json::json;
 use crate::cli::active::put_active_with_cloud;
 use crate::config::LoginArgs;
 
-/// Default daemon admin port (matches `ServeArgs` `SAFECLAW_PORT`).
-const DEFAULT_DAEMON_PORT: u16 = 23294;
+/// Default daemon control-plane port (matches `ServeArgs` `SAFECLAW_PORT`).
+const DEFAULT_DAEMON_PORT: u16 = crate::config::CONTROL_PORT;
 
 /// The baked cloud endpoint the daemon pairs with. Device→cloud is FIXED (not
 /// user config): `SAFECLAW_CLOUD_URL` (undocumented runtime override, for

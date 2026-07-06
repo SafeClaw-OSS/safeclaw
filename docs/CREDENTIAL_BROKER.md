@@ -91,11 +91,16 @@ security-relevant field, and the settled tuple already makes it first-class):
 // STORED — aux.connections[<conn_id>].  conn_id is the map key (not repeated in the value).
 // Minimal by construction: everything else is derived or lives elsewhere.
 {
-  "service": "github",          // string | null   (null = raw)
-  "hosts":   ["api.github.com"] // string[] | null  (see the SSOT invariant)
+  "service": "github",           // string | null   (null = raw)
+  "hosts":   ["api.github.com"], // string[] | null  (see the SSOT invariant)
+  "secrets": ["GITHUB_TOKEN"]    // string[] | null  — the UPPERCASE keys this conn uses
 }
-// secrets: NOT stored here — flat secrets pool, addressed [<conn_id>:]<KEY>; a
-//          connection's secrets are the reverse-index of that namespace.
+// secrets: REQUIRED for a RAW connection (service = null) — it answers "which
+//          secrets" DIRECTLY, so discovery / cache-bootstrap read it instead of
+//          reverse-indexing the flat pool by casing. OMITTED (null) for a
+//          service-backed connection: its keys derive from the service's declared
+//          `secrets` (incl. the oauth2 refresh key). Values still live in the flat
+//          pool, addressed [<conn_id>:]<KEY> (bare when conn_id == service_id).
 // policy:  NOT here — aux.policy.connections.<conn_id>.
 // phantom: NEVER stored — it is a DERIVED composite of (conn_id + a secret key);
 //          storing it would be redundant and ambiguous for multi-secret conns.
@@ -106,22 +111,35 @@ security-relevant field, and the settled tuple already makes it first-class):
 //   service with *.wildcards   ⇒ hosts required: exact FQDNs pinned ⊆ the wildcards
 ```
 
-**Phantom belongs to the DISCOVERY view, not the stored record.** `sc status`
-projects each connection into the agent-facing shape. `phantoms` is a **map
-(injectable role → ready-made phantom)** — one uniform type for sole- and
-multi-secret connections (no string-vs-list split), and its keys ARE the
-injectable roles, so no separate `secrets` field:
+**Phantom belongs to the DISCOVERY view, not the stored record.** The registry
+(`GET /v/{vid}/registry`, mirrored by `sc status`) projects into the agent-facing
+shape as **two arrays**: `services[]` — the browse catalog, 1:1 with the service
+tomls, carrying NO connection state — and `connections[]` — 1:1 with
+`aux.connections`, each row a DERIVED `connected` flag plus a ready-made
+`phantoms` **list**. A phantom names a CONNECTION, so it lives only on the
+connection row. `phantoms` is a **list** of ready-made strings the agent copies
+verbatim (form A: sole injectable → the short `__sc__<conn>__`; several →
+role-qualified `__sc__<conn>__<role>__` — one form per role, never both):
 
 ```jsonc
-// sc status (agent-facing projection — derived, not stored)
-{ "connections": [
-    { "name": "github",
+// GET /v/{vid}/registry  (agent-facing projection — derived, not stored)
+{ "version": 4,
+  "locked": false,                              // PER-VAULT (this vault, not the daemon)
+  "services":    [ /* browse catalog — no connected/phantoms */ ],
+  "connections": [
+    { "id": "github", "service": "github",
       "hosts": ["api.github.com", "github.com"],
-      "phantoms": { "GITHUB_TOKEN": "__sc__github__" } }   // sole role → the short form
-  ], "proxy": "http://127.0.0.1:23294", "routed": true }
-// multi-secret:  "phantoms": { "USERNAME": "__sc__bb__username__", "API_TOKEN": "__sc__bb__api_token__" }
-// oauth2:        "phantoms": { "ACCESS": "__sc__gmail__", "ACCOUNT_ID": "__sc__gmail__account_id__" }
+      "connected": true, "phantoms": ["__sc__github__"] },        // sole → short form
+    { "id": "stripe_key",                                          // RAW: no service…
+      "hosts": ["api.stripe.com"], "secrets": ["STRIPE_KEY"],     // …carries explicit secrets
+      "connected": true, "phantoms": ["__sc__stripe_key__"] }
+  ] }
+// multi-secret:  "phantoms": ["__sc__bb__username__", "__sc__bb__api_token__"]
+// oauth2:        "phantoms": ["__sc__gmail__", "__sc__gmail__account_id__"]  // ACCESS + exposes
 ```
+
+(There is NO routing preflight anywhere — the broker is opt-in, §14: the agent
+routes every credential request explicitly, so "am I routed?" has no meaning.)
 
 **The service toml schema.** `[[upstream]]` is retired (it was `/use`-era
 routing; its essence was the host set). A service declares exactly what a
@@ -158,9 +176,9 @@ semantics), no variable system:
   raw connection** — insertion-auth self-hosting needs no service definition;
   self-hosted+OAuth is deferred until a real case appears.
 
-**Named sections are auth MECHANISMS, never tools.** OAuth2 (`[upstream.auth]`
-upgraded in place; fields unchanged; `oauth2` not `oauth` — precise,
-self-documents the parse semantics):
+**Named sections are auth MECHANISMS, never tools.** OAuth2 lives in an `[oauth2]`
+table (`oauth2` not `oauth` — precise, self-documents the parse semantics) whose
+token slots carry RFC 6749 response field names:
 
 ```toml
 [service]
@@ -168,15 +186,18 @@ id = "gmail"
 name = "Gmail"
 
 hosts = ["gmail.googleapis.com"]
+secrets = ["GMAIL_REFRESH_TOKEN"]            # uniform `secrets` — lists the refresh key too
 
 [oauth2]
 provider = "google"                          # -> _providers/google.toml
 scopes   = ["https://www.googleapis.com/auth/gmail.send", …]
-secret   = "GMAIL_REFRESH_TOKEN"             # the stored refresh secret feeding the mint
+refresh_token = "GMAIL_REFRESH_TOKEN"        # RFC 6749 field → the vault secret KEY the
+                                             # durable refresh token is stored under
+# id_token = "GMAIL_ID_TOKEN"                # only if the provider returns a stored id token
 # exposes = ["account_id"]                   # optional extra minted/derived values →
                                              # __sc__<conn>__account_id__ (openai-codex case)
-# __sc__<conn>__ resolves to the MINTED access token; the refresh secret is
-# referenced only by [oauth2] ⇒ internal by construction, no flag needed.
+# __sc__<conn>__ resolves to the MINTED access token; the refresh key is durable
+# storage for the mint ⇒ internal by construction, never an injectable phantom.
 ```
 
 *(`[[api]]` is deleted along with `[[upstream]]` — it was the `/use` routing
@@ -283,7 +304,10 @@ install, private key `chmod 600`, never leaves the machine — no system-trust
 install, no GUI prompt). The bundle just points a child process at them:
 
 ```
-HTTPS_PROXY / HTTP_PROXY = http://127.0.0.1:<port>
+HTTPS_PROXY / HTTP_PROXY = http://<vid>:<agent-key>@127.0.0.1:23294
+                                      # vid routes to a vault; the key is the
+                                      # agent's identity, verified BEFORE any
+                                      # substitution (§14 auth)
 NO_PROXY = localhost,127.0.0.1
 NODE_USE_ENV_PROXY = 1                # Node 24+ fetch honours proxy only with this
 SSL_CERT_FILE / REQUESTS_CA_BUNDLE / CURL_CA_BUNDLE / NODE_EXTRA_CA_CERTS /
@@ -345,7 +369,7 @@ it is a different *transport onto the same core*, never a second model.
 |---|---|---|
 | under the proxy (session/agent-scope `sc run`) | CONNECT → SNI hits the connection's host → helper emits phantom → proxy Basic-decodes, substitutes, re-encodes; streaming relays natively | transparent |
 | not under the proxy, agent shells git | **`sc run -- git push` — the per-command prefix IS git's adaptor** (same bundle, command scope) | task completes |
-| no routing possible at all | routing discipline (§14): report the situation | explicit, not a mystery 401 |
+| no routing possible at all | opt-in discipline (§14): don't send the phantom — say so to the user | explicit, not a mystery 401 |
 | SSH remote (`git@…`) | not HTTP — outside the broker; setup hints "use the HTTPS remote for brokered flows" | honest boundary |
 
 Helper registration is residue-free: `sc run` injects
@@ -367,8 +391,13 @@ optional zero-schema convenience (§4).
   Basic — position is the agent's, via the phantom; no declaration needed). The
   vault always stores the **semantic** value, never a pre-encoded form.
 - **`[oauth2]`: the minted access token** (refresh→access in the daemon, [built]).
-  The one non-direct case; a future request-signer (SigV4/HMAC) would be another
-  named section when it becomes real.
+  The mint is cached **in memory keyed by `sha256(refresh_token)`** (never
+  persisted; wiped on lock): a hit reuses the unexpired access token and never
+  sends the refresh upstream. Keying on the refresh VALUE (not `(vault, conn)`)
+  auto-invalidates on reconnect / refresh-token rotation — a new refresh is a
+  natural cache miss → fresh mint — and never collides across accounts. The one
+  non-direct case; a future request-signer (SigV4/HMAC) would be another named
+  section when it becomes real.
 - The old `{{secret.X | b64|basic}}` egress filters are **cut** (they served the
   retired daemon-built-header path; no known pre-encoded-slot use case — YAGNI,
   revisit on a real one).
@@ -419,8 +448,17 @@ the reverse-intuitive trap):
 - **Non-interactive** (script / agent pipe): missing host → error listing the two
   fixes (`--host <h>` / `--no-broker`). Never hangs.
 
-`sc set --host` **creates the raw connection** (`service: None` + `hosts`);
-hostless `--no-broker` writes a no-broker item invisible to the broker.
+`sc set KEY [VALUE] --host H` **creates the raw connection** — id `= lower(KEY)`,
+`service: None`, `hosts: [H]`, and explicit `secrets: [KEY]` (KEY force-uppercased
+to the one canonical form; the value is stored bare in the flat pool). Hostless
+`--no-broker` (or `--host none`) writes a no-broker item invisible to the broker,
+and drops any raw connection a prior `sc set … --host` created for the key.
+
+`sc set --host` is the single-secret **shorthand of `sc connect`** (`connect ⊃
+set`): `sc connect <name> --host H… --secret KEY=VALUE…` builds a multi-secret raw
+connection, and `--service SVC` a service-backed one — where `--host` then only
+PINS an exact FQDN ⊆ the service's `*.suffix` hosts, and each `--secret KEY` must
+be a subset of the service's declared secrets.
 
 ## 12. Storage-only items (the "no upstream" family)
 
@@ -457,68 +495,109 @@ policy**, propose a service definition) under one unified mechanism. Export does
 ops do (upstream = self). This is why a `system` category exists in the vault. Out
 of scope now; noted so the mechanism composes later.
 
-## 14. Agent mental model + discovery — the routing discipline
+## 14. Agent surface — opt-in, three planes, dual-face port, atomic env (LOCKED 2026-07-06)
 
-One concept: *"local proxy; phantom where the credential goes; route traffic
-through it."*
+(Absorbs `docs/AGENT_SURFACE_REDESIGN.md`, built + shipped on `feat/broker-phantom`;
+that file is deleted. Supersedes this section's old "routing discipline".)
 
-**Invariant: phantom ⟺ routed.** `sc run` is not always on, and both states must
-work as expected: routed ⇒ phantoms substitute transparently; not routed ⇒ the
-agent must *know* and pick a routing option (per-command `sc run --` prefix,
-session `--export-env`) — or, if no routing is possible, **say so to the user**.
-Never fire a phantom at a real server: the upstream 401 is indistinguishable from
-a bad token. Enforced from both sides:
+**Opt-in, NOT a mandatory proxy.** Normal traffic goes direct and untouched.
+Only credential traffic — a request the agent DELIBERATELY writes a phantom
+into — is routed (`sc run --`, or per-request `--proxy $SAFECLAW_PROXY_URL`).
+A dead daemon degrades only vault features, never all egress; a phantom sent
+unrouted reaches the upstream as a literal string → clean 401, never a leak.
+Consequence: **all routing-detection is deleted** (probe host, `is_routed`,
+the `sc status` routing block) — the agent routes every vault request
+explicitly, so "am I routed?" has no meaning. If no routing is possible, the
+agent doesn't send the phantom and says so.
 
-- **Preflight (unrouted side):** `sc status` reports `routed: true/false` by
-  inspecting its **own inherited env** (the same env any subprocess would get) for
-  the bundle **and liveness-probing the proxy** (vars present but proxy dead ⇒
-  `false`).
-- **Fail-closed (routed side):** a syntactically-valid phantom naming an unknown
-  connection is **rejected by the proxy with a clear 4xx** ("unknown connection
-  'githb'"), never forwarded. (Safe because the phantom marker makes accidental
-  matches ~impossible — §5.) So inside routing, phantom errors are *our* precise
-  errors; outside routing, the preflight prevents the ambiguous case entirely.
+**Three planes, and WHO is the client:**
 
-Discovery shape: `sc status` → `{ connections:[{name, phantom, hosts}],
-proxy, routed }` — **discovery returns the ready-made phantom string**; the
-agent copies, never constructs (zero-derivation: malformed phantoms become
-impossible, and the format can evolve without breaking agents). The phantom
-FORMAT is mechanism knowledge and lives in the skill's one-concept sentence;
-per-connection INSTANCES live here; **toml `setup` never carries phantom
-mechanics** (that would be per-service prose smuggling in the generic
-mechanism). Novice loop: user adds a connection in the console → the agent's
-next `sc status` shows it + its phantom → used. The console's phantom
-copy-button is a HUMAN supplementary channel (debugging, manual paste), never
-the agent's channel.
+| plane | port | the CLIENT is | auth | for |
+|---|---|---|---|---|
+| **data (proxy)** | :23294 | the **agent's runtime** (its HTTP client + `sc run` children) | agent-key | discovery reads + brokered credential traffic |
+| **control** | :23295 | the **`sc` CLI** (human, or agent via a shelled `sc up`) | passkey / localhost | unlock, connect, approve, status |
+| **account** | cloud :443 | the **`sc` CLI** (`login`/`logout` ≡ `sc device *`, `sc agent *`) | device-key (pair-token bootstraps it) | pair devices, mint agent keys, hash registry, blob sync, op-relay |
 
-**Skill delta (drafted; replaces the old `/use` "Call shape" section — the
-connect-guidance / setup-hints / vault-locked / approval-polling sections stay
-as shipped). No "local", no "proxy" vocabulary — the agent needs "SafeClaw",
-nothing lower-level:**
+The agent's own traffic touches ONLY :23294. `sc` is a control/account tool —
+never a client of the proxy port; `sc run` doesn't *use* the proxy, it
+*launches a child* onto it. Two ports stay (data-plane/control-plane
+separation: independent exposure requires independent listeners); the proxy
+DEFAULTS to loopback as a safe default, not a law — remote exposure is a
+future capability gated on TLS + a network-grade key + user-owned infra.
 
-```markdown
-## Using a connection
+**Dual-face :23294** (RFC 7230 §5.3 request-line dispatch): CONNECT /
+absolute-form → the MITM proxy face; **origin-form → a read-only API face**
+(`/health`, `/ca` unauthenticated; `/v/{vid}/registry`, `/op/{id}` Bearer
+agent-key), self-answered from the SAME projection functions the control
+plane serves so the two ports can't drift. Self-authority absolute-form =
+loop guard. Writes/ceremony never appear here. Discovery is a plain direct
+GET — never through the proxy. Captive-portal 401s carry an ABSOLUTE
+`poll_url` at this face.
 
-Every connected service in `/registry` carries a ready-made **phantom** — a
-placeholder like `__sc__github__`. Put it exactly where the real credential
-would go (the env var a tool reads, a header, a config file). SafeClaw swaps
-it for the real value on the way out — and only toward that connection's
-`hosts`.
+**The agent's env = its SSOT — four dotenv vars, minted as ONE block:**
 
-Phantoms only work when the traffic passes through SafeClaw. Check first:
+```
+SAFECLAW_DAEMON_URL=http://127.0.0.1:23294               # API face
+SAFECLAW_VAULT_ID=<vid>                                  # discovery path param + proxy username
+SAFECLAW_API_KEY=<key>                                   # identity — Bearer (API face) + proxy password
+SAFECLAW_PROXY_URL=http://<vid>:<key>@127.0.0.1:23294    # proxy face (optional — `sc run` derives it)
+```
 
-    sc status      # routed: true|false, plus each connection's phantom
+**`sc agent add <name>` IS the single minter**: it prints this whole block to
+stdout (key shown once; stderr guidance carries no secret) — a mint-time
+projection of the DEVICE atoms — and the agent appends it unseen to its own
+`.env`. The key stays out of the install prompt AND the transcript (settled:
+the cloud also can't know a device's real atoms, so a console-baked env would
+freeze assumptions). `sc env` stays the HUMAN-shell projection (`DAEMON_URL`
++ `VAULT_ID`, never a key — a device-level key would collapse per-agent
+revocation). Install chain: prompt = install + pair-token login + `sc agent
+add >> .env` + a CLAUDE.md reminder.
 
-`routed: false` → run the command through SafeClaw (`sc run -- <cmd>`, or the
-service's `setup` hint). Don't send a phantom unrouted — the upstream just
-rejects it, indistinguishably from a bad key.
-``` Skill stays **generic**: the one concept + the routing discipline +
-"call discovery; never hold raw secrets" — per-service config → the service's `[setup]`
-+ registry. Install prompt = one-time bootstrap (goal + anchors, not a command
-list). Clean removal = a per-project manifest, not agent memory.
+**Atoms are truth, `_url`s are derived** — `src/cli/active.rs` is the single
+derivation point. Device atoms: config `daemon` host + the port constants +
+the default vault; vault history lives in `~/.safeclaw/known_vaults.toml`
+(known_hosts-style). THE invariant: **proxy and control always derive from
+the same daemon host** — when `$SAFECLAW_DAEMON_URL` is set, its HOST feeds
+`control_root` and every derived proxy URL, so an agent's shelled `sc` and
+its own HTTP cannot target different daemons; worst case is a uniformly
+stale snapshot, never a split. Vault precedence at the one choke point
+(`resolve_active`): `--vault > $SAFECLAW_VAULT_ID (env pin) > config >
+single-known auto-select`. Mint-time projections (`sc env`, `sc agent add`)
+read DEVICE atoms only — never the env pins (a re-eval must not freeze its
+own prior output). Remote is config, not code: hand-edit the daemon atom,
+copy the PUBLIC `ca.pem` (`$SAFECLAW_CA_PATH`); `ca.key` never leaves.
+
+**Auth:** the api-key is the AGENT's identity (agent ≡ api-key,
+account-level) and the proxy verifies it **before any substitution** —
+Proxy-Auth password on the proxy face, Bearer on the API face — against the
+cloud-synced hash-set (in-memory, blob-external → works while locked).
+Absent Proxy-Auth = blind tunnel (non-participating); present-but-wrong =
+407. An auth miss with a key present triggers ONE debounced hash refresh (a
+just-minted `sc agent add` key must not 407 for the 30s sync loop).
+
+Discovery shape: `GET $DAEMON_URL/v/$VAULT_ID/registry` → `{ services[],
+connections:[{ id, hosts, connected, phantoms }] }` — **discovery returns the
+ready-made phantom strings**; the agent copies, never constructs. The phantom
+FORMAT lives in the skill's one-concept sentence; per-connection INSTANCES
+live here; toml `setup` never carries phantom mechanics. Egress floor =
+mainstream SSRF hygiene only (private/loopback/link-local IP literals +
+`localhost` names; no `.internal` name blocks — a credential only reaches a
+human-anchored host anyway). Skill stays generic; the shipped
+`static/safeclaw-skill.md` is the canonical agent-facing text.
 
 ## 15. Superseded / Decided NOT to do (1–2 lines each; don't re-litigate)
 
+- **Routing preflight / `phantom ⟺ routed` discipline — RETIRED (2026-07-06).**
+  Probe host, `is_routed`, `sc status` routing block all deleted: opt-in means
+  the agent routes explicitly, so the unrouted-phantom state isn't a detection
+  problem (it's a clean upstream 401 by design).
+- **Key-in-the-install-prompt (console pre-baked env) — REJECTED.** Puts a
+  long-lived credential in the transcript AND bakes cloud-side assumptions
+  about device atoms. The device-side minter (`sc agent add` → full dotenv
+  block on stdout) achieves single-minter without either cost.
+- **`sc env` emitting the agent key / a key-bearing PROXY_URL — REJECTED.**
+  Device-scope tool; one device-level key would collapse per-agent
+  revocation/audit.
 - **`/use/<conn>/<path>` endpoint — RETIRED.** Two injection triggers (URL-conn +
   phantom) create conflict/precedence/缺省 combinatorics; phantom-only is one
   trigger. Raw connections are single-host, so a real upstream URL + phantom fully

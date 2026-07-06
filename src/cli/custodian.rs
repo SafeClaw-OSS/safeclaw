@@ -1,6 +1,6 @@
 //! Daemon read-only diagnostics: `sc pubkey` (HPKE outer-envelope key, fetched
 //! from a running daemon) and `sc registry` (public service catalog, rendered
-//! OFFLINE from the compiled-in recipes — no daemon needed). Daemon lifecycle
+//! OFFLINE from the compiled-in services — no daemon needed). Daemon lifecycle
 //! (up / down / restart / logs / serve) lives in `service` + `up`; vault/daemon
 //! status in `status`.
 
@@ -12,7 +12,7 @@ pub async fn pubkey(args: CommonArgs) -> Result<(), String> {
 }
 
 /// `sc registry` — render the static service catalog from the compiled-in
-/// recipes, no running daemon. This is the exact shape `GET /registry` serves;
+/// services, no running daemon. This is the exact shape `GET /registry` serves;
 /// CI runs `sc registry --json` to publish the catalog artifact the console
 /// reads. Offline by construction (`ServiceRegistry::compiled_only()`).
 pub fn registry(args: RegistryArgs) -> Result<(), String> {
@@ -57,10 +57,13 @@ async fn fetch_print(_args: CommonArgs, path: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// The daemon URL — `$SAFECLAW_VAULT_URL` / active config, else localhost.
+/// The daemon control root. `resolve_active` errs only when no vault is
+/// selected — fall back to the SAME shared derivation (env-first host), not a
+/// hardcoded localhost that would ignore an agent's `$SAFECLAW_DAEMON_URL`.
 fn resolve_daemon_url() -> Result<String, String> {
     if let Ok((c, _)) = resolve_active(None) {
         return Ok(c);
     }
-    Ok("http://localhost:23294".to_string())
+    let cfg = crate::cli::active::load().unwrap_or_default();
+    Ok(crate::cli::active::control_root(&cfg))
 }

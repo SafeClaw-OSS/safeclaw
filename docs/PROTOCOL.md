@@ -26,7 +26,7 @@
 | SUDP role | SafeClaw 实例 |
 |---|---|
 | **U** Authorizer | 用户本人，通过 WebAuthn passkey + browser |
-| **R** Requester | LLM agent，通过 `POST /v/{vid}/use/<svc>/<rest>` 发起 op |
+| **R** Requester | LLM agent，credential traffic 走 resident proxy（phantom），需 approval 时 proxy 代建 op |
 | **T** Custodian | safeclaw daemon |
 | **E** Environment | 上游 service (OpenAI/Anthropic/...)，非 SUDP 参与者 |
 | **`\Sigma`** Sealed state | `~/.safeclaw/vault.dat`（SCSV format，§5.1） |
@@ -136,7 +136,11 @@ ActType vocabulary 跟随 `sudp` 上游：`Enroll / Write / Rotate / Revoke / Ex
 
 **`reveal` 已废弃。** 历史的 "reveal = plaintext export to R" mode 已并入 `export` + "custodian-as-recipient" 部署模式：当 R 无 KEM 能力时，custodian 自己生成 ephemeral keypair、自己充当 recipient、execute_export → decap → 业务层用明文（如转给 agent over TLS）。custodian 显式承担"我把 secret 给出去了"的安全责任，paper 不打折，footgun 在 [[approve-ui-ownership-transfer]] UI 警告里显式化。
 
-**Use op** 走 `ANY /v/{vid}/use/<svc>/<rest>` R-side sugar（§4.1，单端口 `:23294`；独立 proxy port `:23295` 已**移除**），内部 compile 成 Use op 后 redemption 阶段汇流到 `POST /op/{op_id}/approve`。
+**Use op** 由 resident credential proxy（phantom-only local HTTPS MITM，`:23294`
+`PROXY_PORT`，详 CREDENTIAL_BROKER.md）在 phantom 命中时创建为 `authorize_only`
+op；旧的 `/use`/`/stream` R-side sugar 已**移除**。control/API plane（含 `POST
+/v/{vid}/op`、`POST /op/{op_id}/approve`）在 `:23295` `CONTROL_PORT`。redemption
+阶段仍统一汇流到 `POST /op/{op_id}/approve`（op plane 语义不变）。
 
 ### 3.3 Type-specific `act.scope` schemas
 
@@ -199,17 +203,26 @@ ActType vocabulary 跟随 `sudp` 上游：`Enroll / Write / Rotate / Revoke / Ex
 ### 4.1 Endpoint table
 
 ```
+─── Two localhost listeners (2026-07-03 port swap) ───────────────────────────
+# CONTROL/API plane  :23295 (CONTROL_PORT)  — the axum Router; every HTTP endpoint
+#                    below. Agent reaches it only via $SAFECLAW_VAULT_URL.
+# CREDENTIAL proxy   :23294 (PROXY_PORT)     — resident local HTTPS MITM; the sole
+#                    agent credential-traffic surface (phantom substitution).
+#                    NOT an HTTP endpoint here — see CREDENTIAL_BROKER.md.
+
 ─── Vault-scoped (creation / management) ─────────────────────────────────────
 
 POST  /v/{vid}/op                    R 创建 op            → { op_id, r, expires_at }    [HPKE: SHOULD]
-# NOTE (2026-07-03): the R-side sugar routes below are being replaced by the phantom-only local
-# HTTPS proxy (CREDENTIAL_BROKER.md) — op plane, ActType vocabulary, grant machinery UNCHANGED.
-POST  /v/{vid}/use/{service}         R-side sugar (Use, catch-all path = "*")           [HPKE: SHOULD]
-POST  /v/{vid}/use/{service}/{rest}  R-side sugar (Use, sub-path under service root)    [HPKE: SHOULD]
-POST  /v/{vid}/export/<key>          R-side sugar (Export)→ 同上                          [HPKE: SHOULD]
+# The old /use + /stream R-side sugar routes are RETIRED (phantom-only proxy;
+# CREDENTIAL_BROKER.md). A Use op is now created by the proxy pipeline as
+# authorize_only — op plane, ActType vocabulary, grant machinery UNCHANGED.
+POST  /v/{vid}/export/<key>          disabled stub → 403 on the agent surface
+                                     (raw-secret export off-limits; the human path
+                                      is the op-plane Export ceremony)
 GET   /v/{vid}/passkeys              该 vault 的凭据列表
 GET   /v/{vid}/events                tenant-scoped SSE 流
 GET   /v/{vid}/approvals             paginated approval/audit history (详 §5.4)
+GET   /v/{vid}/registry              per-vault live view (catalog + connected state)
 
 ─── Op-flat (对已存在 op 的动作) ─────────────────────────────────────────────
 
@@ -221,19 +234,22 @@ POST  /op/{op_id}/reject             U: 拒绝 (SafeClaw 部署层 state transit
 
 GET   /health
 GET   /pubkey                        sc_pk (HPKE bootstrap)
-GET   /menu                          service catalog: { id, name, sub?, description?,
-                                     endpoints: [{ method, path, approval, wildcard? }] }
-                                     —— 公开访问 (no auth)，frontend approve UI 用它把 service
-                                     id 解析成 "Name (sub)" 展示
+GET   /registry                      service catalog: { id, name, category, hosts,
+                                     phantoms, ... } —— 公开访问 (no auth)
+GET   /skill.md                      agent skill (302 → canonical on GitHub)
 ```
 
-**`/v/{vid}/use/{service}` 两种 form 的边界**：services with `[[api]] path = "*"` 是 catch-all，agent 可以直接 POST 到 `/v/{vid}/use/{service}`（rest 为空），daemon 把 `path` 编入 op.scope 为 `/`；带 sub-path 的 service（如 OpenAI 的 `/v1/chat/completions`）走 `/v/{vid}/use/{service}/{rest}`。这两个 route 共享同一个内部 handler（`handle_no_rest` 是 thin wrapper），URL grammar 区分仅是 axum router 层面的事。
-
-**`/menu` `sub` field**：v1 起 service.toml 的 `[service] sub` 通过 registry 暴露。前端不再在 UI 层 hardcode service 描述——`/approve/{op_id}` 收到 `use` op 时 fetch /c/registry 一次，按 `op.scope.service` 查 `name + sub`，渲染 "Inbox (demo target)"；找不到 fallback raw id。
+**`/registry` 投影**：service.toml 的 `name` / `hosts` / `phantoms` 通过 registry
+暴露（per-vault endpoint 再叠加 connected / needs_reauth）。前端 approve UI fetch
+`/registry` 按 `op.scope.service` 查 `name`；找不到 fallback raw id。
 
 **HPKE coverage.** 标注 `[HPKE: MUST]` 的 endpoint 请求体含 G 或同等密码学敏感物质，必须 HPKE 外信封封装（详 §4.2）。`[HPKE: SHOULD]` 的请求体含可观测意图（target 名、上游业务 payload），建议封装。无标注 = 无敏感载荷，TLS 足够。响应方向机密性由 SUDP Export sealing 在协议内部负责（§4.5）。
 
-**R-side sugar 共用 SUDP-aware 内部实现.** `/v/{vid}/use/...`、`/v/{vid}/export/...` 的 handler 只做"URL+body → sudp::Operation"编译，编译完调同一个 op-creation service。**无 HTTP redirect，无平行实现。** Redemption 阶段统一 `POST /op/{op_id}/approve`。
+**Op creation 统一走 `POST /v/{vid}/op`.** phantom-only 下不再有 `/use`/`/stream`
+R-side sugar：credential traffic 走 resident proxy（CREDENTIAL_BROKER.md），proxy
+在 phantom 命中且需 approval 时把请求 compile 成 `authorize_only` Use op。`/export`
+仅剩 agent-surface 的 disabled stub（403）。**无 HTTP redirect，无平行实现。**
+Redemption 阶段统一 `POST /op/{op_id}/approve`。
 
 **Creation 在 parent 下，存在物的动作 flat at root.** 任何 URL 中**最多出现一个 ID** — `/v/{vid}/...` 创建（vault 是 parent）、`/op/{op_id}/...` 操作 op（op_id 自带 vault 归属，daemon 内部 lookup）。杜绝 `/v/{vid}/op/{op_id}/...` 这种双 ID URL。
 

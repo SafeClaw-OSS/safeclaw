@@ -1,4 +1,4 @@
-//! HTTP server: admin port (`:23294`) router.
+//! HTTP server: control/API plane (`CONTROL_PORT`, `:23295`) router.
 //!
 //! v1 URL surface (PROTOCOL.md §4.1 / `[[v1-endpoint-design]]` /
 //! `[[architecture-final-2026-05-27]]`):
@@ -27,6 +27,7 @@
 //! SafeClaw pro-backend is the auth boundary).
 
 pub mod broker;
+pub mod broker_flow;
 pub mod handlers;
 
 use std::sync::Arc;
@@ -78,14 +79,14 @@ pub fn app_router(state: Arc<AppState>) -> Router {
         .with_state(state.clone());
     router = router.layer(DefaultBodyLimit::max(MAX_BODY_BYTES));
 
-    // ── Broker plane ─────────────────────────────────────────────────────
-    // The agent-facing broker routes (use / stream; /export is registered but
-    // disabled-stubbed for v1 — raw-secret exfil off the agent surface). These —
-    // and ONLY these — carry the agent-key gate (`require_api_key`): every request must
-    // present `Authorization: Bearer <agent-key>` whose sha256 is in the
-    // cloud-synced account hash-set. They formerly lived on a second port
-    // (:23295, now removed); merging them here keeps the gate scoped to the
-    // broker surface so control routes are unaffected.
+    // ── Agent-surface control routes ─────────────────────────────────────
+    // The only agent-facing HTTP route left on the control plane is the
+    // `/export` disabled stub (raw-secret exfil off the agent surface — the
+    // op-plane Export ceremony is the human path). Live credential traffic no
+    // longer goes through an HTTP route: it rides the resident phantom-only
+    // proxy (S2, a separate listener). This sub-router carries the agent-key
+    // gate (`require_api_key`) so the stub stays scoped like the old broker
+    // surface without touching the passkey/admin-gated control routes.
     let broker = broker_router(state);
     router = router.merge(broker);
 
@@ -101,22 +102,13 @@ pub fn app_router(state: Arc<AppState>) -> Router {
 /// these broker routes only — the control routes in `app_router` keep their own
 /// (passkey / X-Admin-Key / auth-free-localhost) gating untouched.
 fn broker_router(state: Arc<AppState>) -> Router {
-    use crate::proxy::{env, stream, use_broker};
-    use axum::routing::any;
+    use crate::proxy::env;
 
     Router::new()
-        // /export → disabled stub for v1 (raw-secret export off the agent surface).
+        // /export → disabled stub (raw-secret export off the agent surface; the
+        // op-plane Export ceremony is the human path).
         .route("/v/{vid}/export/{key}", post(env::disabled))
-        .route("/v/{vid}/use/{service}", any(use_broker::handle_no_rest))
-        .route("/v/{vid}/use/{service}/{*rest}", any(use_broker::handle))
-        // Streaming passthrough (git smart-HTTP, etc.). Body limit DISABLED on
-        // this route only — packfiles can be hundreds of MB and are streamed,
-        // not buffered. Still behind the agent-key gate below.
-        .route(
-            "/v/{vid}/stream/{service}/{*rest}",
-            any(stream::handle).layer(DefaultBodyLimit::disable()),
-        )
-        // Agent-key gate — scoped to exactly these broker routes.
+        // Agent-key gate — scoped to exactly this route.
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             crate::api_key::require_api_key,

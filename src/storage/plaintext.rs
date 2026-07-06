@@ -1,4 +1,4 @@
-//! v3 vault plaintext shape — per `docs/STORES_AND_ITEMS.md`.
+//! v4 vault plaintext shape — per `docs/STORES_AND_ITEMS.md`.
 //!
 //! Physical layout (Design B): the decrypted protected state `M` =
 //! `sudp::state::ProtectedState { targets, peers, aux }` carries:
@@ -24,7 +24,7 @@ use crate::core::policy::Policy;
 use crate::error::{AppError, Result};
 
 /// Current schema version. Hard-fail on any other value.
-pub const PLAINTEXT_VERSION: u32 = 3;
+pub const PLAINTEXT_VERSION: u32 = 4;
 
 /// Reserved store IDs. These two stores are always present in every vault.
 pub const NATIVE_SECRETS_ID: &str = "native-secrets";
@@ -74,14 +74,27 @@ pub struct Store {
 /// configured. There is no status field to drift out of sync.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Connection {
-    /// Which recipe (TYPE) this instantiates. Decouples `connection_id` from
-    /// the service so there can be many connections per service.
-    pub service: String,
-    /// Per-connection values for the recipe-declared re-map slots only (e.g.
-    /// `host` for a self-hosted upstream — §4). A connection can fill ONLY the
-    /// slots the recipe declares (anti-SSRF). Omitted when none.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub config: BTreeMap<String, String>,
+    /// The service (TYPE) this instantiates, or `None` for a **raw** connection
+    /// (`sc set K --host h`) that references no service and anchors its own
+    /// `hosts`. When set, hosts derive from the service (SSoT); an instance may
+    /// only PIN exact FQDNs within a service's `*.suffix` wildcards.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service: Option<String>,
+    /// The connection's anchored hosts. Required for a raw connection (the
+    /// egress anchor). For a service-backed connection: `None` when the service
+    /// declares exact hosts only (derived, no stored copy); the pinned exact
+    /// FQDNs (⊆ the service's `*.suffix` entries) when the service is wildcard.
+    /// Enforced exact-FQDN at egress; never a bare `*`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hosts: Option<Vec<String>>,
+    /// The UPPERCASE secret KEY names this connection uses. **REQUIRED for a raw
+    /// connection** (`service: None`) — it answers "which secrets" directly, so
+    /// discovery and cache-bootstrap read it instead of reverse-indexing the
+    /// native-secrets namespace by casing. **OMITTED (`None`) for a service-backed
+    /// connection**: its secrets derive from the service's declared `secrets`
+    /// (including the oauth2 refresh-token KEY). One canonical answer, no drift.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secrets: Option<Vec<String>>,
 }
 
 /// An **in-flight** connect handshake — everything the daemon needs to redeem
@@ -90,23 +103,36 @@ pub struct Connection {
 /// it here) — there is never a partial/duplicate record.
 ///
 /// Relayed to the daemon *through the sealed vault* to stay cloud-blind: the
-/// browser drives consent, seals `{ service, config, code, verifier }` here, and
-/// the daemon (not the backend) performs the code→token exchange. The `code` is
-/// single-use with a ~10-min TTL. `redirect_uri` is NOT here — it's a fixed
-/// property of the OAuth client, held in the provider config. Mirrors the
-/// frontend `lib/vault-grant.ts` `Connecting` shape.
+/// browser drives consent, seals `{ service, hosts?, oauth2: { code, code_verifier } }`
+/// here, and the daemon (not the backend) performs the code→token exchange. The
+/// generic identity (`service`, `hosts`) is top-level; the mechanism handshake
+/// state nests under the mechanism key (`oauth2`) so a future auth mechanism
+/// nests under ITS key without the schema getting messy. `redirect_uri` is NOT
+/// here — it's a fixed property of the OAuth client, held in the provider config.
+/// Mirrors the frontend `lib/vault-grant.ts` `Connecting` shape.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Connecting {
-    /// The recipe (TYPE) being instantiated.
+    /// The service (TYPE) being instantiated.
     pub service: String,
-    /// Per-connection re-map slot values, carried through to the established
-    /// [`Connection`] on exchange. Omitted when none.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub config: BTreeMap<String, String>,
-    /// The single-use authorization code from the loopback redirect.
+    /// Exact FQDNs pinned at connect for a `*.suffix` wildcard service, carried
+    /// through to the established [`Connection`] on exchange. Omitted (`None`)
+    /// for an exact-hosts service.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hosts: Option<Vec<String>>,
+    /// OAuth2 (RFC 6749 authorization_code + RFC 7636 PKCE) handshake state.
+    /// Nested under the mechanism key — mirrors the service.toml `[oauth2]`.
+    pub oauth2: ConnectingOAuth2,
+}
+
+/// The oauth2 handshake temps of an in-flight connect (RFC 6749 / 7636). These
+/// are flow-standard, not per-service, so they live here rather than in the
+/// service.toml `[oauth2]`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConnectingOAuth2 {
+    /// The single-use authorization code from the loopback redirect (RFC 6749).
     pub code: String,
     /// The PKCE code_verifier (RFC 7636) the browser generated for this flow.
-    pub verifier: String,
+    pub code_verifier: String,
     /// Terminal exchange failure — set by the daemon when the code→token
     /// exchange fails non-recoverably (`invalid_grant`: the authorization code
     /// expired or was already used). The console renders "connection failed,
@@ -132,7 +158,7 @@ pub fn secret_address(conn_id: &str, service_id: &str, role: &str) -> String {
     }
 }
 
-/// `aux` payload — everything inside `ProtectedState.aux` for v3 vaults.
+/// `aux` payload — everything inside `ProtectedState.aux` for v4 vaults.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VaultAux {
     pub version: u32,
@@ -160,6 +186,14 @@ pub struct VaultAux {
     /// sensible range during prune.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audit_retention_days: Option<u32>,
+    /// Per-vault custom service definitions: `service_id → verbatim v4
+    /// service.toml source`. Validated (v4 schema, provider ∈ shipped
+    /// `_providers`, no tool-named sections) at unlock before it can broker,
+    /// and again at author time. Sparse — empty when the user authored none. A
+    /// custom service is folded into the catalog exactly like a compiled one;
+    /// it never shadows a built-in id.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub services: BTreeMap<String, String>,
 }
 
 impl VaultAux {
@@ -194,6 +228,7 @@ impl VaultAux {
             connecting: BTreeMap::new(),
             connections: BTreeMap::new(),
             audit_retention_days: None,
+            services: BTreeMap::new(),
         }
     }
 }
@@ -212,7 +247,7 @@ pub struct VaultPlaintextView {
 }
 
 impl VaultPlaintextView {
-    /// Parse from an opened `ProtectedState`. Hard-fails on `version != 3`.
+    /// Parse from an opened `ProtectedState`. Hard-fails on `version != 4`.
     pub fn from_protected_state(m: &ProtectedState) -> Result<Self> {
         let aux: VaultAux = serde_json::from_value(m.aux.clone())
             .map_err(|e| AppError::Internal(format!("vault aux parse: {}", e)))?;
@@ -293,7 +328,7 @@ mod tests {
     fn parse_minimal_aux_succeeds() {
         let m = build_protected_state(
             serde_json::json!({
-                "version": 3,
+                "version": 4,
                 "stores": {
                     "native-secrets": { "kind": "native-secrets", "category": "value" },
                     "native-files":   { "kind": "native-files",   "category": "file"  }
@@ -303,7 +338,7 @@ mod tests {
             &[("openai_api_key", b"sk-test")],
         );
         let view = VaultPlaintextView::from_protected_state(&m).unwrap();
-        assert_eq!(view.aux.version, 3);
+        assert_eq!(view.aux.version, 4);
         assert_eq!(view.aux.store_order, vec!["native-secrets", "native-files"]);
         assert_eq!(view.resolve_value_native("openai_api_key"), Some(&b"sk-test"[..]));
         assert_eq!(view.resolve_value_native("nonexistent"), None);
@@ -329,7 +364,7 @@ mod tests {
         let aux = VaultAux::initial();
         let json = serde_json::to_value(&aux).unwrap();
         let aux2: VaultAux = serde_json::from_value(json).unwrap();
-        assert_eq!(aux2.version, 3);
+        assert_eq!(aux2.version, 4);
         assert!(aux2.stores.contains_key("native-secrets"));
         assert!(aux2.stores.contains_key("native-files"));
         assert_eq!(aux2.store_order.len(), 2);

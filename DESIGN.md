@@ -1,5 +1,15 @@
 # SafeClaw — System Design
 
+> **⚠️ PARTIALLY SUPERSEDED (2026-07-03 phantom-only pivot).** The **proxy data
+> plane** described below — the `/use` forward-proxy, base-URL rewriting, the
+> `[[api]]` multi-step engine, and the two-port model with **Admin 23294 /
+> Proxy 23295** — is retired. Canon for credential flow = the resident
+> phantom-only local HTTPS proxy in [docs/CREDENTIAL_BROKER.md](./docs/CREDENTIAL_BROKER.md).
+> Ports are now **control/API 23295 (`CONTROL_PORT`) / credential proxy 23294
+> (`PROXY_PORT`)** — swapped from what this doc shows. The crypto primitives,
+> vault state machine, passkey/auth boundary, sync, and op/approval flow remain
+> accurate.
+
 **Audience.** This document is the canonical design reference for the open-source `safeclaw` Rust binary. It is written for two readers:
 
 1. A future contributor who needs to understand what the system does and why each piece exists.

@@ -4,46 +4,182 @@
 //! then write (assertion only) to seal + submit. All crypto local.
 
 use std::collections::BTreeMap;
+use std::io::IsTerminal;
 
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
 use serde_json::{json, Value};
 
 use crate::cli::active::resolve_active;
+use crate::cli::conn::{insert_raw_connection, remove_connection, valid_conn_id, valid_role, validate_raw_host};
 use crate::cli::webauthn::*;
 use crate::config::{GetArgs, RmArgs, SetArgs};
 use crate::crypto::kdf::WRAP_VERSION;
 
 const DS_SEAL: &[u8] = b"sudp/v1/seal";
 
+/// What `sc set` does with the item's broker binding.
+enum BrokerIntent {
+    /// Store the value with no host — human-only, invisible to the agent.
+    NoBroker,
+    /// Create a raw connection anchored to these exact FQDNs.
+    Host(Vec<String>),
+}
+
 pub async fn run_set(args: SetArgs) -> Result<(), String> {
     let (custodian, vault) = resolve_active(args.vault.as_deref())?;
-    let key = args.key.clone();
-    let value = args.value.clone();
-    eprintln!("safeclaw set {} — two passkey gestures (unlock + write)", key);
+    // §1: secret KEYs are ALWAYS uppercase. Force-uppercase on input (a lowercase
+    // key is auto-converted, never stored lowercase) so there is one canonical
+    // form. Reject anything that isn't a valid env KEY even after uppercasing.
+    let key = args.key.trim().to_ascii_uppercase();
+    if !valid_role(&key) {
+        return Err(format!(
+            "'{}' is not a valid secret key — use UPPERCASE letters, digits and '_' (e.g. STRIPE_KEY)",
+            args.key.trim()
+        ));
+    }
 
+    // Value: explicit arg, else hidden TTY prompt, else (non-TTY) an error.
+    let value = match args.value.clone() {
+        Some(v) => v,
+        None => prompt_secret_value(&key)?,
+    };
+
+    // Broker intent: --no-broker | --host <h..> | (TTY) prompt | (non-TTY) error.
+    let intent = resolve_broker_intent(&key, &args.host, args.no_broker)?;
+
+    // The single-secret sugar: the connection id is the lowercased key — a plain
+    // handle (safe now that `secrets` is stored explicitly, no reverse-index
+    // coupling — §9). Validate the id + anchor hosts BEFORE spending a passkey
+    // gesture — an invalid --host must not cost the user an unlock touch.
+    let conn = key.to_ascii_lowercase();
+    if let BrokerIntent::Host(hosts) = &intent {
+        if !valid_conn_id(&conn) {
+            return Err(format!(
+                "can't derive a connection id from '{}' — use `sc connect <name> --host {} --secret {}=<value>` instead",
+                key,
+                hosts.first().map(String::as_str).unwrap_or("<domain>"),
+                key
+            ));
+        }
+        for h in hosts {
+            validate_raw_host(h)?;
+        }
+    }
+
+    eprintln!("safeclaw set {} — two passkey gestures (unlock + write)", key);
     let meta = fetch_passkey_meta(&custodian, &vault).await?;
-    let (kv, aux, user_key) = do_unlock(&custodian, &vault, &meta, args.no_browser, args.timeout, args.cb_port).await?;
+    let (kv, mut aux, user_key) =
+        do_unlock(&custodian, &vault, &meta, args.no_browser, args.timeout, args.cb_port).await?;
 
     let mut new_kv = kv;
     new_kv.insert(key.clone(), value);
+
+    match intent {
+        BrokerIntent::NoBroker => {
+            // Opting out must actually un-broker: drop any raw connection a prior
+            // `sc set <key> --host …` created for this key, else the item stays
+            // agent-usable through that stale connection despite --no-broker.
+            if remove_connection(&mut aux, &conn) {
+                eprintln!("  removed the prior host anchor for '{}'", conn);
+            }
+            eprintln!("  stored · no host anchored — agent cannot use this item (`sc secret get` reveals it for a human)");
+        }
+        BrokerIntent::Host(hosts) => {
+            // Raw single-secret connection: explicit `secrets = [KEY]`, id = the
+            // lowercased key handle, stored bare (§2/§9).
+            insert_raw_connection(&mut aux, &conn, &hosts, std::slice::from_ref(&key));
+            eprintln!("  connection '{}' → {} · phantom __sc__{}__", conn, hosts.join(", "), conn);
+        }
+    }
 
     seal_and_submit_write(&custodian, &vault, &meta, &user_key, &new_kv, &aux, args.no_browser, args.timeout, args.cb_port).await?;
     eprintln!("safeclaw set — {} written", key);
     Ok(())
 }
 
+/// Decide the broker binding for `sc set`. Host is a REQUIRED answer (spec §11):
+/// `--no-broker` / `--host none` opt out explicitly; otherwise `--host` anchors;
+/// missing on a TTY → prompt; missing off a TTY → a clear error naming both
+/// fixes (never hang, never silently store an unusable item).
+fn resolve_broker_intent(key: &str, host: &[String], no_broker: bool) -> Result<BrokerIntent, String> {
+    if no_broker {
+        return Ok(BrokerIntent::NoBroker);
+    }
+    // `--host none` is the explicit opt-out sentinel.
+    if host.len() == 1 && host[0].eq_ignore_ascii_case("none") {
+        eprintln!("  --host none → stored without a host · agent cannot use this item");
+        return Ok(BrokerIntent::NoBroker);
+    }
+    if !host.is_empty() {
+        return Ok(BrokerIntent::Host(host.to_vec()));
+    }
+    if std::io::stdin().is_terminal() {
+        let entered = prompt_host(key)?;
+        if entered.eq_ignore_ascii_case("none") {
+            eprintln!("  stored without a host · agent cannot use this item");
+            return Ok(BrokerIntent::NoBroker);
+        }
+        Ok(BrokerIntent::Host(vec![entered]))
+    } else {
+        Err(format!(
+            "'{}' needs a host so the agent can use it — pass `--host <domain>` (the API's domain, e.g. api.stripe.com), or `--no-broker` to store it for humans only",
+            key
+        ))
+    }
+}
+
+/// Hidden value prompt (TTY only — keeps the secret out of shell history / `ps`).
+fn prompt_secret_value(key: &str) -> Result<String, String> {
+    if !std::io::stdin().is_terminal() {
+        return Err(format!(
+            "no value given for '{}' — pass it as an argument (non-interactive input isn't a terminal)",
+            key
+        ));
+    }
+    let v = rpassword::prompt_password(format!("Value for {} (hidden): ", key))
+        .map_err(|e| format!("read value: {}", e))?;
+    if v.is_empty() {
+        return Err("value cannot be empty".into());
+    }
+    Ok(v)
+}
+
+/// Required host prompt. Echoes the intent so an arg-order slip is visible.
+fn prompt_host(key: &str) -> Result<String, String> {
+    use std::io::Write as _;
+    eprintln!("'{}' needs an egress host so the agent can use it.", key);
+    eprint!("Host (the API's exact domain, e.g. api.stripe.com; 'none' = store for humans only): ");
+    std::io::stderr().flush().ok();
+    let mut line = String::new();
+    std::io::stdin()
+        .read_line(&mut line)
+        .map_err(|e| format!("read host: {}", e))?;
+    let h = line.trim().to_string();
+    if h.is_empty() {
+        return Err("a host is required (or `none` / `--no-broker` to store for humans only)".into());
+    }
+    Ok(h)
+}
+
 pub async fn run_rm(args: RmArgs) -> Result<(), String> {
     let (custodian, vault) = resolve_active(args.vault.as_deref())?;
-    let key = args.key.clone();
+    // §1: secret KEYs are canonical uppercase — normalize on input so `sc rm
+    // github_token` finds the stored `GITHUB_TOKEN`.
+    let key = args.key.trim().to_ascii_uppercase();
     eprintln!("safeclaw rm {} — two passkey gestures (unlock + write)", key);
 
     let meta = fetch_passkey_meta(&custodian, &vault).await?;
-    let (kv, aux, user_key) = do_unlock(&custodian, &vault, &meta, args.no_browser, args.timeout, args.cb_port).await?;
+    let (kv, mut aux, user_key) = do_unlock(&custodian, &vault, &meta, args.no_browser, args.timeout, args.cb_port).await?;
 
     let mut new_kv = kv;
     if new_kv.remove(&key).is_none() {
         return Err(format!("key {} not found in vault", key));
+    }
+    // Drop the raw connection this key backed (id == lowercased key), if any, so
+    // no connection is left dangling at a now-missing secret.
+    if remove_connection(&mut aux, &key.to_ascii_lowercase()) {
+        eprintln!("  also removed its connection '{}'", key.to_ascii_lowercase());
     }
 
     seal_and_submit_write(&custodian, &vault, &meta, &user_key, &new_kv, &aux, args.no_browser, args.timeout, args.cb_port).await?;
@@ -51,7 +187,11 @@ pub async fn run_rm(args: RmArgs) -> Result<(), String> {
     Ok(())
 }
 
-async fn do_unlock(
+/// Unlock the vault (passkey gesture 1/2) and return `(kv, aux, user_key)` —
+/// the current native-secrets map, the raw `aux` value, and the derived user
+/// key. Shared by every CLI verb that mutates the vault (`sc set` / `sc rm` /
+/// `sc connect` / `sc service add`).
+pub(crate) async fn do_unlock(
     custodian: &str, vault: &str, meta: &PasskeyMeta,
     no_browser: bool, timeout: u64, cb_port: Option<u16>,
 ) -> Result<(BTreeMap<String, String>, Value, Vec<u8>), String> {
@@ -106,7 +246,9 @@ async fn do_unlock(
     Ok((kv, aux, user_key))
 }
 
-async fn seal_and_submit_write(
+/// Reseal `(kv, aux)` under a fresh K and submit the write (passkey gesture
+/// 2/2). Shared by every CLI verb that mutates the vault.
+pub(crate) async fn seal_and_submit_write(
     custodian: &str, vault: &str, meta: &PasskeyMeta,
     user_key: &[u8], kv: &BTreeMap<String, String>, aux: &Value,
     no_browser: bool, timeout: u64, cb_port: Option<u16>,
@@ -186,7 +328,9 @@ fn decode_prf_salt(s: &str) -> Result<Vec<u8>, String> {
 
 pub async fn run_get(args: GetArgs) -> Result<(), String> {
     let (custodian, vault) = resolve_active(args.vault.as_deref())?;
-    let key = args.key.trim().to_string();
+    // §1: secret KEYs are canonical uppercase — normalize on input so a human
+    // `sc get github_token` resolves the stored `GITHUB_TOKEN`.
+    let key = args.key.trim().to_ascii_uppercase();
     if key.is_empty() {
         return Err("key cannot be empty".into());
     }

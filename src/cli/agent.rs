@@ -27,9 +27,9 @@ fn cloud_and_key() -> Result<(String, String), String> {
     let cloud = cfg
         .cloud_backend
         .filter(|s| !s.is_empty())
-        .ok_or("this device isn't paired — run `sc login <pair-token>` first")?;
+        .ok_or("this device isn't paired — run `sc login --pair-token <token>` first")?;
     let key = crate::sync::device_key()
-        .ok_or("no device-key — run `sc login <pair-token>` first")?;
+        .ok_or("no device-key — run `sc login --pair-token <token>` first")?;
     Ok((cloud.trim_end_matches('/').to_string(), key))
 }
 
@@ -60,6 +60,22 @@ struct ListKey {
 
 async fn add(args: AgentAddArgs) -> Result<(), String> {
     let (cloud, key) = cloud_and_key()?;
+    // Resolve the projection inputs BEFORE minting: erroring out after the
+    // POST would strand a live account-level key the caller never saw.
+    let cfg = load_config().unwrap_or_default();
+    let Some(vid) = crate::cli::active::device_default_vault(&cfg) else {
+        return Err(
+            "no vault on this device — run `sc login --pair-token <token>` (it sets the \
+             vault), or `sc vault use`, then retry"
+                .into(),
+        );
+    };
+    let daemon_url = format!(
+        "{}:{}",
+        crate::cli::active::device_daemon_host(&cfg),
+        crate::config::PROXY_PORT
+    );
+
     let resp = client()?
         .post(format!("{}/api/vault/agents", cloud))
         .bearer_auth(&key)
@@ -71,16 +87,32 @@ async fn add(args: AgentAddArgs) -> Result<(), String> {
         return Err(format!("create agent key failed: HTTP {}", resp.status()));
     }
     let r: CreateResp = resp.json().await.map_err(|e| format!("parse response: {}", e))?;
-    // Key to STDOUT ONLY (so `KEY=$(sc agent add x)` captures it); STDERR guidance
-    // carries NO key, so an agent can blind-capture stdout without the secret
-    // leaking into its transcript via a stderr copy.
-    println!("{}", r.token);
+
+    // ── Mint-time projection (CREDENTIAL_BROKER.md §14): this IS the minter ─
+    // Print the agent's COMPLETE env as dotenv lines: a snapshot of the DEVICE
+    // atoms (config daemon host + port constants + default vault) plus the
+    // fresh key. The agent appends ONE command's stdout to its own `.env` —
+    // its SSOT from then on — and never assembles a value. STDOUT only;
+    // stderr guidance carries NO secret, so blind-capture keeps the key out
+    // of the agent's transcript (and out of the install prompt).
+    println!("SAFECLAW_DAEMON_URL={}", daemon_url);
+    println!("SAFECLAW_VAULT_ID={}", vid);
+    println!("SAFECLAW_API_KEY={}", r.token);
+    println!(
+        "SAFECLAW_PROXY_URL={}",
+        crate::cli::proxy_env::proxy_url_for_vault(&daemon_url, &vid, Some(&r.token))
+    );
+
+    let rm_name = if args.name.contains(char::is_whitespace) {
+        format!("'{}'", args.name)
+    } else {
+        args.name.clone()
+    };
     eprintln!(
-        "\nAgent '{}' created. Its key was printed to stdout, shown ONCE — set it as \
-         SAFECLAW_API_KEY in the agent's env (capture stdout without echoing it). \
-         SAFECLAW_VAULT_URL comes from `sc env`. Works on any paired device; \
-         revoke: `sc agent rm {}`.",
-        args.name, args.name
+        "\nAgent '{}' created — its complete SafeClaw env (incl. its api key, shown ONCE) \
+         went to stdout. Append those lines to the env file your framework loads, without \
+         displaying them. Works on any paired device; revoke: `sc agent rm {}`.",
+        args.name, rm_name
     );
     Ok(())
 }

@@ -37,7 +37,7 @@ safeclaw <command> [--daemon URL]   # CLI mode (talks to a running daemon)
 ```
 
 - `safeclaw serve` is what's running today — `main.rs` already does this. Add a `serve` subcommand wrapper so `safeclaw` alone prints help instead of starting the daemon.
-- CLI mode talks to the daemon over HTTP, default `http://127.0.0.1:23294`. Override with `--daemon <URL>` flag or `SAFECLAW_DAEMON` env var.
+- CLI mode talks to the daemon over HTTP, default `http://127.0.0.1:23295`. Override with `--daemon <URL>` flag or `SAFECLAW_DAEMON` env var.
 
 ### State layout (CLI side)
 
@@ -49,12 +49,12 @@ safeclaw <command> [--daemon URL]   # CLI mode (talks to a running daemon)
 
 `config.toml`:
 ```toml
-default_daemon = "http://127.0.0.1:23294"
+default_daemon = "http://127.0.0.1:23295"
 default_vault  = "<vault-id-uuid>"
 default_context = "local"
 
 [contexts.local]
-daemon = "http://127.0.0.1:23294"
+daemon = "http://127.0.0.1:23295"
 vault  = "<uuid>"
 
 [contexts.work]
@@ -163,7 +163,7 @@ Two paths. Default is browser-callback. Copy-paste is the fallback.
 
 **When this works:** anywhere a desktop browser can reach `127.0.0.1` on the CLI's machine. That's most workstations.
 
-**Daemon discovery for the page URL:** the daemon serves the auth page off its own origin (`SAFECLAW_ORIGIN`). For local OSS, that's `http://localhost:23294/cli/auth`. For SaaS-style deploys, it's the configured public origin. CLI just composes `<origin>/cli/auth?...`.
+**Daemon discovery for the page URL:** the daemon serves the auth page off its own origin (`SAFECLAW_ORIGIN`). For local OSS, that's `http://localhost:23295/cli/auth`. For SaaS-style deploys, it's the configured public origin. CLI just composes `<origin>/cli/auth?...`.
 
 ### B. Copy-paste base64 (fallback)
 

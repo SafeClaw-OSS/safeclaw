@@ -141,7 +141,7 @@ impl RiskMap {
 
 // ── Rules ───────────────────────────────────────────────────────────────────────
 
-/// A fully-formed policy rule — from a recipe's `policy.toml`, or the merged
+/// A fully-formed policy rule — from a service's `policy.toml`, or the merged
 /// result after user edits. CLASSIFIES a matched request by `risk`; the
 /// decision comes from the [`RiskMap`]. Rules never carry a `level`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -212,11 +212,11 @@ pub struct RuleConfig {
 
 /// A connection's user policy layer (PROTOCOL.md `M.policy.connections.<id>`).
 /// Sparse — present only for connections the user actually customised. The
-/// built-in rule set comes from the connection's *service* recipe; this adds a
+/// built-in rule set comes from the connection's *service* definition; this adds a
 /// per-connection default override and per-rule edits/additions.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ConnectionPolicy {
-    /// Override this connection's default read/write floor (over the recipe's).
+    /// Override this connection's default read/write floor (over the service's).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default: Option<Levels>,
     /// Per-rule edits (override built-in by id) and additions (new id + match).
@@ -251,7 +251,7 @@ impl Default for Policy {
         // Design stance: SafeClaw is *first* a credential-separating proxy —
         // the agent never holds the secret, the daemon injects it — and only
         // *secondly* an approval gate for risky operations. So the baseline
-        // floor is `allow` (inject + forward, no per-call friction); recipes
+        // floor is `allow` (inject + forward, no per-call friction); services
         // tighten genuinely risky paths via `risk` on rules. (llm/channel are
         // redundant with the global default but kept explicit so a future
         // stricter global default doesn't silently re-gate them.)
@@ -299,10 +299,10 @@ impl Policy {
 
 // ── Merge ─────────────────────────────────────────────────────────────────────
 
-/// Field-wise merge of two [`Levels`] with user > recipe precedence. Each field
-/// independently takes the user's value when set, else the recipe's.
-pub fn merge_levels(user: Option<&Levels>, recipe: Option<&Levels>) -> Option<Levels> {
-    match (user, recipe) {
+/// Field-wise merge of two [`Levels`] with user > built-in precedence. Each field
+/// independently takes the user's value when set, else the built-in's.
+pub fn merge_levels(user: Option<&Levels>, built_in: Option<&Levels>) -> Option<Levels> {
+    match (user, built_in) {
         (None, None) => None,
         (Some(u), None) => Some(u.clone()),
         (None, Some(r)) => Some(r.clone()),

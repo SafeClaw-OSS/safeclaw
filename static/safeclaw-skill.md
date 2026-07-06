@@ -1,37 +1,36 @@
 # SafeClaw
 
-SafeClaw is a passkey-gated credential broker. Send a request through
-it; SafeClaw injects the user's stored credentials server-side and
-forwards.
+SafeClaw is a passkey-gated credential broker. You never hold the real secret:
+each connected service gives you a **phantom** — a placeholder like
+`__sc__github__`. Put the phantom where the credential belongs (an env var a tool
+reads, a request header, a config file) and run that command through `sc run --`;
+SafeClaw swaps the phantom for the real value on the way out, only toward that
+connection's own `hosts`. The user approves anything sensitive with a passkey tap.
 
-## Daemon startup (self-host only)
+Only traffic you deliberately route through `sc run` is touched — everything else
+goes straight out untouched. A phantom sent unrouted just reaches the upstream as
+a literal string (a clean 401), never a leak.
 
-If `$SAFECLAW_VAULT_URL` points at `localhost` / `127.0.0.1`, make sure
-the daemon is up before the first call (`sc up` is idempotent):
+## Your config
+
+Your install prompt set these — use each verbatim, never construct one. If any is
+unset, stop and ask the user.
+
+- **`$SAFECLAW_DAEMON_URL`** — the daemon, e.g. `http://127.0.0.1:23294`.
+- **`$SAFECLAW_VAULT_ID`** — your vault id.
+- **`$SAFECLAW_API_KEY`** — your identity; send `Authorization: Bearer
+  $SAFECLAW_API_KEY` on every request below.
+
+Make sure the daemon is up before the first call (idempotent):
 
 ```bash
-curl -s -o /dev/null --connect-timeout 1 "$SAFECLAW_VAULT_URL/registry" \
-  || safeclaw up
-```
-
-## Auth
-
-Two env vars:
-
-- **`$SAFECLAW_VAULT_URL`** — base URL of the user's SafeClaw daemon,
-  e.g. `http://localhost:23294/v/abc-def`. If unset, get it from
-  `sc env`; don't guess or hardcode a value.
-- **`$SAFECLAW_API_KEY`** — your bearer token, from the dashboard's
-  "Connect a new agent" flow or `sc agent add`.
-
-```
-Authorization: Bearer $SAFECLAW_API_KEY
+curl -s -o /dev/null --connect-timeout 1 "$SAFECLAW_DAEMON_URL/health" || sc up
 ```
 
 ## Discover what's available
 
 ```
-GET $SAFECLAW_VAULT_URL/registry
+GET $SAFECLAW_DAEMON_URL/v/$SAFECLAW_VAULT_ID/registry
 Authorization: Bearer $SAFECLAW_API_KEY
 ```
 
@@ -39,115 +38,89 @@ Filter to save context: `?view=summary` and/or `?ids=a,b`.
 
 ```jsonc
 {
-  "version": 2,
-  "vault_locked": false,
+  "version": 4,
+  "locked": false,
   "console_url": "https://.../vault/<your-vault-id>",  // deep link to this vault
   "vault_entries": ["OPENAI_API_KEY", "GMAIL_REFRESH_TOKEN"],  // null when locked
-  "services": [
-    { "id": "openai", "name": "OpenAI", "category": "llm",
-      "connected": true,
-      "endpoints": [{ "method": "ANY", "path": "/openai", "wildcard": true }],
-      "vault_fields": [{ "name": "OPENAI_API_KEY", "kind": "secret" }] }
+  "services": [       // the catalog — what SafeClaw supports
+    { "id": "github", "name": "GitHub", "category": "integration",
+      "hosts": ["api.github.com", "github.com"], "secrets": ["GITHUB_TOKEN"] }
+  ],
+  "connections": [    // what's usable now
+    { "id": "github", "service": "github", "connected": true,
+      "hosts": ["api.github.com", "github.com"],
+      "phantoms": ["__sc__github__"] }
   ]
 }
 ```
 
-Use `connected: true` services freely.
+Copy a phantom verbatim from a `connected: true` connection — never build one.
 
-If a service is `connected: false` (or absent), the user must add its
-credential. **Hand them a link — don't run commands or walk them through
-provider menus:**
+If `locked: true`, run `sc up` — it unlocks the vault and prints an approval
+link; surface that link (the user taps their passkey) and retry.
 
-```
-Connect <service name>: open <console_url>#connections, paste your
-credential there, approve with your passkey.
-```
-
-After they confirm, re-GET the registry for `connected: true`. (Where to
-*get* the credential is the provider's side — mention it only if asked.)
-
-Headless fallback, user at the daemon's own terminal: `sc set
-<vault_fields[n].name> <value>`.
-
-Never enter credentials yourself. Never echo one back.
-
-If `vault_locked: true`, run `sc up`, surface the approval link it
-prints to the user, and retry once they've tapped. Don't tell the user
-to "unlock" or suggest a browser URL of your own.
-
-## Call shape
+If the service you want has no `connected: true` connection, the user must add
+its credential. Hand them a link — don't run commands or walk them through
+provider menus:
 
 ```
-<METHOD> $SAFECLAW_VAULT_URL/use/<service>[/<path>]
-Authorization: Bearer $SAFECLAW_API_KEY
+Connect <service name>: open <console_url>#connections, add your credential
+there, approve with your passkey.
 ```
 
-`<service>` is a service `id`; `<path>` is the upstream's own path
-(optional for catch-all services). The daemon forwards your method,
-path, and body verbatim, with the **upstream's natural method** — e.g.
-`GET $SAFECLAW_VAULT_URL/use/gmail/gmail/v1/users/me/messages`,
-`POST $SAFECLAW_VAULT_URL/use/openai/v1/chat/completions`.
+You never see or handle it; after they confirm, re-GET the registry. Where to
+*get* the credential is the provider's side — mention it only if asked.
 
-Every response (initial call and follow-up polls) has the same shape:
+Headless fallback, the user at the daemon's own terminal (passkey-gated):
 
-```jsonc
-{ "status": "ok" | "pending" | "rejected", ... }
+```
+sc set STRIPE_KEY --host api.stripe.com        # one secret + its host anchor
+sc connect myapi --host api.example.com --secret API_TOKEN=<value>
 ```
 
-| HTTP | status | extra fields | meaning |
-|------|--------|--------------|---------|
-| 200 | `ok` | `value` | done; use `value` |
-| 202 | `pending` | `approval: {id, approve_url, poll_url, expires_at, expires_in, interval}` | needs user approve; poll every `interval`s (also sent as `Retry-After`) |
-| 403 | `rejected` | — | user denied; do not retry |
-| 404 | (none) | — | expired or unknown |
+Never enter a credential yourself; never echo one back.
 
-`value` for a Use call is the upstream's full response:
-`{ status, headers, body, body_base64? }`. `body` is a string — JSON-parse
-it if you need structured fields.
+## Using a connection
 
-**Critical:** after a `pending` reply, NEVER re-POST the original URL —
-that mints a fresh approval each time. Use `approval.poll_url` instead.
+Prefix the command with `sc run --` so its traffic is brokered; put the phantom
+where the credential belongs, or it reaches the upstream as a literal string and
+is rejected.
+
+```bash
+sc run -- curl https://api.stripe.com/v1/charges \
+  -H "Authorization: Bearer __sc__stripe__"
+GITHUB_TOKEN=__sc__github__ sc run -- gh pr list
+sc run -- git clone https://__sc__github__@github.com/<owner>/<repo>
+```
+
+Multi-account is by phantom VALUE, not env-var name: switch `__sc__github__` →
+`__sc__github_work__`. One request carries one connection's phantom(s).
 
 ## Configuring a local tool (`setup` hints)
 
-Some services need a **local tool** (a CLI, an SDK) pointed at SafeClaw instead
-of its real endpoint, so the tool's traffic is brokered and the credential never
-enters it. When a service needs this, its `/registry` entry carries a **`setup`**
-hint — a goal plus ready-to-run config commands, already filled in for your
-deployment. Read it, **tell the user what you're configuring and why first**,
-then apply it (adapt to the user's real config if it differs).
+Some services need a local tool (a CLI, an SDK) run through SafeClaw so its
+traffic is brokered. Such a service's `/registry` entry carries a **`setup`**
+hint — a goal plus ready-to-run steps. Tell the user what you're configuring and
+why, then apply it (adapting to their real config). The `setup` hint is the
+source of truth.
 
-## Polling
+## Approvals
 
-Two patterns. Try A first; fall back to B if your runtime can't hold a
-long shell command.
+Some credentials are policy-gated: the first time you route a request that needs
+one, SafeClaw fails the command and its error output carries an approval line:
 
-### A — Auto-poll
-
-Surface `approval.approve_url` to the user on its own line. Do NOT ask
-them to type "done" — their browser tap is the signal. Then:
-
-```bash
-POLL_URL="<approval.poll_url from the 202 body>"
-for i in $(seq 1 100); do
-  RESP=$(curl -sS -H "Authorization: Bearer $SAFECLAW_API_KEY" "$POLL_URL")
-  STATUS=$(echo "$RESP" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("status",""))')
-  case "$STATUS" in
-    ok)         echo "$RESP"; break;;   # done — the result is in `value`
-    rejected)   echo "ended: $STATUS"; exit 0;;
-    pending|*)  sleep 3;;
-  esac
-done
+```
+SafeClaw approval needed to use this credential.
+Approve with your passkey:
+  https://.../grant/<op_id>
+Then re-run the same command.
 ```
 
-If the loop finishes and it's still `pending`, don't abandon it — the op
-stays valid ~30 min. Switch to B: ask them to reply once they've tapped,
-then poll once more.
+Surface that link on its own line — the user's browser tap is the signal, don't
+ask them to type "done". Once approved, re-run the exact same command; the
+approval is cached. A destination host you haven't used before is a one-time
+*permanent grant* — same flow.
 
-If poll returns HTTP 404, the op expired or the daemon restarted. Do NOT keep polling — re-POST the original request to get a fresh op.
-
-### B — 2-step (runtimes that can't block, e.g. Telegram cron-style)
-
-Surface `approval.approve_url` and ask the user to reply "done" once
-they've approved. On their reply, GET `approval.poll_url` once. If still
-`pending`, ask them to wait and reply again.
+If you can't easily re-run, the approval JSON also carries an absolute `poll_url`;
+GET it (with `Authorization: Bearer $SAFECLAW_API_KEY`) until `status` is `ok`,
+then re-run. The op stays valid ~30 min.

@@ -65,19 +65,38 @@ async fn get_op_json(
     op_id: String,
 ) -> Result<axum::response::Response> {
     use axum::response::IntoResponse;
+    let body = op_poll_value(&state, &op_id)?;
+    let pending = body.get("status").and_then(|s| s.as_str()) == Some("pending");
+    let mut resp = Json(body).into_response();
+    // Pending → advertise the poll pacing (Retry-After, matching the 202's
+    // `approval.interval`) so agents keep a standard cadence.
+    if pending {
+        if let Ok(v) = axum::http::HeaderValue::from_str(
+            &crate::approval::store::POLL_INTERVAL_HINT_SECS.to_string(),
+        ) {
+            resp.headers_mut().insert(axum::http::header::RETRY_AFTER, v);
+        }
+    }
+    Ok(resp)
+}
+
+/// The `/op/{id}` poll body as a plain `Value`. Shared by the axum handler
+/// (above) and the 23294 API face (`proxy::api_face`), so the agent's poll loop
+/// sees identical JSON whether it hit the control plane or the proxy port. Pure
+/// read — briefly locks `approvals`, no I/O.
+pub fn op_poll_value(state: &AppState, op_id: &str) -> Result<Value> {
     let store = state.approvals.lock().unwrap();
-    let rec = store.get(&op_id).ok_or(AppError::NotFound)?;
+    let rec = store.get(op_id).ok_or(AppError::NotFound)?;
     // Consumed ops: the approve window is closed. Return a minimal tombstone
     // — no op content — to limit the exposure window for the agent request
     // body and upstream URL that live in op.act.scope. The op_id's 122-bit
     // entropy is the access-control mechanism for in-flight ops; once the
     // op is consumed, that window should close.
     if matches!(rec.status, ApprovalStatus::Consumed) {
-        return Ok(Json(json!({
+        return Ok(json!({
             "op_id": rec.id,
             "status": "consumed",
-        }))
-        .into_response());
+        }));
     }
 
     let act_kind = discriminator(&rec.op.act);
@@ -110,7 +129,7 @@ async fn get_op_json(
         ApprovalStatus::Rejected { .. } => ("rejected", None),
         ApprovalStatus::Consumed => unreachable!("handled above"),
     };
-    let mut resp = Json(json!({
+    Ok(json!({
         "op_id": rec.id,
         "r": rec.r,
         "status": status,
@@ -121,17 +140,6 @@ async fn get_op_json(
         "value": value,
         "expires_at": rec.expires_at_unix,
     }))
-    .into_response();
-    // Pending → advertise the poll pacing (Retry-After, matching the 202's
-    // `approval.interval`) so agents keep a standard cadence.
-    if matches!(rec.status, ApprovalStatus::Pending) {
-        if let Ok(v) = axum::http::HeaderValue::from_str(
-            &crate::approval::store::POLL_INTERVAL_HINT_SECS.to_string(),
-        ) {
-            resp.headers_mut().insert(axum::http::header::RETRY_AFTER, v);
-        }
-    }
-    Ok(resp)
 }
 
 /// `POST /op/{op_id}/approve` — U submits the signed grant. T validates and
@@ -268,7 +276,7 @@ pub async fn approve_op(
     // 4. Act dispatch — same logic that previously lived in grant.rs.
     // Captured here for the audit row finalize at the bottom (Use's upstream
     // status code; None for all other act kinds).
-    let mut audit_upstream_status: Option<i64> = None;
+    let audit_upstream_status: Option<i64> = None;
     let (response, cached_value) = match &validated.op.act.kind {
         ActType::Enroll if validated.op.act.target == "passkeys" => {
             // Add-passkey-to-existing-vault path. PROTOCOL.md §3.4 maps
@@ -651,59 +659,14 @@ pub async fn approve_op(
         }
         ActType::Use => {
             // Read seam (per-item first, whole-blob Option fallback) lives inside
-            // the broker resolve/forward calls — so a web-enrolled per-item vault
+            // the broker resolve call — so a web-enrolled per-item vault
             // (no vault.dat) resolves without the old "vault not initialized" bail.
-            // Streaming captive-portal authorize (`/stream/` ask path): resolve
-            // and stash the secret for the agent's *retried* stream to consume;
-            // do NOT forward — there is no buffered request here (the real one
-            // rides the retry stream). use_broker sets scope.authorize_only.
-            if validated
-                .op
-                .act
-                .scope
-                .get("authorize_only")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false)
-            {
-                let s_o = crate::server::broker::resolve_use_primary(
-                    &validated.op,
-                    &validated.wrapping_key,
-                    &validated.credential_id_bytes,
-                    existing_vault.as_ref(),
-                    &state,
-                    &vault_id,
-                )
-                .await?;
-                let conn = validated
-                    .op
-                    .act
-                    .scope
-                    .get("connection_id")
-                    .or_else(|| validated.op.act.scope.get("service"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let ttl = state
-                    .approvals
-                    .lock()
-                    .unwrap()
-                    .get(&op_id)
-                    .and_then(|r| r.policy_context.clone())
-                    .map(|p| p.ttl_seconds)
-                    .unwrap_or(300);
-                if !conn.is_empty() {
-                    let now = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
-                    state.cache_insert(&vault_id, &conn, s_o, Some(now + ttl));
-                }
-                (
-                    json!({ "ok": true, "act": "use", "authorized": true, "stream": true }),
-                    None,
-                )
-            } else {
-            let outcome = crate::server::broker::execute_use_forward(
+            // Phantom-only: an approved Use op is ALWAYS authorize_only — the
+            // resident proxy serves live traffic and retries the real request
+            // after approval. Resolve the connection's primary secret with the
+            // verified grant and stash it so the retry fast-paths; never forward
+            // here (there is no buffered request on the op plane).
+            let s_o = crate::server::broker::resolve_use_primary(
                 &validated.op,
                 &validated.wrapping_key,
                 &validated.credential_id_bytes,
@@ -712,65 +675,34 @@ pub async fn approve_op(
                 &vault_id,
             )
             .await?;
-            // Cache the resolved s_o per PROTOCOL.md §6.2 — but ONLY if
-            // the policy decision that drove this op was allow or ask
-            // (with TTL). ask-always explicitly never caches (the bytes
-            // go out of scope here and Rust drops them; we don't
-            // re-export them anywhere).
-            //
-            // The `policy_context` was stamped on the ApprovalRecord at
-            // /use time; we read it here without mutating state. Cache
-            // write happens *after* a successful forward, so a failed
-            // upstream call doesn't pollute the cache.
-            {
-                let pc_for_cache = state
-                    .approvals
-                    .lock()
-                    .unwrap()
-                    .get(&op_id)
-                    .and_then(|r| r.policy_context.clone());
-                if let Some(pc) = pc_for_cache {
-                    // Key the resolved-secret cache by the **connection**
-                    // (CONNECTION_SCHEMA.md §6) so two accounts of one service
-                    // never share a slot. Falls back to `service` for the default
-                    // connection (conn == service).
-                    let conn = validated
-                        .op
-                        .act
-                        .scope
-                        .get("connection_id")
-                        .or_else(|| validated.op.act.scope.get("service"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    if !conn.is_empty() {
-                        let now = SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .map(|d| d.as_secs())
-                            .unwrap_or(0);
-                        let expires_at = match pc.level {
-                            crate::core::policy::AccessLevel::Allow => None, // ∞ until lock
-                            crate::core::policy::AccessLevel::Ask => Some(now + pc.ttl_seconds),
-                            _ => Some(0), // sentinel: don't cache (shouldn't be reached)
-                        };
-                        if expires_at != Some(0) {
-                            state.cache_insert(
-                                &vault_id,
-                                &conn,
-                                outcome.s_o.clone(),
-                                expires_at,
-                            );
-                        }
-                    }
-                }
+            let conn = validated
+                .op
+                .act
+                .scope
+                .get("connection_id")
+                .or_else(|| validated.op.act.scope.get("service"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let ttl = state
+                .approvals
+                .lock()
+                .unwrap()
+                .get(&op_id)
+                .and_then(|r| r.policy_context.clone())
+                .map(|p| p.ttl_seconds)
+                .unwrap_or(300);
+            if !conn.is_empty() {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                state.cache_insert(&vault_id, &conn, s_o, Some(now + ttl));
             }
-            audit_upstream_status = Some(outcome.response.status as i64);
-            let body = serde_json::to_string(&outcome.response)?;
             (
-                json!({ "ok": true, "act": "use", "response": serde_json::from_str::<Value>(&body).unwrap_or(Value::Null) }),
-                Some(body),
+                json!({ "ok": true, "act": "use", "authorized": true, "stream": true }),
+                None,
             )
-            }
         }
         ActType::Custom(name) => match name.as_str() {
             // Lifecycle op (H3 / PROTOCOL.md §6.3): decrypt vault, bootstrap
@@ -936,6 +868,41 @@ pub async fn approve_op(
                     None,
                 )
             }
+            // Component C — one-tap host widen. The agent hit a destination the
+            // connection doesn't anchor; the user approves adding that exact
+            // FQDN as a permanent grant. Session-level today (the in-memory
+            // routing snapshot is widened so the agent's retry passes the
+            // anchor); durable persistence into `aux.connections[conn].hosts`
+            // is the documented follow-up (see BUILD_NOTES: widen durable write).
+            "widen-host" => {
+                let conn = validated
+                    .op
+                    .act
+                    .scope
+                    .get("connection_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let host = validated
+                    .op
+                    .act
+                    .scope
+                    .get("host")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if conn.is_empty() || host.is_empty() {
+                    return Err(AppError::BadRequest(
+                        "widen-host scope needs connection_id + host".into(),
+                    ));
+                }
+                state.widen_connection_host(&vault_id, &conn, &host);
+                tracing::info!(vault = %vault_id, conn = %conn, host = %host, "host widened (session)");
+                (
+                    json!({ "ok": true, "act": "widen-host", "connection_id": conn, "host": host }),
+                    None,
+                )
+            }
             other => {
                 return Err(AppError::BadRequest(format!(
                     "unsupported Custom act: {}",
@@ -979,7 +946,7 @@ pub async fn approve_op(
 
     // Cache write: an Ask-level approval scopes a TTL'd "next matching
     // request fast-paths" effect. Service id pulled off the op's scope
-    // (which `use_broker` populates verbatim). No-op when:
+    // (which the broker resolve path populates verbatim). No-op when:
     //   - The op wasn't a Use (policy_ctx_for_cache is None)
     //   - The level was Allow / AskAlways / Deny (not stored)
     //   - The vault relocked between approve and now (record_ask_approval
@@ -1008,12 +975,28 @@ pub async fn approve_op(
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
+            // Host-scoped grant: read the resolved host the proxy stamped onto
+            // the policy context (falls back to the op scope for robustness).
+            let host = pc
+                .host
+                .clone()
+                .or_else(|| {
+                    validated
+                        .op
+                        .act
+                        .scope
+                        .get("host")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                })
+                .unwrap_or_default();
             if !conn.is_empty() && !req_method.is_empty() {
                 state.record_ask_approval(
                     &rec_vault_id,
                     &conn,
                     pc.rule_id,
                     &req_method,
+                    &host,
                     pc.ttl_seconds,
                 );
             }
@@ -1098,7 +1081,7 @@ pub async fn reject_op(
 ///   2. `policy` — the effective policy tree (`aux.policy` overlaid on
 ///      compiled defaults). Holds the risk map, default floors, per-category,
 ///      and per-connection user policy. Built-in per-service rules are read
-///      live from the recipe at eval, not cached here.
+///      live from the service at eval, not cached here.
 /// Build + persist the local per-item store (`vault.per-item.json`) from a
 /// just-decrypted whole-blob vault + its view. The keyset (registry +
 /// credentials + wrapped_key) is copied verbatim from the whole-blob
@@ -1223,38 +1206,26 @@ pub(crate) fn bootstrap_cache_from_view(
                 }
             }
 
-            // v3 multi-secret: resolve every `{{secret.NAME}}` the recipe's
-            // upstream templates (URL + headers + query) reference so the
-            // allow fast-path can render multi-secret recipes without a vault
-            // view. Single-secret recipes yield a one-entry map; oauth recipes
-            // reference no `{{secret.*}}` and so populate nothing here (their
-            // token is minted from the refresh_token at forward time).
+            // v4 multi-secret: resolve each declared `secrets` role so the
+            // allow fast-path can inject multi-secret services without a vault
+            // view. oauth services declare no injectable direct secret here
+            // (their access token is minted from the refresh_token at forward).
             if let Some(svc) = state.services.get(service_id) {
-                if let Some(u) = svc.upstream.first() {
-                    let mut names = crate::server::broker::referenced_secrets(&u.url);
-                    for v in u.headers.values().chain(u.query.values()) {
-                        for n in crate::server::broker::referenced_secrets(v) {
-                            if !names.contains(&n) {
-                                names.push(n);
-                            }
-                        }
+                let mut map: std::collections::HashMap<String, Vec<u8>> =
+                    std::collections::HashMap::new();
+                for name in &svc.service.secrets {
+                    if let Some(val) = view.resolve_value_native(name) {
+                        map.insert(name.clone(), val.to_vec());
                     }
-                    let mut map: std::collections::HashMap<String, Vec<u8>> =
-                        std::collections::HashMap::new();
-                    for name in names {
-                        if let Some(val) = view.resolve_value_native(&name) {
-                            map.insert(name, val.to_vec());
-                        }
-                    }
-                    if !map.is_empty() {
-                        cache.allow_secrets.insert(service_id.to_string(), map);
-                    }
+                }
+                if !map.is_empty() {
+                    cache.allow_secrets.insert(service_id.to_string(), map);
                 }
             }
         }
 
         // Built-in policy rules are NOT cached: they're read live from the
-        // recipe registry at eval and merged with the connection's user rules
+        // service registry at eval and merged with the connection's user rules
         // (`aux.policy.connections.<id>.rules`). See
         // `AppState::evaluate_request_policy`.
     }
@@ -1264,10 +1235,13 @@ pub(crate) fn bootstrap_cache_from_view(
     // already covered every default connection (conn == service, bare name);
     // here we add the named ones, keyed by connection_id, resolving each role at
     // its §3 address but storing the multi-secret map under the BARE name so the
-    // render path matches `{{secret.<role>}}`. (Allow-level only — ask-level
-    // connections resolve lazily from the op's namespaced `target` at approve.)
+    // proxy's phantom resolution finds each role's bytes. (Allow-level only —
+    // ask-level connections resolve lazily from the op's namespaced `target`.)
     for (conn, c) in view.aux.connections.iter() {
-        let service = &c.service;
+        // Raw connections (service: None) have no service to bootstrap from; their
+        // bytes resolve lazily at approve. Only service-backed named connections
+        // are pre-bootstrapped here.
+        let Some(service) = c.service.as_deref() else { continue };
         if conn == service {
             continue; // default — already bootstrapped above
         }
@@ -1286,26 +1260,76 @@ pub(crate) fn bootstrap_cache_from_view(
             }
         }
         if let Some(svc) = state.services.get(service) {
-            if let Some(u) = svc.upstream.first() {
-                let mut names = crate::server::broker::referenced_secrets(&u.url);
-                for v in u.headers.values().chain(u.query.values()) {
-                    for n in crate::server::broker::referenced_secrets(v) {
-                        if !names.contains(&n) {
-                            names.push(n);
-                        }
-                    }
+            let mut map: std::collections::HashMap<String, Vec<u8>> =
+                std::collections::HashMap::new();
+            for name in &svc.service.secrets {
+                let addr = crate::storage::plaintext::secret_address(conn, service, name);
+                if let Some(val) = view.resolve_value_native(&addr) {
+                    map.insert(name.clone(), val.to_vec());
                 }
-                let mut map: std::collections::HashMap<String, Vec<u8>> =
-                    std::collections::HashMap::new();
-                for name in names {
-                    let addr = crate::storage::plaintext::secret_address(conn, service, &name);
-                    if let Some(val) = view.resolve_value_native(&addr) {
-                        map.insert(name, val.to_vec()); // bare name → render match
-                    }
-                }
-                if !map.is_empty() {
-                    cache.allow_secrets.insert(conn.clone(), map);
-                }
+            }
+            if !map.is_empty() {
+                cache.allow_secrets.insert(conn.clone(), map);
+            }
+        }
+    }
+
+    // Raw connections (`service: None`, created by `sc set K --host h` or
+    // `sc connect`) have no service definition, so the per-service loops above
+    // skip them. Their policy floor is the global default (`allow`), and the
+    // resident proxy resolves an allow request straight from the session cache
+    // (no grant to open the vault), so their secret bytes MUST be resident. §2:
+    // read the connection's EXPLICIT `secrets` (uppercase KEY names, stored bare)
+    // — no reverse-index-by-casing. Each KEY is resolved case-insensitively
+    // (canonical uppercase storage, but a legacy key may differ).
+    for (conn, c) in view.aux.connections.iter() {
+        if c.service.is_some() {
+            continue; // service-backed — handled above
+        }
+        let Some(keys) = &c.secrets else { continue };
+        let mut map: std::collections::HashMap<String, Vec<u8>> =
+            std::collections::HashMap::new();
+        for key in keys {
+            if let Some((_, bytes)) = view
+                .native_secrets
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(key))
+            {
+                map.insert(key.clone(), bytes.clone());
+            }
+        }
+        // Sole secret → also the short-phantom `primary`; a multi-secret raw
+        // connection resolves each role from the map (role phantoms).
+        if map.len() == 1 {
+            let primary = map.values().next().cloned().unwrap();
+            cache
+                .entries
+                .insert(conn.clone(), crate::state::CacheEntry { value: primary, expires_at: None });
+        }
+        if !map.is_empty() {
+            cache.allow_secrets.insert(conn.clone(), map);
+        }
+    }
+
+    // Custom (per-vault `aux.services`) definitions: validate before they can
+    // broker (defense in depth — never trust the stored blob), never shadow a
+    // built-in id, load only if valid. Wiped on lock with the rest of the cache.
+    let known_providers = state.services.provider_names();
+    for (service_id, toml_src) in view.aux.services.iter() {
+        if state.services.get(service_id).is_some() {
+            tracing::warn!(service = %service_id, "custom service shadows a built-in id — skipped");
+            continue;
+        }
+        if let Err(e) = crate::service::validate::validate_service(toml_src, &known_providers) {
+            tracing::warn!(service = %service_id, "custom service failed validation: {:?} — skipped", e);
+            continue;
+        }
+        match toml::from_str::<crate::service::ServiceDef>(toml_src) {
+            Ok(def) => {
+                cache.custom_services.insert(service_id.clone(), def);
+            }
+            Err(e) => {
+                tracing::warn!(service = %service_id, "custom service parse failed: {} — skipped", e)
             }
         }
     }

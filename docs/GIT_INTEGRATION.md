@@ -1,6 +1,6 @@
 # Git / GitHub / GitLab via SafeClaw — implementation spec
 
-> **⚠️ PARTIALLY SUPERSEDED (2026-07-03 phantom-only pivot).** The `/stream/<service>` route and insteadOf/URL-rewrite guidance here are retired. Git now rides the MITM proxy: `sc git-credential` driven by the recipe `[basic]` section, Basic decode/substitute in the proxy, `sc run --` prefix when unrouted, phantom-in-URL-userinfo for raw hosts. Canon = [CREDENTIAL_BROKER.md](./CREDENTIAL_BROKER.md); toml rules = [SERVICES.md](./SERVICES.md) v4.
+> **⚠️ PARTIALLY SUPERSEDED (2026-07-03 phantom-only pivot).** The `/stream/<service>` route and insteadOf/URL-rewrite guidance here are retired. Git now rides the MITM proxy: the proxy Basic-decodes `Authorization: Basic` and substitutes the phantom natively (there is NO `[basic]` service section); `sc git-credential` is an optional zero-schema helper (emit `("x", <sole phantom>)`); `sc run --` prefix when unrouted; phantom-in-URL-userinfo for raw hosts. Canon = [CREDENTIAL_BROKER.md](./CREDENTIAL_BROKER.md); toml rules = [SERVICES.md](./SERVICES.md) v4.
 
 > **Status: DECIDED design, to be implemented.** Companion to
 > [CONNECTIONS_AND_AUTH.md](./CONNECTIONS_AND_AUTH.md) (provider/service/connection

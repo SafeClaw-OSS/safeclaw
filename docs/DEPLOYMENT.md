@@ -93,8 +93,8 @@ Group=safeclaw
 WorkingDirectory=/var/lib/safeclaw
 Environment=SAFECLAW_STATE_DIR=/var/lib/safeclaw/state
 Environment=SAFECLAW_BIND=127.0.0.1
-Environment=SAFECLAW_PORT=23294
-Environment=SAFECLAW_PROXY_PORT=23295
+Environment=SAFECLAW_PORT=23295
+Environment=SAFECLAW_PROXY_PORT=23294
 Environment=SAFECLAW_RP_ID=safeclaw.pro
 Environment=SAFECLAW_ORIGIN=https://safeclaw.pro
 ExecStart=/usr/local/bin/safeclaw

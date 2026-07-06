@@ -227,6 +227,7 @@ mod tests {
                 std::process::id()
             )),
             port: 0,
+            proxy_port: 0,
             listen: "127.0.0.1".into(),
             origin: "http://localhost".into(),
             rp_id: "localhost".into(),

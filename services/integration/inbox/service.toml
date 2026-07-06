@@ -2,48 +2,13 @@
 id = "inbox"
 name = "Inbox"
 help = """
-A live target that receives broker-forwarded requests so you can see
-SafeClaw's contract end-to-end. The daemon injects your
-`env.INBOX_API_KEY` into the Authorization header and forwards to
-inbox.dev.safeclaw.pro; the /try page tails the inbox over SSE so
-you can see exactly what the receiver saw, without the agent ever
-holding the raw value.
-
-## Canonical shape
-
-Although the inbox accepts any body and any sub-path, agents should
-send a single canonical request so the demo is consistent:
-
-  POST /api/use/inbox
-  Content-Type: application/json
-  {"message": "<your text>"}
-
-Use any method/path/body you like for experiments — the inbox stores
-the raw bytes — but `{"message": "..."}` is what the UI is tuned for.
-
-## Self-verify
-
-After a POST, the agent can confirm delivery via:
-
-  GET /api/use/inbox/recent
-
-Returns `{ bucket, count, messages: [...] }` for the caller's own
-bucket (derived from the injected Authorization, so each agent only
-ever sees its own messages). Pre-approved (`allow` policy) so the
-check doesn't require a human in the loop.
+A live target that receives broker-forwarded requests so you can see SafeClaw's
+contract end-to-end. Put the connection's phantom (see `sc status`) in the
+Authorization header and send to inbox.dev.safeclaw.pro; the /try page tails the
+inbox over SSE so you can see exactly what the receiver saw — without ever holding
+the raw value. Canonical shape: POST /api/messages {"message":"<text>"}; verify
+with GET /recent (pre-approved, your own bucket only).
 """
 
-[[upstream]]
-id = "default"
-url = "https://inbox.dev.safeclaw.pro"
-auth = { env = "INBOX_API_KEY" }
-
-  [upstream.headers]
-  Authorization = "Bearer {{secret.INBOX_API_KEY}}"
-
-[[api]]
-path = "*"
-
-  [[api.steps]]
-  target = "upstream:default"
-  returns = true
+hosts = ["inbox.dev.safeclaw.pro"]
+secrets = ["INBOX_API_KEY"]

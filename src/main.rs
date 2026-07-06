@@ -118,8 +118,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::GitCredential(args) => {
             // Invoked by git, not users. Never print to stderr on the happy path
             // (git reads stdout); surface only hard errors.
-            cli::git_credential::run(args).map_err(|e| -> Box<dyn std::error::Error> {
+            cli::git_credential::run(args).await.map_err(|e| -> Box<dyn std::error::Error> {
                 eprintln!("safeclaw git-credential: {}", e);
+                e.into()
+            })
+        }
+        Command::Run(args) => {
+            cli::run::run(args).await.map_err(|e| -> Box<dyn std::error::Error> {
+                eprintln!("safeclaw run: {}", e);
+                e.into()
+            })
+        }
+        Command::Connect(args) => {
+            cli::connect::run(args).await.map_err(|e| -> Box<dyn std::error::Error> {
+                eprintln!("safeclaw connect: {}", e);
                 e.into()
             })
         }
@@ -138,6 +150,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Logout(args) => {
             cli::logout::run(args).await.map_err(|e| -> Box<dyn std::error::Error> {
                 eprintln!("safeclaw logout: {}", e);
+                e.into()
+            })
+        }
+        Command::Device(args) => {
+            use safeclaw::config::DeviceSubcommand;
+            let r = match args.sub {
+                DeviceSubcommand::Login(a) => cli::login::run(a).await,
+                DeviceSubcommand::Logout(a) => cli::logout::run(a).await,
+            };
+            r.map_err(|e| -> Box<dyn std::error::Error> {
+                eprintln!("safeclaw device: {}", e);
                 e.into()
             })
         }
@@ -170,6 +193,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             use safeclaw::config::ServiceSubcommand;
             let r = match args.sub {
                 ServiceSubcommand::Validate(a) => cli::service_def::run_validate(a).await,
+                ServiceSubcommand::Add(a) => cli::service_def::run_add(a).await,
             };
             r.map_err(|e| -> Box<dyn std::error::Error> {
                 eprintln!("safeclaw service: {}", e);
@@ -229,12 +253,30 @@ async fn run_daemon(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     // show activity without a cloud daemon. Best-effort + gated like blob sync.
     tokio::spawn(safeclaw::sync::ship_audit_loop(state.clone()));
 
+    // Install the process-wide rustls crypto provider ONCE (aws-lc-rs, never
+    // OpenSSL) before the proxy's TLS stacks touch it. Ignore "already set" —
+    // some transitive dep may have installed it first; ours is identical.
+    let _ = hudsucker::rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+    // The resident credential proxy (the ONE agent-facing surface) runs on its
+    // own listener at PROXY_PORT, concurrently with the control/API plane below.
+    // Best-effort + detached: a proxy exit logs and leaves the control plane
+    // serving (never silently take the daemon down). See src/proxy/mod.rs.
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            if let Err(e) = safeclaw::proxy::serve(state).await {
+                tracing::error!("resident proxy exited: {} — control plane stays up", e);
+            }
+        });
+    }
+
     let listen_ip: std::net::IpAddr = config.listen.parse().unwrap_or_else(|_| "127.0.0.1".parse().unwrap());
 
-    // Single port (2026-06-23 zero-inbound pivot): control + broker planes
-    // share one listener. The broker routes (use/stream/export) carry the
-    // agent-key gate inside the router; control routes (op/approve/passkeys/
-    // admin) keep their passkey / X-Admin-Key gating. See server::app_router.
+    // Two localhost listeners (2026-07-03 phantom-only proxy): the control/API
+    // plane (op/approve/passkeys/registry/admin) on CONTROL_PORT here, and the
+    // resident MITM credential proxy on PROXY_PORT (spawned above). The agent
+    // reaches control only via $SAFECLAW_VAULT_URL, so the port is env-addressed.
     let addr = SocketAddr::new(listen_ip, config.port);
     let app = app_router(state.clone());
 
