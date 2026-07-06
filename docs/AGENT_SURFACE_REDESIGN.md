@@ -8,6 +8,33 @@ do NOT re-litigate. Method that produced these: [[feedback_design_constraints_fi
 
 ---
 
+## BUILD STATUS (2026-07-06)
+
+**SHIPPED on `feat/broker-phantom`** (`6244ca1`→`8a39bb7`; `cargo build` + `cargo test --lib`
+196 green): §2 dual-face proxy (`src/proxy/api_face.rs` origin-form → registry/op/health/ca,
+loop guard, shared `*_value` projections; verified against hudsucker 0.24.1 `serve_stream`
+authority-injection so it can't misfire on MITM'd inner traffic) · §3 direct-GET discovery ·
+§4 `sc env` = `DAEMON_URL`+`VAULT_ID` (no key, `VAULT_URL` retired) · §5 `resolve_active`
+env-pin = `VAULT_ID` only + single-vault auto-select + `sc status` pin-vs-config · §7 egress
+mainstream IP floor (dropped `.internal`/metadata NAME blocks) · §8 proxy verifies the agent
+key (`Proxy-Auth` password → `check_token` in `pipeline` BEFORE substitution; keyless
+`unlocked_vault` fallback removed; `sc run` threads the key) · §9 all routing-detection
+deleted (probe/`is_routed`/helpers) + absolute `poll_url`. **Skill** rewritten (`static/safeclaw-skill.md`).
+**Console/backend** (`-fe` + backend `dev`): `VAULT_URL`→`DAEMON_URL`+`VAULT_ID` prose only.
+
+**DEFERRED to morning discussion (§6/§11 key-pre-baking):** the install prompt still uses
+`sc agent add` (blind-capture) for the agent key + keeps the pair-token for device pairing.
+Pre-baking the key INTO the prompt REVERSES a deliberate security decision in the backend
+(`vault-routes.mjs` L393-401: key kept out of the chat transcript) and interacts with device
+pairing — a "反复点" the user asked to defer. The e2e WORKS without it: the agent gets
+`DAEMON_URL`+`VAULT_ID` from `sc env` and `API_KEY` from `sc agent add` (hash cloud-synced),
+and `sc run` derives `PROXY_URL` from `VAULT_ID`+`API_KEY`. Discuss the transcript-security
+tradeoff + device-pairing-token fate, then build.
+
+**Adversarial review** (6-dim workflow) run before handoff; findings triaged in memory.
+
+---
+
 ## 1. Opt-in, NOT a mandatory proxy
 Normal traffic goes DIRECT and untouched. Only credential traffic — a request the agent
 DELIBERATELY writes a phantom into — is routed through the proxy (via `sc run --`, or a
