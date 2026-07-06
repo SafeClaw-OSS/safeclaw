@@ -71,15 +71,45 @@ async fn add(args: AgentAddArgs) -> Result<(), String> {
         return Err(format!("create agent key failed: HTTP {}", resp.status()));
     }
     let r: CreateResp = resp.json().await.map_err(|e| format!("parse response: {}", e))?;
-    // Key to STDOUT ONLY (so `KEY=$(sc agent add x)` captures it); STDERR guidance
-    // carries NO key, so an agent can blind-capture stdout without the secret
-    // leaking into its transcript via a stderr copy.
-    println!("{}", r.token);
+
+    // ── Mint-time projection (AGENT_SURFACE §6/§11): this IS the minter ─────
+    // Print the agent's COMPLETE env as dotenv lines: a snapshot of the DEVICE
+    // atoms (config daemon host + port constants + default vault) plus the
+    // fresh key. The agent appends ONE command's stdout to its own `.env` —
+    // its SSOT from then on — and never assembles a value. STDOUT only;
+    // stderr guidance carries NO secret, so blind-capture keeps the key out
+    // of the agent's transcript (and out of the install prompt).
+    let cfg = load_config().unwrap_or_default();
+    let daemon_url = format!(
+        "{}:{}",
+        crate::cli::active::device_daemon_host(&cfg),
+        crate::config::PROXY_PORT
+    );
+    match crate::cli::active::device_default_vault(&cfg) {
+        Some(vid) => {
+            println!("SAFECLAW_DAEMON_URL={}", daemon_url);
+            println!("SAFECLAW_VAULT_ID={}", vid);
+            println!("SAFECLAW_API_KEY={}", r.token);
+            println!(
+                "SAFECLAW_PROXY_URL={}",
+                crate::cli::proxy_env::proxy_url_for_vault(&daemon_url, &vid, Some(&r.token))
+            );
+        }
+        None => {
+            // No vault on this device yet (agent ⊥ vault — the key itself is
+            // account-level). The routing lines need a vault: pair first, then
+            // mint a complete env with a fresh add.
+            println!("SAFECLAW_API_KEY={}", r.token);
+            eprintln!(
+                "\nnote: no vault on this device — only SAFECLAW_API_KEY was printed. Run \
+                 `sc login <pair-token>` first, then `sc agent add` mints the complete env."
+            );
+        }
+    }
     eprintln!(
-        "\nAgent '{}' created. Its key was printed to stdout, shown ONCE — set it as \
-         SAFECLAW_API_KEY in the agent's env (capture stdout without echoing it). \
-         SAFECLAW_VAULT_URL comes from `sc env`. Works on any paired device; \
-         revoke: `sc agent rm {}`.",
+        "\nAgent '{}' created — its complete SafeClaw env (incl. its api key, shown ONCE) \
+         went to stdout. Append those lines to the env file your framework loads, without \
+         displaying them. Works on any paired device; revoke: `sc agent rm {}`.",
         args.name, args.name
     );
     Ok(())

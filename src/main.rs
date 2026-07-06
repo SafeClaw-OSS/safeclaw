@@ -153,6 +153,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 e.into()
             })
         }
+        Command::Device(args) => {
+            use safeclaw::config::DeviceSubcommand;
+            let r = match args.sub {
+                DeviceSubcommand::Login(a) => cli::login::run(a).await,
+                DeviceSubcommand::Logout(a) => cli::logout::run(a).await,
+            };
+            r.map_err(|e| -> Box<dyn std::error::Error> {
+                eprintln!("safeclaw device: {}", e);
+                e.into()
+            })
+        }
         Command::Secret(args) => {
             use safeclaw::config::SecretSubcommand;
             let r = match args.sub {

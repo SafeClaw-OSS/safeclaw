@@ -93,13 +93,19 @@ pub enum Command {
     /// (works on any paired device), `ls` lists them, `rm` revokes. Short: `sc a`.
     #[command(alias = "a")]
     Agent(AgentArgs),
+    /// The DEVICE axis of the account plane: `sc device login/logout` are the
+    /// canonical spellings of top-level `sc login`/`sc logout` (kept as
+    /// shortcuts). Symmetric with `sc agent *` — both are account-level,
+    /// device-key/pair-token authed, cloud-backed.
+    Device(DeviceArgs),
     /// Operator-only commands. Each subcommand requires `$SAFECLAW_ADMIN_KEY`
     /// to be set on the CLI side AND match the daemon's `SAFECLAW_ADMIN_KEY`
     /// env. In SaaS deployments only the SafeClaw team holds this key.
     Admin(AdminArgs),
-    /// Print the active vault as a shell `export` line so agents see
-    /// `SAFECLAW_VAULT_URL` from the env. Run as `eval "$(safeclaw env)"`.
-    /// The per-agent broker key (`SAFECLAW_API_KEY`) comes from `sc agent add`.
+    /// Print `export` lines for the HUMAN's shell (`eval "$(sc env)"`):
+    /// SAFECLAW_DAEMON_URL + SAFECLAW_VAULT_ID projected from this device's
+    /// config — never a key. An AGENT's complete env (incl. its key) is minted
+    /// by `sc agent add` instead.
     Env,
     /// Self-update: download the latest release binary for this platform,
     /// verify its sha256, and replace the running binary in place. No-op when
@@ -321,8 +327,10 @@ pub struct AgentArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum AgentSubcommand {
-    /// Mint a new agent key (printed ONCE). Account-level: works on any of
-    /// your paired devices. Put it in the agent's `SAFECLAW_API_KEY`.
+    /// Mint a new agent identity and print its COMPLETE env (dotenv lines:
+    /// DAEMON_URL / VAULT_ID / API_KEY / PROXY_URL, key shown ONCE) — the
+    /// agent appends stdout to its own `.env`. Account-level: works on any of
+    /// your paired devices.
     Add(AgentAddArgs),
     /// List this account's agents (name, key prefix, last-used).
     Ls,
@@ -341,6 +349,21 @@ pub struct AgentAddArgs {
 pub struct AgentRmArgs {
     /// Agent name, key prefix, or id (see `sc agent ls`).
     pub name: String,
+}
+
+/// `sc device` — the device axis of the account plane.
+#[derive(Debug, Args)]
+pub struct DeviceArgs {
+    #[command(subcommand)]
+    pub sub: DeviceSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum DeviceSubcommand {
+    /// Pair this host to your vault (same as top-level `sc login`).
+    Login(LoginArgs),
+    /// Unpair this host (same as top-level `sc logout`).
+    Logout(LogoutArgs),
 }
 
 #[derive(Debug, Subcommand)]
