@@ -535,13 +535,17 @@ GET — never through the proxy. Captive-portal 401s carry an ABSOLUTE
 `poll_url` at this face.
 
 **Waiting is a process, not a held connection**: every pending-approval body
-also names `sc op wait <op_id>` — a waiter that polls `/op/{id}` until the op
-resolves, then exits with the outcome (0 approved / 2 rejected / 3 expired /
-4 timeout). An agent backgrounds it and treats process-exit as its wake-up —
-the `sc up` unlock experience generalized to every approval. Polling never
-consumes the grant (the retried request does, via `cache_take`), so waiting
-and re-running can't race. Sandboxed agent without `sc` → the JSON `poll_url`
-is the same contract by hand; the reject-and-re-run floor is unchanged.
+on a paired daemon also names `sc op wait <op_id>` — a waiter that polls
+`/op/{id}` until the op resolves, then exits with the outcome (0 approved /
+5 rejected / 3 expired / 4 timeout; 2 stays clap's usage-error code). An
+agent backgrounds it and treats process-exit as its wake-up — the `sc up`
+unlock experience generalized to every approval. Polling never consumes the
+grant (a retry reads the approval cache; only `ask-always` burns it
+single-use via `cache_take`), so waiting and re-running can't race. The
+record's `expires_at` tracks the op's own Valid window, so the waiter 404s
+exactly when the op stops being approvable. Sandboxed agent without `sc` →
+the JSON `poll_url` is the same contract by hand; the reject-and-re-run
+floor is unchanged.
 
 **The agent's env = its SSOT — four dotenv vars, minted as ONE block:**
 

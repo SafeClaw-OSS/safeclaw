@@ -172,7 +172,7 @@ pub enum Command {
     GitCredential(GitCredentialArgs),
     /// Approval ops. `sc op wait <op_id>` blocks until the op resolves — the
     /// waiter an agent backgrounds after a pending-approval reply; its exit
-    /// is the wake-up (0 approved, 2 rejected, 3 expired, 4 timeout).
+    /// is the wake-up (0 approved, 5 rejected, 3 expired, 4 timeout).
     Op(OpArgs),
 }
 
@@ -249,7 +249,8 @@ pub struct OpWaitArgs {
     /// Op id from a pending-approval response (its `op_id` JSON field /
     /// `x-safeclaw-op-id` header).
     pub op_id: String,
-    /// Max seconds to wait before giving up (the op itself expires in ~30 min).
+    /// Max seconds to wait before giving up (the op's own expiry usually
+    /// ends the wait first).
     #[arg(long, default_value = "1900")]
     pub timeout: u64,
 }

@@ -584,11 +584,10 @@ impl BrokerHandler {
                 let body = format!(
                     "SafeClaw approval needed to use this credential.\n\
                      Approve with your passkey:\n  {}\n\
-                     To wait: sc op wait {}   (background it; its exit is the signal)\n\
-                     Then re-run the same command.\n\n\
+                     {}Then re-run the same command.\n\n\
                      {}\n",
                     approve_url,
-                    op_id,
+                    wait_hint(&approve_url, &op_id),
                     json!({
                         "status": "pending",
                         "op_id": op_id,
@@ -655,13 +654,12 @@ impl BrokerHandler {
                 let body = format!(
                     "SafeClaw: connection '{}' is not anchored to '{}'.\n\
                      Approve adding this host as a PERMANENT grant (passkey):\n  {}\n\
-                     To wait: sc op wait {}   (background it; its exit is the signal)\n\
-                     Then re-run the same command.\n\n\
+                     {}Then re-run the same command.\n\n\
                      {}\n",
                     conn,
                     host,
                     approve_url,
-                    op_id,
+                    wait_hint(&approve_url, &op_id),
                     json!({
                         "status": "pending",
                         "op_id": op_id,
@@ -691,6 +689,20 @@ impl BrokerHandler {
             ),
         )
         .into()
+    }
+}
+
+/// The waiter line for pending-approval bodies — only when the approve link
+/// is absolute (cloud-paired). An unpaired daemon has no reachable approval
+/// surface, and a hinted wait there would just block until the op expires.
+fn wait_hint(approve_url: &str, op_id: &str) -> String {
+    if approve_url.starts_with("http") {
+        format!(
+            "To wait: sc op wait {}   (background it; its exit is the signal)\n",
+            op_id
+        )
+    } else {
+        String::new()
     }
 }
 

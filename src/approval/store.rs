@@ -125,6 +125,17 @@ impl ApprovalStore {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
+        // The record's lifetime tracks the op's own Valid window (capped by
+        // the default): a pending record that outlives its op advertises an
+        // `expires_at` no passkey tap can meet — a waiter would spin on a
+        // zombie. Ops without an exp keep the default ceiling.
+        let ttl_secs = op
+            .valid
+            .exp
+            .map(|e| e.saturating_sub(now_unix))
+            .filter(|&s| s > 0)
+            .map(|s| s.min(DEFAULT_TTL.as_secs()))
+            .unwrap_or(DEFAULT_TTL.as_secs());
         let rec = ApprovalRecord {
             id: id.clone(),
             vault_id,
@@ -133,8 +144,8 @@ impl ApprovalStore {
             status: ApprovalStatus::Pending,
             cached_value: None,
             created_at: Instant::now(),
-            expires_at_unix: now_unix + DEFAULT_TTL.as_secs(),
-            ttl: DEFAULT_TTL,
+            expires_at_unix: now_unix + ttl_secs,
+            ttl: Duration::from_secs(ttl_secs),
             policy_context,
             fail_count: 0,
         };
@@ -257,5 +268,27 @@ mod tests {
         let id = s.create("vault1".into(), fake_op(), "fake_r".into());
         s.reject(&id, "user denied");
         assert!(s.consume(&id).is_none());
+    }
+
+    #[test]
+    fn record_ttl_follows_op_valid_window() {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        // A bounded op: the record expires with the op, not at the default.
+        let mut op = fake_op();
+        op.valid = Valid::single_use(now, Some(now + 120));
+        let mut s = ApprovalStore::new();
+        let id = s.create("vault1".into(), op, "r".into());
+        let rec = s.get(&id).unwrap();
+        assert!(rec.ttl <= Duration::from_secs(120));
+        assert!(rec.ttl >= Duration::from_secs(118)); // clock-tick slack
+        assert!(rec.expires_at_unix <= now + 121);
+
+        // No exp (fake_op default) keeps the default ceiling.
+        let id2 = s.create("vault1".into(), fake_op(), "r".into());
+        assert_eq!(s.get(&id2).unwrap().ttl, DEFAULT_TTL);
     }
 }
