@@ -274,6 +274,7 @@ impl BrokerHandler {
                     || self.state.custom_service(&vault_id, &conn).is_some();
                 if known_service {
                     crate::storage::plaintext::Connection {
+                        label: None,
                         service: Some(conn.clone()),
                         hosts: None,
                         secrets: None,
@@ -302,7 +303,6 @@ impl BrokerHandler {
             .as_ref()
             .and_then(|d| d.oauth2.as_ref())
             .map(|o| o.refresh_token.clone());
-        let is_oauth = oauth_refresh.is_some();
         // The service id policy/mint use; for a raw connection there is none so
         // the conn id stands in (registry lookups miss → global default floor).
         let service_id = conn_rec.service.clone().unwrap_or_else(|| conn.clone());

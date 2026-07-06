@@ -91,6 +91,7 @@ security-relevant field, and the settled tuple already makes it first-class):
 // STORED — aux.connections[<conn_id>].  conn_id is the map key (not repeated in the value).
 // Minimal by construction: everything else is derived or lives elsewhere.
 {
+  "label":   "Work Laptop",      // string | null — user's VERBATIM display name (2026-07-06)
   "service": "github",           // string | null   (null = raw)
   "hosts":   ["api.github.com"], // string[] | null  (see the SSOT invariant)
   "secrets": ["GITHUB_TOKEN"]    // string[] | null  — the UPPERCASE keys this conn uses
@@ -104,6 +105,15 @@ security-relevant field, and the settled tuple already makes it first-class):
 // policy:  NOT here — aux.policy.connections.<conn_id>.
 // phantom: NEVER stored — it is a DERIVED composite of (conn_id + a secret key);
 //          storing it would be redundant and ambiguous for multi-secret conns.
+// label:   display ONLY (web shows it; id stays the technical handle for
+//          phantoms/policy/audit). Also on aux.connecting; the daemon carries it
+//          through the connecting→connections move. Absent ⇒ render the id.
+//          NAMING (2026-07-06, service-backed): the user types only a QUALIFIER;
+//          display composes "<Service> · <qualifier>" and conn_id =
+//          <service>_<slug(qualifier)> ("GitHub · Work Laptop" ⇒ github_work_laptop).
+//          The service half of the identity is structural, never retyped. The
+//          default connection stays unqualified (conn_id == service_id). RAW
+//          connections keep free naming (no service to scope under).
 
 // hosts has ONE source (SSOT):
 //   service = null             ⇒ hosts required (raw; normally a single host)
