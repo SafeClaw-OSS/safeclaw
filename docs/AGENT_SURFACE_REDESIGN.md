@@ -78,9 +78,13 @@ account ops; "expose :23295" is a narrower remote-manage-this-daemon need.
   means re-minting the agent env.
 - **Two SSOTs at two levels, bridged ONCE at mint — the agent never treats `sc` as its source.**
   The DEVICE SSOT is config atoms (used by the daemon's bind + the human's `sc`). The AGENT SSOT is the
-  agent's OWN `.env`: the minter projects the device atoms into ready `_url`s and writes them there ONCE
-  (mint time). At runtime the agent reads its `.env` for its own HTTP — it does NOT re-derive from atoms
-  and does NOT call `sc` to learn its own vars. A `sc` the agent shells INHERITS that same `.env`
+  agent's OWN `.env`, a mint-time projection of the device atoms. **Who does the "mint" TODAY (no single
+  component): `sc env` projects the atoms → `DAEMON_URL`+`VAULT_ID`, and `sc agent add` returns the
+  `API_KEY`; the AGENT runs both (per the install prompt) and writes its own `.env`.** A SINGLE minter
+  that pre-bakes the whole `.env` (incl the key) into the prompt is exactly the DEFERRED §6/§11 (the
+  console mint endpoint becomes the minter). Either way it's a mint-time projection, written ONCE. At
+  runtime the agent reads its `.env` for its own HTTP — it does NOT re-derive from atoms and does NOT
+  call `sc` to learn its own vars. A `sc` the agent shells INHERITS that same `.env`
   (env-first, §5), so the agent's HTTP and its shelled `sc` share ONE SSOT automatically — the split
   can't arise from cross-derivation. So assembly (atoms → `_url`) happens at the **mint dimension**, off
   the agent's reasoning (assembly = silent-error surface). **Agent required surface =
