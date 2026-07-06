@@ -10,27 +10,38 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crate::config::{default_state_dir, CONTROL_PORT, PROXY_PORT};
+use crate::config::default_state_dir;
 
-/// Resident CA cert path — `<state_dir>/ca.pem`, where the daemon generated it
-/// on first start.
+/// Resident CA cert path: `$SAFECLAW_CA_PATH` when set (a hand-configured
+/// remote daemon — the PUBLIC `ca.pem` copied over manually; the private
+/// `ca.key` never leaves the daemon), else `<state_dir>/ca.pem`, where the
+/// local daemon generated it on first start.
 pub fn resident_ca_path() -> PathBuf {
+    if let Some(p) = std::env::var_os("SAFECLAW_CA_PATH") {
+        if !p.is_empty() {
+            return PathBuf::from(p);
+        }
+    }
     default_state_dir().join("ca.pem")
 }
 
-/// The proxy URL a child's `HTTPS_PROXY` points at:
-/// `http://<vid>:<key>@127.0.0.1:<PROXY_PORT>`. The vid (username) routes to a
-/// vault; the key (password) is the agent's identity, verified by the proxy
-/// before any substitution (§8). An absent key leaves the password slot empty
+/// The proxy URL a child's `HTTPS_PROXY` points at: the API-face root
+/// (`scheme://host:port`, from `active::api_face_root`) with `<vid>:<key>`
+/// spliced into the userinfo. The vid (username) routes to a vault; the key
+/// (password) is the agent's identity, verified by the proxy before any
+/// substitution (§8). An absent key leaves the password slot empty
 /// (`<vid>:@`) — the proxy 407s such a request (participating but
-/// unauthenticated), the human-without-an-agent-key case.
-pub fn proxy_url_for_vault(vid: &str, key: Option<&str>) -> String {
+/// unauthenticated), the human-without-an-agent-key case. Deriving from the
+/// API-face root keeps proxy and control on ONE daemon host (the invariant).
+pub fn proxy_url_for_vault(api_root: &str, vid: &str, key: Option<&str>) -> String {
     let key_enc = key.map(|k| urlencoding::encode(k).into_owned()).unwrap_or_default();
+    let (scheme, rest) = api_root.split_once("://").unwrap_or(("http", api_root));
     format!(
-        "http://{}:{}@127.0.0.1:{}",
+        "{}://{}:{}@{}",
+        scheme,
         urlencoding::encode(vid),
         key_enc,
-        PROXY_PORT
+        rest.trim_end_matches('/')
     )
 }
 
@@ -69,9 +80,10 @@ pub fn build_bundle(
     b
 }
 
-/// Is the daemon's control plane answering on localhost `CONTROL_PORT`? `sc run`'s
-/// liveness gate — the proxy shares the daemon process, so control up ⇒ proxy up.
-pub async fn control_plane_up() -> bool {
+/// Is the daemon's control plane answering at `control_root` (from
+/// `active::control_root` — env-first host)? `sc run`'s liveness gate — the
+/// proxy shares the daemon process, so control up ⇒ proxy up.
+pub async fn control_plane_up(control_root: &str) -> bool {
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_millis(500))
         .build()
@@ -79,7 +91,7 @@ pub async fn control_plane_up() -> bool {
         Ok(c) => c,
         Err(_) => return false,
     };
-    let url = format!("http://127.0.0.1:{}/health", CONTROL_PORT);
+    let url = format!("{}/health", control_root.trim_end_matches('/'));
     matches!(client.get(&url).send().await, Ok(r) if r.status().is_success())
 }
 
@@ -89,21 +101,27 @@ mod tests {
 
     #[test]
     fn proxy_url_carries_vault_and_key() {
-        // vid in the username, api-key in the password, resident proxy port.
+        // vid in the username, api-key in the password, spliced into the
+        // API-face root (same host as every other derived URL).
         assert_eq!(
-            proxy_url_for_vault("default", Some("sc_agent_k9")),
-            format!("http://default:sc_agent_k9@127.0.0.1:{}", PROXY_PORT)
+            proxy_url_for_vault("http://127.0.0.1:23294", "default", Some("sc_agent_k9")),
+            "http://default:sc_agent_k9@127.0.0.1:23294"
         );
         // No key → empty password slot (the proxy 407s it).
         assert_eq!(
-            proxy_url_for_vault("default", None),
-            format!("http://default:@127.0.0.1:{}", PROXY_PORT)
+            proxy_url_for_vault("http://127.0.0.1:23294", "default", None),
+            "http://default:@127.0.0.1:23294"
+        );
+        // A remote API-face root keeps its host AND custom port.
+        assert_eq!(
+            proxy_url_for_vault("https://box.example.com:9999/", "v1", Some("k")),
+            "https://v1:k@box.example.com:9999"
         );
     }
 
     #[test]
     fn bundle_has_full_family_and_helper() {
-        let proxy = proxy_url_for_vault("abc", Some("k1"));
+        let proxy = proxy_url_for_vault("http://127.0.0.1:23294", "abc", Some("k1"));
         let b = build_bundle(&proxy, "/x/ca.pem", None);
         let get = |k: &str| b.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
         assert_eq!(get("HTTPS_PROXY").unwrap(), proxy);
@@ -128,7 +146,7 @@ mod tests {
     #[test]
     fn bundle_chains_git_config_indices() {
         // Parent already set two entries → we append at index 2, count becomes 3.
-        let proxy = proxy_url_for_vault("abc", Some("k1"));
+        let proxy = proxy_url_for_vault("http://127.0.0.1:23294", "abc", Some("k1"));
         let b = build_bundle(&proxy, "/x/ca.pem", Some(2));
         let get = |k: &str| b.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
         assert_eq!(get("GIT_CONFIG_COUNT").unwrap(), "3");

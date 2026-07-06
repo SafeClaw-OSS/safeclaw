@@ -24,24 +24,18 @@
 //! written yet — `eval "$(safeclaw env)"` then no-ops safely instead of
 //! exporting empty strings.
 
-use crate::cli::active::load as load_config;
+use crate::cli::active::{device_daemon_host, device_default_vault, load as load_config};
 use crate::config::PROXY_PORT;
 
 pub fn run() -> Result<(), String> {
     let cfg = load_config()?;
-    if cfg.daemon.is_none() {
-        println!("# safeclaw: no active config — run `safeclaw vault create` first");
+    // Device atoms only — never the process env (`sc env` MINTS the pin; a
+    // re-eval that read its own prior output would freeze stale values).
+    let Some(vault) = device_default_vault(&cfg) else {
+        println!("# safeclaw: no vault on this device — run `sc login` or `sc vault create` first");
         return Ok(());
-    }
-    let vault = match cfg.vault {
-        Some(v) => v,
-        None => {
-            println!("# safeclaw: active config has no vault — run `safeclaw vault create` first");
-            return Ok(());
-        }
     };
-    // The API face is the resident local daemon, always loopback:PROXY_PORT.
-    let daemon_url = format!("http://127.0.0.1:{}", PROXY_PORT);
+    let daemon_url = format!("{}:{}", device_daemon_host(&cfg), PROXY_PORT);
     println!("export SAFECLAW_DAEMON_URL={}", shell_quote(&daemon_url));
     println!("export SAFECLAW_VAULT_ID={}", shell_quote(&vault));
     Ok(())

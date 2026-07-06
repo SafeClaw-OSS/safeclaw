@@ -54,8 +54,8 @@ pub async fn run(args: LogoutArgs) -> Result<(), String> {
     }
 
     // 4. Clear the pairing from config.toml: active vault, cloud backend,
-    //    frontend origin, and the known-vaults history (incl. any orphans).
-    //    Preserve user `settings` (e.g. cb_port) — those aren't pairing state.
+    //    frontend origin, and the known-vaults catalog (its own file; incl. any
+    //    orphans). Preserve user `settings` (e.g. cb_port) — not pairing state.
     let mut cleared = load().unwrap_or_default();
     cleared.daemon = None;
     cleared.vault = None;
@@ -63,6 +63,7 @@ pub async fn run(args: LogoutArgs) -> Result<(), String> {
     cleared.frontend_origin = None;
     cleared.known_vaults.clear();
     save(&cleared)?;
+    crate::cli::active::clear_known_vaults()?;
 
     if was_paired {
         eprintln!("Unpaired this machine — daemon stopped, local pairing cleared.");
@@ -70,8 +71,8 @@ pub async fn run(args: LogoutArgs) -> Result<(), String> {
         eprintln!("Nothing was paired; cleared any stale local config.");
     }
     eprintln!();
-    eprintln!("  Your agent's SAFECLAW_VAULT_URL / SAFECLAW_API_KEY may still be exported in");
-    eprintln!("  your shell profile (e.g. ~/.zshrc) — they're stale now. Remove them, or");
+    eprintln!("  Your agent's SAFECLAW_* env (DAEMON_URL / VAULT_ID / API_KEY) may still be");
+    eprintln!("  persisted in its .env or your shell profile — it's stale now. Remove it, or");
     eprintln!("  re-pair with `sc login --pair-token <token>`.");
     Ok(())
 }

@@ -243,9 +243,9 @@ fn synced_vault_ids(cfg: &crate::cli::active::CliConfig) -> Vec<String> {
     if let Some(v) = cfg.vault.as_deref().filter(|s| !s.is_empty()) {
         ids.push(v.to_string());
     }
-    for kv in &cfg.known_vaults {
+    for kv in crate::cli::active::known_vaults() {
         if !kv.vault.is_empty() && !ids.iter().any(|x| x == &kv.vault) {
-            ids.push(kv.vault.clone());
+            ids.push(kv.vault);
         }
     }
     ids
@@ -1995,19 +1995,23 @@ mod tests {
         };
         active::save(&cfg).unwrap();
 
-        // Remove the ACTIVE vault by vid: dropped from known_vaults AND cleared active.
+        // Remove the ACTIVE vault by vid: dropped from the catalog AND cleared
+        // active. The write also migrates the legacy config-field entries into
+        // the catalog file (`known_vaults.toml`) and clears the field.
         assert_eq!(active::forget_vault("vid-A"), Ok(true));
         let after = active::load().unwrap();
         assert!(after.vault.is_none());
         assert!(after.daemon.is_none());
-        assert_eq!(after.known_vaults.len(), 1);
-        assert_eq!(after.known_vaults[0].vault, "vid-B");
+        assert!(after.known_vaults.is_empty(), "legacy field migrated to the file");
+        let known = active::known_vaults();
+        assert_eq!(known.len(), 1);
+        assert_eq!(known[0].vault, "vid-B");
 
         // Idempotent: forgetting it again is a no-op (Ok(false)).
         assert_eq!(active::forget_vault("vid-A"), Ok(false));
         // A non-active known vault: removed, active untouched.
         assert_eq!(active::forget_vault("vid-B"), Ok(true));
-        assert!(active::load().unwrap().known_vaults.is_empty());
+        assert!(active::known_vaults().is_empty());
 
         match prev {
             Some(v) => std::env::set_var("HOME", v),

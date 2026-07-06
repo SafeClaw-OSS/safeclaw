@@ -8,7 +8,7 @@
 
 use std::path::Path;
 
-use crate::cli::active::resolve_active;
+use crate::cli::active::{api_face_root, load as load_config, resolve_active};
 use crate::cli::env::shell_quote;
 use crate::cli::proxy_env::{build_bundle, control_plane_up, proxy_url_for_vault, resident_ca_path};
 use crate::config::RunArgs;
@@ -22,9 +22,9 @@ pub async fn run(args: RunArgs) -> Result<(), String> {
         );
     }
 
-    let (_daemon, vid) = resolve_active(args.vault.as_deref())?;
+    let (control, vid) = resolve_active(args.vault.as_deref())?;
     let ca = resident_ca_path();
-    preflight(&ca).await?;
+    preflight(&ca, &control).await?;
 
     let proxy_url = agent_proxy_url(&vid, args.vault.is_some());
     // Friendly hint (user's request): a human shell has no agent identity, so
@@ -63,7 +63,8 @@ pub async fn run(args: RunArgs) -> Result<(), String> {
 /// The proxy URL the child's `HTTPS_PROXY` gets (AGENT_SURFACE §11). Preference:
 /// the agent's OWN `$SAFECLAW_PROXY_URL` (carries its vid + api-key) copied
 /// VERBATIM — zero assembly — unless `--vault` overrode the vault, in which case
-/// build one for the resolved vid, splicing the agent's `$SAFECLAW_API_KEY`.
+/// build one for the resolved vid, splicing the agent's `$SAFECLAW_API_KEY` into
+/// the API-face root (same daemon host as everything else — the invariant).
 /// `sc run` never owns or persists the key; it only propagates the agent's own.
 fn agent_proxy_url(vid: &str, vault_overridden: bool) -> String {
     if !vault_overridden {
@@ -74,7 +75,8 @@ fn agent_proxy_url(vid: &str, vault_overridden: bool) -> String {
         }
     }
     let key = std::env::var("SAFECLAW_API_KEY").ok().filter(|s| !s.is_empty());
-    proxy_url_for_vault(vid, key.as_deref())
+    let cfg = load_config().unwrap_or_default();
+    proxy_url_for_vault(&api_face_root(&cfg), vid, key.as_deref())
 }
 
 /// Does this shell carry an agent identity? A key rides either the agent's
@@ -87,14 +89,14 @@ fn agent_has_key() -> bool {
 /// The CA must exist and the daemon must be up (the proxy shares its process).
 /// Otherwise a friendly `sc up` hint — never a mystery TLS / connection error
 /// inside the child.
-async fn preflight(ca: &Path) -> Result<(), String> {
+async fn preflight(ca: &Path, control_root: &str) -> Result<(), String> {
     if !ca.exists() {
         return Err(format!(
             "SafeClaw CA not found at {} — the daemon generates it on first start. Run `sc up`, then retry.",
             ca.display()
         ));
     }
-    if control_plane_up().await {
+    if control_plane_up(control_root).await {
         return Ok(());
     }
     Err("SafeClaw isn't running — bring it up with `sc up`, then retry.".into())

@@ -7,7 +7,7 @@ use serde_json::json;
 
 use crate::cli::status::{fetch_status, print_status, VaultState};
 use crate::cli::webauthn::*;
-use crate::cli::active::{forget as forget_vault, join_vault_url, load as load_config, put_active, resolve_active, split_vault_url};
+use crate::cli::active::{forget as forget_vault, join_vault_url, known_vaults, load as load_config, put_active, resolve_active, split_vault_url};
 use crate::config::{VaultCreateArgs, VaultDeleteArgs, VaultForgetArgs, VaultSubcommand, VaultUseArgs};
 
 // Port must equal `config::CONTROL_PORT` (the daemon's control/API plane).
@@ -41,12 +41,13 @@ pub async fn run(sub: VaultSubcommand) -> Result<(), String> {
 
 async fn run_ls() -> Result<(), String> {
     let cfg = load_config()?;
-    if cfg.known_vaults.is_empty() {
+    let known = known_vaults();
+    if known.is_empty() {
         println!("(no vaults yet — `safeclaw vault create` or `safeclaw vault use`)");
         return Ok(());
     }
     let active = (cfg.daemon.as_deref(), cfg.vault.as_deref());
-    for (i, kv) in cfg.known_vaults.iter().enumerate() {
+    for (i, kv) in known.iter().enumerate() {
         let marker = if active == (Some(&kv.daemon), Some(&kv.vault)) { "*" } else { " " };
         println!("  {} {}) {}", marker, i + 1, join_vault_url(&kv.daemon, &kv.vault));
     }
@@ -58,11 +59,11 @@ async fn run_ls() -> Result<(), String> {
 /// - numeric index (1-based) into the known_vaults list
 fn resolve_url_or_idx(arg: &str) -> Result<(String, String), String> {
     if let Ok(idx) = arg.parse::<usize>() {
-        let cfg = load_config()?;
-        if idx < 1 || idx > cfg.known_vaults.len() {
-            return Err(format!("index {} out of range [1-{}]", idx, cfg.known_vaults.len()));
+        let known = known_vaults();
+        if idx < 1 || idx > known.len() {
+            return Err(format!("index {} out of range [1-{}]", idx, known.len()));
         }
-        let kv = &cfg.known_vaults[idx - 1];
+        let kv = &known[idx - 1];
         return Ok((kv.daemon.clone(), kv.vault.clone()));
     }
     split_vault_url(arg).ok_or_else(|| {
@@ -112,8 +113,7 @@ async fn run_forget(args: VaultForgetArgs) -> Result<(), String> {
     let (custodian, vault) = if let Some(arg) = args.url_or_idx {
         resolve_url_or_idx(&arg)?
     } else {
-        let cfg = load_config()?;
-        if cfg.known_vaults.is_empty() {
+        if known_vaults().is_empty() {
             return Err("no vaults in known list — nothing to forget".into());
         }
         let url = interactive_pick(OnEmpty::Abort)?.ok_or("cancelled")?;
@@ -139,11 +139,12 @@ enum OnEmpty {
 
 fn interactive_pick(on_empty: OnEmpty) -> Result<Option<String>, String> {
     let cfg = load_config().unwrap_or_default();
+    let known = known_vaults();
     let active = (cfg.daemon.as_deref(), cfg.vault.as_deref());
-    let has_known = !cfg.known_vaults.is_empty();
+    let has_known = !known.is_empty();
     if has_known {
         eprintln!("Known vaults:");
-        for (i, kv) in cfg.known_vaults.iter().enumerate() {
+        for (i, kv) in known.iter().enumerate() {
             let marker = if active == (Some(&kv.daemon), Some(&kv.vault)) { " (active)" } else { "" };
             eprintln!("  {}) {}{}", i + 1, join_vault_url(&kv.daemon, &kv.vault), marker);
         }
@@ -170,10 +171,10 @@ fn interactive_pick(on_empty: OnEmpty) -> Result<Option<String>, String> {
         };
     }
     if let Ok(idx) = trimmed.parse::<usize>() {
-        if idx < 1 || idx > cfg.known_vaults.len() {
-            return Err(format!("index {} out of range [1-{}]", idx, cfg.known_vaults.len()));
+        if idx < 1 || idx > known.len() {
+            return Err(format!("index {} out of range [1-{}]", idx, known.len()));
         }
-        let kv = &cfg.known_vaults[idx - 1];
+        let kv = &known[idx - 1];
         return Ok(Some(join_vault_url(&kv.daemon, &kv.vault)));
     }
     Ok(Some(trimmed.to_string()))
@@ -392,8 +393,8 @@ async fn run_delete(args: VaultDeleteArgs) -> Result<(), String> {
 /// If multiple → prompt the user to pick.
 /// Returns the first enrolled passkey's meta (cred_id + pub_x/y).
 async fn pick_reuse_passkey(new_custodian: &str, new_vault_id: &str) -> Result<crate::cli::webauthn::PasskeyMeta, String> {
-    let cfg = load_config().unwrap_or_default();
-    let candidates: Vec<_> = cfg.known_vaults.iter()
+    let known = known_vaults();
+    let candidates: Vec<_> = known.iter()
         .filter(|kv| kv.daemon.trim_end_matches('/') == new_custodian.trim_end_matches('/')
             && kv.vault != new_vault_id)
         .collect();
