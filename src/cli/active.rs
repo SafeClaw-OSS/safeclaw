@@ -3,7 +3,7 @@
 //!
 //! The DEVICE atoms live here: `daemon` (the daemon the human's `sc` talks to)
 //! and `vault` (the durable default), plus cloud pairing coordinates. URLs are
-//! DERIVED from the atoms, never stored (AGENT_SURFACE design wave: atoms are
+//! DERIVED from the atoms, never stored (CREDENTIAL_BROKER.md §14: atoms are
 //! truth, `_url`s are projections):
 //!
 //! - control root  = daemon host + `CONTROL_PORT` (ceremony/write plane)
@@ -427,7 +427,7 @@ pub fn device_default_vault(cfg: &CliConfig) -> Option<String> {
 }
 
 /// Resolve the active `(control_root, vault)` pair every short-lived `sc`
-/// command routes through — the single choke point (AGENT_SURFACE §5).
+/// command routes through — the single choke point (CREDENTIAL_BROKER.md §14).
 ///
 /// - **control root:** see [`control_root`] — the env `DAEMON_URL` HOST wins
 ///   (the single-host invariant), else config, else the loopback default.

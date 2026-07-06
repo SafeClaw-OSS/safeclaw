@@ -72,7 +72,7 @@ async fn add(args: AgentAddArgs) -> Result<(), String> {
     }
     let r: CreateResp = resp.json().await.map_err(|e| format!("parse response: {}", e))?;
 
-    // ── Mint-time projection (AGENT_SURFACE §6/§11): this IS the minter ─────
+    // ── Mint-time projection (CREDENTIAL_BROKER.md §14): this IS the minter ─────
     // Print the agent's COMPLETE env as dotenv lines: a snapshot of the DEVICE
     // atoms (config daemon host + port constants + default vault) plus the
     // fresh key. The agent appends ONE command's stdout to its own `.env` —

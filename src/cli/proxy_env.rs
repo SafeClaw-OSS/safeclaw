@@ -3,7 +3,7 @@
 //! daemon never disagree on the proxy address or the CA location.
 //!
 //! Routing DETECTION (probe host / `is_routed` / `$HTTPS_PROXY` introspection) is
-//! deliberately gone (AGENT_SURFACE §9): the broker is opt-in, so the agent
+//! deliberately gone (CREDENTIAL_BROKER.md §14): the broker is opt-in, so the agent
 //! routes every credential request EXPLICITLY (`sc run` / `--proxy`) — the
 //! "phantom sent unrouted" state is unreachable, so there's nothing to detect.
 

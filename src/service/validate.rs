@@ -45,7 +45,7 @@ fn host_is_blocked_ip(host: &str) -> bool {
 /// IP-range based (`host_is_blocked_ip`, which already covers the 169.254/16
 /// metadata IP) — mainstream forward-proxy hygiene. We add ONLY the loopback
 /// names here; NO `.internal` / `metadata.google.internal` name special-cases
-/// (AGENT_SURFACE §7): a credential only reaches a host a HUMAN deliberately
+/// (CREDENTIAL_BROKER.md §14): a credential only reaches a host a HUMAN deliberately
 /// anchored (curated PR / `sc connect` behind a passkey), we don't resolve DNS
 /// at egress, and blocking `.internal` would wrongly reject a user's legitimate
 /// self-hosted `*.internal` service.

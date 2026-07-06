@@ -6,7 +6,7 @@
 //! eval "$(safeclaw env)"
 //! ```
 //!
-//! `sc env` is the DEVICE/human's tool (AGENT_SURFACE §4/§11) — it emits the
+//! `sc env` is the DEVICE/human's tool (CREDENTIAL_BROKER.md §14) — it emits the
 //! routing vars only, NEVER a key:
 //!
 //! - `SAFECLAW_DAEMON_URL` — the resident daemon's API face
@@ -15,10 +15,10 @@
 //!   (`resolve_active` reads it), the `AWS_PROFILE` analog.
 //!
 //! The AGENT's config (all four vars INCL its per-agent `SAFECLAW_API_KEY` +
-//! `SAFECLAW_PROXY_URL`) comes from its INSTALL PROMPT, not here: agent ≡
+//! `SAFECLAW_PROXY_URL`) is minted whole by `sc agent add`, not here: agent ≡
 //! api-key, account-level, so each agent holds its own key and `sc env` (device
 //! scope) must never emit one — that would collapse every agent on the device to
-//! one key. See [[project_vault_agent_architecture_2026_06_25]] / AGENT_SURFACE §11.
+//! one key. See [[project_vault_agent_architecture_2026_06_25]] / CREDENTIAL_BROKER.md §14.
 //!
 //! Falls back to printing comments + a clear hint if no config has been
 //! written yet — `eval "$(safeclaw env)"` then no-ops safely instead of

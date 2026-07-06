@@ -60,7 +60,7 @@ pub async fn run(args: RunArgs) -> Result<(), String> {
     exec_child(&args.cmd, &bundle)
 }
 
-/// The proxy URL the child's `HTTPS_PROXY` gets (AGENT_SURFACE §11). Preference:
+/// The proxy URL the child's `HTTPS_PROXY` gets (CREDENTIAL_BROKER.md §14). Preference:
 /// the agent's OWN `$SAFECLAW_PROXY_URL` (carries its vid + api-key) copied
 /// VERBATIM — zero assembly — unless `--vault` overrode the vault, in which case
 /// build one for the resolved vid, splicing the agent's `$SAFECLAW_API_KEY` into

@@ -90,7 +90,7 @@ impl HttpHandler for BrokerHandler {
             return req.into();
         }
 
-        // API face (AGENT_SURFACE §2): an origin-form request (or an absolute-form
+        // API face (CREDENTIAL_BROKER.md §14): an origin-form request (or an absolute-form
         // one looped back at our own authority) is discovery / op-poll / health /
         // ca — self-answered read-only here, never forwarded upstream. This is the
         // agent's ONE port: the same listener serves the proxy face (below) and

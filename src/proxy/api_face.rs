@@ -1,7 +1,8 @@
 //! The 23294 **API face** — a read-only responder living on the proxy listener.
 //!
-//! The proxy port serves two RFC 7230 §5.3 request-line forms (AGENT_SURFACE
-//! §2): CONNECT / absolute-form = the credential proxy (MITM / blind-tunnel);
+//! The proxy port serves two RFC 7230 §5.3 request-line forms
+//! (CREDENTIAL_BROKER.md §14): CONNECT / absolute-form = the credential proxy
+//! (MITM / blind-tunnel);
 //! **origin-form** (`GET /v/{vid}/registry`) = discovery + op-poll, self-answered
 //! here so the agent needs ONE port. A self-authority absolute-form request (the
 //! agent wrongly routed discovery through its own proxy) is the loop-guard case,
