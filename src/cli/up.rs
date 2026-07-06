@@ -50,6 +50,17 @@ pub async fn restart() -> Result<(), String> {
 /// briefly for the daemon to finish pulling the vault on a fresh start.
 /// Best-effort: an unreachable daemon just isn't unlocked here.
 pub async fn ensure_unlocked() -> Result<(), String> {
+    // Pairing is DEVICE state — an env pin alone (a stale agent .env after
+    // `sc logout`) must not send us into the reachability wait below. Before
+    // the default-daemon change, cfg.daemon=None made resolve_active err here;
+    // same instant no-op, now stated explicitly.
+    let cfg = crate::cli::active::load().unwrap_or_default();
+    if cfg.vault.is_none()
+        && cfg.cloud_backend.is_none()
+        && crate::cli::active::known_vaults().is_empty()
+    {
+        return Ok(()); // nothing paired yet — nothing to unlock
+    }
     let (custodian, vault) = match resolve_active(None) {
         Ok(v) => v,
         Err(_) => return Ok(()), // nothing paired yet — nothing to unlock

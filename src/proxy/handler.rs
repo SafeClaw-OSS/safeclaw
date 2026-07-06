@@ -574,9 +574,12 @@ impl BrokerHandler {
                 let approve_url = crate::cli::active::grant_url(&op_id);
                 // §9: absolute poll_url. This 401 is emitted mid-proxy (e.g. while
                 // brokering a gmail request), so a relative `/op/<id>` would
-                // resolve against the UPSTREAM's domain. Point it at the daemon's
-                // API face (the agent's $SAFECLAW_DAEMON_URL) so the agent's poll
-                // (Bearer-gated) lands on us.
+                // resolve against the UPSTREAM's domain. Loopback is the only
+                // address the daemon can assert about itself — correct for the
+                // supported local deployment. (A remote-exposed proxy — future,
+                // gated — would need an advertised-origin config atom; until
+                // then a remote agent just re-runs the command instead of
+                // polling, the skill's primary path.)
                 let poll_url = format!("http://127.0.0.1:{}/op/{}", self.state.config.proxy_port, op_id);
                 let body = format!(
                     "SafeClaw approval needed to use this credential.\n\

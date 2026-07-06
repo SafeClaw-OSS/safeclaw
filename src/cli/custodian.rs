@@ -57,10 +57,13 @@ async fn fetch_print(_args: CommonArgs, path: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// The daemon URL — `$SAFECLAW_VAULT_URL` / active config, else localhost.
+/// The daemon control root. `resolve_active` errs only when no vault is
+/// selected — fall back to the SAME shared derivation (env-first host), not a
+/// hardcoded localhost that would ignore an agent's `$SAFECLAW_DAEMON_URL`.
 fn resolve_daemon_url() -> Result<String, String> {
     if let Ok((c, _)) = resolve_active(None) {
         return Ok(c);
     }
-    Ok("http://localhost:23295".to_string())
+    let cfg = crate::cli::active::load().unwrap_or_default();
+    Ok(crate::cli::active::control_root(&cfg))
 }

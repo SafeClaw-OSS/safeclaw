@@ -1,9 +1,9 @@
 use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand};
 
-/// Control/API plane port — the axum Router (op / approve / registry / health /
-/// events). The agent never addresses it by number; it reaches it only via
-/// `$SAFECLAW_VAULT_URL`, so the port is env-addressed and invisible.
+/// Control plane port — the axum Router (op / approve / ceremonies / events).
+/// The `sc` CLI's target; the agent's own traffic never touches it (the agent
+/// holds only `$SAFECLAW_DAEMON_URL`, the proxy port's API face).
 pub const CONTROL_PORT: u16 = 23295;
 
 /// Credential-proxy plane port (0x5AFE) — the phantom-only local HTTPS MITM the
@@ -443,8 +443,8 @@ pub enum VaultSubcommand {
     /// List vaults this CLI has used (from local config) + mark the
     /// active one with `*`.
     Ls,
-    /// Switch the active vault. Pass a SAFECLAW_VAULT_URL, an index
-    /// from `sc vault ls`, --local for the localhost default vault,
+    /// Switch the active vault. Pass a vault URL (`<daemon>/v/<vault_id>`),
+    /// an index from `sc vault ls`, --local for the localhost default vault,
     /// or nothing for an interactive prompt.
     Use(VaultUseArgs),
     /// Remove a vault from the local known list (does NOT touch the
@@ -470,9 +470,9 @@ pub enum VaultSubcommand {
 
 #[derive(Debug, Args)]
 pub struct VaultUseArgs {
-    /// Either a SAFECLAW_VAULT_URL (`<custodian>/v/<vault_id>`) or a
-    /// numeric index from `sc vault ls`. If omitted and `--local` is
-    /// also omitted, an interactive prompt lists known vaults.
+    /// Either a vault URL (`<daemon>/v/<vault_id>`) or a numeric index
+    /// from `sc vault ls`. If omitted and `--local` is also omitted, an
+    /// interactive prompt lists known vaults.
     pub url_or_idx: Option<String>,
     /// Shortcut for the localhost control-plane vault (`/v/default`).
     #[arg(long, conflicts_with = "url_or_idx")]
@@ -481,8 +481,8 @@ pub struct VaultUseArgs {
 
 #[derive(Debug, Args)]
 pub struct VaultForgetArgs {
-    /// SAFECLAW_VAULT_URL or numeric index from `sc vault ls`. If
-    /// omitted, an interactive prompt lists known vaults.
+    /// A vault URL (`<daemon>/v/<vault_id>`) or numeric index from
+    /// `sc vault ls`. If omitted, an interactive prompt lists known vaults.
     pub url_or_idx: Option<String>,
 }
 
@@ -582,11 +582,11 @@ pub struct ServeArgs {
     #[arg(long, env = "SAFECLAW_STATE_DIR")]
     pub state_dir: Option<PathBuf>,
 
-    /// The control/API plane port (`CONTROL_PORT`). The CLI, op-approval
-    /// polling, `/registry`, `/health`, `/events`, and any reverse proxy talk
-    /// to the daemon here; the agent reaches it only through
-    /// `$SAFECLAW_VAULT_URL`. (Not "admin port" — the admin surface is just the
-    /// `/admin/*` subset, gated by --admin-key.)
+    /// The control plane port (`CONTROL_PORT`). The `sc` CLI, op-approval
+    /// polling, ceremonies, `/events`, and any reverse proxy talk to the
+    /// daemon here; the agent's own traffic uses only the proxy port
+    /// (`$SAFECLAW_DAEMON_URL`). (Not "admin port" — the admin surface is
+    /// just the `/admin/*` subset, gated by --admin-key.)
     #[arg(long, env = "SAFECLAW_PORT", default_value_t = CONTROL_PORT)]
     pub port: u16,
 
@@ -713,9 +713,9 @@ pub struct LogoutArgs {
     pub keep_remote: bool,
 }
 
-/// Reusable arg set for read-only short-lived commands. The daemon URL comes
-/// from `$SAFECLAW_VAULT_URL` / the active config; `--vault` only reselects the
-/// vault id on that daemon.
+/// Reusable arg set for read-only short-lived commands. The daemon control
+/// root comes from the shared derivation (env `$SAFECLAW_DAEMON_URL` host >
+/// config > default); `--vault` only reselects the vault id on that daemon.
 #[derive(Debug, Args)]
 pub struct CommonArgs {
     #[arg(long)]

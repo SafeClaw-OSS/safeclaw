@@ -692,6 +692,10 @@ async fn fetch_agent_key_hashes(
 /// like the blob sync (no-op for a local-only/unpaired daemon). Call once
 /// before serving so the broker accepts account agent-keys from the start.
 pub async fn sync_agent_keys_once(state: &Arc<AppState>) {
+    sync_agent_keys_with_timeout(state, Duration::from_secs(15)).await;
+}
+
+async fn sync_agent_keys_with_timeout(state: &Arc<AppState>, timeout: Duration) {
     let cfg = match active::load() {
         Ok(c) => c,
         Err(_) => return,
@@ -702,7 +706,7 @@ pub async fn sync_agent_keys_once(state: &Arc<AppState>) {
     let Some(dk) = device_key() else {
         return;
     };
-    let client = match reqwest::Client::builder().timeout(Duration::from_secs(15)).build() {
+    let client = match reqwest::Client::builder().timeout(timeout).build() {
         Ok(c) => c,
         Err(_) => return,
     };
@@ -713,22 +717,23 @@ pub async fn sync_agent_keys_once(state: &Arc<AppState>) {
     }
 }
 
-/// One debounced refresh on an agent-key AUTH MISS. A key minted seconds ago
+/// One serialized refresh on an agent-key AUTH MISS. A key minted seconds ago
 /// (`sc agent add` prints the agent's env → the agent uses it immediately)
 /// would otherwise sit invalid for up to the 30s loop interval — the exact
-/// window the install flow now hits. Debounce (2s) keeps a bad-key flood from
-/// hammering the backend. Returns true when a refresh actually ran (the
-/// caller re-checks membership); false = debounced, the miss stands.
+/// window the install flow now hits. The tokio Mutex is held ACROSS the fetch:
+/// a concurrent miss WAITS for the in-flight refresh (then sees the fresh
+/// stamp) instead of being bounced to a reject, and a bad-key flood is capped
+/// at one outstanding backend call per 2s window. The short 3s timeout bounds
+/// the reject path's latency when the backend is down. Always returns true =
+/// "the hash-set is now as fresh as it gets — re-check membership".
 pub async fn refresh_agent_keys_on_miss(state: &Arc<AppState>) -> bool {
     const DEBOUNCE: Duration = Duration::from_secs(2);
-    {
-        let mut last = state.agent_key_resync.lock().unwrap();
-        if matches!(*last, Some(t) if t.elapsed() < DEBOUNCE) {
-            return false;
-        }
-        *last = Some(std::time::Instant::now());
+    let mut last = state.agent_key_resync.lock().await;
+    if matches!(*last, Some(t) if t.elapsed() < DEBOUNCE) {
+        return true;
     }
-    sync_agent_keys_once(state).await;
+    *last = Some(std::time::Instant::now());
+    sync_agent_keys_with_timeout(state, Duration::from_secs(3)).await;
     true
 }
 

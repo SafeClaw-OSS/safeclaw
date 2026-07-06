@@ -157,21 +157,37 @@ pub fn known_vaults() -> Vec<KnownVault> {
 }
 
 fn read_known_file() -> Vec<KnownVault> {
+    // Reads are LENIENT (a corrupt catalog acts empty — like a deleted
+    // known_hosts); writes are not: `update_known_vaults` refuses to rewrite
+    // over a file it couldn't parse, so a hand-edit typo can't become silent
+    // data loss.
+    known_file_parse_error().ok().flatten().unwrap_or_default()
+}
+
+/// `Ok(Some(vaults))` = file parsed; `Ok(None)` = no file; `Err` = file exists
+/// but doesn't parse.
+fn known_file_parse_error() -> Result<Option<Vec<KnownVault>>, String> {
     let Ok(path) = known_vaults_path() else {
-        return Vec::new();
+        return Ok(None);
     };
     let Ok(text) = fs::read_to_string(&path) else {
-        return Vec::new();
+        return Ok(None);
     };
     toml::from_str::<KnownVaultsFile>(&text)
-        .map(|f| f.vaults)
-        .unwrap_or_default()
+        .map(|f| Some(f.vaults))
+        .map_err(|e| format!("{} doesn't parse: {}", path.display(), e))
 }
 
 /// Rewrite the catalog with `mutate` applied to the MERGED view (file + legacy
 /// config field). Atomic tmp-rename write; completes the migration by clearing
-/// the legacy field afterwards.
+/// the legacy field afterwards. Refuses to clobber an unparseable file.
 fn update_known_vaults<F: FnOnce(&mut Vec<KnownVault>)>(mutate: F) -> Result<(), String> {
+    if let Err(e) = known_file_parse_error() {
+        return Err(format!(
+            "refusing to rewrite the vault catalog: {} — fix or delete the file, then retry",
+            e
+        ));
+    }
     let mut list = known_vaults();
     mutate(&mut list);
     let path = known_vaults_path()?;
@@ -212,23 +228,25 @@ fn remember_vault(daemon: &str, vault: &str) -> Result<(), String> {
     })
 }
 
-/// Remove a vault from the catalog. If it was active, clears active.
-/// Returns true if something was removed.
+/// Remove a vault from the catalog. If it was active, clears active — even
+/// when the pair is absent from the catalog (e.g. a hand-deleted catalog
+/// file), mirroring `forget_vault`. Returns true if anything changed.
 pub fn forget(custodian: &str, vault: &str) -> Result<bool, String> {
-    if !known_vaults()
+    let removed_known = known_vaults()
         .iter()
-        .any(|kv| kv.daemon == custodian && kv.vault == vault)
-    {
-        return Ok(false);
+        .any(|kv| kv.daemon == custodian && kv.vault == vault);
+    if removed_known {
+        update_known_vaults(|l| l.retain(|kv| !(kv.daemon == custodian && kv.vault == vault)))?;
     }
-    update_known_vaults(|l| l.retain(|kv| !(kv.daemon == custodian && kv.vault == vault)))?;
     let mut cfg = load().unwrap_or_default();
-    if cfg.daemon.as_deref() == Some(custodian) && cfg.vault.as_deref() == Some(vault) {
+    let cleared_active =
+        cfg.daemon.as_deref() == Some(custodian) && cfg.vault.as_deref() == Some(vault);
+    if cleared_active {
         cfg.daemon = None;
         cfg.vault = None;
         save(&cfg)?;
     }
-    Ok(true)
+    Ok(removed_known || cleared_active)
 }
 
 /// Remove a vault from the catalog by **vault id alone** (any custodian), and
@@ -389,15 +407,14 @@ pub fn device_daemon_host(cfg: &CliConfig) -> String {
 /// remote daemon on a non-default control port would need a config edit
 /// (that deployment doesn't exist yet).
 pub fn control_root(cfg: &CliConfig) -> String {
-    control_root_with(env_daemon_host(), cfg)
+    control_root_from(env_daemon_host(), cfg.daemon.as_deref())
 }
 
-fn control_root_with(env_host: Option<String>, cfg: &CliConfig) -> String {
+fn control_root_from(env_host: Option<String>, config_daemon: Option<&str>) -> String {
     if let Some(h) = env_host {
         return format!("{}:{}", h, crate::config::CONTROL_PORT);
     }
-    cfg.daemon
-        .clone()
+    config_daemon
         .filter(|s| !s.is_empty())
         .map(|s| s.trim_end_matches('/').to_string())
         .unwrap_or_else(|| format!("http://127.0.0.1:{}", crate::config::CONTROL_PORT))
@@ -405,14 +422,17 @@ fn control_root_with(env_host: Option<String>, cfg: &CliConfig) -> String {
 
 /// The API-face root (`scheme://host:PROXY_PORT`) — the value an agent holds
 /// as `SAFECLAW_DAEMON_URL`. Env verbatim when set (the agent's snapshot,
-/// custom port included); else derived from the device atom.
+/// custom port included); else derived from the device atom. The env value
+/// passes the SAME `scheme_host` parse gate as `control_root` — a malformed
+/// value is ignored by BOTH faces, never honored by one and dropped by the
+/// other (that asymmetry would split the invariant).
 pub fn api_face_root(cfg: &CliConfig) -> String {
     let env_url = std::env::var("SAFECLAW_DAEMON_URL").ok().filter(|s| !s.is_empty());
     api_face_root_with(env_url, cfg)
 }
 
 fn api_face_root_with(env_url: Option<String>, cfg: &CliConfig) -> String {
-    match env_url {
+    match env_url.filter(|u| scheme_host(u).is_some()) {
         Some(u) => u.trim_end_matches('/').to_string(),
         None => format!("{}:{}", device_daemon_host(cfg), crate::config::PROXY_PORT),
     }
@@ -438,24 +458,39 @@ pub fn device_default_vault(cfg: &CliConfig) -> Option<String> {
 ///   shell (no pin) still follows config + `sc vault use`.
 pub fn resolve_active(vault_override: Option<&str>) -> Result<(String, String), String> {
     let cfg = load()?;
-    let daemon = control_root(&cfg);
-    let vault = vault_override
+    let explicit = vault_override
         .map(str::to_string)
         .or_else(|| std::env::var("SAFECLAW_VAULT_ID").ok().filter(|s| !s.is_empty()))
-        .or_else(|| device_default_vault(&cfg))
-        .ok_or_else(|| "no vault selected — run `sc login` or `sc vault use`".to_string())?;
-    Ok((daemon, vault))
+        .or_else(|| cfg.vault.clone());
+    if let Some(vault) = explicit {
+        return Ok((control_root(&cfg), vault));
+    }
+    // Single-vault auto-select: the catalog entry records WHICH daemon that
+    // vault lives behind — pair them, so a cleared active selection can't
+    // send the auto-selected vault to the default control root. The env host
+    // still wins (invariant).
+    if let Some(kv) = single_known_entry() {
+        return Ok((
+            control_root_from(env_daemon_host(), Some(&kv.daemon)),
+            kv.vault,
+        ));
+    }
+    Err("no vault selected — run `sc login` or `sc vault use`".to_string())
 }
 
 /// Single-vault auto-select (§5): exactly one known vault defaults to it, so a
 /// fresh shell needs no `sc vault use` and the agent/human vault can't diverge
 /// in the common single-vault case. `None` for zero or many.
-fn single_known_vault() -> Option<String> {
-    let mut it = known_vaults().into_iter().map(|kv| kv.vault);
+fn single_known_entry() -> Option<KnownVault> {
+    let mut it = known_vaults().into_iter();
     match (it.next(), it.next()) {
-        (Some(v), None) => Some(v),
+        (Some(kv), None) => Some(kv),
         _ => None,
     }
+}
+
+fn single_known_vault() -> Option<String> {
+    single_known_entry().map(|kv| kv.vault)
 }
 
 #[cfg(test)]
@@ -490,21 +525,19 @@ mod tests {
 
     #[test]
     fn control_root_env_host_wins_config_verbatim_else_default() {
-        let cfg = CliConfig {
-            daemon: Some("http://127.0.0.1:9999".into()), // hand-edited custom control port
-            ..Default::default()
-        };
+        // hand-edited custom control port in config
+        let cfg_daemon = Some("http://127.0.0.1:9999");
         // Env host set (an agent's shell): its HOST + the control-port constant —
         // the single-host invariant (proxy face and control face share a daemon).
         assert_eq!(
-            control_root_with(Some("https://box.example.com".into()), &cfg),
+            control_root_from(Some("https://box.example.com".into()), cfg_daemon),
             format!("https://box.example.com:{}", crate::config::CONTROL_PORT)
         );
         // No env: config's control root VERBATIM (custom port preserved).
-        assert_eq!(control_root_with(None, &cfg), "http://127.0.0.1:9999");
+        assert_eq!(control_root_from(None, cfg_daemon), "http://127.0.0.1:9999");
         // Bare machine: loopback default.
         assert_eq!(
-            control_root_with(None, &CliConfig::default()),
+            control_root_from(None, None),
             format!("http://127.0.0.1:{}", crate::config::CONTROL_PORT)
         );
     }
@@ -523,6 +556,12 @@ mod tests {
         // Derived: device daemon HOST + the proxy-port constant.
         assert_eq!(
             api_face_root_with(None, &cfg),
+            format!("http://box.example.com:{}", crate::config::PROXY_PORT)
+        );
+        // A malformed env value (no scheme) is ignored by BOTH faces — the
+        // same parse gate as control_root, so the two can't split on it.
+        assert_eq!(
+            api_face_root_with(Some("box.example.com:23294".into()), &cfg),
             format!("http://box.example.com:{}", crate::config::PROXY_PORT)
         );
     }
