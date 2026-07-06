@@ -775,29 +775,6 @@ impl AppState {
         }
     }
 
-    /// How many vaults are currently unlocked — enough to resolve the CONNECT's
-    /// vid when the userinfo is absent (0 → nothing to broker; 1 → the common
-    /// single-vault machine; ≥2 → the agent must name the vault via `sc run`).
-    pub fn unlocked_vault(&self) -> UnlockedVaults {
-        let states = self.vault_states.lock().unwrap();
-        let mut it = states
-            .iter()
-            .filter(|(_, v)| matches!(v, VaultState::Unlocked { .. }))
-            .map(|(k, _)| k.clone());
-        match (it.next(), it.next()) {
-            (None, _) => UnlockedVaults::None,
-            (Some(id), None) => UnlockedVaults::One(id),
-            (Some(_), Some(_)) => UnlockedVaults::Many,
-        }
-    }
-}
-
-/// The unlocked-vault population, used to bind a proxied request to a vault
-/// when the CONNECT carries no vid userinfo.
-pub enum UnlockedVaults {
-    None,
-    One(String),
-    Many,
 }
 
 #[cfg(test)]
