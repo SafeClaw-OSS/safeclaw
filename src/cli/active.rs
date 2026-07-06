@@ -317,8 +317,9 @@ pub fn frontend_origin() -> Option<String> {
 /// the absolute cloud page `{frontend_origin}/grant/{op_id}` — the only
 /// approval surface a remote user can actually reach (the daemon is
 /// zero-inbound localhost). For a local-only / self-host daemon it's the
-/// relative `/op/{op_id}` page the daemon serves itself. Single source of
-/// truth for both the broker's `approve_url` and the CLI's remote-approve arm.
+/// relative `/op/{op_id}` poll path (JSON status — no local approval page
+/// exists yet, which is why callers gate absolute-vs-relative). Single source
+/// of truth for both the broker's `approve_url` and the CLI's remote-approve arm.
 pub fn grant_url(op_id: &str) -> String {
     match frontend_origin() {
         Some(origin) => format!("{}/grant/{}", origin, op_id),

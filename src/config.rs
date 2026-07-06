@@ -170,6 +170,10 @@ pub enum Command {
     /// the only thing it ever prints.
     #[command(name = "git-credential", hide = true)]
     GitCredential(GitCredentialArgs),
+    /// Approval ops. `sc op wait <op_id>` blocks until the op resolves — the
+    /// waiter an agent backgrounds after a pending-approval reply; its exit
+    /// is the wake-up (0 approved, 5 rejected, 3 expired, 4 timeout).
+    Op(OpArgs),
 }
 
 /// `sc run` — paste the resident proxy + CA env bundle onto a child (or the
@@ -225,6 +229,29 @@ pub struct ConnectArgs {
     #[arg(long, env = "SAFECLAW_CB_PORT")]
     pub cb_port: Option<u16>,
     #[arg(long, default_value = "120")]
+    pub timeout: u64,
+}
+
+#[derive(Debug, Args)]
+pub struct OpArgs {
+    #[command(subcommand)]
+    pub sub: OpSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum OpSubcommand {
+    /// Block until an approval op resolves; the exit code carries the outcome.
+    Wait(OpWaitArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct OpWaitArgs {
+    /// Op id from a pending-approval response (its `op_id` JSON field /
+    /// `x-safeclaw-op-id` header).
+    pub op_id: String,
+    /// Max seconds to wait before giving up (the op's own expiry usually
+    /// ends the wait first).
+    #[arg(long, default_value = "1900")]
     pub timeout: u64,
 }
 

@@ -200,6 +200,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 e.into()
             })
         }
+        Command::Op(args) => {
+            use safeclaw::config::OpSubcommand;
+            let r = match args.sub {
+                OpSubcommand::Wait(a) => cli::op::run_wait(a).await,
+            };
+            r.map_err(|e| -> Box<dyn std::error::Error> {
+                eprintln!("safeclaw op: {}", e);
+                e.into()
+            })
+        }
         Command::Version => {
             println!("safeclaw {}", env!("CARGO_PKG_VERSION"));
             Ok(())

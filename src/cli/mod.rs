@@ -19,6 +19,7 @@ pub mod git_credential;
 pub mod login;
 pub mod logout;
 pub mod ls;
+pub mod op;
 pub mod passkey;
 pub mod proxy_env;
 pub mod run;

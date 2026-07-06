@@ -113,14 +113,17 @@ one, SafeClaw fails the command and its error output carries an approval line:
 SafeClaw approval needed to use this credential.
 Approve with your passkey:
   https://.../grant/<op_id>
+To wait: sc op wait <op_id>   (background it; its exit is the signal)
 Then re-run the same command.
 ```
 
-Surface that link on its own line — the user's browser tap is the signal, don't
-ask them to type "done". Once approved, re-run the exact same command; the
-approval is cached. A destination host you haven't used before is a one-time
-*permanent grant* — same flow.
+Surface that link on its own line — the user's browser tap is the signal,
+don't ask them to type "done". Background the wait (exit 0 = approved), then
+re-run the exact same command — the approval is cached. A destination host
+you haven't used before is a one-time *permanent grant* — same flow.
 
-If you can't easily re-run, the approval JSON also carries an absolute `poll_url`;
-GET it (with `Authorization: Bearer $SAFECLAW_API_KEY`) until `status` is `ok`,
-then re-run. The op stays valid ~30 min.
+No `sc` on your PATH? Same ceremony: GET the approval JSON's absolute
+`poll_url` (with `Authorization: Bearer $SAFECLAW_API_KEY`) every few seconds
+as one background command until `status` is `ok`, then re-run. Can't run
+background commands at all? Ask the user to reply once they've tapped.
+The JSON's `expires_at` bounds how long the op stays approvable.
