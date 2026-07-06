@@ -35,6 +35,93 @@ tradeoff + device-pairing-token fate, then build.
 
 ---
 
+## DESIGN WAVE 2026-07-06 — authoritative mental model + atomic-env (POST-E2E cleanup; local build unaffected)
+
+Discussion-derived, self-consistency-reviewed. This SUPERSEDES the port/env framing scattered
+below and REVISES §5's implementation (same direction, cleaner). All of it is a **post-e2e
+cleanup** — the current local build is correct (everything defaults to `127.0.0.1`, so nothing
+splits); build this after the user's e2e.
+
+### A. The authoritative mental model — three planes, and WHO is the client
+| plane | port | the CLIENT is | auth | for |
+|---|---|---|---|---|
+| **data (proxy)** | :23294 | the **agent's runtime** (its HTTP client + `sc run`-launched children) | agent-key | discovery (`/v/{vid}/registry`, `/op`, `/health`, `/ca`) + broker credentials |
+| **control** | :23295 | the **`sc` CLI** (human directly, or agent via a shelled `sc up`) | passkey / localhost | unlock, connect, approve, status |
+| **account** | cloud :443 | the **`sc` CLI** (`login`/`logout`, `agent add/ls/rm`) | device-key (pair-token bootstraps it) | pair devices, mint agent-keys, hash registry, blob sync, op-relay |
+
+One-liner that ends the confusion: **the agent's own traffic touches ONLY the proxy port (:23294);
+`sc` is a control/account tool that talks to :23295 + the cloud and is NEVER a client of the proxy
+port; `sc run` doesn't *use* the proxy, it *launches a child* onto it.** When an agent "runs sc",
+that is the `sc` CLI acting on the control/account plane — not the agent's data flow. `sc status` /
+`sc git-credential` discovery hits the CONTROL port's `/registry` (:23295); the AGENT's discovery
+hits the proxy port's API face (:23294) — same projection, two ports, two audiences.
+
+### B. Two ports STAY (reframed) — data/control-plane separation
+The split is the classic data-plane/control-plane pattern (Envoy admin vs data, etcd client vs peer,
+DBs). Reframe from "the proxy MUST be loopback" (too absolute) to: **two independently-exposable
+planes; the proxy DEFAULTS to loopback as a safe default, not a permanent law.** Independent exposure
+(expose the proxy to an agent fleet without exposing admin, or vice-versa) *requires* independent
+listeners → two ports. Exposing the proxy remotely is a valid FUTURE capability, gated on: (1) TLS on
+the client→proxy leg, (2) the api-key hardened to a network-grade secret (rotation/rate-limit/lockout),
+(3) the remote daemon being the USER's own infra (a vendor-run proxy would see the substituted
+credential → breaks cloud-blind). The account plane (cloud) is ALREADY the authed remote surface for
+account ops; "expose :23295" is a narrower remote-manage-this-daemon need.
+
+### C. Atomic env — atoms are truth, `_url`s are DERIVED, agent stays at `_url`
+- **Atoms (source of truth):** `DAEMON_HOST` (scheme+host) · `PROXY_PORT` · `CONTROL_PORT` · `VAULT_ID`,
+  plus the agent's `API_KEY` (identity, not a routing atom — routing ⊥ principal). Device config holds
+  the atom DEFAULTS (`http://127.0.0.1` / `23294` / `23295`); user may hand-edit + restart (no
+  convenience tooling — manual is fine for the advanced case).
+- **`_url`s are NEVER stored — always derived from atoms.** Device-side this is LIVE (`sc` derives on
+  every run, so a hand-edited atom takes effect on restart → "self-consistent playability"). The
+  agent's env is a mint-time SNAPSHOT (the minter derived it from the atoms once); changing atoms
+  means re-minting the agent env.
+- **Two SSOTs at two levels, bridged ONCE at mint — the agent never treats `sc` as its source.**
+  The DEVICE SSOT is config atoms (used by the daemon's bind + the human's `sc`). The AGENT SSOT is the
+  agent's OWN `.env`: the minter projects the device atoms into ready `_url`s and writes them there ONCE
+  (mint time). At runtime the agent reads its `.env` for its own HTTP — it does NOT re-derive from atoms
+  and does NOT call `sc` to learn its own vars. A `sc` the agent shells INHERITS that same `.env`
+  (env-first, §5), so the agent's HTTP and its shelled `sc` share ONE SSOT automatically — the split
+  can't arise from cross-derivation. So assembly (atoms → `_url`) happens at the **mint dimension**, off
+  the agent's reasoning (assembly = silent-error surface). **Agent required surface =
+  `DAEMON_URL` + `VAULT_ID` + `API_KEY` (3)**, all read from its `.env`; `PROXY_URL` demoted to optional
+  (`sc run` derives it). Sub-choice: the `.env` carries `DAEMON_URL` only and `sc` derives control from
+  its host (3 vars, control-port defaulted — recommended), OR carries an explicit control endpoint too
+  (zero runtime derivation, handles a custom remote control port) — the agent's mental surface is 3
+  either way (it ignores the control var).
+
+### D. THE self-consistency invariant (the crux — must be encoded)
+**Proxy and control ALWAYS derive from the SAME daemon host.** Concretely: when an agent shells `sc`,
+`resolve_active` derives the control root from the **agent's own `DAEMON_URL` host** (+ `CONTROL_PORT`),
+NOT from device config. So an agent's proxy face and its shelled-`sc` control face are the same daemon
+by construction → they **cannot split**. Worst case is a stale snapshot (agent points at an old daemon)
+= a clean, uniform failure (both faces fail together), never half-working. This REVISES §5's
+implementation: `resolve_active` reads `DAEMON_URL`'s host (not only `VAULT_ID`), and
+`proxy_url_for_vault` takes a host instead of hardcoding `127.0.0.1` — same env-first direction, no
+split. (If code ever lets `sc` take the host from config while the agent uses its env `DAEMON_URL`, the
+split returns — this is the one invariant to hold.)
+
+**Scoped boundary (not a problem now):** `DAEMON_URL` carries scheme+host+`PROXY_PORT` but NOT
+`CONTROL_PORT`, so `sc` supplies the control port from the default constant — correct for local +
+remote-with-default-ports. A remote daemon on a NON-default control port would add `CONTROL_PORT` to
+the agent env; doesn't exist yet.
+
+### E. Settled sub-decisions
+- **CA:** `ca.pem` (public cert) is distributable — the `/ca` endpoint serves it (done); `ca.key`
+  (private) never leaves (loopback + `chmod 600`). Remote = copy the PUBLIC cert (safe). Local-first,
+  remote via manual public-cert copy; security-first — no private-key exposure ever.
+- **Account plane = device axis (`login`/`logout`) + agent axis (`agent *`), both account-level,
+  device-key authed.** Add a `sc device` group with `login`/`logout` as aliases (symmetry with `agent`).
+  Key minting is inherently a backend op (shared hash registry + device-key auth) — NEVER on the
+  daemon's localhost ports.
+- **`known_vaults` → its own file** (like `~/.ssh/known_hosts`: append-growing, harmless to delete),
+  separate from the active-selection/account config.
+- **CA path override + remote `sc run`:** `sc run`'s proxy is already env-overridable
+  (`$SAFECLAW_PROXY_URL`); make the CA path overridable too, so a hand-configured remote daemon works
+  (default local, remote via manual config). run/env are local-by-DEFAULT, not local-by-necessity.
+
+---
+
 ## 1. Opt-in, NOT a mandatory proxy
 Normal traffic goes DIRECT and untouched. Only credential traffic — a request the agent
 DELIBERATELY writes a phantom into — is routed through the proxy (via `sc run --`, or a
