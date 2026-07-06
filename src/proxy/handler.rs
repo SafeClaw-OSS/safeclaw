@@ -584,9 +584,11 @@ impl BrokerHandler {
                 let body = format!(
                     "SafeClaw approval needed to use this credential.\n\
                      Approve with your passkey:\n  {}\n\
+                     To wait: sc op wait {}   (background it; its exit is the signal)\n\
                      Then re-run the same command.\n\n\
                      {}\n",
                     approve_url,
+                    op_id,
                     json!({
                         "status": "pending",
                         "op_id": op_id,
@@ -644,13 +646,29 @@ impl BrokerHandler {
             None,
             ip,
         ) {
-            Ok((op_id, _r, _exp)) => {
+            Ok((op_id, _r, exp)) => {
                 let approve_url = crate::cli::active::grant_url(&op_id);
+                // Same machine-readable tail as the credential-use 401 above —
+                // the waiter contract is op-generic, so the widen op gets it too.
+                let poll_url =
+                    format!("http://127.0.0.1:{}/op/{}", self.state.config.proxy_port, op_id);
                 let body = format!(
                     "SafeClaw: connection '{}' is not anchored to '{}'.\n\
                      Approve adding this host as a PERMANENT grant (passkey):\n  {}\n\
-                     Then re-run the same command.\n",
-                    conn, host, approve_url
+                     To wait: sc op wait {}   (background it; its exit is the signal)\n\
+                     Then re-run the same command.\n\n\
+                     {}\n",
+                    conn,
+                    host,
+                    approve_url,
+                    op_id,
+                    json!({
+                        "status": "pending",
+                        "op_id": op_id,
+                        "approve_url": approve_url,
+                        "poll_url": poll_url,
+                        "expires_at": exp,
+                    })
                 );
                 return Response::builder()
                     .status(StatusCode::FORBIDDEN)
