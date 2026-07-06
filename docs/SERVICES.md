@@ -50,11 +50,16 @@ and are the same list for **every** service — an `[oauth2]` service lists its
 refresh-token key here too (whatever `[oauth2].refresh_token` names). Presence of
 all of them is what makes a connection "connected".
 
-- The phantom `__sc__<conn>__` resolves to the sole injectable secret; if a
-  service declares several, agents use `__sc__<conn>__<key>__` (key lowercased).
-- For an `[oauth2]` service the phantom resolves to the **minted access token**,
-  not the listed refresh key — the refresh key is durable-storage only, internal
-  to the mint, and never injectable.
+- **The injectable rule (uniform):** a connection's phantoms resolve to what its
+  *production* PRODUCES. No section = pass-through: the products are the declared
+  `secrets` themselves. A production section (`[oauth2]`; future `[sigv4]`-class)
+  makes its OUTPUT the injectable and marks every secret its fields name (e.g.
+  `refresh_token = "…"`) as a production INPUT — stored, never injectable
+  (the proxy answers such a phantom with an explicit `403 refresh_forbidden`).
+  The registry's per-connection `phantoms` list is the computed projection of
+  this rule — agents copy from it, never derive.
+- The phantom `__sc__<conn>__` resolves to the sole injectable; if a connection
+  has several, agents use `__sc__<conn>__<key>__` (key lowercased).
 - Insertion needs no declaration: the value replaces the phantom wherever the
   tool puts it — any header, query param, URL path, body, or inside a decoded
   `Authorization: Basic`. Never in the URL authority.
