@@ -71,9 +71,11 @@ impl HttpHandler for BrokerHandler {
         self.key = key;
         // Absent Proxy-Auth (no vid) → non-participating traffic: blind-tunnel it
         // (§8; a stray phantom then reaches upstream literally → clean 401, never
-        // a leak). Only a request that NAMES a vault and targets a host some
-        // unlocked vault anchors is a MITM candidate — the precise per-vault
-        // anchor + the key check happen in `pipeline`.
+        // a leak). A creds-less CONNECT to a host we DO anchor was already met
+        // with a 407 in handle_request (RFC 7235 challenge), so anything absent
+        // reaching here targets a host no unlocked vault anchors. Only a request
+        // that NAMES a vault and targets an anchored host is a MITM candidate —
+        // the precise per-vault anchor + the key check happen in `pipeline`.
         if self.vid.is_none() {
             return false;
         }
@@ -84,9 +86,31 @@ impl HttpHandler for BrokerHandler {
     }
 
     async fn handle_request(&mut self, ctx: &HttpContext, req: Request<Body>) -> RequestOrResponse {
-        // The CONNECT itself is forwarded unchanged (vid already captured in
-        // should_intercept, which runs inside process_connect).
+        // A CONNECT normally passes straight through to process_connect, which
+        // returns `200 Connection established` and then lets should_intercept
+        // read the CONNECT's Proxy-Authorization to decide MITM-vs-tunnel.
+        //
+        // But not every client sends proxy credentials preemptively. The RFC 7235
+        // convention is to send an unauthenticated request first and only repeat
+        // it WITH credentials after a `407 Proxy Authentication Required`
+        // challenge. Debian/Ubuntu git (libcurl-gnutls) does exactly this — the
+        // whole system-git population; curl, wget and python were measured
+        // sending creds preemptively, so they were never affected. A challenge-
+        // first client's creds-less CONNECT has no vid, so today it gets
+        // blind-tunneled — the phantom is never substituted and reaches the
+        // upstream literally (a clean 401, but the credential path silently never
+        // engages). Answer it with a 407 so it re-sends authenticated. Scope the
+        // challenge to a host some unlocked vault anchors: unrelated traffic still
+        // tunnels untouched, preserving "only routed traffic is touched".
         if req.method() == Method::CONNECT {
+            let (vid, _) = creds_from_proxy_auth(&req);
+            if vid.is_none() {
+                if let Some(h) = req.uri().host() {
+                    if self.state.host_in_any_unlocked_union(h) {
+                        return proxy_auth_challenge().into();
+                    }
+                }
+            }
             return req.into();
         }
 
@@ -937,6 +961,23 @@ fn err_response(status: StatusCode, code: &str, msg: &str) -> Response<Body> {
         .unwrap_or_else(|_| plain(status, msg))
 }
 
+/// A `407 Proxy Authentication Required` challenge for a CONNECT that arrived
+/// without proxy credentials but targets a host we broker. RFC 7235 challenge-
+/// first clients (notably Debian/Ubuntu git over libcurl-gnutls) send no
+/// `Proxy-Authorization` until they see this, then repeat the CONNECT
+/// authenticated. `Basic` is the only scheme we
+/// accept — the CONNECT userinfo carries `base64("<vid>:<key>")`; the realm
+/// names us. Empty body + explicit zero length so the connection stays alive and
+/// the client retries the CONNECT on it.
+fn proxy_auth_challenge() -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::PROXY_AUTHENTICATION_REQUIRED)
+        .header(header::PROXY_AUTHENTICATE, "Basic realm=\"safeclaw\"")
+        .header(header::CONTENT_LENGTH, "0")
+        .body(Body::empty())
+        .unwrap_or_else(|_| plain(StatusCode::PROXY_AUTHENTICATION_REQUIRED, "proxy auth required"))
+}
+
 /// Best-effort terminal audit row for a forwarded (or denied) request. Denies
 /// pass `upstream_status = 0`.
 fn write_forward_audit(state: &AppState, p: &AuditPending, upstream_status: u16) {
@@ -1025,6 +1066,18 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         assert_eq!(creds_from_proxy_auth(&empty_vid).0, None);
+    }
+
+    #[test]
+    fn proxy_auth_challenge_is_407_with_basic_realm() {
+        // RFC 7235 challenge-first clients (Debian/Ubuntu git over libcurl-gnutls)
+        // only send Proxy-Authorization after this exact response.
+        let res = proxy_auth_challenge();
+        assert_eq!(res.status(), StatusCode::PROXY_AUTHENTICATION_REQUIRED);
+        assert_eq!(
+            res.headers().get(header::PROXY_AUTHENTICATE).unwrap(),
+            "Basic realm=\"safeclaw\"",
+        );
     }
 
     #[test]
