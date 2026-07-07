@@ -1063,6 +1063,25 @@ mod tests {
     }
 
     #[test]
+    fn rewrite_headers_substitutes_basic_username_position() {
+        // git clone https://__sc__github__@github.com → Basic b64("phantom:") —
+        // the phantom rides the USERNAME slot (password empty). Regression pair
+        // to the password-position test above.
+        let mut values = HashMap::new();
+        values.insert("__sc__github__".to_string(), "ghp_REAL".to_string());
+        let mut h = HeaderMap::new();
+        h.insert(
+            header::AUTHORIZATION,
+            format!("Basic {}", b64(b"__sc__github__:")).parse().unwrap(),
+        );
+        let out = rewrite_headers(&h, &values, false);
+        let auth = out.get(header::AUTHORIZATION).expect("auth header survived").to_str().unwrap();
+        let enc = auth.strip_prefix("Basic ").unwrap();
+        let decoded = base64::engine::general_purpose::STANDARD.decode(enc).unwrap();
+        assert_eq!(decoded, b"ghp_REAL:", "phantom substituted in USERNAME position");
+    }
+
+    #[test]
     fn rewrite_headers_strips_shadowing_agent_bearer() {
         // The phantom lives elsewhere; the agent's own Authorization must not
         // ride along (it would shadow the injected credential).
