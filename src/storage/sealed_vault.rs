@@ -938,7 +938,7 @@ mod tests {
             &k, vid, ItemNs::Aux, "store_order", 1,
             &ItemPayload::live(
                 ItemNs::Aux, "store_order",
-                serde_json::json!(["native-secrets", "native-files", "gcp-1"]),
+                serde_json::json!(["native-secrets", "gcp-1"]),
             ),
         ).unwrap();
 
@@ -949,7 +949,7 @@ mod tests {
             view.aux.connections.get("gmail").and_then(|c| c.service.as_deref()),
             Some("gmail")
         );
-        assert_eq!(view.aux.store_order, vec!["native-secrets", "native-files", "gcp-1"]);
+        assert_eq!(view.aux.store_order, vec!["native-secrets", "gcp-1"]);
         assert_eq!(view.aux.version, 4);
     }
 }

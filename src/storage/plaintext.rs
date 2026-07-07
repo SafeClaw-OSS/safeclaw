@@ -26,20 +26,21 @@ use crate::error::{AppError, Result};
 /// Current schema version. Hard-fail on any other value.
 pub const PLAINTEXT_VERSION: u32 = 4;
 
-/// Reserved store IDs. These two stores are always present in every vault.
+/// Reserved store ID. `native-secrets` is always present in every vault.
 pub const NATIVE_SECRETS_ID: &str = "native-secrets";
-pub const NATIVE_FILES_ID: &str = "native-files";
 
-/// Reserved kind strings, equal to the reserved store IDs.
+/// Reserved kind string, equal to the reserved store ID.
 pub const NATIVE_SECRETS_KIND: &str = "native-secrets";
-pub const NATIVE_FILES_KIND: &str = "native-files";
 
-/// Category — value (bytes resolvable to a single secret string) vs file
-/// (blob retrieved by id). Declared per-store, not per-item.
+/// Category — how a store's items resolve. `Value` = bytes resolvable to a
+/// single secret string. `File` is a LEGACY variant, retained only so vaults
+/// sealed before the file-store removal still deserialize; no store creates it
+/// now (restore point: tag `checkpoint/file-feature`). Declared per-store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Category {
     Value,
+    /// Legacy — retained for backward-compatible deserialization only.
     File,
 }
 
@@ -52,9 +53,8 @@ pub struct Store {
     pub kind: String,
     pub category: Category,
     /// Per-item metadata. For `native-secrets`, this map is empty in `aux`
-    /// because byte values physically live in `ProtectedState.targets`.
-    /// For `native-files`, values are `{ blob_id, size }`. For external
-    /// stores (gcp / 1p / aws — Phase 2+), shape is adapter-defined.
+    /// because byte values physically live in `ProtectedState.targets`. For
+    /// external stores (gcp / 1p / aws — Phase 2+), shape is adapter-defined.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub items: BTreeMap<String, serde_json::Value>,
     /// Adapter-specific configuration (e.g. `project_id` for gcp).
@@ -210,9 +210,8 @@ pub struct VaultAux {
 }
 
 impl VaultAux {
-    /// Build the minimal initial aux for a freshly enrolled vault: both
-    /// reserved stores present and empty, with the default order
-    /// `[native-secrets, native-files]`.
+    /// Build the minimal initial aux for a freshly enrolled vault: the reserved
+    /// `native-secrets` store present and empty, order `[native-secrets]`.
     pub fn initial() -> Self {
         let mut stores = BTreeMap::new();
         stores.insert(
@@ -224,19 +223,10 @@ impl VaultAux {
                 extra: serde_json::Map::new(),
             },
         );
-        stores.insert(
-            NATIVE_FILES_ID.to_string(),
-            Store {
-                kind: NATIVE_FILES_KIND.to_string(),
-                category: Category::File,
-                items: BTreeMap::new(),
-                extra: serde_json::Map::new(),
-            },
-        );
         Self {
             version: PLAINTEXT_VERSION,
             stores,
-            store_order: vec![NATIVE_SECRETS_ID.to_string(), NATIVE_FILES_ID.to_string()],
+            store_order: vec![NATIVE_SECRETS_ID.to_string()],
             policy: None,
             connecting: BTreeMap::new(),
             connections: BTreeMap::new(),
@@ -337,6 +327,8 @@ mod tests {
         m
     }
 
+    // Backward-compat: a vault sealed before the file-store removal still has a
+    // `native-files` store (category "file"); it must still deserialize.
     #[test]
     fn parse_minimal_aux_succeeds() {
         let m = build_protected_state(
@@ -379,7 +371,7 @@ mod tests {
         let aux2: VaultAux = serde_json::from_value(json).unwrap();
         assert_eq!(aux2.version, 4);
         assert!(aux2.stores.contains_key("native-secrets"));
-        assert!(aux2.stores.contains_key("native-files"));
-        assert_eq!(aux2.store_order.len(), 2);
+        assert!(!aux2.stores.contains_key("native-files")); // file store removed
+        assert_eq!(aux2.store_order, vec!["native-secrets"]);
     }
 }

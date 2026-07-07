@@ -122,9 +122,9 @@ pub fn build_adapter(
                 .clone();
             Ok(Adapter::Gcp(GcpSecretManagerAdapter::new(project_id, sa_json)?))
         }
-        // native-files and future kinds (1password-sa, aws-secrets-manager)
-        // aren't wired through this dispatcher yet — they live in
-        // store_order but are skipped during value resolution.
+        // Future kinds (1password-sa, aws-secrets-manager) aren't wired through
+        // this dispatcher yet — they live in store_order but are skipped during
+        // value resolution.
         other => Err(AdapterError::Config(format!(
             "unsupported store kind '{}' (have: native-secrets, gcp-secret-manager)",
             other
