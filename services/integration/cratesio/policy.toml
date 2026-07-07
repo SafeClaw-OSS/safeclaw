@@ -1,0 +1,101 @@
+# crates.io policy. Routine registry traffic — search, crate metadata, version
+# lookups, `/me` identity checks, downloads — flows freely; the approval gate is
+# spent on the few operations the ecosystem itself treats as consequential:
+# crates.io scopes its own tokens by exactly publish / yank / change-owners, and
+# Trusted Publishing exists so nobody has to hold a standing publish credential.
+# Each rule is a per-connection override point in the console.
+#
+# `cargo publish/yank/owner` all speak these same /api/v1 paths, so the rules
+# gate cargo and raw curl alike. The sparse index (index.crates.io) and crate
+# downloads (static.crates.io) are separate unauthenticated hosts and never
+# route through this connection.
+#
+# DELETE /api/v1/crates/{name} (full crate deletion, RFC 3660) is deliberately
+# absent: crates.io serves it cookie-only — an API token can never reach it.
+
+[default]
+read = "allow"
+write = "allow"
+
+# ── Publish (irreversible: crates.io only yanks, never deletes) ──────────────
+# `ask` rather than `ask-always`: a workspace release publishes many crates
+# back-to-back through this one path, and each verify-build can take minutes —
+# the 30-minute window makes that one passkey per release train, not per crate.
+[[rule]]
+id = "publish"
+label = "Publish a crate version"
+match = "PUT /api/v1/crates/new"
+level = "ask"
+ttl = 1800
+
+# ── Version availability (recoverable, but shifts what downstream resolves) ──
+[[rule]]
+id = "yank"
+label = "Yank a version"
+match = "DELETE /api/v1/crates/*/*/yank"
+level = "ask"
+
+[[rule]]
+id = "unyank"
+label = "Unyank a version"
+match = "PUT /api/v1/crates/*/*/unyank"
+level = "ask"
+
+# The newer PATCH form of yank/unyank (sets `yanked` + `yank_message`).
+[[rule]]
+id = "update-version"
+label = "Update a version (yank status / message)"
+match = "PATCH /api/v1/crates/*/*"
+level = "ask"
+
+# ── Change who can publish (security posture) ────────────────────────────────
+[[rule]]
+id = "add-owner"
+label = "Add a crate owner"
+match = "PUT /api/v1/crates/*/owners"
+level = "ask-always"
+
+[[rule]]
+id = "remove-owner"
+label = "Remove a crate owner"
+match = "DELETE /api/v1/crates/*/owners"
+level = "ask-always"
+
+# ── Supply chain (standing publish rights for CI; publish-security settings) ─
+# Creating a Trusted Publishing config lets a CI workflow mint publish tokens
+# from then on — the crates.io analog of adding a deploy key.
+[[rule]]
+id = "add-trusted-publishing"
+label = "Add a Trusted Publishing config (CI publish rights)"
+match = "POST /api/v1/trusted_publishing/*"
+level = "ask-always"
+
+[[rule]]
+id = "remove-trusted-publishing"
+label = "Remove a Trusted Publishing config"
+match = "DELETE /api/v1/trusted_publishing/*/*"
+level = "ask"
+
+# PATCH crate settings currently carries one field: `trustpub_only` — whether
+# the crate accepts token publishes at all. Loosening it widens the publish
+# surface, so the whole settings path is gated.
+[[rule]]
+id = "crate-settings"
+label = "Change crate publish settings"
+match = "PATCH /api/v1/crates/*"
+level = "ask-always"
+
+# ── Credential lifecycle ──────────────────────────────────────────────────────
+[[rule]]
+id = "revoke-token"
+label = "Revoke an API token"
+match = "DELETE /api/v1/me/tokens/*"
+level = "ask"
+
+# Revoking the token this connection injects bricks the connection until the
+# user mints a replacement by hand.
+[[rule]]
+id = "revoke-current-token"
+label = "Revoke this connection's own token"
+match = "DELETE /api/v1/tokens/current"
+level = "ask"
