@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use clap::Parser;
+use clap::FromArgMatches;
 use safeclaw::cli;
 use safeclaw::config::{Cli, Command, Config, ServeArgs};
 use safeclaw::server::app_router;
@@ -9,7 +9,11 @@ use safeclaw::state::AppState;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let cli = Cli::parse();
+    // Parse through `cli::help::command()` (not `Cli::parse()`) so the top-level
+    // `sc` / `sc --help` prints our grouped, gh-style help; per-command help is
+    // still clap's default.
+    let cli = Cli::from_arg_matches(&cli::help::command().get_matches())
+        .unwrap_or_else(|e| e.exit());
     match cli.command {
         Command::Status(args) => {
             // CLI commands log to stderr; don't initialise the tracing

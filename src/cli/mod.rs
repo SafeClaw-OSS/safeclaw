@@ -16,6 +16,7 @@ pub mod discovery;
 pub mod doctor;
 pub mod env;
 pub mod git_credential;
+pub mod help;
 pub mod login;
 pub mod logout;
 pub mod ls;
