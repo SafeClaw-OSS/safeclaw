@@ -426,6 +426,105 @@ pub(crate) async fn apply_pending_connects(state: &Arc<AppState>, vault_id: &str
     true
 }
 
+/// Persist a ROTATED refresh_token back into the sealed vault at its §3 address
+/// (`secret_address(conn, service, role)` — the SAME slot the connect exchange
+/// wrote). A rotating provider (OpenAI) hands back a fresh refresh_token on every
+/// refresh and invalidates the one we sent, so the broker calls this after a
+/// mint; otherwise the NEXT refresh would present a dead token and force a
+/// spurious reconnect.
+///
+/// Mirrors the read → mutate → reseal → reconcile tail of [`apply_pending_connects`]
+/// but writes ONE secret and runs no exchange. The caller (the broker mint path)
+/// ALREADY HOLDS the per-vault write lock ([`AppState::vault_write_lock`]) — this
+/// does NOT re-acquire it (that lock is what serializes this against a concurrent
+/// connect exchange). Best-effort: logs and returns `false` on any vault-I/O
+/// failure — a lost rotation only forces a later reconnect, never a corrupt write.
+pub(crate) async fn persist_rotated_refresh_locked(
+    state: &Arc<AppState>,
+    vault_id: &str,
+    conn_id: &str,
+    service_id: &str,
+    role: &str,
+    new_refresh_token: &str,
+) -> bool {
+    let Some(k) = state.cloned_state_key(vault_id) else {
+        return false; // locked — nothing retained to write with
+    };
+
+    let vault_path = state
+        .config
+        .state_dir
+        .join("vaults")
+        .join(vault_id)
+        .join("vault.dat");
+    let vault_dat = match crate::storage::sealed_vault::read(&vault_path) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(vault = %vault_id, "oauth rotate: read vault.dat failed: {}", e);
+            None
+        }
+    };
+    let mut m = if let Some(vault) = &vault_dat {
+        match crate::server::handlers::metadata::open_protected_state_with_key(&k, vault) {
+            Ok(m) => m,
+            Err(_) => return false, // rotated K — next unlock re-reads
+        }
+    } else {
+        let Ok(pi_path) = state.vaults.per_item_path(vault_id) else {
+            return false;
+        };
+        let Ok(Some(pv)) = crate::storage::sealed_vault::read_per_item(&pi_path) else {
+            return false;
+        };
+        let view = match crate::server::handlers::metadata::decrypt_vault_view_peritem_with_key(
+            &k, &pv, vault_id,
+        ) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        match build_m_from_view(&view) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(vault = %vault_id, "oauth rotate: rebuild M failed: {}", e);
+                return false;
+            }
+        }
+    };
+
+    m.put_secret(
+        secret_address(conn_id, service_id, role),
+        new_refresh_token.as_bytes().to_vec(),
+    );
+
+    let view = match crate::storage::plaintext::VaultPlaintextView::from_protected_state(&m) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(vault = %vault_id, "oauth rotate: view rebuild failed: {}", e);
+            return false;
+        }
+    };
+    if let Some(mut vault) = vault_dat {
+        if let Err(e) =
+            crate::server::handlers::metadata::reseal_body_with_key(&k, &mut vault, &m)
+        {
+            tracing::warn!(vault = %vault_id, "oauth rotate: re-seal failed: {}", e);
+            return false;
+        }
+        if let Err(e) = crate::storage::sealed_vault::write_atomic(&vault_path, &vault) {
+            tracing::warn!(vault = %vault_id, "oauth rotate: write vault.dat failed: {}", e);
+            return false;
+        }
+        reconcile_per_item_after_connect(state, vault_id, Some(&vault), &view, &k);
+    } else {
+        reconcile_per_item_after_connect(state, vault_id, None, &view, &k);
+    }
+
+    let cache = crate::server::handlers::approve::bootstrap_cache_from_view(&view, state);
+    state.unlock_vault(vault_id.to_string(), cache, k);
+    tracing::info!(vault = %vault_id, service = %service_id, "oauth refresh: rotated refresh_token persisted");
+    true
+}
+
 /// Rebuild a [`ProtectedState`] `M` from a folded per-item view — the inverse of
 /// [`VaultPlaintextView::from_protected_state`]. Lets the connect state machine
 /// (which reads/writes `M`'s aux + secrets) run against a web-enrolled per-item

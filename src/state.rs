@@ -471,6 +471,18 @@ impl AppState {
     /// Look up a cached OAuth `access_token` by `sha256(refresh_token)` hex (§5).
     /// Returns `None` if locked, never minted, or past its expiry. Lazily evicts
     /// expired entries (same shape as `cache_lookup`).
+    /// The per-vault async write lock — serializes anything that reseals the
+    /// vault body (connect exchange, oauth refresh-token rotation) so two writers
+    /// can't clobber each other. Same map the connect + sync paths use inline.
+    pub fn vault_write_lock(&self, vault_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.vault_write_locks.lock().unwrap();
+        Arc::clone(
+            locks
+                .entry(vault_id.to_string())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+        )
+    }
+
     pub fn oauth_access_lookup(&self, vault_id: &str, refresh_hash: &str) -> Option<Vec<u8>> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)

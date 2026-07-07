@@ -112,7 +112,7 @@ pub fn register_pending_use(
 /// connection (never persisted). On `invalid_grant` the connection is flagged
 /// needs-reauth and an `Unauthorized` propagates.
 pub async fn resolve_auth_value(
-    state: &crate::state::AppState,
+    state: &Arc<crate::state::AppState>,
     vault_id: &str,
     conn_id: &str,
     service_id: &str,
@@ -139,12 +139,22 @@ pub async fn resolve_auth_value(
         )));
     };
 
-    // §5: mint cache keyed by sha256(refresh_token). Keying on the INPUT means a
-    // reconnect / refresh-token rotation (a NEW refresh) is a natural cache miss →
-    // fresh mint, and two accounts never collide. The refresh is read LOCALLY only
-    // to compute the key; on a hit nothing is minted and the refresh never leaves
-    // the daemon.
+    // §5: mint cache keyed by sha256(refresh_token). The refresh is read LOCALLY
+    // only to compute the key; on a hit nothing is minted and the refresh never
+    // leaves the daemon.
     let refresh_hash = sha256_hex(raw);
+    if let Some(cached) = state.oauth_access_lookup(vault_id, &refresh_hash) {
+        return Ok(cached);
+    }
+
+    // Single-flight per vault: a rotating provider (OpenAI) mints a NEW
+    // refresh_token on every refresh and invalidates the old, so two concurrent
+    // cache-miss requests would race — the second's now-stale token gets
+    // invalid_grant and the connection false-flags needs-reauth. Serialize the
+    // refresh + rotation write-back under the SAME per-vault write lock the
+    // connect path uses, then re-check the cache (the winner may have filled it).
+    let write_lock = state.vault_write_lock(vault_id);
+    let _guard = write_lock.lock().await;
     if let Some(cached) = state.oauth_access_lookup(vault_id, &refresh_hash) {
         return Ok(cached);
     }
@@ -169,7 +179,7 @@ pub async fn resolve_auth_value(
     })?;
     let style = state.services.provider_oauth_style(&oauth.provider);
 
-    let (access_token, expires_at) = crate::auth::oauth2::perform_refresh(
+    let (access_token, expires_at, rotated_refresh) = crate::auth::oauth2::perform_refresh(
         token_url,
         &client_id,
         client_secret.as_deref(),
@@ -189,8 +199,29 @@ pub async fn resolve_auth_value(
 
     state.oauth_clear_reauth(vault_id, conn_id);
     let safe_expires_at = expires_at.saturating_sub(60);
-    // §5: cache under the SAME key the lookup uses — sha256(refresh_token) — so a
-    // subsequent request within the token's lifetime hits instead of re-minting.
-    state.oauth_access_insert(vault_id, &refresh_hash, access_token.as_bytes().to_vec(), safe_expires_at);
+
+    // A rotating provider handed back a NEW refresh_token and killed the one we
+    // sent: persist it back to the vault (else the next refresh sends a dead
+    // token) and cache the minted access token under the NEW key — the next
+    // request reads the rotated token, so keying on the old hash would always
+    // miss. We hold the write lock; the persist helper must NOT re-acquire it.
+    let cache_key = match rotated_refresh.as_deref() {
+        Some(new_rt) if new_rt.as_bytes() != raw => {
+            crate::auth::connect::persist_rotated_refresh_locked(
+                state,
+                vault_id,
+                conn_id,
+                service_id,
+                &oauth.refresh_token,
+                new_rt,
+            )
+            .await;
+            sha256_hex(new_rt.as_bytes())
+        }
+        // §5: no rotation → cache under the SAME key the lookup uses, so a
+        // subsequent request within the token's lifetime hits without re-minting.
+        _ => refresh_hash,
+    };
+    state.oauth_access_insert(vault_id, &cache_key, access_token.as_bytes().to_vec(), safe_expires_at);
     Ok(access_token.into_bytes())
 }

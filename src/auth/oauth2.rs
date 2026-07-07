@@ -175,7 +175,12 @@ pub async fn exchange_code(
 /// with per-deployment config (token_url + client_id + optional client_secret,
 /// resolved from the service definition + its provider).
 ///
-/// Returns `(access_token, absolute_expires_at_unix_secs)` on success.
+/// Returns `(access_token, absolute_expires_at_unix_secs, rotated_refresh_token)`
+/// on success. `rotated_refresh_token` is `Some` when the provider returned a
+/// NEW `refresh_token` in the refresh response (OpenAI mints a fresh one on every
+/// refresh and invalidates the old; Google does not) — the caller MUST persist it
+/// back to the vault, or the next refresh would send a dead token. `None` when the
+/// provider omitted it (the stored refresh_token stays valid).
 /// On refresh failure, returns an `Err(String)` with the provider's
 /// error body — caller inspects this to detect `invalid_grant` and
 /// surface a "needs reauth" UI flag.
@@ -185,7 +190,7 @@ pub async fn perform_refresh(
     client_secret: Option<&str>,
     refresh_token_value: &str,
     style: OAuthStyle,
-) -> Result<(String, u64), String> {
+) -> Result<(String, u64, Option<String>), String> {
     tracing::info!(
         "oauth2 refresh: token_url={} style={}",
         token_url,
@@ -250,11 +255,18 @@ pub async fn perform_refresh(
         .and_then(|v| v.as_u64())
         .unwrap_or(3600);
 
+    // A rotating provider (OpenAI) returns a fresh refresh_token here and
+    // invalidates the one we sent; surface it so the caller can persist it.
+    let rotated_refresh = body
+        .get("refresh_token")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
     let now_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    Ok((access_token, now_secs + expires_in))
+    Ok((access_token, now_secs + expires_in, rotated_refresh))
 }
 
 #[cfg(test)]
