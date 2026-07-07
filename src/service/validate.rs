@@ -192,16 +192,64 @@ fn validate_service_inner(
         }
     }
 
-    // OAuth2: provider present + (custom path) a shipped provider; exposes are
-    // lowercase slugs that don't collide with secrets.
+    // OAuth2: the section must be RESOLVABLE — either its inline fields carry
+    // the endpoints + client, or `provider` names a shipped template that does.
+    // Inline fields get the same floor as provider files (https to a public
+    // host, no confidential secret). Exposes are lowercase slugs that don't
+    // collide with secrets.
     if let Some(o) = &def.oauth2 {
-        if o.provider.trim().is_empty() {
-            errs.push("[oauth2] requires a provider".into());
-        } else if let Some(known) = known_providers {
-            if !known.contains(&o.provider) {
+        let inline_complete =
+            o.authorization_url.is_some() && o.token_url.is_some() && o.client_id.is_some();
+        match &o.provider {
+            Some(p) if p.trim().is_empty() => {
+                errs.push("[oauth2] provider must not be empty (omit it to go fully inline)".into());
+            }
+            Some(p) => {
+                // A named template must exist on the custom path UNLESS the
+                // inline fields already fully resolve (then it's only a label).
+                if let Some(known) = known_providers {
+                    if !known.contains(p) && !inline_complete {
+                        errs.push(format!(
+                            "[oauth2] provider '{}' is not a shipped provider (or declare authorization_url + token_url + client_id inline)",
+                            p
+                        ));
+                    }
+                }
+            }
+            None => {
+                if !inline_complete {
+                    errs.push("[oauth2] with no provider must declare authorization_url + token_url + client_id inline".into());
+                }
+            }
+        }
+        if o.client_secret.is_some() && o.client_type.as_deref() != Some("public") {
+            errs.push(
+                "[oauth2] a literal client_secret requires client_type = \"public\" \
+                 (a confidential secret must never sit in a definition)"
+                    .into(),
+            );
+        }
+        if let Some(u) = &o.authorization_url {
+            validate_https_public_url("[oauth2] authorization_url", u, &mut errs);
+        }
+        if let Some(u) = &o.token_url {
+            validate_https_public_url("[oauth2] token_url", u, &mut errs);
+        }
+        for (role, path) in &o.claims {
+            if !o.exposes.iter().any(|e| e == role) {
+                errs.push(format!("[oauth2] claims key '{}' is not in exposes", role));
+            }
+            if path.is_empty() || path.iter().any(|s| s.trim().is_empty()) {
+                errs.push(format!("[oauth2] claims path for '{}' has an empty segment", role));
+            }
+        }
+        // authorize_params are ADDITIONS to the consent URL — never overrides
+        // of the protocol params the flow itself controls.
+        for k in o.authorize_params.keys() {
+            if RESERVED_AUTHORIZE_PARAMS.contains(&k.as_str()) {
                 errs.push(format!(
-                    "[oauth2] provider '{}' is not a shipped provider",
-                    o.provider
+                    "[oauth2] authorize_params may not set the reserved param '{}'",
+                    k
                 ));
             }
         }
@@ -269,6 +317,20 @@ pub fn validate_provider(toml_str: &str) -> Result<(), Vec<String>> {
     if errs.is_empty() { Ok(()) } else { Err(errs) }
 }
 
+/// Consent-URL query params the OAuth flow itself controls — an
+/// `authorize_params` map may never set these (the frontend applies the map
+/// FIRST and the protocol params after, so an entry here would silently lose;
+/// reject it loudly instead).
+const RESERVED_AUTHORIZE_PARAMS: &[&str] = &[
+    "client_id",
+    "redirect_uri",
+    "response_type",
+    "scope",
+    "state",
+    "code_challenge",
+    "code_challenge_method",
+];
+
 /// A provider endpoint must be an https literal to a public host.
 fn validate_https_public_url(label: &str, url: &str, errs: &mut Vec<String>) {
     if !url.starts_with("https://") {
@@ -320,6 +382,71 @@ refresh_token = "GMAIL_REFRESH_TOKEN"
         assert!(validate_service(oauth, &empty).is_err());
         let known: HashSet<String> = ["google".to_string()].into_iter().collect();
         assert!(validate_service(oauth, &known).is_ok());
+    }
+
+    #[test]
+    fn inline_oauth2_needs_no_provider() {
+        let inline = r#"
+[service]
+id = "acme"
+name = "Acme"
+hosts = ["api.acme.dev"]
+secrets = ["ACME_REFRESH_TOKEN"]
+[oauth2]
+authorization_url = "https://auth.acme.dev/authorize"
+token_url = "https://auth.acme.dev/token"
+client_id = "acme-public"
+refresh_token = "ACME_REFRESH_TOKEN"
+"#;
+        // Custom path with ZERO shipped providers: inline is self-sufficient.
+        let empty = HashSet::new();
+        assert!(validate_service(inline, &empty).is_ok());
+        // A provider label on top of complete inline fields is fine too.
+        let labeled = inline.replace("[oauth2]", "[oauth2]\nprovider = \"acme\"");
+        assert!(validate_service(&labeled, &empty).is_ok());
+        // Incomplete inline without a known provider is rejected.
+        let broken = inline.replace("token_url = \"https://auth.acme.dev/token\"\n", "");
+        assert!(validate_service(&broken, &empty).is_err());
+        // http:// endpoints and confidential inline secrets are rejected.
+        let http = inline.replace("https://auth.acme.dev/token", "http://auth.acme.dev/token");
+        assert!(validate_service(&http, &empty).is_err());
+        let secret = inline.replace("client_id = \"acme-public\"", "client_id = \"acme-public\"\nclient_secret = \"shh\"");
+        assert!(validate_service(&secret, &empty).is_err());
+        let pub_secret = inline.replace(
+            "client_id = \"acme-public\"",
+            "client_id = \"acme-public\"\nclient_secret = \"shh\"\nclient_type = \"public\"",
+        );
+        assert!(validate_service(&pub_secret, &empty).is_ok());
+    }
+
+    #[test]
+    fn oauth2_claims_and_authorize_params_are_checked() {
+        let base = r#"
+[service]
+id = "acme"
+name = "Acme"
+hosts = ["api.acme.dev"]
+secrets = ["ACME_REFRESH_TOKEN"]
+[oauth2]
+authorization_url = "https://auth.acme.dev/authorize"
+token_url = "https://auth.acme.dev/token"
+client_id = "acme-public"
+refresh_token = "ACME_REFRESH_TOKEN"
+exposes = ["account_id"]
+"#;
+        let empty = HashSet::new();
+        let good = format!("{base}[oauth2.claims]\naccount_id = [\"ns\", \"leaf\"]\n");
+        assert!(validate_service(&good, &empty).is_ok());
+        // claims key must be an exposes role; path segments must be non-empty.
+        let stray = format!("{base}[oauth2.claims]\nother = [\"x\"]\n");
+        assert!(validate_service(&stray, &empty).is_err());
+        let hollow = format!("{base}[oauth2.claims]\naccount_id = []\n");
+        assert!(validate_service(&hollow, &empty).is_err());
+        // authorize_params may add params but never reserved protocol ones.
+        let extra = format!("{base}[oauth2.authorize_params]\nfoo_flag = \"true\"\n");
+        assert!(validate_service(&extra, &empty).is_ok());
+        let reserved = format!("{base}[oauth2.authorize_params]\nredirect_uri = \"https://evil.example\"\n");
+        assert!(validate_service(&reserved, &empty).is_err());
     }
 
     #[test]

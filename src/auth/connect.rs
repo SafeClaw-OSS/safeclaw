@@ -56,6 +56,13 @@ pub struct ExchangeConfig {
     /// The service's mainstream secret role, e.g. `GMAIL_REFRESH_TOKEN` — the base
     /// name the refresh_token is written under (namespaced per `conn`).
     pub secret_role: String,
+    /// The secret KEY a returned OIDC id_token is stored under, when the service
+    /// declares one (`[oauth2].id_token`). `None` = don't store it.
+    pub id_token_role: Option<String>,
+    /// `exposes` roles derived from the exchange's id_token: `(role, claim
+    /// path)`. The role is stored UPPERCASED at its §3 address (env-key
+    /// convention; the lowercase phantom segment matches case-insensitively).
+    pub exposes: Vec<(String, Vec<String>)>,
 }
 
 /// Resolve the exchange config for a connection's **service** from the
@@ -71,7 +78,21 @@ pub fn resolve_exchange_config(
     let token_url = resolved.token_url?;
     let client_id = resolved.client_id?;
     let secret_role = oauth.refresh_token.clone();
-    let style = services.provider_oauth_style(&oauth.provider);
+    let style = services.oauth_style(oauth);
+    // Each exposed role's claim path: the explicit `[oauth2].claims` mapping,
+    // else the role name itself as a top-level claim.
+    let exposes = oauth
+        .exposes
+        .iter()
+        .map(|role| {
+            let path = oauth
+                .claims
+                .get(role)
+                .cloned()
+                .unwrap_or_else(|| vec![role.clone()]);
+            (role.clone(), path)
+        })
+        .collect();
     Some(ExchangeConfig {
         token_url,
         client_id,
@@ -79,6 +100,8 @@ pub fn resolve_exchange_config(
         style,
         redirect_uri: resolved.redirect_uri,
         secret_role,
+        id_token_role: oauth.id_token.clone(),
+        exposes,
     })
 }
 
@@ -111,21 +134,50 @@ fn set_aux_map<T: Serialize>(m: &mut ProtectedState, key: &str, map: BTreeMap<St
 
 /// Apply one successful exchange to the open `ProtectedState`: write the durable
 /// refresh_token at the §3 address (`secret_address(conn, service, role)`,
-/// overwriting any prior one — a re-connect supersedes) and **MOVE** the entry
-/// from `aux.connecting` into `aux.connections` (no partial/duplicate record).
-/// `hosts` carries any exact FQDNs pinned at connect for a wildcard service.
-/// Pure state transition (no I/O) so it's unit-testable against a mocked
-/// `ProtectedState`.
+/// overwriting any prior one — a re-connect supersedes), store the id_token /
+/// its derived `exposes` claims when the service declares them, and **MOVE**
+/// the entry from `aux.connecting` into `aux.connections` (no partial/duplicate
+/// record). `hosts` carries any exact FQDNs pinned at connect for a wildcard
+/// service. Pure state transition (no I/O) so it's unit-testable against a
+/// mocked `ProtectedState`.
 pub fn apply_exchange_result(
     m: &mut ProtectedState,
     conn: &str,
     service: &str,
     hosts: Option<Vec<String>>,
-    role: &str,
+    cfg: &ExchangeConfig,
     tokens: &ExchangedTokens,
 ) {
     if let Some(rt) = &tokens.refresh_token {
-        m.put_secret(secret_address(conn, service, role), rt.as_bytes().to_vec());
+        m.put_secret(secret_address(conn, service, &cfg.secret_role), rt.as_bytes().to_vec());
+    }
+    if let Some(idt) = &tokens.id_token {
+        // Store the raw id_token only when the service names a slot for it.
+        if let Some(idt_role) = &cfg.id_token_role {
+            m.put_secret(secret_address(conn, service, idt_role), idt.as_bytes().to_vec());
+        }
+        // Derive each exposed role from its id_token claim. Stored UPPERCASED
+        // (env-key convention for vault items); the lowercase phantom segment
+        // resolves case-insensitively. A missing claim is logged, not fatal —
+        // the phantom then answers with the precise "not derived" refusal.
+        for (role, path) in &cfg.exposes {
+            match crate::auth::oauth2::id_token_claim(idt, path) {
+                Some(v) => {
+                    let key = role.to_ascii_uppercase();
+                    m.put_secret(secret_address(conn, service, &key), v.into_bytes());
+                }
+                None => tracing::warn!(
+                    conn = %conn,
+                    role = %role,
+                    "oauth connect: id_token carries no claim at the exposes path"
+                ),
+            }
+        }
+    } else if !cfg.exposes.is_empty() {
+        tracing::warn!(
+            conn = %conn,
+            "oauth connect: service exposes derived roles but the exchange returned no id_token"
+        );
     }
     // MOVE: drop from `connecting`, add to `connections` (name carried over).
     let mut connecting = aux_map::<Connecting>(m, "connecting");
@@ -198,7 +250,7 @@ where
         // Capture what the post-exchange MOVE needs before `p` is consumed.
         let service = p.service.clone();
         let hosts = p.hosts.clone();
-        let role = cfg.secret_role.clone();
+        let cfg_apply = cfg.clone();
         match exchange(conn.clone(), cfg, p).await {
             Ok(tokens) => {
                 if tokens.refresh_token.is_none() {
@@ -210,7 +262,7 @@ where
                     );
                     continue;
                 }
-                apply_exchange_result(m, &conn, &service, hosts, &role, &tokens);
+                apply_exchange_result(m, &conn, &service, hosts, &cfg_apply, &tokens);
                 completed += 1;
                 tracing::info!(
                     conn = %conn,
@@ -625,6 +677,22 @@ mod tests {
             refresh_token: rt.map(|s| s.to_string()),
             access_token: "at-123".to_string(),
             expires_at: 9_999_999_999,
+            id_token: None,
+        }
+    }
+
+    /// A minimal ExchangeConfig for apply_exchange_result tests — only the
+    /// write-side fields matter (endpoints/client are exchange-side).
+    fn cfg(role: &str) -> ExchangeConfig {
+        ExchangeConfig {
+            token_url: "https://example.test/token".into(),
+            client_id: "client".into(),
+            client_secret: None,
+            style: OAuthStyle::Form,
+            redirect_uri: "http://127.0.0.1:8765/cb".into(),
+            secret_role: role.to_string(),
+            id_token_role: None,
+            exposes: vec![],
         }
     }
 
@@ -676,7 +744,7 @@ mod tests {
             "gmail",
             "gmail",
             None,
-            "GMAIL_REFRESH_TOKEN",
+            &cfg("GMAIL_REFRESH_TOKEN"),
             &tokens(Some("rt-NEW")),
         );
         assert_eq!(m.secret("GMAIL_REFRESH_TOKEN").unwrap(), b"rt-NEW");
@@ -697,7 +765,7 @@ mod tests {
             "gmail-work",
             "gmail",
             None,
-            "GMAIL_REFRESH_TOKEN",
+            &cfg("GMAIL_REFRESH_TOKEN"),
             &tokens(Some("rt-NEW")),
         );
         assert_eq!(m.secret("gmail-work:GMAIL_REFRESH_TOKEN").unwrap(), b"rt-NEW");
@@ -714,7 +782,7 @@ mod tests {
             "acme-forge",
             "acme",
             Some(vec!["tenant.acme.dev".to_string()]),
-            "ACME_TOKEN",
+            &cfg("ACME_TOKEN"),
             &tokens(Some("rt-NEW")),
         );
         let conns = aux_map::<Connection>(&m, "connections");
@@ -722,6 +790,29 @@ mod tests {
             conns.get("acme-forge").and_then(|c| c.hosts.clone()),
             Some(vec!["tenant.acme.dev".to_string()]),
         );
+    }
+
+    #[test]
+    fn apply_exchange_derives_exposes_from_id_token() {
+        use base64::Engine as _;
+        let enc = |v: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(v);
+        let claims = serde_json::json!({
+            "https://api.openai.com/auth": { "chatgpt_account_id": "acct-42" }
+        });
+        let idt = format!("{}.{}.{}", enc(b"{}"), enc(claims.to_string().as_bytes()), enc(b"s"));
+
+        let mut m = with_connecting("openai_codex", "openai_codex", "code-AUX");
+        let mut c = cfg("OPENAI_CODEX_REFRESH_TOKEN");
+        c.exposes = vec![(
+            "account_id".to_string(),
+            vec!["https://api.openai.com/auth".to_string(), "chatgpt_account_id".to_string()],
+        )];
+        let mut t = tokens(Some("rt-NEW"));
+        t.id_token = Some(idt);
+        apply_exchange_result(&mut m, "openai_codex", "openai_codex", None, &c, &t);
+        assert_eq!(m.secret("OPENAI_CODEX_REFRESH_TOKEN").unwrap(), b"rt-NEW");
+        // Derived role stored UPPERCASED at the bare (default-conn) address.
+        assert_eq!(m.secret("ACCOUNT_ID").unwrap(), b"acct-42");
     }
 
     #[test]
@@ -733,7 +824,7 @@ mod tests {
             "gmail",
             "gmail",
             None,
-            "GMAIL_REFRESH_TOKEN",
+            &cfg("GMAIL_REFRESH_TOKEN"),
             &tokens(Some("rt-NEW")),
         );
         assert_eq!(m.secret("GMAIL_REFRESH_TOKEN").unwrap(), b"rt-NEW");

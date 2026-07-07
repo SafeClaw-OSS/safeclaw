@@ -177,7 +177,7 @@ pub async fn resolve_auth_value(
     let refresh_token_str = std::str::from_utf8(raw).map_err(|_| {
         AppError::Internal(format!("oauth2 refresh_token for '{}' not utf-8", service_id))
     })?;
-    let style = state.services.provider_oauth_style(&oauth.provider);
+    let style = state.services.oauth_style(&oauth);
 
     let (access_token, expires_at, rotated_refresh) = crate::auth::oauth2::perform_refresh(
         token_url,

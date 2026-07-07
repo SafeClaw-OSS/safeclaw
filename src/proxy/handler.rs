@@ -552,9 +552,18 @@ impl BrokerHandler {
                 if oauth_refresh.is_some_and(|k| role.eq_ignore_ascii_case(k)) {
                     return Err(ResolveErr::RefreshForbidden);
                 }
-                // A minted-derived `exposes` value (e.g. codex account_id) — the
-                // mint doesn't surface these yet.
-                return Err(ResolveErr::Exposes(role));
+                // An `exposes` value derived at connect (e.g. codex account_id):
+                // stored UPPERCASED in the vault, cached with the connection's
+                // other roles — matched case-insensitively like any role. Absent
+                // (not yet derived / pre-`exposes` connect) → the precise refusal.
+                match secrets_map.as_ref().and_then(|m| {
+                    m.iter()
+                        .find(|(k, _)| k.eq_ignore_ascii_case(&role))
+                        .map(|(_, v)| v.clone())
+                }) {
+                    Some(v) => v,
+                    None => return Err(ResolveErr::Exposes(role)),
+                }
             } else {
                 match &ph.role {
                     Some(r) => secrets_map

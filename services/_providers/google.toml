@@ -29,3 +29,10 @@ client_id         = "499410884315-6m6vu98ls61i0e0cn38663mm573nu87a.apps.googleus
 client_secret     = "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"
 client_type       = "public"
 redirect_uri      = "http://127.0.0.1:8765/safeclaw/oauth/callback"
+
+# Google-specific consent-URL params: without access_type=offline +
+# prompt=consent a repeat consent returns no refresh_token. Carried on the
+# connect descriptor so the frontend applies them as data, not hardcodes.
+[provider.google.authorize_params]
+access_type = "offline"
+prompt      = "consent"

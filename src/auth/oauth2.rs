@@ -28,6 +28,42 @@ pub struct ExchangedTokens {
     pub access_token: String,
     /// Absolute unix-seconds expiry of `access_token`.
     pub expires_at: u64,
+    /// OIDC id_token, when the provider returned one. Source of the `exposes`
+    /// claim derivations (e.g. openai-codex's `chatgpt_account_id`) and of the
+    /// stored id_token slot when the service declares one.
+    pub id_token: Option<String>,
+}
+
+/// Read a claim from a JWT's payload without verifying the signature — fine
+/// here because the token just arrived over TLS from the provider's own /token
+/// endpoint (the same trust as every other field of that response). `path`
+/// walks nested objects (an OIDC namespace key like
+/// `https://api.openai.com/auth` is ONE segment); as a fallback the LEAF
+/// segment is also tried as a top-level claim (providers have moved claims
+/// between the two across versions). Returns the claim as a string (non-string
+/// scalars are JSON-serialized).
+pub fn id_token_claim(id_token: &str, path: &[String]) -> Option<String> {
+    use base64::Engine as _;
+    let payload_b64 = id_token.split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload_b64)
+        .ok()?;
+    let payload: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let mut cur = &payload;
+    let walked = 'walk: {
+        for seg in path {
+            match cur.get(seg) {
+                Some(v) => cur = v,
+                None => break 'walk None,
+            }
+        }
+        Some(cur)
+    };
+    let v = walked.or_else(|| path.last().and_then(|leaf| payload.get(leaf)))?;
+    match v {
+        serde_json::Value::String(s) => Some(s.clone()),
+        other => Some(other.to_string()),
+    }
 }
 
 /// Build the form-urlencoded params for an authorization_code exchange
@@ -154,6 +190,10 @@ pub async fn exchange_code(
         .get("refresh_token")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
+    let id_token = body
+        .get("id_token")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
     let expires_in = body
         .get("expires_in")
         .and_then(|v| v.as_u64())
@@ -167,6 +207,7 @@ pub async fn exchange_code(
         refresh_token,
         access_token,
         expires_at: now_secs + expires_in,
+        id_token,
     })
 }
 
@@ -272,6 +313,37 @@ pub async fn perform_refresh(
 #[cfg(test)]
 mod connect_request_tests {
     use super::*;
+
+    /// An unsigned JWT whose payload is `claims` (header/signature irrelevant —
+    /// id_token_claim only reads the middle segment).
+    fn jwt(claims: serde_json::Value) -> String {
+        use base64::Engine as _;
+        let enc = |v: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(v);
+        format!("{}.{}.{}", enc(b"{}"), enc(claims.to_string().as_bytes()), enc(b"sig"))
+    }
+
+    #[test]
+    fn id_token_claim_walks_namespaced_path() {
+        let t = jwt(serde_json::json!({
+            "https://api.openai.com/auth": { "chatgpt_account_id": "acct-123" }
+        }));
+        let path = vec!["https://api.openai.com/auth".to_string(), "chatgpt_account_id".to_string()];
+        assert_eq!(id_token_claim(&t, &path).as_deref(), Some("acct-123"));
+    }
+
+    #[test]
+    fn id_token_claim_falls_back_to_top_level_leaf() {
+        let t = jwt(serde_json::json!({ "chatgpt_account_id": "acct-789" }));
+        let path = vec!["https://api.openai.com/auth".to_string(), "chatgpt_account_id".to_string()];
+        assert_eq!(id_token_claim(&t, &path).as_deref(), Some("acct-789"));
+    }
+
+    #[test]
+    fn id_token_claim_none_when_absent_or_malformed() {
+        let t = jwt(serde_json::json!({ "sub": "x" }));
+        assert!(id_token_claim(&t, &["missing".to_string()]).is_none());
+        assert!(id_token_claim("not-a-jwt", &["a".to_string()]).is_none());
+    }
 
     // ── form (Google / default) body construction ──────────────────────────
 

@@ -1139,6 +1139,17 @@ fn seed_per_item_store(
     );
 }
 
+/// The role KEYs cached for a service's connections: the declared `secrets`
+/// plus any `[oauth2].exposes` roles (derived at connect, stored UPPERCASED —
+/// the phantom's lowercase segment matches case-insensitively at resolve).
+fn cacheable_roles(svc: &crate::service::ServiceDef) -> Vec<String> {
+    let mut roles: Vec<String> = svc.service.secrets.clone();
+    if let Some(o) = &svc.oauth2 {
+        roles.extend(o.exposes.iter().map(|r| r.to_ascii_uppercase()));
+    }
+    roles
+}
+
 pub(crate) fn bootstrap_cache_from_view(
     view: &VaultPlaintextView,
     state: &AppState,
@@ -1209,13 +1220,15 @@ pub(crate) fn bootstrap_cache_from_view(
             // v4 multi-secret: resolve each declared `secrets` role so the
             // allow fast-path can inject multi-secret services without a vault
             // view. oauth services declare no injectable direct secret here
-            // (their access token is minted from the refresh_token at forward).
+            // (their access token is minted from the refresh_token at forward),
+            // but their `exposes` roles — derived at connect and stored
+            // UPPERCASED — ARE injectable, so they load alongside.
             if let Some(svc) = state.services.get(service_id) {
                 let mut map: std::collections::HashMap<String, Vec<u8>> =
                     std::collections::HashMap::new();
-                for name in &svc.service.secrets {
-                    if let Some(val) = view.resolve_value_native(name) {
-                        map.insert(name.clone(), val.to_vec());
+                for name in cacheable_roles(svc) {
+                    if let Some(val) = view.resolve_value_native(&name) {
+                        map.insert(name, val.to_vec());
                     }
                 }
                 if !map.is_empty() {
@@ -1262,10 +1275,10 @@ pub(crate) fn bootstrap_cache_from_view(
         if let Some(svc) = state.services.get(service) {
             let mut map: std::collections::HashMap<String, Vec<u8>> =
                 std::collections::HashMap::new();
-            for name in &svc.service.secrets {
-                let addr = crate::storage::plaintext::secret_address(conn, service, name);
+            for name in cacheable_roles(svc) {
+                let addr = crate::storage::plaintext::secret_address(conn, service, &name);
                 if let Some(val) = view.resolve_value_native(&addr) {
-                    map.insert(name.clone(), val.to_vec());
+                    map.insert(name, val.to_vec());
                 }
             }
             if !map.is_empty() {

@@ -324,7 +324,9 @@ fn build_service(
 
     let policy = policy_for(services, id, include_policy_rules);
     let oauth2 = def.oauth2.as_ref().map(|o| RegistryServiceOAuth2 {
-        provider: o.provider.clone(),
+        // Wire shape stays a plain string; a fully-inline section (no template)
+        // reads "custom" — same label ConnectDescriptor::provider falls back to.
+        provider: o.provider.clone().unwrap_or_else(|| "custom".to_string()),
         scopes: o.scopes.clone(),
     });
 
