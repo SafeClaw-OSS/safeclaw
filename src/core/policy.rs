@@ -303,22 +303,36 @@ fn parse_match_pattern(pattern: &str) -> (Option<&str>, &str) {
     (None, pattern)
 }
 
-/// Match a request path against a pattern. `*` matches exactly one path segment.
+/// Match a request path against a pattern. `*` matches exactly one path
+/// segment; a trailing `**` matches one-or-more remaining segments (only
+/// meaningful as the final segment — it lets a single rule cover
+/// variable-depth paths like git refs `git/refs/heads/feature/x` or nested
+/// file paths). `**` anywhere but last is treated as a literal (won't match).
 fn path_matches(pattern: &str, path: &str) -> bool {
     let pat_segments: Vec<&str> = pattern.trim_end_matches('/').split('/').collect();
     let path_segments: Vec<&str> = path.trim_end_matches('/').split('/').collect();
+
+    // Trailing `**`: the fixed prefix must match segment-for-segment, and the
+    // path must have at least one further segment for `**` to cover.
+    if let Some((last, prefix)) = pat_segments.split_last() {
+        if *last == "**" {
+            if path_segments.len() <= prefix.len() {
+                return false;
+            }
+            return prefix
+                .iter()
+                .zip(path_segments.iter())
+                .all(|(p, s)| *p == "*" || p == s);
+        }
+    }
+
     if pat_segments.len() != path_segments.len() {
         return false;
     }
-    for (p, s) in pat_segments.iter().zip(path_segments.iter()) {
-        if *p == "*" {
-            continue;
-        }
-        if p != s {
-            return false;
-        }
-    }
-    true
+    pat_segments
+        .iter()
+        .zip(path_segments.iter())
+        .all(|(p, s)| *p == "*" || p == s)
 }
 
 /// Specificity score (nginx longest-match): used only as a tiebreaker between
@@ -337,7 +351,7 @@ fn specificity(rule: &PolicyRule) -> u32 {
             score += 5;
         }
         for seg in path.split('/') {
-            if !seg.is_empty() && seg != "*" {
+            if !seg.is_empty() && seg != "*" && seg != "**" {
                 score += 10;
             }
         }
@@ -497,6 +511,21 @@ mod tests {
     fn wildcard_matches_one_segment() {
         assert!(path_matches("/repos/*/issues", "/repos/r/issues"));
         assert!(!path_matches("/repos/*", "/repos/o/r"));
+    }
+
+    #[test]
+    fn double_star_matches_variable_depth() {
+        // One rule covers any-depth refs (heads/main, heads/feature/x, tags/v1).
+        let p = "/repos/*/*/git/refs/**";
+        assert!(path_matches(p, "/repos/o/r/git/refs/heads/main"));
+        assert!(path_matches(p, "/repos/o/r/git/refs/heads/feature/x"));
+        assert!(path_matches(p, "/repos/o/r/git/refs/tags/v1"));
+        // `**` requires at least one segment — the bare prefix does not match.
+        assert!(!path_matches(p, "/repos/o/r/git/refs"));
+        // Fixed prefix still has to line up.
+        assert!(!path_matches(p, "/repos/o/r/git/blobs/abc"));
+        // A single `*` is still exactly one segment (no accidental widening).
+        assert!(!path_matches("/repos/*/*/git/refs/*", "/repos/o/r/git/refs/heads/main"));
     }
 
     #[test]
