@@ -1158,8 +1158,40 @@ pub(crate) fn bootstrap_cache_from_view(
     // Effective policy = the vault's sparse `aux.policy` overlaid on compiled
     // defaults. Rebuilt here on every unlock/refresh, so a per-connection edit
     // is live on the next request (PROTOCOL.md §6.2/§6.4).
-    cache.policy = crate::core::policy::Policy::effective(view.aux.policy.as_ref());
+    let effective_policy = crate::core::policy::Policy::effective(view.aux.policy.as_ref());
+    cache.policy = effective_policy.clone();
     cache.audit_retention_days = view.aux.audit_retention_days;
+    // Residency mirrors the DECISION floor (`AppState::evaluate_request_policy`):
+    // a connection's credential is pre-loaded at unlock iff its effective READ
+    // floor resolves to `allow` — recipe `[default]` ⊕ the user's `aux.policy`
+    // connection override, then category, then the global `allow` floor. This
+    // replaces the old `default_read_level(service) == Allow` gate, whose
+    // no-`[policy]` fallback was `ask-always` (contradicting the decision layer's
+    // global-`allow` floor, so the first use of a policy-less recipe always
+    // prompted) and which never consulted `aux.policy` (a user tightening a
+    // service to ask-always still got it resident — PROTOCOL.md §6.2). Reusing
+    // `evaluate` with a GET and no rules resolves exactly that read floor, so
+    // residency can't drift from the decision. `service = None` ⇒ raw connection.
+    let read_floor_allows = |service: Option<&str>, conn: &str| -> bool {
+        let recipe = service.and_then(|s| state.services.default_policy_levels(s));
+        let user = effective_policy
+            .connections
+            .get(conn)
+            .and_then(|c| c.default.as_ref());
+        let conn_levels = crate::core::policy::merge_levels(user, recipe.as_ref());
+        let category = service
+            .map(|s| state.services.default_category(s))
+            .unwrap_or("integration");
+        crate::core::policy::evaluate(
+            "GET",
+            "/",
+            None,
+            None,
+            conn_levels.as_ref(),
+            &effective_policy,
+            Some(category),
+        ) == crate::core::policy::AccessLevel::Allow
+    };
     // Routing snapshot (CONNECTION_SCHEMA.md §6): `connection_id → {service,
     // config}`. The per-service loop below bootstraps every *default* connection
     // (conn == service); a second pass after it covers *named* connections.
@@ -1195,16 +1227,15 @@ pub(crate) fn bootstrap_cache_from_view(
             .insert(store_id.clone(), (store.clone(), zeroize::Zeroizing::new(sa_json)));
     }
     for (service_id, _) in state.services.iter_sorted() {
-        // PROTOCOL.md §6.2: only services whose default read level is
+        // PROTOCOL.md §6.2: only connections whose effective READ floor is
         // `allow` get their auth value loaded at unlock. ask / ask-always
-        // services have memory_ttl = rule.ttl / 0 respectively, so the
-        // bytes shouldn't sit in cache pre-approval. They're filled
-        // lazily by `approve_op` after the user passkey gesture (ask) or
-        // never (ask-always — fresh-decrypted-per-request via the
-        // grant's W_c and immediately zeroized).
-        if state.services.default_read_level(service_id)
-            == crate::core::policy::AccessLevel::Allow
-        {
+        // connections don't sit in cache pre-approval — they're filled lazily
+        // by `approve_op` after the user passkey gesture (ask) or never
+        // (ask-always — fresh-decrypted-per-request via the grant's W_c and
+        // immediately zeroized). Marked `from_bootstrap` so a per-path
+        // ask/ask-always RULE on this (read-allow) connection still forces a
+        // fresh passkey instead of riding this residency.
+        if read_floor_allows(Some(service_id), service_id) {
             if let Some(item_name) = state.services.service_env_key(service_id) {
                 if let Some(val) = view.resolve_value_native(&item_name) {
                     cache.entries.insert(
@@ -1212,6 +1243,7 @@ pub(crate) fn bootstrap_cache_from_view(
                         crate::state::CacheEntry {
                             value: val.to_vec(),
                             expires_at: None, // allow = lives whole unlocked session
+                            from_bootstrap: true,
                         },
                     );
                 }
@@ -1258,9 +1290,7 @@ pub(crate) fn bootstrap_cache_from_view(
         if conn == service {
             continue; // default — already bootstrapped above
         }
-        if state.services.default_read_level(service)
-            != crate::core::policy::AccessLevel::Allow
-        {
+        if !read_floor_allows(Some(service), conn) {
             continue;
         }
         if let Some(role) = state.services.service_env_key(service) {
@@ -1268,7 +1298,11 @@ pub(crate) fn bootstrap_cache_from_view(
             if let Some(val) = view.resolve_value_native(&addr) {
                 cache.entries.insert(
                     conn.clone(),
-                    crate::state::CacheEntry { value: val.to_vec(), expires_at: None },
+                    crate::state::CacheEntry {
+                        value: val.to_vec(),
+                        expires_at: None,
+                        from_bootstrap: true,
+                    },
                 );
             }
         }
@@ -1300,6 +1334,12 @@ pub(crate) fn bootstrap_cache_from_view(
             continue; // service-backed — handled above
         }
         let Some(keys) = &c.secrets else { continue };
+        // Same read-floor gate as service connections: a raw connection the user
+        // tightened to ask/ask-always must NOT be resident (PROTOCOL.md §6.2); an
+        // untouched raw connection floors to the global `allow` and stays resident.
+        if !read_floor_allows(None, conn) {
+            continue;
+        }
         let mut map: std::collections::HashMap<String, Vec<u8>> =
             std::collections::HashMap::new();
         for key in keys {
@@ -1315,9 +1355,10 @@ pub(crate) fn bootstrap_cache_from_view(
         // connection resolves each role from the map (role phantoms).
         if map.len() == 1 {
             let primary = map.values().next().cloned().unwrap();
-            cache
-                .entries
-                .insert(conn.clone(), crate::state::CacheEntry { value: primary, expires_at: None });
+            cache.entries.insert(
+                conn.clone(),
+                crate::state::CacheEntry { value: primary, expires_at: None, from_bootstrap: true },
+            );
         }
         if !map.is_empty() {
             cache.allow_secrets.insert(conn.clone(), map);

@@ -405,16 +405,24 @@ impl BrokerHandler {
         }
 
         // The credential bytes come from the session cache (the proxy has no
-        // grant to open the vault). Allow / Ask read it; AskAlways burns it
-        // single-use. A miss on Ask/AskAlways (or an unexpected miss on Allow)
-        // falls through to the captive portal.
-        let (primary, secrets_map) = if level == AccessLevel::AskAlways {
-            (self.state.cache_take(&vault_id, &conn), None)
-        } else {
-            (
+        // grant to open the vault). A miss falls through to the captive portal.
+        //   - Allow: read the resident value (incl. the unlock bootstrap) + the
+        //     allow multi-secret map — the frictionless fast-path.
+        //   - Ask / AskAlways: GRANT-ONLY. Both ignore the allow-level bootstrap
+        //     (`cache_lookup_grant` / `cache_take` skip `from_bootstrap` entries,
+        //     and we pass no `allow_secrets` map) so a per-path ask/ask-always
+        //     rule ALWAYS forces a fresh passkey the first time, even on a
+        //     connection whose read floor is `allow` and is therefore resident.
+        //     AskAlways additionally burns its grant single-use; a downgraded
+        //     (approved-and-cached) Ask arrives here as Allow and reads its grant
+        //     via the fast-path above.
+        let (primary, secrets_map) = match level {
+            AccessLevel::AskAlways => (self.state.cache_take(&vault_id, &conn), None),
+            AccessLevel::Ask => (self.state.cache_lookup_grant(&vault_id, &conn), None),
+            _ => (
                 self.state.cache_lookup(&vault_id, &conn),
                 self.state.cache_lookup_secrets(&vault_id, &conn),
-            )
+            ),
         };
 
         let values = match self

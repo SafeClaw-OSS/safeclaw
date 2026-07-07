@@ -69,6 +69,14 @@ pub struct CacheEntry {
     /// `None` = never expires within the unlocked session (allow-level).
     /// `Some(t)` = expires at unix-second `t` (ask-level TTL).
     pub expires_at: Option<u64>,
+    /// `true` = this value was pre-loaded at unlock by `bootstrap_cache_from_view`
+    /// (the connection's read floor is `allow`), NOT produced by a passkey grant.
+    /// The allow fast-path (`cache_lookup`) uses it, but `ask`/`ask-always` paths
+    /// (`cache_lookup_grant` / `cache_take`) must IGNORE it — a per-path
+    /// ask/ask-always rule has to force a fresh approval, never ride the
+    /// allow-level residency. A real grant (from `approve_op`) overwrites it with
+    /// `from_bootstrap = false`.
+    pub from_bootstrap: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -438,7 +446,8 @@ impl AppState {
         if let Some(VaultState::Unlocked { cache, .. }) = states.get_mut(vault_id) {
             cache.entries.insert(
                 conn_id.to_string(),
-                CacheEntry { value, expires_at },
+                // A real approval grant — consumable by ask/ask-always.
+                CacheEntry { value, expires_at, from_bootstrap: false },
             );
         }
     }
@@ -459,6 +468,12 @@ impl AppState {
             Some(VaultState::Unlocked { cache, .. }) => cache,
             _ => return None,
         };
+        // A bootstrap-resident value is NOT a grant — an `ask-always` request must
+        // force a fresh passkey, not consume the allow-level residency. Leave it
+        // in place (the allow fast-path still needs it) and report a miss.
+        if cache.entries.get(conn_id).is_some_and(|e| e.from_bootstrap) {
+            return None;
+        }
         let entry = cache.entries.remove(conn_id)?;
         if let Some(exp) = entry.expires_at {
             if now >= exp {
@@ -466,6 +481,34 @@ impl AppState {
             }
         }
         Some(entry.value)
+    }
+
+    /// Like [`Self::cache_lookup`] but **grant-only**: a bootstrap-resident value
+    /// (`from_bootstrap`) is treated as a miss. Used by the `ask` path so the
+    /// first matching request forces a passkey approval instead of riding the
+    /// connection's allow-level residency; after approval the downgraded (Allow)
+    /// retry reads the real grant via `cache_lookup`. Non-destructive; honors TTL.
+    pub fn cache_lookup_grant(&self, vault_id: &str, conn_id: &str) -> Option<Vec<u8>> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let mut states = self.vault_states.lock().unwrap();
+        let cache = match states.get_mut(vault_id) {
+            Some(VaultState::Unlocked { cache, .. }) => cache,
+            _ => return None,
+        };
+        let entry = cache.entries.get(conn_id)?;
+        if entry.from_bootstrap {
+            return None;
+        }
+        if let Some(exp) = entry.expires_at {
+            if now >= exp {
+                cache.entries.remove(conn_id);
+                return None;
+            }
+        }
+        Some(entry.value.clone())
     }
 
     /// Look up a cached OAuth `access_token` by `sha256(refresh_token)` hex (§5).
@@ -522,6 +565,8 @@ impl AppState {
                 CacheEntry {
                     value,
                     expires_at: Some(expires_at),
+                    // oauth_access has its own lookup path; the flag is unread here.
+                    from_bootstrap: false,
                 },
             );
         }
@@ -823,6 +868,38 @@ mod tests {
             SecretsCache::default(),
             zeroize::Zeroizing::new(Vec::new()),
         );
+    }
+
+    /// Directly seed a bootstrap-resident entry (what `bootstrap_cache_from_view`
+    /// produces for an allow-read connection) — there's no public setter since
+    /// only unlock writes these.
+    fn insert_bootstrap(state: &AppState, vault_id: &str, conn: &str, value: &[u8]) {
+        let mut states = state.vault_states.lock().unwrap();
+        if let Some(VaultState::Unlocked { cache, .. }) = states.get_mut(vault_id) {
+            cache.entries.insert(
+                conn.to_string(),
+                CacheEntry { value: value.to_vec(), expires_at: None, from_bootstrap: true },
+            );
+        }
+    }
+
+    #[test]
+    fn bootstrap_entry_serves_allow_but_never_ask_paths() {
+        let state = test_state();
+        unlock_with_empty_cache(&state, "v1");
+        insert_bootstrap(&state, "v1", "github", b"tok");
+        // allow fast-path uses the residency…
+        assert_eq!(state.cache_lookup("v1", "github"), Some(b"tok".to_vec()));
+        // …but ask / ask-always must NOT: a bootstrap value is not a grant.
+        assert_eq!(state.cache_lookup_grant("v1", "github"), None);
+        assert_eq!(state.cache_take("v1", "github"), None);
+        // cache_take left it in place (allow reads still work afterwards).
+        assert_eq!(state.cache_lookup("v1", "github"), Some(b"tok".to_vec()));
+        // A real grant overwrites it and IS consumable single-use.
+        state.cache_insert("v1", "github", b"granted".to_vec(), None);
+        assert_eq!(state.cache_lookup_grant("v1", "github"), Some(b"granted".to_vec()));
+        assert_eq!(state.cache_take("v1", "github"), Some(b"granted".to_vec()));
+        assert_eq!(state.cache_take("v1", "github"), None); // consumed
     }
 
     #[test]
