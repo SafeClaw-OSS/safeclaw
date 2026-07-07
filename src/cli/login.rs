@@ -89,10 +89,14 @@ pub async fn run(args: LoginArgs) -> Result<(), String> {
         ));
     }
 
-    // ── Resolve device name: flag > $HOSTNAME / $COMPUTERNAME > literal ──
+    // ── Resolve device name: flag > OS hostname > $HOSTNAME / $COMPUTERNAME
+    //    env > literal. The hostname syscall is the reliable source — the env
+    //    vars are unset in most non-login / non-interactive shells, which is
+    //    what used to strand a device on the "agent-device" fallback. ──
     let device_name = args
         .device_name
         .clone()
+        .or_else(|| hostname::get().ok().and_then(|h| h.into_string().ok()).filter(|s| !s.is_empty()))
         .or_else(|| std::env::var("HOSTNAME").ok().filter(|s| !s.is_empty()))
         .or_else(|| std::env::var("COMPUTERNAME").ok().filter(|s| !s.is_empty()))
         .unwrap_or_else(|| "agent-device".to_string());

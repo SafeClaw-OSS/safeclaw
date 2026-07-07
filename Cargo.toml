@@ -28,6 +28,7 @@ tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 tower = "0.5"
+hostname = "0.4"
 
 # Protocol / crypto core — see [[sudp-crate]]. SafeClaw is a custodian
 # implementation; sudp provides the abstract protocol + standard cryptographic

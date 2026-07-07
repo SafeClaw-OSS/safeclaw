@@ -368,7 +368,9 @@ pub enum AgentSubcommand {
 
 #[derive(Debug, Args)]
 pub struct AgentAddArgs {
-    /// Friendly name for the agent (e.g. "Claude Code", "deploy-bot").
+    /// A short name identifying THIS agent — use your own tool / agent name
+    /// (e.g. "Claude Code", "Cursor", "deploy-bot"), not a generic one, so you
+    /// can recognize it later in the console's Access list.
     pub name: String,
 }
 
@@ -714,7 +716,7 @@ pub struct LoginArgs {
     #[arg(long)]
     pub pair_token: String,
     /// Friendly label shown for this host in the dashboard's device list.
-    /// Defaults to `$HOSTNAME` / `$COMPUTERNAME`, else `agent-device`.
+    /// Defaults to the machine's hostname, else `agent-device`.
     #[arg(long)]
     pub device_name: Option<String>,
     /// Test-only: allow a plaintext `http://` custodian URL. Without this,
