@@ -1300,4 +1300,33 @@ client_type = "public"
         assert_eq!(eval("POST", "/gmail/v1/users/me/messages/send"), AccessLevel::AskAlways);
         assert_eq!(eval("DELETE", "/gmail/v1/users/me/messages/abc123"), AccessLevel::AskAlways);
     }
+
+    #[test]
+    fn compiled_cratesio_policy_gates_publish_surface() {
+        use crate::core::policy::{evaluate, AccessLevel, Policy};
+        let r = ServiceRegistry::load();
+        let rules = r.default_policy_rules("cratesio")
+            .expect("cratesio policy.toml must parse and yield rules");
+        let policy = Policy::default();
+        let eval = |m: &str, p: &str| {
+            evaluate(m, p, None, Some(&rules), None, &policy, Some("integration"))
+        };
+        // Routine traffic rides the allow floor.
+        assert_eq!(eval("GET", "/api/v1/me"), AccessLevel::Allow);
+        assert_eq!(eval("GET", "/api/v1/crates"), AccessLevel::Allow);
+        assert_eq!(eval("PUT", "/api/v1/crates/serde/follow"), AccessLevel::Allow);
+        // Publish + version availability ask once per window.
+        assert_eq!(eval("PUT", "/api/v1/crates/new"), AccessLevel::Ask);
+        assert_eq!(eval("DELETE", "/api/v1/crates/serde/1.0.219/yank"), AccessLevel::Ask);
+        assert_eq!(eval("PUT", "/api/v1/crates/serde/1.0.219/unyank"), AccessLevel::Ask);
+        assert_eq!(eval("PATCH", "/api/v1/crates/serde/1.0.219"), AccessLevel::Ask);
+        // Ownership + supply chain gate every time.
+        assert_eq!(eval("PUT", "/api/v1/crates/serde/owners"), AccessLevel::AskAlways);
+        assert_eq!(eval("DELETE", "/api/v1/crates/serde/owners"), AccessLevel::AskAlways);
+        assert_eq!(eval("POST", "/api/v1/trusted_publishing/github_configs"), AccessLevel::AskAlways);
+        assert_eq!(eval("PATCH", "/api/v1/crates/serde"), AccessLevel::AskAlways);
+        // Publish approvals cover a workspace release train, not one crate.
+        let publish = rules.iter().find(|ru| ru.id.as_deref() == Some("publish")).unwrap();
+        assert_eq!(publish.ttl, Some(1800));
+    }
 }
