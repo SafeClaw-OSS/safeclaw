@@ -9,6 +9,12 @@ use safeclaw::state::AppState;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Loopback is never proxied: pin localhost into NO_PROXY before any HTTP
+    // client is built, so a corporate HTTPS_PROXY (or the one `sc run` injects)
+    // can't trap our calls to the local daemon. reqwest honours env proxies by
+    // default, so shaping the env here covers every client at once.
+    cli::proxy_env::pin_localhost_no_proxy();
+
     // Parse through `cli::help::command()` (not `Cli::parse()`) so the top-level
     // `sc` / `sc --help` prints our grouped, gh-style help; per-command help is
     // still clap's default.

@@ -58,10 +58,20 @@ pub fn build_bundle(
     ca: &str,
     parent_git_config_count: Option<u32>,
 ) -> Vec<(String, String)> {
+    // Set the WHOLE proxy family, both cases (`curl` reads only lowercase
+    // `http_proxy` for plaintext — it ignores UPPER `HTTP_PROXY` as an httpoxy
+    // defence, CVE-2016-5385 — and some tools read only one case or only
+    // `ALL_PROXY`). NO_PROXY keeps every loopback spelling out of the broker.
+    let no_proxy = "localhost,127.0.0.1,::1";
     let mut b = vec![
         ("HTTPS_PROXY".to_string(), proxy_url.to_string()),
+        ("https_proxy".to_string(), proxy_url.to_string()),
         ("HTTP_PROXY".to_string(), proxy_url.to_string()),
-        ("NO_PROXY".to_string(), "localhost,127.0.0.1".to_string()),
+        ("http_proxy".to_string(), proxy_url.to_string()),
+        ("ALL_PROXY".to_string(), proxy_url.to_string()),
+        ("all_proxy".to_string(), proxy_url.to_string()),
+        ("NO_PROXY".to_string(), no_proxy.to_string()),
+        ("no_proxy".to_string(), no_proxy.to_string()),
         // Node 24+ built-in fetch honours the proxy env only with this set.
         ("NODE_USE_ENV_PROXY".to_string(), "1".to_string()),
         ("SSL_CERT_FILE".to_string(), ca.to_string()),
@@ -78,6 +88,40 @@ pub fn build_bundle(
     b.push((format!("GIT_CONFIG_KEY_{}", idx), "credential.helper".to_string()));
     b.push((format!("GIT_CONFIG_VALUE_{}", idx), "!sc git-credential".to_string()));
     b
+}
+
+/// Ensure THIS `sc` process never routes loopback traffic through a proxy:
+/// merge `localhost` / `127.0.0.1` / `::1` into `NO_PROXY` (both cases) before
+/// any reqwest client is built. reqwest honours the standard `*_PROXY` env by
+/// default, so without this a user's corporate `HTTPS_PROXY` — or the
+/// `HTTPS_PROXY` that `sc run` injects for a child that then shells `sc` — would
+/// trap our own calls to the LOCAL daemon: a corp proxy can't reach 127.0.0.1,
+/// and inside a `sc run` bundle the call would loop back through our own MITM.
+/// Shaping the env once is simpler (and completer) than overriding proxy on
+/// every client; remote hosts still honour the proxy, so corp egress keeps
+/// working. Call once at startup, before the first HTTP client.
+pub fn pin_localhost_no_proxy() {
+    for key in ["NO_PROXY", "no_proxy"] {
+        let merged = with_loopback(&std::env::var(key).unwrap_or_default());
+        std::env::set_var(key, merged);
+    }
+}
+
+/// Merge the loopback hosts into a comma-separated NO_PROXY value, preserving the
+/// caller's existing entries and order, appending only what's missing (case-
+/// insensitive). Pure so it's testable without touching process env.
+fn with_loopback(current: &str) -> String {
+    let mut hosts: Vec<String> = current
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    for lb in ["localhost", "127.0.0.1", "::1"] {
+        if !hosts.iter().any(|h| h.eq_ignore_ascii_case(lb)) {
+            hosts.push(lb.to_string());
+        }
+    }
+    hosts.join(",")
 }
 
 /// Is the daemon's control plane answering at `control_root` (from
@@ -124,9 +168,12 @@ mod tests {
         let proxy = proxy_url_for_vault("http://127.0.0.1:23294", "abc", Some("k1"));
         let b = build_bundle(&proxy, "/x/ca.pem", None);
         let get = |k: &str| b.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
-        assert_eq!(get("HTTPS_PROXY").unwrap(), proxy);
-        assert_eq!(get("HTTP_PROXY"), get("HTTPS_PROXY"));
-        assert_eq!(get("NO_PROXY").unwrap(), "localhost,127.0.0.1");
+        // Whole family, both cases (curl-plaintext + ALL_PROXY-only tools).
+        for k in ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"] {
+            assert_eq!(get(k).unwrap(), proxy, "{k}");
+        }
+        assert_eq!(get("NO_PROXY").unwrap(), "localhost,127.0.0.1,::1");
+        assert_eq!(get("no_proxy"), get("NO_PROXY"));
         assert_eq!(get("NODE_USE_ENV_PROXY").unwrap(), "1");
         for k in [
             "SSL_CERT_FILE",
@@ -141,6 +188,23 @@ mod tests {
         assert_eq!(get("GIT_CONFIG_COUNT").unwrap(), "1");
         assert_eq!(get("GIT_CONFIG_KEY_0").unwrap(), "credential.helper");
         assert_eq!(get("GIT_CONFIG_VALUE_0").unwrap(), "!sc git-credential");
+    }
+
+    #[test]
+    fn with_loopback_appends_missing_preserves_existing() {
+        // Empty → just the loopback set.
+        assert_eq!(with_loopback(""), "localhost,127.0.0.1,::1");
+        // Existing corp entries kept + ordered first; only missing loopback added.
+        assert_eq!(
+            with_loopback("corp.internal, 10.0.0.0/8"),
+            "corp.internal,10.0.0.0/8,localhost,127.0.0.1,::1"
+        );
+        // Idempotent + case-insensitive: no dupes when loopback already present.
+        assert_eq!(with_loopback("LOCALHOST,127.0.0.1"), "LOCALHOST,127.0.0.1,::1");
+        assert_eq!(
+            with_loopback("localhost,127.0.0.1,::1"),
+            "localhost,127.0.0.1,::1"
+        );
     }
 
     #[test]
