@@ -231,10 +231,9 @@ Adapter resolves the referenced item recursively (terminates at
   "connecting":  { /* in-flight OAuth handshakes, keyed by connection_id */ },
   "connections": { /* established connections, keyed by connection_id */ },
 
-  // ─── Policy — ONE tree (POLICY_RISK_TIERS.md) ─────────────────
+  // ─── Policy — ONE tree (POLICY.md) ────────────────────────────
   "policy": {
     "timeout": 300,
-    "risk":    { /* sparse risk→level map; e.g. { "medium": "allow" } */ },
     "default":    { "read": "allow", "write": "allow" },
     "categories": { "llm": { "read": "allow", "write": "allow" } },
     "connections": {
@@ -242,7 +241,7 @@ Adapter resolves the referenced item recursively (terminates at
       // from the connection's service recipe, merged with these edits
       "gmail": {
         "default": { "read": "ask" },
-        "rules":   { "read-email": { "risk": "low" } }
+        "rules":   { "read-email": { "level": "allow" } }
       }
     }
   },
@@ -265,7 +264,7 @@ Every top-level field has a documented reason. No dead fields.
 | `store_order` | new (this design) | required | Resolution priority |
 | `connecting` | connections layer | sparse | In-flight OAuth handshakes, keyed by `connection_id`. See [CONNECTION_SCHEMA.md](CONNECTION_SCHEMA.md). |
 | `connections` | connections layer | sparse | Established connections, keyed by `connection_id`. Status is derived. See [CONNECTION_SCHEMA.md](CONNECTION_SCHEMA.md). |
-| `policy` | new (replaces split) | optional | The whole policy tree — `timeout`, the `risk`→level map, the read/write `default` floor, per-`category` floors, and per-`connection` user policy. Sparse; absent on fresh vaults → daemon uses `Policy::default()`. The canonical reference is [POLICY_RISK_TIERS.md](POLICY_RISK_TIERS.md). **Replaces the old split `service_state` + `policy_defaults`.** |
+| `policy` | new (replaces split) | optional | The whole policy tree — `timeout`, the read/write `default` floor, per-`category` floors, and per-`connection` user policy. Rules carry their access `level` directly. Sparse; absent on fresh vaults → daemon uses `Policy::default()`. The canonical reference is [POLICY.md](POLICY.md). **Replaces the old split `service_state` + `policy_defaults`.** |
 | `audit_retention_days` | new | optional | Audit-log retention in days. `None` = keep forever. |
 | `push_subscriptions` | dev's `notifications.subscriptions` (flattened) | required | Per-user web-push endpoints; sensitive (deanonymizing). Renamed because dev's two-level nesting (`notifications.subscriptions`) carried no information. |
 | `vapid_private_key` | dev (unchanged) | required | Server-side push signing key |
@@ -274,22 +273,18 @@ The `policy` tree (rust: `core::policy::Policy`) is sparse and self-defaulting a
 every layer:
 
 - `timeout` — approval hold, seconds.
-- `risk` — sparse `{low?, medium?, high?, critical?}` → `AccessLevel`. Unset tiers
-  fall to the built-in default `low→allow, medium→ask, high→ask-always,
-  critical→ask-always`. **deny is never a default** — the user opts into it.
-  Read live at eval, so a single edit re-tunes every same-tier rule on the next
-  request. See [POLICY_RISK_TIERS.md](POLICY_RISK_TIERS.md).
 - `default` — global read/write floor (`Levels { read?, write?, ttl? }`) when no
-  rule and no more-specific default matches. These are **decisions** (access
-  levels), not risk classifications.
+  rule and no more-specific default matches. Values are access **decisions**
+  (`allow | ask | ask-always | deny`). The read/write split is the method-derived
+  base (`is_write_method`). See [POLICY.md](POLICY.md).
 - `categories` — per-category floor (e.g. `llm`, `channel`); beats `default`.
 - `connections.<connection_id>` — per-**connection** user policy
   (`ConnectionPolicy { default?, rules }`). The built-in rule set comes from the
   connection's *service* recipe (`policy.toml`); `rules` is a sparse map keyed by
-  rule id where each `RuleConfig { match?, label?, body?, risk?, ttl? }` either
-  **overrides** a built-in rule by id, or (if it carries `match`) **adds** a new
-  rule. Connections are addressed by `connection_id`, NOT per-service —
-  see [CONNECTION_SCHEMA.md](CONNECTION_SCHEMA.md).
+  rule id where each `RuleConfig { match?, label?, body?, level?, ttl? }` either
+  **overrides** a built-in rule by id (set `level`/`ttl`), or (if it carries
+  `match`) **adds** a new rule. Connections are addressed by `connection_id`, NOT
+  per-service — see [CONNECTION_SCHEMA.md](CONNECTION_SCHEMA.md).
 
 ### 7.2 What's removed from v2/dev
 
@@ -299,8 +294,8 @@ every layer:
 | `files: [{id, name, size}]` | `native-files.items` |
 | `services.X.upstream` / `services.X.auth` (registry shadow) | Read live from service.toml at runtime |
 | `service_state` (per-service policy overrides) | folded into `policy.connections.<connection_id>` (per-connection, not per-service) |
-| `policy_defaults` (global preferences) | folded into the top-level `policy` tree (`timeout` / `risk` / `default` / `categories`) |
-| per-rule `level` pin, per-rule `ask_ttl` | rules carry `risk` only; the cache TTL field is `ttl` |
+| `policy_defaults` (global preferences) | folded into the top-level `policy` tree (`timeout` / `default` / `categories`) |
+| per-rule `ask_ttl`; the interim `risk` tier + per-vault `risk`→level map | rules carry their access `level` directly; the cache TTL field is `ttl` |
 
 ---
 

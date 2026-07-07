@@ -93,11 +93,11 @@ pub struct SecretsCache {
     pub allow_secrets: HashMap<String, HashMap<String, Vec<u8>>>,
     /// The effective policy tree — the vault's `aux.policy` overlaid on the
     /// compiled-in `Policy::default()` at unlock/refresh (so unset parts use
-    /// safe defaults). Holds the risk map, default floors, per-category, and
-    /// per-connection user policy. Built-in per-service rules are NOT cached
-    /// here — they're read live from the service registry at eval and merged
-    /// with this tree's `connections.<id>.rules`. Rebuilt on every vault write
-    /// → a `risk` / map edit is realtime on the next request.
+    /// safe defaults). Holds default floors, per-category, and per-connection
+    /// user policy. Built-in per-service rules are NOT cached here — they're
+    /// read live from the service registry at eval and merged with this tree's
+    /// `connections.<id>.rules`. Rebuilt on every vault write → a policy edit is
+    /// realtime on the next request.
     pub policy: crate::core::policy::Policy,
     /// Audit log retention in days. Snapshot of `aux.audit_retention_days`
     /// at unlock. `None` = keep forever. Used by `GET /v/{vid}/approvals` to
@@ -558,8 +558,8 @@ impl AppState {
     /// Resolution (PROTOCOL.md §6.4):
     ///   - merge the service's built-in rules with this connection's
     ///     user rules (`cache.policy.connections[conn].rules`),
-    ///   - most-restrictive matching rule wins (deny-override), its `risk`
-    ///     resolved through the live risk map (`cache.policy.risk`),
+    ///   - most-restrictive matching rule wins (deny-override), each rule's
+    ///     decision being its own `level`,
     ///   - else connection / category / global default floor, else ask-always,
     ///   - **active `ask` approvals** — if the decision is `Ask`, a rule
     ///     matched, AND the `(connection, rule_id, method)` triple is in the
@@ -605,9 +605,9 @@ impl AppState {
             conn_policy.and_then(|c| c.default.as_ref()),
             builtin_levels.as_ref(),
         );
-        // The risk map + category/global floors live in `cache.policy` (the
-        // user's `aux.policy` overlaid on compiled defaults at refresh). Read
-        // live here → a risk-map edit is realtime on the next request.
+        // The category/global floors live in `cache.policy` (the user's
+        // `aux.policy` overlaid on compiled defaults at refresh). Read live
+        // here → a policy edit is realtime on the next request.
         let category = self.services.default_category(service_id);
         let (level, matched_rule, ttl) = crate::core::policy::evaluate_with_match(
             method,
@@ -880,13 +880,13 @@ mod tests {
     /// a single approval blanket-authorized every verb on a service.
     #[test]
     fn ask_grant_is_scoped_to_method_and_rule() {
-        use crate::core::policy::{AccessLevel, ConnectionPolicy, Policy, RiskTier, RuleConfig};
+        use crate::core::policy::{AccessLevel, ConnectionPolicy, Policy, RuleConfig};
 
-        // Inject the test rules as the connection's user rules (medium → ask).
+        // Inject the test rules as the connection's user rules (level = ask).
         // "gh" has no service definition, so built-in is empty and these are the only rules.
         let ask_rule = |pat: &str| RuleConfig {
             match_pattern: Some(pat.to_string()),
-            risk: Some(RiskTier::Medium),
+            level: Some(AccessLevel::Ask),
             ttl: Some(60),
             ..Default::default()
         };

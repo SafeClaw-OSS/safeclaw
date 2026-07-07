@@ -6,10 +6,10 @@ write = "ask-always"
 id = "list-files"
 label = "List files"
 match = "GET /drive/v3/files"
-risk = "low"
+level = "allow"
 
 [[rule]]
 id = "delete-file"
 label = "Delete file"
 match = "DELETE /drive/v3/files/*"
-risk = "critical"
+level = "ask-always"

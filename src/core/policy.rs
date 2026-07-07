@@ -1,15 +1,12 @@
-//! Policy engine — risk-classified rules → access decisions.
+//! Policy engine — path-matched rules → access decisions.
 //!
-//! Two vocabularies, deliberately distinct and never co-occurring on one object:
-//!
-//! - **risk** ([`RiskTier`]) — a CLASSIFICATION of an action: `low | medium |
-//!   high | critical` (the standard severity scale). Lives only on *rules*.
-//! - **level** ([`AccessLevel`]) — the access DECISION: `allow | ask |
-//!   ask-always | deny`. Lives only in the [`RiskMap`], in the read/write
-//!   defaults, and as the resolved output.
-//!
-//! The bridge is [`RiskMap`] (`aux.policy.risk`): risk → level, read live at
-//! eval so a user edit re-tunes every same-tier rule on the next request.
+//! **One vocabulary**: [`AccessLevel`] (`allow | ask | ask-always | deny`) — the
+//! access DECISION. It is what a rule declares, what the read/write floor
+//! declares, and what evaluation returns. (An earlier revision split an
+//! author-assigned `risk` CLASSIFICATION from the resolved `level`, bridged by a
+//! per-vault risk→level map. That indirection is gone: a rule states its
+//! decision directly, and the recipe author writes `allow`/`ask` on the action
+//! instead of a `low`/`high` label.)
 //!
 //! Resolution order (PROTOCOL.md §6.4): most-restrictive matching rule
 //! (deny-override / fail-safe) → connection default → category default →
@@ -51,6 +48,17 @@ impl std::fmt::Display for AccessLevel {
 }
 
 impl AccessLevel {
+    /// Parse a kebab-case level name. `None` for anything else.
+    pub fn parse(s: &str) -> Option<AccessLevel> {
+        match s {
+            "allow" => Some(AccessLevel::Allow),
+            "ask" => Some(AccessLevel::Ask),
+            "ask-always" => Some(AccessLevel::AskAlways),
+            "deny" => Some(AccessLevel::Deny),
+            _ => None,
+        }
+    }
+
     /// Restrictiveness rank — higher = stricter. Used to resolve overlapping
     /// rules by "most restrictive wins" (deny-override / fail-safe, à la AWS
     /// IAM / Cedar). PROTOCOL.md §6.4.
@@ -64,86 +72,13 @@ impl AccessLevel {
     }
 }
 
-// ── Risk Tier ──────────────────────────────────────────────────────────────────
-
-/// Author-assigned risk classification — the SINGLE thing a rule declares about
-/// *what it is*. The concrete decision is derived via [`RiskMap`]. `low /
-/// medium / high / critical` is the standard severity scale (CVSS, security
-/// advisories), mapping 1:1 to the four access levels by default. `risk` hangs
-/// on the *rule* (matcher + optional body predicate), not a fixed action enum,
-/// so future predicate rules (`amount > $100`) classify the same way.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum RiskTier {
-    Low,
-    Medium,
-    High,
-    Critical,
-}
-
-impl std::fmt::Display for RiskTier {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            RiskTier::Low => write!(f, "low"),
-            RiskTier::Medium => write!(f, "medium"),
-            RiskTier::High => write!(f, "high"),
-            RiskTier::Critical => write!(f, "critical"),
-        }
-    }
-}
-
-impl RiskTier {
-    /// Parse a kebab-case tier name. `None` for anything else.
-    pub fn parse(s: &str) -> Option<RiskTier> {
-        match s {
-            "low" => Some(RiskTier::Low),
-            "medium" => Some(RiskTier::Medium),
-            "high" => Some(RiskTier::High),
-            "critical" => Some(RiskTier::Critical),
-            _ => None,
-        }
-    }
-}
-
-/// Maps each [`RiskTier`] to an [`AccessLevel`] — THE only knob between a rule's
-/// `risk` and its approval behaviour. Sparse: each tier is optional and falls
-/// back to the built-in default in [`RiskMap::get`], so a user customising one
-/// tier (`{"medium":"allow"}`) is a clean JSON-merge-patch (PROTOCOL.md §3.3).
-/// Lives in [`Policy::risk`] (`aux.policy.risk`), read live at eval → realtime,
-/// zero cache invalidation.
-///
-/// The built-in default **never produces `deny`**: SafeClaw gates, it does not
-/// block by default. `deny` is opt-in — set `critical` (or one rule) to it.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct RiskMap {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub low: Option<AccessLevel>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub medium: Option<AccessLevel>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub high: Option<AccessLevel>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub critical: Option<AccessLevel>,
-}
-
-impl RiskMap {
-    /// Resolve a tier to a level, filling the built-in default for unset tiers:
-    /// `low→allow, medium→ask, high→ask-always, critical→ask-always`.
-    pub fn get(&self, tier: RiskTier) -> AccessLevel {
-        match tier {
-            RiskTier::Low => self.low.unwrap_or(AccessLevel::Allow),
-            RiskTier::Medium => self.medium.unwrap_or(AccessLevel::Ask),
-            RiskTier::High => self.high.unwrap_or(AccessLevel::AskAlways),
-            RiskTier::Critical => self.critical.unwrap_or(AccessLevel::AskAlways),
-        }
-    }
-}
-
 // ── Rules ───────────────────────────────────────────────────────────────────────
 
 /// A fully-formed policy rule — from a service's `policy.toml`, or the merged
-/// result after user edits. CLASSIFIES a matched request by `risk`; the
-/// decision comes from the [`RiskMap`]. Rules never carry a `level`.
+/// result after user edits. A matched rule decides the request via its `level`.
+/// `level` hangs on the *rule* (matcher + optional `body` predicate), so future
+/// predicate rules (`amount > $100`) decide the same way. A rule with no `level`
+/// is malformed — it can never decide — and is skipped at evaluation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PolicyRule {
     /// Unique id (e.g. "send-email"). The key for user edits / the ask-cache scope.
@@ -158,9 +93,9 @@ pub struct PolicyRule {
     /// Regex matched against request body text. Omit to skip body matching.
     #[serde(default)]
     pub body: Option<String>,
-    /// Risk classification. Decision = `risk_map[risk]`, resolved live.
+    /// The access decision when this rule matches.
     #[serde(default)]
-    pub risk: Option<RiskTier>,
+    pub level: Option<AccessLevel>,
     /// Cache TTL (seconds) after an `ask` approval, scoped to this rule
     /// (PROTOCOL.md §6.1 `policy.rules[].ttl`).
     #[serde(default)]
@@ -168,15 +103,17 @@ pub struct PolicyRule {
 }
 
 impl PolicyRule {
-    /// The access decision for this rule under `risk_map`. `None` only if the
-    /// rule declares no `risk` (malformed) → caller falls through to defaults.
-    pub fn effective_level(&self, risk_map: &RiskMap) -> Option<AccessLevel> {
-        self.risk.map(|r| risk_map.get(r))
+    /// The access decision for this rule. `None` only if the rule declares no
+    /// `level` (malformed) → caller falls through to defaults.
+    pub fn effective_level(&self) -> Option<AccessLevel> {
+        self.level
     }
 }
 
-/// Read/write access levels — a floor DECISION (not a classification) for when
-/// no rule matches. Used at the connection, category, and global layers.
+/// Read/write access levels — a floor DECISION for when no rule matches. Used at
+/// the connection, category, and global layers. The read/write split is the
+/// method-derived base: `is_write_method` picks `write` for mutating methods,
+/// `read` otherwise.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Levels {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -190,7 +127,7 @@ pub struct Levels {
 
 /// A sparse user edit to one rule, keyed by rule id in `aux.policy.connections.
 /// <id>.rules`. Two modes:
-///   - **override** an existing built-in rule (set `risk` and/or `ttl`; the id
+///   - **override** an existing built-in rule (set `level` and/or `ttl`; the id
 ///     matches a built-in),
 ///   - **add** a new rule (carries its own `match` — the presence of `match` is
 ///     what makes it a new rule rather than an override).
@@ -203,7 +140,7 @@ pub struct RuleConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub risk: Option<RiskTier>,
+    pub level: Option<AccessLevel>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ttl: Option<u64>,
 }
@@ -232,9 +169,6 @@ pub struct Policy {
     /// Approval hold timeout in seconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout: Option<u64>,
-    /// risk → level map (sparse; unset tiers use the built-in default).
-    #[serde(default)]
-    pub risk: RiskMap,
     /// Global default floor (when no rule and no more-specific default match).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default: Option<Levels>,
@@ -252,9 +186,9 @@ impl Default for Policy {
         // the agent never holds the secret, the daemon injects it — and only
         // *secondly* an approval gate for risky operations. So the baseline
         // floor is `allow` (inject + forward, no per-call friction); services
-        // tighten genuinely risky paths via `risk` on rules. (llm/channel are
-        // redundant with the global default but kept explicit so a future
-        // stricter global default doesn't silently re-gate them.)
+        // tighten genuinely sensitive paths with a stricter `level` on rules.
+        // (llm/channel are redundant with the global default but kept explicit
+        // so a future stricter global default doesn't silently re-gate them.)
         let allow_rw = || Levels {
             read: Some(AccessLevel::Allow),
             write: Some(AccessLevel::Allow),
@@ -265,7 +199,6 @@ impl Default for Policy {
         categories.insert("channel".into(), allow_rw());
         Self {
             timeout: Some(300),
-            risk: RiskMap::default(),
             default: Some(allow_rw()),
             categories,
             connections: HashMap::new(),
@@ -275,8 +208,7 @@ impl Default for Policy {
 
 impl Policy {
     /// Overlay a user's sparse `aux.policy` onto the compiled defaults so unset
-    /// parts (global floor, category defaults) keep safe values. The risk map
-    /// is self-defaulting ([`RiskMap::get`]) so it's taken as-is. Called at
+    /// parts (global floor, category defaults) keep safe values. Called at
     /// unlock/refresh to produce the effective policy the evaluator reads.
     pub fn effective(user: Option<&Policy>) -> Policy {
         let mut p = Policy::default();
@@ -284,7 +216,6 @@ impl Policy {
             if u.timeout.is_some() {
                 p.timeout = u.timeout;
             }
-            p.risk = u.risk.clone();
             if u.default.is_some() {
                 p.default = u.default.clone();
             }
@@ -315,7 +246,7 @@ pub fn merge_levels(user: Option<&Levels>, built_in: Option<&Levels>) -> Option<
 }
 
 /// Merge a connection's user [`RuleConfig`] edits onto a service's built-in
-/// rules. By id: an edit overrides `risk` / `ttl` (and `label`/`body` if given)
+/// rules. By id: an edit overrides `level` / `ttl` (and `label`/`body` if given)
 /// of the matching built-in; an entry with a `match` whose id is *not* built-in
 /// is appended as a new rule. PROTOCOL.md §6.4 `M.policy` (logical merged view).
 pub fn merge_rules(
@@ -328,7 +259,7 @@ pub fn merge_rules(
             let edit = rule.id.as_ref().and_then(|id| user.get(id));
             match edit {
                 Some(e) => PolicyRule {
-                    risk: e.risk.or(rule.risk),
+                    level: e.level.or(rule.level),
                     ttl: e.ttl.or(rule.ttl),
                     label: e.label.clone().or_else(|| rule.label.clone()),
                     body: e.body.clone().or_else(|| rule.body.clone()),
@@ -351,7 +282,7 @@ pub fn merge_rules(
                 label: e.label.clone(),
                 match_pattern: Some(m.clone()),
                 body: e.body.clone(),
-                risk: e.risk,
+                level: e.level,
                 ttl: e.ttl,
             });
         }
@@ -492,8 +423,8 @@ pub fn evaluate_with_match(
             if !matches_rule(rule, method, path, body) {
                 continue;
             }
-            let Some(level) = rule.effective_level(&policy.risk) else {
-                continue; // rule declares no risk → no decision; skip.
+            let Some(level) = rule.effective_level() else {
+                continue; // rule declares no level → no decision; skip.
             };
             let key = (level.restrictiveness(), specificity(rule));
             if best.is_none() || key > (best.unwrap().0, best.unwrap().1) {
@@ -542,34 +473,23 @@ mod tests {
         Policy::default()
     }
 
-    fn rule(id: &str, pat: &str, risk: RiskTier) -> PolicyRule {
+    fn rule(id: &str, pat: &str, level: AccessLevel) -> PolicyRule {
         PolicyRule {
             id: Some(id.into()),
             label: None,
             match_pattern: Some(pat.into()),
             body: None,
-            risk: Some(risk),
+            level: Some(level),
             ttl: None,
         }
     }
 
-    // ── RiskMap ────────────────────────────────────────────────────────────
+    // ── AccessLevel ──────────────────────────────────────────────────────────
     #[test]
-    fn risk_map_default_never_denies() {
-        let m = RiskMap::default();
-        assert_eq!(m.get(RiskTier::Low), AccessLevel::Allow);
-        assert_eq!(m.get(RiskTier::Medium), AccessLevel::Ask);
-        assert_eq!(m.get(RiskTier::High), AccessLevel::AskAlways);
-        assert_eq!(m.get(RiskTier::Critical), AccessLevel::AskAlways); // NOT deny
-    }
-
-    #[test]
-    fn risk_map_is_sparse() {
-        // A user customising one tier deserializes; unset tiers keep defaults.
-        let m: RiskMap = serde_json::from_str(r#"{"medium":"allow"}"#).unwrap();
-        assert_eq!(m.get(RiskTier::Medium), AccessLevel::Allow); // customised
-        assert_eq!(m.get(RiskTier::Low), AccessLevel::Allow); // default
-        assert_eq!(m.get(RiskTier::Critical), AccessLevel::AskAlways); // default
+    fn access_level_parses_and_ranks() {
+        assert_eq!(AccessLevel::parse("ask-always"), Some(AccessLevel::AskAlways));
+        assert_eq!(AccessLevel::parse("nope"), None);
+        assert!(AccessLevel::Deny.restrictiveness() > AccessLevel::Allow.restrictiveness());
     }
 
     // ── Path matching / specificity (unchanged engine) ───────────────────────
@@ -582,55 +502,52 @@ mod tests {
     #[test]
     fn specificity_exact_with_method_beats_wildcard() {
         assert!(
-            specificity(&rule("a", "POST /m/send", RiskTier::High))
-                > specificity(&rule("b", "POST /m/*", RiskTier::Low))
+            specificity(&rule("a", "POST /m/send", AccessLevel::AskAlways))
+                > specificity(&rule("b", "POST /m/*", AccessLevel::Allow))
         );
     }
 
-    // ── Risk resolution ──────────────────────────────────────────────────────
+    // ── Level resolution ─────────────────────────────────────────────────────
     #[test]
-    fn risk_resolves_via_map() {
-        // The headline: list (low→allow) + read (medium→ask) = read an email in
-        // ONE approval, not two.
-        let low = vec![rule("list", "GET /m", RiskTier::Low)];
+    fn level_on_rule_decides() {
+        // The headline: list (allow) + read (ask) = read an email in ONE
+        // approval, not two.
+        let low = vec![rule("list", "GET /m", AccessLevel::Allow)];
         assert_eq!(evaluate("GET", "/m", None, Some(&low), None, &policy(), None), AccessLevel::Allow);
-        let med = vec![rule("read", "GET /m/*", RiskTier::Medium)];
+        let med = vec![rule("read", "GET /m/*", AccessLevel::Ask)];
         assert_eq!(evaluate("GET", "/m/1", None, Some(&med), None, &policy(), None), AccessLevel::Ask);
-        let high = vec![rule("send", "POST /m/send", RiskTier::High)];
+        let high = vec![rule("send", "POST /m/send", AccessLevel::AskAlways)];
         assert_eq!(evaluate("POST", "/m/send", None, Some(&high), None, &policy(), None), AccessLevel::AskAlways);
-        let crit = vec![rule("del", "DELETE /m/*", RiskTier::Critical)];
-        assert_eq!(evaluate("DELETE", "/m/1", None, Some(&crit), None, &policy(), None), AccessLevel::AskAlways);
+        let del = vec![rule("del", "DELETE /m/*", AccessLevel::Deny)];
+        assert_eq!(evaluate("DELETE", "/m/1", None, Some(&del), None, &policy(), None), AccessLevel::Deny);
     }
 
     #[test]
-    fn editing_risk_map_retunes_all_same_tier_rules() {
-        let mut p = policy();
-        p.risk.medium = Some(AccessLevel::Allow); // user loosens medium globally
-        let rules = vec![rule("read", "GET /x/*", RiskTier::Medium)];
-        assert_eq!(evaluate("GET", "/x/1", None, Some(&rules), None, &p, None), AccessLevel::Allow);
-    }
-
-    #[test]
-    fn user_can_set_critical_to_deny() {
-        let mut p = policy();
-        p.risk.critical = Some(AccessLevel::Deny);
-        let rules = vec![rule("del", "DELETE /m/*", RiskTier::Critical)];
-        assert_eq!(evaluate("DELETE", "/m/1", None, Some(&rules), None, &p, None), AccessLevel::Deny);
+    fn rule_with_no_level_is_skipped() {
+        // A malformed rule (no level) can never decide → falls through to the
+        // global default (allow).
+        let bad = vec![PolicyRule {
+            id: Some("bad".into()),
+            label: None,
+            match_pattern: Some("GET /x".into()),
+            body: None,
+            level: None,
+            ttl: None,
+        }];
+        assert_eq!(evaluate("GET", "/x", None, Some(&bad), None, &policy(), None), AccessLevel::Allow);
     }
 
     // ── Conflict resolution: deny-override / most-restrictive ─────────────────
     #[test]
     fn most_restrictive_matching_rule_wins() {
-        // Two rules match the same request; the stricter (critical) wins even
-        // though it's less specific — fail-safe, not most-specific.
-        let mut p = policy();
-        p.risk.critical = Some(AccessLevel::Deny);
+        // Two rules match the same request; the stricter (deny) wins even though
+        // it's less specific — fail-safe, not most-specific.
         let rules = vec![
-            rule("broad", "DELETE /m/*", RiskTier::Critical), // less specific, stricter
-            rule("narrow", "DELETE /m/safe", RiskTier::Low),  // more specific, looser
+            rule("broad", "DELETE /m/*", AccessLevel::Deny),      // less specific, stricter
+            rule("narrow", "DELETE /m/safe", AccessLevel::Allow), // more specific, looser
         ];
         assert_eq!(
-            evaluate("DELETE", "/m/safe", None, Some(&rules), None, &p, None),
+            evaluate("DELETE", "/m/safe", None, Some(&rules), None, &policy(), None),
             AccessLevel::Deny
         );
     }
@@ -658,27 +575,36 @@ mod tests {
 
     // ── Merge: override by id + add new rule ──────────────────────────────────
     #[test]
-    fn merge_overrides_risk_by_id() {
-        let built_in = vec![rule("read", "GET /m/*", RiskTier::Medium)];
+    fn merge_overrides_level_by_id() {
+        let built_in = vec![rule("read", "GET /m/*", AccessLevel::Ask)];
         let mut user = HashMap::new();
-        user.insert("read".into(), RuleConfig { risk: Some(RiskTier::Low), ..Default::default() });
+        user.insert("read".into(), RuleConfig { level: Some(AccessLevel::Allow), ..Default::default() });
         let merged = merge_rules(&built_in, &user);
-        assert_eq!(merged[0].risk, Some(RiskTier::Low));
+        assert_eq!(merged[0].level, Some(AccessLevel::Allow));
         assert_eq!(merged[0].match_pattern.as_deref(), Some("GET /m/*")); // preserved
     }
 
     #[test]
+    fn merge_lets_user_tighten_a_rule_to_deny() {
+        let built_in = vec![rule("del", "DELETE /m/*", AccessLevel::AskAlways)];
+        let mut user = HashMap::new();
+        user.insert("del".into(), RuleConfig { level: Some(AccessLevel::Deny), ..Default::default() });
+        let merged = merge_rules(&built_in, &user);
+        assert_eq!(evaluate("DELETE", "/m/1", None, Some(&merged), None, &policy(), None), AccessLevel::Deny);
+    }
+
+    #[test]
     fn merge_adds_new_rule_with_match() {
-        let built_in = vec![rule("send", "POST /m/send", RiskTier::High)];
+        let built_in = vec![rule("send", "POST /m/send", AccessLevel::AskAlways)];
         let mut user = HashMap::new();
         user.insert("vip".into(), RuleConfig {
             match_pattern: Some("POST /m/vip".into()),
-            risk: Some(RiskTier::Low),
+            level: Some(AccessLevel::Allow),
             ..Default::default()
         });
         let merged = merge_rules(&built_in, &user);
         assert_eq!(merged.len(), 2);
-        assert!(merged.iter().any(|r| r.id.as_deref() == Some("vip") && r.risk == Some(RiskTier::Low)));
+        assert!(merged.iter().any(|r| r.id.as_deref() == Some("vip") && r.level == Some(AccessLevel::Allow)));
     }
 
     #[test]
@@ -694,7 +620,7 @@ mod tests {
     // ── ask-cache scope: method is part of the key (regression) ──────────────
     #[test]
     fn matched_rule_id_and_ttl_returned_for_ask_cache() {
-        let mut rules = vec![rule("read", "GET /x", RiskTier::Medium)];
+        let mut rules = vec![rule("read", "GET /x", AccessLevel::Ask)];
         rules[0].ttl = Some(60);
         let (lvl, id, ttl) = evaluate_with_match("GET", "/x", None, Some(&rules), None, &policy(), None);
         assert_eq!(lvl, AccessLevel::Ask);

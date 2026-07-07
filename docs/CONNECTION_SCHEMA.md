@@ -193,9 +193,9 @@ A connection's policy is keyed by the same `connection_id` under
 set comes from the connection's *service* recipe (`policy.toml`); the user's
 sparse edits/additions merge on top (`ConnectionPolicy { default?, rules }`). Two
 connections of the same service (`gmail`, `gmail_work`) therefore get independent
-policy overrides. The full policy model — risk tiers, the risk→level map, the
+policy overrides. The full policy model — per-action `level` decisions, the
 default floors, deny-override resolution, `ttl` — is in
-[POLICY_RISK_TIERS.md](POLICY_RISK_TIERS.md); the whole `aux.policy` tree is in
+[POLICY.md](POLICY.md); the whole `aux.policy` tree is in
 [STORES_AND_ITEMS.md §7](STORES_AND_ITEMS.md).
 
 ---

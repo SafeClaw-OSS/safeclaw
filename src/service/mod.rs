@@ -244,10 +244,10 @@ pub struct TomlPolicyRule {
 }
 
 impl TomlPolicyRule {
-    /// Convert legacy method+path_exact+path_suffix to a risk-classified rule.
-    /// The legacy `level` is mapped to the equivalent risk tier.
+    /// Convert legacy method+path_exact+path_suffix to a core rule. The legacy
+    /// `level` is the access decision directly.
     fn to_core_rule(&self) -> Option<crate::core::policy::PolicyRule> {
-        let risk = level_to_risk(&self.level)?;
+        let level = crate::core::policy::AccessLevel::parse(&self.level)?;
 
         let path_part = if let Some(ref exact) = self.path_exact {
             exact.trim_end_matches('/').to_string()
@@ -266,7 +266,7 @@ impl TomlPolicyRule {
             label: None,
             match_pattern: Some(match_pattern),
             body: None,
-            risk: Some(risk),
+            level: Some(level),
             ttl: None,
         })
     }
@@ -291,10 +291,10 @@ pub struct PolicyFileRule {
     /// Regex matched against request body (optional).
     #[serde(default)]
     pub body: Option<String>,
-    /// Risk tier (`low` | `medium` | `high` | `critical`). The decision is
-    /// derived live via the vault's risk map. A rule with no `risk` is skipped.
+    /// Access decision (`allow` | `ask` | `ask-always` | `deny`) when this rule
+    /// matches. A rule with no parseable `level` is skipped.
     #[serde(default)]
-    pub risk: Option<String>,
+    pub level: Option<String>,
     /// `ask`-cache TTL in seconds (PROTOCOL.md §6.1 `policy.rules[].ttl`).
     #[serde(default)]
     pub ttl: Option<u64>,
@@ -312,15 +312,15 @@ impl PolicyFileDef {
 
     pub fn to_policy_rules(&self) -> Vec<crate::core::policy::PolicyRule> {
         self.rule.iter().filter_map(|r| {
-            // A rule classifies by risk only; one with no parseable risk is
+            // A rule decides via its `level`; one with no parseable level is
             // skipped (it could never decide).
-            let risk = r.risk.as_deref().and_then(crate::core::policy::RiskTier::parse)?;
+            let level = r.level.as_deref().and_then(crate::core::policy::AccessLevel::parse)?;
             Some(crate::core::policy::PolicyRule {
                 id: Some(r.id.clone()),
                 label: Some(r.label.clone()),
                 match_pattern: Some(r.match_pattern.clone()),
                 body: r.body.clone(),
-                risk: Some(risk),
+                level: Some(level),
                 ttl: r.ttl,
             })
         }).collect()
@@ -333,19 +333,6 @@ fn parse_access_level(s: Option<&String>) -> Option<crate::core::policy::AccessL
         "ask" => Some(crate::core::policy::AccessLevel::Ask),
         "ask-always" => Some(crate::core::policy::AccessLevel::AskAlways),
         "deny" => Some(crate::core::policy::AccessLevel::Deny),
-        _ => None,
-    }
-}
-
-/// Map a legacy access-level string to the equivalent risk tier (for the
-/// deprecated inline `[[policy.rules]]` format, which still used `level`).
-fn level_to_risk(level: &str) -> Option<crate::core::policy::RiskTier> {
-    use crate::core::policy::RiskTier;
-    match level {
-        "allow" => Some(RiskTier::Low),
-        "ask" => Some(RiskTier::Medium),
-        "ask-always" => Some(RiskTier::High),
-        "deny" => Some(RiskTier::Critical),
         _ => None,
     }
 }

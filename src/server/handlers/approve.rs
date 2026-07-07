@@ -1079,8 +1079,8 @@ pub async fn reject_op(
 ///      anymore: a rule-level Allow on a service whose default was Ask still
 ///      needs the bytes ready for fast-path forwarding.
 ///   2. `policy` — the effective policy tree (`aux.policy` overlaid on
-///      compiled defaults). Holds the risk map, default floors, per-category,
-///      and per-connection user policy. Built-in per-service rules are read
+///      compiled defaults). Holds default floors, per-category, and
+///      per-connection user policy. Built-in per-service rules are read
 ///      live from the service at eval, not cached here.
 /// Build + persist the local per-item store (`vault.per-item.json`) from a
 /// just-decrypted whole-blob vault + its view. The keyset (registry +
@@ -1145,8 +1145,8 @@ pub(crate) fn bootstrap_cache_from_view(
 ) -> SecretsCache {
     let mut cache = SecretsCache::default();
     // Effective policy = the vault's sparse `aux.policy` overlaid on compiled
-    // defaults. Rebuilt here on every unlock/refresh, so a risk-map / per-
-    // connection edit is live on the next request (PROTOCOL.md §6.2/§6.4).
+    // defaults. Rebuilt here on every unlock/refresh, so a per-connection edit
+    // is live on the next request (PROTOCOL.md §6.2/§6.4).
     cache.policy = crate::core::policy::Policy::effective(view.aux.policy.as_ref());
     cache.audit_retention_days = view.aux.audit_retention_days;
     // Routing snapshot (CONNECTION_SCHEMA.md §6): `connection_id → {service,

@@ -21,10 +21,10 @@ read = "allow"
 id = "inbox-read-recent"
 label = "List recent messages in your own inbox bucket"
 match = "GET /recent"
-risk = "low"
+level = "allow"
 
 [[rule]]
 id = "inbox-any"
 label = "Any call to the inbox service"
 match = "*"
-risk = "medium"
+level = "ask"

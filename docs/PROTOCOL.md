@@ -592,7 +592,7 @@ Sketch:
 **关键 sections**:
 - `stores` / `store_order` / per-store `items`: 见 STORES_AND_ITEMS.md（核心 vault 内容模型）
 - `connecting` / `connections`: 连接抽象，keyed by `connection_id`（见 CONNECTION_SCHEMA.md）
-- `policy`: standing authorization（SUDP §02 "Policy"）= ONE tree `{ timeout, risk, default, categories, connections }` — risk→level 映射 + 默认 floor + per-category + **per-connection** 用户策略。替代旧的 `policy_defaults` + `service_state` 二分。详 §6.4
+- `policy`: standing authorization（SUDP §02 "Policy"）= ONE tree `{ timeout, default, categories, connections }` — 默认 floor + per-category + **per-connection** 用户策略；rule 直接携带决策 `level`。替代旧的 `policy_defaults` + `service_state` 二分。详 §6.4
 - `push_subscriptions`: Web Push 订阅端点
 - `vapid_private_key`: Web Push 签名私钥
 - `peers`: SUDP rotation 的 in-state peer map（每次 write op 由 acting credential 更新自己的 entry，对其他 credentials 用缓存的 W_c 重新 wrap K'，详 SUDP paper §05-sudp-protocol/06-phase3-consumption.tex Default recoverability policy）
@@ -767,8 +767,7 @@ NOT in memory:
   - 任何 ask/ask-always 服务的 auth（未在 cache 时）
 ```
 
-**Default `memory_ttl`**（按 **effective level** 派生 —— 即 rule 的 `risk` 经 `M.policy.risk`
-映射后的决策，§6.4）:
+**Default `memory_ttl`**（按 **effective level** 派生 —— 即 rule 的 `level`，或 floor 决策，§6.4）:
 
 | effective level | 默认 `memory_ttl` | secrets_cache 行为 |
 |---|---|---|
@@ -804,9 +803,10 @@ User 可在 vault `services.<name>.memory_ttl` 显式覆盖。
 
 ### 6.4 Policy 形式化
 
-`M.policy` 是一棵树：`{ timeout, risk, default, categories, connections }`。一条 **rule
-只声明 `risk`**（`low|medium|high|critical`，分类）；**决策 `level`**（`allow|ask|ask-always|deny`）
-由 `M.policy.risk` 映射派生（risk→level），read live。两套词汇正交、永不在 rule 上共存。
+`M.policy` 是一棵树：`{ timeout, default, categories, connections }`。**单一词汇 `level`**
+（`allow|ask|ask-always|deny`，访问决策）：一条 rule 直接声明它的 `level`，read/write floor
+也是 level，求值输出也是 level。（旧版曾把 rule 的 `risk` 分类经一张 per-vault 映射表派生到
+`level`；该间接层已删除——recipe 作者直接在动作上写决策。）
 
 一个连接的有效 rule 集 = 该连接 *service* recipe 的内置 rule ⊕ 用户的
 `M.policy.connections.<conn>.rules`（按 id override，或带 `match` 的新增）。
@@ -822,7 +822,7 @@ Policy(conn_id, o):
   // Conflict resolution = DENY-OVERRIDE / most-restrictive wins (fail-safe,
   // à la IAM/Cedar). Among ALL matching rules, pick the strictest effective
   // level; specificity only tiebreaks (for a deterministic ask-cache scope).
-  level = max_by_restrictiveness( risk_map[r.risk] for r in rules if matches(r, o) )
+  level = max_by_restrictiveness( r.level for r in rules if matches(r, o) and r.level != null )
           ?? connection_default ?? category_default ?? global_default ?? "ask-always"
   case level:
     "allow"       => admit
@@ -835,9 +835,9 @@ Policy(conn_id, o):
          not admitted (must trigger approval flow)
 ```
 
-**risk → level 默认映射**（`M.policy.risk`，sparse + 用户可改 + self-defaulting）：
-`low→allow, medium→ask, high→ask-always, critical→ask-always`. **deny 从不做默认**——
-SafeClaw 是 gate 非 block；用户显式把 `critical`（或某条 rule）设成 `deny` 才会拒。
+一条 `level` 为空的 rule（畸形）无法决策 → 跳过，落到 floor。**deny 从不做出厂默认**——
+SafeClaw 是 gate 非 block；recipe/用户显式把某条 rule 设成 `deny` 才会拒。基线 floor 从请求
+方法派生（`is_write_method`：写→`write`，否则→`read`）。
 
 **Restrictiveness 全序**（deny-override 用）：`deny > ask-always > ask > allow`.
 

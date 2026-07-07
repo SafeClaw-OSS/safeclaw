@@ -204,8 +204,9 @@ pub struct RegistryPolicyRule {
     pub match_pattern: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub body: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub risk: Option<String>,
+    /// The built-in access decision (`allow` | `ask` | `ask-always` | `deny`)
+    /// the recipe declares for this action. The console shows it and lets the
+    /// user override it per-connection.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub level: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -270,15 +271,16 @@ fn policy_for(
             p.rule
                 .iter()
                 .map(|r| {
-                    let risk = r.risk.as_deref().and_then(crate::core::policy::RiskTier::parse);
-                    let level = risk
-                        .map(|t| crate::core::policy::RiskMap::default().get(t).to_string());
+                    let level = r
+                        .level
+                        .as_deref()
+                        .and_then(crate::core::policy::AccessLevel::parse)
+                        .map(|l| l.to_string());
                     RegistryPolicyRule {
                         id: r.id.clone(),
                         label: r.label.clone(),
                         match_pattern: r.match_pattern.clone(),
                         body: r.body.clone(),
-                        risk: risk.map(|t| t.to_string()),
                         level,
                         ttl: r.ttl,
                     }

@@ -177,8 +177,8 @@ pub struct VaultAux {
     pub version: u32,
     pub stores: BTreeMap<String, Store>,
     pub store_order: Vec<String>,
-    /// The policy tree — risk map, default floors, per-category, and per-
-    /// connection user policy (PROTOCOL.md §5.2 / §6.4 `M.policy`). Absent on
+    /// The policy tree — default floors, per-category, and per-connection user
+    /// policy (PROTOCOL.md §5.2 / §6.4 `M.policy`). Absent on
     /// fresh vaults → daemon uses `Policy::default()`. Replaces the old split
     /// `policy_defaults` + `service_state`.
     #[serde(default, skip_serializing_if = "Option::is_none")]

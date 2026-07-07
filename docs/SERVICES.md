@@ -9,7 +9,7 @@ A service is a folder `services/{category}/{id}/`:
 ```
 services/integration/github/
   service.toml     # this page
-  policy.toml      # risk-tier rules — see POLICY_RISK_TIERS.md; rules match (host, path, method)
+  policy.toml      # per-action rules (each declares a level) — see POLICY.md; rules match (host, path, method)
 ```
 
 Format: TOML (authored by humans/agents; CI publishes `registry.json`).
