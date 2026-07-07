@@ -274,7 +274,7 @@ impl BrokerHandler {
                     || self.state.custom_service(&vault_id, &conn).is_some();
                 if known_service {
                     crate::storage::plaintext::Connection {
-                        label: None,
+                        name: None,
                         service: Some(conn.clone()),
                         hosts: None,
                         secrets: None,

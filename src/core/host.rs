@@ -204,7 +204,7 @@ mod tests {
         let mut def = direct("acme", &["api.acme.com"], &["ACME_TOKEN"]);
         def.service.hosts.push("*.acme.dev".to_string());
         let conn = Connection {
-            label: None,
+            name: None,
             service: Some("acme".to_string()),
             hosts: Some(vec!["tenant1.acme.dev".to_string()]),
             secrets: None,
@@ -217,7 +217,7 @@ mod tests {
 
     #[test]
     fn resolved_hosts_raw_uses_own_hosts() {
-        let conn = Connection { label: None, service: None, hosts: Some(vec!["api.stripe.com".to_string()]), secrets: Some(vec!["STRIPE_KEY".to_string()]) };
+        let conn = Connection { name: None, service: None, hosts: Some(vec!["api.stripe.com".to_string()]), secrets: Some(vec!["STRIPE_KEY".to_string()]) };
         assert_eq!(resolved_hosts(&conn, None), vec!["api.stripe.com".to_string()]);
     }
 

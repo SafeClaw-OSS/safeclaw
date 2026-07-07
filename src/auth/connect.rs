@@ -127,16 +127,16 @@ pub fn apply_exchange_result(
     if let Some(rt) = &tokens.refresh_token {
         m.put_secret(secret_address(conn, service, role), rt.as_bytes().to_vec());
     }
-    // MOVE: drop from `connecting`, add to `connections` (label carried over).
+    // MOVE: drop from `connecting`, add to `connections` (name carried over).
     let mut connecting = aux_map::<Connecting>(m, "connecting");
-    let label = connecting.remove(conn).and_then(|c| c.label);
+    let name = connecting.remove(conn).and_then(|c| c.name);
     set_aux_map(m, "connecting", connecting);
 
     let mut connections = aux_map::<Connection>(m, "connections");
     connections.insert(
         conn.to_string(),
         // Service-backed: secrets derive from the service def, never stored here.
-        Connection { label, service: Some(service.to_string()), hosts, secrets: None },
+        Connection { name, service: Some(service.to_string()), hosts, secrets: None },
     );
     set_aux_map(m, "connections", connections);
 }

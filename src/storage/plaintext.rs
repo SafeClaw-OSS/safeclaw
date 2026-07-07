@@ -74,13 +74,15 @@ pub struct Store {
 /// configured. There is no status field to drift out of sync.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Connection {
-    /// User-facing display name — the VERBATIM qualifier/name the user typed
-    /// when creating this connection (spaces/case preserved; e.g. "Work
-    /// Laptop" → shown as "GitHub · Work Laptop"). Display-only: the conn id
-    /// stays the technical handle (phantoms / policy / audit). Absent =
-    /// render the id (default connections, CLI-created, pre-label rows).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub label: Option<String>,
+    /// User-facing display name — the FULL string shown in lists ("GitHub ·
+    /// Work Laptop", "Gmail", "Stripe Key"), verbatim as composed/typed at
+    /// creation. Same field name + contract as a service's `name`: every
+    /// creation path writes it; it is display-only (the conn id stays the
+    /// technical handle for phantoms / policy / audit). Wire-optional ONLY
+    /// for legacy rows (pre-name, CLI-created, or written as `label` — the
+    /// serde alias) — absent = render the id.
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "label")]
+    pub name: Option<String>,
     /// The service (TYPE) this instantiates, or `None` for a **raw** connection
     /// (`sc set K --host h`) that references no service and anchors its own
     /// `hosts`. When set, hosts derive from the service (SSoT); an instance may
@@ -120,9 +122,9 @@ pub struct Connection {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Connecting {
     /// User-facing display name, carried through to the established
-    /// [`Connection`] on exchange (see `Connection::label`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub label: Option<String>,
+    /// [`Connection`] on exchange (see `Connection::name`).
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "label")]
+    pub name: Option<String>,
     /// The service (TYPE) being instantiated.
     pub service: String,
     /// Exact FQDNs pinned at connect for a `*.suffix` wildcard service, carried

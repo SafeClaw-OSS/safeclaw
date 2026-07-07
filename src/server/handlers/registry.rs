@@ -632,7 +632,7 @@ secrets = ["GITHUB_TOKEN"]
     fn connection_rows_derive_phantoms_and_connected() {
         // Raw connection: explicit secrets, connected when the KEY is present.
         let conn = Connection {
-            label: None,
+            name: None,
             service: None,
             hosts: Some(vec!["api.stripe.com".to_string()]),
             secrets: Some(vec!["STRIPE_KEY".to_string()]),
