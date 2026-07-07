@@ -598,6 +598,10 @@ pub struct LogsArgs {
     /// Show only the last N lines (passed to journalctl as -n).
     #[arg(long, short = 'n', default_value = "200")]
     pub lines: u32,
+    /// Keep journald's full format (local wall-clock, host, pid). Default output
+    /// is `-o cat` — just the daemon's own already-timestamped line.
+    #[arg(long)]
+    pub raw: bool,
 }
 
 #[derive(Debug, Args)]

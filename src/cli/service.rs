@@ -195,6 +195,14 @@ pub fn run_logs(args: LogsArgs) -> Result<(), String> {
     let n = args.lines.to_string();
     let mut cmd = ProcCommand::new("journalctl");
     cmd.args(["--user", "-u", UNIT_BASENAME, "-n", &n]);
+    // `-o cat` prints only the daemon's own log line — which already carries an
+    // ISO timestamp + level + module — dropping journald's redundant
+    // `<date> <host> sc[pid]:` prefix that otherwise doubles the timestamp and
+    // pushes the useful message off the right edge. `--raw` restores the full
+    // journald format (local wall-clock, host, pid) when you want it.
+    if !args.raw {
+        cmd.args(["-o", "cat"]);
+    }
     if args.follow {
         cmd.arg("-f");
     }
