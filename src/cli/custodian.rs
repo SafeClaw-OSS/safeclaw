@@ -17,7 +17,11 @@ pub async fn pubkey(args: CommonArgs) -> Result<(), String> {
 /// reads. Offline by construction (`ServiceRegistry::compiled_only()`).
 pub fn registry(args: RegistryArgs) -> Result<(), String> {
     let reg = crate::service::ServiceRegistry::compiled_only();
-    let catalog = crate::server::handlers::registry::render_catalog(&reg, false, None, false)
+    // include_policy_rules = true: this catalog is the SSoT the CONSOLE reads
+    // (CI publishes it as registry.json) and the policy panel needs each
+    // service's per-action rules. The agent-facing `GET /registry` still omits
+    // them by default (lean); only this published artifact opts in.
+    let catalog = crate::server::handlers::registry::render_catalog(&reg, true, None, false)
         .map_err(|e| e.to_string())?;
     if args.json {
         println!(
