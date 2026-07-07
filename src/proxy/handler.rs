@@ -206,6 +206,18 @@ impl BrokerHandler {
 
         // No phantom anywhere → forward untouched (rebuild body if we buffered).
         if phantoms.is_empty() {
+            // We only reach here for an intercepted request — the host is anchored
+            // by some unlocked connection — that named no phantom. Most often the
+            // caller simply forgot it; left untouched the request goes upstream
+            // unauthenticated and the puzzling result is a bare 401/403 with no
+            // hint that the credential was never in the request. Leave a greppable
+            // breadcrumb (`sc logs --raw | grep phantom`) for exactly that debug.
+            tracing::debug!(
+                host = %dest_host,
+                "routed to an anchored host but the request carries no phantom — \
+                 forwarded unauthenticated; include the connection's phantom \
+                 (e.g. __sc__<conn>__) if brokering was intended"
+            );
             let body = body_bytes
                 .map(Body::from)
                 .unwrap_or_else(|| orig_body.take().unwrap_or_else(Body::empty));
