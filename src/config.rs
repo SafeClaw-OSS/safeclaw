@@ -61,9 +61,11 @@ pub enum Command {
     Lock(UnlockArgs),
     /// Tail the local daemon's logs (journalctl).
     Logs(LogsArgs),
-    /// Run the daemon in the FOREGROUND (this process). For Docker / dev / a
-    /// hand-written systemd unit. Config via SAFECLAW_* env + flags; Ctrl-C to
-    /// stop. The installed background service runs this under the hood.
+    /// ADVANCED / self-host: run the daemon in the FOREGROUND (this process),
+    /// for Docker / a hand-written systemd unit / non-systemd hosts. On a normal
+    /// Linux box you never call this — `sc up` installs a background service
+    /// whose entry-point IS `sc serve`. Config via SAFECLAW_* env + flags;
+    /// Ctrl-C to stop.
     Serve(ServeArgs),
     /// HPKE outer-envelope public key (diagnostic).
     #[command(hide = true)]
@@ -144,11 +146,16 @@ pub enum Command {
     /// plaintext secret ever enters the child's env — the agent writes the
     /// phantom (`__sc__<conn>__`) itself; the proxy substitutes at egress.
     Run(RunArgs),
-    /// Create a raw connection (a secret + its egress host anchor) in one step —
-    /// the CLI twin of the console's custom-connection form. Interactive: prompts
-    /// for host(s) then secret KEY(s) with hidden values. Non-interactive: pass
-    /// `--host <domain>` (repeatable) and `--secret KEY=VALUE` (repeatable) /
-    /// `--use-existing KEY`. The connection is reachable via `__sc__<name>__`.
+    /// Manage the connections in the active vault (add / ls / rm). A connection
+    /// is a secret (or several) bound to an egress host anchor; the agent reaches
+    /// it via the phantom `__sc__<id>__`. The CLI twin of the console's
+    /// "Connections". Short: `sc conn`.
+    #[command(alias = "conn")]
+    Connection(ConnectionArgs),
+    /// Back-compat alias for `sc connection add`. The canonical spelling is
+    /// `sc connection add <id>` (a noun-namespace, matching `sc secret`/`vault`/
+    /// `agent`); kept hidden so existing `sc connect …` calls keep working.
+    #[command(hide = true)]
     Connect(ConnectArgs),
     /// Print the safeclaw binary version.
     Version,
@@ -194,17 +201,21 @@ pub struct RunArgs {
     pub cmd: Vec<String>,
 }
 
-/// `sc connect` — create a raw connection (secret(s) + host anchor) in one
-/// unlock+write cycle.
+/// `sc connection add` (alias `sc connect`) — create a connection (secret(s) +
+/// host anchor) in one unlock+write cycle.
 #[derive(Debug, Args)]
 pub struct ConnectArgs {
-    /// Connection id: `[a-z0-9_]`, starts alphanumeric, no `__`. Becomes the
-    /// phantom `__sc__<name>__` and the user-facing handle.
-    pub name: String,
-    /// Back this connection with a catalog SERVICE (id from `sc registry`): its
-    /// hosts and declared secrets. `--host` then only PINS an exact FQDN inside
-    /// one of the service's `*.suffix` wildcards. Omit for a raw connection
-    /// (anchor your own `--host` + `--secret`).
+    /// A short id YOU choose for this connection (not picked from a list) —
+    /// free text is slugified to `[a-z0-9_]` (e.g. "My Work" → `my_work`) and
+    /// becomes the phantom `__sc__<id>__` the agent uses. Omit on a terminal to
+    /// be prompted (with the rest of the wizard); required off a terminal.
+    #[arg(value_name = "ID")]
+    pub name: Option<String>,
+    /// Back this connection with a catalog SERVICE — its id from `sc registry`
+    /// (e.g. `github`), which supplies the hosts + declared secret keys. `--host`
+    /// then only PINS an exact FQDN inside one of the service's `*.suffix`
+    /// wildcards. Omit for a raw connection (you anchor your own `--host` +
+    /// `--secret`).
     #[arg(long)]
     pub service: Option<String>,
     /// Anchored egress host (exact domain, repeatable). Required for a raw
@@ -217,10 +228,61 @@ pub struct ConnectArgs {
     #[arg(long)]
     pub secret: Vec<String>,
     /// Back this connection with an EXISTING vault secret named KEY (no new
-    /// value). Only valid when that secret's name lowercases to `<name>` (the
+    /// value). Only valid when that secret's name lowercases to `<id>` (the
     /// raw single-secret reverse-index) — i.e. promoting a `--no-broker` item.
     #[arg(long)]
     pub use_existing: Vec<String>,
+    #[arg(long)]
+    pub vault: Option<String>,
+    #[arg(long)]
+    pub no_browser: bool,
+    /// Fixed port for the localhost callback server (for SSH port-forwarding).
+    #[arg(long, env = "SAFECLAW_CB_PORT")]
+    pub cb_port: Option<u16>,
+    #[arg(long, default_value = "120")]
+    pub timeout: u64,
+}
+
+#[derive(Debug, Args)]
+pub struct ConnectionArgs {
+    #[command(subcommand)]
+    pub sub: ConnectionSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ConnectionSubcommand {
+    /// Create a connection (secret(s) + host anchor) in one unlock+write cycle.
+    /// On a terminal, `sc connection add` with no args runs a short wizard
+    /// (id → optional service → host(s) → secret(s)); off a terminal, pass the
+    /// `<id>` and `--host`/`--secret` (or `--service`) as flags.
+    Add(ConnectArgs),
+    /// List the connections the agent can use (id, hosts, phantoms) — the same
+    /// projection `sc status` shows. `--json` for scripts.
+    Ls(ConnectionLsArgs),
+    /// Remove a connection and its secret(s) from the vault (two passkey
+    /// gestures: unlock + write). Mirrors the console's "Disconnect".
+    Rm(ConnectionRmArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ConnectionLsArgs {
+    /// Emit machine-readable JSON instead of the human table.
+    #[arg(long)]
+    pub json: bool,
+    #[arg(long)]
+    pub vault: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct ConnectionRmArgs {
+    /// The connection id to remove (see `sc connection ls`). Free text is
+    /// slugified the same way `add` mints it.
+    #[arg(value_name = "ID")]
+    pub id: String,
+    /// Skip the interactive confirmation (required off a terminal, since the
+    /// delete of the connection + its secrets is irreversible without a re-add).
+    #[arg(long)]
+    pub yes: bool,
     #[arg(long)]
     pub vault: Option<String>,
     #[arg(long)]

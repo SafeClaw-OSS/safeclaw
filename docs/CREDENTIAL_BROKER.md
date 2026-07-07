@@ -470,11 +470,13 @@ to the one canonical form; the value is stored bare in the flat pool). Hostless
 `--no-broker` (or `--host none`) writes a no-broker item invisible to the broker,
 and drops any raw connection a prior `sc set … --host` created for the key.
 
-`sc set --host` is the single-secret **shorthand of `sc connect`** (`connect ⊃
-set`): `sc connect <name> --host H… --secret KEY=VALUE…` builds a multi-secret raw
-connection, and `--service SVC` a service-backed one — where `--host` then only
-PINS an exact FQDN ⊆ the service's `*.suffix` hosts, and each `--secret KEY` must
-be a subset of the service's declared secrets.
+`sc set --host` is the single-secret **shorthand of `sc connection add`** (`add ⊃
+set`; `sc connect` is the hidden back-compat alias): `sc connection add <id> --host
+H… --secret KEY=VALUE…` builds a multi-secret raw connection, and `--service SVC` a
+service-backed one — where `--host` then only PINS an exact FQDN ⊆ the service's
+`*.suffix` hosts, and each `--secret KEY` must be a subset of the service's declared
+secrets. `<id>` is a handle you choose (free text is slugified). Siblings:
+`sc connection ls` / `sc connection rm <id>`.
 
 ## 12. Storage-only items (the "no upstream" family)
 

@@ -42,7 +42,7 @@ const SECTIONS: &[(&str, &[(&str, &str)])] = &[
     (
         "Connections",
         &[
-            ("connect", "Create a connection (secret + egress host)"),
+            ("connection", "Manage connections: add / ls / rm"),
             ("run", "Run a command through the credential proxy"),
             ("registry", "Show the service catalog"),
             ("store", "Manage connected external stores"),

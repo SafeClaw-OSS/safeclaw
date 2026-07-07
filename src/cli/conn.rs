@@ -24,6 +24,37 @@ pub fn valid_conn_id(s: &str) -> bool {
     s.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
 }
 
+/// Turn a free-typed handle ("My Work Gmail") into a safe connection id
+/// ("my_work_gmail"): lowercase, collapse every non-`[a-z0-9]` run into a single
+/// `_`, trim leading/trailing `_`, cap at 64. Mirrors the console's
+/// `slugifyHandle` so the CLI and web mint the same id from the same input (the
+/// one divergence: no NFKD fold — a non-ASCII char becomes a separator rather
+/// than its ASCII base, e.g. `café` → `caf`). The result always satisfies
+/// [`valid_conn_id`] or is empty (caller re-prompts / errors).
+pub fn slugify_conn_id(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut prev_sep = true; // treat start as a separator so leading runs drop
+    for c in input.chars().flat_map(|c| c.to_lowercase()) {
+        if c.is_ascii_lowercase() || c.is_ascii_digit() {
+            out.push(c);
+            prev_sep = false;
+        } else if !prev_sep {
+            out.push('_');
+            prev_sep = true;
+        }
+    }
+    while out.ends_with('_') {
+        out.pop();
+    }
+    if out.len() > 64 {
+        out.truncate(64);
+        while out.ends_with('_') {
+            out.pop();
+        }
+    }
+    out
+}
+
 /// A secret role KEY on a connection: env-style `[A-Za-z0-9_]` starting with a
 /// letter. Because its lowercase becomes a phantom role segment
 /// (`__sc__<conn>__<role>__`), it may carry no `__` (the delimiter) and no
@@ -166,6 +197,21 @@ mod tests {
         assert!(!valid_conn_id("git-hub")); // hyphen
         assert!(!valid_conn_id("_x")); // must start alphanumeric
         assert!(!valid_conn_id(""));
+    }
+
+    #[test]
+    fn slugify_matches_console_and_yields_valid_id() {
+        assert_eq!(slugify_conn_id("My Work Gmail"), "my_work_gmail");
+        assert_eq!(slugify_conn_id("github"), "github");
+        assert_eq!(slugify_conn_id("  spaced  out  "), "spaced_out");
+        assert_eq!(slugify_conn_id("a--b__c"), "a_b_c"); // any non-alnum run → one '_'
+        assert_eq!(slugify_conn_id("café"), "caf"); // non-ASCII becomes a separator
+        assert_eq!(slugify_conn_id("___"), ""); // nothing usable → empty (caller re-prompts)
+        // Whatever it emits (non-empty) is a legal connection id.
+        for s in ["My Work", "s3 bucket", "GitHub-Work"] {
+            let id = slugify_conn_id(s);
+            assert!(!id.is_empty() && valid_conn_id(&id), "slug {:?} → {:?}", s, id);
+        }
     }
 
     #[test]

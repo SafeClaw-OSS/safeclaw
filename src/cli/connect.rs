@@ -19,30 +19,223 @@
 use std::io::IsTerminal;
 use std::io::Write as _;
 
+use serde_json::Value;
+
 use crate::cli::active::resolve_active;
 use crate::cli::conn::{
-    insert_raw_connection, insert_service_connection, valid_conn_id, valid_role, validate_raw_host,
+    insert_raw_connection, insert_service_connection, remove_connection, slugify_conn_id,
+    valid_role, validate_raw_host,
 };
 use crate::cli::secret::{do_unlock, seal_and_submit_write};
 use crate::cli::webauthn::fetch_passkey_meta;
-use crate::config::ConnectArgs;
+use crate::config::{ConnectArgs, ConnectionLsArgs, ConnectionRmArgs};
 use crate::service::ServiceRegistry;
 use crate::storage::plaintext::secret_address;
 
-pub async fn run(args: ConnectArgs) -> Result<(), String> {
+pub async fn run(mut args: ConnectArgs) -> Result<(), String> {
     let (custodian, vault) = resolve_active(args.vault.as_deref())?;
-    let name = args.name.clone();
-    if !valid_conn_id(&name) {
-        return Err(format!(
-            "connection name '{}' must be [a-z0-9_], start alphanumeric, and contain no '__'",
-            name
-        ));
-    }
+
+    // Resolve the connection id: slugify a provided handle, or (no id given) run
+    // the TTY wizard — which prompts the id and may also pick a `--service`.
+    let name = resolve_conn_id(&mut args)?;
 
     match args.service.clone() {
         Some(service) => run_service_backed(&custodian, &vault, &name, &service, &args).await,
         None => run_raw(&custodian, &vault, &name, &args).await,
     }
+}
+
+/// Turn the optional `<id>` arg into a concrete, phantom-safe connection id.
+/// Provided handle → slugified (echoing the result when it changed). Omitted →
+/// wizard on a terminal (prompt the id, then optionally a catalog service);
+/// hard error off a terminal.
+fn resolve_conn_id(args: &mut ConnectArgs) -> Result<String, String> {
+    if let Some(raw) = args.name.clone() {
+        let id = slugify_conn_id(&raw);
+        if id.is_empty() {
+            return Err(format!(
+                "'{}' has no usable id characters — choose a handle with letters or digits",
+                raw
+            ));
+        }
+        if id != raw {
+            eprintln!("safeclaw connect — using id '{}' (from '{}')", id, raw);
+        }
+        return Ok(id);
+    }
+
+    if !std::io::stdin().is_terminal() {
+        return Err(
+            "provide a connection id: `sc connection add <id> --host <domain> --secret KEY=VALUE` (or `--service <id>`)".into(),
+        );
+    }
+
+    // Wizard step 1 — the id.
+    let id = loop {
+        let raw = prompt_line("Connection id (a short handle you choose, e.g. work_gmail): ")?;
+        let raw = raw.trim();
+        if raw.is_empty() {
+            eprintln!("  an id is required");
+            continue;
+        }
+        let id = slugify_conn_id(raw);
+        if id.is_empty() {
+            eprintln!("  '{}' has no usable id characters; use letters/digits", raw);
+            continue;
+        }
+        if id != raw {
+            eprintln!("  → id '{}'", id);
+        }
+        break id;
+    };
+
+    // Wizard step 2 — optionally back it with a catalog service (skip if the
+    // caller already passed `--service`). Blank = a raw connection.
+    if args.service.is_none() {
+        let svc = prompt_line(
+            "Back with a catalog service? id from `sc registry`, or blank for a raw connection: ",
+        )?;
+        let svc = svc.trim();
+        if !svc.is_empty() {
+            args.service = Some(svc.to_string());
+        }
+    }
+    Ok(id)
+}
+
+// ── ls ───────────────────────────────────────────────────────────────────────
+
+/// `sc connection ls` — the agent-usable connection projection (the same rows
+/// `sc status` prints), optionally as JSON.
+pub async fn run_ls(args: ConnectionLsArgs) -> Result<(), String> {
+    let (custodian, vault) = resolve_active(args.vault.as_deref())?;
+    let conns = crate::cli::discovery::connections(&custodian, &vault).await?;
+
+    if args.json {
+        let arr: Vec<Value> = conns
+            .iter()
+            .map(|c| serde_json::json!({ "id": c.name, "hosts": c.hosts, "phantoms": c.phantoms }))
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&Value::Array(arr)).unwrap_or_else(|_| "[]".into())
+        );
+        return Ok(());
+    }
+
+    if conns.is_empty() {
+        println!(
+            "no connections — add one with `sc connection add <id> --host <domain> --secret KEY=VALUE`"
+        );
+        return Ok(());
+    }
+    for c in &conns {
+        println!("{}", c.name);
+        if !c.hosts.is_empty() {
+            println!("  hosts:    {}", c.hosts.join(", "));
+        }
+        for ph in &c.phantoms {
+            println!("  phantom:  {}", ph);
+        }
+    }
+    Ok(())
+}
+
+// ── rm ───────────────────────────────────────────────────────────────────────
+
+/// `sc connection rm <id>` — drop a connection record AND its stored secret(s),
+/// the inverse of `add` and the CLI twin of the console's "Disconnect". Two
+/// passkey gestures (unlock + write); confirms first unless `--yes`.
+pub async fn run_rm(args: ConnectionRmArgs) -> Result<(), String> {
+    let (custodian, vault) = resolve_active(args.vault.as_deref())?;
+    let id = slugify_conn_id(&args.id);
+    if id.is_empty() {
+        return Err(format!("'{}' is not a valid connection id", args.id));
+    }
+
+    // Confirm the destructive delete BEFORE the passkey gesture (don't make the
+    // user tap, then abort). Off a terminal, require `--yes`.
+    if !args.yes {
+        if !std::io::stdin().is_terminal() {
+            return Err(format!(
+                "refusing to remove connection '{}' without confirmation — pass `--yes` (non-interactive)",
+                id
+            ));
+        }
+        let ans = prompt_line(&format!(
+            "Remove connection '{}' and its stored secret(s)? [y/N]: ",
+            id
+        ))?;
+        if !matches!(ans.trim(), "y" | "Y" | "yes" | "YES") {
+            eprintln!("aborted");
+            return Ok(());
+        }
+    }
+
+    eprintln!("safeclaw connection rm {} — two passkey gestures (unlock + write)", id);
+    let meta = fetch_passkey_meta(&custodian, &vault).await?;
+    let (kv, mut aux, user_key) =
+        do_unlock(&custodian, &vault, &meta, args.no_browser, args.timeout, args.cb_port).await?;
+
+    // The connection record (raw or service-backed) names the secrets it owns.
+    let rec = aux
+        .get("connections")
+        .and_then(|c| c.get(&id))
+        .cloned()
+        .ok_or_else(|| format!("no connection '{}' in this vault (see `sc connection ls`)", id))?;
+
+    let mut new_kv = kv;
+    let mut removed_secrets = Vec::new();
+    for addr in connection_secret_addresses(&id, &rec) {
+        if new_kv.remove(&addr).is_some() {
+            removed_secrets.push(addr);
+        }
+    }
+    remove_connection(&mut aux, &id);
+
+    seal_and_submit_write(
+        &custodian, &vault, &meta, &user_key, &new_kv, &aux, args.no_browser, args.timeout, args.cb_port,
+    )
+    .await?;
+
+    if removed_secrets.is_empty() {
+        eprintln!("safeclaw connection rm — '{}' removed", id);
+    } else {
+        eprintln!(
+            "safeclaw connection rm — '{}' removed (+{} secret(s): {})",
+            id,
+            removed_secrets.len(),
+            removed_secrets.join(", ")
+        );
+    }
+    Ok(())
+}
+
+/// The kv addresses a connection's secrets live at, so `rm` deletes exactly what
+/// `add` wrote (mirrors the console's disconnect address computation). Raw: the
+/// explicit `secrets` list, stored at BARE uppercase keys. Service-backed:
+/// `secret_address(id, service, ROLE)` for each of the service's declared roles.
+fn connection_secret_addresses(id: &str, rec: &Value) -> Vec<String> {
+    if let Some(service) = rec.get("service").and_then(|v| v.as_str()) {
+        let reg = ServiceRegistry::load();
+        return match reg.get(service) {
+            Some(def) => def
+                .service
+                .secrets
+                .iter()
+                .map(|role| secret_address(id, service, &role.to_ascii_uppercase()))
+                .collect(),
+            None => Vec::new(),
+        };
+    }
+    rec.get("secrets")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_ascii_uppercase()))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 // ── raw connection ───────────────────────────────────────────────────────────
@@ -70,7 +263,7 @@ async fn run_raw(custodian: &str, vault: &str, name: &str, args: &ConnectArgs) -
         );
     }
 
-    eprintln!("safeclaw connect {} — two passkey gestures (unlock + write)", name);
+    eprintln!("safeclaw connection add {} — two passkey gestures (unlock + write)", name);
     let meta = fetch_passkey_meta(custodian, vault).await?;
     let (kv, mut aux, user_key) =
         do_unlock(custodian, vault, &meta, args.no_browser, args.timeout, args.cb_port).await?;
@@ -160,7 +353,7 @@ async fn run_service_backed(
         }
     }
 
-    eprintln!("safeclaw connect {} → service '{}' — two passkey gestures (unlock + write)", name, service);
+    eprintln!("safeclaw connection add {} → service '{}' — two passkey gestures (unlock + write)", name, service);
     let meta = fetch_passkey_meta(custodian, vault).await?;
     let (kv, mut aux, user_key) =
         do_unlock(custodian, vault, &meta, args.no_browser, args.timeout, args.cb_port).await?;

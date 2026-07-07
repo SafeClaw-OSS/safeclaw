@@ -133,9 +133,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 e.into()
             })
         }
+        // `sc connect …` is the hidden back-compat spelling of `sc connection add`.
         Command::Connect(args) => {
             cli::connect::run(args).await.map_err(|e| -> Box<dyn std::error::Error> {
                 eprintln!("safeclaw connect: {}", e);
+                e.into()
+            })
+        }
+        Command::Connection(args) => {
+            use safeclaw::config::ConnectionSubcommand;
+            let r = match args.sub {
+                ConnectionSubcommand::Add(a) => cli::connect::run(a).await,
+                ConnectionSubcommand::Ls(a) => cli::connect::run_ls(a).await,
+                ConnectionSubcommand::Rm(a) => cli::connect::run_rm(a).await,
+            };
+            r.map_err(|e| -> Box<dyn std::error::Error> {
+                eprintln!("safeclaw connection: {}", e);
                 e.into()
             })
         }
