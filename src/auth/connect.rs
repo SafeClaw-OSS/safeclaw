@@ -65,14 +65,20 @@ pub struct ExchangeConfig {
     pub exposes: Vec<(String, Vec<String>)>,
 }
 
-/// Resolve the exchange config for a connection's **service** from the
-/// registry. `None` when the service is unknown, isn't oauth2, or is missing a
-/// token_url / client_id / secret role (e.g. a provider literal we can't load).
+/// Resolve the exchange config for a connection's **service**. The service def
+/// is looked up in the built-in registry first, then this vault's own
+/// per-vault custom services (`aux.services`, e.g. a user-authored inline
+/// `[oauth2]`) — without the fallback a custom OAuth service's connect could
+/// never complete (its def isn't in the global registry). Provider *templates*
+/// still resolve against `services` (a custom def may name a built-in
+/// provider). `None` when the service is unknown to BOTH, isn't oauth2, or is
+/// missing a token_url / client_id / secret role.
 pub fn resolve_exchange_config(
     services: &crate::service::ServiceRegistry,
+    custom: &std::collections::HashMap<String, crate::service::ServiceDef>,
     service: &str,
 ) -> Option<ExchangeConfig> {
-    let svc = services.get(service)?;
+    let svc = services.get(service).or_else(|| custom.get(service))?;
     let oauth = svc.oauth2.as_ref()?;
     let resolved = services.resolve_oauth_config(oauth);
     let token_url = resolved.token_url?;
@@ -227,6 +233,7 @@ fn collect_pending(m: &ProtectedState) -> Vec<(String, Connecting)> {
 /// tokens (or an error string to log + skip).
 pub async fn run_pending<F, Fut>(
     services: &crate::service::ServiceRegistry,
+    custom: &std::collections::HashMap<String, crate::service::ServiceDef>,
     m: &mut ProtectedState,
     mut exchange: F,
 ) -> (usize, usize)
@@ -238,7 +245,7 @@ where
     let mut completed = 0usize;
     let mut failed = 0usize;
     for (conn, p) in pending {
-        let Some(cfg) = resolve_exchange_config(services, &p.service) else {
+        let Some(cfg) = resolve_exchange_config(services, custom, &p.service) else {
             tracing::warn!(
                 conn = %conn,
                 service = %p.service,
@@ -415,7 +422,12 @@ pub(crate) async fn apply_pending_connects(state: &Arc<AppState>, vault_id: &str
     }
 
     let services = &state.services;
-    let (completed, failed) = run_pending(services, &mut m, |_conn, cfg, p| async move {
+    // Per-vault custom services (`aux.services`) so a user-authored inline
+    // [oauth2] service's connect can resolve — the bootstrap that populates
+    // this cache always runs before us (sync/watch/unlock+write all refresh
+    // the cache, THEN process connects), so it's fresh here.
+    let custom = state.custom_services_snapshot(vault_id);
+    let (completed, failed) = run_pending(services, &custom, &mut m, |_conn, cfg, p| async move {
         crate::auth::oauth2::exchange_code(
             &cfg.token_url,
             &cfg.client_id,
@@ -702,6 +714,11 @@ mod tests {
         crate::service::ServiceRegistry::load()
     }
 
+    /// No per-vault custom services — most tests exercise the built-in path.
+    fn no_custom() -> std::collections::HashMap<String, crate::service::ServiceDef> {
+        std::collections::HashMap::new()
+    }
+
 
     #[test]
     fn collect_pending_reads_aux_connecting() {
@@ -837,7 +854,7 @@ mod tests {
         let mut m = with_connecting("gmail", "gmail", "code-AUX");
 
         let mut seen = None;
-        let (n, _) = run_pending(&services, &mut m, |conn, cfg, p| {
+        let (n, _) = run_pending(&services, &no_custom(), &mut m, |conn, cfg, p| {
             seen = Some((conn.clone(), cfg.token_url.clone(), cfg.redirect_uri.clone(), p.oauth2.code.clone()));
             async move { Ok(tokens(Some("rt-NEW"))) }
         })
@@ -868,7 +885,7 @@ mod tests {
         let services = gmail_registry();
         let mut m = with_connecting("gmail", "gmail", "code-EXPIRED");
 
-        let (n, _) = run_pending(&services, &mut m, |_conn, _cfg, _p| async move {
+        let (n, _) = run_pending(&services, &no_custom(), &mut m, |_conn, _cfg, _p| async move {
             Err("oauth2 code-exchange returned HTTP 400 — invalid_grant".to_string())
         })
         .await;
@@ -886,7 +903,7 @@ mod tests {
         let services = gmail_registry();
         let mut m = with_connecting("gmail", "gmail", "code-A");
 
-        let (n, _) = run_pending(&services, &mut m, |_conn, _cfg, _p| async move {
+        let (n, _) = run_pending(&services, &no_custom(), &mut m, |_conn, _cfg, _p| async move {
             Ok(tokens(None)) // consent without offline access → no refresh_token
         })
         .await;
@@ -904,7 +921,7 @@ mod tests {
         let mut m = with_connecting("whatever", "nosuchservice", "code-A");
 
         let mut called = false;
-        let (n, _) = run_pending(&services, &mut m, |_conn, _cfg, _p| {
+        let (n, _) = run_pending(&services, &no_custom(), &mut m, |_conn, _cfg, _p| {
             called = true;
             async move { Ok(tokens(Some("rt"))) }
         })
@@ -918,7 +935,7 @@ mod tests {
     #[test]
     fn resolve_exchange_config_for_gmail_uses_public_desktop_client() {
         let services = gmail_registry();
-        let cfg = resolve_exchange_config(&services, "gmail")
+        let cfg = resolve_exchange_config(&services, &no_custom(), "gmail")
             .expect("gmail resolves to an oauth2 exchange config");
         assert!(cfg.token_url.starts_with("https://oauth2.googleapis.com/token"));
         assert!(
@@ -935,6 +952,41 @@ mod tests {
     #[test]
     fn resolve_exchange_config_none_for_unknown() {
         let services = gmail_registry();
-        assert!(resolve_exchange_config(&services, "nosuchservice").is_none());
+        assert!(resolve_exchange_config(&services, &no_custom(), "nosuchservice").is_none());
+    }
+
+    #[test]
+    fn resolve_exchange_config_finds_a_per_vault_custom_service() {
+        // A user-authored inline [oauth2] service lives ONLY in aux.services,
+        // never the built-in registry — the finisher must resolve it via the
+        // `custom` map (regression: without it a custom OAuth connect could
+        // never complete and retried forever).
+        let services = gmail_registry();
+        let toml_src = r#"
+[service]
+id = "acme"
+name = "Acme"
+hosts = ["api.acme.dev"]
+secrets = ["REFRESH_TOKEN"]
+
+[oauth2]
+authorization_url = "https://auth.acme.dev/authorize"
+token_url = "https://auth.acme.dev/token"
+client_id = "acme-public"
+refresh_token = "REFRESH_TOKEN"
+"#;
+        let def: crate::service::ServiceDef =
+            toml::from_str(toml_src).expect("valid custom oauth2 def");
+        let mut custom = std::collections::HashMap::new();
+        custom.insert("acme".to_string(), def);
+
+        // Unknown to the built-in registry alone…
+        assert!(resolve_exchange_config(&services, &no_custom(), "acme").is_none());
+        // …resolvable once the vault's own custom def is supplied.
+        let cfg = resolve_exchange_config(&services, &custom, "acme")
+            .expect("custom inline oauth2 service resolves");
+        assert_eq!(cfg.token_url, "https://auth.acme.dev/token");
+        assert_eq!(cfg.client_id, "acme-public");
+        assert_eq!(cfg.secret_role, "REFRESH_TOKEN");
     }
 }

@@ -776,6 +776,21 @@ impl AppState {
         }
     }
 
+    /// Snapshot this vault's per-vault custom (`aux.services`) definitions from
+    /// the unlocked cache. The OAuth connect-finisher resolves a custom service's
+    /// exchange config against these — the global `self.services` registry holds
+    /// built-ins only. Empty when the vault is Locked or none are authored.
+    pub fn custom_services_snapshot(
+        &self,
+        vault_id: &str,
+    ) -> std::collections::HashMap<String, crate::service::ServiceDef> {
+        let states = self.vault_states.lock().unwrap();
+        match states.get(vault_id) {
+            Some(VaultState::Unlocked { cache, .. }) => cache.custom_services.clone(),
+            _ => Default::default(),
+        }
+    }
+
     /// The exact FQDNs a connection's credential may egress to, resolved
     /// through the compiled registry and the vault's custom services. `None`
     /// when the vault is Locked or the connection id is unknown.

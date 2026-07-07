@@ -339,7 +339,12 @@ fn build_service(
         secrets: def.service.secrets.clone(),
         policy,
         oauth2,
-        connect: services.connect_descriptor(id),
+        // Resolve the descriptor from the `def` in hand, not by id — the id
+        // lookup only knows built-ins, so a per-vault custom oauth2 service
+        // (passed here with its own def) would get `connect: null` and never
+        // look connectable in the console. `connect_descriptor_for` still
+        // resolves any named provider template against the built-in registry.
+        connect: def.oauth2.as_ref().and_then(|o| services.connect_descriptor_for(o)),
         setup: if render_setup_hint { render_setup(def) } else { None },
     }
 }
@@ -557,6 +562,41 @@ pub fn vault_registry_value(
 #[cfg(test)]
 mod setup_tests {
     use super::*;
+
+    #[test]
+    fn custom_oauth_service_gets_a_connect_descriptor() {
+        // A per-vault custom [oauth2] service is passed to build_service with its
+        // own def (it isn't in the built-in registry). Regression: resolving the
+        // descriptor by id returned None for it, so the console never saw it as
+        // connectable — resolve from the def instead.
+        let services = crate::service::ServiceRegistry::load();
+        let def: ServiceDef = toml::from_str(
+            r#"
+[service]
+id = "acme"
+name = "Acme"
+hosts = ["api.acme.dev"]
+secrets = ["REFRESH_TOKEN"]
+
+[oauth2]
+authorization_url = "https://auth.acme.dev/authorize"
+token_url = "https://auth.acme.dev/token"
+client_id = "acme-public"
+refresh_token = "REFRESH_TOKEN"
+"#,
+        )
+        .unwrap();
+        assert!(
+            services.get("acme").is_none(),
+            "precondition: acme is NOT a built-in",
+        );
+        let row = build_service(&services, "acme", &def, false, false, false);
+        let d = row.connect.expect("custom oauth2 service must advertise a connect descriptor");
+        assert_eq!(d.provider, "custom");
+        assert_eq!(d.authorization_url, "https://auth.acme.dev/authorize");
+        assert_eq!(d.client_id, "acme-public");
+        // The confidential half never rides the descriptor.
+    }
 
     #[test]
     fn render_setup_is_plain_passthrough() {
