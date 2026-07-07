@@ -501,7 +501,7 @@ impl ServiceRegistry {
                 continue;
             }
 
-            // Otherwise, scan one level deeper (category subfolder: llm/, channel/, integration/)
+            // Otherwise, scan one level deeper (category subfolder: llm/, notify/, integration/)
             let Ok(sub_entries) = std::fs::read_dir(&path) else { continue };
             for sub_entry in sub_entries.flatten() {
                 let sub_path = sub_entry.path();

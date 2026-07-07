@@ -172,7 +172,7 @@ pub struct Policy {
     /// Global default floor (when no rule and no more-specific default match).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default: Option<Levels>,
-    /// Per-category default floor (e.g. "llm", "channel"). Beats `default`.
+    /// Per-category default floor (e.g. "llm", "notify"). Beats `default`.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub categories: HashMap<String, Levels>,
     /// Per-connection user policy, keyed by `connection_id`.
@@ -187,7 +187,7 @@ impl Default for Policy {
         // *secondly* an approval gate for risky operations. So the baseline
         // floor is `allow` (inject + forward, no per-call friction); services
         // tighten genuinely sensitive paths with a stricter `level` on rules.
-        // (llm/channel are redundant with the global default but kept explicit
+        // (llm/notify are redundant with the global default but kept explicit
         // so a future stricter global default doesn't silently re-gate them.)
         let allow_rw = || Levels {
             read: Some(AccessLevel::Allow),
@@ -196,7 +196,7 @@ impl Default for Policy {
         };
         let mut categories = HashMap::new();
         categories.insert("llm".into(), allow_rw());
-        categories.insert("channel".into(), allow_rw());
+        categories.insert("notify".into(), allow_rw());
         Self {
             timeout: Some(300),
             default: Some(allow_rw()),
