@@ -560,7 +560,7 @@ mod setup_tests {
     fn render_setup_is_plain_passthrough() {
         let toml = r#"
 setup = """
-Routed? Nothing to configure. Not routed? Prefix: sc run -- git clone ...
+Put the phantom in the URL: sc run -- git clone https://x:__sc__github__@github.com/o/r
 """
 
 [service]

@@ -25,8 +25,9 @@ pub struct ServiceDef {
     /// is internal by construction and never injectable.
     #[serde(default)]
     pub oauth2: Option<OAuth2Def>,
-    /// Optional agent-facing `setup` prose (routed ⇒ nothing to configure;
-    /// unrouted ⇒ `sc run -- <cmd>`). Plain text — no template tokens.
+    /// Optional agent-facing `setup` prose: service-specific guidance on where a
+    /// phantom goes for this service's tools (a header, an env var, a URL) when
+    /// run under `sc run --`. Plain text — no template tokens.
     #[serde(default)]
     pub setup: Option<String>,
     /// Optional inline policy fallback (`[policy.levels]` / `[[policy.rules]]`).
@@ -944,7 +945,7 @@ secrets = ["GITHUB_TOKEN"]
     fn setup_block_parses_plain_prose() {
         let toml_str = r#"
 setup = """
-Routed? Nothing to configure. Not routed? Prefix: sc run -- git clone ...
+Put the phantom in the URL: sc run -- git clone https://x:__sc__github__@github.com/o/r
 """
 
 [service]

@@ -1,11 +1,10 @@
 setup = """
-Routed (under `sc run` / the env bundle)? Nothing to configure — $GITHUB_TOKEN is
-already the phantom; git resolves credentials via the safeclaw helper.
-Not routed? Prefix: `sc run -- git clone https://github.com/<owner>/<repo>`.
-Multi-account: switch the phantom value (GITHUB_TOKEN=__sc__github_work__ gh ...),
-or for git put the phantom in the URL username:
-https://__sc__github_work__@github.com/<owner>/<repo>.
-Use HTTPS remotes; SSH is outside the broker.
+git over HTTPS (SSH is outside the broker): put the phantom in the URL as the
+credential — token in the password slot, any dummy user — so no pre-existing git
+credential helper can shadow it:
+  sc run -- git clone https://x-access-token:__sc__github__@github.com/<owner>/<repo>
+Same shape for remote add / push / fetch. Multi-account: switch the phantom value
+(__sc__github_work__).
 """
 
 [service]
