@@ -127,13 +127,16 @@ pub async fn resolve_auth_value(
     // latter — looking only at the compiled registry would miss it and fall
     // through to returning `raw`, i.e. the refresh token, straight to the
     // upstream. That must never happen.
+    // custom-FIRST (see proxy::handler): mint against the vault-authored def when
+    // present — the SAME precedence the forward path uses, so the two never
+    // disagree about which oauth config backs a connection.
     let oauth = state
-        .services
-        .get(service_id)
+        .custom_service(vault_id, service_id)
         .and_then(|s| s.oauth2.clone())
         .or_else(|| {
             state
-                .custom_service(vault_id, service_id)
+                .services
+                .get(service_id)
                 .and_then(|s| s.oauth2.clone())
         });
     let Some(oauth) = oauth else {

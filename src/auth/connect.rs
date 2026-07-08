@@ -78,7 +78,9 @@ pub fn resolve_exchange_config(
     custom: &std::collections::HashMap<String, crate::service::ServiceDef>,
     service: &str,
 ) -> Option<ExchangeConfig> {
-    let svc = services.get(service).or_else(|| custom.get(service))?;
+    // custom-FIRST (see proxy::handler): a vault-authored def wins over a same-id
+    // registry service for connect / token-exchange too.
+    let svc = custom.get(service).or_else(|| services.get(service))?;
     let oauth = svc.oauth2.as_ref()?;
     let resolved = services.resolve_oauth_config(oauth);
     let token_url = resolved.token_url?;
@@ -1235,5 +1237,44 @@ refresh_token = "REFRESH_TOKEN"
         assert_eq!(cfg.token_url, "https://auth.acme.dev/token");
         assert_eq!(cfg.client_id, "acme-public");
         assert_eq!(cfg.secret_role, "REFRESH_TOKEN");
+    }
+
+    #[test]
+    fn resolve_exchange_config_custom_shadows_same_id_registry() {
+        // custom-FIRST precedence: when a vault-authored def and a registry
+        // service share an id, the USER's def wins — so shipping a first-party
+        // service never silently repoints an existing custom connection (a user's
+        // `gmail` that is really something else keeps its own wiring). The
+        // registry defines `gmail`; a same-id custom def with a distinct token
+        // endpoint must shadow it.
+        let services = gmail_registry();
+        // Sanity: the registry really defines `gmail` (else this proves nothing).
+        assert!(
+            resolve_exchange_config(&services, &no_custom(), "gmail").is_some(),
+            "registry must define gmail for the shadow test to be meaningful"
+        );
+        let toml_src = r#"
+[service]
+id = "gmail"
+name = "Custom shadow of gmail"
+hosts = ["api.example.test"]
+secrets = ["REFRESH_TOKEN"]
+
+[oauth2]
+authorization_url = "https://shadow.test/authorize"
+token_url = "https://shadow.test/token"
+client_id = "shadow-client"
+refresh_token = "REFRESH_TOKEN"
+"#;
+        let def: crate::service::ServiceDef =
+            toml::from_str(toml_src).expect("valid custom oauth2 def");
+        let mut custom = std::collections::HashMap::new();
+        custom.insert("gmail".to_string(), def);
+
+        let cfg = resolve_exchange_config(&services, &custom, "gmail")
+            .expect("resolves with a same-id custom def present");
+        // The CUSTOM endpoint + client win, not the registry's Google ones.
+        assert_eq!(cfg.token_url, "https://shadow.test/token");
+        assert_eq!(cfg.client_id, "shadow-client");
     }
 }

@@ -341,11 +341,15 @@ impl BrokerHandler {
             }
         };
         let def = conn_rec.service.as_deref().and_then(|s| {
+            // custom-FIRST precedence (the SSoT for this rule): a vault-authored
+            // def (aux.services) shadows a same-id registry service, so shipping
+            // a first-party service NEVER silently repoints a user's existing
+            // connection (their `gcp` that is really github keeps working). The
+            // registry def applies only where no custom def exists — a fresh,
+            // opt-in connection, gated by the create-time duplicate-id check.
             self.state
-                .services
-                .get(s)
-                .cloned()
-                .or_else(|| self.state.custom_service(&vault_id, s))
+                .custom_service(&vault_id, s)
+                .or_else(|| self.state.services.get(s).cloned())
         });
         // Some(refresh KEY) ⇔ this is an oauth connection. The key rides along
         // so the resolver can answer a phantom naming the REFRESH secret with

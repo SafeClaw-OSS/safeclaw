@@ -802,10 +802,12 @@ impl AppState {
         };
         let conn_rec = cache.connections.get(conn)?;
         let def = conn_rec.service.as_deref().and_then(|s| {
-            self.services
+            // custom-FIRST (see proxy::handler)
+            cache
+                .custom_services
                 .get(s)
                 .cloned()
-                .or_else(|| cache.custom_services.get(s).cloned())
+                .or_else(|| self.services.get(s).cloned())
         });
         Some(crate::core::host::resolved_hosts(conn_rec, def.as_ref()))
     }
@@ -823,10 +825,12 @@ impl AppState {
             };
             for conn_rec in cache.connections.values() {
                 let def = conn_rec.service.as_deref().and_then(|s| {
-                    self.services
+                    // custom-FIRST (see proxy::handler)
+                    cache
+                        .custom_services
                         .get(s)
                         .cloned()
-                        .or_else(|| cache.custom_services.get(s).cloned())
+                        .or_else(|| self.services.get(s).cloned())
                 });
                 for h in crate::core::host::resolved_hosts(conn_rec, def.as_ref()) {
                     if crate::core::host::host_matches_exact(host, &h) {

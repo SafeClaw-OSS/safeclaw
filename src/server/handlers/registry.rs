@@ -572,12 +572,13 @@ pub fn vault_registry_value(state: &AppState, vault_id: &str, q: &RegistryQuery)
                 continue;
             }
             let def: Option<ServiceDef> = conn.service.as_deref().and_then(|s| {
-                state.services.get(s).cloned().or_else(|| {
-                    custom_services
-                        .iter()
-                        .find(|(k, _)| k == s)
-                        .map(|(_, d)| d.clone())
-                })
+                // custom-FIRST (see proxy::handler): the console shows the def a
+                // connection actually resolves against.
+                custom_services
+                    .iter()
+                    .find(|(k, _)| k == s)
+                    .map(|(_, d)| d.clone())
+                    .or_else(|| state.services.get(s).cloned())
             });
             let mut row = build_connection(conn_id, conn, def.as_ref(), &native_keys, summary);
             if row.connected && state.oauth_needs_reauth(vault_id, conn_id) {
