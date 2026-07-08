@@ -40,18 +40,16 @@ level = "ask-always"
 
 # ── Change who can reach the database (security posture) ─────────────────────
 # Applying network restrictions can open the project to 0.0.0.0/0 (the whole
-# internet), like making a repo public. Two endpoints do it (Beta apply + Alpha
-# patch); gate both so neither is a bypass.
+# internet), like making a repo public. Supabase exposes the same operation at
+# two endpoints (Beta apply + Alpha patch); the match list is an OR so ONE rule
+# (one console toggle) covers both — neither is a bypass.
 [[rule]]
 id = "open-network"
-label = "Apply network restrictions (who can reach the database)"
-match = "POST /v1/projects/*/network-restrictions/apply"
-level = "ask-always"
-
-[[rule]]
-id = "open-network-patch"
-label = "Update network restrictions (who can reach the database)"
-match = "PATCH /v1/projects/*/network-restrictions"
+label = "Change network restrictions (who can reach the database)"
+match = [
+  "POST /v1/projects/*/network-restrictions/apply",
+  "PATCH /v1/projects/*/network-restrictions",
+]
 level = "ask-always"
 
 # ── Hand the project to another owner ────────────────────────────────────────

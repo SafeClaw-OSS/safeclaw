@@ -315,7 +315,7 @@ impl TomlPolicyRule {
         Some(crate::core::policy::PolicyRule {
             id: None,
             label: None,
-            match_pattern: Some(match_pattern),
+            match_patterns: vec![match_pattern],
             body: None,
             level: Some(level),
             ttl: None,
@@ -336,9 +336,11 @@ pub struct PolicyFileDef {
 pub struct PolicyFileRule {
     pub id: String,
     pub label: String,
-    /// Path pattern: "METHOD /path" or "/path" (any method). `*` = one segment.
-    #[serde(rename = "match")]
-    pub match_pattern: String,
+    /// Path pattern(s): "METHOD /path" or "/path" (any method). `*` = one
+    /// segment. A single string, or a list = OR (fires if any matches) for one
+    /// operation exposed at several endpoints. See core `PolicyRule::match_patterns`.
+    #[serde(rename = "match", deserialize_with = "crate::core::policy::match_spec::deserialize")]
+    pub match_pattern: Vec<String>,
     /// Regex matched against request body (optional).
     #[serde(default)]
     pub body: Option<String>,
@@ -369,7 +371,7 @@ impl PolicyFileDef {
             Some(crate::core::policy::PolicyRule {
                 id: Some(r.id.clone()),
                 label: Some(r.label.clone()),
-                match_pattern: Some(r.match_pattern.clone()),
+                match_patterns: r.match_pattern.clone(),
                 body: r.body.clone(),
                 level: Some(level),
                 ttl: r.ttl,

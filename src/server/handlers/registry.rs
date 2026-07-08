@@ -206,8 +206,10 @@ pub struct RegistryPolicyDefaults {
 pub struct RegistryPolicyRule {
     pub id: String,
     pub label: String,
-    #[serde(rename = "match")]
-    pub match_pattern: String,
+    /// Single pattern serializes as a bare string (registry.json stays stable for
+    /// one-match rules); a list serializes as a list (OR — see core `PolicyRule`).
+    #[serde(rename = "match", serialize_with = "crate::core::policy::match_spec::serialize")]
+    pub match_pattern: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub body: Option<String>,
     /// The built-in access decision (`allow` | `ask` | `ask-always` | `deny`)

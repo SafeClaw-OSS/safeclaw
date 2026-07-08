@@ -19,6 +19,36 @@ use serde::{Deserialize, Serialize};
 use regex::Regex;
 use std::collections::HashMap;
 
+/// Serde for a rule's `match`: accept either a single `"METHOD /path"` string or
+/// a list of them (OR — any pattern matches). A single pattern serializes back
+/// as a bare string so registry.json stays byte-stable for the common one-match
+/// rule; a list serializes as a list. Used by the core [`PolicyRule`] and mirrored
+/// by the service-registry (`PolicyFileRule`) and registry-response types.
+pub(crate) mod match_spec {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum OneOrMany {
+            One(String),
+            Many(Vec<String>),
+        }
+        Ok(match OneOrMany::deserialize(d)? {
+            OneOrMany::One(s) => vec![s],
+            OneOrMany::Many(v) => v,
+        })
+    }
+
+    pub fn serialize<S: Serializer>(v: &[String], s: S) -> Result<S::Ok, S::Error> {
+        if v.len() == 1 {
+            v[0].serialize(s)
+        } else {
+            v.serialize(s)
+        }
+    }
+}
+
 // ── Access Level ───────────────────────────────────────────────────────────────
 
 /// The access DECISION for a request.
@@ -87,9 +117,15 @@ pub struct PolicyRule {
     /// Human-readable label for the console.
     #[serde(default)]
     pub label: Option<String>,
-    /// Path pattern: `"METHOD /path"` or `"/path"` (any method). `*` = one segment.
-    #[serde(default, rename = "match")]
-    pub match_pattern: Option<String>,
+    /// Path pattern(s): `"METHOD /path"` or `"/path"` (any method). `*` = one
+    /// segment. Accepts a single string OR a list — a list is an OR (the rule
+    /// fires if ANY pattern matches), for one logical operation exposed at
+    /// several endpoints (e.g. a Beta and an Alpha endpoint that do the same
+    /// thing). This is the REST-side equivalent of the `body` regex's OR that
+    /// collapses several GraphQL mutations into one rule. Empty = no path/method
+    /// constraint (the rule decides on `body` alone, or unconditionally).
+    #[serde(default, rename = "match", skip_serializing_if = "Vec::is_empty", with = "match_spec")]
+    pub match_patterns: Vec<String>,
     /// Regex matched against request body text. Omit to skip body matching.
     #[serde(default)]
     pub body: Option<String>,
@@ -284,7 +320,7 @@ pub fn merge_rules(
             out.push(PolicyRule {
                 id: Some(id.clone()),
                 label: e.label.clone(),
-                match_pattern: Some(m.clone()),
+                match_patterns: vec![m.clone()],
                 body: e.body.clone(),
                 level: e.level,
                 ttl: e.ttl,
@@ -349,31 +385,42 @@ fn specificity(rule: &PolicyRule) -> u32 {
     if rule.body.is_some() {
         score += 1000;
     }
-    if let Some(ref pattern) = rule.match_pattern {
-        let (method, path) = parse_match_pattern(pattern);
-        if method.is_some() {
-            score += 5;
-        }
-        for seg in path.split('/') {
-            if !seg.is_empty() && seg != "*" && seg != "**" {
-                score += 10;
+    // A match list scores by its most-specific pattern (the best case): a rule
+    // is at least as specific as its tightest alternative.
+    let path_score = rule
+        .match_patterns
+        .iter()
+        .map(|pattern| {
+            let (method, path) = parse_match_pattern(pattern);
+            let mut s: u32 = if method.is_some() { 5 } else { 0 };
+            for seg in path.split('/') {
+                if !seg.is_empty() && seg != "*" && seg != "**" {
+                    s += 10;
+                }
             }
-        }
-    }
-    score
+            s
+        })
+        .max()
+        .unwrap_or(0);
+    score + path_score
 }
 
 /// Check if a single rule matches the given request.
 fn matches_rule(rule: &PolicyRule, method: &str, path: &str, body: Option<&str>) -> bool {
-    if let Some(ref pattern) = rule.match_pattern {
+    if !rule.match_patterns.is_empty() {
         let path_no_query = path.split('?').next().unwrap_or(path);
-        let (rule_method, rule_path) = parse_match_pattern(pattern);
-        if let Some(m) = rule_method {
-            if m != method {
-                return false;
+        // OR across the rule's patterns: the rule's path/method predicate holds
+        // if ANY listed "METHOD /path" matches this request.
+        let any = rule.match_patterns.iter().any(|pattern| {
+            let (rule_method, rule_path) = parse_match_pattern(pattern);
+            if let Some(m) = rule_method {
+                if m != method {
+                    return false;
+                }
             }
-        }
-        if !path_matches(rule_path, path_no_query) {
+            path_matches(rule_path, path_no_query)
+        });
+        if !any {
             return false;
         }
     }
@@ -500,7 +547,7 @@ mod tests {
         PolicyRule {
             id: Some(id.into()),
             label: None,
-            match_pattern: Some(pat.into()),
+            match_patterns: vec![pat.into()],
             body: None,
             level: Some(level),
             ttl: None,
@@ -561,13 +608,53 @@ mod tests {
     }
 
     #[test]
+    fn match_list_is_an_or_across_patterns() {
+        // One rule, two endpoints (different method AND path depth) for the same
+        // logical operation — both fire it, unrelated requests don't.
+        let rules = vec![PolicyRule {
+            id: Some("open-network".into()),
+            label: None,
+            match_patterns: vec![
+                "POST /v1/projects/*/network-restrictions/apply".into(),
+                "PATCH /v1/projects/*/network-restrictions".into(),
+            ],
+            body: None,
+            level: Some(AccessLevel::AskAlways),
+            ttl: None,
+        }];
+        let ev = |m: &str, p: &str| evaluate(m, p, None, Some(&rules), None, &policy(), &[]);
+        assert_eq!(ev("POST", "/v1/projects/abc/network-restrictions/apply"), AccessLevel::AskAlways);
+        assert_eq!(ev("PATCH", "/v1/projects/abc/network-restrictions"), AccessLevel::AskAlways);
+        // Wrong method on the PATCH path, or an unrelated path → no match → floor.
+        assert_eq!(ev("GET", "/v1/projects/abc/network-restrictions"), AccessLevel::Allow);
+        assert_eq!(ev("POST", "/v1/projects/abc/database/query"), AccessLevel::Allow);
+    }
+
+    #[test]
+    fn match_spec_roundtrips_string_and_list() {
+        // Single stays a bare string on the wire; a list stays a list.
+        let one = PolicyRule { id: None, label: None, match_patterns: vec!["POST /a".into()], body: None, level: Some(AccessLevel::Ask), ttl: None };
+        let j = serde_json::to_value(&one).unwrap();
+        assert_eq!(j.get("match").unwrap(), &serde_json::json!("POST /a"));
+        let back: PolicyRule = serde_json::from_value(j).unwrap();
+        assert_eq!(back.match_patterns, vec!["POST /a".to_string()]);
+
+        let many = PolicyRule { id: None, label: None, match_patterns: vec!["POST /a".into(), "PATCH /b".into()], body: None, level: Some(AccessLevel::Ask), ttl: None };
+        let j = serde_json::to_value(&many).unwrap();
+        assert_eq!(j.get("match").unwrap(), &serde_json::json!(["POST /a", "PATCH /b"]));
+        // A bare-string `match` still deserializes (back-compat).
+        let from_str: PolicyRule = serde_json::from_value(serde_json::json!({"match": "GET /x", "level": "ask"})).unwrap();
+        assert_eq!(from_str.match_patterns, vec!["GET /x".to_string()]);
+    }
+
+    #[test]
     fn rule_with_no_level_is_skipped() {
         // A malformed rule (no level) can never decide → falls through to the
         // global default (allow).
         let bad = vec![PolicyRule {
             id: Some("bad".into()),
             label: None,
-            match_pattern: Some("GET /x".into()),
+            match_patterns: vec!["GET /x".into()],
             body: None,
             level: None,
             ttl: None,
@@ -632,7 +719,7 @@ mod tests {
         user.insert("read".into(), RuleConfig { level: Some(AccessLevel::Allow), ..Default::default() });
         let merged = merge_rules(&built_in, &user);
         assert_eq!(merged[0].level, Some(AccessLevel::Allow));
-        assert_eq!(merged[0].match_pattern.as_deref(), Some("GET /m/*")); // preserved
+        assert_eq!(merged[0].match_patterns, vec!["GET /m/*".to_string()]); // preserved
     }
 
     #[test]
