@@ -131,6 +131,10 @@ pub struct RegistryService {
     /// (cloud-blind). Absent for non-oauth2 / summary.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub oauth2: Option<RegistryServiceOAuth2>,
+    /// Auxiliary: where a human mints this service's key/token ([service]
+    /// `key_page`). Display-only. Absent for summary / services without one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_page: Option<String>,
     /// Public OAuth consent params (authorization_url / client_id / scopes /
     /// pkce / redirect_uri) — what a frontend needs to START a cloud-blind
     /// connect. Absent for non-oauth2 / summary.
@@ -317,6 +321,7 @@ fn build_service(
             secrets: vec![],
             policy: None,
             oauth2: None,
+            key_page: None,
             connect: None,
             setup: None,
         };
@@ -339,6 +344,7 @@ fn build_service(
         secrets: def.service.secrets.clone(),
         policy,
         oauth2,
+        key_page: def.service.key_page.clone(),
         // Resolve the descriptor from the `def` in hand, not by id — the id
         // lookup only knows built-ins, so a per-vault custom oauth2 service
         // (passed here with its own def) would get `connect: null` and never

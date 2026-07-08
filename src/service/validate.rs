@@ -192,6 +192,15 @@ fn validate_service_inner(
         }
     }
 
+    // key_page: auxiliary display-only link, but it IS rendered as an <a href>
+    // by the console — require a plain web URL so a custom definition can't
+    // smuggle a javascript:/data: link into the UI.
+    if let Some(u) = &def.service.key_page {
+        if !(u.starts_with("https://") || u.starts_with("http://")) {
+            errs.push(format!("key_page '{}' must be an http(s) URL", u));
+        }
+    }
+
     // OAuth2: the section must be RESOLVABLE — either its inline fields carry
     // the endpoints + client, or `provider` names a shipped template that does.
     // Inline fields get the same floor as provider files (https to a public
@@ -531,6 +540,25 @@ secrets = ["ACME_TOKEN"]
     fn rejects_bad_secret_role() {
         let bad = GITHUB.replace("\"GITHUB_TOKEN\"", "\"github-token\"");
         assert!(validate_recipe(&bad, true).unwrap_err().iter().any(|e| e.contains("env key")));
+    }
+
+    #[test]
+    fn key_page_optional_and_https_only() {
+        // Absent: fine (GITHUB fixture has none). Present https: fine.
+        let with = GITHUB.replace(
+            "secrets = [\"GITHUB_TOKEN\"]",
+            "secrets = [\"GITHUB_TOKEN\"]\nkey_page = \"https://github.com/settings/tokens?type=beta\"",
+        );
+        assert!(validate_recipe(&with, true).is_ok());
+        // Rendered as a link — a non-web scheme must be rejected.
+        let bad = with.replace(
+            "https://github.com/settings/tokens?type=beta",
+            "javascript:alert(1)",
+        );
+        assert!(validate_recipe(&bad, true)
+            .unwrap_err()
+            .iter()
+            .any(|e| e.contains("key_page")));
     }
 
     #[test]

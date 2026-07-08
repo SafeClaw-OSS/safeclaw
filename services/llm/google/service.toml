@@ -6,3 +6,5 @@ name = "Google AI"
 # there — no declaration beyond host + secret.
 hosts = ["generativelanguage.googleapis.com"]
 secrets = ["GEMINI_API_KEY"]
+# Where a human mints the token (auxiliary; console/CLI helper link).
+key_page = "https://aistudio.google.com/apikey"

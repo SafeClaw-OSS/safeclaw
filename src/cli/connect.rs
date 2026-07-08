@@ -398,6 +398,10 @@ async fn run_service_backed(
     })?;
     let service_hosts = def.service.hosts.clone();
     let service_secrets = def.service.secrets.clone();
+    // Auxiliary pointer to where the token is minted (display-only).
+    if let Some(url) = def.service.key_page.as_deref() {
+        eprintln!("  Get a token: {}", url);
+    }
 
     // `--host` on a service-backed connect only PINS a host inside the service's
     // declared set: each pin must match an exact host or fall within a `*.suffix`
