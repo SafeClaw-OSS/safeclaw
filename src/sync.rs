@@ -1297,15 +1297,23 @@ pub async fn push_items_best_effort(state: &Arc<AppState>, vault_id: &str) {
     // EVERY sync (the "sc sync is slow and nothing even changed" bug).
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
-    let rows: Vec<(String, u64, String)> = pv
+    let mut rows: Vec<(String, u64, String, bool)> = pv
         .items
         .iter()
         .filter(|(_, s)| s.version > s.synced_version)
-        .map(|(id, s)| (id.clone(), s.version, URL_SAFE_NO_PAD.encode(&s.ct)))
+        .map(|(id, s)| (id.clone(), s.version, URL_SAFE_NO_PAD.encode(&s.ct), s.tombstone))
         .collect();
     if rows.is_empty() {
         return;
     }
+    // Writes BEFORE deletes: push every live row first, tombstones last (stable
+    // sort keeps the id order within each group). A completed connect writes
+    // its `connection`/secret rows AND a tombstone for the old `connecting` row
+    // in one batch; if the tombstone reached the cloud first, a syncing console
+    // would briefly see the connect withdrawn with no connection yet ("not
+    // configured"). Ordering the delete last means every intermediate snapshot
+    // is either still-connecting or fully-connected, never a dangling gap.
+    rows.sort_by_key(|(_, _, _, tombstone)| *tombstone);
 
     // A conflict/error on ONE item says nothing about the others (each item_id
     // is independent), so we NEVER stop the loop early — doing so would strand
@@ -1316,7 +1324,7 @@ pub async fn push_items_best_effort(state: &Arc<AppState>, vault_id: &str) {
     let mut conflicted = false;
     let mut endpoint_missing = false;
     let mut pushed: Vec<(String, u64)> = Vec::new();
-    for (id, version, ct_b64) in rows {
+    for (id, version, ct_b64, _tombstone) in rows {
         // base_version = version-1 for an update; a version-1 row is a create.
         let base_version = if version > 1 { Some(version - 1) } else { None };
         match push_item(cloud, vault_id, &dk, &id, base_version, version, &ct_b64).await {

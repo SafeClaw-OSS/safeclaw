@@ -255,6 +255,17 @@ pub struct StoredItem {
     /// which safely re-offers the row once.
     #[serde(default)]
     pub synced_version: u64,
+    /// True when this row's sealed body is a tombstone (`status:"deleted"`).
+    /// Local metadata only (not AAD-bound, never sent) — it lets the push loop
+    /// order writes BEFORE deletes so a syncing observer never sees a dangling
+    /// reference. Concretely: a completed connect writes 3 rows at once (the
+    /// refresh-token secret, the `connection` record, and a tombstone for the
+    /// old `connecting` row); if the tombstone lands on the cloud first, the
+    /// console briefly sees the connect withdrawn with no connection yet and
+    /// renders "not configured". Serde-defaulted to false (an adopted or
+    /// pre-upgrade row reads as live — harmless, it only affects push order).
+    #[serde(default)]
+    pub tombstone: bool,
 }
 
 /// The passkey-wrap layer — §7's small CAS blob, unchanged in substance from
@@ -337,9 +348,14 @@ impl PerItemVault {
 
     /// Insert or replace a raw sealed item (used by the pull/adopt path — the ct
     /// is already sealed by whoever wrote the cloud row, so by construction the
-    /// cloud has this exact version: the row lands clean).
+    /// cloud has this exact version: the row lands clean). `tombstone` stays
+    /// false: an adopted row is clean and never re-pushed, so its push-order
+    /// flag is never consulted (and we hold no K here to open the ct anyway).
     pub fn put_raw(&mut self, item_id_b64: String, version: u64, ct: Vec<u8>) {
-        self.items.insert(item_id_b64, StoredItem { version, ct, synced_version: version });
+        self.items.insert(
+            item_id_b64,
+            StoredItem { version, ct, synced_version: version, tombstone: false },
+        );
     }
 
     /// Drop a stored item outright (local GC of a fully-propagated tombstone).
@@ -463,7 +479,8 @@ impl PerItemVault {
         // A local write leaves `synced_version` where it was (the new version
         // is by definition not on the cloud yet) — the row is dirty until pushed.
         let synced_version = self.items.get(&id).map(|s| s.synced_version).unwrap_or(0);
-        self.items.insert(id.clone(), StoredItem { version, ct, synced_version });
+        let tombstone = payload.is_tombstone();
+        self.items.insert(id.clone(), StoredItem { version, ct, synced_version, tombstone });
         Ok(id)
     }
 
@@ -955,6 +972,43 @@ mod tests {
         .unwrap();
         let s = pv.get_item(&id).unwrap();
         assert_eq!((s.version, s.synced_version), (2, 1), "bumped row is dirty above its synced floor");
+    }
+
+    #[test]
+    fn tombstone_flag_tracks_payload_status() {
+        use sudp::primitives::StdPrimitives;
+        let k = [0x33u8; 32];
+        let vid = "vault-tomb";
+        let mut pv = PerItemVault::build_initial(
+            b"c".to_vec(), "x".into(), "y".into(), "Dev".into(), vec![0u8; 32], vec![0u8; 48],
+        )
+        .unwrap();
+
+        // A live write is NOT a tombstone; a deleting write IS one — so the push
+        // loop can order writes before deletes.
+        let live = pv
+            .seal_and_bump::<StdPrimitives>(
+                &k, vid, ItemNs::Connection, "gcp",
+                &ItemPayload::live(ItemNs::Connection, "gcp", serde_json::json!({"service": "gcp"})),
+            )
+            .unwrap().0;
+        assert!(!pv.get_item(&live).unwrap().tombstone, "live row is not a tombstone");
+
+        let dead = pv
+            .seal_and_bump::<StdPrimitives>(
+                &k, vid, ItemNs::Connecting, "gcp",
+                &ItemPayload::tombstone(ItemNs::Connecting, "gcp"),
+            )
+            .unwrap().0;
+        assert!(pv.get_item(&dead).unwrap().tombstone, "deleting row is a tombstone");
+
+        // Survives the JSON codec (serde-defaulted, so an old store loads false).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.per-item.json");
+        write_per_item_atomic(&path, &pv).unwrap();
+        let loaded = read_per_item(&path).unwrap().unwrap();
+        assert!(!loaded.get_item(&live).unwrap().tombstone);
+        assert!(loaded.get_item(&dead).unwrap().tombstone);
     }
 
     #[test]
