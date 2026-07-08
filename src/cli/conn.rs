@@ -21,7 +21,8 @@ pub fn valid_conn_id(s: &str) -> bool {
         Some(c) if c.is_ascii_lowercase() || c.is_ascii_digit() => {}
         _ => return false,
     }
-    s.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+    s.chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
 }
 
 /// Turn a free-typed handle ("My Work Gmail") into a safe connection id
@@ -82,7 +83,10 @@ pub fn validate_raw_host(h: &str) -> Result<(), String> {
         return Err("host cannot be empty".into());
     }
     if h.contains("://") || h.contains('/') || h.contains("{{") {
-        return Err(format!("host '{}' must be a bare domain (no scheme/path)", h));
+        return Err(format!(
+            "host '{}' must be a bare domain (no scheme/path)",
+            h
+        ));
     }
     if h.contains(':') {
         return Err(format!("host '{}' must not carry a port", h));
@@ -115,23 +119,26 @@ pub fn insert_raw_connection(aux: &mut Value, conn_id: &str, hosts: &[String], s
     if !conns.is_object() {
         *conns = json!({});
     }
-    conns
-        .as_object_mut()
-        .unwrap()
-        .insert(conn_id.to_string(), json!({ "hosts": hosts, "secrets": secrets }));
+    conns.as_object_mut().unwrap().insert(
+        conn_id.to_string(),
+        json!({ "hosts": hosts, "secrets": secrets }),
+    );
 }
 
 /// Insert (or replace) a SERVICE-backed connection into the vault `aux` value,
 /// preserving every other aux key. `hosts` is `Some(pins)` only when the user
 /// pinned exact FQDNs inside a service's `*.suffix` wildcard (else `None`, hosts
 /// derive from the service). `secrets` is omitted — a service-backed connection's
-/// secrets derive from the service's declared `secrets` (§2). The written shape
-/// deserializes to `Connection { service: Some(..), hosts, secrets: None }`.
+/// secrets derive from the service's declared `secrets` (§2). `keys` is the
+/// role→KEY binding of a NAMED connection (§3; omitted = identity bindings, the
+/// default connection's shape). The written shape deserializes to
+/// `Connection { service: Some(..), hosts, secrets: None, keys }`.
 pub fn insert_service_connection(
     aux: &mut Value,
     conn_id: &str,
     service: &str,
     hosts: Option<&[String]>,
+    keys: Option<&[(String, String)]>,
 ) {
     ensure_object(aux);
     let obj = aux.as_object_mut().unwrap();
@@ -143,6 +150,13 @@ pub fn insert_service_connection(
     rec.insert("service".to_string(), Value::String(service.to_string()));
     if let Some(h) = hosts {
         rec.insert("hosts".to_string(), json!(h));
+    }
+    if let Some(k) = keys.filter(|k| !k.is_empty()) {
+        let map: serde_json::Map<String, Value> = k
+            .iter()
+            .map(|(role, key)| (role.clone(), Value::String(key.clone())))
+            .collect();
+        rec.insert("keys".to_string(), Value::Object(map));
     }
     conns
         .as_object_mut()
@@ -207,10 +221,15 @@ mod tests {
         assert_eq!(slugify_conn_id("a--b__c"), "a_b_c"); // any non-alnum run → one '_'
         assert_eq!(slugify_conn_id("café"), "caf"); // non-ASCII becomes a separator
         assert_eq!(slugify_conn_id("___"), ""); // nothing usable → empty (caller re-prompts)
-        // Whatever it emits (non-empty) is a legal connection id.
+                                                // Whatever it emits (non-empty) is a legal connection id.
         for s in ["My Work", "s3 bucket", "GitHub-Work"] {
             let id = slugify_conn_id(s);
-            assert!(!id.is_empty() && valid_conn_id(&id), "slug {:?} → {:?}", s, id);
+            assert!(
+                !id.is_empty() && valid_conn_id(&id),
+                "slug {:?} → {:?}",
+                s,
+                id
+            );
         }
     }
 
@@ -272,14 +291,24 @@ mod tests {
     fn insert_service_connection_omits_secrets_and_optional_hosts() {
         let mut aux = json!({ "version": 4 });
         // Default connection, hosts derived (None).
-        insert_service_connection(&mut aux, "gmail", "gmail", None);
+        insert_service_connection(&mut aux, "gmail", "gmail", None, None);
         assert_eq!(aux["connections"]["gmail"]["service"], "gmail");
         assert!(aux["connections"]["gmail"].get("hosts").is_none());
         assert!(aux["connections"]["gmail"].get("secrets").is_none());
         // Named connection with a pinned wildcard host.
-        insert_service_connection(&mut aux, "acme_t1", "acme", Some(&["t1.acme.dev".to_string()]));
+        insert_service_connection(
+            &mut aux,
+            "acme_t1",
+            "acme",
+            Some(&["t1.acme.dev".to_string()]),
+            Some(&[("ACME_TOKEN".to_string(), "ACME_TOKEN_T1".to_string())]),
+        );
         assert_eq!(aux["connections"]["acme_t1"]["service"], "acme");
         assert_eq!(aux["connections"]["acme_t1"]["hosts"][0], "t1.acme.dev");
+        assert_eq!(
+            aux["connections"]["acme_t1"]["keys"]["ACME_TOKEN"],
+            "ACME_TOKEN_T1"
+        );
     }
 
     #[test]

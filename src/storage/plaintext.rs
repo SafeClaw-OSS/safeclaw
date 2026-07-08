@@ -104,6 +104,16 @@ pub struct Connection {
     /// (including the oauth2 refresh-token KEY). One canonical answer, no drift.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secrets: Option<Vec<String>>,
+    /// Service-backed connections only: explicit `ROLE → vault KEY` bindings
+    /// (CONNECTION_SCHEMA.md §3). Sparse — a missing role binds to its own bare
+    /// mainstream name (the default connection's identity binding), so a default
+    /// connection normally stores no map at all. A NAMED connection's creator
+    /// writes one (suggested `<ROLE>_<QUALIFIER>`, see [`suggested_secret_key`])
+    /// so two accounts of one service never collide on a key; any binding may
+    /// point at an existing vault key to share it. Raw connections never use
+    /// this — their `secrets` list IS the binding (role == KEY).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keys: Option<BTreeMap<String, String>>,
 }
 
 /// An **in-flight** connect handshake — everything the daemon needs to redeem
@@ -132,6 +142,13 @@ pub struct Connecting {
     /// for an exact-hosts service.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hosts: Option<Vec<String>>,
+    /// Explicit `ROLE → vault KEY` bindings chosen at connect, carried through
+    /// to the established [`Connection`] on exchange (see `Connection::keys`).
+    /// Absent = the daemon derives the default binding at exchange time
+    /// (identity for the default connection, [`suggested_secret_key`] for a
+    /// named one).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keys: Option<BTreeMap<String, String>>,
     /// OAuth2 (RFC 6749 authorization_code + RFC 7636 PKCE) handshake state.
     /// Nested under the mechanism key — mirrors the service.toml `[oauth2]`.
     pub oauth2: ConnectingOAuth2,
@@ -156,19 +173,52 @@ pub struct ConnectingOAuth2 {
     pub error: Option<String>,
 }
 
-/// The vault address of a connection's secret role (CONNECTION_SCHEMA.md §3):
-/// the **bare** mainstream name for the default connection (`conn_id ==
-/// service_id`, 1:1 with env/GCP import), or `<conn_id>:<ROLE>` for a **named**
-/// one. The `:` delimiter is invalid in env-var names, so a namespaced key can
-/// never masquerade as an env var. One rule, applied everywhere a connection's
-/// secret is written (connect) or read (broker / cache bootstrap), so the two
-/// can't drift.
-pub fn secret_address(conn_id: &str, service_id: &str, role: &str) -> String {
-    if conn_id == service_id {
-        role.to_string()
-    } else {
-        format!("{conn_id}:{role}")
+/// The vault KEY a connection's secret ROLE resolves to (CONNECTION_SCHEMA.md
+/// §3). Every secret lives at a **bare**, env-valid, UPPERCASE KEY — the flat
+/// pool is one env namespace, 1:1 with env/GCP-read-through import; nothing is
+/// namespaced. The connection RECORD binds roles to keys: an explicit
+/// `keys[ROLE]` entry wins (case-insensitive on the role), otherwise the role's
+/// own mainstream name — the identity binding every default connection uses.
+/// The address is **stored data, not a computed convention**, so writer and
+/// reader can't drift.
+pub fn secret_key_for(conn: Option<&Connection>, role: &str) -> String {
+    if let Some(m) = conn.and_then(|c| c.keys.as_ref()) {
+        if let Some(k) = m.get(role) {
+            return k.clone();
+        }
+        if let Some((_, k)) = m.iter().find(|(r, _)| r.eq_ignore_ascii_case(role)) {
+            return k.clone();
+        }
     }
+    role.to_string()
+}
+
+/// Creation-time DEFAULT `keys` binding for a **named** connection's role:
+/// `<ROLE>_<QUALIFIER>` (qualifier = `conn_id` minus the `<service>_` prefix,
+/// uppercased) — distinct from the default connection's bare mainstream name so
+/// two accounts of one service never collide. A suggestion only: the creator
+/// may override (e.g. bind to an existing key); the stored record is
+/// authoritative. Identity (the bare role) for the default connection.
+pub fn suggested_secret_key(conn_id: &str, service_id: &str, role: &str) -> String {
+    if conn_id == service_id {
+        return role.to_string();
+    }
+    let qual = conn_id
+        .strip_prefix(&format!("{service_id}_"))
+        .unwrap_or(conn_id);
+    // Keep the suggestion env-valid whatever the qualifier charset: uppercase,
+    // any non-[A-Z0-9] byte → `_`.
+    let qual: String = qual
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("{role}_{qual}")
 }
 
 /// `aux` payload — everything inside `ProtectedState.aux` for v4 vaults.
@@ -264,7 +314,10 @@ impl VaultPlaintextView {
         for (name, val) in m.secrets.iter() {
             native_secrets.insert(name.clone(), val.as_bytes().to_vec());
         }
-        Ok(VaultPlaintextView { aux, native_secrets })
+        Ok(VaultPlaintextView {
+            aux,
+            native_secrets,
+        })
     }
 
     /// Synchronous resolve restricted to `native-secrets`. Used by the
@@ -318,7 +371,10 @@ impl VaultPlaintextView {
 mod tests {
     use super::*;
 
-    fn build_protected_state(aux_json: serde_json::Value, targets: &[(&str, &[u8])]) -> ProtectedState {
+    fn build_protected_state(
+        aux_json: serde_json::Value,
+        targets: &[(&str, &[u8])],
+    ) -> ProtectedState {
         let mut m = ProtectedState::new();
         m.aux = aux_json;
         for (k, v) in targets {
@@ -345,7 +401,10 @@ mod tests {
         let view = VaultPlaintextView::from_protected_state(&m).unwrap();
         assert_eq!(view.aux.version, 4);
         assert_eq!(view.aux.store_order, vec!["native-secrets", "native-files"]);
-        assert_eq!(view.resolve_value_native("openai_api_key"), Some(&b"sk-test"[..]));
+        assert_eq!(
+            view.resolve_value_native("openai_api_key"),
+            Some(&b"sk-test"[..])
+        );
         assert_eq!(view.resolve_value_native("nonexistent"), None);
     }
 
@@ -373,5 +432,55 @@ mod tests {
         assert!(aux2.stores.contains_key("native-secrets"));
         assert!(!aux2.stores.contains_key("native-files")); // file store removed
         assert_eq!(aux2.store_order, vec!["native-secrets"]);
+    }
+
+    #[test]
+    fn secret_key_resolution_record_wins_identity_default() {
+        // No record / no map / unmapped role → identity (the bare role).
+        assert_eq!(
+            secret_key_for(None, "GMAIL_REFRESH_TOKEN"),
+            "GMAIL_REFRESH_TOKEN"
+        );
+        let bare = Connection::default();
+        assert_eq!(
+            secret_key_for(Some(&bare), "GMAIL_REFRESH_TOKEN"),
+            "GMAIL_REFRESH_TOKEN"
+        );
+        // A `keys` entry wins, matched case-insensitively on the role.
+        let mut keys = BTreeMap::new();
+        keys.insert(
+            "GMAIL_REFRESH_TOKEN".to_string(),
+            "GMAIL_REFRESH_TOKEN_BOB".to_string(),
+        );
+        let rec = Connection {
+            keys: Some(keys),
+            ..Connection::default()
+        };
+        assert_eq!(
+            secret_key_for(Some(&rec), "GMAIL_REFRESH_TOKEN"),
+            "GMAIL_REFRESH_TOKEN_BOB"
+        );
+        assert_eq!(
+            secret_key_for(Some(&rec), "gmail_refresh_token"),
+            "GMAIL_REFRESH_TOKEN_BOB"
+        );
+        assert_eq!(secret_key_for(Some(&rec), "OTHER_ROLE"), "OTHER_ROLE");
+    }
+
+    #[test]
+    fn suggested_key_identity_for_default_qualified_for_named() {
+        assert_eq!(
+            suggested_secret_key("gmail", "gmail", "GMAIL_REFRESH_TOKEN"),
+            "GMAIL_REFRESH_TOKEN"
+        );
+        assert_eq!(
+            suggested_secret_key("gmail_bob", "gmail", "GMAIL_REFRESH_TOKEN"),
+            "GMAIL_REFRESH_TOKEN_BOB"
+        );
+        // Non-`<service>_`-prefixed / odd-charset ids stay env-valid.
+        assert_eq!(
+            suggested_secret_key("work-acct", "gmail", "GMAIL_REFRESH_TOKEN"),
+            "GMAIL_REFRESH_TOKEN_WORK_ACCT"
+        );
     }
 }

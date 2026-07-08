@@ -38,7 +38,7 @@ use crate::error::Result;
 use crate::server::handlers::op::validate_vault_id;
 use crate::service::{ServiceDef, ServiceRegistry};
 use crate::state::{AppState, VaultState};
-use crate::storage::plaintext::{secret_address, Connection};
+use crate::storage::plaintext::{secret_key_for, Connection};
 
 /// The current registry wire version.
 const REGISTRY_VERSION: u32 = 4;
@@ -344,16 +344,23 @@ fn build_service(
         // (passed here with its own def) would get `connect: null` and never
         // look connectable in the console. `connect_descriptor_for` still
         // resolves any named provider template against the built-in registry.
-        connect: def.oauth2.as_ref().and_then(|o| services.connect_descriptor_for(o)),
-        setup: if render_setup_hint { render_setup(def) } else { None },
+        connect: def
+            .oauth2
+            .as_ref()
+            .and_then(|o| services.connect_descriptor_for(o)),
+        setup: if render_setup_hint {
+            render_setup(def)
+        } else {
+            None
+        },
     }
 }
 
 /// Build one CONNECTION row from an `aux.connections` entry: derive `connected` +
 /// the ready-made `phantoms` list. Service-backed → the service def's phantoms
 /// (oauth ACCESS + exposes, or the declared direct secrets), connected when every
-/// required secret is present at its §3 address. Raw → its explicit `secrets`
-/// (§2), connected when every declared KEY is present (bare).
+/// required role's bound key (§3 `keys` map, identity default) is present. Raw →
+/// its explicit `secrets` (§2), connected when every declared KEY is present.
 fn build_connection(
     conn_id: &str,
     conn: &Connection,
@@ -361,8 +368,10 @@ fn build_connection(
     native_keys: &HashSet<String>,
     summary: bool,
 ) -> RegistryConnection {
-    let (connected, phantoms, secrets): (bool, Vec<String>, Option<Vec<String>>) = match &conn.service {
-        Some(service_id) => {
+    let (connected, phantoms, secrets): (bool, Vec<String>, Option<Vec<String>>) = match &conn
+        .service
+    {
+        Some(_service_id) => {
             let phantoms: Vec<String> = def
                 .map(|d| phantoms_for(conn_id, d).into_values().collect())
                 .unwrap_or_default();
@@ -371,8 +380,8 @@ fn build_connection(
                     let required = required_keys(d);
                     required.is_empty()
                         || required.iter().all(|role| {
-                            let addr = secret_address(conn_id, service_id, role);
-                            native_keys.iter().any(|k| k.eq_ignore_ascii_case(&addr))
+                            let key = secret_key_for(Some(conn), role);
+                            native_keys.iter().any(|k| k.eq_ignore_ascii_case(&key))
                         })
                 })
                 .unwrap_or(false);
@@ -392,7 +401,11 @@ fn build_connection(
     RegistryConnection {
         id: conn_id.to_string(),
         service: conn.service.clone(),
-        hosts: if summary { Vec::new() } else { resolved_hosts(conn, def) },
+        hosts: if summary {
+            Vec::new()
+        } else {
+            resolved_hosts(conn, def)
+        },
         secrets: if summary { None } else { secrets },
         connected,
         phantoms: if summary { Vec::new() } else { phantoms },
@@ -465,11 +478,7 @@ pub async fn vault_registry(
 /// control-plane handler (above) AND the 23294 API face (`proxy::api_face`), so
 /// discovery can't drift between the two ports. Pure read — briefly locks
 /// `vault_states`, no I/O.
-pub fn vault_registry_value(
-    state: &AppState,
-    vault_id: &str,
-    q: &RegistryQuery,
-) -> Result<Value> {
+pub fn vault_registry_value(state: &AppState, vault_id: &str, q: &RegistryQuery) -> Result<Value> {
     validate_vault_id(vault_id)?;
     let include_policy_rules = q.include_policy_rules();
     let ids_filter = q.ids_filter();
@@ -487,12 +496,25 @@ pub fn vault_registry_value(
         let states = state.vault_states.lock().unwrap();
         match states.get(vault_id) {
             Some(VaultState::Unlocked { cache, .. }) => {
-                let mut custom: Vec<(String, ServiceDef)> =
-                    cache.custom_services.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                let mut custom: Vec<(String, ServiceDef)> = cache
+                    .custom_services
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
                 custom.sort_by(|a, b| a.0.cmp(&b.0));
-                (cache.native_keys.clone(), custom, cache.connections.clone(), false)
+                (
+                    cache.native_keys.clone(),
+                    custom,
+                    cache.connections.clone(),
+                    false,
+                )
             }
-            _ => (HashSet::new(), Vec::new(), std::collections::HashMap::new(), true),
+            _ => (
+                HashSet::new(),
+                Vec::new(),
+                std::collections::HashMap::new(),
+                true,
+            ),
         }
     };
 
@@ -503,7 +525,16 @@ pub fn vault_registry_value(
         .into_iter()
         .filter(|(_, def)| !def.service.hidden)
         .filter(|(id, _)| ids_filter.as_ref().map_or(true, |set| set.contains(*id)))
-        .map(|(id, def)| build_service(&state.services, id, def, include_policy_rules, true, summary))
+        .map(|(id, def)| {
+            build_service(
+                &state.services,
+                id,
+                def,
+                include_policy_rules,
+                true,
+                summary,
+            )
+        })
         .collect();
     for (id, def) in &custom_services {
         if ids_filter.as_ref().map_or(false, |set| !set.contains(id)) {
@@ -512,7 +543,14 @@ pub fn vault_registry_value(
         if def.service.hidden {
             continue;
         }
-        services.push(build_service(&state.services, id, def, include_policy_rules, true, summary));
+        services.push(build_service(
+            &state.services,
+            id,
+            def,
+            include_policy_rules,
+            true,
+            summary,
+        ));
     }
     services.sort_by(|a, b| a.id.cmp(&b.id));
 
@@ -520,15 +558,19 @@ pub fn vault_registry_value(
     let mut conn_rows: Vec<RegistryConnection> = Vec::new();
     if !locked {
         for (conn_id, conn) in &connections {
-            if ids_filter.as_ref().map_or(false, |set| !set.contains(conn_id)) {
+            if ids_filter
+                .as_ref()
+                .map_or(false, |set| !set.contains(conn_id))
+            {
                 continue;
             }
             let def: Option<ServiceDef> = conn.service.as_deref().and_then(|s| {
-                state
-                    .services
-                    .get(s)
-                    .cloned()
-                    .or_else(|| custom_services.iter().find(|(k, _)| k == s).map(|(_, d)| d.clone()))
+                state.services.get(s).cloned().or_else(|| {
+                    custom_services
+                        .iter()
+                        .find(|(k, _)| k == s)
+                        .map(|(_, d)| d.clone())
+                })
             });
             let mut row = build_connection(conn_id, conn, def.as_ref(), &native_keys, summary);
             if row.connected && state.oauth_needs_reauth(vault_id, conn_id) {
@@ -591,7 +633,9 @@ refresh_token = "REFRESH_TOKEN"
             "precondition: acme is NOT a built-in",
         );
         let row = build_service(&services, "acme", &def, false, false, false);
-        let d = row.connect.expect("custom oauth2 service must advertise a connect descriptor");
+        let d = row
+            .connect
+            .expect("custom oauth2 service must advertise a connect descriptor");
         assert_eq!(d.provider, "custom");
         assert_eq!(d.authorization_url, "https://auth.acme.dev/authorize");
         assert_eq!(d.client_id, "acme-public");
@@ -652,7 +696,11 @@ secrets = ["GITHUB_TOKEN"]
     #[test]
     fn service_summary_drops_heavy_fields() {
         let reg = ServiceRegistry::compiled_only();
-        let (id, def) = reg.iter_sorted().into_iter().next().expect("a compiled service");
+        let (id, def) = reg
+            .iter_sorted()
+            .into_iter()
+            .next()
+            .expect("a compiled service");
 
         let full = build_service(&reg, id, def, false, true, false);
         let sum = build_service(&reg, id, def, false, true, true);
@@ -680,6 +728,7 @@ secrets = ["GITHUB_TOKEN"]
             service: None,
             hosts: Some(vec!["api.stripe.com".to_string()]),
             secrets: Some(vec!["STRIPE_KEY".to_string()]),
+            keys: None,
         };
         let present: HashSet<String> = ["STRIPE_KEY".to_string()].into_iter().collect();
         let row = build_connection("stripe_key", &conn, None, &present, false);

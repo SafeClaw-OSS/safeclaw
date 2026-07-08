@@ -11,7 +11,7 @@
 //! 2. for each, resolve the connection's *service* → its provider
 //!    (client_id / secret / token_url + the fixed redirect_uri, all from the
 //!    public Desktop literal) and exchange the code at `token_url`;
-//! 3. WRITE the durable refresh_token at the §3 address `[<conn>:]<ROLE>` and
+//! 3. WRITE the durable refresh_token at its bound BARE key (§3 `keys` map) and
 //!    **MOVE** the entry from `aux.connecting` into `aux.connections`; re-seal the
 //!    body under the same `K` and persist `vault.dat`.
 //!
@@ -23,9 +23,10 @@
 //!
 //! **Multi-connection.** `connection_id` is independent of `service_id`: each
 //! `connecting`/`connections` entry names its `service` explicitly, so two Gmail
-//! accounts (`gmail`, `gmail-work`) connect side-by-side. The refresh_token
-//! address is bare for the default (`conn == service`) and `<conn>:<ROLE>` for a
-//! named one (see [`secret_address`]).
+//! accounts (`gmail`, `gmail_work`) connect side-by-side. Every secret is stored
+//! at a BARE uppercase KEY; the connection record's `keys` map binds each role
+//! to its key (identity for the default connection, `<ROLE>_<QUALIFIER>` by
+//! default for a named one — see [`secret_key_for`] / [`suggested_secret_key`]).
 //!
 //! **Best-effort, never fatal.** Anything that goes wrong logs and is skipped; a
 //! malformed/unresolvable pending or an exchange failure (e.g. an expired code)
@@ -40,7 +41,7 @@ use sudp::state::ProtectedState;
 
 use crate::auth::oauth2::{ExchangedTokens, OAuthStyle};
 use crate::state::AppState;
-use crate::storage::plaintext::{secret_address, Connecting, Connection};
+use crate::storage::plaintext::{secret_key_for, suggested_secret_key, Connecting, Connection};
 
 /// The OAuth client/endpoint a pending connect resolves to before exchange, plus
 /// the service's secret role (so we know where to write the result).
@@ -139,28 +140,65 @@ fn set_aux_map<T: Serialize>(m: &mut ProtectedState, key: &str, map: BTreeMap<St
 }
 
 /// Apply one successful exchange to the open `ProtectedState`: write the durable
-/// refresh_token at the §3 address (`secret_address(conn, service, role)`,
-/// overwriting any prior one — a re-connect supersedes), store the id_token /
-/// its derived `exposes` claims when the service declares them, and **MOVE**
-/// the entry from `aux.connecting` into `aux.connections` (no partial/duplicate
-/// record). `hosts` carries any exact FQDNs pinned at connect for a wildcard
-/// service. Pure state transition (no I/O) so it's unit-testable against a
-/// mocked `ProtectedState`.
+/// refresh_token at its bound BARE key (overwriting any prior one — a re-connect
+/// supersedes), store the id_token / its derived `exposes` claims when the
+/// service declares them, and **MOVE** the entry from `aux.connecting` into
+/// `aux.connections` (no partial/duplicate record). `hosts` carries any exact
+/// FQDNs pinned at connect for a wildcard service; `keys` carries the creator's
+/// explicit role→KEY bindings — absent, a NAMED connection gets the
+/// [`suggested_secret_key`] defaults derived here (the default connection binds
+/// identity, so it stores no map). Pure state transition (no I/O) so it's
+/// unit-testable against a mocked `ProtectedState`.
 pub fn apply_exchange_result(
     m: &mut ProtectedState,
     conn: &str,
     service: &str,
     hosts: Option<Vec<String>>,
+    keys: Option<BTreeMap<String, String>>,
     cfg: &ExchangeConfig,
     tokens: &ExchangedTokens,
 ) {
+    // The record's role→KEY bindings. Every role this exchange stores must be
+    // bound BEFORE the writes below so writer and future readers use one map.
+    let keys: Option<BTreeMap<String, String>> = keys.or_else(|| {
+        if conn == service {
+            return None; // identity binding — no map stored
+        }
+        let mut map = BTreeMap::new();
+        let mut bind = |role: &str| {
+            let r = role.to_ascii_uppercase();
+            let k = suggested_secret_key(conn, service, &r);
+            map.insert(r, k);
+        };
+        bind(&cfg.secret_role);
+        if let Some(idt_role) = &cfg.id_token_role {
+            bind(idt_role);
+        }
+        for (role, _) in &cfg.exposes {
+            bind(role);
+        }
+        Some(map)
+    });
+    let rec = Connection {
+        name: None, // set below from the connecting entry
+        service: Some(service.to_string()),
+        hosts,
+        secrets: None,
+        keys,
+    };
     if let Some(rt) = &tokens.refresh_token {
-        m.put_secret(secret_address(conn, service, &cfg.secret_role), rt.as_bytes().to_vec());
+        m.put_secret(
+            secret_key_for(Some(&rec), &cfg.secret_role),
+            rt.as_bytes().to_vec(),
+        );
     }
     if let Some(idt) = &tokens.id_token {
         // Store the raw id_token only when the service names a slot for it.
         if let Some(idt_role) = &cfg.id_token_role {
-            m.put_secret(secret_address(conn, service, idt_role), idt.as_bytes().to_vec());
+            m.put_secret(
+                secret_key_for(Some(&rec), idt_role),
+                idt.as_bytes().to_vec(),
+            );
         }
         // Derive each exposed role from its id_token claim. Stored UPPERCASED
         // (env-key convention for vault items); the lowercase phantom segment
@@ -170,7 +208,7 @@ pub fn apply_exchange_result(
             match crate::auth::oauth2::id_token_claim(idt, path) {
                 Some(v) => {
                     let key = role.to_ascii_uppercase();
-                    m.put_secret(secret_address(conn, service, &key), v.into_bytes());
+                    m.put_secret(secret_key_for(Some(&rec), &key), v.into_bytes());
                 }
                 None => tracing::warn!(
                     conn = %conn,
@@ -191,11 +229,9 @@ pub fn apply_exchange_result(
     set_aux_map(m, "connecting", connecting);
 
     let mut connections = aux_map::<Connection>(m, "connections");
-    connections.insert(
-        conn.to_string(),
-        // Service-backed: secrets derive from the service def, never stored here.
-        Connection { name, service: Some(service.to_string()), hosts, secrets: None },
-    );
+    // Service-backed: secrets derive from the service def, never stored here;
+    // `keys` is the role→KEY binding fixed above.
+    connections.insert(conn.to_string(), Connection { name, ..rec });
     set_aux_map(m, "connections", connections);
 }
 
@@ -257,6 +293,7 @@ where
         // Capture what the post-exchange MOVE needs before `p` is consumed.
         let service = p.service.clone();
         let hosts = p.hosts.clone();
+        let keys = p.keys.clone();
         let cfg_apply = cfg.clone();
         match exchange(conn.clone(), cfg, p).await {
             Ok(tokens) => {
@@ -269,7 +306,7 @@ where
                     );
                     continue;
                 }
-                apply_exchange_result(m, &conn, &service, hosts, &cfg_apply, &tokens);
+                apply_exchange_result(m, &conn, &service, hosts, keys, &cfg_apply, &tokens);
                 completed += 1;
                 tracing::info!(
                     conn = %conn,
@@ -466,8 +503,7 @@ pub(crate) async fn apply_pending_connects(state: &Arc<AppState>, vault_id: &str
     // version-bumped for CAS, so a concurrent browser edit to a DIFFERENT item
     // never collides (contract §4).
     if let Some(mut vault) = vault_dat {
-        if let Err(e) =
-            crate::server::handlers::metadata::reseal_body_with_key(&k, &mut vault, &m)
+        if let Err(e) = crate::server::handlers::metadata::reseal_body_with_key(&k, &mut vault, &m)
         {
             tracing::warn!(vault = %vault_id, "oauth connect: re-seal failed: {}", e);
             return false;
@@ -490,9 +526,9 @@ pub(crate) async fn apply_pending_connects(state: &Arc<AppState>, vault_id: &str
     true
 }
 
-/// Persist a ROTATED refresh_token back into the sealed vault at its §3 address
-/// (`secret_address(conn, service, role)` — the SAME slot the connect exchange
-/// wrote). A rotating provider (OpenAI) hands back a fresh refresh_token on every
+/// Persist a ROTATED refresh_token back into the sealed vault at its bound BARE
+/// key (`secret_key_for` over the established connection record — the SAME slot
+/// the connect exchange wrote). A rotating provider (OpenAI) hands back a fresh refresh_token on every
 /// refresh and invalidates the one we sent, so the broker calls this after a
 /// mint; otherwise the NEXT refresh would present a dead token and force a
 /// spurious reconnect.
@@ -507,7 +543,6 @@ pub(crate) async fn persist_rotated_refresh_locked(
     state: &Arc<AppState>,
     vault_id: &str,
     conn_id: &str,
-    service_id: &str,
     role: &str,
     new_refresh_token: &str,
 ) -> bool {
@@ -555,8 +590,11 @@ pub(crate) async fn persist_rotated_refresh_locked(
         }
     };
 
+    // Resolve the role's bound key from the established record — the map the
+    // exchange wrote (or identity for a default connection).
+    let rec = aux_map::<Connection>(&m, "connections").remove(conn_id);
     m.put_secret(
-        secret_address(conn_id, service_id, role),
+        secret_key_for(rec.as_ref(), role),
         new_refresh_token.as_bytes().to_vec(),
     );
 
@@ -568,8 +606,7 @@ pub(crate) async fn persist_rotated_refresh_locked(
         }
     };
     if let Some(mut vault) = vault_dat {
-        if let Err(e) =
-            crate::server::handlers::metadata::reseal_body_with_key(&k, &mut vault, &m)
+        if let Err(e) = crate::server::handlers::metadata::reseal_body_with_key(&k, &mut vault, &m)
         {
             tracing::warn!(vault = %vault_id, "oauth rotate: re-seal failed: {}", e);
             return false;
@@ -585,7 +622,7 @@ pub(crate) async fn persist_rotated_refresh_locked(
 
     let cache = crate::server::handlers::approve::bootstrap_cache_from_view(&view, state);
     state.unlock_vault(vault_id.to_string(), cache, k);
-    tracing::info!(vault = %vault_id, service = %service_id, "oauth refresh: rotated refresh_token persisted");
+    tracing::info!(vault = %vault_id, conn = %conn_id, "oauth refresh: rotated refresh_token persisted");
     true
 }
 
@@ -597,8 +634,7 @@ fn build_m_from_view(
     view: &crate::storage::plaintext::VaultPlaintextView,
 ) -> Result<ProtectedState, String> {
     let mut m = ProtectedState::new();
-    m.aux = serde_json::to_value(&view.aux)
-        .map_err(|e| format!("aux to json: {}", e))?;
+    m.aux = serde_json::to_value(&view.aux).map_err(|e| format!("aux to json: {}", e))?;
     for (name, bytes) in &view.native_secrets {
         m.put_secret(name.clone(), bytes.clone());
     }
@@ -646,9 +682,7 @@ fn reconcile_per_item_after_connect(
             if changed.is_empty() {
                 return;
             }
-            if let Err(e) =
-                crate::storage::sealed_vault::write_per_item_atomic(&path, &pv)
-            {
+            if let Err(e) = crate::storage::sealed_vault::write_per_item_atomic(&path, &pv) {
                 tracing::warn!(vault = %vault_id, "per-item connect reconcile write failed: {}", e);
                 return;
             }
@@ -719,7 +753,6 @@ mod tests {
         std::collections::HashMap::new()
     }
 
-
     #[test]
     fn collect_pending_reads_aux_connecting() {
         let m = with_connecting("gmail", "gmail", "code-AUX");
@@ -754,12 +787,13 @@ mod tests {
 
     #[test]
     fn apply_exchange_default_writes_bare_and_moves() {
-        // Default connection: conn == service → bare refresh_token name.
+        // Default connection: conn == service → bare refresh_token name, no map.
         let mut m = with_connecting("gmail", "gmail", "code-AUX");
         apply_exchange_result(
             &mut m,
             "gmail",
             "gmail",
+            None,
             None,
             &cfg("GMAIL_REFRESH_TOKEN"),
             &tokens(Some("rt-NEW")),
@@ -770,25 +804,76 @@ mod tests {
             "connecting entry must be dropped after exchange"
         );
         let conns = aux_map::<Connection>(&m, "connections");
-        assert_eq!(conns.get("gmail").and_then(|c| c.service.as_deref()), Some("gmail"));
+        assert_eq!(
+            conns.get("gmail").and_then(|c| c.service.as_deref()),
+            Some("gmail")
+        );
+        assert!(
+            conns.get("gmail").and_then(|c| c.keys.as_ref()).is_none(),
+            "default conn stores no keys map"
+        );
     }
 
     #[test]
-    fn apply_exchange_named_writes_prefixed_address() {
-        // Named connection: conn != service → `<conn>:<ROLE>` address.
-        let mut m = with_connecting("gmail-work", "gmail", "code-AUX");
+    fn apply_exchange_named_writes_suggested_bare_key_and_records_binding() {
+        // Named connection: conn != service → suggested `<ROLE>_<QUALIFIER>`
+        // BARE key, recorded in the connection's `keys` map.
+        let mut m = with_connecting("gmail_work", "gmail", "code-AUX");
         apply_exchange_result(
             &mut m,
-            "gmail-work",
+            "gmail_work",
             "gmail",
+            None,
             None,
             &cfg("GMAIL_REFRESH_TOKEN"),
             &tokens(Some("rt-NEW")),
         );
-        assert_eq!(m.secret("gmail-work:GMAIL_REFRESH_TOKEN").unwrap(), b"rt-NEW");
-        assert!(m.secrets.get("GMAIL_REFRESH_TOKEN").is_none(), "named conn must not write the bare name");
+        assert_eq!(m.secret("GMAIL_REFRESH_TOKEN_WORK").unwrap(), b"rt-NEW");
+        assert!(
+            m.secrets.get("GMAIL_REFRESH_TOKEN").is_none(),
+            "named conn must not clobber the default's key"
+        );
         let conns = aux_map::<Connection>(&m, "connections");
-        assert_eq!(conns.get("gmail-work").and_then(|c| c.service.as_deref()), Some("gmail"));
+        let rec = conns.get("gmail_work").expect("record moved");
+        assert_eq!(rec.service.as_deref(), Some("gmail"));
+        assert_eq!(
+            rec.keys
+                .as_ref()
+                .and_then(|k| k.get("GMAIL_REFRESH_TOKEN"))
+                .map(String::as_str),
+            Some("GMAIL_REFRESH_TOKEN_WORK"),
+        );
+    }
+
+    #[test]
+    fn apply_exchange_named_honors_creator_chosen_keys() {
+        // A creator-supplied binding (e.g. "reuse my existing key") wins over
+        // the suggestion, for both the write and the recorded map.
+        let mut m = with_connecting("gmail_work", "gmail", "code-AUX");
+        let mut keys = BTreeMap::new();
+        keys.insert(
+            "GMAIL_REFRESH_TOKEN".to_string(),
+            "MY_WORK_GMAIL_RT".to_string(),
+        );
+        apply_exchange_result(
+            &mut m,
+            "gmail_work",
+            "gmail",
+            None,
+            Some(keys),
+            &cfg("GMAIL_REFRESH_TOKEN"),
+            &tokens(Some("rt-NEW")),
+        );
+        assert_eq!(m.secret("MY_WORK_GMAIL_RT").unwrap(), b"rt-NEW");
+        let conns = aux_map::<Connection>(&m, "connections");
+        assert_eq!(
+            conns
+                .get("gmail_work")
+                .and_then(|c| c.keys.as_ref())
+                .and_then(|k| k.get("GMAIL_REFRESH_TOKEN"))
+                .map(String::as_str),
+            Some("MY_WORK_GMAIL_RT"),
+        );
     }
 
     #[test]
@@ -799,6 +884,7 @@ mod tests {
             "acme-forge",
             "acme",
             Some(vec!["tenant.acme.dev".to_string()]),
+            None,
             &cfg("ACME_TOKEN"),
             &tokens(Some("rt-NEW")),
         );
@@ -816,17 +902,25 @@ mod tests {
         let claims = serde_json::json!({
             "https://api.openai.com/auth": { "chatgpt_account_id": "acct-42" }
         });
-        let idt = format!("{}.{}.{}", enc(b"{}"), enc(claims.to_string().as_bytes()), enc(b"s"));
+        let idt = format!(
+            "{}.{}.{}",
+            enc(b"{}"),
+            enc(claims.to_string().as_bytes()),
+            enc(b"s")
+        );
 
         let mut m = with_connecting("openai_codex", "openai_codex", "code-AUX");
         let mut c = cfg("OPENAI_CODEX_REFRESH_TOKEN");
         c.exposes = vec![(
             "account_id".to_string(),
-            vec!["https://api.openai.com/auth".to_string(), "chatgpt_account_id".to_string()],
+            vec![
+                "https://api.openai.com/auth".to_string(),
+                "chatgpt_account_id".to_string(),
+            ],
         )];
         let mut t = tokens(Some("rt-NEW"));
         t.id_token = Some(idt);
-        apply_exchange_result(&mut m, "openai_codex", "openai_codex", None, &c, &t);
+        apply_exchange_result(&mut m, "openai_codex", "openai_codex", None, None, &c, &t);
         assert_eq!(m.secret("OPENAI_CODEX_REFRESH_TOKEN").unwrap(), b"rt-NEW");
         // Derived role stored UPPERCASED at the bare (default-conn) address.
         assert_eq!(m.secret("ACCOUNT_ID").unwrap(), b"acct-42");
@@ -841,6 +935,7 @@ mod tests {
             "gmail",
             "gmail",
             None,
+            None,
             &cfg("GMAIL_REFRESH_TOKEN"),
             &tokens(Some("rt-NEW")),
         );
@@ -850,20 +945,32 @@ mod tests {
     #[tokio::test]
     async fn run_pending_success_moves_and_writes() {
         let services = gmail_registry();
-        let role = services.service_env_key("gmail").expect("gmail has a secret role");
+        let role = services
+            .service_env_key("gmail")
+            .expect("gmail has a secret role");
         let mut m = with_connecting("gmail", "gmail", "code-AUX");
 
         let mut seen = None;
         let (n, _) = run_pending(&services, &no_custom(), &mut m, |conn, cfg, p| {
-            seen = Some((conn.clone(), cfg.token_url.clone(), cfg.redirect_uri.clone(), p.oauth2.code.clone()));
+            seen = Some((
+                conn.clone(),
+                cfg.token_url.clone(),
+                cfg.redirect_uri.clone(),
+                p.oauth2.code.clone(),
+            ));
             async move { Ok(tokens(Some("rt-NEW"))) }
         })
         .await;
 
         assert_eq!(n, 1);
-        assert!(aux_map::<Connecting>(&m, "connecting").is_empty(), "connecting cleared");
+        assert!(
+            aux_map::<Connecting>(&m, "connecting").is_empty(),
+            "connecting cleared"
+        );
         assert_eq!(
-            aux_map::<Connection>(&m, "connections").get("gmail").and_then(|c| c.service.clone()),
+            aux_map::<Connection>(&m, "connections")
+                .get("gmail")
+                .and_then(|c| c.service.clone()),
             Some("gmail".to_string()),
         );
         assert_eq!(m.secret(&role).unwrap(), b"rt-NEW");
@@ -885,9 +992,14 @@ mod tests {
         let services = gmail_registry();
         let mut m = with_connecting("gmail", "gmail", "code-EXPIRED");
 
-        let (n, _) = run_pending(&services, &no_custom(), &mut m, |_conn, _cfg, _p| async move {
-            Err("oauth2 code-exchange returned HTTP 400 — invalid_grant".to_string())
-        })
+        let (n, _) = run_pending(
+            &services,
+            &no_custom(),
+            &mut m,
+            |_conn, _cfg, _p| async move {
+                Err("oauth2 code-exchange returned HTTP 400 — invalid_grant".to_string())
+            },
+        )
         .await;
 
         assert_eq!(n, 0, "a failed exchange completes nothing");
@@ -903,9 +1015,14 @@ mod tests {
         let services = gmail_registry();
         let mut m = with_connecting("gmail", "gmail", "code-A");
 
-        let (n, _) = run_pending(&services, &no_custom(), &mut m, |_conn, _cfg, _p| async move {
-            Ok(tokens(None)) // consent without offline access → no refresh_token
-        })
+        let (n, _) = run_pending(
+            &services,
+            &no_custom(),
+            &mut m,
+            |_conn, _cfg, _p| async move {
+                Ok(tokens(None)) // consent without offline access → no refresh_token
+            },
+        )
         .await;
 
         assert_eq!(n, 0);
@@ -937,7 +1054,9 @@ mod tests {
         let services = gmail_registry();
         let cfg = resolve_exchange_config(&services, &no_custom(), "gmail")
             .expect("gmail resolves to an oauth2 exchange config");
-        assert!(cfg.token_url.starts_with("https://oauth2.googleapis.com/token"));
+        assert!(cfg
+            .token_url
+            .starts_with("https://oauth2.googleapis.com/token"));
         assert!(
             cfg.client_id.ends_with(".apps.googleusercontent.com"),
             "client_id must be the google provider literal"
@@ -946,7 +1065,10 @@ mod tests {
         assert!(cfg.client_secret.is_some());
         assert!(matches!(cfg.style, OAuthStyle::Form));
         assert!(cfg.redirect_uri.starts_with("http://127.0.0.1"));
-        assert!(!cfg.secret_role.is_empty(), "gmail service declares a secret role");
+        assert!(
+            !cfg.secret_role.is_empty(),
+            "gmail service declares a secret role"
+        );
     }
 
     #[test]

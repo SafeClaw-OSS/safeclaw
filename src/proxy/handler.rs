@@ -56,7 +56,12 @@ pub struct BrokerHandler {
 
 impl BrokerHandler {
     pub fn new(state: Arc<AppState>) -> Self {
-        Self { state, vid: None, key: None, pending: None }
+        Self {
+            state,
+            vid: None,
+            key: None,
+            pending: None,
+        }
     }
 }
 
@@ -120,7 +125,9 @@ impl HttpHandler for BrokerHandler {
         // agent's ONE port: the same listener serves the proxy face (below) and
         // this read API.
         if crate::proxy::api_face::is_api_face(&req, self.state.config.proxy_port) {
-            return crate::proxy::api_face::respond(&self.state, &req).await.into();
+            return crate::proxy::api_face::respond(&self.state, &req)
+                .await
+                .into();
         }
 
         self.pipeline(ctx, req).await
@@ -180,11 +187,18 @@ impl BrokerHandler {
 
         // Decide whether to buffer the body for scanning (bounded + text-ish).
         let scan_body = body_is_text(&parts.headers)
-            && content_length(&parts.headers).map(|n| n <= MAX_BODY_SCAN).unwrap_or(false);
+            && content_length(&parts.headers)
+                .map(|n| n <= MAX_BODY_SCAN)
+                .unwrap_or(false);
 
         let mut body_bytes: Option<Vec<u8>> = None;
         if scan_body {
-            match orig_body.take().expect("body present before scan").collect().await {
+            match orig_body
+                .take()
+                .expect("body present before scan")
+                .collect()
+                .await
+            {
                 Ok(collected) => {
                     let bytes = collected.to_bytes().to_vec();
                     if let Ok(s) = std::str::from_utf8(&bytes) {
@@ -261,8 +275,8 @@ impl BrokerHandler {
         // miss with a key PRESENT, refresh the hash-set once (debounced): a key
         // minted seconds ago by `sc agent add` must not 407 for the 30s loop.
         if !self.key_is_valid() {
-            let refreshed = self.key.is_some()
-                && crate::sync::refresh_agent_keys_on_miss(&self.state).await;
+            let refreshed =
+                self.key.is_some() && crate::sync::refresh_agent_keys_on_miss(&self.state).await;
             if !refreshed || !self.key_is_valid() {
                 return err_response(
                     StatusCode::PROXY_AUTHENTICATION_REQUIRED,
@@ -314,6 +328,7 @@ impl BrokerHandler {
                         service: Some(conn.clone()),
                         hosts: None,
                         secrets: None,
+                        keys: None,
                     }
                 } else {
                     return err_response(
@@ -354,7 +369,10 @@ impl BrokerHandler {
                 return err_response(
                     StatusCode::FORBIDDEN,
                     "host_forbidden",
-                    &format!("destination '{}' is not a permitted egress target", dest_host),
+                    &format!(
+                        "destination '{}' is not a permitted egress target",
+                        dest_host
+                    ),
                 )
                 .into();
             }
@@ -362,7 +380,9 @@ impl BrokerHandler {
         }
 
         // ── policy ───────────────────────────────────────────────────────────
-        let body_for_policy = body_bytes.as_deref().and_then(|b| std::str::from_utf8(b).ok());
+        let body_for_policy = body_bytes
+            .as_deref()
+            .and_then(|b| std::str::from_utf8(b).ok());
         let decision = self.state.evaluate_request_policy(
             &vault_id,
             &conn,
@@ -426,13 +446,33 @@ impl BrokerHandler {
         };
 
         let values = match self
-            .resolve_values(&vault_id, &conn, &service_id, oauth_refresh.as_deref(), &phantoms, primary, secrets_map)
+            .resolve_values(
+                &vault_id,
+                &conn,
+                &service_id,
+                oauth_refresh.as_deref(),
+                &phantoms,
+                primary,
+                secrets_map,
+            )
             .await
         {
             Ok(v) => v,
             Err(ResolveErr::NeedsApproval) => {
                 return self
-                    .captive_portal(&vault_id, &conn, &service_id, &dest_host, &method, &path, level, rule_id, ttl, ip)
+                    .captive_portal(
+                        &vault_id,
+                        &conn,
+                        &conn_rec,
+                        &service_id,
+                        &dest_host,
+                        &method,
+                        &path,
+                        level,
+                        rule_id,
+                        ttl,
+                        ip,
+                    )
                     .await
             }
             Err(ResolveErr::Ambiguous) => {
@@ -538,57 +578,60 @@ impl BrokerHandler {
         let mut out = HashMap::new();
         for ph in phantoms {
             let is_oauth = oauth_refresh.is_some();
-            let bytes: Vec<u8> = if is_oauth
-                && ph.role.as_deref().map(|r| r == "access").unwrap_or(true)
-            {
-                // The oauth ACCESS phantom: mint from the refresh token (primary).
-                let refresh = primary.clone().ok_or(ResolveErr::NeedsApproval)?;
-                crate::server::broker_flow::resolve_auth_value(
-                    &self.state, vault_id, conn, service_id, &refresh,
-                )
-                .await
-                .map_err(|e| match e {
-                    crate::error::AppError::Unauthorized(m) => ResolveErr::Mint(m),
-                    other => ResolveErr::Mint(format!("{:?}", other)),
-                })?
-            } else if is_oauth {
-                let role = ph.role.clone().unwrap_or_default();
-                // Naming the REFRESH secret is a category error, not a missing
-                // feature: phantoms resolve to a connection's PRODUCED value
-                // (the minted access token), never a production INPUT. The
-                // refusal is precise so the boundary self-documents.
-                if oauth_refresh.is_some_and(|k| role.eq_ignore_ascii_case(k)) {
-                    return Err(ResolveErr::RefreshForbidden);
-                }
-                // An `exposes` value derived at connect (e.g. codex account_id):
-                // stored UPPERCASED in the vault, cached with the connection's
-                // other roles — matched case-insensitively like any role. Absent
-                // (not yet derived / pre-`exposes` connect) → the precise refusal.
-                match secrets_map.as_ref().and_then(|m| {
-                    m.iter()
-                        .find(|(k, _)| k.eq_ignore_ascii_case(&role))
-                        .map(|(_, v)| v.clone())
-                }) {
-                    Some(v) => v,
-                    None => return Err(ResolveErr::Exposes(role)),
-                }
-            } else {
-                match &ph.role {
-                    Some(r) => secrets_map
-                        .as_ref()
-                        .and_then(|m| {
-                            m.iter()
-                                .find(|(k, _)| k.eq_ignore_ascii_case(r))
-                                .map(|(_, v)| v.clone())
-                        })
-                        .ok_or(ResolveErr::NeedsApproval)?,
-                    None => match &secrets_map {
-                        Some(m) if m.len() > 1 => return Err(ResolveErr::Ambiguous),
-                        Some(m) if m.len() == 1 => m.values().next().cloned().unwrap(),
-                        _ => primary.clone().ok_or(ResolveErr::NeedsApproval)?,
-                    },
-                }
-            };
+            let bytes: Vec<u8> =
+                if is_oauth && ph.role.as_deref().map(|r| r == "access").unwrap_or(true) {
+                    // The oauth ACCESS phantom: mint from the refresh token (primary).
+                    let refresh = primary.clone().ok_or(ResolveErr::NeedsApproval)?;
+                    crate::server::broker_flow::resolve_auth_value(
+                        &self.state,
+                        vault_id,
+                        conn,
+                        service_id,
+                        &refresh,
+                    )
+                    .await
+                    .map_err(|e| match e {
+                        crate::error::AppError::Unauthorized(m) => ResolveErr::Mint(m),
+                        other => ResolveErr::Mint(format!("{:?}", other)),
+                    })?
+                } else if is_oauth {
+                    let role = ph.role.clone().unwrap_or_default();
+                    // Naming the REFRESH secret is a category error, not a missing
+                    // feature: phantoms resolve to a connection's PRODUCED value
+                    // (the minted access token), never a production INPUT. The
+                    // refusal is precise so the boundary self-documents.
+                    if oauth_refresh.is_some_and(|k| role.eq_ignore_ascii_case(k)) {
+                        return Err(ResolveErr::RefreshForbidden);
+                    }
+                    // An `exposes` value derived at connect (e.g. codex account_id):
+                    // stored UPPERCASED in the vault, cached with the connection's
+                    // other roles — matched case-insensitively like any role. Absent
+                    // (not yet derived / pre-`exposes` connect) → the precise refusal.
+                    match secrets_map.as_ref().and_then(|m| {
+                        m.iter()
+                            .find(|(k, _)| k.eq_ignore_ascii_case(&role))
+                            .map(|(_, v)| v.clone())
+                    }) {
+                        Some(v) => v,
+                        None => return Err(ResolveErr::Exposes(role)),
+                    }
+                } else {
+                    match &ph.role {
+                        Some(r) => secrets_map
+                            .as_ref()
+                            .and_then(|m| {
+                                m.iter()
+                                    .find(|(k, _)| k.eq_ignore_ascii_case(r))
+                                    .map(|(_, v)| v.clone())
+                            })
+                            .ok_or(ResolveErr::NeedsApproval)?,
+                        None => match &secrets_map {
+                            Some(m) if m.len() > 1 => return Err(ResolveErr::Ambiguous),
+                            Some(m) if m.len() == 1 => m.values().next().cloned().unwrap(),
+                            _ => primary.clone().ok_or(ResolveErr::NeedsApproval)?,
+                        },
+                    }
+                };
             let s = String::from_utf8(bytes).map_err(|_| ResolveErr::NotUtf8)?;
             out.insert(ph.raw.clone(), s);
         }
@@ -602,6 +645,7 @@ impl BrokerHandler {
         &self,
         vault_id: &str,
         conn: &str,
+        conn_rec: &crate::storage::plaintext::Connection,
         service_id: &str,
         host: &str,
         method: &str,
@@ -620,7 +664,9 @@ impl BrokerHandler {
             .services
             .service_env_key(service_id)
             .unwrap_or_else(|| service_id.to_string());
-        let target = crate::storage::plaintext::secret_address(conn, service_id, &role);
+        // The op `target` is the role's bound BARE key (record `keys` map,
+        // identity default) — the same slot every writer uses.
+        let target = crate::storage::plaintext::secret_key_for(Some(conn_rec), &role);
 
         let scope = json!({
             "connection_id": conn,
@@ -631,8 +677,15 @@ impl BrokerHandler {
             "authorize_only": true,
         });
         let op = Operation {
-            act: Act { kind: ActType::Use, target, scope },
-            bind: Bind { redeemer: vault_id.to_string(), recipient: None },
+            act: Act {
+                kind: ActType::Use,
+                target,
+                scope,
+            },
+            bind: Bind {
+                redeemer: vault_id.to_string(),
+                recipient: None,
+            },
             valid: Valid::single_use(now, Some(now + ttl_secs)),
         };
         let pc = crate::approval::PolicyContext {
@@ -659,7 +712,10 @@ impl BrokerHandler {
                 // gated — would need an advertised-origin config atom; until
                 // then a remote agent just re-runs the command instead of
                 // polling, the skill's primary path.)
-                let poll_url = format!("http://127.0.0.1:{}/op/{}", self.state.config.proxy_port, op_id);
+                let poll_url = format!(
+                    "http://127.0.0.1:{}/op/{}",
+                    self.state.config.proxy_port, op_id
+                );
                 let body = format!(
                     "SafeClaw approval needed to use this credential.\n\
                      Approve with your passkey:\n  {}\n\
@@ -713,8 +769,15 @@ impl BrokerHandler {
             "etld1": etld1(host),
         });
         let op = Operation {
-            act: Act { kind: ActType::Custom("widen-host".into()), target: String::new(), scope },
-            bind: Bind { redeemer: vault_id.to_string(), recipient: None },
+            act: Act {
+                kind: ActType::Custom("widen-host".into()),
+                target: String::new(),
+                scope,
+            },
+            bind: Bind {
+                redeemer: vault_id.to_string(),
+                recipient: None,
+            },
             valid: Valid::single_use(now, Some(now + 900)),
         };
         let approve_line = match crate::server::broker_flow::register_pending_use(
@@ -728,8 +791,10 @@ impl BrokerHandler {
                 let approve_url = crate::cli::active::grant_url(&op_id);
                 // Same machine-readable tail as the credential-use 401 above —
                 // the waiter contract is op-generic, so the widen op gets it too.
-                let poll_url =
-                    format!("http://127.0.0.1:{}/op/{}", self.state.config.proxy_port, op_id);
+                let poll_url = format!(
+                    "http://127.0.0.1:{}/op/{}",
+                    self.state.config.proxy_port, op_id
+                );
                 let body = format!(
                     "SafeClaw: connection '{}' is not anchored to '{}'.\n\
                      Approve adding this host as a PERMANENT grant (passkey):\n  {}\n\
@@ -830,9 +895,14 @@ fn creds_from_proxy_auth(req: &Request<Body>) -> (Option<String>, Option<String>
         .headers()
         .get(header::PROXY_AUTHORIZATION)
         .and_then(|h| h.to_str().ok())
-        .and_then(|s| s.strip_prefix("Basic ").or_else(|| s.strip_prefix("basic ")))
+        .and_then(|s| {
+            s.strip_prefix("Basic ")
+                .or_else(|| s.strip_prefix("basic "))
+        })
         .and_then(|b64| {
-            base64::engine::general_purpose::STANDARD.decode(b64.trim()).ok()
+            base64::engine::general_purpose::STANDARD
+                .decode(b64.trim())
+                .ok()
         })
         .and_then(|d| String::from_utf8(d).ok())
     else {
@@ -870,7 +940,10 @@ fn content_length(headers: &HeaderMap) -> Option<u64> {
 }
 
 fn body_is_text(headers: &HeaderMap) -> bool {
-    match headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()) {
+    match headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+    {
         Some(ct) => {
             let ct = ct.to_ascii_lowercase();
             ct.contains("json")
@@ -907,7 +980,10 @@ fn rewrite_headers(
             // Basic → decode, substitute, re-encode; else substitute raw. If no
             // phantom was in it, the agent's own auth is stripped (the injected
             // credential elsewhere is the real one; agents can't shadow it).
-            if let Some(rest) = vs.strip_prefix("Basic ").or_else(|| vs.strip_prefix("basic ")) {
+            if let Some(rest) = vs
+                .strip_prefix("Basic ")
+                .or_else(|| vs.strip_prefix("basic "))
+            {
                 if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(rest.trim()) {
                     if let Ok(text) = String::from_utf8(decoded) {
                         let (new_text, any) =
@@ -915,8 +991,7 @@ fn rewrite_headers(
                         if any {
                             let enc = base64::engine::general_purpose::STANDARD
                                 .encode(new_text.as_bytes());
-                            if let Ok(hv) =
-                                header::HeaderValue::from_str(&format!("Basic {}", enc))
+                            if let Ok(hv) = header::HeaderValue::from_str(&format!("Basic {}", enc))
                             {
                                 out.insert(header::AUTHORIZATION, hv);
                             }
@@ -1004,7 +1079,12 @@ fn proxy_auth_challenge() -> Response<Body> {
         .header(header::PROXY_AUTHENTICATE, "Basic realm=\"safeclaw\"")
         .header(header::CONTENT_LENGTH, "0")
         .body(Body::empty())
-        .unwrap_or_else(|_| plain(StatusCode::PROXY_AUTHENTICATION_REQUIRED, "proxy auth required"))
+        .unwrap_or_else(|_| {
+            plain(
+                StatusCode::PROXY_AUTHENTICATION_REQUIRED,
+                "proxy auth required",
+            )
+        })
 }
 
 /// Best-effort terminal audit row for a forwarded (or denied) request. Denies
@@ -1064,14 +1144,20 @@ mod tests {
             .unwrap();
         assert_eq!(
             creds_from_proxy_auth(&req),
-            (Some("vault-abc".to_string()), Some("sc_agent_k9".to_string()))
+            (
+                Some("vault-abc".to_string()),
+                Some("sc_agent_k9".to_string())
+            )
         );
 
         // Legacy empty password (`vid:`) → vid present, key None (→ 407 later,
         // it's participating but unauthenticated).
         let no_key = Request::builder()
             .uri("api.github.com:443")
-            .header(header::PROXY_AUTHORIZATION, format!("Basic {}", b64(b"vault-abc:")))
+            .header(
+                header::PROXY_AUTHORIZATION,
+                format!("Basic {}", b64(b"vault-abc:")),
+            )
             .body(Body::empty())
             .unwrap();
         assert_eq!(
@@ -1091,7 +1177,10 @@ mod tests {
         // Empty vid (`:key`) is not a routing hint → vid None.
         let empty_vid = Request::builder()
             .uri("api.github.com:443")
-            .header(header::PROXY_AUTHORIZATION, format!("Basic {}", b64(b":sc_agent_k9")))
+            .header(
+                header::PROXY_AUTHORIZATION,
+                format!("Basic {}", b64(b":sc_agent_k9")),
+            )
             .body(Body::empty())
             .unwrap();
         assert_eq!(creds_from_proxy_auth(&empty_vid).0, None);
@@ -1131,16 +1220,26 @@ mod tests {
         let mut values = HashMap::new();
         values.insert("__sc__github__".to_string(), "ghp_REAL".to_string());
         let mut h = HeaderMap::new();
-        h.insert(header::PROXY_AUTHORIZATION, "Basic Zm9vOg==".parse().unwrap());
+        h.insert(
+            header::PROXY_AUTHORIZATION,
+            "Basic Zm9vOg==".parse().unwrap(),
+        );
         h.insert(
             header::AUTHORIZATION,
-            format!("Basic {}", b64(b"x:__sc__github__")).parse().unwrap(),
+            format!("Basic {}", b64(b"x:__sc__github__"))
+                .parse()
+                .unwrap(),
         );
         let out = rewrite_headers(&h, &values, false);
-        assert!(out.get(header::PROXY_AUTHORIZATION).is_none(), "proxy auth stripped");
+        assert!(
+            out.get(header::PROXY_AUTHORIZATION).is_none(),
+            "proxy auth stripped"
+        );
         let auth = out.get(header::AUTHORIZATION).unwrap().to_str().unwrap();
         let enc = auth.strip_prefix("Basic ").unwrap();
-        let decoded = base64::engine::general_purpose::STANDARD.decode(enc).unwrap();
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(enc)
+            .unwrap();
         assert_eq!(decoded, b"x:ghp_REAL", "phantom substituted inside Basic");
     }
 
@@ -1154,13 +1253,24 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert(
             header::AUTHORIZATION,
-            format!("Basic {}", b64(b"__sc__github__:")).parse().unwrap(),
+            format!("Basic {}", b64(b"__sc__github__:"))
+                .parse()
+                .unwrap(),
         );
         let out = rewrite_headers(&h, &values, false);
-        let auth = out.get(header::AUTHORIZATION).expect("auth header survived").to_str().unwrap();
+        let auth = out
+            .get(header::AUTHORIZATION)
+            .expect("auth header survived")
+            .to_str()
+            .unwrap();
         let enc = auth.strip_prefix("Basic ").unwrap();
-        let decoded = base64::engine::general_purpose::STANDARD.decode(enc).unwrap();
-        assert_eq!(decoded, b"ghp_REAL:", "phantom substituted in USERNAME position");
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(enc)
+            .unwrap();
+        assert_eq!(
+            decoded, b"ghp_REAL:",
+            "phantom substituted in USERNAME position"
+        );
     }
 
     #[test]
@@ -1169,7 +1279,10 @@ mod tests {
         // ride along (it would shadow the injected credential).
         let values: HashMap<String, String> = HashMap::new();
         let mut h = HeaderMap::new();
-        h.insert(header::AUTHORIZATION, "Bearer agents-own-token".parse().unwrap());
+        h.insert(
+            header::AUTHORIZATION,
+            "Bearer agents-own-token".parse().unwrap(),
+        );
         let out = rewrite_headers(&h, &values, false);
         assert!(out.get(header::AUTHORIZATION).is_none());
     }
@@ -1179,7 +1292,10 @@ mod tests {
         let mut values = HashMap::new();
         values.insert("__sc__stripe_key__".to_string(), "sk_live_X".to_string());
         let mut h = HeaderMap::new();
-        h.insert(header::AUTHORIZATION, "Bearer __sc__stripe_key__".parse().unwrap());
+        h.insert(
+            header::AUTHORIZATION,
+            "Bearer __sc__stripe_key__".parse().unwrap(),
+        );
         let out = rewrite_headers(&h, &values, false);
         assert_eq!(
             out.get(header::AUTHORIZATION).unwrap().to_str().unwrap(),

@@ -100,8 +100,11 @@ security-relevant field, and the settled tuple already makes it first-class):
 //          secrets" DIRECTLY, so discovery / cache-bootstrap read it instead of
 //          reverse-indexing the flat pool by casing. OMITTED (null) for a
 //          service-backed connection: its keys derive from the service's declared
-//          `secrets` (incl. the oauth2 refresh key). Values still live in the flat
-//          pool, addressed [<conn_id>:]<KEY> (bare when conn_id == service_id).
+//          `secrets` (incl. the oauth2 refresh key). Values live in the flat
+//          pool at BARE env-valid keys; the record's sparse `keys` map binds
+//          role → KEY (identity when unmapped — CONNECTION_SCHEMA.md §3), so a
+//          named connection stores at distinct suggested keys
+//          (GMAIL_REFRESH_TOKEN_WORK) and may bind to an existing key to share.
 // policy:  NOT here — aux.policy.connections.<conn_id>.
 // phantom: NEVER stored — it is a DERIVED composite of (conn_id + a secret key);
 //          storing it would be redundant and ambiguous for multi-secret conns.
@@ -271,8 +274,9 @@ __sc__<conn>__                   // DEFAULT shorthand — the connection's sole 
   suffix appears only when a connection genuinely exposes several.
 - `<conn>` is the id the user gave at connect time and sees in the UI
   (`github`, `gmail_work`) — nothing new to learn. Connect enforces env-safe ids.
-- Storage addressing `[<conn>:]<ROLE>` (with `:`) is **unchanged** — `:` lives
-  only in internal addressing; the phantom surface uses the env-safe form.
+- Storage keys are ALL bare env-valid names; the connection record's `keys`
+  map binds role → KEY (CONNECTION_SCHEMA.md §3). The phantom stays the only
+  SafeClaw-invented string on any surface.
 - The `__sc__…__` shell is a **leak breadcrumb**: an un-substituted phantom is
   recognizable in logs/upstream errors.
 - Multi-account is disambiguated by **conn name** (`__sc__gmail__` vs
@@ -301,14 +305,13 @@ does profiles (`AWS_PROFILE`, kubectl contexts, per-project `.env`/direnv):
   business — no coupling between URL usernames and connection ids is designed or
   documented.
 
-**Storage keys are internal-only, and `:` is chosen deliberately.** The vault key
-(`[<conn>:]<ROLE>`) never reaches the agent — the agent surface is exactly two
-things: the tool's env var name (its contract) and the phantom value (ours).
-Conn ids and roles are locked to `[a-z0-9_]`; `:` sits **outside** that charset,
-so internal-address splitting is always unambiguous and an internal key can never
-be mistaken for a phantom or an env var name — three surfaces, mutually exclusive
-charsets. *Storage-only vs connection secret* is decided by **whether any
-connection claims the key**, not by key syntax.
+**Storage keys never reach the agent, and there is no address syntax at all.**
+The agent surface is exactly two things: the tool's env var name (its contract)
+and the phantom value (ours). Vault keys are plain env names — which connection
+uses which key is data in the connection RECORD (`keys` map / raw `secrets`
+list), not something parsed out of the key. *Storage-only vs connection secret*
+is decided by **whether any connection claims the key**, not by key syntax.
+(The pre-2026-07-08 `[<conn>:]<ROLE>` colon namespacing is retired.)
 
 ## 6. Transport: the local HTTPS proxy + the env bundle
 

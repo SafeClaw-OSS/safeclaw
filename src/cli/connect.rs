@@ -10,8 +10,10 @@
 //!     declared secrets. `--host` is then optional and only PINS an exact FQDN
 //!     inside the service's `*.suffix` wildcards (each pin ⊆ the service hosts).
 //!     Secret values are provided with `--secret KEY=VALUE`; keys must be a
-//!     subset of the service's declared secrets. Stored at the §3 address
-//!     (`secret_address`: bare for the default connection, `<name>:<KEY>` named).
+//!     subset of the service's declared secrets. Every value is stored at a
+//!     BARE uppercase key (§3): the role's own name for the default connection,
+//!     the suggested `<ROLE>_<QUALIFIER>` for a named one — recorded in the
+//!     connection's `keys` map (the binding is stored data, never recomputed).
 //!
 //! Secret KEYs are canonical UPPERCASE (§1); a lowercase `--secret key=…` is
 //! auto-converted. Connection ids are lowercase.
@@ -30,7 +32,7 @@ use crate::cli::secret::{do_unlock, seal_and_submit_write};
 use crate::cli::webauthn::fetch_passkey_meta;
 use crate::config::{ConnectArgs, ConnectionLsArgs, ConnectionRmArgs};
 use crate::service::ServiceRegistry;
-use crate::storage::plaintext::secret_address;
+use crate::storage::plaintext::{secret_key_for, suggested_secret_key};
 
 pub async fn run(mut args: ConnectArgs) -> Result<(), String> {
     let (custodian, vault) = resolve_active(args.vault.as_deref())?;
@@ -80,7 +82,10 @@ fn resolve_conn_id(args: &mut ConnectArgs) -> Result<String, String> {
         }
         let id = slugify_conn_id(raw);
         if id.is_empty() {
-            eprintln!("  '{}' has no usable id characters; use letters/digits", raw);
+            eprintln!(
+                "  '{}' has no usable id characters; use letters/digits",
+                raw
+            );
             continue;
         }
         if id != raw {
@@ -172,21 +177,36 @@ pub async fn run_rm(args: ConnectionRmArgs) -> Result<(), String> {
         }
     }
 
-    eprintln!("safeclaw connection rm {} — two passkey gestures (unlock + write)", id);
+    eprintln!(
+        "safeclaw connection rm {} — two passkey gestures (unlock + write)",
+        id
+    );
     let meta = fetch_passkey_meta(&custodian, &vault).await?;
-    let (kv, mut aux, user_key) =
-        do_unlock(&custodian, &vault, &meta, args.no_browser, args.timeout, args.cb_port).await?;
+    let (kv, mut aux, user_key) = do_unlock(
+        &custodian,
+        &vault,
+        &meta,
+        args.no_browser,
+        args.timeout,
+        args.cb_port,
+    )
+    .await?;
 
     // The connection record (raw or service-backed) names the secrets it owns.
     let rec = aux
         .get("connections")
         .and_then(|c| c.get(&id))
         .cloned()
-        .ok_or_else(|| format!("no connection '{}' in this vault (see `sc connection ls`)", id))?;
+        .ok_or_else(|| {
+            format!(
+                "no connection '{}' in this vault (see `sc connection ls`)",
+                id
+            )
+        })?;
 
     let mut new_kv = kv;
     let mut removed_secrets = Vec::new();
-    for addr in connection_secret_addresses(&id, &rec) {
+    for addr in connection_secret_addresses(&rec) {
         if new_kv.remove(&addr).is_some() {
             removed_secrets.push(addr);
         }
@@ -194,7 +214,15 @@ pub async fn run_rm(args: ConnectionRmArgs) -> Result<(), String> {
     remove_connection(&mut aux, &id);
 
     seal_and_submit_write(
-        &custodian, &vault, &meta, &user_key, &new_kv, &aux, args.no_browser, args.timeout, args.cb_port,
+        &custodian,
+        &vault,
+        &meta,
+        &user_key,
+        &new_kv,
+        &aux,
+        args.no_browser,
+        args.timeout,
+        args.cb_port,
     )
     .await?;
 
@@ -211,19 +239,21 @@ pub async fn run_rm(args: ConnectionRmArgs) -> Result<(), String> {
     Ok(())
 }
 
-/// The kv addresses a connection's secrets live at, so `rm` deletes exactly what
-/// `add` wrote (mirrors the console's disconnect address computation). Raw: the
-/// explicit `secrets` list, stored at BARE uppercase keys. Service-backed:
-/// `secret_address(id, service, ROLE)` for each of the service's declared roles.
-fn connection_secret_addresses(id: &str, rec: &Value) -> Vec<String> {
+/// The BARE vault keys a connection's secrets live at, so `rm` deletes exactly
+/// what `add` wrote (mirrors the console's disconnect computation). Raw: the
+/// explicit `secrets` list. Service-backed: each declared role resolved through
+/// the record's `keys` map (identity when unmapped).
+fn connection_secret_addresses(rec: &Value) -> Vec<String> {
     if let Some(service) = rec.get("service").and_then(|v| v.as_str()) {
+        let conn: Option<crate::storage::plaintext::Connection> =
+            serde_json::from_value(rec.clone()).ok();
         let reg = ServiceRegistry::load();
         return match reg.get(service) {
             Some(def) => def
                 .service
                 .secrets
                 .iter()
-                .map(|role| secret_address(id, service, &role.to_ascii_uppercase()))
+                .map(|role| secret_key_for(conn.as_ref(), &role.to_ascii_uppercase()))
                 .collect(),
             None => Vec::new(),
         };
@@ -240,7 +270,12 @@ fn connection_secret_addresses(id: &str, rec: &Value) -> Vec<String> {
 
 // ── raw connection ───────────────────────────────────────────────────────────
 
-async fn run_raw(custodian: &str, vault: &str, name: &str, args: &ConnectArgs) -> Result<(), String> {
+async fn run_raw(
+    custodian: &str,
+    vault: &str,
+    name: &str,
+    args: &ConnectArgs,
+) -> Result<(), String> {
     // Hosts: anchor our own exact FQDNs.
     let hosts = if !args.host.is_empty() {
         args.host.clone()
@@ -259,14 +294,25 @@ async fn run_raw(custodian: &str, vault: &str, name: &str, args: &ConnectArgs) -
     let gathered = gather_secrets(name, &args.secret, &args.use_existing)?;
     if gathered.new_values.is_empty() && gathered.existing.is_empty() {
         return Err(
-            "a connection needs at least one secret — `--secret KEY=VALUE` or `--use-existing KEY`".into(),
+            "a connection needs at least one secret — `--secret KEY=VALUE` or `--use-existing KEY`"
+                .into(),
         );
     }
 
-    eprintln!("safeclaw connection add {} — two passkey gestures (unlock + write)", name);
+    eprintln!(
+        "safeclaw connection add {} — two passkey gestures (unlock + write)",
+        name
+    );
     let meta = fetch_passkey_meta(custodian, vault).await?;
-    let (kv, mut aux, user_key) =
-        do_unlock(custodian, vault, &meta, args.no_browser, args.timeout, args.cb_port).await?;
+    let (kv, mut aux, user_key) = do_unlock(
+        custodian,
+        vault,
+        &meta,
+        args.no_browser,
+        args.timeout,
+        args.cb_port,
+    )
+    .await?;
     let mut new_kv = kv;
 
     // Raw secrets are stored at their BARE uppercase KEY (§2 — the vault is a
@@ -279,14 +325,28 @@ async fn run_raw(custodian: &str, vault: &str, name: &str, args: &ConnectArgs) -
     // --use-existing: reference an existing BARE secret KEY (no new value).
     for existing in &gathered.existing {
         if !new_kv.contains_key(existing) {
-            return Err(format!("--use-existing {}: no such secret in the vault", existing));
+            return Err(format!(
+                "--use-existing {}: no such secret in the vault",
+                existing
+            ));
         }
         secret_keys.push(existing.clone());
     }
     dedup_upper(&mut secret_keys);
 
     insert_raw_connection(&mut aux, name, &hosts, &secret_keys);
-    seal_and_submit_write(custodian, vault, &meta, &user_key, &new_kv, &aux, args.no_browser, args.timeout, args.cb_port).await?;
+    seal_and_submit_write(
+        custodian,
+        vault,
+        &meta,
+        &user_key,
+        &new_kv,
+        &aux,
+        args.no_browser,
+        args.timeout,
+        args.cb_port,
+    )
+    .await?;
 
     report_phantoms(name, &hosts, &secret_keys);
     Ok(())
@@ -348,33 +408,80 @@ async fn run_service_backed(
                 "secret '{}' is not declared by service '{}' (its secrets: {})",
                 role,
                 service,
-                if service_secrets.is_empty() { "none".into() } else { service_secrets.join(", ") }
+                if service_secrets.is_empty() {
+                    "none".into()
+                } else {
+                    service_secrets.join(", ")
+                }
             ));
         }
     }
 
-    eprintln!("safeclaw connection add {} → service '{}' — two passkey gestures (unlock + write)", name, service);
+    eprintln!(
+        "safeclaw connection add {} → service '{}' — two passkey gestures (unlock + write)",
+        name, service
+    );
     let meta = fetch_passkey_meta(custodian, vault).await?;
-    let (kv, mut aux, user_key) =
-        do_unlock(custodian, vault, &meta, args.no_browser, args.timeout, args.cb_port).await?;
+    let (kv, mut aux, user_key) = do_unlock(
+        custodian,
+        vault,
+        &meta,
+        args.no_browser,
+        args.timeout,
+        args.cb_port,
+    )
+    .await?;
     let mut new_kv = kv;
 
-    // Service-backed secrets are stored at the §3 address (bare for the default
-    // connection `name == service`, `<name>:<KEY>` for a named one).
+    // Every secret is stored at a BARE uppercase KEY (§3): the role's own
+    // mainstream name for the default connection (`name == service`), or the
+    // suggested `<ROLE>_<QUALIFIER>` for a named one — recorded in the
+    // connection's `keys` map so readers resolve the same slot.
+    let keys: Option<Vec<(String, String)>> = if name == service {
+        None
+    } else {
+        Some(
+            gathered
+                .new_values
+                .iter()
+                .map(|(role, _)| (role.clone(), suggested_secret_key(name, service, role)))
+                .collect(),
+        )
+    };
     for (role, val) in &gathered.new_values {
-        new_kv.insert(secret_address(name, service, role), val.clone());
+        let key = keys
+            .as_ref()
+            .and_then(|m| m.iter().find(|(r, _)| r == role).map(|(_, k)| k.clone()))
+            .unwrap_or_else(|| role.clone());
+        new_kv.insert(key, val.clone());
     }
 
-    insert_service_connection(&mut aux, name, service, pins.as_deref());
-    seal_and_submit_write(custodian, vault, &meta, &user_key, &new_kv, &aux, args.no_browser, args.timeout, args.cb_port).await?;
+    insert_service_connection(&mut aux, name, service, pins.as_deref(), keys.as_deref());
+    seal_and_submit_write(
+        custodian,
+        vault,
+        &meta,
+        &user_key,
+        &new_kv,
+        &aux,
+        args.no_browser,
+        args.timeout,
+        args.cb_port,
+    )
+    .await?;
 
     // The service def is the SSoT for the advertised phantoms.
-    let phantoms: Vec<String> = crate::core::host::phantoms_for(name, def).into_values().collect();
+    let phantoms: Vec<String> = crate::core::host::phantoms_for(name, def)
+        .into_values()
+        .collect();
     let host_line = pins
         .as_ref()
         .map(|p| p.join(", "))
         .unwrap_or_else(|| service_hosts.join(", "));
-    eprintln!("safeclaw connect — '{}' → {} ({})", name, service, host_line);
+    eprintln!(
+        "safeclaw connect — '{}' → {} ({})",
+        name, service, host_line
+    );
     for ph in &phantoms {
         eprintln!("  phantom: {}", ph);
     }
@@ -396,22 +503,35 @@ struct Gathered {
 /// Parse `--secret KEY[=VALUE]` (and `--use-existing KEY`), uppercasing every KEY
 /// to the canonical form (§1). A bare `--secret KEY` prompts for a hidden value
 /// on a TTY. Fully-interactive (no flags) loops prompting KEY + value.
-fn gather_secrets(name: &str, secret_flags: &[String], use_existing: &[String]) -> Result<Gathered, String> {
+fn gather_secrets(
+    name: &str,
+    secret_flags: &[String],
+    use_existing: &[String],
+) -> Result<Gathered, String> {
     let mut new_values: Vec<(String, String)> = Vec::new();
-    let existing: Vec<String> = use_existing.iter().map(|k| k.trim().to_ascii_uppercase()).collect();
+    let existing: Vec<String> = use_existing
+        .iter()
+        .map(|k| k.trim().to_ascii_uppercase())
+        .collect();
 
     if !secret_flags.is_empty() {
         for s in secret_flags {
             if let Some((k, v)) = s.split_once('=') {
                 let role = k.trim().to_ascii_uppercase();
                 if !valid_role(&role) {
-                    return Err(format!("secret KEY '{}' isn't a valid env key ([A-Z0-9_])", k.trim()));
+                    return Err(format!(
+                        "secret KEY '{}' isn't a valid env key ([A-Z0-9_])",
+                        k.trim()
+                    ));
                 }
                 new_values.push((role, v.to_string()));
             } else if std::io::stdin().is_terminal() {
                 let role = s.trim().to_ascii_uppercase();
                 if !valid_role(&role) {
-                    return Err(format!("secret KEY '{}' isn't a valid env key ([A-Z0-9_])", s.trim()));
+                    return Err(format!(
+                        "secret KEY '{}' isn't a valid env key ([A-Z0-9_])",
+                        s.trim()
+                    ));
                 }
                 let val = rpassword::prompt_password(format!("Value for {} (hidden): ", role))
                     .map_err(|e| format!("read value: {}", e))?;
@@ -430,7 +550,8 @@ fn gather_secrets(name: &str, secret_flags: &[String], use_existing: &[String]) 
         // Fully interactive: loop prompting KEY names + hidden values.
         if !std::io::stdin().is_terminal() {
             return Err(
-                "no secrets given — `--secret KEY=VALUE` (repeatable) or `--use-existing KEY`".into(),
+                "no secrets given — `--secret KEY=VALUE` (repeatable) or `--use-existing KEY`"
+                    .into(),
             );
         }
         loop {
@@ -460,7 +581,10 @@ fn gather_secrets(name: &str, secret_flags: &[String], use_existing: &[String]) 
             return Err(format!("duplicate secret KEY '{}'", role));
         }
     }
-    Ok(Gathered { new_values, existing })
+    Ok(Gathered {
+        new_values,
+        existing,
+    })
 }
 
 fn dedup_upper(keys: &mut Vec<String>) {
@@ -469,7 +593,10 @@ fn dedup_upper(keys: &mut Vec<String>) {
 }
 
 fn prompt_hosts(name: &str) -> Result<Vec<String>, String> {
-    eprintln!("Connection '{}' needs at least one egress host (the API's exact domain).", name);
+    eprintln!(
+        "Connection '{}' needs at least one egress host (the API's exact domain).",
+        name
+    );
     let mut hosts = Vec::new();
     loop {
         let prompt = if hosts.is_empty() {

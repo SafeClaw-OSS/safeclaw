@@ -16,7 +16,10 @@ use axum::{
     extract::{Path, State},
     Json,
 };
-use base64::{engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD}, Engine};
+use base64::{
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+    Engine,
+};
 
 /// HPKE `info` prefix for the pending-passkey deposit seal. The full info
 /// string is `PENDING_PASSKEY_INFO_PREFIX ‖ vault_id ‖ 0x1F ‖ cid_new` —
@@ -31,13 +34,13 @@ use crate::audit::{STATUS_APPROVED, STATUS_REJECTED};
 use crate::error::{AppError, Result};
 use crate::passkey::PasskeyEntry;
 use crate::protocol::operation::{
-    as_enroll_credential, as_export_path, as_write_patch, decode_credential_id,
-    discriminator, ActType,
+    as_enroll_credential, as_export_path, as_write_patch, decode_credential_id, discriminator,
+    ActType,
 };
 use crate::protocol::{render_operation, validate_grant, Grant};
 use crate::server::handlers::metadata::decrypt_vault_view_keep_key;
+use crate::state::{AppState, ApprovalEvent, SecretsCache};
 use crate::storage::plaintext::VaultPlaintextView;
-use crate::state::{ApprovalEvent, AppState, SecretsCache};
 use crate::storage::sealed_vault::{
     build_initial, find_pubkey, find_pubkey_in_registry, read as read_vault, read_per_item,
     replace_after_write, write_atomic,
@@ -60,10 +63,7 @@ pub async fn get_op(
     }
 }
 
-async fn get_op_json(
-    state: Arc<AppState>,
-    op_id: String,
-) -> Result<axum::response::Response> {
+async fn get_op_json(state: Arc<AppState>, op_id: String) -> Result<axum::response::Response> {
     use axum::response::IntoResponse;
     let body = op_poll_value(&state, &op_id)?;
     let pending = body.get("status").and_then(|s| s.as_str()) == Some("pending");
@@ -74,7 +74,8 @@ async fn get_op_json(
         if let Ok(v) = axum::http::HeaderValue::from_str(
             &crate::approval::store::POLL_INTERVAL_HINT_SECS.to_string(),
         ) {
-            resp.headers_mut().insert(axum::http::header::RETRY_AFTER, v);
+            resp.headers_mut()
+                .insert(axum::http::header::RETRY_AFTER, v);
         }
     }
     Ok(resp)
@@ -119,9 +120,7 @@ pub fn op_poll_value(state: &AppState, op_id: &str) -> Result<Value> {
         // secret is opaque — never parse it, even when it happens to be JSON).
         ApprovalStatus::Approved => {
             let v = rec.cached_value.clone().map(|s| match &rec.op.act.kind {
-                ActType::Use => {
-                    serde_json::from_str::<Value>(&s).unwrap_or(Value::String(s))
-                }
+                ActType::Use => serde_json::from_str::<Value>(&s).unwrap_or(Value::String(s)),
                 _ => Value::String(s),
             });
             ("ok", v)
@@ -220,10 +219,14 @@ pub async fn approve_op(
     // (Legacy local op-page ships plaintext `wrapping_key` and skips this.)
     if grant.wk_enc.is_some() || grant.wk_ct.is_some() {
         let enc_b64 = grant.wk_enc.as_deref().ok_or_else(|| {
-            AppError::BadRequest("sealed wrapping key needs both wk_enc and wk_ct (wk_enc missing)".into())
+            AppError::BadRequest(
+                "sealed wrapping key needs both wk_enc and wk_ct (wk_enc missing)".into(),
+            )
         })?;
         let ct_b64 = grant.wk_ct.as_deref().ok_or_else(|| {
-            AppError::BadRequest("sealed wrapping key needs both wk_enc and wk_ct (wk_ct missing)".into())
+            AppError::BadRequest(
+                "sealed wrapping key needs both wk_enc and wk_ct (wk_ct missing)".into(),
+            )
         })?;
         let enc = URL_SAFE_NO_PAD
             .decode(enc_b64)
@@ -234,7 +237,9 @@ pub async fn approve_op(
         let info = crate::crypto::envelope::grant_seal_info(&op_id);
         let wk = state.sc.open(&enc, &ct, &info, b"")?;
         if wk.len() != 32 {
-            return Err(AppError::BadRequest("sealed wrapping_key must be 32 bytes".into()));
+            return Err(AppError::BadRequest(
+                "sealed wrapping_key must be 32 bytes".into(),
+            ));
         }
         grant.wrapping_key = Some(STANDARD.encode(&wk));
     }
@@ -308,9 +313,9 @@ pub async fn approve_op(
                 .get("new")
                 .and_then(|n| n.get("credential_id"))
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| AppError::BadRequest(
-                    "add-passkey: scope.new.credential_id required".into(),
-                ))?
+                .ok_or_else(|| {
+                    AppError::BadRequest("add-passkey: scope.new.credential_id required".into())
+                })?
                 .to_string();
             // Pop the pending file (single-use, deleted on read).
             let pending = crate::storage::pending_passkey::load_and_consume(
@@ -351,9 +356,9 @@ pub async fn approve_op(
             let redeemed = sudp::grant::RedeemedGrant {
                 o: validated.op.clone(),
                 credential_id: validated.credential_id_bytes.clone(),
-                wrapping_key: sudp::grant::WrappingKey::from_bytes(
-                    std::mem::take(&mut validated.wrapping_key),
-                ),
+                wrapping_key: sudp::grant::WrappingKey::from_bytes(std::mem::take(
+                    &mut validated.wrapping_key,
+                )),
                 opt: sudp::grant::GrantOpt::default(),
             };
             let opened = sudp::phases::consumption::open::<sudp::primitives::StdPrimitives>(
@@ -416,9 +421,10 @@ pub async fn approve_op(
                     "vault already initialized for this vault_id".into(),
                 ));
             }
-            let payload = grant.setup_payload.as_ref().ok_or_else(|| {
-                AppError::BadRequest("enroll grant missing setup_payload".into())
-            })?;
+            let payload = grant
+                .setup_payload
+                .as_ref()
+                .ok_or_else(|| AppError::BadRequest("enroll grant missing setup_payload".into()))?;
             let cid_bytes = decode_credential_id(&credential.credential_id)?;
             let prf_salt = STANDARD
                 .decode(&credential.prf_salt)
@@ -575,11 +581,9 @@ pub async fn approve_op(
             // The at-least-one safeguard still catches "revoking the only
             // remaining credential".
             let target = validated.op.act.target.as_str();
-            let cid_b64 = target
-                .strip_prefix("passkeys.")
-                .ok_or_else(|| AppError::BadRequest(
-                    "revoke target must be 'passkeys.<credential_id>'".into(),
-                ))?;
+            let cid_b64 = target.strip_prefix("passkeys.").ok_or_else(|| {
+                AppError::BadRequest("revoke target must be 'passkeys.<credential_id>'".into())
+            })?;
             let mut vault = existing_vault
                 .clone()
                 .ok_or_else(|| AppError::Conflict("vault not initialized".into()))?;
@@ -602,7 +606,10 @@ pub async fn approve_op(
                 cred_count = vault.credentials.len(),
                 "vault revoke-passkey applied"
             );
-            (json!({ "ok": true, "act": "revoke", "target": target }), None)
+            (
+                json!({ "ok": true, "act": "revoke", "target": target }),
+                None,
+            )
         }
         ActType::Export => {
             // F-15: reject KEM-sealed Export until it is implemented.
@@ -633,9 +640,8 @@ pub async fn approve_op(
             if path == "env" || path.is_empty() {
                 let mut all = serde_json::Map::new();
                 for (k, v) in view.native_secrets.iter() {
-                    let s = String::from_utf8(v.clone()).map_err(|_| {
-                        AppError::Internal("native-secrets item not utf8".into())
-                    })?;
+                    let s = String::from_utf8(v.clone())
+                        .map_err(|_| AppError::Internal("native-secrets item not utf8".into()))?;
                     all.insert(k.clone(), serde_json::Value::String(s));
                 }
                 let resp = json!({
@@ -727,9 +733,8 @@ pub async fn approve_op(
                 // build a new aux when the user writes.
                 let mut kv = serde_json::Map::new();
                 for (k, v) in view.native_secrets.iter() {
-                    let s = String::from_utf8(v.clone()).map_err(|_| {
-                        AppError::Internal("native-secrets item not utf8".into())
-                    })?;
+                    let s = String::from_utf8(v.clone())
+                        .map_err(|_| AppError::Internal("native-secrets item not utf8".into()))?;
                     kv.insert(k.clone(), Value::String(s));
                 }
                 let aux_json = serde_json::to_value(&view.aux)?;
@@ -794,9 +799,10 @@ pub async fn approve_op(
                 // approvals "from 50 minutes ago" instead of an empty log.
                 // Matches the admin DELETE path's ordering (admin.rs).
                 state.audits.forget(&vault_id);
-                state.vaults.remove(&vault_id).map_err(|e| {
-                    AppError::Internal(format!("vault dir remove: {}", e))
-                })?;
+                state
+                    .vaults
+                    .remove(&vault_id)
+                    .map_err(|e| AppError::Internal(format!("vault dir remove: {}", e)))?;
                 {
                     let mut states = state.vault_states.lock().unwrap();
                     states.remove(&vault_id);
@@ -815,26 +821,24 @@ pub async fn approve_op(
             // pipeline. Self-rename allowed (matches per-VM UX).
             "rename-passkey" => {
                 let target = validated.op.act.target.as_str();
-                let cid_b64 = target
-                    .strip_prefix("passkeys.")
-                    .ok_or_else(|| AppError::BadRequest(
+                let cid_b64 = target.strip_prefix("passkeys.").ok_or_else(|| {
+                    AppError::BadRequest(
                         "rename-passkey target must be 'passkeys.<credential_id>'".into(),
-                    ))?;
+                    )
+                })?;
                 let new_name = validated
                     .op
                     .act
                     .scope
                     .get("device_name")
                     .and_then(|v| v.as_str())
-                    .ok_or_else(|| AppError::BadRequest(
-                        "rename-passkey scope.device_name required".into(),
-                    ))?
+                    .ok_or_else(|| {
+                        AppError::BadRequest("rename-passkey scope.device_name required".into())
+                    })?
                     .trim()
                     .to_string();
                 if new_name.is_empty() {
-                    return Err(AppError::BadRequest(
-                        "device_name cannot be empty".into(),
-                    ));
+                    return Err(AppError::BadRequest("device_name cannot be empty".into()));
                 }
                 if new_name.len() > 120 {
                     return Err(AppError::BadRequest(
@@ -849,9 +853,9 @@ pub async fn approve_op(
                     .registry
                     .get::<sudp::passkey::WebAuthn>(&cid_bytes)
                     .map_err(|e| AppError::Internal(format!("registry get: {}", e)))?
-                    .ok_or_else(|| AppError::BadRequest(
-                        "target credential not enrolled on this vault".into(),
-                    ))?;
+                    .ok_or_else(|| {
+                        AppError::BadRequest("target credential not enrolled on this vault".into())
+                    })?;
                 pk.device_name = new_name.clone();
                 vault
                     .registry
@@ -924,9 +928,9 @@ pub async fn approve_op(
     // short-circuit the next matching request.
     let (rec_id, rec_vault_id, response_preview, policy_ctx_for_cache) = {
         let mut store = state.approvals.lock().unwrap();
-        let rec = store.approve(&op_id, cached_value.clone()).ok_or_else(|| {
-            AppError::Conflict("op no longer pending after validation".into())
-        })?;
+        let rec = store
+            .approve(&op_id, cached_value.clone())
+            .ok_or_else(|| AppError::Conflict("op no longer pending after validation".into()))?;
         let preview = match &validated.op.act.kind {
             ActType::Use => cached_value
                 .as_deref()
@@ -1052,7 +1056,14 @@ pub async fn reject_op(
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     if let Ok(store) = state.audits.for_vault(&rec_vault_id) {
-        if let Err(e) = store.finalize(&op_id, STATUS_REJECTED, now, None, Some("user denied"), None) {
+        if let Err(e) = store.finalize(
+            &op_id,
+            STATUS_REJECTED,
+            now,
+            None,
+            Some("user denied"),
+            None,
+        ) {
             tracing::warn!(vault = %rec_vault_id, op = %op_id, "audit finalize rejected failed: {}", e);
         }
     }
@@ -1066,9 +1077,10 @@ pub async fn reject_op(
         reason: Some("user denied".into()),
     });
 
-    Ok(Json(json!({ "ok": true, "op_id": rec_id, "status": "rejected" })))
+    Ok(Json(
+        json!({ "ok": true, "op_id": rec_id, "status": "rejected" }),
+    ))
 }
-
 
 /// Build the per-service `secrets_cache` from a decrypted v3 view. The cache
 /// carries three things per session:
@@ -1122,9 +1134,7 @@ fn seed_per_item_store(
         items_seq,
         keyset_seq,
     };
-    if let Err(e) =
-        pv.seed_items_from_view::<sudp::primitives::StdPrimitives>(k, vault_id, view)
-    {
+    if let Err(e) = pv.seed_items_from_view::<sudp::primitives::StdPrimitives>(k, vault_id, view) {
         tracing::warn!(vault = %vault_id, "per-item seed from view failed: {}", e);
         return;
     }
@@ -1215,16 +1225,19 @@ pub(crate) fn bootstrap_cache_from_view(
         if store.kind != "gcp-secret-manager" {
             continue;
         }
-        let Some(creds_item) = store
-            .extra
-            .get("credentials_item")
-            .and_then(|v| v.as_str())
-        else { continue };
-        let Some(sa_json) = view.native_secrets.get(creds_item).cloned() else { continue };
+        let Some(creds_item) = store.extra.get("credentials_item").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(sa_json) = view.native_secrets.get(creds_item).cloned() else {
+            continue;
+        };
         cache
             .external_stores
             // F-19: wrap SA JSON bytes in Zeroizing so they are zeroed on drop.
-            .insert(store_id.clone(), (store.clone(), zeroize::Zeroizing::new(sa_json)));
+            .insert(
+                store_id.clone(),
+                (store.clone(), zeroize::Zeroizing::new(sa_json)),
+            );
     }
     for (service_id, _) in state.services.iter_sorted() {
         // PROTOCOL.md §6.2: only connections whose effective READ floor is
@@ -1236,8 +1249,13 @@ pub(crate) fn bootstrap_cache_from_view(
         // ask/ask-always RULE on this (read-allow) connection still forces a
         // fresh passkey instead of riding this residency.
         if read_floor_allows(Some(service_id), service_id) {
-            if let Some(item_name) = state.services.service_env_key(service_id) {
-                if let Some(val) = view.resolve_value_native(&item_name) {
+            // The default connection's record (usually absent) may rebind a role
+            // to an existing key (`keys` map); identity otherwise. Cache maps
+            // stay ROLE-keyed — only the storage lookup goes through the record.
+            let rec = view.aux.connections.get(service_id);
+            if let Some(role) = state.services.service_env_key(service_id) {
+                let key = crate::storage::plaintext::secret_key_for(rec, &role);
+                if let Some(val) = view.resolve_value_native(&key) {
                     cache.entries.insert(
                         service_id.to_string(),
                         crate::state::CacheEntry {
@@ -1259,7 +1277,8 @@ pub(crate) fn bootstrap_cache_from_view(
                 let mut map: std::collections::HashMap<String, Vec<u8>> =
                     std::collections::HashMap::new();
                 for name in cacheable_roles(svc) {
-                    if let Some(val) = view.resolve_value_native(&name) {
+                    let key = crate::storage::plaintext::secret_key_for(rec, &name);
+                    if let Some(val) = view.resolve_value_native(&key) {
                         map.insert(name, val.to_vec());
                     }
                 }
@@ -1275,18 +1294,21 @@ pub(crate) fn bootstrap_cache_from_view(
         // `AppState::evaluate_request_policy`.
     }
 
-    // Named connections (`conn_id != service_id`) carry namespaced secrets
-    // `<conn>:<ROLE>` (CONNECTION_SCHEMA.md §3). The per-service loop above
-    // already covered every default connection (conn == service, bare name);
-    // here we add the named ones, keyed by connection_id, resolving each role at
-    // its §3 address but storing the multi-secret map under the BARE name so the
-    // proxy's phantom resolution finds each role's bytes. (Allow-level only —
-    // ask-level connections resolve lazily from the op's namespaced `target`.)
+    // Named connections (`conn_id != service_id`) bind each ROLE to its own
+    // BARE key via the record's `keys` map (CONNECTION_SCHEMA.md §3; identity
+    // when unmapped). The per-service loop above already covered every default
+    // connection; here we add the named ones, keyed by connection_id, resolving
+    // each role through its binding but storing the multi-secret map under the
+    // ROLE name so the proxy's phantom resolution finds each role's bytes.
+    // (Allow-level only — ask-level connections resolve lazily from the op's
+    // bound `target` key.)
     for (conn, c) in view.aux.connections.iter() {
         // Raw connections (service: None) have no service to bootstrap from; their
         // bytes resolve lazily at approve. Only service-backed named connections
         // are pre-bootstrapped here.
-        let Some(service) = c.service.as_deref() else { continue };
+        let Some(service) = c.service.as_deref() else {
+            continue;
+        };
         if conn == service {
             continue; // default — already bootstrapped above
         }
@@ -1294,8 +1316,8 @@ pub(crate) fn bootstrap_cache_from_view(
             continue;
         }
         if let Some(role) = state.services.service_env_key(service) {
-            let addr = crate::storage::plaintext::secret_address(conn, service, &role);
-            if let Some(val) = view.resolve_value_native(&addr) {
+            let key = crate::storage::plaintext::secret_key_for(Some(c), &role);
+            if let Some(val) = view.resolve_value_native(&key) {
                 cache.entries.insert(
                     conn.clone(),
                     crate::state::CacheEntry {
@@ -1310,8 +1332,8 @@ pub(crate) fn bootstrap_cache_from_view(
             let mut map: std::collections::HashMap<String, Vec<u8>> =
                 std::collections::HashMap::new();
             for name in cacheable_roles(svc) {
-                let addr = crate::storage::plaintext::secret_address(conn, service, &name);
-                if let Some(val) = view.resolve_value_native(&addr) {
+                let key = crate::storage::plaintext::secret_key_for(Some(c), &name);
+                if let Some(val) = view.resolve_value_native(&key) {
                     map.insert(name, val.to_vec());
                 }
             }
@@ -1340,8 +1362,7 @@ pub(crate) fn bootstrap_cache_from_view(
         if !read_floor_allows(None, conn) {
             continue;
         }
-        let mut map: std::collections::HashMap<String, Vec<u8>> =
-            std::collections::HashMap::new();
+        let mut map: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
         for key in keys {
             if let Some((_, bytes)) = view
                 .native_secrets
@@ -1357,7 +1378,11 @@ pub(crate) fn bootstrap_cache_from_view(
             let primary = map.values().next().cloned().unwrap();
             cache.entries.insert(
                 conn.clone(),
-                crate::state::CacheEntry { value: primary, expires_at: None, from_bootstrap: true },
+                crate::state::CacheEntry {
+                    value: primary,
+                    expires_at: None,
+                    from_bootstrap: true,
+                },
             );
         }
         if !map.is_empty() {
@@ -1389,4 +1414,3 @@ pub(crate) fn bootstrap_cache_from_view(
     }
     cache
 }
-

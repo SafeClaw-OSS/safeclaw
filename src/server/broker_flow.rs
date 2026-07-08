@@ -15,7 +15,7 @@ use serde_json::Value;
 use crate::audit;
 use crate::error::{AppError, Result};
 use crate::protocol::Operation;
-use crate::state::{ApprovalEvent, AppState};
+use crate::state::{AppState, ApprovalEvent};
 
 /// The daemon's shared outbound HTTP client (redirect policy = none). Re-exported
 /// here so the proxy pipeline has one obvious home for it.
@@ -25,7 +25,10 @@ pub use crate::core::forward::HTTP_CLIENT;
 /// refresh token keeps the map keys fixed-size and not raw secrets.
 fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
-    Sha256::digest(bytes).iter().map(|b| format!("{:02x}", b)).collect()
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect()
 }
 
 /// A hop-by-hop header (RFC 7230 §6.1) that must never be forwarded verbatim.
@@ -128,7 +131,11 @@ pub async fn resolve_auth_value(
         .services
         .get(service_id)
         .and_then(|s| s.oauth2.clone())
-        .or_else(|| state.custom_service(vault_id, service_id).and_then(|s| s.oauth2.clone()));
+        .or_else(|| {
+            state
+                .custom_service(vault_id, service_id)
+                .and_then(|s| s.oauth2.clone())
+        });
     let Some(oauth) = oauth else {
         // The pipeline only calls this for an oauth ACCESS phantom (is_oauth was
         // true from the resolved def). Not finding a config here means the two
@@ -175,7 +182,10 @@ pub async fn resolve_auth_value(
     let client_secret = resolved.client_secret.clone();
 
     let refresh_token_str = std::str::from_utf8(raw).map_err(|_| {
-        AppError::Internal(format!("oauth2 refresh_token for '{}' not utf-8", service_id))
+        AppError::Internal(format!(
+            "oauth2 refresh_token for '{}' not utf-8",
+            service_id
+        ))
     })?;
     let style = state.services.oauth_style(&oauth);
 
@@ -191,7 +201,10 @@ pub async fn resolve_auth_value(
         tracing::warn!(vault = %vault_id, service = %service_id, "oauth2 refresh failed: {}", e);
         if e.contains("invalid_grant") {
             state.oauth_mark_reauth(vault_id, conn_id);
-            AppError::Unauthorized(format!("oauth2 refresh_token invalid — reconnect {}", service_id))
+            AppError::Unauthorized(format!(
+                "oauth2 refresh_token invalid — reconnect {}",
+                service_id
+            ))
         } else {
             AppError::Internal(format!("oauth2 refresh failed: {}", e))
         }
@@ -211,7 +224,6 @@ pub async fn resolve_auth_value(
                 state,
                 vault_id,
                 conn_id,
-                service_id,
                 &oauth.refresh_token,
                 new_rt,
             )
@@ -222,6 +234,11 @@ pub async fn resolve_auth_value(
         // subsequent request within the token's lifetime hits without re-minting.
         _ => refresh_hash,
     };
-    state.oauth_access_insert(vault_id, &cache_key, access_token.as_bytes().to_vec(), safe_expires_at);
+    state.oauth_access_insert(
+        vault_id,
+        &cache_key,
+        access_token.as_bytes().to_vec(),
+        safe_expires_at,
+    );
     Ok(access_token.into_bytes())
 }

@@ -155,8 +155,8 @@ pub fn phantoms_for(conn_id: &str, def: &ServiceDef) -> BTreeMap<String, String>
 }
 
 /// The `phantoms` map for a raw connection (`service: None`): its injectable
-/// secret keys are the reverse-index of the `[<conn>:]<ROLE>` namespace, passed
-/// in by the caller.
+/// secret keys are the record's explicit `secrets` list (bare KEYs), passed in
+/// by the caller.
 pub fn phantoms_for_raw(conn_id: &str, secret_keys: &[String]) -> BTreeMap<String, String> {
     let mut map = BTreeMap::new();
     insert_direct(&mut map, conn_id, secret_keys);
@@ -208,6 +208,7 @@ mod tests {
             service: Some("acme".to_string()),
             hosts: Some(vec!["tenant1.acme.dev".to_string()]),
             secrets: None,
+            keys: None,
         };
         let hosts = resolved_hosts(&conn, Some(&def));
         assert!(hosts.contains(&"api.acme.com".to_string()));
@@ -217,7 +218,7 @@ mod tests {
 
     #[test]
     fn resolved_hosts_raw_uses_own_hosts() {
-        let conn = Connection { name: None, service: None, hosts: Some(vec!["api.stripe.com".to_string()]), secrets: Some(vec!["STRIPE_KEY".to_string()]) };
+        let conn = Connection { name: None, service: None, hosts: Some(vec!["api.stripe.com".to_string()]), secrets: Some(vec!["STRIPE_KEY".to_string()]), keys: None };
         assert_eq!(resolved_hosts(&conn, None), vec!["api.stripe.com".to_string()]);
     }
 
