@@ -907,6 +907,135 @@ pub async fn approve_op(
                     None,
                 )
             }
+            // List the vault's custom service definitions (`aux.services`) with
+            // each one's validation status + referencing connections. Read-only
+            // (opens the view under the grant's W_c, never writes). This is the
+            // only surface that shows an INVALID definition — the daemon skips
+            // those at unlock and the console only renders a def through its
+            // connections, so a broken/orphaned def is otherwise invisible.
+            "service-ls" => {
+                let (view, _k) = crate::server::handlers::metadata::open_view_for_grant_keep_key(
+                    &state,
+                    &vault_id,
+                    &validated.op,
+                    &validated.wrapping_key,
+                    &validated.credential_id_bytes,
+                    existing_vault.as_ref(),
+                )?;
+                let mut services = Vec::new();
+                for (id, toml_src) in &view.aux.services {
+                    let problems = crate::service::validate::validate_service(toml_src)
+                        .err()
+                        .unwrap_or_default();
+                    services.push(json!({
+                        "id": id,
+                        "valid": problems.is_empty(),
+                        "problems": problems,
+                        "connections": service_refs(&view, id),
+                    }));
+                }
+                let resp = json!({ "ok": true, "act": "service-ls", "services": services });
+                let cached = Some(resp.to_string());
+                (resp, cached)
+            }
+            // Delete a custom service definition. Connections referencing it are
+            // kept (their stored secrets stay resolvable) but reported so the CLI
+            // can warn. Daemon-side reseal + reconcile + push — the CLI needs no
+            // PRF key, so this works over SSH via the grant link.
+            "service-rm" => {
+                let id = validated.op.act.target.trim().to_string();
+                if id.is_empty() {
+                    return Err(AppError::BadRequest(
+                        "service-rm target (service id) required".into(),
+                    ));
+                }
+                let (mut view, k) =
+                    crate::server::handlers::metadata::open_view_for_grant_keep_key(
+                        &state,
+                        &vault_id,
+                        &validated.op,
+                        &validated.wrapping_key,
+                        &validated.credential_id_bytes,
+                        existing_vault.as_ref(),
+                    )?;
+                let refs = service_refs(&view, &id);
+                if view.aux.services.remove(&id).is_none() {
+                    return Err(AppError::BadRequest(format!(
+                        "no custom service '{}' in this vault",
+                        id
+                    )));
+                }
+                crate::auth::connect::persist_mutated_view(&state, &vault_id, &view, &k)
+                    .map_err(AppError::Internal)?;
+                {
+                    let state = state.clone();
+                    let vid = vault_id.clone();
+                    tokio::spawn(async move {
+                        crate::sync::push_keys_best_effort(&state, &vid).await;
+                        crate::sync::push_items_best_effort(&state, &vid).await;
+                    });
+                }
+                tracing::info!(vault = %vault_id, service = %id, "custom service removed");
+                let resp = json!({
+                    "ok": true, "act": "service-rm",
+                    "removed": id, "referencing_connections": refs,
+                });
+                let cached = Some(resp.to_string());
+                (resp, cached)
+            }
+            // Store a validated custom service definition (`aux.services`). The
+            // toml rides `scope.toml`; the daemon re-validates (same gate as the
+            // unlock-time check) and refuses to shadow a built-in id. Daemon-side
+            // reseal + reconcile + push, like service-rm.
+            "service-add" => {
+                let toml_src = validated
+                    .op
+                    .act
+                    .scope
+                    .get("toml")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| AppError::BadRequest("service-add scope.toml required".into()))?
+                    .to_string();
+                if let Err(problems) = crate::service::validate::validate_service(&toml_src) {
+                    return Err(AppError::BadRequest(format!(
+                        "invalid service definition: {}",
+                        problems.join("; ")
+                    )));
+                }
+                let def: crate::service::ServiceDef = toml::from_str(&toml_src)
+                    .map_err(|e| AppError::BadRequest(format!("parse: {}", e)))?;
+                let id = def.service.id.clone();
+                if state.services.get(&id).is_some() {
+                    return Err(AppError::BadRequest(format!(
+                        "'{}' shadows a built-in service id",
+                        id
+                    )));
+                }
+                let (mut view, k) =
+                    crate::server::handlers::metadata::open_view_for_grant_keep_key(
+                        &state,
+                        &vault_id,
+                        &validated.op,
+                        &validated.wrapping_key,
+                        &validated.credential_id_bytes,
+                        existing_vault.as_ref(),
+                    )?;
+                view.aux.services.insert(id.clone(), toml_src);
+                crate::auth::connect::persist_mutated_view(&state, &vault_id, &view, &k)
+                    .map_err(AppError::Internal)?;
+                {
+                    let state = state.clone();
+                    let vid = vault_id.clone();
+                    tokio::spawn(async move {
+                        crate::sync::push_keys_best_effort(&state, &vid).await;
+                        crate::sync::push_items_best_effort(&state, &vid).await;
+                    });
+                }
+                tracing::info!(vault = %vault_id, service = %id, "custom service added");
+                let resp = json!({ "ok": true, "act": "service-add", "id": id });
+                let cached = Some(resp.to_string());
+                (resp, cached)
+            }
             other => {
                 return Err(AppError::BadRequest(format!(
                     "unsupported Custom act: {}",
@@ -1036,6 +1165,24 @@ pub async fn approve_op(
     });
 
     Ok(Json(response))
+}
+
+/// Connection ids (established `aux.connections` + in-flight `aux.connecting`)
+/// whose `service` references `service_id` — for the `service-ls`/`service-rm`
+/// "still referenced by …" report.
+fn service_refs(view: &crate::storage::plaintext::VaultPlaintextView, service_id: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for (cid, c) in &view.aux.connections {
+        if c.service.as_deref() == Some(service_id) {
+            out.push(cid.clone());
+        }
+    }
+    for (cid, c) in &view.aux.connecting {
+        if c.service == service_id && !out.contains(cid) {
+            out.push(cid.clone());
+        }
+    }
+    out
 }
 
 pub async fn reject_op(

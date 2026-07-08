@@ -677,6 +677,49 @@ fn build_m_from_view(
     Ok(m)
 }
 
+/// Daemon-side persist of an already-mutated view — the grant-approved
+/// equivalent of the CLI's `seal_and_submit_write` for an aux edit (e.g.
+/// `sc service rm` / `sc service add`). Reseals the whole-blob `vault.dat` when
+/// one backs this vault, reconciles the per-item store (diff + version bump,
+/// contract §4), and refreshes the in-memory cache so the change is live for the
+/// broker. Does NOT push — the caller spawns the sync fan-out AFTER its write
+/// guard drops (the push path re-takes the per-vault write lock, which is not
+/// reentrant), exactly as `ActType::Write` does. `k` is the state key recovered
+/// from the grant's `W_c` (via `open_view_for_grant_keep_key`), so the CLI never
+/// touches the PRF-derived user key — a `sc service` write works over SSH
+/// through the plain grant link.
+pub(crate) fn persist_mutated_view(
+    state: &Arc<AppState>,
+    vault_id: &str,
+    view: &crate::storage::plaintext::VaultPlaintextView,
+    k: &[u8],
+) -> Result<(), String> {
+    let m = build_m_from_view(view)?;
+    let vault_path = state
+        .config
+        .state_dir
+        .join("vaults")
+        .join(vault_id)
+        .join("vault.dat");
+    let vault_dat = crate::storage::sealed_vault::read(&vault_path).ok().flatten();
+    if let Some(mut vault) = vault_dat {
+        crate::server::handlers::metadata::reseal_body_with_key(k, &mut vault, &m)
+            .map_err(|e| format!("reseal vault.dat: {}", e))?;
+        crate::storage::sealed_vault::write_atomic(&vault_path, &vault)
+            .map_err(|e| format!("write vault.dat: {}", e))?;
+        reconcile_per_item_after_connect(state, vault_id, Some(&vault), view, k);
+    } else {
+        reconcile_per_item_after_connect(state, vault_id, None, view, k);
+    }
+    let cache = crate::server::handlers::approve::bootstrap_cache_from_view(view, state);
+    state.unlock_vault(
+        vault_id.to_string(),
+        cache,
+        zeroize::Zeroizing::new(k.to_vec()),
+    );
+    Ok(())
+}
+
 /// Apply the post-connect state (new refresh-token secret + connecting→
 /// connections MOVE) to the local per-item store as version-bumped item
 /// upserts/tombstones, then persist it. Best-effort; logs and returns on any

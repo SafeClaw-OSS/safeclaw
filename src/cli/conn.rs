@@ -239,18 +239,6 @@ pub fn insert_custom_service(aux: &mut Value, id: &str, toml_source: &str) {
         .insert(id.to_string(), Value::String(toml_source.to_string()));
 }
 
-/// Remove a custom service definition from `aux.services`, preserving every
-/// other aux key. Returns true if an entry was present.
-pub fn remove_custom_service(aux: &mut Value, id: &str) -> bool {
-    let Some(obj) = aux.as_object_mut() else {
-        return false;
-    };
-    let Some(svcs) = obj.get_mut("services").and_then(|s| s.as_object_mut()) else {
-        return false;
-    };
-    svcs.remove(id).is_some()
-}
-
 /// Remove a connection from `aux.connections`, preserving every other aux key.
 /// Returns true if an entry was present. Used by `sc set --no-broker` and
 /// `sc rm` to un-broker / clean up the connection tied to a key.
