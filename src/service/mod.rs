@@ -147,13 +147,14 @@ pub struct ServiceMeta {
     /// Services sharing the same group are merged into one card in the UI.
     #[serde(default)]
     pub group: Option<String>,
-    /// Optional, purely auxiliary: the page where a human mints/manages this
-    /// service's API key or token (e.g. `https://crates.io/settings/tokens`).
-    /// Consumers render it as a helper link (console "Open ... -> API tokens",
-    /// CLI "Get a token: ..."); it never participates in routing or policy.
-    /// Must be http(s) when present (validated -- it is rendered as a link).
+    /// Optional, purely auxiliary: the page where a HUMAN mints/manages this
+    /// service's secret (e.g. `https://crates.io/settings/tokens`). Pairs with
+    /// `secrets` above. Display-only — consumers render it as a helper link
+    /// (console "Open ... -> API tokens", CLI "Get a token: ..."); nothing ever
+    /// FETCHES a secret from it, and it never participates in routing or
+    /// policy. Must be http(s) when present (it is rendered as a link).
     #[serde(default)]
-    pub key_page: Option<String>,
+    pub secret_url: Option<String>,
     /// Help text returned by GET /{service}/help and rendered into safeclaw.md.
     /// Supports template variables: {{wallet.*}} resolved from vault service data.
     #[serde(default)]

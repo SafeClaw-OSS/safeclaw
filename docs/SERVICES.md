@@ -20,7 +20,7 @@ Format: TOML (authored by humans/agents; CI publishes `registry.json`).
 [service]
 id = "github"            # required; [a-z0-9_], no "__". category = the {category}/ dir, not a field
 name = "GitHub"          # display name
-# optional: group, hidden, activation, help
+# optional: group, hidden, activation, help, secret_url
 
 hosts = ["api.github.com", "github.com"]
 secrets = ["GITHUB_TOKEN"]
@@ -63,6 +63,16 @@ all of them is what makes a connection "connected".
 - Insertion needs no declaration: the value replaces the phantom wherever the
   tool puts it — any header, query param, URL path, body, or inside a decoded
   `Authorization: Basic`. Never in the URL authority.
+
+### `secret_url` (optional)
+
+Where a HUMAN mints/manages this service's secret (e.g.
+`https://crates.io/settings/tokens`). Purely auxiliary and display-only: the
+console renders it as an "Open … → API tokens" helper link and
+`sc connection add --service` prints it ("Get a token: …"). Nothing ever
+fetches a secret from it, and it never participates in routing or policy.
+Must be `http(s)` when present — it is rendered as a link, so the validator
+rejects non-web schemes.
 
 ### `[oauth2]`
 

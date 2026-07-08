@@ -13,5 +13,5 @@ name = "crates.io"
 
 hosts = ["crates.io"]
 secrets = ["CARGO_REGISTRY_TOKEN"]
-# Where a human mints the token (auxiliary; console/CLI helper link).
-key_page = "https://crates.io/settings/tokens"
+# Where a human mints the secret (auxiliary; display-only helper link).
+secret_url = "https://crates.io/settings/tokens"

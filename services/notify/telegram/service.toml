@@ -7,5 +7,5 @@ name = "Telegram"
 # declaration needed beyond the host + secret.
 hosts = ["api.telegram.org"]
 secrets = ["TELEGRAM_BOT_TOKEN"]
-# Where a human mints the token (auxiliary; console/CLI helper link).
-key_page = "https://t.me/BotFather"
+# Where a human mints the secret (auxiliary; display-only helper link).
+secret_url = "https://t.me/BotFather"

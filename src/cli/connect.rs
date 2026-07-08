@@ -399,7 +399,7 @@ async fn run_service_backed(
     let service_hosts = def.service.hosts.clone();
     let service_secrets = def.service.secrets.clone();
     // Auxiliary pointer to where the token is minted (display-only).
-    if let Some(url) = def.service.key_page.as_deref() {
+    if let Some(url) = def.service.secret_url.as_deref() {
         eprintln!("  Get a token: {}", url);
     }
 

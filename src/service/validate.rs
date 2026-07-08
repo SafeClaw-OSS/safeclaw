@@ -192,12 +192,12 @@ fn validate_service_inner(
         }
     }
 
-    // key_page: auxiliary display-only link, but it IS rendered as an <a href>
+    // secret_url: auxiliary display-only link, but it IS rendered as an <a href>
     // by the console — require a plain web URL so a custom definition can't
     // smuggle a javascript:/data: link into the UI.
-    if let Some(u) = &def.service.key_page {
+    if let Some(u) = &def.service.secret_url {
         if !(u.starts_with("https://") || u.starts_with("http://")) {
-            errs.push(format!("key_page '{}' must be an http(s) URL", u));
+            errs.push(format!("secret_url '{}' must be an http(s) URL", u));
         }
     }
 
@@ -543,11 +543,11 @@ secrets = ["ACME_TOKEN"]
     }
 
     #[test]
-    fn key_page_optional_and_https_only() {
+    fn secret_url_optional_and_https_only() {
         // Absent: fine (GITHUB fixture has none). Present https: fine.
         let with = GITHUB.replace(
             "secrets = [\"GITHUB_TOKEN\"]",
-            "secrets = [\"GITHUB_TOKEN\"]\nkey_page = \"https://github.com/settings/tokens?type=beta\"",
+            "secrets = [\"GITHUB_TOKEN\"]\nsecret_url = \"https://github.com/settings/tokens?type=beta\"",
         );
         assert!(validate_recipe(&with, true).is_ok());
         // Rendered as a link — a non-web scheme must be rejected.
@@ -558,7 +558,7 @@ secrets = ["ACME_TOKEN"]
         assert!(validate_recipe(&bad, true)
             .unwrap_err()
             .iter()
-            .any(|e| e.contains("key_page")));
+            .any(|e| e.contains("secret_url")));
     }
 
     #[test]
