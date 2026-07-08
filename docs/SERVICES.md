@@ -84,10 +84,16 @@ Declare only when the service authenticates with minted OAuth2 access tokens.
 secrets = ["GMAIL_REFRESH_TOKEN"]   # the refresh key is listed here too (uniform `secrets`)
 
 [oauth2]
-provider = "google"                 # -> services/_providers/<provider>.toml
+provider = "google"                 # display label only ("Connect with Google")
 scopes   = ["https://www.googleapis.com/auth/gmail.send"]
 refresh_token = "GMAIL_REFRESH_TOKEN"  # RFC 6749 field name → the vault secret KEY the
                                     #   durable refresh token is stored under
+authorization_url = "https://accounts.google.com/o/oauth2/v2/auth"
+token_url         = "https://oauth2.googleapis.com/token"
+pkce              = true
+client_id         = "499410884315-…apps.googleusercontent.com"  # PUBLIC client, inline
+# client_secret + client_type = "public" only for a non-confidential client
+# (there is no provider-template layer; every [oauth2] is inline-complete)
 # id_token = "GMAIL_ID_TOKEN"       # only when the provider returns a stored OIDC id token
 # exposes = ["account_id"]          # optional extra derived values →
                                     #   __sc__<conn>__account_id__

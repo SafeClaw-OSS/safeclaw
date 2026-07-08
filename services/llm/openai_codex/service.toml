@@ -9,13 +9,12 @@ group = "openai"
 hosts = ["chatgpt.com", "api.openai.com"]
 secrets = ["OPENAI_CODEX_REFRESH_TOKEN"]
 
-# Fully-inline OAuth 2.0 (no shipped provider template): OpenAI has no
-# third-party app registry — "sign in with ChatGPT" exists only through the
-# PUBLIC client of the open-source Codex CLI, so its id, endpoints, and
-# whitelisted loopback redirect are reused verbatim here. Pure PKCE (no
+# OpenAI has no third-party app registry — "sign in with ChatGPT" exists only
+# through the PUBLIC client of the open-source Codex CLI, so its id, endpoints,
+# and whitelisted loopback redirect are reused verbatim here. Pure PKCE (no
 # client_secret). The consent lands on localhost:1455 (nothing listens — the
 # console's paste-the-URL step reads the code out, same UX as gmail).
-# `provider = "openai"` stays as the frontend display label only.
+# `provider = "openai"` is the frontend display label only.
 [oauth2]
 provider = "openai"
 authorization_url = "https://auth.openai.com/oauth/authorize"

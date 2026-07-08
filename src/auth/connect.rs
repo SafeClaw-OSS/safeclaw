@@ -70,10 +70,9 @@ pub struct ExchangeConfig {
 /// is looked up in the built-in registry first, then this vault's own
 /// per-vault custom services (`aux.services`, e.g. a user-authored inline
 /// `[oauth2]`) — without the fallback a custom OAuth service's connect could
-/// never complete (its def isn't in the global registry). Provider *templates*
-/// still resolve against `services` (a custom def may name a built-in
-/// provider). `None` when the service is unknown to BOTH, isn't oauth2, or is
-/// missing a token_url / client_id / secret role.
+/// never complete (its def isn't in the global registry). `None` when the
+/// service is unknown to BOTH, isn't oauth2, or is missing a token_url /
+/// client_id / secret role.
 pub fn resolve_exchange_config(
     services: &crate::service::ServiceRegistry,
     custom: &std::collections::HashMap<String, crate::service::ServiceDef>,

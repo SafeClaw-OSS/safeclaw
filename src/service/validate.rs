@@ -7,7 +7,8 @@
 //! catches problems up front and rejects things the runtime can't see in
 //! isolation — a bad host anchor, egress to a private/loopback/metadata
 //! address, a stale v3 or tool-named section (rejected at parse by
-//! `deny_unknown_fields`), and an oauth2 section naming an unknown provider.
+//! `deny_unknown_fields`), and an incomplete `[oauth2]` section (it must be
+//! inline-complete — there is no provider-template layer).
 //!
 //! Pure + synchronous: no DNS, no network. Hosts that are *domain names* are
 //! accepted (resolution-time SSRF is a separate runtime concern); only literal
@@ -16,7 +17,7 @@
 use std::collections::HashSet;
 use std::net::IpAddr;
 
-use super::{ProviderFileDef, ServiceDef};
+use super::ServiceDef;
 
 /// True if `host` (no scheme, no port) is a literal IP in a range we must never
 /// let a definition egress to.
@@ -62,23 +63,8 @@ pub fn host_egress_allowed(authority: &str) -> bool {
     !(host_is_blocked_ip(authority) || host_is_blocked_name(authority))
 }
 
-/// A provider / connection id slug: `^[a-z0-9][a-z0-9_-]{0,63}$`. No `:`, `/`,
-/// `.` — so a namespaced `<connection_id>:<role>` vault key can never be forged
-/// from an id, and an id can never traverse paths.
-fn is_valid_slug(s: &str) -> bool {
-    let mut chars = s.chars();
-    match chars.next() {
-        Some(c) if c.is_ascii_lowercase() || c.is_ascii_digit() => {}
-        _ => return false,
-    }
-    s.len() <= 64
-        && s.chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
-}
-
 /// A service / connection id usable as a phantom `<conn>` segment: `[a-z0-9_]`,
-/// no `__` (the phantom delimiter), starting alphanumeric. Stricter than
-/// `is_valid_slug` (no `-`) because the phantom charset excludes `-`.
+/// no `__` (the phantom delimiter), starting alphanumeric.
 fn is_valid_service_id(s: &str) -> bool {
     if s.is_empty() || s.len() > 64 || s.contains("__") {
         return false;
@@ -142,20 +128,17 @@ fn validate_host(entry: &str, errs: &mut Vec<String>) {
 /// compatibility but no longer gates anything (exec steps were removed with the
 /// v3 execution surface). Returns `Ok(())` or every problem found.
 pub fn validate_recipe(toml_str: &str, _first_party: bool) -> Result<(), Vec<String>> {
-    validate_service_inner(toml_str, None)
+    validate_service_inner(toml_str)
 }
 
-/// Validate a v4 `service.toml` source against a set of shipped provider names —
-/// the custom-service (`aux.services`) path. In addition to the base checks, an
-/// `[oauth2]` section's `provider` must name one of `known_providers`.
-pub fn validate_service(toml_str: &str, known_providers: &HashSet<String>) -> Result<(), Vec<String>> {
-    validate_service_inner(toml_str, Some(known_providers))
+/// Validate a v4 `service.toml` source — the custom-service (`aux.services`)
+/// path. Same checks as `validate_recipe` (the old shipped-provider set is
+/// gone; `[oauth2]` must be inline-complete everywhere).
+pub fn validate_service(toml_str: &str) -> Result<(), Vec<String>> {
+    validate_service_inner(toml_str)
 }
 
-fn validate_service_inner(
-    toml_str: &str,
-    known_providers: Option<&HashSet<String>>,
-) -> Result<(), Vec<String>> {
+fn validate_service_inner(toml_str: &str) -> Result<(), Vec<String>> {
     // deny_unknown_fields on ServiceDef/OAuth2Def turns every stale v3 section
     // and every tool-named section into a parse error here.
     let def: ServiceDef = match toml::from_str(toml_str) {
@@ -201,35 +184,16 @@ fn validate_service_inner(
         }
     }
 
-    // OAuth2: the section must be RESOLVABLE — either its inline fields carry
-    // the endpoints + client, or `provider` names a shipped template that does.
-    // Inline fields get the same floor as provider files (https to a public
-    // host, no confidential secret). Exposes are lowercase slugs that don't
-    // collide with secrets.
+    // OAuth2: the section is SELF-SUFFICIENT — the inline fields must carry the
+    // endpoints + client (there is no template layer; `provider` is a display
+    // label only). Endpoint floor: https to a public host, no confidential
+    // secret. Exposes are lowercase slugs that don't collide with secrets.
     if let Some(o) = &def.oauth2 {
-        let inline_complete =
-            o.authorization_url.is_some() && o.token_url.is_some() && o.client_id.is_some();
-        match &o.provider {
-            Some(p) if p.trim().is_empty() => {
-                errs.push("[oauth2] provider must not be empty (omit it to go fully inline)".into());
-            }
-            Some(p) => {
-                // A named template must exist on the custom path UNLESS the
-                // inline fields already fully resolve (then it's only a label).
-                if let Some(known) = known_providers {
-                    if !known.contains(p) && !inline_complete {
-                        errs.push(format!(
-                            "[oauth2] provider '{}' is not a shipped provider (or declare authorization_url + token_url + client_id inline)",
-                            p
-                        ));
-                    }
-                }
-            }
-            None => {
-                if !inline_complete {
-                    errs.push("[oauth2] with no provider must declare authorization_url + token_url + client_id inline".into());
-                }
-            }
+        if !(o.authorization_url.is_some() && o.token_url.is_some() && o.client_id.is_some()) {
+            errs.push("[oauth2] must declare authorization_url + token_url + client_id inline".into());
+        }
+        if o.provider.as_deref().is_some_and(|p| p.trim().is_empty()) {
+            errs.push("[oauth2] provider (display label) must not be empty (omit it instead)".into());
         }
         if o.client_secret.is_some() && o.client_type.as_deref() != Some("public") {
             errs.push(
@@ -293,39 +257,6 @@ fn validate_service_inner(
     if errs.is_empty() { Ok(()) } else { Err(errs) }
 }
 
-/// Validate a `services/_providers/<name>.toml` source. A LITERAL
-/// `client_secret` may appear ONLY for a `client_type = "public"` client — a
-/// confidential Web-app secret must never be committed. Also checks the provider
-/// name is a slug and the OAuth endpoints are https literals to a public host.
-pub fn validate_provider(toml_str: &str) -> Result<(), Vec<String>> {
-    let def: ProviderFileDef = match toml::from_str(toml_str) {
-        Ok(d) => d,
-        Err(e) => return Err(vec![format!("parse error: {}", e)]),
-    };
-
-    let mut errs = Vec::new();
-    for (name, p) in &def.provider {
-        if !is_valid_slug(name) {
-            errs.push(format!("provider '{}': name is not a valid slug", name));
-        }
-        if p.client_secret.is_some() && p.client_type.as_deref() != Some("public") {
-            errs.push(format!(
-                "provider '{}': a literal client_secret requires client_type = \"public\" \
-                 (a confidential Web-app secret must never be committed to a definition)",
-                name
-            ));
-        }
-        if let Some(u) = &p.authorization_url {
-            validate_https_public_url(&format!("provider '{}' authorization_url", name), u, &mut errs);
-        }
-        if let Some(u) = &p.token_url {
-            validate_https_public_url(&format!("provider '{}' token_url", name), u, &mut errs);
-        }
-    }
-
-    if errs.is_empty() { Ok(()) } else { Err(errs) }
-}
-
 /// Consent-URL query params the OAuth flow itself controls — an
 /// `authorize_params` map may never set these (the frontend applies the map
 /// FIRST and the protocol params after, so an entry here would silently lose;
@@ -374,8 +305,10 @@ secrets = ["GITHUB_TOKEN"]
     }
 
     #[test]
-    fn valid_oauth2_service() {
-        let oauth = r#"
+    fn oauth2_must_be_inline_complete() {
+        // A provider label with no inline wiring is no longer resolvable —
+        // there is no template layer to fill the gaps.
+        let label_only = r#"
 [service]
 id = "gmail"
 name = "Gmail"
@@ -385,16 +318,12 @@ secrets = ["GMAIL_REFRESH_TOKEN"]
 provider = "google"
 refresh_token = "GMAIL_REFRESH_TOKEN"
 "#;
-        assert!(validate_recipe(oauth, false).is_ok());
-        // With a provider set that lacks google, the custom path rejects it.
-        let empty = HashSet::new();
-        assert!(validate_service(oauth, &empty).is_err());
-        let known: HashSet<String> = ["google".to_string()].into_iter().collect();
-        assert!(validate_service(oauth, &known).is_ok());
+        assert!(validate_recipe(label_only, false).is_err());
+        assert!(validate_service(label_only).is_err());
     }
 
     #[test]
-    fn inline_oauth2_needs_no_provider() {
+    fn inline_oauth2_is_self_sufficient() {
         let inline = r#"
 [service]
 id = "acme"
@@ -407,25 +336,23 @@ token_url = "https://auth.acme.dev/token"
 client_id = "acme-public"
 refresh_token = "ACME_REFRESH_TOKEN"
 "#;
-        // Custom path with ZERO shipped providers: inline is self-sufficient.
-        let empty = HashSet::new();
-        assert!(validate_service(inline, &empty).is_ok());
-        // A provider label on top of complete inline fields is fine too.
+        assert!(validate_service(inline).is_ok());
+        // A provider label on top of complete inline fields is fine (label only).
         let labeled = inline.replace("[oauth2]", "[oauth2]\nprovider = \"acme\"");
-        assert!(validate_service(&labeled, &empty).is_ok());
-        // Incomplete inline without a known provider is rejected.
+        assert!(validate_service(&labeled).is_ok());
+        // Incomplete inline is rejected.
         let broken = inline.replace("token_url = \"https://auth.acme.dev/token\"\n", "");
-        assert!(validate_service(&broken, &empty).is_err());
+        assert!(validate_service(&broken).is_err());
         // http:// endpoints and confidential inline secrets are rejected.
         let http = inline.replace("https://auth.acme.dev/token", "http://auth.acme.dev/token");
-        assert!(validate_service(&http, &empty).is_err());
+        assert!(validate_service(&http).is_err());
         let secret = inline.replace("client_id = \"acme-public\"", "client_id = \"acme-public\"\nclient_secret = \"shh\"");
-        assert!(validate_service(&secret, &empty).is_err());
+        assert!(validate_service(&secret).is_err());
         let pub_secret = inline.replace(
             "client_id = \"acme-public\"",
             "client_id = \"acme-public\"\nclient_secret = \"shh\"\nclient_type = \"public\"",
         );
-        assert!(validate_service(&pub_secret, &empty).is_ok());
+        assert!(validate_service(&pub_secret).is_ok());
     }
 
     #[test]
@@ -443,19 +370,18 @@ client_id = "acme-public"
 refresh_token = "ACME_REFRESH_TOKEN"
 exposes = ["account_id"]
 "#;
-        let empty = HashSet::new();
         let good = format!("{base}[oauth2.claims]\naccount_id = [\"ns\", \"leaf\"]\n");
-        assert!(validate_service(&good, &empty).is_ok());
+        assert!(validate_service(&good).is_ok());
         // claims key must be an exposes role; path segments must be non-empty.
         let stray = format!("{base}[oauth2.claims]\nother = [\"x\"]\n");
-        assert!(validate_service(&stray, &empty).is_err());
+        assert!(validate_service(&stray).is_err());
         let hollow = format!("{base}[oauth2.claims]\naccount_id = []\n");
-        assert!(validate_service(&hollow, &empty).is_err());
+        assert!(validate_service(&hollow).is_err());
         // authorize_params may add params but never reserved protocol ones.
         let extra = format!("{base}[oauth2.authorize_params]\nfoo_flag = \"true\"\n");
-        assert!(validate_service(&extra, &empty).is_ok());
+        assert!(validate_service(&extra).is_ok());
         let reserved = format!("{base}[oauth2.authorize_params]\nredirect_uri = \"https://evil.example\"\n");
-        assert!(validate_service(&reserved, &empty).is_err());
+        assert!(validate_service(&reserved).is_err());
     }
 
     #[test]
@@ -561,49 +487,13 @@ secrets = ["ACME_TOKEN"]
             .any(|e| e.contains("secret_url")));
     }
 
+
     #[test]
-    fn slug_rules() {
-        for ok in ["gmail", "openclaw-dashboard", "openai-codex", "a1_b-2"] {
-            assert!(is_valid_slug(ok), "{ok} should be a valid slug");
+    fn compiled_services_pass_validator() {
+        for (id, _category, toml_str) in crate::generated_services::compiled_service_tomls() {
+            validate_recipe(toml_str, false)
+                .unwrap_or_else(|e| panic!("compiled service '{}' failed validator: {:?}", id, e));
         }
-        for bad in ["", "-leading", "Upper", "has:colon", "has/slash", "has.dot"] {
-            assert!(!is_valid_slug(bad), "{bad} should be rejected");
-        }
-    }
-
-    const GOOGLE_PROVIDER: &str = r#"
-[provider.google]
-auth_mode = "oauth2"
-flow = "authorization_code"
-authorization_url = "https://accounts.google.com/o/oauth2/v2/auth"
-token_url = "https://oauth2.googleapis.com/token"
-pkce = true
-client_id = "499410884315-x.apps.googleusercontent.com"
-client_secret = "GOCSPX-public-desktop"
-client_type = "public"
-"#;
-
-    #[test]
-    fn public_desktop_provider_with_secret_ok() {
-        assert!(validate_provider(GOOGLE_PROVIDER).is_ok());
-    }
-
-    #[test]
-    fn confidential_secret_in_provider_rejected() {
-        let bad = GOOGLE_PROVIDER.replace("client_type = \"public\"", "client_type = \"confidential\"");
-        let errs = validate_provider(&bad).unwrap_err();
-        assert!(errs.iter().any(|e| e.contains("client_type = \"public\"")), "{:?}", errs);
-    }
-
-    #[test]
-    fn compiled_providers_pass_validator() {
-        let mut checked = 0;
-        for (_name, toml_str) in crate::generated_services::compiled_provider_tomls() {
-            validate_provider(toml_str)
-                .unwrap_or_else(|e| panic!("compiled provider failed validator: {:?}", e));
-            checked += 1;
-        }
-        assert!(checked >= 1, "expected at least the google provider compiled in");
     }
 
     #[test]

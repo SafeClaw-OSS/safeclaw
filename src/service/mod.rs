@@ -38,12 +38,11 @@ pub struct ServiceDef {
 }
 
 /// The one named auth MECHANISM. The `[oauth2]` section is SELF-SUFFICIENT: it
-/// can declare the endpoints + public client inline (`authorization_url`,
-/// `token_url`, `client_id`, …) — which is what makes a user-authored custom
-/// OAuth service work without any daemon-side provider shipping. `provider`
-/// optionally names a shipped `_providers/*` template that fills any field the
-/// section leaves out (our curated Google trio shares one registered client
-/// that way); inline fields always win over the template.
+/// declares the endpoints + public client inline (`authorization_url`,
+/// `token_url`, `client_id`, …) — the same shape whether it ships in-tree or is
+/// user-authored (`aux.services`). There is no template/inheritance layer;
+/// services sharing an OAuth client (the Google trio) simply repeat it.
+/// `provider` is a pure display label ("Connect with Google").
 ///
 /// Token slots use the RFC 6749 response field names: `refresh_token` maps the
 /// durable refresh token to the vault secret KEY it is stored under (internal —
@@ -59,8 +58,8 @@ pub struct ServiceDef {
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OAuth2Def {
-    /// Optional shipped `_providers/*` template this section inherits from.
-    /// Also serves as the frontend's display label ("Connect with Google").
+    /// Pure display label for the frontend's connect button ("Connect with
+    /// Google"). Carries NO configuration; absent reads as "custom".
     #[serde(default)]
     pub provider: Option<String>,
     #[serde(default)]
@@ -83,7 +82,7 @@ pub struct OAuth2Def {
     #[serde(default)]
     pub claims: HashMap<String, Vec<String>>,
 
-    // ── Inline endpoints + public client (each falls back to `provider`) ──
+    // ── Inline endpoints + public client ──
     /// CONNECT step endpoint (user consent).
     #[serde(default)]
     pub authorization_url: Option<String>,
@@ -95,29 +94,28 @@ pub struct OAuth2Def {
     pub client_id: Option<String>,
     /// OAuth client_secret — allowed ONLY for `client_type = "public"` (a
     /// confidential secret must never sit in a recipe; the validator enforces
-    /// this, same rule as ProviderDef).
+    /// this).
     #[serde(default)]
     pub client_secret: Option<String>,
     /// RFC 6749 §2.1: `"public"` | `"confidential"`.
     #[serde(default)]
     pub client_type: Option<String>,
-    /// Whether the connect flow uses PKCE (RFC 7636). Defaults to the provider
-    /// template's value, else `true` (every public client should).
+    /// Whether the connect flow uses PKCE (RFC 7636). Defaults to `true`
+    /// (every public client should).
     #[serde(default)]
     pub pkce: Option<bool>,
-    /// The OAuth client's fixed redirect_uri. Falls back to the provider
-    /// template, else [`DEFAULT_LOOPBACK_REDIRECT`].
+    /// The OAuth client's fixed redirect_uri. Falls back to
+    /// [`DEFAULT_LOOPBACK_REDIRECT`].
     #[serde(default)]
     pub redirect_uri: Option<String>,
     /// Body style for the `/token` call: `form` (default) or `json` (Anthropic).
     #[serde(default)]
     pub oauth_style: Option<String>,
-    /// Extra static query params for the consent URL — the per-provider quirks
+    /// Extra static query params for the consent URL — the per-vendor quirks
     /// (Google's `access_type=offline`/`prompt=consent`, codex's
-    /// `codex_cli_simplified_flow=true`). Merged over the provider template's
-    /// (inline wins per key). Reserved protocol params (client_id, redirect_uri,
-    /// scope, state, response_type, code_challenge*) are rejected by the
-    /// validator — these are ADDITIONS, never overrides.
+    /// `codex_cli_simplified_flow=true`). Reserved protocol params (client_id,
+    /// redirect_uri, scope, state, response_type, code_challenge*) are rejected
+    /// by the validator — these are ADDITIONS, never overrides.
     #[serde(default)]
     pub authorize_params: HashMap<String, String>,
 }
@@ -171,110 +169,60 @@ pub struct ServiceMeta {
 
 fn default_category() -> String { "integration".to_string() }
 
-// ── ProviderDef: parsed from services/_providers/<name>.toml ─────────────────
-
-/// A `[provider.<name>]` block — the shared OAuth template reused by every
-/// service on that provider (= Nango `providers.yaml`).
-/// CONNECTIONS_AND_AUTH.md §2. Lives in `services/_providers/<name>.toml`.
-///
-/// A service's `[upstream.auth]` with `provider = "<name>"` inherits
-/// `auth_mode` (= the service's `type`), the endpoints, and the client app
-/// from here, declaring only what's unique (scopes, the secret slot, the
-/// injection). Inline auth without a `provider` keeps declaring `type` +
-/// endpoints locally.
-#[derive(Debug, Clone, serde::Deserialize)]
-pub struct ProviderFileDef {
-    /// Wraps the single `[provider.<name>]` table. The map key is the provider
-    /// name (`google`), the value is the template.
-    pub provider: HashMap<String, ProviderDef>,
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
-pub struct ProviderDef {
-    /// = Nango `auth_mode`; the service's `type` inherits this (`oauth2`).
-    #[serde(default)]
-    pub auth_mode: Option<String>,
-    /// OAuth grant flow, e.g. `authorization_code`.
-    #[serde(default)]
-    pub flow: Option<String>,
-    /// CONNECT step endpoint (user consent).
-    #[serde(default)]
-    pub authorization_url: Option<String>,
-    /// REFRESH + code-exchange endpoint.
-    #[serde(default)]
-    pub token_url: Option<String>,
-    /// Whether the connect flow uses PKCE (RFC 7636).
-    #[serde(default)]
-    pub pkce: bool,
-    /// OAuth client_id (a public Desktop client may ship its id here).
-    #[serde(default)]
-    pub client_id: Option<String>,
-    /// OAuth client_secret. A LITERAL `client_secret` is allowed in a service definition
-    /// ONLY for a `client_type = "public"` client (a confidential Web-app
-    /// secret must never be committed). The validator enforces this.
-    #[serde(default)]
-    pub client_secret: Option<String>,
-    /// RFC 6749 §2.1: `"public"` | `"confidential"`.
-    #[serde(default)]
-    pub client_type: Option<String>,
-    /// The OAuth client's fixed `redirect_uri` (CONNECTION_SCHEMA.md §5). A
-    /// constant of the client, NOT part of each handshake — used in both the
-    /// consent URL (frontend, via the connect descriptor) and the daemon's
-    /// code→token exchange, so the two always match. Loopback for a Desktop
-    /// client. Falls back to [`DEFAULT_LOOPBACK_REDIRECT`] when omitted.
-    #[serde(default)]
-    pub redirect_uri: Option<String>,
-    /// Body style for the refresh / code-exchange `/token` call: `form`
-    /// (default) or `json` (Anthropic). A property of the provider's token
-    /// endpoint, so it lives here rather than on each service's `[oauth2]`.
-    #[serde(default)]
-    pub oauth_style: Option<String>,
-    /// Extra static query params for the consent URL (see
-    /// `OAuth2Def::authorize_params` — a service's inline map wins per key).
-    #[serde(default)]
-    pub authorize_params: HashMap<String, String>,
-}
-
-/// The loopback redirect for desktop/PKCE OAuth clients when a provider doesn't
-/// pin its own `redirect_uri`. Matches the frontend `DEFAULT_LOOPBACK_REDIRECT`
-/// so the consent request and the code→token exchange always agree.
+/// The loopback redirect for desktop/PKCE OAuth clients when an `[oauth2]`
+/// section doesn't pin its own `redirect_uri`. Matches the frontend
+/// `DEFAULT_LOOPBACK_REDIRECT` so the consent request and the code→token
+/// exchange always agree.
 pub const DEFAULT_LOOPBACK_REDIRECT: &str = "http://127.0.0.1:8765/safeclaw/oauth/callback";
 
-/// The OAuth client/endpoint config a service's auth resolves to after
-/// provider inheritance — see `ServiceRegistry::resolve_oauth_config`.
+/// A service's `[oauth2]` client/endpoint config with the defaults applied —
+/// see `ServiceRegistry::resolve_oauth_config`.
 #[derive(Debug, Clone)]
 pub struct ResolvedOAuthConfig {
     pub token_url: Option<String>,
     pub client_id: Option<String>,
     pub client_secret: Option<String>,
-    /// The OAuth client's fixed redirect_uri (provider literal, or the loopback
+    /// The OAuth client's fixed redirect_uri (inline literal, or the loopback
     /// default). Sent in the daemon's code→token exchange so it matches the
     /// consent request the browser made.
     pub redirect_uri: String,
 }
 
-/// The PUBLIC OAuth consent parameters a frontend needs to START a connect for
-/// a service: where to send the user (authorization_url), as whom (client_id),
-/// for what (scopes), and whether to use PKCE. CONNECTIONS_AND_AUTH.md §4a.
+/// The OAuth wiring of a service's `[oauth2]` section, as broadcast on the
+/// public `/registry` response — everything a frontend needs to START a
+/// connect (consent URL) and to DISPLAY the wiring faithfully.
+/// CONNECTIONS_AND_AUTH.md §4a.
 ///
-/// **Cloud-blind by construction:** the confidential half — `client_secret` and
-/// `token_url` — is deliberately NOT here. The browser only drives consent and
-/// seals the resulting `{code, verifier}` into the vault; the daemon holds the
-/// secret and does the code→token exchange locally. So this struct is safe to
-/// serialize into the public `/registry` response.
+/// This mirrors the definition 1:1 on purpose: a definition may only ever
+/// contain PUBLIC-client material (the validator rejects a literal
+/// `client_secret` unless `client_type = "public"`), so there is nothing
+/// confidential to withhold — hiding fields here would only make the console
+/// lie about what the toml says. The daemon still does the code→token
+/// exchange locally; the browser only drives consent and seals the resulting
+/// `{code, verifier}` into the vault.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ConnectDescriptor {
+    /// Display label ("Connect with Google"); "custom" when the def names none.
     pub provider: String,
-    pub auth_mode: String,
     pub authorization_url: String,
+    /// REFRESH + code-exchange endpoint (display/reference — the daemon uses it,
+    /// the frontend never calls it).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_url: Option<String>,
     pub client_id: String,
+    /// The PUBLIC client's secret, when the def ships one (e.g. Google's
+    /// Desktop client, non-confidential by design).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_secret: Option<String>,
     pub scopes: Vec<String>,
     pub pkce: bool,
     /// The OAuth client's fixed redirect_uri — the frontend builds the consent
     /// URL from this (not a hardcoded constant) so it always matches what the
     /// daemon sends at code→token exchange (CONNECTION_SCHEMA.md §5).
     pub redirect_uri: String,
-    /// Extra static consent-URL query params (provider quirks: Google's
+    /// `/token` body style: `form` (default) or `json`.
+    pub oauth_style: String,
+    /// Extra static consent-URL query params (vendor quirks: Google's
     /// `access_type=offline`, codex's `codex_cli_simplified_flow=true`). The
     /// frontend appends these BEFORE setting the reserved protocol params, so
     /// they can never override client_id/redirect_uri/state/….
@@ -418,10 +366,6 @@ pub struct ServiceRegistry {
     services: HashMap<String, ServiceDef>,
     /// Parsed policy.toml files (service_id → PolicyFileDef).
     policies: HashMap<String, PolicyFileDef>,
-    /// Parsed `[provider.<name>]` blocks (provider name → ProviderDef), loaded
-    /// from `services/_providers/*.toml`. A service's `auth.provider` inherits
-    /// `auth_mode`/endpoints/client from here.
-    providers: HashMap<String, ProviderDef>,
 }
 
 impl ServiceRegistry {
@@ -432,10 +376,9 @@ impl ServiceRegistry {
     pub fn load() -> Self {
         let mut services = HashMap::new();
         let mut policies = HashMap::new();
-        let mut providers = HashMap::new();
 
         // Layer 1: compiled-in defaults (always loaded as base)
-        Self::load_compiled_defaults(&mut services, &mut policies, &mut providers);
+        Self::load_compiled_defaults(&mut services, &mut policies);
 
         // Layer 2: $SAFECLAW_DATA/services/ override
         let dirs = Self::discover_service_dirs();
@@ -461,15 +404,11 @@ impl ServiceRegistry {
         // Layer 3: ~/.safeclaw/services/ (user-installed, overrides everything)
         Self::load_user_services(&mut services, &mut policies);
 
-        // Providers: runtime `services/_providers/*.toml` override the
-        // compiled-in defaults (same precedence intent as services).
-        Self::load_runtime_providers(&mut providers);
-
         tracing::info!(
-            "Loaded {} service definitions, {} policy files, {} providers",
-            services.len(), policies.len(), providers.len()
+            "Loaded {} service definitions, {} policy files",
+            services.len(), policies.len()
         );
-        Self { services, policies, providers }
+        Self { services, policies }
     }
 
     /// Build a registry from ONLY the compiled-in (in-tree) services — no
@@ -480,45 +419,8 @@ impl ServiceRegistry {
     pub fn compiled_only() -> Self {
         let mut services = HashMap::new();
         let mut policies = HashMap::new();
-        let mut providers = HashMap::new();
-        Self::load_compiled_defaults(&mut services, &mut policies, &mut providers);
-        Self { services, policies, providers }
-    }
-
-    /// Discover and parse `services/_providers/*.toml` from the same roots as
-    /// `discover_service_dirs` ($SAFECLAW_DATA/services first, then beside the
-    /// binary). Each file holds one or more `[provider.<name>]` blocks.
-    fn load_runtime_providers(providers: &mut HashMap<String, ProviderDef>) {
-        let mut roots: Vec<std::path::PathBuf> = Vec::new();
-        if let Ok(data) = std::env::var("SAFECLAW_DATA") {
-            roots.push(std::path::Path::new(&data).join("services"));
-        }
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(parent) = exe.parent() {
-                roots.push(parent.join("services"));
-            }
-        }
-        for root in roots {
-            let dir = root.join("_providers");
-            let Ok(entries) = std::fs::read_dir(&dir) else { continue };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) != Some("toml") {
-                    continue;
-                }
-                let Ok(content) = std::fs::read_to_string(&path) else { continue };
-                match toml::from_str::<ProviderFileDef>(&content) {
-                    Ok(def) => {
-                        for (name, p) in def.provider {
-                            providers.insert(name, p);
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed to parse provider {}: {}", path.display(), e);
-                    }
-                }
-            }
-        }
+        Self::load_compiled_defaults(&mut services, &mut policies);
+        Self { services, policies }
     }
 
     /// Returns (service_id, service_toml_content, optional_policy_toml_content).
@@ -648,7 +550,6 @@ impl ServiceRegistry {
     fn load_compiled_defaults(
         services: &mut HashMap<String, ServiceDef>,
         policies: &mut HashMap<String, PolicyFileDef>,
-        providers: &mut HashMap<String, ProviderDef>,
     ) {
         let defaults = crate::generated_services::compiled_service_tomls();
         for (id, category, toml_str) in defaults {
@@ -663,14 +564,6 @@ impl ServiceRegistry {
         for (id, toml_str) in policy_defaults {
             if let Ok(def) = toml::from_str::<PolicyFileDef>(toml_str) {
                 policies.insert(id.to_string(), def);
-            }
-        }
-        let provider_defaults = crate::generated_services::compiled_provider_tomls();
-        for (_file, toml_str) in provider_defaults {
-            if let Ok(def) = toml::from_str::<ProviderFileDef>(toml_str) {
-                for (name, p) in def.provider {
-                    providers.insert(name, p);
-                }
             }
         }
     }
@@ -742,59 +635,33 @@ impl ServiceRegistry {
         svc.service.secrets.iter().map(|s| s.trim()).find(|s| !s.is_empty()).map(|s| s.to_string())
     }
 
-    /// The `/token` body style for a service's `[oauth2]`: inline
-    /// `oauth_style` wins, else the provider template's, else `form`.
+    /// The `/token` body style for a service's `[oauth2]`: `oauth_style`,
+    /// defaulting to `form`.
     pub fn oauth_style(&self, oauth: &OAuth2Def) -> OAuthStyle {
-        let style = oauth
-            .oauth_style
-            .as_deref()
-            .or_else(|| self.oauth_provider(oauth).and_then(|p| p.oauth_style.as_deref()));
-        match style {
+        match oauth.oauth_style.as_deref() {
             Some("json") => OAuthStyle::Json,
             _ => OAuthStyle::Form,
         }
     }
 
-    /// Look up a `[provider.<name>]` template by name.
-    pub fn provider(&self, name: &str) -> Option<&ProviderDef> {
-        self.providers.get(name)
-    }
-
-    /// The provider template an `[oauth2]` section inherits from, if it names one.
-    fn oauth_provider(&self, oauth: &OAuth2Def) -> Option<&ProviderDef> {
-        oauth.provider.as_deref().and_then(|p| self.providers.get(p))
-    }
-
-    /// Resolve the OAuth client/endpoint config for a service's `[oauth2]`
-    /// section: INLINE fields first, then the optional provider template. Any
-    /// field neither supplies is `None` (caller decides whether it's fatal).
+    /// A service's `[oauth2]` client/endpoint config with the defaults applied
+    /// (loopback redirect_uri). A missing field is `None` (caller decides
+    /// whether it's fatal).
     pub fn resolve_oauth_config(&self, oauth: &OAuth2Def) -> ResolvedOAuthConfig {
-        let provider = self.oauth_provider(oauth);
-        let token_url = oauth
-            .token_url
-            .clone()
-            .or_else(|| provider.and_then(|p| p.token_url.clone()));
-        let client_id = oauth
-            .client_id
-            .clone()
-            .or_else(|| provider.and_then(|p| p.client_id.clone()));
-        let client_secret = oauth
-            .client_secret
-            .clone()
-            .or_else(|| provider.and_then(|p| p.client_secret.clone()));
-        let redirect_uri = oauth
-            .redirect_uri
-            .clone()
-            .or_else(|| provider.and_then(|p| p.redirect_uri.clone()))
-            .unwrap_or_else(|| DEFAULT_LOOPBACK_REDIRECT.to_string());
-        ResolvedOAuthConfig { token_url, client_id, client_secret, redirect_uri }
+        ResolvedOAuthConfig {
+            token_url: oauth.token_url.clone(),
+            client_id: oauth.client_id.clone(),
+            client_secret: oauth.client_secret.clone(),
+            redirect_uri: oauth
+                .redirect_uri
+                .clone()
+                .unwrap_or_else(|| DEFAULT_LOOPBACK_REDIRECT.to_string()),
+        }
     }
 
-    /// The PUBLIC OAuth consent parameters for `service_id` — what a frontend
-    /// needs to start a cloud-blind connect. The confidential half
-    /// (client_secret / token_url) is intentionally omitted; the daemon does the
-    /// exchange. `None` when the service isn't oauth2, or neither the inline
-    /// section nor its provider supplies an authorization_url + client_id.
+    /// The public OAuth wiring broadcast for `service_id` — see
+    /// [`ConnectDescriptor`]. `None` when the service isn't oauth2 or its
+    /// section lacks an authorization_url + client_id.
     pub fn connect_descriptor(&self, service_id: &str) -> Option<ConnectDescriptor> {
         let def = self.services.get(service_id)?;
         let oauth = def.oauth2.as_ref()?;
@@ -804,36 +671,26 @@ impl ServiceRegistry {
     /// [`Self::connect_descriptor`] for an `[oauth2]` section directly — shared
     /// with per-vault custom services that don't live in `self.services`.
     pub fn connect_descriptor_for(&self, oauth: &OAuth2Def) -> Option<ConnectDescriptor> {
-        let p = self.oauth_provider(oauth);
         Some(ConnectDescriptor {
             provider: oauth
                 .provider
                 .clone()
                 .unwrap_or_else(|| "custom".to_string()),
-            auth_mode: p
-                .and_then(|p| p.auth_mode.clone())
-                .unwrap_or_else(|| "oauth2".to_string()),
-            authorization_url: oauth
-                .authorization_url
-                .clone()
-                .or_else(|| p.and_then(|p| p.authorization_url.clone()))?,
-            client_id: oauth
-                .client_id
-                .clone()
-                .or_else(|| p.and_then(|p| p.client_id.clone()))?,
+            authorization_url: oauth.authorization_url.clone()?,
+            token_url: oauth.token_url.clone(),
+            client_id: oauth.client_id.clone()?,
+            client_secret: oauth.client_secret.clone(),
             scopes: oauth.scopes.clone(),
-            pkce: oauth.pkce.unwrap_or_else(|| p.map(|p| p.pkce).unwrap_or(true)),
+            pkce: oauth.pkce.unwrap_or(true),
             redirect_uri: oauth
                 .redirect_uri
                 .clone()
-                .or_else(|| p.and_then(|p| p.redirect_uri.clone()))
                 .unwrap_or_else(|| DEFAULT_LOOPBACK_REDIRECT.to_string()),
-            authorize_params: {
-                // Template's params under the service's inline ones (inline wins).
-                let mut merged = p.map(|p| p.authorize_params.clone()).unwrap_or_default();
-                merged.extend(oauth.authorize_params.clone());
-                merged
+            oauth_style: match oauth.oauth_style.as_deref() {
+                Some("json") => "json".to_string(),
+                _ => "form".to_string(),
             },
+            authorize_params: oauth.authorize_params.clone(),
         })
     }
 
@@ -876,12 +733,6 @@ impl ServiceRegistry {
         &self.services
     }
 
-    /// The set of shipped provider names (for validating a custom service's
-    /// `[oauth2].provider` against what actually exists).
-    pub fn provider_names(&self) -> std::collections::HashSet<String> {
-        self.providers.keys().cloned().collect()
-    }
-
 }
 
 // ── User service directory ───────────────────────────────────────────────────
@@ -896,8 +747,8 @@ mod tests {
     use super::*;
     use crate::core::policy::AccessLevel;
 
-    fn reg(services: HashMap<String, ServiceDef>, providers: HashMap<String, ProviderDef>) -> ServiceRegistry {
-        ServiceRegistry { services, policies: HashMap::new(), providers }
+    fn reg(services: HashMap<String, ServiceDef>) -> ServiceRegistry {
+        ServiceRegistry { services, policies: HashMap::new() }
     }
 
     // ── PolicyDef::to_levels (inline policy fallback kept) ───────────────────
@@ -1035,7 +886,7 @@ refresh_token = "GMAIL_REFRESH_TOKEN"
         let def: ServiceDef = toml::from_str(toml_str).unwrap();
         let mut services = HashMap::new();
         services.insert("gmail".into(), def);
-        let r = reg(services, HashMap::new());
+        let r = reg(services);
         assert_eq!(r.service_env_key("gmail").as_deref(), Some("GMAIL_REFRESH_TOKEN"));
     }
 
@@ -1051,7 +902,7 @@ secrets = ["GITHUB_TOKEN"]
         let def: ServiceDef = toml::from_str(toml_str).unwrap();
         let mut services = HashMap::new();
         services.insert("github".into(), def);
-        let r = reg(services, HashMap::new());
+        let r = reg(services);
         assert_eq!(r.service_env_key("github").as_deref(), Some("GITHUB_TOKEN"));
     }
 
@@ -1073,72 +924,13 @@ secrets = ["GITHUB_TOKEN"]
         assert!(setup.contains("sc run --"));
     }
 
-    // ── provider parsing + resolution ────────────────────────────────────────
+    // ── [oauth2] inline resolution ────────────────────────────────────────────
 
     #[test]
-    fn provider_file_parses() {
-        let toml_str = r#"
-[provider.google]
-auth_mode = "oauth2"
-flow = "authorization_code"
-authorization_url = "https://accounts.google.com/o/oauth2/v2/auth"
-token_url = "https://oauth2.googleapis.com/token"
-pkce = true
-client_id = "499410884315-x.apps.googleusercontent.com"
-client_secret = "GOCSPX-public"
-client_type = "public"
-"#;
-        let file: ProviderFileDef = toml::from_str(toml_str).unwrap();
-        let p = file.provider.get("google").unwrap();
-        assert_eq!(p.auth_mode.as_deref(), Some("oauth2"));
-        assert!(p.pkce);
-        assert_eq!(p.client_type.as_deref(), Some("public"));
-    }
-
-    #[test]
-    fn resolve_oauth_config_via_provider_literal() {
-        let svc_toml = r#"
-[service]
-id = "gmail"
-name = "Gmail"
-hosts = ["gmail.googleapis.com"]
-[oauth2]
-provider = "google"
-refresh_token = "GMAIL_REFRESH_TOKEN"
-"#;
-        let prov_toml = r#"
-[provider.google]
-auth_mode = "oauth2"
-token_url = "https://oauth2.googleapis.com/token"
-client_id = "public-client-id"
-client_secret = "public-secret"
-client_type = "public"
-"#;
-        let def: ServiceDef = toml::from_str(svc_toml).unwrap();
-        let pfile: ProviderFileDef = toml::from_str(prov_toml).unwrap();
-        let mut services = HashMap::new();
-        services.insert("gmail".into(), def);
-        let mut providers = HashMap::new();
-        for (name, p) in pfile.provider { providers.insert(name, p); }
-        let r = reg(services, providers);
-        let oauth = r.get("gmail").unwrap().oauth2.clone().unwrap();
-        let cfg = r.resolve_oauth_config(&oauth);
-        assert_eq!(cfg.token_url.as_deref(), Some("https://oauth2.googleapis.com/token"));
-        assert_eq!(cfg.client_id.as_deref(), Some("public-client-id"));
-        assert_eq!(cfg.client_secret.as_deref(), Some("public-secret"));
-    }
-
-    #[test]
-    fn oauth_style_defaults_form_reads_provider_json_and_inline_wins() {
-        let mut providers = HashMap::new();
-        let mut p: ProviderDef = toml::from_str::<ProviderFileDef>(
-            "[provider.a]\nauth_mode=\"oauth2\"\n",
-        ).unwrap().provider.remove("a").unwrap();
-        p.oauth_style = Some("json".into());
-        providers.insert("anthropic".to_string(), p);
-        let r = reg(HashMap::new(), providers);
-        let oauth = |provider: Option<&str>, style: Option<&str>| OAuth2Def {
-            provider: provider.map(|s| s.to_string()),
+    fn oauth_style_defaults_form_inline_json_wins() {
+        let r = reg(HashMap::new());
+        let oauth = |style: Option<&str>| OAuth2Def {
+            provider: None,
             scopes: vec![],
             refresh_token: "RT".into(),
             id_token: None,
@@ -1154,29 +946,15 @@ client_type = "public"
             oauth_style: style.map(|s| s.to_string()),
             authorize_params: HashMap::new(),
         };
-        // Provider template's json is read through.
-        assert!(matches!(r.oauth_style(&oauth(Some("anthropic"), None)), OAuthStyle::Json));
-        // Unknown / absent provider defaults to form.
-        assert!(matches!(r.oauth_style(&oauth(Some("missing"), None)), OAuthStyle::Form));
-        assert!(matches!(r.oauth_style(&oauth(None, None)), OAuthStyle::Form));
-        // Inline declaration wins over the template.
-        assert!(matches!(r.oauth_style(&oauth(Some("anthropic"), Some("form"))), OAuthStyle::Form));
-        assert!(matches!(r.oauth_style(&oauth(None, Some("json"))), OAuthStyle::Json));
+        assert!(matches!(r.oauth_style(&oauth(None)), OAuthStyle::Form));
+        assert!(matches!(r.oauth_style(&oauth(Some("form"))), OAuthStyle::Form));
+        assert!(matches!(r.oauth_style(&oauth(Some("json"))), OAuthStyle::Json));
     }
 
     // ── compiled-in sanity (post-migration) ──────────────────────────────────
 
     #[test]
     fn compiled_services_parse_and_validate() {
-        let known_providers: std::collections::HashSet<String> = {
-            let mut set = std::collections::HashSet::new();
-            for (_f, toml_str) in crate::generated_services::compiled_provider_tomls() {
-                if let Ok(pf) = toml::from_str::<ProviderFileDef>(toml_str) {
-                    for name in pf.provider.keys() { set.insert(name.clone()); }
-                }
-            }
-            set
-        };
         for (id, _category, toml_str) in crate::generated_services::compiled_service_tomls() {
             let def: ServiceDef = toml::from_str(toml_str)
                 .unwrap_or_else(|e| panic!("service '{}' failed to parse: {}", id, e));
@@ -1184,26 +962,26 @@ client_type = "public"
             if !def.service.hidden {
                 assert!(!def.service.hosts.is_empty(), "service '{}' declares no hosts", id);
             }
-            // If oauth2, its provider must be a slug (existence checked elsewhere;
-            // codex intentionally references a not-yet-shipped provider).
+            // [oauth2] is self-sufficient: every compiled oauth service must be
+            // inline-complete (there is no template layer to fill gaps).
             if let Some(o) = &def.oauth2 {
-                let _ = &known_providers; // referenced for the custom-toml path
                 assert!(!o.refresh_token.is_empty(), "service '{}' oauth2 has empty refresh_token", id);
+                assert!(o.authorization_url.is_some(), "service '{}' oauth2 missing authorization_url", id);
+                assert!(o.token_url.is_some(), "service '{}' oauth2 missing token_url", id);
+                assert!(o.client_id.is_some(), "service '{}' oauth2 missing client_id", id);
             }
         }
     }
 
     #[test]
     fn compiled_codex_resolves_fully_inline() {
-        // openai_codex ships NO provider template — its [oauth2] must resolve
-        // (and advertise a connect descriptor) from inline fields alone.
         let mut services = HashMap::new();
         for (id, _category, toml_str) in crate::generated_services::compiled_service_tomls() {
             if let Ok(def) = toml::from_str::<ServiceDef>(toml_str) {
                 services.insert(id.to_string(), def);
             }
         }
-        let r = reg(services, HashMap::new()); // deliberately zero providers
+        let r = reg(services);
         let oauth = r.get("openai_codex").unwrap().oauth2.clone().expect("codex [oauth2]");
         let cfg = r.resolve_oauth_config(&oauth);
         assert_eq!(cfg.token_url.as_deref(), Some("https://auth.openai.com/oauth/token"));
@@ -1224,67 +1002,61 @@ client_type = "public"
     }
 
     #[test]
-    fn descriptor_merges_authorize_params_inline_over_template() {
-        let mut providers = HashMap::new();
-        let p: ProviderDef = toml::from_str::<ProviderFileDef>(
-            "[provider.g]\nauthorization_url=\"https://a.example/auth\"\nclient_id=\"cid\"\n[provider.g.authorize_params]\naccess_type=\"offline\"\nprompt=\"consent\"\n",
-        ).unwrap().provider.remove("g").unwrap();
-        providers.insert("g".to_string(), p);
-        let r = reg(HashMap::new(), providers);
+    fn descriptor_labels_custom_when_no_provider() {
+        let r = reg(HashMap::new());
         let mut oauth: OAuth2Def = toml::from_str(
-            "provider=\"g\"\nrefresh_token=\"RT\"\n[authorize_params]\nprompt=\"login\"\n",
+            "refresh_token=\"RT\"\nauthorization_url=\"https://b.example/auth\"\nclient_id=\"cid\"\n[authorize_params]\nprompt=\"login\"\n",
         ).unwrap();
         let d = r.connect_descriptor_for(&oauth).unwrap();
-        assert_eq!(d.authorize_params.get("access_type").map(String::as_str), Some("offline"));
-        assert_eq!(d.authorize_params.get("prompt").map(String::as_str), Some("login"), "inline wins");
-        // Fully inline (no provider): descriptor still forms.
-        oauth.provider = None;
-        oauth.authorization_url = Some("https://b.example/auth".into());
-        oauth.client_id = Some("cid2".into());
+        assert_eq!(d.provider, "custom");
+        assert_eq!(d.client_id, "cid");
+        assert_eq!(d.authorize_params.get("prompt").map(String::as_str), Some("login"));
+        // A provider name is a pure label — it changes nothing but the label.
+        oauth.provider = Some("g".into());
         let d2 = r.connect_descriptor_for(&oauth).unwrap();
-        assert_eq!(d2.provider, "custom");
-        assert_eq!(d2.client_id, "cid2");
+        assert_eq!(d2.provider, "g");
+        assert_eq!(d2.client_id, "cid");
     }
 
     #[test]
-    fn compiled_google_services_inherit_provider() {
-        let mut providers = HashMap::new();
-        for (_f, toml_str) in crate::generated_services::compiled_provider_tomls() {
-            let pfile: ProviderFileDef = toml::from_str(toml_str).unwrap();
-            for (name, p) in pfile.provider { providers.insert(name, p); }
-        }
-        assert!(providers.contains_key("google"), "google provider must be compiled in");
+    fn compiled_google_trio_is_inline_complete_and_shares_one_client() {
         let mut services = HashMap::new();
         for (id, _category, toml_str) in crate::generated_services::compiled_service_tomls() {
             if let Ok(def) = toml::from_str::<ServiceDef>(toml_str) {
                 services.insert(id.to_string(), def);
             }
         }
-        let r = reg(services, providers);
+        let r = reg(services);
+        let mut client_ids = std::collections::HashSet::new();
         for id in ["gmail", "gdrive", "gcalendar"] {
             let oauth = r.get(id).unwrap().oauth2.clone()
                 .unwrap_or_else(|| panic!("{} missing [oauth2]", id));
             assert_eq!(oauth.provider.as_deref(), Some("google"), "{}", id);
             let cfg = r.resolve_oauth_config(&oauth);
             assert_eq!(cfg.token_url.as_deref(), Some("https://oauth2.googleapis.com/token"), "{}", id);
-            assert!(cfg.client_id.is_some(), "{} client_id", id);
+            client_ids.insert(cfg.client_id.expect("client_id"));
             assert!(!oauth.scopes.is_empty(), "{} scopes", id);
         }
+        assert_eq!(client_ids.len(), 1, "the trio must share ONE Desktop client (rotate together)");
     }
 
     #[test]
-    fn connect_descriptor_for_gmail_exposes_public_consent_only() {
+    fn connect_descriptor_for_gmail_mirrors_the_full_wiring() {
+        // The descriptor is a 1:1 mirror of the def — a def can only hold
+        // public-client material (validator), so nothing is withheld and the
+        // console can display the wiring faithfully.
         let r = ServiceRegistry::load();
-        let d = r.connect_descriptor("gmail").expect("gmail is oauth2 with a google provider");
+        let d = r.connect_descriptor("gmail").expect("gmail is oauth2");
         assert_eq!(d.provider, "google");
-        assert_eq!(d.auth_mode, "oauth2");
         assert!(d.authorization_url.starts_with("https://accounts.google.com/"));
+        assert_eq!(d.token_url.as_deref(), Some("https://oauth2.googleapis.com/token"));
         assert!(d.client_id.ends_with(".apps.googleusercontent.com"));
+        assert!(d.client_secret.as_deref().is_some_and(|s| s.starts_with("GOCSPX-")),
+            "the public Desktop client_secret is part of the wiring");
         assert!(d.pkce);
+        assert_eq!(d.oauth_style, "form");
         assert!(d.scopes.iter().any(|s| s.contains("gmail.send")));
-        let json = serde_json::to_string(&d).unwrap();
-        assert!(!json.contains("GOCSPX"), "client_secret leaked: {json}");
-        assert!(!json.contains("oauth2.googleapis.com/token"), "token_url leaked: {json}");
+        assert_eq!(d.authorize_params.get("access_type").map(String::as_str), Some("offline"));
     }
 
     #[test]

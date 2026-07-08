@@ -271,9 +271,9 @@ provider = "google"
 scopes   = [ "…/gmail.send", "…/gmail.readonly", "…/gmail.modify" ]
 secret   = "GMAIL_REFRESH_TOKEN"     # mainstream role this recipe injects (DEFINEd)
 
-# services/_providers/google.toml — the OAuth client's fixed redirect_uri lives here,
+# The OAuth client's fixed redirect_uri lives in the service's [oauth2] section,
 # not in each handshake:
-[provider.google]
+[oauth2]
 # … client_id / token_url / pkce …
 redirect_uri = "http://127.0.0.1:8765/safeclaw/oauth/callback"
 ```

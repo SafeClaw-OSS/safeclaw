@@ -1,9 +1,8 @@
 /// Build script: scan services/ directory and generate compiled-in TOML registries.
 ///
 /// Generates src/generated_services.rs with:
-///   - compiled_service_tomls() -> &[(&str, &str)]
+///   - compiled_service_tomls() -> &[(&str, &str, &str)]
 ///   - compiled_policy_tomls() -> &[(&str, &str)]
-///   - compiled_provider_tomls() -> &[(&str, &str)]  (services/_providers/*.toml)
 ///
 /// This eliminates hand-written include_str! lists — adding a new service
 /// just requires creating a TOML file in services/.
@@ -17,33 +16,15 @@ fn main() {
 
     let mut service_entries = Vec::new();
     let mut policy_entries = Vec::new();
-    let mut provider_entries = Vec::new();
 
     // Scan services/{category}/{id}/ layout
     if services_dir.is_dir() {
         scan_services(services_dir, &mut service_entries, &mut policy_entries);
     }
 
-    // Scan services/_providers/*.toml — shared [provider.<name>] templates.
-    let providers_dir = services_dir.join("_providers");
-    if providers_dir.is_dir() {
-        if let Ok(entries) = fs::read_dir(&providers_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) != Some("toml") {
-                    continue;
-                }
-                let name = path.file_stem().unwrap().to_str().unwrap().to_string();
-                let rel = path.to_str().unwrap().to_string();
-                provider_entries.push((name, rel));
-            }
-        }
-    }
-
     // Sort for deterministic output
     service_entries.sort();
     policy_entries.sort();
-    provider_entries.sort();
 
     // Generate Rust source
     let mut code = String::new();
@@ -68,15 +49,6 @@ fn main() {
     for (id, rel_path) in &policy_entries {
         code.push_str(&format!("        (\"{}\", include_str!(\"../{}\") ),\n", id, rel_path));
     }
-    code.push_str("    ]\n}\n\n");
-
-    code.push_str("/// Compiled-in provider TOML definitions (services/_providers/*.toml).\n");
-    code.push_str("/// Tuple is (provider_file_stem, toml_content).\n");
-    code.push_str("pub fn compiled_provider_tomls() -> &'static [(&'static str, &'static str)] {\n");
-    code.push_str("    &[\n");
-    for (name, rel_path) in &provider_entries {
-        code.push_str(&format!("        (\"{}\", include_str!(\"../{}\") ),\n", name, rel_path));
-    }
     code.push_str("    ]\n}\n");
 
     fs::write(&out_path, code).expect("Failed to write generated_services.rs");
@@ -98,8 +70,8 @@ fn scan_services(
     for cat_entry in categories.flatten() {
         let cat_path = cat_entry.path();
         if !cat_path.is_dir() { continue; }
-        // Skip underscore-prefixed dirs: `_providers` (handled separately) and
-        // `_parked` (system-category / daemon-exec services excluded from v4).
+        // Skip underscore-prefixed dirs, e.g. `_parked` (system-category /
+        // daemon-exec services excluded from v4).
         if cat_path.file_name().and_then(|n| n.to_str()).map_or(false, |n| n.starts_with('_')) {
             continue;
         }

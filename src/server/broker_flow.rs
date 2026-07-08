@@ -169,13 +169,13 @@ pub async fn resolve_auth_value(
     let resolved = state.services.resolve_oauth_config(&oauth);
     let token_url = resolved.token_url.as_deref().ok_or_else(|| {
         AppError::Internal(format!(
-            "service '{}' is oauth2 but its provider has no token_url",
+            "service '{}' is oauth2 but declares no token_url",
             service_id
         ))
     })?;
     let client_id = resolved.client_id.clone().ok_or_else(|| {
         AppError::Internal(format!(
-            "service '{}' is oauth2 but its provider has no client_id",
+            "service '{}' is oauth2 but declares no client_id",
             service_id
         ))
     })?;

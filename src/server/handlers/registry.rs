@@ -348,8 +348,7 @@ fn build_service(
         // Resolve the descriptor from the `def` in hand, not by id — the id
         // lookup only knows built-ins, so a per-vault custom oauth2 service
         // (passed here with its own def) would get `connect: null` and never
-        // look connectable in the console. `connect_descriptor_for` still
-        // resolves any named provider template against the built-in registry.
+        // look connectable in the console.
         connect: def
             .oauth2
             .as_ref()
@@ -645,7 +644,8 @@ refresh_token = "REFRESH_TOKEN"
         assert_eq!(d.provider, "custom");
         assert_eq!(d.authorization_url, "https://auth.acme.dev/authorize");
         assert_eq!(d.client_id, "acme-public");
-        // The confidential half never rides the descriptor.
+        // The descriptor mirrors the def 1:1 — token_url rides too.
+        assert_eq!(d.token_url.as_deref(), Some("https://auth.acme.dev/token"));
     }
 
     #[test]

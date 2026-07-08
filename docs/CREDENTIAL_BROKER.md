@@ -208,7 +208,7 @@ hosts = ["gmail.googleapis.com"]
 secrets = ["GMAIL_REFRESH_TOKEN"]            # uniform `secrets` — lists the refresh key too
 
 [oauth2]
-provider = "google"                          # -> _providers/google.toml
+provider = "google"                          # display label only; wiring is inline
 scopes   = ["https://www.googleapis.com/auth/gmail.send", …]
 refresh_token = "GMAIL_REFRESH_TOKEN"        # RFC 6749 field → the vault secret KEY the
                                              # durable refresh token is stored under
@@ -694,11 +694,11 @@ human-anchored host anyway). Skill stays generic; the shipped
 - **No `broker.rs`/`approve.rs` rewrite** — additive over the existing 2-RTT flow.
 - **No pre-storing encoded credential forms** — the vault stores the semantic value.
 - **No baked "common host" hint list** — service-declared / agent deep-link / TOFU.
-- **No user/agent-authored OAuth PROVIDER definitions** — the provider
-  (`_providers/*.toml`: endpoints, client, `client_type=public` gate) is
-  curated/PR-only. OAuth **connections** are self-serve via a **custom service
-  toml** (per-vault `aux.services`, validated; referencing an existing provider
-  only) → then added like any catalog service — NEVER an OAuth option inside
+- **No provider-template layer** (retired 2026-07-08) — every `[oauth2]` is
+  inline-complete (endpoints, client, `client_type=public` gate enforced by the
+  validator). OAuth **connections** are self-serve via a **custom service
+  toml** (per-vault `aux.services`, validated) → then added like any catalog
+  service — NEVER an OAuth option inside
   the add-connection form (it would force an `oauth` field onto the 2-field
   connection record). Custom-toml authoring is a separate low-frequency
   surface: the v4 schema is what it accepts, nothing else.

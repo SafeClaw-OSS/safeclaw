@@ -379,8 +379,8 @@ pub enum ServiceSubcommand {
     /// Store a validated custom service definition in the active vault
     /// (`aux.services`), so its connections show up in the catalog and can be
     /// added like any built-in. Validates the v4 schema first; the daemon
-    /// re-validates (provider ∈ shipped, no tool-named sections) at unlock
-    /// before it can broker. Two passkey gestures (unlock + write).
+    /// re-validates (v4 schema, no tool-named sections) at unlock before it
+    /// can broker. Two passkey gestures (unlock + write).
     Add(ServiceAddArgs),
 }
 

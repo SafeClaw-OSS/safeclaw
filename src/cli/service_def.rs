@@ -44,15 +44,15 @@ pub async fn run_validate(args: ServiceValidateArgs) -> Result<(), String> {
 
 /// `sc service add <file.toml>` — validate a v4 definition, then store it in the
 /// active vault's `aux.services` (keyed by the service id). The daemon
-/// re-validates at unlock (provider ∈ shipped, no tool-named sections, never
-/// shadow a built-in) before it can broker — this is the authoring gate.
+/// re-validates at unlock (v4 schema, no tool-named sections, never shadow a
+/// built-in) before it can broker — this is the authoring gate.
 pub async fn run_add(args: ServiceAddArgs) -> Result<(), String> {
     let (custodian, vault) = resolve_active(args.vault.as_deref())?;
     let toml_str = std::fs::read_to_string(&args.path)
         .map_err(|e| format!("cannot read {}: {}", args.path.display(), e))?;
 
-    // Base v4 schema check up front (the daemon adds the provider check at
-    // unlock — the CLI can't see the shipped provider set offline).
+    // Full v4 schema check up front — the same validator the daemon re-runs
+    // at unlock.
     if let Err(problems) = validate_recipe(&toml_str, false) {
         eprintln!(
             "✗ {} — {} problem{}:",

@@ -1393,13 +1393,12 @@ pub(crate) fn bootstrap_cache_from_view(
     // Custom (per-vault `aux.services`) definitions: validate before they can
     // broker (defense in depth — never trust the stored blob), never shadow a
     // built-in id, load only if valid. Wiped on lock with the rest of the cache.
-    let known_providers = state.services.provider_names();
     for (service_id, toml_src) in view.aux.services.iter() {
         if state.services.get(service_id).is_some() {
             tracing::warn!(service = %service_id, "custom service shadows a built-in id — skipped");
             continue;
         }
-        if let Err(e) = crate::service::validate::validate_service(toml_src, &known_providers) {
+        if let Err(e) = crate::service::validate::validate_service(toml_src) {
             tracing::warn!(service = %service_id, "custom service failed validation: {:?} — skipped", e);
             continue;
         }

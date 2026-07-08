@@ -127,7 +127,8 @@ pub struct Connection {
 /// generic identity (`service`, `hosts`) is top-level; the mechanism handshake
 /// state nests under the mechanism key (`oauth2`) so a future auth mechanism
 /// nests under ITS key without the schema getting messy. `redirect_uri` is NOT
-/// here — it's a fixed property of the OAuth client, held in the provider config.
+/// here — it's a fixed property of the OAuth client, held in the service's
+/// `[oauth2]` section.
 /// Mirrors the frontend `lib/vault-grant.ts` `Connecting` shape.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Connecting {
@@ -250,8 +251,8 @@ pub struct VaultAux {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audit_retention_days: Option<u32>,
     /// Per-vault custom service definitions: `service_id → verbatim v4
-    /// service.toml source`. Validated (v4 schema, provider ∈ shipped
-    /// `_providers`, no tool-named sections) at unlock before it can broker,
+    /// service.toml source`. Validated (v4 schema, inline-complete `[oauth2]`,
+    /// no tool-named sections) at unlock before it can broker,
     /// and again at author time. Sparse — empty when the user authored none. A
     /// custom service is folded into the catalog exactly like a compiled one;
     /// it never shadows a built-in id.
