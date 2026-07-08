@@ -382,12 +382,51 @@ pub enum ServiceSubcommand {
     /// re-validates (v4 schema, no tool-named sections) at unlock before it
     /// can broker. Two passkey gestures (unlock + write).
     Add(ServiceAddArgs),
+    /// List the vault's custom service definitions (`aux.services`) with each
+    /// one's validation status — an INVALID definition is silently skipped by
+    /// the daemon (its connections stay stuck), and the console only surfaces
+    /// definitions that have a connection, so this is where orphaned or broken
+    /// defs become visible. One passkey gesture (unlock, read-only).
+    Ls(ServiceLsArgs),
+    /// Delete a custom service definition from the vault (`aux.services`).
+    /// Warns when connections still reference it (they keep working off stored
+    /// secrets but lose the service backing). Two passkey gestures
+    /// (unlock + write).
+    Rm(ServiceRmArgs),
 }
 
 #[derive(Debug, Args)]
 pub struct ServiceAddArgs {
     /// Path to the v4 service.toml to store in the vault.
     pub path: std::path::PathBuf,
+    #[arg(long)]
+    pub vault: Option<String>,
+    #[arg(long)]
+    pub no_browser: bool,
+    /// Fixed port for the localhost callback server (for SSH port-forwarding).
+    #[arg(long, env = "SAFECLAW_CB_PORT")]
+    pub cb_port: Option<u16>,
+    #[arg(long, default_value = "120")]
+    pub timeout: u64,
+}
+
+#[derive(Debug, Args)]
+pub struct ServiceLsArgs {
+    #[arg(long)]
+    pub vault: Option<String>,
+    #[arg(long)]
+    pub no_browser: bool,
+    /// Fixed port for the localhost callback server (for SSH port-forwarding).
+    #[arg(long, env = "SAFECLAW_CB_PORT")]
+    pub cb_port: Option<u16>,
+    #[arg(long, default_value = "120")]
+    pub timeout: u64,
+}
+
+#[derive(Debug, Args)]
+pub struct ServiceRmArgs {
+    /// The service id to delete (as shown by `sc service ls`).
+    pub id: String,
     #[arg(long)]
     pub vault: Option<String>,
     #[arg(long)]

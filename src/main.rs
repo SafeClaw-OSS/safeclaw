@@ -217,6 +217,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let r = match args.sub {
                 ServiceSubcommand::Validate(a) => cli::service_def::run_validate(a).await,
                 ServiceSubcommand::Add(a) => cli::service_def::run_add(a).await,
+                ServiceSubcommand::Ls(a) => cli::service_def::run_ls(a).await,
+                ServiceSubcommand::Rm(a) => cli::service_def::run_rm(a).await,
             };
             r.map_err(|e| -> Box<dyn std::error::Error> {
                 eprintln!("safeclaw service: {}", e);
