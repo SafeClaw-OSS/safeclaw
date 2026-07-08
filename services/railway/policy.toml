@@ -10,12 +10,16 @@
 read = "allow"
 write = "allow"
 
+# Mutation names below are ground truth from GraphQL introspection against
+# backboard.railway.com/graphql/v2 (2026-07-08), not guessed.
+
 # ── Destroy / lose work (irreversible) ───────────────────────────────────────
+# workspaceDelete is the biggest: it takes every project under the workspace.
 [[rule]]
 id = "delete-infra"
-label = "Delete a project, service, environment, or volume"
+label = "Delete a workspace, project, service, environment, or volume"
 match = "POST /graphql/**"
-body = "projectDelete|serviceDelete|environmentDelete|volumeDelete"
+body = "workspaceDelete|projectDelete|serviceDelete|environmentDelete|volumeDelete"
 level = "ask-always"
 
 # ── Mint a durable credential (escapes the broker) ───────────────────────────
@@ -27,4 +31,15 @@ id = "mint-token"
 label = "Mint an API token"
 match = "POST /graphql/**"
 body = "projectTokenCreate|apiTokenCreate"
+level = "ask-always"
+
+# ── Change who can get in (access posture) ───────────────────────────────────
+# Adding/inviting a member, changing a role, transferring the project to a new
+# owner, or adding an SSH key that grants shell into running containers. All rare,
+# all consequential; matches github's collaborator / transfer / deploy-key gates.
+[[rule]]
+id = "change-access"
+label = "Add a member, change a role, transfer ownership, or add an SSH key"
+match = "POST /graphql/**"
+body = "projectMemberAdd|projectMemberUpdate|projectInviteUser|projectTransfer|workspaceUserInvite|workspacePermissionChange|sshPublicKeyCreate"
 level = "ask-always"

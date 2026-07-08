@@ -1178,7 +1178,9 @@ secrets = ["GITHUB_TOKEN"]
         assert_eq!(eval(r#"{"query":"query { me { name } }"}"#), AccessLevel::Allow);
         assert_eq!(eval(r#"{"query":"mutation { serviceInstanceRedeploy(id: 1) }"}"#), AccessLevel::Allow);
         assert_eq!(eval(r#"{"query":"mutation { variableUpsert(input: {}) }"}"#), AccessLevel::Allow);
-        // Each irreversible destroy is caught by mutation name.
+        // Each irreversible destroy is caught by mutation name (incl. the biggest,
+        // workspaceDelete — every project under the workspace).
+        assert_eq!(eval(r#"{"query":"mutation { workspaceDelete(id: \"w\") }"}"#), AccessLevel::AskAlways);
         assert_eq!(eval(r#"{"query":"mutation { projectDelete(id: \"p\") }"}"#), AccessLevel::AskAlways);
         assert_eq!(eval(r#"{"query":"mutation { serviceDelete(id: \"s\") }"}"#), AccessLevel::AskAlways);
         assert_eq!(eval(r#"{"query":"mutation { environmentDelete(id: \"e\") }"}"#), AccessLevel::AskAlways);
@@ -1186,6 +1188,10 @@ secrets = ["GITHUB_TOKEN"]
         // Minting a durable token escapes the broker → gated.
         assert_eq!(eval(r#"{"query":"mutation { projectTokenCreate(input: {}) }"}"#), AccessLevel::AskAlways);
         assert_eq!(eval(r#"{"query":"mutation { apiTokenCreate(input: {}) }"}"#), AccessLevel::AskAlways);
+        // Access-posture changes (member/role/transfer/ssh key) → gated.
+        assert_eq!(eval(r#"{"query":"mutation { projectMemberAdd(input: {}) }"}"#), AccessLevel::AskAlways);
+        assert_eq!(eval(r#"{"query":"mutation { projectTransferInitiate(id: \"p\") }"}"#), AccessLevel::AskAlways);
+        assert_eq!(eval(r#"{"query":"mutation { sshPublicKeyCreate(input: {}) }"}"#), AccessLevel::AskAlways);
     }
 
     #[test]
