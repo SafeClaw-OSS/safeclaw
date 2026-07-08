@@ -1183,6 +1183,9 @@ secrets = ["GITHUB_TOKEN"]
         assert_eq!(eval(r#"{"query":"mutation { serviceDelete(id: \"s\") }"}"#), AccessLevel::AskAlways);
         assert_eq!(eval(r#"{"query":"mutation { environmentDelete(id: \"e\") }"}"#), AccessLevel::AskAlways);
         assert_eq!(eval(r#"{"query":"mutation { volumeDelete(id: \"v\") }"}"#), AccessLevel::AskAlways);
+        // Minting a durable token escapes the broker → gated.
+        assert_eq!(eval(r#"{"query":"mutation { projectTokenCreate(input: {}) }"}"#), AccessLevel::AskAlways);
+        assert_eq!(eval(r#"{"query":"mutation { apiTokenCreate(input: {}) }"}"#), AccessLevel::AskAlways);
     }
 
     #[test]
@@ -1203,5 +1206,7 @@ secrets = ["GITHUB_TOKEN"]
         assert_eq!(eval("DELETE", "/v1/projects/abcdef/functions/hello"), AccessLevel::Allow);
         // Deleting the whole project is the one irreversible catastrophe.
         assert_eq!(eval("DELETE", "/v1/projects/abcdef"), AccessLevel::AskAlways);
+        // Opening the database to the network is a security-posture change → gated.
+        assert_eq!(eval("POST", "/v1/projects/abcdef/network-restrictions/apply"), AccessLevel::AskAlways);
     }
 }

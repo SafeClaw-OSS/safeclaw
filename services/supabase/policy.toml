@@ -10,13 +10,25 @@
 # prompt on every query. Sub-resource deletes (a function, a secret, a branch) are
 # recoverable and ride the floor; only the project-level DELETE is caught, because
 # the match is exactly one segment after `projects`.
+#
+# The other gated action changes who can reach the database: applying network
+# restrictions can open the project to 0.0.0.0/0 (the whole internet). Like making
+# a repo public, it's a rare, deliberate security-posture change.
 
 [default]
 read = "allow"
 write = "allow"
 
+# ── Destroy / lose work (irreversible) ───────────────────────────────────────
 [[rule]]
 id = "delete-project"
 label = "Delete a project (destroys its database and all data)"
 match = "DELETE /v1/projects/*"
+level = "ask-always"
+
+# ── Change who can reach the database (security posture) ─────────────────────
+[[rule]]
+id = "open-network"
+label = "Change network restrictions (who can reach the database)"
+match = "POST /v1/projects/*/network-restrictions/apply"
 level = "ask-always"
