@@ -1,0 +1,19 @@
+# Railway policy. The whole API is one GraphQL endpoint (POST /graphql/v2), so
+# the read/write floor can't tell a query from a mutation — everything is POST.
+# The token never enters the agent and egress is host-anchored, so routine work
+# (deploys, variable/domain changes, redeploys, queries) rides the write=allow
+# floor. The approval gate is spent only on the irreversible destroys, matched by
+# GraphQL mutation name in the request body: deleting a project, service,
+# environment, or volume wipes running infra and its data with no undo. One rule,
+# one console toggle; split or loosen it per-connection if you want finer grain.
+
+[default]
+read = "allow"
+write = "allow"
+
+[[rule]]
+id = "delete-infra"
+label = "Delete a project, service, environment, or volume"
+match = "POST /graphql/**"
+body = "projectDelete|serviceDelete|environmentDelete|volumeDelete"
+level = "ask-always"

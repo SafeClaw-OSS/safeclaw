@@ -1162,4 +1162,46 @@ secrets = ["GITHUB_TOKEN"]
         let publish = rules.iter().find(|ru| ru.id.as_deref() == Some("publish")).unwrap();
         assert_eq!(publish.ttl, Some(1800));
     }
+
+    #[test]
+    fn compiled_railway_policy_gates_only_destroys() {
+        use crate::core::policy::{evaluate, AccessLevel, Policy};
+        let r = ServiceRegistry::load();
+        let rules = r.default_policy_rules("railway")
+            .expect("railway policy.toml must parse and yield rules");
+        let policy = Policy::default();
+        let eval = |body: &str| {
+            // The whole API is one POST endpoint; the mutation name lives in the body.
+            evaluate("POST", "/graphql/v2", Some(body), Some(&rules), None, &policy, &["app".into()])
+        };
+        // Routine GraphQL (queries + non-destroy mutations) rides the allow floor.
+        assert_eq!(eval(r#"{"query":"query { me { name } }"}"#), AccessLevel::Allow);
+        assert_eq!(eval(r#"{"query":"mutation { serviceInstanceRedeploy(id: 1) }"}"#), AccessLevel::Allow);
+        assert_eq!(eval(r#"{"query":"mutation { variableUpsert(input: {}) }"}"#), AccessLevel::Allow);
+        // Each irreversible destroy is caught by mutation name.
+        assert_eq!(eval(r#"{"query":"mutation { projectDelete(id: \"p\") }"}"#), AccessLevel::AskAlways);
+        assert_eq!(eval(r#"{"query":"mutation { serviceDelete(id: \"s\") }"}"#), AccessLevel::AskAlways);
+        assert_eq!(eval(r#"{"query":"mutation { environmentDelete(id: \"e\") }"}"#), AccessLevel::AskAlways);
+        assert_eq!(eval(r#"{"query":"mutation { volumeDelete(id: \"v\") }"}"#), AccessLevel::AskAlways);
+    }
+
+    #[test]
+    fn compiled_supabase_policy_gates_only_project_delete() {
+        use crate::core::policy::{evaluate, AccessLevel, Policy};
+        let r = ServiceRegistry::load();
+        let rules = r.default_policy_rules("supabase")
+            .expect("supabase policy.toml must parse and yield rules");
+        let policy = Policy::default();
+        let eval = |m: &str, p: &str| {
+            evaluate(m, p, None, Some(&rules), None, &policy, &["app".into()])
+        };
+        // Routine developer work — incl. arbitrary SQL — rides the allow floor.
+        assert_eq!(eval("GET", "/v1/projects"), AccessLevel::Allow);
+        assert_eq!(eval("POST", "/v1/projects"), AccessLevel::Allow);
+        assert_eq!(eval("POST", "/v1/projects/abcdef/database/query"), AccessLevel::Allow);
+        // A sub-resource delete (function, secret, branch) is recoverable → floor.
+        assert_eq!(eval("DELETE", "/v1/projects/abcdef/functions/hello"), AccessLevel::Allow);
+        // Deleting the whole project is the one irreversible catastrophe.
+        assert_eq!(eval("DELETE", "/v1/projects/abcdef"), AccessLevel::AskAlways);
+    }
 }

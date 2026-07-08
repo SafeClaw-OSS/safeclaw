@@ -1,0 +1,22 @@
+# Supabase policy (Management API, api.supabase.com/v1). The token never enters
+# the agent and egress is host-anchored, so routine developer work — creating
+# projects, running SQL (POST /v1/projects/*/database/query), managing tables,
+# edge functions, config, secrets, branches — rides the write=allow floor. The
+# approval gate is spent on the one irreversible catastrophe: deleting a whole
+# project takes its database and every row with it, with no undo.
+#
+# SQL query is deliberately NOT gated: it's the daily bread (migrations, reads),
+# and like `git push` it can't be cheaply told apart from a read — gating it would
+# prompt on every query. Sub-resource deletes (a function, a secret, a branch) are
+# recoverable and ride the floor; only the project-level DELETE is caught, because
+# the match is exactly one segment after `projects`.
+
+[default]
+read = "allow"
+write = "allow"
+
+[[rule]]
+id = "delete-project"
+label = "Delete a project (destroys its database and all data)"
+match = "DELETE /v1/projects/*"
+level = "ask-always"

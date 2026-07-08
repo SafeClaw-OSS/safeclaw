@@ -1,0 +1,22 @@
+setup = """
+Railway's API is a single GraphQL endpoint. Put the phantom in the bearer header;
+the proxy substitutes it at egress, the token never enters the agent:
+  sc run -- curl https://backboard.railway.com/graphql/v2 \\
+    -H "Authorization: Bearer __sc__railway__" \\
+    -H "Content-Type: application/json" \\
+    -d '{"query":"query { me { name } }"}'
+Multi-account: switch the phantom value (__sc__railway_work__).
+"""
+
+[service]
+id = "railway"
+name = "Railway"
+# Classification for browse/filter and policy tag-floors; lowercase-kebab, multi OK.
+tags = ["app"]
+
+# One account/team token backs the whole GraphQL API. Both hosts resolve
+# (railway.app is the legacy domain, railway.com the current one).
+hosts = ["backboard.railway.com", "backboard.railway.app"]
+secrets = ["RAILWAY_API_TOKEN"]
+# Where a human mints the secret (auxiliary; display-only helper link).
+secret_url = "https://railway.com/account/tokens"
