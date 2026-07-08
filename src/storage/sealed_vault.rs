@@ -245,6 +245,16 @@ pub struct StoredItem {
     /// in JSON.
     #[serde(with = "b64url_bytes")]
     pub ct: Vec<u8>,
+    /// The highest `version` of this id KNOWN to be on the cloud —
+    /// `version > synced_version` means the row is DIRTY (needs a push);
+    /// equal means clean, and the push loop skips it. Without this every sync
+    /// re-offered every already-synced row and burned one 409 round-trip per
+    /// row. Local bookkeeping only (not AAD-bound, never sent): set by the
+    /// pull/adopt path and by a successful push; `0` (the serde default, and
+    /// what an existing on-disk store loads as) = "never confirmed on cloud",
+    /// which safely re-offers the row once.
+    #[serde(default)]
+    pub synced_version: u64,
 }
 
 /// The passkey-wrap layer — §7's small CAS blob, unchanged in substance from
@@ -326,9 +336,10 @@ impl PerItemVault {
     }
 
     /// Insert or replace a raw sealed item (used by the pull/adopt path — the ct
-    /// is already sealed by whoever wrote the cloud row).
+    /// is already sealed by whoever wrote the cloud row, so by construction the
+    /// cloud has this exact version: the row lands clean).
     pub fn put_raw(&mut self, item_id_b64: String, version: u64, ct: Vec<u8>) {
-        self.items.insert(item_id_b64, StoredItem { version, ct });
+        self.items.insert(item_id_b64, StoredItem { version, ct, synced_version: version });
     }
 
     /// Drop a stored item outright (local GC of a fully-propagated tombstone).
@@ -449,7 +460,10 @@ impl PerItemVault {
         let ctx = ItemCtx::for_item::<S>(k, vault_id, ns, name, version)?;
         let ct = seal_item::<S>(k, &ctx, payload)?;
         let id = ctx.item_id_b64();
-        self.items.insert(id.clone(), StoredItem { version, ct });
+        // A local write leaves `synced_version` where it was (the new version
+        // is by definition not on the cloud yet) — the row is dirty until pushed.
+        let synced_version = self.items.get(&id).map(|s| s.synced_version).unwrap_or(0);
+        self.items.insert(id.clone(), StoredItem { version, ct, synced_version });
         Ok(id)
     }
 
@@ -900,6 +914,47 @@ mod tests {
             .open_item::<StdPrimitives>(&k, vid, ItemNs::Secret, "NOPE")
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn synced_version_tracks_dirty_vs_clean() {
+        use sudp::primitives::StdPrimitives;
+        let k = [0x21u8; 32];
+        let vid = "vault-dirty";
+        let mut pv = PerItemVault::build_initial(
+            b"c".to_vec(),
+            "x".into(),
+            "y".into(),
+            "Dev".into(),
+            vec![0u8; 32],
+            vec![0u8; 48],
+        )
+        .unwrap();
+
+        // A fresh local write is DIRTY (never confirmed on cloud).
+        let id = pv
+            .seal_and_upsert::<StdPrimitives>(
+                &k, vid, ItemNs::Secret, "T",
+                1,
+                &ItemPayload::secret_live("T", "v1"),
+            )
+            .unwrap();
+        assert_eq!(pv.get_item(&id).unwrap().synced_version, 0, "local write starts dirty");
+
+        // Pull/adopt lands CLEAN — the cloud has this exact version by construction.
+        let ct = pv.get_item(&id).unwrap().ct.clone();
+        pv.put_raw(id.clone(), 1, ct);
+        assert_eq!(pv.get_item(&id).unwrap().synced_version, 1, "adopted row is clean");
+
+        // A subsequent local bump goes dirty again, KEEPING the confirmed floor.
+        pv.seal_and_upsert::<StdPrimitives>(
+            &k, vid, ItemNs::Secret, "T",
+            2,
+            &ItemPayload::secret_live("T", "v2"),
+        )
+        .unwrap();
+        let s = pv.get_item(&id).unwrap();
+        assert_eq!((s.version, s.synced_version), (2, 1), "bumped row is dirty above its synced floor");
     }
 
     #[test]

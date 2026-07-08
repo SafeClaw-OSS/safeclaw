@@ -1291,39 +1291,41 @@ pub async fn push_items_best_effort(state: &Arc<AppState>, vault_id: &str) {
     let Some(pv) = read_per_item_store(state_dir, vault_id) else {
         return;
     };
-    // Snapshot (id, version, ct_b64) so we don't hold the store across awaits.
+    // Snapshot only the DIRTY rows (version > synced_version) so we don't hold
+    // the store across awaits. Clean rows (already confirmed on the cloud) are
+    // skipped outright — re-offering them cost one 409 round-trip PER ROW on
+    // EVERY sync (the "sc sync is slow and nothing even changed" bug).
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
     let rows: Vec<(String, u64, String)> = pv
         .items
         .iter()
+        .filter(|(_, s)| s.version > s.synced_version)
         .map(|(id, s)| (id.clone(), s.version, URL_SAFE_NO_PAD.encode(&s.ct)))
         .collect();
+    if rows.is_empty() {
+        return;
+    }
 
     // A conflict/error on ONE item says nothing about the others (each item_id
     // is independent), so we NEVER stop the loop early — doing so would strand
-    // every item ordered after the first conflict. The classic trap: an
-    // already-synced version-1 row (e.g. a setup secret) is re-offered as a
-    // create every push and 409s; a naive early-return then blocks a freshly
-    // written OAuth connection/secret ordered after it from EVER reaching the
-    // cloud (the "connect completes on the daemon but web stays connecting"
-    // bug). We push what we can, adopt server truth for the conflicting items
-    // with a single pull afterward, and leave any genuine same-item conflict to
-    // `reconcile_conflicts_after_pull` at unlock (needs K + (ns,name)).
+    // every item ordered after the first conflict. We push what we can, adopt
+    // server truth for the conflicting items with a single pull afterward, and
+    // leave any genuine same-item conflict to `reconcile_conflicts_after_pull`
+    // at unlock (needs K + (ns,name)).
     let mut conflicted = false;
     let mut endpoint_missing = false;
+    let mut pushed: Vec<(String, u64)> = Vec::new();
     for (id, version, ct_b64) in rows {
         // base_version = version-1 for an update; a version-1 row is a create.
         let base_version = if version > 1 { Some(version - 1) } else { None };
         match push_item(cloud, vault_id, &dk, &id, base_version, version, &ct_b64).await {
-            Ok(PushOutcome::Ok { .. }) => {}
+            Ok(PushOutcome::Ok { .. }) => pushed.push((id, version)),
             Ok(PushOutcome::EndpointMissing) => {
                 endpoint_missing = true;
                 break; // the whole /items endpoint is down — nothing more to try
             }
             Ok(PushOutcome::Conflict { current_version }) => {
-                // Often just an already-synced row (cloud == our version); skip
-                // it and keep pushing the rest. Server truth is adopted below.
                 tracing::debug!(
                     vault = %vault_id, item = %id, current_version,
                     "per-item push: 409 conflict; skipping item, adopting server truth after loop"
@@ -1336,10 +1338,31 @@ pub async fn push_items_best_effort(state: &Arc<AppState>, vault_id: &str) {
             }
         }
     }
+    // Mark what landed as clean — re-read the store (a writer may have raced us)
+    // and only stamp rows still at the exact version we pushed; a row bumped
+    // meanwhile stays dirty and goes out on the next sync.
+    if !pushed.is_empty() {
+        if let Some(mut pv) = read_per_item_store(state_dir, vault_id) {
+            let mut changed = false;
+            for (id, version) in &pushed {
+                if let Some(s) = pv.items.get_mut(id) {
+                    if s.version == *version && s.synced_version < *version {
+                        s.synced_version = *version;
+                        changed = true;
+                    }
+                }
+            }
+            if changed {
+                if let Err(e) = write_per_item_store(state_dir, vault_id, &pv) {
+                    tracing::warn!(vault = %vault_id, "per-item push: synced-version write-back failed: {}", e);
+                }
+            }
+        }
+    }
     if conflicted && !endpoint_missing {
         let _ = pull_items(state_dir, cloud, vault_id, &dk).await;
     }
-    tracing::debug!(vault = %vault_id, "per-item push: all local items pushed");
+    tracing::debug!(vault = %vault_id, "per-item push: dirty items pushed");
 }
 
 // ─────────────────────────────────────────────────────────────────────────
