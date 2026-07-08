@@ -1091,7 +1091,7 @@ pub async fn reject_op(
 ///      anymore: a rule-level Allow on a service whose default was Ask still
 ///      needs the bytes ready for fast-path forwarding.
 ///   2. `policy` — the effective policy tree (`aux.policy` overlaid on
-///      compiled defaults). Holds default floors, per-category, and
+///      compiled defaults). Holds default floors, per-tag, and
 ///      per-connection user policy. Built-in per-service rules are read
 ///      live from the service at eval, not cached here.
 /// Build + persist the local per-item store (`vault.per-item.json`) from a
@@ -1174,7 +1174,7 @@ pub(crate) fn bootstrap_cache_from_view(
     // Residency mirrors the DECISION floor (`AppState::evaluate_request_policy`):
     // a connection's credential is pre-loaded at unlock iff its effective READ
     // floor resolves to `allow` — recipe `[default]` ⊕ the user's `aux.policy`
-    // connection override, then category, then the global `allow` floor. This
+    // connection override, then tag, then the global `allow` floor. This
     // replaces the old `default_read_level(service) == Allow` gate, whose
     // no-`[policy]` fallback was `ask-always` (contradicting the decision layer's
     // global-`allow` floor, so the first use of a policy-less recipe always
@@ -1189,9 +1189,9 @@ pub(crate) fn bootstrap_cache_from_view(
             .get(conn)
             .and_then(|c| c.default.as_ref());
         let conn_levels = crate::core::policy::merge_levels(user, recipe.as_ref());
-        let category = service
-            .map(|s| state.services.default_category(s))
-            .unwrap_or("integration");
+        let tags = service
+            .map(|s| state.services.service_tags(s))
+            .unwrap_or(&[]);
         crate::core::policy::evaluate(
             "GET",
             "/",
@@ -1199,7 +1199,7 @@ pub(crate) fn bootstrap_cache_from_view(
             None,
             conn_levels.as_ref(),
             &effective_policy,
-            Some(category),
+            tags,
         ) == crate::core::policy::AccessLevel::Allow
     };
     // Routing snapshot (CONNECTION_SCHEMA.md §6): `connection_id → {service,

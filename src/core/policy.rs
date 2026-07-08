@@ -9,7 +9,7 @@
 //! instead of a `low`/`high` label.)
 //!
 //! Resolution order (PROTOCOL.md §6.4): most-restrictive matching rule
-//! (deny-override / fail-safe) → connection default → category default →
+//! (deny-override / fail-safe) → connection default → tag default →
 //! global default → floor (`ask-always`).
 //!
 //! Rule matching uses path patterns (nginx-style):
@@ -111,7 +111,7 @@ impl PolicyRule {
 }
 
 /// Read/write access levels — a floor DECISION for when no rule matches. Used at
-/// the connection, category, and global layers. The read/write split is the
+/// the connection, tag, and global layers. The read/write split is the
 /// method-derived base: `is_write_method` picks `write` for mutating methods,
 /// `read` otherwise.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -172,7 +172,10 @@ pub struct Policy {
     /// Global default floor (when no rule and no more-specific default match).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default: Option<Levels>,
-    /// Per-category default floor (e.g. "llm", "notify"). Beats `default`.
+    /// Per-tag default floor, keyed by service tag (e.g. "ai", "messaging").
+    /// Beats `default`. Serde name stays `categories` — the map is sealed in
+    /// `aux.policy`, and its KEYS are data, so the tags cutover needed no
+    /// schema change (stale old-name keys simply never match).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub categories: HashMap<String, Levels>,
     /// Per-connection user policy, keyed by `connection_id`.
@@ -187,16 +190,17 @@ impl Default for Policy {
         // *secondly* an approval gate for risky operations. So the baseline
         // floor is `allow` (inject + forward, no per-call friction); services
         // tighten genuinely sensitive paths with a stricter `level` on rules.
-        // (llm/notify are redundant with the global default but kept explicit
-        // so a future stricter global default doesn't silently re-gate them.)
+        // (ai/messaging are redundant with the global default but kept
+        // explicit so a future stricter global default doesn't silently
+        // re-gate them.)
         let allow_rw = || Levels {
             read: Some(AccessLevel::Allow),
             write: Some(AccessLevel::Allow),
             ttl: None,
         };
         let mut categories = HashMap::new();
-        categories.insert("llm".into(), allow_rw());
-        categories.insert("notify".into(), allow_rw());
+        categories.insert("ai".into(), allow_rw());
+        categories.insert("messaging".into(), allow_rw());
         Self {
             timeout: Some(300),
             default: Some(allow_rw()),
@@ -208,7 +212,7 @@ impl Default for Policy {
 
 impl Policy {
     /// Overlay a user's sparse `aux.policy` onto the compiled defaults so unset
-    /// parts (global floor, category defaults) keep safe values. Called at
+    /// parts (global floor, tag defaults) keep safe values. Called at
     /// unlock/refresh to produce the effective policy the evaluator reads.
     pub fn effective(user: Option<&Policy>) -> Policy {
         let mut p = Policy::default();
@@ -404,9 +408,9 @@ pub fn evaluate(
     rules: Option<&Vec<PolicyRule>>,
     connection_levels: Option<&Levels>,
     policy: &Policy,
-    category: Option<&str>,
+    tags: &[String],
 ) -> AccessLevel {
-    evaluate_with_match(method, path, body, rules, connection_levels, policy, category).0
+    evaluate_with_match(method, path, body, rules, connection_levels, policy, tags).0
 }
 
 /// Resolve the access decision for a request, returning `(level,
@@ -417,7 +421,8 @@ pub fn evaluate(
 ///      (deny-override / fail-safe). Ties broken by specificity for a
 ///      deterministic ask-cache scope (`(connection, rule_id, method)`).
 ///   2. else connection default (read/write floor),
-///   3. else category default,
+///   3. else tag default (the service's tags matched against the
+///      `Policy.categories` floor map; several hits → most restrictive wins),
 ///   4. else global default,
 ///   5. else `ask-always` (safe floor).
 /// `matched_rule_id` / `ttl` are `Some` only when a rule decided (step 1).
@@ -428,7 +433,7 @@ pub fn evaluate_with_match(
     rules: Option<&Vec<PolicyRule>>,
     connection_levels: Option<&Levels>,
     policy: &Policy,
-    category: Option<&str>,
+    tags: &[String],
 ) -> (AccessLevel, Option<String>, Option<u64>) {
     // 1. Rules — most-restrictive matching wins (deny-override).
     if let Some(rules) = rules {
@@ -450,7 +455,7 @@ pub fn evaluate_with_match(
         }
     }
 
-    // 2-4. Default floor: connection → category → global. Read/write split.
+    // 2-4. Default floor: connection → tag → global. Read/write split.
     let pick = |lv: &Levels| -> Option<(AccessLevel, Option<u64>)> {
         let l = if is_write_method(method) { lv.write } else { lv.read };
         l.map(|l| (l, lv.ttl))
@@ -460,12 +465,16 @@ pub fn evaluate_with_match(
             return (l, None, ttl);
         }
     }
-    if let Some(cat) = category {
-        if let Some(lv) = policy.categories.get(cat) {
-            if let Some((l, ttl)) = pick(lv) {
-                return (l, None, ttl);
-            }
-        }
+    // A service may carry several tags; if more than one hits a floor that
+    // decides this method, the most restrictive wins (fail-closed, mirrors
+    // the rule-layer deny-override above).
+    let tag_hit = tags
+        .iter()
+        .filter_map(|t| policy.categories.get(t))
+        .filter_map(|lv| pick(lv))
+        .max_by_key(|(l, _)| l.restrictiveness());
+    if let Some((l, ttl)) = tag_hit {
+        return (l, None, ttl);
     }
     if let Some(lv) = policy.default.as_ref() {
         if let Some((l, ttl)) = pick(lv) {
@@ -542,13 +551,13 @@ mod tests {
         // The headline: list (allow) + read (ask) = read an email in ONE
         // approval, not two.
         let low = vec![rule("list", "GET /m", AccessLevel::Allow)];
-        assert_eq!(evaluate("GET", "/m", None, Some(&low), None, &policy(), None), AccessLevel::Allow);
+        assert_eq!(evaluate("GET", "/m", None, Some(&low), None, &policy(), &[]), AccessLevel::Allow);
         let med = vec![rule("read", "GET /m/*", AccessLevel::Ask)];
-        assert_eq!(evaluate("GET", "/m/1", None, Some(&med), None, &policy(), None), AccessLevel::Ask);
+        assert_eq!(evaluate("GET", "/m/1", None, Some(&med), None, &policy(), &[]), AccessLevel::Ask);
         let high = vec![rule("send", "POST /m/send", AccessLevel::AskAlways)];
-        assert_eq!(evaluate("POST", "/m/send", None, Some(&high), None, &policy(), None), AccessLevel::AskAlways);
+        assert_eq!(evaluate("POST", "/m/send", None, Some(&high), None, &policy(), &[]), AccessLevel::AskAlways);
         let del = vec![rule("del", "DELETE /m/*", AccessLevel::Deny)];
-        assert_eq!(evaluate("DELETE", "/m/1", None, Some(&del), None, &policy(), None), AccessLevel::Deny);
+        assert_eq!(evaluate("DELETE", "/m/1", None, Some(&del), None, &policy(), &[]), AccessLevel::Deny);
     }
 
     #[test]
@@ -563,7 +572,7 @@ mod tests {
             level: None,
             ttl: None,
         }];
-        assert_eq!(evaluate("GET", "/x", None, Some(&bad), None, &policy(), None), AccessLevel::Allow);
+        assert_eq!(evaluate("GET", "/x", None, Some(&bad), None, &policy(), &[]), AccessLevel::Allow);
     }
 
     // ── Conflict resolution: deny-override / most-restrictive ─────────────────
@@ -576,30 +585,43 @@ mod tests {
             rule("narrow", "DELETE /m/safe", AccessLevel::Allow), // more specific, looser
         ];
         assert_eq!(
-            evaluate("DELETE", "/m/safe", None, Some(&rules), None, &policy(), None),
+            evaluate("DELETE", "/m/safe", None, Some(&rules), None, &policy(), &[]),
             AccessLevel::Deny
         );
     }
 
     // ── Default floor chain ──────────────────────────────────────────────────
     #[test]
-    fn no_rule_falls_through_to_connection_then_category_then_global() {
+    fn no_rule_falls_through_to_connection_then_tag_then_global() {
         // No matching rule → connection floor wins when set.
         let conn = Levels { read: Some(AccessLevel::Ask), write: None, ttl: None };
         assert_eq!(
-            evaluate("GET", "/unmatched", None, Some(&vec![]), Some(&conn), &policy(), None),
+            evaluate("GET", "/unmatched", None, Some(&vec![]), Some(&conn), &policy(), &[]),
             AccessLevel::Ask
         );
-        // No connection floor → category (llm = allow).
+        // No connection floor → tag floor (ai = allow).
         assert_eq!(
-            evaluate("POST", "/v1/chat", None, None, None, &policy(), Some("llm")),
+            evaluate("POST", "/v1/chat", None, None, None, &policy(), &["ai".into()]),
             AccessLevel::Allow
         );
-        // No category match → global default (allow).
+        // No tag match → global default (allow).
         assert_eq!(
-            evaluate("GET", "/x", None, None, None, &policy(), Some("unknown")),
+            evaluate("GET", "/x", None, None, None, &policy(), &["unknown".into()]),
             AccessLevel::Allow
         );
+    }
+
+    #[test]
+    fn multiple_tag_floors_most_restrictive_wins() {
+        let mut p = policy();
+        p.categories.insert(
+            "wallet".into(),
+            Levels { read: Some(AccessLevel::AskAlways), write: Some(AccessLevel::Deny), ttl: None },
+        );
+        // ai says allow, wallet says ask-always/deny → the stricter floor wins.
+        let tags = vec!["ai".to_string(), "wallet".to_string()];
+        assert_eq!(evaluate("GET", "/x", None, None, None, &p, &tags), AccessLevel::AskAlways);
+        assert_eq!(evaluate("POST", "/x", None, None, None, &p, &tags), AccessLevel::Deny);
     }
 
     // ── Merge: override by id + add new rule ──────────────────────────────────
@@ -619,7 +641,7 @@ mod tests {
         let mut user = HashMap::new();
         user.insert("del".into(), RuleConfig { level: Some(AccessLevel::Deny), ..Default::default() });
         let merged = merge_rules(&built_in, &user);
-        assert_eq!(evaluate("DELETE", "/m/1", None, Some(&merged), None, &policy(), None), AccessLevel::Deny);
+        assert_eq!(evaluate("DELETE", "/m/1", None, Some(&merged), None, &policy(), &[]), AccessLevel::Deny);
     }
 
     #[test]
@@ -651,7 +673,7 @@ mod tests {
     fn matched_rule_id_and_ttl_returned_for_ask_cache() {
         let mut rules = vec![rule("read", "GET /x", AccessLevel::Ask)];
         rules[0].ttl = Some(60);
-        let (lvl, id, ttl) = evaluate_with_match("GET", "/x", None, Some(&rules), None, &policy(), None);
+        let (lvl, id, ttl) = evaluate_with_match("GET", "/x", None, Some(&rules), None, &policy(), &[]);
         assert_eq!(lvl, AccessLevel::Ask);
         assert_eq!(id.as_deref(), Some("read"));
         assert_eq!(ttl, Some(60));

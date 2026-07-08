@@ -1,6 +1,8 @@
 [service]
 id = "gmail"
 name = "Gmail"
+# Classification for browse/filter and policy tag-floors; lowercase-kebab, multi OK.
+tags = ["app"]
 
 hosts = ["gmail.googleapis.com"]
 secrets = ["GMAIL_REFRESH_TOKEN"]

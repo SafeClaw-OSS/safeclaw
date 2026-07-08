@@ -11,6 +11,8 @@ approve link (in npm's error output), then re-run.
 [service]
 id = "npm"
 name = "npm"
+# Classification for browse/filter and policy tag-floors; lowercase-kebab, multi OK.
+tags = ["app"]
 
 hosts = ["registry.npmjs.org"]
 secrets = ["NPM_TOKEN"]

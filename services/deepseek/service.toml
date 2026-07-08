@@ -1,6 +1,8 @@
 [service]
 id = "deepseek"
 name = "DeepSeek"
+# Classification for browse/filter and policy tag-floors; lowercase-kebab, multi OK.
+tags = ["ai"]
 
 hosts = ["api.deepseek.com"]
 secrets = ["DEEPSEEK_API_KEY"]

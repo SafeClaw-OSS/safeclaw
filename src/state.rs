@@ -101,7 +101,7 @@ pub struct SecretsCache {
     pub allow_secrets: HashMap<String, HashMap<String, Vec<u8>>>,
     /// The effective policy tree — the vault's `aux.policy` overlaid on the
     /// compiled-in `Policy::default()` at unlock/refresh (so unset parts use
-    /// safe defaults). Holds default floors, per-category, and per-connection
+    /// safe defaults). Holds default floors, per-tag, and per-connection
     /// user policy. Built-in per-service rules are NOT cached here — they're
     /// read live from the service registry at eval and merged with this tree's
     /// `connections.<id>.rules`. Rebuilt on every vault write → a policy edit is
@@ -125,7 +125,7 @@ pub struct SecretsCache {
     ///   - the resolved **destination host** — an approval for host A must not
     ///     authorize host B within the TTL (host is request data in the
     ///     phantom-only model: one connection may anchor several hosts).
-    /// A category-/connection-default Ask (no rule matched) is deliberately
+    /// A tag-/connection-default Ask (no rule matched) is deliberately
     /// **not cached** — it has no author-defined path scope to bound a grant,
     /// so it re-prompts every request. Value: Unix-epoch-second expiry.
     ///
@@ -617,7 +617,7 @@ impl AppState {
     ///     user rules (`cache.policy.connections[conn].rules`),
     ///   - most-restrictive matching rule wins (deny-override), each rule's
     ///     decision being its own `level`,
-    ///   - else connection / category / global default floor, else ask-always,
+    ///   - else connection / tag / global default floor, else ask-always,
     ///   - **active `ask` approvals** — if the decision is `Ask`, a rule
     ///     matched, AND the `(connection, rule_id, method)` triple is in the
     ///     unexpired rule_approvals cache, downgrades to `Allow` so the
@@ -662,10 +662,10 @@ impl AppState {
             conn_policy.and_then(|c| c.default.as_ref()),
             builtin_levels.as_ref(),
         );
-        // The category/global floors live in `cache.policy` (the user's
+        // The tag/global floors live in `cache.policy` (the user's
         // `aux.policy` overlaid on compiled defaults at refresh). Read live
         // here → a policy edit is realtime on the next request.
-        let category = self.services.default_category(service_id);
+        let tags = self.services.service_tags(service_id);
         let (level, matched_rule, ttl) = crate::core::policy::evaluate_with_match(
             method,
             path,
@@ -673,7 +673,7 @@ impl AppState {
             Some(&rules),
             connection_levels.as_ref(),
             &cache.policy,
-            Some(category),
+            tags,
         );
 
         // Cache hit honors the `ask`-with-TTL semantic, but the grant is
@@ -681,7 +681,7 @@ impl AppState {
         // for the same (service, rule, method), not yet expired, downgrades
         // this Ask to Allow so the request fast-paths without a passkey
         // prompt. Two deliberate bounds keep a window from over-reaching:
-        //   - No rule matched (category-/service-default Ask) → never a hit:
+        //   - No rule matched (tag-/service-default Ask) → never a hit:
         //     there is no author-defined path scope to bound the grant.
         //   - Method is part of the key → approving a GET cannot fast-path a
         //     later POST/DELETE inside the window.
@@ -722,7 +722,7 @@ impl AppState {
     /// `ttl` falling back to `Policy.timeout` or a safe 300s default.
     ///
     /// The grant is scoped to `(service, rule_id, method)`. Two bounds:
-    ///   - `rule_id == None` (category-/service-default Ask, no rule matched)
+    ///   - `rule_id == None` (tag-/service-default Ask, no rule matched)
     ///     is **not recorded** — without an author-defined path scope a grant
     ///     would blanket the whole service, so such ops re-prompt every time.
     ///   - `method` is part of the key, so approving one verb never lets a
@@ -1047,7 +1047,7 @@ mod tests {
         );
         assert_eq!(rule.as_deref(), Some("write"));
 
-        // A category-default Ask (no rule) is never recorded, so it can never
+        // A tag-default Ask (no rule) is never recorded, so it can never
         // produce a fast-path — record is a no-op for rule_id == None.
         state.record_ask_approval(vid, "gh", None, "GET", "api.gh.com", 60);
     }

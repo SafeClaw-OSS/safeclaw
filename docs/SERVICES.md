@@ -4,10 +4,11 @@ How to write a SafeClaw service definition. Design rationale lives in
 [CREDENTIAL_BROKER.md](./CREDENTIAL_BROKER.md); this page is the authoring
 reference only.
 
-A service is a folder `services/{category}/{id}/`:
+A service is a folder `services/{id}/` — flat, so the filesystem itself
+enforces id uniqueness. Classification is data (`tags`), not layout.
 
 ```
-services/integration/github/
+services/github/
   service.toml     # this page
   policy.toml      # per-action rules (each declares a level) — see POLICY.md; rules match (host, path, method)
 ```
@@ -18,8 +19,9 @@ Format: TOML (authored by humans/agents; CI publishes `registry.json`).
 
 ```toml
 [service]
-id = "github"            # required; [a-z0-9_], no "__". category = the {category}/ dir, not a field
+id = "github"            # required; [a-z0-9_], no "__"; must equal the services/{id}/ dir name
 name = "GitHub"          # display name
+tags = ["app"]           # classification, multiple allowed — see below
 # optional: group, hidden, activation, help, secret_url
 
 hosts = ["api.github.com", "github.com"]
@@ -63,6 +65,22 @@ all of them is what makes a connection "connected".
 - Insertion needs no declaration: the value replaces the phantom wherever the
   tool puts it — any header, query param, URL path, body, or inside a decoded
   `Authorization: Basic`. Never in the URL authority.
+
+### `tags`
+
+Classification, replacing the old `services/{category}/` directory layer.
+Lowercase-kebab slugs, several allowed, no duplicates (validator-enforced —
+shape only, the vocabulary is open).
+
+- Core vocabulary today: `ai` (model providers), `app` (external apps/SaaS),
+  `messaging` (Telegram-class channels). Business-dimension tags (e.g.
+  `wallet`) coexist freely in the same list.
+- Consumers: the console derives its filter chips and grouping from the tags
+  present in the registry (an unknown tag renders verbatim as a chip), and the
+  policy engine matches tags against the per-tag default floors — when several
+  of a service's tags carry a floor, the most restrictive wins.
+- Untagged (typical for per-vault custom services): no tag floor applies —
+  only the global floor — and the console buckets the service as an app.
 
 ### `secret_url` (optional)
 

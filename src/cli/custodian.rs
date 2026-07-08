@@ -29,9 +29,9 @@ pub fn registry(args: RegistryArgs) -> Result<(), String> {
             serde_json::to_string_pretty(&catalog).map_err(|e| e.to_string())?
         );
     } else {
-        println!("{:<24} {:<30} CATEGORY", "ID", "NAME");
+        println!("{:<24} {:<30} TAGS", "ID", "NAME");
         for s in &catalog.services {
-            println!("{:<24} {:<30} {}", s.id, s.name, s.category);
+            println!("{:<24} {:<30} {}", s.id, s.name, s.tags.join(","));
         }
     }
     Ok(())

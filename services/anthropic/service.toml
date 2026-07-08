@@ -1,6 +1,8 @@
 [service]
 id = "anthropic"
 name = "Anthropic"
+# Classification for browse/filter and policy tag-floors; lowercase-kebab, multi OK.
+tags = ["ai"]
 group = "anthropic"
 
 hosts = ["api.anthropic.com"]

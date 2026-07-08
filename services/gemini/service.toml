@@ -1,6 +1,8 @@
 [service]
 id = "google"
 name = "Google AI"
+# Classification for browse/filter and policy tag-floors; lowercase-kebab, multi OK.
+tags = ["ai"]
 
 # Gemini takes the key as a query param (`?key=`); the agent writes the phantom
 # there — no declaration beyond host + secret.

@@ -1,6 +1,7 @@
 /// TOML-driven service registry (v4, phantom-only broker).
 ///
-/// Each service is defined by a `service.toml` in `services/{category}/{id}/`.
+/// Each service is defined by a `service.toml` in `services/{id}/` (flat — the
+/// dir name is the id; classification lives in the `tags` field, not layout).
 /// A service declares what a minimal connection has — `hosts` + `secrets` —
 /// plus the one non-direct production (`[oauth2]`) and cosmetic helpers. No
 /// routing/transport is declared: the phantom is the sole intent carrier and
@@ -124,12 +125,15 @@ pub struct OAuth2Def {
 pub struct ServiceMeta {
     pub id: String,
     pub name: String,
-    /// Category is NOT a toml field — it's derived from the
-    /// services/{category}/{id}/ directory at build time and injected by the
-    /// loader (see `load_compiled_defaults`). The serde default only applies to
-    /// per-vault custom services / tests that construct a bare `[service]`.
-    #[serde(default = "default_category")]
-    pub category: String,
+    /// Classification tags (lowercase-kebab, multiple allowed) — e.g. "ai",
+    /// "app", "messaging", "wallet". Replaces the old directory-derived single
+    /// category. Dual use: browse/filter metadata on the registry wire, and
+    /// policy tag-floor matching (`Policy.categories` keys; when several tags
+    /// hit floors the most restrictive wins). Absent (per-vault custom
+    /// services) = untagged: no tag floor applies, console buckets it as an
+    /// app.
+    #[serde(default)]
+    pub tags: Vec<String>,
     /// Anchored egress hosts — exact FQDNs or `*.suffix` wildcards (leftmost
     /// single label). The runtime anchor validates the destination against the
     /// exact entries (and pinned instances of the wildcards). Declared under the
@@ -166,8 +170,6 @@ pub struct ServiceMeta {
     #[serde(default)]
     pub hidden: bool,
 }
-
-fn default_category() -> String { "integration".to_string() }
 
 /// The loopback redirect for desktop/PKCE OAuth clients when an `[oauth2]`
 /// section doesn't pin its own `redirect_uri`. Matches the frontend
@@ -477,7 +479,9 @@ impl ServiceRegistry {
                 continue;
             }
 
-            // Otherwise, scan one level deeper (category subfolder: llm/, notify/, integration/)
+            // Otherwise, scan one level deeper — tolerant reader for the
+            // retired nested services/{category}/{id}/ layout (pre-tags
+            // user-installed dirs may still carry it).
             let Ok(sub_entries) = std::fs::read_dir(&path) else { continue };
             for sub_entry in sub_entries.flatten() {
                 let sub_path = sub_entry.path();
@@ -552,11 +556,8 @@ impl ServiceRegistry {
         policies: &mut HashMap<String, PolicyFileDef>,
     ) {
         let defaults = crate::generated_services::compiled_service_tomls();
-        for (id, category, toml_str) in defaults {
-            if let Ok(mut def) = toml::from_str::<ServiceDef>(toml_str) {
-                // Category is the SSoT-from-directory value (build.rs), not a
-                // toml field — inject it over the serde default.
-                def.service.category = category.to_string();
+        for (id, toml_str) in defaults {
+            if let Ok(def) = toml::from_str::<ServiceDef>(toml_str) {
                 services.insert(id.to_string(), def);
             }
         }
@@ -585,11 +586,12 @@ impl ServiceRegistry {
         entries
     }
 
-    /// Get default category for a service, falling back to "service".
-    pub fn default_category(&self, service_name: &str) -> &str {
+    /// Classification tags for a service; empty for unknown ids and untagged
+    /// (custom) services — no tag floor applies then, only the global floor.
+    pub fn service_tags(&self, service_name: &str) -> &[String] {
         self.services.get(service_name)
-            .map(|d| d.service.category.as_str())
-            .unwrap_or("service")
+            .map(|d| d.service.tags.as_slice())
+            .unwrap_or(&[])
     }
 
     /// Default-read AccessLevel for a service (H3 unlock bootstrap predicate).
@@ -784,7 +786,7 @@ mod tests {
         let toml_levels = def.to_levels();
         let access = crate::core::policy::evaluate(
             "POST", "/v1/chat", None, None, toml_levels.as_ref(),
-            &crate::core::policy::Policy::default(), Some("integration"),
+            &crate::core::policy::Policy::default(), &["app".into()],
         );
         assert_eq!(access, AccessLevel::Allow);
     }
@@ -954,7 +956,7 @@ secrets = ["GITHUB_TOKEN"]
 
     #[test]
     fn compiled_services_parse_and_validate() {
-        for (id, _category, toml_str) in crate::generated_services::compiled_service_tomls() {
+        for (id, toml_str) in crate::generated_services::compiled_service_tomls() {
             let def: ServiceDef = toml::from_str(toml_str)
                 .unwrap_or_else(|e| panic!("service '{}' failed to parse: {}", id, e));
             // Non-hidden services must anchor at least one host.
@@ -975,7 +977,7 @@ secrets = ["GITHUB_TOKEN"]
     #[test]
     fn compiled_codex_resolves_fully_inline() {
         let mut services = HashMap::new();
-        for (id, _category, toml_str) in crate::generated_services::compiled_service_tomls() {
+        for (id, toml_str) in crate::generated_services::compiled_service_tomls() {
             if let Ok(def) = toml::from_str::<ServiceDef>(toml_str) {
                 services.insert(id.to_string(), def);
             }
@@ -1020,7 +1022,7 @@ secrets = ["GITHUB_TOKEN"]
     #[test]
     fn compiled_google_trio_is_inline_complete_and_shares_one_client() {
         let mut services = HashMap::new();
-        for (id, _category, toml_str) in crate::generated_services::compiled_service_tomls() {
+        for (id, toml_str) in crate::generated_services::compiled_service_tomls() {
             if let Ok(def) = toml::from_str::<ServiceDef>(toml_str) {
                 services.insert(id.to_string(), def);
             }
@@ -1072,7 +1074,7 @@ secrets = ["GITHUB_TOKEN"]
             .expect("gmail policy.toml must parse and yield rules");
         let policy = Policy::default();
         let eval = |m: &str, p: &str| {
-            evaluate(m, p, None, Some(&rules), None, &policy, Some("integration"))
+            evaluate(m, p, None, Some(&rules), None, &policy, &["app".into()])
         };
         assert_eq!(eval("GET", "/gmail/v1/users/me/messages"), AccessLevel::Allow);
         assert_eq!(eval("GET", "/gmail/v1/users/me/messages/abc123"), AccessLevel::Ask);
@@ -1088,7 +1090,7 @@ secrets = ["GITHUB_TOKEN"]
             .expect("cratesio policy.toml must parse and yield rules");
         let policy = Policy::default();
         let eval = |m: &str, p: &str| {
-            evaluate(m, p, None, Some(&rules), None, &policy, Some("integration"))
+            evaluate(m, p, None, Some(&rules), None, &policy, &["app".into()])
         };
         // Routine traffic rides the allow floor.
         assert_eq!(eval("GET", "/api/v1/me"), AccessLevel::Allow);

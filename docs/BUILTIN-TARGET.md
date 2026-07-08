@@ -20,7 +20,7 @@ Services with Rust-native handlers should declare their API surface in TOML like
 [service]
 id = "files"
 name = "Files"
-category = "system"
+tags = ["system"]
 help = "..."
 
 [[api]]

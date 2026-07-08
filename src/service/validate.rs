@@ -175,6 +175,23 @@ fn validate_service_inner(toml_str: &str) -> Result<(), Vec<String>> {
         }
     }
 
+    // Tags: lowercase-kebab slugs, no duplicates. Free vocabulary (custom
+    // services may invent business tags); only the SHAPE is enforced so the
+    // console can render any tag as a filter chip verbatim.
+    let mut seen_tag = HashSet::new();
+    for t in &def.service.tags {
+        let kebab = !t.is_empty()
+            && t.split('-').all(|seg| {
+                !seg.is_empty() && seg.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+            });
+        if !kebab {
+            errs.push(format!("tag '{}' is not lowercase-kebab ([a-z0-9] segments joined by '-')", t));
+        }
+        if !seen_tag.insert(t.as_str()) {
+            errs.push(format!("duplicate tag '{}'", t));
+        }
+    }
+
     // secret_url: auxiliary display-only link, but it IS rendered as an <a href>
     // by the console — require a plain web URL so a custom definition can't
     // smuggle a javascript:/data: link into the UI.
@@ -482,10 +499,33 @@ secrets = ["ACME_TOKEN"]
             .any(|e| e.contains("secret_url")));
     }
 
+    #[test]
+    fn tags_lowercase_kebab_no_dups() {
+        let ok = GITHUB.replace(
+            "name = \"GitHub\"",
+            "name = \"GitHub\"\ntags = [\"app\", \"code-hosting\"]",
+        );
+        assert!(validate_recipe(&ok, true).is_ok());
+        for bad_tags in ["[\"App\"]", "[\"code_hosting\"]", "[\"-app\"]", "[\"\"]", "[\"app\", \"app\"]"] {
+            let bad = GITHUB.replace(
+                "name = \"GitHub\"",
+                &format!("name = \"GitHub\"\ntags = {}", bad_tags),
+            );
+            assert!(
+                validate_recipe(&bad, true)
+                    .unwrap_err()
+                    .iter()
+                    .any(|e| e.contains("tag")),
+                "expected tag error for {}",
+                bad_tags
+            );
+        }
+    }
+
 
     #[test]
     fn compiled_services_pass_validator() {
-        for (id, _category, toml_str) in crate::generated_services::compiled_service_tomls() {
+        for (id, toml_str) in crate::generated_services::compiled_service_tomls() {
             validate_recipe(toml_str, false)
                 .unwrap_or_else(|e| panic!("compiled service '{}' failed validator: {:?}", id, e));
         }

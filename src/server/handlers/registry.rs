@@ -113,7 +113,9 @@ impl RegistryQuery {
 pub struct RegistryService {
     pub id: String,
     pub name: String,
-    pub category: String,
+    /// Classification tags ("ai", "app", "messaging", …). Always serialized
+    /// (empty for untagged custom services) so consumers see a stable shape.
+    pub tags: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     /// Anchored egress hosts (service-declared exact FQDNs / `*.suffix`).
@@ -315,7 +317,7 @@ fn build_service(
         return RegistryService {
             id: id.to_string(),
             name: def.service.name.clone(),
-            category: def.service.category.clone(),
+            tags: def.service.tags.clone(),
             description: None,
             hosts: vec![],
             secrets: vec![],
@@ -338,7 +340,7 @@ fn build_service(
     RegistryService {
         id: id.to_string(),
         name: def.service.name.clone(),
-        category: def.service.category.clone(),
+        tags: def.service.tags.clone(),
         description: def.service.help.clone(),
         hosts: def.service.hosts.clone(),
         secrets: def.service.secrets.clone(),
@@ -713,7 +715,7 @@ secrets = ["GITHUB_TOKEN"]
 
         assert_eq!(sum.id, full.id);
         assert_eq!(sum.name, full.name);
-        assert_eq!(sum.category, full.category);
+        assert_eq!(sum.tags, full.tags);
         // Heavy fields drop from the summary wire (skip_serializing_if).
         assert!(sum.hosts.is_empty());
         assert!(sum.secrets.is_empty());

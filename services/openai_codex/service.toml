@@ -1,6 +1,8 @@
 [service]
 id = "openai_codex"
 name = "OpenAI Codex"
+# Classification for browse/filter and policy tag-floors; lowercase-kebab, multi OK.
+tags = ["ai"]
 group = "openai"
 
 # Codex talks to the ChatGPT backend with a minted OAuth access token plus a

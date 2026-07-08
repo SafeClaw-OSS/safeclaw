@@ -117,7 +117,7 @@ git request  (carries  Authorization: Bearer <SAFECLAW_API_KEY>)
 [service]
 id = "github"
 name = "GitHub"
-category = "integration"
+tags = ["app"]
 
 # A. REST API  →  /v/{vid}/use/github
 [[upstream]]
@@ -175,7 +175,7 @@ write = "allow"          # streaming = allow-only (see §1.3)
 [service]
 id = "gitlab"
 name = "GitLab"
-category = "integration"
+tags = ["app"]
 
 [[upstream]]
 id  = "rest"

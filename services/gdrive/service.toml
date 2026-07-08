@@ -1,6 +1,8 @@
 [service]
 id = "gdrive"
 name = "Google Drive"
+# Classification for browse/filter and policy tag-floors; lowercase-kebab, multi OK.
+tags = ["app"]
 
 hosts = ["www.googleapis.com"]
 secrets = ["GOOGLE_DRIVE_REFRESH_TOKEN"]
