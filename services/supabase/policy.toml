@@ -2,33 +2,63 @@
 # the agent and egress is host-anchored, so routine developer work — creating
 # projects, running SQL (POST /v1/projects/*/database/query), managing tables,
 # edge functions, config, secrets, branches — rides the write=allow floor. The
-# approval gate is spent on the one irreversible catastrophe: deleting a whole
-# project takes its database and every row with it, with no undo.
+# gate is spent on the consequential few, in three buckets: destroy, mint a
+# credential, change who can reach/own the project.
+#
+# Paths + methods below are ground truth from the OpenAPI spec
+# (api.supabase.com/api/v1-json, 2026-07-08), not guessed. REST can't collapse
+# operations into one body-regex the way GraphQL can, so each path is its own
+# rule; that's why supabase carries more rules than railway for the same idea.
 #
 # SQL query is deliberately NOT gated: it's the daily bread (migrations, reads),
-# and like `git push` it can't be cheaply told apart from a read — gating it would
-# prompt on every query. Sub-resource deletes (a function, a secret, a branch) are
-# recoverable and ride the floor; only the project-level DELETE is caught, because
-# the match is exactly one segment after `projects`.
-#
-# The other gated action changes who can reach the database: applying network
-# restrictions can open the project to 0.0.0.0/0 (the whole internet). Like making
-# a repo public, it's a rare, deliberate security-posture change.
+# and like `git push` it can't be cheaply told apart from a read.
 
 [default]
 read = "allow"
 write = "allow"
 
 # ── Destroy / lose work (irreversible) ───────────────────────────────────────
+# Only the project-level DELETE — the match is exactly one segment after
+# `projects`, so sub-resource deletes (a function, a secret, a branch) stay on
+# the floor (recoverable).
 [[rule]]
 id = "delete-project"
 label = "Delete a project (destroys its database and all data)"
 match = "DELETE /v1/projects/*"
 level = "ask-always"
 
+# ── Mint a durable credential (escapes the broker) ───────────────────────────
+# A new API key (the secret/service-role class is god-mode over the database) is
+# a credential SafeClaw never brokers — minting one via the API end-runs
+# credential separation. Editing/deleting a specific key (…/api-keys/{id}) is a
+# deeper path and stays on the floor.
+[[rule]]
+id = "mint-api-key"
+label = "Create a project API key"
+match = "POST /v1/projects/*/api-keys"
+level = "ask-always"
+
 # ── Change who can reach the database (security posture) ─────────────────────
+# Applying network restrictions can open the project to 0.0.0.0/0 (the whole
+# internet), like making a repo public. Two endpoints do it (Beta apply + Alpha
+# patch); gate both so neither is a bypass.
 [[rule]]
 id = "open-network"
-label = "Change network restrictions (who can reach the database)"
+label = "Apply network restrictions (who can reach the database)"
 match = "POST /v1/projects/*/network-restrictions/apply"
+level = "ask-always"
+
+[[rule]]
+id = "open-network-patch"
+label = "Update network restrictions (who can reach the database)"
+match = "PATCH /v1/projects/*/network-restrictions"
+level = "ask-always"
+
+# ── Hand the project to another owner ────────────────────────────────────────
+# Creating a claim token lets another organization take ownership of the project
+# — the transfer-repo parallel.
+[[rule]]
+id = "transfer-ownership"
+label = "Create a claim token (hand the project to another owner)"
+match = "POST /v1/projects/*/claim-token"
 level = "ask-always"

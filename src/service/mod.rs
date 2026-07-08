@@ -1208,11 +1208,19 @@ secrets = ["GITHUB_TOKEN"]
         assert_eq!(eval("GET", "/v1/projects"), AccessLevel::Allow);
         assert_eq!(eval("POST", "/v1/projects"), AccessLevel::Allow);
         assert_eq!(eval("POST", "/v1/projects/abcdef/database/query"), AccessLevel::Allow);
+        assert_eq!(eval("POST", "/v1/projects/abcdef/secrets"), AccessLevel::Allow);
         // A sub-resource delete (function, secret, branch) is recoverable → floor.
         assert_eq!(eval("DELETE", "/v1/projects/abcdef/functions/hello"), AccessLevel::Allow);
+        // Editing/deleting a specific api-key is a deeper path → floor.
+        assert_eq!(eval("PATCH", "/v1/projects/abcdef/api-keys/key1"), AccessLevel::Allow);
         // Deleting the whole project is the one irreversible catastrophe.
         assert_eq!(eval("DELETE", "/v1/projects/abcdef"), AccessLevel::AskAlways);
-        // Opening the database to the network is a security-posture change → gated.
+        // Minting a new API key escapes the broker → gated.
+        assert_eq!(eval("POST", "/v1/projects/abcdef/api-keys"), AccessLevel::AskAlways);
+        // Opening the database to the network → gated on BOTH endpoints (no bypass).
         assert_eq!(eval("POST", "/v1/projects/abcdef/network-restrictions/apply"), AccessLevel::AskAlways);
+        assert_eq!(eval("PATCH", "/v1/projects/abcdef/network-restrictions"), AccessLevel::AskAlways);
+        // Handing the project to another owner → gated.
+        assert_eq!(eval("POST", "/v1/projects/abcdef/claim-token"), AccessLevel::AskAlways);
     }
 }
