@@ -354,6 +354,13 @@ impl BrokerHandler {
             .as_ref()
             .and_then(|d| d.oauth2.as_ref())
             .map(|o| o.refresh_token.clone());
+        // The vault role that backs this connection's credential (oauth refresh
+        // key, else first declared secret), resolved from the SAME custom-aware
+        // `def` above — NOT re-derived registry-only downstream. This is the op
+        // `target` a captive-portal (ask) approval resolves + stashes, so a
+        // custom `[oauth2]` service (registry miss) still names its real secret
+        // instead of falling back to the connection id.
+        let op_role = def.as_ref().and_then(|d| d.env_role());
         // The service id policy/mint use; for a raw connection there is none so
         // the conn id stands in (registry lookups miss → global default floor).
         let service_id = conn_rec.service.clone().unwrap_or_else(|| conn.clone());
@@ -465,6 +472,7 @@ impl BrokerHandler {
                         &conn,
                         &conn_rec,
                         &service_id,
+                        op_role.clone(),
                         &dest_host,
                         &method,
                         &path,
@@ -647,6 +655,7 @@ impl BrokerHandler {
         conn: &str,
         conn_rec: &crate::storage::plaintext::Connection,
         service_id: &str,
+        op_role: Option<String>,
         host: &str,
         method: &str,
         path: &str,
@@ -659,11 +668,10 @@ impl BrokerHandler {
         let now = now_secs();
         let ttl_secs = ttl.unwrap_or(DEFAULT_ASK_TTL);
 
-        let role = self
-            .state
-            .services
-            .service_env_key(service_id)
-            .unwrap_or_else(|| service_id.to_string());
+        // `op_role` was resolved in `handle` from the custom-aware `def` (the
+        // same source the forward path mints from); a raw, service-less
+        // connection has none, so the connection id stands in.
+        let role = op_role.unwrap_or_else(|| service_id.to_string());
         // The op `target` is the role's bound BARE key (record `keys` map,
         // identity default) — the same slot every writer uses.
         let target = crate::storage::plaintext::secret_key_for(Some(conn_rec), &role);

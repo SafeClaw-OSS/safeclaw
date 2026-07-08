@@ -38,6 +38,32 @@ pub struct ServiceDef {
     pub policy: Option<PolicyDef>,
 }
 
+impl ServiceDef {
+    /// The stored secret role that backs this service's credential: the oauth2
+    /// refresh-token role for an `[oauth2]` service, else its first `secrets`
+    /// entry. `None` when it declares neither. A pure projection over the def —
+    /// the SINGLE source of truth for "which vault role holds this service's
+    /// secret", so a registry service and a vault-custom service resolve
+    /// identically. Callers that only have a `service_id` and a registry go
+    /// through [`service_env_key`]; callers that may face a custom service
+    /// resolve the `ServiceDef` first (registry `.or_else(custom_service)`) and
+    /// call this directly.
+    pub fn env_role(&self) -> Option<String> {
+        if let Some(o) = self.oauth2.as_ref() {
+            let s = o.refresh_token.trim();
+            if !s.is_empty() {
+                return Some(s.to_string());
+            }
+        }
+        self.service
+            .secrets
+            .iter()
+            .map(|s| s.trim())
+            .find(|s| !s.is_empty())
+            .map(|s| s.to_string())
+    }
+}
+
 /// The one named auth MECHANISM. The `[oauth2]` section is SELF-SUFFICIENT: it
 /// declares the endpoints + public client inline (`authorization_url`,
 /// `token_url`, `client_id`, …) — the same shape whether it ships in-tree or is
@@ -623,18 +649,15 @@ impl ServiceRegistry {
         crate::core::policy::AccessLevel::AskAlways
     }
 
-    /// The stored secret role that backs a service's credential: the oauth2
-    /// refresh-token role for an `[oauth2]` service, else its first `secrets`
-    /// entry. `None` when the service declares neither.
+    /// The stored secret role that backs a **registry** service's credential.
+    /// Thin wrapper over [`ServiceDef::env_role`] — a registry-only lookup.
+    /// A connection may reference a vault-custom service (`aux.services`) that
+    /// is NOT in the compiled registry; such a caller must resolve the
+    /// `ServiceDef` custom-awarely (registry `.or_else(custom_service)`) and
+    /// call `def.env_role()` directly, or it will miss the custom def and fall
+    /// back to the connection id — the bug this split removes.
     pub fn service_env_key(&self, service_id: &str) -> Option<String> {
-        let svc = self.services.get(service_id)?;
-        if let Some(o) = svc.oauth2.as_ref() {
-            let s = o.refresh_token.trim();
-            if !s.is_empty() {
-                return Some(s.to_string());
-            }
-        }
-        svc.service.secrets.iter().map(|s| s.trim()).find(|s| !s.is_empty()).map(|s| s.to_string())
+        self.services.get(service_id).and_then(|d| d.env_role())
     }
 
     /// The `/token` body style for a service's `[oauth2]`: `oauth_style`,
@@ -906,6 +929,35 @@ secrets = ["GITHUB_TOKEN"]
         services.insert("github".into(), def);
         let r = reg(services);
         assert_eq!(r.service_env_key("github").as_deref(), Some("GITHUB_TOKEN"));
+    }
+
+    #[test]
+    fn custom_def_env_role_resolves_when_registry_misses() {
+        // A vault-custom `[oauth2]` service (e.g. a user-added "gcp"): NOT in the
+        // compiled registry. `service_env_key(id)` is a registry-only lookup, so
+        // it returns None and the ask/approve path would fall back to the
+        // connection id as the op `target` — the "secret 'gcp' not found" bug.
+        // Resolving the def and calling `env_role()` directly is source-agnostic
+        // and names the real refresh key.
+        let toml_str = r#"
+[service]
+id = "gcp"
+name = "Google Cloud"
+hosts = ["compute.googleapis.com"]
+[oauth2]
+provider = "google"
+refresh_token = "GCP_REFRESH_TOKEN"
+"#;
+        let def: ServiceDef = toml::from_str(toml_str).unwrap();
+        // The pure projection resolves regardless of where the def came from —
+        // the single source of truth both the forward and approve paths share.
+        assert_eq!(def.env_role().as_deref(), Some("GCP_REFRESH_TOKEN"));
+        // A registry WITHOUT this custom service confirms the asymmetry the fix
+        // removes: the id-based lookup misses, so a caller that may face a custom
+        // service must go through the resolved def's `env_role`, never the
+        // registry-only `service_env_key`.
+        let r = reg(HashMap::new());
+        assert_eq!(r.service_env_key("gcp"), None);
     }
 
     #[test]
