@@ -148,9 +148,12 @@ pub async fn run_ls(args: ConnectionLsArgs) -> Result<(), String> {
 
 // ── rm ───────────────────────────────────────────────────────────────────────
 
-/// `sc connection rm <id>` — drop a connection record AND its stored secret(s),
-/// the inverse of `add` and the CLI twin of the console's "Disconnect". Two
-/// passkey gestures (unlock + write); confirms first unless `--yes`.
+/// `sc connection rm <id>` — drop a connection record and the secret(s) ONLY
+/// it references, the inverse of `add` and the CLI twin of the console's
+/// removal. Shared-pool semantics (CONNECTION_SCHEMA.md §3): a key another
+/// connection still references is always kept (printed with its claimants);
+/// `--keep-secrets` keeps everything (unreference only). Two passkey gestures
+/// (unlock + write); confirms first unless `--yes`.
 pub async fn run_rm(args: ConnectionRmArgs) -> Result<(), String> {
     let (custodian, vault) = resolve_active(args.vault.as_deref())?;
     let id = slugify_conn_id(&args.id);
@@ -168,8 +171,13 @@ pub async fn run_rm(args: ConnectionRmArgs) -> Result<(), String> {
             ));
         }
         let ans = prompt_line(&format!(
-            "Remove connection '{}' and its stored secret(s)? [y/N]: ",
-            id
+            "Remove connection '{}'{}? [y/N]: ",
+            id,
+            if args.keep_secrets {
+                " (keeping its secrets)"
+            } else {
+                " and the secret(s) only it references"
+            },
         ))?;
         if !matches!(ans.trim(), "y" | "Y" | "yes" | "YES") {
             eprintln!("aborted");
@@ -206,9 +214,21 @@ pub async fn run_rm(args: ConnectionRmArgs) -> Result<(), String> {
 
     let mut new_kv = kv;
     let mut removed_secrets = Vec::new();
-    for addr in connection_secret_addresses(&rec) {
-        if new_kv.remove(&addr).is_some() {
-            removed_secrets.push(addr);
+    let mut kept_secrets: Vec<(String, Vec<String>)> = Vec::new();
+    if !args.keep_secrets {
+        // Shared-pool guard: never delete a key another connection still
+        // references (raw list / keys map / identity binding).
+        let claims = crate::cli::conn::other_connection_claims(&aux, &id);
+        for addr in connection_secret_addresses(&rec) {
+            if let Some(by) = claims.get(&addr) {
+                if new_kv.contains_key(&addr) {
+                    kept_secrets.push((addr, by.clone()));
+                }
+                continue;
+            }
+            if new_kv.remove(&addr).is_some() {
+                removed_secrets.push(addr);
+            }
         }
     }
     remove_connection(&mut aux, &id);
@@ -235,6 +255,12 @@ pub async fn run_rm(args: ConnectionRmArgs) -> Result<(), String> {
             removed_secrets.len(),
             removed_secrets.join(", ")
         );
+    }
+    if args.keep_secrets {
+        eprintln!("  secrets kept (record removed only)");
+    }
+    for (key, by) in &kept_secrets {
+        eprintln!("  kept: {} (still referenced by {})", key, by.join(", "));
     }
     Ok(())
 }
@@ -618,7 +644,7 @@ fn prompt_hosts(name: &str) -> Result<Vec<String>, String> {
     Ok(hosts)
 }
 
-fn prompt_line(prompt: &str) -> Result<String, String> {
+pub(crate) fn prompt_line(prompt: &str) -> Result<String, String> {
     eprint!("{}", prompt);
     std::io::stderr().flush().ok();
     let mut line = String::new();

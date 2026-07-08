@@ -1,5 +1,5 @@
-use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand};
+use std::path::PathBuf;
 
 /// Control plane port — the axum Router (op / approve / ceremonies / events).
 /// The `sc` CLI's target; the agent's own traffic never touches it (the agent
@@ -24,7 +24,11 @@ pub const PROXY_PORT: u16 = 23294;
 ///
 /// Bare `safeclaw` (no subcommand) prints help.
 #[derive(Debug, Parser)]
-#[command(name = "safeclaw", version, about = "SafeClaw — passkey-gated credential broker")]
+#[command(
+    name = "safeclaw",
+    version,
+    about = "SafeClaw — passkey-gated credential broker"
+)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
@@ -283,6 +287,11 @@ pub struct ConnectionRmArgs {
     /// delete of the connection + its secrets is irreversible without a re-add).
     #[arg(long)]
     pub yes: bool,
+    /// Remove only the connection record and keep every secret value in the
+    /// vault (unreference). Default deletes the keys ONLY this connection
+    /// references; keys other connections still reference are always kept.
+    #[arg(long)]
+    pub keep_secrets: bool,
     #[arg(long)]
     pub vault: Option<String>,
     #[arg(long)]
@@ -603,7 +612,6 @@ pub struct VaultDeleteArgs {
     /// no implicit "current vault" for destructive ops.
     pub vault: String,
 
-
     /// Bypass the interactive confirmation. Without this flag the command
     /// refuses to proceed (since deletion is irreversible).
     #[arg(long)]
@@ -872,6 +880,11 @@ pub struct SetArgs {
 pub struct RmArgs {
     /// Native-secrets key name to remove from the vault.
     pub key: String,
+    /// Remove the key even when connections still reference it. They are
+    /// never deleted with it — they just turn unconfigured until the key is
+    /// re-added. Required off a terminal; interactive runs prompt instead.
+    #[arg(long)]
+    pub force: bool,
     #[arg(long)]
     pub vault: Option<String>,
     #[arg(long)]
@@ -917,7 +930,9 @@ impl Config {
         // crate, and we already require origin to be well-formed for WebAuthn
         // to work. Strips scheme, path, and :port. Falls back to "localhost"
         // if origin is somehow unparseable.
-        let rp_id = args.rp_id.unwrap_or_else(|| host_from_origin(&origin).unwrap_or_else(|| "localhost".into()));
+        let rp_id = args
+            .rp_id
+            .unwrap_or_else(|| host_from_origin(&origin).unwrap_or_else(|| "localhost".into()));
         // state_dir default = ~/.safeclaw/state (see `default_state_dir`).
         let state_dir = args.state_dir.unwrap_or_else(default_state_dir);
         Self {
@@ -954,5 +969,9 @@ fn host_from_origin(origin: &str) -> Option<String> {
         .or_else(|| origin.strip_prefix("http://"))?;
     let host_port = after_scheme.split('/').next()?;
     let host = host_port.split(':').next()?;
-    if host.is_empty() { None } else { Some(host.to_string()) }
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_string())
+    }
 }
