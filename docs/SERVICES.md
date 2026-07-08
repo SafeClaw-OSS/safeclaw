@@ -92,8 +92,9 @@ authorization_url = "https://accounts.google.com/o/oauth2/v2/auth"
 token_url         = "https://oauth2.googleapis.com/token"
 pkce              = true
 client_id         = "499410884315-…apps.googleusercontent.com"  # PUBLIC client, inline
-# client_secret + client_type = "public" only for a non-confidential client
-# (there is no provider-template layer; every [oauth2] is inline-complete)
+# client_secret only for a non-confidential PUBLIC client (by convention,
+# review-enforced; no client_type field). No provider-template layer; every
+# [oauth2] is inline-complete.
 # id_token = "GMAIL_ID_TOKEN"       # only when the provider returns a stored OIDC id token
 # exposes = ["account_id"]          # optional extra derived values →
                                     #   __sc__<conn>__account_id__

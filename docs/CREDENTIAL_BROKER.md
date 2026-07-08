@@ -695,8 +695,9 @@ human-anchored host anyway). Skill stays generic; the shipped
 - **No pre-storing encoded credential forms** — the vault stores the semantic value.
 - **No baked "common host" hint list** — service-declared / agent deep-link / TOFU.
 - **No provider-template layer** (retired 2026-07-08) — every `[oauth2]` is
-  inline-complete (endpoints, client, `client_type=public` gate enforced by the
-  validator). OAuth **connections** are self-serve via a **custom service
+  inline-complete (endpoints, client; a literal client_secret is a public
+  client's by convention, review-enforced — the client_type assertion field is
+  retired too). OAuth **connections** are self-serve via a **custom service
   toml** (per-vault `aux.services`, validated) → then added like any catalog
   service — NEVER an OAuth option inside
   the add-connection form (it would force an `oauth` field onto the 2-field

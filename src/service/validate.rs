@@ -195,13 +195,6 @@ fn validate_service_inner(toml_str: &str) -> Result<(), Vec<String>> {
         if o.provider.as_deref().is_some_and(|p| p.trim().is_empty()) {
             errs.push("[oauth2] provider (display label) must not be empty (omit it instead)".into());
         }
-        if o.client_secret.is_some() && o.client_type.as_deref() != Some("public") {
-            errs.push(
-                "[oauth2] a literal client_secret requires client_type = \"public\" \
-                 (a confidential secret must never sit in a definition)"
-                    .into(),
-            );
-        }
         if let Some(u) = &o.authorization_url {
             validate_https_public_url("[oauth2] authorization_url", u, &mut errs);
         }
@@ -343,16 +336,18 @@ refresh_token = "ACME_REFRESH_TOKEN"
         // Incomplete inline is rejected.
         let broken = inline.replace("token_url = \"https://auth.acme.dev/token\"\n", "");
         assert!(validate_service(&broken).is_err());
-        // http:// endpoints and confidential inline secrets are rejected.
+        // http:// endpoints are rejected.
         let http = inline.replace("https://auth.acme.dev/token", "http://auth.acme.dev/token");
         assert!(validate_service(&http).is_err());
+        // A literal client_secret is a public client's by convention — fine.
         let secret = inline.replace("client_id = \"acme-public\"", "client_id = \"acme-public\"\nclient_secret = \"shh\"");
-        assert!(validate_service(&secret).is_err());
-        let pub_secret = inline.replace(
+        assert!(validate_service(&secret).is_ok());
+        // The retired client_type assertion is an unknown field now.
+        let stale = inline.replace(
             "client_id = \"acme-public\"",
             "client_id = \"acme-public\"\nclient_secret = \"shh\"\nclient_type = \"public\"",
         );
-        assert!(validate_service(&pub_secret).is_ok());
+        assert!(validate_service(&stale).is_err());
     }
 
     #[test]

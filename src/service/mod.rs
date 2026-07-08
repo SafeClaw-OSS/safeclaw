@@ -92,14 +92,14 @@ pub struct OAuth2Def {
     /// OAuth client_id (a PUBLIC client's id — safe to declare in a recipe).
     #[serde(default)]
     pub client_id: Option<String>,
-    /// OAuth client_secret — allowed ONLY for `client_type = "public"` (a
-    /// confidential secret must never sit in a recipe; the validator enforces
-    /// this).
+    /// OAuth client_secret. A literal secret in a definition is BY CONVENTION a
+    /// PUBLIC client's (RFC 6749 §2.1) — non-confidential by the vendor's own
+    /// design, like Google's Desktop client. A confidential secret must never
+    /// sit in a recipe; that line is review-enforced (there is no client_type
+    /// field to assert it — tooling stamped it automatically, so it proved
+    /// nothing).
     #[serde(default)]
     pub client_secret: Option<String>,
-    /// RFC 6749 §2.1: `"public"` | `"confidential"`.
-    #[serde(default)]
-    pub client_type: Option<String>,
     /// Whether the connect flow uses PKCE (RFC 7636). Defaults to `true`
     /// (every public client should).
     #[serde(default)]
@@ -194,12 +194,12 @@ pub struct ResolvedOAuthConfig {
 /// CONNECTIONS_AND_AUTH.md §4a.
 ///
 /// This mirrors the definition 1:1 on purpose: a definition may only ever
-/// contain PUBLIC-client material (the validator rejects a literal
-/// `client_secret` unless `client_type = "public"`), so there is nothing
-/// confidential to withhold — hiding fields here would only make the console
-/// lie about what the toml says. The daemon still does the code→token
-/// exchange locally; the browser only drives consent and seals the resulting
-/// `{code, verifier}` into the vault.
+/// contain PUBLIC-client material (a literal `client_secret` in a def is a
+/// public client's by convention — see `OAuth2Def::client_secret`), so there
+/// is nothing confidential to withhold — hiding fields here would only make
+/// the console lie about what the toml says. The daemon still does the
+/// code→token exchange locally; the browser only drives consent and seals the
+/// resulting `{code, verifier}` into the vault.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ConnectDescriptor {
     /// Display label ("Connect with Google"); "custom" when the def names none.
@@ -940,7 +940,6 @@ secrets = ["GITHUB_TOKEN"]
             token_url: None,
             client_id: None,
             client_secret: None,
-            client_type: None,
             pkce: None,
             redirect_uri: None,
             oauth_style: style.map(|s| s.to_string()),
