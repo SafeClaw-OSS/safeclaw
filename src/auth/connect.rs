@@ -313,24 +313,61 @@ where
                 );
             }
             Err(e) => {
-                if e.contains("invalid_grant") {
-                    // Terminal: the code expired or was already used. Stamp the
-                    // connecting entry so the console shows "failed — reconnect"
-                    // instead of a perpetual "connecting". Only a fresh consent
-                    // (new code) recovers — it overwrites this entry (clearing
-                    // the error).
-                    mark_connecting_failed(m, &conn, "authorization expired or already used");
+                if let Some(reason) = terminal_exchange_reason(&e) {
+                    // Terminal: retrying the SAME code/config can never succeed.
+                    // Stamp the connecting entry so the console shows
+                    // "failed — reconnect" (with the provider's reason) instead
+                    // of a perpetual "connecting" retry-storming the token
+                    // endpoint. Only a fresh consent (new code, possibly a fixed
+                    // def) recovers — it overwrites this entry, clearing the
+                    // error.
+                    mark_connecting_failed(m, &conn, &reason);
                     failed += 1;
-                    tracing::warn!(conn = %conn, "oauth connect: invalid_grant (code expired/used) — marked failed");
+                    tracing::warn!(conn = %conn, "oauth connect: terminal exchange rejection — marked failed: {}", e);
                 } else {
-                    // Transient (network / provider 5xx) — leave connecting + retry
-                    // on the next sync.
+                    // Transient (network / provider 5xx / rate limit) — leave
+                    // connecting + retry on the next sync.
                     tracing::warn!(conn = %conn, "oauth connect: exchange failed (transient), will retry: {}", e);
                 }
             }
         }
     }
     (completed, failed)
+}
+
+/// Classify an exchange failure: `Some(reason)` when re-sending the SAME
+/// request can never succeed (the provider REJECTED it — expired code, missing
+/// client_secret, bad client, wrong redirect …), `None` when it's worth
+/// retrying (network error, provider 5xx, rate limit). Blindly retrying a
+/// rejection forms a retry storm against the token endpoint: the sync watcher
+/// re-processes the pending entry every cycle, forever.
+///
+/// The error is a formatted string (`exchange_code` returns
+/// `"… returned HTTP <status> — <body>"`), so classification is textual: any
+/// 4xx is a rejection except 408 (timeout) and 429 (rate limit). The reason
+/// surfaces the provider's `error_description`/`error` when the body is the
+/// standard RFC 6749 §5.2 JSON.
+fn terminal_exchange_reason(e: &str) -> Option<String> {
+    if e.contains("invalid_grant") {
+        return Some("authorization expired or already used".to_string());
+    }
+    let rejected = e.contains("returned HTTP 4")
+        && !e.contains("returned HTTP 408")
+        && !e.contains("returned HTTP 429");
+    if !rejected {
+        return None;
+    }
+    let detail = e
+        .split_once("— ")
+        .and_then(|(_, body)| serde_json::from_str::<serde_json::Value>(body.trim()).ok())
+        .and_then(|v| {
+            v.get("error_description")
+                .or_else(|| v.get("error"))
+                .and_then(|d| d.as_str())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| "provider rejected the exchange".to_string());
+    Some(format!("provider rejected the exchange: {}", detail))
 }
 
 /// Stamp a terminal `error` on one `connecting` entry (leaving code/code_verifier
@@ -1007,6 +1044,52 @@ mod tests {
             "connecting must survive a failed exchange (user retries within TTL)"
         );
         assert!(aux_map::<Connection>(&m, "connections").is_empty());
+    }
+
+    #[test]
+    fn terminal_exchange_reason_classifies_rejections_vs_transients() {
+        // 4xx rejections are terminal, with the provider's detail surfaced.
+        let missing_secret = terminal_exchange_reason(
+            "oauth2 code-exchange returned HTTP 400 Bad Request — {\"error\":\"invalid_request\",\"error_description\":\"client_secret is missing.\"}",
+        );
+        assert_eq!(
+            missing_secret.as_deref(),
+            Some("provider rejected the exchange: client_secret is missing.")
+        );
+        assert!(terminal_exchange_reason("… invalid_grant …").is_some());
+        assert!(terminal_exchange_reason("oauth2 code-exchange returned HTTP 401 — nope").is_some());
+        // Network errors, 5xx, timeouts, and rate limits stay retryable.
+        assert!(terminal_exchange_reason("oauth2 code-exchange request failed: connection reset").is_none());
+        assert!(terminal_exchange_reason("oauth2 code-exchange returned HTTP 500 — oops").is_none());
+        assert!(terminal_exchange_reason("oauth2 code-exchange returned HTTP 429 — slow down").is_none());
+        assert!(terminal_exchange_reason("oauth2 code-exchange returned HTTP 408 — timeout").is_none());
+    }
+
+    #[tokio::test]
+    async fn run_pending_rejection_marks_failed_transient_does_not() {
+        let services = gmail_registry();
+
+        // A 400 rejection (not invalid_grant) stamps a terminal error.
+        let mut m = with_connecting("gmail", "gmail", "code-A");
+        let (n, failed) = run_pending(&services, &no_custom(), &mut m, |_conn, _cfg, _p| async move {
+            Err("oauth2 code-exchange returned HTTP 400 Bad Request — {\"error\":\"invalid_request\",\"error_description\":\"client_secret is missing.\"}".to_string())
+        })
+        .await;
+        assert_eq!((n, failed), (0, 1));
+        let entry = &aux_map::<Connecting>(&m, "connecting")["gmail"];
+        assert!(
+            entry.oauth2.error.as_deref().unwrap_or("").contains("client_secret is missing."),
+            "the provider's reason must surface on the entry: {:?}", entry.oauth2.error
+        );
+
+        // A 5xx stays pending with NO error (retried next sync).
+        let mut m = with_connecting("gmail", "gmail", "code-B");
+        let (n, failed) = run_pending(&services, &no_custom(), &mut m, |_conn, _cfg, _p| async move {
+            Err("oauth2 code-exchange returned HTTP 500 — oops".to_string())
+        })
+        .await;
+        assert_eq!((n, failed), (0, 0));
+        assert!(aux_map::<Connecting>(&m, "connecting")["gmail"].oauth2.error.is_none());
     }
 
     #[tokio::test]
