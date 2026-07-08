@@ -1036,6 +1036,119 @@ pub async fn approve_op(
                 let cached = Some(resp.to_string());
                 (resp, cached)
             }
+            // Delete a native secret KEY. Shared-pool semantics
+            // (CONNECTION_SCHEMA.md §3): never cascades into a connection — the
+            // referencing connections just turn unconfigured until the key is
+            // re-added. Returns who referenced it so the CLI can say so. The
+            // KEY name is public (rides the op), the value never does.
+            "secret-rm" => {
+                let key = validated.op.act.target.trim().to_ascii_uppercase();
+                if key.is_empty() {
+                    return Err(AppError::BadRequest("secret-rm target (key) required".into()));
+                }
+                let (mut view, k) =
+                    crate::server::handlers::metadata::open_view_for_grant_keep_key(
+                        &state,
+                        &vault_id,
+                        &validated.op,
+                        &validated.wrapping_key,
+                        &validated.credential_id_bytes,
+                        existing_vault.as_ref(),
+                    )?;
+                if !view.native_secrets.contains_key(&key) {
+                    return Err(AppError::BadRequest(format!("key '{}' not found in vault", key)));
+                }
+                let referenced_by = view
+                    .aux
+                    .connection_claims(&state.services, "")
+                    .remove(&key)
+                    .unwrap_or_default();
+                view.native_secrets.remove(&key);
+                crate::auth::connect::persist_mutated_view(&state, &vault_id, &view, &k)
+                    .map_err(AppError::Internal)?;
+                {
+                    let state = state.clone();
+                    let vid = vault_id.clone();
+                    tokio::spawn(async move {
+                        crate::sync::push_keys_best_effort(&state, &vid).await;
+                        crate::sync::push_items_best_effort(&state, &vid).await;
+                    });
+                }
+                tracing::info!(vault = %vault_id, key = %key, "secret removed");
+                let resp = json!({
+                    "ok": true, "act": "secret-rm",
+                    "removed": key, "referenced_by": referenced_by,
+                });
+                let cached = Some(resp.to_string());
+                (resp, cached)
+            }
+            // Delete a connection record. Unless `scope.keep_secrets`, also
+            // deletes the secret(s) ONLY this connection references (shared-pool
+            // guard: a key another connection still claims is kept). Returns the
+            // removed + kept secret lists so the CLI can report them.
+            "connection-rm" => {
+                let id = validated.op.act.target.trim().to_string();
+                if id.is_empty() {
+                    return Err(AppError::BadRequest(
+                        "connection-rm target (connection id) required".into(),
+                    ));
+                }
+                let keep_secrets = validated
+                    .op
+                    .act
+                    .scope
+                    .get("keep_secrets")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let (mut view, k) =
+                    crate::server::handlers::metadata::open_view_for_grant_keep_key(
+                        &state,
+                        &vault_id,
+                        &validated.op,
+                        &validated.wrapping_key,
+                        &validated.credential_id_bytes,
+                        existing_vault.as_ref(),
+                    )?;
+                let rec = view.aux.connections.get(&id).cloned().ok_or_else(|| {
+                    AppError::BadRequest(format!("no connection '{}' in this vault", id))
+                })?;
+                let mut removed_secrets: Vec<String> = Vec::new();
+                let mut kept_secrets: Vec<(String, Vec<String>)> = Vec::new();
+                if !keep_secrets {
+                    let claims = view.aux.connection_claims(&state.services, &id);
+                    for addr in rec.secret_addresses(&state.services) {
+                        if let Some(by) = claims.get(&addr) {
+                            if view.native_secrets.contains_key(&addr) {
+                                kept_secrets.push((addr, by.clone()));
+                            }
+                            continue;
+                        }
+                        if view.native_secrets.remove(&addr).is_some() {
+                            removed_secrets.push(addr);
+                        }
+                    }
+                }
+                view.aux.connections.remove(&id);
+                crate::auth::connect::persist_mutated_view(&state, &vault_id, &view, &k)
+                    .map_err(AppError::Internal)?;
+                {
+                    let state = state.clone();
+                    let vid = vault_id.clone();
+                    tokio::spawn(async move {
+                        crate::sync::push_keys_best_effort(&state, &vid).await;
+                        crate::sync::push_items_best_effort(&state, &vid).await;
+                    });
+                }
+                tracing::info!(vault = %vault_id, connection = %id, "connection removed");
+                let resp = json!({
+                    "ok": true, "act": "connection-rm",
+                    "removed": id,
+                    "removed_secrets": removed_secrets,
+                    "kept_secrets": kept_secrets,
+                });
+                let cached = Some(resp.to_string());
+                (resp, cached)
+            }
             other => {
                 return Err(AppError::BadRequest(format!(
                     "unsupported Custom act: {}",

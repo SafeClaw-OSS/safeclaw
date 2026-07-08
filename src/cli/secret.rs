@@ -11,6 +11,7 @@ use base64::Engine;
 use serde_json::{json, Value};
 
 use crate::cli::active::resolve_active;
+use crate::cli::approve::{act_result, approve_op, ApproveOpts};
 use crate::cli::conn::{
     insert_raw_connection, remove_connection, valid_conn_id, valid_role, validate_raw_host,
 };
@@ -201,67 +202,41 @@ pub async fn run_rm(args: RmArgs) -> Result<(), String> {
     // §1: secret KEYs are canonical uppercase — normalize on input so `sc rm
     // github_token` finds the stored `GITHUB_TOKEN`.
     let key = args.key.trim().to_ascii_uppercase();
-    eprintln!(
-        "safeclaw rm {} — two passkey gestures (unlock + write)",
-        key
-    );
-
-    let meta = fetch_passkey_meta(&custodian, &vault).await?;
-    let (kv, mut aux, user_key) = do_unlock(
-        &custodian,
-        &vault,
-        &meta,
-        args.no_browser,
-        args.timeout,
-        args.cb_port,
-    )
-    .await?;
-
-    let mut new_kv = kv;
-    if !new_kv.contains_key(&key) {
-        return Err(format!("key {} not found in vault", key));
+    if key.is_empty() {
+        return Err("key required".into());
     }
-    // Shared-pool semantics (CONNECTION_SCHEMA.md §3): connections REFERENCE
-    // keys, they don't own them. Deleting a value never cascades into a
-    // connection (its config/policy/audit anchor outlive a value) and is never
-    // blocked — the referencing connections just turn unconfigured until the
-    // key is re-added. Surface who they are before the destructive write.
-    let referenced_by = crate::cli::conn::connections_referencing(&aux, &key);
-    if !referenced_by.is_empty() {
-        eprintln!(
-            "  {} is referenced by connection(s): {} — they stay, turning unconfigured until the key is re-added",
-            key,
-            referenced_by.join(", ")
-        );
-        if !args.force {
-            if !std::io::stdin().is_terminal() {
-                return Err(format!(
-                    "refusing to remove referenced key '{}' without confirmation — pass `--force` (non-interactive)",
-                    key
-                ));
-            }
-            let ans = crate::cli::connect::prompt_line("Remove it anyway? [y/N]: ")?;
-            if !matches!(ans.trim(), "y" | "Y" | "yes" | "YES") {
-                eprintln!("aborted");
-                return Ok(());
-            }
+    // Anti-fat-finger confirm BEFORE the gesture (the grant page also names the
+    // op). The referenced-by detail is reported AFTER — the daemon computes it
+    // while it holds the open vault. The KEY name rides the op (public); the
+    // value never leaves the vault.
+    if !args.force && std::io::stdin().is_terminal() {
+        let ans = crate::cli::connect::prompt_line(&format!("Remove key '{}'? [y/N]: ", key))?;
+        if !matches!(ans.trim(), "y" | "Y" | "yes" | "YES") {
+            eprintln!("aborted");
+            return Ok(());
         }
     }
-    new_kv.remove(&key);
+    let op = json!({
+        "act": { "type": { "custom": "secret-rm" }, "target": key, "scope": null },
+        "bind": { "redeemer": vault },
+        "valid": { "iat": now_unix(), "multiplicity": "one" }
+    });
+    let opts = ApproveOpts { no_browser: args.no_browser, cb_port: args.cb_port, timeout: args.timeout };
+    let body = approve_op(&custodian, &vault, &op, &format!("Remove key {}", key), &opts).await?;
 
-    seal_and_submit_write(
-        &custodian,
-        &vault,
-        &meta,
-        &user_key,
-        &new_kv,
-        &aux,
-        args.no_browser,
-        args.timeout,
-        args.cb_port,
-    )
-    .await?;
-    eprintln!("safeclaw rm — {} removed", key);
+    let refs: Vec<String> = act_result(&body)
+        .get("referenced_by")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+        .unwrap_or_default();
+    if !refs.is_empty() {
+        eprintln!(
+            "note: {} is referenced by connection(s): {} — they turn unconfigured until the key is re-added",
+            key,
+            refs.join(", ")
+        );
+    }
+    println!("key '{}' removed", key);
     Ok(())
 }
 

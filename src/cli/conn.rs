@@ -5,11 +5,7 @@
 //! value in a way that preserves every other key. Raw connections carry explicit
 //! `secrets` (§2); service-backed connections omit them (derived from the service).
 
-use std::collections::BTreeMap;
-
 use serde_json::{json, Value};
-
-use crate::storage::plaintext::{secret_key_for, Connection};
 
 use crate::service::validate::host_egress_allowed;
 
@@ -168,63 +164,6 @@ pub fn insert_service_connection(
         .insert(conn_id.to_string(), Value::Object(rec));
 }
 
-/// Every vault KEY some connection (other than `exclude`) references, with
-/// the referencing connection ids — the shared-pool guard every deletion flow
-/// consults (CONNECTION_SCHEMA.md §3): connections REFERENCE keys, they don't
-/// own them, so a key another connection still references is never deleted
-/// with this one, and deleting a key never cascades into a connection (its
-/// config/policy/audit anchor outlive a value — it just turns unconfigured).
-/// Covers raw `secrets` lists, service `keys`-map values, and the identity
-/// bindings of each service's declared roles (compiled registry; a per-vault
-/// CUSTOM service's identity roles aren't resolvable here, but its recorded
-/// `keys` bindings still count).
-pub fn other_connection_claims(aux: &Value, exclude: &str) -> BTreeMap<String, Vec<String>> {
-    let mut claims: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    let Some(conns) = aux.get("connections").and_then(|c| c.as_object()) else {
-        return claims;
-    };
-    let reg = crate::service::ServiceRegistry::load();
-    for (id, rec_val) in conns {
-        if id == exclude {
-            continue;
-        }
-        let Ok(rec) = serde_json::from_value::<Connection>(rec_val.clone()) else {
-            continue;
-        };
-        let mut add = |key: String| {
-            let by = claims.entry(key).or_default();
-            if !by.contains(id) {
-                by.push(id.clone());
-            }
-        };
-        match rec.service.as_deref() {
-            None => {
-                for k in rec.secrets.clone().unwrap_or_default() {
-                    add(k.to_ascii_uppercase());
-                }
-            }
-            Some(service) => {
-                if let Some(def) = reg.get(service) {
-                    for role in &def.service.secrets {
-                        add(secret_key_for(Some(&rec), &role.to_ascii_uppercase()));
-                    }
-                }
-                for k in rec.keys.clone().unwrap_or_default().into_values() {
-                    add(k);
-                }
-            }
-        }
-    }
-    claims
-}
-
-/// The connections referencing one vault KEY — `sc rm`'s warn-then-allow check.
-pub fn connections_referencing(aux: &Value, key: &str) -> Vec<String> {
-    other_connection_claims(aux, "")
-        .remove(&key.to_ascii_uppercase())
-        .unwrap_or_default()
-}
-
 /// Store a custom service definition (verbatim v4 toml source) under
 /// `aux.services[<id>]`, preserving every other aux key.
 pub fn insert_custom_service(aux: &mut Value, id: &str, toml_source: &str) {
@@ -380,34 +319,4 @@ mod tests {
         assert!(aux["connections"]["a"].is_object());
     }
 
-    #[test]
-    fn claims_cover_raw_keysmap_and_identity_bindings() {
-        let aux = json!({
-            "connections": {
-                "stripe_key": { "hosts": ["api.stripe.com"], "secrets": ["SHARED_KEY"] },
-                "gmail":      { "service": "gmail" },
-                "gmail_work": { "service": "gmail",
-                                "keys": { "GMAIL_REFRESH_TOKEN": "GMAIL_REFRESH_TOKEN_WORK" } },
-            }
-        });
-        // Excluding the raw conn: its own key is not a claim, but BOTH gmail
-        // conns' keys are — the default via its IDENTITY binding (no keys map),
-        // the named one via its map. That identity coverage is exactly what the
-        // old ad-hoc guards missed.
-        let claims = other_connection_claims(&aux, "stripe_key");
-        assert!(!claims.contains_key("SHARED_KEY"));
-        assert_eq!(
-            claims.get("GMAIL_REFRESH_TOKEN").map(Vec::as_slice),
-            Some(&["gmail".to_string()][..])
-        );
-        assert_eq!(
-            claims.get("GMAIL_REFRESH_TOKEN_WORK").map(Vec::as_slice),
-            Some(&["gmail_work".to_string()][..])
-        );
-        // `sc rm SHARED_KEY` warns naming the raw conn (nothing excluded).
-        assert_eq!(
-            connections_referencing(&aux, "shared_key"),
-            vec!["stripe_key".to_string()]
-        );
-    }
 }

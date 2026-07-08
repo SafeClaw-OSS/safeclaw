@@ -194,6 +194,83 @@ pub fn secret_key_for(conn: Option<&Connection>, role: &str) -> String {
     role.to_string()
 }
 
+impl Connection {
+    /// The vault KEYs this connection's secrets live at: a service-backed
+    /// connection's declared roles bound via `keys`/identity (resolved through
+    /// `reg`), or a raw connection's explicit UPPERCASE `secrets` list. A
+    /// service unknown to `reg` (e.g. a per-vault custom def not loaded) yields
+    /// no service-role addresses — the recorded `keys` bindings still surface
+    /// through [`VaultAux::connection_claims`].
+    pub fn secret_addresses(&self, reg: &crate::service::ServiceRegistry) -> Vec<String> {
+        match self.service.as_deref() {
+            Some(service) => match reg.get(service) {
+                Some(def) => def
+                    .service
+                    .secrets
+                    .iter()
+                    .map(|role| secret_key_for(Some(self), &role.to_ascii_uppercase()))
+                    .collect(),
+                None => Vec::new(),
+            },
+            None => self
+                .secrets
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|s| s.to_ascii_uppercase())
+                .collect(),
+        }
+    }
+}
+
+impl VaultAux {
+    /// Every vault KEY some connection (other than `exclude`) references, mapped
+    /// to the referencing connection ids — the shared-pool guard every deletion
+    /// flow consults (CONNECTION_SCHEMA.md §3): connections REFERENCE keys, they
+    /// don't own them, so a key another connection still references is never
+    /// deleted with this one, and deleting a key never cascades into a
+    /// connection (it just turns unconfigured). Covers raw `secrets` lists,
+    /// service `keys`-map values, and each service's declared-role identity
+    /// bindings (resolved via `reg`; a per-vault CUSTOM service's identity roles
+    /// aren't in `reg`, but its recorded `keys` bindings still count).
+    pub fn connection_claims(
+        &self,
+        reg: &crate::service::ServiceRegistry,
+        exclude: &str,
+    ) -> BTreeMap<String, Vec<String>> {
+        let mut claims: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (id, rec) in &self.connections {
+            if id == exclude {
+                continue;
+            }
+            let mut add = |key: String| {
+                let by = claims.entry(key).or_default();
+                if !by.contains(id) {
+                    by.push(id.clone());
+                }
+            };
+            match rec.service.as_deref() {
+                None => {
+                    for k in rec.secrets.clone().unwrap_or_default() {
+                        add(k.to_ascii_uppercase());
+                    }
+                }
+                Some(service) => {
+                    if let Some(def) = reg.get(service) {
+                        for role in &def.service.secrets {
+                            add(secret_key_for(Some(rec), &role.to_ascii_uppercase()));
+                        }
+                    }
+                    for k in rec.keys.clone().unwrap_or_default().into_values() {
+                        add(k);
+                    }
+                }
+            }
+        }
+        claims
+    }
+}
+
 /// Creation-time DEFAULT `keys` binding for a **named** connection's role:
 /// `<ROLE>_<QUALIFIER>` (qualifier = `conn_id` minus the `<service>_` prefix,
 /// uppercased) — distinct from the default connection's bare mainstream name so
@@ -371,6 +448,44 @@ impl VaultPlaintextView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connection_claims_cover_raw_keysmap_and_identity_bindings() {
+        // Registry is loaded so gmail's declared GMAIL_REFRESH_TOKEN role
+        // resolves; a raw conn owns its explicit secrets; a named conn binds via
+        // its keys map. The default gmail conn's IDENTITY binding is the case the
+        // old ad-hoc guards missed.
+        let reg = crate::service::ServiceRegistry::load();
+        let mut aux = VaultAux::initial();
+        aux.connections.insert(
+            "stripe_key".into(),
+            Connection { name: None, service: None, hosts: None, secrets: Some(vec!["SHARED_KEY".into()]), keys: None },
+        );
+        aux.connections.insert(
+            "gmail".into(),
+            Connection { name: None, service: Some("gmail".into()), hosts: None, secrets: None, keys: None },
+        );
+        let mut work_keys = BTreeMap::new();
+        work_keys.insert("GMAIL_REFRESH_TOKEN".into(), "GMAIL_REFRESH_TOKEN_WORK".into());
+        aux.connections.insert(
+            "gmail_work".into(),
+            Connection { name: None, service: Some("gmail".into()), hosts: None, secrets: None, keys: Some(work_keys) },
+        );
+
+        // Excluding the raw conn: its own key isn't a claim, but BOTH gmail
+        // conns' keys are (default via identity, named via its map).
+        let claims = aux.connection_claims(&reg, "stripe_key");
+        assert!(!claims.contains_key("SHARED_KEY"));
+        assert_eq!(claims.get("GMAIL_REFRESH_TOKEN").map(Vec::as_slice), Some(&["gmail".to_string()][..]));
+        assert_eq!(claims.get("GMAIL_REFRESH_TOKEN_WORK").map(Vec::as_slice), Some(&["gmail_work".to_string()][..]));
+
+        // secret_addresses: a raw conn lists its own; a named conn resolves its
+        // bound key; the default conn is the identity role.
+        let raw = &aux.connections["stripe_key"];
+        assert_eq!(raw.secret_addresses(&reg), vec!["SHARED_KEY".to_string()]);
+        assert_eq!(aux.connections["gmail"].secret_addresses(&reg), vec!["GMAIL_REFRESH_TOKEN".to_string()]);
+        assert_eq!(aux.connections["gmail_work"].secret_addresses(&reg), vec!["GMAIL_REFRESH_TOKEN_WORK".to_string()]);
+    }
 
     fn build_protected_state(
         aux_json: serde_json::Value,

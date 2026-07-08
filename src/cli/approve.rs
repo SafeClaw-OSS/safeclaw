@@ -31,6 +31,20 @@ use serde_json::{json, Value};
 
 use crate::cli::webauthn::*;
 
+/// Unwrap the daemon act's result object from an [`approve_op`] response. The
+/// REMOTE arm returns the poll body `{status, value:<json-string>}` (value =
+/// the op's `cached_value`); the LOCAL arm returns the act result object
+/// directly. Both collapse to the same object when the daemon op sets
+/// `cached_value = result.to_string()` (as the `service-*` / `secret-rm` /
+/// `connection-rm` ops do).
+pub(crate) fn act_result(body: &Value) -> Value {
+    match body.get("value") {
+        Some(Value::String(s)) => serde_json::from_str(s).unwrap_or(Value::Null),
+        Some(v) => v.clone(),
+        None => body.clone(),
+    }
+}
+
 /// Browser-gesture knobs threaded from the calling command (the local arm
 /// uses them; the remote arm ignores them — the gesture is in the browser).
 pub struct ApproveOpts {

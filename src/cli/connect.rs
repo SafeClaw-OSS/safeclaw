@@ -21,18 +21,19 @@
 use std::io::IsTerminal;
 use std::io::Write as _;
 
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use crate::cli::active::resolve_active;
 use crate::cli::conn::{
-    insert_raw_connection, insert_service_connection, remove_connection, slugify_conn_id,
-    valid_role, validate_raw_host,
+    insert_raw_connection, insert_service_connection, slugify_conn_id, valid_role,
+    validate_raw_host,
 };
+use crate::cli::approve::{act_result, approve_op, ApproveOpts};
 use crate::cli::secret::{do_unlock, seal_and_submit_write};
-use crate::cli::webauthn::fetch_passkey_meta;
+use crate::cli::webauthn::{fetch_passkey_meta, now_unix};
 use crate::config::{ConnectArgs, ConnectionLsArgs, ConnectionRmArgs};
 use crate::service::ServiceRegistry;
-use crate::storage::plaintext::{secret_key_for, suggested_secret_key};
+use crate::storage::plaintext::suggested_secret_key;
 
 pub async fn run(mut args: ConnectArgs) -> Result<(), String> {
     let (custodian, vault) = resolve_active(args.vault.as_deref())?;
@@ -161,8 +162,10 @@ pub async fn run_rm(args: ConnectionRmArgs) -> Result<(), String> {
         return Err(format!("'{}' is not a valid connection id", args.id));
     }
 
-    // Confirm the destructive delete BEFORE the passkey gesture (don't make the
-    // user tap, then abort). Off a terminal, require `--yes`.
+    // Anti-fat-finger confirm BEFORE the gesture (the grant page also names the
+    // op). The cascade detail — which secrets get deleted — is reported AFTER,
+    // computed daemon-side under the open vault. The connection id rides the op
+    // (public); no secret value ever does. Off a terminal, require `--yes`.
     if !args.yes {
         if !std::io::stdin().is_terminal() {
             return Err(format!(
@@ -185,72 +188,25 @@ pub async fn run_rm(args: ConnectionRmArgs) -> Result<(), String> {
         }
     }
 
-    eprintln!(
-        "safeclaw connection rm {} — two passkey gestures (unlock + write)",
-        id
-    );
-    let meta = fetch_passkey_meta(&custodian, &vault).await?;
-    let (kv, mut aux, user_key) = do_unlock(
-        &custodian,
-        &vault,
-        &meta,
-        args.no_browser,
-        args.timeout,
-        args.cb_port,
-    )
-    .await?;
+    let op = json!({
+        "act": { "type": { "custom": "connection-rm" }, "target": id, "scope": { "keep_secrets": args.keep_secrets } },
+        "bind": { "redeemer": vault },
+        "valid": { "iat": now_unix(), "multiplicity": "one" }
+    });
+    let opts = ApproveOpts { no_browser: args.no_browser, cb_port: args.cb_port, timeout: args.timeout };
+    let body = approve_op(&custodian, &vault, &op, &format!("Remove connection {}", id), &opts).await?;
 
-    // The connection record (raw or service-backed) names the secrets it owns.
-    let rec = aux
-        .get("connections")
-        .and_then(|c| c.get(&id))
-        .cloned()
-        .ok_or_else(|| {
-            format!(
-                "no connection '{}' in this vault (see `sc connection ls`)",
-                id
-            )
-        })?;
-
-    let mut new_kv = kv;
-    let mut removed_secrets = Vec::new();
-    let mut kept_secrets: Vec<(String, Vec<String>)> = Vec::new();
-    if !args.keep_secrets {
-        // Shared-pool guard: never delete a key another connection still
-        // references (raw list / keys map / identity binding).
-        let claims = crate::cli::conn::other_connection_claims(&aux, &id);
-        for addr in connection_secret_addresses(&rec) {
-            if let Some(by) = claims.get(&addr) {
-                if new_kv.contains_key(&addr) {
-                    kept_secrets.push((addr, by.clone()));
-                }
-                continue;
-            }
-            if new_kv.remove(&addr).is_some() {
-                removed_secrets.push(addr);
-            }
-        }
-    }
-    remove_connection(&mut aux, &id);
-
-    seal_and_submit_write(
-        &custodian,
-        &vault,
-        &meta,
-        &user_key,
-        &new_kv,
-        &aux,
-        args.no_browser,
-        args.timeout,
-        args.cb_port,
-    )
-    .await?;
-
+    let result = act_result(&body);
+    let removed_secrets: Vec<String> = result
+        .get("removed_secrets")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+        .unwrap_or_default();
     if removed_secrets.is_empty() {
-        eprintln!("safeclaw connection rm — '{}' removed", id);
+        println!("connection '{}' removed", id);
     } else {
-        eprintln!(
-            "safeclaw connection rm — '{}' removed (+{} secret(s): {})",
+        println!(
+            "connection '{}' removed (+{} secret(s): {})",
             id,
             removed_secrets.len(),
             removed_secrets.join(", ")
@@ -259,39 +215,20 @@ pub async fn run_rm(args: ConnectionRmArgs) -> Result<(), String> {
     if args.keep_secrets {
         eprintln!("  secrets kept (record removed only)");
     }
-    for (key, by) in &kept_secrets {
-        eprintln!("  kept: {} (still referenced by {})", key, by.join(", "));
+    // kept_secrets: [[key, [referencing_conn, …]], …]
+    if let Some(kept) = result.get("kept_secrets").and_then(|v| v.as_array()) {
+        for entry in kept {
+            let Some(pair) = entry.as_array() else { continue };
+            let key = pair.first().and_then(|v| v.as_str()).unwrap_or("?");
+            let by = pair
+                .get(1)
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", "))
+                .unwrap_or_default();
+            eprintln!("  kept: {} (still referenced by {})", key, by);
+        }
     }
     Ok(())
-}
-
-/// The BARE vault keys a connection's secrets live at, so `rm` deletes exactly
-/// what `add` wrote (mirrors the console's disconnect computation). Raw: the
-/// explicit `secrets` list. Service-backed: each declared role resolved through
-/// the record's `keys` map (identity when unmapped).
-fn connection_secret_addresses(rec: &Value) -> Vec<String> {
-    if let Some(service) = rec.get("service").and_then(|v| v.as_str()) {
-        let conn: Option<crate::storage::plaintext::Connection> =
-            serde_json::from_value(rec.clone()).ok();
-        let reg = ServiceRegistry::load();
-        return match reg.get(service) {
-            Some(def) => def
-                .service
-                .secrets
-                .iter()
-                .map(|role| secret_key_for(conn.as_ref(), &role.to_ascii_uppercase()))
-                .collect(),
-            None => Vec::new(),
-        };
-    }
-    rec.get("secrets")
-        .and_then(|v| v.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|x| x.as_str().map(|s| s.to_ascii_uppercase()))
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 // ── raw connection ───────────────────────────────────────────────────────────

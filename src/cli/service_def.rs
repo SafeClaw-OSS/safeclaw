@@ -3,27 +3,14 @@
 //! upload editor will enforce, so authors can check a service.toml before
 //! submitting it.
 
-use serde_json::{json, Value};
+use serde_json::json;
 
 use crate::cli::active::resolve_active;
-use crate::cli::approve::{approve_op, ApproveOpts};
+use crate::cli::approve::{act_result, approve_op, ApproveOpts};
 use crate::cli::webauthn::now_unix;
 use crate::config::{ServiceAddArgs, ServiceLsArgs, ServiceRmArgs, ServiceValidateArgs};
 use crate::service::validate::validate_recipe;
 use crate::service::ServiceDef;
-
-/// Unwrap the daemon act's result object from an `approve_op` response. The
-/// REMOTE arm returns the poll body `{status, value:<json-string>}` (value =
-/// the op's `cached_value`); the LOCAL arm returns the act result object
-/// directly. Both collapse to the same object because every `service-*` op sets
-/// `cached_value = result.to_string()`.
-fn act_result(body: &Value) -> Value {
-    match body.get("value") {
-        Some(Value::String(s)) => serde_json::from_str(s).unwrap_or(Value::Null),
-        Some(v) => v.clone(),
-        None => body.clone(),
-    }
-}
 
 pub async fn run_validate(args: ServiceValidateArgs) -> Result<(), String> {
     let path = &args.path;
