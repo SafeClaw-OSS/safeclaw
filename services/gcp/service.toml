@@ -1,0 +1,64 @@
+setup = """
+Google Cloud APIs are REST over per-service hosts (compute.googleapis.com,
+storage.googleapis.com, run.googleapis.com, …). The phantom resolves to a minted
+OAuth access token — put it in the bearer header; the proxy substitutes it at
+egress, the token never enters the agent:
+  sc run -- curl \\
+    "https://compute.googleapis.com/compute/v1/projects/PROJECT/zones" \\
+    -H "Authorization: Bearer __sc__gcp__"
+Scope is cloud-platform (full GCP). Multi-account: switch the phantom value
+(__sc__gcp_work__).
+"""
+
+[service]
+id = "gcp"
+name = "Google Cloud"
+# Classification for browse/filter and policy tag-floors; lowercase-kebab, multi OK.
+tags = ["app"]
+
+# GCP is a multi-host platform: one cloud-platform token reaches every API, each
+# on its own `*.googleapis.com` host. The Google TRIO hosts (www./gmail.
+# googleapis.com) are deliberately NOT here — they belong to gmail/gdrive/
+# gcalendar, and a host may anchor only one connection. Add a host to widen reach.
+hosts = [
+  "compute.googleapis.com",
+  "storage.googleapis.com",
+  "cloudresourcemanager.googleapis.com",
+  "iam.googleapis.com",
+  "run.googleapis.com",
+  "container.googleapis.com",
+  "cloudfunctions.googleapis.com",
+  "artifactregistry.googleapis.com",
+  "serviceusage.googleapis.com",
+  "logging.googleapis.com",
+  "monitoring.googleapis.com",
+  "pubsub.googleapis.com",
+  "bigquery.googleapis.com",
+  "secretmanager.googleapis.com",
+]
+secrets = ["GCP_REFRESH_TOKEN"]
+
+[oauth2]
+# Display label only ("Connect with Google") — carries no config.
+provider = "google"
+# Full GCP access — one consent covers every host above. A narrower deployment can
+# swap in a read-only (…/auth/cloud-platform.read-only) or per-API scope.
+scopes = [
+  "https://www.googleapis.com/auth/cloud-platform",
+]
+refresh_token = "GCP_REFRESH_TOKEN"
+
+# Shared Google Desktop OAuth client — same PUBLIC (non-confidential) client as
+# gmail/gdrive/gcalendar; rotate all four together. Canonical rationale for
+# shipping the client_secret in the clear: services/gmail/service.toml.
+authorization_url = "https://accounts.google.com/o/oauth2/v2/auth"
+token_url         = "https://oauth2.googleapis.com/token"
+pkce              = true
+client_id         = "499410884315-6m6vu98ls61i0e0cn38663mm573nu87a.apps.googleusercontent.com"
+client_secret     = "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"
+redirect_uri      = "http://127.0.0.1:8765/safeclaw/oauth/callback"
+
+# Google quirk: without these a repeat consent returns no refresh_token.
+[oauth2.authorize_params]
+access_type = "offline"
+prompt      = "consent"
