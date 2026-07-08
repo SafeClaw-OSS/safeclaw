@@ -476,7 +476,7 @@ impl BrokerHandler {
                     .await
             }
             Err(ResolveErr::Ambiguous) => {
-                let roles = phantom_role_hint(&conn, def.as_ref());
+                let roles = phantom_role_hint(&conn, &conn_rec, def.as_ref());
                 return err_response(
                     StatusCode::BAD_REQUEST,
                     "ambiguous_phantom",
@@ -1027,13 +1027,23 @@ fn rewrite_headers(
 }
 
 /// A human hint listing a connection's role phantoms (for the ambiguous case).
-fn phantom_role_hint(conn: &str, def: Option<&crate::service::ServiceDef>) -> String {
-    match def {
-        Some(d) => crate::core::host::phantoms_for(conn, d)
-            .into_values()
-            .collect::<Vec<_>>()
-            .join(", "),
-        None => crate::core::host::short_phantom(conn),
+fn phantom_role_hint(
+    conn: &str,
+    rec: &crate::storage::plaintext::Connection,
+    def: Option<&crate::service::ServiceDef>,
+) -> String {
+    let map = match def {
+        Some(d) => crate::core::host::phantoms_for(conn, d),
+        // Raw connection: the injectable keys are the record's explicit
+        // `secrets` list — the same source `sc connection ls` prints. (This
+        // used to fall back to the bare phantom, i.e. the exact form the
+        // Ambiguous error had just rejected.)
+        None => crate::core::host::phantoms_for_raw(conn, rec.secrets.as_deref().unwrap_or(&[])),
+    };
+    if map.is_empty() {
+        crate::core::host::short_phantom(conn)
+    } else {
+        map.into_values().collect::<Vec<_>>().join(", ")
     }
 }
 
