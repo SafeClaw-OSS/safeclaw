@@ -27,8 +27,10 @@ use crate::state::AppState;
 /// in headers / URL / Basic-auth in practice, never a multi-MiB upload.
 const MAX_BODY_SCAN: u64 = 1024 * 1024;
 
-/// The default validity window for a captive-portal op if policy gives no ttl.
-const DEFAULT_ASK_TTL: u64 = 300;
+/// The last-resort `ask`-once window when neither the matched rule nor any
+/// floor (`default.ttl`) pins one — the "Ask once" grant lasts this long after
+/// approval. Kept in sync with the console's shown default (15 min).
+const DEFAULT_ASK_TTL: u64 = 900;
 
 /// What `handle_response` needs to write the terminal audit row after the
 /// upstream answers a forwarded (allow) request.
@@ -670,7 +672,14 @@ impl BrokerHandler {
     ) -> RequestOrResponse {
         use crate::protocol::operation::{Act, ActType, Bind, Operation, Valid};
         let now = now_secs();
-        let ttl_secs = ttl.unwrap_or(DEFAULT_ASK_TTL);
+        // Two DIFFERENT windows, deliberately independent:
+        //   - grant_ttl: how long the approved `ask`-once grant stays cached so
+        //     later matching requests fast-path (rule/floor `ttl`, else 15 min).
+        //   - hold_secs: how long THIS pending op waits for the passkey before it
+        //     expires (aux.policy.timeout, else 5 min). A long grant window must
+        //     not stretch the approval deadline.
+        let grant_ttl = ttl.unwrap_or(DEFAULT_ASK_TTL);
+        let hold_secs = self.state.policy_approval_hold(vault_id);
 
         // `op_role` was resolved in `handle` from the custom-aware `def` (the
         // same source the forward path mints from); a raw, service-less
@@ -698,12 +707,12 @@ impl BrokerHandler {
                 redeemer: vault_id.to_string(),
                 recipient: None,
             },
-            valid: Valid::single_use(now, Some(now + ttl_secs)),
+            valid: Valid::single_use(now, Some(now + hold_secs)),
         };
         let pc = crate::approval::PolicyContext {
             level,
             rule_id,
-            ttl_seconds: ttl_secs,
+            ttl_seconds: grant_ttl,
             host: Some(host.to_string()),
         };
 

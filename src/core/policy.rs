@@ -482,6 +482,22 @@ pub fn evaluate_with_match(
     policy: &Policy,
     tags: &[String],
 ) -> (AccessLevel, Option<String>, Option<u64>) {
+    // The `ask`-cache window a matched rule inherits when it pins no `ttl` of
+    // its own: the ttl of the most-specific floor (connection → tag → global),
+    // the SAME precedence as the read/write floor decision below. Direction-
+    // independent (Levels.ttl is a single value). Resolved up front because a
+    // rule decision returns early; consumed only by an `ask` rule (a
+    // floor-`ask` never caches), and a final constant fills in when nothing
+    // pins a window at all.
+    let floor_ttl = connection_levels
+        .and_then(|lv| lv.ttl)
+        .or_else(|| {
+            tags.iter()
+                .filter_map(|t| policy.categories.get(t))
+                .find_map(|lv| lv.ttl)
+        })
+        .or_else(|| policy.default.as_ref().and_then(|lv| lv.ttl));
+
     // 1. Rules — most-restrictive matching wins (deny-override).
     if let Some(rules) = rules {
         let mut best: Option<(u8, u32, &PolicyRule, AccessLevel)> = None;
@@ -498,7 +514,8 @@ pub fn evaluate_with_match(
             }
         }
         if let Some((_, _, rule, level)) = best {
-            return (level, rule.id.clone(), rule.ttl);
+            // The rule's own ttl wins; else it inherits the default-floor window.
+            return (level, rule.id.clone(), rule.ttl.or(floor_ttl));
         }
     }
 
@@ -552,6 +569,32 @@ mod tests {
             level: Some(level),
             ttl: None,
         }
+    }
+
+    // ── ask-once window (ttl) resolution ─────────────────────────────────────
+    #[test]
+    fn ask_rule_without_ttl_inherits_floor_window() {
+        let rules = vec![rule("del", "DELETE /x", AccessLevel::Ask)]; // ttl: None
+        let conn = Levels { read: None, write: None, ttl: Some(1234) };
+
+        // A matched ask rule that pins no ttl inherits the connection-floor window.
+        let (_l, id, ttl) =
+            evaluate_with_match("DELETE", "/x", None, Some(&rules), Some(&conn), &policy(), &[]);
+        assert_eq!(id.as_deref(), Some("del"));
+        assert_eq!(ttl, Some(1234));
+
+        // The rule's own ttl wins over the floor window.
+        let mut pinned = rules.clone();
+        pinned[0].ttl = Some(60);
+        let (_l2, _id2, ttl2) =
+            evaluate_with_match("DELETE", "/x", None, Some(&pinned), Some(&conn), &policy(), &[]);
+        assert_eq!(ttl2, Some(60));
+
+        // No ttl anywhere in the floors → None (the proxy applies its constant).
+        let bare = Levels::default();
+        let (_l3, _id3, ttl3) =
+            evaluate_with_match("DELETE", "/x", None, Some(&rules), Some(&bare), &policy(), &[]);
+        assert_eq!(ttl3, None);
     }
 
     // ── AccessLevel ──────────────────────────────────────────────────────────

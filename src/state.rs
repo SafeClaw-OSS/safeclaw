@@ -760,6 +760,24 @@ impl AppState {
         }
     }
 
+    /// The approval-hold window (seconds): how long a pending `ask` op waits
+    /// for the passkey gesture before it expires. This is the user's
+    /// `aux.policy.timeout` ("Approval timeout" in the console), or a 5-minute
+    /// default. DISTINCT from the post-approval `ask`-once grant window (the
+    /// rule/floor `ttl`) — a long grant window must not stretch the deadline the
+    /// user has to actually approve. Falls back to the default when the vault is
+    /// locked or sets no timeout.
+    pub fn policy_approval_hold(&self, vault_id: &str) -> u64 {
+        const DEFAULT_APPROVAL_HOLD: u64 = 300;
+        let states = self.vault_states.lock().unwrap();
+        match states.get(vault_id) {
+            Some(VaultState::Unlocked { cache, .. }) => {
+                cache.policy.timeout.unwrap_or(DEFAULT_APPROVAL_HOLD)
+            }
+            _ => DEFAULT_APPROVAL_HOLD,
+        }
+    }
+
     // ── Proxy-facing accessors (resident phantom-only proxy) ─────────────────
 
     /// Clone a connection record out of the unlocked routing snapshot. `None`
