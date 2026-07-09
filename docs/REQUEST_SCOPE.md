@@ -162,10 +162,13 @@ scope   = ["amount", "merchant"]
 consent = "Pay {amount} to {merchant}"
 ```
 ```toml
-# policy.toml  (purchase base stays ask; a large purchase escalates)
-[[rule]] id="purchase"       match="POST /v2/purchase" level="ask"
-[[rule]] id="purchase-large" match="POST /v2/purchase" when="vars.amount > 80" level="ask-always"
+# policy.toml  (a spend is ask-always + bound; a hard cap denies via `when`)
+[[rule]] id="purchase"     match="POST /v2/purchase" level="ask-always"
+[[rule]] id="purchase-cap" match="POST /v2/purchase" when="vars.amount > 1000" level="deny"
 ```
+A purchase is `ask-always` (single-use, bound to amount+merchant), NOT `ask`:
+a reusable `ask` window would let the same spend repeat unprompted. `when` here
+composes a hard ceiling (deny > ask-always).
 Exact body field names (`/amount`, `/merchant_id`) are pinned at e2e against the
 live Snaplii A2M API and adjusted if they differ.
 
@@ -223,11 +226,16 @@ still silently ignored — orthogonal to this feature.)
 Surfaced by the adversarial review; each fails SAFE (toward more gating / a
 re-prompt) or is a documented author responsibility, none is a silent bypass:
 
-- **Binding is an `ask-always` property.** A plain `ask` shows the consent on
-  approval but its TTL window is not re-bound per request. For an action where
-  each invocation must be individually authorized and bound, use `ask-always`
-  (snaplii escalates to it above the threshold; the sub-threshold base `ask` is
-  the "approve once, then a short convenience window" tier by choice).
+- **A scoped decision binds; the tier picks single-use vs reuse.** A request
+  that resolves a non-empty scope is bound for BOTH `ask` and `ask-always`:
+  `ask-always` is single-use (every request re-prompts); a scoped `ask` peeks —
+  reused for the SAME bound values within its window, but a DIFFERENT value
+  (a different amount / merchant) still misses and re-prompts. So a scoped-ask
+  consent is never a false promise. **An irreversible or spending action must be
+  `ask-always`, not `ask`**: a reusable window still lets the *identical* spend
+  repeat unprompted, which for money is drainage. (An UNSCOPED `ask` — no
+  `[requests]` — keeps the Phase-1 connection-wide window: the documented
+  usable-but-not-bound default.)
 - **Whitelist binds only named fields.** A body field not in `scope` is neither
   shown nor bound — the author must name every field that defines the action
   (P4/P5). For snaplii, if the live purchase body carries a recipient/SKU, add

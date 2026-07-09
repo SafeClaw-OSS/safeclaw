@@ -699,63 +699,59 @@ pub async fn approve_op(
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
             let level = pc.as_ref().map(|p| p.level);
-            if level == Some(crate::core::policy::AccessLevel::AskAlways) {
-                // ask-always: the approval is a ONE-SHOT bound to the exact
-                // request the user saw — (connection, method, host, path) off
-                // the op scope the proxy stamped at op-create. Never the
-                // conn-keyed `entries`: a conn-global value would let ANY
-                // later ask-always request on this connection (any method /
-                // path) silently spend an unconsumed approval. If the binding
-                // tuple is missing (malformed scope), store NOTHING — the
-                // replay re-prompts, which is the safe failure.
+            // Phase 2: fold the bound `[requests]` scope-field values the proxy
+            // stamped into `scope.scope_vars` (and the passkey signed) into the
+            // grant identity. Rebuild the SAME sorted pairs the redeem path
+            // re-extracts from the live request, so an approval for `amount=80`
+            // can't be spent by `amount=180`. Empty (no requests shape) ⇒ `""`.
+            let bound: Vec<(String, String)> = scope
+                .get("scope_vars")
+                .and_then(|v| v.as_object())
+                .map(|m| {
+                    let mut pairs: Vec<(String, String)> = m
+                        .iter()
+                        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                        .collect();
+                    pairs.sort_by(|a, b| a.0.cmp(&b.0));
+                    pairs
+                })
+                .unwrap_or_default();
+            let scope_digest = crate::service::scope_digest(&bound);
+            let is_ask_always = level == Some(crate::core::policy::AccessLevel::AskAlways);
+            let scoped_ask =
+                level == Some(crate::core::policy::AccessLevel::Ask) && !scope_digest.is_empty();
+            if is_ask_always || scoped_ask {
+                // Request-BOUND grant (`op_grants`), keyed by the exact request
+                // the user saw — (connection, method, host, path, scope_digest)
+                // off the op scope. Never the conn-keyed `entries`: a conn-global
+                // value would let a DIFFERENT request on this connection silently
+                // ride the approval. ask-always is single-use; a scoped ask is
+                // reusable for the SAME bound action within its window. If the
+                // binding tuple is missing (malformed scope), store NOTHING — the
+                // replay re-prompts, the safe failure.
                 let method = scope.get("method").and_then(|v| v.as_str()).unwrap_or("");
                 let path = scope.get("path").and_then(|v| v.as_str()).unwrap_or("");
                 let host = pc
                     .as_ref()
                     .and_then(|p| p.host.clone())
-                    .or_else(|| {
-                        scope.get("host").and_then(|v| v.as_str()).map(String::from)
-                    })
+                    .or_else(|| scope.get("host").and_then(|v| v.as_str()).map(String::from))
                     .unwrap_or_default();
-                // Phase 2: the grant identity also folds the bound `[requests]`
-                // scope-field values the proxy stamped into `scope.scope_vars`
-                // (and the user's passkey signed). Rebuild the SAME sorted pairs
-                // the redeem path re-extracts from the live request, so an
-                // approval for `amount=80` can't be spent by `amount=180`. Empty
-                // (no requests shape) ⇒ `""` = the Phase-1 path-only key.
-                let bound: Vec<(String, String)> = scope
-                    .get("scope_vars")
-                    .and_then(|v| v.as_object())
-                    .map(|m| {
-                        let mut pairs: Vec<(String, String)> = m
-                            .iter()
-                            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                            .collect();
-                        pairs.sort_by(|a, b| a.0.cmp(&b.0));
-                        pairs
-                    })
-                    .unwrap_or_default();
-                let scope_digest = crate::service::scope_digest(&bound);
+                let window = if is_ask_always {
+                    crate::state::ASK_ALWAYS_REPLAY_WINDOW_SECS
+                } else {
+                    pc.as_ref().map(|p| p.ttl_seconds).unwrap_or(300)
+                };
                 if !conn.is_empty() && !method.is_empty() && !host.is_empty() && !path.is_empty() {
-                    state.op_grant_insert(
-                        &vault_id,
-                        &conn,
-                        method,
-                        &host,
-                        path,
-                        &scope_digest,
-                        s_o,
-                        now + crate::state::ASK_ALWAYS_REPLAY_WINDOW_SECS,
-                    );
+                    state.op_grant_insert(&vault_id, &conn, method, &host, path, &scope_digest, s_o, now + window);
                 } else {
                     tracing::warn!(
                         vault = %vault_id, op = %op_id,
-                        "ask-always approve without a full request binding — grant not stored (replay will re-prompt)"
+                        "bound approve without a full request binding — grant not stored (replay will re-prompt)"
                     );
                 }
             } else if !conn.is_empty() {
-                // ask (and legacy no-context ops): conn-keyed value with the
-                // grant-window TTL, read by the downgraded-to-Allow retry.
+                // Unscoped ask (and legacy no-context ops): conn-keyed value with
+                // the grant-window TTL, read by the downgraded-to-Allow retry.
                 let ttl = pc.as_ref().map(|p| p.ttl_seconds).unwrap_or(300);
                 state.cache_insert(&vault_id, &conn, s_o, Some(now + ttl));
             }
@@ -1251,8 +1247,20 @@ pub async fn approve_op(
     //   - The level was Allow / AskAlways / Deny (not stored)
     //   - The vault relocked between approve and now (record_ask_approval
     //     is a no-op then)
+    // A SCOPED ask does NOT use this conn-keyed downgrade window — it was bound
+    // into `op_grants` above (redeemed by peek), so writing a rule_approvals
+    // entry here would let `evaluate` downgrade it to Allow and fast-path a
+    // DIFFERENT bound value on the connection. Only an UNSCOPED ask (Phase-1)
+    // takes the window.
+    let has_scope_binding = validated
+        .op
+        .act
+        .scope
+        .get("scope_vars")
+        .and_then(|v| v.as_object())
+        .is_some_and(|m| !m.is_empty());
     if let Some(pc) = policy_ctx_for_cache {
-        if pc.level == crate::core::policy::AccessLevel::Ask {
+        if pc.level == crate::core::policy::AccessLevel::Ask && !has_scope_binding {
             // The grant is scoped to the **connection** (CONNECTION_SCHEMA.md §6):
             // approving account A's request never fast-paths account B. Falls back
             // to `service` for the default connection (conn == service).

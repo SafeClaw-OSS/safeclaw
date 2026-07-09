@@ -517,13 +517,20 @@ impl AppState {
         }
     }
 
-    /// Look up AND remove the `ask-always` one-shot grant for exactly this
-    /// request tuple — single-use consumption, the replay half of the
-    /// captive-portal contract. A request whose (method, host, path) differs
-    /// from what the user approved is a miss and re-prompts; there is NO
-    /// fallback to the conn-keyed `entries` (allow residency / plain-ask
-    /// leftovers are not grants for an ask-always action). `None` when
-    /// locked / absent / expired.
+    /// Redeem the scope-bound grant for exactly this request tuple. A request
+    /// whose (method, host, path, scope_digest) differs from what the user
+    /// approved is a miss and re-prompts; there is NO fallback to the conn-keyed
+    /// `entries` (allow residency / plain-ask leftovers are not grants for a
+    /// bound action). `None` when locked / absent / expired.
+    ///
+    /// `consume` distinguishes the two bound tiers:
+    ///   - `ask-always` → `true`: single-use, removed on redeem (each request
+    ///     re-prompts).
+    ///   - a scoped `ask` → `false`: PEEK — the grant is reused for the SAME
+    ///     bound action within its window, but a DIFFERENT action (different
+    ///     digest) still misses and re-prompts. (An irreversible/spending action
+    ///     should be `ask-always`: a peeked window still lets the identical
+    ///     spend repeat, which for money is drainage.)
     pub fn op_grant_take(
         &self,
         vault_id: &str,
@@ -532,6 +539,7 @@ impl AppState {
         host: &str,
         path: &str,
         scope_digest: &str,
+        consume: bool,
     ) -> Option<Vec<u8>> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -549,13 +557,18 @@ impl AppState {
             path.to_string(),
             scope_digest.to_string(),
         );
-        let entry = cache.op_grants.remove(&key)?;
-        if let Some(exp) = entry.expires_at {
-            if now >= exp {
-                return None;
-            }
+        // Peek first so an expired entry (of either tier) is dropped and a
+        // reusable ask grant survives a hit.
+        let entry = cache.op_grants.get(&key)?;
+        if entry.expires_at.is_some_and(|exp| now >= exp) {
+            cache.op_grants.remove(&key);
+            return None;
         }
-        Some(entry.value)
+        if consume {
+            cache.op_grants.remove(&key).map(|e| e.value)
+        } else {
+            Some(entry.value.clone())
+        }
     }
 
     /// Like [`Self::cache_lookup`] but **grant-only**: a bootstrap-resident value
@@ -1011,7 +1024,7 @@ mod tests {
         // real conn-keyed ask grant) is invisible to op_grant_take.
         state.cache_insert("v1", "github", b"granted".to_vec(), None);
         assert_eq!(
-            state.op_grant_take("v1", "github", "DELETE", "api.github.com", "/repos/a/b", ""),
+            state.op_grant_take("v1", "github", "DELETE", "api.github.com", "/repos/a/b", "", true),
             None
         );
         // The ask path sees its grant as usual.
@@ -1037,12 +1050,12 @@ mod tests {
         state.op_grant_insert("v1", "svc", "POST", "api.x.com", "/v2/purchase", "", b"tok".to_vec(), far);
         // First take returns the value …
         assert_eq!(
-            state.op_grant_take("v1", "svc", "POST", "api.x.com", "/v2/purchase", ""),
+            state.op_grant_take("v1", "svc", "POST", "api.x.com", "/v2/purchase", "", true),
             Some(b"tok".to_vec())
         );
         // … and removes it: a second take misses, and nothing leaked into the
         // conn-keyed entries for the allow/ask paths to find.
-        assert_eq!(state.op_grant_take("v1", "svc", "POST", "api.x.com", "/v2/purchase", ""), None);
+        assert_eq!(state.op_grant_take("v1", "svc", "POST", "api.x.com", "/v2/purchase", "", true), None);
         assert_eq!(state.cache_lookup("v1", "svc"), None);
     }
 
@@ -1057,13 +1070,13 @@ mod tests {
         let far = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() + 600;
         state.op_grant_insert("v1", "svc", "POST", "api.x.com", "/v2/purchase", "", b"tok".to_vec(), far);
         // Different path / method / host / connection → all miss.
-        assert_eq!(state.op_grant_take("v1", "svc", "POST", "api.x.com", "/v2/refund", ""), None);
-        assert_eq!(state.op_grant_take("v1", "svc", "DELETE", "api.x.com", "/v2/purchase", ""), None);
-        assert_eq!(state.op_grant_take("v1", "svc", "POST", "api.y.com", "/v2/purchase", ""), None);
-        assert_eq!(state.op_grant_take("v1", "other", "POST", "api.x.com", "/v2/purchase", ""), None);
+        assert_eq!(state.op_grant_take("v1", "svc", "POST", "api.x.com", "/v2/refund", "", true), None);
+        assert_eq!(state.op_grant_take("v1", "svc", "DELETE", "api.x.com", "/v2/purchase", "", true), None);
+        assert_eq!(state.op_grant_take("v1", "svc", "POST", "api.y.com", "/v2/purchase", "", true), None);
+        assert_eq!(state.op_grant_take("v1", "other", "POST", "api.x.com", "/v2/purchase", "", true), None);
         // Host comparison is case-insensitive (hosts are lowercased at insert).
         assert_eq!(
-            state.op_grant_take("v1", "svc", "POST", "API.X.COM", "/v2/purchase", ""),
+            state.op_grant_take("v1", "svc", "POST", "API.X.COM", "/v2/purchase", "", true),
             Some(b"tok".to_vec())
         );
     }
@@ -1074,7 +1087,7 @@ mod tests {
         unlock_with_empty_cache(&state, "v1");
         state.op_grant_insert("v1", "svc", "POST", "api.x.com", "/p", "", b"stale".to_vec(), 0);
         // Expired grant is not returned (and is consumed/dropped).
-        assert_eq!(state.op_grant_take("v1", "svc", "POST", "api.x.com", "/p", ""), None);
+        assert_eq!(state.op_grant_take("v1", "svc", "POST", "api.x.com", "/p", "", true), None);
     }
 
     /// Phase 2: the scope digest is part of the key. Approving `amount=80`
@@ -1090,13 +1103,33 @@ mod tests {
         let d180 = crate::service::scope_digest(&[("amount".into(), "180".into())]);
         state.op_grant_insert("v1", "svc", "POST", "api.x.com", "/v2/purchase", &d80, b"tok".to_vec(), far);
         // The tampered ($180) replay misses and does NOT consume…
-        assert_eq!(state.op_grant_take("v1", "svc", "POST", "api.x.com", "/v2/purchase", &d180), None);
+        assert_eq!(state.op_grant_take("v1", "svc", "POST", "api.x.com", "/v2/purchase", &d180, true), None);
         // …so the honest ($80) replay still succeeds, exactly once.
         assert_eq!(
-            state.op_grant_take("v1", "svc", "POST", "api.x.com", "/v2/purchase", &d80),
+            state.op_grant_take("v1", "svc", "POST", "api.x.com", "/v2/purchase", &d80, true),
             Some(b"tok".to_vec())
         );
-        assert_eq!(state.op_grant_take("v1", "svc", "POST", "api.x.com", "/v2/purchase", &d80), None);
+        assert_eq!(state.op_grant_take("v1", "svc", "POST", "api.x.com", "/v2/purchase", &d80, true), None);
+    }
+
+    /// A scoped `ask` peeks (reuses within its window for the SAME bound
+    /// action), while a DIFFERENT bound value still misses — so the request
+    /// consent is never a false promise, but the identical action isn't
+    /// re-prompted every time (that's the ask-vs-ask-always distinction).
+    #[test]
+    fn op_grant_take_peek_reuses_same_action_but_not_a_different_one() {
+        let state = test_state();
+        unlock_with_empty_cache(&state, "v1");
+        let far = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() + 600;
+        let d_read = crate::service::scope_digest(&[("q".into(), "alpha".into())]);
+        let d_other = crate::service::scope_digest(&[("q".into(), "beta".into())]);
+        state.op_grant_insert("v1", "svc", "POST", "api.x.com", "/search", &d_read, b"tok".to_vec(), far);
+        // Peek (consume=false) reuses the SAME action any number of times…
+        assert_eq!(state.op_grant_take("v1", "svc", "POST", "api.x.com", "/search", &d_read, false), Some(b"tok".to_vec()));
+        assert_eq!(state.op_grant_take("v1", "svc", "POST", "api.x.com", "/search", &d_read, false), Some(b"tok".to_vec()));
+        // …but a DIFFERENT bound value misses (re-prompt), without disturbing the grant.
+        assert_eq!(state.op_grant_take("v1", "svc", "POST", "api.x.com", "/search", &d_other, false), None);
+        assert_eq!(state.op_grant_take("v1", "svc", "POST", "api.x.com", "/search", &d_read, false), Some(b"tok".to_vec()));
     }
 
     #[test]

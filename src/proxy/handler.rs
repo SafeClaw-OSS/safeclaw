@@ -494,16 +494,21 @@ impl BrokerHandler {
         //     all, so it can't ride the allow residency OR a plain-ask/stale
         //     leftover: an approval is spendable only by the action the user
         //     saw, once.
+        let scoped = !scope_digest.is_empty();
         let (primary, secrets_map) = match level {
+            // Single-use, request-bound.
             AccessLevel::AskAlways => (
-                self.state.op_grant_take(
-                    &vault_id,
-                    &conn,
-                    &method,
-                    &dest_host,
-                    &path,
-                    &scope_digest,
-                ),
+                self.state
+                    .op_grant_take(&vault_id, &conn, &method, &dest_host, &path, &scope_digest, true),
+                None,
+            ),
+            // A scoped `ask` is ALSO request-bound (peek/reuse within window),
+            // so its consent is never a false promise: a different field value
+            // misses and re-prompts. An UNSCOPED ask keeps the Phase-1 conn-keyed
+            // grant (the documented "usable but not fully bound" default).
+            AccessLevel::Ask if scoped => (
+                self.state
+                    .op_grant_take(&vault_id, &conn, &method, &dest_host, &path, &scope_digest, false),
                 None,
             ),
             AccessLevel::Ask => (self.state.cache_lookup_grant(&vault_id, &conn), None),

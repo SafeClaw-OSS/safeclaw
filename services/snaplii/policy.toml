@@ -20,21 +20,27 @@ write = "allow"
 # The quote (POST /v2/quote) deliberately stays on the floor: it prices a cart
 # without committing anything — gating it would put friction on the browse
 # loop while the purchase itself is already gated.
+# A purchase is an irreversible spend, so it is `ask-always` — approved EVERY
+# time and bound to the exact amount + merchant (service.toml
+# `[requests.purchase]`). Not a plain `ask`: an `ask` opens a reuse window, and
+# for money a reusable window means the identical spend can repeat unprompted —
+# so a spend must be single-use. Binding means approving "$80 to Acme" cannot be
+# redeemed as "$180" or "to a different merchant"; the console shows exactly
+# that line ("Buy from Acme for 80").
 [[rule]]
 id = "purchase"
 label = "Buy a gift card (spends wallet balance)"
 match = "POST /v2/purchase"
-level = "ask"
-
-# A large purchase escalates to ask-always: approved every time, and bound to
-# the exact amount + merchant (service.toml `[requests.purchase]`). Composes by
-# most-restrictive-wins — a purchase over the threshold matches BOTH rules, so
-# ask-always beats ask; at or under it, only the base rule fires (`ask`). The
-# `vars.amount` comes from the request shape; an undefined amount → this rule
-# simply doesn't fire (the base `ask` still gates the spend).
-[[rule]]
-id = "purchase-large"
-label = "Buy a gift card over $80 (bound to amount + merchant)"
-match = "POST /v2/purchase"
-when = "vars.amount > 80"
 level = "ask-always"
+
+# A hard ceiling, gated on the body amount (`when`): a purchase over $1000 is
+# blocked outright, not just prompted. Demonstrates a field-value decision
+# composing by most-restrictive-wins (deny beats ask-always). `vars.amount` is
+# the bound field; an undefined amount → this rule doesn't fire and the spend
+# stays ask-always (never a bypass).
+[[rule]]
+id = "purchase-cap"
+label = "Block a purchase over $1000"
+match = "POST /v2/purchase"
+when = "vars.amount > 1000"
+level = "deny"
