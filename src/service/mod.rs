@@ -87,8 +87,8 @@ impl ServiceDef {
     /// Resolve the request into its matching `[requests]` shape and extract the
     /// declared vars — the join point that feeds both a policy `when` and the
     /// approval binding/consent. `None` when no shape matches (⇒ no vars, an
-    /// empty scope: the Phase-1 path-only grant). The first matching shape wins;
-    /// shapes should not overlap (a build lint warns). Body is parsed as JSON
+    /// empty scope: the Phase-1 path-only grant). Selection is deterministic
+    /// (see below); shapes should not overlap. Body is parsed as JSON
     /// once; a non-JSON body or a pointer that misses leaves that var undefined
     /// (per P3, an undefined var makes a `when` simply not fire, and it is
     /// omitted from the bound set).
@@ -99,10 +99,20 @@ impl ServiceDef {
         query: Option<&str>,
         body: Option<&str>,
     ) -> Option<RequestScope> {
-        let (shape_name, shape) = self.requests.iter().find(|(_, s)| {
+        // Deterministic selection: `requests` is a HashMap, so iterate its keys
+        // in a STABLE (sorted) order — otherwise two overlapping shapes would
+        // pick a random winner per process, making the bound digest unstable
+        // (a legit replay could hash a different shape than approve did →
+        // spurious re-prompt). Shapes should not overlap; this makes "they
+        // shouldn't, but if they do" harmless and repeatable.
+        let mut names: Vec<&String> = self.requests.keys().collect();
+        names.sort();
+        let (shape_name, shape) = names.into_iter().find_map(|n| {
+            let s = &self.requests[n];
             s.match_pattern
                 .iter()
                 .any(|p| crate::core::policy::pattern_matches(p, method, path))
+                .then_some((n, s))
         })?;
         let body_json: Option<serde_json::Value> = body.and_then(|b| serde_json::from_str(b).ok());
         let mut vars = crate::core::policy::VarMap::new();
@@ -116,11 +126,15 @@ impl ServiceDef {
         }
         // The bound subset: scope vars that actually resolved, sorted for a
         // stable digest. An unresolved scope var is simply omitted (approve and
-        // redeem both omit it, so the identity stays consistent).
+        // redeem both omit it, so the identity stays consistent). A large value
+        // (a whole email with an attachment) is bound by DIGEST, not verbatim —
+        // otherwise it would bloat the op that travels the approval relay
+        // (approve.rs would 413). approve and redeem apply the SAME cap, so the
+        // grant identity is unchanged; only the display degrades to a summary.
         let mut bound: Vec<(String, String)> = shape
             .scope
             .iter()
-            .filter_map(|k| vars.get(k).map(|v| (k.clone(), v.clone())))
+            .filter_map(|k| vars.get(k).map(|v| (k.clone(), cap_bound_value(v))))
             .collect();
         bound.sort_by(|a, b| a.0.cmp(&b.0));
         Some(RequestScope {
@@ -418,10 +432,79 @@ pub struct RequestShape {
     /// nothing bound (P5). Whitelist only in v1.
     #[serde(default)]
     pub scope: Vec<String>,
-    /// A human phrasing rendered on the approval screen; `{name}` interpolates
-    /// var `name`. Every referenced var must be in `scope` (verified at build).
+    /// How the approval screen phrases this action. Either a text template
+    /// (`"Buy from {merchant} for {amount}"`) or a named renderer
+    /// (`{ render = "email" }`). See [`ConsentSpec`].
     #[serde(default)]
-    pub consent: Option<String>,
+    pub consent: Option<ConsentSpec>,
+}
+
+/// The approval-screen presentation for a request shape. Two forms (untagged):
+/// a **text template** interpolated over the bound vars, or a **named
+/// renderer** the frontend owns (e.g. `email` decodes the bound `raw` message
+/// into From/To/Subject/Body). The toml only ever NAMES a renderer — the
+/// decode/layout code lives in the console, keeping the definition declarative
+/// (the same "standardized ⇒ config, bespoke ⇒ code" split as `[auth]`).
+///
+/// **P4 (show ⊆ bind) holds by construction for the rich form**: a renderer can
+/// only read the bound `scope_vars`, so it can never show a value the grant
+/// doesn't lock. The text form is checked explicitly at build (`{tokens}` ⊆
+/// scope). Unknown `render` ids degrade to the generic field view.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+pub enum ConsentSpec {
+    /// `"Buy from {merchant} for {amount}"` — interpolated over `scope_vars`.
+    Text(String),
+    /// `{ render = "email", title = "Email to send" }` — a frontend renderer id
+    /// (+ optional header) fed the bound `scope_vars`.
+    Rich(RichConsent),
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RichConsent {
+    /// Frontend renderer id (`email`, `payment`, …). Unknown ⇒ generic view.
+    pub render: String,
+    /// Optional header override; the renderer supplies a default otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+}
+
+impl ConsentSpec {
+    /// The `{token}` names a text template interpolates (empty for the rich
+    /// form). Used by build verification for the show ⊆ bind check.
+    pub fn text_tokens(&self) -> Vec<String> {
+        match self {
+            ConsentSpec::Text(t) => consent_tokens(t),
+            ConsentSpec::Rich(_) => Vec::new(),
+        }
+    }
+}
+
+/// The `{name}` tokens a consent text template interpolates. `{{`/`}}` is a
+/// literal brace. Unterminated `{` is ignored.
+pub fn consent_tokens(template: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let bytes = template.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'{' {
+            if i + 1 < bytes.len() && bytes[i + 1] == b'{' {
+                i += 2;
+                continue;
+            }
+            if let Some(end) = template[i + 1..].find('}') {
+                let name = template[i + 1..i + 1 + end].trim().to_string();
+                if !name.is_empty() {
+                    out.push(name);
+                }
+                i = i + 1 + end + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
 }
 
 /// Where a var is addressed. OpenAPI's `in` convention.
@@ -498,14 +581,32 @@ pub struct RequestScope {
     /// The scope-bound `(name, value)` pairs, SORTED by name. What
     /// [`scope_digest`] hashes into the grant identity. Empty ⇒ nothing bound.
     pub bound: Vec<(String, String)>,
-    /// The shape's consent template, if any.
-    pub consent: Option<String>,
+    /// The shape's consent presentation spec, if any.
+    pub consent: Option<ConsentSpec>,
 }
 
 impl RequestScope {
     /// The digest of the bound values — the grant-identity extension.
     pub fn digest(&self) -> String {
         scope_digest(&self.bound)
+    }
+}
+
+/// A bound value larger than this is bound by digest, not verbatim, so the op
+/// that carries it (through the approval relay) stays small. 8 KiB keeps a
+/// normal email/JSON field verbatim (the console renders it legibly) while a
+/// message with a big attachment degrades to a summary instead of 413-ing.
+const BOUND_VALUE_CAP: usize = 8 * 1024;
+
+/// Cap a bound value: verbatim if small, else `sha256:<hex>#<len>` — applied
+/// identically at op-create AND at redeem, so the grant identity is stable; the
+/// console shows the marker when it can't render the (absent) full value.
+fn cap_bound_value(v: &str) -> String {
+    if v.len() <= BOUND_VALUE_CAP {
+        v.to_string()
+    } else {
+        use sha2::{Digest, Sha256};
+        format!("sha256:{:x}#{}", Sha256::digest(v.as_bytes()), v.len())
     }
 }
 
@@ -1576,7 +1677,7 @@ consent = "Buy from {merchant} for {amount}"
             rs.bound,
             vec![("amount".to_string(), "80".to_string()), ("merchant".to_string(), "m_1".to_string())]
         );
-        assert_eq!(rs.consent.as_deref(), Some("Buy from {merchant} for {amount}"));
+        assert!(matches!(&rs.consent, Some(ConsentSpec::Text(t)) if t == "Buy from {merchant} for {amount}"));
     }
 
     #[test]
@@ -1592,6 +1693,39 @@ consent = "Buy from {merchant} for {amount}"
         assert!(rs.vars.get("merchant").is_none());
         // Only the resolved scope var is bound.
         assert_eq!(rs.bound, vec![("amount".to_string(), "5".to_string())]);
+    }
+
+    #[test]
+    fn consent_text_and_rich_forms_parse() {
+        // Text form → tokens for the show ⊆ bind check.
+        let def = snaplii_def();
+        let c = &def.requests["purchase"].consent;
+        assert!(matches!(c, Some(ConsentSpec::Text(_))));
+        assert_eq!(c.as_ref().unwrap().text_tokens(), vec!["merchant", "amount"]);
+        // Rich form → a named renderer, no text tokens (show ⊆ bind by construction).
+        let gmail: ServiceDef = toml::from_str(
+            r#"
+[service]
+id = "gmail"
+name = "Gmail"
+hosts = ["gmail.googleapis.com"]
+secrets = ["GMAIL_REFRESH_TOKEN"]
+[requests.send]
+match = "POST /gmail/v1/users/me/messages/send"
+vars.raw = "/raw"
+scope = ["raw"]
+consent = { render = "email", title = "Email to send" }
+"#,
+        )
+        .unwrap();
+        match &gmail.requests["send"].consent {
+            Some(ConsentSpec::Rich(r)) => {
+                assert_eq!(r.render, "email");
+                assert_eq!(r.title.as_deref(), Some("Email to send"));
+            }
+            other => panic!("expected rich consent, got {other:?}"),
+        }
+        assert!(gmail.requests["send"].consent.as_ref().unwrap().text_tokens().is_empty());
     }
 
     #[test]
@@ -1616,5 +1750,20 @@ consent = "Buy from {merchant} for {amount}"
         assert_ne!(a.digest(), c.digest(), "changed amount → different digest → re-prompt");
         // Empty scope collapses to "" (the Phase-1 key).
         assert_eq!(scope_digest(&[]), "");
+    }
+
+    #[test]
+    fn large_bound_value_is_digested_not_verbatim() {
+        // A big field (a whole email) binds by digest so the op stays small —
+        // and the digest is still deterministic and tamper-sensitive.
+        let big = "x".repeat(BOUND_VALUE_CAP + 100);
+        let capped = cap_bound_value(&big);
+        assert!(capped.starts_with("sha256:"), "large value → digest marker, got {capped}");
+        assert!(capped.len() < 100, "marker is small, not the whole value");
+        // Small values stay verbatim.
+        assert_eq!(cap_bound_value("hello"), "hello");
+        // Same big value → same marker (stable identity); a changed one differs.
+        assert_eq!(cap_bound_value(&big), capped);
+        assert_ne!(cap_bound_value(&"y".repeat(BOUND_VALUE_CAP + 100)), capped);
     }
 }

@@ -510,7 +510,12 @@ impl Condition {
         let Some(value) = vars.get(&self.var) else {
             return false;
         };
-        let value_num = value.parse::<f64>().ok();
+        // Trim so a padded amount (`"100 "`, `"\t80"`) that the upstream still
+        // reads as a number can't slip under a threshold gate by failing our
+        // parse; reject non-finite (NaN/inf) so exotic encodings don't compare
+        // in surprising ways. A value that still isn't a finite number stays
+        // `None` → an ordering condition is false (the base rule keeps gating).
+        let value_num = value.trim().parse::<f64>().ok().filter(|n| n.is_finite());
         match self.op {
             CmpOp::Eq => match self.lit_num {
                 Some(n) => value_num == Some(n),
@@ -986,6 +991,14 @@ mod tests {
         assert!(Condition::parse(r#"vars.merchant != "evil""#).unwrap().eval(&vars));
         // Undefined var → false (P3), never a panic.
         assert!(!Condition::parse("vars.missing > 0").unwrap().eval(&vars));
+        // A padded numeric string still compares (can't evade a threshold by
+        // whitespace); non-finite never satisfies an ordering.
+        let mut padded = VarMap::new();
+        padded.insert("amount".into(), " 100 ".into());
+        assert!(Condition::parse("vars.amount > 80").unwrap().eval(&padded));
+        let mut naan = VarMap::new();
+        naan.insert("amount".into(), "NaN".into());
+        assert!(!Condition::parse("vars.amount > 80").unwrap().eval(&naan));
         // Ordering against a non-numeric value → false, not an error.
         assert!(!Condition::parse("vars.merchant > 0").unwrap().eval(&vars));
         // Malformed → None (build-time rejects; runtime treats as non-match).

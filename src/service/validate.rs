@@ -298,7 +298,10 @@ fn validate_service_inner(toml_str: &str) -> Result<(), Vec<String>> {
                 }
             }
         }
-        // scope ⊆ vars: you can only bind a field you declared.
+        // scope ⊆ vars: you can only bind a field you declared. Reject
+        // duplicates too — a repeated entry makes the approve digest (object,
+        // deduped) and redeem digest (vec, not) permanently disagree.
+        let mut seen_scope = HashSet::new();
         for k in &shape.scope {
             if !shape.vars.contains_key(k) {
                 errs.push(format!(
@@ -306,11 +309,15 @@ fn validate_service_inner(toml_str: &str) -> Result<(), Vec<String>> {
                     name, k
                 ));
             }
+            if !seen_scope.insert(k) {
+                errs.push(format!("[requests.{}] scope lists '{}' more than once", name, k));
+            }
         }
-        // P4 show ⊆ bind: every {token} a consent template interpolates must be
-        // in scope (so the user can only be shown values the grant locks).
+        // P4 show ⊆ bind (text form): every {token} a consent template
+        // interpolates must be in scope. The rich `{ render }` form satisfies
+        // show ⊆ bind by construction — its renderer only reads `scope_vars`.
         if let Some(consent) = &shape.consent {
-            for tok in consent_tokens(consent) {
+            for tok in consent.text_tokens() {
                 if !shape.scope.contains(&tok) {
                     errs.push(format!(
                         "[requests.{}] consent references '{{{}}}', which is not in `scope` (show ⊆ bind)",
@@ -322,33 +329,6 @@ fn validate_service_inner(toml_str: &str) -> Result<(), Vec<String>> {
     }
 
     if errs.is_empty() { Ok(()) } else { Err(errs) }
-}
-
-/// The `{name}` tokens a consent template interpolates. A `{{`/`}}` is a
-/// literal brace (not a token). Unterminated `{` is ignored (a `match`-time
-/// render just leaves it literal).
-fn consent_tokens(template: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let bytes = template.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'{' {
-            if i + 1 < bytes.len() && bytes[i + 1] == b'{' {
-                i += 2;
-                continue;
-            }
-            if let Some(end) = template[i + 1..].find('}') {
-                let name = template[i + 1..i + 1 + end].trim().to_string();
-                if !name.is_empty() {
-                    out.push(name);
-                }
-                i = i + 1 + end + 1;
-                continue;
-            }
-        }
-        i += 1;
-    }
-    out
 }
 
 /// Cross-file check: every `vars.<name>` a policy.toml rule's `when` references
@@ -364,6 +344,15 @@ pub fn validate_service_policy(service_toml: &str, policy_toml: &str) -> Result<
         .values()
         .flat_map(|s| s.vars.keys().map(|k| k.as_str()))
         .collect();
+    // A field the DECISION depends on must also be BOUND — else an ask-always
+    // approved for `risk == "high"` could be redeemed at `risk == "low"`
+    // (the grant wouldn't lock the deciding field). So a `when` var must be in
+    // SOME shape's scope, not merely declared.
+    let bound: HashSet<&str> = def
+        .requests
+        .values()
+        .flat_map(|s| s.scope.iter().map(|k| k.as_str()))
+        .collect();
     let mut errs = Vec::new();
     for rule in &policy.rule {
         let Some(when) = &rule.when else { continue };
@@ -376,6 +365,11 @@ pub fn validate_service_policy(service_toml: &str, policy_toml: &str) -> Result<
         if !declared.contains(bare) {
             errs.push(format!(
                 "rule '{}': `when` references var '{}', which no [requests] shape declares",
+                rule.id, cond.var_name()
+            ));
+        } else if !bound.contains(bare) {
+            errs.push(format!(
+                "rule '{}': `when` gates on var '{}', which is not in any shape's `scope` — a deciding field must be bound (add it to scope)",
                 rule.id, cond.var_name()
             ));
         }
@@ -731,6 +725,34 @@ level = "ask-always"
         let policy_malformed = policy_ok.replace("vars.amount > 80", "amount is big");
         let e = validate_service_policy(REQ_SERVICE, &policy_malformed).unwrap_err();
         assert!(e.iter().any(|s| s.contains("not a valid condition")), "got {:?}", e);
+    }
+
+    #[test]
+    fn policy_when_var_must_be_bound_in_scope() {
+        // A var declared but NOT in scope: gating on it is rejected (a deciding
+        // field must be bound, else the approved decision can differ from the
+        // redeemed one).
+        let svc = REQ_SERVICE.replace(
+            "vars.amount = \"/amount\"",
+            "vars.amount = \"/amount\"\nvars.risk = \"/risk\"",
+        );
+        let policy = r#"
+[[rule]]
+id = "risky"
+label = "risky"
+match = "POST /buy"
+when = "vars.risk == \"high\""
+level = "ask-always"
+"#;
+        let e = validate_service_policy(&svc, policy).unwrap_err();
+        assert!(e.iter().any(|s| s.contains("not in any shape's `scope`")), "got {:?}", e);
+    }
+
+    #[test]
+    fn duplicate_scope_entry_rejected() {
+        let bad = REQ_SERVICE.replace(r#"scope = ["amount"]"#, r#"scope = ["amount", "amount"]"#);
+        let e = validate_service(&bad).unwrap_err();
+        assert!(e.iter().any(|s| s.contains("more than once")), "got {:?}", e);
     }
 
     #[test]

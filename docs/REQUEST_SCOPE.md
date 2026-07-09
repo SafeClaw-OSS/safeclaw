@@ -61,9 +61,12 @@ consent = "Pay {amount} to {merchant}"      # human phrasing; {name} vars must b
 
 - **`match`** — `"METHOD /path"` (or `"/path"` for any method); `*` = one segment,
   `**` = trailing depth. Exactly the policy-rule matcher (`match_spec`). A list is
-  an OR. Shapes should not overlap; the first declared wins and a build lint warns.
+  an OR. Shapes should not overlap; if they do, selection is deterministic (the
+  matching shape whose name sorts first wins) so the bound digest stays stable.
 - **`vars.<name>`** — an address into the request:
-  - a **bare string** = a JSON Pointer into the (JSON or form-urlencoded) **body**;
+  - a **bare string** = a JSON Pointer into the **body** (parsed as JSON; v1 is
+    JSON-only — a non-JSON body leaves body vars undefined, which is safe: a
+    `when` doesn't fire and nothing is bound);
   - `{ in = "query", at = "<param>" }` = a **query** parameter by name;
   - `{ in = "body", at = "/ptr" }` = the explicit long form of the bare string.
   Addressing is structural (RFC 6901), never a regex over serialized bytes, so
@@ -214,6 +217,39 @@ future edit drops snaplii's `amount` var while a rule still says
 `vars.amount > 80`, the suite goes red. (`policy.toml` has no
 `deny_unknown_fields` today, a pre-existing gap: a mistyped rule FIELD name is
 still silently ignored — orthogonal to this feature.)
+
+## Known limitations (deliberate for v1)
+
+Surfaced by the adversarial review; each fails SAFE (toward more gating / a
+re-prompt) or is a documented author responsibility, none is a silent bypass:
+
+- **Binding is an `ask-always` property.** A plain `ask` shows the consent on
+  approval but its TTL window is not re-bound per request. For an action where
+  each invocation must be individually authorized and bound, use `ask-always`
+  (snaplii escalates to it above the threshold; the sub-threshold base `ask` is
+  the "approve once, then a short convenience window" tier by choice).
+- **Whitelist binds only named fields.** A body field not in `scope` is neither
+  shown nor bound — the author must name every field that defines the action
+  (P4/P5). For snaplii, if the live purchase body carries a recipient/SKU, add
+  it to `scope` at e2e.
+- **`when` is a refinement, not a gate of last resort (P3).** An undefined var
+  makes its rule not fire; if a `when` rule were the ONLY thing between a path
+  and a permissive floor, an unreadable field would fall through to that floor.
+  Always keep a base rule (snaplii's `purchase → ask` under the
+  `purchase-large → ask-always`). Verification requires a `when` var to be
+  bound, but does not (cannot) prove a base rule exists.
+- **Parser differential.** The binding assumes SafeClaw's JSON parse equals the
+  upstream's. `serde_json` is duplicate-key-last-wins and lenient in ways a
+  given API may not share; a crafted body (`{"amount":180,"amount":80}`) could
+  bind/show one value while the upstream acts on another. This is the
+  proxy-vs-origin parsing class (cf. request smuggling); out of scope for v1.
+- **Numeric canonicalization.** `80`, `80.0`, `8e1` compare equal to a `when`
+  threshold but bind three different digest strings — so a replay that
+  re-serializes the number differently re-prompts (fails safe, never
+  under-binds). A literal byte-identical replay is unaffected.
+- **Large values bind by digest.** A bound value over 8 KiB (a big email) binds
+  its `sha256:…#len` instead of the verbatim value, so the op stays under the
+  relay's size limit; its console preview degrades to the marker.
 
 ## Deferred (documented, not built in v1)
 

@@ -770,7 +770,12 @@ impl BrokerHandler {
                 scope["scope_vars"] = serde_json::Value::Object(obj);
             }
             if let Some(c) = &rs.consent {
-                scope["consent"] = serde_json::Value::String(c.clone());
+                // Either a "text template" string or a {render,title} object —
+                // the console picks the renderer. Display-only (not in the
+                // digest); still signed into β, and strings-only so JCS is happy.
+                if let Ok(v) = serde_json::to_value(c) {
+                    scope["consent"] = v;
+                }
             }
         }
         let op = Operation {
