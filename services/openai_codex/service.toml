@@ -35,8 +35,12 @@ exposes = ["account_id"]
 account_id = ["https://api.openai.com/auth", "chatgpt_account_id"]
 
 # Codex CLI's own consent-URL params (build_authorize_url in openai/codex):
-# the simplified flow renders the code-on-page consent this client expects, and
-# id_token_add_organizations puts the account claims into the id_token.
+# the simplified flow renders the code-on-page consent this client expects,
+# id_token_add_organizations puts the account claims into the id_token, and
+# originator identifies the client software — sent verbatim as the real CLI
+# sends it so OpenAI renders the same consent (a missing originator was the
+# suspected cause of a differently-rendered page; verify at codex e2e).
 [auth.authorize_params]
 id_token_add_organizations = "true"
 codex_cli_simplified_flow = "true"
+originator = "codex_cli_rs"
