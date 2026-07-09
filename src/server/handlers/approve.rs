@@ -1410,11 +1410,11 @@ fn seed_per_item_store(
 }
 
 /// The role KEYs cached for a service's connections: the declared `secrets`
-/// plus any `[oauth2].exposes` roles (derived at connect, stored UPPERCASED —
+/// plus any oauth `[auth].exposes` roles (derived at connect, stored UPPERCASED —
 /// the phantom's lowercase segment matches case-insensitively at resolve).
 fn cacheable_roles(svc: &crate::service::ServiceDef) -> Vec<String> {
     let mut roles: Vec<String> = svc.service.secrets.clone();
-    if let Some(o) = &svc.oauth2 {
+    if let Some(o) = svc.oauth2() {
         roles.extend(o.exposes.iter().map(|r| r.to_ascii_uppercase()));
     }
     roles

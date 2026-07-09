@@ -128,11 +128,12 @@ pub struct RegistryService {
     pub secrets: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub policy: Option<RegistryServicePolicy>,
-    /// The PUBLIC oauth2 half — provider + scopes — for the browse catalog. The
-    /// confidential half (client_secret / token_url) is never exposed
-    /// (cloud-blind). Absent for non-oauth2 / summary.
+    /// The PUBLIC `[auth]` half — mechanism type plus, for oauth2, provider +
+    /// scopes — mirrors the toml's `[auth] type = …`. The confidential wiring
+    /// (client_secret / token_url) is never exposed (cloud-blind). Absent for
+    /// static services / summary.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub oauth2: Option<RegistryServiceOAuth2>,
+    pub auth: Option<RegistryServiceAuth>,
     /// Auxiliary: where a human mints this service's key/token ([service]
     /// `secret_url`). Display-only. Absent for summary / services without one.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -148,11 +149,13 @@ pub struct RegistryService {
     pub setup: Option<String>,
 }
 
-/// The public oauth2 summary on a service catalog row (browse view).
+/// The public `[auth]` summary on a service catalog row (browse view),
+/// type-discriminated like the toml section it mirrors.
 #[derive(Debug, Serialize)]
-pub struct RegistryServiceOAuth2 {
-    pub provider: String,
-    pub scopes: Vec<String>,
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum RegistryServiceAuth {
+    Oauth2 { provider: String, scopes: Vec<String> },
+    Snaplii {},
 }
 
 /// An established CONNECTION row — 1:1 with `aux.connections` plus the DERIVED
@@ -324,7 +327,7 @@ fn build_service(
             hosts: vec![],
             secrets: vec![],
             policy: None,
-            oauth2: None,
+            auth: None,
             secret_url: None,
             connect: None,
             setup: None,
@@ -332,11 +335,15 @@ fn build_service(
     }
 
     let policy = policy_for(services, id, include_policy_rules);
-    let oauth2 = def.oauth2.as_ref().map(|o| RegistryServiceOAuth2 {
-        // Wire shape stays a plain string; a fully-inline section (no template)
-        // reads "custom" — same label ConnectDescriptor::provider falls back to.
-        provider: o.provider.clone().unwrap_or_else(|| "custom".to_string()),
-        scopes: o.scopes.clone(),
+    let auth = def.auth.as_ref().map(|a| match a {
+        crate::service::AuthDef::Oauth2(o) => RegistryServiceAuth::Oauth2 {
+            // Wire shape stays a plain string; a fully-inline section (no
+            // template) reads "custom" — same label ConnectDescriptor falls
+            // back to.
+            provider: o.provider.clone().unwrap_or_else(|| "custom".to_string()),
+            scopes: o.scopes.clone(),
+        },
+        crate::service::AuthDef::Snaplii(_) => RegistryServiceAuth::Snaplii {},
     });
 
     RegistryService {
@@ -347,15 +354,14 @@ fn build_service(
         hosts: def.service.hosts.clone(),
         secrets: def.service.secrets.clone(),
         policy,
-        oauth2,
+        auth,
         secret_url: def.service.secret_url.clone(),
         // Resolve the descriptor from the `def` in hand, not by id — the id
         // lookup only knows built-ins, so a per-vault custom oauth2 service
         // (passed here with its own def) would get `connect: null` and never
         // look connectable in the console.
         connect: def
-            .oauth2
-            .as_ref()
+            .oauth2()
             .and_then(|o| services.connect_descriptor_for(o)),
         setup: if render_setup_hint {
             render_setup(def)
@@ -630,7 +636,8 @@ name = "Acme"
 hosts = ["api.acme.dev"]
 secrets = ["REFRESH_TOKEN"]
 
-[oauth2]
+[auth]
+type = "oauth2"
 authorization_url = "https://auth.acme.dev/authorize"
 token_url = "https://auth.acme.dev/token"
 client_id = "acme-public"
@@ -724,7 +731,7 @@ secrets = ["GITHUB_TOKEN"]
         assert!(sum.secrets.is_empty());
         assert!(sum.policy.is_none());
         assert!(sum.connect.is_none());
-        assert!(sum.oauth2.is_none());
+        assert!(sum.auth.is_none());
         assert!(sum.setup.is_none());
         // Full view carries the declared hosts + secrets.
         assert_eq!(full.hosts, def.service.hosts);

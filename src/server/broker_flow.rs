@@ -107,13 +107,14 @@ pub fn register_pending_use(
 }
 
 /// Resolve the credential value the proxy injects for a phantom before egress.
-/// For a direct service this is a no-op (returns the stored bytes). For an
-/// `[oauth2]` service the `raw` bytes are the refresh token, not the access
-/// token the upstream wants: exchange them at the provider's `/token` endpoint
-/// (or reuse a still-valid cached access token) and return the fresh access
-/// token. The access-token cache lives on `AppState::oauth_access`, keyed by
-/// connection (never persisted). On `invalid_grant` the connection is flagged
-/// needs-reauth and an `Unauthorized` propagates.
+/// For a static service this is a no-op (returns the stored bytes). For a
+/// MINTED mechanism (`[auth]`) the `raw` bytes are the mint's INPUT (oauth2
+/// refresh token / snaplii api key), not the wire token the upstream wants:
+/// exchange them at the mechanism's token endpoint (or reuse a still-valid
+/// cached token) and return the fresh token. The token cache lives on
+/// `AppState::oauth_access`, keyed by connection (never persisted). On an
+/// invalid input credential the connection is flagged needs-reauth and an
+/// `Unauthorized` propagates.
 pub async fn resolve_auth_value(
     state: &Arc<crate::state::AppState>,
     vault_id: &str,
@@ -121,36 +122,36 @@ pub async fn resolve_auth_value(
     service_id: &str,
     raw: &[u8],
 ) -> Result<Vec<u8>> {
-    // Resolve the oauth2 config from the SAME sources the pipeline used to decide
-    // this is an oauth connection: the compiled registry AND the vault's custom
-    // services (aux.services). A custom `[oauth2]` service lives only in the
-    // latter — looking only at the compiled registry would miss it and fall
-    // through to returning `raw`, i.e. the refresh token, straight to the
-    // upstream. That must never happen.
+    // Resolve the mechanism from the SAME sources the pipeline used to decide
+    // this is a minted connection: the vault's custom services (aux.services)
+    // AND the compiled registry. A custom def lives only in the former —
+    // looking only at the compiled registry would miss it and fall through to
+    // returning `raw`, i.e. the mint input, straight to the upstream. That
+    // must never happen.
     // custom-FIRST (see proxy::handler): mint against the vault-authored def when
     // present — the SAME precedence the forward path uses, so the two never
-    // disagree about which oauth config backs a connection.
-    let oauth = state
+    // disagree about which config backs a connection.
+    let auth = state
         .custom_service(vault_id, service_id)
-        .and_then(|s| s.oauth2.clone())
+        .and_then(|s| s.auth.clone())
         .or_else(|| {
             state
                 .services
                 .get(service_id)
-                .and_then(|s| s.oauth2.clone())
+                .and_then(|s| s.auth.clone())
         });
-    let Some(oauth) = oauth else {
-        // The pipeline only calls this for an oauth ACCESS phantom (is_oauth was
-        // true from the resolved def). Not finding a config here means the two
-        // disagree — fail closed, never leak the refresh token as a fallback.
+    let Some(auth) = auth else {
+        // The pipeline only calls this for a minted ACCESS phantom (mint_input
+        // was Some from the resolved def). Not finding a mechanism here means
+        // the two disagree — fail closed, never leak the input as a fallback.
         return Err(AppError::Internal(format!(
-            "connection '{}' resolved as oauth2 but service '{}' exposes no oauth2 config",
+            "connection '{}' resolved as minted but service '{}' exposes no [auth] mechanism",
             conn_id, service_id
         )));
     };
 
-    // §5: mint cache keyed by sha256(refresh_token). The refresh is read LOCALLY
-    // only to compute the key; on a hit nothing is minted and the refresh never
+    // §5: mint cache keyed by sha256(mint input). The input is read LOCALLY
+    // only to compute the key; on a hit nothing is minted and the input never
     // leaves the daemon.
     let refresh_hash = sha256_hex(raw);
     if let Some(cached) = state.oauth_access_lookup(vault_id, &refresh_hash) {
@@ -168,6 +169,42 @@ pub async fn resolve_auth_value(
     if let Some(cached) = state.oauth_access_lookup(vault_id, &refresh_hash) {
         return Ok(cached);
     }
+
+    let oauth = match auth {
+        crate::service::AuthDef::Oauth2(o) => o,
+        crate::service::AuthDef::Snaplii(_) => {
+            // Snaplii's bespoke key→JWT exchange (auth::snaplii): same cache,
+            // same key, no rotation. The connection id doubles as the agent
+            // label Snaplii sees (user-chosen; multi-account = distinct ids).
+            let api_key = std::str::from_utf8(raw).map_err(|_| {
+                AppError::Internal(format!("snaplii api key for '{}' not utf-8", service_id))
+            })?;
+            let (jwt, expires_at) = crate::auth::snaplii::exchange(api_key, conn_id)
+                .await
+                .map_err(|e| {
+                    tracing::warn!(vault = %vault_id, service = %service_id, "snaplii exchange failed: {}", e);
+                    if e.contains("HTTP 401") || e.contains("HTTP 403") {
+                        // The stored key itself was refused — reconnect territory.
+                        state.oauth_mark_reauth(vault_id, conn_id);
+                        AppError::Unauthorized(format!(
+                            "snaplii api key rejected — reconnect {}",
+                            service_id
+                        ))
+                    } else {
+                        AppError::Internal(e)
+                    }
+                })?;
+            state.oauth_clear_reauth(vault_id, conn_id);
+            let safe_expires_at = expires_at.saturating_sub(60);
+            state.oauth_access_insert(
+                vault_id,
+                &refresh_hash,
+                jwt.as_bytes().to_vec(),
+                safe_expires_at,
+            );
+            return Ok(jwt.into_bytes());
+        }
+    };
 
     let resolved = state.services.resolve_oauth_config(&oauth);
     let token_url = resolved.token_url.as_deref().ok_or_else(|| {

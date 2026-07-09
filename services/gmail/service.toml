@@ -7,7 +7,8 @@ tags = ["app"]
 hosts = ["gmail.googleapis.com"]
 secrets = ["GMAIL_REFRESH_TOKEN"]
 
-[oauth2]
+[auth]
+type = "oauth2"
 # Display label only ("Connect with Google") — carries no config.
 provider = "google"
 scopes = [
@@ -48,6 +49,6 @@ redirect_uri      = "http://127.0.0.1:8765/safeclaw/oauth/callback"
 
 # Google-specific consent-URL params: without access_type=offline +
 # prompt=consent a repeat consent returns no refresh_token.
-[oauth2.authorize_params]
+[auth.authorize_params]
 access_type = "offline"
 prompt      = "consent"

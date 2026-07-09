@@ -3,7 +3,7 @@
 /// Each service is defined by a `service.toml` in `services/{id}/` (flat — the
 /// dir name is the id; classification lives in the `tags` field, not layout).
 /// A service declares what a minimal connection has — `hosts` + `secrets` —
-/// plus the one non-direct production (`[oauth2]`) and cosmetic helpers. No
+/// plus the auth mechanism (`[auth]`, absent = static) and cosmetic helpers. No
 /// routing/transport is declared: the phantom is the sole intent carrier and
 /// the request already carries the real upstream URL.
 
@@ -16,16 +16,20 @@ use crate::auth::oauth2::OAuthStyle;
 
 /// A service TYPE. `deny_unknown_fields` rejects stale v3 sections and any
 /// tool-named section (`[git]`, `[docker]`) at parse — auth is a MECHANISM,
-/// never a tool, and the only named auth section is `[oauth2]`.
+/// never a tool, and the only auth section is `[auth]` (type-discriminated).
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServiceDef {
     pub service: ServiceMeta,
-    /// The sole non-direct production. When present, the phantom resolves to a
-    /// minted OAuth access token; the refresh token named by `oauth2.refresh_token`
-    /// is internal by construction and never injectable.
+    /// The auth MECHANISM — how the wire credential is produced from the
+    /// stored secret(s). Discriminated by `type` (the same shape as OpenAPI
+    /// `securitySchemes.type`). ABSENT = static: the stored secret IS the wire
+    /// value, substituted verbatim wherever the agent's phantom names it.
+    /// When present, the default phantom resolves to a MINTED short-lived
+    /// token and the mechanism's input role (`mint_input_role`) is internal
+    /// by construction and never injectable.
     #[serde(default)]
-    pub oauth2: Option<OAuth2Def>,
+    pub auth: Option<AuthDef>,
     /// Optional agent-facing `setup` prose: service-specific guidance on where a
     /// phantom goes for this service's tools (a header, an env var, a URL) when
     /// run under `sc run --`. Plain text — no template tokens.
@@ -39,21 +43,51 @@ pub struct ServiceDef {
 }
 
 impl ServiceDef {
-    /// The stored secret role that backs this service's credential: the oauth2
-    /// refresh-token role for an `[oauth2]` service, else its first `secrets`
-    /// entry. `None` when it declares neither. A pure projection over the def —
-    /// the SINGLE source of truth for "which vault role holds this service's
-    /// secret", so a registry service and a vault-custom service resolve
-    /// identically. Callers that only have a `service_id` and a registry go
-    /// through [`service_env_key`]; callers that may face a custom service
-    /// resolve the `ServiceDef` first (registry `.or_else(custom_service)`) and
-    /// call this directly.
-    pub fn env_role(&self) -> Option<String> {
-        if let Some(o) = self.oauth2.as_ref() {
-            let s = o.refresh_token.trim();
-            if !s.is_empty() {
-                return Some(s.to_string());
+    /// The `[auth] type = "oauth2"` section, when that is this service's
+    /// mechanism. Shorthand for the oauth-only call sites (consent flow,
+    /// console wiring) so they don't each match on [`AuthDef`].
+    pub fn oauth2(&self) -> Option<&OAuth2Def> {
+        match self.auth.as_ref() {
+            Some(AuthDef::Oauth2(o)) => Some(o),
+            _ => None,
+        }
+    }
+
+    /// The stored role that is the INPUT of a minted mechanism — the value the
+    /// mint consumes (oauth2's refresh token, snaplii's api key). `Some` ⇔ the
+    /// connection's wire credential is minted, and this role is internal by
+    /// construction: a phantom naming it gets the precise never-injectable
+    /// refusal. `None` for a static service.
+    pub fn mint_input_role(&self) -> Option<String> {
+        match self.auth.as_ref()? {
+            AuthDef::Oauth2(o) => {
+                let s = o.refresh_token.trim();
+                (!s.is_empty()).then(|| s.to_string())
             }
+            AuthDef::Snaplii(_) => self.first_secret(),
+        }
+    }
+
+    fn first_secret(&self) -> Option<String> {
+        self.service
+            .secrets
+            .iter()
+            .map(|s| s.trim())
+            .find(|s| !s.is_empty())
+            .map(|s| s.to_string())
+    }
+
+    /// The stored secret role that backs this service's credential: the mint
+    /// input role for a minted service, else its first `secrets` entry. `None`
+    /// when it declares neither. A pure projection over the def — the SINGLE
+    /// source of truth for "which vault role holds this service's secret", so a
+    /// registry service and a vault-custom service resolve identically. Callers
+    /// that only have a `service_id` and a registry go through
+    /// [`service_env_key`]; callers that may face a custom service resolve the
+    /// `ServiceDef` first (custom `.or_else(registry)`) and call this directly.
+    pub fn env_role(&self) -> Option<String> {
+        if let Some(r) = self.mint_input_role() {
+            return Some(r);
         }
         self.service
             .secrets
@@ -64,7 +98,35 @@ impl ServiceDef {
     }
 }
 
-/// The one named auth MECHANISM. The `[oauth2]` section is SELF-SUFFICIENT: it
+/// The `[auth]` section: which mechanism produces this service's wire
+/// credential, discriminated by `type` — the same shape as OpenAPI's
+/// `securitySchemes.type`. The rule that keeps this enum honest: a mechanism
+/// whose wire format is STANDARDIZED (oauth2 — RFC 6749 fixes the vocabulary)
+/// is declarative config; a bespoke envelope with no published vocabulary
+/// (snaplii) is a code built-in and its variant carries no config, because
+/// parameterizing an unstandardized wire would mean inventing a private DSL.
+/// Absent `[auth]` = static (the 70% case): no mint, phantom substitutes the
+/// stored secret verbatim.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AuthDef {
+    /// OAuth 2.0 (RFC 6749): the stored refresh token mints access tokens at
+    /// `token_url`. Fields are the RFC's own names, declared inline.
+    Oauth2(OAuth2Def),
+    /// Snaplii's bespoke key→JWT exchange (`auth::snaplii`). The envelope is
+    /// unstandardized (JSON `{agent_id, api_key}` → JWT; no OAuth grant), so
+    /// it lives in code; the variant is deliberately field-free.
+    Snaplii(SnapliiDef),
+}
+
+/// `[auth] type = "snaplii"` carries no configuration — the exchange envelope
+/// (URL, field names, response shape) is hard-coded in [`crate::auth::snaplii`]
+/// and the input key is the service's first `secrets` role.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SnapliiDef {}
+
+/// The oauth2 mechanism config. The section is SELF-SUFFICIENT: it
 /// declares the endpoints + public client inline (`authorization_url`,
 /// `token_url`, `client_id`, …) — the same shape whether it ships in-tree or is
 /// user-authored (`aux.services`). There is no template/inheritance layer;
@@ -691,7 +753,7 @@ impl ServiceRegistry {
     /// section lacks an authorization_url + client_id.
     pub fn connect_descriptor(&self, service_id: &str) -> Option<ConnectDescriptor> {
         let def = self.services.get(service_id)?;
-        let oauth = def.oauth2.as_ref()?;
+        let oauth = def.oauth2()?;
         self.connect_descriptor_for(oauth)
     }
 
@@ -832,7 +894,7 @@ secrets = ["GITHUB_TOKEN"]
         assert_eq!(def.service.id, "github");
         assert_eq!(def.service.hosts, vec!["api.github.com", "github.com"]);
         assert_eq!(def.service.secrets, vec!["GITHUB_TOKEN"]);
-        assert!(def.oauth2.is_none());
+        assert!(def.auth.is_none());
     }
 
     #[test]
@@ -844,13 +906,14 @@ name = "Gmail"
 
 hosts = ["gmail.googleapis.com"]
 
-[oauth2]
+[auth]
+type = "oauth2"
 provider = "google"
 scopes = ["https://www.googleapis.com/auth/gmail.send"]
 refresh_token = "GMAIL_REFRESH_TOKEN"
 "#;
         let def: ServiceDef = toml::from_str(toml_str).unwrap();
-        let o = def.oauth2.as_ref().unwrap();
+        let o = def.oauth2().unwrap();
         assert_eq!(o.provider.as_deref(), Some("google"));
         assert_eq!(o.refresh_token, "GMAIL_REFRESH_TOKEN");
         assert_eq!(o.scopes.len(), 1);
@@ -866,13 +929,64 @@ name = "OpenAI Codex"
 
 hosts = ["api.openai.com"]
 
-[oauth2]
+[auth]
+type = "oauth2"
 provider = "openai"
 refresh_token = "OPENAI_CODEX_REFRESH_TOKEN"
 exposes = ["account_id"]
 "#;
         let def: ServiceDef = toml::from_str(toml_str).unwrap();
-        assert_eq!(def.oauth2.as_ref().unwrap().exposes, vec!["account_id"]);
+        assert_eq!(def.oauth2().unwrap().exposes, vec!["account_id"]);
+    }
+
+    #[test]
+    fn parse_auth_snaplii_and_mint_roles() {
+        let toml_str = r#"
+[service]
+id = "snaplii"
+name = "Snaplii"
+hosts = ["aipayment.snaplii.com"]
+secrets = ["SNAPLII_API_KEY"]
+
+[auth]
+type = "snaplii"
+"#;
+        let def: ServiceDef = toml::from_str(toml_str).unwrap();
+        assert!(matches!(def.auth, Some(AuthDef::Snaplii(_))));
+        assert!(def.oauth2().is_none());
+        // The mint input (and thus env_role / never-injectable role) is the
+        // first secrets entry.
+        assert_eq!(def.mint_input_role().as_deref(), Some("SNAPLII_API_KEY"));
+        assert_eq!(def.env_role().as_deref(), Some("SNAPLII_API_KEY"));
+    }
+
+    #[test]
+    fn auth_section_rejects_unknown_type_and_legacy_oauth2_section() {
+        // Unknown mechanism type fails at parse, never a silent static fallback.
+        let bad = r#"
+[service]
+id = "x"
+name = "X"
+hosts = ["x.example.com"]
+
+[auth]
+type = "sigv4-someday"
+"#;
+        assert!(toml::from_str::<ServiceDef>(bad).is_err());
+
+        // The retired section name is an unknown field at the top level — the
+        // serde error names the offending section, pointing authors at [auth].
+        let legacy = r#"
+[service]
+id = "x"
+name = "X"
+hosts = ["x.example.com"]
+
+[oauth2]
+refresh_token = "K"
+"#;
+        let err = toml::from_str::<ServiceDef>(legacy).unwrap_err().to_string();
+        assert!(err.contains("oauth2"), "error should name the offending section: {}", err);
     }
 
     #[test]
@@ -906,7 +1020,8 @@ url = "https://x.com"
 id = "gmail"
 name = "Gmail"
 hosts = ["gmail.googleapis.com"]
-[oauth2]
+[auth]
+type = "oauth2"
 provider = "google"
 refresh_token = "GMAIL_REFRESH_TOKEN"
 "#;
@@ -946,7 +1061,8 @@ secrets = ["GITHUB_TOKEN"]
 id = "gcp"
 name = "Google Cloud"
 hosts = ["compute.googleapis.com"]
-[oauth2]
+[auth]
+type = "oauth2"
 provider = "google"
 refresh_token = "GCP_REFRESH_TOKEN"
 "#;
@@ -1019,7 +1135,7 @@ secrets = ["GITHUB_TOKEN"]
             }
             // [oauth2] is self-sufficient: every compiled oauth service must be
             // inline-complete (there is no template layer to fill gaps).
-            if let Some(o) = &def.oauth2 {
+            if let Some(o) = def.oauth2() {
                 assert!(!o.refresh_token.is_empty(), "service '{}' oauth2 has empty refresh_token", id);
                 assert!(o.authorization_url.is_some(), "service '{}' oauth2 missing authorization_url", id);
                 assert!(o.token_url.is_some(), "service '{}' oauth2 missing token_url", id);
@@ -1037,7 +1153,7 @@ secrets = ["GITHUB_TOKEN"]
             }
         }
         let r = reg(services);
-        let oauth = r.get("openai_codex").unwrap().oauth2.clone().expect("codex [oauth2]");
+        let oauth = r.get("openai_codex").unwrap().oauth2().cloned().expect("codex [auth] oauth2");
         let cfg = r.resolve_oauth_config(&oauth);
         assert_eq!(cfg.token_url.as_deref(), Some("https://auth.openai.com/oauth/token"));
         assert_eq!(cfg.client_id.as_deref(), Some("app_EMoamEEZ73f0CkXaXp7hrann"));
@@ -1084,7 +1200,7 @@ secrets = ["GITHUB_TOKEN"]
         let r = reg(services);
         let mut client_ids = std::collections::HashSet::new();
         for id in ["gmail", "gdrive", "gcalendar"] {
-            let oauth = r.get(id).unwrap().oauth2.clone()
+            let oauth = r.get(id).unwrap().oauth2().cloned()
                 .unwrap_or_else(|| panic!("{} missing [oauth2]", id));
             assert_eq!(oauth.provider.as_deref(), Some("google"), "{}", id);
             let cfg = r.resolve_oauth_config(&oauth);

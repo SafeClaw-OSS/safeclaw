@@ -7,7 +7,8 @@ tags = ["app"]
 hosts = ["www.googleapis.com"]
 secrets = ["GOOGLE_DRIVE_REFRESH_TOKEN"]
 
-[oauth2]
+[auth]
+type = "oauth2"
 # Display label only ("Connect with Google") — carries no config.
 provider = "google"
 scopes = [
@@ -27,6 +28,6 @@ client_secret     = "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"
 redirect_uri      = "http://127.0.0.1:8765/safeclaw/oauth/callback"
 
 # Google quirk: without these a repeat consent returns no refresh_token.
-[oauth2.authorize_params]
+[auth.authorize_params]
 access_type = "offline"
 prompt      = "consent"

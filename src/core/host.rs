@@ -137,19 +137,26 @@ fn insert_direct(map: &mut BTreeMap<String, String>, conn_id: &str, roles: &[Str
 }
 
 /// The discovery `phantoms` map (injectable role → ready-made phantom string)
-/// for a service-backed connection. oauth2 → an `ACCESS` short-form phantom
-/// (the minted token) plus one role-qualified phantom per `exposes` entry; the
-/// refresh secret is NEVER in the map. Direct → the service's `secrets` (sole →
-/// short form, several → role-qualified).
+/// for a service-backed connection. A minted mechanism (`[auth]`) → an
+/// `ACCESS` short-form phantom (the minted token) plus, for oauth2, one
+/// role-qualified phantom per `exposes` entry; the mint's input secret is
+/// NEVER in the map. Static → the service's `secrets` (sole → short form,
+/// several → role-qualified).
 pub fn phantoms_for(conn_id: &str, def: &ServiceDef) -> BTreeMap<String, String> {
     let mut map = BTreeMap::new();
-    if let Some(o) = &def.oauth2 {
-        map.insert("ACCESS".to_string(), short_phantom(conn_id));
-        for role in &o.exposes {
-            map.insert(role.to_ascii_uppercase(), role_phantom(conn_id, role));
+    match &def.auth {
+        Some(crate::service::AuthDef::Oauth2(o)) => {
+            map.insert("ACCESS".to_string(), short_phantom(conn_id));
+            for role in &o.exposes {
+                map.insert(role.to_ascii_uppercase(), role_phantom(conn_id, role));
+            }
         }
-    } else {
-        insert_direct(&mut map, conn_id, &def.service.secrets);
+        // Any other minted mechanism (snaplii): the sole injectable is the
+        // minted token behind the default phantom; the input key never appears.
+        Some(_) => {
+            map.insert("ACCESS".to_string(), short_phantom(conn_id));
+        }
+        None => insert_direct(&mut map, conn_id, &def.service.secrets),
     }
     map
 }
@@ -241,7 +248,8 @@ mod tests {
 id = "gmail"
 name = "Gmail"
 hosts = ["gmail.googleapis.com"]
-[oauth2]
+[auth]
+type = "oauth2"
 provider = "google"
 refresh_token = "GMAIL_REFRESH_TOKEN"
 exposes = ["account_id"]

@@ -205,25 +205,32 @@ fn validate_service_inner(toml_str: &str) -> Result<(), Vec<String>> {
     // endpoints + client (there is no template layer; `provider` is a display
     // label only). Endpoint floor: https to a public host, no confidential
     // secret. Exposes are lowercase slugs that don't collide with secrets.
-    if let Some(o) = &def.oauth2 {
+    if let Some(crate::service::AuthDef::Snaplii(_)) = &def.auth {
+        // The snaplii mechanism's exchange input is the first `secrets` role —
+        // a def without one can never mint.
+        if def.mint_input_role().is_none() {
+            errs.push("[auth] type=\"snaplii\" requires a [service] secrets entry (the exchange api key)".into());
+        }
+    }
+    if let Some(o) = def.oauth2() {
         if !(o.authorization_url.is_some() && o.token_url.is_some() && o.client_id.is_some()) {
-            errs.push("[oauth2] must declare authorization_url + token_url + client_id inline".into());
+            errs.push("[auth] oauth2 must declare authorization_url + token_url + client_id inline".into());
         }
         if o.provider.as_deref().is_some_and(|p| p.trim().is_empty()) {
-            errs.push("[oauth2] provider (display label) must not be empty (omit it instead)".into());
+            errs.push("[auth] provider (display label) must not be empty (omit it instead)".into());
         }
         if let Some(u) = &o.authorization_url {
-            validate_https_public_url("[oauth2] authorization_url", u, &mut errs);
+            validate_https_public_url("[auth] authorization_url", u, &mut errs);
         }
         if let Some(u) = &o.token_url {
-            validate_https_public_url("[oauth2] token_url", u, &mut errs);
+            validate_https_public_url("[auth] token_url", u, &mut errs);
         }
         for (role, path) in &o.claims {
             if !o.exposes.iter().any(|e| e == role) {
-                errs.push(format!("[oauth2] claims key '{}' is not in exposes", role));
+                errs.push(format!("[auth] claims key '{}' is not in exposes", role));
             }
             if path.is_empty() || path.iter().any(|s| s.trim().is_empty()) {
-                errs.push(format!("[oauth2] claims path for '{}' has an empty segment", role));
+                errs.push(format!("[auth] claims path for '{}' has an empty segment", role));
             }
         }
         // authorize_params are ADDITIONS to the consent URL — never overrides
@@ -231,7 +238,7 @@ fn validate_service_inner(toml_str: &str) -> Result<(), Vec<String>> {
         for k in o.authorize_params.keys() {
             if RESERVED_AUTHORIZE_PARAMS.contains(&k.as_str()) {
                 errs.push(format!(
-                    "[oauth2] authorize_params may not set the reserved param '{}'",
+                    "[auth] authorize_params may not set the reserved param '{}'",
                     k
                 ));
             }
@@ -324,7 +331,8 @@ id = "gmail"
 name = "Gmail"
 hosts = ["gmail.googleapis.com"]
 secrets = ["GMAIL_REFRESH_TOKEN"]
-[oauth2]
+[auth]
+type = "oauth2"
 provider = "google"
 refresh_token = "GMAIL_REFRESH_TOKEN"
 "#;
@@ -340,7 +348,8 @@ id = "acme"
 name = "Acme"
 hosts = ["api.acme.dev"]
 secrets = ["ACME_REFRESH_TOKEN"]
-[oauth2]
+[auth]
+type = "oauth2"
 authorization_url = "https://auth.acme.dev/authorize"
 token_url = "https://auth.acme.dev/token"
 client_id = "acme-public"
@@ -375,24 +384,25 @@ id = "acme"
 name = "Acme"
 hosts = ["api.acme.dev"]
 secrets = ["ACME_REFRESH_TOKEN"]
-[oauth2]
+[auth]
+type = "oauth2"
 authorization_url = "https://auth.acme.dev/authorize"
 token_url = "https://auth.acme.dev/token"
 client_id = "acme-public"
 refresh_token = "ACME_REFRESH_TOKEN"
 exposes = ["account_id"]
 "#;
-        let good = format!("{base}[oauth2.claims]\naccount_id = [\"ns\", \"leaf\"]\n");
+        let good = format!("{base}[auth.claims]\naccount_id = [\"ns\", \"leaf\"]\n");
         assert!(validate_service(&good).is_ok());
         // claims key must be an exposes role; path segments must be non-empty.
-        let stray = format!("{base}[oauth2.claims]\nother = [\"x\"]\n");
+        let stray = format!("{base}[auth.claims]\nother = [\"x\"]\n");
         assert!(validate_service(&stray).is_err());
-        let hollow = format!("{base}[oauth2.claims]\naccount_id = []\n");
+        let hollow = format!("{base}[auth.claims]\naccount_id = []\n");
         assert!(validate_service(&hollow).is_err());
         // authorize_params may add params but never reserved protocol ones.
-        let extra = format!("{base}[oauth2.authorize_params]\nfoo_flag = \"true\"\n");
+        let extra = format!("{base}[auth.authorize_params]\nfoo_flag = \"true\"\n");
         assert!(validate_service(&extra).is_ok());
-        let reserved = format!("{base}[oauth2.authorize_params]\nredirect_uri = \"https://evil.example\"\n");
+        let reserved = format!("{base}[auth.authorize_params]\nredirect_uri = \"https://evil.example\"\n");
         assert!(validate_service(&reserved).is_err());
     }
 

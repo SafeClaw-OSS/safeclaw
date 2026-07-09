@@ -351,13 +351,12 @@ impl BrokerHandler {
                 .custom_service(&vault_id, s)
                 .or_else(|| self.state.services.get(s).cloned())
         });
-        // Some(refresh KEY) ⇔ this is an oauth connection. The key rides along
-        // so the resolver can answer a phantom naming the REFRESH secret with
-        // the precise refusal (never-injectable), not a generic role error.
-        let oauth_refresh = def
-            .as_ref()
-            .and_then(|d| d.oauth2.as_ref())
-            .map(|o| o.refresh_token.clone());
+        // Some(input KEY) ⇔ this connection's wire credential is MINTED (oauth2
+        // access token, snaplii JWT). The key rides along so the resolver can
+        // answer a phantom naming the mint's INPUT secret (refresh token /
+        // api key) with the precise refusal (never-injectable), not a generic
+        // role error.
+        let mint_input = def.as_ref().and_then(|d| d.mint_input_role());
         // The vault role that backs this connection's credential (oauth refresh
         // key, else first declared secret), resolved from the SAME custom-aware
         // `def` above — NOT re-derived registry-only downstream. This is the op
@@ -461,7 +460,7 @@ impl BrokerHandler {
                 &vault_id,
                 &conn,
                 &service_id,
-                oauth_refresh.as_deref(),
+                mint_input.as_deref(),
                 &phantoms,
                 primary,
                 secrets_map,
@@ -582,17 +581,18 @@ impl BrokerHandler {
         vault_id: &str,
         conn: &str,
         service_id: &str,
-        oauth_refresh: Option<&str>,
+        mint_input: Option<&str>,
         phantoms: &[Phantom],
         primary: Option<Vec<u8>>,
         secrets_map: Option<HashMap<String, Vec<u8>>>,
     ) -> Result<HashMap<String, String>, ResolveErr> {
         let mut out = HashMap::new();
         for ph in phantoms {
-            let is_oauth = oauth_refresh.is_some();
+            let is_minted = mint_input.is_some();
             let bytes: Vec<u8> =
-                if is_oauth && ph.role.as_deref().map(|r| r == "access").unwrap_or(true) {
-                    // The oauth ACCESS phantom: mint from the refresh token (primary).
+                if is_minted && ph.role.as_deref().map(|r| r == "access").unwrap_or(true) {
+                    // The ACCESS phantom of a minted mechanism: mint from the stored
+                    // input secret (primary) — oauth refresh token / snaplii api key.
                     let refresh = primary.clone().ok_or(ResolveErr::NeedsApproval)?;
                     crate::server::broker_flow::resolve_auth_value(
                         &self.state,
@@ -606,13 +606,13 @@ impl BrokerHandler {
                         crate::error::AppError::Unauthorized(m) => ResolveErr::Mint(m),
                         other => ResolveErr::Mint(format!("{:?}", other)),
                     })?
-                } else if is_oauth {
+                } else if is_minted {
                     let role = ph.role.clone().unwrap_or_default();
                     // Naming the REFRESH secret is a category error, not a missing
                     // feature: phantoms resolve to a connection's PRODUCED value
                     // (the minted access token), never a production INPUT. The
                     // refusal is precise so the boundary self-documents.
-                    if oauth_refresh.is_some_and(|k| role.eq_ignore_ascii_case(k)) {
+                    if mint_input.is_some_and(|k| role.eq_ignore_ascii_case(k)) {
                         return Err(ResolveErr::RefreshForbidden);
                     }
                     // An `exposes` value derived at connect (e.g. codex account_id):

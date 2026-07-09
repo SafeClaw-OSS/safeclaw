@@ -81,7 +81,7 @@ pub fn resolve_exchange_config(
     // custom-FIRST (see proxy::handler): a vault-authored def wins over a same-id
     // registry service for connect / token-exchange too.
     let svc = custom.get(service).or_else(|| services.get(service))?;
-    let oauth = svc.oauth2.as_ref()?;
+    let oauth = svc.oauth2()?;
     let resolved = services.resolve_oauth_config(oauth);
     let token_url = resolved.token_url?;
     let client_id = resolved.client_id?;
@@ -1218,7 +1218,8 @@ name = "Acme"
 hosts = ["api.acme.dev"]
 secrets = ["REFRESH_TOKEN"]
 
-[oauth2]
+[auth]
+type = "oauth2"
 authorization_url = "https://auth.acme.dev/authorize"
 token_url = "https://auth.acme.dev/token"
 client_id = "acme-public"
@@ -1260,7 +1261,8 @@ name = "Custom shadow of gmail"
 hosts = ["api.example.test"]
 secrets = ["REFRESH_TOKEN"]
 
-[oauth2]
+[auth]
+type = "oauth2"
 authorization_url = "https://shadow.test/authorize"
 token_url = "https://shadow.test/token"
 client_id = "shadow-client"

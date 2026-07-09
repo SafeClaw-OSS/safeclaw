@@ -17,7 +17,8 @@ secrets = ["OPENAI_CODEX_REFRESH_TOKEN"]
 # client_secret). The consent lands on localhost:1455 (nothing listens — the
 # console's paste-the-URL step reads the code out, same UX as gmail).
 # `provider = "openai"` is the frontend display label only.
-[oauth2]
+[auth]
+type = "oauth2"
 provider = "openai"
 authorization_url = "https://auth.openai.com/oauth/authorize"
 token_url = "https://auth.openai.com/oauth/token"
@@ -30,12 +31,12 @@ exposes = ["account_id"]
 
 # The ChatGPT account id lives in a namespaced id_token claim; older tokens
 # carried it top-level (the leaf name is auto-tried as a fallback).
-[oauth2.claims]
+[auth.claims]
 account_id = ["https://api.openai.com/auth", "chatgpt_account_id"]
 
 # Codex CLI's own consent-URL params (build_authorize_url in openai/codex):
 # the simplified flow renders the code-on-page consent this client expects, and
 # id_token_add_organizations puts the account claims into the id_token.
-[oauth2.authorize_params]
+[auth.authorize_params]
 id_token_add_organizations = "true"
 codex_cli_simplified_flow = "true"
