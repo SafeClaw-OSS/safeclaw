@@ -10,6 +10,15 @@ pub const CONTROL_PORT: u16 = 23295;
 /// agent's tool traffic is routed through by `sc run`'s env bundle.
 pub const PROXY_PORT: u16 = 23294;
 
+/// Default cap on a brokered request's body (bytes) — the unified boundary:
+/// what policy judges and what phantoms resolve against is ONE buffered view
+/// of the body, so a phantom-bearing request whose body exceeds this is
+/// REFUSED (413) rather than forwarded policy-blind. Generous by design (the
+/// daemon runs user-side, authenticated, cost is local); the same convention
+/// as nginx's `client_max_body_size`: hard limit + explained refusal +
+/// user-adjustable knob (`--body-cap` / `SAFECLAW_BODY_CAP`).
+pub const DEFAULT_BODY_CAP: u64 = 32 * 1024 * 1024;
+
 /// Top-level CLI shape. `safeclaw` (short alias `sc`) is one binary
 /// with two roles:
 ///
@@ -771,6 +780,13 @@ pub struct ServeArgs {
     /// local-only (legacy embedded op-page). Auth uses `--admin-key`.
     #[arg(long, env = "SAFECLAW_RELAY_URL")]
     pub relay_url: Option<String>,
+
+    /// Max body size (bytes) the broker will buffer for a phantom-bearing
+    /// request. Over the cap the request is refused with a clear 413 — the
+    /// proxy never forwards a credential alongside a body policy couldn't
+    /// inspect. Raise it if a legitimate brokered upload hits the limit.
+    #[arg(long, env = "SAFECLAW_BODY_CAP", default_value_t = DEFAULT_BODY_CAP)]
+    pub body_cap: u64,
 }
 
 /// `sc status` takes no flags — the daemon (control root) comes from
@@ -948,6 +964,8 @@ pub struct Config {
     pub rp_id: String,
     pub admin_key: Option<String>,
     pub relay_url: Option<String>,
+    /// See `ServeArgs::body_cap` / [`DEFAULT_BODY_CAP`].
+    pub body_cap: u64,
 }
 
 impl Config {
@@ -983,6 +1001,7 @@ impl Config {
             rp_id,
             admin_key: args.admin_key,
             relay_url: args.relay_url,
+            body_cap: args.body_cap,
         }
     }
 }

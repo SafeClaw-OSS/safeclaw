@@ -959,6 +959,7 @@ mod tests {
             rp_id: "localhost".into(),
             admin_key: None,
             relay_url: None,
+            body_cap: crate::config::DEFAULT_BODY_CAP,
         };
         AppState::new(cfg)
     }

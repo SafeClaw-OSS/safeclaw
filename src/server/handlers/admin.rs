@@ -130,6 +130,7 @@ mod tests {
             rp_id: "localhost".into(),
             admin_key: key.map(|s| s.to_string()),
             relay_url: None,
+            body_cap: crate::config::DEFAULT_BODY_CAP,
         };
         let _ = std::fs::create_dir_all(&cfg.state_dir);
         let _ = std::fs::create_dir_all(cfg.state_dir.join("vaults"));

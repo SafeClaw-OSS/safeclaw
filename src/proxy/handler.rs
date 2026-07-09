@@ -23,9 +23,6 @@ use serde_json::json;
 use crate::proxy::resolver::{self, Phantom};
 use crate::state::AppState;
 
-/// Bodies larger than this (or non-text) pass through unscanned — phantoms live
-/// in headers / URL / Basic-auth in practice, never a multi-MiB upload.
-const MAX_BODY_SCAN: u64 = 1024 * 1024;
 
 /// The last-resort `ask`-once window when neither the matched rule nor any
 /// floor (`default.ttl`) pins one — the "Ask once" grant lasts this long after
@@ -187,26 +184,47 @@ impl BrokerHandler {
             merge_phantoms(&mut phantoms, resolver::collect_phantoms(&decoded));
         }
 
-        // Decide whether to buffer the body for scanning (bounded + text-ish).
-        let scan_body = body_is_text(&parts.headers)
-            && content_length(&parts.headers)
-                .map(|n| n <= MAX_BODY_SCAN)
-                .unwrap_or(false);
+        // ── unified body boundary (P1) ───────────────────────────────────────
+        // Policy judgment and phantom resolution consume ONE buffered view of
+        // the body, produced right here — never two boundaries. A request that
+        // names a phantom in its URL/headers is brokered, so its body MUST fit
+        // the cap for policy to see it: over-cap is a hard, explained refusal
+        // (413) — never a policy-blind forward with a live credential, and
+        // never an approval prompt over content the user can't read (P2).
+        // Content-Type takes no part in this decision (it's caller-controlled);
+        // for phantom-less requests it stays a cheap heuristic for whether a
+        // body-only phantom is worth looking for — an unscanned body-only
+        // phantom just reaches upstream literally (a clean 401, the documented
+        // semantic).
+        let cap = self.state.config.body_cap;
+        let header_phantoms = !phantoms.is_empty();
+        if header_phantoms {
+            // A declared over-cap length is refused before reading a byte.
+            if let Some(n) = content_length(&parts.headers) {
+                if n > cap {
+                    return body_over_cap(n, cap).into();
+                }
+            }
+        }
+        let scan_body = header_phantoms
+            || (body_is_text(&parts.headers)
+                && content_length(&parts.headers)
+                    .map(|n| n <= cap)
+                    .unwrap_or(false));
 
         let mut body_bytes: Option<Vec<u8>> = None;
         if scan_body {
-            match orig_body
-                .take()
-                .expect("body present before scan")
-                .collect()
-                .await
-            {
-                Ok(collected) => {
-                    let bytes = collected.to_bytes().to_vec();
-                    if let Ok(s) = std::str::from_utf8(&bytes) {
-                        merge_phantoms(&mut phantoms, resolver::collect_phantoms(s));
-                    }
-                    body_bytes = Some(bytes);
+            // `Limited` enforces the cap even without a Content-Length
+            // (chunked transfer) — the declared-length check above is only the
+            // cheap early exit.
+            let limited = http_body_util::Limited::new(
+                orig_body.take().expect("body present before scan"),
+                cap as usize,
+            );
+            match limited.collect().await {
+                Ok(collected) => body_bytes = Some(collected.to_bytes().to_vec()),
+                Err(e) if e.downcast_ref::<http_body_util::LengthLimitError>().is_some() => {
+                    return body_over_cap(0, cap).into();
                 }
                 Err(e) => {
                     tracing::warn!("proxy: body collect failed: {}", e);
@@ -218,6 +236,15 @@ impl BrokerHandler {
                     .into();
                 }
             }
+        }
+        // One lossy view serves BOTH the phantom scan and policy below, so a
+        // binary(ish) body is not a blind spot: rules evaluate against what is
+        // actually there. Forwarding still uses the untouched raw bytes.
+        let body_text: Option<String> = body_bytes
+            .as_deref()
+            .map(|b| String::from_utf8_lossy(b).into_owned());
+        if let Some(s) = body_text.as_deref() {
+            merge_phantoms(&mut phantoms, resolver::collect_phantoms(s));
         }
 
         // No phantom anywhere → forward untouched (rebuild body if we buffered).
@@ -392,9 +419,8 @@ impl BrokerHandler {
         }
 
         // ── policy ───────────────────────────────────────────────────────────
-        let body_for_policy = body_bytes
-            .as_deref()
-            .and_then(|b| std::str::from_utf8(b).ok());
+        // The same lossy view the phantom scan used (unified boundary).
+        let body_for_policy = body_text.as_deref();
         let decision = self.state.evaluate_request_policy(
             &vault_id,
             &conn,
@@ -1095,6 +1121,31 @@ fn plain(status: StatusCode, msg: &str) -> Response<Body> {
         .expect("static response builds")
 }
 
+/// The unified-boundary refusal (P1/P2): a phantom-bearing request whose body
+/// exceeds the broker cap gets a 413 that says exactly what was over and how
+/// to raise the knob — never a policy-blind forward with a live credential,
+/// and never an approval prompt over content the user can't read.
+/// `declared = 0` means the length was unknown (chunked) and the cap was hit
+/// while buffering.
+fn body_over_cap(declared: u64, cap: u64) -> Response<Body> {
+    let what = if declared > 0 {
+        format!("declared Content-Length ({} bytes)", declared)
+    } else {
+        "streamed body".to_string()
+    };
+    err_response(
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "broker_body_limit",
+        &format!(
+            "this request names a phantom but its {} exceeds the broker's inspectable \
+             cap ({} bytes) — the proxy will not forward a credential alongside a body \
+             policy cannot see. If the request is legitimate, raise the daemon's \
+             --body-cap / SAFECLAW_BODY_CAP.",
+            what, cap
+        ),
+    )
+}
+
 /// A plain-text 4xx/5xx with a machine-readable `x-safeclaw-error` token.
 fn err_response(status: StatusCode, code: &str, msg: &str) -> Response<Body> {
     Response::builder()
@@ -1169,6 +1220,22 @@ mod tests {
 
     fn b64(s: &[u8]) -> String {
         base64::engine::general_purpose::STANDARD.encode(s)
+    }
+
+    /// The unified-boundary refusal contract: 413, machine-readable error
+    /// token, and a message naming both the offending size and the knob —
+    /// P2 says the caller must learn exactly what was over and how to widen.
+    #[test]
+    fn body_over_cap_is_explained_413() {
+        let resp = body_over_cap(50_000_000, 32 * 1024 * 1024);
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            resp.headers().get("x-safeclaw-error").unwrap(),
+            "broker_body_limit"
+        );
+        // Chunked variant (length unknown while buffering) still explains.
+        let resp = body_over_cap(0, 1024);
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[test]
