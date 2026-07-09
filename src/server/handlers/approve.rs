@@ -717,6 +717,25 @@ pub async fn approve_op(
                         scope.get("host").and_then(|v| v.as_str()).map(String::from)
                     })
                     .unwrap_or_default();
+                // Phase 2: the grant identity also folds the bound `[requests]`
+                // scope-field values the proxy stamped into `scope.scope_vars`
+                // (and the user's passkey signed). Rebuild the SAME sorted pairs
+                // the redeem path re-extracts from the live request, so an
+                // approval for `amount=80` can't be spent by `amount=180`. Empty
+                // (no requests shape) ⇒ `""` = the Phase-1 path-only key.
+                let bound: Vec<(String, String)> = scope
+                    .get("scope_vars")
+                    .and_then(|v| v.as_object())
+                    .map(|m| {
+                        let mut pairs: Vec<(String, String)> = m
+                            .iter()
+                            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                            .collect();
+                        pairs.sort_by(|a, b| a.0.cmp(&b.0));
+                        pairs
+                    })
+                    .unwrap_or_default();
+                let scope_digest = crate::service::scope_digest(&bound);
                 if !conn.is_empty() && !method.is_empty() && !host.is_empty() && !path.is_empty() {
                     state.op_grant_insert(
                         &vault_id,
@@ -724,6 +743,7 @@ pub async fn approve_op(
                         method,
                         &host,
                         path,
+                        &scope_digest,
                         s_o,
                         now + crate::state::ASK_ALWAYS_REPLAY_WINDOW_SECS,
                     );
@@ -1490,6 +1510,7 @@ pub(crate) fn bootstrap_cache_from_view(
             "GET",
             "/",
             None,
+            &crate::core::policy::VarMap::new(),
             None,
             conn_levels.as_ref(),
             &effective_policy,

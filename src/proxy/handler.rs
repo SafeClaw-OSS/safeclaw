@@ -418,6 +418,20 @@ impl BrokerHandler {
             return self.widen_deny(&vault_id, &conn, &dest_host, ip).await;
         }
 
+        // ── request scope (Phase 2, docs/REQUEST_SCOPE.md) ─────────────────────
+        // Resolve the matching `[requests]` shape and extract its vars from the
+        // SAME buffered body view (unified boundary) + the URL query. Feeds
+        // three consumers: the policy `when` predicate (`vars`), the ask-always
+        // grant identity (`scope_digest`), and the approval consent (via
+        // `req_scope` → captive_portal). Absent shape ⇒ empty vars + `""` digest
+        // = the Phase-1 path-only grant, unchanged.
+        let req_scope = def.as_ref().and_then(|d| {
+            d.extract_request_scope(&method, &path, parts.uri.query(), body_text.as_deref())
+        });
+        let vars: crate::core::policy::VarMap =
+            req_scope.as_ref().map(|r| r.vars.clone()).unwrap_or_default();
+        let scope_digest = req_scope.as_ref().map(|r| r.digest()).unwrap_or_default();
+
         // ── policy ───────────────────────────────────────────────────────────
         // The same lossy view the phantom scan used (unified boundary).
         let body_for_policy = body_text.as_deref();
@@ -429,6 +443,7 @@ impl BrokerHandler {
             &path,
             &dest_host,
             body_for_policy,
+            &vars,
         );
         let (level, rule_id, ttl) = match decision {
             Some(d) => d,
@@ -481,8 +496,14 @@ impl BrokerHandler {
         //     saw, once.
         let (primary, secrets_map) = match level {
             AccessLevel::AskAlways => (
-                self.state
-                    .op_grant_take(&vault_id, &conn, &method, &dest_host, &path),
+                self.state.op_grant_take(
+                    &vault_id,
+                    &conn,
+                    &method,
+                    &dest_host,
+                    &path,
+                    &scope_digest,
+                ),
                 None,
             ),
             AccessLevel::Ask => (self.state.cache_lookup_grant(&vault_id, &conn), None),
@@ -519,6 +540,7 @@ impl BrokerHandler {
                         level,
                         rule_id,
                         ttl,
+                        req_scope.as_ref(),
                         ip,
                     )
                     .await
@@ -703,6 +725,7 @@ impl BrokerHandler {
         level: crate::core::policy::AccessLevel,
         rule_id: Option<String>,
         ttl: Option<u64>,
+        req_scope: Option<&crate::service::RequestScope>,
         ip: IpAddr,
     ) -> RequestOrResponse {
         use crate::protocol::operation::{Act, ActType, Bind, Operation, Valid};
@@ -724,7 +747,7 @@ impl BrokerHandler {
         // identity default) — the same slot every writer uses.
         let target = crate::storage::plaintext::secret_key_for(Some(conn_rec), &role);
 
-        let scope = json!({
+        let mut scope = json!({
             "connection_id": conn,
             "service": service_id,
             "host": host,
@@ -732,6 +755,24 @@ impl BrokerHandler {
             "path": path,
             "authorize_only": true,
         });
+        // Phase 2: fold the bound `[requests]` scope-field VALUES and the consent
+        // template into the op scope. They are signed into β (the user's passkey
+        // authorizes exactly the fields shown) and re-derived at approve to build
+        // the grant-identity digest. Values are STRINGS — the canonical (JCS)
+        // encoder rejects floats, and it keeps approve/redeem digests byte-equal.
+        if let Some(rs) = req_scope {
+            if !rs.bound.is_empty() {
+                let obj: serde_json::Map<String, serde_json::Value> = rs
+                    .bound
+                    .iter()
+                    .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+                    .collect();
+                scope["scope_vars"] = serde_json::Value::Object(obj);
+            }
+            if let Some(c) = &rs.consent {
+                scope["consent"] = serde_json::Value::String(c.clone());
+            }
+        }
         let op = Operation {
             act: Act {
                 kind: ActType::Use,

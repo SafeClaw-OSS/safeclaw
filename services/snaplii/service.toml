@@ -28,3 +28,19 @@ secret_url = "https://www.snaplii.com/a2m/"
 # section carries no config. The connection id is the agent label Snaplii sees.
 [auth]
 type = "snaplii"
+
+# Request shapes (docs/REQUEST_SCOPE.md): a purchase's body fields become part
+# of what the user approves. `amount` drives the policy `when` (a large purchase
+# asks every time) AND, with `merchant`, binds the approval — so approving $80
+# to one merchant cannot be replayed as $180 or to a different merchant.
+#
+# CONFIRM AT E2E: the body JSON Pointers (`/amount`, `/merchant_id`) are
+# best-effort against Snaplii's A2M API; adjust to the live field names. A
+# mismatch degrades safely — an unresolved var just leaves the purchase at its
+# base `ask` with no field binding, never a bypass.
+[requests.purchase]
+match = "POST /v2/purchase"
+vars.amount   = "/amount"
+vars.merchant = "/merchant_id"
+scope   = ["amount", "merchant"]
+consent = "Buy from {merchant} for {amount}"

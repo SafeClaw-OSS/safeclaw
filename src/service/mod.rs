@@ -40,6 +40,13 @@ pub struct ServiceDef {
     /// and any service that inlines its floor.
     #[serde(default)]
     pub policy: Option<PolicyDef>,
+    /// Request shapes (`[requests.<name>]`): the body/query fields this
+    /// service's endpoints expose, which of them identify an action for
+    /// binding (`scope`), and how to phrase them (`consent`). Opt-in — absent
+    /// ⇒ the body is not part of any grant identity (Phase-1 behavior). See
+    /// docs/REQUEST_SCOPE.md and [`RequestShape`].
+    #[serde(default)]
+    pub requests: HashMap<String, RequestShape>,
 }
 
 impl ServiceDef {
@@ -75,6 +82,52 @@ impl ServiceDef {
             .map(|s| s.trim())
             .find(|s| !s.is_empty())
             .map(|s| s.to_string())
+    }
+
+    /// Resolve the request into its matching `[requests]` shape and extract the
+    /// declared vars — the join point that feeds both a policy `when` and the
+    /// approval binding/consent. `None` when no shape matches (⇒ no vars, an
+    /// empty scope: the Phase-1 path-only grant). The first matching shape wins;
+    /// shapes should not overlap (a build lint warns). Body is parsed as JSON
+    /// once; a non-JSON body or a pointer that misses leaves that var undefined
+    /// (per P3, an undefined var makes a `when` simply not fire, and it is
+    /// omitted from the bound set).
+    pub fn extract_request_scope(
+        &self,
+        method: &str,
+        path: &str,
+        query: Option<&str>,
+        body: Option<&str>,
+    ) -> Option<RequestScope> {
+        let (shape_name, shape) = self.requests.iter().find(|(_, s)| {
+            s.match_pattern
+                .iter()
+                .any(|p| crate::core::policy::pattern_matches(p, method, path))
+        })?;
+        let body_json: Option<serde_json::Value> = body.and_then(|b| serde_json::from_str(b).ok());
+        let mut vars = crate::core::policy::VarMap::new();
+        for (name, def) in &shape.vars {
+            if let Some(v) = def.resolve(body_json.as_ref(), query) {
+                // Bare name for the common single-shape case; qualified
+                // `shape.name` so a rule spanning several shapes can disambiguate.
+                vars.insert(format!("{}.{}", shape_name, name), v.clone());
+                vars.insert(name.clone(), v);
+            }
+        }
+        // The bound subset: scope vars that actually resolved, sorted for a
+        // stable digest. An unresolved scope var is simply omitted (approve and
+        // redeem both omit it, so the identity stays consistent).
+        let mut bound: Vec<(String, String)> = shape
+            .scope
+            .iter()
+            .filter_map(|k| vars.get(k).map(|v| (k.clone(), v.clone())))
+            .collect();
+        bound.sort_by(|a, b| a.0.cmp(&b.0));
+        Some(RequestScope {
+            vars,
+            bound,
+            consent: shape.consent.clone(),
+        })
     }
 
     /// The stored secret role that backs this service's credential: the mint
@@ -344,6 +397,139 @@ impl PolicyDef {
     }
 }
 
+// ── Request shapes: `[requests.<name>]` (docs/REQUEST_SCOPE.md) ──────────────
+
+/// One request shape: a method+path matcher plus the body/query fields it
+/// exposes (`vars`), which of them bind the grant (`scope`), and how to phrase
+/// the action for a human (`consent`). `deny_unknown_fields` so a typo is a
+/// parse error, not a silently-ignored field.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RequestShape {
+    /// `"METHOD /path"` (or `"/path"`), or a list = OR. Same grammar / serde as
+    /// a policy rule's `match`.
+    #[serde(rename = "match", deserialize_with = "crate::core::policy::match_spec::deserialize")]
+    pub match_pattern: Vec<String>,
+    /// `name → address`. A bare string addresses a body JSON Pointer; the table
+    /// form `{ in = "query", at = "<param>" }` addresses a query parameter.
+    #[serde(default)]
+    pub vars: HashMap<String, VarDef>,
+    /// The subset of `vars` whose VALUES bind the grant identity. Absent/empty ⇒
+    /// nothing bound (P5). Whitelist only in v1.
+    #[serde(default)]
+    pub scope: Vec<String>,
+    /// A human phrasing rendered on the approval screen; `{name}` interpolates
+    /// var `name`. Every referenced var must be in `scope` (verified at build).
+    #[serde(default)]
+    pub consent: Option<String>,
+}
+
+/// Where a var is addressed. OpenAPI's `in` convention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VarLoc {
+    Body,
+    Query,
+}
+
+/// A var's address into the request. Untagged: a bare string is the common
+/// case (a body JSON Pointer); the table form spells the location out.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(untagged)]
+pub enum VarDef {
+    /// Bare string = a JSON Pointer (RFC 6901) into the request BODY.
+    BodyPointer(String),
+    /// `{ in = "body"|"query", at = "<pointer-or-param>" }`.
+    Located {
+        #[serde(rename = "in")]
+        location: VarLoc,
+        at: String,
+    },
+}
+
+impl VarDef {
+    /// Resolve this var's value (as a string) from the parsed body / raw query.
+    /// `None` = absent / unparseable (an undefined var).
+    fn resolve(&self, body: Option<&serde_json::Value>, query: Option<&str>) -> Option<String> {
+        match self {
+            VarDef::BodyPointer(ptr) => from_body(body, ptr),
+            VarDef::Located { location: VarLoc::Body, at } => from_body(body, at),
+            VarDef::Located { location: VarLoc::Query, at } => from_query(query, at),
+        }
+    }
+}
+
+fn from_body(body: Option<&serde_json::Value>, ptr: &str) -> Option<String> {
+    json_scalar_to_string(body?.pointer(ptr)?)
+}
+
+fn from_query(query: Option<&str>, name: &str) -> Option<String> {
+    let urldecode = |s: &str| {
+        urlencoding::decode(s)
+            .map(|c| c.into_owned())
+            .unwrap_or_else(|_| s.to_string())
+    };
+    query?.split('&').find_map(|pair| {
+        let mut it = pair.splitn(2, '=');
+        let k = it.next()?;
+        (urldecode(k) == name).then(|| urldecode(it.next().unwrap_or("")))
+    })
+}
+
+/// A JSON value → the string used for `when` comparison and grant binding. A
+/// number renders via serde (`80` → `"80"`); a string is itself; a bool →
+/// `"true"`/`"false"`; a container binds its compact JSON; null = undefined.
+fn json_scalar_to_string(v: &serde_json::Value) -> Option<String> {
+    match v {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Bool(b) => Some(b.to_string()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        other => serde_json::to_string(other).ok(),
+    }
+}
+
+/// The result of resolving a request against its `[requests]` shape.
+#[derive(Debug, Clone, Default)]
+pub struct RequestScope {
+    /// Every resolved var, `name → value` and `shape.name → value`. Fed to a
+    /// policy `when`.
+    pub vars: crate::core::policy::VarMap,
+    /// The scope-bound `(name, value)` pairs, SORTED by name. What
+    /// [`scope_digest`] hashes into the grant identity. Empty ⇒ nothing bound.
+    pub bound: Vec<(String, String)>,
+    /// The shape's consent template, if any.
+    pub consent: Option<String>,
+}
+
+impl RequestScope {
+    /// The digest of the bound values — the grant-identity extension.
+    pub fn digest(&self) -> String {
+        scope_digest(&self.bound)
+    }
+}
+
+/// A stable digest over the sorted `(var, value)` pairs a shape binds. `""` when
+/// nothing is bound, so a request with no shape / empty scope collapses to the
+/// Phase-1 `(conn, method, host, path)` key (no field binding). The approve
+/// write and the redeem read compute this identically over the same pairs, so a
+/// tampered field value yields a different key → a miss → a fresh prompt.
+pub fn scope_digest(bound: &[(String, String)]) -> String {
+    if bound.is_empty() {
+        return String::new();
+    }
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    // Length-prefix each field so `(ab, c)` and `(a, bc)` can't collide.
+    for (k, v) in bound {
+        h.update((k.len() as u64).to_le_bytes());
+        h.update(k.as_bytes());
+        h.update((v.len() as u64).to_le_bytes());
+        h.update(v.as_bytes());
+    }
+    format!("{:x}", h.finalize())
+}
+
 /// Policy rule as it appears in legacy service.toml `[[policy.rules]]`.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct TomlPolicyRule {
@@ -379,6 +565,7 @@ impl TomlPolicyRule {
             label: None,
             match_patterns: vec![match_pattern],
             body: None,
+            when: None,
             level: Some(level),
             ttl: None,
         })
@@ -406,6 +593,11 @@ pub struct PolicyFileRule {
     /// Regex matched against request body (optional).
     #[serde(default)]
     pub body: Option<String>,
+    /// Structured field condition (`"vars.amount > 80"`), AND-combined with
+    /// `match`/`body`. Vars come from the service's `[requests]`. See core
+    /// [`crate::core::policy::Condition`] and docs/REQUEST_SCOPE.md.
+    #[serde(default)]
+    pub when: Option<String>,
     /// Access decision (`allow` | `ask` | `ask-always` | `deny`) when this rule
     /// matches. A rule with no parseable `level` is skipped.
     #[serde(default)]
@@ -435,6 +627,7 @@ impl PolicyFileDef {
                 label: Some(r.label.clone()),
                 match_patterns: r.match_pattern.clone(),
                 body: r.body.clone(),
+                when: r.when.clone(),
                 level: Some(level),
                 ttl: r.ttl,
             })
@@ -872,9 +1065,8 @@ mod tests {
         let def = PolicyDef { levels: Some(levels), rules: vec![] };
         let toml_levels = def.to_levels();
         let access = crate::core::policy::evaluate(
-            "POST", "/v1/chat", None, None, toml_levels.as_ref(),
-            &crate::core::policy::Policy::default(), &["app".into()],
-        );
+            "POST", "/v1/chat", None, &crate::core::policy::VarMap::new(), None, toml_levels.as_ref(),
+            &crate::core::policy::Policy::default(), &["app".into()]);
         assert_eq!(access, AccessLevel::Allow);
     }
 
@@ -1244,7 +1436,7 @@ secrets = ["GITHUB_TOKEN"]
             .expect("gmail policy.toml must parse and yield rules");
         let policy = Policy::default();
         let eval = |m: &str, p: &str| {
-            evaluate(m, p, None, Some(&rules), None, &policy, &["app".into()])
+            evaluate(m, p, None, &crate::core::policy::VarMap::new(), Some(&rules), None, &policy, &["app".into()])
         };
         assert_eq!(eval("GET", "/gmail/v1/users/me/messages"), AccessLevel::Allow);
         assert_eq!(eval("GET", "/gmail/v1/users/me/messages/abc123"), AccessLevel::Ask);
@@ -1260,7 +1452,7 @@ secrets = ["GITHUB_TOKEN"]
             .expect("cratesio policy.toml must parse and yield rules");
         let policy = Policy::default();
         let eval = |m: &str, p: &str| {
-            evaluate(m, p, None, Some(&rules), None, &policy, &["app".into()])
+            evaluate(m, p, None, &crate::core::policy::VarMap::new(), Some(&rules), None, &policy, &["app".into()])
         };
         // Routine traffic rides the allow floor.
         assert_eq!(eval("GET", "/api/v1/me"), AccessLevel::Allow);
@@ -1290,7 +1482,7 @@ secrets = ["GITHUB_TOKEN"]
         let policy = Policy::default();
         let eval = |body: &str| {
             // The whole API is one POST endpoint; the mutation name lives in the body.
-            evaluate("POST", "/graphql/v2", Some(body), Some(&rules), None, &policy, &["app".into()])
+            evaluate("POST", "/graphql/v2", Some(body), &crate::core::policy::VarMap::new(), Some(&rules), None, &policy, &["app".into()])
         };
         // Routine GraphQL (queries + non-destroy mutations) rides the allow floor.
         assert_eq!(eval(r#"{"query":"query { me { name } }"}"#), AccessLevel::Allow);
@@ -1320,7 +1512,7 @@ secrets = ["GITHUB_TOKEN"]
             .expect("supabase policy.toml must parse and yield rules");
         let policy = Policy::default();
         let eval = |m: &str, p: &str| {
-            evaluate(m, p, None, Some(&rules), None, &policy, &["app".into()])
+            evaluate(m, p, None, &crate::core::policy::VarMap::new(), Some(&rules), None, &policy, &["app".into()])
         };
         // Routine developer work — incl. arbitrary SQL — rides the allow floor.
         assert_eq!(eval("GET", "/v1/projects"), AccessLevel::Allow);
@@ -1340,5 +1532,89 @@ secrets = ["GITHUB_TOKEN"]
         assert_eq!(eval("PATCH", "/v1/projects/abcdef/network-restrictions"), AccessLevel::AskAlways);
         // Handing the project to another owner → gated.
         assert_eq!(eval("POST", "/v1/projects/abcdef/claim-token"), AccessLevel::AskAlways);
+    }
+
+    // ── [requests] extraction + scope digest (Phase 2) ───────────────────────
+
+    fn snaplii_def() -> ServiceDef {
+        toml::from_str(
+            r#"
+[service]
+id = "snaplii"
+name = "Snaplii"
+hosts = ["aipayment.snaplii.com"]
+secrets = ["SNAPLII_API_KEY"]
+[auth]
+type = "snaplii"
+[requests.purchase]
+match = "POST /v2/purchase"
+vars.amount   = "/amount"
+vars.merchant = "/merchant_id"
+vars.force    = { in = "query", at = "force" }
+scope   = ["amount", "merchant"]
+consent = "Buy from {merchant} for {amount}"
+"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn extract_resolves_body_and_query_vars() {
+        let def = snaplii_def();
+        let body = r#"{"amount": 80, "merchant_id": "m_1", "nonce": "xyz"}"#;
+        let rs = def
+            .extract_request_scope("POST", "/v2/purchase", Some("force=true"), Some(body))
+            .expect("purchase shape matches");
+        // Bare + qualified names both present, values stringified.
+        assert_eq!(rs.vars.get("amount").map(String::as_str), Some("80"));
+        assert_eq!(rs.vars.get("purchase.amount").map(String::as_str), Some("80"));
+        assert_eq!(rs.vars.get("merchant").map(String::as_str), Some("m_1"));
+        assert_eq!(rs.vars.get("force").map(String::as_str), Some("true"));
+        // Bound = the scope subset, sorted; the query `force` and body `nonce`
+        // are NOT bound (not in scope).
+        assert_eq!(
+            rs.bound,
+            vec![("amount".to_string(), "80".to_string()), ("merchant".to_string(), "m_1".to_string())]
+        );
+        assert_eq!(rs.consent.as_deref(), Some("Buy from {merchant} for {amount}"));
+    }
+
+    #[test]
+    fn extract_none_on_no_match_and_undefined_vars_omitted() {
+        let def = snaplii_def();
+        // No shape matches a GET → None (Phase-1 path-only grant).
+        assert!(def.extract_request_scope("GET", "/v2/balance", None, None).is_none());
+        // Missing body field → that var is simply absent (not an error).
+        let rs = def
+            .extract_request_scope("POST", "/v2/purchase", None, Some(r#"{"amount": 5}"#))
+            .unwrap();
+        assert_eq!(rs.vars.get("amount").map(String::as_str), Some("5"));
+        assert!(rs.vars.get("merchant").is_none());
+        // Only the resolved scope var is bound.
+        assert_eq!(rs.bound, vec![("amount".to_string(), "5".to_string())]);
+    }
+
+    #[test]
+    fn scope_digest_stable_and_tamper_sensitive() {
+        // The $80/$180 guarantee at the digest level: same bound values → same
+        // digest (order-independent); a changed value → a different digest; a
+        // field NOT in scope (a nonce) never affects it.
+        let d80 = scope_digest(&[("amount".into(), "80".into()), ("merchant".into(), "m_1".into())]);
+        let d80_reordered = scope_digest(&[("merchant".into(), "m_1".into()), ("amount".into(), "80".into())]);
+        let d180 = scope_digest(&[("amount".into(), "180".into()), ("merchant".into(), "m_1".into())]);
+        // digest() sorts, so reordering the input pairs is irrelevant once sorted;
+        // here we compare the raw fn on already-sorted inputs.
+        assert_eq!(d80, d80);
+        assert_ne!(d80, d180);
+        assert_ne!(d80, d80_reordered); // raw fn is order-sensitive…
+        // …which is why extract_request_scope always sorts before hashing:
+        let def = snaplii_def();
+        let a = def.extract_request_scope("POST", "/v2/purchase", None, Some(r#"{"amount":80,"merchant_id":"m_1"}"#)).unwrap();
+        let b = def.extract_request_scope("POST", "/v2/purchase", Some("force=1"), Some(r#"{"merchant_id":"m_1","amount":80,"nonce":"Q"}"#)).unwrap();
+        assert_eq!(a.digest(), b.digest(), "same bound values (nonce/query ignored) → same digest");
+        let c = def.extract_request_scope("POST", "/v2/purchase", None, Some(r#"{"amount":180,"merchant_id":"m_1"}"#)).unwrap();
+        assert_ne!(a.digest(), c.digest(), "changed amount → different digest → re-prompt");
+        // Empty scope collapses to "" (the Phase-1 key).
+        assert_eq!(scope_digest(&[]), "");
     }
 }

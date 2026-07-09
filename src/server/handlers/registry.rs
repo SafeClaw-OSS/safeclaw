@@ -215,6 +215,10 @@ pub struct RegistryPolicyRule {
     pub match_pattern: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub body: Option<String>,
+    /// Structured field condition (`"vars.amount > 80"`) — surfaced so the
+    /// console can show it beside the rule and offer it as an override.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub when: Option<String>,
     /// The built-in access decision (`allow` | `ask` | `ask-always` | `deny`)
     /// the recipe declares for this action. The console shows it and lets the
     /// user override it per-connection.
@@ -292,6 +296,7 @@ fn policy_for(
                         label: r.label.clone(),
                         match_pattern: r.match_pattern.clone(),
                         body: r.body.clone(),
+                        when: r.when.clone(),
                         level,
                         ttl: r.ttl,
                     }

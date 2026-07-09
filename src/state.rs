@@ -142,20 +142,27 @@ pub struct SecretsCache {
     /// restart also blows it away (vaults boot Locked, cache starts empty).
     pub rule_approvals: HashMap<(String, String, String, String), u64>,
     /// `ask-always` one-shot grants, keyed by the REQUEST the user approved:
-    /// `(connection_id, method, host, path)`. Written by `approve_op` when the
-    /// op's policy level was AskAlways; consumed (removed) by the proxy's
-    /// replay exactly once. This is what makes an `ask-always` approval mean
-    /// "this action, once": a grant minted for `POST /v2/purchase` can never
-    /// be spent by a different method/host/path on the same connection, and
-    /// the ask-always path never falls back to the conn-keyed `entries` (so it
-    /// can't ride a plain-ask leftover or the allow residency either).
+    /// `(connection_id, method, host, path, scope_digest)`. Written by
+    /// `approve_op` when the op's policy level was AskAlways; consumed (removed)
+    /// by the proxy's replay exactly once. This is what makes an `ask-always`
+    /// approval mean "this action, once": a grant minted for `POST /v2/purchase`
+    /// can never be spent by a different method/host/path on the same
+    /// connection, and the ask-always path never falls back to the conn-keyed
+    /// `entries` (so it can't ride a plain-ask leftover or the allow residency).
+    ///
+    /// `scope_digest` (Phase 2) folds the values of the service's declared
+    /// `[requests]` scope fields into the identity (`""` when a service declares
+    /// none — the Phase-1 path-only key). So approving `amount=80` cannot be
+    /// replayed as `amount=180`: the redeem re-extracts the fields, the digest
+    /// differs, the grant misses (without being consumed) and re-prompts. See
+    /// `crate::service::scope_digest` and docs/REQUEST_SCOPE.md.
     ///
     /// Expiry is deliberately GENEROUS (`ASK_ALWAYS_REPLAY_WINDOW_SECS`, not a
     /// short grace): an agent that only replays when its user next prompts it
     /// (e.g. a chat agent) may take minutes to re-run. Single-use + exact
     /// binding is what makes the long window safe — time is not the guard.
     /// Same memory window as the rest of the cache: dropped on lock/refresh.
-    pub op_grants: HashMap<(String, String, String, String), CacheEntry>,
+    pub op_grants: HashMap<(String, String, String, String, String), CacheEntry>,
     /// Item names present in the decrypted `native-secrets` kv (names only,
     /// never values). Surface for `GET /v/{vid}/secret-keys` so the frontend
     /// can decide which services are "reachable" without paying for an
@@ -487,6 +494,7 @@ impl AppState {
         method: &str,
         host: &str,
         path: &str,
+        scope_digest: &str,
         value: Vec<u8>,
         expires_at: u64,
     ) {
@@ -498,6 +506,7 @@ impl AppState {
                     method.to_string(),
                     host.to_ascii_lowercase(),
                     path.to_string(),
+                    scope_digest.to_string(),
                 ),
                 CacheEntry {
                     value,
@@ -522,6 +531,7 @@ impl AppState {
         method: &str,
         host: &str,
         path: &str,
+        scope_digest: &str,
     ) -> Option<Vec<u8>> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -537,6 +547,7 @@ impl AppState {
             method.to_string(),
             host.to_ascii_lowercase(),
             path.to_string(),
+            scope_digest.to_string(),
         );
         let entry = cache.op_grants.remove(&key)?;
         if let Some(exp) = entry.expires_at {
@@ -695,6 +706,7 @@ impl AppState {
         path: &str,
         host: &str,
         body: Option<&str>,
+        vars: &crate::core::policy::VarMap,
     ) -> Option<(crate::core::policy::AccessLevel, Option<String>, Option<u64>)> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -734,6 +746,7 @@ impl AppState {
             method,
             path,
             body,
+            vars,
             Some(&rules),
             connection_levels.as_ref(),
             &cache.policy,
@@ -998,7 +1011,7 @@ mod tests {
         // real conn-keyed ask grant) is invisible to op_grant_take.
         state.cache_insert("v1", "github", b"granted".to_vec(), None);
         assert_eq!(
-            state.op_grant_take("v1", "github", "DELETE", "api.github.com", "/repos/a/b"),
+            state.op_grant_take("v1", "github", "DELETE", "api.github.com", "/repos/a/b", ""),
             None
         );
         // The ask path sees its grant as usual.
@@ -1021,15 +1034,15 @@ mod tests {
         let state = test_state();
         unlock_with_empty_cache(&state, "v1");
         let far = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() + 600;
-        state.op_grant_insert("v1", "svc", "POST", "api.x.com", "/v2/purchase", b"tok".to_vec(), far);
+        state.op_grant_insert("v1", "svc", "POST", "api.x.com", "/v2/purchase", "", b"tok".to_vec(), far);
         // First take returns the value …
         assert_eq!(
-            state.op_grant_take("v1", "svc", "POST", "api.x.com", "/v2/purchase"),
+            state.op_grant_take("v1", "svc", "POST", "api.x.com", "/v2/purchase", ""),
             Some(b"tok".to_vec())
         );
         // … and removes it: a second take misses, and nothing leaked into the
         // conn-keyed entries for the allow/ask paths to find.
-        assert_eq!(state.op_grant_take("v1", "svc", "POST", "api.x.com", "/v2/purchase"), None);
+        assert_eq!(state.op_grant_take("v1", "svc", "POST", "api.x.com", "/v2/purchase", ""), None);
         assert_eq!(state.cache_lookup("v1", "svc"), None);
     }
 
@@ -1042,15 +1055,15 @@ mod tests {
         let state = test_state();
         unlock_with_empty_cache(&state, "v1");
         let far = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() + 600;
-        state.op_grant_insert("v1", "svc", "POST", "api.x.com", "/v2/purchase", b"tok".to_vec(), far);
+        state.op_grant_insert("v1", "svc", "POST", "api.x.com", "/v2/purchase", "", b"tok".to_vec(), far);
         // Different path / method / host / connection → all miss.
-        assert_eq!(state.op_grant_take("v1", "svc", "POST", "api.x.com", "/v2/refund"), None);
-        assert_eq!(state.op_grant_take("v1", "svc", "DELETE", "api.x.com", "/v2/purchase"), None);
-        assert_eq!(state.op_grant_take("v1", "svc", "POST", "api.y.com", "/v2/purchase"), None);
-        assert_eq!(state.op_grant_take("v1", "other", "POST", "api.x.com", "/v2/purchase"), None);
+        assert_eq!(state.op_grant_take("v1", "svc", "POST", "api.x.com", "/v2/refund", ""), None);
+        assert_eq!(state.op_grant_take("v1", "svc", "DELETE", "api.x.com", "/v2/purchase", ""), None);
+        assert_eq!(state.op_grant_take("v1", "svc", "POST", "api.y.com", "/v2/purchase", ""), None);
+        assert_eq!(state.op_grant_take("v1", "other", "POST", "api.x.com", "/v2/purchase", ""), None);
         // Host comparison is case-insensitive (hosts are lowercased at insert).
         assert_eq!(
-            state.op_grant_take("v1", "svc", "POST", "API.X.COM", "/v2/purchase"),
+            state.op_grant_take("v1", "svc", "POST", "API.X.COM", "/v2/purchase", ""),
             Some(b"tok".to_vec())
         );
     }
@@ -1059,9 +1072,31 @@ mod tests {
     fn op_grant_take_honors_expiry() {
         let state = test_state();
         unlock_with_empty_cache(&state, "v1");
-        state.op_grant_insert("v1", "svc", "POST", "api.x.com", "/p", b"stale".to_vec(), 0);
+        state.op_grant_insert("v1", "svc", "POST", "api.x.com", "/p", "", b"stale".to_vec(), 0);
         // Expired grant is not returned (and is consumed/dropped).
-        assert_eq!(state.op_grant_take("v1", "svc", "POST", "api.x.com", "/p"), None);
+        assert_eq!(state.op_grant_take("v1", "svc", "POST", "api.x.com", "/p", ""), None);
+    }
+
+    /// Phase 2: the scope digest is part of the key. Approving `amount=80`
+    /// (digest_80) means a replay whose fields hash to a DIFFERENT digest (the
+    /// $180 request) misses — without consuming — so the honest $80 replay still
+    /// works afterwards.
+    #[test]
+    fn op_grant_take_is_scope_digest_bound() {
+        let state = test_state();
+        unlock_with_empty_cache(&state, "v1");
+        let far = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() + 600;
+        let d80 = crate::service::scope_digest(&[("amount".into(), "80".into())]);
+        let d180 = crate::service::scope_digest(&[("amount".into(), "180".into())]);
+        state.op_grant_insert("v1", "svc", "POST", "api.x.com", "/v2/purchase", &d80, b"tok".to_vec(), far);
+        // The tampered ($180) replay misses and does NOT consume…
+        assert_eq!(state.op_grant_take("v1", "svc", "POST", "api.x.com", "/v2/purchase", &d180), None);
+        // …so the honest ($80) replay still succeeds, exactly once.
+        assert_eq!(
+            state.op_grant_take("v1", "svc", "POST", "api.x.com", "/v2/purchase", &d80),
+            Some(b"tok".to_vec())
+        );
+        assert_eq!(state.op_grant_take("v1", "svc", "POST", "api.x.com", "/v2/purchase", &d80), None);
     }
 
     #[test]
@@ -1125,7 +1160,7 @@ mod tests {
         // Baseline: GET resolves to Ask under the "read" rule. (Default
         // connection: connection_id == service_id == "gh".)
         let (lvl, rule, _) = state
-            .evaluate_request_policy(vid, "gh", "gh", "GET", "/x", "api.gh.com", None)
+            .evaluate_request_policy(vid, "gh", "gh", "GET", "/x", "api.gh.com", None, &crate::core::policy::VarMap::new())
             .unwrap();
         assert_eq!(lvl, AccessLevel::Ask);
         assert_eq!(rule.as_deref(), Some("read"));
@@ -1135,14 +1170,14 @@ mod tests {
 
         // The same GET toward the same host now fast-paths (the feature works).
         let (lvl, _, _) = state
-            .evaluate_request_policy(vid, "gh", "gh", "GET", "/x", "api.gh.com", None)
+            .evaluate_request_policy(vid, "gh", "gh", "GET", "/x", "api.gh.com", None, &crate::core::policy::VarMap::new())
             .unwrap();
         assert_eq!(lvl, AccessLevel::Allow, "approved GET should fast-path");
 
         // Same GET/rule toward a DIFFERENT host must NOT fast-path — the grant
         // is host-scoped (E2E-5 oracle: approve host A → call host B → re-ask).
         let (lvl, _, _) = state
-            .evaluate_request_policy(vid, "gh", "gh", "GET", "/x", "evil.gh.com", None)
+            .evaluate_request_policy(vid, "gh", "gh", "GET", "/x", "evil.gh.com", None, &crate::core::policy::VarMap::new())
             .unwrap();
         assert_eq!(
             lvl,
@@ -1152,7 +1187,7 @@ mod tests {
 
         // A POST is a DIFFERENT verb/rule — the GET approval must not cover it.
         let (lvl, rule, _) = state
-            .evaluate_request_policy(vid, "gh", "gh", "POST", "/x", "api.gh.com", None)
+            .evaluate_request_policy(vid, "gh", "gh", "POST", "/x", "api.gh.com", None, &crate::core::policy::VarMap::new())
             .unwrap();
         assert_eq!(
             lvl,

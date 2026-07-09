@@ -25,3 +25,16 @@ id = "purchase"
 label = "Buy a gift card (spends wallet balance)"
 match = "POST /v2/purchase"
 level = "ask"
+
+# A large purchase escalates to ask-always: approved every time, and bound to
+# the exact amount + merchant (service.toml `[requests.purchase]`). Composes by
+# most-restrictive-wins — a purchase over the threshold matches BOTH rules, so
+# ask-always beats ask; at or under it, only the base rule fires (`ask`). The
+# `vars.amount` comes from the request shape; an undefined amount → this rule
+# simply doesn't fire (the base `ask` still gates the spend).
+[[rule]]
+id = "purchase-large"
+label = "Buy a gift card over $80 (bound to amount + merchant)"
+match = "POST /v2/purchase"
+when = "vars.amount > 80"
+level = "ask-always"

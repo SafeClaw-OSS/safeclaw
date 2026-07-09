@@ -271,6 +271,115 @@ fn validate_service_inner(toml_str: &str) -> Result<(), Vec<String>> {
         }
     }
 
+    // [requests] shapes (docs/REQUEST_SCOPE.md). Intra-service invariants — the
+    // cross-file "when-var ∈ requests" check needs the paired policy.toml and
+    // lives in `validate_service_policy` / the compiled-defs test.
+    for (name, shape) in &def.requests {
+        if shape.match_pattern.is_empty() {
+            errs.push(format!("[requests.{}] declares no `match`", name));
+        }
+        // A body pointer must be an RFC 6901 pointer (leading '/'); a query
+        // `at` must be non-empty. Catches `vars.x = "amount"` (missing '/').
+        for (var, def_) in &shape.vars {
+            match def_ {
+                crate::service::VarDef::BodyPointer(p)
+                | crate::service::VarDef::Located { location: crate::service::VarLoc::Body, at: p } => {
+                    if !p.starts_with('/') {
+                        errs.push(format!(
+                            "[requests.{}] var '{}' body address '{}' must be a JSON Pointer (start with '/')",
+                            name, var, p
+                        ));
+                    }
+                }
+                crate::service::VarDef::Located { location: crate::service::VarLoc::Query, at } => {
+                    if at.is_empty() {
+                        errs.push(format!("[requests.{}] var '{}' query `at` is empty", name, var));
+                    }
+                }
+            }
+        }
+        // scope ⊆ vars: you can only bind a field you declared.
+        for k in &shape.scope {
+            if !shape.vars.contains_key(k) {
+                errs.push(format!(
+                    "[requests.{}] scope names '{}', which is not a declared var",
+                    name, k
+                ));
+            }
+        }
+        // P4 show ⊆ bind: every {token} a consent template interpolates must be
+        // in scope (so the user can only be shown values the grant locks).
+        if let Some(consent) = &shape.consent {
+            for tok in consent_tokens(consent) {
+                if !shape.scope.contains(&tok) {
+                    errs.push(format!(
+                        "[requests.{}] consent references '{{{}}}', which is not in `scope` (show ⊆ bind)",
+                        name, tok
+                    ));
+                }
+            }
+        }
+    }
+
+    if errs.is_empty() { Ok(()) } else { Err(errs) }
+}
+
+/// The `{name}` tokens a consent template interpolates. A `{{`/`}}` is a
+/// literal brace (not a token). Unterminated `{` is ignored (a `match`-time
+/// render just leaves it literal).
+fn consent_tokens(template: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let bytes = template.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'{' {
+            if i + 1 < bytes.len() && bytes[i + 1] == b'{' {
+                i += 2;
+                continue;
+            }
+            if let Some(end) = template[i + 1..].find('}') {
+                let name = template[i + 1..i + 1 + end].trim().to_string();
+                if !name.is_empty() {
+                    out.push(name);
+                }
+                i = i + 1 + end + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Cross-file check: every `vars.<name>` a policy.toml rule's `when` references
+/// must be a var declared by SOME `[requests]` shape in the paired
+/// service.toml, and every `when` must parse. Runs where both files are
+/// available (the compiled-defaults test; a future console paired submit).
+pub fn validate_service_policy(service_toml: &str, policy_toml: &str) -> Result<(), Vec<String>> {
+    let def: ServiceDef = toml::from_str(service_toml).map_err(|e| vec![format!("service parse: {}", e)])?;
+    let policy: crate::service::PolicyFileDef =
+        toml::from_str(policy_toml).map_err(|e| vec![format!("policy parse: {}", e)])?;
+    let declared: HashSet<&str> = def
+        .requests
+        .values()
+        .flat_map(|s| s.vars.keys().map(|k| k.as_str()))
+        .collect();
+    let mut errs = Vec::new();
+    for rule in &policy.rule {
+        let Some(when) = &rule.when else { continue };
+        let Some(cond) = crate::core::policy::Condition::parse(when) else {
+            errs.push(format!("rule '{}': `when = \"{}\"` is not a valid condition (expected `vars.<name> <op> <literal>`)", rule.id, when));
+            continue;
+        };
+        // Strip a `shape.` qualifier for the membership check.
+        let bare = cond.var_name().rsplit('.').next().unwrap_or(cond.var_name());
+        if !declared.contains(bare) {
+            errs.push(format!(
+                "rule '{}': `when` references var '{}', which no [requests] shape declares",
+                rule.id, cond.var_name()
+            ));
+        }
+    }
     if errs.is_empty() { Ok(()) } else { Err(errs) }
 }
 
@@ -539,6 +648,89 @@ secrets = ["ACME_TOKEN"]
             validate_recipe(toml_str, false)
                 .unwrap_or_else(|e| panic!("compiled service '{}' failed validator: {:?}", id, e));
         }
+    }
+
+    /// The cross-file gate (the de-facto build check for in-tree defs): for
+    /// every compiled service that ships a policy.toml, every rule `when` must
+    /// parse and reference a var some `[requests]` shape declares. This is what
+    /// makes `vars.amount > 80` in snaplii's policy fail the test suite if the
+    /// service.toml ever drops the `amount` var.
+    #[test]
+    fn compiled_policies_when_vars_are_declared() {
+        let services: std::collections::HashMap<&str, &str> =
+            crate::generated_services::compiled_service_tomls()
+                .iter()
+                .copied()
+                .collect();
+        for (id, policy_toml) in crate::generated_services::compiled_policy_tomls() {
+            let Some(service_toml) = services.get(id) else {
+                continue; // policy with no paired service — nothing to cross-check
+            };
+            validate_service_policy(service_toml, policy_toml)
+                .unwrap_or_else(|e| panic!("service '{}' policy/requests mismatch: {:?}", id, e));
+        }
+    }
+
+    // ── [requests] verification (Phase 2) ────────────────────────────────────
+
+    const REQ_SERVICE: &str = r#"
+[service]
+id = "pay"
+name = "Pay"
+hosts = ["api.pay.com"]
+secrets = ["PAY_KEY"]
+[requests.purchase]
+match = "POST /buy"
+vars.amount = "/amount"
+scope = ["amount"]
+consent = "Spend {amount}"
+"#;
+
+    #[test]
+    fn requests_valid_service_passes() {
+        validate_service(REQ_SERVICE).expect("well-formed [requests] passes");
+    }
+
+    #[test]
+    fn consent_var_must_be_in_scope() {
+        let bad = REQ_SERVICE.replace(r#"consent = "Spend {amount}""#, r#"consent = "Send {secret}""#);
+        let e = validate_service(&bad).unwrap_err();
+        assert!(e.iter().any(|s| s.contains("consent references '{secret}'")), "got {:?}", e);
+    }
+
+    #[test]
+    fn scope_must_name_a_declared_var() {
+        let bad = REQ_SERVICE.replace(r#"scope = ["amount"]"#, r#"scope = ["amount", "ghost"]"#);
+        let e = validate_service(&bad).unwrap_err();
+        assert!(e.iter().any(|s| s.contains("'ghost', which is not a declared var")), "got {:?}", e);
+    }
+
+    #[test]
+    fn body_pointer_must_start_with_slash() {
+        let bad = REQ_SERVICE.replace(r#"vars.amount = "/amount""#, r#"vars.amount = "amount""#);
+        let e = validate_service(&bad).unwrap_err();
+        assert!(e.iter().any(|s| s.contains("must be a JSON Pointer")), "got {:?}", e);
+    }
+
+    #[test]
+    fn policy_when_var_must_be_declared() {
+        let policy_ok = r#"
+[[rule]]
+id = "big"
+label = "big"
+match = "POST /buy"
+when = "vars.amount > 80"
+level = "ask-always"
+"#;
+        validate_service_policy(REQ_SERVICE, policy_ok).expect("when var 'amount' is declared");
+
+        let policy_bad = policy_ok.replace("vars.amount > 80", "vars.total > 80");
+        let e = validate_service_policy(REQ_SERVICE, &policy_bad).unwrap_err();
+        assert!(e.iter().any(|s| s.contains("references var 'total'")), "got {:?}", e);
+
+        let policy_malformed = policy_ok.replace("vars.amount > 80", "amount is big");
+        let e = validate_service_policy(REQ_SERVICE, &policy_malformed).unwrap_err();
+        assert!(e.iter().any(|s| s.contains("not a valid condition")), "got {:?}", e);
     }
 
     #[test]

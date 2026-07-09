@@ -7,6 +7,17 @@ tags = ["app"]
 hosts = ["gmail.googleapis.com"]
 secrets = ["GMAIL_REFRESH_TOKEN"]
 
+# Request shapes (docs/REQUEST_SCOPE.md): binding the send body's `raw` field
+# (the base64url RFC822 message) means an approved email cannot be swapped for a
+# different one on replay — the ask-always grant is tied to this exact message.
+# v1 binds + labels it; decoding raw→subject/to/body for a legible consent line
+# is a v2 transform (the approval screen shows the folded value meanwhile).
+[requests.send]
+match = "POST /gmail/v1/users/me/messages/send"
+vars.raw = "/raw"
+scope   = ["raw"]
+consent = "Send this email"
+
 [auth]
 type = "oauth2"
 # Display label only ("Connect with Google") — carries no config.
