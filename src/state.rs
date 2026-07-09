@@ -56,7 +56,8 @@ const EVENT_CHANNEL_CAPACITY: usize = 128;
 ///     session, populated at unlock bootstrap)
 ///   - `ask` services → `expires_at = Some(unix_secs)`, filled after
 ///     `approval-confirm` with the matched rule's `ttl`
-///   - `ask-always` services → never cached (entry simply absent)
+///   - `ask-always` services → never in `entries`; their one-shot grants
+///     live in `op_grants`, keyed by the approved request tuple
 ///
 /// `cache_lookup` does lazy eviction: an entry past its `expires_at`
 /// is removed and treated as a miss. No active sweeper today —
@@ -71,13 +72,20 @@ pub struct CacheEntry {
     pub expires_at: Option<u64>,
     /// `true` = this value was pre-loaded at unlock by `bootstrap_cache_from_view`
     /// (the connection's read floor is `allow`), NOT produced by a passkey grant.
-    /// The allow fast-path (`cache_lookup`) uses it, but `ask`/`ask-always` paths
-    /// (`cache_lookup_grant` / `cache_take`) must IGNORE it — a per-path
-    /// ask/ask-always rule has to force a fresh approval, never ride the
-    /// allow-level residency. A real grant (from `approve_op`) overwrites it with
-    /// `from_bootstrap = false`.
+    /// The allow fast-path (`cache_lookup`) uses it, but the `ask` path
+    /// (`cache_lookup_grant`) must IGNORE it — a per-path ask rule has to
+    /// force a fresh approval, never ride the allow-level residency. (The
+    /// ask-always path never reads `entries` at all — see `op_grants`.) A real
+    /// grant (from `approve_op`) overwrites it with `from_bootstrap = false`.
     pub from_bootstrap: bool,
 }
+
+/// How long an approved `ask-always` one-shot grant stays redeemable
+/// (`op_grants` expiry = approve-time + this). Generous on purpose: the
+/// replay is agent-driven, and an agent that only acts when its user next
+/// prompts it can take many minutes. Safety comes from single-use + exact
+/// request binding, not from this window.
+pub const ASK_ALWAYS_REPLAY_WINDOW_SECS: u64 = 1800;
 
 #[derive(Debug, Clone, Default)]
 pub struct SecretsCache {
@@ -133,6 +141,21 @@ pub struct SecretsCache {
     /// lock (which zero-outs the entire cache via Default drop). Daemon
     /// restart also blows it away (vaults boot Locked, cache starts empty).
     pub rule_approvals: HashMap<(String, String, String, String), u64>,
+    /// `ask-always` one-shot grants, keyed by the REQUEST the user approved:
+    /// `(connection_id, method, host, path)`. Written by `approve_op` when the
+    /// op's policy level was AskAlways; consumed (removed) by the proxy's
+    /// replay exactly once. This is what makes an `ask-always` approval mean
+    /// "this action, once": a grant minted for `POST /v2/purchase` can never
+    /// be spent by a different method/host/path on the same connection, and
+    /// the ask-always path never falls back to the conn-keyed `entries` (so it
+    /// can't ride a plain-ask leftover or the allow residency either).
+    ///
+    /// Expiry is deliberately GENEROUS (`ASK_ALWAYS_REPLAY_WINDOW_SECS`, not a
+    /// short grace): an agent that only replays when its user next prompts it
+    /// (e.g. a chat agent) may take minutes to re-run. Single-use + exact
+    /// binding is what makes the long window safe — time is not the guard.
+    /// Same memory window as the rest of the cache: dropped on lock/refresh.
+    pub op_grants: HashMap<(String, String, String, String), CacheEntry>,
     /// Item names present in the decrypted `native-secrets` kv (names only,
     /// never values). Surface for `GET /v/{vid}/secret-keys` so the frontend
     /// can decide which services are "reachable" without paying for an
@@ -446,19 +469,60 @@ impl AppState {
         if let Some(VaultState::Unlocked { cache, .. }) = states.get_mut(vault_id) {
             cache.entries.insert(
                 conn_id.to_string(),
-                // A real approval grant — consumable by ask/ask-always.
+                // A real approval grant — consumable by the ask retry path.
                 CacheEntry { value, expires_at, from_bootstrap: false },
             );
         }
     }
 
-    /// Look up AND remove a cached auth value for `(vault, connection)` —
-    /// single-use consumption. The streaming captive-portal path uses this for
-    /// `ask-always` services so each streamed operation (e.g. a `cargo publish`)
-    /// burns its approval and the next one re-prompts for a fresh passkey.
-    /// Honors TTL expiry like [`Self::cache_lookup`]; `None` when locked /
-    /// absent / expired.
-    pub fn cache_take(&self, vault_id: &str, conn_id: &str) -> Option<Vec<u8>> {
+    /// Store an `ask-always` one-shot grant, bound to the request tuple the
+    /// user's passkey approved. Overwrites a prior grant for the same tuple
+    /// (a fresh tap supersedes). No-op when the vault is locked.
+    ///
+    /// See [`ASK_ALWAYS_REPLAY_WINDOW_SECS`] for the expiry callers should use.
+    pub fn op_grant_insert(
+        &self,
+        vault_id: &str,
+        conn_id: &str,
+        method: &str,
+        host: &str,
+        path: &str,
+        value: Vec<u8>,
+        expires_at: u64,
+    ) {
+        let mut states = self.vault_states.lock().unwrap();
+        if let Some(VaultState::Unlocked { cache, .. }) = states.get_mut(vault_id) {
+            cache.op_grants.insert(
+                (
+                    conn_id.to_string(),
+                    method.to_string(),
+                    host.to_ascii_lowercase(),
+                    path.to_string(),
+                ),
+                CacheEntry {
+                    value,
+                    expires_at: Some(expires_at),
+                    from_bootstrap: false,
+                },
+            );
+        }
+    }
+
+    /// Look up AND remove the `ask-always` one-shot grant for exactly this
+    /// request tuple — single-use consumption, the replay half of the
+    /// captive-portal contract. A request whose (method, host, path) differs
+    /// from what the user approved is a miss and re-prompts; there is NO
+    /// fallback to the conn-keyed `entries` (allow residency / plain-ask
+    /// leftovers are not grants for an ask-always action). `None` when
+    /// locked / absent / expired.
+    pub fn op_grant_take(
+        &self,
+        vault_id: &str,
+        conn_id: &str,
+        method: &str,
+        host: &str,
+        path: &str,
+    ) -> Option<Vec<u8>> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -468,13 +532,13 @@ impl AppState {
             Some(VaultState::Unlocked { cache, .. }) => cache,
             _ => return None,
         };
-        // A bootstrap-resident value is NOT a grant — an `ask-always` request must
-        // force a fresh passkey, not consume the allow-level residency. Leave it
-        // in place (the allow fast-path still needs it) and report a miss.
-        if cache.entries.get(conn_id).is_some_and(|e| e.from_bootstrap) {
-            return None;
-        }
-        let entry = cache.entries.remove(conn_id)?;
+        let key = (
+            conn_id.to_string(),
+            method.to_string(),
+            host.to_ascii_lowercase(),
+            path.to_string(),
+        );
+        let entry = cache.op_grants.remove(&key)?;
         if let Some(exp) = entry.expires_at {
             if now >= exp {
                 return None;
@@ -927,16 +991,17 @@ mod tests {
         insert_bootstrap(&state, "v1", "github", b"tok");
         // allow fast-path uses the residency…
         assert_eq!(state.cache_lookup("v1", "github"), Some(b"tok".to_vec()));
-        // …but ask / ask-always must NOT: a bootstrap value is not a grant.
+        // …but ask must NOT: a bootstrap value is not a grant.
         assert_eq!(state.cache_lookup_grant("v1", "github"), None);
-        assert_eq!(state.cache_take("v1", "github"), None);
-        // cache_take left it in place (allow reads still work afterwards).
-        assert_eq!(state.cache_lookup("v1", "github"), Some(b"tok".to_vec()));
-        // A real grant overwrites it and IS consumable single-use.
+        // ask-always never reads `entries` at all — the residency (and even a
+        // real conn-keyed ask grant) is invisible to op_grant_take.
         state.cache_insert("v1", "github", b"granted".to_vec(), None);
+        assert_eq!(
+            state.op_grant_take("v1", "github", "DELETE", "api.github.com", "/repos/a/b"),
+            None
+        );
+        // The ask path sees its grant as usual.
         assert_eq!(state.cache_lookup_grant("v1", "github"), Some(b"granted".to_vec()));
-        assert_eq!(state.cache_take("v1", "github"), Some(b"granted".to_vec()));
-        assert_eq!(state.cache_take("v1", "github"), None); // consumed
     }
 
     #[test]
@@ -950,26 +1015,52 @@ mod tests {
     }
 
     #[test]
-    fn cache_take_consumes_single_use() {
-        // Backs the streaming captive-portal `ask-always` path: each stream
-        // burns its approval so the next one re-prompts for a fresh passkey.
+    fn op_grant_take_consumes_single_use() {
+        // The ask-always captive-portal contract: one approval = one replay.
         let state = test_state();
         unlock_with_empty_cache(&state, "v1");
-        state.cache_insert("v1", "svc", b"tok".to_vec(), None);
+        let far = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() + 600;
+        state.op_grant_insert("v1", "svc", "POST", "api.x.com", "/v2/purchase", b"tok".to_vec(), far);
         // First take returns the value …
-        assert_eq!(state.cache_take("v1", "svc"), Some(b"tok".to_vec()));
-        // … and removes it: a second take and a plain lookup both miss.
-        assert_eq!(state.cache_take("v1", "svc"), None);
+        assert_eq!(
+            state.op_grant_take("v1", "svc", "POST", "api.x.com", "/v2/purchase"),
+            Some(b"tok".to_vec())
+        );
+        // … and removes it: a second take misses, and nothing leaked into the
+        // conn-keyed entries for the allow/ask paths to find.
+        assert_eq!(state.op_grant_take("v1", "svc", "POST", "api.x.com", "/v2/purchase"), None);
         assert_eq!(state.cache_lookup("v1", "svc"), None);
     }
 
+    /// Security regression (the $80/$180 hole): an ask-always grant is bound
+    /// to the REQUEST the user approved. A replay whose method, host, or path
+    /// differs must miss — and the miss must NOT consume the stored grant, so
+    /// the legitimate replay still works afterwards.
     #[test]
-    fn cache_take_honors_expiry() {
+    fn op_grant_take_is_request_bound() {
         let state = test_state();
         unlock_with_empty_cache(&state, "v1");
-        state.cache_insert("v1", "svc", b"stale".to_vec(), Some(0));
-        // Expired entry is not returned (and is consumed/dropped).
-        assert_eq!(state.cache_take("v1", "svc"), None);
+        let far = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() + 600;
+        state.op_grant_insert("v1", "svc", "POST", "api.x.com", "/v2/purchase", b"tok".to_vec(), far);
+        // Different path / method / host / connection → all miss.
+        assert_eq!(state.op_grant_take("v1", "svc", "POST", "api.x.com", "/v2/refund"), None);
+        assert_eq!(state.op_grant_take("v1", "svc", "DELETE", "api.x.com", "/v2/purchase"), None);
+        assert_eq!(state.op_grant_take("v1", "svc", "POST", "api.y.com", "/v2/purchase"), None);
+        assert_eq!(state.op_grant_take("v1", "other", "POST", "api.x.com", "/v2/purchase"), None);
+        // Host comparison is case-insensitive (hosts are lowercased at insert).
+        assert_eq!(
+            state.op_grant_take("v1", "svc", "POST", "API.X.COM", "/v2/purchase"),
+            Some(b"tok".to_vec())
+        );
+    }
+
+    #[test]
+    fn op_grant_take_honors_expiry() {
+        let state = test_state();
+        unlock_with_empty_cache(&state, "v1");
+        state.op_grant_insert("v1", "svc", "POST", "api.x.com", "/p", b"stale".to_vec(), 0);
+        // Expired grant is not returned (and is consumed/dropped).
+        assert_eq!(state.op_grant_take("v1", "svc", "POST", "api.x.com", "/p"), None);
     }
 
     #[test]

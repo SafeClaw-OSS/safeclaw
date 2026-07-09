@@ -681,28 +681,62 @@ pub async fn approve_op(
                 &vault_id,
             )
             .await?;
-            let conn = validated
-                .op
-                .act
-                .scope
+            let scope = &validated.op.act.scope;
+            let conn = scope
                 .get("connection_id")
-                .or_else(|| validated.op.act.scope.get("service"))
+                .or_else(|| scope.get("service"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let ttl = state
+            let pc = state
                 .approvals
                 .lock()
                 .unwrap()
                 .get(&op_id)
-                .and_then(|r| r.policy_context.clone())
-                .map(|p| p.ttl_seconds)
-                .unwrap_or(300);
-            if !conn.is_empty() {
-                let now = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
+                .and_then(|r| r.policy_context.clone());
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let level = pc.as_ref().map(|p| p.level);
+            if level == Some(crate::core::policy::AccessLevel::AskAlways) {
+                // ask-always: the approval is a ONE-SHOT bound to the exact
+                // request the user saw — (connection, method, host, path) off
+                // the op scope the proxy stamped at op-create. Never the
+                // conn-keyed `entries`: a conn-global value would let ANY
+                // later ask-always request on this connection (any method /
+                // path) silently spend an unconsumed approval. If the binding
+                // tuple is missing (malformed scope), store NOTHING — the
+                // replay re-prompts, which is the safe failure.
+                let method = scope.get("method").and_then(|v| v.as_str()).unwrap_or("");
+                let path = scope.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                let host = pc
+                    .as_ref()
+                    .and_then(|p| p.host.clone())
+                    .or_else(|| {
+                        scope.get("host").and_then(|v| v.as_str()).map(String::from)
+                    })
+                    .unwrap_or_default();
+                if !conn.is_empty() && !method.is_empty() && !host.is_empty() && !path.is_empty() {
+                    state.op_grant_insert(
+                        &vault_id,
+                        &conn,
+                        method,
+                        &host,
+                        path,
+                        s_o,
+                        now + crate::state::ASK_ALWAYS_REPLAY_WINDOW_SECS,
+                    );
+                } else {
+                    tracing::warn!(
+                        vault = %vault_id, op = %op_id,
+                        "ask-always approve without a full request binding — grant not stored (replay will re-prompt)"
+                    );
+                }
+            } else if !conn.is_empty() {
+                // ask (and legacy no-context ops): conn-keyed value with the
+                // grant-window TTL, read by the downgraded-to-Allow retry.
+                let ttl = pc.as_ref().map(|p| p.ttl_seconds).unwrap_or(300);
                 state.cache_insert(&vault_id, &conn, s_o, Some(now + ttl));
             }
             (

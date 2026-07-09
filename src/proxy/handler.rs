@@ -440,16 +440,25 @@ impl BrokerHandler {
         // grant to open the vault). A miss falls through to the captive portal.
         //   - Allow: read the resident value (incl. the unlock bootstrap) + the
         //     allow multi-secret map — the frictionless fast-path.
-        //   - Ask / AskAlways: GRANT-ONLY. Both ignore the allow-level bootstrap
-        //     (`cache_lookup_grant` / `cache_take` skip `from_bootstrap` entries,
-        //     and we pass no `allow_secrets` map) so a per-path ask/ask-always
-        //     rule ALWAYS forces a fresh passkey the first time, even on a
-        //     connection whose read floor is `allow` and is therefore resident.
-        //     AskAlways additionally burns its grant single-use; a downgraded
-        //     (approved-and-cached) Ask arrives here as Allow and reads its grant
-        //     via the fast-path above.
+        //   - Ask: GRANT-ONLY. Ignores the allow-level bootstrap
+        //     (`cache_lookup_grant` skips `from_bootstrap` entries, and we pass
+        //     no `allow_secrets` map) so a per-path ask rule ALWAYS forces a
+        //     fresh passkey the first time, even on a connection whose read
+        //     floor is `allow` and is therefore resident. A downgraded
+        //     (approved-and-cached) Ask arrives here as Allow and reads its
+        //     grant via the fast-path above.
+        //   - AskAlways: ONE-SHOT, REQUEST-BOUND. Redeems only the grant the
+        //     approve ceremony minted for exactly this (connection, method,
+        //     host, path) — consumed single-use. It never reads `entries` at
+        //     all, so it can't ride the allow residency OR a plain-ask/stale
+        //     leftover: an approval is spendable only by the action the user
+        //     saw, once.
         let (primary, secrets_map) = match level {
-            AccessLevel::AskAlways => (self.state.cache_take(&vault_id, &conn), None),
+            AccessLevel::AskAlways => (
+                self.state
+                    .op_grant_take(&vault_id, &conn, &method, &dest_host, &path),
+                None,
+            ),
             AccessLevel::Ask => (self.state.cache_lookup_grant(&vault_id, &conn), None),
             _ => (
                 self.state.cache_lookup(&vault_id, &conn),

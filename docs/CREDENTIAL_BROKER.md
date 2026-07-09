@@ -562,11 +562,27 @@ on a paired daemon also names `sc op wait <op_id>` — a waiter that polls
 agent backgrounds it and treats process-exit as its wake-up — the `sc up`
 unlock experience generalized to every approval. Polling never consumes the
 grant (a retry reads the approval cache; only `ask-always` burns it
-single-use via `cache_take`), so waiting and re-running can't race. The
-record's `expires_at` tracks the op's own Valid window, so the waiter 404s
+single-use), so waiting and re-running can't race. The record's
+`expires_at` tracks the op's own Valid window, so the waiter 404s
 exactly when the op stops being approvable. Sandboxed agent without `sc` →
 the JSON `poll_url` is the same contract by hand; the reject-and-re-run
 floor is unchanged.
+
+**An `ask-always` approval is a one-shot bound to the request the user saw**
+(v0.9.28): approving mints a grant keyed by the op's `(connection, method,
+host, path)` in `op_grants`, consumed single-use by the replay
+(`op_grant_take`). A replay whose method/host/path differ — the
+approve-$80-then-send-$180 shape rides only as far as the path identity;
+a different endpoint or verb re-prompts — misses WITHOUT consuming, so the
+legitimate replay still works. The ask-always resolve path never reads the
+conn-keyed `entries`, so an unconsumed approval can no longer be spent by an
+unrelated later request on the same connection, and it can't ride allow
+residency or a plain-ask leftover. The redeem window is generous
+(`ASK_ALWAYS_REPLAY_WINDOW_SECS`, 30 min — an agent that replays only when
+its user next prompts it may take minutes); single-use + exact binding is
+the guard, not time. Known boundary (settled 2026-07-09): the request BODY
+is not part of the binding — same method+host+path with a different body
+redeems. Body-field binding is the Phase-2 `[requests]`/vars/scope design.
 
 **The agent's env = its SSOT — four dotenv vars, minted as ONE block:**
 
