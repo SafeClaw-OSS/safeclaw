@@ -16,10 +16,12 @@ secrets = ["GMAIL_REFRESH_TOKEN"]
 match = "POST /gmail/v1/users/me/messages/send"
 vars.raw = "/raw"
 scope   = ["raw"]
-# The `email` console renderer decodes the bound `raw` (base64url RFC822) into a
-# legible From/To/Subject/Body preview, with the raw message under Advanced
-# Details. Binding `raw` means the approved message can't be swapped on replay.
-consent = { render = "email", title = "Email to send" }
+# `consent` is the one-line summary; `render` names the console renderer that
+# decodes the bound `raw` (base64url RFC822) into a legible From/To/Subject/Body
+# preview (raw under Advanced Details). Binding `raw` means the approved message
+# can't be swapped on replay.
+consent = "Send this email"
+render  = "email"
 
 [auth]
 type = "oauth2"

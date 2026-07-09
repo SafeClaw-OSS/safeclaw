@@ -20,27 +20,27 @@ write = "allow"
 # The quote (POST /v2/quote) deliberately stays on the floor: it prices a cart
 # without committing anything — gating it would put friction on the browse
 # loop while the purchase itself is already gated.
-# A purchase is an irreversible spend, so it is `ask-always` — approved EVERY
-# time and bound to the exact amount + merchant (service.toml
-# `[requests.purchase]`). Not a plain `ask`: an `ask` opens a reuse window, and
-# for money a reusable window means the identical spend can repeat unprompted —
-# so a spend must be single-use. Binding means approving "$80 to Acme" cannot be
-# redeemed as "$180" or "to a different merchant"; the console shows exactly
-# that line ("Buy from Acme for 80").
+# Small-value convenience, big-value confirmation — the contactless-payment
+# social norm (no-verification ceilings: US ~$100, EU €50, UK £100). A purchase
+# at or under the threshold is `ask` (approve once, then a reuse window), and
+# it is BOUND to its exact amount + merchant (service.toml `[requests.purchase]`)
+# — so approving "$40 to Acme" cannot be ridden by "$75 to EvilCorp" (a
+# different value re-prompts). Over the threshold escalates to `ask-always`
+# (every spend confirmed, single-use). To make even small purchases frictionless
+# (no tap at all), set this base to `allow`.
 [[rule]]
 id = "purchase"
 label = "Buy a gift card (spends wallet balance)"
 match = "POST /v2/purchase"
-level = "ask-always"
+level = "ask"
 
-# A hard ceiling, gated on the body amount (`when`): a purchase over $1000 is
-# blocked outright, not just prompted. Demonstrates a field-value decision
-# composing by most-restrictive-wins (deny beats ask-always). `vars.amount` is
-# the bound field; an undefined amount → this rule doesn't fire and the spend
-# stays ask-always (never a bypass).
+# Over the small-value ceiling, confirm every spend, bound to amount + merchant.
+# Composes by most-restrictive-wins (a purchase over the threshold matches both
+# rules → ask-always beats ask). `vars.amount` is the bound field; an undefined
+# amount → this rule doesn't fire and the base `ask` still gates (never a bypass).
 [[rule]]
-id = "purchase-cap"
-label = "Block a purchase over $1000"
+id = "purchase-large"
+label = "Confirm a purchase over $100 (bound to amount + merchant)"
 match = "POST /v2/purchase"
-when = "vars.amount > 1000"
-level = "deny"
+when = "vars.amount > 100"
+level = "ask-always"

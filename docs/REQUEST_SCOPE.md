@@ -74,8 +74,16 @@ consent = "Pay {amount} to {merchant}"      # human phrasing; {name} vars must b
   that isn't parseable, yields an **undefined** var.
 - **`scope`** — the subset of vars whose VALUES become part of the grant identity.
   Absent or `[]` ⇒ nothing bound (P5). Whitelist only in v1 (see Deferred).
-- **`consent`** — a template rendered on the approval screen. `{name}` interpolates
-  var `name`; every referenced var must be in `scope` (P4, build-enforced).
+- **`consent`** — ALWAYS a one-line template STRING (never an object):
+  `"Pay {amount} to {merchant}"`. `{name}` interpolates var `name`; every
+  referenced var must be in `scope` (P4, build-enforced).
+- **`render`** — an OPTIONAL separate string, a presentation-TYPE hint for a
+  richer console renderer (`"email"` decodes the bound base64url `raw` into a
+  From/To/Subject/Body card). This is the OAuth RAR (RFC 9396) shape: a
+  structured authorization detail carries a `type`; the client renders per type;
+  `consent` stays the human-readable summary / fallback. The renderer code lives
+  in the console and reads ONLY `scope_vars`, so show ⊆ bind holds; an
+  unknown/absent `render` falls back to the `consent` template.
 
 ### `in` and the pointer space (why this, not a home-grown scheme)
 
@@ -140,13 +148,20 @@ are. That is the point: bind the fields that define the action, ignore the noise
 
 ## Consent display
 
-The op carries `consent` = `{ template, vars: { name: value, … } }` (the scope
-values, which are what the user is authorizing). The approval frontend renders
-the template and, for a long value (a whole email body, a large JSON field),
-folds it behind a "show details" toggle — a pure front-end hide/show over data
-the daemon already sent. The daemon never truncates the value it binds; only the
-display folds. (A value large enough that it shouldn't traverse the op-relay at
-all — hundreds of KB — degrades to a `sha256:…(size)` digest with the label; rare.)
+The op scope carries `consent` (the template string), the optional `render`
+hint, and `scope_vars` (the bound values — what the user is authorizing). The
+console picks a renderer by `render`:
+
+- none / `text` → interpolate the `consent` template over `scope_vars`
+  ("Buy from Acme for 40");
+- `email` → decode the bound base64url `raw` into a From/To/Subject/Body card;
+- unknown → a generic bound-field list.
+
+The technical request (method/host/path) and the raw bound values fold under a
+"▶ Advanced Details" disclosure — a pure front-end hide/show over data the
+daemon already sent. The daemon never truncates the value it binds; only the
+display folds. (A bound value over 8 KiB is bound by `sha256:…#len` so the op
+stays small; its preview degrades to that marker.)
 
 ## The three worked services
 
@@ -162,15 +177,16 @@ scope   = ["amount", "merchant"]
 consent = "Pay {amount} to {merchant}"
 ```
 ```toml
-# policy.toml  (a spend is ask-always + bound; a hard cap denies via `when`)
-[[rule]] id="purchase"     match="POST /v2/purchase" level="ask-always"
-[[rule]] id="purchase-cap" match="POST /v2/purchase" when="vars.amount > 1000" level="deny"
+# policy.toml — small-value convenience, big-value confirmation (contactless norm)
+[[rule]] id="purchase"       match="POST /v2/purchase" level="ask"
+[[rule]] id="purchase-large" match="POST /v2/purchase" when="vars.amount > 100" level="ask-always"
 ```
-A purchase is `ask-always` (single-use, bound to amount+merchant), NOT `ask`:
-a reusable `ask` window would let the same spend repeat unprompted. `when` here
-composes a hard ceiling (deny > ask-always).
-Exact body field names (`/amount`, `/merchant_id`) are pinned at e2e against the
-live Snaplii A2M API and adjusted if they differ.
+A small purchase is `ask` (approve once, reuse window) but BOUND to amount +
+merchant — approving "$40 to Acme" cannot be ridden by "$75 to EvilCorp" (a
+different value re-prompts). Over the threshold escalates to `ask-always`
+(every spend confirmed, single-use). To make small purchases frictionless with
+no tap, set the base to `allow`. Exact body field names (`/amount`,
+`/merchant_id`) and the threshold are pinned at e2e against the live A2M API.
 
 ### gmail — bind a large body field
 
@@ -179,7 +195,8 @@ live Snaplii A2M API and adjusted if they differ.
 match = "POST /gmail/v1/users/me/messages/send"
 vars.raw = "/raw"                 # the base64url RFC822 message — the whole email
 scope   = ["raw"]
-consent = "Send this email"       # v1: raw folded/opaque; WYSIWYG decode is v2
+consent = "Send this email"       # one-line summary / fallback
+render  = "email"                 # console decodes raw → From/To/Subject/Body card
 ```
 Binding `raw` means an approved email cannot be swapped for a different one on
 replay. Decoding base64url→RFC822 to show subject/to/body legibly is a v2 consent
@@ -231,11 +248,13 @@ re-prompt) or is a documented author responsibility, none is a silent bypass:
   `ask-always` is single-use (every request re-prompts); a scoped `ask` peeks —
   reused for the SAME bound values within its window, but a DIFFERENT value
   (a different amount / merchant) still misses and re-prompts. So a scoped-ask
-  consent is never a false promise. **An irreversible or spending action must be
-  `ask-always`, not `ask`**: a reusable window still lets the *identical* spend
-  repeat unprompted, which for money is drainage. (An UNSCOPED `ask` — no
-  `[requests]` — keeps the Phase-1 connection-wide window: the documented
-  usable-but-not-bound default.)
+  consent is never a false promise. A scoped `ask` is right for the
+  small-value-convenience tier (contactless norm): a distinct purchase is
+  approved once, an *identical* repeat rides the window, a *different* one
+  re-prompts. If even an identical repeat must re-confirm (a high-value spend),
+  use `ask-always` (single-use). If any small purchase should be frictionless
+  with no tap, use `allow`. (An UNSCOPED `ask` — no `[requests]` — keeps the
+  Phase-1 connection-wide window: the documented usable-but-not-bound default.)
 - **Whitelist binds only named fields.** A body field not in `scope` is neither
   shown nor bound — the author must name every field that defines the action
   (P4/P5). For snaplii, if the live purchase body carries a recipient/SKU, add

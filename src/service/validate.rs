@@ -313,11 +313,11 @@ fn validate_service_inner(toml_str: &str) -> Result<(), Vec<String>> {
                 errs.push(format!("[requests.{}] scope lists '{}' more than once", name, k));
             }
         }
-        // P4 show ⊆ bind (text form): every {token} a consent template
-        // interpolates must be in scope. The rich `{ render }` form satisfies
-        // show ⊆ bind by construction — its renderer only reads `scope_vars`.
+        // P4 show ⊆ bind: every {token} a consent template interpolates must be
+        // in scope. (A `render` hint needs no check — its console renderer only
+        // reads the bound `scope_vars`, so show ⊆ bind holds by construction.)
         if let Some(consent) = &shape.consent {
-            for tok in consent.text_tokens() {
+            for tok in crate::service::consent_tokens(consent) {
                 if !shape.scope.contains(&tok) {
                     errs.push(format!(
                         "[requests.{}] consent references '{{{}}}', which is not in `scope` (show ⊆ bind)",

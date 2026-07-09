@@ -48,9 +48,9 @@ pub fn render_operation(op: &Operation) -> String {
 
 /// A brokered Use op. Surface the request line (method + host + path) and, for
 /// a Phase-2 scope, the consent — so a HEADLESS / CLI approver (no console)
-/// sees what the console's rich card shows, not just the target slot. A text
-/// consent is rendered with its bound `scope_vars`; a rich `{ render }` consent
-/// falls back to listing the bound fields (the decode lives in the console).
+/// sees what the console's rich card shows, not just the target slot. The
+/// `consent` template is interpolated over the bound `scope_vars`; with none,
+/// the bound fields are listed. (A `render` hint is a console-only concern.)
 fn render_use(op: &Operation) -> String {
     let scope = &op.act.scope;
     let s = |k: &str| scope.get(k).and_then(|v| v.as_str()).unwrap_or("");
@@ -66,18 +66,18 @@ fn render_use(op: &Operation) -> String {
         })
         .unwrap_or_default();
 
-    // The consent line: interpolate a text template over the bound fields, or
-    // (rich form / none) list the bound fields.
-    let consent_line = match scope.get("consent") {
-        Some(serde_json::Value::String(t)) => Some(interpolate(t, &bound)),
-        Some(serde_json::Value::Object(_)) | None if !bound.is_empty() => Some(
+    // The consent line: interpolate the template over the bound fields; with no
+    // template but some bound fields, list them.
+    let consent_line = match scope.get("consent").and_then(|v| v.as_str()) {
+        Some(t) => Some(interpolate(t, &bound)),
+        None if !bound.is_empty() => Some(
             bound
                 .iter()
                 .map(|(k, v)| format!("{}={}", k, truncate(v, 80)))
                 .collect::<Vec<_>>()
                 .join(", "),
         ),
-        _ => None,
+        None => None,
     };
 
     let request = if !method.is_empty() || !host.is_empty() || !path.is_empty() {

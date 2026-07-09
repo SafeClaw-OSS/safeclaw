@@ -141,6 +141,7 @@ impl ServiceDef {
             vars,
             bound,
             consent: shape.consent.clone(),
+            render: shape.render.clone(),
         })
     }
 
@@ -432,53 +433,22 @@ pub struct RequestShape {
     /// nothing bound (P5). Whitelist only in v1.
     #[serde(default)]
     pub scope: Vec<String>,
-    /// How the approval screen phrases this action. Either a text template
-    /// (`"Buy from {merchant} for {amount}"`) or a named renderer
-    /// (`{ render = "email" }`). See [`ConsentSpec`].
+    /// The one-line human phrasing shown on the approval screen: a template
+    /// with `{var}` placeholders interpolated over the bound values, e.g.
+    /// `"Buy from {merchant} for {amount}"`. Uniform across every service —
+    /// always a plain string. Every `{token}` must be in `scope` (build-checked).
     #[serde(default)]
-    pub consent: Option<ConsentSpec>,
-}
-
-/// The approval-screen presentation for a request shape. Two forms (untagged):
-/// a **text template** interpolated over the bound vars, or a **named
-/// renderer** the frontend owns (e.g. `email` decodes the bound `raw` message
-/// into From/To/Subject/Body). The toml only ever NAMES a renderer — the
-/// decode/layout code lives in the console, keeping the definition declarative
-/// (the same "standardized ⇒ config, bespoke ⇒ code" split as `[auth]`).
-///
-/// **P4 (show ⊆ bind) holds by construction for the rich form**: a renderer can
-/// only read the bound `scope_vars`, so it can never show a value the grant
-/// doesn't lock. The text form is checked explicitly at build (`{tokens}` ⊆
-/// scope). Unknown `render` ids degrade to the generic field view.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(untagged)]
-pub enum ConsentSpec {
-    /// `"Buy from {merchant} for {amount}"` — interpolated over `scope_vars`.
-    Text(String),
-    /// `{ render = "email", title = "Email to send" }` — a frontend renderer id
-    /// (+ optional header) fed the bound `scope_vars`.
-    Rich(RichConsent),
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RichConsent {
-    /// Frontend renderer id (`email`, `payment`, …). Unknown ⇒ generic view.
-    pub render: String,
-    /// Optional header override; the renderer supplies a default otherwise.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub title: Option<String>,
-}
-
-impl ConsentSpec {
-    /// The `{token}` names a text template interpolates (empty for the rich
-    /// form). Used by build verification for the show ⊆ bind check.
-    pub fn text_tokens(&self) -> Vec<String> {
-        match self {
-            ConsentSpec::Text(t) => consent_tokens(t),
-            ConsentSpec::Rich(_) => Vec::new(),
-        }
-    }
+    pub consent: Option<String>,
+    /// Optional presentation-TYPE hint for a richer console renderer, e.g.
+    /// `"email"` (decode the bound base64url `raw` into From/To/Subject/Body).
+    /// This is the OAuth RAR (RFC 9396) pattern: a structured authorization
+    /// detail carries a `type`; the client renders per type; `consent` remains
+    /// the human-readable summary / fallback. The decode/layout code lives in
+    /// the console (declarative toml, code in the console) and reads ONLY the
+    /// bound `scope_vars`, so show ⊆ bind holds. Unknown/absent ⇒ the `consent`
+    /// template (or a generic bound-field list).
+    #[serde(default)]
+    pub render: Option<String>,
 }
 
 /// The `{name}` tokens a consent text template interpolates. `{{`/`}}` is a
@@ -581,8 +551,10 @@ pub struct RequestScope {
     /// The scope-bound `(name, value)` pairs, SORTED by name. What
     /// [`scope_digest`] hashes into the grant identity. Empty ⇒ nothing bound.
     pub bound: Vec<(String, String)>,
-    /// The shape's consent presentation spec, if any.
-    pub consent: Option<ConsentSpec>,
+    /// The shape's consent template (one-line, `{var}` placeholders).
+    pub consent: Option<String>,
+    /// The shape's optional renderer-type hint (`"email"`, …).
+    pub render: Option<String>,
 }
 
 impl RequestScope {
@@ -1677,7 +1649,7 @@ consent = "Buy from {merchant} for {amount}"
             rs.bound,
             vec![("amount".to_string(), "80".to_string()), ("merchant".to_string(), "m_1".to_string())]
         );
-        assert!(matches!(&rs.consent, Some(ConsentSpec::Text(t)) if t == "Buy from {merchant} for {amount}"));
+        assert_eq!(rs.consent.as_deref(), Some("Buy from {merchant} for {amount}"));
     }
 
     #[test]
@@ -1696,13 +1668,14 @@ consent = "Buy from {merchant} for {amount}"
     }
 
     #[test]
-    fn consent_text_and_rich_forms_parse() {
-        // Text form → tokens for the show ⊆ bind check.
+    fn consent_is_a_template_string_with_an_optional_render_hint() {
+        // consent is always a plain template string; its tokens feed show ⊆ bind.
         let def = snaplii_def();
-        let c = &def.requests["purchase"].consent;
-        assert!(matches!(c, Some(ConsentSpec::Text(_))));
-        assert_eq!(c.as_ref().unwrap().text_tokens(), vec!["merchant", "amount"]);
-        // Rich form → a named renderer, no text tokens (show ⊆ bind by construction).
+        let purchase = &def.requests["purchase"];
+        assert_eq!(purchase.consent.as_deref(), Some("Buy from {merchant} for {amount}"));
+        assert_eq!(purchase.render, None);
+        assert_eq!(consent_tokens(purchase.consent.as_deref().unwrap()), vec!["merchant", "amount"]);
+        // `render` is a SEPARATE optional hint (RAR-style type), not a consent shape.
         let gmail: ServiceDef = toml::from_str(
             r#"
 [service]
@@ -1714,18 +1687,14 @@ secrets = ["GMAIL_REFRESH_TOKEN"]
 match = "POST /gmail/v1/users/me/messages/send"
 vars.raw = "/raw"
 scope = ["raw"]
-consent = { render = "email", title = "Email to send" }
+consent = "Send this email"
+render = "email"
 "#,
         )
         .unwrap();
-        match &gmail.requests["send"].consent {
-            Some(ConsentSpec::Rich(r)) => {
-                assert_eq!(r.render, "email");
-                assert_eq!(r.title.as_deref(), Some("Email to send"));
-            }
-            other => panic!("expected rich consent, got {other:?}"),
-        }
-        assert!(gmail.requests["send"].consent.as_ref().unwrap().text_tokens().is_empty());
+        let send = &gmail.requests["send"];
+        assert_eq!(send.consent.as_deref(), Some("Send this email"));
+        assert_eq!(send.render.as_deref(), Some("email"));
     }
 
     #[test]

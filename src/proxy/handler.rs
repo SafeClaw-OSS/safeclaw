@@ -774,13 +774,14 @@ impl BrokerHandler {
                     .collect();
                 scope["scope_vars"] = serde_json::Value::Object(obj);
             }
+            // Display-only (not in the digest); still signed into β, and
+            // strings so JCS is happy. `consent` = the one-line template; the
+            // optional `render` = a console renderer-type hint (RAR-style).
             if let Some(c) = &rs.consent {
-                // Either a "text template" string or a {render,title} object —
-                // the console picks the renderer. Display-only (not in the
-                // digest); still signed into β, and strings-only so JCS is happy.
-                if let Ok(v) = serde_json::to_value(c) {
-                    scope["consent"] = v;
-                }
+                scope["consent"] = serde_json::Value::String(c.clone());
+            }
+            if let Some(r) = &rs.render {
+                scope["render"] = serde_json::Value::String(r.clone());
             }
         }
         let op = Operation {
