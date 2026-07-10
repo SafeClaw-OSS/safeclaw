@@ -56,7 +56,7 @@ vars.amount   = "/amount"                   # bare string = body JSON Pointer (R
 vars.merchant = "/merchant_id"
 vars.force    = { in = "query", at = "force" }   # a query parameter
 scope   = ["amount", "merchant"]            # which vars BIND the grant (⊆ declared vars)
-consent = "Pay {amount} to {merchant}"      # human phrasing; {name} vars must be ⊆ scope
+consent = "Pay {{ vars.amount }} to {{ vars.merchant }}"   # {{ vars.x | filter }} template
 ```
 
 - **`match`** — `"METHOD /path"` (or `"/path"` for any method); `*` = one segment,
@@ -74,16 +74,22 @@ consent = "Pay {amount} to {merchant}"      # human phrasing; {name} vars must b
   that isn't parseable, yields an **undefined** var.
 - **`scope`** — the subset of vars whose VALUES become part of the grant identity.
   Absent or `[]` ⇒ nothing bound (P5). Whitelist only in v1 (see Deferred).
-- **`consent`** — ALWAYS a one-line template STRING (never an object):
-  `"Pay {amount} to {merchant}"`. `{name}` interpolates var `name`; every
-  referenced var must be in `scope` (P4, build-enforced).
-- **`render`** — an OPTIONAL separate string, a presentation-TYPE hint for a
-  richer console renderer (`"email"` decodes the bound base64url `raw` into a
-  From/To/Subject/Body card). This is the OAuth RAR (RFC 9396) shape: a
-  structured authorization detail carries a `type`; the client renders per type;
-  `consent` stays the human-readable summary / fallback. The renderer code lives
-  in the console and reads ONLY `scope_vars`, so show ⊆ bind holds; an
-  unknown/absent `render` falls back to the `consent` template.
+- **`consent`** — ONE template string, using the SAME `{{ vars.x | filter }}`
+  pipe grammar as git-integration's `{{ secret.X | basic }}` (the Liquid / Jinja
+  convention). Two shapes:
+  - **plain interpolation** — `"Buy from {{ vars.merchant }} for {{ vars.amount }}"`;
+  - **a rich renderer via a filter** — `"{{ vars.raw | email }}"`, where `email`
+    is console code (like git's `basic` = base64) that decodes the bound
+    base64url message into a From/To/Subject/Body card.
+
+  A filter names console code (declarative toml, code in the console — the same
+  split as `[auth]`); adding a renderer is adding a filter, no schema change.
+  Every referenced `vars.<name>` must be in `scope` (P4, build-enforced), and a
+  filter reads ONLY that bound value. **Values are auto-escaped by the
+  renderer** (React text nodes) — they come from the agent, so a value
+  containing `<script>` is displayed, never executed (XSS-safe). A filter never
+  fetches a URL from a value (no SSRF); the approve action is passkey-gated (not
+  a template/CSRF concern).
 
 ### `in` and the pointer space (why this, not a home-grown scheme)
 
@@ -148,14 +154,14 @@ are. That is the point: bind the fields that define the action, ignore the noise
 
 ## Consent display
 
-The op scope carries `consent` (the template string), the optional `render`
-hint, and `scope_vars` (the bound values — what the user is authorizing). The
-console picks a renderer by `render`:
+The op scope carries `consent` (the `{{ vars.x | filter }}` template) and
+`scope_vars` (the bound values — what the user is authorizing). The console
+parses the template and renders each reference:
 
-- none / `text` → interpolate the `consent` template over `scope_vars`
-  ("Buy from Acme for 40");
-- `email` → decode the bound base64url `raw` into a From/To/Subject/Body card;
-- unknown → a generic bound-field list.
+- a plain `{{ vars.x }}` → the escaped value inline ("Buy from Acme for 40");
+- `{{ vars.raw | email }}` → decode the bound base64url message into a
+  From/To/Subject/Body card;
+- an unknown filter / no template → a generic bound-field list.
 
 The technical request (method/host/path) and the raw bound values fold under a
 "▶ Advanced Details" disclosure — a pure front-end hide/show over data the
@@ -174,7 +180,7 @@ match = "POST /v2/purchase"
 vars.amount   = "/amount"
 vars.merchant = "/merchant_id"
 scope   = ["amount", "merchant"]
-consent = "Pay {amount} to {merchant}"
+consent = "Buy from {{ vars.merchant }} for {{ vars.amount }}"
 ```
 ```toml
 # policy.toml — small-value convenience, big-value confirmation (contactless norm)
@@ -195,12 +201,11 @@ no tap, set the base to `allow`. Exact body field names (`/amount`,
 match = "POST /gmail/v1/users/me/messages/send"
 vars.raw = "/raw"                 # the base64url RFC822 message — the whole email
 scope   = ["raw"]
-consent = "Send this email"       # one-line summary / fallback
-render  = "email"                 # console decodes raw → From/To/Subject/Body card
+consent = "{{ vars.raw | email }}"   # the `email` filter → From/To/Subject/Body card
 ```
 Binding `raw` means an approved email cannot be swapped for a different one on
-replay. Decoding base64url→RFC822 to show subject/to/body legibly is a v2 consent
-transform; v1 binds and labels it.
+replay. The `email` filter (console code, like git's `| basic`) decodes
+base64url→RFC822 into a legible card, the raw message under Advanced Details.
 
 ### github — the opt-out baseline
 

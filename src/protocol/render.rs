@@ -91,11 +91,30 @@ fn render_use(op: &Operation) -> String {
     }
 }
 
+/// Render a `{{ vars.x | filter }}` consent template to plain text for the CLI:
+/// interpolate each reference with its bound value (a filter is a
+/// console-display concern, so here the value is shown as-is / truncated).
 fn interpolate(template: &str, bound: &[(String, String)]) -> String {
-    let mut out = template.to_string();
-    for (k, v) in bound {
-        out = out.replace(&format!("{{{}}}", k), &truncate(v, 80));
+    let vals: std::collections::HashMap<&str, &str> =
+        bound.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let mut out = String::new();
+    let mut rest = template;
+    while let Some(start) = rest.find("{{") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let Some(end) = after.find("}}") else {
+            out.push_str("{{");
+            rest = after;
+            continue;
+        };
+        let inner = after[..end].trim();
+        let name = inner.splitn(2, '|').next().unwrap_or("").trim();
+        if let Some(var) = name.strip_prefix("vars.").map(str::trim) {
+            out.push_str(&truncate(vals.get(var).copied().unwrap_or(""), 80));
+        }
+        rest = &after[end + 2..];
     }
+    out.push_str(rest);
     out
 }
 

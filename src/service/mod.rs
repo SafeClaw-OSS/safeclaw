@@ -141,7 +141,6 @@ impl ServiceDef {
             vars,
             bound,
             consent: shape.consent.clone(),
-            render: shape.render.clone(),
         })
     }
 
@@ -433,48 +432,56 @@ pub struct RequestShape {
     /// nothing bound (P5). Whitelist only in v1.
     #[serde(default)]
     pub scope: Vec<String>,
-    /// The one-line human phrasing shown on the approval screen: a template
-    /// with `{var}` placeholders interpolated over the bound values, e.g.
-    /// `"Buy from {merchant} for {amount}"`. Uniform across every service —
-    /// always a plain string. Every `{token}` must be in `scope` (build-checked).
+    /// The approval-screen phrasing: a template over the bound vars, using the
+    /// SAME `{{ vars.x | filter }}` pipe syntax as git-integration's
+    /// `{{ secret.X | basic }}` (the Liquid/Jinja convention). Two shapes:
+    ///   - plain interpolation — `"Buy from {{ vars.merchant }} for {{ vars.amount }}"`;
+    ///   - a rich renderer via a filter — `"{{ vars.raw | email }}"` (the `email`
+    ///     console filter decodes the bound base64url message into a card).
+    /// One field, always a string; a filter names console code (declarative
+    /// toml, code in the console — the same split as `[auth]`). Every referenced
+    /// `vars.<name>` must be in `scope` (P4 show ⊆ bind, build-checked); a filter
+    /// reads ONLY that bound value. Interpolated values are auto-escaped by the
+    /// renderer (they come from the agent).
     #[serde(default)]
     pub consent: Option<String>,
-    /// Optional presentation-TYPE hint for a richer console renderer, e.g.
-    /// `"email"` (decode the bound base64url `raw` into From/To/Subject/Body).
-    /// This is the OAuth RAR (RFC 9396) pattern: a structured authorization
-    /// detail carries a `type`; the client renders per type; `consent` remains
-    /// the human-readable summary / fallback. The decode/layout code lives in
-    /// the console (declarative toml, code in the console) and reads ONLY the
-    /// bound `scope_vars`, so show ⊆ bind holds. Unknown/absent ⇒ the `consent`
-    /// template (or a generic bound-field list).
-    #[serde(default)]
-    pub render: Option<String>,
 }
 
-/// The `{name}` tokens a consent text template interpolates. `{{`/`}}` is a
-/// literal brace. Unterminated `{` is ignored.
-pub fn consent_tokens(template: &str) -> Vec<String> {
+/// One `{{ vars.<name> [| <filter>] }}` reference in a consent template.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConsentRef {
+    pub var: String,
+    pub filter: Option<String>,
+}
+
+/// Parse a consent template's `{{ vars.<name> [| <filter>] }}` references (the
+/// same pipe grammar as git-integration's `{{ secret.X | basic }}`). Literal
+/// text and malformed/prefix-less tokens are skipped. Used for both build
+/// verification (var ⊆ scope) and the CLI's plain-text render.
+pub fn consent_refs(template: &str) -> Vec<ConsentRef> {
     let mut out = Vec::new();
-    let bytes = template.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'{' {
-            if i + 1 < bytes.len() && bytes[i + 1] == b'{' {
-                i += 2;
-                continue;
-            }
-            if let Some(end) = template[i + 1..].find('}') {
-                let name = template[i + 1..i + 1 + end].trim().to_string();
-                if !name.is_empty() {
-                    out.push(name);
-                }
-                i = i + 1 + end + 1;
-                continue;
+    let mut rest = template;
+    while let Some(start) = rest.find("{{") {
+        let after = &rest[start + 2..];
+        let Some(end) = after.find("}}") else { break };
+        let inner = after[..end].trim();
+        let mut parts = inner.splitn(2, '|');
+        let expr = parts.next().unwrap_or("").trim();
+        let filter = parts.next().map(|f| f.trim().to_string()).filter(|f| !f.is_empty());
+        if let Some(name) = expr.strip_prefix("vars.").map(str::trim) {
+            if !name.is_empty() {
+                out.push(ConsentRef { var: name.to_string(), filter });
             }
         }
-        i += 1;
+        rest = &after[end + 2..];
     }
     out
+}
+
+/// The `vars.<name>` names a consent template references — for the show ⊆ bind
+/// build check.
+pub fn consent_tokens(template: &str) -> Vec<String> {
+    consent_refs(template).into_iter().map(|r| r.var).collect()
 }
 
 /// Where a var is addressed. OpenAPI's `in` convention.
@@ -551,10 +558,8 @@ pub struct RequestScope {
     /// The scope-bound `(name, value)` pairs, SORTED by name. What
     /// [`scope_digest`] hashes into the grant identity. Empty ⇒ nothing bound.
     pub bound: Vec<(String, String)>,
-    /// The shape's consent template (one-line, `{var}` placeholders).
+    /// The shape's consent template (`{{ vars.x | filter }}` syntax).
     pub consent: Option<String>,
-    /// The shape's optional renderer-type hint (`"email"`, …).
-    pub render: Option<String>,
 }
 
 impl RequestScope {
@@ -1625,7 +1630,7 @@ vars.amount   = "/amount"
 vars.merchant = "/merchant_id"
 vars.force    = { in = "query", at = "force" }
 scope   = ["amount", "merchant"]
-consent = "Buy from {merchant} for {amount}"
+consent = "Buy from {{ vars.merchant }} for {{ vars.amount }}"
 "#,
         )
         .unwrap()
@@ -1649,7 +1654,7 @@ consent = "Buy from {merchant} for {amount}"
             rs.bound,
             vec![("amount".to_string(), "80".to_string()), ("merchant".to_string(), "m_1".to_string())]
         );
-        assert_eq!(rs.consent.as_deref(), Some("Buy from {merchant} for {amount}"));
+        assert_eq!(rs.consent.as_deref(), Some("Buy from {{ vars.merchant }} for {{ vars.amount }}"));
     }
 
     #[test]
@@ -1668,33 +1673,20 @@ consent = "Buy from {merchant} for {amount}"
     }
 
     #[test]
-    fn consent_is_a_template_string_with_an_optional_render_hint() {
-        // consent is always a plain template string; its tokens feed show ⊆ bind.
+    fn consent_is_one_template_with_pipe_filters() {
+        // Plain interpolation: `{{ vars.x }}` → the referenced var names.
         let def = snaplii_def();
         let purchase = &def.requests["purchase"];
-        assert_eq!(purchase.consent.as_deref(), Some("Buy from {merchant} for {amount}"));
-        assert_eq!(purchase.render, None);
+        assert_eq!(purchase.consent.as_deref(), Some("Buy from {{ vars.merchant }} for {{ vars.amount }}"));
         assert_eq!(consent_tokens(purchase.consent.as_deref().unwrap()), vec!["merchant", "amount"]);
-        // `render` is a SEPARATE optional hint (RAR-style type), not a consent shape.
-        let gmail: ServiceDef = toml::from_str(
-            r#"
-[service]
-id = "gmail"
-name = "Gmail"
-hosts = ["gmail.googleapis.com"]
-secrets = ["GMAIL_REFRESH_TOKEN"]
-[requests.send]
-match = "POST /gmail/v1/users/me/messages/send"
-vars.raw = "/raw"
-scope = ["raw"]
-consent = "Send this email"
-render = "email"
-"#,
-        )
-        .unwrap();
-        let send = &gmail.requests["send"];
-        assert_eq!(send.consent.as_deref(), Some("Send this email"));
-        assert_eq!(send.render.as_deref(), Some("email"));
+        // A rich renderer is a FILTER in the same one template field — same
+        // `{{ x | filter }}` grammar as git's `{{ secret.X | basic }}`.
+        let refs = consent_refs("{{ vars.raw | email }}");
+        assert_eq!(refs, vec![ConsentRef { var: "raw".into(), filter: Some("email".into()) }]);
+        // A filter still counts its var for show ⊆ bind.
+        assert_eq!(consent_tokens("{{ vars.raw | email }}"), vec!["raw"]);
+        // A token without the `vars.` prefix is ignored (left literal).
+        assert!(consent_tokens("hello {{ merchant }}").is_empty());
     }
 
     #[test]

@@ -43,4 +43,4 @@ match = "POST /v2/purchase"
 vars.amount   = "/amount"
 vars.merchant = "/merchant_id"
 scope   = ["amount", "merchant"]
-consent = "Buy from {merchant} for {amount}"
+consent = "Buy from {{ vars.merchant }} for {{ vars.amount }}"

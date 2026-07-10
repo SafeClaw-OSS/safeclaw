@@ -677,7 +677,7 @@ secrets = ["PAY_KEY"]
 match = "POST /buy"
 vars.amount = "/amount"
 scope = ["amount"]
-consent = "Spend {amount}"
+consent = "Spend {{ vars.amount }}"
 "#;
 
     #[test]
@@ -687,7 +687,7 @@ consent = "Spend {amount}"
 
     #[test]
     fn consent_var_must_be_in_scope() {
-        let bad = REQ_SERVICE.replace(r#"consent = "Spend {amount}""#, r#"consent = "Send {secret}""#);
+        let bad = REQ_SERVICE.replace(r#"consent = "Spend {{ vars.amount }}""#, r#"consent = "Send {{ vars.secret }}""#);
         let e = validate_service(&bad).unwrap_err();
         assert!(e.iter().any(|s| s.contains("consent references '{secret}'")), "got {:?}", e);
     }
