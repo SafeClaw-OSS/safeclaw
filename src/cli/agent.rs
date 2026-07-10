@@ -95,12 +95,12 @@ async fn add(args: AgentAddArgs) -> Result<(), String> {
     // STDOUT only; stderr guidance carries NO secret, so blind-capture keeps the
     // key out of the agent's transcript (and out of the install prompt).
     //
-    // We deliberately do NOT bake `SAFECLAW_PROXY_URL` here. It is fully derived
-    // (`api_face_root` host + vid + key), and baking it froze a host:port that a
-    // moved daemon made stale — and `sc run` PREFERRED that snapshot verbatim, so
-    // the child's HTTPS_PROXY pointed at a dead port. `sc run` now rebuilds the
-    // proxy URL live from the daemon face + this key, so the derived-only env
-    // self-heals. This matches the skill's documented 3-var contract.
+    // We deliberately do NOT bake a precomputed full proxy URL
+    // (`<vid>:<key>@host`) here. It carries no information not already in these
+    // three vars, and baking it froze a host:port that a moved daemon made stale.
+    // `sc run` rebuilds the child's HTTPS_PROXY live from the broker face + this
+    // key, so the derived-only env self-heals — this is the skill's documented
+    // 3-var contract.
     println!("SAFECLAW_BROKER_URL={}", broker_url);
     println!("SAFECLAW_VAULT_ID={}", vid);
     println!("SAFECLAW_API_KEY={}", r.token);

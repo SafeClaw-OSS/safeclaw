@@ -523,7 +523,7 @@ that file is deleted. Supersedes this section's old "routing discipline".)
 
 **Opt-in, NOT a mandatory proxy.** Normal traffic goes direct and untouched.
 Only credential traffic — a request the agent DELIBERATELY writes a phantom
-into — is routed (`sc run --`, or per-request `--proxy $SAFECLAW_PROXY_URL`).
+into — is routed (`sc run --`).
 A dead daemon degrades only vault features, never all egress; a phantom sent
 unrouted reaches the upstream as a literal string → clean 401, never a leak.
 Consequence: **all routing-detection is deleted** (probe host, `is_routed`,
@@ -587,10 +587,9 @@ redeems. Body-field binding is the Phase-2 `[requests]`/vars/scope design.
 **The agent's env = its SSOT — four dotenv vars, minted as ONE block:**
 
 ```
-SAFECLAW_DAEMON_URL=http://127.0.0.1:23294               # API face
+SAFECLAW_BROKER_URL=http://127.0.0.1:23294               # broker/API face
 SAFECLAW_VAULT_ID=<vid>                                  # discovery path param + proxy username
 SAFECLAW_API_KEY=<key>                                   # identity — Bearer (API face) + proxy password
-SAFECLAW_PROXY_URL=http://<vid>:<key>@127.0.0.1:23294    # proxy face (optional — `sc run` derives it)
 ```
 
 **`sc agent add <name>` IS the single minter**: it prints this whole block to
@@ -598,7 +597,7 @@ stdout (key shown once; stderr guidance carries no secret) — a mint-time
 projection of the DEVICE atoms — and the agent appends it unseen to its own
 `.env`. The key stays out of the install prompt AND the transcript (settled:
 the cloud also can't know a device's real atoms, so a console-baked env would
-freeze assumptions). `sc env` stays the HUMAN-shell projection (`DAEMON_URL`
+freeze assumptions). `sc env` stays the HUMAN-shell projection (`BROKER_URL`
 + `VAULT_ID`, never a key — a device-level key would collapse per-agent
 revocation). Install chain: prompt = install + pair-token login + `sc agent
 add >> .env` + a CLAUDE.md reminder.
@@ -607,7 +606,7 @@ add >> .env` + a CLAUDE.md reminder.
 derivation point. Device atoms: config `daemon` host + the port constants +
 the default vault; vault history lives in `~/.safeclaw/known_vaults.toml`
 (known_hosts-style). THE invariant: **proxy and control always derive from
-the same daemon host** — when `$SAFECLAW_DAEMON_URL` is set, its HOST feeds
+the same daemon host** — when `$SAFECLAW_BROKER_URL` is set, its HOST feeds
 `control_root` and every derived proxy URL, so an agent's shelled `sc` and
 its own HTTP cannot target different daemons; worst case is a uniformly
 stale snapshot, never a split. Vault precedence at the one choke point
@@ -625,7 +624,7 @@ Absent Proxy-Auth = blind tunnel (non-participating); present-but-wrong =
 407. An auth miss with a key present triggers ONE debounced hash refresh (a
 just-minted `sc agent add` key must not 407 for the 30s sync loop).
 
-Discovery shape: `GET $DAEMON_URL/v/$VAULT_ID/registry` → `{ services[],
+Discovery shape: `GET $BROKER_URL/v/$VAULT_ID/registry` → `{ services[],
 connections:[{ id, hosts, connected, phantoms }] }` — **discovery returns the
 ready-made phantom strings**; the agent copies, never constructs. The phantom
 FORMAT lives in the skill's one-concept sentence; per-connection INSTANCES

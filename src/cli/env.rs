@@ -18,8 +18,8 @@
 //! is minted whole by `sc agent add`, not here: agent ≡ api-key, account-level,
 //! so each agent holds its own key and `sc env` (device scope) must never emit
 //! one — that would collapse every agent on the device to one key. `sc run`
-//! derives the proxy URL live from the daemon face + that key, so neither tool
-//! bakes a `SAFECLAW_PROXY_URL`. See
+//! derives the child's HTTPS_PROXY live from the broker face + that key, so
+//! neither tool bakes a precomputed proxy URL. See
 //! [[project_vault_agent_architecture_2026_06_25]] / CREDENTIAL_BROKER.md §14.
 //!
 //! Falls back to printing comments + a clear hint if no config has been
