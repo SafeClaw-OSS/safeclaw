@@ -361,14 +361,18 @@ fn classify_pull_body(
         return Ok(PullOutcome::Unchanged);
     }
 
+    let version = body.get("version").and_then(|v| v.as_u64()).unwrap_or(0);
+
     // PER-ITEM: a per-item vault's `/blob` row is now a keyset-lifecycle marker
     // ONLY — the browser writes `{ lifecycle: "per-item-v3", version }` with NO
     // `blob` field (setupEnvVault). The keyset itself rides `/keys`
     // (`pull_keys`), not the whole-blob path. So a live 200 body with no `blob`
     // (and not a tombstone — handled above) is NOT an error and must NOT be
     // persisted to `vault.dat`: treat it as `Unchanged`. (A legacy whole-blob
-    // vault still sends a `blob`; that path is unchanged below.)
+    // vault still sends a `blob`; that path is unchanged below.) The version
+    // cursor MUST still advance (see `record_blob_version`).
     let Some(blob) = body.get("blob") else {
+        record_blob_version(state_dir, vault, version);
         return Ok(PullOutcome::Unchanged);
     };
     // PER-ITEM: `putBlob` wraps the lifecycle marker, so it arrives as
@@ -378,12 +382,32 @@ fn classify_pull_body(
     // persist it as vault.dat — treat as Unchanged so `sc sync` doesn't choke
     // trying to parse a lifecycle marker as a SealedState (missing `registry`).
     if blob.get("lifecycle").is_some() {
+        record_blob_version(state_dir, vault, version);
         return Ok(PullOutcome::Unchanged);
     }
 
-    let version = body.get("version").and_then(|v| v.as_u64()).unwrap_or(0);
     persist_blob(state_dir, vault, blob, version)?;
     Ok(PullOutcome::Updated(version))
+}
+
+/// Advance the `.blob_version` cursor WITHOUT writing `vault.dat`. A per-item
+/// vault's `/blob` row is a lifecycle marker that is never persisted as
+/// content, but its `version` must still advance the `?since=` cursor —
+/// otherwise every `/blob` probe re-delivers the marker, and `/blob/wait`
+/// (which answers instantly whenever `version > since`) never parks: that
+/// unrecorded cursor was the pre-0.9.36 bug that turned the 25s long-poll
+/// into a ~1.5s hot loop. `version == 0` (field absent) records nothing.
+fn record_blob_version(state_dir: &Path, vault: &str, version: u64) {
+    if version == 0 {
+        return;
+    }
+    let sidecar = version_sidecar(state_dir, vault);
+    if let Some(parent) = sidecar.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Err(e) = std::fs::write(&sidecar, version.to_string()) {
+        tracing::warn!(vault = %vault, "cloud sync: failed to record blob version: {}", e);
+    }
 }
 
 /// Validate a pulled blob as a `SealedVault`, write it to `vault.dat`
@@ -723,8 +747,11 @@ async fn sync_agent_keys_with_timeout(state: &Arc<AppState>, timeout: Duration) 
     };
     if let Some(hashes) = fetch_agent_key_hashes(&client, cloud, &dk).await {
         let n = hashes.len();
-        state.set_agent_key_hashes(hashes);
-        tracing::debug!(count = n, "synced agent-key hash-set");
+        // Log only when the set actually moved — this runs on a 30s loop, and
+        // an unconditional line here is the daemon's loudest idle chatter.
+        if state.set_agent_key_hashes(hashes) {
+            tracing::info!(count = n, "agent-key hash-set updated");
+        }
     }
 }
 
@@ -918,11 +945,30 @@ fn retention_cutoff(days: u32) -> Option<i64> {
     Some(now - (days as i64) * 86_400)
 }
 
-/// Long-lived background sync watcher. Long-polls the cloud blob-version
-/// endpoint (`/v/{vid}/blob/wait?since=<local>`, server holds ~25s and
-/// responds the instant the version bumps); on a change, pulls the new sealed
-/// blob into `vault.dat` (under the per-vault write lock, serialized against
-/// approve's writes) and refreshes the unlocked cache with the retained `K`.
+/// Long-lived background sync watcher — one task per synced vault, holding up
+/// to TWO server long-polls concurrently (`tokio::select!`), both ~25s
+/// server-held so an idle daemon PARKS instead of polling:
+///
+///  - `/blob/wait?since=<.blob_version>` — the LIFECYCLE channel, and the sole
+///    lifecycle AUTHORITY (tombstone drop, auth-stop). For a whole-blob vault a
+///    wake also delivers the new sealed blob; for a per-item vault the row is a
+///    lifecycle marker whose `version` still bumps on keyset/lifecycle writes.
+///  - `/items/wait?since=<items_seq>` — the CONTENT channel: a per-item write
+///    anywhere (web policy edit, second device) bumps a row's `seq` and wakes
+///    us instantly. ADVISORY wake-only: every error here just backs off and
+///    re-arms — it never stops the loop and never drops state (a tombstoned
+///    vault 403s on this route; the blob channel delivers the actual verdict).
+///    Disabled for the run on 404 (backend without the route); blob-channel
+///    wakes still pull items.
+///
+/// Either wake runs the same serial pull block (`pull_and_process`) IN THIS
+/// task, so `pull_items`' read-modify-write of the per-item store stays
+/// single-flight per vault — same serialization as the old one-channel loop.
+///
+/// The `since` cursors are what make parking work: the server answers the
+/// instant its version/seq exceeds `since`. A cursor that never advances
+/// (the pre-0.9.36 per-item bug — lifecycle markers skipped the sidecar
+/// write) turns the 25s long-poll into a ~1.5s hot loop.
 /// Best-effort + detached: a local-only/unpaired/offline daemon just no-ops or
 /// backs off, and any failure here NEVER affects serving. See
 /// [[project_realtime_sync_v1_decision]].
@@ -938,12 +984,42 @@ pub async fn watch_loop(state: Arc<AppState>, vault: String, cloud: String, dk: 
     };
     tracing::info!(vault = %vault, "cloud sync watch loop started");
 
+    enum Wake {
+        Blob(Result<reqwest::Response, reqwest::Error>),
+        Items(Result<reqwest::Response, reqwest::Error>),
+    }
+
     let mut backoff = Duration::from_secs(2);
+    let mut items_channel = true; // false after a 404 (backend without /items/wait)
     loop {
         let local_ver = read_local_version(&state_dir, &vault);
-        let url = format!("{}/v/{}/blob/wait?since={}", cloud, vault, local_ver);
-        match client.get(&url).bearer_auth(&dk).send().await {
-            Ok(resp) => match resp.status().as_u16() {
+        let blob_url = format!("{}/v/{}/blob/wait?since={}", cloud, vault, local_ver);
+        let blob_fut = client.get(&blob_url).bearer_auth(&dk).send();
+        // The content channel only exists once the vault has a per-item store
+        // (its cursor lives there). Reading the store each round is a small
+        // local file parse — negligible against a 25s park.
+        let items_since = if items_channel {
+            read_per_item_store(&state_dir, &vault).map(|pv| pv.items_seq)
+        } else {
+            None
+        };
+        let wake = match items_since {
+            Some(seq) => {
+                let items_url = format!("{}/v/{}/items/wait?since={}", cloud, vault, seq);
+                let items_fut = client.get(&items_url).bearer_auth(&dk).send();
+                // Whichever channel answers first wins; the loser is dropped
+                // mid-hold (the server notices the close) and re-armed next
+                // round. Worst case that's one extra request per ~25s window.
+                tokio::select! {
+                    r = blob_fut => Wake::Blob(r),
+                    r = items_fut => Wake::Items(r),
+                }
+            }
+            None => Wake::Blob(blob_fut.await),
+        };
+
+        match wake {
+            Wake::Blob(Ok(resp)) => match resp.status().as_u16() {
                 200 => {
                     backoff = Duration::from_secs(2);
                     let body: serde_json::Value = match resp.json().await {
@@ -970,16 +1046,18 @@ pub async fn watch_loop(state: Arc<AppState>, vault: String, cloud: String, dk: 
                         // Long-poll window elapsed with no change — re-poll.
                         continue;
                     }
+                    let version = body.get("version").and_then(|v| v.as_u64()).unwrap_or(0);
                     // Persist the whole-blob body to vault.dat ONLY when it's a real
                     // SealedState. A per-item vault's /blob is a lifecycle marker
                     // ({lifecycle, version}), NOT a SealedState — so skip persist for
-                    // it (this was the bug that spammed "not a valid SealedState")
-                    // and, crucially, DON'T `continue`: fall through to the per-item
-                    // keyset/item pulls below, since the content lives in /keys +
-                    // /items, not the blob. A persist error on a real blob is now
-                    // logged but also doesn't starve the per-item pulls.
+                    // it and, crucially, DON'T `continue`: fall through to the
+                    // per-item keyset/item pulls, since the content lives in /keys +
+                    // /items, not the blob. A persist error on a real blob doesn't
+                    // starve those pulls either — but it must NOT advance the cursor
+                    // (the un-persisted blob would never be re-offered) and must eat
+                    // a backoff below, or the instant re-answer becomes a hot loop.
+                    let mut persist_failed = false;
                     if let Some(blob) = body.get("blob").filter(|b| b.get("lifecycle").is_none()) {
-                        let version = body.get("version").and_then(|v| v.as_u64()).unwrap_or(0);
                         // Serialize against approve.rs's vault.dat writes.
                         let lock = {
                             let mut locks = state.vault_write_locks.lock().unwrap();
@@ -992,33 +1070,21 @@ pub async fn watch_loop(state: Arc<AppState>, vault: String, cloud: String, dk: 
                         let _guard = lock.lock().await;
                         if let Err(e) = persist_blob(&state_dir, &vault, blob, version) {
                             tracing::warn!(vault = %vault, "cloud sync watch: persist failed: {}", e);
+                            persist_failed = true;
                         } else {
                             refresh_after_pull(&state, &vault);
                         }
+                    } else {
+                        // Lifecycle marker (or blob absent): nothing to persist, but
+                        // the cursor MUST advance or this long-poll answers instantly
+                        // forever — the ~1.5s spin this fix is about.
+                        record_blob_version(&state_dir, &vault, version);
                     }
-                    // PER-ITEM: a keyset/blob change often coincides with content
-                    // changes; pull the KEYSET (`/keys`) FIRST so the item fold
-                    // sees a fresh K-wrap layer, then pull item rows and refresh
-                    // the cache from the folded item view. Best-effort.
-                    match pull_keys(&state_dir, &cloud, &vault, &dk).await {
-                        Ok(n) if n > 0 => tracing::info!(vault = %vault, adopted = n, "cloud sync watch: pulled keyset rows"),
-                        Ok(_) => {}
-                        Err(e) => tracing::debug!(vault = %vault, "cloud sync watch: keyset pull failed: {}", e),
+                    pull_and_process(&state, &state_dir, &cloud, &vault, &dk, "blob").await;
+                    if persist_failed {
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(Duration::from_secs(60));
                     }
-                    match pull_items(&state_dir, &cloud, &vault, &dk).await {
-                        Ok(n) if n > 0 => refresh_after_item_pull(&state, &vault),
-                        Ok(_) => {}
-                        Err(e) => tracing::debug!(vault = %vault, "cloud sync watch: per-item pull failed: {}", e),
-                    }
-                    // A freshly-pulled connecting item (from a browser "Connect")
-                    // needs the OAuth code→token exchange completed + the
-                    // refresh_token persisted. Run this AFTER the pulls so it acts
-                    // on the just-synced state — otherwise a connect lands one tick
-                    // late (or never, absent a further change). Matches the explicit
-                    // `sc sync` path. Best-effort; takes the write lock itself
-                    // (not reentrant), so it runs after the guard above drops.
-                    crate::auth::connect::process_vault_connects(&state, &vault).await;
-                    tracing::debug!(vault = %vault, "cloud sync watch: poll processed (blob + per-item)");
                 }
                 404 => {
                     // No blob in the cloud yet — gentle retry.
@@ -1033,7 +1099,41 @@ pub async fn watch_loop(state: Arc<AppState>, vault: String, cloud: String, dk: 
                     backoff = (backoff * 2).min(Duration::from_secs(60));
                 }
             },
-            Err(_) => {
+            Wake::Items(Ok(resp)) => match resp.status().as_u16() {
+                200 => {
+                    backoff = Duration::from_secs(2);
+                    let body: serde_json::Value = match resp.json().await {
+                        Ok(b) => b,
+                        Err(_) => {
+                            tokio::time::sleep(backoff).await;
+                            continue;
+                        }
+                    };
+                    if body.get("unchanged").and_then(|v| v.as_bool()).unwrap_or(false) {
+                        // Long-poll window elapsed with no change — re-poll.
+                        continue;
+                    }
+                    // Rows changed. The wait body carries them, but re-fetching via
+                    // the shared pull block (same code as blob wakes + `sc sync`)
+                    // keeps ONE adopt path; one cheap extra request per real change.
+                    pull_and_process(&state, &state_dir, &cloud, &vault, &dk, "items").await;
+                }
+                404 => {
+                    items_channel = false;
+                    tracing::info!(vault = %vault, "cloud sync watch: /items/wait unavailable (404); content rides blob-channel wakes only");
+                }
+                401 | 403 => {
+                    // Could be a deletion in progress (a tombstoned vault fails this
+                    // route's ownership gate) or a revoked device — either way the
+                    // blob channel owns the verdict. Back off, never stop from here.
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
+                _ => {
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(60));
+                }
+            },
+            Wake::Blob(Err(_)) | Wake::Items(Err(_)) => {
                 // Transient (timeout/offline). The 40s read-timeout exceeds the
                 // 25s server hold, so a clean long-poll return shouldn't error here.
                 tokio::time::sleep(backoff).await;
@@ -1041,6 +1141,37 @@ pub async fn watch_loop(state: Arc<AppState>, vault: String, cloud: String, dk: 
             }
         }
     }
+}
+
+/// The shared wake block, run serially in the vault's watcher task: pull the
+/// KEYSET (`/keys`) FIRST so the item fold sees a fresh K-wrap layer, then pull
+/// item rows (refreshing the unlocked cache when anything was adopted), then
+/// complete any pending browser-initiated OAuth connect that just synced in
+/// (the code→token exchange + refresh_token persist — running it AFTER the
+/// pulls means a connect lands on this wake, not one tick late; matches the
+/// explicit `sc sync` path). Best-effort throughout; `process_vault_connects`
+/// takes the vault write lock itself (not reentrant), so callers must not hold
+/// it. `channel` is only for the trace line.
+async fn pull_and_process(
+    state: &Arc<AppState>,
+    state_dir: &Path,
+    cloud: &str,
+    vault: &str,
+    dk: &str,
+    channel: &str,
+) {
+    match pull_keys(state_dir, cloud, vault, dk).await {
+        Ok(n) if n > 0 => tracing::info!(vault = %vault, adopted = n, "cloud sync watch: pulled keyset rows"),
+        Ok(_) => {}
+        Err(e) => tracing::debug!(vault = %vault, "cloud sync watch: keyset pull failed: {}", e),
+    }
+    match pull_items(state_dir, cloud, vault, dk).await {
+        Ok(n) if n > 0 => refresh_after_item_pull(state, vault),
+        Ok(_) => {}
+        Err(e) => tracing::debug!(vault = %vault, "cloud sync watch: per-item pull failed: {}", e),
+    }
+    crate::auth::connect::process_vault_connects(state, vault).await;
+    tracing::debug!(vault = %vault, channel = channel, "cloud sync watch: wake processed");
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1986,32 +2117,38 @@ mod tests {
     /// PER-ITEM: a per-item vault's `/blob` GET now returns a keyset-lifecycle
     /// marker with NO `blob` field (`{ lifecycle:"per-item-v3", version }`). The
     /// classifier must treat it as `Unchanged` (the keyset rides `/keys` now) and
-    /// write NOTHING to `vault.dat` — NOT error, NOT persist.
+    /// write NOTHING to `vault.dat` — NOT error, NOT persist. The version
+    /// SIDECAR, however, MUST advance: an unrecorded marker version means every
+    /// `?since=` probe re-fires — `/blob/wait` answered instantly forever and the
+    /// 25s long-poll became a ~1.5s hot loop (the 0.9.36 spin bug).
     #[test]
-    fn lifecycle_only_body_classifies_as_unchanged_and_writes_nothing() {
+    fn lifecycle_only_body_classifies_as_unchanged_and_records_version() {
         let dir = tempdir().unwrap();
-        let body = serde_json::json!({ "lifecycle": "per-item-v3", "version": 1u64 });
+        let body = serde_json::json!({ "lifecycle": "per-item-v3", "version": 7u64 });
         assert_eq!(
             classify_pull_body(dir.path(), "v-life", &body).unwrap(),
             PullOutcome::Unchanged
         );
         // No vault.dat written — a lifecycle marker is not content.
         assert!(!dir.path().join("vaults").join("v-life").join("vault.dat").exists());
-        assert!(!version_sidecar(dir.path(), "v-life").exists());
+        // ...but the cursor advanced, so the next since=7 probe can park.
+        assert_eq!(read_local_version(dir.path(), "v-life"), 7);
         // Even a bare `{}` (no blob, no status, no unchanged) is Unchanged, not
-        // an error (the old code returned Err "blob missing").
+        // an error (the old code returned Err "blob missing"). No version field
+        // → nothing to record.
         assert_eq!(
             classify_pull_body(dir.path(), "v-empty", &serde_json::json!({})).unwrap(),
             PullOutcome::Unchanged
         );
+        assert!(!version_sidecar(dir.path(), "v-empty").exists());
         // THE REAL WIRE SHAPE: `putBlob` wraps the marker, and handleBlobGet
         // returns `{ blob: { lifecycle, version }, version, status:"live" }`. The
         // marker sits UNDER `blob`, so this must be Unchanged (not parsed as a
         // SealedState). This is the shape `sc sync` actually receives — the case
         // the top-level-`lifecycle` body above never exercised.
         let wrapped = serde_json::json!({
-            "blob": { "lifecycle": "per-item-v3", "version": 1u64 },
-            "version": 1u64,
+            "blob": { "lifecycle": "per-item-v3", "version": 9u64 },
+            "version": 9u64,
             "status": "live"
         });
         assert_eq!(
@@ -2019,6 +2156,7 @@ mod tests {
             PullOutcome::Unchanged
         );
         assert!(!dir.path().join("vaults").join("v-wrap").join("vault.dat").exists());
+        assert_eq!(read_local_version(dir.path(), "v-wrap"), 9);
     }
 
     /// A live blob (status absent → treated live, backward-compatible with the

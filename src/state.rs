@@ -326,8 +326,13 @@ impl AppState {
     }
 
     /// Replace the synced account-level agent-key hash-set (sha256 hex).
-    pub fn set_agent_key_hashes(&self, hashes: std::collections::HashSet<String>) {
-        *self.agent_key_hashes.lock().unwrap() = hashes;
+    /// Returns whether the set actually changed, so the 30s refresh loop can
+    /// log only real updates instead of one line per tick.
+    pub fn set_agent_key_hashes(&self, hashes: std::collections::HashSet<String>) -> bool {
+        let mut cur = self.agent_key_hashes.lock().unwrap();
+        let changed = *cur != hashes;
+        *cur = hashes;
+        changed
     }
 
     /// TTL for the redeemed-code ledger. OAuth authorization codes expire
