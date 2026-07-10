@@ -423,6 +423,19 @@ fn control_port() -> u16 {
         .unwrap_or(crate::config::CONTROL_PORT)
 }
 
+/// The proxy-face port the `sc` CLI targets: `$SAFECLAW_PROXY_PORT` when set (the
+/// single override, shared with `sc serve`), else the constant. Mirrors
+/// [`control_port`] so a stale proxy port baked into an agent's snapshot
+/// (`$SAFECLAW_DAEMON_URL` from an old `sc agent add`) never wins — a moved
+/// daemon self-heals, and a real custom port is coordinated the same way
+/// `$SAFECLAW_PORT` coordinates the control face.
+fn proxy_port() -> u16 {
+    std::env::var("SAFECLAW_PROXY_PORT")
+        .ok()
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(crate::config::PROXY_PORT)
+}
+
 fn control_root_from(env_host: Option<String>, config_daemon: Option<&str>, port: u16) -> String {
     if let Some(h) = env_host {
         return format!("{}:{}", h, port);
@@ -433,9 +446,14 @@ fn control_root_from(env_host: Option<String>, config_daemon: Option<&str>, port
         .unwrap_or_else(|| format!("http://127.0.0.1:{}", port))
 }
 
-/// The API-face root (`scheme://host:PROXY_PORT`) — the value an agent holds
-/// as `SAFECLAW_DAEMON_URL`. Env verbatim when set (the agent's snapshot,
-/// custom port included); else derived from the device atom. The env value
+/// The API-face root (`scheme://host:<proxy-port>`) — the daemon face an agent
+/// holds as `SAFECLAW_DAEMON_URL`. Env-first HOST (the single-host invariant:
+/// proxy and control share one daemon host), else the device atom; the PORT is
+/// always [`proxy_port`], NEVER the snapshot's port. This is symmetric with
+/// [`control_root`], which likewise takes the env HOST but resolves the port
+/// itself — so a stale `$SAFECLAW_DAEMON_URL` port from an old `sc agent add`
+/// (the daemon since moved) is ignored by BOTH faces and self-heals, instead of
+/// silently pinning the child's `HTTPS_PROXY` to a dead port. The env value
 /// passes the SAME `scheme_host` parse gate as `control_root` — a malformed
 /// value is ignored by BOTH faces, never honored by one and dropped by the
 /// other (that asymmetry would split the invariant).
@@ -445,10 +463,11 @@ pub fn api_face_root(cfg: &CliConfig) -> String {
 }
 
 fn api_face_root_with(env_url: Option<String>, cfg: &CliConfig) -> String {
-    match env_url.filter(|u| scheme_host(u).is_some()) {
-        Some(u) => u.trim_end_matches('/').to_string(),
-        None => format!("{}:{}", device_daemon_host(cfg), crate::config::PROXY_PORT),
-    }
+    let host = env_url
+        .as_deref()
+        .and_then(scheme_host)
+        .unwrap_or_else(|| device_daemon_host(cfg));
+    format!("{}:{}", host, proxy_port())
 }
 
 /// The device-default vault (config default, else the single known vault) —
@@ -563,26 +582,29 @@ mod tests {
     }
 
     #[test]
-    fn api_face_root_env_verbatim_else_derived() {
+    fn api_face_root_env_host_wins_port_always_resolved() {
+        use crate::config::PROXY_PORT;
         let cfg = CliConfig {
-            daemon: Some("http://box.example.com:23295".into()),
+            daemon: Some("http://box.example.com:23299".into()),
             ..Default::default()
         };
-        // The agent's snapshot wins untouched (custom proxy port included).
+        // Env host wins, but the PORT is always proxy_port() — a stale port in
+        // the agent's snapshot (`:9999`, an old daemon) is DROPPED, not pinned
+        // into the child's HTTPS_PROXY. Symmetric with control_root.
         assert_eq!(
             api_face_root_with(Some("http://box.example.com:9999/".into()), &cfg),
-            "http://box.example.com:9999"
+            format!("http://box.example.com:{}", PROXY_PORT)
         );
-        // Derived: device daemon HOST + the proxy-port constant.
+        // No env: device daemon HOST + the resolved proxy port.
         assert_eq!(
             api_face_root_with(None, &cfg),
-            format!("http://box.example.com:{}", crate::config::PROXY_PORT)
+            format!("http://box.example.com:{}", PROXY_PORT)
         );
-        // A malformed env value (no scheme) is ignored by BOTH faces — the
+        // A malformed env value (no scheme) falls back to the device HOST — the
         // same parse gate as control_root, so the two can't split on it.
         assert_eq!(
-            api_face_root_with(Some("box.example.com:23294".into()), &cfg),
-            format!("http://box.example.com:{}", crate::config::PROXY_PORT)
+            api_face_root_with(Some("box.example.com:9999".into()), &cfg),
+            format!("http://box.example.com:{}", PROXY_PORT)
         );
     }
 

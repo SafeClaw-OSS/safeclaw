@@ -14,11 +14,13 @@
 //! - `SAFECLAW_VAULT_ID`   — the active vault; this PINS the shell's vault
 //!   (`resolve_active` reads it), the `AWS_PROFILE` analog.
 //!
-//! The AGENT's config (all four vars INCL its per-agent `SAFECLAW_API_KEY` +
-//! `SAFECLAW_PROXY_URL`) is minted whole by `sc agent add`, not here: agent ≡
-//! api-key, account-level, so each agent holds its own key and `sc env` (device
-//! scope) must never emit one — that would collapse every agent on the device to
-//! one key. See [[project_vault_agent_architecture_2026_06_25]] / CREDENTIAL_BROKER.md §14.
+//! The AGENT's config (these routing vars PLUS its per-agent `SAFECLAW_API_KEY`)
+//! is minted whole by `sc agent add`, not here: agent ≡ api-key, account-level,
+//! so each agent holds its own key and `sc env` (device scope) must never emit
+//! one — that would collapse every agent on the device to one key. `sc run`
+//! derives the proxy URL live from the daemon face + that key, so neither tool
+//! bakes a `SAFECLAW_PROXY_URL`. See
+//! [[project_vault_agent_architecture_2026_06_25]] / CREDENTIAL_BROKER.md §14.
 //!
 //! Falls back to printing comments + a clear hint if no config has been
 //! written yet — `eval "$(safeclaw env)"` then no-ops safely instead of

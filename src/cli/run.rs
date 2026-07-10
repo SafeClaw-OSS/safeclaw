@@ -28,7 +28,7 @@ pub async fn run(args: RunArgs) -> Result<(), String> {
     let ca = resident_ca_path();
     preflight(&ca, &control).await?;
 
-    let proxy_url = agent_proxy_url(&vid, args.vault.is_some());
+    let proxy_url = agent_proxy_url(&vid);
     // Friendly hint (user's request): a human shell has no agent identity, so
     // credential substitution will 407. Say so once, up front — non-credential
     // traffic is unaffected, so this is a note, not an error.
@@ -66,20 +66,15 @@ pub async fn run(args: RunArgs) -> Result<(), String> {
     exec_child(&args.cmd, &bundle)
 }
 
-/// The proxy URL the child's `HTTPS_PROXY` gets (CREDENTIAL_BROKER.md §14). Preference:
-/// the agent's OWN `$SAFECLAW_PROXY_URL` (carries its vid + api-key) copied
-/// VERBATIM — zero assembly — unless `--vault` overrode the vault, in which case
-/// build one for the resolved vid, splicing the agent's `$SAFECLAW_API_KEY` into
-/// the API-face root (same daemon host as everything else — the invariant).
-/// `sc run` never owns or persists the key; it only propagates the agent's own.
-fn agent_proxy_url(vid: &str, vault_overridden: bool) -> String {
-    if !vault_overridden {
-        if let Ok(u) = std::env::var("SAFECLAW_PROXY_URL") {
-            if !u.is_empty() {
-                return u;
-            }
-        }
-    }
+/// The proxy URL the child's `HTTPS_PROXY` gets (CREDENTIAL_BROKER.md §14).
+/// Always REBUILT for the resolved vid: the agent's own `$SAFECLAW_API_KEY`
+/// spliced into the CURRENT API-face root (same daemon host as everything else —
+/// the invariant), never a snapshotted `$SAFECLAW_PROXY_URL` copied verbatim.
+/// The snapshot would pin a stale host:port from an old `sc agent add` (a moved
+/// daemon → the child's proxy points at a dead port); rebuilding tracks the live
+/// daemon and self-heals. `sc run` still never owns or persists the key — it
+/// reads the agent's own from the env and splices it in memory only.
+fn agent_proxy_url(vid: &str) -> String {
     let key = std::env::var("SAFECLAW_API_KEY").ok().filter(|s| !s.is_empty());
     let cfg = load_config().unwrap_or_default();
     proxy_url_for_vault(&api_face_root(&cfg), vid, key.as_deref())
@@ -104,6 +99,19 @@ async fn preflight(ca: &Path, control_root: &str) -> Result<(), String> {
     }
     if control_plane_up(control_root).await {
         return Ok(());
+    }
+    // A stale `$SAFECLAW_DAEMON_URL` (an old `sc agent add` snapshot) points the
+    // whole resolution at a daemon HOST that has since moved — say so, rather
+    // than the misleading "isn't running" when a daemon may well be up on the
+    // default host/port. (A stale PORT alone can't reach here: `control_root`
+    // takes only the env HOST and resolves the port itself.)
+    if let Some(u) = std::env::var("SAFECLAW_DAEMON_URL").ok().filter(|s| !s.is_empty()) {
+        return Err(format!(
+            "SafeClaw isn't answering at {control_root} (host from your agent env's \
+             SAFECLAW_DAEMON_URL={u}). If the daemon moved or restarted elsewhere, unset that \
+             stale value or re-run `sc agent add` to re-mint your env, then retry. \
+             Otherwise start it with `sc up`."
+        ));
     }
     Err("SafeClaw isn't running — bring it up with `sc up`, then retry.".into())
 }

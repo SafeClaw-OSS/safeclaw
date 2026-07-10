@@ -115,8 +115,8 @@ pub fn proxy_url_for_vault(api_root: &str, vid: &str, key: Option<&str>) -> Stri
 
 /// The env bundle that routes a child through the resident proxy and trusts its
 /// CA. `proxy_url` is the full `http://<vid>:<key>@127.0.0.1:<port>` the child's
-/// `HTTPS_PROXY` gets — the agent's own `$SAFECLAW_PROXY_URL` verbatim, or one
-/// built from the resolved vault + key. `parent_git_config_count` is the
+/// `HTTPS_PROXY` gets — built by `sc run` from the resolved vault + the agent's
+/// key against the current daemon face. `parent_git_config_count` is the
 /// inherited `GIT_CONFIG_COUNT` (if any) so our credential-helper registration
 /// CHAINS at the next free index rather than clobbering an already-configured
 /// helper. Returns ordered `(key, value)` pairs — no plaintext secret is ever

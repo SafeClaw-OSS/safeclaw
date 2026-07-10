@@ -89,19 +89,21 @@ async fn add(args: AgentAddArgs) -> Result<(), String> {
     let r: CreateResp = resp.json().await.map_err(|e| format!("parse response: {}", e))?;
 
     // ── Mint-time projection (CREDENTIAL_BROKER.md §14): this IS the minter ─
-    // Print the agent's COMPLETE env as dotenv lines: a snapshot of the DEVICE
-    // atoms (config daemon host + port constants + default vault) plus the
-    // fresh key. The agent appends ONE command's stdout to its own `.env` —
-    // its SSOT from then on — and never assembles a value. STDOUT only;
-    // stderr guidance carries NO secret, so blind-capture keeps the key out
-    // of the agent's transcript (and out of the install prompt).
+    // Print the agent's env as three dotenv lines: the daemon's API face + the
+    // default vault + the fresh key. The agent appends ONE command's stdout to
+    // its own `.env` — its SSOT from then on — and never assembles a value.
+    // STDOUT only; stderr guidance carries NO secret, so blind-capture keeps the
+    // key out of the agent's transcript (and out of the install prompt).
+    //
+    // We deliberately do NOT bake `SAFECLAW_PROXY_URL` here. It is fully derived
+    // (`api_face_root` host + vid + key), and baking it froze a host:port that a
+    // moved daemon made stale — and `sc run` PREFERRED that snapshot verbatim, so
+    // the child's HTTPS_PROXY pointed at a dead port. `sc run` now rebuilds the
+    // proxy URL live from the daemon face + this key, so the derived-only env
+    // self-heals. This matches the skill's documented 3-var contract.
     println!("SAFECLAW_DAEMON_URL={}", daemon_url);
     println!("SAFECLAW_VAULT_ID={}", vid);
     println!("SAFECLAW_API_KEY={}", r.token);
-    println!(
-        "SAFECLAW_PROXY_URL={}",
-        crate::cli::proxy_env::proxy_url_for_vault(&daemon_url, &vid, Some(&r.token))
-    );
 
     let rm_name = if args.name.contains(char::is_whitespace) {
         format!("'{}'", args.name)
