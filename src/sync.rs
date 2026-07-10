@@ -1434,6 +1434,10 @@ struct KeyRowData {
     x25519_pub: Option<String>,
     prf_salt: String,
     wrapped_key: String,
+    /// Optional key-check value (KCV) `v_c` — present once enrolled/backfilled
+    /// against a build that computes it; absent on older rows.
+    #[serde(default)]
+    wc_check: Option<String>,
 }
 
 /// Pull keyset rows changed since the local `.keyset_seq` cursor and adopt them
@@ -1548,6 +1552,7 @@ fn adopt_key_rows(pv: &mut PerItemVault, rows: &[KeyRow]) -> Result<usize, Strin
             &row.data.device_name,
             &row.data.prf_salt,
             &row.data.wrapped_key,
+            row.data.wc_check.as_deref(),
         )
         .map_err(|e| format!("adopt key row {}: {}", row.cid, e))?;
         seen.insert(row.cid.as_str(), row.version);
@@ -1608,7 +1613,7 @@ pub async fn push_keys_best_effort(state: &Arc<AppState>, vault_id: &str) {
             Ok(Some(pk)) => pk,
             _ => continue, // no registry entry — can't form a complete row
         };
-        let data = serde_json::json!({
+        let mut data = serde_json::json!({
             "x": pk.x,
             "y": pk.y,
             "device_name": pk.device_name,
@@ -1618,6 +1623,11 @@ pub async fn push_keys_best_effort(state: &Arc<AppState>, vault_id: &str) {
             "prf_salt": STANDARD.encode(&cred.prf_salt),
             "wrapped_key": STANDARD.encode(&cred.wrapped_key),
         });
+        // Carry the optional KCV cloud-side (STANDARD base64) so other devices
+        // and later pulls see it. Omitted entirely when absent.
+        if let Some(v) = &cred.wc_check {
+            data["wc_check"] = serde_json::Value::String(STANDARD.encode(v));
+        }
         rows.push((cid_b64, data));
     }
 
