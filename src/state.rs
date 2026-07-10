@@ -279,6 +279,17 @@ pub struct AppState {
     /// cleared on a successful refresh or a fresh connect; a still-dead token
     /// re-marks on the next use.
     pub oauth_reauth_needed: Mutex<std::collections::HashSet<(String, String)>>,
+    /// Authorization codes this daemon has already REDEEMED (sha256-hex → when).
+    /// An OAuth code is single-use: a stale write (a buggy web Save, a
+    /// cross-device echo, or a pull that re-introduces the `connecting` entry
+    /// before our success push lands) can resurrect a code we already consumed.
+    /// Re-exchanging it earns `invalid_grant`, which the connect state machine
+    /// would misread as a terminal failure and use to clobber the live
+    /// connection. This is the idempotency key: skip any code already here.
+    /// Daemon-local + NEVER synced (so no stale write can revert it); in-memory
+    /// (a restart empties it, by which point the cloud has converged). Entries
+    /// self-reap after `REDEEMED_CODE_TTL` (codes expire ~10min upstream).
+    pub oauth_redeemed_codes: Mutex<HashMap<String, std::time::Instant>>,
     /// Most-recent lifecycle-ceremony op this daemon has open, keyed by
     /// `(vault_id, ceremony_name)` (e.g. `vault-unlock`). When a new ceremony op
     /// is created it supersedes the prior one — the daemon withdraws the stale
@@ -309,6 +320,7 @@ impl AppState {
             agent_key_hashes: Mutex::new(std::collections::HashSet::new()),
             agent_key_resync: tokio::sync::Mutex::new(None),
             oauth_reauth_needed: Mutex::new(std::collections::HashSet::new()),
+            oauth_redeemed_codes: Mutex::new(HashMap::new()),
             live_ceremony_ops: Mutex::new(HashMap::new()),
         }
     }
@@ -316,6 +328,32 @@ impl AppState {
     /// Replace the synced account-level agent-key hash-set (sha256 hex).
     pub fn set_agent_key_hashes(&self, hashes: std::collections::HashSet<String>) {
         *self.agent_key_hashes.lock().unwrap() = hashes;
+    }
+
+    /// TTL for the redeemed-code ledger. OAuth authorization codes expire
+    /// ~10min after issue; 15min covers clock skew, then entries self-reap.
+    const REDEEMED_CODE_TTL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+    /// Record that this daemon successfully redeemed `code` — the idempotency
+    /// key that stops a stale re-introduction from re-exchanging it. See
+    /// [`Self::oauth_redeemed_codes`].
+    pub fn note_code_redeemed(&self, code: &str) {
+        let mut m = self.oauth_redeemed_codes.lock().unwrap();
+        Self::reap_redeemed(&mut m);
+        m.insert(crate::api_key::sha256_hex(code), std::time::Instant::now());
+    }
+
+    /// True iff this daemon already redeemed `code` — a re-exchange would be a
+    /// no-win `invalid_grant`, so the connect machine skips it.
+    pub fn was_code_redeemed(&self, code: &str) -> bool {
+        let mut m = self.oauth_redeemed_codes.lock().unwrap();
+        Self::reap_redeemed(&mut m);
+        m.contains_key(&crate::api_key::sha256_hex(code))
+    }
+
+    fn reap_redeemed(m: &mut HashMap<String, std::time::Instant>) {
+        let now = std::time::Instant::now();
+        m.retain(|_, t| now.duration_since(*t) < Self::REDEEMED_CODE_TTL);
     }
 
     /// Emit an event into the broadcast channel. Silently swallows the "no

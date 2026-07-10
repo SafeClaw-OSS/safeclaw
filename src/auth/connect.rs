@@ -284,6 +284,13 @@ fn provider_host(token_url: &str) -> String {
     after.split(['/', '?', '#']).next().unwrap_or(token_url).to_string()
 }
 
+/// Sentinel the exchange closure returns for a code THIS daemon has already
+/// redeemed (see [`crate::state::AppState::was_code_redeemed`]). `run_pending`
+/// treats it as neither success nor failure: skip silently, leave the entry,
+/// stamp NO error — a re-`invalid_grant` on an already-consumed code must never
+/// clobber the live connection.
+const ALREADY_REDEEMED: &str = "__sc_already_redeemed__";
+
 /// Drive the connecting→refresh→move state machine over an open `ProtectedState`,
 /// given an async `exchange` closure (injected so tests can avoid real network
 /// calls). Mutates `m` in place; returns a [`ConnectReport`] of what happened. On
@@ -341,6 +348,20 @@ where
                 );
             }
             Err(e) => {
+                if e == ALREADY_REDEEMED {
+                    // Idempotency: this daemon already redeemed this code, and a
+                    // stale write (a buggy web Save, a cross-device echo, or a
+                    // pull that resurrected the pending entry before our success
+                    // push landed) put it back in `connecting`. Re-sending it
+                    // would earn a no-win `invalid_grant`; treat it as neither
+                    // success nor failure — leave the entry, stamp nothing, let
+                    // sync convergence settle it.
+                    tracing::info!(
+                        conn = %conn,
+                        "oauth connect: code already redeemed by this daemon — skipping stale re-introduction (not a failure)"
+                    );
+                    continue;
+                }
                 if let Some(reason) = terminal_exchange_reason(&e) {
                     // Terminal: retrying the SAME code/config can never succeed.
                     // Stamp the connecting entry so the console shows
@@ -532,17 +553,33 @@ pub(crate) async fn apply_pending_connects(state: &Arc<AppState>, vault_id: &str
     // this cache always runs before us (sync/watch/unlock+write all refresh
     // the cache, THEN process connects), so it's fresh here.
     let custom = state.custom_services_snapshot(vault_id);
-    let report = run_pending(services, &custom, &mut m, |_conn, cfg, p| async move {
-        crate::auth::oauth2::exchange_code(
-            &cfg.token_url,
-            &cfg.client_id,
-            cfg.client_secret.as_deref(),
-            &p.oauth2.code,
-            &p.oauth2.code_verifier,
-            &cfg.redirect_uri,
-            cfg.style,
-        )
-        .await
+    let st = state.clone();
+    let report = run_pending(services, &custom, &mut m, move |_conn, cfg, p| {
+        let state = st.clone();
+        async move {
+            // Idempotency key = the authorization code. A single-use code this
+            // daemon already redeemed must never be re-exchanged (a stale write
+            // can resurrect its `connecting` entry); re-sending earns a no-win
+            // `invalid_grant` that would clobber the live connection. The ledger
+            // is daemon-local + never synced, so no stale write can revert it.
+            if state.was_code_redeemed(&p.oauth2.code) {
+                return Err(ALREADY_REDEEMED.to_string());
+            }
+            let out = crate::auth::oauth2::exchange_code(
+                &cfg.token_url,
+                &cfg.client_id,
+                cfg.client_secret.as_deref(),
+                &p.oauth2.code,
+                &p.oauth2.code_verifier,
+                &cfg.redirect_uri,
+                cfg.style,
+            )
+            .await;
+            if out.is_ok() {
+                state.note_code_redeemed(&p.oauth2.code);
+            }
+            out
+        }
     })
     .await;
 
@@ -1174,6 +1211,36 @@ mod tests {
         assert_eq!((report.completed.len(), report.failed.len()), (0, 0));
         assert_eq!(report.unreached.len(), 1, "a transient failure is reported as unreached");
         assert!(aux_map::<Connecting>(&m, "connecting")["gmail"].oauth2.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn run_pending_already_redeemed_skips_without_failing() {
+        // A code THIS daemon already redeemed can be resurrected in `connecting`
+        // by a stale write (buggy web Save, cross-device echo, or a pull that
+        // re-introduces the entry before our success push lands). Re-exchanging
+        // it would earn `invalid_grant`; the exchange closure returns the
+        // ALREADY_REDEEMED sentinel instead. The machine must SKIP it: nothing
+        // reported, and the entry LEFT UNTOUCHED (no error — a redeemed code is
+        // not a failure, so it must never clobber the live connection).
+        let services = gmail_registry();
+        let mut m = with_connecting("gmail", "gmail", "code-USED");
+        let report = run_pending(&services, &no_custom(), &mut m, |_conn, _cfg, _p| async move {
+            Err(ALREADY_REDEEMED.to_string())
+        })
+        .await;
+        assert_eq!(
+            (report.completed.len(), report.failed.len(), report.unreached.len()),
+            (0, 0, 0),
+            "a redeemed-code skip must report nothing"
+        );
+        assert!(!report.changed(), "nothing mutated ⇒ caller must not persist/push");
+        let entry = &aux_map::<Connecting>(&m, "connecting")["gmail"];
+        assert!(
+            entry.oauth2.error.is_none(),
+            "a redeemed code must NOT be stamped failed: {:?}",
+            entry.oauth2.error
+        );
+        assert_eq!(entry.oauth2.code, "code-USED", "the entry is left intact");
     }
 
     #[tokio::test]

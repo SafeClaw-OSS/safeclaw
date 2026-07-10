@@ -33,7 +33,7 @@ use axum::{
 use crate::error::{AppError, Result};
 use crate::state::AppState;
 
-fn sha256_hex(s: &str) -> String {
+pub(crate) fn sha256_hex(s: &str) -> String {
     use sha2::{Digest, Sha256};
     let d = Sha256::digest(s.as_bytes());
     d.iter().map(|b| format!("{:02x}", b)).collect()
