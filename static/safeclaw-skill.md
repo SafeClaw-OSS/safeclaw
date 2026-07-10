@@ -13,13 +13,16 @@ a literal string (a clean 401), never a leak.
 
 ## Your config
 
-Your install prompt set these — use each verbatim, never construct one. If any is
-unset, stop and ask the user.
+Your install prompt set these — use each verbatim, never construct one.
 
 - **`$SAFECLAW_DAEMON_URL`** — the daemon, e.g. `http://127.0.0.1:23294`.
 - **`$SAFECLAW_VAULT_ID`** — your vault id.
 - **`$SAFECLAW_API_KEY`** — your identity; send `Authorization: Bearer
   $SAFECLAW_API_KEY` on every request below.
+
+If `$SAFECLAW_API_KEY` isn't set, load your agent env file first (its path is in
+your always-loaded instructions) — don't re-run `sc agent add`, which mints a
+duplicate.
 
 Make sure the daemon is up before the first call (idempotent):
 
