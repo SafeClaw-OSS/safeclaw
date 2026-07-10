@@ -27,6 +27,8 @@ Make sure the daemon is up before the first call (idempotent):
 curl -s -o /dev/null --connect-timeout 1 "$SAFECLAW_DAEMON_URL/health" || sc up
 ```
 
+Check `sc help` anytime for more.
+
 ## Discover what's available
 
 ```
@@ -90,11 +92,16 @@ is rejected.
 sc run -- curl https://api.stripe.com/v1/charges \
   -H "Authorization: Bearer __sc__stripe__"
 GITHUB_TOKEN=__sc__github__ sc run -- gh pr list
-sc run -- git clone https://__sc__github__@github.com/<owner>/<repo>
 ```
 
 Multi-account is by phantom VALUE, not env-var name: switch `__sc__github__` →
 `__sc__github_work__`. One request carries one connection's phantom(s).
+
+An auth failure (401/403) on a brokered call is usually routing, not the secret:
+confirm the command actually ran under `sc run --` with the phantom in the
+request before suspecting the credential. Where the phantom goes for a specific
+tool (a request header, an env var, a URL) can carry service nuance — check that
+connection's `setup` hint.
 
 ## Configuring a local tool (`setup` hints)
 
