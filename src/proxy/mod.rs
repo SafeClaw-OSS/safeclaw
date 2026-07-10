@@ -46,7 +46,7 @@ pub async fn serve(state: Arc<AppState>) -> Result<(), String> {
         // a corporate/on-demand proxy (e.g. Google APIs on a firewalled network)
         // forwards through it instead of timing out on a direct dial. See
         // proxy/upstream.rs.
-        .with_http_connector(upstream::forward_connector())
+        .with_http_connector(upstream::forward_connector(state.egress_proxy.clone()))
         .with_http_handler(BrokerHandler::new(state.clone()))
         .build()
         .map_err(|e| format!("proxy build: {}", e))?;

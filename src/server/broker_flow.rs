@@ -17,9 +17,10 @@ use crate::error::{AppError, Result};
 use crate::protocol::Operation;
 use crate::state::{AppState, ApprovalEvent};
 
-/// The daemon's shared outbound HTTP client (redirect policy = none). Re-exported
-/// here so the proxy pipeline has one obvious home for it.
-pub use crate::core::forward::HTTP_CLIENT;
+/// The daemon's shared outbound HTTP client accessor (redirect policy = none;
+/// egress proxy hot-swappable). Re-exported here so the proxy pipeline has one
+/// obvious home for it.
+pub use crate::core::forward::http_client;
 
 /// `sha256(bytes)` as lowercase hex — the oauth mint-cache key (§5). Hashing the
 /// refresh token keeps the map keys fixed-size and not raw secrets.

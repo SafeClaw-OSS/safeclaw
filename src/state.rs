@@ -296,6 +296,12 @@ pub struct AppState {
     /// op from the relay so the console stops showing "1 approval waiting" after
     /// a `sc unlock` was abandoned + retried. See requester-cancel design.
     pub live_ceremony_ops: Mutex<HashMap<(String, String), String>>,
+    /// The device egress proxy the resident proxy's forward hop tunnels through,
+    /// in a swappable cell so `sc proxy set/clear` HOT-reloads it via
+    /// `/proxy/reload` — no daemon restart, no vault re-unlock. Shared with the
+    /// hudsucker forward connector (see `proxy::upstream`); the reqwest side
+    /// swaps via `core::forward::reload_egress_proxy`.
+    pub egress_proxy: crate::proxy::upstream::EgressProxyCell,
 }
 
 impl AppState {
@@ -322,6 +328,7 @@ impl AppState {
             oauth_reauth_needed: Mutex::new(std::collections::HashSet::new()),
             oauth_redeemed_codes: Mutex::new(HashMap::new()),
             live_ceremony_ops: Mutex::new(HashMap::new()),
+            egress_proxy: crate::proxy::upstream::new_cell(),
         }
     }
 

@@ -21,7 +21,17 @@
 //! can reach the wider internet but NOT the SafeClaw backend doesn't break the
 //! cloud sync that was working over a direct route.
 
+use std::sync::OnceLock;
+
 use crate::config::default_state_dir;
+
+/// The operator's REAL shell egress proxy, captured ONCE by `apply_to_env`
+/// before it fills any env slot from the stored file. Needed by [`effective`]:
+/// after `apply_to_env` has copied the file value into the env, we can no longer
+/// tell an env-from-shell proxy from an env-from-file one, but env > config must
+/// still hold. `None` = no shell proxy was set; unset (`get()` is `None`) = the
+/// capture never ran (e.g. a unit test not going through `apply_to_env`).
+static SHELL_PROXY: OnceLock<Option<String>> = OnceLock::new();
 
 /// Persisted egress-proxy URL location: `<state_dir>/egress-proxy` (one line, the
 /// URL). Absent/empty = no configured egress proxy.
@@ -69,6 +79,9 @@ pub fn clear() -> Result<(), String> {
 /// GitHub fetch both honour it. An already-set `HTTPS_PROXY` in the real env
 /// takes precedence and is left untouched (env > config).
 pub fn apply_to_env() {
+    // Snapshot any REAL shell proxy BEFORE we fill env slots from the file, so
+    // `effective()` can keep env > config even after this pollutes the env.
+    let _ = SHELL_PROXY.get_or_init(shell_proxy_now);
     let Some(url) = load() else { return };
     for key in [
         "HTTPS_PROXY",
@@ -102,6 +115,40 @@ pub fn apply_to_env() {
             std::env::set_var(key, merged);
         }
     }
+}
+
+/// The egress proxy the DAEMON's own swappable clients (the shared reqwest
+/// client + the resident proxy's forward connector) should use RIGHT NOW,
+/// honouring env > config: a real shell proxy (captured at startup) wins;
+/// otherwise the stored file — re-read FRESH so a runtime `sc proxy set` (which
+/// rewrites the file) takes effect via `/proxy/reload` without touching, or
+/// re-reading, process env. Falls back to [`load`] if the capture never ran.
+pub fn effective() -> Option<String> {
+    match SHELL_PROXY.get() {
+        Some(Some(shell)) => Some(shell.clone()),
+        _ => load(),
+    }
+}
+
+/// The first non-empty proxy set in THIS process's env right now. Read once by
+/// `apply_to_env` before it shapes env, so it reflects the operator's shell.
+fn shell_proxy_now() -> Option<String> {
+    for key in [
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ] {
+        if let Some(v) = std::env::var_os(key) {
+            let v = v.to_string_lossy().trim().to_string();
+            if !v.is_empty() {
+                return Some(v);
+            }
+        }
+    }
+    None
 }
 
 /// Extract the bare host from a `scheme://host[:port]/path` URL (no scheme, port,

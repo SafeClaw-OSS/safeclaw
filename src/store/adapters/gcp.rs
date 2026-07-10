@@ -22,7 +22,7 @@ use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
-use crate::core::forward::HTTP_CLIENT;
+use crate::core::forward::http_client;
 
 use super::super::adapter::{AdapterError, AdapterResult};
 
@@ -125,7 +125,7 @@ impl GcpSecretManagerAdapter {
         }
 
         let jwt = self.sign_jwt(now)?;
-        let resp = HTTP_CLIENT
+        let resp = http_client()
             .post(TOKEN_ENDPOINT)
             .form(&[
                 ("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),
@@ -179,7 +179,7 @@ impl GcpSecretManagerAdapter {
             "{}/projects/{}/secrets/{}/versions/latest:access",
             SECRET_MANAGER_BASE, self.project_id, name
         );
-        let resp = HTTP_CLIENT
+        let resp = http_client()
             .get(&url)
             .bearer_auth(&token)
             .send()
@@ -214,7 +214,7 @@ impl GcpSecretManagerAdapter {
             "{}/projects/{}/secrets",
             SECRET_MANAGER_BASE, self.project_id
         );
-        let resp = HTTP_CLIENT
+        let resp = http_client()
             .get(&url)
             .bearer_auth(&token)
             .send()

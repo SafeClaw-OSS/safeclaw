@@ -17,7 +17,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::core::forward::HTTP_CLIENT;
+use crate::core::forward::http_client;
 
 pub const TOKEN_URL: &str = "https://aipayment.snaplii.com/v2/auth/token";
 
@@ -33,7 +33,7 @@ const DEFAULT_TTL_SECS: u64 = 600;
 /// doubles as the agent label Snaplii sees, so it stays user-chosen (rename /
 /// multi-account = distinct connection ids) without a config field for it.
 pub async fn exchange(api_key: &str, agent_id: &str) -> Result<(String, u64), String> {
-    let resp = HTTP_CLIENT
+    let resp = http_client()
         .post(TOKEN_URL)
         .json(&serde_json::json!({ "agent_id": agent_id, "api_key": api_key }))
         .send()

@@ -8,15 +8,19 @@
 //! the provider through the proxy — the exact "Gmail via `sc run` times out"
 //! failure, where GitHub still works only because it is directly reachable.
 //!
-//! This connector closes that gap. It resolves the SAME egress proxy the
-//! reqwest clients use (the `*_PROXY` env that `egress_proxy::apply_to_env`
-//! shapes at startup, a real shell proxy still winning), and for each forward
-//! connection either dials the target directly or tunnels to it through the
-//! proxy via HTTP `CONNECT`. The resulting TCP stream is handed to hyper-rustls,
-//! which performs TLS to the ORIGINAL host — so SNI and certificate validation
-//! are unchanged; only the transport path moves. The proxy is resolved ONCE at
-//! daemon start, which matches the model exactly: `sc proxy set` rewrites the
-//! env source and bounces the daemon.
+//! This connector closes that gap. It reads the SAME effective egress proxy the
+//! reqwest clients use (`egress_proxy::effective()` — a real shell proxy wins,
+//! else the stored file), and for each forward connection either dials the
+//! target directly or tunnels to it through the proxy via HTTP `CONNECT`. The
+//! resulting TCP stream is handed to hyper-rustls, which performs TLS to the
+//! ORIGINAL host — so SNI and certificate validation are unchanged; only the
+//! transport path moves.
+//!
+//! The proxy lives in a shared, swappable [`EgressProxyCell`] (also held by
+//! `AppState`) that the connector reads PER-CONNECTION, so `sc proxy set/clear`
+//! HOT-reloads it via `/proxy/reload` ([`reload_cell`]) — the forward hop
+//! re-points on its next connection with NO daemon restart, and so no vault
+//! re-unlock.
 //!
 //! Scope: HTTP proxies (the corporate / local norm, and what `sc proxy set`
 //! documents). A non-HTTP proxy URL (https/socks) is logged and ignored — the
@@ -25,7 +29,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -40,18 +44,62 @@ use tokio::net::TcpStream;
 use tower_service::Service;
 
 /// Fail-fast bound on the whole forward-hop connect (TCP + CONNECT handshake).
-/// Mirrors the daemon's shared reqwest client (`core::forward::HTTP_CLIENT`,
+/// Mirrors the daemon's shared reqwest client (`core::forward::http_client`,
 /// 8s): a wrong/dead egress proxy or a black-holed route surfaces as a clean
 /// "couldn't reach the provider" instead of hanging for the OS default (~75s).
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
+/// A live, swappable egress-proxy cell shared by `AppState` and the resident
+/// proxy's forward connector. `None` inside = dial upstream directly. Swapped in
+/// place by [`reload_cell`] on `/proxy/reload` (after `sc proxy set/clear`), so
+/// the forward hop re-points on its next connection with NO daemon restart (and
+/// so no vault re-unlock).
+pub type EgressProxyCell = Arc<RwLock<Option<Arc<ProxyCfg>>>>;
+
+/// Build a fresh egress-proxy cell from the currently-effective proxy. Held in
+/// `AppState`; a clone backs the forward connector.
+pub fn new_cell() -> EgressProxyCell {
+    Arc::new(RwLock::new(resolve_current()))
+}
+
+/// Re-resolve the effective egress proxy and swap it into `cell` in place — the
+/// hot-reload path (`/proxy/reload`), no restart.
+pub fn reload_cell(cell: &EgressProxyCell) {
+    *cell.write().unwrap() = resolve_current();
+}
+
+/// The currently-effective egress proxy (env > stored file) parsed to a
+/// `ProxyCfg`. `None` = direct (unset, or a non-HTTP proxy we can't tunnel).
+fn resolve_current() -> Option<Arc<ProxyCfg>> {
+    let url = crate::cli::egress_proxy::effective()?;
+    match parse_proxy(&url) {
+        Some(cfg) => {
+            tracing::info!(
+                proxy_host = %cfg.host,
+                proxy_port = cfg.port,
+                "resident proxy forward hop routes through the egress proxy"
+            );
+            Some(Arc::new(cfg))
+        }
+        None => {
+            tracing::warn!(
+                "egress proxy '{}' is not an HTTP proxy URL — the resident \
+                 proxy's forward hop dials upstream directly",
+                url
+            );
+            None
+        }
+    }
+}
+
 /// Build the resident proxy's forward connector: hyper-rustls (same rustls
 /// config hudsucker's `with_rustls_connector` uses — aws-lc-rs provider, webpki
 /// roots, TLS1.2+1.3, HTTP/1 only, matching hudsucker's non-default `http2`)
-/// wrapping our egress-proxy-aware `TunnelConnector`.
-pub fn forward_connector() -> HttpsConnector<TunnelConnector> {
+/// wrapping our egress-proxy-aware `TunnelConnector`. `cell` is the live proxy
+/// (shared with `AppState`) the connector reads per-connection.
+pub fn forward_connector(cell: EgressProxyCell) -> HttpsConnector<TunnelConnector> {
     let provider = aws_lc_rs::default_provider();
     let tls = ClientConfig::builder_with_provider(Arc::new(provider))
         .with_safe_default_protocol_versions()
@@ -63,21 +111,25 @@ pub fn forward_connector() -> HttpsConnector<TunnelConnector> {
         .with_tls_config(tls)
         .https_or_http()
         .enable_http1()
-        .wrap_connector(TunnelConnector::from_env())
+        .wrap_connector(TunnelConnector::new(cell))
 }
 
 /// A base connector (`Service<Uri>`) that dials the target directly or through
-/// a configured HTTP egress proxy via `CONNECT`. Wrapped by hyper-rustls, which
-/// then layers TLS to the original host over whichever stream this returns.
+/// the configured HTTP egress proxy via `CONNECT`. Wrapped by hyper-rustls,
+/// which then layers TLS to the original host over whichever stream this
+/// returns. Reads the proxy from a shared live cell, so a runtime `sc proxy set`
+/// re-points the forward hop on the NEXT connection — no restart.
 #[derive(Clone)]
 pub struct TunnelConnector {
-    proxy: Option<Arc<ProxyCfg>>,
-    /// Hosts that always dial direct (loopback + `NO_PROXY`), lowercased.
+    proxy: EgressProxyCell,
+    /// Hosts that always dial direct (loopback + `NO_PROXY`), lowercased. Static
+    /// for the daemon's life (the pinned custodian + loopback don't change).
     no_proxy: Arc<Vec<String>>,
 }
 
+/// A parsed HTTP egress proxy the forward hop tunnels through.
 #[derive(Debug, Clone, PartialEq)]
-struct ProxyCfg {
+pub struct ProxyCfg {
     host: String,
     port: u16,
     /// `Basic <base64(user:pass)>` value when the proxy URL carries userinfo.
@@ -85,26 +137,15 @@ struct ProxyCfg {
 }
 
 impl TunnelConnector {
-    /// Resolve the egress proxy + `NO_PROXY` from the process env (the single
-    /// source `apply_to_env` shaped). Logs the resolved proxy once at startup.
-    pub fn from_env() -> Self {
-        let proxy = resolve_proxy_env();
-        match &proxy {
-            Some(p) => tracing::info!(
-                proxy_host = %p.host,
-                proxy_port = p.port,
-                "resident proxy forward hop routes through the egress proxy"
-            ),
-            None => tracing::debug!("resident proxy forward hop dials upstream directly"),
-        }
+    fn new(proxy: EgressProxyCell) -> Self {
         Self {
-            proxy: proxy.map(Arc::new),
+            proxy,
             no_proxy: Arc::new(resolve_no_proxy_env()),
         }
     }
 
     fn use_proxy_for(&self, host: &str) -> Option<Arc<ProxyCfg>> {
-        let p = self.proxy.clone()?;
+        let p = self.proxy.read().unwrap().clone()?;
         let h = host.to_ascii_lowercase();
         if self.no_proxy.iter().any(|e| no_proxy_matches(e, &h)) {
             return None;
@@ -222,32 +263,6 @@ async fn connect_via_proxy(p: &ProxyCfg, host: &str, port: u16) -> Result<TcpStr
     Ok(stream)
 }
 
-/// First non-empty `*_PROXY` env slot, parsed. HTTPS first (the forward hop is
-/// always HTTPS), then the case variants, then the `ALL_PROXY` catch-alls — the
-/// same precedence reqwest applies internally, so both agree on one proxy.
-fn resolve_proxy_env() -> Option<ProxyCfg> {
-    for key in ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"] {
-        let raw = std::env::var(key).unwrap_or_default();
-        let raw = raw.trim();
-        if raw.is_empty() {
-            continue;
-        }
-        match parse_proxy(raw) {
-            Some(cfg) => return Some(cfg),
-            None => {
-                tracing::warn!(
-                    var = key,
-                    "egress proxy '{}' is not an HTTP proxy URL — the resident \
-                     proxy's forward hop only tunnels through HTTP proxies; \
-                     dialing upstream directly",
-                    raw
-                );
-            }
-        }
-    }
-    None
-}
-
 /// Parse an `http://[user:pass@]host[:port]` proxy URL. Returns `None` for a
 /// non-HTTP scheme (https/socks) — unsupported for the CONNECT forward hop.
 fn parse_proxy(url: &str) -> Option<ProxyCfg> {
@@ -315,6 +330,11 @@ fn no_proxy_matches(entry: &str, host: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// A live cell holding `p` — the shape `AppState`/`forward_connector` share.
+    fn cell(p: Option<ProxyCfg>) -> EgressProxyCell {
+        Arc::new(RwLock::new(p.map(Arc::new)))
+    }
+
     #[test]
     fn parse_http_proxy_forms() {
         assert_eq!(
@@ -373,7 +393,7 @@ mod tests {
     #[test]
     fn use_proxy_honours_no_proxy_and_loopback() {
         let c = TunnelConnector {
-            proxy: Some(Arc::new(ProxyCfg {
+            proxy: cell(Some(ProxyCfg {
                 host: "127.0.0.1".into(),
                 port: 7778,
                 auth: None,
@@ -395,9 +415,37 @@ mod tests {
     #[test]
     fn no_configured_proxy_never_uses_one() {
         let c = TunnelConnector {
-            proxy: None,
+            proxy: cell(None),
             no_proxy: Arc::new(vec![]),
         };
+        assert!(c.use_proxy_for("gmail.googleapis.com").is_none());
+    }
+
+    #[test]
+    fn swapping_the_shared_cell_repoints_a_live_connector() {
+        // The hot-reload contract: an ALREADY-built connector reads the shared
+        // cell per-connection, so `/proxy/reload` swapping it in place re-points
+        // the forward hop with no rebuild/restart.
+        let shared = cell(None);
+        let c = TunnelConnector {
+            proxy: shared.clone(),
+            no_proxy: Arc::new(vec!["localhost".into(), "127.0.0.1".into()]),
+        };
+        // Starts direct.
+        assert!(c.use_proxy_for("gmail.googleapis.com").is_none());
+        // A `sc proxy set` reload swaps the cell…
+        *shared.write().unwrap() = Some(Arc::new(ProxyCfg {
+            host: "127.0.0.1".into(),
+            port: 7778,
+            auth: None,
+        }));
+        // …and the same connector now tunnels — without being rebuilt.
+        let p = c
+            .use_proxy_for("gmail.googleapis.com")
+            .expect("now proxied");
+        assert_eq!((p.host.as_str(), p.port), ("127.0.0.1", 7778));
+        // …and a `sc proxy clear` reload swaps it back to direct.
+        *shared.write().unwrap() = None;
         assert!(c.use_proxy_for("gmail.googleapis.com").is_none());
     }
 
@@ -471,7 +519,7 @@ mod tests {
         let (proxy_port, seen) = spawn_proxy(backend_port).await;
 
         let mut conn = TunnelConnector {
-            proxy: Some(Arc::new(ProxyCfg {
+            proxy: cell(Some(ProxyCfg {
                 host: "127.0.0.1".into(),
                 port: proxy_port,
                 auth: None,
@@ -502,7 +550,7 @@ mod tests {
     async fn forward_hop_dials_direct_when_no_proxy() {
         let backend_port = spawn_backend().await;
         let mut conn = TunnelConnector {
-            proxy: None,
+            proxy: cell(None),
             no_proxy: Arc::new(vec![]),
         };
         // No proxy configured → connect straight to the backend on loopback.

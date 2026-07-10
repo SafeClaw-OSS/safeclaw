@@ -1,6 +1,6 @@
 // OAuth2 wire calls: refresh + authorization-code exchange (pure, no schema).
 
-use crate::core::forward::HTTP_CLIENT;
+use crate::core::forward::http_client;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// OAuth2 refresh content type.
@@ -148,7 +148,7 @@ pub async fn exchange_code(
             let body = code_exchange_json_body(
                 client_id, client_secret, code, code_verifier, redirect_uri,
             );
-            HTTP_CLIENT
+            http_client()
                 .post(token_url)
                 .header("Content-Type", "application/json")
                 .json(&body)
@@ -160,7 +160,7 @@ pub async fn exchange_code(
             let form_params = code_exchange_form_params(
                 client_id, client_secret, code, code_verifier, redirect_uri,
             );
-            HTTP_CLIENT
+            http_client()
                 .post(token_url)
                 .form(&form_params)
                 .send()
@@ -248,7 +248,7 @@ pub async fn perform_refresh(
                 "refresh_token": refresh_token_value,
                 "client_id": client_id,
             });
-            HTTP_CLIENT
+            http_client()
                 .post(token_url)
                 .header("Content-Type", "application/json")
                 .json(&body)
@@ -265,7 +265,7 @@ pub async fn perform_refresh(
             if let Some(secret) = client_secret {
                 form_params.push(("client_secret", secret));
             }
-            HTTP_CLIENT
+            http_client()
                 .post(token_url)
                 .form(&form_params)
                 .send()

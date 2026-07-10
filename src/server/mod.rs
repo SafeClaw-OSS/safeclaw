@@ -66,6 +66,10 @@ pub fn app_router(state: Arc<AppState>) -> Router {
         .route("/v/{vid}/secret-keys", get(handlers::secret_keys::secret_keys))
         .route("/v/{vid}/registry", get(handlers::registry::vault_registry))
         .route("/v/{vid}/usage", get(handlers::usage::usage))
+        // Device egress-proxy hot-reload (after `sc proxy set/clear`) — no vault
+        // context, no params: re-reads the local stored value into the live
+        // clients so the daemon re-points egress without a restart/re-unlock.
+        .route("/proxy/reload", post(handlers::proxy::reload))
         // Op-flat (vault context lives on the approval record).
         // GET /op/{id} returns the JSON poll response (status + cached value).
         // The agent / CLI polls this; the human approves on safeclaw.pro via

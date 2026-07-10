@@ -4,10 +4,11 @@
 //! shell `HTTPS_PROXY`, so behind a corporate or on-demand proxy its own egress
 //! (OAuth code/refresh exchange, the resident proxy's forward hop, `sc upgrade`)
 //! would hit the internet directly and time out. This stores the proxy at the
-//! device level ([`egress_proxy`]) and bounces the daemon so it re-reads it at
-//! startup — the standard "configure at the service, restart to apply" model.
+//! device level ([`egress_proxy`]) and HOT-reloads it into the running daemon
+//! (`POST /proxy/reload`), which rebuilds its egress clients in place — instant,
+//! with NO restart and NO vault re-unlock.
 
-use crate::cli::{egress_proxy, service, up};
+use crate::cli::{active, egress_proxy, service};
 use crate::config::ProxySubcommand;
 
 pub async fn run(sub: ProxySubcommand) -> Result<(), String> {
@@ -36,7 +37,7 @@ async fn set(url: String) -> Result<(), String> {
     }
     egress_proxy::store(&url)?;
     eprintln!("Egress proxy set to {url}.");
-    bounce_to_apply().await
+    apply_live().await
 }
 
 async fn clear() -> Result<(), String> {
@@ -46,7 +47,7 @@ async fn clear() -> Result<(), String> {
     }
     egress_proxy::clear()?;
     eprintln!("Egress proxy cleared — the daemon will reach the internet directly.");
-    bounce_to_apply().await
+    apply_live().await
 }
 
 fn show() -> Result<(), String> {
@@ -70,15 +71,43 @@ fn show() -> Result<(), String> {
     }
 }
 
-/// Restart the daemon so it re-reads the egress proxy at startup, then converge
-/// back to unlocked (one passkey tap) — same chokepoint as `sc restart`. When no
-/// daemon unit is installed yet, the stored value will be picked up by the first
-/// `sc up`.
-async fn bounce_to_apply() -> Result<(), String> {
+/// Hot-reload the running daemon's egress clients (`POST /proxy/reload`) so the
+/// new value applies immediately — no restart, no vault re-unlock. When no
+/// daemon is installed/reachable yet, the stored value is picked up by the first
+/// `sc up`. A reload failure is never fatal to `sc proxy set` (the value is
+/// already persisted); we just tell the user how it'll take effect.
+async fn apply_live() -> Result<(), String> {
     if !service::unit_installed() {
         eprintln!("  (no daemon installed yet — it'll take effect on `sc up`.)");
         return Ok(());
     }
-    eprintln!("  Restarting the daemon to apply (you'll re-unlock)…");
-    up::restart().await
+    let cfg = active::load().unwrap_or_default();
+    let url = format!(
+        "{}/proxy/reload",
+        active::control_root(&cfg).trim_end_matches('/')
+    );
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => return Err(format!("http client: {}", e)),
+    };
+    match client.post(&url).send().await {
+        Ok(r) if r.status().is_success() => {
+            eprintln!("  Applied to the running daemon (no restart).");
+            Ok(())
+        }
+        Ok(r) => {
+            eprintln!(
+                "  (daemon returned HTTP {} — restart to apply: `sc restart`)",
+                r.status()
+            );
+            Ok(())
+        }
+        Err(_) => {
+            eprintln!("  (daemon not reachable — it'll take effect on next `sc up`.)");
+            Ok(())
+        }
+    }
 }
