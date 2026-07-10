@@ -14,6 +14,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // can't trap our calls to the local daemon. reqwest honours env proxies by
     // default, so shaping the env here covers every client at once.
     cli::proxy_env::pin_localhost_no_proxy();
+    // Apply the device's configured EGRESS proxy (`sc proxy set`) to this
+    // process's env before any client is built — the launchd/systemd daemon does
+    // not inherit the operator's shell `HTTPS_PROXY`, so this is how the daemon's
+    // OAuth exchange + MITM forward reach a corporate/on-demand upstream. A real
+    // shell `HTTPS_PROXY` still wins; the custodian is pinned to NO_PROXY inside.
+    cli::egress_proxy::apply_to_env();
 
     // Parse through `cli::help::command()` (not `Cli::parse()`) so the top-level
     // `sc` / `sc --help` prints our grouped, gh-style help; per-command help is
@@ -92,6 +98,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Config(args) => {
             cli::config::run(args.sub).map_err(|e| -> Box<dyn std::error::Error> {
                 eprintln!("safeclaw config: {}", e);
+                e.into()
+            })
+        }
+        Command::Proxy(args) => {
+            cli::proxy::run(args.sub).await.map_err(|e| -> Box<dyn std::error::Error> {
+                eprintln!("safeclaw proxy: {}", e);
                 e.into()
             })
         }

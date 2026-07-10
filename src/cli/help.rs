@@ -68,6 +68,7 @@ const SECTIONS: &[(&str, &[(&str, &str)])] = &[
             ("upgrade", "Self-update to the latest release"),
             ("env", "Print shell exports for your shell"),
             ("config", "Read/write CLI preferences"),
+            ("proxy", "Set the daemon's upstream egress proxy"),
             ("service", "Work with service.toml definitions"),
             ("op", "Approval ops (e.g. op wait)"),
         ],

@@ -103,6 +103,12 @@ pub enum Command {
     /// chain (flag > env > config > default). Subs: set / get / unset /
     /// list.
     Config(ConfigArgs),
+    /// Manage this device's upstream egress proxy (the HTTP proxy the daemon uses
+    /// to reach the internet). Subs: set / show / clear. Behind a corporate or
+    /// on-demand proxy this is how the daemon completes OAuth connects and routes
+    /// its forward hop, since the background daemon doesn't inherit your shell's
+    /// `HTTPS_PROXY`.
+    Proxy(ProxyArgs),
     /// Manage the active vault's enrolled passkeys. `ls` is read-only;
     /// `add` / `remove` / `rename` need crypto ceremonies and are deferred
     /// to a later session. Short: `sc p`.
@@ -691,6 +697,26 @@ pub enum StoreSubcommand {
     /// List external stores connected to the active vault. Needs the
     /// vault unlocked (we read from daemon's cache snapshot).
     Ls(CommonArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ProxyArgs {
+    #[command(subcommand)]
+    pub sub: ProxySubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ProxySubcommand {
+    /// Set the device's upstream EGRESS proxy — the HTTP proxy the daemon uses to
+    /// reach the internet (OAuth exchanges, the resident proxy's forward hop,
+    /// `sc upgrade`). Persists it and bounces the daemon so it takes effect (one
+    /// passkey tap to re-unlock). e.g. `sc proxy set http://127.0.0.1:7778`.
+    Set { url: String },
+    /// Print the configured egress proxy (and any shell `HTTPS_PROXY` that would
+    /// override it). Exit nonzero when nothing is configured.
+    Show,
+    /// Remove the configured egress proxy and bounce the daemon back to direct.
+    Clear,
 }
 
 #[derive(Debug, Args)]
