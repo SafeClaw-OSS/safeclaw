@@ -399,26 +399,38 @@ pub fn device_daemon_host(cfg: &CliConfig) -> String {
         .unwrap_or_else(|| "http://127.0.0.1".to_string())
 }
 
-/// The control root (`scheme://host:CONTROL_PORT`) every ceremony/write `sc`
+/// The control root (`scheme://host:<control-port>`) every ceremony/write `sc`
 /// call targets. Env-first: `$SAFECLAW_DAEMON_URL`'s HOST wins when set (the
 /// invariant — shelled `sc` and the agent's own HTTP share one daemon); else
 /// config's `daemon` VERBATIM (it may carry a hand-edited custom control
 /// port); else the loopback default. The env value carries the PROXY port,
-/// never the control port, so the control port comes from the constant — a
-/// remote daemon on a non-default control port would need a config edit
-/// (that deployment doesn't exist yet).
+/// never the control port, so the control port comes from [`control_port`]:
+/// `$SAFECLAW_PORT` when set, else the constant. This is the SAME env `sc
+/// serve` and `sc login` read, so exporting `SAFECLAW_PORT=<p>` moves the
+/// daemon, its recorded config, AND this resolution together — a coordinated
+/// port change survives even in an agent shell that carries a proxy-face
+/// `SAFECLAW_DAEMON_URL`.
 pub fn control_root(cfg: &CliConfig) -> String {
-    control_root_from(env_daemon_host(), cfg.daemon.as_deref())
+    control_root_from(env_daemon_host(), cfg.daemon.as_deref(), control_port())
 }
 
-fn control_root_from(env_host: Option<String>, config_daemon: Option<&str>) -> String {
+/// The control-plane port the `sc` CLI targets: `$SAFECLAW_PORT` when set (the
+/// single override, shared with `sc serve` / `sc login`), else the constant.
+fn control_port() -> u16 {
+    std::env::var("SAFECLAW_PORT")
+        .ok()
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(crate::config::CONTROL_PORT)
+}
+
+fn control_root_from(env_host: Option<String>, config_daemon: Option<&str>, port: u16) -> String {
     if let Some(h) = env_host {
-        return format!("{}:{}", h, crate::config::CONTROL_PORT);
+        return format!("{}:{}", h, port);
     }
     config_daemon
         .filter(|s| !s.is_empty())
         .map(|s| s.trim_end_matches('/').to_string())
-        .unwrap_or_else(|| format!("http://127.0.0.1:{}", crate::config::CONTROL_PORT))
+        .unwrap_or_else(|| format!("http://127.0.0.1:{}", port))
 }
 
 /// The API-face root (`scheme://host:PROXY_PORT`) — the value an agent holds
@@ -472,7 +484,7 @@ pub fn resolve_active(vault_override: Option<&str>) -> Result<(String, String), 
     // still wins (invariant).
     if let Some(kv) = single_known_entry() {
         return Ok((
-            control_root_from(env_daemon_host(), Some(&kv.daemon)),
+            control_root_from(env_daemon_host(), Some(&kv.daemon), control_port()),
             kv.vault,
         ));
     }
@@ -526,20 +538,27 @@ mod tests {
 
     #[test]
     fn control_root_env_host_wins_config_verbatim_else_default() {
+        use crate::config::CONTROL_PORT;
         // hand-edited custom control port in config
         let cfg_daemon = Some("http://127.0.0.1:9999");
-        // Env host set (an agent's shell): its HOST + the control-port constant —
+        // Env host set (an agent's shell): its HOST + the resolved control port —
         // the single-host invariant (proxy face and control face share a daemon).
         assert_eq!(
-            control_root_from(Some("https://box.example.com".into()), cfg_daemon),
-            format!("https://box.example.com:{}", crate::config::CONTROL_PORT)
+            control_root_from(Some("https://box.example.com".into()), cfg_daemon, CONTROL_PORT),
+            format!("https://box.example.com:{}", CONTROL_PORT)
+        );
+        // A moved control port (SAFECLAW_PORT) rides through the env-host branch,
+        // so an agent shell carrying a proxy-face DAEMON_URL still targets it.
+        assert_eq!(
+            control_root_from(Some("http://127.0.0.1".into()), cfg_daemon, 23293),
+            "http://127.0.0.1:23293"
         );
         // No env: config's control root VERBATIM (custom port preserved).
-        assert_eq!(control_root_from(None, cfg_daemon), "http://127.0.0.1:9999");
-        // Bare machine: loopback default.
+        assert_eq!(control_root_from(None, cfg_daemon, CONTROL_PORT), "http://127.0.0.1:9999");
+        // Bare machine: loopback default at the resolved port.
         assert_eq!(
-            control_root_from(None, None),
-            format!("http://127.0.0.1:{}", crate::config::CONTROL_PORT)
+            control_root_from(None, None, CONTROL_PORT),
+            format!("http://127.0.0.1:{}", CONTROL_PORT)
         );
     }
 
