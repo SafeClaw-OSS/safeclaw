@@ -70,7 +70,7 @@ async fn add(args: AgentAddArgs) -> Result<(), String> {
                 .into(),
         );
     };
-    let daemon_url = format!(
+    let broker_url = format!(
         "{}:{}",
         crate::cli::active::device_daemon_host(&cfg),
         crate::config::PROXY_PORT
@@ -101,7 +101,7 @@ async fn add(args: AgentAddArgs) -> Result<(), String> {
     // the child's HTTPS_PROXY pointed at a dead port. `sc run` now rebuilds the
     // proxy URL live from the daemon face + this key, so the derived-only env
     // self-heals. This matches the skill's documented 3-var contract.
-    println!("SAFECLAW_DAEMON_URL={}", daemon_url);
+    println!("SAFECLAW_BROKER_URL={}", broker_url);
     println!("SAFECLAW_VAULT_ID={}", vid);
     println!("SAFECLAW_API_KEY={}", r.token);
 

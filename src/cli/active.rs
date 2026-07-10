@@ -7,10 +7,10 @@
 //! truth, `_url`s are projections):
 //!
 //! - control root  = daemon host + `CONTROL_PORT` (ceremony/write plane)
-//! - API-face root = daemon host + `PROXY_PORT`   (the agent's `DAEMON_URL`)
+//! - API-face root = daemon host + `PROXY_PORT`   (the agent's `BROKER_URL`)
 //!
 //! THE self-consistency invariant: both planes derive from ONE daemon-host
-//! value. When `$SAFECLAW_DAEMON_URL` is set (an agent's env snapshot), its
+//! value. When `$SAFECLAW_BROKER_URL` is set (an agent's env snapshot), its
 //! host wins — an agent's shelled `sc` then targets the SAME daemon the
 //! agent's own HTTP does, by construction; the two faces cannot split.
 //!
@@ -381,11 +381,19 @@ fn scheme_host(url: &str) -> Option<String> {
     Some(format!("{}://{}", scheme, host))
 }
 
-fn env_daemon_host() -> Option<String> {
-    std::env::var("SAFECLAW_DAEMON_URL")
+/// The agent's broker-face URL from the env: `$SAFECLAW_BROKER_URL` (the
+/// self-describing name — this is SafeClaw's broker/API face, NOT the control
+/// port), falling back to the legacy `$SAFECLAW_DAEMON_URL` so an env minted
+/// before the rename keeps working. Empty values are ignored.
+pub fn env_broker_url() -> Option<String> {
+    std::env::var("SAFECLAW_BROKER_URL")
         .ok()
         .filter(|s| !s.is_empty())
-        .and_then(|u| scheme_host(&u))
+        .or_else(|| std::env::var("SAFECLAW_DAEMON_URL").ok().filter(|s| !s.is_empty()))
+}
+
+fn env_daemon_host() -> Option<String> {
+    env_broker_url().and_then(|u| scheme_host(&u))
 }
 
 /// The DEVICE's daemon-host atom (`scheme://host`): config's `daemon` with its
@@ -400,7 +408,7 @@ pub fn device_daemon_host(cfg: &CliConfig) -> String {
 }
 
 /// The control root (`scheme://host:<control-port>`) every ceremony/write `sc`
-/// call targets. Env-first: `$SAFECLAW_DAEMON_URL`'s HOST wins when set (the
+/// call targets. Env-first: `$SAFECLAW_BROKER_URL`'s HOST wins when set (the
 /// invariant — shelled `sc` and the agent's own HTTP share one daemon); else
 /// config's `daemon` VERBATIM (it may carry a hand-edited custom control
 /// port); else the loopback default. The env value carries the PROXY port,
@@ -409,7 +417,7 @@ pub fn device_daemon_host(cfg: &CliConfig) -> String {
 /// serve` and `sc login` read, so exporting `SAFECLAW_PORT=<p>` moves the
 /// daemon, its recorded config, AND this resolution together — a coordinated
 /// port change survives even in an agent shell that carries a proxy-face
-/// `SAFECLAW_DAEMON_URL`.
+/// `SAFECLAW_BROKER_URL`.
 pub fn control_root(cfg: &CliConfig) -> String {
     control_root_from(env_daemon_host(), cfg.daemon.as_deref(), control_port())
 }
@@ -426,7 +434,7 @@ fn control_port() -> u16 {
 /// The proxy-face port the `sc` CLI targets: `$SAFECLAW_PROXY_PORT` when set (the
 /// single override, shared with `sc serve`), else the constant. Mirrors
 /// [`control_port`] so a stale proxy port baked into an agent's snapshot
-/// (`$SAFECLAW_DAEMON_URL` from an old `sc agent add`) never wins — a moved
+/// (`$SAFECLAW_BROKER_URL` from an old `sc agent add`) never wins — a moved
 /// daemon self-heals, and a real custom port is coordinated the same way
 /// `$SAFECLAW_PORT` coordinates the control face.
 fn proxy_port() -> u16 {
@@ -447,19 +455,18 @@ fn control_root_from(env_host: Option<String>, config_daemon: Option<&str>, port
 }
 
 /// The API-face root (`scheme://host:<proxy-port>`) — the daemon face an agent
-/// holds as `SAFECLAW_DAEMON_URL`. Env-first HOST (the single-host invariant:
+/// holds as `SAFECLAW_BROKER_URL`. Env-first HOST (the single-host invariant:
 /// proxy and control share one daemon host), else the device atom; the PORT is
 /// always [`proxy_port`], NEVER the snapshot's port. This is symmetric with
 /// [`control_root`], which likewise takes the env HOST but resolves the port
-/// itself — so a stale `$SAFECLAW_DAEMON_URL` port from an old `sc agent add`
+/// itself — so a stale `$SAFECLAW_BROKER_URL` port from an old `sc agent add`
 /// (the daemon since moved) is ignored by BOTH faces and self-heals, instead of
 /// silently pinning the child's `HTTPS_PROXY` to a dead port. The env value
 /// passes the SAME `scheme_host` parse gate as `control_root` — a malformed
 /// value is ignored by BOTH faces, never honored by one and dropped by the
 /// other (that asymmetry would split the invariant).
 pub fn api_face_root(cfg: &CliConfig) -> String {
-    let env_url = std::env::var("SAFECLAW_DAEMON_URL").ok().filter(|s| !s.is_empty());
-    api_face_root_with(env_url, cfg)
+    api_face_root_with(env_broker_url(), cfg)
 }
 
 fn api_face_root_with(env_url: Option<String>, cfg: &CliConfig) -> String {
@@ -481,7 +488,7 @@ pub fn device_default_vault(cfg: &CliConfig) -> Option<String> {
 /// Resolve the active `(control_root, vault)` pair every short-lived `sc`
 /// command routes through — the single choke point (CREDENTIAL_BROKER.md §14).
 ///
-/// - **control root:** see [`control_root`] — the env `DAEMON_URL` HOST wins
+/// - **control root:** see [`control_root`] — the env `BROKER_URL` HOST wins
 ///   (the single-host invariant), else config, else the loopback default.
 /// - **vault precedence:** `--vault flag > $SAFECLAW_VAULT_ID (env pin) >
 ///   config default > single-vault auto-select`. The env pin is what makes an
@@ -567,7 +574,7 @@ mod tests {
             format!("https://box.example.com:{}", CONTROL_PORT)
         );
         // A moved control port (SAFECLAW_PORT) rides through the env-host branch,
-        // so an agent shell carrying a proxy-face DAEMON_URL still targets it.
+        // so an agent shell carrying a proxy-face BROKER_URL still targets it.
         assert_eq!(
             control_root_from(Some("http://127.0.0.1".into()), cfg_daemon, 23293),
             "http://127.0.0.1:23293"

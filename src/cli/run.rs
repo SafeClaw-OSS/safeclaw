@@ -34,8 +34,9 @@ pub async fn run(args: RunArgs) -> Result<(), String> {
     // traffic is unaffected, so this is a note, not an error.
     if !args.export_env && !agent_has_key() {
         eprintln!(
-            "note: no SafeClaw agent key in this shell — credential substitution will 407 \
-             (run inside your agent, which holds its own key). Non-credential traffic is unaffected."
+            "note: no SafeClaw agent key in this shell — credential substitution will 407. \
+             Load your agent env (the file holding SAFECLAW_API_KEY) and retry; this is not a \
+             daemon or port problem. Non-credential traffic is unaffected."
         );
     }
 
@@ -100,15 +101,19 @@ async fn preflight(ca: &Path, control_root: &str) -> Result<(), String> {
     if control_plane_up(control_root).await {
         return Ok(());
     }
-    // A stale `$SAFECLAW_DAEMON_URL` (an old `sc agent add` snapshot) points the
-    // whole resolution at a daemon HOST that has since moved — say so, rather
-    // than the misleading "isn't running" when a daemon may well be up on the
-    // default host/port. (A stale PORT alone can't reach here: `control_root`
+    // A stale broker URL (an old `sc agent add` snapshot) points the whole
+    // resolution at a daemon HOST that has since moved — name the actual var the
+    // agent set (new `SAFECLAW_BROKER_URL` or legacy `SAFECLAW_DAEMON_URL`),
+    // rather than the misleading "isn't running" when a daemon may well be up on
+    // the default host/port. (A stale PORT alone can't reach here: `control_root`
     // takes only the env HOST and resolves the port itself.)
-    if let Some(u) = std::env::var("SAFECLAW_DAEMON_URL").ok().filter(|s| !s.is_empty()) {
+    if let Some((name, u)) = ["SAFECLAW_BROKER_URL", "SAFECLAW_DAEMON_URL"]
+        .into_iter()
+        .find_map(|k| std::env::var(k).ok().filter(|s| !s.is_empty()).map(|v| (k, v)))
+    {
         return Err(format!(
             "SafeClaw isn't answering at {control_root} (host from your agent env's \
-             SAFECLAW_DAEMON_URL={u}). If the daemon moved or restarted elsewhere, unset that \
+             {name}={u}). If the daemon moved or restarted elsewhere, unset that \
              stale value or re-run `sc agent add` to re-mint your env, then retry. \
              Otherwise start it with `sc up`."
         ));

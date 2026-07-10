@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 /// Control plane port (`0x5AFD`) — the axum Router (op / approve / ceremonies /
 /// events). The `sc` CLI's target; the agent's own traffic never touches it (the
-/// agent holds only `$SAFECLAW_DAEMON_URL`, the proxy port's API face).
+/// agent holds only `$SAFECLAW_BROKER_URL`, the proxy port's API face).
 /// Sits just below the proxy's `0x5AFE`: both are below the OS ephemeral floor
 /// and IANA-unregistered, so nothing should grab them by chance. Moved off the
 /// former `23295` (`0x5AFF`), which some dev tools (e.g. a VS Code extension
@@ -128,7 +128,7 @@ pub enum Command {
     /// env. In SaaS deployments only the SafeClaw team holds this key.
     Admin(AdminArgs),
     /// Print `export` lines for the HUMAN's shell (`eval "$(sc env)"`):
-    /// SAFECLAW_DAEMON_URL + SAFECLAW_VAULT_ID projected from this device's
+    /// SAFECLAW_BROKER_URL + SAFECLAW_VAULT_ID projected from this device's
     /// config — never a key. An AGENT's complete env (incl. its key) is minted
     /// by `sc agent add` instead.
     Env,
@@ -484,9 +484,9 @@ pub struct AgentArgs {
 #[derive(Debug, Subcommand)]
 pub enum AgentSubcommand {
     /// Mint a new agent identity and print its COMPLETE env (dotenv lines:
-    /// DAEMON_URL / VAULT_ID / API_KEY / PROXY_URL, key shown ONCE) — the
-    /// agent appends stdout to its own `.env`. Account-level: works on any of
-    /// your paired devices.
+    /// BROKER_URL / VAULT_ID / API_KEY, key shown ONCE) — the agent appends
+    /// stdout to its own `.env`. Account-level: works on any of your paired
+    /// devices.
     Add(AgentAddArgs),
     /// List this account's agents (name, key prefix, last-used).
     Ls,
@@ -766,7 +766,7 @@ pub struct ServeArgs {
     /// The control plane port (`CONTROL_PORT`). The `sc` CLI, op-approval
     /// polling, ceremonies, `/events`, and any reverse proxy talk to the
     /// daemon here; the agent's own traffic uses only the proxy port
-    /// (`$SAFECLAW_DAEMON_URL`). (Not "admin port" — the admin surface is
+    /// (`$SAFECLAW_BROKER_URL`). (Not "admin port" — the admin surface is
     /// just the `/admin/*` subset, gated by --admin-key.)
     #[arg(long, env = "SAFECLAW_PORT", default_value_t = CONTROL_PORT)]
     pub port: u16,
@@ -909,7 +909,7 @@ pub struct LogoutArgs {
 }
 
 /// Reusable arg set for read-only short-lived commands. The daemon control
-/// root comes from the shared derivation (env `$SAFECLAW_DAEMON_URL` host >
+/// root comes from the shared derivation (env `$SAFECLAW_BROKER_URL` host >
 /// config > default); `--vault` only reselects the vault id on that daemon.
 #[derive(Debug, Args)]
 pub struct CommonArgs {

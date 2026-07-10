@@ -15,7 +15,7 @@ a literal string (a clean 401), never a leak.
 
 Your install prompt set these — use each verbatim, never construct one.
 
-- **`$SAFECLAW_DAEMON_URL`** — the daemon, e.g. `http://127.0.0.1:23294`.
+- **`$SAFECLAW_BROKER_URL`** — SafeClaw's broker URL, e.g. `http://127.0.0.1:23294`.
 - **`$SAFECLAW_VAULT_ID`** — your vault id.
 - **`$SAFECLAW_API_KEY`** — your identity; send `Authorization: Bearer
   $SAFECLAW_API_KEY` on every request below.
@@ -27,7 +27,7 @@ duplicate.
 Make sure the daemon is up before the first call (idempotent):
 
 ```bash
-curl -s -o /dev/null --connect-timeout 1 "$SAFECLAW_DAEMON_URL/health" || sc up
+curl -s -o /dev/null --connect-timeout 1 "$SAFECLAW_BROKER_URL/health" || sc up
 ```
 
 Check `sc help` anytime for more.
@@ -35,7 +35,7 @@ Check `sc help` anytime for more.
 ## Discover what's available
 
 ```
-GET $SAFECLAW_DAEMON_URL/v/$SAFECLAW_VAULT_ID/registry
+GET $SAFECLAW_BROKER_URL/v/$SAFECLAW_VAULT_ID/registry
 Authorization: Bearer $SAFECLAW_API_KEY
 ```
 

@@ -63,7 +63,7 @@ fn next_delay(retry_after: Option<&str>) -> Duration {
 
 pub async fn run_wait(args: OpWaitArgs) -> Result<(), String> {
     // Corrupt config degrades to defaults, NOT a hardcoded localhost that
-    // would ignore an agent's $SAFECLAW_DAEMON_URL (same rule as custodian.rs).
+    // would ignore an agent's $SAFECLAW_BROKER_URL (same rule as custodian.rs).
     let root = control_root(&load().unwrap_or_default());
     let poll_url = format!(
         "{}/op/{}",

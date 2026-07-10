@@ -63,7 +63,7 @@ async fn fetch_print(_args: CommonArgs, path: &str) -> Result<(), String> {
 
 /// The daemon control root. `resolve_active` errs only when no vault is
 /// selected — fall back to the SAME shared derivation (env-first host), not a
-/// hardcoded localhost that would ignore an agent's `$SAFECLAW_DAEMON_URL`.
+/// hardcoded localhost that would ignore an agent's `$SAFECLAW_BROKER_URL`.
 fn resolve_daemon_url() -> Result<String, String> {
     if let Ok((c, _)) = resolve_active(None) {
         return Ok(c);

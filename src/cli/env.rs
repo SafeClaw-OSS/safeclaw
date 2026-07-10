@@ -9,7 +9,7 @@
 //! `sc env` is the DEVICE/human's tool (CREDENTIAL_BROKER.md §14) — it emits the
 //! routing vars only, NEVER a key:
 //!
-//! - `SAFECLAW_DAEMON_URL` — the resident daemon's API face
+//! - `SAFECLAW_BROKER_URL` — the resident daemon's API face
 //!   (`http://127.0.0.1:<PROXY_PORT>`), for reference / manual `/health` / `/ca`.
 //! - `SAFECLAW_VAULT_ID`   — the active vault; this PINS the shell's vault
 //!   (`resolve_active` reads it), the `AWS_PROFILE` analog.
@@ -37,8 +37,8 @@ pub fn run() -> Result<(), String> {
         println!("# safeclaw: no vault on this device — run `sc login` or `sc vault create` first");
         return Ok(());
     };
-    let daemon_url = format!("{}:{}", device_daemon_host(&cfg), PROXY_PORT);
-    println!("export SAFECLAW_DAEMON_URL={}", shell_quote(&daemon_url));
+    let broker_url = format!("{}:{}", device_daemon_host(&cfg), PROXY_PORT);
+    println!("export SAFECLAW_BROKER_URL={}", shell_quote(&broker_url));
     println!("export SAFECLAW_VAULT_ID={}", shell_quote(&vault));
     Ok(())
 }
