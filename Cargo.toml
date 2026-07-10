@@ -1,6 +1,6 @@
 [package]
 name = "safeclaw"
-version = "0.9.33"
+version = "0.9.34"
 edition = "2021"
 description = "SafeClaw daemon — multi-vault passkey-gated credential vault for AI agents"
 # Functional Source License 1.1 (Apache-2.0 future). FSL is not an SPDX id,
@@ -64,6 +64,11 @@ futures-util = "0.3"
 # BodyExt::collect for the bounded body scan.
 hudsucker = "0.24"
 http-body-util = "0.1"
+# Portable OS trust-store roots (mac Keychain / linux cert files / windows
+# store) so `sc run` can hand tools a CA bundle = broker root + system roots.
+# Without the system roots, tools with no compiled CApath fallback (cargo's
+# vendored libcurl) fail to verify passthrough (non-brokered) public hosts.
+rustls-native-certs = "0.8"
 toml = "0.8"
 dirs = "5"
 url = "2"

@@ -10,7 +10,9 @@ use std::path::Path;
 
 use crate::cli::active::{api_face_root, load as load_config, resolve_active};
 use crate::cli::env::shell_quote;
-use crate::cli::proxy_env::{build_bundle, control_plane_up, proxy_url_for_vault, resident_ca_path};
+use crate::cli::proxy_env::{
+    build_bundle, control_plane_up, proxy_url_for_vault, resident_ca_bundle_path, resident_ca_path,
+};
 use crate::config::RunArgs;
 
 pub async fn run(args: RunArgs) -> Result<(), String> {
@@ -37,7 +39,11 @@ pub async fn run(args: RunArgs) -> Result<(), String> {
         );
     }
 
-    let ca_str = ca.to_string_lossy().to_string();
+    // Hand the child a bundle = broker root + OS trust-store roots (not the
+    // broker-only `ca.pem`), so tools without a compiled system-CApath fallback
+    // (cargo) can still verify passthrough public hosts. Falls back to the
+    // broker-only path on any error, so this never regresses brokered calls.
+    let ca_str = resident_ca_bundle_path().to_string_lossy().to_string();
     // Chain onto an already-configured git helper rather than clobber it.
     let parent_count = std::env::var("GIT_CONFIG_COUNT")
         .ok()

@@ -7,7 +7,7 @@
 //! routes every credential request EXPLICITLY (`sc run` / `--proxy`) — the
 //! "phantom sent unrouted" state is unreachable, so there's nothing to detect.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::config::default_state_dir;
@@ -23,6 +23,74 @@ pub fn resident_ca_path() -> PathBuf {
         }
     }
     default_state_dir().join("ca.pem")
+}
+
+/// The CA bundle `sc run` hands a child: the broker root (needed to verify the
+/// proxy's MITM cert on BROKERED hosts) PLUS the machine's OS trust-store roots
+/// (needed to verify the REAL cert on PASSTHROUGH / non-brokered public hosts,
+/// which the proxy tunnels transparently). Pointing tools at the broker-only
+/// `ca.pem` breaks any tool with no compiled system-CApath fallback (cargo's
+/// vendored libcurl is the notable one): it then can't verify a passthrough host
+/// like `index.crates.io` and fails cert verification. Bundling the system roots
+/// in fixes every such tool WITHOUT installing anything into the OS trust store —
+/// we only READ the roots already there.
+///
+/// Written to `<state_dir>/ca-bundle.pem` fresh each call (picks up OS root
+/// updates), atomically (temp + rename) so a concurrent `sc run` never reads a
+/// torn file. On ANY failure — unreadable broker cert, no OS roots, unwritable
+/// dir — we fall back to the broker-only path, i.e. exactly the pre-bundle
+/// behaviour: brokered hosts keep working, passthrough hosts stay as they were.
+/// The broker root is ALWAYS first, so the broker can never be silently dropped.
+pub fn resident_ca_bundle_path() -> PathBuf {
+    let broker = resident_ca_path();
+    write_ca_bundle(&broker).unwrap_or(broker)
+}
+
+fn write_ca_bundle(broker: &Path) -> std::io::Result<PathBuf> {
+    let broker_pem = std::fs::read_to_string(broker)?;
+    // OS trust store, best effort: whatever loads, we use; load errors are
+    // ignored (the broker root alone still makes brokered hosts work).
+    let natives: Vec<Vec<u8>> = rustls_native_certs::load_native_certs()
+        .certs
+        .into_iter()
+        .map(|c| c.as_ref().to_vec())
+        .collect();
+    let content = compose_ca_bundle(&broker_pem, &natives);
+    let dir = broker.parent().unwrap_or_else(|| Path::new("."));
+    let target = dir.join("ca-bundle.pem");
+    // Atomic publish: pid-suffixed temp in the same dir, then rename (same-fs,
+    // so the rename is atomic and a reader sees only whole content).
+    let tmp = dir.join(format!(".ca-bundle.pem.tmp.{}", std::process::id()));
+    std::fs::write(&tmp, content.as_bytes())?;
+    std::fs::rename(&tmp, &target)?;
+    Ok(target)
+}
+
+/// Compose the bundle text: broker cert(s) first (never dropped), then each OS
+/// root as its own PEM block. Pure so the ordering + framing is unit-testable
+/// without touching the OS trust store or the filesystem.
+fn compose_ca_bundle(broker_pem: &str, extra_der: &[Vec<u8>]) -> String {
+    let mut out = String::new();
+    out.push_str(broker_pem.trim_end());
+    out.push('\n');
+    for der in extra_der {
+        out.push_str(&der_to_pem(der));
+    }
+    out
+}
+
+/// DER → one PEM CERTIFICATE block (base64, 64-col lines). base64 output is
+/// pure ASCII, so the per-chunk `from_utf8` cannot fail.
+fn der_to_pem(der: &[u8]) -> String {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let b64 = STANDARD.encode(der);
+    let mut out = String::from("-----BEGIN CERTIFICATE-----\n");
+    for chunk in b64.as_bytes().chunks(64) {
+        out.push_str(std::str::from_utf8(chunk).expect("base64 is ASCII"));
+        out.push('\n');
+    }
+    out.push_str("-----END CERTIFICATE-----\n");
+    out
 }
 
 /// The proxy URL a child's `HTTPS_PROXY` points at: the API-face root
@@ -74,12 +142,19 @@ pub fn build_bundle(
         ("no_proxy".to_string(), no_proxy.to_string()),
         // Node 24+ built-in fetch honours the proxy env only with this set.
         ("NODE_USE_ENV_PROXY".to_string(), "1".to_string()),
+        // CA trust: `ca` is the combined bundle (broker root + OS roots) from
+        // `resident_ca_bundle_path`. Each var is how a given toolchain finds its
+        // CA file. cargo is the odd one out — its vendored libcurl ignores
+        // SSL_CERT_FILE/CURL_CA_BUNDLE and reads only CARGO_HTTP_CAINFO — so it
+        // needs its own entry or `sc run -- cargo …` can't verify passthrough
+        // hosts like index.crates.io.
         ("SSL_CERT_FILE".to_string(), ca.to_string()),
         ("REQUESTS_CA_BUNDLE".to_string(), ca.to_string()),
         ("CURL_CA_BUNDLE".to_string(), ca.to_string()),
         ("NODE_EXTRA_CA_CERTS".to_string(), ca.to_string()),
         ("GIT_SSL_CAINFO".to_string(), ca.to_string()),
         ("DENO_CERT".to_string(), ca.to_string()),
+        ("CARGO_HTTP_CAINFO".to_string(), ca.to_string()),
     ];
     // git's per-process config env (no gitconfig writes): register our helper at
     // the next free index. `!` is git's shell-command marker.
@@ -182,12 +257,48 @@ mod tests {
             "NODE_EXTRA_CA_CERTS",
             "GIT_SSL_CAINFO",
             "DENO_CERT",
+            // cargo's vendored libcurl reads only this one.
+            "CARGO_HTTP_CAINFO",
         ] {
             assert_eq!(get(k).unwrap(), "/x/ca.pem");
         }
         assert_eq!(get("GIT_CONFIG_COUNT").unwrap(), "1");
         assert_eq!(get("GIT_CONFIG_KEY_0").unwrap(), "credential.helper");
         assert_eq!(get("GIT_CONFIG_VALUE_0").unwrap(), "!sc git-credential");
+    }
+
+    #[test]
+    fn der_to_pem_is_well_formed_and_roundtrips() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        // A DER long enough to force multiple 64-col base64 lines.
+        let der: Vec<u8> = (0u8..=200).cycle().take(200).collect();
+        let pem = der_to_pem(&der);
+        assert!(pem.starts_with("-----BEGIN CERTIFICATE-----\n"));
+        assert!(pem.ends_with("-----END CERTIFICATE-----\n"));
+        // Every body line is <= 64 cols (OpenSSL/libcurl reject over-wide PEM).
+        for line in pem.lines().filter(|l| !l.starts_with("-----")) {
+            assert!(line.len() <= 64, "over-wide PEM line: {}", line.len());
+        }
+        // The base64 body decodes back to the exact DER.
+        let body: String = pem.lines().filter(|l| !l.starts_with("-----")).collect();
+        assert_eq!(STANDARD.decode(body).unwrap(), der);
+    }
+
+    #[test]
+    fn compose_keeps_broker_first_and_never_drops_it() {
+        let broker = "-----BEGIN CERTIFICATE-----\nQlJPS0VS\n-----END CERTIFICATE-----\n";
+        let extras = vec![b"aaa".to_vec(), b"bbb".to_vec()];
+        let out = compose_ca_bundle(broker, &extras);
+        // Broker block leads, verbatim.
+        assert!(out.starts_with("-----BEGIN CERTIFICATE-----\nQlJPS0VS"));
+        // One broker + two OS roots = three CERTIFICATE blocks.
+        assert_eq!(out.matches("BEGIN CERTIFICATE").count(), 3);
+        // Zero OS roots (load failed / empty store) still keeps the broker — the
+        // fallback must never leave the broker out.
+        assert_eq!(
+            compose_ca_bundle(broker, &[]).matches("BEGIN CERTIFICATE").count(),
+            1
+        );
     }
 
     #[test]
