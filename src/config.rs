@@ -1,12 +1,16 @@
 use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 
-/// Control plane port — the axum Router (op / approve / ceremonies / events).
-/// The `sc` CLI's target; the agent's own traffic never touches it (the agent
-/// holds only `$SAFECLAW_DAEMON_URL`, the proxy port's API face).
-pub const CONTROL_PORT: u16 = 23295;
+/// Control plane port (`0x5AFD`) — the axum Router (op / approve / ceremonies /
+/// events). The `sc` CLI's target; the agent's own traffic never touches it (the
+/// agent holds only `$SAFECLAW_DAEMON_URL`, the proxy port's API face).
+/// Sits just below the proxy's `0x5AFE`: both are below the OS ephemeral floor
+/// and IANA-unregistered, so nothing should grab them by chance. Moved off the
+/// former `23295` (`0x5AFF`), which some dev tools (e.g. a VS Code extension
+/// host) deterministically squat — overridable via `$SAFECLAW_PORT`.
+pub const CONTROL_PORT: u16 = 23293;
 
-/// Credential-proxy plane port (0x5AFE) — the phantom-only local HTTPS MITM the
+/// Credential-proxy plane port (`0x5AFE`) — the phantom-only local HTTPS MITM the
 /// agent's tool traffic is routed through by `sc run`'s env bundle.
 pub const PROXY_PORT: u16 = 23294;
 
@@ -598,7 +602,7 @@ pub enum VaultSubcommand {
     /// Remove a vault from the local known list (does NOT touch the
     /// daemon — for that use `sc vault delete`). Pass URL or index.
     Forget(VaultForgetArgs),
-    /// Create a new vault. Default = local (http://localhost:23295,
+    /// Create a new vault. Default = local (http://localhost:23293,
     /// vault id "default"). Pass --remote <URL> to create on a remote
     /// custodian (auto-generates a UUID). Saves to config and makes
     /// the new vault active.

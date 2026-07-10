@@ -10,7 +10,7 @@
 //! - `/health`, `/ca` — unauthenticated (liveness / public CA cert).
 //! - `/v/{vid}/registry`, `/op/{id}` — the agent Bearer key (§8).
 //!
-//! Writes / ceremony never appear here — they stay on the control port (23295),
+//! Writes / ceremony never appear here — they stay on the control port (23293),
 //! passkey-gated and invisible to the agent. The read projections come from the
 //! SAME functions the control plane serves (`registry::vault_registry_value`,
 //! `approve::op_poll_value`, `health::health_value`), so the two ports can't

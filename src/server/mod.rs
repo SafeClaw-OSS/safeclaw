@@ -1,4 +1,4 @@
-//! HTTP server: control/API plane (`CONTROL_PORT`, `:23295`) router.
+//! HTTP server: control/API plane (`CONTROL_PORT`, `:23293`) router.
 //!
 //! v1 URL surface (PROTOCOL.md §4.1 / `[[v1-endpoint-design]]` /
 //! `[[architecture-final-2026-05-27]]`):

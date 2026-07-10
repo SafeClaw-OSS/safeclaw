@@ -11,7 +11,7 @@ use crate::cli::active::{forget as forget_vault, join_vault_url, known_vaults, l
 use crate::config::{VaultCreateArgs, VaultDeleteArgs, VaultForgetArgs, VaultSubcommand, VaultUseArgs};
 
 // Port must equal `config::CONTROL_PORT` (the daemon's control/API plane).
-const LOCAL_CUSTODIAN: &str = "http://localhost:23295";
+const LOCAL_CUSTODIAN: &str = "http://localhost:23293";
 const LOCAL_VAULT_ID: &str = "default";
 
 /// True if the custodian URL points at this machine. Used to specialize

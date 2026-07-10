@@ -267,9 +267,9 @@ fn ssh_session_detected() -> bool {
         || std::env::var_os("SSH_CLIENT").is_some()
 }
 
-/// Default port to suggest in the SSH-tunnel hint. Sits one above the
-/// daemon's 23294/23295 pair so the three safeclaw ports cluster together
-/// and the tunnel command stays compact.
+/// Default port to suggest in the SSH-tunnel hint. Clusters just above the
+/// daemon's 23293/23294 pair (skipping the commonly-squatted 23295) so the
+/// safeclaw ports stay together and the tunnel command stays compact.
 const SUGGESTED_CB_PORT: u16 = 23296;
 
 /// If `url` points at this machine, return the port. Used to decide
