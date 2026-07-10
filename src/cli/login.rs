@@ -29,28 +29,70 @@ use crate::config::LoginArgs;
 /// Default daemon control-plane port (matches `ServeArgs` `SAFECLAW_PORT`).
 const DEFAULT_DAEMON_PORT: u16 = crate::config::CONTROL_PORT;
 
-/// The baked cloud endpoint the daemon pairs with. Device→cloud is FIXED (not
-/// user config): `SAFECLAW_CLOUD_URL` (undocumented runtime override, for
-/// self-host) > `SAFECLAW_BAKED_CLOUD_URL` (CI-pinned at build time) > the
-/// hardcoded default below. Domain changes ship via `sc upgrade`, not config.
-///
-/// PRE-LAUNCH: prod (`https://safeclaw.pro`) is NOT deployed — it's a marketing
-/// page with no pairing API — so EVERY build (debug AND release) pairs with dev
-/// for now. When prod goes live, switch the default to the build-profile split:
-///   `if cfg!(debug_assertions) { dev } else { "https://safeclaw.pro" }`
-/// (and bump + re-release so install.sh serves a prod-pointing binary).
-fn baked_cloud_url() -> String {
+/// Resolve which cloud the pair-token is exchanged against. Precedence:
+///   1. `SAFECLAW_CLOUD_URL` — runtime self-host escape hatch (any URL; HTTPS
+///      enforced below). Undocumented; for people running their own custodian.
+///   2. `--env {prod,dev}` — the FIRST-PARTY selector the console's install
+///      prompt uses. It is a SYMBOL, not a URL: it resolves only against the
+///      compiled-in allowlist below. This is deliberate — `sc login` has no
+///      `--custodian <url>` flag, because a malicious skill prompt could
+///      otherwise redirect pairing to an attacker host. A symbol bounded to
+///      first-party domains means a hostile prompt can at worst flip you
+///      between your OWN prod/dev, never to a third party. The prod console
+///      omits the flag (→ default prod); the dev console appends `--env dev`.
+///   3. `SAFECLAW_BAKED_CLOUD_URL` — compile-time self-host bake.
+///   4. Default: prod. Every real user only ever deals with prod.
+/// The resolved value is only the target at `sc login` time; once paired, the
+/// machine is pinned to the backend persisted in config.toml, so this never
+/// matters again for that machine.
+fn resolve_custodian(env_flag: Option<&str>) -> Result<String, String> {
     if let Ok(u) = std::env::var("SAFECLAW_CLOUD_URL") {
         if !u.is_empty() {
-            return u;
+            return Ok(u);
         }
+    }
+    if let Some(env) = env_flag {
+        return env_selector_to_url(env);
     }
     if let Some(u) = option_env!("SAFECLAW_BAKED_CLOUD_URL") {
         if !u.is_empty() {
-            return u.to_string();
+            return Ok(u.to_string());
         }
     }
-    "https://dev.safeclaw.pro".to_string()
+    Ok("https://safeclaw.pro".to_string())
+}
+
+/// The `--env` allowlist. A SYMBOL → first-party URL only; anything else is a
+/// hard error. This is the gate that keeps a hostile install prompt from
+/// steering pairing off first-party domains — do not widen it to accept URLs.
+fn env_selector_to_url(env: &str) -> Result<String, String> {
+    match env {
+        "prod" => Ok("https://safeclaw.pro".to_string()),
+        "dev" => Ok("https://dev.safeclaw.pro".to_string()),
+        other => Err(format!(
+            "unknown --env '{}': expected 'prod' or 'dev'",
+            other
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::env_selector_to_url;
+
+    #[test]
+    fn env_selector_allowlist_maps_first_party_only() {
+        assert_eq!(env_selector_to_url("prod").unwrap(), "https://safeclaw.pro");
+        assert_eq!(
+            env_selector_to_url("dev").unwrap(),
+            "https://dev.safeclaw.pro"
+        );
+        // Anything that is not an exact first-party symbol is rejected — a
+        // hostile prompt cannot smuggle a custodian URL through `--env`.
+        assert!(env_selector_to_url("https://attacker.com").is_err());
+        assert!(env_selector_to_url("staging").is_err());
+        assert!(env_selector_to_url("").is_err());
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -67,8 +109,8 @@ struct ExchangeResp {
 }
 
 pub async fn run(args: LoginArgs) -> Result<(), String> {
-    // ── Cloud endpoint is baked (device→cloud is fixed .pro) ─────────────
-    let custodian = baked_cloud_url();
+    // ── Resolve cloud endpoint: env override > --env selector > baked ─────
+    let custodian = resolve_custodian(args.env.as_deref())?;
     let custodian = custodian.trim_end_matches('/').to_string();
 
     // ── Enforce HTTPS for the custodian URL ──────────────────────────────

@@ -848,6 +848,13 @@ pub struct LoginArgs {
     /// Defaults to the machine's hostname, else `agent-device`.
     #[arg(long)]
     pub device_name: Option<String>,
+    /// First-party environment selector: `prod` (default) or `dev`. Resolves
+    /// only against a compiled-in allowlist — it is NOT a raw custodian URL, so
+    /// a hostile install prompt can at worst flip between your own prod/dev,
+    /// never to a third-party host. The prod console omits it; the dev console's
+    /// install prompt appends `--env dev`.
+    #[arg(long)]
+    pub env: Option<String>,
     /// Test-only: allow a plaintext `http://` custodian URL. Without this,
     /// `sc login` refuses non-HTTPS URLs to keep the pair-token off the wire
     /// in cleartext (a malicious skill prompt could otherwise smuggle in an
