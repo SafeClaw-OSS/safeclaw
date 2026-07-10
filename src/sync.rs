@@ -137,7 +137,16 @@ pub async fn pull_on_start(state_dir: &Path) {
 /// `Ok(true)` when a newer blob was pulled. Never needs a passkey — it only
 /// moves already-sealed state forward: the pull is device-key-authed, and the
 /// connect re-seal uses the retained `K` from a prior unlock (no-ops if locked).
-pub async fn sync_vault_now(state: &Arc<AppState>, vault_id: &str) -> Result<bool, String> {
+/// Result of an on-demand `sc sync`: whether new cloud state was pulled, plus the
+/// [`ConnectReport`](crate::auth::connect::ConnectReport) of any pending-connect
+/// work so the CLI can SURFACE completions / failures / "couldn't reach provider"
+/// instead of the daemon eating them silently.
+pub struct SyncOutcome {
+    pub pulled: bool,
+    pub connects: crate::auth::connect::ConnectReport,
+}
+
+pub async fn sync_vault_now(state: &Arc<AppState>, vault_id: &str) -> Result<SyncOutcome, String> {
     let cfg = active::load().map_err(|_| {
         "not set up yet — run `sc login` to pair this daemon with the cloud".to_string()
     })?;
@@ -170,7 +179,7 @@ pub async fn sync_vault_now(state: &Arc<AppState>, vault_id: &str) -> Result<boo
             // return without the connect step (there is nothing left to act on).
             drop_local_vault_locked(state, vault_id).await;
             tracing::info!(vault = %vault_id, "cloud sync: vault deleted upstream; dropped local state");
-            return Ok(false);
+            return Ok(SyncOutcome { pulled: false, connects: Default::default() });
         }
     };
     // PER-ITEM: pull the KEYSET (`/keys`), then the content item rows (`/items`).
@@ -197,7 +206,9 @@ pub async fn sync_vault_now(state: &Arc<AppState>, vault_id: &str) -> Result<boo
     }
     // Complete a pending connect even when the blob was unchanged — the pending
     // item may have synced earlier (background watcher) but never been processed.
-    crate::auth::connect::process_vault_connects(state, vault_id).await;
+    // Capture the outcome so `sc sync` can report it (completed / reconnect /
+    // couldn't-reach-provider) instead of the failure staying buried in the log.
+    let connects = crate::auth::connect::process_vault_connects(state, vault_id).await;
     // PER-ITEM (bidirectional): flush any LOCAL-ahead keys/items to the cloud.
     // Sync used to only PULL, so a daemon-side change that never got pushed —
     // e.g. a completed OAuth connect whose push was stranded behind a conflicting
@@ -206,7 +217,7 @@ pub async fn sync_vault_now(state: &Arc<AppState>, vault_id: &str) -> Result<boo
     // already-synced rows 409-skip without blocking the rest.
     push_keys_best_effort(state, vault_id).await;
     push_items_best_effort(state, vault_id).await;
-    Ok(pulled)
+    Ok(SyncOutcome { pulled, connects })
 }
 
 /// After a per-item pull adopted new rows, refresh the in-memory cache for an

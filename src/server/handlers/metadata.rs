@@ -156,7 +156,22 @@ pub async fn sync_now(
         return Json(json!({ "ok": false, "error": e.to_string() }));
     }
     match crate::sync::sync_vault_now(&state, &vault_id).await {
-        Ok(pulled) => Json(json!({ "ok": true, "pulled": pulled })),
+        Ok(out) => {
+            let c = &out.connects;
+            Json(json!({
+                "ok": true,
+                "pulled": out.pulled,
+                "connects": {
+                    "completed": c.completed,
+                    "failed": c.failed.iter()
+                        .map(|(conn, reason)| json!({ "conn": conn, "reason": reason }))
+                        .collect::<Vec<_>>(),
+                    "unreached": c.unreached.iter()
+                        .map(|(conn, host)| json!({ "conn": conn, "host": host }))
+                        .collect::<Vec<_>>(),
+                },
+            }))
+        }
         Err(e) => Json(json!({ "ok": false, "error": e })),
     }
 }

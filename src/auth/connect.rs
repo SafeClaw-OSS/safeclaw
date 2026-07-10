@@ -253,18 +253,44 @@ fn collect_pending(m: &ProtectedState) -> Vec<(String, Connecting)> {
         .collect()
 }
 
+/// Per-run outcome of the connect state machine, so callers (and ultimately
+/// `sc sync`) can SURFACE what happened instead of failing silently. Three
+/// disjoint buckets:
+/// - `completed`: got a refresh_token, MOVEd to `connections`.
+/// - `failed`: TERMINALLY rejected (`invalid_grant` / other 4xx) — an `error` was
+///   stamped so the console renders "reconnect"; carries the provider's reason.
+/// - `unreached`: a TRANSIENT failure (couldn't reach the provider — network /
+///   proxy / 5xx) — left pending, NO error stamped, retried next sync; carries the
+///   provider host so the user can tell "my egress is broken" from "the code died".
+#[derive(Debug, Default, Clone)]
+pub struct ConnectReport {
+    pub completed: Vec<String>,
+    pub failed: Vec<(String, String)>,
+    pub unreached: Vec<(String, String)>,
+}
+
+impl ConnectReport {
+    /// Did anything MUTATE the sealed state (⇒ the caller must persist + push)?
+    /// A transient `unreached` stamps nothing, so it does not count.
+    pub fn changed(&self) -> bool {
+        !self.completed.is_empty() || !self.failed.is_empty()
+    }
+}
+
+/// The bare host of a token endpoint (`https://oauth2.googleapis.com/token` →
+/// `oauth2.googleapis.com`), for the human-readable "couldn't reach X" signal.
+fn provider_host(token_url: &str) -> String {
+    let after = token_url.split_once("://").map(|(_, r)| r).unwrap_or(token_url);
+    after.split(['/', '?', '#']).next().unwrap_or(token_url).to_string()
+}
+
 /// Drive the connecting→refresh→move state machine over an open `ProtectedState`,
 /// given an async `exchange` closure (injected so tests can avoid real network
-/// calls). Mutates `m` in place; returns the number of connects that completed (a
-/// refresh_token was written). On a per-connect failure it logs and **leaves the
-/// `connecting` entry in place** (the user retries within the code TTL) — it never
-/// aborts the whole batch.
+/// calls). Mutates `m` in place; returns a [`ConnectReport`] of what happened. On
+/// a per-connect failure it logs and **leaves the `connecting` entry in place**
+/// (the user retries within the code TTL) — it never aborts the whole batch.
 ///
-/// Returns `(completed, failed)`: `completed` = connects that got a refresh_token
-/// (MOVEd to `connections`); `failed` = connects whose code was TERMINALLY
-/// rejected (`invalid_grant`) — those get an `error` stamped on their `connecting`
-/// entry so the console can render "reconnect". Transient errors bump neither (the
-/// next sync retries). The caller persists + pushes whenever either is non-zero.
+/// The caller persists + pushes whenever [`ConnectReport::changed`] is true.
 ///
 /// `exchange(conn, cfg, connecting)` performs the code→token call and returns the
 /// tokens (or an error string to log + skip).
@@ -273,14 +299,13 @@ pub async fn run_pending<F, Fut>(
     custom: &std::collections::HashMap<String, crate::service::ServiceDef>,
     m: &mut ProtectedState,
     mut exchange: F,
-) -> (usize, usize)
+) -> ConnectReport
 where
     F: FnMut(String, ExchangeConfig, Connecting) -> Fut,
     Fut: std::future::Future<Output = Result<ExchangedTokens, String>>,
 {
     let pending = collect_pending(m);
-    let mut completed = 0usize;
-    let mut failed = 0usize;
+    let mut report = ConnectReport::default();
     for (conn, p) in pending {
         let Some(cfg) = resolve_exchange_config(services, custom, &p.service) else {
             tracing::warn!(
@@ -296,6 +321,7 @@ where
         let hosts = p.hosts.clone();
         let keys = p.keys.clone();
         let cfg_apply = cfg.clone();
+        let host = provider_host(&cfg_apply.token_url);
         match exchange(conn.clone(), cfg, p).await {
             Ok(tokens) => {
                 if tokens.refresh_token.is_none() {
@@ -308,7 +334,7 @@ where
                     continue;
                 }
                 apply_exchange_result(m, &conn, &service, hosts, keys, &cfg_apply, &tokens);
-                completed += 1;
+                report.completed.push(conn.clone());
                 tracing::info!(
                     conn = %conn,
                     "oauth connect: refresh_token persisted; moved to connections"
@@ -324,17 +350,19 @@ where
                     // def) recovers — it overwrites this entry, clearing the
                     // error.
                     mark_connecting_failed(m, &conn, &reason);
-                    failed += 1;
+                    report.failed.push((conn.clone(), reason));
                     tracing::warn!(conn = %conn, "oauth connect: terminal exchange rejection — marked failed: {}", e);
                 } else {
                     // Transient (network / provider 5xx / rate limit) — leave
-                    // connecting + retry on the next sync.
+                    // connecting + retry on the next sync. Report it so `sc sync`
+                    // can say "couldn't reach <host>" instead of a silent spin.
+                    report.unreached.push((conn.clone(), host));
                     tracing::warn!(conn = %conn, "oauth connect: exchange failed (transient), will retry: {}", e);
                 }
             }
         }
     }
-    (completed, failed)
+    report
 }
 
 /// Classify an exchange failure: `Some(reason)` when re-sending the SAME
@@ -396,10 +424,11 @@ fn mark_connecting_failed(m: &mut ProtectedState, conn: &str, reason: &str) {
 /// Holds the per-vault write lock for the open→mutate→re-seal→write cycle so it
 /// serializes against approve.rs's writes and the cloud-sync pull (same lock).
 /// Never panics; any error logs and returns.
-pub async fn process_vault_connects(state: &Arc<AppState>, vault_id: &str) {
+pub async fn process_vault_connects(state: &Arc<AppState>, vault_id: &str) -> ConnectReport {
     // Apply any pending connects (open → exchange → re-seal → persist). On a
     // completion, fan the re-sealed blob out to OTHER devices via the cloud.
-    if apply_pending_connects(state, vault_id).await {
+    let report = apply_pending_connects(state, vault_id).await;
+    if report.changed() {
         // A fresh connect landed → clear any stale needs-reauth flag for this
         // vault (a still-dead token re-marks on the next /use).
         state.oauth_clear_reauth_vault(vault_id);
@@ -421,19 +450,20 @@ pub async fn process_vault_connects(state: &Arc<AppState>, vault_id: &str) {
             crate::sync::push_items_best_effort(&state, &vid).await;
         });
     }
+    report
 }
 
-/// Apply pending connects WITHOUT the cloud push-back. Returns `true` iff at
-/// least one connect completed (and thus `vault.dat` was re-sealed). The push
-/// fan-out lives in the public `process_vault_connects` wrapper, NOT here — that
-/// split is load-bearing: the cloud-sync CAS-conflict recovery
+/// Apply pending connects WITHOUT the cloud push-back. Returns a [`ConnectReport`]
+/// of what happened (empty when locked / nothing pending). The push fan-out lives
+/// in the public `process_vault_connects` wrapper, NOT here — that split is
+/// load-bearing: the cloud-sync CAS-conflict recovery
 /// (`sync::recover_after_conflict`) calls this inner fn to re-apply its mutation
 /// on a freshly-pulled blob; routing it through the push-spawning wrapper would
 /// form an async-recursion cycle (push → recover → process → push) the compiler
 /// can't prove `Send`. Keeping the push out of the recursive edge breaks it.
-pub(crate) async fn apply_pending_connects(state: &Arc<AppState>, vault_id: &str) -> bool {
+pub(crate) async fn apply_pending_connects(state: &Arc<AppState>, vault_id: &str) -> ConnectReport {
     let Some(k) = state.cloned_state_key(vault_id) else {
-        return false; // Locked — no retained K; next unlock retries.
+        return ConnectReport::default(); // Locked — no retained K; next unlock retries.
     };
 
     let lock = {
@@ -467,33 +497,33 @@ pub(crate) async fn apply_pending_connects(state: &Arc<AppState>, vault_id: &str
     let mut m = if let Some(vault) = &vault_dat {
         match crate::server::handlers::metadata::open_protected_state_with_key(&k, vault) {
             Ok(m) => m,
-            Err(_) => return false, // rotated K — lock+unlock retries
+            Err(_) => return ConnectReport::default(), // rotated K — lock+unlock retries
         }
     } else {
         let Ok(pi_path) = state.vaults.per_item_path(vault_id) else {
-            return false;
+            return ConnectReport::default();
         };
         let Ok(Some(pv)) = crate::storage::sealed_vault::read_per_item(&pi_path) else {
-            return false; // neither vault.dat nor a per-item store — nothing to do
+            return ConnectReport::default(); // neither vault.dat nor a per-item store
         };
         let view = match crate::server::handlers::metadata::decrypt_vault_view_peritem_with_key(
             &k, &pv, vault_id,
         ) {
             Ok(v) => v,
-            Err(_) => return false, // rotated K
+            Err(_) => return ConnectReport::default(), // rotated K
         };
         match build_m_from_view(&view) {
             Ok(m) => m,
             Err(e) => {
                 tracing::warn!(vault = %vault_id, "oauth connect: rebuild M from per-item failed: {}", e);
-                return false;
+                return ConnectReport::default();
             }
         }
     };
 
     // Cheap pre-check: nothing to do if there are no in-flight connects.
     if collect_pending(&m).is_empty() {
-        return false;
+        return ConnectReport::default();
     }
 
     let services = &state.services;
@@ -502,7 +532,7 @@ pub(crate) async fn apply_pending_connects(state: &Arc<AppState>, vault_id: &str
     // this cache always runs before us (sync/watch/unlock+write all refresh
     // the cache, THEN process connects), so it's fresh here.
     let custom = state.custom_services_snapshot(vault_id);
-    let (completed, failed) = run_pending(services, &custom, &mut m, |_conn, cfg, p| async move {
+    let report = run_pending(services, &custom, &mut m, |_conn, cfg, p| async move {
         crate::auth::oauth2::exchange_code(
             &cfg.token_url,
             &cfg.client_id,
@@ -516,9 +546,10 @@ pub(crate) async fn apply_pending_connects(state: &Arc<AppState>, vault_id: &str
     })
     .await;
 
-    if completed == 0 && failed == 0 {
-        // Nothing changed (all left pending / transient) — don't rewrite or push.
-        return false;
+    if !report.changed() {
+        // Nothing MUTATED (all left pending / transient) — don't rewrite or push.
+        // Still return the report so a transient `unreached` surfaces to `sc sync`.
+        return report;
     }
     // A terminal failure (invalid_grant) with no completion still MUTATED the
     // state (stamped `error` on the connecting entry) — fall through so it's
@@ -530,7 +561,7 @@ pub(crate) async fn apply_pending_connects(state: &Arc<AppState>, vault_id: &str
         Ok(v) => v,
         Err(e) => {
             tracing::warn!(vault = %vault_id, "oauth connect: view rebuild failed: {}", e);
-            return false;
+            return ConnectReport::default();
         }
     };
 
@@ -544,24 +575,29 @@ pub(crate) async fn apply_pending_connects(state: &Arc<AppState>, vault_id: &str
         if let Err(e) = crate::server::handlers::metadata::reseal_body_with_key(&k, &mut vault, &m)
         {
             tracing::warn!(vault = %vault_id, "oauth connect: re-seal failed: {}", e);
-            return false;
+            return ConnectReport::default();
         }
         if let Err(e) = crate::storage::sealed_vault::write_atomic(&vault_path, &vault) {
             tracing::warn!(vault = %vault_id, "oauth connect: write vault.dat failed: {}", e);
-            return false;
+            return ConnectReport::default();
         }
         reconcile_per_item_after_connect(state, vault_id, Some(&vault), &view, &k);
     } else {
         reconcile_per_item_after_connect(state, vault_id, None, &view, &k);
     }
-    tracing::info!(vault = %vault_id, connects = completed, failed, "oauth connect: processed");
+    tracing::info!(
+        vault = %vault_id,
+        connects = report.completed.len(),
+        failed = report.failed.len(),
+        "oauth connect: processed"
+    );
 
     // Refresh the in-memory cache so /use sees the new refresh_token without a
     // manual lock/unlock. Best-effort.
     let cache = crate::server::handlers::approve::bootstrap_cache_from_view(&view, state);
     state.unlock_vault(vault_id.to_string(), cache, k);
 
-    true
+    report
 }
 
 /// Persist a ROTATED refresh_token back into the sealed vault at its bound BARE
@@ -1032,7 +1068,7 @@ mod tests {
         let mut m = with_connecting("gmail", "gmail", "code-AUX");
 
         let mut seen = None;
-        let (n, _) = run_pending(&services, &no_custom(), &mut m, |conn, cfg, p| {
+        let report = run_pending(&services, &no_custom(), &mut m, |conn, cfg, p| {
             seen = Some((
                 conn.clone(),
                 cfg.token_url.clone(),
@@ -1043,7 +1079,7 @@ mod tests {
         })
         .await;
 
-        assert_eq!(n, 1);
+        assert_eq!(report.completed, vec!["gmail".to_string()]);
         assert!(
             aux_map::<Connecting>(&m, "connecting").is_empty(),
             "connecting cleared"
@@ -1073,7 +1109,7 @@ mod tests {
         let services = gmail_registry();
         let mut m = with_connecting("gmail", "gmail", "code-EXPIRED");
 
-        let (n, _) = run_pending(
+        let report = run_pending(
             &services,
             &no_custom(),
             &mut m,
@@ -1083,7 +1119,8 @@ mod tests {
         )
         .await;
 
-        assert_eq!(n, 0, "a failed exchange completes nothing");
+        assert!(report.completed.is_empty(), "a failed exchange completes nothing");
+        assert_eq!(report.failed.len(), 1, "invalid_grant is a terminal failure");
         assert!(
             aux_map::<Connecting>(&m, "connecting").contains_key("gmail"),
             "connecting must survive a failed exchange (user retries within TTL)"
@@ -1116,24 +1153,26 @@ mod tests {
 
         // A 400 rejection (not invalid_grant) stamps a terminal error.
         let mut m = with_connecting("gmail", "gmail", "code-A");
-        let (n, failed) = run_pending(&services, &no_custom(), &mut m, |_conn, _cfg, _p| async move {
+        let report = run_pending(&services, &no_custom(), &mut m, |_conn, _cfg, _p| async move {
             Err("oauth2 code-exchange returned HTTP 400 Bad Request — {\"error\":\"invalid_request\",\"error_description\":\"client_secret is missing.\"}".to_string())
         })
         .await;
-        assert_eq!((n, failed), (0, 1));
+        assert_eq!((report.completed.len(), report.failed.len()), (0, 1));
         let entry = &aux_map::<Connecting>(&m, "connecting")["gmail"];
         assert!(
             entry.oauth2.error.as_deref().unwrap_or("").contains("client_secret is missing."),
             "the provider's reason must surface on the entry: {:?}", entry.oauth2.error
         );
 
-        // A 5xx stays pending with NO error (retried next sync).
+        // A 5xx stays pending with NO error (retried next sync), but IS surfaced
+        // as `unreached` so `sc sync` can say "couldn't reach the provider".
         let mut m = with_connecting("gmail", "gmail", "code-B");
-        let (n, failed) = run_pending(&services, &no_custom(), &mut m, |_conn, _cfg, _p| async move {
+        let report = run_pending(&services, &no_custom(), &mut m, |_conn, _cfg, _p| async move {
             Err("oauth2 code-exchange returned HTTP 500 — oops".to_string())
         })
         .await;
-        assert_eq!((n, failed), (0, 0));
+        assert_eq!((report.completed.len(), report.failed.len()), (0, 0));
+        assert_eq!(report.unreached.len(), 1, "a transient failure is reported as unreached");
         assert!(aux_map::<Connecting>(&m, "connecting")["gmail"].oauth2.error.is_none());
     }
 
@@ -1142,7 +1181,7 @@ mod tests {
         let services = gmail_registry();
         let mut m = with_connecting("gmail", "gmail", "code-A");
 
-        let (n, _) = run_pending(
+        let report = run_pending(
             &services,
             &no_custom(),
             &mut m,
@@ -1152,7 +1191,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(n, 0);
+        assert!(report.completed.is_empty());
         assert!(
             aux_map::<Connecting>(&m, "connecting").contains_key("gmail"),
             "no durable token ⇒ leave connecting"
@@ -1165,13 +1204,13 @@ mod tests {
         let mut m = with_connecting("whatever", "nosuchservice", "code-A");
 
         let mut called = false;
-        let (n, _) = run_pending(&services, &no_custom(), &mut m, |_conn, _cfg, _p| {
+        let report = run_pending(&services, &no_custom(), &mut m, |_conn, _cfg, _p| {
             called = true;
             async move { Ok(tokens(Some("rt"))) }
         })
         .await;
 
-        assert_eq!(n, 0);
+        assert!(report.completed.is_empty());
         assert!(!called, "exchange must not run when no config resolves");
         assert!(aux_map::<Connecting>(&m, "connecting").contains_key("whatever"));
     }
