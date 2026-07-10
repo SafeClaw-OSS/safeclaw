@@ -27,6 +27,8 @@ Make sure the daemon is up before the first call (idempotent):
 curl -s -o /dev/null --connect-timeout 1 "$SAFECLAW_DAEMON_URL/health" || sc up
 ```
 
+Check `sc help` anytime for more.
+
 ## Discover what's available
 
 ```
