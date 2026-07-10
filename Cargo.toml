@@ -95,3 +95,9 @@ opt-level = "z"
 lto = true
 strip = true
 codegen-units = 1
+
+# TEMPORARY local override while the wc_check (KCV) feature is developed against
+# the unpublished sudp 0.2.1. REMOVE before release and bump the dep to the
+# published `sudp = "0.2.1"`.
+[patch.crates-io]
+sudp = { path = "../sudp/custodian/rust" }

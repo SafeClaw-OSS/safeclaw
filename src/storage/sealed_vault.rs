@@ -135,6 +135,9 @@ pub fn build_initial(
         credential_id,
         prf_salt,
         wrapped_key,
+        // The client seals everything; the KCV (if any) arrives via /keys sync
+        // or the unlock backfill, not this assembly helper.
+        wc_check: None,
     };
     Ok(SealedState {
         version: CURRENT_VERSION,
@@ -332,6 +335,8 @@ impl PerItemVault {
                     credential_id,
                     prf_salt,
                     wrapped_key,
+                    // KCV arrives via /keys sync or the unlock backfill.
+                    wc_check: None,
                 }],
                 keyset_version: 0,
             },
@@ -385,10 +390,17 @@ impl PerItemVault {
         device_name: &str,
         prf_salt_b64: &str,
         wrapped_key_b64: &str,
+        wc_check_b64: Option<&str>,
     ) -> Result<bool> {
         let cid_bytes = decode_credential_id(cid_b64)?;
         let prf_salt = decode_keys_data_field(prf_salt_b64)?;
         let wrapped_key = decode_keys_data_field(wrapped_key_b64)?;
+        // Optional KCV (`wc_check`) — carried verbatim from the cloud row so a
+        // pull preserves a value another device (or an earlier backfill) wrote.
+        let wc_check = wc_check_b64
+            .filter(|s| !s.is_empty())
+            .map(decode_keys_data_field)
+            .transpose()?;
 
         // Registry pubkey (x/y verbatim strings — sudp keeps them as-is).
         let pk = sudp::passkey::WebAuthnPublicKey {
@@ -411,11 +423,17 @@ impl PerItemVault {
         {
             cred.prf_salt = prf_salt;
             cred.wrapped_key = wrapped_key;
+            // Only adopt a cloud-provided KCV; never clear a locally-backfilled
+            // one just because an older row omitted it.
+            if wc_check.is_some() {
+                cred.wc_check = wc_check;
+            }
         } else {
             self.keyset.credentials.push(SealedCredential {
                 credential_id: cid_bytes,
                 prf_salt,
                 wrapped_key,
+                wc_check,
             });
         }
         Ok(true)

@@ -41,6 +41,11 @@ pub struct PasskeyMeta {
     /// P-256 public key Y coordinate (base64). Used by --reuse to skip create().
     #[serde(skip_serializing_if = "Option::is_none")]
     pub public_key_y: Option<String>,
+    /// Optional key-check value (KCV, STANDARD base64). Lets the browser confirm
+    /// a re-derived `W_c` before depositing a grant, without unwrapping `K`.
+    /// Absent for credentials enrolled before the KCV existed (until backfilled).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wc_check: Option<String>,
 }
 
 pub async fn passkeys(
@@ -100,6 +105,7 @@ pub async fn passkeys(
                 prf_salt: STANDARD.encode(&c.prf_salt),
                 public_key_x: pk.as_ref().map(|p| p.x.clone()),
                 public_key_y: pk.as_ref().map(|p| p.y.clone()),
+                wc_check: c.wc_check.as_ref().map(|v| STANDARD.encode(v)),
             }
         })
         .collect();

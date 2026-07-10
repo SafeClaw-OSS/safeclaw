@@ -141,6 +141,56 @@ pub fn op_poll_value(state: &AppState, op_id: &str) -> Result<Value> {
     }))
 }
 
+/// Best-effort: if the acting credential's stored keyset row carries no KCV yet,
+/// compute it from the `W_c` that just unlocked the vault and persist it (then
+/// push the keyset row cloud-side so it survives pulls and reaches other
+/// devices). Idempotent — a credential that already has a KCV is untouched.
+/// Never fatal to the unlock; failures are logged and swallowed. Targets the
+/// per-item keyset (the current home); a legacy `vault.dat`-only vault simply
+/// skips — the browser falls back to its no-precheck path for KCV-less creds.
+fn maybe_backfill_wc_check(state: &Arc<AppState>, vault_id: &str, cid: &[u8], w_c: &[u8]) {
+    let Ok(per_item_path) = state.vaults.per_item_path(vault_id) else {
+        return;
+    };
+    let mut pv = match crate::storage::sealed_vault::read_per_item(&per_item_path) {
+        Ok(Some(pv)) => pv,
+        _ => return, // no per-item keyset (legacy or unreadable) — skip
+    };
+    let Some(cred) = pv
+        .keyset
+        .credentials
+        .iter_mut()
+        .find(|c| c.credential_id == cid)
+    else {
+        return;
+    };
+    if cred.wc_check.is_some() {
+        return; // already present (freshly enrolled with a KCV, or backfilled)
+    }
+    let wc = match sudp::primitives::wc_check_value::<sudp::primitives::HkdfSha256>(
+        w_c,
+        &cred.prf_salt,
+        cid,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(vault = %vault_id, "wc_check backfill KDF failed: {}", e);
+            return;
+        }
+    };
+    cred.wc_check = Some(wc.to_vec());
+    if let Err(e) = crate::storage::sealed_vault::write_per_item_atomic(&per_item_path, &pv) {
+        tracing::warn!(vault = %vault_id, "wc_check backfill write failed: {}", e);
+        return;
+    }
+    tracing::info!(vault = %vault_id, "backfilled wc_check for the acting credential");
+    let state = state.clone();
+    let vid = vault_id.to_string();
+    tokio::spawn(async move {
+        crate::sync::push_keys_best_effort(&state, &vid).await;
+    });
+}
+
 /// `POST /op/{op_id}/approve` — U submits the signed grant. T validates and
 /// dispatches the act (Enroll / Write / Export / Use).
 pub async fn approve_op(
@@ -380,19 +430,28 @@ pub async fn approve_op(
             };
             let wrapped_for_new = Wrap::wrap(&new_w_c, &opened.k[..], &binding)
                 .map_err(|e| AppError::Internal(format!("wrap K under new W_c: {}", e)))?;
-            // W_c for the new credential is no longer needed — zeroize immediately.
+            let new_prf_salt = STANDARD
+                .decode(&pending.prf_salt)
+                .map_err(|_| AppError::BadRequest("prf_salt not base64".into()))?;
+            // Key-check value for the new credential, computed while W_c is still
+            // live: it lets a browser confirm a re-derived W_c before depositing
+            // a grant, WITHOUT unwrapping K. Then W_c is done — zeroize it.
+            let new_wc_check = sudp::primitives::wc_check_value::<sudp::primitives::HkdfSha256>(
+                &new_w_c,
+                &new_prf_salt,
+                &new_cid_bytes,
+            )
+            .map_err(|e| AppError::Internal(format!("wc_check: {}", e)))?;
             let mut new_w_c = new_w_c;
             new_w_c.zeroize();
             // Append to credentials + registry, using the (x, y, prf_salt,
             // device_name) we just popped from the pending file.
             let mut updated = vault.clone();
-            let new_prf_salt = STANDARD
-                .decode(&pending.prf_salt)
-                .map_err(|_| AppError::BadRequest("prf_salt not base64".into()))?;
             updated.credentials.push(sudp::state::SealedCredential {
                 credential_id: new_cid_bytes.clone(),
                 prf_salt: new_prf_salt,
                 wrapped_key: wrapped_for_new,
+                wc_check: Some(new_wc_check.to_vec()),
             });
             let pk = sudp::passkey::WebAuthnPublicKey {
                 x: pending.x,
@@ -798,6 +857,17 @@ pub async fn approve_op(
                     "vault unlocked"
                 );
                 state.unlock_vault(vault_id.clone(), cache, unlock_key);
+                // Backfill the acting credential's key-check value if the stored
+                // keyset predates it (best-effort; we hold the write guard). This
+                // lets a later cross-device approval fail FAST in the browser
+                // (the KCV won't match a divergent W_c) instead of silently
+                // hanging on an unseal the daemon can't complete.
+                maybe_backfill_wc_check(
+                    &state,
+                    &vault_id,
+                    &validated.credential_id_bytes,
+                    &validated.wrapping_key,
+                );
                 // On unlock, complete any pending OAuth connect: a
                 // browser "Connect" may have sealed `<conn>_oauth_pending`
                 // into the vault while it was locked (or before this device
