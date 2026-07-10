@@ -2308,7 +2308,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
 name = "safeclaw"
-version = "0.9.32"
+version = "0.9.33"
 dependencies = [
  "axum",
  "base64",
@@ -2594,6 +2594,8 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 [[package]]
 name = "sudp"
 version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "076f971d93d6ca074ae281b855f49f28a45bf5dcdef1fc666810ed36818a3694"
 dependencies = [
  "base64",
  "chacha20poly1305",
