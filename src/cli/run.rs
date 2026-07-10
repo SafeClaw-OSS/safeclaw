@@ -70,22 +70,20 @@ pub async fn run(args: RunArgs) -> Result<(), String> {
 /// The proxy URL the child's `HTTPS_PROXY` gets (CREDENTIAL_BROKER.md §14).
 /// Always REBUILT for the resolved vid: the agent's own `$SAFECLAW_API_KEY`
 /// spliced into the CURRENT API-face root (same daemon host as everything else —
-/// the invariant), never a snapshotted `$SAFECLAW_PROXY_URL` copied verbatim.
-/// The snapshot would pin a stale host:port from an old `sc agent add` (a moved
-/// daemon → the child's proxy points at a dead port); rebuilding tracks the live
-/// daemon and self-heals. `sc run` still never owns or persists the key — it
-/// reads the agent's own from the env and splices it in memory only.
+/// the invariant), never a pre-baked full proxy URL copied verbatim. A snapshot
+/// would pin a stale host:port from an old `sc agent add` (a moved daemon → the
+/// child's proxy points at a dead port); rebuilding tracks the live daemon and
+/// self-heals. `sc run` still never owns or persists the key — it reads the
+/// agent's own from the env and splices it in memory only.
 fn agent_proxy_url(vid: &str) -> String {
     let key = std::env::var("SAFECLAW_API_KEY").ok().filter(|s| !s.is_empty());
     let cfg = load_config().unwrap_or_default();
     proxy_url_for_vault(&api_face_root(&cfg), vid, key.as_deref())
 }
 
-/// Does this shell carry an agent identity? A key rides either the agent's
-/// pre-baked `$SAFECLAW_PROXY_URL` (password slot) or a bare `$SAFECLAW_API_KEY`.
+/// Does this shell carry an agent identity? Its `$SAFECLAW_API_KEY`.
 fn agent_has_key() -> bool {
-    std::env::var("SAFECLAW_PROXY_URL").map(|s| !s.is_empty()).unwrap_or(false)
-        || std::env::var("SAFECLAW_API_KEY").map(|s| !s.is_empty()).unwrap_or(false)
+    std::env::var("SAFECLAW_API_KEY").map(|s| !s.is_empty()).unwrap_or(false)
 }
 
 /// The CA must exist and the daemon must be up (the proxy shares its process).
