@@ -2342,7 +2342,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
 name = "safeclaw"
-version = "0.9.36"
+version = "0.9.37"
 dependencies = [
  "axum",
  "base64",
@@ -2354,6 +2354,7 @@ dependencies = [
  "hpke",
  "http-body-util",
  "hudsucker",
+ "hyper-rustls",
  "jsonwebtoken",
  "once_cell",
  "p256",
@@ -2375,6 +2376,7 @@ dependencies = [
  "toml",
  "tower",
  "tower-http",
+ "tower-service",
  "tracing",
  "tracing-subscriber",
  "url",
