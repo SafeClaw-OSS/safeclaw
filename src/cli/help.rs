@@ -81,7 +81,18 @@ const SECTIONS: &[(&str, &[(&str, &str)])] = &[
 pub fn command() -> clap::Command {
     let base = Cli::command();
     let help = render(&base);
-    base.arg_required_else_help(true).override_help(help)
+    base.arg_required_else_help(true)
+        .override_help(help)
+        // Global `-v/-vv/-vvv` (curl-style): available on every subcommand. Read
+        // in `main` from the matches (not the derived `Cli`) to init logging.
+        .arg(
+            clap::Arg::new("verbose")
+                .short('v')
+                .long("verbose")
+                .action(clap::ArgAction::Count)
+                .global(true)
+                .help("Increase logging to stderr (-v info, -vv debug, -vvv trace)"),
+        )
 }
 
 /// Collapse a (possibly multi-line) clap `about` to a single trimmed sentence,
@@ -170,5 +181,6 @@ fn render(cmd: &clap::Command) -> String {
     out.push_str("\nOptions:\n");
     out.push_str(&format!("  {:<pad$}Print help (and `sc <command> --help` per command)\n", "-h, --help"));
     out.push_str(&format!("  {:<pad$}Print version\n", "-V, --version"));
+    out.push_str(&format!("  {:<pad$}More logging to stderr (-v info, -vv debug, -vvv trace)\n", "-v, --verbose"));
     out
 }

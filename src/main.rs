@@ -26,8 +26,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Parse through `cli::help::command()` (not `Cli::parse()`) so the top-level
     // `sc` / `sc --help` prints our grouped, gh-style help; per-command help is
     // still clap's default.
-    let cli = Cli::from_arg_matches(&cli::help::command().get_matches())
-        .unwrap_or_else(|e| e.exit());
+    let matches = cli::help::command().get_matches();
+    let verbose = matches.get_count("verbose");
+    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
+    // `serve` installs its own subscriber below (long-running, different
+    // defaults); every other (short-lived) verb gets a stderr subscriber only
+    // when `-v` was asked, so a command's normal output stays clean.
+    if !matches!(cli.command, Command::Serve(_)) {
+        cli::logging::init_cli(verbose);
+    }
     match cli.command {
         Command::Status(args) => {
             // CLI commands log to stderr; don't initialise the tracing
@@ -41,7 +48,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // `serve` is the foreground daemon entry — it bootstraps tracing, owns
         // the runtime, and runs forever, so handle it here, not through the
         // short-lived CLI dispatcher.
-        Command::Serve(serve) => run_daemon(serve).await,
+        Command::Serve(serve) => run_daemon(serve, verbose).await,
         Command::Down => cli::service::run_stop().map_err(daemon_err),
         // `sc restart` = bounce the daemon AND converge back to ready (re-unlock).
         // A process restart wipes the in-memory keys, so it routes through the
@@ -263,11 +270,15 @@ fn daemon_err(e: String) -> Box<dyn std::error::Error> {
     e.into()
 }
 
-async fn run_daemon(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_daemon(args: ServeArgs, verbose: u8) -> Result<(), Box<dyn std::error::Error>> {
+    // A `-v/-vv/-vvv` on `sc serve` raises the daemon's own filter; an explicit
+    // RUST_LOG still wins.
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,safeclaw=debug,tower_http=info".into()),
+                .unwrap_or_else(|_| {
+                    tracing_subscriber::EnvFilter::new(cli::logging::serve_filter(verbose))
+                }),
         )
         .init();
 

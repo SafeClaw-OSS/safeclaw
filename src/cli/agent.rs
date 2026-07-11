@@ -82,7 +82,7 @@ async fn add(args: AgentAddArgs) -> Result<(), String> {
         .json(&serde_json::json!({ "label": args.name, "tier": "agent" }))
         .send()
         .await
-        .map_err(|e| format!("reach {}: {}", cloud, e))?;
+        .map_err(|e| crate::cli::neterr::reach_failed(&cloud, &e))?;
     if !resp.status().is_success() {
         return Err(format!("create agent key failed: HTTP {}", resp.status()));
     }
@@ -127,7 +127,7 @@ async fn fetch_agents(cloud: &str, key: &str) -> Result<Vec<ListKey>, String> {
         .bearer_auth(key)
         .send()
         .await
-        .map_err(|e| format!("reach {}: {}", cloud, e))?;
+        .map_err(|e| crate::cli::neterr::reach_failed(&cloud, &e))?;
     if !resp.status().is_success() {
         return Err(format!("list agents failed: HTTP {}", resp.status()));
     }
@@ -176,7 +176,7 @@ async fn rm(args: AgentRmArgs) -> Result<(), String> {
         .bearer_auth(&key)
         .send()
         .await
-        .map_err(|e| format!("reach {}: {}", cloud, e))?;
+        .map_err(|e| crate::cli::neterr::reach_failed(&cloud, &e))?;
     if !resp.status().is_success() {
         return Err(format!("revoke failed: HTTP {}", resp.status()));
     }

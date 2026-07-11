@@ -114,7 +114,7 @@ async fn revoke_device_cloud(cfg: &CliConfig) -> Result<Option<String>, String> 
         .bearer_auth(&key)
         .send()
         .await
-        .map_err(|e| format!("reach {}: {}", cloud, e))?;
+        .map_err(|e| crate::cli::neterr::reach_failed(cloud, &e))?;
     if !resp.status().is_success() {
         return Err(format!("list devices: HTTP {}", resp.status()));
     }
@@ -131,7 +131,7 @@ async fn revoke_device_cloud(cfg: &CliConfig) -> Result<Option<String>, String> 
         .bearer_auth(&key)
         .send()
         .await
-        .map_err(|e| format!("reach {}: {}", cloud, e))?;
+        .map_err(|e| crate::cli::neterr::reach_failed(cloud, &e))?;
     if !del.status().is_success() {
         return Err(format!("revoke: HTTP {}", del.status()));
     }

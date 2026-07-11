@@ -162,7 +162,7 @@ pub async fn run(args: LoginArgs) -> Result<(), String> {
         .json(&body)
         .send()
         .await
-        .map_err(|e| format!("reach {}: {}", custodian, e))?;
+        .map_err(|e| crate::cli::neterr::reach_failed(&custodian, &e))?;
 
     let status = resp.status();
     if !status.is_success() {

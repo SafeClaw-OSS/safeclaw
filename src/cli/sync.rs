@@ -36,11 +36,12 @@ pub async fn run(args: SyncArgs) -> Result<(), String> {
         report_connects(body.get("connects"));
         Ok(())
     } else {
-        Err(body
-            .get("error")
-            .and_then(|v| v.as_str())
-            .unwrap_or("sync failed")
-            .to_string())
+        // The daemon's sync error crosses a process boundary as a string; if it
+        // reads as a backend-reachability failure (e.g. "reach api.safeclaw.pro:
+        // …"), append the conditional proxy hint — objectively, without claiming
+        // a proxy is missing.
+        let raw = body.get("error").and_then(|v| v.as_str()).unwrap_or("sync failed");
+        Err(crate::cli::neterr::with_proxy_hint(raw))
     }
 }
 

@@ -167,10 +167,87 @@ pub async fn run(args: CommonArgs) -> Result<(), String> {
         ),
     }
 
+    // Egress proxy (informational): the one upstream the daemon + this CLI use to
+    // reach the outside internet. Report the effective value and where it came
+    // from; NEVER print userinfo. This is config state, not a verdict.
+    {
+        let file = crate::cli::egress_proxy::load();
+        match crate::cli::egress_proxy::effective() {
+            None => report.push(
+                Mark::Ok,
+                "egress proxy: none (connecting directly; loopback is never proxied)",
+            ),
+            Some(url) => {
+                let source = if file.as_deref() == Some(url.as_str()) {
+                    "from `sc proxy set`"
+                } else {
+                    "from shell HTTPS_PROXY (overrides `sc proxy set`)"
+                };
+                report.push(
+                    Mark::Ok,
+                    format!("egress proxy: {} ({})", redact_proxy(&url), source),
+                );
+            }
+        }
+    }
+
+    // Cloud backend reachability: the egress that `sc agent` / `sc login` / sync
+    // depend on. (The custodian check above is the LOCAL daemon over loopback,
+    // which is never proxied, so it can't diagnose a real-internet egress
+    // problem.) ANY HTTP response proves reachability; only a transport error is
+    // "unreachable", and we state that fact WITHOUT asserting a proxy is the
+    // cause — at most hinting one (`neterr`), per the objectivity rule.
+    match crate::cli::active::load() {
+        Ok(cfg) => match cfg.cloud_backend.filter(|s| !s.is_empty()) {
+            Some(cloud) => {
+                let cloud = cloud.trim_end_matches('/');
+                match client.get(cloud).send().await {
+                    Ok(_) => {
+                        report.push(Mark::Ok, format!("cloud backend: reachable ({})", cloud))
+                    }
+                    Err(e) => report.push(
+                        Mark::Warn,
+                        format!("cloud backend: {}", crate::cli::neterr::reach_failed(cloud, &e)),
+                    ),
+                }
+            }
+            None => report.push(
+                Mark::Warn,
+                "cloud backend: not paired — run `sc login --pair-token <token>`",
+            ),
+        },
+        // A config-load failure already surfaced as a `fail` row above.
+        Err(_) => {}
+    }
+
     let ok = report.print_and_status();
     if ok {
         Ok(())
     } else {
         Err("one or more checks failed".into())
+    }
+}
+
+/// Strip any `user:pass@` userinfo from a proxy URL so creds never print.
+fn redact_proxy(url: &str) -> String {
+    match url.split_once("://") {
+        Some((scheme, rest)) => {
+            let host = rest.rsplit_once('@').map(|(_, h)| h).unwrap_or(rest);
+            format!("{scheme}://{host}")
+        }
+        None => url.rsplit_once('@').map(|(_, h)| h).unwrap_or(url).to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redact_proxy_drops_userinfo_keeps_host_port() {
+        assert_eq!(redact_proxy("http://u:p@box:9999"), "http://box:9999");
+        assert_eq!(redact_proxy("http://proxy.local:3128"), "http://proxy.local:3128");
+        assert_eq!(redact_proxy("box:9999"), "box:9999");
+        assert_eq!(redact_proxy("u:p@box:9999"), "box:9999");
     }
 }
