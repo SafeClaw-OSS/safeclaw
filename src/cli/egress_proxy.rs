@@ -1,13 +1,18 @@
-//! Device-level EGRESS proxy: the upstream HTTP proxy the daemon (and this CLI)
-//! use to reach the outside internet — OAuth code/refresh exchanges, the resident
-//! MITM proxy's forward hop, and `sc upgrade`'s GitHub fetch.
+//! Device-level EGRESS proxy: the ONE upstream HTTP proxy that BOTH the daemon
+//! and this CLI use to reach every remote host — the SafeClaw backend (pairing,
+//! `sc agent`, sync), third-party OAuth code/refresh exchanges, the resident MITM
+//! proxy's forward hop, and `sc upgrade`'s GitHub fetch. Only loopback is exempt
+//! (pinned into `NO_PROXY` by `proxy_env::pin_localhost_no_proxy`); every other
+//! destination follows the proxy, exactly the way curl/git/Docker behave.
 //!
 //! WHY this exists separate from the child-facing proxy (`proxy_env`): the
 //! macOS launchd agent (and the systemd unit) do NOT inherit the operator's
 //! shell `HTTPS_PROXY`, and both unit generators whitelist only `SAFECLAW_*`, so
 //! a `$HTTPS_PROXY` set in a terminal never reaches the long-running daemon.
-//! Agents behind a corporate/on-demand proxy therefore couldn't complete a Gmail
-//! connect (the daemon-side token exchange hit Google directly and timed out).
+//! Agents behind a corporate/on-demand proxy (and users in regions that can only
+//! reach the SafeClaw backend through a proxy) therefore need a persisted,
+//! device-level value the daemon — and every short-lived `sc` command — can read
+//! on its own, without depending on the current shell.
 //!
 //! Model (deliberately the standard one — Docker/systemd/git all do this): the
 //! proxy is CONFIGURED at the device level, persisted in a file, and applied to
@@ -16,10 +21,8 @@
 //! writes it + bounces the daemon; changing it is a service-config change, not a
 //! per-request knob. An explicit shell `HTTPS_PROXY` still WINS (env > config),
 //! so this only fills the gap, never overrides an operator who set it directly.
-//!
-//! The custodian (cloud control plane) is pinned into `NO_PROXY` so a proxy that
-//! can reach the wider internet but NOT the SafeClaw backend doesn't break the
-//! cloud sync that was working over a direct route.
+//! Hosts that must stay direct (e.g. a narrow proxy that can't reach us) go in
+//! the operator's own `NO_PROXY` — we never silently carve the backend out.
 
 use std::sync::OnceLock;
 
@@ -96,25 +99,12 @@ pub fn apply_to_env() {
             std::env::set_var(key, &url);
         }
     }
-    // Keep the cloud control plane on its (working) direct route: pin the
-    // custodian host into NO_PROXY so a Google-only proxy can't sink cloud sync.
-    let mut extra: Vec<String> = Vec::new();
-    if let Ok(cfg) = crate::cli::active::load() {
-        if let Some(host) = cfg
-            .cloud_backend
-            .as_deref()
-            .filter(|s| !s.is_empty())
-            .and_then(host_of)
-        {
-            extra.push(host);
-        }
-    }
-    if !extra.is_empty() {
-        for key in ["NO_PROXY", "no_proxy"] {
-            let merged = merge_hosts(&std::env::var(key).unwrap_or_default(), &extra);
-            std::env::set_var(key, merged);
-        }
-    }
+    // NB: we do NOT pin the SafeClaw backend into NO_PROXY. A configured proxy
+    // applies to every remote host (backend included) — the mainstream
+    // convention, and the only behaviour that works for operators who can reach
+    // us *only* through a proxy. Loopback stays direct via
+    // `proxy_env::pin_localhost_no_proxy`; any other exceptions are the
+    // operator's own `NO_PROXY` to make.
 }
 
 /// The egress proxy the DAEMON's own swappable clients (the shared reqwest
@@ -151,78 +141,3 @@ fn shell_proxy_now() -> Option<String> {
     None
 }
 
-/// Extract the bare host from a `scheme://host[:port]/path` URL (no scheme, port,
-/// path, or userinfo) — the shape a `NO_PROXY` entry matches on.
-fn host_of(url: &str) -> Option<String> {
-    let after_scheme = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
-    let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
-    // Drop any userinfo, then the port.
-    let host_port = authority
-        .rsplit_once('@')
-        .map(|(_, h)| h)
-        .unwrap_or(authority);
-    let host = host_port
-        .rsplit_once(':')
-        .map(|(h, _)| h)
-        .unwrap_or(host_port);
-    (!host.is_empty()).then(|| host.to_string())
-}
-
-/// Append `extra` hosts to a comma-separated NO_PROXY value, preserving existing
-/// entries/order and skipping case-insensitive duplicates. Pure (testable).
-fn merge_hosts(current: &str, extra: &[String]) -> String {
-    let mut hosts: Vec<String> = current
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
-    for h in extra {
-        if !hosts.iter().any(|e| e.eq_ignore_ascii_case(h)) {
-            hosts.push(h.clone());
-        }
-    }
-    hosts.join(",")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn host_of_strips_scheme_port_path_userinfo() {
-        assert_eq!(
-            host_of("https://api.safeclaw.pro").as_deref(),
-            Some("api.safeclaw.pro")
-        );
-        assert_eq!(
-            host_of("https://api.safeclaw.pro/").as_deref(),
-            Some("api.safeclaw.pro")
-        );
-        assert_eq!(
-            host_of("https://api.safeclaw.pro:8443/v/x/blob").as_deref(),
-            Some("api.safeclaw.pro")
-        );
-        assert_eq!(
-            host_of("http://u:p@box.example.com:9999").as_deref(),
-            Some("box.example.com")
-        );
-        assert_eq!(host_of("").as_deref(), None);
-    }
-
-    #[test]
-    fn merge_hosts_appends_missing_case_insensitive() {
-        assert_eq!(
-            merge_hosts("", &["api.safeclaw.pro".into()]),
-            "api.safeclaw.pro"
-        );
-        assert_eq!(
-            merge_hosts("localhost,127.0.0.1", &["api.safeclaw.pro".into()]),
-            "localhost,127.0.0.1,api.safeclaw.pro"
-        );
-        // Idempotent: already-present (any case) not duplicated.
-        assert_eq!(
-            merge_hosts("localhost,API.safeclaw.pro", &["api.safeclaw.pro".into()]),
-            "localhost,API.safeclaw.pro"
-        );
-    }
-}

@@ -17,8 +17,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Apply the device's configured EGRESS proxy (`sc proxy set`) to this
     // process's env before any client is built — the launchd/systemd daemon does
     // not inherit the operator's shell `HTTPS_PROXY`, so this is how the daemon's
-    // OAuth exchange + MITM forward reach a corporate/on-demand upstream. A real
-    // shell `HTTPS_PROXY` still wins; the custodian is pinned to NO_PROXY inside.
+    // backend sync, OAuth exchange, and MITM forward reach a corporate/on-demand
+    // or region-required upstream. It covers every remote host (the SafeClaw
+    // backend included, so `sc agent`/`sc login`/sync all honour it); a real
+    // shell `HTTPS_PROXY` still wins, and only loopback stays direct.
     cli::egress_proxy::apply_to_env();
 
     // Parse through `cli::help::command()` (not `Cli::parse()`) so the top-level
