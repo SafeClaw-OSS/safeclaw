@@ -138,6 +138,24 @@ impl HttpHandler for BrokerHandler {
         }
         res
     }
+
+    /// A forward-hop to the upstream failed (couldn't connect, egress proxy
+    /// refused/dropped the CONNECT, TLS to the origin failed, …). hudsucker's
+    /// DEFAULT for this is an EMPTY `502` — which is the worst possible signal
+    /// for the audience here: an AI agent making a brokered call gets a blank
+    /// body and can't tell a NETWORK/PROXY problem from a dead credential or a
+    /// provider outage, so it typically misreports "the token is broken." The
+    /// precise cause our `TunnelConnector` already computed (host:port + whether
+    /// it was a direct dial or a proxy CONNECT) otherwise reaches only the daemon
+    /// log. Surface it on the wire instead, tagged `egress_unreachable`, and — for
+    /// a reachability failure — say how to point us at a proxy.
+    async fn handle_error(
+        &mut self,
+        _ctx: &HttpContext,
+        err: hudsucker::hyper_util::client::legacy::Error,
+    ) -> Response<Body> {
+        egress_error_response(err)
+    }
 }
 
 impl BrokerHandler {
@@ -1195,6 +1213,70 @@ fn body_over_cap(declared: u64, cap: u64) -> Response<Body> {
     )
 }
 
+/// Build the agent-facing body for a failed forward-hop (see `handle_error`).
+/// A connect-phase failure is a reachability/egress problem, so it names the
+/// cause and how to configure a proxy; anything else is reported plainly without
+/// a proxy hint that would misdirect. Either way we lead with "not a credential
+/// problem" so the agent doesn't blame the token, and tag it `egress_unreachable`
+/// / `upstream_error` so tooling can branch on the header.
+fn egress_error_response(err: hudsucker::hyper_util::client::legacy::Error) -> Response<Body> {
+    let is_connect = err.is_connect();
+    let cause = error_chain(&err);
+    // Preserve the observability the default handler gave (it logged the raw err).
+    tracing::error!(cause = %cause, is_connect, "forward-hop to upstream failed");
+    let (code, msg) =
+        egress_error_parts(is_connect, &cause, crate::cli::egress_proxy::effective().is_some());
+    err_response(StatusCode::BAD_GATEWAY, code, &msg)
+}
+
+/// The `(x-safeclaw-error code, body)` for a forward-hop failure. Pure so the
+/// branching (connect vs not, proxy configured vs not) is testable without a
+/// `hyper_util` error, which has no public constructor. Never echoes the proxy
+/// URL — it can carry userinfo — pointing at `sc proxy show` instead.
+fn egress_error_parts(is_connect: bool, cause: &str, has_proxy: bool) -> (&'static str, String) {
+    if !is_connect {
+        return (
+            "upstream_error",
+            format!(
+                "SafeClaw could not complete the upstream request (not a credential \
+                 problem): {}",
+                cause
+            ),
+        );
+    }
+    let hint = if has_proxy {
+        "Egress goes through your configured proxy — make sure it's up and can reach \
+         that host (`sc proxy show`), or change it with `sc proxy set <url>` / `sc proxy clear`."
+    } else {
+        "No egress proxy is set — if this machine reaches the internet only through a \
+         proxy, run `sc proxy set <url>`."
+    };
+    (
+        "egress_unreachable",
+        format!(
+            "SafeClaw egress failed (not a credential problem): {}. {}",
+            cause, hint
+        ),
+    )
+}
+
+/// Flatten an error's `source()` chain into one line, dropping empty/duplicate
+/// frames. For a forward-hop failure the deepest frame is our `TunnelConnector`
+/// message (e.g. `forward connect to gmail.googleapis.com:443 timed out`), which
+/// already names host:port and direct-vs-proxy.
+fn error_chain(err: &dyn std::error::Error) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut cur: Option<&dyn std::error::Error> = Some(err);
+    while let Some(e) = cur {
+        let s = e.to_string();
+        if !s.is_empty() && !parts.iter().any(|p| p == &s) {
+            parts.push(s);
+        }
+        cur = e.source();
+    }
+    parts.join(": ")
+}
+
 /// A plain-text 4xx/5xx with a machine-readable `x-safeclaw-error` token.
 fn err_response(status: StatusCode, code: &str, msg: &str) -> Response<Body> {
     Response::builder()
@@ -1285,6 +1367,62 @@ mod tests {
         // Chunked variant (length unknown while buffering) still explains.
         let resp = body_over_cap(0, 1024);
         assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[test]
+    fn error_chain_flattens_and_dedups() {
+        #[derive(Debug)]
+        struct E(&'static str, Option<Box<E>>);
+        impl std::fmt::Display for E {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(self.0)
+            }
+        }
+        impl std::error::Error for E {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                self.1.as_deref().map(|e| e as &dyn std::error::Error)
+            }
+        }
+        let e = E(
+            "client error (Connect)",
+            Some(Box::new(E("forward connect to gmail.googleapis.com:443 timed out", None))),
+        );
+        assert_eq!(
+            error_chain(&e),
+            "client error (Connect): forward connect to gmail.googleapis.com:443 timed out"
+        );
+        // Duplicate frames collapse.
+        let dup = E("same", Some(Box::new(E("same", None))));
+        assert_eq!(error_chain(&dup), "same");
+    }
+
+    #[test]
+    fn egress_error_parts_reachability_names_proxy_knob_not_credential() {
+        let cause = "forward connect to gmail.googleapis.com:443 timed out";
+
+        // Connect failure, no proxy configured: tell them how to set one, and
+        // make clear it is NOT a credential problem (the agent's #1 misread).
+        let (code, msg) = egress_error_parts(true, cause, false);
+        assert_eq!(code, "egress_unreachable");
+        assert!(msg.contains(cause));
+        assert!(msg.contains("not a credential problem"));
+        assert!(msg.contains("sc proxy set"));
+        assert!(msg.contains("No egress proxy is set"));
+
+        // Connect failure WITH a proxy configured: point at the proxy, never
+        // echo its URL (it can carry userinfo), offer show/clear.
+        let (code, msg) = egress_error_parts(true, cause, true);
+        assert_eq!(code, "egress_unreachable");
+        assert!(msg.contains("configured proxy"));
+        assert!(msg.contains("sc proxy show"));
+        assert!(msg.contains("sc proxy clear"));
+
+        // NOT a connect failure (e.g. upstream sent a bad response): no proxy
+        // hint that would misdirect, distinct token.
+        let (code, msg) = egress_error_parts(false, "invalid HTTP response", false);
+        assert_eq!(code, "upstream_error");
+        assert!(!msg.contains("sc proxy set"));
+        assert!(msg.contains("not a credential problem"));
     }
 
     #[test]

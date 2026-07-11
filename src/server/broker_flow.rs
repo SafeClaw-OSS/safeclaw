@@ -246,6 +246,16 @@ pub async fn resolve_auth_value(
                 "oauth2 refresh_token invalid — reconnect {}",
                 service_id
             ))
+        } else if let Some(transport) = e.strip_prefix("oauth2 refresh request failed: ") {
+            // We never even reached the token endpoint: a network/proxy problem,
+            // not a bad credential. Say so (and don't double-wrap "refresh failed:
+            // refresh request failed:"), and point at the proxy knob.
+            AppError::Internal(format!(
+                "couldn't reach {}'s token endpoint to refresh the access token ({}). \
+                 If this machine needs a proxy for outbound HTTPS, set one with \
+                 `sc proxy set <url>`.",
+                service_id, transport
+            ))
         } else {
             AppError::Internal(format!("oauth2 refresh failed: {}", e))
         }
