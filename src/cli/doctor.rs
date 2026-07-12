@@ -54,6 +54,54 @@ impl Report {
 pub async fn run(args: CommonArgs) -> Result<(), String> {
     let mut report = Report::new();
 
+    // Platform + build (debug aid): the first thing a bug report needs — which
+    // OS/arch and which CLI build. `std::env::consts` resolves at compile time
+    // to the target this binary was built for (macos/linux/windows, x86_64/
+    // aarch64), which is exactly the axis platform-specific issues split on.
+    report.push(
+        Mark::Ok,
+        format!(
+            "safeclaw {} ({}/{})",
+            env!("CARGO_PKG_VERSION"),
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+        ),
+    );
+
+    // Environment overrides (debug aid): stale/mistaken SAFECLAW_* env vars are a
+    // recurring cause of "why is it talking to the wrong port/host?" — a leftover
+    // override silently wins over config. List the routing/location vars that are
+    // actually set (names + values; these carry no secrets). Secrets are never
+    // printed here — $SAFECLAW_API_KEY has its own row below.
+    {
+        const OVERRIDE_VARS: &[&str] = &[
+            "SAFECLAW_PORT",
+            "SAFECLAW_PROXY_PORT",
+            "SAFECLAW_BROKER_URL",
+            "SAFECLAW_DAEMON_URL",
+            "SAFECLAW_CLOUD_URL",
+            "SAFECLAW_VAULT_URL",
+            "SAFECLAW_VAULT_ID",
+            "SAFECLAW_STATE_DIR",
+            "SAFECLAW_DATA",
+            "SAFECLAW_CA_PATH",
+        ];
+        let set: Vec<String> = OVERRIDE_VARS
+            .iter()
+            .filter_map(|k| {
+                std::env::var(k)
+                    .ok()
+                    .filter(|v| !v.is_empty())
+                    .map(|v| format!("{}={}", k, v))
+            })
+            .collect();
+        if set.is_empty() {
+            report.push(Mark::Ok, "env overrides: none");
+        } else {
+            report.push(Mark::Ok, format!("env overrides: {}", set.join(", ")));
+        }
+    }
+
     // Config file
     match config_path() {
         Ok(p) if p.exists() => report.push(Mark::Ok, format!("config: {}", p.display())),
