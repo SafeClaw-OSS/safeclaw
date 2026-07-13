@@ -80,6 +80,12 @@ pub fn app_router(state: Arc<AppState>) -> Router {
         // context, no params: re-reads the local stored value into the live
         // clients so the daemon re-points egress without a restart/re-unlock.
         .route("/proxy/reload", post(handlers::proxy::reload))
+        // Browser-fired sync hint (a `no-cors` POST from the console right
+        // after it pre-seals an OAuth connect). Authority-free by contract:
+        // host-allowlisted, rate-limited, uniform 204 — see nudge.rs. The
+        // no-CorsLayer posture below is unaffected (the console never reads
+        // the reply; `no-cors` responses are opaque).
+        .route("/sync/nudge", post(handlers::nudge::sync_nudge))
         // Op-flat (vault context lives on the approval record).
         // GET /op/{id} returns the JSON poll response (status + cached value).
         // The agent / CLI polls this; the human approves on safeclaw.pro via
