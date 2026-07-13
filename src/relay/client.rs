@@ -50,7 +50,7 @@ pub fn spawn_cancel(state: Arc<AppState>, vault_id: String, op_id: String) {
     let daemon_pubkey = URL_SAFE_NO_PAD.encode(state.sc.pk_bytes());
     tokio::spawn(async move {
         let url = format!("{}/v/{}/op/relay/{}/cancel", base, vault_id, op_id);
-        let client = match reqwest::Client::builder().timeout(Duration::from_secs(10)).build() {
+        let client = match crate::cli::egress_proxy::client(Duration::from_secs(10)) {
             Ok(c) => c,
             Err(_) => return,
         };
@@ -105,9 +105,7 @@ async fn run(
     expires_at: u64,
 ) -> Result<(), String> {
     let base = relay_url.trim_end_matches('/');
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(35))
-        .build()
+    let client = crate::cli::egress_proxy::client(Duration::from_secs(35))
         .map_err(|e| format!("relay client init: {}", e))?;
 
     // 1. Register the pending op. op_summary is the full op JSON (the page

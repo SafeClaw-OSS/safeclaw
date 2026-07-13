@@ -249,7 +249,12 @@ pub async fn run(args: CommonArgs) -> Result<(), String> {
         Ok(cfg) => match cfg.cloud_backend.filter(|s| !s.is_empty()) {
             Some(cloud) => {
                 let cloud = cloud.trim_end_matches('/');
-                match client.get(cloud).send().await {
+                // Probe THROUGH the effective egress proxy — the exact route the
+                // daemon's sync takes — so a "reachable" here can't disagree with
+                // a daemon that's actually stranded behind a proxy it can't use.
+                let cloud_client = crate::cli::egress_proxy::client(Duration::from_secs(5))
+                    .unwrap_or_else(|_| client.clone());
+                match cloud_client.get(cloud).send().await {
                     Ok(_) => {
                         report.push(Mark::Ok, format!("cloud backend: reachable ({})", cloud))
                     }

@@ -120,6 +120,57 @@ pub fn effective() -> Option<String> {
     }
 }
 
+/// Apply an EXPLICIT egress proxy (or explicit direct) to a reqwest client
+/// builder — the single place the daemon's HTTP clients agree on how the device
+/// proxy is applied. Loopback and any operator `NO_PROXY` stay direct; a
+/// malformed proxy URL logs and falls back to a direct dial. Setting an explicit
+/// proxy also disables reqwest's ambient-env proxy auto-detection, so this fully
+/// OWNS the routing — it never silently inherits a stale `*_PROXY` from the env
+/// `apply_to_env` froze at startup.
+pub fn apply(b: reqwest::ClientBuilder, proxy: Option<&str>) -> reqwest::ClientBuilder {
+    match proxy {
+        Some(url) => match reqwest::Proxy::all(url) {
+            Ok(p) => {
+                let p = match std::env::var("NO_PROXY")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+                    .and_then(|s| reqwest::NoProxy::from_string(&s))
+                {
+                    Some(np) => p.no_proxy(Some(np)),
+                    None => p,
+                };
+                b.proxy(p)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "egress proxy '{}' is not a valid proxy URL ({}) — dialing directly",
+                    url,
+                    e
+                );
+                b.no_proxy()
+            }
+        },
+        // Explicit direct: ignore any proxy inherited in the process env.
+        None => b.no_proxy(),
+    }
+}
+
+/// Apply the currently-[`effective`] egress proxy to a client builder. Because
+/// `effective()` re-reads the stored value FRESH, a `sc proxy set` that ran
+/// after the daemon started (via `/proxy/reload`, no restart) is honoured by the
+/// very next client built through here — the whole point of the hot path.
+pub fn apply_effective(b: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    apply(b, effective().as_deref())
+}
+
+/// The one constructor for the daemon's per-call cloud clients (sync loops,
+/// op-relay): an HTTP client with the effective device egress proxy applied and
+/// the given overall timeout. Routing sync/relay through here is what makes
+/// `sc proxy set` reach them without a daemon restart — see the module header.
+pub fn client(timeout: std::time::Duration) -> reqwest::Result<reqwest::Client> {
+    apply_effective(reqwest::Client::builder().timeout(timeout)).build()
+}
+
 /// The first non-empty proxy set in THIS process's env right now. Read once by
 /// `apply_to_env` before it shapes env, so it reflects the operator's shell.
 fn shell_proxy_now() -> Option<String> {

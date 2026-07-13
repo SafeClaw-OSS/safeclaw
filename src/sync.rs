@@ -304,9 +304,7 @@ async fn pull(
         vault,
         local_ver
     );
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .build()
+    let client = crate::cli::egress_proxy::client(Duration::from_secs(15))
         .map_err(|e| format!("http client init: {}", e))?;
     let resp = client
         .get(&url)
@@ -560,10 +558,7 @@ pub async fn push_blob_best_effort(state: &Arc<AppState>, vault_id: &str) {
         .join("vaults")
         .join(vault_id)
         .join("vault.dat");
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .build()
-    {
+    let client = match crate::cli::egress_proxy::client(Duration::from_secs(15)) {
         Ok(c) => c,
         Err(_) => return,
     };
@@ -741,7 +736,7 @@ async fn sync_agent_keys_with_timeout(state: &Arc<AppState>, timeout: Duration) 
     let Some(dk) = device_key() else {
         return;
     };
-    let client = match reqwest::Client::builder().timeout(timeout).build() {
+    let client = match crate::cli::egress_proxy::client(timeout) {
         Ok(c) => c,
         Err(_) => return,
     };
@@ -853,10 +848,7 @@ pub async fn ship_audit_once(state: &Arc<AppState>) {
         return; // unpaired — no device-key to authenticate the ingest
     };
     let cloud = cloud.trim_end_matches('/');
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .build()
-    {
+    let client = match crate::cli::egress_proxy::client(Duration::from_secs(15)) {
         Ok(c) => c,
         Err(_) => return,
     };
@@ -975,7 +967,7 @@ fn retention_cutoff(days: u32) -> Option<i64> {
 pub async fn watch_loop(state: Arc<AppState>, vault: String, cloud: String, dk: String) {
     let state_dir = state.config.state_dir.clone();
     // Read-timeout MUST exceed the server's long-poll hold (~25s) plus slack.
-    let client = match reqwest::Client::builder().timeout(Duration::from_secs(40)).build() {
+    let client = match crate::cli::egress_proxy::client(Duration::from_secs(40)) {
         Ok(c) => c,
         Err(e) => {
             tracing::warn!("cloud sync watch: client init failed: {}", e);
@@ -1272,9 +1264,7 @@ pub async fn pull_items(
         vault,
         pv.items_seq
     );
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .build()
+    let client = crate::cli::egress_proxy::client(Duration::from_secs(15))
         .map_err(|e| format!("http client init: {}", e))?;
     let resp = client
         .get(&url)
@@ -1341,9 +1331,7 @@ pub async fn push_item(
     if let Some(bv) = base_version {
         body["base_version"] = serde_json::json!(bv);
     }
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .build()
+    let client = crate::cli::egress_proxy::client(Duration::from_secs(15))
         .map_err(|e| format!("http client init: {}", e))?;
     let resp = client
         .put(&url)
@@ -1390,9 +1378,7 @@ pub async fn gc_item(
         item_id,
         gc_version
     );
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .build()
+    let client = crate::cli::egress_proxy::client(Duration::from_secs(15))
         .map_err(|e| format!("http client init: {}", e))?;
     let resp = client
         .delete(&url)
@@ -1600,9 +1586,7 @@ pub async fn pull_keys(
         vault,
         pv.keyset_seq
     );
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .build()
+    let client = crate::cli::egress_proxy::client(Duration::from_secs(15))
         .map_err(|e| format!("http client init: {}", e))?;
     let resp = client
         .get(&url)
@@ -1799,9 +1783,7 @@ async fn fetch_key_versions(
     device_key: &str,
 ) -> Result<std::collections::HashMap<String, u64>, String> {
     let url = format!("{}/v/{}/keys?since=0", cloud.trim_end_matches('/'), vault);
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .build()
+    let client = crate::cli::egress_proxy::client(Duration::from_secs(15))
         .map_err(|e| format!("http client init: {}", e))?;
     let resp = client
         .get(&url)
@@ -1847,9 +1829,7 @@ async fn push_key(
     if let Some(bv) = base_version {
         body["base_version"] = serde_json::json!(bv);
     }
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .build()
+    let client = crate::cli::egress_proxy::client(Duration::from_secs(15))
         .map_err(|e| format!("http client init: {}", e))?;
     let resp = client
         .put(&url)

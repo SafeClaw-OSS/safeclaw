@@ -55,33 +55,10 @@ pub fn reload_egress_proxy() {
 /// `apply_to_env` pinned (custodian host + loopback), so a Google-only proxy
 /// can't sink cloud sync. A malformed proxy URL logs and goes direct.
 fn build_client(proxy: Option<&str>) -> reqwest::Client {
-    let mut b = reqwest::Client::builder()
+    let b = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(CONNECT_TIMEOUT);
-    match proxy {
-        Some(url) => match reqwest::Proxy::all(url) {
-            Ok(p) => {
-                let p = match std::env::var("NO_PROXY")
-                    .ok()
-                    .filter(|s| !s.is_empty())
-                    .and_then(|s| reqwest::NoProxy::from_string(&s))
-                {
-                    Some(np) => p.no_proxy(Some(np)),
-                    None => p,
-                };
-                b = b.proxy(p);
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "egress proxy '{}' is not a valid proxy URL ({}) — dialing directly",
-                    url,
-                    e
-                );
-                b = b.no_proxy();
-            }
-        },
-        // Explicit direct: ignore any proxy inherited in the process env.
-        None => b = b.no_proxy(),
-    }
-    b.build().expect("failed to build HTTP client")
+    crate::cli::egress_proxy::apply(b, proxy)
+        .build()
+        .expect("failed to build HTTP client")
 }
