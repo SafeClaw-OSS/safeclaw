@@ -120,15 +120,13 @@ pub fn load() -> Result<CliConfig, String> {
 pub fn save(cfg: &CliConfig) -> Result<PathBuf, String> {
     let path = config_path()?;
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| format!("mkdir {}: {}", parent.display(), e))?;
+        fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {}", parent.display(), e))?;
     }
-    let body = toml::to_string_pretty(cfg)
-        .map_err(|e| format!("serialize config: {}", e))?;
+    let body = toml::to_string_pretty(cfg).map_err(|e| format!("serialize config: {}", e))?;
     let tmp = path.with_extension("toml.tmp");
     {
-        let mut f = fs::File::create(&tmp)
-            .map_err(|e| format!("create {}: {}", tmp.display(), e))?;
+        let mut f =
+            fs::File::create(&tmp).map_err(|e| format!("create {}: {}", tmp.display(), e))?;
         f.write_all(body.as_bytes())
             .map_err(|e| format!("write {}: {}", tmp.display(), e))?;
     }
@@ -201,8 +199,7 @@ fn update_known_vaults<F: FnOnce(&mut Vec<KnownVault>)>(mutate: F) -> Result<(),
     mutate(&mut list);
     let path = known_vaults_path()?;
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| format!("mkdir {}: {}", parent.display(), e))?;
+        fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {}", parent.display(), e))?;
     }
     let body = toml::to_string_pretty(&KnownVaultsFile { vaults: list })
         .map_err(|e| format!("serialize known_vaults: {}", e))?;
@@ -226,7 +223,10 @@ pub fn clear_known_vaults() -> Result<(), String> {
 
 /// Dedupe-append one vault to the catalog.
 fn remember_vault(daemon: &str, vault: &str) -> Result<(), String> {
-    let new = KnownVault { daemon: daemon.to_string(), vault: vault.to_string() };
+    let new = KnownVault {
+        daemon: daemon.to_string(),
+        vault: vault.to_string(),
+    };
     if known_vaults().contains(&new) {
         return Ok(());
     }
@@ -401,7 +401,11 @@ pub fn env_broker_url() -> Option<String> {
     std::env::var("SAFECLAW_BROKER_URL")
         .ok()
         .filter(|s| !s.is_empty())
-        .or_else(|| std::env::var("SAFECLAW_DAEMON_URL").ok().filter(|s| !s.is_empty()))
+        .or_else(|| {
+            std::env::var("SAFECLAW_DAEMON_URL")
+                .ok()
+                .filter(|s| !s.is_empty())
+        })
 }
 
 fn env_daemon_host() -> Option<String> {
@@ -511,9 +515,14 @@ pub fn resolve_active(vault_override: Option<&str>) -> Result<(String, String), 
     let cfg = load()?;
     let explicit = vault_override
         .map(str::to_string)
-        .or_else(|| std::env::var("SAFECLAW_VAULT_ID").ok().filter(|s| !s.is_empty()))
+        .or_else(|| {
+            std::env::var("SAFECLAW_VAULT_ID")
+                .ok()
+                .filter(|s| !s.is_empty())
+        })
         .or_else(|| cfg.vault.clone());
     if let Some(vault) = explicit {
+        validate_vault_id_arg(&vault)?;
         return Ok((control_root(&cfg), vault));
     }
     // Single-vault auto-select: the catalog entry records WHICH daemon that
@@ -538,6 +547,27 @@ pub fn resolve_active(vault_override: Option<&str>) -> Result<(String, String), 
     Err("no vault selected — run `sc login` or `sc vault use`".to_string())
 }
 
+/// Client-side mirror of the daemon's vault-id rule (`op::validate_vault_id`:
+/// 1-128 chars of `[A-Za-z0-9-_]`). Catches a display NAME ("test vault2") or a
+/// typo at the argument boundary with a pointer to `sc vault ls`, instead of
+/// letting it travel to the daemon and surface as a deep, opaque
+/// "passkeys HTTP 400 Bad Request" (after the user already typed a
+/// confirmation, in `sc vault delete`'s case).
+fn validate_vault_id_arg(v: &str) -> Result<(), String> {
+    let ok = !v.is_empty()
+        && v.len() <= 128
+        && v.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if ok {
+        Ok(())
+    } else {
+        Err(format!(
+            "'{}' is not a vault id (ids use letters, digits, '-' and '_') — run `sc vault ls` and pass the id from the `/v/<id>` part of the URL",
+            v
+        ))
+    }
+}
+
 /// Single-vault auto-select (§5): exactly one known vault defaults to it, so a
 /// fresh shell needs no `sc vault use` and the agent/human vault can't diverge
 /// in the common single-vault case. `None` for zero or many.
@@ -557,6 +587,23 @@ fn single_known_vault() -> Option<String> {
 mod tests {
     use super::*;
 
+    /// A display name / typo passed as `--vault` must fail at the argument
+    /// boundary with the `sc vault ls` pointer — not travel to the daemon and
+    /// come back as an opaque "passkeys HTTP 400" (the `sc vault delete
+    /// "test vault2"` report).
+    #[test]
+    fn vault_id_arg_rejects_names_and_accepts_ids() {
+        assert!(validate_vault_id_arg("v-abc_123").is_ok());
+        assert!(validate_vault_id_arg("test vault2").is_err());
+        assert!(validate_vault_id_arg("").is_err());
+        assert!(validate_vault_id_arg("http://x/v/id").is_err());
+        let msg = validate_vault_id_arg("test vault2").unwrap_err();
+        assert!(
+            msg.contains("sc vault ls"),
+            "error must point at vault ls: {msg}"
+        );
+    }
+
     #[test]
     fn split_vault_url_basic() {
         assert_eq!(
@@ -573,12 +620,18 @@ mod tests {
 
     #[test]
     fn scheme_host_strips_port_and_path() {
-        assert_eq!(scheme_host("http://127.0.0.1:23294"), Some("http://127.0.0.1".into()));
+        assert_eq!(
+            scheme_host("http://127.0.0.1:23294"),
+            Some("http://127.0.0.1".into())
+        );
         assert_eq!(
             scheme_host("https://box.example.com:23294/x/y"),
             Some("https://box.example.com".into())
         );
-        assert_eq!(scheme_host("http://[::1]:23294"), Some("http://[::1]".into()));
+        assert_eq!(
+            scheme_host("http://[::1]:23294"),
+            Some("http://[::1]".into())
+        );
         assert_eq!(scheme_host("no-scheme"), None);
         assert_eq!(scheme_host("http://"), None);
     }
@@ -591,7 +644,11 @@ mod tests {
         // Env host set (an agent's shell): its HOST + the resolved control port —
         // the single-host invariant (proxy face and control face share a daemon).
         assert_eq!(
-            control_root_from(Some("https://box.example.com".into()), cfg_daemon, CONTROL_PORT),
+            control_root_from(
+                Some("https://box.example.com".into()),
+                cfg_daemon,
+                CONTROL_PORT
+            ),
             format!("https://box.example.com:{}", CONTROL_PORT)
         );
         // A moved control port (SAFECLAW_PORT) rides through the env-host branch,
@@ -601,7 +658,10 @@ mod tests {
             "http://127.0.0.1:23293"
         );
         // No env: config's control root VERBATIM (custom port preserved).
-        assert_eq!(control_root_from(None, cfg_daemon, CONTROL_PORT), "http://127.0.0.1:9999");
+        assert_eq!(
+            control_root_from(None, cfg_daemon, CONTROL_PORT),
+            "http://127.0.0.1:9999"
+        );
         // Bare machine: loopback default at the resolved port.
         assert_eq!(
             control_root_from(None, None, CONTROL_PORT),

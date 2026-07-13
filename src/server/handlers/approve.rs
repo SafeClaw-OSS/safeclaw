@@ -801,7 +801,16 @@ pub async fn approve_op(
                     pc.as_ref().map(|p| p.ttl_seconds).unwrap_or(300)
                 };
                 if !conn.is_empty() && !method.is_empty() && !host.is_empty() && !path.is_empty() {
-                    state.op_grant_insert(&vault_id, &conn, method, &host, path, &scope_digest, s_o, now + window);
+                    state.op_grant_insert(
+                        &vault_id,
+                        &conn,
+                        method,
+                        &host,
+                        path,
+                        &scope_digest,
+                        s_o,
+                        now + window,
+                    );
                 } else {
                     tracing::warn!(
                         vault = %vault_id, op = %op_id,
@@ -1164,7 +1173,9 @@ pub async fn approve_op(
             "secret-rm" => {
                 let key = validated.op.act.target.trim().to_ascii_uppercase();
                 if key.is_empty() {
-                    return Err(AppError::BadRequest("secret-rm target (key) required".into()));
+                    return Err(AppError::BadRequest(
+                        "secret-rm target (key) required".into(),
+                    ));
                 }
                 let (mut view, k) =
                     crate::server::handlers::metadata::open_view_for_grant_keep_key(
@@ -1176,7 +1187,10 @@ pub async fn approve_op(
                         existing_vault.as_ref(),
                     )?;
                 if !view.native_secrets.contains_key(&key) {
-                    return Err(AppError::BadRequest(format!("key '{}' not found in vault", key)));
+                    return Err(AppError::BadRequest(format!(
+                        "key '{}' not found in vault",
+                        key
+                    )));
                 }
                 let referenced_by = view
                     .aux
@@ -1265,6 +1279,314 @@ pub async fn approve_op(
                     "removed": id,
                     "removed_secrets": removed_secrets,
                     "kept_secrets": kept_secrets,
+                });
+                let cached = Some(resp.to_string());
+                (resp, cached)
+            }
+            // Create (or replace) a connection — the CLI's `sc connect`, ONE
+            // approval. `scope` carries the public shape only: hosts / service /
+            // referenced KEY names / an optional `values_digest` committing to
+            // the new secret VALUES the CLI deposited at `/v/{vid}/op-payload`
+            // (the full op rides to the cloud relay, so plaintext never can —
+            // see `AppState::op_payloads`). Daemon-side reseal + push, so this
+            // works over SSH via the grant link like the other write acts.
+            "connection-add" => {
+                let id = validated.op.act.target.trim().to_string();
+                if !crate::cli::conn::valid_conn_id(&id) {
+                    return Err(AppError::BadRequest(format!(
+                        "'{}' is not a valid connection id",
+                        id
+                    )));
+                }
+                let scope = &validated.op.act.scope;
+                let service = scope
+                    .get("service")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let hosts: Option<Vec<String>> =
+                    scope.get("hosts").and_then(|v| v.as_array()).map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_str().map(str::to_string))
+                            .collect()
+                    });
+                let referenced: Vec<String> = scope
+                    .get("secrets")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                for k in &referenced {
+                    if !crate::cli::conn::valid_role(k) || k.to_ascii_uppercase() != *k {
+                        return Err(AppError::BadRequest(format!(
+                            "'{}' is not a valid UPPERCASE secret key",
+                            k
+                        )));
+                    }
+                }
+                let keys: Option<std::collections::BTreeMap<String, String>> =
+                    scope.get("keys").and_then(|v| v.as_object()).map(|m| {
+                        m.iter()
+                            .filter_map(|(r, k)| k.as_str().map(|k| (r.clone(), k.to_string())))
+                            .collect()
+                    });
+                // The committed value deposit (absent = no new values, e.g. a
+                // pure `--use-existing` connection). Single-use; expiry or a
+                // daemon restart between create and approve fails closed.
+                let values = match scope.get("values_digest").and_then(|v| v.as_str()) {
+                    Some(d) => Some(state.op_payload_take(d).ok_or_else(|| {
+                        AppError::BadRequest(
+                            "deposited values not found or expired — re-run the command".into(),
+                        )
+                    })?),
+                    None => None,
+                };
+                if let Some(vals) = &values {
+                    for k in vals.keys() {
+                        if !referenced.contains(k) {
+                            return Err(AppError::BadRequest(format!(
+                                "deposited key '{}' is not in the approved scope.secrets",
+                                k
+                            )));
+                        }
+                    }
+                }
+
+                let (mut view, k) =
+                    crate::server::handlers::metadata::open_view_for_grant_keep_key(
+                        &state,
+                        &vault_id,
+                        &validated.op,
+                        &validated.wrapping_key,
+                        &validated.credential_id_bytes,
+                        existing_vault.as_ref(),
+                    )?;
+
+                let record = match &service {
+                    // RAW: anchors its own exact FQDNs; explicit `secrets` list.
+                    None => {
+                        let hosts = hosts.filter(|h| !h.is_empty()).ok_or_else(|| {
+                            AppError::BadRequest("a raw connection needs at least one host".into())
+                        })?;
+                        for h in &hosts {
+                            crate::cli::conn::validate_raw_host(h).map_err(AppError::BadRequest)?;
+                        }
+                        if referenced.is_empty() {
+                            return Err(AppError::BadRequest(
+                                "a raw connection needs at least one secret key".into(),
+                            ));
+                        }
+                        // `--use-existing` keys (referenced but not deposited)
+                        // must already be in the vault.
+                        for key in &referenced {
+                            let deposited = values
+                                .as_ref()
+                                .map(|v| v.contains_key(key))
+                                .unwrap_or(false);
+                            if !deposited && !view.native_secrets.contains_key(key) {
+                                return Err(AppError::BadRequest(format!(
+                                    "no such secret '{}' in the vault",
+                                    key
+                                )));
+                            }
+                        }
+                        crate::storage::plaintext::Connection {
+                            name: None,
+                            service: None,
+                            hosts: Some(hosts),
+                            secrets: Some(referenced.clone()),
+                            keys: None,
+                        }
+                    }
+                    // SERVICE-backed: hosts derive from the service; `hosts`
+                    // here only PINS exact FQDNs inside its `*.suffix`
+                    // wildcards. Custom-first resolution (per-vault def wins).
+                    Some(svc) => {
+                        let service_hosts: Vec<String> = match view.aux.services.get(svc) {
+                            Some(toml_src) => {
+                                toml::from_str::<crate::service::ServiceDef>(toml_src)
+                                    .map(|d| d.service.hosts)
+                                    .map_err(|e| {
+                                        AppError::BadRequest(format!(
+                                            "custom service '{}': {}",
+                                            svc, e
+                                        ))
+                                    })?
+                            }
+                            None => state
+                                .services
+                                .get(svc)
+                                .ok_or_else(|| {
+                                    AppError::BadRequest(format!("unknown service '{}'", svc))
+                                })?
+                                .service
+                                .hosts
+                                .clone(),
+                        };
+                        let pins = hosts.filter(|h| !h.is_empty());
+                        if let Some(pins) = &pins {
+                            for h in pins {
+                                crate::cli::conn::validate_raw_host(h)
+                                    .map_err(AppError::BadRequest)?;
+                                let ok = service_hosts
+                                    .iter()
+                                    .any(|e| crate::core::host::wildcard_matches(e, h));
+                                if !ok {
+                                    return Err(AppError::BadRequest(format!(
+                                        "pinned host '{}' is not within service '{}' hosts",
+                                        h, svc
+                                    )));
+                                }
+                            }
+                        }
+                        crate::storage::plaintext::Connection {
+                            name: None,
+                            service: Some(svc.clone()),
+                            hosts: pins,
+                            secrets: None,
+                            keys: keys.clone().filter(|m| !m.is_empty()),
+                        }
+                    }
+                };
+
+                let written: Vec<String> = values
+                    .as_ref()
+                    .map(|v| v.keys().cloned().collect())
+                    .unwrap_or_default();
+                if let Some(vals) = values {
+                    for (key, val) in vals {
+                        view.native_secrets.insert(key, val.into_bytes());
+                    }
+                }
+                view.aux.connections.insert(id.clone(), record);
+                crate::auth::connect::persist_mutated_view(&state, &vault_id, &view, &k)
+                    .map_err(AppError::Internal)?;
+                {
+                    let state = state.clone();
+                    let vid = vault_id.clone();
+                    tokio::spawn(async move {
+                        crate::sync::push_keys_best_effort(&state, &vid).await;
+                        crate::sync::push_items_best_effort(&state, &vid).await;
+                    });
+                }
+                tracing::info!(vault = %vault_id, connection = %id, "connection added");
+                let resp = json!({
+                    "ok": true, "act": "connection-add",
+                    "id": id, "service": service,
+                    "written": written, "referenced": referenced,
+                });
+                let cached = Some(resp.to_string());
+                (resp, cached)
+            }
+            // Store one native secret — the CLI's `sc set`, ONE approval. The
+            // value rides the local `op-payload` deposit (committed by
+            // `scope.values_digest`); `scope.hosts` optionally anchors a raw
+            // single-secret connection at the lowercased KEY (the `sc set
+            // --host` sugar), `scope.no_broker` explicitly un-brokers instead.
+            "secret-set" => {
+                let key = validated.op.act.target.trim().to_ascii_uppercase();
+                if !crate::cli::conn::valid_role(&key) {
+                    return Err(AppError::BadRequest(format!(
+                        "'{}' is not a valid secret key",
+                        key
+                    )));
+                }
+                let scope = &validated.op.act.scope;
+                let no_broker = scope
+                    .get("no_broker")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let hosts: Vec<String> = scope
+                    .get("hosts")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if no_broker && !hosts.is_empty() {
+                    return Err(AppError::BadRequest(
+                        "secret-set: no_broker and hosts are mutually exclusive".into(),
+                    ));
+                }
+                let conn = key.to_ascii_lowercase();
+                if !hosts.is_empty() {
+                    if !crate::cli::conn::valid_conn_id(&conn) {
+                        return Err(AppError::BadRequest(format!(
+                            "can't derive a connection id from '{}'",
+                            key
+                        )));
+                    }
+                    for h in &hosts {
+                        crate::cli::conn::validate_raw_host(h).map_err(AppError::BadRequest)?;
+                    }
+                }
+                let digest = scope
+                    .get("values_digest")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        AppError::BadRequest("secret-set: scope.values_digest required".into())
+                    })?;
+                let mut values = state.op_payload_take(digest).ok_or_else(|| {
+                    AppError::BadRequest(
+                        "deposited value not found or expired — re-run the command".into(),
+                    )
+                })?;
+                let value = values.remove(&key).ok_or_else(|| {
+                    AppError::BadRequest("deposited values don't match the op's key".into())
+                })?;
+                if !values.is_empty() {
+                    return Err(AppError::BadRequest(
+                        "secret-set deposit must carry exactly the op's key".into(),
+                    ));
+                }
+
+                let (mut view, k) =
+                    crate::server::handlers::metadata::open_view_for_grant_keep_key(
+                        &state,
+                        &vault_id,
+                        &validated.op,
+                        &validated.wrapping_key,
+                        &validated.credential_id_bytes,
+                        existing_vault.as_ref(),
+                    )?;
+                view.native_secrets.insert(key.clone(), value.into_bytes());
+                let mut removed_prior_anchor = false;
+                if no_broker {
+                    // Opting out must actually un-broker: drop the raw
+                    // connection a prior `sc set <key> --host …` created.
+                    removed_prior_anchor = view.aux.connections.remove(&conn).is_some();
+                } else if !hosts.is_empty() {
+                    view.aux.connections.insert(
+                        conn.clone(),
+                        crate::storage::plaintext::Connection {
+                            name: None,
+                            service: None,
+                            hosts: Some(hosts.clone()),
+                            secrets: Some(vec![key.clone()]),
+                            keys: None,
+                        },
+                    );
+                }
+                crate::auth::connect::persist_mutated_view(&state, &vault_id, &view, &k)
+                    .map_err(AppError::Internal)?;
+                {
+                    let state = state.clone();
+                    let vid = vault_id.clone();
+                    tokio::spawn(async move {
+                        crate::sync::push_keys_best_effort(&state, &vid).await;
+                        crate::sync::push_items_best_effort(&state, &vid).await;
+                    });
+                }
+                tracing::info!(vault = %vault_id, key = %key, "secret set");
+                let resp = json!({
+                    "ok": true, "act": "secret-set", "key": key,
+                    "conn": if hosts.is_empty() { Value::Null } else { json!(conn) },
+                    "hosts": hosts,
+                    "removed_prior_anchor": removed_prior_anchor,
                 });
                 let cached = Some(resp.to_string());
                 (resp, cached)
@@ -1415,7 +1737,10 @@ pub async fn approve_op(
 /// Connection ids (established `aux.connections` + in-flight `aux.connecting`)
 /// whose `service` references `service_id` — for the `service-ls`/`service-rm`
 /// "still referenced by …" report.
-fn service_refs(view: &crate::storage::plaintext::VaultPlaintextView, service_id: &str) -> Vec<String> {
+fn service_refs(
+    view: &crate::storage::plaintext::VaultPlaintextView,
+    service_id: &str,
+) -> Vec<String> {
     let mut out = Vec::new();
     for (cid, c) in &view.aux.connections {
         if c.service.as_deref() == Some(service_id) {

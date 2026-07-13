@@ -21,19 +21,17 @@ pub fn render_operation(op: &Operation) -> String {
                 .unwrap_or("(new device)");
             format!("Add passkey \"{}\" to this vault.", device)
         }
-        ActType::Enroll => {
-            match as_enroll_credential(op) {
-                Ok(cred) => format!(
-                    "Set up vault with passkey \"{}\".",
-                    if cred.device_name.is_empty() {
-                        "(new device)"
-                    } else {
-                        cred.device_name.as_str()
-                    }
-                ),
-                Err(_) => "Set up vault.".to_string(),
-            }
-        }
+        ActType::Enroll => match as_enroll_credential(op) {
+            Ok(cred) => format!(
+                "Set up vault with passkey \"{}\".",
+                if cred.device_name.is_empty() {
+                    "(new device)"
+                } else {
+                    cred.device_name.as_str()
+                }
+            ),
+            Err(_) => "Set up vault.".to_string(),
+        },
         ActType::Write => "Update vault contents.".to_string(),
         ActType::Export => {
             format!(
@@ -42,6 +40,49 @@ pub fn render_operation(op: &Operation) -> String {
             )
         }
         ActType::Use => render_use(op),
+        ActType::Custom(name) if name == "connection-add" => {
+            let scope = &op.act.scope;
+            let list = |k: &str| -> Vec<&str> {
+                scope
+                    .get(k)
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|x| x.as_str()).collect())
+                    .unwrap_or_default()
+            };
+            let target = match scope.get("service").and_then(|v| v.as_str()) {
+                Some(svc) => format!("service {}", svc),
+                None => list("hosts").join(", "),
+            };
+            let keys = list("secrets");
+            if keys.is_empty() {
+                format!("Add connection \"{}\" → {}.", op.act.target, target)
+            } else {
+                format!(
+                    "Add connection \"{}\" → {} (secrets: {}).",
+                    op.act.target,
+                    target,
+                    keys.join(", ")
+                )
+            }
+        }
+        ActType::Custom(name) if name == "secret-set" => {
+            let hosts: Vec<&str> = op
+                .act
+                .scope
+                .get("hosts")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|x| x.as_str()).collect())
+                .unwrap_or_default();
+            if hosts.is_empty() {
+                format!("Store secret {}.", op.act.target)
+            } else {
+                format!(
+                    "Store secret {} for use at {}.",
+                    op.act.target,
+                    hosts.join(", ")
+                )
+            }
+        }
         other => format!("Operation: {:?}", other),
     }
 }
@@ -95,8 +136,10 @@ fn render_use(op: &Operation) -> String {
 /// interpolate each reference with its bound value (a filter is a
 /// console-display concern, so here the value is shown as-is / truncated).
 fn interpolate(template: &str, bound: &[(String, String)]) -> String {
-    let vals: std::collections::HashMap<&str, &str> =
-        bound.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let vals: std::collections::HashMap<&str, &str> = bound
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
     let mut out = String::new();
     let mut rest = template;
     while let Some(start) = rest.find("{{") {

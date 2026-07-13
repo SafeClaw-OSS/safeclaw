@@ -176,7 +176,13 @@ pub struct SecretsCache {
     ///
     /// F-19: credential bytes (GCP SA JSON with RSA private key) are wrapped
     /// in `Zeroizing` so they are zeroed on drop when the vault is locked.
-    pub external_stores: HashMap<String, (crate::storage::plaintext::Store, zeroize::Zeroizing<Vec<u8>>)>,
+    pub external_stores: HashMap<
+        String,
+        (
+            crate::storage::plaintext::Store,
+            zeroize::Zeroizing<Vec<u8>>,
+        ),
+    >,
     /// Derived OAuth access_tokens, keyed by service_id. These are the
     /// short-lived bearer values minted by exchanging the long-lived
     /// `refresh_token` (which lives in `entries`) at the provider's
@@ -326,6 +332,23 @@ pub struct AppState {
     /// ONE listener (the daemon never races itself into an 8765 port conflict).
     /// Cleared when the task exits (idle self-close or bind failure).
     pub oauth_listener_running: Mutex<bool>,
+    /// Secret values a local CLI deposited for a pending write op
+    /// (`connection-add` / `secret-set`), keyed by their salted digest. The op
+    /// carries ONLY the digest in `act.scope` — the full op JSON rides to the
+    /// cloud op-relay for the grant page, so plaintext values must never be in
+    /// it (and the salt keeps a weak value from being brute-forced from the
+    /// public digest). Approving the op binds the digest via β; the act then
+    /// takes the stash, re-verifies the digest, and writes the values. In-memory
+    /// + daemon-local; entries self-reap after `OP_PAYLOAD_TTL` (the op TTL).
+    pub op_payloads: Mutex<HashMap<String, OpPayloadEntry>>,
+}
+
+/// One deposited value-set awaiting its op's approval. See
+/// [`AppState::op_payloads`].
+pub struct OpPayloadEntry {
+    inserted_at: std::time::Instant,
+    nonce: [u8; 32],
+    pub values: std::collections::BTreeMap<String, String>,
 }
 
 impl AppState {
@@ -355,7 +378,73 @@ impl AppState {
             egress_proxy: crate::proxy::upstream::new_cell(),
             oauth_pending: Mutex::new(HashMap::new()),
             oauth_listener_running: Mutex::new(false),
+            op_payloads: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Stash lifetime — matches the pending-op TTL (300s): a payload only
+    /// exists to be consumed by the approval of the op created right after it.
+    const OP_PAYLOAD_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+    /// Flood cap. A human runs one `sc connect` at a time; 32 concurrent
+    /// pending stashes is already pathological.
+    const MAX_OP_PAYLOADS: usize = 32;
+
+    /// Salted commitment over a value-set: `sha256(DS ‖ nonce ‖ canonical(values))`.
+    /// BTreeMap serialization is key-sorted, so `to_vec` is canonical.
+    fn op_payload_digest(
+        nonce: &[u8; 32],
+        values: &std::collections::BTreeMap<String, String>,
+    ) -> String {
+        use sha2::{Digest as _, Sha256};
+        let mut h = Sha256::new();
+        h.update(b"safeclaw/v1/op-payload");
+        h.update(nonce);
+        h.update(serde_json::to_vec(values).unwrap_or_default());
+        h.finalize().iter().map(|b| format!("{:02x}", b)).collect()
+    }
+
+    /// Deposit a value-set; returns the digest the op's `act.scope` must carry.
+    /// `None` when the stash is full (flood guard).
+    pub fn op_payload_insert(
+        &self,
+        values: std::collections::BTreeMap<String, String>,
+    ) -> Option<String> {
+        use rand::RngCore as _;
+        let mut m = self.op_payloads.lock().unwrap();
+        let now = std::time::Instant::now();
+        m.retain(|_, e| now.duration_since(e.inserted_at) < Self::OP_PAYLOAD_TTL);
+        if m.len() >= Self::MAX_OP_PAYLOADS {
+            return None;
+        }
+        let mut nonce = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut nonce);
+        let digest = Self::op_payload_digest(&nonce, &values);
+        m.insert(
+            digest.clone(),
+            OpPayloadEntry {
+                inserted_at: now,
+                nonce,
+                values,
+            },
+        );
+        Some(digest)
+    }
+
+    /// Consume the stash for an approved op. Single-use (removed on take);
+    /// expired entries and digest mismatches (defense-in-depth recompute)
+    /// yield `None` — the caller fails the act closed.
+    pub fn op_payload_take(
+        &self,
+        digest: &str,
+    ) -> Option<std::collections::BTreeMap<String, String>> {
+        let entry = self.op_payloads.lock().unwrap().remove(digest)?;
+        if entry.inserted_at.elapsed() >= Self::OP_PAYLOAD_TTL {
+            return None;
+        }
+        if Self::op_payload_digest(&entry.nonce, &entry.values) != digest {
+            return None;
+        }
+        Some(entry.values)
     }
 
     /// Replace the synced account-level agent-key hash-set (sha256 hex).
@@ -483,7 +572,14 @@ impl AppState {
             .map(|d| d.as_secs())
             .unwrap_or(0);
         let mut states = self.vault_states.lock().unwrap();
-        states.insert(vault_id, VaultState::Unlocked { cache, state_key, unlocked_at });
+        states.insert(
+            vault_id,
+            VaultState::Unlocked {
+                cache,
+                state_key,
+                unlocked_at,
+            },
+        );
     }
 
     /// Clone the retained state key `K` for an Unlocked vault, or `None` when
@@ -589,9 +685,7 @@ impl AppState {
     ) -> Option<HashMap<String, Vec<u8>>> {
         let states = self.vault_states.lock().unwrap();
         match states.get(vault_id) {
-            Some(VaultState::Unlocked { cache, .. }) => {
-                cache.allow_secrets.get(conn_id).cloned()
-            }
+            Some(VaultState::Unlocked { cache, .. }) => cache.allow_secrets.get(conn_id).cloned(),
             _ => None,
         }
     }
@@ -614,7 +708,11 @@ impl AppState {
             cache.entries.insert(
                 conn_id.to_string(),
                 // A real approval grant — consumable by the ask retry path.
-                CacheEntry { value, expires_at, from_bootstrap: false },
+                CacheEntry {
+                    value,
+                    expires_at,
+                    from_bootstrap: false,
+                },
             );
         }
     }
@@ -857,7 +955,11 @@ impl AppState {
         host: &str,
         body: Option<&str>,
         vars: &crate::core::policy::VarMap,
-    ) -> Option<(crate::core::policy::AccessLevel, Option<String>, Option<u64>)> {
+    ) -> Option<(
+        crate::core::policy::AccessLevel,
+        Option<String>,
+        Option<u64>,
+    )> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -928,11 +1030,7 @@ impl AppState {
                 );
                 if let Some(&exp) = cache.rule_approvals.get(&key) {
                     if exp > now {
-                        return Some((
-                            crate::core::policy::AccessLevel::Allow,
-                            matched_rule,
-                            ttl,
-                        ));
+                        return Some((crate::core::policy::AccessLevel::Allow, matched_rule, ttl));
                     } else {
                         cache.rule_approvals.remove(&key);
                     }
@@ -1103,7 +1201,6 @@ impl AppState {
             }
         }
     }
-
 }
 
 #[cfg(test)]
@@ -1127,6 +1224,23 @@ mod tests {
         AppState::new(cfg)
     }
 
+    /// The op-payload stash is single-use and digest-verified: a deposit is
+    /// retrievable exactly once by its returned digest, and an unknown digest
+    /// (wrong, replayed, or post-restart) fails closed.
+    #[test]
+    fn op_payload_deposit_is_single_use_and_digest_bound() {
+        let state = test_state();
+        let mut values = std::collections::BTreeMap::new();
+        values.insert("MIMO_API_TOKEN".to_string(), "s3cret".to_string());
+        let digest = state.op_payload_insert(values.clone()).expect("stash slot");
+        // Two deposits of the SAME values must not collide (fresh salt each).
+        let digest2 = state.op_payload_insert(values.clone()).expect("stash slot");
+        assert_ne!(digest, digest2, "salted digests must differ per deposit");
+        assert_eq!(state.op_payload_take(&digest), Some(values));
+        assert_eq!(state.op_payload_take(&digest), None, "single-use");
+        assert_eq!(state.op_payload_take("deadbeef"), None, "unknown digest");
+    }
+
     fn unlock_with_empty_cache(state: &AppState, vault_id: &str) {
         state.unlock_vault(
             vault_id.to_string(),
@@ -1143,7 +1257,11 @@ mod tests {
         if let Some(VaultState::Unlocked { cache, .. }) = states.get_mut(vault_id) {
             cache.entries.insert(
                 conn.to_string(),
-                CacheEntry { value: value.to_vec(), expires_at: None, from_bootstrap: true },
+                CacheEntry {
+                    value: value.to_vec(),
+                    expires_at: None,
+                    from_bootstrap: true,
+                },
             );
         }
     }
@@ -1161,11 +1279,22 @@ mod tests {
         // real conn-keyed ask grant) is invisible to op_grant_take.
         state.cache_insert("v1", "github", b"granted".to_vec(), None);
         assert_eq!(
-            state.op_grant_take("v1", "github", "DELETE", "api.github.com", "/repos/a/b", "", true),
+            state.op_grant_take(
+                "v1",
+                "github",
+                "DELETE",
+                "api.github.com",
+                "/repos/a/b",
+                "",
+                true
+            ),
             None
         );
         // The ask path sees its grant as usual.
-        assert_eq!(state.cache_lookup_grant("v1", "github"), Some(b"granted".to_vec()));
+        assert_eq!(
+            state.cache_lookup_grant("v1", "github"),
+            Some(b"granted".to_vec())
+        );
     }
 
     #[test]
@@ -1183,8 +1312,21 @@ mod tests {
         // The ask-always captive-portal contract: one approval = one replay.
         let state = test_state();
         unlock_with_empty_cache(&state, "v1");
-        let far = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() + 600;
-        state.op_grant_insert("v1", "svc", "POST", "api.x.com", "/v2/purchase", "", b"tok".to_vec(), far);
+        let far = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 600;
+        state.op_grant_insert(
+            "v1",
+            "svc",
+            "POST",
+            "api.x.com",
+            "/v2/purchase",
+            "",
+            b"tok".to_vec(),
+            far,
+        );
         // First take returns the value …
         assert_eq!(
             state.op_grant_take("v1", "svc", "POST", "api.x.com", "/v2/purchase", "", true),
@@ -1192,7 +1334,10 @@ mod tests {
         );
         // … and removes it: a second take misses, and nothing leaked into the
         // conn-keyed entries for the allow/ask paths to find.
-        assert_eq!(state.op_grant_take("v1", "svc", "POST", "api.x.com", "/v2/purchase", "", true), None);
+        assert_eq!(
+            state.op_grant_take("v1", "svc", "POST", "api.x.com", "/v2/purchase", "", true),
+            None
+        );
         assert_eq!(state.cache_lookup("v1", "svc"), None);
     }
 
@@ -1204,13 +1349,38 @@ mod tests {
     fn op_grant_take_is_request_bound() {
         let state = test_state();
         unlock_with_empty_cache(&state, "v1");
-        let far = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() + 600;
-        state.op_grant_insert("v1", "svc", "POST", "api.x.com", "/v2/purchase", "", b"tok".to_vec(), far);
+        let far = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 600;
+        state.op_grant_insert(
+            "v1",
+            "svc",
+            "POST",
+            "api.x.com",
+            "/v2/purchase",
+            "",
+            b"tok".to_vec(),
+            far,
+        );
         // Different path / method / host / connection → all miss.
-        assert_eq!(state.op_grant_take("v1", "svc", "POST", "api.x.com", "/v2/refund", "", true), None);
-        assert_eq!(state.op_grant_take("v1", "svc", "DELETE", "api.x.com", "/v2/purchase", "", true), None);
-        assert_eq!(state.op_grant_take("v1", "svc", "POST", "api.y.com", "/v2/purchase", "", true), None);
-        assert_eq!(state.op_grant_take("v1", "other", "POST", "api.x.com", "/v2/purchase", "", true), None);
+        assert_eq!(
+            state.op_grant_take("v1", "svc", "POST", "api.x.com", "/v2/refund", "", true),
+            None
+        );
+        assert_eq!(
+            state.op_grant_take("v1", "svc", "DELETE", "api.x.com", "/v2/purchase", "", true),
+            None
+        );
+        assert_eq!(
+            state.op_grant_take("v1", "svc", "POST", "api.y.com", "/v2/purchase", "", true),
+            None
+        );
+        assert_eq!(
+            state.op_grant_take("v1", "other", "POST", "api.x.com", "/v2/purchase", "", true),
+            None
+        );
         // Host comparison is case-insensitive (hosts are lowercased at insert).
         assert_eq!(
             state.op_grant_take("v1", "svc", "POST", "API.X.COM", "/v2/purchase", "", true),
@@ -1222,9 +1392,21 @@ mod tests {
     fn op_grant_take_honors_expiry() {
         let state = test_state();
         unlock_with_empty_cache(&state, "v1");
-        state.op_grant_insert("v1", "svc", "POST", "api.x.com", "/p", "", b"stale".to_vec(), 0);
+        state.op_grant_insert(
+            "v1",
+            "svc",
+            "POST",
+            "api.x.com",
+            "/p",
+            "",
+            b"stale".to_vec(),
+            0,
+        );
         // Expired grant is not returned (and is consumed/dropped).
-        assert_eq!(state.op_grant_take("v1", "svc", "POST", "api.x.com", "/p", "", true), None);
+        assert_eq!(
+            state.op_grant_take("v1", "svc", "POST", "api.x.com", "/p", "", true),
+            None
+        );
     }
 
     /// Phase 2: the scope digest is part of the key. Approving `amount=80`
@@ -1235,18 +1417,45 @@ mod tests {
     fn op_grant_take_is_scope_digest_bound() {
         let state = test_state();
         unlock_with_empty_cache(&state, "v1");
-        let far = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() + 600;
+        let far = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 600;
         let d80 = crate::service::scope_digest(&[("amount".into(), "80".into())]);
         let d180 = crate::service::scope_digest(&[("amount".into(), "180".into())]);
-        state.op_grant_insert("v1", "svc", "POST", "api.x.com", "/v2/purchase", &d80, b"tok".to_vec(), far);
+        state.op_grant_insert(
+            "v1",
+            "svc",
+            "POST",
+            "api.x.com",
+            "/v2/purchase",
+            &d80,
+            b"tok".to_vec(),
+            far,
+        );
         // The tampered ($180) replay misses and does NOT consume…
-        assert_eq!(state.op_grant_take("v1", "svc", "POST", "api.x.com", "/v2/purchase", &d180, true), None);
+        assert_eq!(
+            state.op_grant_take(
+                "v1",
+                "svc",
+                "POST",
+                "api.x.com",
+                "/v2/purchase",
+                &d180,
+                true
+            ),
+            None
+        );
         // …so the honest ($80) replay still succeeds, exactly once.
         assert_eq!(
             state.op_grant_take("v1", "svc", "POST", "api.x.com", "/v2/purchase", &d80, true),
             Some(b"tok".to_vec())
         );
-        assert_eq!(state.op_grant_take("v1", "svc", "POST", "api.x.com", "/v2/purchase", &d80, true), None);
+        assert_eq!(
+            state.op_grant_take("v1", "svc", "POST", "api.x.com", "/v2/purchase", &d80, true),
+            None
+        );
     }
 
     /// A scoped `ask` peeks (reuses within its window for the SAME bound
@@ -1257,16 +1466,41 @@ mod tests {
     fn op_grant_take_peek_reuses_same_action_but_not_a_different_one() {
         let state = test_state();
         unlock_with_empty_cache(&state, "v1");
-        let far = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() + 600;
+        let far = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 600;
         let d_read = crate::service::scope_digest(&[("q".into(), "alpha".into())]);
         let d_other = crate::service::scope_digest(&[("q".into(), "beta".into())]);
-        state.op_grant_insert("v1", "svc", "POST", "api.x.com", "/search", &d_read, b"tok".to_vec(), far);
+        state.op_grant_insert(
+            "v1",
+            "svc",
+            "POST",
+            "api.x.com",
+            "/search",
+            &d_read,
+            b"tok".to_vec(),
+            far,
+        );
         // Peek (consume=false) reuses the SAME action any number of times…
-        assert_eq!(state.op_grant_take("v1", "svc", "POST", "api.x.com", "/search", &d_read, false), Some(b"tok".to_vec()));
-        assert_eq!(state.op_grant_take("v1", "svc", "POST", "api.x.com", "/search", &d_read, false), Some(b"tok".to_vec()));
+        assert_eq!(
+            state.op_grant_take("v1", "svc", "POST", "api.x.com", "/search", &d_read, false),
+            Some(b"tok".to_vec())
+        );
+        assert_eq!(
+            state.op_grant_take("v1", "svc", "POST", "api.x.com", "/search", &d_read, false),
+            Some(b"tok".to_vec())
+        );
         // …but a DIFFERENT bound value misses (re-prompt), without disturbing the grant.
-        assert_eq!(state.op_grant_take("v1", "svc", "POST", "api.x.com", "/search", &d_other, false), None);
-        assert_eq!(state.op_grant_take("v1", "svc", "POST", "api.x.com", "/search", &d_read, false), Some(b"tok".to_vec()));
+        assert_eq!(
+            state.op_grant_take("v1", "svc", "POST", "api.x.com", "/search", &d_other, false),
+            None
+        );
+        assert_eq!(
+            state.op_grant_take("v1", "svc", "POST", "api.x.com", "/search", &d_read, false),
+            Some(b"tok".to_vec())
+        );
     }
 
     #[test]
@@ -1317,9 +1551,13 @@ mod tests {
         rules.insert("read".to_string(), ask_rule("GET /x"));
         rules.insert("write".to_string(), ask_rule("POST /x"));
         let mut policy = Policy::default();
-        policy
-            .connections
-            .insert("gh".to_string(), ConnectionPolicy { default: None, rules });
+        policy.connections.insert(
+            "gh".to_string(),
+            ConnectionPolicy {
+                default: None,
+                rules,
+            },
+        );
 
         let state = test_state();
         let vid = "v-scope";
@@ -1330,7 +1568,16 @@ mod tests {
         // Baseline: GET resolves to Ask under the "read" rule. (Default
         // connection: connection_id == service_id == "gh".)
         let (lvl, rule, _) = state
-            .evaluate_request_policy(vid, "gh", "gh", "GET", "/x", "api.gh.com", None, &crate::core::policy::VarMap::new())
+            .evaluate_request_policy(
+                vid,
+                "gh",
+                "gh",
+                "GET",
+                "/x",
+                "api.gh.com",
+                None,
+                &crate::core::policy::VarMap::new(),
+            )
             .unwrap();
         assert_eq!(lvl, AccessLevel::Ask);
         assert_eq!(rule.as_deref(), Some("read"));
@@ -1340,14 +1587,32 @@ mod tests {
 
         // The same GET toward the same host now fast-paths (the feature works).
         let (lvl, _, _) = state
-            .evaluate_request_policy(vid, "gh", "gh", "GET", "/x", "api.gh.com", None, &crate::core::policy::VarMap::new())
+            .evaluate_request_policy(
+                vid,
+                "gh",
+                "gh",
+                "GET",
+                "/x",
+                "api.gh.com",
+                None,
+                &crate::core::policy::VarMap::new(),
+            )
             .unwrap();
         assert_eq!(lvl, AccessLevel::Allow, "approved GET should fast-path");
 
         // Same GET/rule toward a DIFFERENT host must NOT fast-path — the grant
         // is host-scoped (E2E-5 oracle: approve host A → call host B → re-ask).
         let (lvl, _, _) = state
-            .evaluate_request_policy(vid, "gh", "gh", "GET", "/x", "evil.gh.com", None, &crate::core::policy::VarMap::new())
+            .evaluate_request_policy(
+                vid,
+                "gh",
+                "gh",
+                "GET",
+                "/x",
+                "evil.gh.com",
+                None,
+                &crate::core::policy::VarMap::new(),
+            )
             .unwrap();
         assert_eq!(
             lvl,
@@ -1357,7 +1622,16 @@ mod tests {
 
         // A POST is a DIFFERENT verb/rule — the GET approval must not cover it.
         let (lvl, rule, _) = state
-            .evaluate_request_policy(vid, "gh", "gh", "POST", "/x", "api.gh.com", None, &crate::core::policy::VarMap::new())
+            .evaluate_request_policy(
+                vid,
+                "gh",
+                "gh",
+                "POST",
+                "/x",
+                "api.gh.com",
+                None,
+                &crate::core::policy::VarMap::new(),
+            )
             .unwrap();
         assert_eq!(
             lvl,

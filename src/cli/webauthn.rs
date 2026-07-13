@@ -84,14 +84,18 @@ pub async fn do_browser_gesture(
     }
 
     let bind_addr = format!("127.0.0.1:{}", cb_port.unwrap_or(0));
-    let listener = TcpListener::bind(&bind_addr).await
+    let listener = TcpListener::bind(&bind_addr)
+        .await
         .map_err(|e| format!("bind {}: {}", bind_addr, e))?;
     // Use "localhost" not "127.0.0.1" — WebAuthn treats localhost as a
     // valid origin but rejects raw IP addresses.
     let local_addr = listener.local_addr().map_err(|e| format!("addr: {}", e))?;
     let state_token = random_hex(16);
     let (tx, rx) = oneshot::channel::<GestureResult>();
-    let cb_state = Arc::new(CbState { expected_state: state_token.clone(), tx: Mutex::new(Some(tx)) });
+    let cb_state = Arc::new(CbState {
+        expected_state: state_token.clone(),
+        tx: Mutex::new(Some(tx)),
+    });
     let app = Router::new()
         .route("/done", get(handle_done))
         .with_state(cb_state);
@@ -122,7 +126,11 @@ pub async fn do_browser_gesture(
     }
 
     let server = tokio::spawn(async move {
-        let _ = axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await;
+        let _ = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await;
     });
     let result = tokio::select! {
         r = rx => r.map_err(|_| "callback channel dropped".to_string())?,
@@ -134,7 +142,10 @@ pub async fn do_browser_gesture(
     server.abort();
 
     if result.status != "ok" {
-        return Err(format!("gesture: {}", result.error.as_deref().unwrap_or(&result.status)));
+        return Err(format!(
+            "gesture: {}",
+            result.error.as_deref().unwrap_or(&result.status)
+        ));
     }
     if result.state.as_deref() != Some(&state_token) {
         return Err("CSRF state mismatch".into());
@@ -143,12 +154,33 @@ pub async fn do_browser_gesture(
     Ok(result)
 }
 
-pub async fn create_op(custodian: &str, vault: &str, op: &Value) -> Result<(String, String), String> {
+pub async fn create_op(
+    custodian: &str,
+    vault: &str,
+    op: &Value,
+) -> Result<(String, String), String> {
     let client = http_client()?;
-    let url = format!("{}/v/{}/op", custodian.trim_end_matches('/'), urlencoding::encode(vault));
-    let resp = client.post(&url).json(op).send().await.map_err(|e| format!("create op: {}", e))?;
+    let url = format!(
+        "{}/v/{}/op",
+        custodian.trim_end_matches('/'),
+        urlencoding::encode(vault)
+    );
+    let resp = client
+        .post(&url)
+        .json(op)
+        .send()
+        .await
+        .map_err(|e| format!("create op: {}", e))?;
     if !resp.status().is_success() {
-        return Err(format!("create op HTTP {}: {}", resp.status(), resp.text().await.unwrap_or_default()));
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        // Surface the daemon's human message (e.g. the 423 "vault locked — run
+        // `sc up` to unlock" hint) instead of a raw JSON error envelope.
+        let msg = serde_json::from_str::<Value>(&body)
+            .ok()
+            .and_then(|v| v["message"].as_str().map(str::to_string))
+            .unwrap_or(body);
+        return Err(format!("create op HTTP {}: {}", status, msg));
     }
     let body: Value = resp.json().await.map_err(|e| format!("parse: {}", e))?;
     let op_id = body["op_id"].as_str().ok_or("no op_id")?.to_string();
@@ -157,16 +189,15 @@ pub async fn create_op(custodian: &str, vault: &str, op: &Value) -> Result<(Stri
 }
 
 pub fn compute_beta(r: &[u8], op: &Value) -> Result<Vec<u8>, String> {
-    let beta = crate::crypto::binding::binding_for_op(
-        crate::crypto::binding::DOMAIN_STANDARD, r, op,
-    ).map_err(|e| format!("beta: {}", e))?;
+    let beta =
+        crate::crypto::binding::binding_for_op(crate::crypto::binding::DOMAIN_STANDARD, r, op)
+            .map_err(|e| format!("beta: {}", e))?;
     Ok(beta.to_vec())
 }
 
 pub fn compute_beta_setup(r: &[u8], op: &Value) -> Result<Vec<u8>, String> {
-    let beta = crate::crypto::binding::binding_for_op(
-        crate::crypto::binding::DOMAIN_SETUP, r, op,
-    ).map_err(|e| format!("beta: {}", e))?;
+    let beta = crate::crypto::binding::binding_for_op(crate::crypto::binding::DOMAIN_SETUP, r, op)
+        .map_err(|e| format!("beta: {}", e))?;
     Ok(beta.to_vec())
 }
 
@@ -193,7 +224,10 @@ pub async fn fetch_passkey_meta(custodian: &str, vault: &str) -> Result<PasskeyM
     let passkeys = fetch_passkeys_json(custodian, vault).await?;
     let p = &passkeys[0];
     Ok(PasskeyMeta {
-        credential_id: p["credential_id"].as_str().ok_or("no credential_id")?.to_string(),
+        credential_id: p["credential_id"]
+            .as_str()
+            .ok_or("no credential_id")?
+            .to_string(),
         prf_salt: p["prf_salt"].as_str().ok_or("no prf_salt")?.to_string(),
         public_key_x: p["public_key_x"].as_str().map(|s| s.to_string()),
         public_key_y: p["public_key_y"].as_str().map(|s| s.to_string()),
@@ -203,17 +237,45 @@ pub async fn fetch_passkey_meta(custodian: &str, vault: &str) -> Result<PasskeyM
 /// Fetch the raw passkeys array from GET /v/{vault}/passkeys.
 pub async fn fetch_passkeys_json(custodian: &str, vault: &str) -> Result<Vec<Value>, String> {
     let client = http_client()?;
-    let url = format!("{}/v/{}/passkeys", custodian.trim_end_matches('/'), urlencoding::encode(vault));
-    let resp = client.get(&url).send().await.map_err(|e| format!("passkeys: {}", e))?;
+    let url = format!(
+        "{}/v/{}/passkeys",
+        custodian.trim_end_matches('/'),
+        urlencoding::encode(vault)
+    );
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("passkeys: {}", e))?;
     if !resp.status().is_success() {
-        return Err(format!("passkeys HTTP {}", resp.status()));
+        let status = resp.status();
+        // Surface the daemon's human message (e.g. "vault_id has illegal
+        // chars") instead of a bare status line.
+        let msg = resp
+            .text()
+            .await
+            .ok()
+            .and_then(|b| serde_json::from_str::<Value>(&b).ok())
+            .and_then(|v| v["message"].as_str().map(str::to_string))
+            .unwrap_or_default();
+        return Err(if msg.is_empty() {
+            format!("passkeys HTTP {}", status)
+        } else {
+            format!("passkeys HTTP {}: {}", status, msg)
+        });
     }
     let body: Value = resp.json().await.map_err(|e| format!("parse: {}", e))?;
-    let vault_exists = body.get("vault_exists").and_then(|v| v.as_bool()).unwrap_or(false);
+    let vault_exists = body
+        .get("vault_exists")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     if !vault_exists {
         return Err("vault not found on this custodian — run `safeclaw vault create`".into());
     }
-    let passkeys = body["passkeys"].as_array().ok_or("no passkeys array")?.clone();
+    let passkeys = body["passkeys"]
+        .as_array()
+        .ok_or("no passkeys array")?
+        .clone();
     if passkeys.is_empty() {
         return Err("vault has no enrolled passkeys".into());
     }
@@ -241,7 +303,10 @@ pub fn random_bytes(n: usize) -> Vec<u8> {
 }
 
 pub fn random_hex(n: usize) -> String {
-    random_bytes(n).iter().map(|b| format!("{:02x}", b)).collect()
+    random_bytes(n)
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect()
 }
 
 struct CbState {
@@ -263,8 +328,7 @@ async fn handle_done(
 /// non-trivial Linux/macOS deployment. False positives (X11 forwarding,
 /// remote browser plumbing) are harmless: we only print a hint, never block.
 fn ssh_session_detected() -> bool {
-    std::env::var_os("SSH_CONNECTION").is_some()
-        || std::env::var_os("SSH_CLIENT").is_some()
+    std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_CLIENT").is_some()
 }
 
 /// Default port to suggest in the SSH-tunnel hint. Clusters just above the
@@ -276,7 +340,9 @@ const SUGGESTED_CB_PORT: u16 = 23296;
 /// whether the SSH-tunnel hint needs to forward the daemon port too
 /// (laptop browser → server daemon) on top of the callback port.
 fn local_custodian_port(url: &str) -> Option<u16> {
-    let after = url.strip_prefix("http://").or_else(|| url.strip_prefix("https://"))?;
+    let after = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))?;
     let host_port = after.split('/').next()?;
     let mut parts = host_port.splitn(2, ':');
     let host = parts.next()?;
@@ -339,9 +405,15 @@ fn open_browser(url: &str) -> Result<(), String> {
     let candidates: &[&[&str]] = &[&["cmd", "/C", "start", ""]];
     for cmd in candidates {
         let mut c = std::process::Command::new(cmd[0]);
-        for arg in &cmd[1..] { c.arg(arg); }
-        c.arg(url).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
-        if c.spawn().is_ok() { return Ok(()); }
+        for arg in &cmd[1..] {
+            c.arg(arg);
+        }
+        c.arg(url)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        if c.spawn().is_ok() {
+            return Ok(());
+        }
     }
     Err("no browser opener".into())
 }

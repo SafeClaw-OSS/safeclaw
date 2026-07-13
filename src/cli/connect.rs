@@ -24,13 +24,9 @@ use std::io::Write as _;
 use serde_json::{json, Value};
 
 use crate::cli::active::resolve_active;
-use crate::cli::conn::{
-    insert_raw_connection, insert_service_connection, slugify_conn_id, valid_role,
-    validate_raw_host,
-};
-use crate::cli::approve::{act_result, approve_op, ApproveOpts};
-use crate::cli::secret::{do_unlock, seal_and_submit_write};
-use crate::cli::webauthn::{fetch_passkey_meta, now_unix};
+use crate::cli::approve::{act_result, approve_op, deposit_values, ApproveOpts};
+use crate::cli::conn::{slugify_conn_id, valid_role, validate_raw_host};
+use crate::cli::webauthn::now_unix;
 use crate::config::{ConnectArgs, ConnectionLsArgs, ConnectionRmArgs};
 use crate::service::ServiceRegistry;
 use crate::storage::plaintext::suggested_secret_key;
@@ -193,14 +189,29 @@ pub async fn run_rm(args: ConnectionRmArgs) -> Result<(), String> {
         "bind": { "redeemer": vault },
         "valid": { "iat": now_unix(), "multiplicity": "one" }
     });
-    let opts = ApproveOpts { no_browser: args.no_browser, cb_port: args.cb_port, timeout: args.timeout };
-    let body = approve_op(&custodian, &vault, &op, &format!("Remove connection {}", id), &opts).await?;
+    let opts = ApproveOpts {
+        no_browser: args.no_browser,
+        cb_port: args.cb_port,
+        timeout: args.timeout,
+    };
+    let body = approve_op(
+        &custodian,
+        &vault,
+        &op,
+        &format!("Remove connection {}", id),
+        &opts,
+    )
+    .await?;
 
     let result = act_result(&body);
     let removed_secrets: Vec<String> = result
         .get("removed_secrets")
         .and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(str::to_string))
+                .collect()
+        })
         .unwrap_or_default();
     if removed_secrets.is_empty() {
         println!("connection '{}' removed", id);
@@ -218,12 +229,19 @@ pub async fn run_rm(args: ConnectionRmArgs) -> Result<(), String> {
     // kept_secrets: [[key, [referencing_conn, …]], …]
     if let Some(kept) = result.get("kept_secrets").and_then(|v| v.as_array()) {
         for entry in kept {
-            let Some(pair) = entry.as_array() else { continue };
+            let Some(pair) = entry.as_array() else {
+                continue;
+            };
             let key = pair.first().and_then(|v| v.as_str()).unwrap_or("?");
             let by = pair
                 .get(1)
                 .and_then(|v| v.as_array())
-                .map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", "))
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
                 .unwrap_or_default();
             eprintln!("  kept: {} (still referenced by {})", key, by);
         }
@@ -262,52 +280,42 @@ async fn run_raw(
         );
     }
 
-    eprintln!(
-        "safeclaw connection add {} — two passkey gestures (unlock + write)",
-        name
-    );
-    let meta = fetch_passkey_meta(custodian, vault).await?;
-    let (kv, mut aux, user_key) = do_unlock(
-        custodian,
-        vault,
-        &meta,
-        args.no_browser,
-        args.timeout,
-        args.cb_port,
-    )
-    .await?;
-    let mut new_kv = kv;
-
     // Raw secrets are stored at their BARE uppercase KEY (§2 — the vault is a
     // flat env namespace; two connections referencing the same KEY share it).
-    let mut secret_keys: Vec<String> = Vec::new();
-    for (role, val) in &gathered.new_values {
-        new_kv.insert(role.clone(), val.clone());
-        secret_keys.push(role.clone());
-    }
-    // --use-existing: reference an existing BARE secret KEY (no new value).
-    for existing in &gathered.existing {
-        if !new_kv.contains_key(existing) {
-            return Err(format!(
-                "--use-existing {}: no such secret in the vault",
-                existing
-            ));
-        }
-        secret_keys.push(existing.clone());
-    }
+    // `secret_keys` = every KEY the connection references (new + existing);
+    // the daemon verifies each `--use-existing` KEY actually exists.
+    let mut secret_keys: Vec<String> = gathered
+        .new_values
+        .iter()
+        .map(|(role, _)| role.clone())
+        .collect();
+    secret_keys.extend(gathered.existing.iter().cloned());
     dedup_upper(&mut secret_keys);
 
-    insert_raw_connection(&mut aux, name, &hosts, &secret_keys);
-    seal_and_submit_write(
+    // New VALUES go to the local daemon deposit; the op carries only the
+    // salted digest (the op JSON travels to the cloud grant page — §values).
+    let mut scope = json!({ "hosts": hosts, "secrets": secret_keys });
+    if !gathered.new_values.is_empty() {
+        let values: std::collections::BTreeMap<String, String> =
+            gathered.new_values.iter().cloned().collect();
+        scope["values_digest"] = json!(deposit_values(custodian, vault, &values).await?);
+    }
+    let op = json!({
+        "act": { "type": { "custom": "connection-add" }, "target": name, "scope": scope },
+        "bind": { "redeemer": vault },
+        "valid": { "iat": now_unix(), "multiplicity": "one" }
+    });
+    let opts = ApproveOpts {
+        no_browser: args.no_browser,
+        cb_port: args.cb_port,
+        timeout: args.timeout,
+    };
+    approve_op(
         custodian,
         vault,
-        &meta,
-        &user_key,
-        &new_kv,
-        &aux,
-        args.no_browser,
-        args.timeout,
-        args.cb_port,
+        &op,
+        &format!("Add connection {}", name),
+        &opts,
     )
     .await?;
 
@@ -384,22 +392,6 @@ async fn run_service_backed(
         }
     }
 
-    eprintln!(
-        "safeclaw connection add {} → service '{}' — two passkey gestures (unlock + write)",
-        name, service
-    );
-    let meta = fetch_passkey_meta(custodian, vault).await?;
-    let (kv, mut aux, user_key) = do_unlock(
-        custodian,
-        vault,
-        &meta,
-        args.no_browser,
-        args.timeout,
-        args.cb_port,
-    )
-    .await?;
-    let mut new_kv = kv;
-
     // Every secret is stored at a BARE uppercase KEY (§3): the role's own
     // mainstream name for the default connection (`name == service`), or the
     // suggested `<ROLE>_<QUALIFIER>` for a named one — recorded in the
@@ -415,25 +407,48 @@ async fn run_service_backed(
                 .collect(),
         )
     };
+    let mut values = std::collections::BTreeMap::new();
     for (role, val) in &gathered.new_values {
         let key = keys
             .as_ref()
             .and_then(|m| m.iter().find(|(r, _)| r == role).map(|(_, k)| k.clone()))
             .unwrap_or_else(|| role.clone());
-        new_kv.insert(key, val.clone());
+        values.insert(key, val.clone());
     }
 
-    insert_service_connection(&mut aux, name, service, pins.as_deref(), keys.as_deref());
-    seal_and_submit_write(
+    // New VALUES go to the local daemon deposit; the op carries only the
+    // salted digest plus the public shape (service, pins, key bindings).
+    let written_keys: Vec<String> = values.keys().cloned().collect();
+    let mut scope = json!({ "service": service, "secrets": written_keys });
+    if let Some(p) = &pins {
+        scope["hosts"] = json!(p);
+    }
+    if let Some(k) = keys.as_ref().filter(|k| !k.is_empty()) {
+        let map: serde_json::Map<String, Value> = k
+            .iter()
+            .map(|(role, key)| (role.clone(), Value::String(key.clone())))
+            .collect();
+        scope["keys"] = Value::Object(map);
+    }
+    if !values.is_empty() {
+        scope["values_digest"] = json!(deposit_values(custodian, vault, &values).await?);
+    }
+    let op = json!({
+        "act": { "type": { "custom": "connection-add" }, "target": name, "scope": scope },
+        "bind": { "redeemer": vault },
+        "valid": { "iat": now_unix(), "multiplicity": "one" }
+    });
+    let opts = ApproveOpts {
+        no_browser: args.no_browser,
+        cb_port: args.cb_port,
+        timeout: args.timeout,
+    };
+    approve_op(
         custodian,
         vault,
-        &meta,
-        &user_key,
-        &new_kv,
-        &aux,
-        args.no_browser,
-        args.timeout,
-        args.cb_port,
+        &op,
+        &format!("Add connection {}", name),
+        &opts,
     )
     .await?;
 

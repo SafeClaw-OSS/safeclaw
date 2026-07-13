@@ -58,12 +58,22 @@ pub fn app_router(state: Arc<AppState>) -> Router {
         .route("/skill.md", get(handlers::skill::skill_md))
         // Vault-scoped.
         .route("/v/{vid}/op", post(handlers::op::create))
+        // Local value deposit for connection-add / secret-set write ops — the
+        // op itself carries only a salted digest (its JSON rides to the cloud
+        // relay for the grant page; plaintext values never do).
+        .route("/v/{vid}/op-payload", post(handlers::op_payload::create))
         .route("/v/{vid}/sync", post(handlers::metadata::sync_now))
         .route("/v/{vid}/passkeys", get(handlers::metadata::passkeys))
-        .route("/v/{vid}/pending-passkeys", post(handlers::pending_passkey::create))
+        .route(
+            "/v/{vid}/pending-passkeys",
+            post(handlers::pending_passkey::create),
+        )
         .route("/v/{vid}/events", get(handlers::events::stream))
         .route("/v/{vid}/approvals", get(handlers::approvals::list))
-        .route("/v/{vid}/secret-keys", get(handlers::secret_keys::secret_keys))
+        .route(
+            "/v/{vid}/secret-keys",
+            get(handlers::secret_keys::secret_keys),
+        )
         .route("/v/{vid}/registry", get(handlers::registry::vault_registry))
         .route("/v/{vid}/usage", get(handlers::usage::usage))
         // Device egress-proxy hot-reload (after `sc proxy set/clear`) — no vault
