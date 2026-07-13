@@ -10,12 +10,22 @@
 //! Version-scheme-agnostic: rather than parse tags, it compares the verified
 //! download's hash to the running binary's hash and is a no-op when they match
 //! ("already up to date"). `--force` rewrites anyway.
+//!
+//! Channels: by default it tracks the STABLE line — GitHub's `releases/latest`,
+//! which excludes pre-releases. Dev builds cut off the `dev` branch are tagged
+//! `vX.Y.Z-rc.N` and published as GitHub pre-releases, so they never become
+//! "latest" and can't reach ordinary users. `--pre` opts in: it resolves the
+//! newest release INCLUDING pre-releases (via the releases API) and installs
+//! that — the dogfood path.
 
 use std::time::Duration;
 
 use crate::config::UpgradeArgs;
 
-const BASE: &str = "https://github.com/SafeClaw-OSS/safeclaw/releases/latest/download";
+const REPO: &str = "SafeClaw-OSS/safeclaw";
+/// Stable channel: GitHub's `latest` pointer, which by definition skips
+/// pre-releases and drafts — the asset base every ordinary `sc upgrade` uses.
+const LATEST_BASE: &str = "https://github.com/SafeClaw-OSS/safeclaw/releases/latest/download";
 
 /// Map the build target to the release asset name (matches install.sh + CI).
 fn asset_name() -> Result<&'static str, String> {
@@ -26,6 +36,47 @@ fn asset_name() -> Result<&'static str, String> {
         ("macos", "aarch64") => "safeclaw-macos-aarch64",
         (os, arch) => return Err(format!("unsupported platform {}/{}", os, arch)),
     })
+}
+
+/// Resolve the asset base URL for the requested channel, plus a short label for
+/// user messaging. Stable → GitHub's `latest/download` (no API call). `--pre` →
+/// query the releases API for the newest release (index 0, newest-first,
+/// INCLUDING pre-releases) and point at its `releases/download/<tag>` assets.
+async fn resolve_base(
+    client: &reqwest::Client,
+    pre: bool,
+) -> Result<(String, String), String> {
+    if !pre {
+        return Ok((LATEST_BASE.to_string(), "latest stable".to_string()));
+    }
+    // GitHub requires a User-Agent; the API returns releases newest-first and,
+    // unauthenticated, includes pre-releases but not drafts (CI never drafts).
+    let url = format!("https://api.github.com/repos/{}/releases?per_page=1", REPO);
+    let resp = client
+        .get(&url)
+        .header("User-Agent", "safeclaw-upgrade")
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await
+        .map_err(|e| format!("query releases: {}", e))?;
+    if !resp.status().is_success() {
+        return Err(format!("query releases: HTTP {}", resp.status()));
+    }
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("parse releases: {}", e))?;
+    let tag = body
+        .as_array()
+        .and_then(|a| a.first())
+        .and_then(|r| r.get("tag_name"))
+        .and_then(|t| t.as_str())
+        .ok_or("no releases found (including pre-releases)")?;
+    let base = format!(
+        "https://github.com/{}/releases/download/{}",
+        REPO, tag
+    );
+    Ok((base, format!("pre-release {}", tag)))
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -51,10 +102,16 @@ pub async fn run(args: UpgradeArgs) -> Result<(), String> {
         .build()
         .map_err(|e| format!("http client init: {}", e))?;
 
+    // 0. Resolve which release to pull from. Stable (default) = GitHub's
+    //    `latest` pointer, which skips pre-releases. `--pre` = the newest
+    //    release including pre-releases, resolved by tag so we download from the
+    //    exact `releases/download/<tag>` asset base.
+    let (base, channel) = resolve_base(&client, args.pre).await?;
+
     // 1. Fetch the published checksums first — refuse to install anything we
     //    can't verify (unlike install.sh, which warns-and-continues; a
     //    self-replacing binary is higher-stakes, so we hard-fail).
-    let sums_url = format!("{}/SHA256SUMS", BASE);
+    let sums_url = format!("{}/SHA256SUMS", base);
     let sums = client
         .get(&sums_url)
         .send()
@@ -68,8 +125,8 @@ pub async fn run(args: UpgradeArgs) -> Result<(), String> {
         .ok_or_else(|| format!("no checksum for {} in the latest release", asset))?;
 
     // 2. Download the asset.
-    let asset_url = format!("{}/{}", BASE, asset);
-    eprintln!("Fetching {} (latest release)…", asset);
+    let asset_url = format!("{}/{}", base, asset);
+    eprintln!("Fetching {} ({})…", asset, channel);
     let resp = client
         .get(&asset_url)
         .send()

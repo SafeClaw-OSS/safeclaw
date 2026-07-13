@@ -104,3 +104,8 @@ jobs:
         with:
           files: artifacts/*
           generate_release_notes: true
+          # Semver channel: a hyphenated tag (v1.2.3-rc.1) is a pre-release, so
+          # GitHub never moves the "latest" pointer to it and `sc upgrade` /
+          # install.sh (which pull releases/latest) skip it. A bare vX.Y.Z is
+          # stable and becomes latest. `sc upgrade --pre` opts into pre-releases.
+          prerelease: ${{ contains(github.ref_name, '-') }}

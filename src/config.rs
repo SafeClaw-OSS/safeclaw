@@ -865,6 +865,13 @@ pub struct UpgradeArgs {
     /// the latest release (otherwise `sc upgrade` is a no-op when current).
     #[arg(long)]
     pub force: bool,
+    /// Include pre-releases: install the newest release even if it's a
+    /// pre-release (a `vX.Y.Z-rc.N`-style tag). Default off, so `sc upgrade`
+    /// tracks only STABLE releases — a dev build cut off the `dev` branch is
+    /// published as a GitHub pre-release and never becomes "latest", so it can't
+    /// reach ordinary users. This flag is the opt-in for dogfooding those builds.
+    #[arg(long)]
+    pub pre: bool,
 }
 
 /// Args for `sc login`.
