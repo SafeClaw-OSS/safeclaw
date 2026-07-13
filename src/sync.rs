@@ -197,6 +197,7 @@ pub async fn sync_vault_now(state: &Arc<AppState>, vault_id: &str) -> Result<Syn
             }
             match pull_items(&state.config.state_dir, cloud2, vault_id, &dk2).await {
                 Ok(n) if n > 0 => {
+                    tracing::info!(vault = %vault_id, adopted = n, "per-item pull: adopted rows");
                     refresh_after_item_pull(state, vault_id);
                 }
                 Ok(_) => {}
@@ -979,7 +980,21 @@ pub async fn watch_loop(state: Arc<AppState>, vault: String, cloud: String, dk: 
     enum Wake {
         Blob(Result<reqwest::Response, reqwest::Error>),
         Items(Result<reqwest::Response, reqwest::Error>),
+        /// The reconciliation floor fired — no channel answered for a full
+        /// interval. Run the pull block anyway so staleness stays BOUNDED even
+        /// when both long-poll channels are wedged (laptop sleep / network
+        /// flap can strand a hold in a state where wakes stop arriving — seen
+        /// live 2026-07-13: a gmail connect's pre-sealed entry sat in the
+        /// cloud >1h while the daemon's channels stayed silent; `sc sync`
+        /// adopted it instantly).
+        Reconcile,
     }
+
+    /// Upper bound on how stale a wedged watcher can go. Long-poll wakes are
+    /// still the fast path (instant); this timer only matters when they stop
+    /// coming. One cheap cursor-read per interval per vault — noise next to
+    /// the ~25s park cycle.
+    const RECONCILE_INTERVAL: Duration = Duration::from_secs(300);
 
     let mut backoff = Duration::from_secs(2);
     let mut items_channel = true; // false after a 404 (backend without /items/wait)
@@ -1005,9 +1020,13 @@ pub async fn watch_loop(state: Arc<AppState>, vault: String, cloud: String, dk: 
                 tokio::select! {
                     r = blob_fut => Wake::Blob(r),
                     r = items_fut => Wake::Items(r),
+                    _ = tokio::time::sleep(RECONCILE_INTERVAL) => Wake::Reconcile,
                 }
             }
-            None => Wake::Blob(blob_fut.await),
+            None => tokio::select! {
+                r = blob_fut => Wake::Blob(r),
+                _ = tokio::time::sleep(RECONCILE_INTERVAL) => Wake::Reconcile,
+            },
         };
 
         match wake {
@@ -1125,9 +1144,21 @@ pub async fn watch_loop(state: Arc<AppState>, vault: String, cloud: String, dk: 
                     backoff = (backoff * 2).min(Duration::from_secs(60));
                 }
             },
-            Wake::Blob(Err(_)) | Wake::Items(Err(_)) => {
+            Wake::Reconcile => {
+                // No channel answered for a full interval (normal rounds turn
+                // over every ~25s). Whatever the holds are stuck on, the pull
+                // block below re-reads the real cursors and adopts anything
+                // missed; dropping the stale request futures re-arms both
+                // channels fresh next round.
+                tracing::info!(vault = %vault, "cloud sync watch: no wake for {}s — reconciling", RECONCILE_INTERVAL.as_secs());
+                pull_and_process(&state, &state_dir, &cloud, &vault, &dk, "reconcile").await;
+            }
+            Wake::Blob(Err(e)) | Wake::Items(Err(e)) => {
                 // Transient (timeout/offline). The 40s read-timeout exceeds the
-                // 25s server hold, so a clean long-poll return shouldn't error here.
+                // 25s server hold, so a clean long-poll return shouldn't error
+                // here — worth a (debug) trace: a silent Err loop reads as "the
+                // daemon is fine" while sync is actually down.
+                tracing::debug!(vault = %vault, "cloud sync watch: channel error: {}", e);
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(Duration::from_secs(60));
             }
@@ -1158,7 +1189,13 @@ async fn pull_and_process(
         Err(e) => tracing::debug!(vault = %vault, "cloud sync watch: keyset pull failed: {}", e),
     }
     match pull_items(state_dir, cloud, vault, dk).await {
-        Ok(n) if n > 0 => refresh_after_item_pull(state, vault),
+        Ok(n) if n > 0 => {
+            // INFO parity with the keyset line above: item adoptions are the
+            // content channel doing its job — their absence from the log was
+            // what made a wedged watcher indistinguishable from a quiet one.
+            tracing::info!(vault = %vault, adopted = n, "cloud sync watch: pulled item rows");
+            refresh_after_item_pull(state, vault);
+        }
         Ok(_) => {}
         Err(e) => tracing::debug!(vault = %vault, "cloud sync watch: per-item pull failed: {}", e),
     }
