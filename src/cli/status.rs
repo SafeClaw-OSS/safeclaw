@@ -1,7 +1,6 @@
 //! `safeclaw status` / `safeclaw vault status` — current vault status.
 
-use crate::cli::active::{join_vault_url, load as load_config};
-use crate::cli::discovery::{self, ConnRow};
+use crate::cli::active::{frontend_origin, join_vault_url, load as load_config};
 use crate::config::StatusArgs;
 
 #[derive(Debug)]
@@ -107,13 +106,9 @@ pub async fn run(args: StatusArgs) -> Result<(), String> {
         Some(v) => Some(fetch_status(&control, v).await),
         None => None,
     };
-    let conns: Vec<ConnRow> = match active_vault.as_deref() {
-        Some(v) => discovery::connections(&control, v).await.unwrap_or_default(),
-        None => Vec::new(),
-    };
 
     if args.json {
-        print_json(&d, &vault, &conns, env_pin.as_deref(), config_default.as_deref());
+        print_json(&d, &vault, env_pin.as_deref(), config_default.as_deref());
         return Ok(());
     }
 
@@ -129,6 +124,21 @@ pub async fn run(args: StatusArgs) -> Result<(), String> {
         }
     } else {
         println!("  state:   not running — bring it up with `sc up`");
+    }
+    println!();
+
+    // ── Login (device pairing) ──────────────────────────────────────────
+    // WHERE this host is paired, and which first-party environment — so a dev
+    // login is never mistaken for prod. Derived from the cloud origin persisted
+    // at `sc login`; `None` means a local-only daemon that was never paired.
+    println!("login");
+    match frontend_origin() {
+        Some(origin) => {
+            let host = origin_host(&origin);
+            println!("  state: logged in");
+            println!("  cloud: {} ({})", host, env_label(host));
+        }
+        None => println!("  state: not logged in — run `sc login`"),
     }
     println!();
 
@@ -155,30 +165,37 @@ pub async fn run(args: StatusArgs) -> Result<(), String> {
             println!("         unset SAFECLAW_VAULT_ID (or re-run `eval \"$(sc env)\"`) to follow the default");
         }
     }
-    println!();
-
-    // ── Connections (what the agent can use) ────────────────────────────
-    println!("connections");
-    if conns.is_empty() {
-        println!("  (none — add one with `sc connect <name> --host <domain>`, or in the console)");
-    } else {
-        for c in &conns {
-            println!("  {}", c.name);
-            if !c.hosts.is_empty() {
-                println!("    hosts:    {}", c.hosts.join(", "));
-            }
-            for ph in &c.phantoms {
-                println!("    phantom:  {}", ph);
-            }
-        }
-    }
+    // Connections are NOT shown here: while the vault is locked they can't be
+    // enumerated, so a "(none)" line would read as "you have zero" when the
+    // truth is "unknown until unlocked". The agent discovers them through the
+    // registry endpoint, and the human lists them with `sc connection ls`.
     Ok(())
+}
+
+/// `https://dev.safeclaw.pro/foo` → `dev.safeclaw.pro`. Scheme and any path are
+/// dropped; a bare host (no scheme) is returned unchanged.
+fn origin_host(origin: &str) -> &str {
+    origin
+        .split_once("://")
+        .map_or(origin, |(_, rest)| rest)
+        .split('/')
+        .next()
+        .unwrap_or(origin)
+}
+
+/// Short environment label for a paired cloud host: the first-party prod / dev
+/// domains, else `self-host`. Purely cosmetic — it never gates anything.
+fn env_label(host: &str) -> &'static str {
+    match host {
+        "safeclaw.pro" => "prod",
+        "dev.safeclaw.pro" => "dev",
+        _ => "self-host",
+    }
 }
 
 fn print_json(
     d: &LocalDaemon,
     vault: &Option<VaultStatus>,
-    conns: &[ConnRow],
     env_pin: Option<&str>,
     config_default: Option<&str>,
 ) {
@@ -196,13 +213,18 @@ fn print_json(
             "secrets": secrets,
         })
     });
-    let conns_json: Vec<serde_json::Value> = conns
-        .iter()
-        .map(|c| serde_json::json!({ "name": c.name, "hosts": c.hosts, "phantoms": c.phantoms }))
-        .collect();
+    let login_json = match frontend_origin() {
+        Some(origin) => {
+            let host = origin_host(&origin).to_string();
+            let env = env_label(&host);
+            serde_json::json!({ "logged_in": true, "cloud": host, "env": env })
+        }
+        None => serde_json::json!({ "logged_in": false }),
+    };
     let mismatch = matches!((env_pin, config_default), (Some(p), Some(c)) if p != c);
     let out = serde_json::json!({
         "daemon": { "up": d.up, "version": d.version, "vaults": d.vault_count },
+        "login": login_json,
         "vault": vault_json,
         // §5: the active vault + WHERE it came from (env pin vs device default),
         // so a mismatch is machine-detectable. No routing block — the broker is
@@ -212,7 +234,6 @@ fn print_json(
             "config_default": config_default,
             "mismatch": mismatch,
         },
-        "connections": conns_json,
     });
     println!("{}", serde_json::to_string_pretty(&out).unwrap_or_else(|_| out.to_string()));
 }

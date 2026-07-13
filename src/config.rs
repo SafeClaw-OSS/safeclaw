@@ -279,8 +279,8 @@ pub enum ConnectionSubcommand {
     /// (id → optional service → host(s) → secret(s)); off a terminal, pass the
     /// `<id>` and `--host`/`--secret` (or `--service`) as flags.
     Add(ConnectArgs),
-    /// List the connections the agent can use (id, hosts, phantoms) — the same
-    /// projection `sc status` shows. `--json` for scripts.
+    /// List the connections the agent can use (id, hosts, phantoms). Requires an
+    /// unlocked vault. `--json` for scripts.
     Ls(ConnectionLsArgs),
     /// Remove a connection and its secret(s) from the vault (two passkey
     /// gestures: unlock + write). Mirrors the console's "Disconnect".
