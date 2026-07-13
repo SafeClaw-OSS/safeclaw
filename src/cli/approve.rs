@@ -54,10 +54,10 @@ pub struct ApproveOpts {
     pub timeout: u64,
 }
 
-/// Cap the remote-approval wait just under the daemon's 300s op TTL — the user
-/// is doing a cross-device dance (open the link on their phone/laptop, tap a
-/// passkey), so give them the whole window rather than the short local-gesture
-/// timeout.
+/// Fallback remote-approval wait, used only until the first successful poll
+/// reveals the op's REAL `expires_at` — from then on the CLI waits out exactly
+/// the window the grant page shows the user. (A fixed 280s here once had the
+/// CLI give up at ~5min while the page still displayed a valid ~30min op.)
 const REMOTE_APPROVE_TIMEOUT_SECS: u64 = 280;
 const REMOTE_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
@@ -144,11 +144,12 @@ async fn remote_approve(custodian: &str, op_id: &str, label: &str) -> Result<Val
         custodian.trim_end_matches('/'),
         urlencoding::encode(op_id)
     );
-    let deadline = Instant::now() + Duration::from_secs(REMOTE_APPROVE_TIMEOUT_SECS);
+    let mut deadline = Instant::now() + Duration::from_secs(REMOTE_APPROVE_TIMEOUT_SECS);
+    let mut deadline_from_op = false;
     loop {
         if Instant::now() >= deadline {
             return Err(format!(
-                "timed out waiting for approval — open {} and tap your passkey, then retry",
+                "the approval window expired — re-run the command for a fresh link (was {})",
                 url
             ));
         }
@@ -164,6 +165,17 @@ async fn remote_approve(custodian: &str, op_id: &str, label: &str) -> Result<Val
             Ok(v) => v,
             Err(_) => continue,
         };
+        // Adopt the op's real expiry once: wait exactly as long as the grant
+        // page says the op is live (+ grace for the relay round-trip).
+        if !deadline_from_op {
+            if let Some(exp) = body.get("expires_at").and_then(|v| v.as_u64()) {
+                let now = now_unix();
+                if exp > now {
+                    deadline = Instant::now() + Duration::from_secs(exp - now + 10);
+                    deadline_from_op = true;
+                }
+            }
+        }
         match body.get("status").and_then(|s| s.as_str()).unwrap_or("") {
             // The daemon flips the op to approved once it applies the relayed
             // grant; "consumed" can win if something polled it first. Both mean
