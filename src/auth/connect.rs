@@ -305,8 +305,15 @@ impl ConnectReport {
 /// The bare host of a token endpoint (`https://oauth2.googleapis.com/token` →
 /// `oauth2.googleapis.com`), for the human-readable "couldn't reach X" signal.
 fn provider_host(token_url: &str) -> String {
-    let after = token_url.split_once("://").map(|(_, r)| r).unwrap_or(token_url);
-    after.split(['/', '?', '#']).next().unwrap_or(token_url).to_string()
+    let after = token_url
+        .split_once("://")
+        .map(|(_, r)| r)
+        .unwrap_or(token_url);
+    after
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(token_url)
+        .to_string()
 }
 
 /// Sentinel the exchange closure returns for a code THIS daemon has already
@@ -553,7 +560,14 @@ pub(crate) async fn apply_pending_connects(
     let mut m = if let Some(vault) = &vault_dat {
         match crate::server::handlers::metadata::open_protected_state_with_key(&k, vault) {
             Ok(m) => m,
-            Err(_) => return ConnectReport::default(), // rotated K — lock+unlock retries
+            Err(_) => {
+                // Rotated K — a re-unlock heals. Trace it: this return also
+                // silently skips loopback-listener arming, so without a line
+                // here a skipped scan is indistinguishable from "no pending
+                // connect".
+                tracing::debug!(vault = %vault_id, "oauth connect: vault.dat undecryptable with retained K — skipping scan (re-unlock heals)");
+                return ConnectReport::default();
+            }
         }
     } else {
         let Ok(pi_path) = state.vaults.per_item_path(vault_id) else {
@@ -566,7 +580,10 @@ pub(crate) async fn apply_pending_connects(
             &k, &pv, vault_id,
         ) {
             Ok(v) => v,
-            Err(_) => return ConnectReport::default(), // rotated K
+            Err(_) => {
+                tracing::debug!(vault = %vault_id, "oauth connect: per-item view undecryptable with retained K — skipping scan (re-unlock heals)");
+                return ConnectReport::default();
+            }
         };
         match build_m_from_view(&view) {
             Ok(m) => m,
@@ -853,7 +870,9 @@ pub(crate) fn persist_mutated_view(
         .join("vaults")
         .join(vault_id)
         .join("vault.dat");
-    let vault_dat = crate::storage::sealed_vault::read(&vault_path).ok().flatten();
+    let vault_dat = crate::storage::sealed_vault::read(&vault_path)
+        .ok()
+        .flatten();
     if let Some(mut vault) = vault_dat {
         crate::server::handlers::metadata::reseal_body_with_key(k, &mut vault, &m)
             .map_err(|e| format!("reseal vault.dat: {}", e))?;
@@ -1267,8 +1286,15 @@ mod tests {
         )
         .await;
 
-        assert!(report.completed.is_empty(), "a failed exchange completes nothing");
-        assert_eq!(report.failed.len(), 1, "invalid_grant is a terminal failure");
+        assert!(
+            report.completed.is_empty(),
+            "a failed exchange completes nothing"
+        );
+        assert_eq!(
+            report.failed.len(),
+            1,
+            "invalid_grant is a terminal failure"
+        );
         assert!(
             aux_map::<Connecting>(&m, "connecting").contains_key("gmail"),
             "connecting must survive a failed exchange (user retries within TTL)"
@@ -1287,12 +1313,24 @@ mod tests {
             Some("provider rejected the exchange: client_secret is missing.")
         );
         assert!(terminal_exchange_reason("… invalid_grant …").is_some());
-        assert!(terminal_exchange_reason("oauth2 code-exchange returned HTTP 401 — nope").is_some());
+        assert!(
+            terminal_exchange_reason("oauth2 code-exchange returned HTTP 401 — nope").is_some()
+        );
         // Network errors, 5xx, timeouts, and rate limits stay retryable.
-        assert!(terminal_exchange_reason("oauth2 code-exchange request failed: connection reset").is_none());
-        assert!(terminal_exchange_reason("oauth2 code-exchange returned HTTP 500 — oops").is_none());
-        assert!(terminal_exchange_reason("oauth2 code-exchange returned HTTP 429 — slow down").is_none());
-        assert!(terminal_exchange_reason("oauth2 code-exchange returned HTTP 408 — timeout").is_none());
+        assert!(
+            terminal_exchange_reason("oauth2 code-exchange request failed: connection reset")
+                .is_none()
+        );
+        assert!(
+            terminal_exchange_reason("oauth2 code-exchange returned HTTP 500 — oops").is_none()
+        );
+        assert!(
+            terminal_exchange_reason("oauth2 code-exchange returned HTTP 429 — slow down")
+                .is_none()
+        );
+        assert!(
+            terminal_exchange_reason("oauth2 code-exchange returned HTTP 408 — timeout").is_none()
+        );
     }
 
     #[tokio::test]
@@ -1308,20 +1346,38 @@ mod tests {
         assert_eq!((report.completed.len(), report.failed.len()), (0, 1));
         let entry = &aux_map::<Connecting>(&m, "connecting")["gmail"];
         assert!(
-            entry.oauth2.error.as_deref().unwrap_or("").contains("client_secret is missing."),
-            "the provider's reason must surface on the entry: {:?}", entry.oauth2.error
+            entry
+                .oauth2
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("client_secret is missing."),
+            "the provider's reason must surface on the entry: {:?}",
+            entry.oauth2.error
         );
 
         // A 5xx stays pending with NO error (retried next sync), but IS surfaced
         // as `unreached` so `sc sync` can say "couldn't reach the provider".
         let mut m = with_connecting("gmail", "gmail", "code-B");
-        let report = run_pending(&services, &no_custom(), &mut m, |_conn, _cfg, _p| async move {
-            Err("oauth2 code-exchange returned HTTP 500 — oops".to_string())
-        })
+        let report = run_pending(
+            &services,
+            &no_custom(),
+            &mut m,
+            |_conn, _cfg, _p| async move {
+                Err("oauth2 code-exchange returned HTTP 500 — oops".to_string())
+            },
+        )
         .await;
         assert_eq!((report.completed.len(), report.failed.len()), (0, 0));
-        assert_eq!(report.unreached.len(), 1, "a transient failure is reported as unreached");
-        assert!(aux_map::<Connecting>(&m, "connecting")["gmail"].oauth2.error.is_none());
+        assert_eq!(
+            report.unreached.len(),
+            1,
+            "a transient failure is reported as unreached"
+        );
+        assert!(aux_map::<Connecting>(&m, "connecting")["gmail"]
+            .oauth2
+            .error
+            .is_none());
     }
 
     #[tokio::test]
@@ -1335,16 +1391,26 @@ mod tests {
         // not a failure, so it must never clobber the live connection).
         let services = gmail_registry();
         let mut m = with_connecting("gmail", "gmail", "code-USED");
-        let report = run_pending(&services, &no_custom(), &mut m, |_conn, _cfg, _p| async move {
-            Err(ALREADY_REDEEMED.to_string())
-        })
+        let report = run_pending(
+            &services,
+            &no_custom(),
+            &mut m,
+            |_conn, _cfg, _p| async move { Err(ALREADY_REDEEMED.to_string()) },
+        )
         .await;
         assert_eq!(
-            (report.completed.len(), report.failed.len(), report.unreached.len()),
+            (
+                report.completed.len(),
+                report.failed.len(),
+                report.unreached.len()
+            ),
             (0, 0, 0),
             "a redeemed-code skip must report nothing"
         );
-        assert!(!report.changed(), "nothing mutated ⇒ caller must not persist/push");
+        assert!(
+            !report.changed(),
+            "nothing mutated ⇒ caller must not persist/push"
+        );
         let entry = &aux_map::<Connecting>(&m, "connecting")["gmail"];
         assert!(
             entry.oauth2.error.is_none(),
