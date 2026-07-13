@@ -98,8 +98,12 @@ pub async fn pull_on_start(state_dir: &Path) {
     }
     for vault in &ids {
         match pull(state_dir, cloud, vault, &dk).await {
-            Ok(PullOutcome::Updated(version)) => tracing::info!(vault = %vault, version, "cloud sync: pulled vault.dat from cloud"),
-            Ok(PullOutcome::Unchanged) => tracing::debug!(vault = %vault, "cloud sync: local vault.dat already current"),
+            Ok(PullOutcome::Updated(version)) => {
+                tracing::info!(vault = %vault, version, "cloud sync: pulled vault.dat from cloud")
+            }
+            Ok(PullOutcome::Unchanged) => {
+                tracing::debug!(vault = %vault, "cloud sync: local vault.dat already current")
+            }
             Ok(PullOutcome::Deleted) => {
                 // The vault was deleted (tombstoned) cloud-side while this device
                 // was offline. Drop the local copy on startup so we never serve a
@@ -109,13 +113,17 @@ pub async fn pull_on_start(state_dir: &Path) {
                 drop_local_vault_disk(state_dir, vault);
                 tracing::info!(vault = %vault, "cloud sync: vault deleted upstream; dropped local state");
             }
-            Err(e) => tracing::warn!(vault = %vault, "cloud sync pull failed (serving local state): {}", e),
+            Err(e) => {
+                tracing::warn!(vault = %vault, "cloud sync pull failed (serving local state): {}", e)
+            }
         }
         // PER-ITEM: pull the KEYSET (the passkey-wrap layer, now on `/keys`)
         // BEFORE the content rows, so the folded view later sees a fresh K-wrap
         // layer. Best-effort; a 404 / non-per-item vault is a no-op.
         match pull_keys(state_dir, cloud, vault, &dk).await {
-            Ok(n) if n > 0 => tracing::info!(vault = %vault, adopted = n, "cloud sync: pulled keyset rows"),
+            Ok(n) if n > 0 => {
+                tracing::info!(vault = %vault, adopted = n, "cloud sync: pulled keyset rows")
+            }
             Ok(_) => {}
             Err(e) => tracing::debug!(vault = %vault, "cloud sync: keyset pull failed: {}", e),
         }
@@ -123,7 +131,9 @@ pub async fn pull_on_start(state_dir: &Path) {
         // the first unlock folds them). Best-effort; a 404 / non-per-item vault
         // is a no-op.
         match pull_items(state_dir, cloud, vault, &dk).await {
-            Ok(n) if n > 0 => tracing::info!(vault = %vault, adopted = n, "cloud sync: pulled item rows"),
+            Ok(n) if n > 0 => {
+                tracing::info!(vault = %vault, adopted = n, "cloud sync: pulled item rows")
+            }
             Ok(_) => {}
             Err(e) => tracing::debug!(vault = %vault, "cloud sync: per-item pull failed: {}", e),
         }
@@ -179,7 +189,10 @@ pub async fn sync_vault_now(state: &Arc<AppState>, vault_id: &str) -> Result<Syn
             // return without the connect step (there is nothing left to act on).
             drop_local_vault_locked(state, vault_id).await;
             tracing::info!(vault = %vault_id, "cloud sync: vault deleted upstream; dropped local state");
-            return Ok(SyncOutcome { pulled: false, connects: Default::default() });
+            return Ok(SyncOutcome {
+                pulled: false,
+                connects: Default::default(),
+            });
         }
     };
     // PER-ITEM: pull the KEYSET (`/keys`), then the content item rows (`/items`).
@@ -191,7 +204,9 @@ pub async fn sync_vault_now(state: &Arc<AppState>, vault_id: &str) -> Result<Syn
     if let Some(cloud2) = cfg.cloud_backend.as_deref().filter(|s| !s.is_empty()) {
         if let Some(dk2) = device_key() {
             match pull_keys(&state.config.state_dir, cloud2, vault_id, &dk2).await {
-                Ok(n) if n > 0 => tracing::info!(vault = %vault_id, adopted = n, "keyset pull: adopted rows"),
+                Ok(n) if n > 0 => {
+                    tracing::info!(vault = %vault_id, adopted = n, "keyset pull: adopted rows")
+                }
                 Ok(_) => {}
                 Err(e) => tracing::debug!(vault = %vault_id, "keyset pull failed: {}", e),
             }
@@ -480,7 +495,9 @@ fn drop_local_vault(state: &Arc<AppState>, vault: &str) {
     match active::forget_vault(vault) {
         Ok(true) => {}
         Ok(false) => {}
-        Err(e) => tracing::warn!(vault = %vault, "cloud sync: failed to forget vault from CLI config: {}", e),
+        Err(e) => {
+            tracing::warn!(vault = %vault, "cloud sync: failed to forget vault from CLI config: {}", e)
+        }
     }
 }
 
@@ -514,7 +531,12 @@ fn refresh_after_pull(state: &Arc<AppState>, vault: &str) {
     let Some(k) = state.cloned_state_key(vault) else {
         return; // Locked — no retained K
     };
-    let vault_path = state.config.state_dir.join("vaults").join(vault).join("vault.dat");
+    let vault_path = state
+        .config
+        .state_dir
+        .join("vaults")
+        .join(vault)
+        .join("vault.dat");
     let sealed = match sealed_vault::read(&vault_path) {
         Ok(Some(v)) => v,
         _ => return,
@@ -595,13 +617,7 @@ pub async fn push_blob_best_effort(state: &Arc<AppState>, vault_id: &str) {
             let base_version = read_local_version(&state.config.state_dir, vault_id);
             serde_json::json!({ "blob": blob, "base_version": base_version })
         };
-        let resp = match client
-            .put(&url)
-            .bearer_auth(&dk)
-            .json(&body)
-            .send()
-            .await
-        {
+        let resp = match client.put(&url).bearer_auth(&dk).json(&body).send().await {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!(vault = %vault_id, "push-back: PUT failed: {}", e);
@@ -714,7 +730,11 @@ async fn fetch_agent_key_hashes(
     let keys = body.get("keys")?.as_array()?;
     Some(
         keys.iter()
-            .filter_map(|k| k.get("hash").and_then(|h| h.as_str()).map(|s| s.to_string()))
+            .filter_map(|k| {
+                k.get("hash")
+                    .and_then(|h| h.as_str())
+                    .map(|s| s.to_string())
+            })
             .collect(),
     )
 }
@@ -968,7 +988,8 @@ fn retention_cutoff(days: u32) -> Option<i64> {
 pub async fn watch_loop(state: Arc<AppState>, vault: String, cloud: String, dk: String) {
     let state_dir = state.config.state_dir.clone();
     // Read-timeout MUST exceed the server's long-poll hold (~25s) plus slack.
-    let client = match crate::cli::egress_proxy::client(Duration::from_secs(40)) {
+    const WATCH_TIMEOUT: Duration = Duration::from_secs(40);
+    let mut client = match crate::cli::egress_proxy::client(WATCH_TIMEOUT) {
         Ok(c) => c,
         Err(e) => {
             tracing::warn!("cloud sync watch: client init failed: {}", e);
@@ -995,10 +1016,30 @@ pub async fn watch_loop(state: Arc<AppState>, vault: String, cloud: String, dk: 
     /// coming. One cheap cursor-read per interval per vault — noise next to
     /// the ~25s park cycle.
     const RECONCILE_INTERVAL: Duration = Duration::from_secs(300);
+    /// Rebuild the HTTP client after this many consecutive channel errors. A
+    /// poisoned connection pool (network flap / laptop sleep leaves half-open
+    /// sockets, a dead egress-proxy hop) fails every request from THIS client
+    /// while a fresh one works — seen live 2026-07-13: a laptop watcher went
+    /// silent for >1h while a fresh `sc sync` client adopted rows instantly.
+    const REBUILD_AFTER_ERRS: u32 = 3;
+    /// How long an auth-rejected (401/403) watcher parks before retrying. The
+    /// old behavior — `return`, killing sync for the daemon's lifetime — meant
+    /// ONE transient 403 (a backend deploy / auth-table migration) silently
+    /// ended a device's sync forever. A genuinely revoked device now burns one
+    /// cheap request per interval instead; real deletion still arrives as the
+    /// blob channel's tombstone.
+    const AUTH_RETRY: Duration = Duration::from_secs(600);
+    /// Wall-vs-monotonic divergence that reads as "the system slept mid-round".
+    /// macOS/Linux monotonic clocks exclude suspend, so a lid-close shows up as
+    /// wall time far ahead of monotonic time for the same round.
+    const SUSPEND_SLACK: Duration = Duration::from_secs(30);
 
     let mut backoff = Duration::from_secs(2);
+    let mut consec_errs = 0u32;
     let mut items_channel = true; // false after a 404 (backend without /items/wait)
     loop {
+        let round_wall = std::time::SystemTime::now();
+        let round_mono = std::time::Instant::now();
         let local_ver = read_local_version(&state_dir, &vault);
         let blob_url = format!("{}/v/{}/blob/wait?since={}", cloud, vault, local_ver);
         let blob_fut = client.get(&blob_url).bearer_auth(&dk).send();
@@ -1029,10 +1070,33 @@ pub async fn watch_loop(state: Arc<AppState>, vault: String, cloud: String, dk: 
             },
         };
 
+        // Suspend detection: wall time far ahead of monotonic time for one
+        // round means the system slept mid-hold. Whatever state the parked
+        // request / connection pool woke up in, don't trust it: fresh client,
+        // immediate reconcile, fresh holds. This is what turns "laptop lid
+        // reopened" into a ~1s catch-up instead of a silent stale watcher.
+        let wall = round_wall.elapsed().unwrap_or_default();
+        let mono = round_mono.elapsed();
+        if wall > mono + SUSPEND_SLACK {
+            tracing::info!(
+                vault = %vault,
+                slept_secs = (wall - mono).as_secs(),
+                "cloud sync watch: system suspend detected mid-round — rebuilding client + reconciling"
+            );
+            if let Ok(c) = crate::cli::egress_proxy::client(WATCH_TIMEOUT) {
+                client = c;
+            }
+            pull_and_process(&state, &state_dir, &cloud, &vault, &dk, "resume").await;
+            backoff = Duration::from_secs(2);
+            consec_errs = 0;
+            continue; // drop the possibly-stale wake; fresh holds re-deliver
+        }
+
         match wake {
             Wake::Blob(Ok(resp)) => match resp.status().as_u16() {
                 200 => {
                     backoff = Duration::from_secs(2);
+                    consec_errs = 0;
                     let body: serde_json::Value = match resp.json().await {
                         Ok(b) => b,
                         Err(_) => {
@@ -1053,7 +1117,11 @@ pub async fn watch_loop(state: Arc<AppState>, vault: String, cloud: String, dk: 
                         tracing::info!(vault = %vault, "cloud sync: vault deleted upstream; dropped local state");
                         return;
                     }
-                    if body.get("unchanged").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    if body
+                        .get("unchanged")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false)
+                    {
                         // Long-poll window elapsed with no change — re-poll.
                         continue;
                     }
@@ -1102,8 +1170,16 @@ pub async fn watch_loop(state: Arc<AppState>, vault: String, cloud: String, dk: 
                     tokio::time::sleep(Duration::from_secs(5)).await;
                 }
                 401 | 403 => {
-                    tracing::warn!(vault = %vault, "cloud sync watch: auth rejected (HTTP {}); stopping", resp.status());
-                    return;
+                    // Park, don't die: a transient 403 (backend deploy, auth
+                    // migration) must not end this device's sync until daemon
+                    // restart. See AUTH_RETRY.
+                    tracing::warn!(
+                        vault = %vault,
+                        "cloud sync watch: auth rejected (HTTP {}); retrying in {}s",
+                        resp.status(),
+                        AUTH_RETRY.as_secs()
+                    );
+                    tokio::time::sleep(AUTH_RETRY).await;
                 }
                 _ => {
                     tokio::time::sleep(backoff).await;
@@ -1113,6 +1189,7 @@ pub async fn watch_loop(state: Arc<AppState>, vault: String, cloud: String, dk: 
             Wake::Items(Ok(resp)) => match resp.status().as_u16() {
                 200 => {
                     backoff = Duration::from_secs(2);
+                    consec_errs = 0;
                     let body: serde_json::Value = match resp.json().await {
                         Ok(b) => b,
                         Err(_) => {
@@ -1120,7 +1197,11 @@ pub async fn watch_loop(state: Arc<AppState>, vault: String, cloud: String, dk: 
                             continue;
                         }
                     };
-                    if body.get("unchanged").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    if body
+                        .get("unchanged")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false)
+                    {
                         // Long-poll window elapsed with no change — re-poll.
                         continue;
                     }
@@ -1158,7 +1239,24 @@ pub async fn watch_loop(state: Arc<AppState>, vault: String, cloud: String, dk: 
                 // 25s server hold, so a clean long-poll return shouldn't error
                 // here — worth a (debug) trace: a silent Err loop reads as "the
                 // daemon is fine" while sync is actually down.
-                tracing::debug!(vault = %vault, "cloud sync watch: channel error: {}", e);
+                consec_errs += 1;
+                tracing::debug!(vault = %vault, errors = consec_errs, "cloud sync watch: channel error: {}", e);
+                if consec_errs % REBUILD_AFTER_ERRS == 0 {
+                    // Every request from this client failing while the network
+                    // may be fine points at the client itself (poisoned pool /
+                    // stale proxy tunnel). Swap it and reconcile — if the
+                    // network really is down, the fresh client fails the same
+                    // cheap way and we're back here one backoff later.
+                    tracing::warn!(
+                        vault = %vault,
+                        errors = consec_errs,
+                        "cloud sync watch: consecutive channel errors — rebuilding HTTP client + reconciling"
+                    );
+                    if let Ok(c) = crate::cli::egress_proxy::client(WATCH_TIMEOUT) {
+                        client = c;
+                    }
+                    pull_and_process(&state, &state_dir, &cloud, &vault, &dk, "rebuild").await;
+                }
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(Duration::from_secs(60));
             }
@@ -1184,7 +1282,9 @@ async fn pull_and_process(
     channel: &str,
 ) {
     match pull_keys(state_dir, cloud, vault, dk).await {
-        Ok(n) if n > 0 => tracing::info!(vault = %vault, adopted = n, "cloud sync watch: pulled keyset rows"),
+        Ok(n) if n > 0 => {
+            tracing::info!(vault = %vault, adopted = n, "cloud sync watch: pulled keyset rows")
+        }
         Ok(_) => {}
         Err(e) => tracing::debug!(vault = %vault, "cloud sync watch: keyset pull failed: {}", e),
     }
@@ -1243,12 +1343,18 @@ struct ItemRow {
 
 /// Load the per-item store for a vault, or `None` if it doesn't exist yet.
 fn read_per_item_store(state_dir: &Path, vault: &str) -> Option<PerItemVault> {
-    let path = state_dir.join("vaults").join(vault).join("vault.per-item.json");
+    let path = state_dir
+        .join("vaults")
+        .join(vault)
+        .join("vault.per-item.json");
     pv_store::read_per_item(&path).ok().flatten()
 }
 
 fn write_per_item_store(state_dir: &Path, vault: &str, pv: &PerItemVault) -> Result<(), String> {
-    let path = state_dir.join("vaults").join(vault).join("vault.per-item.json");
+    let path = state_dir
+        .join("vaults")
+        .join(vault)
+        .join("vault.per-item.json");
     pv_store::write_per_item_atomic(&path, pv).map_err(|e| format!("write per-item store: {}", e))
 }
 
@@ -1326,7 +1432,10 @@ pub async fn pull_items(
         .transpose()
         .map_err(|e| format!("parse items array: {}", e))?
         .unwrap_or_default();
-    let max_seq = body.get("seq").and_then(|v| v.as_u64()).unwrap_or(pv.items_seq);
+    let max_seq = body
+        .get("seq")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(pv.items_seq);
     let adopted = adopt_item_rows(&mut pv, &rows, max_seq)?;
     if adopted > 0 || max_seq > 0 {
         write_per_item_store(state_dir, vault, &pv)?;
@@ -1379,7 +1488,8 @@ pub async fn push_item(
         .map_err(|e| format!("reach {}: {}", cloud, e))?;
     match resp.status().as_u16() {
         200 => {
-            let b: serde_json::Value = resp.json().await.map_err(|e| format!("parse put: {}", e))?;
+            let b: serde_json::Value =
+                resp.json().await.map_err(|e| format!("parse put: {}", e))?;
             Ok(PushOutcome::Ok {
                 version: b.get("version").and_then(|v| v.as_u64()).unwrap_or(version),
                 seq: b.get("seq").and_then(|v| v.as_u64()).unwrap_or(0),
@@ -1391,7 +1501,9 @@ pub async fn push_item(
                 .get("currentVersion")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(version);
-            Ok(PushOutcome::Conflict { current_version: current })
+            Ok(PushOutcome::Conflict {
+                current_version: current,
+            })
         }
         404 => Ok(PushOutcome::EndpointMissing),
         other => Err(format!("item PUT HTTP {}", other)),
@@ -1466,7 +1578,14 @@ pub async fn push_items_best_effort(state: &Arc<AppState>, vault_id: &str) {
         .items
         .iter()
         .filter(|(_, s)| s.version > s.synced_version)
-        .map(|(id, s)| (id.clone(), s.version, URL_SAFE_NO_PAD.encode(&s.ct), s.tombstone))
+        .map(|(id, s)| {
+            (
+                id.clone(),
+                s.version,
+                URL_SAFE_NO_PAD.encode(&s.ct),
+                s.tombstone,
+            )
+        })
         .collect();
     if rows.is_empty() {
         return;
@@ -1648,7 +1767,10 @@ pub async fn pull_keys(
         .transpose()
         .map_err(|e| format!("parse keys array: {}", e))?
         .unwrap_or_default();
-    let max_seq = body.get("seq").and_then(|v| v.as_u64()).unwrap_or(pv.keyset_seq);
+    let max_seq = body
+        .get("seq")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(pv.keyset_seq);
     let adopted = adopt_key_rows(&mut pv, &rows)?;
     if max_seq > pv.keyset_seq {
         pv.keyset_seq = max_seq;
@@ -1761,7 +1883,11 @@ pub async fn push_keys_best_effort(state: &Arc<AppState>, vault_id: &str) {
         let cid_b64 = URL_SAFE_NO_PAD.encode(&cred.credential_id);
         // Pull the registry pubkey for x/y/device_name; keep x/y verbatim (they
         // are already the strings the frontend wrote — std-base64).
-        let pk = match pv.keyset.registry.get::<sudp::passkey::WebAuthn>(&cred.credential_id) {
+        let pk = match pv
+            .keyset
+            .registry
+            .get::<sudp::passkey::WebAuthn>(&cred.credential_id)
+        {
             Ok(Some(pk)) => pk,
             _ => continue, // no registry entry — can't form a complete row
         };
@@ -1786,8 +1912,8 @@ pub async fn push_keys_best_effort(state: &Arc<AppState>, vault_id: &str) {
     for (cid_b64, data) in rows {
         let cloud_ver = cloud_versions.get(&cid_b64).copied();
         let (base_version, version) = match cloud_ver {
-            Some(v) => (Some(v), v + 1),         // UPDATE: CAS against cloud's version
-            None => (None, 1),                   // CREATE: omit base_version
+            Some(v) => (Some(v), v + 1), // UPDATE: CAS against cloud's version
+            None => (None, 1),           // CREATE: omit base_version
         };
         match push_key(cloud, vault_id, &dk, &cid_b64, base_version, version, &data).await {
             Ok(PushOutcome::Ok { .. }) => {}
@@ -1877,7 +2003,8 @@ async fn push_key(
         .map_err(|e| format!("reach {}: {}", cloud, e))?;
     match resp.status().as_u16() {
         200 => {
-            let b: serde_json::Value = resp.json().await.map_err(|e| format!("parse put: {}", e))?;
+            let b: serde_json::Value =
+                resp.json().await.map_err(|e| format!("parse put: {}", e))?;
             Ok(PushOutcome::Ok {
                 version: b.get("version").and_then(|v| v.as_u64()).unwrap_or(version),
                 seq: b.get("seq").and_then(|v| v.as_u64()).unwrap_or(0),
@@ -1889,7 +2016,9 @@ async fn push_key(
                 .get("currentVersion")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(version);
-            Ok(PushOutcome::Conflict { current_version: current })
+            Ok(PushOutcome::Conflict {
+                current_version: current,
+            })
         }
         404 => Ok(PushOutcome::EndpointMissing),
         other => Err(format!("key PUT HTTP {}", other)),
@@ -1925,13 +2054,22 @@ mod peritem_tests {
         // Local row at version 2.
         let id = pv
             .seal_and_upsert::<StdPrimitives>(
-                &k, vid, ItemNs::Secret, "A", 2,
+                &k,
+                vid,
+                ItemNs::Secret,
+                "A",
+                2,
                 &crate::storage::item::ItemPayload::secret_live("A", "local"),
             )
             .unwrap();
 
         // A stale row (version 1) must NOT replace it.
-        let stale = ItemRow { item_id: id.clone(), version: 1, seq: 5, ct: "AAAA".into() };
+        let stale = ItemRow {
+            item_id: id.clone(),
+            version: 1,
+            seq: 5,
+            ct: "AAAA".into(),
+        };
         let n = adopt_item_rows(&mut pv, std::slice::from_ref(&stale), 5).unwrap();
         assert_eq!(n, 0, "stale version ignored");
         assert_eq!(pv.get_item(&id).unwrap().version, 2);
@@ -1941,7 +2079,12 @@ mod peritem_tests {
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         use base64::Engine;
         let newer_ct = URL_SAFE_NO_PAD.encode([1u8, 2, 3, 4]);
-        let newer = ItemRow { item_id: id.clone(), version: 3, seq: 9, ct: newer_ct };
+        let newer = ItemRow {
+            item_id: id.clone(),
+            version: 3,
+            seq: 9,
+            ct: newer_ct,
+        };
         let n = adopt_item_rows(&mut pv, std::slice::from_ref(&newer), 9).unwrap();
         assert_eq!(n, 1);
         assert_eq!(pv.get_item(&id).unwrap().version, 3);
@@ -1968,8 +2111,8 @@ mod peritem_tests {
         // Pick wrap bytes whose STANDARD base64 contains `+` AND `/` (so a strict
         // base64url decoder would REJECT them → the exact break this guards).
         let wrapped_key_raw: Vec<u8> = vec![
-            0xFB, 0xFF, 0xBF, 0x00, 0x10, 0x83, 0x10, 0x51, 0x87, 0x20, 0x92, 0x8B,
-            0x30, 0xD3, 0x8F, 0x41, 0x14, 0x93, 0x51, 0x55, 0x97, 0x61, 0x96, 0x9B,
+            0xFB, 0xFF, 0xBF, 0x00, 0x10, 0x83, 0x10, 0x51, 0x87, 0x20, 0x92, 0x8B, 0x30, 0xD3,
+            0x8F, 0x41, 0x14, 0x93, 0x51, 0x55, 0x97, 0x61, 0x96, 0x9B,
         ];
         let x_raw: Vec<u8> = vec![0xAAu8; 32];
         let y_raw: Vec<u8> = vec![0xBBu8; 32];
@@ -2013,7 +2156,10 @@ mod peritem_tests {
             .find(|c| c.credential_id == cred_id_raw)
             .expect("credential adopted");
         assert_eq!(cred.prf_salt, prf_salt_raw, "prf_salt lenient-decoded");
-        assert_eq!(cred.wrapped_key, wrapped_key_raw, "wrapped_key lenient-decoded");
+        assert_eq!(
+            cred.wrapped_key, wrapped_key_raw,
+            "wrapped_key lenient-decoded"
+        );
 
         // 2. The registry has the pubkey entry (x/y kept verbatim as the frontend
         //    strings; sudp stores WebAuthnPublicKey.x/y as-is).
@@ -2030,7 +2176,11 @@ mod peritem_tests {
         //    the credential.
         let _ = adopt_key_rows(&mut pv, std::slice::from_ref(&row)).unwrap();
         assert_eq!(
-            pv.keyset.credentials.iter().filter(|c| c.credential_id == cred_id_raw).count(),
+            pv.keyset
+                .credentials
+                .iter()
+                .filter(|c| c.credential_id == cred_id_raw)
+                .count(),
             1,
             "no duplicate credential on re-adopt"
         );
@@ -2091,7 +2241,10 @@ mod tests {
         let path = dir.path().join("vault.dat");
         sealed_vault::write_atomic(&path, &sealed).unwrap();
         let back = sealed_vault::read(&path).unwrap().unwrap();
-        assert_eq!(back.credentials[0].credential_id, sealed.credentials[0].credential_id);
+        assert_eq!(
+            back.credentials[0].credential_id,
+            sealed.credentials[0].credential_id
+        );
         assert_eq!(back.ciphertext, sealed.ciphertext);
     }
 
@@ -2110,7 +2263,12 @@ mod tests {
         let outcome = classify_pull_body(dir.path(), "v-del", &body).unwrap();
         assert_eq!(outcome, PullOutcome::Deleted);
         // No vault.dat or sidecar created by the classifier.
-        assert!(!dir.path().join("vaults").join("v-del").join("vault.dat").exists());
+        assert!(!dir
+            .path()
+            .join("vaults")
+            .join("v-del")
+            .join("vault.dat")
+            .exists());
         assert!(!version_sidecar(dir.path(), "v-del").exists());
     }
 
@@ -2147,7 +2305,12 @@ mod tests {
             PullOutcome::Unchanged
         );
         // No vault.dat written — a lifecycle marker is not content.
-        assert!(!dir.path().join("vaults").join("v-life").join("vault.dat").exists());
+        assert!(!dir
+            .path()
+            .join("vaults")
+            .join("v-life")
+            .join("vault.dat")
+            .exists());
         // ...but the cursor advanced, so the next since=7 probe can park.
         assert_eq!(read_local_version(dir.path(), "v-life"), 7);
         // Even a bare `{}` (no blob, no status, no unchanged) is Unchanged, not
@@ -2172,7 +2335,12 @@ mod tests {
             classify_pull_body(dir.path(), "v-wrap", &wrapped).unwrap(),
             PullOutcome::Unchanged
         );
-        assert!(!dir.path().join("vaults").join("v-wrap").join("vault.dat").exists());
+        assert!(!dir
+            .path()
+            .join("vaults")
+            .join("v-wrap")
+            .join("vault.dat")
+            .exists());
         assert_eq!(read_local_version(dir.path(), "v-wrap"), 9);
     }
 
@@ -2200,7 +2368,12 @@ mod tests {
         let body = serde_json::json!({ "version": 42u64, "blob": blob });
         let outcome = classify_pull_body(dir.path(), "v-live", &body).unwrap();
         assert_eq!(outcome, PullOutcome::Updated(42));
-        assert!(dir.path().join("vaults").join("v-live").join("vault.dat").exists());
+        assert!(dir
+            .path()
+            .join("vaults")
+            .join("v-live")
+            .join("vault.dat")
+            .exists());
         assert_eq!(read_local_version(dir.path(), "v-live"), 42);
     }
 
@@ -2219,8 +2392,14 @@ mod tests {
             daemon: Some("http://localhost:1".into()),
             vault: Some("vid-A".into()),
             known_vaults: vec![
-                KnownVault { daemon: "http://localhost:1".into(), vault: "vid-A".into() },
-                KnownVault { daemon: "http://localhost:1".into(), vault: "vid-B".into() },
+                KnownVault {
+                    daemon: "http://localhost:1".into(),
+                    vault: "vid-A".into(),
+                },
+                KnownVault {
+                    daemon: "http://localhost:1".into(),
+                    vault: "vid-B".into(),
+                },
             ],
             ..Default::default()
         };
@@ -2233,7 +2412,10 @@ mod tests {
         let after = active::load().unwrap();
         assert!(after.vault.is_none());
         assert!(after.daemon.is_none());
-        assert!(after.known_vaults.is_empty(), "legacy field migrated to the file");
+        assert!(
+            after.known_vaults.is_empty(),
+            "legacy field migrated to the file"
+        );
         // Dropping the ACTIVE vault leaves the deleted-upstream breadcrumb so
         // `sc status` / `resolve_active` can say "re-pair", not "no vaults yet".
         assert_eq!(after.vault_deleted_upstream.as_deref(), Some("vid-A"));
@@ -2247,7 +2429,10 @@ mod tests {
         // breadcrumb overwrite (vid-A is still the one worth reporting).
         assert_eq!(active::forget_vault("vid-B"), Ok(true));
         assert!(active::known_vaults().is_empty());
-        assert_eq!(active::load().unwrap().vault_deleted_upstream.as_deref(), Some("vid-A"));
+        assert_eq!(
+            active::load().unwrap().vault_deleted_upstream.as_deref(),
+            Some("vid-A")
+        );
 
         // The next successful pairing/selection clears the breadcrumb.
         active::put_active("http://localhost:1", "vid-C").unwrap();
