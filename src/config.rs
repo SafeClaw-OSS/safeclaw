@@ -865,13 +865,20 @@ pub struct UpgradeArgs {
     /// the latest release (otherwise `sc upgrade` is a no-op when current).
     #[arg(long)]
     pub force: bool,
-    /// Include pre-releases: install the newest release even if it's a
-    /// pre-release (a `vX.Y.Z-rc.N`-style tag). Default off, so `sc upgrade`
-    /// tracks only STABLE releases — a dev build cut off the `dev` branch is
-    /// published as a GitHub pre-release and never becomes "latest", so it can't
-    /// reach ordinary users. This flag is the opt-in for dogfooding those builds.
-    #[arg(long)]
+    /// Force the PRE-RELEASE channel: install the newest release even if it's a
+    /// `vX.Y.Z-rc.N` pre-release. Normally the channel is DERIVED from the cloud
+    /// this host is paired to (a `dev.*` login tracks pre-releases, prod tracks
+    /// stable), so a dogfood box needs no flag — plain `sc upgrade` already
+    /// tracks rc. This override is for the rare case of pulling an rc while
+    /// paired to prod. Mutually exclusive with `--stable`.
+    #[arg(long, conflicts_with = "stable")]
     pub pre: bool,
+    /// Force the STABLE channel: track only stable releases (GitHub's `latest`,
+    /// which skips pre-releases) regardless of derivation. The escape hatch for a
+    /// `dev.*`-paired box that wants to drop back to stable. Mutually exclusive
+    /// with `--pre`.
+    #[arg(long)]
+    pub stable: bool,
 }
 
 /// Args for `sc login`.
