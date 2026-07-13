@@ -6,6 +6,10 @@ use crate::config::StatusArgs;
 #[derive(Debug)]
 pub struct VaultStatus {
     pub url: String,
+    /// Web console page for this vault (`{frontend_origin}/vault/{id}`) — the
+    /// one URL here that IS meant for a browser. `None` when the device was
+    /// never paired (local-only / self-host: no console exists).
+    pub console: Option<String>,
     pub state: VaultState,
 }
 
@@ -36,53 +40,105 @@ pub async fn probe_local_daemon(control_root: &str) -> LocalDaemon {
         .build()
     {
         Ok(c) => c,
-        Err(_) => return LocalDaemon { up: false, version: None, vault_count: None },
+        Err(_) => {
+            return LocalDaemon {
+                up: false,
+                version: None,
+                vault_count: None,
+            }
+        }
     };
     let health_url = format!("{}/health", control_root.trim_end_matches('/'));
     let resp = match client.get(&health_url).send().await {
         Ok(r) if r.status().is_success() => r,
-        _ => return LocalDaemon { up: false, version: None, vault_count: None },
+        _ => {
+            return LocalDaemon {
+                up: false,
+                version: None,
+                vault_count: None,
+            }
+        }
     };
     let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
-    let version = body.get("version").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let version = body
+        .get("version")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
     let vault_count = body.get("vault_count").and_then(|v| v.as_u64());
-    LocalDaemon { up: true, version, vault_count }
+    LocalDaemon {
+        up: true,
+        version,
+        vault_count,
+    }
 }
 
 pub async fn fetch_status(custodian: &str, vault: &str) -> VaultStatus {
     let url = join_vault_url(custodian, vault);
-    let client = match reqwest::Client::builder().timeout(std::time::Duration::from_secs(5)).build() {
+    // Mirrors the console's route shape (`/vault/{id}`, see fe vault-nav).
+    let console = frontend_origin().map(|o| format!("{}/vault/{}", o, vault));
+    let status = |state| VaultStatus {
+        url: url.clone(),
+        console: console.clone(),
+        state,
+    };
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+    {
         Ok(c) => c,
-        Err(_) => return VaultStatus { url, state: VaultState::Unreachable },
+        Err(_) => return status(VaultState::Unreachable),
     };
 
-    let pk_url = format!("{}/v/{}/passkeys", custodian.trim_end_matches('/'), urlencoding::encode(vault));
+    let pk_url = format!(
+        "{}/v/{}/passkeys",
+        custodian.trim_end_matches('/'),
+        urlencoding::encode(vault)
+    );
     let pk_resp = match client.get(&pk_url).send().await {
         Ok(r) if r.status().is_success() => r,
-        _ => return VaultStatus { url, state: VaultState::Unreachable },
+        _ => return status(VaultState::Unreachable),
     };
     let pk_body: serde_json::Value = match pk_resp.json().await {
         Ok(b) => b,
-        Err(_) => return VaultStatus { url, state: VaultState::Unreachable },
+        Err(_) => return status(VaultState::Unreachable),
     };
-    let exists = pk_body.get("vault_exists").and_then(|v| v.as_bool()).unwrap_or(false);
+    let exists = pk_body
+        .get("vault_exists")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     if !exists {
-        return VaultStatus { url, state: VaultState::NotFound };
+        return status(VaultState::NotFound);
     }
-    let passkeys = pk_body.get("passkeys").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+    let passkeys = pk_body
+        .get("passkeys")
+        .and_then(|v| v.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
 
-    let kk_url = format!("{}/v/{}/secret-keys", custodian.trim_end_matches('/'), urlencoding::encode(vault));
+    let kk_url = format!(
+        "{}/v/{}/secret-keys",
+        custodian.trim_end_matches('/'),
+        urlencoding::encode(vault)
+    );
     match client.get(&kk_url).send().await {
         Ok(r) if r.status().is_success() => {
-            let n = r.json::<serde_json::Value>().await.ok()
-                .and_then(|b| b.get("native_keys").and_then(|v| v.as_array()).map(|a| a.len()))
+            let n = r
+                .json::<serde_json::Value>()
+                .await
+                .ok()
+                .and_then(|b| {
+                    b.get("native_keys")
+                        .and_then(|v| v.as_array())
+                        .map(|a| a.len())
+                })
                 .unwrap_or(0);
-            VaultStatus { url, state: VaultState::Unlocked { passkeys, secrets: n } }
+            status(VaultState::Unlocked {
+                passkeys,
+                secrets: n,
+            })
         }
-        Ok(r) if r.status().as_u16() == 409 => {
-            VaultStatus { url, state: VaultState::Locked { passkeys } }
-        }
-        _ => VaultStatus { url, state: VaultState::Locked { passkeys } },
+        Ok(r) if r.status().as_u16() == 409 => status(VaultState::Locked { passkeys }),
+        _ => status(VaultState::Locked { passkeys }),
     }
 }
 
@@ -98,7 +154,9 @@ pub async fn run(args: StatusArgs) -> Result<(), String> {
     // different vault than the device default is legible (no coined verdict — the
     // facts). Routing DETECTION is gone (§9): the broker is opt-in, the agent
     // routes explicitly with `sc run`, so there's no "am I routed?" to report.
-    let env_pin = std::env::var("SAFECLAW_VAULT_ID").ok().filter(|s| !s.is_empty());
+    let env_pin = std::env::var("SAFECLAW_VAULT_ID")
+        .ok()
+        .filter(|s| !s.is_empty());
     let config_default = cfg.vault.clone();
     let active_vault = env_pin.clone().or_else(|| config_default.clone());
 
@@ -107,8 +165,22 @@ pub async fn run(args: StatusArgs) -> Result<(), String> {
         None => None,
     };
 
+    // The daemon's two local faces, resolved the same env-first way every `sc`
+    // call resolves them. Neither is a web page: `control` is what this CLI
+    // probes, `broker` is what `sc run` wires into an agent's HTTPS_PROXY.
+    // Shown even when the probe failed — "not running" with the probed control
+    // URL next to it is exactly what makes a moved port diagnosable.
+    let broker = crate::cli::active::api_face_root(&cfg);
+
     if args.json {
-        print_json(&d, &vault, env_pin.as_deref(), config_default.as_deref());
+        print_json(
+            &d,
+            &control,
+            &broker,
+            &vault,
+            env_pin.as_deref(),
+            config_default.as_deref(),
+        );
         return Ok(());
     }
 
@@ -124,6 +196,16 @@ pub async fn run(args: StatusArgs) -> Result<(), String> {
         }
     } else {
         println!("  state:   not running — bring it up with `sc up`");
+    }
+    println!("  control: {}", control);
+    println!("  broker:  {} (agent face; wired by `sc run`)", broker);
+    // A shell carrying a stale `$SAFECLAW_BROKER_URL` snapshot (old `sc agent
+    // add`, daemon since moved) is the port-mismatch case status exists to make
+    // legible: the resolution above self-heals, so show the divergence.
+    if let Some(env_url) = crate::cli::active::env_broker_url() {
+        if env_url.trim_end_matches('/') != broker {
+            println!("  note:    this shell's $SAFECLAW_BROKER_URL ({}) is stale; `sc run` uses the broker face above", env_url);
+        }
     }
     println!();
 
@@ -152,7 +234,10 @@ pub async fn run(args: StatusArgs) -> Result<(), String> {
                 // Stranded by an upstream delete — "no vaults yet" would read
                 // as if this device was never set up, when the truth is its
                 // vault was deleted on the web. Name it and point at re-pairing.
-                println!("  note:  vault {} was deleted on the web; this device's pairing to it is gone", dead);
+                println!(
+                    "  note:  vault {} was deleted on the web; this device's pairing to it is gone",
+                    dead
+                );
                 println!("  hint:  generate a new install token in the console (\"Connect a new agent\"), then `sc login`");
             } else if d.vault_count == Some(0) {
                 println!("  hint:  no vaults yet — seal one on the web, then `sc login`");
@@ -201,6 +286,8 @@ fn env_label(host: &str) -> &'static str {
 
 fn print_json(
     d: &LocalDaemon,
+    control: &str,
+    broker: &str,
     vault: &Option<VaultStatus>,
     env_pin: Option<&str>,
     config_default: Option<&str>,
@@ -210,10 +297,13 @@ fn print_json(
             VaultState::Unreachable => ("unreachable", None, None),
             VaultState::NotFound => ("not_found", None, None),
             VaultState::Locked { passkeys } => ("locked", Some(*passkeys), None),
-            VaultState::Unlocked { passkeys, secrets } => ("unlocked", Some(*passkeys), Some(*secrets)),
+            VaultState::Unlocked { passkeys, secrets } => {
+                ("unlocked", Some(*passkeys), Some(*secrets))
+            }
         };
         serde_json::json!({
             "url": s.url,
+            "console": s.console,
             "state": state,
             "passkeys": passkeys,
             "secrets": secrets,
@@ -229,7 +319,13 @@ fn print_json(
     };
     let mismatch = matches!((env_pin, config_default), (Some(p), Some(c)) if p != c);
     let out = serde_json::json!({
-        "daemon": { "up": d.up, "version": d.version, "vaults": d.vault_count },
+        "daemon": {
+            "up": d.up,
+            "version": d.version,
+            "vaults": d.vault_count,
+            "control": control,
+            "broker": broker,
+        },
         "login": login_json,
         "vault": vault_json,
         // §5: the active vault + WHERE it came from (env pin vs device default),
@@ -241,29 +337,37 @@ fn print_json(
             "mismatch": mismatch,
         },
     });
-    println!("{}", serde_json::to_string_pretty(&out).unwrap_or_else(|_| out.to_string()));
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&out).unwrap_or_else(|_| out.to_string())
+    );
 }
 
 pub fn print_status(s: &VaultStatus) {
     println!("active vault");
-    println!("  url:   {}", s.url);
+    // `control:` not `url:` — this is the vault's control-plane address (the
+    // canonical vault handle), not a page; the browsable one is `console:`.
+    println!("  control:  {}", s.url);
+    if let Some(c) = &s.console {
+        println!("  console:  {} (view in browser)", c);
+    }
     match &s.state {
         VaultState::Unreachable => {
             if s.url.contains("//localhost") || s.url.contains("//127.0.0.1") {
-                println!("  state: unreachable — bring the daemon up with `sc up`");
+                println!("  state:    unreachable — bring the daemon up with `sc up`");
             } else {
-                println!("  state: unreachable (is the daemon running?)");
+                println!("  state:    unreachable (is the daemon running?)");
             }
         }
         VaultState::NotFound => {
-            println!("  state: not found (run `sc vault create`, or pick a different URL with `sc vault use`)");
+            println!("  state:    not found (run `sc vault create`, or pick a different URL with `sc vault use`)");
         }
         VaultState::Locked { passkeys } => {
-            println!("  state: locked (run `sc up` to unlock)");
+            println!("  state:    locked (run `sc up` to unlock)");
             println!("  passkeys: {}", passkeys);
         }
         VaultState::Unlocked { passkeys, secrets } => {
-            println!("  state: unlocked");
+            println!("  state:    unlocked");
             println!("  passkeys: {}", passkeys);
             println!("  secrets:  {}", secrets);
         }
