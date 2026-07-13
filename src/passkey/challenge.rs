@@ -6,7 +6,17 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use rand::RngCore;
 
 /// In-memory challenge store for server-issued challenges.
-/// Challenges are random 32-byte values with TTL 5 minutes, single-use.
+///
+/// A challenge `r` is the single-use anti-replay nonce for ONE op's approval
+/// (the passkey signature β is computed over the op `o` AND `r`). Its only job
+/// is to be consumed exactly once by the grant that authorizes that op, so it
+/// must stay valid for as long as the op is approvable — the human has that
+/// whole window to walk over and tap. That window is the approval TTL
+/// (`approval::store::DEFAULT_TTL`, 30 min), and the op's own `o.valid` window
+/// enforces the tighter per-op TTL on the grant path. A shorter challenge TTL
+/// than the op window silently fails late-but-valid approvals ("invalid or
+/// expired challenge `r`"), so we tie the two together here — they can't drift.
+/// Single-use consumption (not a short lifetime) is what prevents replay.
 pub struct ChallengeStore {
     /// challenge_b64 → (issued_at, ip)
     challenges: HashMap<String, (Instant, IpAddr)>,
@@ -14,7 +24,8 @@ pub struct ChallengeStore {
     rate: HashMap<IpAddr, (u32, Instant)>,
 }
 
-const TTL_SECS: u64 = 300; // 5 minutes
+// Tied to the approval window so a challenge never expires before its op does.
+const TTL_SECS: u64 = crate::approval::store::DEFAULT_TTL.as_secs();
 const RATE_LIMIT: u32 = 60; // per minute per IP
 
 impl ChallengeStore {
@@ -97,7 +108,7 @@ mod tests {
         let c = store.issue(localhost()).unwrap();
         // Manually expire it
         if let Some(entry) = store.challenges.get_mut(&c) {
-            entry.0 = Instant::now() - std::time::Duration::from_secs(301);
+            entry.0 = Instant::now() - std::time::Duration::from_secs(TTL_SECS + 1);
         }
         assert!(!store.verify(&c));
     }
@@ -124,7 +135,7 @@ mod tests {
         let mut store = ChallengeStore::new();
         let c = store.issue(localhost()).unwrap();
         if let Some(entry) = store.challenges.get_mut(&c) {
-            entry.0 = Instant::now() - std::time::Duration::from_secs(301);
+            entry.0 = Instant::now() - std::time::Duration::from_secs(TTL_SECS + 1);
         }
         store.cleanup();
         assert!(store.challenges.is_empty());
