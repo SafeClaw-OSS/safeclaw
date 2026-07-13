@@ -237,13 +237,17 @@ pub enum VaultState {
     },
 }
 
-/// A loopback OAuth connect awaiting its `?code&state` redirect on the shared
-/// 8765 callback. Points a pending `state` (RFC 6749) at the (vault, connection)
-/// whose sealed `connecting` entry holds the matching code_verifier.
+/// A loopback OAuth connect awaiting its `?code&state` redirect. Points a
+/// pending `state` (RFC 6749) at the (vault, connection) whose sealed
+/// `connecting` entry holds the matching code_verifier, and carries the
+/// loopback PORT its provider will redirect to (allowlist-checked at
+/// registration — `ServiceRegistry::loopback_allowlist`): 8765 for the
+/// canonical callback, 1455 for openai_codex's registered one.
 #[derive(Clone)]
 pub struct PendingLoopback {
     pub vault_id: String,
     pub conn_id: String,
+    pub port: u16,
     inserted_at: std::time::Instant,
 }
 
@@ -326,12 +330,13 @@ pub struct AppState {
     /// daemon-local; entries self-reap at the 2h ceiling (`LOOPBACK_PENDING_TTL`)
     /// so an abandoned consent never lingers.
     pub oauth_pending: Mutex<HashMap<String, PendingLoopback>>,
-    /// Guard so the on-demand 8765 loopback listener runs as a SINGLE shared
-    /// instance: `true` while a listener task is live. `auth::loopback::ensure_running`
-    /// flips it and spawns only when it was false, so N concurrent connects share
-    /// ONE listener (the daemon never races itself into an 8765 port conflict).
-    /// Cleared when the task exits (idle self-close or bind failure).
-    pub oauth_listener_running: Mutex<bool>,
+    /// Guard so each on-demand loopback listener runs as a SINGLE shared
+    /// instance PER PORT: a port is present while its listener task is live.
+    /// `auth::loopback::ensure_running` inserts and spawns only on a fresh
+    /// port, so N concurrent connects share ONE listener per port (the daemon
+    /// never races itself into a port conflict). A port is removed when its
+    /// task exits (idle self-close or bind failure).
+    pub oauth_listener_running: Mutex<std::collections::HashSet<u16>>,
     /// Secret values a local CLI deposited for a pending write op
     /// (`connection-add` / `secret-set`), keyed by their salted digest. The op
     /// carries ONLY the digest in `act.scope` — the full op JSON rides to the
@@ -377,7 +382,7 @@ impl AppState {
             live_ceremony_ops: Mutex::new(HashMap::new()),
             egress_proxy: crate::proxy::upstream::new_cell(),
             oauth_pending: Mutex::new(HashMap::new()),
-            oauth_listener_running: Mutex::new(false),
+            oauth_listener_running: Mutex::new(std::collections::HashSet::new()),
             op_payloads: Mutex::new(HashMap::new()),
         }
     }
@@ -492,7 +497,7 @@ impl AppState {
     /// Register (or refresh) a loopback connect awaiting its `?code&state`
     /// redirect. Idempotent — a repeated sync tick re-inserts the same mapping
     /// harmlessly (and refreshes its 2h clock).
-    pub fn note_loopback_pending(&self, state: &str, vault_id: &str, conn_id: &str) {
+    pub fn note_loopback_pending(&self, state: &str, vault_id: &str, conn_id: &str, port: u16) {
         if state.is_empty() {
             return;
         }
@@ -503,6 +508,7 @@ impl AppState {
             PendingLoopback {
                 vault_id: vault_id.to_string(),
                 conn_id: conn_id.to_string(),
+                port,
                 inserted_at: std::time::Instant::now(),
             },
         );
@@ -520,13 +526,24 @@ impl AppState {
         m.remove(state)
     }
 
-    /// True iff any loopback connect is currently awaiting a redirect (reaps
-    /// expired entries first). Drives the on-demand listener: non-empty ⇒ keep
-    /// (or open) the shared 8765 window; empty ⇒ let it self-close.
-    pub fn has_loopback_pending(&self) -> bool {
+    /// True iff some loopback connect is awaiting a redirect on `port` (reaps
+    /// expired entries first). Drives that port's on-demand listener: non-empty
+    /// ⇒ keep (or open) its window; empty ⇒ let it self-close.
+    pub fn has_loopback_pending_on(&self, port: u16) -> bool {
         let mut m = self.oauth_pending.lock().unwrap();
         Self::reap_loopback(&mut m);
-        !m.is_empty()
+        m.values().any(|p| p.port == port)
+    }
+
+    /// The distinct ports with a connect currently awaiting a redirect — one
+    /// on-demand listener per entry (`auth::loopback::ensure_running`).
+    pub fn pending_loopback_ports(&self) -> Vec<u16> {
+        let mut m = self.oauth_pending.lock().unwrap();
+        Self::reap_loopback(&mut m);
+        let mut ports: Vec<u16> = m.values().map(|p| p.port).collect();
+        ports.sort_unstable();
+        ports.dedup();
+        ports
     }
 
     /// Drop any pending-loopback entries for a (vault, connection) that reached a

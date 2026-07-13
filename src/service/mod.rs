@@ -332,6 +332,25 @@ pub struct ServiceMeta {
 /// exchange always agree.
 pub const DEFAULT_LOOPBACK_REDIRECT: &str = "http://127.0.0.1:8765/safeclaw/oauth/callback";
 
+/// The loopback port of an OAuth redirect_uri — `Some(port)` only for an
+/// `http://` URI whose host is a loopback NAME with an explicit port
+/// (`http://127.0.0.1:8765/...`, `http://localhost:1455/...`). Anything else —
+/// https, a real host, a default-port URI — is not a target our auto-catch
+/// listener could serve, so `None`.
+pub fn loopback_port(redirect_uri: &str) -> Option<u16> {
+    let rest = redirect_uri.strip_prefix("http://")?;
+    let authority = rest.split('/').next()?;
+    let (host, port) = if let Some(v6) = authority.strip_prefix('[') {
+        v6.split_once("]:")?
+    } else {
+        authority.rsplit_once(':')?
+    };
+    if !matches!(host, "127.0.0.1" | "localhost" | "::1") {
+        return None;
+    }
+    port.parse().ok()
+}
+
 /// A service's `[oauth2]` client/endpoint config with the defaults applied —
 /// see `ServiceRegistry::resolve_oauth_config`.
 #[derive(Debug, Clone)]
@@ -1007,6 +1026,29 @@ impl ServiceRegistry {
     /// A service's `[oauth2]` client/endpoint config with the defaults applied
     /// (loopback redirect_uri). A missing field is `None` (caller decides
     /// whether it's fatal).
+    /// Ports the on-demand OAuth auto-catch listener may bind: the loopback
+    /// targets announced by LOCALLY-INSTALLED service defs (compiled-in +
+    /// `$SAFECLAW_DATA` + `~/.safeclaw/services`) plus the canonical default —
+    /// today `{8765, 1455}` (google-suite default + openai_codex's registered
+    /// callback). This is the SECURITY BOUNDARY for which ports a connect can
+    /// open: vault-synced custom defs (`aux.services`) are deliberately NOT
+    /// consulted, or vault write access would escalate into "bind arbitrary
+    /// local ports on every device". A custom service still gets auto-catch —
+    /// exactly when its redirect lands on a target some local def already
+    /// announces (in practice: the canonical 8765 the custom form defaults to).
+    pub fn loopback_allowlist(&self) -> std::collections::HashSet<u16> {
+        let mut allowed: std::collections::HashSet<u16> =
+            loopback_port(DEFAULT_LOOPBACK_REDIRECT).into_iter().collect();
+        for def in self.services.values() {
+            if let Some(oauth) = def.oauth2() {
+                if let Some(port) = loopback_port(&self.resolve_oauth_config(oauth).redirect_uri) {
+                    allowed.insert(port);
+                }
+            }
+        }
+        allowed
+    }
+
     pub fn resolve_oauth_config(&self, oauth: &OAuth2Def) -> ResolvedOAuthConfig {
         ResolvedOAuthConfig {
             token_url: oauth.token_url.clone(),

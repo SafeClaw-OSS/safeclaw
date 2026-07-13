@@ -18,12 +18,16 @@
 //!    never returns to the browser — the daemon self-completes (cloud-blind, and
 //!    robust to the popup losing `window.opener`).
 //!
-//! **On-demand, single shared window.** The listener opens only while some
-//! connect is awaiting its redirect and self-closes when the last one clears (2h
-//! ceiling per entry, `LOOPBACK_PENDING_TTL`). [`ensure_running`] is guarded by
+//! **On-demand, one shared window PER PORT.** Which ports may ever open is the
+//! allowlist parsed from locally-installed service defs
+//! ([`crate::service::ServiceRegistry::loopback_allowlist`], today `{8765,
+//! 1455}`) — vault content can pick among them but never extend them. A
+//! listener opens only while some connect is awaiting a redirect on its port
+//! and self-closes when the last one clears (2h ceiling per entry,
+//! `LOOPBACK_PENDING_TTL`). [`ensure_running`] is guarded per-port by
 //! [`AppState::oauth_listener_running`] so N concurrent connects — across every
-//! vault — share exactly ONE listener; the daemon never spawns a second 8765 and
-//! races itself into a port conflict.
+//! vault — share exactly ONE listener per port; the daemon never races itself
+//! into a port conflict.
 //!
 //! **Security.** One listener + `state`-routing serves every provider; `state`
 //! (RFC 6749 §10.12) is an unguessable per-flow token. It binds `127.0.0.1` only
@@ -67,54 +71,37 @@ struct CallbackQuery {
     error: String,
 }
 
-/// Parse the fixed loopback `(port, path)` out of `DEFAULT_LOOPBACK_REDIRECT`
-/// (e.g. `http://127.0.0.1:8765/safeclaw/oauth/callback`) so the listener never
-/// drifts from the redirect_uri baked into the service defs. Falls back to the
-/// known literal if the const is ever an unexpected shape.
-fn callback_target() -> (u16, String) {
-    let fallback = (8765u16, "/safeclaw/oauth/callback".to_string());
-    let parse = || -> Option<(u16, String)> {
-        let rest = crate::service::DEFAULT_LOOPBACK_REDIRECT.strip_prefix("http://")?;
-        let (authority, path) = match rest.find('/') {
-            Some(i) => (&rest[..i], rest[i..].to_string()),
-            None => (rest, "/".to_string()),
-        };
-        let port = authority.rsplit_once(':')?.1.parse::<u16>().ok()?;
-        Some((port, path))
-    };
-    parse().unwrap_or(fallback)
-}
-
-/// Ensure the shared 8765 loopback listener is running. Idempotent and
-/// single-instance: spawns exactly one listener task and no-ops while it's live,
-/// so any number of concurrent connects share ONE window. Called by the connect
-/// state machine whenever a connect is registered as awaiting its redirect.
-pub fn ensure_running(state: Arc<AppState>) {
+/// Ensure the shared loopback listener for `port` is running. Idempotent and
+/// single-instance PER PORT: spawns exactly one listener task per port and
+/// no-ops while it's live, so any number of concurrent connects on that port
+/// share ONE window. Called by the connect state machine with each distinct
+/// pending port ([`AppState::pending_loopback_ports`]) — the caller has already
+/// allowlist-checked the port at registration.
+pub fn ensure_running(state: Arc<AppState>, port: u16) {
     {
         let mut running = state.oauth_listener_running.lock().unwrap();
-        if *running {
-            return; // one shared listener already covers every pending connect
+        if !running.insert(port) {
+            return; // this port's shared listener already covers its pendings
         }
-        *running = true;
     }
     tokio::spawn(async move {
-        let bound = serve_until_idle(&state).await;
-        *state.oauth_listener_running.lock().unwrap() = false;
+        let bound = serve_until_idle(&state, port).await;
+        state.oauth_listener_running.lock().unwrap().remove(&port);
         // A connect may have arrived during the graceful drain — re-arm so its
         // redirect still gets caught. Only after a clean (bound) close: never
         // re-arm a bind FAILURE, which would tight-spin against whatever already
-        // owns 8765 (the next sync tick retries instead).
-        if bound && state.has_loopback_pending() {
-            ensure_running(state);
+        // owns the port (the next sync tick retries instead).
+        if bound && state.has_loopback_pending_on(port) {
+            ensure_running(state, port);
         }
     });
 }
 
-/// Bind 8765 and serve until no loopback connect is pending anymore, then close
-/// (releasing the port). Returns whether it managed to bind — `false` means
-/// another process owns 8765, so auto-catch is off and manual paste stands in.
-async fn serve_until_idle(state: &Arc<AppState>) -> bool {
-    let (port, path) = callback_target();
+/// Bind `port` and serve until no loopback connect is pending on it anymore,
+/// then close (releasing it). Returns whether it managed to bind — `false`
+/// means another process owns the port (e.g. the Codex CLI's own login on
+/// 1455), so auto-catch on it is off and manual paste stands in.
+async fn serve_until_idle(state: &Arc<AppState>, port: u16) -> bool {
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let listener = match tokio::net::TcpListener::bind(addr).await {
         Ok(l) => l,
@@ -128,22 +115,25 @@ async fn serve_until_idle(state: &Arc<AppState>) -> bool {
         }
     };
     tracing::info!(
-        "oauth loopback auto-catch open on http://{}{} (closes when idle)",
-        addr,
-        path
+        "oauth loopback auto-catch open on http://{} (closes when idle)",
+        addr
     );
+    // Catch-all route: the match is keyed on `state` (unguessable, single-use),
+    // not the path — one router serves every callback path a provider might
+    // use on this port, and a non-matching hit gets the same bland 404 either
+    // way, so path-shape leaks nothing.
     let app = Router::new()
-        .route(&path, get(handle_callback))
+        .fallback(get(handle_callback))
         .with_state(state.clone());
 
-    // Close as soon as no connect is awaiting a redirect. Polls rather than
-    // signals so a reaped (2h) or completed connect both trip it without extra
-    // wiring at the mutation sites.
+    // Close as soon as no connect is awaiting a redirect on THIS port. Polls
+    // rather than signals so a reaped (2h) or completed connect both trip it
+    // without extra wiring at the mutation sites.
     let idle = state.clone();
     let shutdown = async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(IDLE_CLOSE_POLL_SECS)).await;
-            if !idle.has_loopback_pending() {
+            if !idle.has_loopback_pending_on(port) {
                 break;
             }
         }
@@ -153,7 +143,10 @@ async fn serve_until_idle(state: &Arc<AppState>) -> bool {
         .with_graceful_shutdown(shutdown)
         .await
     {
-        tracing::warn!("oauth loopback listener error: {} — manual paste still works", e);
+        tracing::warn!(
+            "oauth loopback listener error: {} — manual paste still works",
+            e
+        );
     }
     tracing::info!("oauth loopback auto-catch closed (no connect pending)");
     true
@@ -179,7 +172,10 @@ async fn handle_callback(
             q.error.clone()
         };
         tracing::info!(vault = %pending.vault_id, conn = %pending.conn_id, "oauth loopback: redirect carried no usable code ({})", why);
-        return (StatusCode::OK, Html(done_page("Connection cancelled", &why)));
+        return (
+            StatusCode::OK,
+            Html(done_page("Connection cancelled", &why)),
+        );
     }
 
     // Inject the caught code into its pending entry and drive the EXISTING
@@ -229,7 +225,9 @@ fn done_page(title: &str, body: &str) -> String {
 }
 
 fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 #[cfg(test)]
@@ -237,14 +235,41 @@ mod tests {
     use super::*;
 
     #[test]
-    fn callback_target_matches_the_baked_redirect() {
-        // The listener's bind port + route path must track the redirect_uri the
-        // service defs ship, or the redirect lands on nothing.
-        let (port, path) = callback_target();
-        assert_eq!(port, 8765);
-        assert_eq!(path, "/safeclaw/oauth/callback");
-        // And it really is derived from the const, not a hardcoded duplicate.
-        assert!(crate::service::DEFAULT_LOOPBACK_REDIRECT.contains(&format!(":{}{}", port, path)));
+    fn allowlist_covers_the_shipped_redirects() {
+        // The listener may only bind ports the SHIPPED service defs announce —
+        // the canonical 8765 plus openai_codex's registered 1455. A new
+        // provider port must land here via a reviewed service.toml, never via
+        // vault content.
+        let allowed = crate::service::ServiceRegistry::compiled_only().loopback_allowlist();
+        assert!(
+            allowed.contains(&8765),
+            "canonical callback missing: {allowed:?}"
+        );
+        assert!(
+            allowed.contains(&1455),
+            "openai_codex callback missing: {allowed:?}"
+        );
+        assert_eq!(
+            allowed.len(),
+            2,
+            "unexpected extra loopback ports: {allowed:?}"
+        );
+    }
+
+    #[test]
+    fn loopback_port_accepts_loopback_only() {
+        use crate::service::loopback_port;
+        assert_eq!(
+            loopback_port(crate::service::DEFAULT_LOOPBACK_REDIRECT),
+            Some(8765)
+        );
+        assert_eq!(
+            loopback_port("http://localhost:1455/auth/callback"),
+            Some(1455)
+        );
+        assert_eq!(loopback_port("https://127.0.0.1:8765/cb"), None); // not http
+        assert_eq!(loopback_port("http://evil.example:8765/cb"), None); // not loopback
+        assert_eq!(loopback_port("http://127.0.0.1/cb"), None); // no explicit port
     }
 
     #[test]
