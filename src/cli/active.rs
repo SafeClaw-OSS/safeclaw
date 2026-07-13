@@ -59,6 +59,15 @@ pub struct CliConfig {
     /// default.
     #[serde(default, skip_serializing_if = "Settings::is_empty")]
     pub settings: Settings,
+    /// Set when the ACTIVE vault was tombstoned cloud-side (deleted on the
+    /// web) and the sync path cleared the selection — the one case where "no
+    /// vault selected" is a surprise, not a choice. `sc status` and
+    /// `resolve_active` read it to say "your vault was deleted — re-pair"
+    /// instead of a blank zero-vault state. Cleared by the next successful
+    /// pairing/selection (`put_active*`) and by logout. A user-driven
+    /// `sc vault forget` never sets it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vault_deleted_upstream: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
@@ -264,6 +273,7 @@ pub fn forget_vault(vault: &str) -> Result<bool, String> {
     if cleared_active {
         cfg.daemon = None;
         cfg.vault = None;
+        cfg.vault_deleted_upstream = Some(vault.to_string());
         save(&cfg)?;
     }
     Ok(removed_known || cleared_active)
@@ -275,6 +285,7 @@ pub fn put_active(daemon: &str, vault: &str) -> Result<PathBuf, String> {
     let mut cfg = load().unwrap_or_default();
     cfg.daemon = Some(daemon.to_string());
     cfg.vault = Some(vault.to_string());
+    cfg.vault_deleted_upstream = None;
     save(&cfg)
 }
 
@@ -292,6 +303,7 @@ pub fn put_active_with_cloud(
     let mut cfg = load().unwrap_or_default();
     cfg.daemon = Some(daemon.to_string());
     cfg.vault = Some(vault.to_string());
+    cfg.vault_deleted_upstream = None;
     cfg.cloud_backend = Some(cloud_backend.to_string());
     cfg.frontend_origin = frontend_origin
         .filter(|s| !s.is_empty())
@@ -512,6 +524,15 @@ pub fn resolve_active(vault_override: Option<&str>) -> Result<(String, String), 
         return Ok((
             control_root_from(env_daemon_host(), Some(&kv.daemon), control_port()),
             kv.vault,
+        ));
+    }
+    // Stranded by an upstream delete, not by never having paired: name the
+    // vault and point at re-pairing instead of the generic "no vault" error.
+    if let Some(dead) = cfg.vault_deleted_upstream.as_deref() {
+        return Err(format!(
+            "vault {} was deleted on the web, so this device's pairing to it is gone — \
+             generate a new install token in the console (\"Connect a new agent\") and run `sc login`",
+            dead
         ));
     }
     Err("no vault selected — run `sc login` or `sc vault use`".to_string())

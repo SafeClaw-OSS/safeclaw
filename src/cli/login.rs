@@ -173,10 +173,20 @@ pub async fn run(args: LoginArgs) -> Result<(), String> {
                 "pair-token invalid or unknown. Generate a new one at {}/dashboard (\"Connect a new agent\").",
                 custodian
             ),
-            409 => format!(
-                "pair-token already used. Generate a new one at {}/dashboard (\"Connect a new agent\").",
-                custodian
-            ),
+            // 409 = `no_vault`: the vault this token was pinned to is gone
+            // (deleted between mint and exchange), or the account has nothing
+            // sealed. The server message says which — surface it verbatim.
+            // (Historically 409 meant "already used"; that's 401 now.)
+            409 => {
+                let msg = serde_json::from_str::<serde_json::Value>(detail_trimmed)
+                    .ok()
+                    .and_then(|v| v.get("message").and_then(|m| m.as_str()).map(str::to_string))
+                    .unwrap_or_else(|| "no vault to connect".to_string());
+                format!(
+                    "{}. Generate a new install token at {}/dashboard (\"Connect a new agent\").",
+                    msg, custodian
+                )
+            }
             410 => format!(
                 "pair-token expired. Generate a new one at {}/dashboard (\"Connect a new agent\").",
                 custodian

@@ -2197,15 +2197,24 @@ mod tests {
         assert!(after.vault.is_none());
         assert!(after.daemon.is_none());
         assert!(after.known_vaults.is_empty(), "legacy field migrated to the file");
+        // Dropping the ACTIVE vault leaves the deleted-upstream breadcrumb so
+        // `sc status` / `resolve_active` can say "re-pair", not "no vaults yet".
+        assert_eq!(after.vault_deleted_upstream.as_deref(), Some("vid-A"));
         let known = active::known_vaults();
         assert_eq!(known.len(), 1);
         assert_eq!(known[0].vault, "vid-B");
 
         // Idempotent: forgetting it again is a no-op (Ok(false)).
         assert_eq!(active::forget_vault("vid-A"), Ok(false));
-        // A non-active known vault: removed, active untouched.
+        // A non-active known vault: removed, active untouched — and no
+        // breadcrumb overwrite (vid-A is still the one worth reporting).
         assert_eq!(active::forget_vault("vid-B"), Ok(true));
         assert!(active::known_vaults().is_empty());
+        assert_eq!(active::load().unwrap().vault_deleted_upstream.as_deref(), Some("vid-A"));
+
+        // The next successful pairing/selection clears the breadcrumb.
+        active::put_active("http://localhost:1", "vid-C").unwrap();
+        assert!(active::load().unwrap().vault_deleted_upstream.is_none());
 
         match prev {
             Some(v) => std::env::set_var("HOME", v),

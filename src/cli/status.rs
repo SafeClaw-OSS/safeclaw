@@ -148,7 +148,13 @@ pub async fn run(args: StatusArgs) -> Result<(), String> {
         None => {
             println!("active vault");
             println!("  state: none selected");
-            if d.vault_count == Some(0) {
+            if let Some(dead) = cfg.vault_deleted_upstream.as_deref() {
+                // Stranded by an upstream delete — "no vaults yet" would read
+                // as if this device was never set up, when the truth is its
+                // vault was deleted on the web. Name it and point at re-pairing.
+                println!("  note:  vault {} was deleted on the web; this device's pairing to it is gone", dead);
+                println!("  hint:  generate a new install token in the console (\"Connect a new agent\"), then `sc login`");
+            } else if d.vault_count == Some(0) {
                 println!("  hint:  no vaults yet — seal one on the web, then `sc login`");
             } else if crate::cli::active::known_vaults().is_empty() {
                 println!("  hint:  pick one with `sc vault use`, or `sc vault create`");

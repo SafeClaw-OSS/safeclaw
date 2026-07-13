@@ -61,6 +61,7 @@ pub async fn run(args: LogoutArgs) -> Result<(), String> {
     cleared.vault = None;
     cleared.cloud_backend = None;
     cleared.frontend_origin = None;
+    cleared.vault_deleted_upstream = None;
     cleared.known_vaults.clear();
     save(&cleared)?;
     crate::cli::active::clear_known_vaults()?;
