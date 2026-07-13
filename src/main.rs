@@ -331,6 +331,11 @@ async fn run_daemon(args: ServeArgs, verbose: u8) -> Result<(), Box<dyn std::err
         });
     }
 
+    // OAuth loopback auto-catch (src/auth/loopback.rs) is NOT started here: the
+    // 8765 listener opens ON DEMAND — the connect state machine calls
+    // `loopback::ensure_running` only while some connect is awaiting its redirect
+    // — and self-closes when idle. So there is nothing to spawn at boot.
+
     let listen_ip: std::net::IpAddr = config.listen.parse().unwrap_or_else(|_| "127.0.0.1".parse().unwrap());
 
     // Two localhost listeners (2026-07-03 phantom-only proxy): the control/API

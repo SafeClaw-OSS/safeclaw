@@ -208,7 +208,7 @@ pub async fn sync_vault_now(state: &Arc<AppState>, vault_id: &str) -> Result<Syn
     // item may have synced earlier (background watcher) but never been processed.
     // Capture the outcome so `sc sync` can report it (completed / reconnect /
     // couldn't-reach-provider) instead of the failure staying buried in the log.
-    let connects = crate::auth::connect::process_vault_connects(state, vault_id).await;
+    let connects = crate::auth::connect::process_vault_connects(state, vault_id, None).await;
     // PER-ITEM (bidirectional): flush any LOCAL-ahead keys/items to the cloud.
     // Sync used to only PULL, so a daemon-side change that never got pushed —
     // e.g. a completed OAuth connect whose push was stranded behind a conflicting
@@ -696,7 +696,7 @@ async fn recover_after_conflict(
     // and form an async-recursion cycle the compiler can't prove `Send`). We are
     // already inside the push loop: the very next iteration re-reads the re-sealed
     // vault.dat and re-PUTs, so the fan-out is covered without the recursive edge.
-    crate::auth::connect::apply_pending_connects(state, vault_id).await;
+    crate::auth::connect::apply_pending_connects(state, vault_id, None).await;
     true
 }
 
@@ -1170,7 +1170,7 @@ async fn pull_and_process(
         Ok(_) => {}
         Err(e) => tracing::debug!(vault = %vault, "cloud sync watch: per-item pull failed: {}", e),
     }
-    crate::auth::connect::process_vault_connects(state, vault).await;
+    crate::auth::connect::process_vault_connects(state, vault, None).await;
     tracing::debug!(vault = %vault, channel = channel, "cloud sync watch: wake processed");
 }
 

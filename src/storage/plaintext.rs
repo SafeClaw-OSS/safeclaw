@@ -161,9 +161,22 @@ pub struct Connecting {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectingOAuth2 {
     /// The single-use authorization code from the loopback redirect (RFC 6749).
+    /// EMPTY until the code arrives — either the daemon's 8765 loopback listener
+    /// auto-catches the redirect (`crate::auth::loopback`) or the user pastes it
+    /// back (fallback). A pending entry with an empty `code` is "awaiting the
+    /// redirect", not yet exchangeable (the daemon skips it); its `state` (below)
+    /// is how the listener matches the incoming redirect to this entry.
+    #[serde(default)]
     pub code: String,
     /// The PKCE code_verifier (RFC 7636) the browser generated for this flow.
     pub code_verifier: String,
+    /// The `state` param (RFC 6749 §10.12) the browser generated for this flow.
+    /// Sealed so the daemon's shared 8765 loopback listener can match an incoming
+    /// `?code&state` redirect to THIS pending connect (one listener serves every
+    /// provider; `state` is the unguessable router key). Absent on legacy
+    /// paste-only entries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
     /// Terminal exchange failure — set by the daemon when the code→token
     /// exchange fails non-recoverably (`invalid_grant`: the authorization code
     /// expired or was already used). The console renders "connection failed,

@@ -231,6 +231,16 @@ pub enum VaultState {
     },
 }
 
+/// A loopback OAuth connect awaiting its `?code&state` redirect on the shared
+/// 8765 callback. Points a pending `state` (RFC 6749) at the (vault, connection)
+/// whose sealed `connecting` entry holds the matching code_verifier.
+#[derive(Clone)]
+pub struct PendingLoopback {
+    pub vault_id: String,
+    pub conn_id: String,
+    inserted_at: std::time::Instant,
+}
+
 pub struct AppState {
     pub config: Config,
     pub vaults: VaultDir,
@@ -302,6 +312,20 @@ pub struct AppState {
     /// hudsucker forward connector (see `proxy::upstream`); the reqwest side
     /// swaps via `core::forward::reload_egress_proxy`.
     pub egress_proxy: crate::proxy::upstream::EgressProxyCell,
+    /// In-flight loopback OAuth connects awaiting their `?code&state` redirect on
+    /// the shared 8765 callback. `state` → the (vault, connection) whose sealed
+    /// `connecting` entry holds the matching code_verifier. Populated each sync
+    /// tick from a `connecting` entry that carries a `state` and no code yet;
+    /// consumed + removed when `auth::loopback` catches the redirect. In-memory +
+    /// daemon-local; entries self-reap at the 2h ceiling (`LOOPBACK_PENDING_TTL`)
+    /// so an abandoned consent never lingers.
+    pub oauth_pending: Mutex<HashMap<String, PendingLoopback>>,
+    /// Guard so the on-demand 8765 loopback listener runs as a SINGLE shared
+    /// instance: `true` while a listener task is live. `auth::loopback::ensure_running`
+    /// flips it and spawns only when it was false, so N concurrent connects share
+    /// ONE listener (the daemon never races itself into an 8765 port conflict).
+    /// Cleared when the task exits (idle self-close or bind failure).
+    pub oauth_listener_running: Mutex<bool>,
 }
 
 impl AppState {
@@ -329,6 +353,8 @@ impl AppState {
             oauth_redeemed_codes: Mutex::new(HashMap::new()),
             live_ceremony_ops: Mutex::new(HashMap::new()),
             egress_proxy: crate::proxy::upstream::new_cell(),
+            oauth_pending: Mutex::new(HashMap::new()),
+            oauth_listener_running: Mutex::new(false),
         }
     }
 
@@ -366,6 +392,67 @@ impl AppState {
     fn reap_redeemed(m: &mut HashMap<String, std::time::Instant>) {
         let now = std::time::Instant::now();
         m.retain(|_, t| now.duration_since(*t) < Self::REDEEMED_CODE_TTL);
+    }
+
+    /// Ceiling on how long a loopback connect stays matchable while awaiting its
+    /// redirect. The primary driver is "there's an unfinished connect"; this 2h
+    /// cap is the backstop so an abandoned consent never keeps the entry alive
+    /// forever. Generous on purpose — the listener is benign (`auth::loopback`).
+    const LOOPBACK_PENDING_TTL: std::time::Duration = std::time::Duration::from_secs(2 * 60 * 60);
+
+    /// Register (or refresh) a loopback connect awaiting its `?code&state`
+    /// redirect. Idempotent — a repeated sync tick re-inserts the same mapping
+    /// harmlessly (and refreshes its 2h clock).
+    pub fn note_loopback_pending(&self, state: &str, vault_id: &str, conn_id: &str) {
+        if state.is_empty() {
+            return;
+        }
+        let mut m = self.oauth_pending.lock().unwrap();
+        Self::reap_loopback(&mut m);
+        m.insert(
+            state.to_string(),
+            PendingLoopback {
+                vault_id: vault_id.to_string(),
+                conn_id: conn_id.to_string(),
+                inserted_at: std::time::Instant::now(),
+            },
+        );
+    }
+
+    /// Resolve + REMOVE the (vault, connection) for a caught `state`, or `None`
+    /// if unknown/expired. Removal makes the match single-use: a replayed
+    /// redirect finds nothing (and gets the bland 404).
+    pub fn take_loopback_pending(&self, state: &str) -> Option<PendingLoopback> {
+        if state.is_empty() {
+            return None;
+        }
+        let mut m = self.oauth_pending.lock().unwrap();
+        Self::reap_loopback(&mut m);
+        m.remove(state)
+    }
+
+    /// True iff any loopback connect is currently awaiting a redirect (reaps
+    /// expired entries first). Drives the on-demand listener: non-empty ⇒ keep
+    /// (or open) the shared 8765 window; empty ⇒ let it self-close.
+    pub fn has_loopback_pending(&self) -> bool {
+        let mut m = self.oauth_pending.lock().unwrap();
+        Self::reap_loopback(&mut m);
+        !m.is_empty()
+    }
+
+    /// Drop any pending-loopback entries for a (vault, connection) that reached a
+    /// terminal state (completed / failed), so the on-demand listener can close
+    /// promptly instead of lingering to the 2h cap. The auto-catch path already
+    /// took its entry out; this covers the paste-fallback path, whose pre-seal
+    /// registered an entry no redirect ever consumed.
+    pub fn clear_loopback_for_conn(&self, vault_id: &str, conn_id: &str) {
+        let mut m = self.oauth_pending.lock().unwrap();
+        m.retain(|_, p| !(p.vault_id == vault_id && p.conn_id == conn_id));
+    }
+
+    fn reap_loopback(m: &mut HashMap<String, PendingLoopback>) {
+        let now = std::time::Instant::now();
+        m.retain(|_, p| now.duration_since(p.inserted_at) < Self::LOOPBACK_PENDING_TTL);
     }
 
     /// Emit an event into the broadcast channel. Silently swallows the "no

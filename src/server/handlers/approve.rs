@@ -624,7 +624,7 @@ pub async fn approve_op(
                     // best-effort + never clobber (409 → adopt cloud, stop).
                     crate::sync::push_keys_best_effort(&state, &vid).await;
                     crate::sync::push_items_best_effort(&state, &vid).await;
-                    crate::auth::connect::process_vault_connects(&state, &vid).await;
+                    crate::auth::connect::process_vault_connects(&state, &vid, None).await;
                 });
             }
             (json!({ "ok": true, "act": "write" }), None)
@@ -879,7 +879,7 @@ pub async fn approve_op(
                     let state = state.clone();
                     let vid = vault_id.clone();
                     tokio::spawn(async move {
-                        crate::auth::connect::process_vault_connects(&state, &vid).await;
+                        crate::auth::connect::process_vault_connects(&state, &vid, None).await;
                     });
                 }
                 let value = json!({ "kv": Value::Object(kv), "aux": aux_json });

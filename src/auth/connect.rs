@@ -249,8 +249,33 @@ pub fn apply_exchange_result(
 fn collect_pending(m: &ProtectedState) -> Vec<(String, Connecting)> {
     aux_map::<Connecting>(m, "connecting")
         .into_iter()
-        .filter(|(_, c)| c.oauth2.error.is_none())
+        // Skip an entry still AWAITING its code (empty `code`): an auto-catch
+        // connect seals `{code_verifier, state}` BEFORE consent and only gets a
+        // code once the 8765 listener catches the redirect (or the user pastes).
+        // Exchanging an empty code would earn a bogus invalid_grant and clobber
+        // the flow. `error.is_none()` still excludes terminally-failed entries.
+        .filter(|(_, c)| c.oauth2.error.is_none() && !c.oauth2.code.is_empty())
         .collect()
+}
+
+/// Merge codes the 8765 loopback listener caught into their matching pending
+/// entries (keyed by connection id), so [`collect_pending`] picks them up for
+/// exchange this cycle. Only fills an EMPTY code — never overwrites one already
+/// present (a racing paste wins whichever landed first). Pure state edit.
+fn inject_codes(m: &mut ProtectedState, codes: &std::collections::BTreeMap<String, String>) {
+    let mut connecting = aux_map::<Connecting>(m, "connecting");
+    let mut changed = false;
+    for (conn, code) in codes {
+        if let Some(entry) = connecting.get_mut(conn) {
+            if entry.oauth2.code.is_empty() && !code.is_empty() {
+                entry.oauth2.code = code.clone();
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        set_aux_map(m, "connecting", connecting);
+    }
 }
 
 /// Per-run outcome of the connect state machine, so callers (and ultimately
@@ -445,10 +470,16 @@ fn mark_connecting_failed(m: &mut ProtectedState, conn: &str, reason: &str) {
 /// Holds the per-vault write lock for the open→mutate→re-seal→write cycle so it
 /// serializes against approve.rs's writes and the cloud-sync pull (same lock).
 /// Never panics; any error logs and returns.
-pub async fn process_vault_connects(state: &Arc<AppState>, vault_id: &str) -> ConnectReport {
+pub async fn process_vault_connects(
+    state: &Arc<AppState>,
+    vault_id: &str,
+    injected: Option<std::collections::BTreeMap<String, String>>,
+) -> ConnectReport {
     // Apply any pending connects (open → exchange → re-seal → persist). On a
     // completion, fan the re-sealed blob out to OTHER devices via the cloud.
-    let report = apply_pending_connects(state, vault_id).await;
+    // `injected` (conn → code) carries any codes the 8765 loopback listener just
+    // caught; `None` on the ordinary sync path (nothing to inject).
+    let report = apply_pending_connects(state, vault_id, injected).await;
     if report.changed() {
         // A fresh connect landed → clear any stale needs-reauth flag for this
         // vault (a still-dead token re-marks on the next /use).
@@ -482,7 +513,11 @@ pub async fn process_vault_connects(state: &Arc<AppState>, vault_id: &str) -> Co
 /// on a freshly-pulled blob; routing it through the push-spawning wrapper would
 /// form an async-recursion cycle (push → recover → process → push) the compiler
 /// can't prove `Send`. Keeping the push out of the recursive edge breaks it.
-pub(crate) async fn apply_pending_connects(state: &Arc<AppState>, vault_id: &str) -> ConnectReport {
+pub(crate) async fn apply_pending_connects(
+    state: &Arc<AppState>,
+    vault_id: &str,
+    injected: Option<std::collections::BTreeMap<String, String>>,
+) -> ConnectReport {
     let Some(k) = state.cloned_state_key(vault_id) else {
         return ConnectReport::default(); // Locked — no retained K; next unlock retries.
     };
@@ -542,6 +577,37 @@ pub(crate) async fn apply_pending_connects(state: &Arc<AppState>, vault_id: &str
         }
     };
 
+    // Register every loopback connect still AWAITING its redirect (carries a
+    // `state`, no code yet) so the shared 8765 listener can match an incoming
+    // `?code&state` to this (vault, connection). Runs each ordinary sync tick,
+    // keeping the in-memory index fresh (self-reaps at the 2h ceiling). Skipped
+    // on the injected path (the completion call for an entry we already took out
+    // of the index) so a just-completed connect isn't re-registered stale.
+    if injected.is_none() {
+        for (conn_id, c) in aux_map::<Connecting>(&m, "connecting") {
+            if c.oauth2.code.is_empty() {
+                if let Some(st) = &c.oauth2.state {
+                    state.note_loopback_pending(st, vault_id, &conn_id);
+                }
+            }
+        }
+        // Open the shared 8765 listener ON DEMAND — only while some connect is
+        // awaiting its redirect. Idempotent + single-instance: N concurrent
+        // connects (across all vaults) share ONE listener (`ensure_running`
+        // no-ops if already up, so the daemon never races itself into a port
+        // conflict); it self-closes when the last pending clears. No pending ⇒
+        // 8765 never opens.
+        if state.has_loopback_pending() {
+            crate::auth::loopback::ensure_running(state.clone());
+        }
+    }
+
+    // Fill in any codes the 8765 listener caught this round, so the matching
+    // entries become exchangeable in the pre-check + run below.
+    if let Some(injected) = &injected {
+        inject_codes(&mut m, injected);
+    }
+
     // Cheap pre-check: nothing to do if there are no in-flight connects.
     if collect_pending(&m).is_empty() {
         return ConnectReport::default();
@@ -582,6 +648,17 @@ pub(crate) async fn apply_pending_connects(state: &Arc<AppState>, vault_id: &str
         }
     })
     .await;
+
+    // A terminal connect (completed or failed) no longer awaits a redirect —
+    // drop its pending-loopback index entry so the on-demand 8765 listener can
+    // close promptly (the auto-catch path already took it; this covers a
+    // paste-fallback completion whose pre-seal entry no redirect consumed).
+    for c in &report.completed {
+        state.clear_loopback_for_conn(vault_id, c);
+    }
+    for (c, _) in &report.failed {
+        state.clear_loopback_for_conn(vault_id, c);
+    }
 
     if !report.changed() {
         // Nothing MUTATED (all left pending / transient) — don't rewrite or push.
@@ -936,6 +1013,40 @@ mod tests {
         assert!(
             collect_pending(&m).is_empty(),
             "an error-stamped connect must not be treated as pending"
+        );
+    }
+
+    #[test]
+    fn collect_pending_skips_entry_awaiting_its_code() {
+        // An auto-catch connect seals { code_verifier, state } with NO code yet.
+        // collect_pending must skip it (exchanging an empty code earns a bogus
+        // invalid_grant) — until the 8765 listener injects the caught code.
+        let mut m = with_connecting("gmail", "gmail", ""); // empty code
+        m.aux["connecting"]["gmail"]["oauth2"]["state"] = serde_json::json!("st-123");
+        assert!(
+            collect_pending(&m).is_empty(),
+            "an entry awaiting its redirect code must not be treated as pending"
+        );
+        // Inject the caught code → it becomes collectable for exchange.
+        let mut codes = std::collections::BTreeMap::new();
+        codes.insert("gmail".to_string(), "code-CAUGHT".to_string());
+        inject_codes(&mut m, &codes);
+        let got = collect_pending(&m);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].1.oauth2.code, "code-CAUGHT");
+    }
+
+    #[test]
+    fn inject_codes_fills_empty_only() {
+        // A racing manual paste may have already put a code on the entry — the
+        // caught code must NOT overwrite it (whichever landed first wins).
+        let mut m = with_connecting("gmail", "gmail", "already-there");
+        let mut codes = std::collections::BTreeMap::new();
+        codes.insert("gmail".to_string(), "new-code".to_string());
+        inject_codes(&mut m, &codes);
+        assert_eq!(
+            aux_map::<Connecting>(&m, "connecting")["gmail"].oauth2.code,
+            "already-there",
         );
     }
 
