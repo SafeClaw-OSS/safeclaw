@@ -154,7 +154,10 @@ pub struct RegistryService {
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RegistryServiceAuth {
-    Oauth2 { provider: String, scopes: Vec<String> },
+    Oauth2 {
+        provider: String,
+        scopes: Vec<String>,
+    },
     Snaplii {},
 }
 
@@ -211,7 +214,10 @@ pub struct RegistryPolicyRule {
     pub label: String,
     /// Single pattern serializes as a bare string (registry.json stays stable for
     /// one-match rules); a list serializes as a list (OR — see core `PolicyRule`).
-    #[serde(rename = "match", serialize_with = "crate::core::policy::match_spec::serialize")]
+    #[serde(
+        rename = "match",
+        serialize_with = "crate::core::policy::match_spec::serialize"
+    )]
     pub match_pattern: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub body: Option<String>,
@@ -253,6 +259,13 @@ pub struct RegistryResponse {
     pub vault_entries: Option<Option<Vec<String>>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub console_url: Option<String>,
+    /// Consent descriptors for the vault's own control-plane acts (acts.toml,
+    /// raw templates — the client interpolates over the signed op it holds).
+    /// Only on the published SSoT catalog (`sc registry --json` → registry.json,
+    /// same opt-in as policy rules); the agent-facing `GET /registry` stays lean.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acts:
+        Option<&'static std::collections::BTreeMap<String, crate::protocol::consent::ActConsent>>,
 }
 
 /// The secret roles that must be present for a service to be "connected": every
@@ -468,6 +481,7 @@ pub fn render_catalog(
         locked: None,
         vault_entries: None,
         console_url: None,
+        acts: include_policy_rules.then(crate::protocol::consent::act_catalog),
     })
 }
 
@@ -618,6 +632,7 @@ pub fn vault_registry_value(state: &AppState, vault_id: &str, q: &RegistryQuery)
         locked: Some(locked),
         vault_entries,
         console_url: Some(console_url(state, vault_id)),
+        acts: None,
     };
     Ok(serde_json::to_value(body)?)
 }

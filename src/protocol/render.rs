@@ -40,49 +40,26 @@ pub fn render_operation(op: &Operation) -> String {
             )
         }
         ActType::Use => render_use(op),
-        ActType::Custom(name) if name == "connection-add" => {
-            let scope = &op.act.scope;
-            let list = |k: &str| -> Vec<&str> {
-                scope
-                    .get(k)
-                    .and_then(|v| v.as_array())
-                    .map(|a| a.iter().filter_map(|x| x.as_str()).collect())
-                    .unwrap_or_default()
-            };
-            let target = match scope.get("service").and_then(|v| v.as_str()) {
-                Some(svc) => format!("service {}", svc),
-                None => list("hosts").join(", "),
-            };
-            let keys = list("secrets");
-            if keys.is_empty() {
-                format!("Add connection \"{}\" → {}.", op.act.target, target)
-            } else {
-                format!(
-                    "Add connection \"{}\" → {} (secrets: {}).",
-                    op.act.target,
-                    target,
-                    keys.join(", ")
-                )
+        // Control-plane acts: ONE source of copy — the acts.toml descriptor
+        // (action line + non-empty fact rows), so the CLI prompt, audit row,
+        // and grant page can't drift. Table-less acts get the humanized slug,
+        // never a raw debug dump.
+        ActType::Custom(name) => match crate::protocol::consent::consent_for(op) {
+            Some(c) => {
+                let facts = c
+                    .facts
+                    .iter()
+                    .map(|(l, v)| format!("{}: {}", l, v))
+                    .collect::<Vec<_>>()
+                    .join(" · ");
+                if facts.is_empty() {
+                    format!("{}.", c.action)
+                } else {
+                    format!("{} ({}).", c.action, facts)
+                }
             }
-        }
-        ActType::Custom(name) if name == "secret-set" => {
-            let hosts: Vec<&str> = op
-                .act
-                .scope
-                .get("hosts")
-                .and_then(|v| v.as_array())
-                .map(|a| a.iter().filter_map(|x| x.as_str()).collect())
-                .unwrap_or_default();
-            if hosts.is_empty() {
-                format!("Store secret {}.", op.act.target)
-            } else {
-                format!(
-                    "Store secret {} for use at {}.",
-                    op.act.target,
-                    hosts.join(", ")
-                )
-            }
-        }
+            None => crate::protocol::consent::fallback_line(name, &op.act.target),
+        },
         other => format!("Operation: {:?}", other),
     }
 }

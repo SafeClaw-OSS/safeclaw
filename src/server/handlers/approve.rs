@@ -191,6 +191,25 @@ fn maybe_backfill_wc_check(state: &Arc<AppState>, vault_id: &str, cid: &[u8], w_
     });
 }
 
+/// Every custom act the dispatch below handles. Keep in lockstep with the
+/// `ActType::Custom` match arms — `consent::tests::dispatch_and_table_agree`
+/// fails when this list and acts.toml drift in either direction, so an act
+/// can't ship without approval copy (and dead copy can't linger).
+pub(crate) const DISPATCHED_CUSTOM_ACTS: &[&str] = &[
+    "vault-unlock",
+    "vault-lock",
+    "vault-delete",
+    "rename-passkey",
+    "widen-host",
+    "service-ls",
+    "service-rm",
+    "service-add",
+    "secret-rm",
+    "connection-rm",
+    "connection-add",
+    "secret-set",
+];
+
 /// `POST /op/{op_id}/approve` — U submits the signed grant. T validates and
 /// dispatches the act (Enroll / Write / Export / Use).
 pub async fn approve_op(
