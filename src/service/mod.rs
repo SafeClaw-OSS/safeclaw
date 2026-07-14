@@ -6,11 +6,10 @@
 /// plus the auth mechanism (`[auth]`, absent = static) and cosmetic helpers. No
 /// routing/transport is declared: the phantom is the sole intent carrier and
 /// the request already carries the real upstream URL.
-
 pub mod validate;
 
-use std::collections::HashMap;
 use crate::auth::oauth2::OAuthStyle;
+use std::collections::HashMap;
 
 // ── ServiceDef: parsed from service.toml (v4) ───────────────────────────────
 
@@ -441,7 +440,10 @@ impl PolicyDef {
 pub struct RequestShape {
     /// `"METHOD /path"` (or `"/path"`), or a list = OR. Same grammar / serde as
     /// a policy rule's `match`.
-    #[serde(rename = "match", deserialize_with = "crate::core::policy::match_spec::deserialize")]
+    #[serde(
+        rename = "match",
+        deserialize_with = "crate::core::policy::match_spec::deserialize"
+    )]
     pub match_pattern: Vec<String>,
     /// `name → address`. A bare string addresses a body JSON Pointer; the table
     /// form `{ in = "query", at = "<param>" }` addresses a query parameter.
@@ -486,10 +488,16 @@ pub fn consent_refs(template: &str) -> Vec<ConsentRef> {
         let inner = after[..end].trim();
         let mut parts = inner.splitn(2, '|');
         let expr = parts.next().unwrap_or("").trim();
-        let filter = parts.next().map(|f| f.trim().to_string()).filter(|f| !f.is_empty());
+        let filter = parts
+            .next()
+            .map(|f| f.trim().to_string())
+            .filter(|f| !f.is_empty());
         if let Some(name) = expr.strip_prefix("vars.").map(str::trim) {
             if !name.is_empty() {
-                out.push(ConsentRef { var: name.to_string(), filter });
+                out.push(ConsentRef {
+                    var: name.to_string(),
+                    filter,
+                });
             }
         }
         rest = &after[end + 2..];
@@ -532,8 +540,14 @@ impl VarDef {
     fn resolve(&self, body: Option<&serde_json::Value>, query: Option<&str>) -> Option<String> {
         match self {
             VarDef::BodyPointer(ptr) => from_body(body, ptr),
-            VarDef::Located { location: VarLoc::Body, at } => from_body(body, at),
-            VarDef::Located { location: VarLoc::Query, at } => from_query(query, at),
+            VarDef::Located {
+                location: VarLoc::Body,
+                at,
+            } => from_body(body, at),
+            VarDef::Located {
+                location: VarLoc::Query,
+                at,
+            } => from_query(query, at),
         }
     }
 }
@@ -685,7 +699,10 @@ pub struct PolicyFileRule {
     /// Path pattern(s): "METHOD /path" or "/path" (any method). `*` = one
     /// segment. A single string, or a list = OR (fires if any matches) for one
     /// operation exposed at several endpoints. See core `PolicyRule::match_patterns`.
-    #[serde(rename = "match", deserialize_with = "crate::core::policy::match_spec::deserialize")]
+    #[serde(
+        rename = "match",
+        deserialize_with = "crate::core::policy::match_spec::deserialize"
+    )]
     pub match_pattern: Vec<String>,
     /// Regex matched against request body (optional).
     #[serde(default)]
@@ -715,20 +732,26 @@ impl PolicyFileDef {
     }
 
     pub fn to_policy_rules(&self) -> Vec<crate::core::policy::PolicyRule> {
-        self.rule.iter().filter_map(|r| {
-            // A rule decides via its `level`; one with no parseable level is
-            // skipped (it could never decide).
-            let level = r.level.as_deref().and_then(crate::core::policy::AccessLevel::parse)?;
-            Some(crate::core::policy::PolicyRule {
-                id: Some(r.id.clone()),
-                label: Some(r.label.clone()),
-                match_patterns: r.match_pattern.clone(),
-                body: r.body.clone(),
-                when: r.when.clone(),
-                level: Some(level),
-                ttl: r.ttl,
+        self.rule
+            .iter()
+            .filter_map(|r| {
+                // A rule decides via its `level`; one with no parseable level is
+                // skipped (it could never decide).
+                let level = r
+                    .level
+                    .as_deref()
+                    .and_then(crate::core::policy::AccessLevel::parse)?;
+                Some(crate::core::policy::PolicyRule {
+                    id: Some(r.id.clone()),
+                    label: Some(r.label.clone()),
+                    match_patterns: r.match_pattern.clone(),
+                    body: r.body.clone(),
+                    when: r.when.clone(),
+                    level: Some(level),
+                    ttl: r.ttl,
+                })
             })
-        }).collect()
+            .collect()
     }
 }
 
@@ -767,14 +790,18 @@ impl ServiceRegistry {
         if !dirs.is_empty() {
             for (id, service_toml, policy_toml) in dirs {
                 match toml::from_str::<ServiceDef>(&service_toml) {
-                    Ok(def) => { services.insert(id.clone(), def); }
+                    Ok(def) => {
+                        services.insert(id.clone(), def);
+                    }
                     Err(e) => {
                         tracing::warn!("Failed to parse service.toml for {}: {}", id, e);
                     }
                 }
                 if let Some(policy_str) = policy_toml {
                     match toml::from_str::<PolicyFileDef>(&policy_str) {
-                        Ok(def) => { policies.insert(id, def); }
+                        Ok(def) => {
+                            policies.insert(id, def);
+                        }
                         Err(e) => {
                             tracing::warn!("Failed to parse policy.toml for {}: {}", id, e);
                         }
@@ -788,7 +815,8 @@ impl ServiceRegistry {
 
         tracing::info!(
             "Loaded {} service definitions, {} policy files",
-            services.len(), policies.len()
+            services.len(),
+            policies.len()
         );
         Self { services, policies }
     }
@@ -838,16 +866,21 @@ impl ServiceRegistry {
 
     /// Scan for service.toml and policy.toml files. Supports both flat and nested layouts.
     fn scan_dir(base: &std::path::Path, results: &mut Vec<(String, String, Option<String>)>) {
-        let Ok(entries) = std::fs::read_dir(base) else { return };
+        let Ok(entries) = std::fs::read_dir(base) else {
+            return;
+        };
         for entry in entries.flatten() {
             let path = entry.path();
-            if !path.is_dir() { continue; }
+            if !path.is_dir() {
+                continue;
+            }
 
             // Check if this directory itself has service.toml (flat layout)
             let toml_path = path.join("service.toml");
             if toml_path.exists() {
                 if let Ok(content) = std::fs::read_to_string(&toml_path) {
-                    let id = path.file_name()
+                    let id = path
+                        .file_name()
                         .and_then(|n| n.to_str())
                         .unwrap_or("")
                         .to_string();
@@ -862,14 +895,19 @@ impl ServiceRegistry {
             // Otherwise, scan one level deeper — tolerant reader for the
             // retired nested services/{category}/{id}/ layout (pre-tags
             // user-installed dirs may still carry it).
-            let Ok(sub_entries) = std::fs::read_dir(&path) else { continue };
+            let Ok(sub_entries) = std::fs::read_dir(&path) else {
+                continue;
+            };
             for sub_entry in sub_entries.flatten() {
                 let sub_path = sub_entry.path();
-                if !sub_path.is_dir() { continue; }
+                if !sub_path.is_dir() {
+                    continue;
+                }
                 let sub_toml = sub_path.join("service.toml");
                 if sub_toml.exists() {
                     if let Ok(content) = std::fs::read_to_string(&sub_toml) {
-                        let id = sub_path.file_name()
+                        let id = sub_path
+                            .file_name()
                             .and_then(|n| n.to_str())
                             .unwrap_or("")
                             .to_string();
@@ -885,20 +923,29 @@ impl ServiceRegistry {
 
     /// Load user-installed services from ~/.safeclaw/services/.
     /// Skips directories with a `.disabled` marker file.
-    fn load_user_services(services: &mut HashMap<String, ServiceDef>, policies: &mut HashMap<String, PolicyFileDef>) {
+    fn load_user_services(
+        services: &mut HashMap<String, ServiceDef>,
+        policies: &mut HashMap<String, PolicyFileDef>,
+    ) {
         let user_dir = match user_services_dir() {
             Some(d) if d.is_dir() => d,
             _ => return,
         };
 
-        let Ok(entries) = std::fs::read_dir(&user_dir) else { return };
+        let Ok(entries) = std::fs::read_dir(&user_dir) else {
+            return;
+        };
         let mut count = 0u32;
         for entry in entries.flatten() {
             let path = entry.path();
-            if !path.is_dir() { continue; }
+            if !path.is_dir() {
+                continue;
+            }
 
             // Skip disabled services
-            if path.join(".disabled").exists() { continue; }
+            if path.join(".disabled").exists() {
+                continue;
+            }
 
             let id = match path.file_name().and_then(|n| n.to_str()) {
                 Some(s) if !s.is_empty() => s.to_string(),
@@ -906,7 +953,9 @@ impl ServiceRegistry {
             };
 
             let toml_path = path.join("service.toml");
-            let Ok(content) = std::fs::read_to_string(&toml_path) else { continue };
+            let Ok(content) = std::fs::read_to_string(&toml_path) else {
+                continue;
+            };
             match toml::from_str::<ServiceDef>(&content) {
                 Ok(def) => {
                     services.insert(id.clone(), def);
@@ -925,7 +974,11 @@ impl ServiceRegistry {
             }
         }
         if count > 0 {
-            tracing::info!("Loaded {} user-installed services from {}", count, user_dir.display());
+            tracing::info!(
+                "Loaded {} user-installed services from {}",
+                count,
+                user_dir.display()
+            );
         }
     }
 
@@ -957,11 +1010,8 @@ impl ServiceRegistry {
     /// Iterate all loaded service definitions, sorted by id for stable ordering.
     /// Used by the `/v/{vid}/registry` endpoint.
     pub fn iter_sorted(&self) -> Vec<(&str, &ServiceDef)> {
-        let mut entries: Vec<(&str, &ServiceDef)> = self
-            .services
-            .iter()
-            .map(|(k, v)| (k.as_str(), v))
-            .collect();
+        let mut entries: Vec<(&str, &ServiceDef)> =
+            self.services.iter().map(|(k, v)| (k.as_str(), v)).collect();
         entries.sort_by_key(|(k, _)| *k);
         entries
     }
@@ -969,7 +1019,8 @@ impl ServiceRegistry {
     /// Classification tags for a service; empty for unknown ids and untagged
     /// (custom) services — no tag floor applies then, only the global floor.
     pub fn service_tags(&self, service_name: &str) -> &[String] {
-        self.services.get(service_name)
+        self.services
+            .get(service_name)
             .map(|d| d.service.tags.as_slice())
             .unwrap_or(&[])
     }
@@ -1037,8 +1088,9 @@ impl ServiceRegistry {
     /// exactly when its redirect lands on a target some local def already
     /// announces (in practice: the canonical 8765 the custom form defaults to).
     pub fn loopback_allowlist(&self) -> std::collections::HashSet<u16> {
-        let mut allowed: std::collections::HashSet<u16> =
-            loopback_port(DEFAULT_LOOPBACK_REDIRECT).into_iter().collect();
+        let mut allowed: std::collections::HashSet<u16> = loopback_port(DEFAULT_LOOPBACK_REDIRECT)
+            .into_iter()
+            .collect();
         for def in self.services.values() {
             if let Some(oauth) = def.oauth2() {
                 if let Some(port) = loopback_port(&self.resolve_oauth_config(oauth).redirect_uri) {
@@ -1110,7 +1162,10 @@ impl ServiceRegistry {
     }
 
     /// Get default policy rules: policy.toml [[rule]] > service.toml [[policy.rules]].
-    pub fn default_policy_rules(&self, service_name: &str) -> Option<Vec<crate::core::policy::PolicyRule>> {
+    pub fn default_policy_rules(
+        &self,
+        service_name: &str,
+    ) -> Option<Vec<crate::core::policy::PolicyRule>> {
         // Prefer policy.toml [[rule]]
         if let Some(policy) = self.policies.get(service_name) {
             let rules = policy.to_policy_rules();
@@ -1122,7 +1177,11 @@ impl ServiceRegistry {
         let def = self.services.get(service_name)?;
         let policy = def.policy.as_ref()?;
         let rules = policy.to_policy_rules();
-        if rules.is_empty() { None } else { Some(rules) }
+        if rules.is_empty() {
+            None
+        } else {
+            Some(rules)
+        }
     }
 
     /// Get policy file definition (for console UI to show action labels).
@@ -1134,7 +1193,6 @@ impl ServiceRegistry {
     pub fn all(&self) -> &HashMap<String, ServiceDef> {
         &self.services
     }
-
 }
 
 // ── User service directory ───────────────────────────────────────────────────
@@ -1150,7 +1208,10 @@ mod tests {
     use crate::core::policy::AccessLevel;
 
     fn reg(services: HashMap<String, ServiceDef>) -> ServiceRegistry {
-        ServiceRegistry { services, policies: HashMap::new() }
+        ServiceRegistry {
+            services,
+            policies: HashMap::new(),
+        }
     }
 
     // ── PolicyDef::to_levels (inline policy fallback kept) ───────────────────
@@ -1160,7 +1221,10 @@ mod tests {
         let mut levels = HashMap::new();
         levels.insert("read".into(), "allow".into());
         levels.insert("write".into(), "allow".into());
-        let def = PolicyDef { levels: Some(levels), rules: vec![] };
+        let def = PolicyDef {
+            levels: Some(levels),
+            rules: vec![],
+        };
         let sl = def.to_levels().unwrap();
         assert_eq!(sl.read, Some(AccessLevel::Allow));
         assert_eq!(sl.write, Some(AccessLevel::Allow));
@@ -1171,7 +1235,10 @@ mod tests {
         let mut levels = HashMap::new();
         levels.insert("read".into(), "deny".into());
         levels.insert("write".into(), "ask-always".into());
-        let def = PolicyDef { levels: Some(levels), rules: vec![] };
+        let def = PolicyDef {
+            levels: Some(levels),
+            rules: vec![],
+        };
         let sl = def.to_levels().unwrap();
         assert_eq!(sl.read, Some(AccessLevel::Deny));
         assert_eq!(sl.write, Some(AccessLevel::AskAlways));
@@ -1182,11 +1249,21 @@ mod tests {
         let mut levels = HashMap::new();
         levels.insert("read".into(), "allow".into());
         levels.insert("write".into(), "allow".into());
-        let def = PolicyDef { levels: Some(levels), rules: vec![] };
+        let def = PolicyDef {
+            levels: Some(levels),
+            rules: vec![],
+        };
         let toml_levels = def.to_levels();
         let access = crate::core::policy::evaluate(
-            "POST", "/v1/chat", None, &crate::core::policy::VarMap::new(), None, toml_levels.as_ref(),
-            &crate::core::policy::Policy::default(), &["app".into()]);
+            "POST",
+            "/v1/chat",
+            None,
+            &crate::core::policy::VarMap::new(),
+            None,
+            toml_levels.as_ref(),
+            &crate::core::policy::Policy::default(),
+            &["app".into()],
+        );
         assert_eq!(access, AccessLevel::Allow);
     }
 
@@ -1297,8 +1374,14 @@ hosts = ["x.example.com"]
 [oauth2]
 refresh_token = "K"
 "#;
-        let err = toml::from_str::<ServiceDef>(legacy).unwrap_err().to_string();
-        assert!(err.contains("oauth2"), "error should name the offending section: {}", err);
+        let err = toml::from_str::<ServiceDef>(legacy)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("oauth2"),
+            "error should name the offending section: {}",
+            err
+        );
     }
 
     #[test]
@@ -1312,7 +1395,10 @@ hosts = ["x.com"]
 [git]
 helper = "sc"
 "#;
-        assert!(toml::from_str::<ServiceDef>(git).is_err(), "[git] must be rejected");
+        assert!(
+            toml::from_str::<ServiceDef>(git).is_err(),
+            "[git] must be rejected"
+        );
         // A stale v3 `[[upstream]]` is rejected too.
         let v3 = r#"
 [service]
@@ -1322,7 +1408,10 @@ name = "X"
 id = "default"
 url = "https://x.com"
 "#;
-        assert!(toml::from_str::<ServiceDef>(v3).is_err(), "[[upstream]] must be rejected");
+        assert!(
+            toml::from_str::<ServiceDef>(v3).is_err(),
+            "[[upstream]] must be rejected"
+        );
     }
 
     #[test]
@@ -1341,7 +1430,10 @@ refresh_token = "GMAIL_REFRESH_TOKEN"
         let mut services = HashMap::new();
         services.insert("gmail".into(), def);
         let r = reg(services);
-        assert_eq!(r.service_env_key("gmail").as_deref(), Some("GMAIL_REFRESH_TOKEN"));
+        assert_eq!(
+            r.service_env_key("gmail").as_deref(),
+            Some("GMAIL_REFRESH_TOKEN")
+        );
     }
 
     #[test]
@@ -1430,8 +1522,14 @@ secrets = ["GITHUB_TOKEN"]
             authorize_params: HashMap::new(),
         };
         assert!(matches!(r.oauth_style(&oauth(None)), OAuthStyle::Form));
-        assert!(matches!(r.oauth_style(&oauth(Some("form"))), OAuthStyle::Form));
-        assert!(matches!(r.oauth_style(&oauth(Some("json"))), OAuthStyle::Json));
+        assert!(matches!(
+            r.oauth_style(&oauth(Some("form"))),
+            OAuthStyle::Form
+        ));
+        assert!(matches!(
+            r.oauth_style(&oauth(Some("json"))),
+            OAuthStyle::Json
+        ));
     }
 
     // ── compiled-in sanity (post-migration) ──────────────────────────────────
@@ -1443,15 +1541,35 @@ secrets = ["GITHUB_TOKEN"]
                 .unwrap_or_else(|e| panic!("service '{}' failed to parse: {}", id, e));
             // Non-hidden services must anchor at least one host.
             if !def.service.hidden {
-                assert!(!def.service.hosts.is_empty(), "service '{}' declares no hosts", id);
+                assert!(
+                    !def.service.hosts.is_empty(),
+                    "service '{}' declares no hosts",
+                    id
+                );
             }
             // [oauth2] is self-sufficient: every compiled oauth service must be
             // inline-complete (there is no template layer to fill gaps).
             if let Some(o) = def.oauth2() {
-                assert!(!o.refresh_token.is_empty(), "service '{}' oauth2 has empty refresh_token", id);
-                assert!(o.authorization_url.is_some(), "service '{}' oauth2 missing authorization_url", id);
-                assert!(o.token_url.is_some(), "service '{}' oauth2 missing token_url", id);
-                assert!(o.client_id.is_some(), "service '{}' oauth2 missing client_id", id);
+                assert!(
+                    !o.refresh_token.is_empty(),
+                    "service '{}' oauth2 has empty refresh_token",
+                    id
+                );
+                assert!(
+                    o.authorization_url.is_some(),
+                    "service '{}' oauth2 missing authorization_url",
+                    id
+                );
+                assert!(
+                    o.token_url.is_some(),
+                    "service '{}' oauth2 missing token_url",
+                    id
+                );
+                assert!(
+                    o.client_id.is_some(),
+                    "service '{}' oauth2 missing client_id",
+                    id
+                );
             }
         }
     }
@@ -1465,22 +1583,42 @@ secrets = ["GITHUB_TOKEN"]
             }
         }
         let r = reg(services);
-        let oauth = r.get("openai_codex").unwrap().oauth2().cloned().expect("codex [auth] oauth2");
+        let oauth = r
+            .get("openai_codex")
+            .unwrap()
+            .oauth2()
+            .cloned()
+            .expect("codex [auth] oauth2");
         let cfg = r.resolve_oauth_config(&oauth);
-        assert_eq!(cfg.token_url.as_deref(), Some("https://auth.openai.com/oauth/token"));
-        assert_eq!(cfg.client_id.as_deref(), Some("app_EMoamEEZ73f0CkXaXp7hrann"));
+        assert_eq!(
+            cfg.token_url.as_deref(),
+            Some("https://auth.openai.com/oauth/token")
+        );
+        assert_eq!(
+            cfg.client_id.as_deref(),
+            Some("app_EMoamEEZ73f0CkXaXp7hrann")
+        );
         assert!(cfg.client_secret.is_none(), "codex is pure PKCE");
         assert_eq!(cfg.redirect_uri, "http://localhost:1455/auth/callback");
-        let d = r.connect_descriptor("openai_codex").expect("codex descriptor");
+        let d = r
+            .connect_descriptor("openai_codex")
+            .expect("codex descriptor");
         assert!(d.pkce);
         assert_eq!(d.provider, "openai");
         assert_eq!(
-            d.authorize_params.get("codex_cli_simplified_flow").map(String::as_str),
+            d.authorize_params
+                .get("codex_cli_simplified_flow")
+                .map(String::as_str),
             Some("true")
         );
         assert_eq!(
             oauth.claims.get("account_id").map(Vec::as_slice),
-            Some(&["https://api.openai.com/auth".to_string(), "chatgpt_account_id".to_string()][..])
+            Some(
+                &[
+                    "https://api.openai.com/auth".to_string(),
+                    "chatgpt_account_id".to_string()
+                ][..]
+            )
         );
     }
 
@@ -1493,7 +1631,10 @@ secrets = ["GITHUB_TOKEN"]
         let d = r.connect_descriptor_for(&oauth).unwrap();
         assert_eq!(d.provider, "custom");
         assert_eq!(d.client_id, "cid");
-        assert_eq!(d.authorize_params.get("prompt").map(String::as_str), Some("login"));
+        assert_eq!(
+            d.authorize_params.get("prompt").map(String::as_str),
+            Some("login")
+        );
         // A provider name is a pure label — it changes nothing but the label.
         oauth.provider = Some("g".into());
         let d2 = r.connect_descriptor_for(&oauth).unwrap();
@@ -1512,15 +1653,28 @@ secrets = ["GITHUB_TOKEN"]
         let r = reg(services);
         let mut client_ids = std::collections::HashSet::new();
         for id in ["gmail", "gdrive", "gcalendar"] {
-            let oauth = r.get(id).unwrap().oauth2().cloned()
+            let oauth = r
+                .get(id)
+                .unwrap()
+                .oauth2()
+                .cloned()
                 .unwrap_or_else(|| panic!("{} missing [oauth2]", id));
             assert_eq!(oauth.provider.as_deref(), Some("google"), "{}", id);
             let cfg = r.resolve_oauth_config(&oauth);
-            assert_eq!(cfg.token_url.as_deref(), Some("https://oauth2.googleapis.com/token"), "{}", id);
+            assert_eq!(
+                cfg.token_url.as_deref(),
+                Some("https://oauth2.googleapis.com/token"),
+                "{}",
+                id
+            );
             client_ids.insert(cfg.client_id.expect("client_id"));
             assert!(!oauth.scopes.is_empty(), "{} scopes", id);
         }
-        assert_eq!(client_ids.len(), 1, "the trio must share ONE Desktop client (rotate together)");
+        assert_eq!(
+            client_ids.len(),
+            1,
+            "the trio must share ONE Desktop client (rotate together)"
+        );
     }
 
     #[test]
@@ -1531,15 +1685,27 @@ secrets = ["GITHUB_TOKEN"]
         let r = ServiceRegistry::load();
         let d = r.connect_descriptor("gmail").expect("gmail is oauth2");
         assert_eq!(d.provider, "google");
-        assert!(d.authorization_url.starts_with("https://accounts.google.com/"));
-        assert_eq!(d.token_url.as_deref(), Some("https://oauth2.googleapis.com/token"));
+        assert!(d
+            .authorization_url
+            .starts_with("https://accounts.google.com/"));
+        assert_eq!(
+            d.token_url.as_deref(),
+            Some("https://oauth2.googleapis.com/token")
+        );
         assert!(d.client_id.ends_with(".apps.googleusercontent.com"));
-        assert!(d.client_secret.as_deref().is_some_and(|s| s.starts_with("GOCSPX-")),
-            "the public Desktop client_secret is part of the wiring");
+        assert!(
+            d.client_secret
+                .as_deref()
+                .is_some_and(|s| s.starts_with("GOCSPX-")),
+            "the public Desktop client_secret is part of the wiring"
+        );
         assert!(d.pkce);
         assert_eq!(d.oauth_style, "form");
         assert!(d.scopes.iter().any(|s| s.contains("gmail.send")));
-        assert_eq!(d.authorize_params.get("access_type").map(String::as_str), Some("offline"));
+        assert_eq!(
+            d.authorize_params.get("access_type").map(String::as_str),
+            Some("offline")
+        );
     }
 
     #[test]
@@ -1552,44 +1718,103 @@ secrets = ["GITHUB_TOKEN"]
     fn compiled_gmail_policy_resolves_risk_tiers() {
         use crate::core::policy::{evaluate, AccessLevel, Policy};
         let r = ServiceRegistry::load();
-        let rules = r.default_policy_rules("gmail")
+        let rules = r
+            .default_policy_rules("gmail")
             .expect("gmail policy.toml must parse and yield rules");
         let policy = Policy::default();
         let eval = |m: &str, p: &str| {
-            evaluate(m, p, None, &crate::core::policy::VarMap::new(), Some(&rules), None, &policy, &["app".into()])
+            evaluate(
+                m,
+                p,
+                None,
+                &crate::core::policy::VarMap::new(),
+                Some(&rules),
+                None,
+                &policy,
+                &["app".into()],
+            )
         };
-        assert_eq!(eval("GET", "/gmail/v1/users/me/messages"), AccessLevel::Allow);
-        assert_eq!(eval("GET", "/gmail/v1/users/me/messages/abc123"), AccessLevel::Ask);
-        assert_eq!(eval("POST", "/gmail/v1/users/me/messages/send"), AccessLevel::AskAlways);
-        assert_eq!(eval("DELETE", "/gmail/v1/users/me/messages/abc123"), AccessLevel::AskAlways);
+        assert_eq!(
+            eval("GET", "/gmail/v1/users/me/messages"),
+            AccessLevel::Allow
+        );
+        assert_eq!(
+            eval("GET", "/gmail/v1/users/me/messages/abc123"),
+            AccessLevel::Ask
+        );
+        assert_eq!(
+            eval("POST", "/gmail/v1/users/me/messages/send"),
+            AccessLevel::AskAlways
+        );
+        assert_eq!(
+            eval("DELETE", "/gmail/v1/users/me/messages/abc123"),
+            AccessLevel::AskAlways
+        );
     }
 
     #[test]
     fn compiled_cratesio_policy_gates_publish_surface() {
         use crate::core::policy::{evaluate, AccessLevel, Policy};
         let r = ServiceRegistry::load();
-        let rules = r.default_policy_rules("cratesio")
+        let rules = r
+            .default_policy_rules("cratesio")
             .expect("cratesio policy.toml must parse and yield rules");
         let policy = Policy::default();
         let eval = |m: &str, p: &str| {
-            evaluate(m, p, None, &crate::core::policy::VarMap::new(), Some(&rules), None, &policy, &["app".into()])
+            evaluate(
+                m,
+                p,
+                None,
+                &crate::core::policy::VarMap::new(),
+                Some(&rules),
+                None,
+                &policy,
+                &["app".into()],
+            )
         };
         // Routine traffic rides the allow floor.
         assert_eq!(eval("GET", "/api/v1/me"), AccessLevel::Allow);
         assert_eq!(eval("GET", "/api/v1/crates"), AccessLevel::Allow);
-        assert_eq!(eval("PUT", "/api/v1/crates/serde/follow"), AccessLevel::Allow);
+        assert_eq!(
+            eval("PUT", "/api/v1/crates/serde/follow"),
+            AccessLevel::Allow
+        );
         // Publish + version availability ask once per window.
         assert_eq!(eval("PUT", "/api/v1/crates/new"), AccessLevel::Ask);
-        assert_eq!(eval("DELETE", "/api/v1/crates/serde/1.0.219/yank"), AccessLevel::Ask);
-        assert_eq!(eval("PUT", "/api/v1/crates/serde/1.0.219/unyank"), AccessLevel::Ask);
-        assert_eq!(eval("PATCH", "/api/v1/crates/serde/1.0.219"), AccessLevel::Ask);
+        assert_eq!(
+            eval("DELETE", "/api/v1/crates/serde/1.0.219/yank"),
+            AccessLevel::Ask
+        );
+        assert_eq!(
+            eval("PUT", "/api/v1/crates/serde/1.0.219/unyank"),
+            AccessLevel::Ask
+        );
+        assert_eq!(
+            eval("PATCH", "/api/v1/crates/serde/1.0.219"),
+            AccessLevel::Ask
+        );
         // Ownership + supply chain gate every time.
-        assert_eq!(eval("PUT", "/api/v1/crates/serde/owners"), AccessLevel::AskAlways);
-        assert_eq!(eval("DELETE", "/api/v1/crates/serde/owners"), AccessLevel::AskAlways);
-        assert_eq!(eval("POST", "/api/v1/trusted_publishing/github_configs"), AccessLevel::AskAlways);
-        assert_eq!(eval("PATCH", "/api/v1/crates/serde"), AccessLevel::AskAlways);
+        assert_eq!(
+            eval("PUT", "/api/v1/crates/serde/owners"),
+            AccessLevel::AskAlways
+        );
+        assert_eq!(
+            eval("DELETE", "/api/v1/crates/serde/owners"),
+            AccessLevel::AskAlways
+        );
+        assert_eq!(
+            eval("POST", "/api/v1/trusted_publishing/github_configs"),
+            AccessLevel::AskAlways
+        );
+        assert_eq!(
+            eval("PATCH", "/api/v1/crates/serde"),
+            AccessLevel::AskAlways
+        );
         // Publish approvals cover a workspace release train, not one crate.
-        let publish = rules.iter().find(|ru| ru.id.as_deref() == Some("publish")).unwrap();
+        let publish = rules
+            .iter()
+            .find(|ru| ru.id.as_deref() == Some("publish"))
+            .unwrap();
         assert_eq!(publish.ttl, Some(1800));
     }
 
@@ -1597,61 +1822,147 @@ secrets = ["GITHUB_TOKEN"]
     fn compiled_railway_policy_gates_only_destroys() {
         use crate::core::policy::{evaluate, AccessLevel, Policy};
         let r = ServiceRegistry::load();
-        let rules = r.default_policy_rules("railway")
+        let rules = r
+            .default_policy_rules("railway")
             .expect("railway policy.toml must parse and yield rules");
         let policy = Policy::default();
         let eval = |body: &str| {
             // The whole API is one POST endpoint; the mutation name lives in the body.
-            evaluate("POST", "/graphql/v2", Some(body), &crate::core::policy::VarMap::new(), Some(&rules), None, &policy, &["app".into()])
+            evaluate(
+                "POST",
+                "/graphql/v2",
+                Some(body),
+                &crate::core::policy::VarMap::new(),
+                Some(&rules),
+                None,
+                &policy,
+                &["app".into()],
+            )
         };
         // Routine GraphQL (queries + non-destroy mutations) rides the allow floor.
-        assert_eq!(eval(r#"{"query":"query { me { name } }"}"#), AccessLevel::Allow);
-        assert_eq!(eval(r#"{"query":"mutation { serviceInstanceRedeploy(id: 1) }"}"#), AccessLevel::Allow);
-        assert_eq!(eval(r#"{"query":"mutation { variableUpsert(input: {}) }"}"#), AccessLevel::Allow);
+        assert_eq!(
+            eval(r#"{"query":"query { me { name } }"}"#),
+            AccessLevel::Allow
+        );
+        assert_eq!(
+            eval(r#"{"query":"mutation { serviceInstanceRedeploy(id: 1) }"}"#),
+            AccessLevel::Allow
+        );
+        assert_eq!(
+            eval(r#"{"query":"mutation { variableUpsert(input: {}) }"}"#),
+            AccessLevel::Allow
+        );
         // Each irreversible destroy is caught by mutation name (incl. the biggest,
         // workspaceDelete — every project under the workspace).
-        assert_eq!(eval(r#"{"query":"mutation { workspaceDelete(id: \"w\") }"}"#), AccessLevel::AskAlways);
-        assert_eq!(eval(r#"{"query":"mutation { projectDelete(id: \"p\") }"}"#), AccessLevel::AskAlways);
-        assert_eq!(eval(r#"{"query":"mutation { serviceDelete(id: \"s\") }"}"#), AccessLevel::AskAlways);
-        assert_eq!(eval(r#"{"query":"mutation { environmentDelete(id: \"e\") }"}"#), AccessLevel::AskAlways);
-        assert_eq!(eval(r#"{"query":"mutation { volumeDelete(id: \"v\") }"}"#), AccessLevel::AskAlways);
+        assert_eq!(
+            eval(r#"{"query":"mutation { workspaceDelete(id: \"w\") }"}"#),
+            AccessLevel::AskAlways
+        );
+        assert_eq!(
+            eval(r#"{"query":"mutation { projectDelete(id: \"p\") }"}"#),
+            AccessLevel::AskAlways
+        );
+        assert_eq!(
+            eval(r#"{"query":"mutation { serviceDelete(id: \"s\") }"}"#),
+            AccessLevel::AskAlways
+        );
+        assert_eq!(
+            eval(r#"{"query":"mutation { environmentDelete(id: \"e\") }"}"#),
+            AccessLevel::AskAlways
+        );
+        assert_eq!(
+            eval(r#"{"query":"mutation { volumeDelete(id: \"v\") }"}"#),
+            AccessLevel::AskAlways
+        );
         // Minting a durable token escapes the broker → gated.
-        assert_eq!(eval(r#"{"query":"mutation { projectTokenCreate(input: {}) }"}"#), AccessLevel::AskAlways);
-        assert_eq!(eval(r#"{"query":"mutation { apiTokenCreate(input: {}) }"}"#), AccessLevel::AskAlways);
+        assert_eq!(
+            eval(r#"{"query":"mutation { projectTokenCreate(input: {}) }"}"#),
+            AccessLevel::AskAlways
+        );
+        assert_eq!(
+            eval(r#"{"query":"mutation { apiTokenCreate(input: {}) }"}"#),
+            AccessLevel::AskAlways
+        );
         // Access-posture changes (member/role/transfer/ssh key) → gated.
-        assert_eq!(eval(r#"{"query":"mutation { projectMemberAdd(input: {}) }"}"#), AccessLevel::AskAlways);
-        assert_eq!(eval(r#"{"query":"mutation { projectTransferInitiate(id: \"p\") }"}"#), AccessLevel::AskAlways);
-        assert_eq!(eval(r#"{"query":"mutation { sshPublicKeyCreate(input: {}) }"}"#), AccessLevel::AskAlways);
+        assert_eq!(
+            eval(r#"{"query":"mutation { projectMemberAdd(input: {}) }"}"#),
+            AccessLevel::AskAlways
+        );
+        assert_eq!(
+            eval(r#"{"query":"mutation { projectTransferInitiate(id: \"p\") }"}"#),
+            AccessLevel::AskAlways
+        );
+        assert_eq!(
+            eval(r#"{"query":"mutation { sshPublicKeyCreate(input: {}) }"}"#),
+            AccessLevel::AskAlways
+        );
     }
 
     #[test]
     fn compiled_supabase_policy_gates_only_project_delete() {
         use crate::core::policy::{evaluate, AccessLevel, Policy};
         let r = ServiceRegistry::load();
-        let rules = r.default_policy_rules("supabase")
+        let rules = r
+            .default_policy_rules("supabase")
             .expect("supabase policy.toml must parse and yield rules");
         let policy = Policy::default();
         let eval = |m: &str, p: &str| {
-            evaluate(m, p, None, &crate::core::policy::VarMap::new(), Some(&rules), None, &policy, &["app".into()])
+            evaluate(
+                m,
+                p,
+                None,
+                &crate::core::policy::VarMap::new(),
+                Some(&rules),
+                None,
+                &policy,
+                &["app".into()],
+            )
         };
         // Routine developer work — incl. arbitrary SQL — rides the allow floor.
         assert_eq!(eval("GET", "/v1/projects"), AccessLevel::Allow);
         assert_eq!(eval("POST", "/v1/projects"), AccessLevel::Allow);
-        assert_eq!(eval("POST", "/v1/projects/abcdef/database/query"), AccessLevel::Allow);
-        assert_eq!(eval("POST", "/v1/projects/abcdef/secrets"), AccessLevel::Allow);
+        assert_eq!(
+            eval("POST", "/v1/projects/abcdef/database/query"),
+            AccessLevel::Allow
+        );
+        assert_eq!(
+            eval("POST", "/v1/projects/abcdef/secrets"),
+            AccessLevel::Allow
+        );
         // A sub-resource delete (function, secret, branch) is recoverable → floor.
-        assert_eq!(eval("DELETE", "/v1/projects/abcdef/functions/hello"), AccessLevel::Allow);
+        assert_eq!(
+            eval("DELETE", "/v1/projects/abcdef/functions/hello"),
+            AccessLevel::Allow
+        );
         // Editing/deleting a specific api-key is a deeper path → floor.
-        assert_eq!(eval("PATCH", "/v1/projects/abcdef/api-keys/key1"), AccessLevel::Allow);
+        assert_eq!(
+            eval("PATCH", "/v1/projects/abcdef/api-keys/key1"),
+            AccessLevel::Allow
+        );
         // Deleting the whole project is the one irreversible catastrophe.
-        assert_eq!(eval("DELETE", "/v1/projects/abcdef"), AccessLevel::AskAlways);
+        assert_eq!(
+            eval("DELETE", "/v1/projects/abcdef"),
+            AccessLevel::AskAlways
+        );
         // Minting a new API key escapes the broker → gated.
-        assert_eq!(eval("POST", "/v1/projects/abcdef/api-keys"), AccessLevel::AskAlways);
+        assert_eq!(
+            eval("POST", "/v1/projects/abcdef/api-keys"),
+            AccessLevel::AskAlways
+        );
         // Opening the database to the network → gated on BOTH endpoints (no bypass).
-        assert_eq!(eval("POST", "/v1/projects/abcdef/network-restrictions/apply"), AccessLevel::AskAlways);
-        assert_eq!(eval("PATCH", "/v1/projects/abcdef/network-restrictions"), AccessLevel::AskAlways);
+        assert_eq!(
+            eval("POST", "/v1/projects/abcdef/network-restrictions/apply"),
+            AccessLevel::AskAlways
+        );
+        assert_eq!(
+            eval("PATCH", "/v1/projects/abcdef/network-restrictions"),
+            AccessLevel::AskAlways
+        );
         // Handing the project to another owner → gated.
-        assert_eq!(eval("POST", "/v1/projects/abcdef/claim-token"), AccessLevel::AskAlways);
+        assert_eq!(
+            eval("POST", "/v1/projects/abcdef/claim-token"),
+            AccessLevel::AskAlways
+        );
     }
 
     // ── [requests] extraction + scope digest (Phase 2) ───────────────────────
@@ -1687,23 +1998,34 @@ consent = "Buy from {{ vars.merchant }} for {{ vars.amount }}"
             .expect("purchase shape matches");
         // Bare + qualified names both present, values stringified.
         assert_eq!(rs.vars.get("amount").map(String::as_str), Some("80"));
-        assert_eq!(rs.vars.get("purchase.amount").map(String::as_str), Some("80"));
+        assert_eq!(
+            rs.vars.get("purchase.amount").map(String::as_str),
+            Some("80")
+        );
         assert_eq!(rs.vars.get("merchant").map(String::as_str), Some("m_1"));
         assert_eq!(rs.vars.get("force").map(String::as_str), Some("true"));
         // Bound = the scope subset, sorted; the query `force` and body `nonce`
         // are NOT bound (not in scope).
         assert_eq!(
             rs.bound,
-            vec![("amount".to_string(), "80".to_string()), ("merchant".to_string(), "m_1".to_string())]
+            vec![
+                ("amount".to_string(), "80".to_string()),
+                ("merchant".to_string(), "m_1".to_string())
+            ]
         );
-        assert_eq!(rs.consent.as_deref(), Some("Buy from {{ vars.merchant }} for {{ vars.amount }}"));
+        assert_eq!(
+            rs.consent.as_deref(),
+            Some("Buy from {{ vars.merchant }} for {{ vars.amount }}")
+        );
     }
 
     #[test]
     fn extract_none_on_no_match_and_undefined_vars_omitted() {
         let def = snaplii_def();
         // No shape matches a GET → None (Phase-1 path-only grant).
-        assert!(def.extract_request_scope("GET", "/v2/balance", None, None).is_none());
+        assert!(def
+            .extract_request_scope("GET", "/v2/balance", None, None)
+            .is_none());
         // Missing body field → that var is simply absent (not an error).
         let rs = def
             .extract_request_scope("POST", "/v2/purchase", None, Some(r#"{"amount": 5}"#))
@@ -1719,12 +2041,24 @@ consent = "Buy from {{ vars.merchant }} for {{ vars.amount }}"
         // Plain interpolation: `{{ vars.x }}` → the referenced var names.
         let def = snaplii_def();
         let purchase = &def.requests["purchase"];
-        assert_eq!(purchase.consent.as_deref(), Some("Buy from {{ vars.merchant }} for {{ vars.amount }}"));
-        assert_eq!(consent_tokens(purchase.consent.as_deref().unwrap()), vec!["merchant", "amount"]);
+        assert_eq!(
+            purchase.consent.as_deref(),
+            Some("Buy from {{ vars.merchant }} for {{ vars.amount }}")
+        );
+        assert_eq!(
+            consent_tokens(purchase.consent.as_deref().unwrap()),
+            vec!["merchant", "amount"]
+        );
         // A rich renderer is a FILTER in the same one template field — same
         // `{{ x | filter }}` grammar as git's `{{ secret.X | basic }}`.
         let refs = consent_refs("{{ vars.raw | email }}");
-        assert_eq!(refs, vec![ConsentRef { var: "raw".into(), filter: Some("email".into()) }]);
+        assert_eq!(
+            refs,
+            vec![ConsentRef {
+                var: "raw".into(),
+                filter: Some("email".into())
+            }]
+        );
         // A filter still counts its var for show ⊆ bind.
         assert_eq!(consent_tokens("{{ vars.raw | email }}"), vec!["raw"]);
         // A token without the `vars.` prefix is ignored (left literal).
@@ -1736,21 +2070,59 @@ consent = "Buy from {{ vars.merchant }} for {{ vars.amount }}"
         // The $80/$180 guarantee at the digest level: same bound values → same
         // digest (order-independent); a changed value → a different digest; a
         // field NOT in scope (a nonce) never affects it.
-        let d80 = scope_digest(&[("amount".into(), "80".into()), ("merchant".into(), "m_1".into())]);
-        let d80_reordered = scope_digest(&[("merchant".into(), "m_1".into()), ("amount".into(), "80".into())]);
-        let d180 = scope_digest(&[("amount".into(), "180".into()), ("merchant".into(), "m_1".into())]);
+        let d80 = scope_digest(&[
+            ("amount".into(), "80".into()),
+            ("merchant".into(), "m_1".into()),
+        ]);
+        let d80_reordered = scope_digest(&[
+            ("merchant".into(), "m_1".into()),
+            ("amount".into(), "80".into()),
+        ]);
+        let d180 = scope_digest(&[
+            ("amount".into(), "180".into()),
+            ("merchant".into(), "m_1".into()),
+        ]);
         // digest() sorts, so reordering the input pairs is irrelevant once sorted;
         // here we compare the raw fn on already-sorted inputs.
         assert_eq!(d80, d80);
         assert_ne!(d80, d180);
         assert_ne!(d80, d80_reordered); // raw fn is order-sensitive…
-        // …which is why extract_request_scope always sorts before hashing:
+                                        // …which is why extract_request_scope always sorts before hashing:
         let def = snaplii_def();
-        let a = def.extract_request_scope("POST", "/v2/purchase", None, Some(r#"{"amount":80,"merchant_id":"m_1"}"#)).unwrap();
-        let b = def.extract_request_scope("POST", "/v2/purchase", Some("force=1"), Some(r#"{"merchant_id":"m_1","amount":80,"nonce":"Q"}"#)).unwrap();
-        assert_eq!(a.digest(), b.digest(), "same bound values (nonce/query ignored) → same digest");
-        let c = def.extract_request_scope("POST", "/v2/purchase", None, Some(r#"{"amount":180,"merchant_id":"m_1"}"#)).unwrap();
-        assert_ne!(a.digest(), c.digest(), "changed amount → different digest → re-prompt");
+        let a = def
+            .extract_request_scope(
+                "POST",
+                "/v2/purchase",
+                None,
+                Some(r#"{"amount":80,"merchant_id":"m_1"}"#),
+            )
+            .unwrap();
+        let b = def
+            .extract_request_scope(
+                "POST",
+                "/v2/purchase",
+                Some("force=1"),
+                Some(r#"{"merchant_id":"m_1","amount":80,"nonce":"Q"}"#),
+            )
+            .unwrap();
+        assert_eq!(
+            a.digest(),
+            b.digest(),
+            "same bound values (nonce/query ignored) → same digest"
+        );
+        let c = def
+            .extract_request_scope(
+                "POST",
+                "/v2/purchase",
+                None,
+                Some(r#"{"amount":180,"merchant_id":"m_1"}"#),
+            )
+            .unwrap();
+        assert_ne!(
+            a.digest(),
+            c.digest(),
+            "changed amount → different digest → re-prompt"
+        );
         // Empty scope collapses to "" (the Phase-1 key).
         assert_eq!(scope_digest(&[]), "");
     }
@@ -1761,7 +2133,10 @@ consent = "Buy from {{ vars.merchant }} for {{ vars.amount }}"
         // and the digest is still deterministic and tamper-sensitive.
         let big = "x".repeat(BOUND_VALUE_CAP + 100);
         let capped = cap_bound_value(&big);
-        assert!(capped.starts_with("sha256:"), "large value → digest marker, got {capped}");
+        assert!(
+            capped.starts_with("sha256:"),
+            "large value → digest marker, got {capped}"
+        );
         assert!(capped.len() < 100, "marker is small, not the whole value");
         // Small values stay verbatim.
         assert_eq!(cap_bound_value("hello"), "hello");

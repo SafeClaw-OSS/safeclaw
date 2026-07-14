@@ -50,14 +50,13 @@ pub fn seal(key: &[u8; KEY_LEN], plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>
 
 /// One-shot open of `nonce ‖ ciphertext ‖ tag`.
 pub fn open(key: &[u8; KEY_LEN], sealed: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
-    SudpCipher::open(key, sealed, aad)
-        .map_err(|e| match e {
-            sudp::Error::SealDecryptionFailed => {
-                AppError::Unauthorized("AEAD authentication failed".into())
-            }
-            sudp::Error::Malformed(msg) => AppError::BadRequest(msg.to_string()),
-            other => AppError::Internal(format!("AEAD open: {}", other)),
-        })
+    SudpCipher::open(key, sealed, aad).map_err(|e| match e {
+        sudp::Error::SealDecryptionFailed => {
+            AppError::Unauthorized("AEAD authentication failed".into())
+        }
+        sudp::Error::Malformed(msg) => AppError::BadRequest(msg.to_string()),
+        other => AppError::Internal(format!("AEAD open: {}", other)),
+    })
 }
 
 /// Allocate a zeroizing `Vec<u8>` of the given capacity.

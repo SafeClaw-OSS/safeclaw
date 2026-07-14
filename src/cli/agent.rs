@@ -86,7 +86,10 @@ async fn add(args: AgentAddArgs) -> Result<(), String> {
     if !resp.status().is_success() {
         return Err(format!("create agent key failed: HTTP {}", resp.status()));
     }
-    let r: CreateResp = resp.json().await.map_err(|e| format!("parse response: {}", e))?;
+    let r: CreateResp = resp
+        .json()
+        .await
+        .map_err(|e| format!("parse response: {}", e))?;
 
     // ── Mint-time projection (CREDENTIAL_BROKER.md §14): this IS the minter ─
     // Print the agent's env as three dotenv lines: the daemon's API face + the
@@ -131,7 +134,10 @@ async fn fetch_agents(cloud: &str, key: &str) -> Result<Vec<ListKey>, String> {
     if !resp.status().is_success() {
         return Err(format!("list agents failed: HTTP {}", resp.status()));
     }
-    let r: ListResp = resp.json().await.map_err(|e| format!("parse response: {}", e))?;
+    let r: ListResp = resp
+        .json()
+        .await
+        .map_err(|e| format!("parse response: {}", e))?;
     Ok(r.keys)
 }
 
@@ -163,7 +169,12 @@ async fn rm(args: AgentRmArgs) -> Result<(), String> {
         .collect();
     let id = match matches.as_slice() {
         [k] => k.id.clone(),
-        [] => return Err(format!("no agent named '{}' (see `sc agent ls`)", args.name)),
+        [] => {
+            return Err(format!(
+                "no agent named '{}' (see `sc agent ls`)",
+                args.name
+            ))
+        }
         _ => {
             return Err(format!(
                 "'{}' matches multiple agents — remove by id or prefix (`sc agent ls`)",

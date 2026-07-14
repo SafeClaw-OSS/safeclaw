@@ -120,10 +120,7 @@ pub async fn run(args: LoginArgs) -> Result<(), String> {
     // `http://` custodian leaks the token on the wire AND lets an on-path
     // attacker swap the response for an attacker-controlled daemon. Reject
     // by default; the only legitimate cleartext case is dev-loopback.
-    if !args.insecure_http
-        && !custodian.starts_with("https://")
-        && !is_localhost_http(&custodian)
-    {
+    if !args.insecure_http && !custodian.starts_with("https://") && !is_localhost_http(&custodian) {
         return Err(format!(
             "custodian URL must use HTTPS ({} is plaintext); \
              pass --insecure-http to override (test-only)",
@@ -138,7 +135,12 @@ pub async fn run(args: LoginArgs) -> Result<(), String> {
     let device_name = args
         .device_name
         .clone()
-        .or_else(|| hostname::get().ok().and_then(|h| h.into_string().ok()).filter(|s| !s.is_empty()))
+        .or_else(|| {
+            hostname::get()
+                .ok()
+                .and_then(|h| h.into_string().ok())
+                .filter(|s| !s.is_empty())
+        })
         .or_else(|| std::env::var("HOSTNAME").ok().filter(|s| !s.is_empty()))
         .or_else(|| std::env::var("COMPUTERNAME").ok().filter(|s| !s.is_empty()))
         .unwrap_or_else(|| "agent-device".to_string());
@@ -306,8 +308,7 @@ fn write_device_key(path: &std::path::Path, device_key: &str) -> Result<(), Stri
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("mkdir {}: {}", parent.display(), e))?;
     }
-    std::fs::write(path, device_key)
-        .map_err(|e| format!("write {}: {}", path.display(), e))?;
+    std::fs::write(path, device_key).map_err(|e| format!("write {}: {}", path.display(), e))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

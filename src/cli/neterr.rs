@@ -74,7 +74,9 @@ mod tests {
     #[test]
     fn looks_unreachable_matches_transport_shapes_not_logical() {
         assert!(looks_unreachable("reach host: whatever"));
-        assert!(looks_unreachable("error sending request for url (...): timed out"));
+        assert!(looks_unreachable(
+            "error sending request for url (...): timed out"
+        ));
         assert!(!looks_unreachable("HTTP 404 not found"));
         assert!(!looks_unreachable("invalid pair-token"));
     }

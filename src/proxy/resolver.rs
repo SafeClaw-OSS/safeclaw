@@ -213,7 +213,9 @@ mod tests {
         // The telegram token lives in the URL PATH, never the authority.
         let mut m = HashMap::new();
         m.insert("__sc__telegram__".to_string(), "12345:ABCDEF".to_string());
-        let (out, any) = substitute("/bot__sc__telegram__/sendMessage", |ph| m.get(&ph.raw).cloned());
+        let (out, any) = substitute("/bot__sc__telegram__/sendMessage", |ph| {
+            m.get(&ph.raw).cloned()
+        });
         assert!(any);
         assert_eq!(out, "/bot12345:ABCDEF/sendMessage");
     }
@@ -241,10 +243,9 @@ mod tests {
         let mut m = HashMap::new();
         m.insert("__sc__bb__username__".to_string(), "alice".to_string());
         m.insert("__sc__bb__api_token__".to_string(), "t0ken".to_string());
-        let (out, _) = substitute(
-            "__sc__bb__username__:__sc__bb__api_token__",
-            |ph| m.get(&ph.raw).cloned(),
-        );
+        let (out, _) = substitute("__sc__bb__username__:__sc__bb__api_token__", |ph| {
+            m.get(&ph.raw).cloned()
+        });
         assert_eq!(out, "alice:t0ken");
     }
 }

@@ -63,6 +63,11 @@ pub fn verify_assertion(
         rp_id: rp_id.to_string(),
         require_uv: false,
     };
-    <WebAuthn as Authenticator>::verify_assertion(&public_key, expected_challenge, assertion, &context)
-        .map_err(|_| AppError::Unauthorized("WebAuthn assertion verification failed".into()))
+    <WebAuthn as Authenticator>::verify_assertion(
+        &public_key,
+        expected_challenge,
+        assertion,
+        &context,
+    )
+    .map_err(|_| AppError::Unauthorized("WebAuthn assertion verification failed".into()))
 }

@@ -202,4 +202,3 @@ fn shell_proxy_now() -> Option<String> {
     }
     None
 }
-

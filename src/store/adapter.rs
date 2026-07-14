@@ -2,9 +2,7 @@
 
 use crate::storage::plaintext::{Category, Store, VaultPlaintextView};
 
-use super::adapters::{
-    gcp::GcpSecretManagerAdapter, native_secrets::NativeSecretsAdapter,
-};
+use super::adapters::{gcp::GcpSecretManagerAdapter, native_secrets::NativeSecretsAdapter};
 
 /// Errors raised by adapter operations. Resolution-path code treats
 /// `NotFound` as "skip to next store" but `Backend` as fatal (abort the
@@ -85,9 +83,9 @@ pub fn build_adapter(
     view: &VaultPlaintextView,
 ) -> AdapterResult<Adapter> {
     match store.kind.as_str() {
-        "native-secrets" => Ok(Adapter::NativeSecrets(
-            NativeSecretsAdapter::from_view(view),
-        )),
+        "native-secrets" => Ok(Adapter::NativeSecrets(NativeSecretsAdapter::from_view(
+            view,
+        ))),
         "gcp-secret-manager" => {
             let project_id = store
                 .extra
@@ -120,7 +118,9 @@ pub fn build_adapter(
                     ))
                 })?
                 .clone();
-            Ok(Adapter::Gcp(GcpSecretManagerAdapter::new(project_id, sa_json)?))
+            Ok(Adapter::Gcp(GcpSecretManagerAdapter::new(
+                project_id, sa_json,
+            )?))
         }
         // Future kinds (1password-sa, aws-secrets-manager) aren't wired through
         // this dispatcher yet — they live in store_order but are skipped during

@@ -19,7 +19,10 @@ fn hex_encode(b: &[u8]) -> String {
     b.iter().map(|x| format!("{:02x}", x)).collect()
 }
 fn hex_decode(s: &str) -> Vec<u8> {
-    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+        .collect()
 }
 
 fn main() {
@@ -35,8 +38,9 @@ fn main() {
             let enc = URL_SAFE_NO_PAD.decode(&args[3]).expect("enc b64url");
             let ct = URL_SAFE_NO_PAD.decode(&args[4]).expect("ct b64url");
             let op_id = &args[5];
-            let sk = <<SuiteKem as Kem>::PrivateKey as Deserializable>::from_bytes(&hex_decode(sk_hex))
-                .expect("sk");
+            let sk =
+                <<SuiteKem as Kem>::PrivateKey as Deserializable>::from_bytes(&hex_decode(sk_hex))
+                    .expect("sk");
             let pk = <SuiteKem as Kem>::sk_to_pk(&sk);
             let kp = ScKeyPair { sk, pk };
             let info = grant_seal_info(op_id);

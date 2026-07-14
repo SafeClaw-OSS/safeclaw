@@ -76,14 +76,18 @@ pub async fn run(args: RunArgs) -> Result<(), String> {
 /// self-heals. `sc run` still never owns or persists the key — it reads the
 /// agent's own from the env and splices it in memory only.
 fn agent_proxy_url(vid: &str) -> String {
-    let key = std::env::var("SAFECLAW_API_KEY").ok().filter(|s| !s.is_empty());
+    let key = std::env::var("SAFECLAW_API_KEY")
+        .ok()
+        .filter(|s| !s.is_empty());
     let cfg = load_config().unwrap_or_default();
     proxy_url_for_vault(&api_face_root(&cfg), vid, key.as_deref())
 }
 
 /// Does this shell carry an agent identity? Its `$SAFECLAW_API_KEY`.
 fn agent_has_key() -> bool {
-    std::env::var("SAFECLAW_API_KEY").map(|s| !s.is_empty()).unwrap_or(false)
+    std::env::var("SAFECLAW_API_KEY")
+        .map(|s| !s.is_empty())
+        .unwrap_or(false)
 }
 
 /// The CA must exist and the daemon must be up (the proxy shares its process).
@@ -107,7 +111,12 @@ async fn preflight(ca: &Path, control_root: &str) -> Result<(), String> {
     // takes only the env HOST and resolves the port itself.)
     if let Some((name, u)) = ["SAFECLAW_BROKER_URL", "SAFECLAW_DAEMON_URL"]
         .into_iter()
-        .find_map(|k| std::env::var(k).ok().filter(|s| !s.is_empty()).map(|v| (k, v)))
+        .find_map(|k| {
+            std::env::var(k)
+                .ok()
+                .filter(|s| !s.is_empty())
+                .map(|v| (k, v))
+        })
     {
         return Err(format!(
             "SafeClaw isn't answering at {control_root} (host from your agent env's \

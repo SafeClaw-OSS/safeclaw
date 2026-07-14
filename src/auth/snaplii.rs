@@ -45,12 +45,15 @@ pub async fn exchange(api_key: &str, agent_id: &str) -> Result<(String, u64), St
         // Body is Snaplii's own error prose (e.g. bad/revoked key) — surface a
         // bounded slice of it; it never contains our secret.
         let snippet: String = body.chars().take(200).collect();
-        return Err(format!("snaplii token exchange: HTTP {}: {}", status.as_u16(), snippet));
+        return Err(format!(
+            "snaplii token exchange: HTTP {}: {}",
+            status.as_u16(),
+            snippet
+        ));
     }
     let v: serde_json::Value = serde_json::from_str(&body)
         .map_err(|_| "snaplii token response is not JSON".to_string())?;
-    let jwt = find_jwt(&v)
-        .ok_or_else(|| "snaplii token response carries no JWT".to_string())?;
+    let jwt = find_jwt(&v).ok_or_else(|| "snaplii token response carries no JWT".to_string())?;
     let expires_at = jwt_exp(&jwt).unwrap_or_else(|| now_epoch() + DEFAULT_TTL_SECS);
     Ok((jwt, expires_at))
 }
@@ -84,9 +87,11 @@ fn is_jwt_shaped(s: &str) -> bool {
     let parts: Vec<&str> = s.split('.').collect();
     parts.len() == 3
         && parts[0].starts_with("eyJ")
-        && parts
-            .iter()
-            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'))
+        && parts.iter().all(|p| {
+            !p.is_empty()
+                && p.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        })
 }
 
 /// The `exp` claim (RFC 7519 §4.1.4) from the payload, read WITHOUT signature

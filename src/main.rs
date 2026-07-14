@@ -40,10 +40,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // CLI commands log to stderr; don't initialise the tracing
             // subscriber here (it'd pollute the user-facing output of a
             // short-lived command). The daemon path enables it below.
-            cli::status::run(args).await.map_err(|e| -> Box<dyn std::error::Error> {
-                eprintln!("safeclaw status: {}", e);
-                e.into()
-            })
+            cli::status::run(args)
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error> {
+                    eprintln!("safeclaw status: {}", e);
+                    e.into()
+                })
         }
         // `serve` is the foreground daemon entry — it bootstraps tracing, owns
         // the runtime, and runs forever, so handle it here, not through the
@@ -53,17 +55,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // `sc restart` = bounce the daemon AND converge back to ready (re-unlock).
         // A process restart wipes the in-memory keys, so it routes through the
         // same `ensure_unlocked` chokepoint as `sc up` (see cli/up.rs::restart).
-        Command::Restart => {
-            cli::up::restart().await.map_err(|e| -> Box<dyn std::error::Error> {
+        Command::Restart => cli::up::restart()
+            .await
+            .map_err(|e| -> Box<dyn std::error::Error> {
                 eprintln!("safeclaw restart: {}", e);
                 e.into()
-            })
-        }
+            }),
         Command::Sync(args) => {
-            cli::sync::run(args).await.map_err(|e| -> Box<dyn std::error::Error> {
-                eprintln!("safeclaw sync: {}", e);
-                e.into()
-            })
+            cli::sync::run(args)
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error> {
+                    eprintln!("safeclaw sync: {}", e);
+                    e.into()
+                })
         }
         Command::Logs(args) => cli::service::run_logs(args).map_err(daemon_err),
         Command::Pubkey(args) => cli::custodian::pubkey(args).await.map_err(daemon_err),
@@ -73,36 +77,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // ensure the vault is unlocked (the single auto-unlock chokepoint;
             // see cli/up.rs). login / upgrade-restart / agent lazy-start all
             // route through here, so the user never runs a bare "unlock".
-            cli::up::run().await.map_err(|e| -> Box<dyn std::error::Error> {
-                eprintln!("safeclaw up: {}", e);
-                e.into()
-            })
+            cli::up::run()
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error> {
+                    eprintln!("safeclaw up: {}", e);
+                    e.into()
+                })
         }
         Command::Unlock(args) => cli::unlock::run_unlock(args).await.map_err(daemon_err),
         Command::Lock(args) => cli::unlock::run_lock(args).await.map_err(daemon_err),
-        Command::Ls(args) => {
-            cli::ls::run(args).await.map_err(|e| -> Box<dyn std::error::Error> {
+        Command::Ls(args) => cli::ls::run(args)
+            .await
+            .map_err(|e| -> Box<dyn std::error::Error> {
                 eprintln!("safeclaw ls: {}", e);
                 e.into()
-            })
-        }
+            }),
         Command::Get(args) => {
-            cli::secret::run_get(args).await.map_err(|e| -> Box<dyn std::error::Error> {
-                eprintln!("safeclaw get: {}", e);
-                e.into()
-            })
+            cli::secret::run_get(args)
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error> {
+                    eprintln!("safeclaw get: {}", e);
+                    e.into()
+                })
         }
         Command::Doctor(args) => {
-            cli::doctor::run(args).await.map_err(|e| -> Box<dyn std::error::Error> {
-                eprintln!("safeclaw doctor: {}", e);
-                e.into()
-            })
+            cli::doctor::run(args)
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error> {
+                    eprintln!("safeclaw doctor: {}", e);
+                    e.into()
+                })
         }
         Command::Vault(args) => {
-            cli::vault::run(args.sub).await.map_err(|e| -> Box<dyn std::error::Error> {
-                eprintln!("safeclaw vault: {}", e);
-                e.into()
-            })
+            cli::vault::run(args.sub)
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error> {
+                    eprintln!("safeclaw vault: {}", e);
+                    e.into()
+                })
         }
         Command::Config(args) => {
             cli::config::run(args.sub).map_err(|e| -> Box<dyn std::error::Error> {
@@ -111,61 +123,75 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             })
         }
         Command::Proxy(args) => {
-            cli::proxy::run(args.sub).await.map_err(|e| -> Box<dyn std::error::Error> {
-                eprintln!("safeclaw proxy: {}", e);
-                e.into()
-            })
+            cli::proxy::run(args.sub)
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error> {
+                    eprintln!("safeclaw proxy: {}", e);
+                    e.into()
+                })
         }
         Command::Store(args) => {
-            cli::store::run(args.sub).await.map_err(|e| -> Box<dyn std::error::Error> {
-                eprintln!("safeclaw store: {}", e);
-                e.into()
-            })
+            cli::store::run(args.sub)
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error> {
+                    eprintln!("safeclaw store: {}", e);
+                    e.into()
+                })
         }
         Command::Passkey(args) => {
-            cli::passkey::run(args.sub).await.map_err(|e| -> Box<dyn std::error::Error> {
-                eprintln!("safeclaw passkey: {}", e);
-                e.into()
-            })
+            cli::passkey::run(args.sub)
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error> {
+                    eprintln!("safeclaw passkey: {}", e);
+                    e.into()
+                })
         }
         Command::Agent(args) => {
-            cli::agent::run(args.sub).await.map_err(|e| -> Box<dyn std::error::Error> {
-                eprintln!("safeclaw agent: {}", e);
-                e.into()
-            })
+            cli::agent::run(args.sub)
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error> {
+                    eprintln!("safeclaw agent: {}", e);
+                    e.into()
+                })
         }
         Command::Admin(args) => {
-            cli::admin::run(args.sub).await.map_err(|e| -> Box<dyn std::error::Error> {
-                eprintln!("safeclaw admin: {}", e);
-                e.into()
-            })
+            cli::admin::run(args.sub)
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error> {
+                    eprintln!("safeclaw admin: {}", e);
+                    e.into()
+                })
         }
-        Command::Env => {
-            cli::env::run().map_err(|e| -> Box<dyn std::error::Error> {
-                eprintln!("safeclaw env: {}", e);
-                e.into()
-            })
-        }
+        Command::Env => cli::env::run().map_err(|e| -> Box<dyn std::error::Error> {
+            eprintln!("safeclaw env: {}", e);
+            e.into()
+        }),
         Command::GitCredential(args) => {
             // Invoked by git, not users. Never print to stderr on the happy path
             // (git reads stdout); surface only hard errors.
-            cli::git_credential::run(args).await.map_err(|e| -> Box<dyn std::error::Error> {
-                eprintln!("safeclaw git-credential: {}", e);
-                e.into()
-            })
+            cli::git_credential::run(args)
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error> {
+                    eprintln!("safeclaw git-credential: {}", e);
+                    e.into()
+                })
         }
         Command::Run(args) => {
-            cli::run::run(args).await.map_err(|e| -> Box<dyn std::error::Error> {
-                eprintln!("safeclaw run: {}", e);
-                e.into()
-            })
+            cli::run::run(args)
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error> {
+                    eprintln!("safeclaw run: {}", e);
+                    e.into()
+                })
         }
         // `sc connect …` is the hidden back-compat spelling of `sc connection add`.
         Command::Connect(args) => {
-            cli::connect::run(args).await.map_err(|e| -> Box<dyn std::error::Error> {
-                eprintln!("safeclaw connect: {}", e);
-                e.into()
-            })
+            cli::connect::run(args)
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error> {
+                    eprintln!("safeclaw connect: {}", e);
+                    e.into()
+                })
         }
         Command::Connection(args) => {
             use safeclaw::config::ConnectionSubcommand;
@@ -180,22 +206,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             })
         }
         Command::Upgrade(args) => {
-            cli::upgrade::run(args).await.map_err(|e| -> Box<dyn std::error::Error> {
-                eprintln!("safeclaw upgrade: {}", e);
-                e.into()
-            })
+            cli::upgrade::run(args)
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error> {
+                    eprintln!("safeclaw upgrade: {}", e);
+                    e.into()
+                })
         }
         Command::Login(args) => {
-            cli::login::run(args).await.map_err(|e| -> Box<dyn std::error::Error> {
-                eprintln!("safeclaw login: {}", e);
-                e.into()
-            })
+            cli::login::run(args)
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error> {
+                    eprintln!("safeclaw login: {}", e);
+                    e.into()
+                })
         }
         Command::Logout(args) => {
-            cli::logout::run(args).await.map_err(|e| -> Box<dyn std::error::Error> {
-                eprintln!("safeclaw logout: {}", e);
-                e.into()
-            })
+            cli::logout::run(args)
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error> {
+                    eprintln!("safeclaw logout: {}", e);
+                    e.into()
+                })
         }
         Command::Device(args) => {
             use safeclaw::config::DeviceSubcommand;
@@ -222,16 +254,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             })
         }
         Command::Set(args) => {
-            cli::secret::run_set(args).await.map_err(|e| -> Box<dyn std::error::Error> {
-                eprintln!("safeclaw set: {}", e);
-                e.into()
-            })
+            cli::secret::run_set(args)
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error> {
+                    eprintln!("safeclaw set: {}", e);
+                    e.into()
+                })
         }
         Command::Rm(args) => {
-            cli::secret::run_rm(args).await.map_err(|e| -> Box<dyn std::error::Error> {
-                eprintln!("safeclaw rm: {}", e);
-                e.into()
-            })
+            cli::secret::run_rm(args)
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error> {
+                    eprintln!("safeclaw rm: {}", e);
+                    e.into()
+                })
         }
         Command::Service(args) => {
             use safeclaw::config::ServiceSubcommand;
@@ -275,10 +311,9 @@ async fn run_daemon(args: ServeArgs, verbose: u8) -> Result<(), Box<dyn std::err
     // RUST_LOG still wins.
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| {
-                    tracing_subscriber::EnvFilter::new(cli::logging::serve_filter(verbose))
-                }),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                tracing_subscriber::EnvFilter::new(cli::logging::serve_filter(verbose))
+            }),
         )
         .init();
 
@@ -336,7 +371,10 @@ async fn run_daemon(args: ServeArgs, verbose: u8) -> Result<(), Box<dyn std::err
     // `loopback::ensure_running` only while some connect is awaiting its redirect
     // — and self-closes when idle. So there is nothing to spawn at boot.
 
-    let listen_ip: std::net::IpAddr = config.listen.parse().unwrap_or_else(|_| "127.0.0.1".parse().unwrap());
+    let listen_ip: std::net::IpAddr = config
+        .listen
+        .parse()
+        .unwrap_or_else(|_| "127.0.0.1".parse().unwrap());
 
     // Two localhost listeners (2026-07-03 phantom-only proxy): the control/API
     // plane (op/approve/passkeys/registry/admin) on CONTROL_PORT here, and the

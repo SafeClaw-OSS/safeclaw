@@ -15,8 +15,8 @@
 //! Rule matching uses path patterns (nginx-style):
 //! - `match`: `"METHOD /path/with/*/wildcards"` — `*` matches one path segment
 //! - `body`: regex matched against request body text (optional)
-use serde::{Deserialize, Serialize};
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// Serde for a rule's `match`: accept either a single `"METHOD /path"` string or
@@ -124,7 +124,12 @@ pub struct PolicyRule {
     /// thing). This is the REST-side equivalent of the `body` regex's OR that
     /// collapses several GraphQL mutations into one rule. Empty = no path/method
     /// constraint (the rule decides on `body` alone, or unconditionally).
-    #[serde(default, rename = "match", skip_serializing_if = "Vec::is_empty", with = "match_spec")]
+    #[serde(
+        default,
+        rename = "match",
+        skip_serializing_if = "Vec::is_empty",
+        with = "match_spec"
+    )]
     pub match_patterns: Vec<String>,
     /// Regex matched against request body text. Omit to skip body matching.
     #[serde(default)]
@@ -299,10 +304,7 @@ pub fn merge_levels(user: Option<&Levels>, built_in: Option<&Levels>) -> Option<
 /// rules. By id: an edit overrides `level` / `ttl` (and `label`/`body` if given)
 /// of the matching built-in; an entry with a `match` whose id is *not* built-in
 /// is appended as a new rule. PROTOCOL.md §6.4 `M.policy` (logical merged view).
-pub fn merge_rules(
-    built_in: &[PolicyRule],
-    user: &HashMap<String, RuleConfig>,
-) -> Vec<PolicyRule> {
+pub fn merge_rules(built_in: &[PolicyRule], user: &HashMap<String, RuleConfig>) -> Vec<PolicyRule> {
     let mut out: Vec<PolicyRule> = built_in
         .iter()
         .map(|rule| {
@@ -480,14 +482,12 @@ impl Condition {
         }
         // A quoted literal is always a string; else try numeric, fall back to
         // a bare string.
-        let (lit_num, lit_str) = if let Some(inner) = rhs
-            .strip_prefix('"')
-            .and_then(|r| r.strip_suffix('"'))
-        {
-            (None, inner.to_string())
-        } else {
-            (rhs.parse::<f64>().ok(), rhs.to_string())
-        };
+        let (lit_num, lit_str) =
+            if let Some(inner) = rhs.strip_prefix('"').and_then(|r| r.strip_suffix('"')) {
+                (None, inner.to_string())
+            } else {
+                (rhs.parse::<f64>().ok(), rhs.to_string())
+            };
         Some(Condition {
             var: var.to_string(),
             op,
@@ -528,18 +528,16 @@ impl Condition {
             // Ordering: only meaningful when both sides are numbers. A
             // non-numeric value (or a non-numeric literal) can't satisfy `>`,
             // so the condition is false — never an error, never a grant.
-            CmpOp::Gt | CmpOp::Lt | CmpOp::Ge | CmpOp::Le => {
-                match (value_num, self.lit_num) {
-                    (Some(v), Some(n)) => match self.op {
-                        CmpOp::Gt => v > n,
-                        CmpOp::Lt => v < n,
-                        CmpOp::Ge => v >= n,
-                        CmpOp::Le => v <= n,
-                        _ => unreachable!(),
-                    },
-                    _ => false,
-                }
-            }
+            CmpOp::Gt | CmpOp::Lt | CmpOp::Ge | CmpOp::Le => match (value_num, self.lit_num) {
+                (Some(v), Some(n)) => match self.op {
+                    CmpOp::Gt => v > n,
+                    CmpOp::Lt => v < n,
+                    CmpOp::Ge => v >= n,
+                    CmpOp::Le => v <= n,
+                    _ => unreachable!(),
+                },
+                _ => false,
+            },
         }
     }
 }
@@ -620,7 +618,17 @@ pub fn evaluate(
     policy: &Policy,
     tags: &[String],
 ) -> AccessLevel {
-    evaluate_with_match(method, path, body, vars, rules, connection_levels, policy, tags).0
+    evaluate_with_match(
+        method,
+        path,
+        body,
+        vars,
+        rules,
+        connection_levels,
+        policy,
+        tags,
+    )
+    .0
 }
 
 /// Resolve the access decision for a request, returning `(level,
@@ -685,7 +693,11 @@ pub fn evaluate_with_match(
 
     // 2-4. Default floor: connection → tag → global. Read/write split.
     let pick = |lv: &Levels| -> Option<(AccessLevel, Option<u64>)> {
-        let l = if is_write_method(method) { lv.write } else { lv.read };
+        let l = if is_write_method(method) {
+            lv.write
+        } else {
+            lv.read
+        };
         l.map(|l| (l, lv.ttl))
     };
     if let Some(lv) = connection_levels {
@@ -740,32 +752,63 @@ mod tests {
     #[test]
     fn ask_rule_without_ttl_inherits_floor_window() {
         let rules = vec![rule("del", "DELETE /x", AccessLevel::Ask)]; // ttl: None
-        let conn = Levels { read: None, write: None, ttl: Some(1234) };
+        let conn = Levels {
+            read: None,
+            write: None,
+            ttl: Some(1234),
+        };
 
         // A matched ask rule that pins no ttl inherits the connection-floor window.
-        let (_l, id, ttl) =
-            evaluate_with_match("DELETE", "/x", None, &crate::core::policy::VarMap::new(), Some(&rules), Some(&conn), &policy(), &[]);
+        let (_l, id, ttl) = evaluate_with_match(
+            "DELETE",
+            "/x",
+            None,
+            &crate::core::policy::VarMap::new(),
+            Some(&rules),
+            Some(&conn),
+            &policy(),
+            &[],
+        );
         assert_eq!(id.as_deref(), Some("del"));
         assert_eq!(ttl, Some(1234));
 
         // The rule's own ttl wins over the floor window.
         let mut pinned = rules.clone();
         pinned[0].ttl = Some(60);
-        let (_l2, _id2, ttl2) =
-            evaluate_with_match("DELETE", "/x", None, &crate::core::policy::VarMap::new(), Some(&pinned), Some(&conn), &policy(), &[]);
+        let (_l2, _id2, ttl2) = evaluate_with_match(
+            "DELETE",
+            "/x",
+            None,
+            &crate::core::policy::VarMap::new(),
+            Some(&pinned),
+            Some(&conn),
+            &policy(),
+            &[],
+        );
         assert_eq!(ttl2, Some(60));
 
         // No ttl anywhere in the floors → None (the proxy applies its constant).
         let bare = Levels::default();
-        let (_l3, _id3, ttl3) =
-            evaluate_with_match("DELETE", "/x", None, &crate::core::policy::VarMap::new(), Some(&rules), Some(&bare), &policy(), &[]);
+        let (_l3, _id3, ttl3) = evaluate_with_match(
+            "DELETE",
+            "/x",
+            None,
+            &crate::core::policy::VarMap::new(),
+            Some(&rules),
+            Some(&bare),
+            &policy(),
+            &[],
+        );
         assert_eq!(ttl3, None);
     }
 
     // ── AccessLevel ──────────────────────────────────────────────────────────
     #[test]
     fn access_level_parses_and_ranks() {
-        assert_eq!(AccessLevel::parse("ask-always"), Some(AccessLevel::AskAlways));
+        assert_eq!(
+            AccessLevel::parse("ask-always"),
+            Some(AccessLevel::AskAlways)
+        );
         assert_eq!(AccessLevel::parse("nope"), None);
         assert!(AccessLevel::Deny.restrictiveness() > AccessLevel::Allow.restrictiveness());
     }
@@ -789,7 +832,10 @@ mod tests {
         // Fixed prefix still has to line up.
         assert!(!path_matches(p, "/repos/o/r/git/blobs/abc"));
         // A single `*` is still exactly one segment (no accidental widening).
-        assert!(!path_matches("/repos/*/*/git/refs/*", "/repos/o/r/git/refs/heads/main"));
+        assert!(!path_matches(
+            "/repos/*/*/git/refs/*",
+            "/repos/o/r/git/refs/heads/main"
+        ));
     }
 
     #[test]
@@ -806,13 +852,61 @@ mod tests {
         // The headline: list (allow) + read (ask) = read an email in ONE
         // approval, not two.
         let low = vec![rule("list", "GET /m", AccessLevel::Allow)];
-        assert_eq!(evaluate("GET", "/m", None, &crate::core::policy::VarMap::new(), Some(&low), None, &policy(), &[]), AccessLevel::Allow);
+        assert_eq!(
+            evaluate(
+                "GET",
+                "/m",
+                None,
+                &crate::core::policy::VarMap::new(),
+                Some(&low),
+                None,
+                &policy(),
+                &[]
+            ),
+            AccessLevel::Allow
+        );
         let med = vec![rule("read", "GET /m/*", AccessLevel::Ask)];
-        assert_eq!(evaluate("GET", "/m/1", None, &crate::core::policy::VarMap::new(), Some(&med), None, &policy(), &[]), AccessLevel::Ask);
+        assert_eq!(
+            evaluate(
+                "GET",
+                "/m/1",
+                None,
+                &crate::core::policy::VarMap::new(),
+                Some(&med),
+                None,
+                &policy(),
+                &[]
+            ),
+            AccessLevel::Ask
+        );
         let high = vec![rule("send", "POST /m/send", AccessLevel::AskAlways)];
-        assert_eq!(evaluate("POST", "/m/send", None, &crate::core::policy::VarMap::new(), Some(&high), None, &policy(), &[]), AccessLevel::AskAlways);
+        assert_eq!(
+            evaluate(
+                "POST",
+                "/m/send",
+                None,
+                &crate::core::policy::VarMap::new(),
+                Some(&high),
+                None,
+                &policy(),
+                &[]
+            ),
+            AccessLevel::AskAlways
+        );
         let del = vec![rule("del", "DELETE /m/*", AccessLevel::Deny)];
-        assert_eq!(evaluate("DELETE", "/m/1", None, &crate::core::policy::VarMap::new(), Some(&del), None, &policy(), &[]), AccessLevel::Deny);
+        assert_eq!(
+            evaluate(
+                "DELETE",
+                "/m/1",
+                None,
+                &crate::core::policy::VarMap::new(),
+                Some(&del),
+                None,
+                &policy(),
+                &[]
+            ),
+            AccessLevel::Deny
+        );
     }
 
     #[test]
@@ -831,28 +925,71 @@ mod tests {
             level: Some(AccessLevel::AskAlways),
             ttl: None,
         }];
-        let ev = |m: &str, p: &str| evaluate(m, p, None, &crate::core::policy::VarMap::new(), Some(&rules), None, &policy(), &[]);
-        assert_eq!(ev("POST", "/v1/projects/abc/network-restrictions/apply"), AccessLevel::AskAlways);
-        assert_eq!(ev("PATCH", "/v1/projects/abc/network-restrictions"), AccessLevel::AskAlways);
+        let ev = |m: &str, p: &str| {
+            evaluate(
+                m,
+                p,
+                None,
+                &crate::core::policy::VarMap::new(),
+                Some(&rules),
+                None,
+                &policy(),
+                &[],
+            )
+        };
+        assert_eq!(
+            ev("POST", "/v1/projects/abc/network-restrictions/apply"),
+            AccessLevel::AskAlways
+        );
+        assert_eq!(
+            ev("PATCH", "/v1/projects/abc/network-restrictions"),
+            AccessLevel::AskAlways
+        );
         // Wrong method on the PATCH path, or an unrelated path → no match → floor.
-        assert_eq!(ev("GET", "/v1/projects/abc/network-restrictions"), AccessLevel::Allow);
-        assert_eq!(ev("POST", "/v1/projects/abc/database/query"), AccessLevel::Allow);
+        assert_eq!(
+            ev("GET", "/v1/projects/abc/network-restrictions"),
+            AccessLevel::Allow
+        );
+        assert_eq!(
+            ev("POST", "/v1/projects/abc/database/query"),
+            AccessLevel::Allow
+        );
     }
 
     #[test]
     fn match_spec_roundtrips_string_and_list() {
         // Single stays a bare string on the wire; a list stays a list.
-        let one = PolicyRule { id: None, label: None, match_patterns: vec!["POST /a".into()], body: None, when: None, level: Some(AccessLevel::Ask), ttl: None };
+        let one = PolicyRule {
+            id: None,
+            label: None,
+            match_patterns: vec!["POST /a".into()],
+            body: None,
+            when: None,
+            level: Some(AccessLevel::Ask),
+            ttl: None,
+        };
         let j = serde_json::to_value(&one).unwrap();
         assert_eq!(j.get("match").unwrap(), &serde_json::json!("POST /a"));
         let back: PolicyRule = serde_json::from_value(j).unwrap();
         assert_eq!(back.match_patterns, vec!["POST /a".to_string()]);
 
-        let many = PolicyRule { id: None, label: None, match_patterns: vec!["POST /a".into(), "PATCH /b".into()], body: None, when: None, level: Some(AccessLevel::Ask), ttl: None };
+        let many = PolicyRule {
+            id: None,
+            label: None,
+            match_patterns: vec!["POST /a".into(), "PATCH /b".into()],
+            body: None,
+            when: None,
+            level: Some(AccessLevel::Ask),
+            ttl: None,
+        };
         let j = serde_json::to_value(&many).unwrap();
-        assert_eq!(j.get("match").unwrap(), &serde_json::json!(["POST /a", "PATCH /b"]));
+        assert_eq!(
+            j.get("match").unwrap(),
+            &serde_json::json!(["POST /a", "PATCH /b"])
+        );
         // A bare-string `match` still deserializes (back-compat).
-        let from_str: PolicyRule = serde_json::from_value(serde_json::json!({"match": "GET /x", "level": "ask"})).unwrap();
+        let from_str: PolicyRule =
+            serde_json::from_value(serde_json::json!({"match": "GET /x", "level": "ask"})).unwrap();
         assert_eq!(from_str.match_patterns, vec!["GET /x".to_string()]);
     }
 
@@ -869,7 +1006,19 @@ mod tests {
             level: None,
             ttl: None,
         }];
-        assert_eq!(evaluate("GET", "/x", None, &crate::core::policy::VarMap::new(), Some(&bad), None, &policy(), &[]), AccessLevel::Allow);
+        assert_eq!(
+            evaluate(
+                "GET",
+                "/x",
+                None,
+                &crate::core::policy::VarMap::new(),
+                Some(&bad),
+                None,
+                &policy(),
+                &[]
+            ),
+            AccessLevel::Allow
+        );
     }
 
     // ── Conflict resolution: deny-override / most-restrictive ─────────────────
@@ -878,11 +1027,20 @@ mod tests {
         // Two rules match the same request; the stricter (deny) wins even though
         // it's less specific — fail-safe, not most-specific.
         let rules = vec![
-            rule("broad", "DELETE /m/*", AccessLevel::Deny),      // less specific, stricter
+            rule("broad", "DELETE /m/*", AccessLevel::Deny), // less specific, stricter
             rule("narrow", "DELETE /m/safe", AccessLevel::Allow), // more specific, looser
         ];
         assert_eq!(
-            evaluate("DELETE", "/m/safe", None, &crate::core::policy::VarMap::new(), Some(&rules), None, &policy(), &[]),
+            evaluate(
+                "DELETE",
+                "/m/safe",
+                None,
+                &crate::core::policy::VarMap::new(),
+                Some(&rules),
+                None,
+                &policy(),
+                &[]
+            ),
             AccessLevel::Deny
         );
     }
@@ -891,19 +1049,50 @@ mod tests {
     #[test]
     fn no_rule_falls_through_to_connection_then_tag_then_global() {
         // No matching rule → connection floor wins when set.
-        let conn = Levels { read: Some(AccessLevel::Ask), write: None, ttl: None };
+        let conn = Levels {
+            read: Some(AccessLevel::Ask),
+            write: None,
+            ttl: None,
+        };
         assert_eq!(
-            evaluate("GET", "/unmatched", None, &crate::core::policy::VarMap::new(), Some(&vec![]), Some(&conn), &policy(), &[]),
+            evaluate(
+                "GET",
+                "/unmatched",
+                None,
+                &crate::core::policy::VarMap::new(),
+                Some(&vec![]),
+                Some(&conn),
+                &policy(),
+                &[]
+            ),
             AccessLevel::Ask
         );
         // No connection floor → tag floor (ai = allow).
         assert_eq!(
-            evaluate("POST", "/v1/chat", None, &crate::core::policy::VarMap::new(), None, None, &policy(), &["ai".into()]),
+            evaluate(
+                "POST",
+                "/v1/chat",
+                None,
+                &crate::core::policy::VarMap::new(),
+                None,
+                None,
+                &policy(),
+                &["ai".into()]
+            ),
             AccessLevel::Allow
         );
         // No tag match → global default (allow).
         assert_eq!(
-            evaluate("GET", "/x", None, &crate::core::policy::VarMap::new(), None, None, &policy(), &["unknown".into()]),
+            evaluate(
+                "GET",
+                "/x",
+                None,
+                &crate::core::policy::VarMap::new(),
+                None,
+                None,
+                &policy(),
+                &["unknown".into()]
+            ),
             AccessLevel::Allow
         );
     }
@@ -913,12 +1102,40 @@ mod tests {
         let mut p = policy();
         p.categories.insert(
             "wallet".into(),
-            Levels { read: Some(AccessLevel::AskAlways), write: Some(AccessLevel::Deny), ttl: None },
+            Levels {
+                read: Some(AccessLevel::AskAlways),
+                write: Some(AccessLevel::Deny),
+                ttl: None,
+            },
         );
         // ai says allow, wallet says ask-always/deny → the stricter floor wins.
         let tags = vec!["ai".to_string(), "wallet".to_string()];
-        assert_eq!(evaluate("GET", "/x", None, &crate::core::policy::VarMap::new(), None, None, &p, &tags), AccessLevel::AskAlways);
-        assert_eq!(evaluate("POST", "/x", None, &crate::core::policy::VarMap::new(), None, None, &p, &tags), AccessLevel::Deny);
+        assert_eq!(
+            evaluate(
+                "GET",
+                "/x",
+                None,
+                &crate::core::policy::VarMap::new(),
+                None,
+                None,
+                &p,
+                &tags
+            ),
+            AccessLevel::AskAlways
+        );
+        assert_eq!(
+            evaluate(
+                "POST",
+                "/x",
+                None,
+                &crate::core::policy::VarMap::new(),
+                None,
+                None,
+                &p,
+                &tags
+            ),
+            AccessLevel::Deny
+        );
     }
 
     // ── Merge: override by id + add new rule ──────────────────────────────────
@@ -926,7 +1143,13 @@ mod tests {
     fn merge_overrides_level_by_id() {
         let built_in = vec![rule("read", "GET /m/*", AccessLevel::Ask)];
         let mut user = HashMap::new();
-        user.insert("read".into(), RuleConfig { level: Some(AccessLevel::Allow), ..Default::default() });
+        user.insert(
+            "read".into(),
+            RuleConfig {
+                level: Some(AccessLevel::Allow),
+                ..Default::default()
+            },
+        );
         let merged = merge_rules(&built_in, &user);
         assert_eq!(merged[0].level, Some(AccessLevel::Allow));
         assert_eq!(merged[0].match_patterns, vec!["GET /m/*".to_string()]); // preserved
@@ -936,29 +1159,60 @@ mod tests {
     fn merge_lets_user_tighten_a_rule_to_deny() {
         let built_in = vec![rule("del", "DELETE /m/*", AccessLevel::AskAlways)];
         let mut user = HashMap::new();
-        user.insert("del".into(), RuleConfig { level: Some(AccessLevel::Deny), ..Default::default() });
+        user.insert(
+            "del".into(),
+            RuleConfig {
+                level: Some(AccessLevel::Deny),
+                ..Default::default()
+            },
+        );
         let merged = merge_rules(&built_in, &user);
-        assert_eq!(evaluate("DELETE", "/m/1", None, &crate::core::policy::VarMap::new(), Some(&merged), None, &policy(), &[]), AccessLevel::Deny);
+        assert_eq!(
+            evaluate(
+                "DELETE",
+                "/m/1",
+                None,
+                &crate::core::policy::VarMap::new(),
+                Some(&merged),
+                None,
+                &policy(),
+                &[]
+            ),
+            AccessLevel::Deny
+        );
     }
 
     #[test]
     fn merge_adds_new_rule_with_match() {
         let built_in = vec![rule("send", "POST /m/send", AccessLevel::AskAlways)];
         let mut user = HashMap::new();
-        user.insert("vip".into(), RuleConfig {
-            match_pattern: Some("POST /m/vip".into()),
-            level: Some(AccessLevel::Allow),
-            ..Default::default()
-        });
+        user.insert(
+            "vip".into(),
+            RuleConfig {
+                match_pattern: Some("POST /m/vip".into()),
+                level: Some(AccessLevel::Allow),
+                ..Default::default()
+            },
+        );
         let merged = merge_rules(&built_in, &user);
         assert_eq!(merged.len(), 2);
-        assert!(merged.iter().any(|r| r.id.as_deref() == Some("vip") && r.level == Some(AccessLevel::Allow)));
+        assert!(merged
+            .iter()
+            .any(|r| r.id.as_deref() == Some("vip") && r.level == Some(AccessLevel::Allow)));
     }
 
     #[test]
     fn merge_levels_user_wins_fieldwise() {
-        let u = Levels { read: Some(AccessLevel::Allow), write: None, ttl: None };
-        let r = Levels { read: Some(AccessLevel::Ask), write: Some(AccessLevel::Deny), ttl: Some(30) };
+        let u = Levels {
+            read: Some(AccessLevel::Allow),
+            write: None,
+            ttl: None,
+        };
+        let r = Levels {
+            read: Some(AccessLevel::Ask),
+            write: Some(AccessLevel::Deny),
+            ttl: Some(30),
+        };
         let m = merge_levels(Some(&u), Some(&r)).unwrap();
         assert_eq!(m.read, Some(AccessLevel::Allow)); // user
         assert_eq!(m.write, Some(AccessLevel::Deny)); // recipe
@@ -970,7 +1224,16 @@ mod tests {
     fn matched_rule_id_and_ttl_returned_for_ask_cache() {
         let mut rules = vec![rule("read", "GET /x", AccessLevel::Ask)];
         rules[0].ttl = Some(60);
-        let (lvl, id, ttl) = evaluate_with_match("GET", "/x", None, &crate::core::policy::VarMap::new(), Some(&rules), None, &policy(), &[]);
+        let (lvl, id, ttl) = evaluate_with_match(
+            "GET",
+            "/x",
+            None,
+            &crate::core::policy::VarMap::new(),
+            Some(&rules),
+            None,
+            &policy(),
+            &[],
+        );
         assert_eq!(lvl, AccessLevel::Ask);
         assert_eq!(id.as_deref(), Some("read"));
         assert_eq!(ttl, Some(60));
@@ -987,8 +1250,12 @@ mod tests {
         assert!(!Condition::parse("vars.amount > 200").unwrap().eval(&vars));
         assert!(Condition::parse("vars.amount >= 100").unwrap().eval(&vars));
         assert!(Condition::parse("vars.amount <= 100").unwrap().eval(&vars));
-        assert!(Condition::parse(r#"vars.merchant == "acme""#).unwrap().eval(&vars));
-        assert!(Condition::parse(r#"vars.merchant != "evil""#).unwrap().eval(&vars));
+        assert!(Condition::parse(r#"vars.merchant == "acme""#)
+            .unwrap()
+            .eval(&vars));
+        assert!(Condition::parse(r#"vars.merchant != "evil""#)
+            .unwrap()
+            .eval(&vars));
         // Undefined var → false (P3), never a panic.
         assert!(!Condition::parse("vars.missing > 0").unwrap().eval(&vars));
         // A padded numeric string still compares (can't evade a threshold by
@@ -1013,18 +1280,70 @@ mod tests {
         // `ask-always` refinement for amount > 80. Most-restrictive-wins picks
         // ask-always when both match, ask when only the base does.
         let rules = vec![
-            PolicyRule { id: Some("p".into()), label: None, match_patterns: vec!["POST /buy".into()], body: None, when: None, level: Some(AccessLevel::Ask), ttl: None },
-            PolicyRule { id: Some("pl".into()), label: None, match_patterns: vec!["POST /buy".into()], body: None, when: Some("vars.amount > 80".into()), level: Some(AccessLevel::AskAlways), ttl: None },
+            PolicyRule {
+                id: Some("p".into()),
+                label: None,
+                match_patterns: vec!["POST /buy".into()],
+                body: None,
+                when: None,
+                level: Some(AccessLevel::Ask),
+                ttl: None,
+            },
+            PolicyRule {
+                id: Some("pl".into()),
+                label: None,
+                match_patterns: vec!["POST /buy".into()],
+                body: None,
+                when: Some("vars.amount > 80".into()),
+                level: Some(AccessLevel::AskAlways),
+                ttl: None,
+            },
         ];
         let mut big = VarMap::new();
         big.insert("amount".into(), "100".into());
         let mut small = VarMap::new();
         small.insert("amount".into(), "50".into());
 
-        assert_eq!(evaluate("POST", "/buy", None, &big, Some(&rules), None, &policy(), &[]), AccessLevel::AskAlways);
-        assert_eq!(evaluate("POST", "/buy", None, &small, Some(&rules), None, &policy(), &[]), AccessLevel::Ask);
+        assert_eq!(
+            evaluate(
+                "POST",
+                "/buy",
+                None,
+                &big,
+                Some(&rules),
+                None,
+                &policy(),
+                &[]
+            ),
+            AccessLevel::AskAlways
+        );
+        assert_eq!(
+            evaluate(
+                "POST",
+                "/buy",
+                None,
+                &small,
+                Some(&rules),
+                None,
+                &policy(),
+                &[]
+            ),
+            AccessLevel::Ask
+        );
         // Amount undefined (no shape matched / field absent) → the `when` rule
         // doesn't fire, the base `ask` still gates the spend (never a bypass).
-        assert_eq!(evaluate("POST", "/buy", None, &VarMap::new(), Some(&rules), None, &policy(), &[]), AccessLevel::Ask);
+        assert_eq!(
+            evaluate(
+                "POST",
+                "/buy",
+                None,
+                &VarMap::new(),
+                Some(&rules),
+                None,
+                &policy(),
+                &[]
+            ),
+            AccessLevel::Ask
+        );
     }
 }

@@ -101,7 +101,9 @@ pub async fn run_wait(args: OpWaitArgs) -> Result<(), String> {
                 }
             }
             Ok(resp) if resp.status().as_u16() == 404 => {
-                eprintln!("expired or unknown — re-run the original command to mint a fresh approval");
+                eprintln!(
+                    "expired or unknown — re-run the original command to mint a fresh approval"
+                );
                 std::process::exit(3);
             }
             Ok(resp) => {

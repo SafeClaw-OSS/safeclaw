@@ -20,8 +20,8 @@
 //! shape) should write their own `/etc/systemd/system/safeclaw.service`
 //! and not touch these commands.
 
-use std::process::Command as ProcCommand;
 use crate::config::LogsArgs;
+use std::process::Command as ProcCommand;
 
 const UNIT_BASENAME: &str = "safeclaw.service";
 /// First line of every unit we generate. The idempotency guard refuses to
@@ -85,8 +85,8 @@ fn run_launchctl(args: &[&str], action: &str) -> Result<(), String> {
 
 #[cfg(target_os = "linux")]
 pub async fn run_start_systemd(force: bool) -> Result<(), String> {
-    let bin = std::env::current_exe()
-        .map_err(|e| format!("can't find current binary path: {}", e))?;
+    let bin =
+        std::env::current_exe().map_err(|e| format!("can't find current binary path: {}", e))?;
     let bin_str = bin.to_string_lossy().to_string();
 
     // Collect any SAFECLAW_* env vars set in the calling shell — these
@@ -109,7 +109,11 @@ pub async fn run_start_systemd(force: bool) -> Result<(), String> {
     // Broker auth is the cloud-synced agent-key hash-set (agent ≡ api-key),
     // refreshed at runtime by `crate::sync` — there's no machine-local key file
     // to provision here. See [[project_vault_agent_architecture_2026_06_25]].
-    let env_block = if env_lines.is_empty() { String::new() } else { format!("{}\n", env_lines.join("\n")) };
+    let env_block = if env_lines.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", env_lines.join("\n"))
+    };
 
     let unit = format!(
         "{UNIT_MARKER}\n\
@@ -182,8 +186,8 @@ pub async fn run_start_systemd(force: bool) -> Result<(), String> {
 
 #[cfg(target_os = "macos")]
 pub async fn run_start_systemd(force: bool) -> Result<(), String> {
-    let bin = std::env::current_exe()
-        .map_err(|e| format!("can't find current binary path: {}", e))?;
+    let bin =
+        std::env::current_exe().map_err(|e| format!("can't find current binary path: {}", e))?;
     let bin_str = bin.to_string_lossy().to_string();
 
     // Same policy as the systemd path: the daemon inherits SAFECLAW_* set in
@@ -284,7 +288,10 @@ pub async fn run_start_systemd(force: bool) -> Result<(), String> {
     eprintln!("✓ daemon installed and running ({})", plist_path.display());
     eprintln!("  binary:   {}", bin_str);
     if !env_entries.is_empty() {
-        eprintln!("  env:      {} SAFECLAW_* var(s) embedded", env_entries.len());
+        eprintln!(
+            "  env:      {} SAFECLAW_* var(s) embedded",
+            env_entries.len()
+        );
     }
     eprintln!("  logs:     {}", log_str);
     eprintln!();
@@ -317,7 +324,8 @@ pub fn run_ensure_running() -> Result<(), String> {
     // Not active. If the unit exists, just start it (no rewrite). Otherwise
     // the daemon was never installed as a service — guide the user.
     ensure_unit_installed().map_err(|_| {
-        "daemon is not running and no service is installed — run `sc up` once to install it".to_string()
+        "daemon is not running and no service is installed — run `sc up` once to install it"
+            .to_string()
     })?;
     run_systemctl(&["start", UNIT_BASENAME], "start")?;
     eprintln!("✓ daemon started");
@@ -428,7 +436,8 @@ pub fn run_logs(args: LogsArgs) -> Result<(), String> {
         cmd.arg("-f");
     }
     // Inherit stdio so journalctl prints directly + Ctrl-C works.
-    let status = cmd.status()
+    let status = cmd
+        .status()
         .map_err(|e| format!("spawn journalctl: {}", e))?;
     if !status.success() {
         return Err(format!("journalctl exited with status {}", status));
@@ -538,11 +547,16 @@ fn run_systemctl(args: &[&str], action: &str) -> Result<(), String> {
     let mut cmd = ProcCommand::new("systemctl");
     cmd.arg("--user");
     cmd.args(args);
-    let output = cmd.output()
+    let output = cmd
+        .output()
         .map_err(|e| format!("spawn systemctl: {}", e))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("systemctl --user {} failed: {}", action, stderr.trim()));
+        return Err(format!(
+            "systemctl --user {} failed: {}",
+            action,
+            stderr.trim()
+        ));
     }
     Ok(())
 }

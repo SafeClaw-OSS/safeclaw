@@ -44,8 +44,9 @@ pub fn canonicalize_body(value: &Value) -> Result<Vec<u8>> {
         }
         other => other.clone(),
     };
-    sudp_canonical::canonicalize_strict(&filtered)
-        .map_err(|_| AppError::BadRequest("op contains float values (not permitted in canonical form)".into()))
+    sudp_canonical::canonicalize_strict(&filtered).map_err(|_| {
+        AppError::BadRequest("op contains float values (not permitted in canonical form)".into())
+    })
 }
 
 /// Produce a canonical byte representation of `value` without any field

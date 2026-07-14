@@ -70,12 +70,10 @@ impl ChallengeStore {
     /// Remove expired challenges and stale rate limit entries.
     pub fn cleanup(&mut self) {
         let now = Instant::now();
-        self.challenges.retain(|_, (issued_at, _)| {
-            now.duration_since(*issued_at).as_secs() < TTL_SECS
-        });
-        self.rate.retain(|_, (_, window_start)| {
-            now.duration_since(*window_start).as_secs() < 120
-        });
+        self.challenges
+            .retain(|_, (issued_at, _)| now.duration_since(*issued_at).as_secs() < TTL_SECS);
+        self.rate
+            .retain(|_, (_, window_start)| now.duration_since(*window_start).as_secs() < 120);
     }
 }
 

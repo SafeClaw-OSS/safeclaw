@@ -105,7 +105,10 @@ mod tests {
     #[test]
     fn unlock_only_when_locked() {
         assert!(should_attempt_unlock(&VaultState::Locked { passkeys: 1 }));
-        assert!(!should_attempt_unlock(&VaultState::Unlocked { passkeys: 1, secrets: 3 }));
+        assert!(!should_attempt_unlock(&VaultState::Unlocked {
+            passkeys: 1,
+            secrets: 3
+        }));
         assert!(!should_attempt_unlock(&VaultState::Unreachable));
         assert!(!should_attempt_unlock(&VaultState::NotFound));
     }

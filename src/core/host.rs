@@ -62,7 +62,10 @@ fn strip_port(authority: &str) -> &str {
         // [ipv6]:port → the bracketed host
         return rest.split(']').next().unwrap_or(rest);
     }
-    authority.rsplit_once(':').map(|(h, _)| h).unwrap_or(authority)
+    authority
+        .rsplit_once(':')
+        .map(|(h, _)| h)
+        .unwrap_or(authority)
 }
 
 /// Exact-FQDN match for runtime enforcement: case-insensitive, port-aware.
@@ -72,7 +75,9 @@ pub fn host_matches_exact(dest_authority: &str, allowed_fqdn: &str) -> bool {
 
 /// True if `dest_authority` matches any of the `resolved` exact FQDNs.
 pub fn host_allowed(dest_authority: &str, resolved: &[String]) -> bool {
-    resolved.iter().any(|h| host_matches_exact(dest_authority, h))
+    resolved
+        .iter()
+        .any(|h| host_matches_exact(dest_authority, h))
 }
 
 /// Single-label leftmost wildcard match (TLS-cert rule): `*.suffix` matches
@@ -175,8 +180,16 @@ mod tests {
     use super::*;
 
     fn direct(id: &str, hosts: &[&str], secrets: &[&str]) -> ServiceDef {
-        let hosts = hosts.iter().map(|s| format!("\"{}\"", s)).collect::<Vec<_>>().join(", ");
-        let secrets = secrets.iter().map(|s| format!("\"{}\"", s)).collect::<Vec<_>>().join(", ");
+        let hosts = hosts
+            .iter()
+            .map(|s| format!("\"{}\"", s))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let secrets = secrets
+            .iter()
+            .map(|s| format!("\"{}\"", s))
+            .collect::<Vec<_>>()
+            .join(", ");
         let toml = format!(
             "[service]\nid = \"{}\"\nname = \"X\"\nhosts = [{}]\nsecrets = [{}]\n",
             id, hosts, secrets
@@ -195,10 +208,19 @@ mod tests {
 
     #[test]
     fn wildcard_single_label_only() {
-        assert!(wildcard_matches("*.openai.azure.com", "foo.openai.azure.com"));
-        assert!(wildcard_matches("*.openai.azure.com", "FOO.OPENAI.AZURE.COM"));
+        assert!(wildcard_matches(
+            "*.openai.azure.com",
+            "foo.openai.azure.com"
+        ));
+        assert!(wildcard_matches(
+            "*.openai.azure.com",
+            "FOO.OPENAI.AZURE.COM"
+        ));
         // two labels rejected (single-label leftmost).
-        assert!(!wildcard_matches("*.openai.azure.com", "a.b.openai.azure.com"));
+        assert!(!wildcard_matches(
+            "*.openai.azure.com",
+            "a.b.openai.azure.com"
+        ));
         // zero labels rejected.
         assert!(!wildcard_matches("*.openai.azure.com", "openai.azure.com"));
         // exact pattern is a plain compare.
@@ -225,20 +247,38 @@ mod tests {
 
     #[test]
     fn resolved_hosts_raw_uses_own_hosts() {
-        let conn = Connection { name: None, service: None, hosts: Some(vec!["api.stripe.com".to_string()]), secrets: Some(vec!["STRIPE_KEY".to_string()]), keys: None };
-        assert_eq!(resolved_hosts(&conn, None), vec!["api.stripe.com".to_string()]);
+        let conn = Connection {
+            name: None,
+            service: None,
+            hosts: Some(vec!["api.stripe.com".to_string()]),
+            secrets: Some(vec!["STRIPE_KEY".to_string()]),
+            keys: None,
+        };
+        assert_eq!(
+            resolved_hosts(&conn, None),
+            vec!["api.stripe.com".to_string()]
+        );
     }
 
     #[test]
     fn phantoms_direct_sole_and_multi() {
         let sole = direct("github", &["api.github.com"], &["GITHUB_TOKEN"]);
         let m = phantoms_for("github", &sole);
-        assert_eq!(m.get("GITHUB_TOKEN").map(String::as_str), Some("__sc__github__"));
+        assert_eq!(
+            m.get("GITHUB_TOKEN").map(String::as_str),
+            Some("__sc__github__")
+        );
 
         let multi = direct("bb", &["api.bitbucket.org"], &["USERNAME", "API_TOKEN"]);
         let m = phantoms_for("bb", &multi);
-        assert_eq!(m.get("USERNAME").map(String::as_str), Some("__sc__bb__username__"));
-        assert_eq!(m.get("API_TOKEN").map(String::as_str), Some("__sc__bb__api_token__"));
+        assert_eq!(
+            m.get("USERNAME").map(String::as_str),
+            Some("__sc__bb__username__")
+        );
+        assert_eq!(
+            m.get("API_TOKEN").map(String::as_str),
+            Some("__sc__bb__api_token__")
+        );
     }
 
     #[test]
@@ -257,7 +297,10 @@ exposes = ["account_id"]
         let def: ServiceDef = toml::from_str(toml).unwrap();
         let m = phantoms_for("gmail", &def);
         assert_eq!(m.get("ACCESS").map(String::as_str), Some("__sc__gmail__"));
-        assert_eq!(m.get("ACCOUNT_ID").map(String::as_str), Some("__sc__gmail__account_id__"));
+        assert_eq!(
+            m.get("ACCOUNT_ID").map(String::as_str),
+            Some("__sc__gmail__account_id__")
+        );
         // The refresh secret is never surfaced as an injectable phantom.
         assert!(!m.contains_key("GMAIL_REFRESH_TOKEN"));
     }

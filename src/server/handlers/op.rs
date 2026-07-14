@@ -20,7 +20,7 @@ use serde_json::{json, Value};
 use crate::audit;
 use crate::error::{AppError, Result};
 use crate::protocol::operation::{ActType, Operation};
-use crate::state::{ApprovalEvent, AppState};
+use crate::state::{AppState, ApprovalEvent};
 
 pub async fn create(
     State(state): State<Arc<AppState>>,
@@ -145,9 +145,14 @@ fn cancel_superseded(state: &Arc<AppState>, vault_id: &str, op_id: &str, now: i6
     };
     if was_pending {
         if let Ok(store) = state.audits.for_vault(vault_id) {
-            if let Err(e) =
-                store.finalize(op_id, audit::STATUS_CANCELLED, now, None, Some(REASON), None)
-            {
+            if let Err(e) = store.finalize(
+                op_id,
+                audit::STATUS_CANCELLED,
+                now,
+                None,
+                Some(REASON),
+                None,
+            ) {
                 tracing::warn!(vault = %vault_id, op = %op_id, "audit finalize cancelled failed: {}", e);
             }
         }
@@ -185,7 +190,9 @@ fn reject_broker_kind(kind: &ActType) -> Result<()> {
 
 pub fn validate_vault_id(id: &str) -> Result<()> {
     if id.is_empty() || id.len() > 128 {
-        return Err(AppError::BadRequest("invalid vault_id (1-128 chars)".into()));
+        return Err(AppError::BadRequest(
+            "invalid vault_id (1-128 chars)".into(),
+        ));
     }
     if !id
         .chars()
@@ -216,7 +223,11 @@ mod tests {
             ActType::Custom("vault-lock".into()),
             ActType::Custom("vault-delete".into()),
         ] {
-            assert!(reject_broker_kind(&kind).is_ok(), "kind {:?} should pass", kind);
+            assert!(
+                reject_broker_kind(&kind).is_ok(),
+                "kind {:?} should pass",
+                kind
+            );
         }
     }
 

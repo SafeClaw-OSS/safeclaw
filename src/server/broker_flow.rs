@@ -137,12 +137,7 @@ pub async fn resolve_auth_value(
     let auth = state
         .custom_service(vault_id, service_id)
         .and_then(|s| s.auth.clone())
-        .or_else(|| {
-            state
-                .services
-                .get(service_id)
-                .and_then(|s| s.auth.clone())
-        });
+        .or_else(|| state.services.get(service_id).and_then(|s| s.auth.clone()));
     let Some(auth) = auth else {
         // The pipeline only calls this for a minted ACCESS phantom (mint_input
         // was Some from the resolved def). Not finding a mechanism here means

@@ -146,7 +146,11 @@ pub async fn exchange_code(
     let resp = match style {
         OAuthStyle::Json => {
             let body = code_exchange_json_body(
-                client_id, client_secret, code, code_verifier, redirect_uri,
+                client_id,
+                client_secret,
+                code,
+                code_verifier,
+                redirect_uri,
             );
             http_client()
                 .post(token_url)
@@ -158,7 +162,11 @@ pub async fn exchange_code(
         }
         OAuthStyle::Form => {
             let form_params = code_exchange_form_params(
-                client_id, client_secret, code, code_verifier, redirect_uri,
+                client_id,
+                client_secret,
+                code,
+                code_verifier,
+                redirect_uri,
             );
             http_client()
                 .post(token_url)
@@ -171,9 +179,15 @@ pub async fn exchange_code(
 
     if !resp.status().is_success() {
         let status = resp.status();
-        let body_text = resp.text().await.unwrap_or_else(|_| "<no body>".to_string());
+        let body_text = resp
+            .text()
+            .await
+            .unwrap_or_else(|_| "<no body>".to_string());
         tracing::warn!("oauth2 code-exchange error body: {}", body_text);
-        return Err(format!("oauth2 code-exchange returned HTTP {} — {}", status, body_text));
+        return Err(format!(
+            "oauth2 code-exchange returned HTTP {} — {}",
+            status, body_text
+        ));
     }
 
     let body: serde_json::Value = resp
@@ -276,9 +290,15 @@ pub async fn perform_refresh(
 
     if !resp.status().is_success() {
         let status = resp.status();
-        let body_text = resp.text().await.unwrap_or_else(|_| "<no body>".to_string());
+        let body_text = resp
+            .text()
+            .await
+            .unwrap_or_else(|_| "<no body>".to_string());
         tracing::warn!("oauth2 refresh error body: {}", body_text);
-        return Err(format!("oauth2 refresh returned HTTP {} — {}", status, body_text));
+        return Err(format!(
+            "oauth2 refresh returned HTTP {} — {}",
+            status, body_text
+        ));
     }
 
     let body: serde_json::Value = resp
@@ -319,7 +339,12 @@ mod connect_request_tests {
     fn jwt(claims: serde_json::Value) -> String {
         use base64::Engine as _;
         let enc = |v: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(v);
-        format!("{}.{}.{}", enc(b"{}"), enc(claims.to_string().as_bytes()), enc(b"sig"))
+        format!(
+            "{}.{}.{}",
+            enc(b"{}"),
+            enc(claims.to_string().as_bytes()),
+            enc(b"sig")
+        )
     }
 
     #[test]
@@ -327,14 +352,20 @@ mod connect_request_tests {
         let t = jwt(serde_json::json!({
             "https://api.openai.com/auth": { "chatgpt_account_id": "acct-123" }
         }));
-        let path = vec!["https://api.openai.com/auth".to_string(), "chatgpt_account_id".to_string()];
+        let path = vec![
+            "https://api.openai.com/auth".to_string(),
+            "chatgpt_account_id".to_string(),
+        ];
         assert_eq!(id_token_claim(&t, &path).as_deref(), Some("acct-123"));
     }
 
     #[test]
     fn id_token_claim_falls_back_to_top_level_leaf() {
         let t = jwt(serde_json::json!({ "chatgpt_account_id": "acct-789" }));
-        let path = vec!["https://api.openai.com/auth".to_string(), "chatgpt_account_id".to_string()];
+        let path = vec![
+            "https://api.openai.com/auth".to_string(),
+            "chatgpt_account_id".to_string(),
+        ];
         assert_eq!(id_token_claim(&t, &path).as_deref(), Some("acct-789"));
     }
 
@@ -371,9 +402,8 @@ mod connect_request_tests {
 
     #[test]
     fn form_params_omit_client_secret_for_pkce_only() {
-        let p = code_exchange_form_params(
-            "client-123", None, "code", "verif", "http://127.0.0.1/cb",
-        );
+        let p =
+            code_exchange_form_params("client-123", None, "code", "verif", "http://127.0.0.1/cb");
         assert!(!p.iter().any(|(k, _)| *k == "client_secret"));
         assert!(p.contains(&("grant_type", "authorization_code")));
     }
@@ -400,9 +430,7 @@ mod connect_request_tests {
 
     #[test]
     fn json_body_omits_client_secret_when_absent() {
-        let b = code_exchange_json_body(
-            "client-123", None, "code", "verif", "http://127.0.0.1/cb",
-        );
+        let b = code_exchange_json_body("client-123", None, "code", "verif", "http://127.0.0.1/cb");
         assert!(b.get("client_secret").is_none());
         assert_eq!(b["grant_type"], "authorization_code");
     }

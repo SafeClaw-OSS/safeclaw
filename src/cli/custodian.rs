@@ -57,7 +57,10 @@ async fn fetch_print(_args: CommonArgs, path: &str) -> Result<(), String> {
         ));
     }
     let body: serde_json::Value = resp.json().await.map_err(|e| format!("parse: {}", e))?;
-    println!("{}", serde_json::to_string_pretty(&body).unwrap_or_default());
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&body).unwrap_or_default()
+    );
     Ok(())
 }
 

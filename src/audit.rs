@@ -123,12 +123,7 @@ pub fn row_from_op(
 ) -> ApprovalRow {
     let act_kind = crate::protocol::operation::discriminator(&op.act);
     let scope = &op.act.scope;
-    let pick = |k: &str| {
-        scope
-            .get(k)
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-    };
+    let pick = |k: &str| scope.get(k).and_then(|v| v.as_str()).map(|s| s.to_string());
     ApprovalRow {
         id: id.to_string(),
         created_at,
@@ -242,13 +237,16 @@ impl AuditStore {
     }
 
     /// Drop every row whose `created_at` is older than `cutoff` (unix
-     /// seconds). Returns the number of deleted rows. Used for opportunistic
-     /// retention cleanup — caller picks the cutoff based on the vault's
-     /// `audit_retention_days` setting (None = keep forever).
+    /// seconds). Returns the number of deleted rows. Used for opportunistic
+    /// retention cleanup — caller picks the cutoff based on the vault's
+    /// `audit_retention_days` setting (None = keep forever).
     pub fn prune_older_than(&self, cutoff: i64) -> Result<u64> {
         let conn = self.conn.lock().unwrap();
         let count = conn
-            .execute("DELETE FROM approvals WHERE created_at < ?1", params![cutoff])
+            .execute(
+                "DELETE FROM approvals WHERE created_at < ?1",
+                params![cutoff],
+            )
             .map_err(|e| AppError::Internal(format!("audit prune: {}", e)))?;
         Ok(count as u64)
     }
@@ -346,7 +344,14 @@ impl AuditStore {
                  reason=COALESCE(?4, reason),
                  upstream_status=COALESCE(?5, upstream_status)
              WHERE id=?6",
-            params![status, decided_at, credential_id, reason, upstream_status, id],
+            params![
+                status,
+                decided_at,
+                credential_id,
+                reason,
+                upstream_status,
+                id
+            ],
         )
         .map_err(|e| AppError::Internal(format!("audit finalize: {}", e)))?;
         Ok(())
@@ -475,7 +480,8 @@ impl AuditStore {
             })
             .map_err(|e| AppError::Internal(format!("usage query: {}", e)))?;
         let mut total: i64 = 0;
-        let mut by_service: std::collections::BTreeMap<String, i64> = std::collections::BTreeMap::new();
+        let mut by_service: std::collections::BTreeMap<String, i64> =
+            std::collections::BTreeMap::new();
         for r in rows {
             let (svc, n) = r.map_err(|e| AppError::Internal(format!("usage row: {}", e)))?;
             total += n;
@@ -618,7 +624,8 @@ mod tests {
 
         // A ceremony left unshipped while the switch was off back-ships once
         // it flips on — and marking it synced removes it from the outbox.
-        s.mark_synced(&["op-use".into(), "op-write".into()]).unwrap();
+        s.mark_synced(&["op-use".into(), "op-write".into()])
+            .unwrap();
         assert!(s.list_unsynced(10, true).unwrap().is_empty());
     }
 
@@ -636,8 +643,15 @@ mod tests {
     fn finalize_pending_to_approved() {
         let (_tmp, s) = fresh_store();
         s.insert(&row("op1", STATUS_PENDING, 100)).unwrap();
-        s.finalize("op1", STATUS_APPROVED, 150, Some("cred-xyz"), None, Some(200))
-            .unwrap();
+        s.finalize(
+            "op1",
+            STATUS_APPROVED,
+            150,
+            Some("cred-xyz"),
+            None,
+            Some(200),
+        )
+        .unwrap();
         let all = s.list(None, None, None, 10).unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].status, STATUS_APPROVED);
@@ -668,7 +682,9 @@ mod tests {
         let page1 = s.list(None, None, None, 3).unwrap();
         assert_eq!(page1.len(), 3);
         // oldest of page 1 = op8 (created_at=800); next page since=800.
-        let page2 = s.list(None, None, Some(page1.last().unwrap().created_at), 3).unwrap();
+        let page2 = s
+            .list(None, None, Some(page1.last().unwrap().created_at), 3)
+            .unwrap();
         assert_eq!(page2.len(), 3);
         assert_eq!(page2[0].id, "op7");
     }
@@ -783,7 +799,8 @@ mod tests {
 
         // Re-marking is idempotent (empty + already-synced ids are no-ops).
         s.mark_synced(&[]).unwrap();
-        s.mark_synced(&["op1".to_string(), "op2".to_string()]).unwrap();
+        s.mark_synced(&["op1".to_string(), "op2".to_string()])
+            .unwrap();
         assert!(s.list_unsynced(100, false).unwrap().is_empty());
 
         // A pending row that finalizes to a terminal Use status becomes shippable.

@@ -6,7 +6,6 @@
 ///
 /// This eliminates hand-written include_str! lists — adding a new service
 /// just requires creating a TOML file in services/.
-
 use std::fs;
 use std::path::Path;
 
@@ -48,7 +47,10 @@ fn main() {
     code.push_str("pub fn compiled_policy_tomls() -> &'static [(&'static str, &'static str)] {\n");
     code.push_str("    &[\n");
     for (id, rel_path) in &policy_entries {
-        code.push_str(&format!("        (\"{}\", include_str!(\"../{}\") ),\n", id, rel_path));
+        code.push_str(&format!(
+            "        (\"{}\", include_str!(\"../{}\") ),\n",
+            id, rel_path
+        ));
     }
     code.push_str("    ]\n}\n");
 
@@ -79,14 +81,22 @@ fn scan_services(
     service_entries: &mut Vec<(String, String)>,
     policy_entries: &mut Vec<(String, String)>,
 ) {
-    let Ok(entries) = fs::read_dir(base) else { return };
+    let Ok(entries) = fs::read_dir(base) else {
+        return;
+    };
 
     for entry in entries.flatten() {
         let svc_path = entry.path();
-        if !svc_path.is_dir() { continue; }
+        if !svc_path.is_dir() {
+            continue;
+        }
         // Skip underscore-prefixed dirs, e.g. `_parked` (services excluded
         // from the build).
-        if svc_path.file_name().and_then(|n| n.to_str()).map_or(false, |n| n.starts_with('_')) {
+        if svc_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map_or(false, |n| n.starts_with('_'))
+        {
             continue;
         }
 

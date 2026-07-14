@@ -102,7 +102,9 @@ fn der_to_pem(der: &[u8]) -> String {
 /// unauthenticated), the human-without-an-agent-key case. Deriving from the
 /// API-face root keeps proxy and control on ONE daemon host (the invariant).
 pub fn proxy_url_for_vault(api_root: &str, vid: &str, key: Option<&str>) -> String {
-    let key_enc = key.map(|k| urlencoding::encode(k).into_owned()).unwrap_or_default();
+    let key_enc = key
+        .map(|k| urlencoding::encode(k).into_owned())
+        .unwrap_or_default();
     let (scheme, rest) = api_root.split_once("://").unwrap_or(("http", api_root));
     format!(
         "{}://{}:{}@{}",
@@ -160,8 +162,14 @@ pub fn build_bundle(
     // the next free index. `!` is git's shell-command marker.
     let idx = parent_git_config_count.unwrap_or(0);
     b.push(("GIT_CONFIG_COUNT".to_string(), (idx + 1).to_string()));
-    b.push((format!("GIT_CONFIG_KEY_{}", idx), "credential.helper".to_string()));
-    b.push((format!("GIT_CONFIG_VALUE_{}", idx), "!sc git-credential".to_string()));
+    b.push((
+        format!("GIT_CONFIG_KEY_{}", idx),
+        "credential.helper".to_string(),
+    ));
+    b.push((
+        format!("GIT_CONFIG_VALUE_{}", idx),
+        "!sc git-credential".to_string(),
+    ));
     b
 }
 
@@ -244,7 +252,14 @@ mod tests {
         let b = build_bundle(&proxy, "/x/ca.pem", None);
         let get = |k: &str| b.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
         // Whole family, both cases (curl-plaintext + ALL_PROXY-only tools).
-        for k in ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"] {
+        for k in [
+            "HTTPS_PROXY",
+            "https_proxy",
+            "HTTP_PROXY",
+            "http_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+        ] {
             assert_eq!(get(k).unwrap(), proxy, "{k}");
         }
         assert_eq!(get("NO_PROXY").unwrap(), "localhost,127.0.0.1,::1");
@@ -296,7 +311,9 @@ mod tests {
         // Zero OS roots (load failed / empty store) still keeps the broker — the
         // fallback must never leave the broker out.
         assert_eq!(
-            compose_ca_bundle(broker, &[]).matches("BEGIN CERTIFICATE").count(),
+            compose_ca_bundle(broker, &[])
+                .matches("BEGIN CERTIFICATE")
+                .count(),
             1
         );
     }
@@ -311,7 +328,10 @@ mod tests {
             "corp.internal,10.0.0.0/8,localhost,127.0.0.1,::1"
         );
         // Idempotent + case-insensitive: no dupes when loopback already present.
-        assert_eq!(with_loopback("LOCALHOST,127.0.0.1"), "LOCALHOST,127.0.0.1,::1");
+        assert_eq!(
+            with_loopback("LOCALHOST,127.0.0.1"),
+            "LOCALHOST,127.0.0.1,::1"
+        );
         assert_eq!(
             with_loopback("localhost,127.0.0.1,::1"),
             "localhost,127.0.0.1,::1"

@@ -85,10 +85,14 @@ pub async fn create(
     //    are fixed-size after b64 decode but checking length early
     //    rejects obviously malformed payloads before the crypto work.
     if body.credential_id.is_empty() || body.credential_id.len() > 1024 {
-        return Err(AppError::BadRequest("credential_id length out of range".into()));
+        return Err(AppError::BadRequest(
+            "credential_id length out of range".into(),
+        ));
     }
     if body.device_name.len() > 128 {
-        return Err(AppError::BadRequest("device_name too long (max 128)".into()));
+        return Err(AppError::BadRequest(
+            "device_name too long (max 128)".into(),
+        ));
     }
 
     // 2. Recompute the payload hash that the client should have signed.

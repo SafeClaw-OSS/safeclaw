@@ -8,7 +8,7 @@
 //! exchange in `snaplii`; `connect` completes the OAuth CONNECT handshake on
 //! the daemon.
 
-pub mod oauth2;
-pub mod snaplii;
 pub mod connect;
 pub mod loopback;
+pub mod oauth2;
+pub mod snaplii;

@@ -12,7 +12,10 @@ use axum::{
     extract::{Path, State},
     Json,
 };
-use base64::{engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD}, Engine};
+use base64::{
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+    Engine,
+};
 use serde::Serialize;
 use serde_json::{json, Value};
 use sudp::grant::{GrantOpt, RedeemedGrant, WrappingKey};
@@ -100,7 +103,10 @@ pub async fn passkeys(
             let pk = find_pubkey_in_registry(&registry, &cid_b64);
             PasskeyMeta {
                 credential_id: cid_b64,
-                device_name: pk.as_ref().map(|p| p.device_name.clone()).unwrap_or_default(),
+                device_name: pk
+                    .as_ref()
+                    .map(|p| p.device_name.clone())
+                    .unwrap_or_default(),
                 created_at: 0, // sudp Registry doesn't track this; future: aux side-store.
                 prf_salt: STANDARD.encode(&c.prf_salt),
                 public_key_x: pk.as_ref().map(|p| p.x.clone()),
@@ -135,7 +141,10 @@ pub async fn passkeys(
 /// `sc_pk_fingerprint` lets remote clients OOB-verify the key on first pin
 /// (per PROTOCOL.md §4.2.2 trust establishment).
 pub async fn pubkey(State(state): State<Arc<AppState>>) -> Json<Value> {
-    use base64::{engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD}, Engine};
+    use base64::{
+        engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+        Engine,
+    };
     use sha2::{Digest, Sha256};
     let pk_bytes = state.sc.pk_bytes();
     let fp = Sha256::digest(&pk_bytes);

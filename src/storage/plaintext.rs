@@ -472,32 +472,65 @@ mod tests {
         let mut aux = VaultAux::initial();
         aux.connections.insert(
             "stripe_key".into(),
-            Connection { name: None, service: None, hosts: None, secrets: Some(vec!["SHARED_KEY".into()]), keys: None },
+            Connection {
+                name: None,
+                service: None,
+                hosts: None,
+                secrets: Some(vec!["SHARED_KEY".into()]),
+                keys: None,
+            },
         );
         aux.connections.insert(
             "gmail".into(),
-            Connection { name: None, service: Some("gmail".into()), hosts: None, secrets: None, keys: None },
+            Connection {
+                name: None,
+                service: Some("gmail".into()),
+                hosts: None,
+                secrets: None,
+                keys: None,
+            },
         );
         let mut work_keys = BTreeMap::new();
-        work_keys.insert("GMAIL_REFRESH_TOKEN".into(), "GMAIL_REFRESH_TOKEN_WORK".into());
+        work_keys.insert(
+            "GMAIL_REFRESH_TOKEN".into(),
+            "GMAIL_REFRESH_TOKEN_WORK".into(),
+        );
         aux.connections.insert(
             "gmail_work".into(),
-            Connection { name: None, service: Some("gmail".into()), hosts: None, secrets: None, keys: Some(work_keys) },
+            Connection {
+                name: None,
+                service: Some("gmail".into()),
+                hosts: None,
+                secrets: None,
+                keys: Some(work_keys),
+            },
         );
 
         // Excluding the raw conn: its own key isn't a claim, but BOTH gmail
         // conns' keys are (default via identity, named via its map).
         let claims = aux.connection_claims(&reg, "stripe_key");
         assert!(!claims.contains_key("SHARED_KEY"));
-        assert_eq!(claims.get("GMAIL_REFRESH_TOKEN").map(Vec::as_slice), Some(&["gmail".to_string()][..]));
-        assert_eq!(claims.get("GMAIL_REFRESH_TOKEN_WORK").map(Vec::as_slice), Some(&["gmail_work".to_string()][..]));
+        assert_eq!(
+            claims.get("GMAIL_REFRESH_TOKEN").map(Vec::as_slice),
+            Some(&["gmail".to_string()][..])
+        );
+        assert_eq!(
+            claims.get("GMAIL_REFRESH_TOKEN_WORK").map(Vec::as_slice),
+            Some(&["gmail_work".to_string()][..])
+        );
 
         // secret_addresses: a raw conn lists its own; a named conn resolves its
         // bound key; the default conn is the identity role.
         let raw = &aux.connections["stripe_key"];
         assert_eq!(raw.secret_addresses(&reg), vec!["SHARED_KEY".to_string()]);
-        assert_eq!(aux.connections["gmail"].secret_addresses(&reg), vec!["GMAIL_REFRESH_TOKEN".to_string()]);
-        assert_eq!(aux.connections["gmail_work"].secret_addresses(&reg), vec!["GMAIL_REFRESH_TOKEN_WORK".to_string()]);
+        assert_eq!(
+            aux.connections["gmail"].secret_addresses(&reg),
+            vec!["GMAIL_REFRESH_TOKEN".to_string()]
+        );
+        assert_eq!(
+            aux.connections["gmail_work"].secret_addresses(&reg),
+            vec!["GMAIL_REFRESH_TOKEN_WORK".to_string()]
+        );
     }
 
     fn build_protected_state(

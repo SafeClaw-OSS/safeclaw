@@ -107,7 +107,10 @@ pub async fn run(args: CommonArgs) -> Result<(), String> {
         Ok(p) if p.exists() => report.push(Mark::Ok, format!("config: {}", p.display())),
         Ok(p) => report.push(
             Mark::Warn,
-            format!("config: {} (missing — run `safeclaw vault create`)", p.display()),
+            format!(
+                "config: {} (missing — run `safeclaw vault create`)",
+                p.display()
+            ),
         ),
         Err(e) => report.push(Mark::Fail, format!("config path: {}", e)),
     }
@@ -140,11 +143,11 @@ pub async fn run(args: CommonArgs) -> Result<(), String> {
             let status = resp.status();
             if status.is_success() {
                 let body: serde_json::Value = resp.json().await.unwrap_or_default();
-                let version = body
-                    .get("version")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("?");
-                let count = body.get("vault_count").and_then(|v| v.as_u64()).unwrap_or(0);
+                let version = body.get("version").and_then(|v| v.as_str()).unwrap_or("?");
+                let count = body
+                    .get("vault_count")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
                 report.push(
                     Mark::Ok,
                     format!(
@@ -181,10 +184,7 @@ pub async fn run(args: CommonArgs) -> Result<(), String> {
                 .map(|a| a.len())
                 .unwrap_or(0);
             if exists {
-                report.push(
-                    Mark::Ok,
-                    format!("vault: enrolled ({} passkey(s))", n),
-                );
+                report.push(Mark::Ok, format!("vault: enrolled ({} passkey(s))", n));
             } else {
                 report.push(
                     Mark::Warn,
@@ -192,10 +192,7 @@ pub async fn run(args: CommonArgs) -> Result<(), String> {
                 );
             }
         }
-        Ok(resp) => report.push(
-            Mark::Warn,
-            format!("vault probe: HTTP {}", resp.status()),
-        ),
+        Ok(resp) => report.push(Mark::Warn, format!("vault probe: HTTP {}", resp.status())),
         Err(e) => report.push(Mark::Warn, format!("vault probe: {}", e)),
     }
 
@@ -255,12 +252,13 @@ pub async fn run(args: CommonArgs) -> Result<(), String> {
                 let cloud_client = crate::cli::egress_proxy::client(Duration::from_secs(5))
                     .unwrap_or_else(|_| client.clone());
                 match cloud_client.get(cloud).send().await {
-                    Ok(_) => {
-                        report.push(Mark::Ok, format!("cloud backend: reachable ({})", cloud))
-                    }
+                    Ok(_) => report.push(Mark::Ok, format!("cloud backend: reachable ({})", cloud)),
                     Err(e) => report.push(
                         Mark::Warn,
-                        format!("cloud backend: {}", crate::cli::neterr::reach_failed(cloud, &e)),
+                        format!(
+                            "cloud backend: {}",
+                            crate::cli::neterr::reach_failed(cloud, &e)
+                        ),
                     ),
                 }
             }
@@ -288,7 +286,11 @@ fn redact_proxy(url: &str) -> String {
             let host = rest.rsplit_once('@').map(|(_, h)| h).unwrap_or(rest);
             format!("{scheme}://{host}")
         }
-        None => url.rsplit_once('@').map(|(_, h)| h).unwrap_or(url).to_string(),
+        None => url
+            .rsplit_once('@')
+            .map(|(_, h)| h)
+            .unwrap_or(url)
+            .to_string(),
     }
 }
 
@@ -299,7 +301,10 @@ mod tests {
     #[test]
     fn redact_proxy_drops_userinfo_keeps_host_port() {
         assert_eq!(redact_proxy("http://u:p@box:9999"), "http://box:9999");
-        assert_eq!(redact_proxy("http://proxy.local:3128"), "http://proxy.local:3128");
+        assert_eq!(
+            redact_proxy("http://proxy.local:3128"),
+            "http://proxy.local:3128"
+        );
         assert_eq!(redact_proxy("box:9999"), "box:9999");
         assert_eq!(redact_proxy("u:p@box:9999"), "box:9999");
     }

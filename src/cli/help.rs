@@ -129,7 +129,10 @@ fn render(cmd: &clap::Command) -> String {
         let name = s.get_name().to_string();
         about.insert(
             name.clone(),
-            short_from_about(&s.get_about().map(|a| a.to_string()).unwrap_or_default(), 52),
+            short_from_about(
+                &s.get_about().map(|a| a.to_string()).unwrap_or_default(),
+                52,
+            ),
         );
         visible.push(name);
     }
@@ -169,7 +172,10 @@ fn render(cmd: &clap::Command) -> String {
         }
     }
 
-    let others: Vec<&String> = visible.iter().filter(|v| !curated.contains(v.as_str())).collect();
+    let others: Vec<&String> = visible
+        .iter()
+        .filter(|v| !curated.contains(v.as_str()))
+        .collect();
     if !others.is_empty() {
         out.push_str("\nOther\n");
         for name in others {
@@ -179,8 +185,14 @@ fn render(cmd: &clap::Command) -> String {
     }
 
     out.push_str("\nOptions:\n");
-    out.push_str(&format!("  {:<pad$}Print help (and `sc <command> --help` per command)\n", "-h, --help"));
+    out.push_str(&format!(
+        "  {:<pad$}Print help (and `sc <command> --help` per command)\n",
+        "-h, --help"
+    ));
     out.push_str(&format!("  {:<pad$}Print version\n", "-V, --version"));
-    out.push_str(&format!("  {:<pad$}More logging to stderr (-v info, -vv debug, -vvv trace)\n", "-v, --verbose"));
+    out.push_str(&format!(
+        "  {:<pad$}More logging to stderr (-v info, -vv debug, -vvv trace)\n",
+        "-v, --verbose"
+    ));
     out
 }

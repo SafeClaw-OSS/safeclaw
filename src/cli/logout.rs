@@ -48,8 +48,7 @@ pub async fn run(args: LogoutArgs) -> Result<(), String> {
     if let Some(home) = dirs::home_dir() {
         let p = home.join(".safeclaw").join("device-key");
         if p.exists() {
-            std::fs::remove_file(&p)
-                .map_err(|e| format!("remove {}: {}", p.display(), e))?;
+            std::fs::remove_file(&p).map_err(|e| format!("remove {}: {}", p.display(), e))?;
         }
     }
 
@@ -119,7 +118,10 @@ async fn revoke_device_cloud(cfg: &CliConfig) -> Result<Option<String>, String> 
     if !resp.status().is_success() {
         return Err(format!("list devices: HTTP {}", resp.status()));
     }
-    let list: DeviceList = resp.json().await.map_err(|e| format!("parse devices: {}", e))?;
+    let list: DeviceList = resp
+        .json()
+        .await
+        .map_err(|e| format!("parse devices: {}", e))?;
 
     // The device list returns each key's stable PREFIX; our full key starts with it.
     let Some(me) = list.keys.into_iter().find(|d| key.starts_with(&d.prefix)) else {

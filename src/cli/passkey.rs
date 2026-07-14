@@ -10,7 +10,7 @@ use std::time::Duration;
 use serde::Deserialize;
 
 use crate::cli::active::resolve_active;
-use crate::config::{PasskeyRemoveArgs, PasskeyRenameArgs, PasskeySubcommand, CommonArgs};
+use crate::config::{CommonArgs, PasskeyRemoveArgs, PasskeyRenameArgs, PasskeySubcommand};
 
 pub async fn run(sub: PasskeySubcommand) -> Result<(), String> {
     match sub {
@@ -76,11 +76,17 @@ async fn run_ls(args: CommonArgs) -> Result<(), String> {
     }
     let body: PasskeysBody = resp.json().await.map_err(|e| format!("parse: {}", e))?;
     if !body.vault_exists {
-        println!("(vault {} is not yet enrolled — run `safeclaw setup`)", vault);
+        println!(
+            "(vault {} is not yet enrolled — run `safeclaw setup`)",
+            vault
+        );
         return Ok(());
     }
     if body.passkeys.is_empty() {
-        println!("(vault {} has no passkeys — re-enroll via `safeclaw setup`)", vault);
+        println!(
+            "(vault {} has no passkeys — re-enroll via `safeclaw setup`)",
+            vault
+        );
         return Ok(());
     }
     let id_w = body
@@ -104,10 +110,7 @@ async fn run_ls(args: CommonArgs) -> Result<(), String> {
         } else {
             p.credential_id.clone()
         };
-        let device = p
-            .device_name
-            .as_deref()
-            .unwrap_or("(unnamed)");
+        let device = p.device_name.as_deref().unwrap_or("(unnamed)");
         let last_used = p
             .last_used_at
             .as_deref()

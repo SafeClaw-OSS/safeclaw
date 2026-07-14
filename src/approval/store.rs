@@ -157,7 +157,6 @@ impl ApprovalStore {
         self.inner.get(id).filter(|r| !r.is_expired())
     }
 
-
     pub fn approve(&mut self, id: &str, value: Option<String>) -> Option<&ApprovalRecord> {
         if let Some(rec) = self.inner.get_mut(id) {
             if !matches!(rec.status, ApprovalStatus::Pending) || rec.is_expired() {
@@ -213,9 +212,8 @@ impl ApprovalStore {
 
     /// Drop expired and consumed records.
     pub fn cleanup(&mut self) {
-        self.inner.retain(|_, r| {
-            !r.is_expired() && !matches!(r.status, ApprovalStatus::Consumed)
-        });
+        self.inner
+            .retain(|_, r| !r.is_expired() && !matches!(r.status, ApprovalStatus::Consumed));
     }
 }
 
@@ -246,7 +244,10 @@ mod tests {
     fn create_approve_consume() {
         let mut s = ApprovalStore::new();
         let id = s.create("vault1".into(), fake_op(), "fake_r".into());
-        assert!(matches!(s.get(&id).unwrap().status, ApprovalStatus::Pending));
+        assert!(matches!(
+            s.get(&id).unwrap().status,
+            ApprovalStatus::Pending
+        ));
         s.approve(&id, Some("secret".into()));
         assert!(matches!(
             s.get(&id).unwrap().status,

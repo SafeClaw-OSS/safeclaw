@@ -1,14 +1,19 @@
 //! `safeclaw vault ...` — vault lifecycle ops.
 
-use std::io::{self, Write as _};
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
 use serde_json::json;
+use std::io::{self, Write as _};
 
+use crate::cli::active::{
+    forget as forget_vault, join_vault_url, known_vaults, load as load_config, put_active,
+    resolve_active, split_vault_url,
+};
 use crate::cli::status::{fetch_status, print_status, VaultState};
 use crate::cli::webauthn::*;
-use crate::cli::active::{forget as forget_vault, join_vault_url, known_vaults, load as load_config, put_active, resolve_active, split_vault_url};
-use crate::config::{VaultCreateArgs, VaultDeleteArgs, VaultForgetArgs, VaultSubcommand, VaultUseArgs};
+use crate::config::{
+    VaultCreateArgs, VaultDeleteArgs, VaultForgetArgs, VaultSubcommand, VaultUseArgs,
+};
 
 // Port must equal `config::CONTROL_PORT` (the daemon's control/API plane).
 const LOCAL_CUSTODIAN: &str = "http://localhost:23293";
@@ -48,8 +53,17 @@ async fn run_ls() -> Result<(), String> {
     }
     let active = (cfg.daemon.as_deref(), cfg.vault.as_deref());
     for (i, kv) in known.iter().enumerate() {
-        let marker = if active == (Some(&kv.daemon), Some(&kv.vault)) { "*" } else { " " };
-        println!("  {} {}) {}", marker, i + 1, join_vault_url(&kv.daemon, &kv.vault));
+        let marker = if active == (Some(&kv.daemon), Some(&kv.vault)) {
+            "*"
+        } else {
+            " "
+        };
+        println!(
+            "  {} {}) {}",
+            marker,
+            i + 1,
+            join_vault_url(&kv.daemon, &kv.vault)
+        );
     }
     Ok(())
 }
@@ -66,9 +80,7 @@ fn resolve_url_or_idx(arg: &str) -> Result<(String, String), String> {
         let kv = &known[idx - 1];
         return Ok((kv.daemon.clone(), kv.vault.clone()));
     }
-    split_vault_url(arg).ok_or_else(|| {
-        format!("not a valid SAFECLAW_VAULT_URL or index: {}", arg)
-    })
+    split_vault_url(arg).ok_or_else(|| format!("not a valid SAFECLAW_VAULT_URL or index: {}", arg))
 }
 
 async fn run_use(args: VaultUseArgs) -> Result<(), String> {
@@ -79,8 +91,7 @@ async fn run_use(args: VaultUseArgs) -> Result<(), String> {
     } else {
         let url = interactive_pick(OnEmpty::UseLocalDefault)?
             .expect("UseLocalDefault never returns None");
-        split_vault_url(&url)
-            .ok_or_else(|| format!("not a valid SAFECLAW_VAULT_URL: {}", url))?
+        split_vault_url(&url).ok_or_else(|| format!("not a valid SAFECLAW_VAULT_URL: {}", url))?
     };
 
     // Probe before saving. If the vault doesn't exist on the custodian,
@@ -96,8 +107,13 @@ async fn run_use(args: VaultUseArgs) -> Result<(), String> {
         }
         VaultState::Unreachable => {
             if is_localhost(&custodian) {
-                eprintln!("warning: no local daemon at {} — start one with `safeclaw c start`", custodian);
-                eprintln!("  (saving anyway; `safeclaw status` will recheck once the daemon is up)");
+                eprintln!(
+                    "warning: no local daemon at {} — start one with `safeclaw c start`",
+                    custodian
+                );
+                eprintln!(
+                    "  (saving anyway; `safeclaw status` will recheck once the daemon is up)"
+                );
             } else {
                 eprintln!("warning: couldn't reach custodian; saving anyway");
             }
@@ -117,12 +133,14 @@ async fn run_forget(args: VaultForgetArgs) -> Result<(), String> {
             return Err("no vaults in known list — nothing to forget".into());
         }
         let url = interactive_pick(OnEmpty::Abort)?.ok_or("cancelled")?;
-        split_vault_url(&url)
-            .ok_or_else(|| format!("not a valid SAFECLAW_VAULT_URL: {}", url))?
+        split_vault_url(&url).ok_or_else(|| format!("not a valid SAFECLAW_VAULT_URL: {}", url))?
     };
     let removed = forget_vault(&custodian, &vault)?;
     if !removed {
-        return Err(format!("vault not in known list: {}", join_vault_url(&custodian, &vault)));
+        return Err(format!(
+            "vault not in known list: {}",
+            join_vault_url(&custodian, &vault)
+        ));
     }
     println!("forgot: {}", join_vault_url(&custodian, &vault));
     Ok(())
@@ -145,8 +163,17 @@ fn interactive_pick(on_empty: OnEmpty) -> Result<Option<String>, String> {
     if has_known {
         eprintln!("Known vaults:");
         for (i, kv) in known.iter().enumerate() {
-            let marker = if active == (Some(&kv.daemon), Some(&kv.vault)) { " (active)" } else { "" };
-            eprintln!("  {}) {}{}", i + 1, join_vault_url(&kv.daemon, &kv.vault), marker);
+            let marker = if active == (Some(&kv.daemon), Some(&kv.vault)) {
+                " (active)"
+            } else {
+                ""
+            };
+            eprintln!(
+                "  {}) {}{}",
+                i + 1,
+                join_vault_url(&kv.daemon, &kv.vault),
+                marker
+            );
         }
         eprintln!();
     }
@@ -154,10 +181,14 @@ fn interactive_pick(on_empty: OnEmpty) -> Result<Option<String>, String> {
     // - has_known controls whether "index" is offered
     // - on_empty controls what Enter does
     let prompt = match (has_known, &on_empty) {
-        (true,  OnEmpty::UseLocalDefault) => "Pick: index, SAFECLAW_VAULT_URL, or Enter for local default: ",
-        (true,  OnEmpty::Abort)           => "Pick: index or SAFECLAW_VAULT_URL (Enter to cancel): ",
-        (false, OnEmpty::UseLocalDefault) => "Paste a SAFECLAW_VAULT_URL, or press Enter for local default: ",
-        (false, OnEmpty::Abort)           => "Paste a SAFECLAW_VAULT_URL (Enter to cancel): ",
+        (true, OnEmpty::UseLocalDefault) => {
+            "Pick: index, SAFECLAW_VAULT_URL, or Enter for local default: "
+        }
+        (true, OnEmpty::Abort) => "Pick: index or SAFECLAW_VAULT_URL (Enter to cancel): ",
+        (false, OnEmpty::UseLocalDefault) => {
+            "Paste a SAFECLAW_VAULT_URL, or press Enter for local default: "
+        }
+        (false, OnEmpty::Abort) => "Paste a SAFECLAW_VAULT_URL (Enter to cancel): ",
     };
     eprint!("{}", prompt);
     io::stderr().flush().ok();
@@ -184,10 +215,16 @@ async fn run_create(args: VaultCreateArgs) -> Result<(), String> {
     use crate::crypto::kdf::WRAP_VERSION;
 
     let (custodian, vault_id) = match args.remote.as_deref() {
-        Some(remote) => (remote.trim_end_matches('/').to_string(), uuid::Uuid::new_v4().to_string()),
+        Some(remote) => (
+            remote.trim_end_matches('/').to_string(),
+            uuid::Uuid::new_v4().to_string(),
+        ),
         None => (LOCAL_CUSTODIAN.to_string(), LOCAL_VAULT_ID.to_string()),
     };
-    eprintln!("safeclaw vault create — new vault at {}", join_vault_url(&custodian, &vault_id));
+    eprintln!(
+        "safeclaw vault create — new vault at {}",
+        join_vault_url(&custodian, &vault_id)
+    );
 
     let prf_eval_salt_js = b"safeclaw-prf-v1";
 
@@ -199,35 +236,58 @@ async fn run_create(args: VaultCreateArgs) -> Result<(), String> {
     let (cred_id, pub_x, pub_y, prf_first_b64) = if args.reuse_passkey {
         let meta = pick_reuse_passkey(&custodian, &vault_id).await?;
         let cred_id = meta.credential_id;
-        let pub_x = meta.public_key_x
+        let pub_x = meta
+            .public_key_x
             .ok_or("passkeys endpoint didn't return public_key_x — upgrade daemon and retry")?;
-        let pub_y = meta.public_key_y
+        let pub_y = meta
+            .public_key_y
             .ok_or("passkeys endpoint didn't return public_key_y — upgrade daemon and retry")?;
         eprintln!("  step 1/2: touch passkey to confirm reuse (PRF)…");
         let dummy_beta = [0u8; 32];
         let get_result = do_browser_gesture(
-            &custodian, &vault_id, &dummy_beta,
-            Some(prf_eval_salt_js), &cred_id,
+            &custodian,
+            &vault_id,
+            &dummy_beta,
+            Some(prf_eval_salt_js),
+            &cred_id,
             "Reuse passkey (PRF)",
-            args.no_browser, args.timeout, false, args.cb_port,
-        ).await?;
-        let prf = get_result.prf_first
-            .ok_or("PRF unavailable on this authenticator — use `sc vault create` without --reuse")?;
+            args.no_browser,
+            args.timeout,
+            false,
+            args.cb_port,
+        )
+        .await?;
+        let prf = get_result.prf_first.ok_or(
+            "PRF unavailable on this authenticator — use `sc vault create` without --reuse",
+        )?;
         (cred_id, pub_x, pub_y, prf)
     } else {
         // ── Step 1: register passkey (WebAuthn create()) ─────────────────
         eprintln!("  step 1/3: register a passkey in your browser…");
         let create_result = do_browser_gesture(
-            &custodian, &vault_id, &[0u8; 32],
-            Some(prf_eval_salt_js), "",
+            &custodian,
+            &vault_id,
+            &[0u8; 32],
+            Some(prf_eval_salt_js),
+            "",
             "Create vault (register passkey)",
-            args.no_browser, args.timeout, true, args.cb_port,
-        ).await?;
-        let cred_id = create_result.credential_id.clone()
+            args.no_browser,
+            args.timeout,
+            true,
+            args.cb_port,
+        )
+        .await?;
+        let cred_id = create_result
+            .credential_id
+            .clone()
             .ok_or("browser didn't return credential_id")?;
-        let pub_x = create_result.public_key_x.clone()
+        let pub_x = create_result
+            .public_key_x
+            .clone()
             .ok_or("browser didn't return public_key_x")?;
-        let pub_y = create_result.public_key_y.clone()
+        let pub_y = create_result
+            .public_key_y
+            .clone()
             .ok_or("browser didn't return public_key_y")?;
         // ── Step 2: get PRF output ────────────────────────────────────
         let prf = if let Some(ref pf) = create_result.prf_first {
@@ -236,32 +296,49 @@ async fn run_create(args: VaultCreateArgs) -> Result<(), String> {
             eprintln!("  step 2/3: PRF not available on create — doing a second passkey gesture…");
             let dummy_beta = [0u8; 32];
             let get_result = do_browser_gesture(
-                &custodian, &vault_id, &dummy_beta,
-                Some(prf_eval_salt_js), &cred_id,
+                &custodian,
+                &vault_id,
+                &dummy_beta,
+                Some(prf_eval_salt_js),
+                &cred_id,
                 "Vault setup (PRF)",
-                args.no_browser, args.timeout, false, args.cb_port,
-            ).await?;
-            get_result.prf_first
+                args.no_browser,
+                args.timeout,
+                false,
+                args.cb_port,
+            )
+            .await?;
+            get_result
+                .prf_first
                 .ok_or("PRF still unavailable — authenticator may not support PRF extension")?
         };
         (cred_id, pub_x, pub_y, prf)
     };
-    let prf_first_bytes = URL_SAFE_NO_PAD.decode(&prf_first_b64)
+    let prf_first_bytes = URL_SAFE_NO_PAD
+        .decode(&prf_first_b64)
         .map_err(|e| format!("decode prf_first: {}", e))?;
     let user_key = prf_to_user_key(&prf_first_bytes)?;
-    let cred_id_raw = URL_SAFE_NO_PAD.decode(&cred_id)
+    let cred_id_raw = URL_SAFE_NO_PAD
+        .decode(&cred_id)
         .map_err(|e| format!("decode cred_id: {}", e))?;
 
     // ── Seal initial vault state ──────────────────────────────────────
-    let seal_step = if args.reuse_passkey { "step 2/2" } else { "step 3/3" };
+    let seal_step = if args.reuse_passkey {
+        "step 2/2"
+    } else {
+        "step 3/3"
+    };
     eprintln!("  {}: sealing initial vault state…", seal_step);
     let prf_salt = random_bytes(32);
     let state_key = random_bytes(32); // K
-    let wrapping_key = crate::crypto::kdf::derive_wrapping_key(
-        &user_key, &prf_salt, &cred_id_raw, WRAP_VERSION,
-    ).map_err(|e| format!("derive wrapping key: {}", e))?;
+    let wrapping_key =
+        crate::crypto::kdf::derive_wrapping_key(&user_key, &prf_salt, &cred_id_raw, WRAP_VERSION)
+            .map_err(|e| format!("derive wrapping key: {}", e))?;
 
-    let binding = sudp::primitives::WrapBinding { credential_id: &cred_id_raw, version: WRAP_VERSION };
+    let binding = sudp::primitives::WrapBinding {
+        credential_id: &cred_id_raw,
+        version: WRAP_VERSION,
+    };
     let wrapped_key = <sudp::primitives::AeadWrap<sudp::primitives::ChaCha20Poly1305>
         as sudp::primitives::KeyWrap>::wrap(&wrapping_key, &state_key, &binding)
         .map_err(|e| format!("wrap K: {}", e))?;
@@ -282,8 +359,11 @@ async fn run_create(args: VaultCreateArgs) -> Result<(), String> {
         ad
     };
     let ciphertext = <sudp::primitives::ChaCha20Poly1305 as sudp::primitives::Aead>::seal(
-        &state_key, &canonical_m, &seal_ad,
-    ).map_err(|e| format!("seal M: {}", e))?;
+        &state_key,
+        &canonical_m,
+        &seal_ad,
+    )
+    .map_err(|e| format!("seal M: {}", e))?;
 
     // ── Build Enroll op + create on daemon ────────────────────────────
     let enroll_op = json!({
@@ -301,17 +381,26 @@ async fn run_create(args: VaultCreateArgs) -> Result<(), String> {
         "valid": { "iat": now_unix(), "multiplicity": "one" }
     });
     let (op_id, r) = create_op(&custodian, &vault_id, &enroll_op).await?;
-    let r_bytes = STANDARD.decode(&r).map_err(|e| format!("decode r: {}", e))?;
+    let r_bytes = STANDARD
+        .decode(&r)
+        .map_err(|e| format!("decode r: {}", e))?;
     let beta = compute_beta_setup(&r_bytes, &enroll_op)?;
 
     // ── Assertion gesture (sign β) ────────────────────────────────────
     eprintln!("  signing enrollment grant — touch passkey again…");
     let assert_result = do_browser_gesture(
-        &custodian, &op_id, &beta,
-        None, &cred_id,
+        &custodian,
+        &op_id,
+        &beta,
+        None,
+        &cred_id,
         "Confirm vault creation",
-        args.no_browser, args.timeout, false, args.cb_port,
-    ).await?;
+        args.no_browser,
+        args.timeout,
+        false,
+        args.cb_port,
+    )
+    .await?;
 
     // ── Submit Enroll grant ───────────────────────────────────────────
     let grant = json!({
@@ -332,13 +421,21 @@ async fn run_create(args: VaultCreateArgs) -> Result<(), String> {
     });
     let client = http_client()?;
     let resp = client
-        .post(format!("{}/op/{}/approve", custodian.trim_end_matches('/'), urlencoding::encode(&op_id)))
+        .post(format!(
+            "{}/op/{}/approve",
+            custodian.trim_end_matches('/'),
+            urlencoding::encode(&op_id)
+        ))
         .json(&grant)
         .send()
         .await
         .map_err(|e| format!("approve: {}", e))?;
     if !resp.status().is_success() {
-        return Err(format!("approve HTTP {}: {}", resp.status(), resp.text().await.unwrap_or_default()));
+        return Err(format!(
+            "approve HTTP {}: {}",
+            resp.status(),
+            resp.text().await.unwrap_or_default()
+        ));
     }
 
     put_active(&custodian, &vault_id).map_err(|e| format!("save config: {}", e))?;
@@ -382,7 +479,14 @@ async fn run_delete(args: VaultDeleteArgs) -> Result<(), String> {
         cb_port: args.cb_port,
         timeout: args.timeout,
     };
-    crate::cli::approve::approve_op(&custodian, &vault, &op, "Delete vault (irreversible)", &opts).await?;
+    crate::cli::approve::approve_op(
+        &custodian,
+        &vault,
+        &op,
+        "Delete vault (irreversible)",
+        &opts,
+    )
+    .await?;
     eprintln!("safeclaw vault delete — ok (vault {} wiped)", vault);
     Ok(())
 }
@@ -392,11 +496,17 @@ async fn run_delete(args: VaultDeleteArgs) -> Result<(), String> {
 /// If only one other vault exists → use it automatically.
 /// If multiple → prompt the user to pick.
 /// Returns the first enrolled passkey's meta (cred_id + pub_x/y).
-async fn pick_reuse_passkey(new_custodian: &str, new_vault_id: &str) -> Result<crate::cli::webauthn::PasskeyMeta, String> {
+async fn pick_reuse_passkey(
+    new_custodian: &str,
+    new_vault_id: &str,
+) -> Result<crate::cli::webauthn::PasskeyMeta, String> {
     let known = known_vaults();
-    let candidates: Vec<_> = known.iter()
-        .filter(|kv| kv.daemon.trim_end_matches('/') == new_custodian.trim_end_matches('/')
-            && kv.vault != new_vault_id)
+    let candidates: Vec<_> = known
+        .iter()
+        .filter(|kv| {
+            kv.daemon.trim_end_matches('/') == new_custodian.trim_end_matches('/')
+                && kv.vault != new_vault_id
+        })
         .collect();
     if candidates.is_empty() {
         return Err(format!(
@@ -405,7 +515,10 @@ async fn pick_reuse_passkey(new_custodian: &str, new_vault_id: &str) -> Result<c
         ));
     }
     let source_vault = if candidates.len() == 1 {
-        eprintln!("  reusing passkey from: {}", join_vault_url(&candidates[0].daemon, &candidates[0].vault));
+        eprintln!(
+            "  reusing passkey from: {}",
+            join_vault_url(&candidates[0].daemon, &candidates[0].vault)
+        );
         &candidates[0].vault
     } else {
         eprintln!("Pick a vault to reuse a passkey from:");
@@ -418,7 +531,11 @@ async fn pick_reuse_passkey(new_custodian: &str, new_vault_id: &str) -> Result<c
         io::stdin().read_line(&mut buf).map_err(|e| e.to_string())?;
         let idx: usize = buf.trim().parse().map_err(|_| "invalid index")?;
         if idx < 1 || idx > candidates.len() {
-            return Err(format!("index {} out of range [1-{}]", idx, candidates.len()));
+            return Err(format!(
+                "index {} out of range [1-{}]",
+                idx,
+                candidates.len()
+            ));
         }
         &candidates[idx - 1].vault
     };

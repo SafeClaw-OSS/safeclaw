@@ -74,7 +74,8 @@ fn is_valid_service_id(s: &str) -> bool {
         Some(c) if c.is_ascii_lowercase() || c.is_ascii_digit() => {}
         _ => return false,
     }
-    s.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+    s.chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
 }
 
 /// A secret role key: env-style `[A-Z0-9_]`, starts with a letter, and — because
@@ -85,15 +86,24 @@ fn is_valid_role(s: &str) -> bool {
     if s.is_empty() || s.contains("__") || s.ends_with('_') {
         return false;
     }
-    let first_ok = s.chars().next().map(|c| c.is_ascii_uppercase()).unwrap_or(false);
-    first_ok && s.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+    let first_ok = s
+        .chars()
+        .next()
+        .map(|c| c.is_ascii_uppercase())
+        .unwrap_or(false);
+    first_ok
+        && s.chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
 }
 
 /// A single host anchor entry: an exact FQDN or a `*.suffix` wildcard (leftmost,
 /// single label). Authorities only — no scheme, no path, no port, no template.
 fn validate_host(entry: &str, errs: &mut Vec<String>) {
     if entry.contains("://") || entry.contains('/') || entry.contains("{{") {
-        errs.push(format!("host '{}' must be a bare authority (no scheme/path/template)", entry));
+        errs.push(format!(
+            "host '{}' must be a bare authority (no scheme/path/template)",
+            entry
+        ));
         return;
     }
     if entry.contains(':') {
@@ -108,19 +118,28 @@ fn validate_host(entry: &str, errs: &mut Vec<String>) {
         // A `*.suffix` wildcard: the suffix itself must carry no further '*' and
         // be a real multi-label domain to pin within.
         if suffix.contains('*') || suffix.is_empty() {
-            errs.push(format!("host '{}': '*' is only allowed as the leftmost single label", entry));
+            errs.push(format!(
+                "host '{}': '*' is only allowed as the leftmost single label",
+                entry
+            ));
             return;
         }
         suffix
     } else {
         if entry.contains('*') {
-            errs.push(format!("host '{}': '*' is only allowed as the leftmost single label", entry));
+            errs.push(format!(
+                "host '{}': '*' is only allowed as the leftmost single label",
+                entry
+            ));
             return;
         }
         entry
     };
     if host_is_blocked_ip(base) || host_is_blocked_name(base) {
-        errs.push(format!("host '{}' is loopback / private / link-local — not allowed", entry));
+        errs.push(format!(
+            "host '{}' is loopback / private / link-local — not allowed",
+            entry
+        ));
     }
 }
 
@@ -168,7 +187,10 @@ fn validate_service_inner(toml_str: &str) -> Result<(), Vec<String>> {
     let mut seen_secret = HashSet::new();
     for s in &def.service.secrets {
         if !is_valid_role(s) {
-            errs.push(format!("secret role '{}' is not a valid env key ([A-Z0-9_])", s));
+            errs.push(format!(
+                "secret role '{}' is not a valid env key ([A-Z0-9_])",
+                s
+            ));
         }
         if !seen_secret.insert(s.to_ascii_uppercase()) {
             errs.push(format!("duplicate secret role '{}'", s));
@@ -182,10 +204,16 @@ fn validate_service_inner(toml_str: &str) -> Result<(), Vec<String>> {
     for t in &def.service.tags {
         let kebab = !t.is_empty()
             && t.split('-').all(|seg| {
-                !seg.is_empty() && seg.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+                !seg.is_empty()
+                    && seg
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
             });
         if !kebab {
-            errs.push(format!("tag '{}' is not lowercase-kebab ([a-z0-9] segments joined by '-')", t));
+            errs.push(format!(
+                "tag '{}' is not lowercase-kebab ([a-z0-9] segments joined by '-')",
+                t
+            ));
         }
         if !seen_tag.insert(t.as_str()) {
             errs.push(format!("duplicate tag '{}'", t));
@@ -209,12 +237,18 @@ fn validate_service_inner(toml_str: &str) -> Result<(), Vec<String>> {
         // The snaplii mechanism's exchange input is the first `secrets` role —
         // a def without one can never mint.
         if def.mint_input_role().is_none() {
-            errs.push("[auth] type=\"snaplii\" requires a [service] secrets entry (the exchange api key)".into());
+            errs.push(
+                "[auth] type=\"snaplii\" requires a [service] secrets entry (the exchange api key)"
+                    .into(),
+            );
         }
     }
     if let Some(o) = def.oauth2() {
         if !(o.authorization_url.is_some() && o.token_url.is_some() && o.client_id.is_some()) {
-            errs.push("[auth] oauth2 must declare authorization_url + token_url + client_id inline".into());
+            errs.push(
+                "[auth] oauth2 must declare authorization_url + token_url + client_id inline"
+                    .into(),
+            );
         }
         if o.provider.as_deref().is_some_and(|p| p.trim().is_empty()) {
             errs.push("[auth] provider (display label) must not be empty (omit it instead)".into());
@@ -230,7 +264,10 @@ fn validate_service_inner(toml_str: &str) -> Result<(), Vec<String>> {
                 errs.push(format!("[auth] claims key '{}' is not in exposes", role));
             }
             if path.is_empty() || path.iter().any(|s| s.trim().is_empty()) {
-                errs.push(format!("[auth] claims path for '{}' has an empty segment", role));
+                errs.push(format!(
+                    "[auth] claims path for '{}' has an empty segment",
+                    role
+                ));
             }
         }
         // authorize_params are ADDITIONS to the consent URL — never overrides
@@ -246,27 +283,50 @@ fn validate_service_inner(toml_str: &str) -> Result<(), Vec<String>> {
         // Durable token slots use RFC 6749 field names; each must be a valid
         // uppercase env KEY that is ALSO declared in the top-level `secrets` set
         // (secrets is the uniform durable-credential contract — SERVICES.md §3).
-        let declared = |k: &str| def.service.secrets.iter().any(|s| s.eq_ignore_ascii_case(k));
+        let declared = |k: &str| {
+            def.service
+                .secrets
+                .iter()
+                .any(|s| s.eq_ignore_ascii_case(k))
+        };
         if o.refresh_token.trim().is_empty() {
             errs.push("[oauth2] requires a refresh_token (the vault secret KEY the refresh token is stored under)".into());
         } else if !is_valid_role(&o.refresh_token) {
-            errs.push(format!("[oauth2] refresh_token '{}' is not a valid env key ([A-Z0-9_])", o.refresh_token));
+            errs.push(format!(
+                "[oauth2] refresh_token '{}' is not a valid env key ([A-Z0-9_])",
+                o.refresh_token
+            ));
         } else if !declared(&o.refresh_token) {
-            errs.push(format!("[oauth2] refresh_token '{}' must be listed in the service's top-level secrets", o.refresh_token));
+            errs.push(format!(
+                "[oauth2] refresh_token '{}' must be listed in the service's top-level secrets",
+                o.refresh_token
+            ));
         }
         if let Some(idt) = &o.id_token {
             if !is_valid_role(idt) {
-                errs.push(format!("[oauth2] id_token '{}' is not a valid env key ([A-Z0-9_])", idt));
+                errs.push(format!(
+                    "[oauth2] id_token '{}' is not a valid env key ([A-Z0-9_])",
+                    idt
+                ));
             } else if !declared(idt) {
-                errs.push(format!("[oauth2] id_token '{}' must be listed in the service's top-level secrets", idt));
+                errs.push(format!(
+                    "[oauth2] id_token '{}' must be listed in the service's top-level secrets",
+                    idt
+                ));
             }
         }
         for e in &o.exposes {
             if !is_valid_service_id(e) {
-                errs.push(format!("[oauth2] exposes entry '{}' is not a valid role ([a-z0-9_])", e));
+                errs.push(format!(
+                    "[oauth2] exposes entry '{}' is not a valid role ([a-z0-9_])",
+                    e
+                ));
             }
             if seen_secret.contains(&e.to_ascii_uppercase()) {
-                errs.push(format!("[oauth2] exposes entry '{}' collides with a secret role", e));
+                errs.push(format!(
+                    "[oauth2] exposes entry '{}' collides with a secret role",
+                    e
+                ));
             }
         }
     }
@@ -283,7 +343,10 @@ fn validate_service_inner(toml_str: &str) -> Result<(), Vec<String>> {
         for (var, def_) in &shape.vars {
             match def_ {
                 crate::service::VarDef::BodyPointer(p)
-                | crate::service::VarDef::Located { location: crate::service::VarLoc::Body, at: p } => {
+                | crate::service::VarDef::Located {
+                    location: crate::service::VarLoc::Body,
+                    at: p,
+                } => {
                     if !p.starts_with('/') {
                         errs.push(format!(
                             "[requests.{}] var '{}' body address '{}' must be a JSON Pointer (start with '/')",
@@ -291,9 +354,15 @@ fn validate_service_inner(toml_str: &str) -> Result<(), Vec<String>> {
                         ));
                     }
                 }
-                crate::service::VarDef::Located { location: crate::service::VarLoc::Query, at } => {
+                crate::service::VarDef::Located {
+                    location: crate::service::VarLoc::Query,
+                    at,
+                } => {
                     if at.is_empty() {
-                        errs.push(format!("[requests.{}] var '{}' query `at` is empty", name, var));
+                        errs.push(format!(
+                            "[requests.{}] var '{}' query `at` is empty",
+                            name, var
+                        ));
                     }
                 }
             }
@@ -310,7 +379,10 @@ fn validate_service_inner(toml_str: &str) -> Result<(), Vec<String>> {
                 ));
             }
             if !seen_scope.insert(k) {
-                errs.push(format!("[requests.{}] scope lists '{}' more than once", name, k));
+                errs.push(format!(
+                    "[requests.{}] scope lists '{}' more than once",
+                    name, k
+                ));
             }
         }
         // P4 show ⊆ bind: every {token} a consent template interpolates must be
@@ -328,7 +400,11 @@ fn validate_service_inner(toml_str: &str) -> Result<(), Vec<String>> {
         }
     }
 
-    if errs.is_empty() { Ok(()) } else { Err(errs) }
+    if errs.is_empty() {
+        Ok(())
+    } else {
+        Err(errs)
+    }
 }
 
 /// Cross-file check: every `vars.<name>` a policy.toml rule's `when` references
@@ -336,7 +412,8 @@ fn validate_service_inner(toml_str: &str) -> Result<(), Vec<String>> {
 /// service.toml, and every `when` must parse. Runs where both files are
 /// available (the compiled-defaults test; a future console paired submit).
 pub fn validate_service_policy(service_toml: &str, policy_toml: &str) -> Result<(), Vec<String>> {
-    let def: ServiceDef = toml::from_str(service_toml).map_err(|e| vec![format!("service parse: {}", e)])?;
+    let def: ServiceDef =
+        toml::from_str(service_toml).map_err(|e| vec![format!("service parse: {}", e)])?;
     let policy: crate::service::PolicyFileDef =
         toml::from_str(policy_toml).map_err(|e| vec![format!("policy parse: {}", e)])?;
     let declared: HashSet<&str> = def
@@ -361,11 +438,16 @@ pub fn validate_service_policy(service_toml: &str, policy_toml: &str) -> Result<
             continue;
         };
         // Strip a `shape.` qualifier for the membership check.
-        let bare = cond.var_name().rsplit('.').next().unwrap_or(cond.var_name());
+        let bare = cond
+            .var_name()
+            .rsplit('.')
+            .next()
+            .unwrap_or(cond.var_name());
         if !declared.contains(bare) {
             errs.push(format!(
                 "rule '{}': `when` references var '{}', which no [requests] shape declares",
-                rule.id, cond.var_name()
+                rule.id,
+                cond.var_name()
             ));
         } else if !bound.contains(bare) {
             errs.push(format!(
@@ -374,7 +456,11 @@ pub fn validate_service_policy(service_toml: &str, policy_toml: &str) -> Result<
             ));
         }
     }
-    if errs.is_empty() { Ok(()) } else { Err(errs) }
+    if errs.is_empty() {
+        Ok(())
+    } else {
+        Err(errs)
+    }
 }
 
 /// Consent-URL query params the OAuth flow itself controls — an
@@ -396,12 +482,18 @@ fn validate_https_public_url(label: &str, url: &str, errs: &mut Vec<String>) {
     if !url.starts_with("https://") {
         errs.push(format!("{}: URL must be https:// (got '{}')", label, url));
     }
-    let Some(authority) = url.split_once("://").map(|(_, r)| r.split('/').next().unwrap_or(r)) else {
+    let Some(authority) = url
+        .split_once("://")
+        .map(|(_, r)| r.split('/').next().unwrap_or(r))
+    else {
         errs.push(format!("{}: URL has no scheme://host ('{}')", label, url));
         return;
     };
     if host_is_blocked_ip(authority) || host_is_blocked_name(authority) {
-        errs.push(format!("{}: egress host '{}' is loopback / private / link-local", label, authority));
+        errs.push(format!(
+            "{}: egress host '{}' is loopback / private / link-local",
+            label, authority
+        ));
     }
 }
 
@@ -469,7 +561,10 @@ refresh_token = "ACME_REFRESH_TOKEN"
         let http = inline.replace("https://auth.acme.dev/token", "http://auth.acme.dev/token");
         assert!(validate_service(&http).is_err());
         // A literal client_secret is a public client's by convention — fine.
-        let secret = inline.replace("client_id = \"acme-public\"", "client_id = \"acme-public\"\nclient_secret = \"shh\"");
+        let secret = inline.replace(
+            "client_id = \"acme-public\"",
+            "client_id = \"acme-public\"\nclient_secret = \"shh\"",
+        );
         assert!(validate_service(&secret).is_ok());
         // The retired client_type assertion is an unknown field now.
         let stale = inline.replace(
@@ -505,7 +600,8 @@ exposes = ["account_id"]
         // authorize_params may add params but never reserved protocol ones.
         let extra = format!("{base}[auth.authorize_params]\nfoo_flag = \"true\"\n");
         assert!(validate_service(&extra).is_ok());
-        let reserved = format!("{base}[auth.authorize_params]\nredirect_uri = \"https://evil.example\"\n");
+        let reserved =
+            format!("{base}[auth.authorize_params]\nredirect_uri = \"https://evil.example\"\n");
         assert!(validate_service(&reserved).is_err());
     }
 
@@ -540,7 +636,11 @@ name = "Acme"
 hosts = ["api.acme.com", "*.openai.azure.com"]
 secrets = ["ACME_TOKEN"]
 "#;
-        assert!(validate_recipe(ok, true).is_ok(), "{:?}", validate_recipe(ok, true));
+        assert!(
+            validate_recipe(ok, true).is_ok(),
+            "{:?}",
+            validate_recipe(ok, true)
+        );
         // bare '*' forbidden.
         let bad = ok.replace("\"*.openai.azure.com\"", "\"*\"");
         assert!(validate_recipe(&bad, true).is_err());
@@ -556,12 +656,21 @@ secrets = ["ACME_TOKEN"]
         // Literal private/loopback/link-local IPs (169.254.169.254 = the metadata
         // IP, covered by the range, not a name special-case) + loopback names.
         // `metadata.google.internal` / `*.internal` are NOT name-blocked (§7).
-        for bad in ["10.0.0.5", "192.168.1.1", "127.0.0.1", "169.254.169.254", "localhost"] {
+        for bad in [
+            "10.0.0.5",
+            "192.168.1.1",
+            "127.0.0.1",
+            "169.254.169.254",
+            "localhost",
+        ] {
             let toml = GITHUB.replace("\"api.github.com\"", &format!("\"{}\"", bad));
             let errs = validate_recipe(&toml, true).unwrap_err();
             assert!(
-                errs.iter().any(|e| e.contains("loopback") || e.contains("not allowed")),
-                "{} should be blocked, got {:?}", bad, errs
+                errs.iter()
+                    .any(|e| e.contains("loopback") || e.contains("not allowed")),
+                "{} should be blocked, got {:?}",
+                bad,
+                errs
             );
         }
     }
@@ -572,7 +681,11 @@ secrets = ["ACME_TOKEN"]
         // self-hosted service may be `foo.internal`); the metadata IP is blocked
         // by the range floor, so there's no name special-case to maintain.
         let toml = GITHUB.replace("\"api.github.com\"", "\"metadata.google.internal\"");
-        assert!(validate_recipe(&toml, true).is_ok(), "{:?}", validate_recipe(&toml, true));
+        assert!(
+            validate_recipe(&toml, true).is_ok(),
+            "{:?}",
+            validate_recipe(&toml, true)
+        );
         let internal = GITHUB.replace("\"api.github.com\"", "\"vault.corp.internal\"");
         assert!(validate_recipe(&internal, true).is_ok());
     }
@@ -580,17 +693,29 @@ secrets = ["ACME_TOKEN"]
     #[test]
     fn rejects_bad_service_id() {
         let bad = GITHUB.replace("id = \"github\"", "id = \"Git Hub\"");
-        assert!(validate_recipe(&bad, true).unwrap_err().iter().any(|e| e.contains("not valid")));
+        assert!(validate_recipe(&bad, true)
+            .unwrap_err()
+            .iter()
+            .any(|e| e.contains("not valid")));
         let dbl = GITHUB.replace("id = \"github\"", "id = \"git__hub\"");
-        assert!(validate_recipe(&dbl, true).unwrap_err().iter().any(|e| e.contains("not valid")));
+        assert!(validate_recipe(&dbl, true)
+            .unwrap_err()
+            .iter()
+            .any(|e| e.contains("not valid")));
         let dash = GITHUB.replace("id = \"github\"", "id = \"git-hub\"");
-        assert!(validate_recipe(&dash, true).unwrap_err().iter().any(|e| e.contains("not valid")));
+        assert!(validate_recipe(&dash, true)
+            .unwrap_err()
+            .iter()
+            .any(|e| e.contains("not valid")));
     }
 
     #[test]
     fn rejects_bad_secret_role() {
         let bad = GITHUB.replace("\"GITHUB_TOKEN\"", "\"github-token\"");
-        assert!(validate_recipe(&bad, true).unwrap_err().iter().any(|e| e.contains("env key")));
+        assert!(validate_recipe(&bad, true)
+            .unwrap_err()
+            .iter()
+            .any(|e| e.contains("env key")));
     }
 
     #[test]
@@ -619,7 +744,13 @@ secrets = ["ACME_TOKEN"]
             "name = \"GitHub\"\ntags = [\"app\", \"code-hosting\"]",
         );
         assert!(validate_recipe(&ok, true).is_ok());
-        for bad_tags in ["[\"App\"]", "[\"code_hosting\"]", "[\"-app\"]", "[\"\"]", "[\"app\", \"app\"]"] {
+        for bad_tags in [
+            "[\"App\"]",
+            "[\"code_hosting\"]",
+            "[\"-app\"]",
+            "[\"\"]",
+            "[\"app\", \"app\"]",
+        ] {
             let bad = GITHUB.replace(
                 "name = \"GitHub\"",
                 &format!("name = \"GitHub\"\ntags = {}", bad_tags),
@@ -634,7 +765,6 @@ secrets = ["ACME_TOKEN"]
             );
         }
     }
-
 
     #[test]
     fn compiled_services_pass_validator() {
@@ -687,23 +817,40 @@ consent = "Spend {{ vars.amount }}"
 
     #[test]
     fn consent_var_must_be_in_scope() {
-        let bad = REQ_SERVICE.replace(r#"consent = "Spend {{ vars.amount }}""#, r#"consent = "Send {{ vars.secret }}""#);
+        let bad = REQ_SERVICE.replace(
+            r#"consent = "Spend {{ vars.amount }}""#,
+            r#"consent = "Send {{ vars.secret }}""#,
+        );
         let e = validate_service(&bad).unwrap_err();
-        assert!(e.iter().any(|s| s.contains("consent references '{secret}'")), "got {:?}", e);
+        assert!(
+            e.iter()
+                .any(|s| s.contains("consent references '{secret}'")),
+            "got {:?}",
+            e
+        );
     }
 
     #[test]
     fn scope_must_name_a_declared_var() {
         let bad = REQ_SERVICE.replace(r#"scope = ["amount"]"#, r#"scope = ["amount", "ghost"]"#);
         let e = validate_service(&bad).unwrap_err();
-        assert!(e.iter().any(|s| s.contains("'ghost', which is not a declared var")), "got {:?}", e);
+        assert!(
+            e.iter()
+                .any(|s| s.contains("'ghost', which is not a declared var")),
+            "got {:?}",
+            e
+        );
     }
 
     #[test]
     fn body_pointer_must_start_with_slash() {
         let bad = REQ_SERVICE.replace(r#"vars.amount = "/amount""#, r#"vars.amount = "amount""#);
         let e = validate_service(&bad).unwrap_err();
-        assert!(e.iter().any(|s| s.contains("must be a JSON Pointer")), "got {:?}", e);
+        assert!(
+            e.iter().any(|s| s.contains("must be a JSON Pointer")),
+            "got {:?}",
+            e
+        );
     }
 
     #[test]
@@ -720,11 +867,19 @@ level = "ask-always"
 
         let policy_bad = policy_ok.replace("vars.amount > 80", "vars.total > 80");
         let e = validate_service_policy(REQ_SERVICE, &policy_bad).unwrap_err();
-        assert!(e.iter().any(|s| s.contains("references var 'total'")), "got {:?}", e);
+        assert!(
+            e.iter().any(|s| s.contains("references var 'total'")),
+            "got {:?}",
+            e
+        );
 
         let policy_malformed = policy_ok.replace("vars.amount > 80", "amount is big");
         let e = validate_service_policy(REQ_SERVICE, &policy_malformed).unwrap_err();
-        assert!(e.iter().any(|s| s.contains("not a valid condition")), "got {:?}", e);
+        assert!(
+            e.iter().any(|s| s.contains("not a valid condition")),
+            "got {:?}",
+            e
+        );
     }
 
     #[test]
@@ -745,14 +900,22 @@ when = "vars.risk == \"high\""
 level = "ask-always"
 "#;
         let e = validate_service_policy(&svc, policy).unwrap_err();
-        assert!(e.iter().any(|s| s.contains("not in any shape's `scope`")), "got {:?}", e);
+        assert!(
+            e.iter().any(|s| s.contains("not in any shape's `scope`")),
+            "got {:?}",
+            e
+        );
     }
 
     #[test]
     fn duplicate_scope_entry_rejected() {
         let bad = REQ_SERVICE.replace(r#"scope = ["amount"]"#, r#"scope = ["amount", "amount"]"#);
         let e = validate_service(&bad).unwrap_err();
-        assert!(e.iter().any(|s| s.contains("more than once")), "got {:?}", e);
+        assert!(
+            e.iter().any(|s| s.contains("more than once")),
+            "got {:?}",
+            e
+        );
     }
 
     #[test]

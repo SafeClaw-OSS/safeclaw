@@ -92,7 +92,10 @@ pub async fn stream(
             }
         }));
 
-    let guarded = PermitStream { inner, _permit: permit };
+    let guarded = PermitStream {
+        inner,
+        _permit: permit,
+    };
 
     Ok(Sse::new(guarded).keep_alive(
         KeepAlive::new()

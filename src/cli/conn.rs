@@ -318,5 +318,4 @@ mod tests {
         assert_eq!(aux["services"]["myapi"], "[service]\nid=\"myapi\"\n");
         assert!(aux["connections"]["a"].is_object());
     }
-
 }

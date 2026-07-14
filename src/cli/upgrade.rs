@@ -61,10 +61,14 @@ fn resolve_channel(args: &UpgradeArgs) -> (bool, String) {
         return (true, "pre-release (--pre)".to_string());
     }
     match frontend_origin() {
-        Some(origin) if origin_host(&origin).starts_with("dev.") => {
-            (true, format!("pre-release (paired to {})", origin_host(&origin)))
-        }
-        Some(origin) => (false, format!("stable (paired to {})", origin_host(&origin))),
+        Some(origin) if origin_host(&origin).starts_with("dev.") => (
+            true,
+            format!("pre-release (paired to {})", origin_host(&origin)),
+        ),
+        Some(origin) => (
+            false,
+            format!("stable (paired to {})", origin_host(&origin)),
+        ),
         None => (false, "stable (not paired)".to_string()),
     }
 }
@@ -85,10 +89,7 @@ fn origin_host(origin: &str) -> &str {
 /// Pre-release → query the releases API for the newest release (index 0,
 /// newest-first, INCLUDING pre-releases) and point at its
 /// `releases/download/<tag>` assets.
-async fn resolve_base(
-    client: &reqwest::Client,
-    pre: bool,
-) -> Result<(String, String), String> {
+async fn resolve_base(client: &reqwest::Client, pre: bool) -> Result<(String, String), String> {
     if !pre {
         return Ok((LATEST_BASE.to_string(), "latest stable".to_string()));
     }
@@ -115,16 +116,16 @@ async fn resolve_base(
         .and_then(|r| r.get("tag_name"))
         .and_then(|t| t.as_str())
         .ok_or("no releases found (including pre-releases)")?;
-    let base = format!(
-        "https://github.com/{}/releases/download/{}",
-        REPO, tag
-    );
+    let base = format!("https://github.com/{}/releases/download/{}", REPO, tag);
     Ok((base, format!("pre-release {}", tag)))
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
-    Sha256::digest(bytes).iter().map(|b| format!("{:02x}", b)).collect()
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect()
 }
 
 /// Pull the expected hash for `asset` out of a `SHA256SUMS` file body
@@ -143,12 +144,19 @@ mod tests {
     use super::*;
 
     fn args(pre: bool, stable: bool) -> UpgradeArgs {
-        UpgradeArgs { force: false, pre, stable }
+        UpgradeArgs {
+            force: false,
+            pre,
+            stable,
+        }
     }
 
     #[test]
     fn origin_host_strips_scheme_and_path() {
-        assert_eq!(origin_host("https://dev.safeclaw.pro/grant/x"), "dev.safeclaw.pro");
+        assert_eq!(
+            origin_host("https://dev.safeclaw.pro/grant/x"),
+            "dev.safeclaw.pro"
+        );
         assert_eq!(origin_host("https://safeclaw.pro"), "safeclaw.pro");
         assert_eq!(origin_host("bare.host.example"), "bare.host.example");
     }
@@ -195,7 +203,10 @@ pub async fn run(args: UpgradeArgs) -> Result<(), String> {
     if !sums.status().is_success() {
         return Err(format!("fetch SHA256SUMS: HTTP {}", sums.status()));
     }
-    let sums = sums.text().await.map_err(|e| format!("read SHA256SUMS: {}", e))?;
+    let sums = sums
+        .text()
+        .await
+        .map_err(|e| format!("read SHA256SUMS: {}", e))?;
     let expected = expected_hash(&sums, asset)
         .ok_or_else(|| format!("no checksum for {} in the latest release", asset))?;
 
@@ -210,7 +221,10 @@ pub async fn run(args: UpgradeArgs) -> Result<(), String> {
     if !resp.status().is_success() {
         return Err(format!("download {}: HTTP {}", asset, resp.status()));
     }
-    let bytes = resp.bytes().await.map_err(|e| format!("read {}: {}", asset, e))?;
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| format!("read {}: {}", asset, e))?;
 
     // 3. Verify integrity before it touches disk.
     let actual = sha256_hex(&bytes);
@@ -242,7 +256,12 @@ pub async fn run(args: UpgradeArgs) -> Result<(), String> {
         .ok_or_else(|| "current binary has no parent dir".to_string())?;
     let tmp = dir.join(format!(".sc-upgrade-{}.tmp", std::process::id()));
     std::fs::write(&tmp, &bytes).map_err(|e| {
-        format!("write {} (need write access to {}): {}", tmp.display(), dir.display(), e)
+        format!(
+            "write {} (need write access to {}): {}",
+            tmp.display(),
+            dir.display(),
+            e
+        )
     })?;
     #[cfg(unix)]
     {

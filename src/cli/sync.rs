@@ -28,10 +28,17 @@ pub async fn run(args: SyncArgs) -> Result<(), String> {
         .await
         .map_err(|e| format!("parse daemon response: {}", e))?;
     if body.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
-        let pulled = body.get("pulled").and_then(|v| v.as_bool()).unwrap_or(false);
+        let pulled = body
+            .get("pulled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         eprintln!(
             "safeclaw sync — ok ({})",
-            if pulled { "pulled new state from cloud" } else { "already current" }
+            if pulled {
+                "pulled new state from cloud"
+            } else {
+                "already current"
+            }
         );
         report_connects(body.get("connects"));
         Ok(())
@@ -40,7 +47,10 @@ pub async fn run(args: SyncArgs) -> Result<(), String> {
         // reads as a backend-reachability failure (e.g. "reach api.safeclaw.pro:
         // …"), append the conditional proxy hint — objectively, without claiming
         // a proxy is missing.
-        let raw = body.get("error").and_then(|v| v.as_str()).unwrap_or("sync failed");
+        let raw = body
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("sync failed");
         Err(crate::cli::neterr::with_proxy_hint(raw))
     }
 }
@@ -64,7 +74,11 @@ fn report_connects(connects: Option<&serde_json::Value>) {
     let completed: Vec<String> = c
         .get("completed")
         .and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
         .unwrap_or_default();
     if !completed.is_empty() {
         eprintln!("  connected: {}", completed.join(", "));
@@ -73,8 +87,14 @@ fn report_connects(connects: Option<&serde_json::Value>) {
     // Terminal: the console shows "Connect failed — reconnect"; echo the reason.
     if let Some(failed) = c.get("failed").and_then(|v| v.as_array()) {
         for f in failed {
-            let conn = f.get("conn").and_then(|v| v.as_str()).unwrap_or("connection");
-            let reason = f.get("reason").and_then(|v| v.as_str()).unwrap_or("rejected");
+            let conn = f
+                .get("conn")
+                .and_then(|v| v.as_str())
+                .unwrap_or("connection");
+            let reason = f
+                .get("reason")
+                .and_then(|v| v.as_str())
+                .unwrap_or("rejected");
             eprintln!("  {conn}: connect failed ({reason}) — reconnect from the console.");
         }
     }

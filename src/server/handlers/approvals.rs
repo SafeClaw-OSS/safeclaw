@@ -19,8 +19,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::audit::{
-    STATUS_ALLOWED, STATUS_APPROVED, STATUS_DENIED, STATUS_EXPIRED, STATUS_PENDING,
-    STATUS_REJECTED,
+    STATUS_ALLOWED, STATUS_APPROVED, STATUS_DENIED, STATUS_EXPIRED, STATUS_PENDING, STATUS_REJECTED,
 };
 use crate::error::Result;
 use crate::server::handlers::op::validate_vault_id;

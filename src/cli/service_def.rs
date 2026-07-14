@@ -63,7 +63,10 @@ pub async fn run_add(args: ServiceAddArgs) -> Result<(), String> {
         for p in &problems {
             eprintln!("  • {}", p);
         }
-        return Err(format!("{}: service validation failed", args.path.display()));
+        return Err(format!(
+            "{}: service validation failed",
+            args.path.display()
+        ));
     }
     let def: ServiceDef = toml::from_str(&toml_str).map_err(|e| format!("parse: {}", e))?;
     let id = def.service.id.clone();
@@ -73,8 +76,19 @@ pub async fn run_add(args: ServiceAddArgs) -> Result<(), String> {
         "bind": { "redeemer": vault },
         "valid": { "iat": now_unix(), "multiplicity": "one" }
     });
-    let opts = ApproveOpts { no_browser: args.no_browser, cb_port: args.cb_port, timeout: args.timeout };
-    approve_op(&custodian, &vault, &op, &format!("Add service {}", id), &opts).await?;
+    let opts = ApproveOpts {
+        no_browser: args.no_browser,
+        cb_port: args.cb_port,
+        timeout: args.timeout,
+    };
+    approve_op(
+        &custodian,
+        &vault,
+        &op,
+        &format!("Add service {}", id),
+        &opts,
+    )
+    .await?;
     println!("service '{}' stored", id);
     Ok(())
 }
@@ -92,7 +106,11 @@ pub async fn run_ls(args: ServiceLsArgs) -> Result<(), String> {
         "bind": { "redeemer": vault },
         "valid": { "iat": now_unix(), "multiplicity": "one" }
     });
-    let opts = ApproveOpts { no_browser: args.no_browser, cb_port: args.cb_port, timeout: args.timeout };
+    let opts = ApproveOpts {
+        no_browser: args.no_browser,
+        cb_port: args.cb_port,
+        timeout: args.timeout,
+    };
     let body = approve_op(&custodian, &vault, &op, "List services", &opts).await?;
 
     let services = act_result(&body)
@@ -110,7 +128,12 @@ pub async fn run_ls(args: ServiceLsArgs) -> Result<(), String> {
         let conns = s
             .get("connections")
             .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", "))
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
             .unwrap_or_default();
         let used = if conns.is_empty() {
             "no connections".to_string()
@@ -151,13 +174,28 @@ pub async fn run_rm(args: ServiceRmArgs) -> Result<(), String> {
         "bind": { "redeemer": vault },
         "valid": { "iat": now_unix(), "multiplicity": "one" }
     });
-    let opts = ApproveOpts { no_browser: args.no_browser, cb_port: args.cb_port, timeout: args.timeout };
-    let body = approve_op(&custodian, &vault, &op, &format!("Remove service {}", args.id), &opts).await?;
+    let opts = ApproveOpts {
+        no_browser: args.no_browser,
+        cb_port: args.cb_port,
+        timeout: args.timeout,
+    };
+    let body = approve_op(
+        &custodian,
+        &vault,
+        &op,
+        &format!("Remove service {}", args.id),
+        &opts,
+    )
+    .await?;
 
     let refs: Vec<String> = act_result(&body)
         .get("referencing_connections")
         .and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(str::to_string))
+                .collect()
+        })
         .unwrap_or_default();
     if !refs.is_empty() {
         eprintln!(

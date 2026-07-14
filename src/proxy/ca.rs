@@ -56,7 +56,10 @@ pub fn load_or_generate(state_dir: &Path) -> Result<ResidentCa, String> {
     // 1000 cached leaf configs is ample for the handful of hosts a machine's
     // agents talk to; the provider is our own aws-lc-rs (never OpenSSL).
     let authority = RcgenAuthority::new(issuer, 1000, aws_lc_rs::default_provider());
-    Ok(ResidentCa { authority, cert_path })
+    Ok(ResidentCa {
+        authority,
+        cert_path,
+    })
 }
 
 /// Generate a fresh self-signed CA (ECDSA P-256), returning `(cert_pem, key_pem)`.
@@ -104,9 +107,15 @@ mod tests {
         // Second call reuses the same files (no regeneration).
         let _second = load_or_generate(dir.path()).unwrap();
         let cert2 = fs::read_to_string(dir.path().join("ca.pem")).unwrap();
-        assert_eq!(cert1, cert2, "CA must be reused across calls, not regenerated");
+        assert_eq!(
+            cert1, cert2,
+            "CA must be reused across calls, not regenerated"
+        );
 
-        let mode = fs::metadata(dir.path().join("ca.key")).unwrap().permissions().mode();
+        let mode = fs::metadata(dir.path().join("ca.key"))
+            .unwrap()
+            .permissions()
+            .mode();
         assert_eq!(mode & 0o777, 0o600, "ca.key must be owner-only");
     }
 }
