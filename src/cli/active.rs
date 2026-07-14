@@ -67,6 +67,15 @@ pub struct CliConfig {
     /// so the env var is the robust rollback lever.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sync_stream: Option<String>,
+    /// Ceremony-audit switch: absent/"auto" = the audit shipper also ships
+    /// control-plane terminal outcomes (unlock/set/connect grants) to the
+    /// cloud audit_events, "off" = Use ops only (the pre-rc.6 contract).
+    /// Read once per 30s ship tick, so flipping it bites without a restart;
+    /// while off, ceremony rows stay in the local outbox and back-ship on
+    /// re-enable (bounded by audit retention). `SAFECLAW_AUDIT_CEREMONIES`
+    /// overrides, same robustness rationale as `sync_stream` above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit_ceremonies: Option<String>,
     /// Set when the ACTIVE vault was tombstoned cloud-side (deleted on the
     /// web) and the sync path cleared the selection — the one case where "no
     /// vault selected" is a surprise, not a choice. `sc status` and

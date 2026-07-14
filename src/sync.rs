@@ -905,17 +905,22 @@ const AUDIT_SHIP_BATCH: u32 = 200;
 /// `vault_id` (from the URL path) and `account_id` (from the authenticated
 /// device-key) — the daemon never asserts ownership in the body. Secret values,
 /// query strings, and request/response bodies are NEVER included (audit.rs only
-/// ever records method / sanitized path / status / timestamps).
+/// ever records method / sanitized path / status / timestamps / key prefix).
 #[derive(serde::Serialize)]
 struct AuditEventWire {
     event_id: String, // daemon-minted op id; the backend's UPSERT key
     ts: i64,          // event time (unix secs): decided_at, else created_at
-    decision: String, // allowed | approved | denied | rejected | expired
+    decision: String, // allowed | approved | denied | rejected | expired | cancelled
     op_id: String,    // approval linkage (= event_id for Use ops)
+    act_kind: String, // 'use' | ceremony kinds (enroll/write/…)
     #[serde(skip_serializing_if = "Option::is_none")]
     service: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     action: Option<String>, // "METHOD path", e.g. "POST /v1/chat/completions"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target: Option<String>, // ceremony subject (key name / connection id)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_id: Option<String>, // agent api-key PREFIX (= cloud api_keys.prefix)
 }
 
 fn event_from_row(row: &crate::audit::ApprovalRow) -> AuditEventWire {
@@ -930,8 +935,44 @@ fn event_from_row(row: &crate::audit::ApprovalRow) -> AuditEventWire {
         ts: row.decided_at.unwrap_or(row.created_at),
         decision: row.status.clone(),
         op_id: row.id.clone(),
+        act_kind: row.act_kind.clone(),
         service: row.service.clone(),
         action,
+        target: row.target.clone(),
+        agent_id: row.agent_prefix.clone(),
+    }
+}
+
+/// The `audit_ceremonies` switch: ship control-plane terminal outcomes
+/// alongside Use ops? Default ON (user decision 2026-07-14: the console's
+/// approved tile counts every consent terminal). Same shape as
+/// `sync_stream_enabled` — env `SAFECLAW_AUDIT_CEREMONIES` beats the config
+/// key, `off`-family synonyms disable, anything unrecognized stays on the
+/// default but warns once.
+fn audit_ceremonies_enabled(cfg: &crate::cli::active::CliConfig) -> bool {
+    let v = std::env::var("SAFECLAW_AUDIT_CEREMONIES")
+        .ok()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            cfg.audit_ceremonies
+                .as_ref()
+                .map(|s| s.trim().to_ascii_lowercase())
+        });
+    match v.as_deref() {
+        None | Some("auto" | "on") => true,
+        Some("off" | "0" | "false" | "no" | "disabled") => false,
+        Some(other) => {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            let other = other.to_string();
+            WARNED.call_once(|| {
+                tracing::warn!(
+                    value = %other,
+                    "audit_ceremonies: unrecognized value (expected auto|off); treating as auto"
+                );
+            });
+            true
+        }
     }
 }
 
@@ -961,8 +1002,9 @@ pub async fn ship_audit_once(state: &Arc<AppState>) {
         Ok(c) => c,
         Err(_) => return,
     };
+    let ceremonies = audit_ceremonies_enabled(&cfg);
     for vault in synced_vault_ids(&cfg) {
-        ship_vault_audit(state, &client, cloud, &dk, &vault).await;
+        ship_vault_audit(state, &client, cloud, &dk, &vault, ceremonies).await;
     }
 }
 
@@ -972,6 +1014,7 @@ async fn ship_vault_audit(
     cloud: &str,
     device_key: &str,
     vault: &str,
+    ship_ceremonies: bool,
 ) {
     // `for_vault` only opens DBs for vaults that exist on disk; a known-but-not-
     // yet-served vault just yields NotFound and is skipped this tick.
@@ -991,7 +1034,7 @@ async fn ship_vault_audit(
     // Drain the backlog in batches; stop on the first error (retry next tick)
     // or when a short page signals the queue is empty.
     loop {
-        let rows = match store.list_unsynced(AUDIT_SHIP_BATCH) {
+        let rows = match store.list_unsynced(AUDIT_SHIP_BATCH, ship_ceremonies) {
             Ok(r) => r,
             Err(e) => {
                 tracing::debug!(vault = %vault, "audit ship: list_unsynced failed: {}", e);

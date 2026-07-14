@@ -60,6 +60,7 @@ pub fn register_pending_use(
     op: Operation,
     policy_context: Option<crate::approval::PolicyContext>,
     ip: IpAddr,
+    agent_prefix: Option<String>,
 ) -> Result<(String, String, u64)> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -80,7 +81,8 @@ pub fn register_pending_use(
     };
 
     if let Ok(audit_store) = state.audits.for_vault(vault_id) {
-        let row = audit::row_from_op(&op_id, &op, now as i64, expires_at as i64);
+        let mut row = audit::row_from_op(&op_id, &op, now as i64, expires_at as i64);
+        row.agent_prefix = agent_prefix;
         if let Err(e) = audit_store.insert(&row) {
             tracing::warn!(vault = %vault_id, op = %op_id, "audit insert pending (use) failed: {}", e);
         }

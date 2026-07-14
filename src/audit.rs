@@ -3,8 +3,9 @@
 //! Append-only SQLite at `<state>/vaults/<vid>/audit.db`. Records every
 //! op lifecycle event — pending creation, terminal decision, cache-hit
 //! auto-forward. Only operational metadata (service / method / path /
-//! status / timestamps / credential_id); **no secret values, request
-//! bodies, or response bodies** ever land on disk. That keeps the audit
+//! status / timestamps / credential_id / agent key PREFIX); **no secret
+//! values, full api-keys, request bodies, or response bodies** ever land
+//! on disk. That keeps the audit
 //! file at the same trust level as a web-server access log — useful for
 //! "what did my agent do" without needing SUDP-grade encryption.
 //!
@@ -63,6 +64,10 @@ CREATE TABLE IF NOT EXISTS approvals (
     reason          TEXT,
     credential_id   TEXT,
     upstream_status INTEGER,
+    -- Agent attribution: first 16 chars of the agent api-key that produced a
+    -- Use row (= api_keys.prefix in the cloud). NULL for ceremonies and
+    -- CLI-initiated ops. Never the full key.
+    agent_prefix    TEXT,
     -- De-daemon (DE_DAEMON.md §4): cloud audit-shipper outbox flag.
     -- 0 = not yet shipped to the cloud `audit_events` table; 1 = shipped.
     synced          INTEGER NOT NULL DEFAULT 0
@@ -96,6 +101,15 @@ pub struct ApprovalRow {
     pub credential_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub upstream_status: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_prefix: Option<String>,
+}
+
+/// First 16 chars of an agent api-key — the non-secret identity handle the
+/// cloud stores as `api_keys.prefix` (backend PREFIX_LEN = 16; keep in step).
+/// Char-boundary safe; shorter inputs pass through whole.
+pub fn agent_key_prefix(key: &str) -> String {
+    key.chars().take(16).collect()
 }
 
 /// Derive an audit row from an `Operation` at the moment of op creation
@@ -133,6 +147,9 @@ pub fn row_from_op(
         reason: None,
         credential_id: None,
         upstream_status: None,
+        // Stamped by the caller when the op came through the broker with an
+        // authenticated agent key; ceremonies / CLI-initiated ops stay None.
+        agent_prefix: None,
     }
 }
 
@@ -163,6 +180,8 @@ impl AuditStore {
             "ALTER TABLE approvals ADD COLUMN synced INTEGER NOT NULL DEFAULT 0",
             [],
         );
+        // Additive `agent_prefix` (0.9.48-rc.6) — same idempotent-ALTER idiom.
+        let _ = conn.execute("ALTER TABLE approvals ADD COLUMN agent_prefix TEXT", []);
         // Outbox scan index — created here (not in SCHEMA) so it always runs
         // AFTER `synced` is guaranteed to exist on both fresh and migrated DBs.
         // Partial: indexes only the unshipped rows the shipper actually scans.
@@ -184,8 +203,8 @@ impl AuditStore {
             "INSERT INTO approvals
              (id, created_at, decided_at, expires_at, status, act_kind,
               service, method, path, target, reason, credential_id,
-              upstream_status)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+              upstream_status, agent_prefix)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 row.id,
                 row.created_at,
@@ -200,6 +219,7 @@ impl AuditStore {
                 row.reason,
                 row.credential_id,
                 row.upstream_status,
+                row.agent_prefix,
             ],
         )
         .map_err(|e| AppError::Internal(format!("audit insert: {}", e)))?;
@@ -239,18 +259,29 @@ impl AuditStore {
     /// agent broker activity ships (a forward happened, or an ask was decided
     /// allowed/approved/denied/rejected/expired). Oldest-first so shipping
     /// preserves event order and the batch boundary is stable across ticks.
-    pub fn list_unsynced(&self, limit: u32) -> Result<Vec<ApprovalRow>> {
+    /// `include_ceremonies` widens the outbox from Use ops to EVERY terminal
+    /// row (control-plane grants: enroll/write/…) — the `audit_ceremonies`
+    /// config switch. While the switch is off, non-use rows simply stay
+    /// `synced = 0` (retention still prunes them); flipping it on later
+    /// back-ships whatever retention has kept, so history heals itself.
+    pub fn list_unsynced(&self, limit: u32, include_ceremonies: bool) -> Result<Vec<ApprovalRow>> {
+        let kind_clause = if include_ceremonies {
+            ""
+        } else {
+            "AND act_kind = 'use' "
+        };
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
-            .prepare(
+            .prepare(&format!(
                 "SELECT id, created_at, decided_at, expires_at, status, act_kind,
                         service, method, path, target, reason, credential_id,
-                        upstream_status
+                        upstream_status, agent_prefix
                  FROM approvals
-                 WHERE synced = 0 AND act_kind = 'use' AND status != 'pending'
+                 WHERE synced = 0 {}AND status != 'pending'
                  ORDER BY created_at ASC
                  LIMIT ?1",
-            )
+                kind_clause
+            ))
             .map_err(|e| AppError::Internal(format!("audit unsynced prepare: {}", e)))?;
         let rows = stmt
             .query_map(params![limit], |row| {
@@ -268,6 +299,7 @@ impl AuditStore {
                     reason: row.get(10)?,
                     credential_id: row.get(11)?,
                     upstream_status: row.get(12)?,
+                    agent_prefix: row.get(13)?,
                 })
             })
             .map_err(|e| AppError::Internal(format!("audit unsynced query: {}", e)))?;
@@ -359,7 +391,7 @@ impl AuditStore {
         let sql = format!(
             "SELECT id, created_at, decided_at, expires_at, status, act_kind,
                     service, method, path, target, reason, credential_id,
-                    upstream_status
+                    upstream_status, agent_prefix
              FROM approvals{}
              ORDER BY created_at DESC
              LIMIT ?{}",
@@ -388,6 +420,7 @@ impl AuditStore {
                     reason: row.get(10)?,
                     credential_id: row.get(11)?,
                     upstream_status: row.get(12)?,
+                    agent_prefix: row.get(13)?,
                 })
             })
             .map_err(|e| AppError::Internal(format!("audit query: {}", e)))?;
@@ -554,7 +587,39 @@ mod tests {
             reason: None,
             credential_id: None,
             upstream_status: None,
+            agent_prefix: None,
         }
+    }
+
+    #[test]
+    fn unsynced_gates_ceremonies_on_flag() {
+        let (_tmp, s) = fresh_store();
+        // Terminal Use row with attribution, terminal ceremony, pending ceremony.
+        let mut used = row("op-use", STATUS_ALLOWED, 100);
+        used.agent_prefix = Some("sc_agent_ABCDEFG".into());
+        s.insert(&used).unwrap();
+        let mut write = row("op-write", STATUS_APPROVED, 200);
+        write.act_kind = "write".into();
+        s.insert(&write).unwrap();
+        let mut enroll_pending = row("op-enroll", STATUS_PENDING, 300);
+        enroll_pending.act_kind = "enroll".into();
+        s.insert(&enroll_pending).unwrap();
+
+        // Switch off: Use ops only — the pre-rc.6 outbox contract.
+        let narrow = s.list_unsynced(10, false).unwrap();
+        assert_eq!(narrow.len(), 1);
+        assert_eq!(narrow[0].id, "op-use");
+        assert_eq!(narrow[0].agent_prefix.as_deref(), Some("sc_agent_ABCDEFG"));
+
+        // Switch on: ceremonies join; pending still NEVER ships.
+        let wide = s.list_unsynced(10, true).unwrap();
+        let ids: Vec<&str> = wide.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, ["op-use", "op-write"]);
+
+        // A ceremony left unshipped while the switch was off back-ships once
+        // it flips on — and marking it synced removes it from the outbox.
+        s.mark_synced(&["op-use".into(), "op-write".into()]).unwrap();
+        assert!(s.list_unsynced(10, true).unwrap().is_empty());
     }
 
     #[test]
@@ -698,31 +763,33 @@ mod tests {
         s.insert(&approved).unwrap();
         // Pending = transient, NOT shipped.
         s.insert(&row("op-pending", STATUS_PENDING, 300)).unwrap();
-        // Control-plane op (act_kind != 'use') = NOT shipped.
+        // Control-plane op (act_kind != 'use') = NOT shipped on the narrow
+        // (ceremonies-off) outbox this test exercises; see
+        // unsynced_gates_ceremonies_on_flag for the widened contract.
         let mut write = row("op-write", STATUS_APPROVED, 400);
         write.act_kind = "write".into();
         s.insert(&write).unwrap();
 
-        let un = s.list_unsynced(100).unwrap();
+        let un = s.list_unsynced(100, false).unwrap();
         assert_eq!(un.len(), 2, "only terminal Use rows ship");
         assert_eq!(un[0].id, "op1", "oldest-first");
         assert_eq!(un[1].id, "op2");
 
         // Marking synced removes a row from the outbox.
         s.mark_synced(&["op1".to_string()]).unwrap();
-        let un2 = s.list_unsynced(100).unwrap();
+        let un2 = s.list_unsynced(100, false).unwrap();
         assert_eq!(un2.len(), 1);
         assert_eq!(un2[0].id, "op2");
 
         // Re-marking is idempotent (empty + already-synced ids are no-ops).
         s.mark_synced(&[]).unwrap();
         s.mark_synced(&["op1".to_string(), "op2".to_string()]).unwrap();
-        assert!(s.list_unsynced(100).unwrap().is_empty());
+        assert!(s.list_unsynced(100, false).unwrap().is_empty());
 
         // A pending row that finalizes to a terminal Use status becomes shippable.
         s.finalize("op-pending", STATUS_APPROVED, 350, None, None, Some(200))
             .unwrap();
-        let un3 = s.list_unsynced(100).unwrap();
+        let un3 = s.list_unsynced(100, false).unwrap();
         assert_eq!(un3.len(), 1);
         assert_eq!(un3[0].id, "op-pending");
     }
