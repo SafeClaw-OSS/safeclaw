@@ -70,7 +70,7 @@ async fn add(args: AgentAddArgs) -> Result<(), String> {
                 .into(),
         );
     };
-    let daemon_url = format!(
+    let broker_url = format!(
         "{}:{}",
         crate::cli::active::device_daemon_host(&cfg),
         crate::config::PROXY_PORT
@@ -82,26 +82,31 @@ async fn add(args: AgentAddArgs) -> Result<(), String> {
         .json(&serde_json::json!({ "label": args.name, "tier": "agent" }))
         .send()
         .await
-        .map_err(|e| format!("reach {}: {}", cloud, e))?;
+        .map_err(|e| crate::cli::neterr::reach_failed(&cloud, &e))?;
     if !resp.status().is_success() {
         return Err(format!("create agent key failed: HTTP {}", resp.status()));
     }
-    let r: CreateResp = resp.json().await.map_err(|e| format!("parse response: {}", e))?;
+    let r: CreateResp = resp
+        .json()
+        .await
+        .map_err(|e| format!("parse response: {}", e))?;
 
     // ── Mint-time projection (CREDENTIAL_BROKER.md §14): this IS the minter ─
-    // Print the agent's COMPLETE env as dotenv lines: a snapshot of the DEVICE
-    // atoms (config daemon host + port constants + default vault) plus the
-    // fresh key. The agent appends ONE command's stdout to its own `.env` —
-    // its SSOT from then on — and never assembles a value. STDOUT only;
-    // stderr guidance carries NO secret, so blind-capture keeps the key out
-    // of the agent's transcript (and out of the install prompt).
-    println!("SAFECLAW_DAEMON_URL={}", daemon_url);
+    // Print the agent's env as three dotenv lines: the daemon's API face + the
+    // default vault + the fresh key. The agent appends ONE command's stdout to
+    // its own `.env` — its SSOT from then on — and never assembles a value.
+    // STDOUT only; stderr guidance carries NO secret, so blind-capture keeps the
+    // key out of the agent's transcript (and out of the install prompt).
+    //
+    // We deliberately do NOT bake a precomputed full proxy URL
+    // (`<vid>:<key>@host`) here. It carries no information not already in these
+    // three vars, and baking it froze a host:port that a moved daemon made stale.
+    // `sc run` rebuilds the child's HTTPS_PROXY live from the broker face + this
+    // key, so the derived-only env self-heals — this is the skill's documented
+    // 3-var contract.
+    println!("SAFECLAW_BROKER_URL={}", broker_url);
     println!("SAFECLAW_VAULT_ID={}", vid);
     println!("SAFECLAW_API_KEY={}", r.token);
-    println!(
-        "SAFECLAW_PROXY_URL={}",
-        crate::cli::proxy_env::proxy_url_for_vault(&daemon_url, &vid, Some(&r.token))
-    );
 
     let rm_name = if args.name.contains(char::is_whitespace) {
         format!("'{}'", args.name)
@@ -125,11 +130,14 @@ async fn fetch_agents(cloud: &str, key: &str) -> Result<Vec<ListKey>, String> {
         .bearer_auth(key)
         .send()
         .await
-        .map_err(|e| format!("reach {}: {}", cloud, e))?;
+        .map_err(|e| crate::cli::neterr::reach_failed(&cloud, &e))?;
     if !resp.status().is_success() {
         return Err(format!("list agents failed: HTTP {}", resp.status()));
     }
-    let r: ListResp = resp.json().await.map_err(|e| format!("parse response: {}", e))?;
+    let r: ListResp = resp
+        .json()
+        .await
+        .map_err(|e| format!("parse response: {}", e))?;
     Ok(r.keys)
 }
 
@@ -161,7 +169,12 @@ async fn rm(args: AgentRmArgs) -> Result<(), String> {
         .collect();
     let id = match matches.as_slice() {
         [k] => k.id.clone(),
-        [] => return Err(format!("no agent named '{}' (see `sc agent ls`)", args.name)),
+        [] => {
+            return Err(format!(
+                "no agent named '{}' (see `sc agent ls`)",
+                args.name
+            ))
+        }
         _ => {
             return Err(format!(
                 "'{}' matches multiple agents — remove by id or prefix (`sc agent ls`)",
@@ -174,12 +187,12 @@ async fn rm(args: AgentRmArgs) -> Result<(), String> {
         .bearer_auth(&key)
         .send()
         .await
-        .map_err(|e| format!("reach {}: {}", cloud, e))?;
+        .map_err(|e| crate::cli::neterr::reach_failed(&cloud, &e))?;
     if !resp.status().is_success() {
         return Err(format!("revoke failed: HTTP {}", resp.status()));
     }
     eprintln!(
-        "Revoked agent '{}'. It stops working on every device after that device's next sync.",
+        "Revoked agent '{}'. Streaming devices drop it within a second; an offline device drops it on its next sync.",
         args.name
     );
     Ok(())

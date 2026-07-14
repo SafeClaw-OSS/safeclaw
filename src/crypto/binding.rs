@@ -88,8 +88,18 @@ mod tests {
     #[test]
     fn op_binding_changes_with_op() {
         let r = [0x11u8; 16];
-        let a = binding_for_op(DOMAIN_STANDARD, &r, &json!({ "act": { "type": "reveal", "path": "x" } })).unwrap();
-        let b = binding_for_op(DOMAIN_STANDARD, &r, &json!({ "act": { "type": "reveal", "path": "y" } })).unwrap();
+        let a = binding_for_op(
+            DOMAIN_STANDARD,
+            &r,
+            &json!({ "act": { "type": "reveal", "path": "x" } }),
+        )
+        .unwrap();
+        let b = binding_for_op(
+            DOMAIN_STANDARD,
+            &r,
+            &json!({ "act": { "type": "reveal", "path": "y" } }),
+        )
+        .unwrap();
         assert_ne!(a, b);
     }
 

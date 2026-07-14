@@ -15,7 +15,7 @@ pub fn health_value(state: &AppState) -> Value {
     let vault_count = state.vaults.list().map(|v| v.len()).unwrap_or(0);
     json!({
         "ok": true,
-        "version": env!("CARGO_PKG_VERSION"),
+        "version": crate::build_version(),
         "vault_count": vault_count,
     })
 }

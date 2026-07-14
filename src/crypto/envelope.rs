@@ -21,10 +21,8 @@ use std::fs;
 use std::path::PathBuf;
 
 use hpke::{
-    aead::ChaCha20Poly1305,
-    kdf::HkdfSha256,
-    kem::X25519HkdfSha256,
-    Deserializable, Kem, OpModeR, OpModeS, Serializable,
+    aead::ChaCha20Poly1305, kdf::HkdfSha256, kem::X25519HkdfSha256, Deserializable, Kem, OpModeR,
+    OpModeS, Serializable,
 };
 use rand::rngs::OsRng;
 
@@ -88,8 +86,8 @@ impl ScKeyPair {
     pub fn load_or_generate() -> Result<Self> {
         let path = sk_path()?;
         if path.exists() {
-            let bytes = fs::read(&path)
-                .map_err(|e| AppError::Internal(format!("read sc_sk: {}", e)))?;
+            let bytes =
+                fs::read(&path).map_err(|e| AppError::Internal(format!("read sc_sk: {}", e)))?;
             let sk = <SuiteKem as Kem>::PrivateKey::from_bytes(&bytes)
                 .map_err(|e| AppError::Internal(format!("sc_sk deserialize: {}", e)))?;
             let pk = <SuiteKem as Kem>::sk_to_pk(&sk);
@@ -114,7 +112,13 @@ impl ScKeyPair {
 
     /// HPKE single-shot open. `info` MUST commit to any deployment context
     /// the sender bound the seal to (for pending-passkeys: vault_id ‖ cid).
-    pub fn open(&self, encapped_key: &[u8], ciphertext: &[u8], info: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
+    pub fn open(
+        &self,
+        encapped_key: &[u8],
+        ciphertext: &[u8],
+        info: &[u8],
+        aad: &[u8],
+    ) -> Result<Vec<u8>> {
         let encapped = <<SuiteKem as Kem>::EncappedKey as Deserializable>::from_bytes(encapped_key)
             .map_err(|e| AppError::BadRequest(format!("encapped_key deserialize: {}", e)))?;
         let mut ctx = hpke::setup_receiver::<SuiteAead, SuiteKdf, SuiteKem>(
@@ -130,8 +134,7 @@ impl ScKeyPair {
 }
 
 fn sk_path() -> Result<PathBuf> {
-    let home = dirs::home_dir()
-        .ok_or_else(|| AppError::Internal("no home dir".into()))?;
+    let home = dirs::home_dir().ok_or_else(|| AppError::Internal("no home dir".into()))?;
     Ok(home.join(".safeclaw").join("crypto").join("sc_sk.bin"))
 }
 
@@ -174,7 +177,10 @@ mod tests {
     #[test]
     fn grant_seal_info_shape() {
         let info = grant_seal_info("zz");
-        assert_eq!(&info[..GRANT_SEAL_INFO_PREFIX.len()], GRANT_SEAL_INFO_PREFIX);
+        assert_eq!(
+            &info[..GRANT_SEAL_INFO_PREFIX.len()],
+            GRANT_SEAL_INFO_PREFIX
+        );
         assert_eq!(info[GRANT_SEAL_INFO_PREFIX.len()], 0x1f);
         assert_eq!(&info[GRANT_SEAL_INFO_PREFIX.len() + 1..], b"zz");
     }

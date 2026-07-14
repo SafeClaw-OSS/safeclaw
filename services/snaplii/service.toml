@@ -1,0 +1,46 @@
+setup = """
+Snaplii pays real merchants (gift cards, bill pay) from a pre-funded wallet.
+Put the phantom in the bearer header; the broker exchanges the stored api key
+for a short-lived JWT at egress — neither ever enters the agent:
+  sc run -- curl https://aipayment.snaplii.com/v2/balance \\
+    -H "Authorization: Bearer __sc__snaplii__"
+Purchases (POST /v2/purchase) ask for approval by default.
+"""
+
+[service]
+id = "snaplii"
+name = "Snaplii"
+# Classification for browse/filter and policy tag-floors; lowercase-kebab, multi OK.
+tags = ["wallet"]
+
+# One AI-payment api key (snp_sk_live_…, minted in the Snaplii app under
+# More → Payment Methods → AI Payment Management) backs the whole A2M API.
+# The key can SPEND (within its Snaplii-side per-key daily cap) — it is the
+# mint input of `[auth] type = "snaplii"` and never injectable; the agent only
+# ever holds the phantom.
+hosts = ["aipayment.snaplii.com"]
+secrets = ["SNAPLII_API_KEY"]
+# Where a human mints the secret (auxiliary; display-only helper link).
+secret_url = "https://www.snaplii.com/a2m/"
+
+# Snaplii's key→JWT exchange is a bespoke envelope (no OAuth grant, no RFC
+# field names), so it is a code built-in — see src/auth/snaplii.rs — and this
+# section carries no config. The connection id is the agent label Snaplii sees.
+[auth]
+type = "snaplii"
+
+# Request shapes (docs/REQUEST_SCOPE.md): a purchase's body fields become part
+# of what the user approves. `amount` drives the policy `when` (a large purchase
+# asks every time) AND, with `merchant`, binds the approval — so approving $80
+# to one merchant cannot be replayed as $180 or to a different merchant.
+#
+# CONFIRM AT E2E: the body JSON Pointers (`/amount`, `/merchant_id`) are
+# best-effort against Snaplii's A2M API; adjust to the live field names. A
+# mismatch degrades safely — an unresolved var just leaves the purchase at its
+# base `ask` with no field binding, never a bypass.
+[requests.purchase]
+match = "POST /v2/purchase"
+vars.amount   = "/amount"
+vars.merchant = "/merchant_id"
+scope   = ["amount", "merchant"]
+consent = "Buy from {{ vars.merchant }} for {{ vars.amount }}"

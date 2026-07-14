@@ -2,9 +2,7 @@
 
 use crate::storage::plaintext::{Category, Store, VaultPlaintextView};
 
-use super::adapters::{
-    gcp::GcpSecretManagerAdapter, native_secrets::NativeSecretsAdapter,
-};
+use super::adapters::{gcp::GcpSecretManagerAdapter, native_secrets::NativeSecretsAdapter};
 
 /// Errors raised by adapter operations. Resolution-path code treats
 /// `NotFound` as "skip to next store" but `Backend` as fatal (abort the
@@ -29,6 +27,16 @@ pub type AdapterResult<T> = std::result::Result<T, AdapterError>;
 pub enum Adapter {
     NativeSecrets(NativeSecretsAdapter),
     Gcp(GcpSecretManagerAdapter),
+}
+
+/// The session cache (`SecretsCache`) derives Debug; never print adapter
+/// internals (credentials) — the kind tag is all a debug dump may show.
+impl std::fmt::Debug for Adapter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Adapter")
+            .field("kind", &self.kind())
+            .finish()
+    }
 }
 
 impl Adapter {
@@ -85,9 +93,9 @@ pub fn build_adapter(
     view: &VaultPlaintextView,
 ) -> AdapterResult<Adapter> {
     match store.kind.as_str() {
-        "native-secrets" => Ok(Adapter::NativeSecrets(
-            NativeSecretsAdapter::from_view(view),
-        )),
+        "native-secrets" => Ok(Adapter::NativeSecrets(NativeSecretsAdapter::from_view(
+            view,
+        ))),
         "gcp-secret-manager" => {
             let project_id = store
                 .extra
@@ -120,11 +128,13 @@ pub fn build_adapter(
                     ))
                 })?
                 .clone();
-            Ok(Adapter::Gcp(GcpSecretManagerAdapter::new(project_id, sa_json)?))
+            Ok(Adapter::Gcp(GcpSecretManagerAdapter::new(
+                project_id, sa_json,
+            )?))
         }
-        // native-files and future kinds (1password-sa, aws-secrets-manager)
-        // aren't wired through this dispatcher yet — they live in
-        // store_order but are skipped during value resolution.
+        // Future kinds (1password-sa, aws-secrets-manager) aren't wired through
+        // this dispatcher yet — they live in store_order but are skipped during
+        // value resolution.
         other => Err(AdapterError::Config(format!(
             "unsupported store kind '{}' (have: native-secrets, gcp-secret-manager)",
             other

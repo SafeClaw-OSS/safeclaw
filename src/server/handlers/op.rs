@@ -20,7 +20,7 @@ use serde_json::{json, Value};
 use crate::audit;
 use crate::error::{AppError, Result};
 use crate::protocol::operation::{ActType, Operation};
-use crate::state::{ApprovalEvent, AppState};
+use crate::state::{AppState, ApprovalEvent};
 
 pub async fn create(
     State(state): State<Arc<AppState>>,
@@ -47,6 +47,20 @@ pub async fn create(
         || matches!(&op.act.kind, ActType::Custom(name) if name == "vault-unlock");
     if !is_lifecycle_bypass && state.is_vault_locked(&vault_id) {
         return Err(AppError::VaultLocked);
+    }
+    // ONE approval window (SSOT, user decision 2026-07-14): ops that arrive
+    // without an explicit Valid window — the CLI ceremonies (unlock / set /
+    // connect) — inherit the vault's `aux.policy.timeout`, the SAME knob the
+    // broker's ask path uses, so the grant-page countdown, the value stash,
+    // and the op's own expiry can never disagree. A locked vault (the unlock
+    // ceremony) can't read its policy and takes the 30-min default.
+    let mut op = op;
+    if op.valid.exp.is_none() {
+        let now_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        op.valid.exp = Some(now_unix + state.policy_approval_hold(&vault_id));
     }
     let ip: IpAddr = addr.ip();
     let r = {
@@ -145,9 +159,14 @@ fn cancel_superseded(state: &Arc<AppState>, vault_id: &str, op_id: &str, now: i6
     };
     if was_pending {
         if let Ok(store) = state.audits.for_vault(vault_id) {
-            if let Err(e) =
-                store.finalize(op_id, audit::STATUS_CANCELLED, now, None, Some(REASON), None)
-            {
+            if let Err(e) = store.finalize(
+                op_id,
+                audit::STATUS_CANCELLED,
+                now,
+                None,
+                Some(REASON),
+                None,
+            ) {
                 tracing::warn!(vault = %vault_id, op = %op_id, "audit finalize cancelled failed: {}", e);
             }
         }
@@ -185,7 +204,9 @@ fn reject_broker_kind(kind: &ActType) -> Result<()> {
 
 pub fn validate_vault_id(id: &str) -> Result<()> {
     if id.is_empty() || id.len() > 128 {
-        return Err(AppError::BadRequest("invalid vault_id (1-128 chars)".into()));
+        return Err(AppError::BadRequest(
+            "invalid vault_id (1-128 chars)".into(),
+        ));
     }
     if !id
         .chars()
@@ -216,7 +237,11 @@ mod tests {
             ActType::Custom("vault-lock".into()),
             ActType::Custom("vault-delete".into()),
         ] {
-            assert!(reject_broker_kind(&kind).is_ok(), "kind {:?} should pass", kind);
+            assert!(
+                reject_broker_kind(&kind).is_ok(),
+                "kind {:?} should pass",
+                kind
+            );
         }
     }
 
@@ -233,6 +258,7 @@ mod tests {
             rp_id: "localhost".into(),
             admin_key: None,
             relay_url: None,
+            body_cap: crate::config::DEFAULT_BODY_CAP,
         };
         AppState::new(cfg)
     }

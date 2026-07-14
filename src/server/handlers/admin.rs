@@ -92,6 +92,7 @@ pub async fn delete_vault(
         let mut states = state.vault_states.lock().unwrap();
         states.remove(&vault_id);
     }
+    state.last_host_unions.lock().unwrap().remove(&vault_id);
 
     // 2. Close the audit SQLite handle (if any) before deleting its
     //    backing file. AuditRegistry::forget is a no-op for vaults
@@ -115,9 +116,9 @@ pub async fn delete_vault(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::{HeaderMap, HeaderValue};
     use crate::config::Config;
     use crate::state::AppState;
+    use axum::http::{HeaderMap, HeaderValue};
     use std::path::PathBuf;
 
     fn state_with_key(key: Option<&str>) -> AppState {
@@ -130,6 +131,7 @@ mod tests {
             rp_id: "localhost".into(),
             admin_key: key.map(|s| s.to_string()),
             relay_url: None,
+            body_cap: crate::config::DEFAULT_BODY_CAP,
         };
         let _ = std::fs::create_dir_all(&cfg.state_dir);
         let _ = std::fs::create_dir_all(cfg.state_dir.join("vaults"));

@@ -31,6 +31,20 @@ use serde_json::{json, Value};
 
 use crate::cli::webauthn::*;
 
+/// Unwrap the daemon act's result object from an [`approve_op`] response. The
+/// REMOTE arm returns the poll body `{status, value:<json-string>}` (value =
+/// the op's `cached_value`); the LOCAL arm returns the act result object
+/// directly. Both collapse to the same object when the daemon op sets
+/// `cached_value = result.to_string()` (as the `service-*` / `secret-rm` /
+/// `connection-rm` ops do).
+pub(crate) fn act_result(body: &Value) -> Value {
+    match body.get("value") {
+        Some(Value::String(s)) => serde_json::from_str(s).unwrap_or(Value::Null),
+        Some(v) => v.clone(),
+        None => body.clone(),
+    }
+}
+
 /// Browser-gesture knobs threaded from the calling command (the local arm
 /// uses them; the remote arm ignores them — the gesture is in the browser).
 pub struct ApproveOpts {
@@ -40,12 +54,48 @@ pub struct ApproveOpts {
     pub timeout: u64,
 }
 
-/// Cap the remote-approval wait just under the daemon's 300s op TTL — the user
-/// is doing a cross-device dance (open the link on their phone/laptop, tap a
-/// passkey), so give them the whole window rather than the short local-gesture
-/// timeout.
+/// Fallback remote-approval wait, used only until the first successful poll
+/// reveals the op's REAL `expires_at` — from then on the CLI waits out exactly
+/// the window the grant page shows the user. (A fixed 280s here once had the
+/// CLI give up at ~5min while the page still displayed a valid ~30min op.)
 const REMOTE_APPROVE_TIMEOUT_SECS: u64 = 280;
 const REMOTE_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Deposit secret VALUES with the local daemon ahead of a write op
+/// (`connection-add` / `secret-set`) and return the `values_digest` the op's
+/// `act.scope` must carry. The op JSON travels to the cloud grant page, so the
+/// values themselves never ride it — only this salted commitment does (the
+/// salt stays on the daemon, so a weak value can't be brute-forced from it).
+pub async fn deposit_values(
+    custodian: &str,
+    vault: &str,
+    values: &std::collections::BTreeMap<String, String>,
+) -> Result<String, String> {
+    let client = http_client()?;
+    let url = format!(
+        "{}/v/{}/op-payload",
+        custodian.trim_end_matches('/'),
+        urlencoding::encode(vault)
+    );
+    let resp = client
+        .post(&url)
+        .json(&json!({ "values": values }))
+        .send()
+        .await
+        .map_err(|e| format!("deposit values: {}", e))?;
+    if !resp.status().is_success() {
+        return Err(format!(
+            "deposit values HTTP {}: {}",
+            resp.status(),
+            resp.text().await.unwrap_or_default()
+        ));
+    }
+    let body: Value = resp.json().await.map_err(|e| format!("parse: {}", e))?;
+    body["values_digest"]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| "no values_digest in response".into())
+}
 
 /// Create `op` on the daemon and drive it to a passkey approval. Returns the
 /// daemon's approve response JSON (e.g. the unlock's `{kv, aux}` value) on
@@ -80,7 +130,10 @@ pub async fn approve_op(
 async fn remote_approve(custodian: &str, op_id: &str, label: &str) -> Result<Value, String> {
     let url = crate::cli::active::grant_url(op_id);
     eprintln!();
-    eprintln!("To {}, open this link and tap your passkey:", label.to_lowercase());
+    eprintln!(
+        "To {}, open this link and tap your passkey:",
+        label.to_lowercase()
+    );
     eprintln!("  {}", url);
     eprintln!();
     eprintln!("Waiting for approval…");
@@ -91,11 +144,12 @@ async fn remote_approve(custodian: &str, op_id: &str, label: &str) -> Result<Val
         custodian.trim_end_matches('/'),
         urlencoding::encode(op_id)
     );
-    let deadline = Instant::now() + Duration::from_secs(REMOTE_APPROVE_TIMEOUT_SECS);
+    let mut deadline = Instant::now() + Duration::from_secs(REMOTE_APPROVE_TIMEOUT_SECS);
+    let mut deadline_from_op = false;
     loop {
         if Instant::now() >= deadline {
             return Err(format!(
-                "timed out waiting for approval — open {} and tap your passkey, then retry",
+                "the approval window expired — re-run the command for a fresh link (was {})",
                 url
             ));
         }
@@ -111,6 +165,17 @@ async fn remote_approve(custodian: &str, op_id: &str, label: &str) -> Result<Val
             Ok(v) => v,
             Err(_) => continue,
         };
+        // Adopt the op's real expiry once: wait exactly as long as the grant
+        // page says the op is live (+ grace for the relay round-trip).
+        if !deadline_from_op {
+            if let Some(exp) = body.get("expires_at").and_then(|v| v.as_u64()) {
+                let now = now_unix();
+                if exp > now {
+                    deadline = Instant::now() + Duration::from_secs(exp - now + 10);
+                    deadline_from_op = true;
+                }
+            }
+        }
         match body.get("status").and_then(|s| s.as_str()).unwrap_or("") {
             // The daemon flips the op to approved once it applies the relayed
             // grant; "consumed" can win if something polled it first. Both mean
@@ -121,7 +186,20 @@ async fn remote_approve(custodian: &str, op_id: &str, label: &str) -> Result<Val
                 eprintln!("  approved ✓");
                 return Ok(body);
             }
-            "rejected" => return Err("approval was rejected".into()),
+            "rejected" => {
+                let reason = body.get("reason").and_then(|v| v.as_str()).unwrap_or("");
+                if reason.contains("superseded") {
+                    return Err(
+                        "approval superseded by a newer request (not a user rejection) — \
+                         re-run the command"
+                            .into(),
+                    );
+                }
+                if !reason.is_empty() {
+                    return Err(format!("approval was rejected: {}", reason).into());
+                }
+                return Err("approval was rejected".into());
+            }
             _ => {} // pending — keep polling
         }
     }
@@ -158,7 +236,10 @@ async fn local_ceremony(
     )
     .await?;
 
-    let prf_first = result.prf_first.clone().ok_or("gesture didn't return prf_first")?;
+    let prf_first = result
+        .prf_first
+        .clone()
+        .ok_or("gesture didn't return prf_first")?;
     let prf_first_bytes = URL_SAFE_NO_PAD
         .decode(&prf_first)
         .map_err(|e| format!("decode prf_first: {}", e))?;

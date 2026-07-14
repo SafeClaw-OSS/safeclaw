@@ -29,28 +29,70 @@ use crate::config::LoginArgs;
 /// Default daemon control-plane port (matches `ServeArgs` `SAFECLAW_PORT`).
 const DEFAULT_DAEMON_PORT: u16 = crate::config::CONTROL_PORT;
 
-/// The baked cloud endpoint the daemon pairs with. Device→cloud is FIXED (not
-/// user config): `SAFECLAW_CLOUD_URL` (undocumented runtime override, for
-/// self-host) > `SAFECLAW_BAKED_CLOUD_URL` (CI-pinned at build time) > the
-/// hardcoded default below. Domain changes ship via `sc upgrade`, not config.
-///
-/// PRE-LAUNCH: prod (`https://safeclaw.pro`) is NOT deployed — it's a marketing
-/// page with no pairing API — so EVERY build (debug AND release) pairs with dev
-/// for now. When prod goes live, switch the default to the build-profile split:
-///   `if cfg!(debug_assertions) { dev } else { "https://safeclaw.pro" }`
-/// (and bump + re-release so install.sh serves a prod-pointing binary).
-fn baked_cloud_url() -> String {
+/// Resolve which cloud the pair-token is exchanged against. Precedence:
+///   1. `SAFECLAW_CLOUD_URL` — runtime self-host escape hatch (any URL; HTTPS
+///      enforced below). Undocumented; for people running their own custodian.
+///   2. `--env {prod,dev}` — the FIRST-PARTY selector the console's install
+///      prompt uses. It is a SYMBOL, not a URL: it resolves only against the
+///      compiled-in allowlist below. This is deliberate — `sc login` has no
+///      `--custodian <url>` flag, because a malicious skill prompt could
+///      otherwise redirect pairing to an attacker host. A symbol bounded to
+///      first-party domains means a hostile prompt can at worst flip you
+///      between your OWN prod/dev, never to a third party. The prod console
+///      omits the flag (→ default prod); the dev console appends `--env dev`.
+///   3. `SAFECLAW_BAKED_CLOUD_URL` — compile-time self-host bake.
+///   4. Default: prod. Every real user only ever deals with prod.
+/// The resolved value is only the target at `sc login` time; once paired, the
+/// machine is pinned to the backend persisted in config.toml, so this never
+/// matters again for that machine.
+fn resolve_custodian(env_flag: Option<&str>) -> Result<String, String> {
     if let Ok(u) = std::env::var("SAFECLAW_CLOUD_URL") {
         if !u.is_empty() {
-            return u;
+            return Ok(u);
         }
+    }
+    if let Some(env) = env_flag {
+        return env_selector_to_url(env);
     }
     if let Some(u) = option_env!("SAFECLAW_BAKED_CLOUD_URL") {
         if !u.is_empty() {
-            return u.to_string();
+            return Ok(u.to_string());
         }
     }
-    "https://dev.safeclaw.pro".to_string()
+    Ok("https://safeclaw.pro".to_string())
+}
+
+/// The `--env` allowlist. A SYMBOL → first-party URL only; anything else is a
+/// hard error. This is the gate that keeps a hostile install prompt from
+/// steering pairing off first-party domains — do not widen it to accept URLs.
+fn env_selector_to_url(env: &str) -> Result<String, String> {
+    match env {
+        "prod" => Ok("https://safeclaw.pro".to_string()),
+        "dev" => Ok("https://dev.safeclaw.pro".to_string()),
+        other => Err(format!(
+            "unknown --env '{}': expected 'prod' or 'dev'",
+            other
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::env_selector_to_url;
+
+    #[test]
+    fn env_selector_allowlist_maps_first_party_only() {
+        assert_eq!(env_selector_to_url("prod").unwrap(), "https://safeclaw.pro");
+        assert_eq!(
+            env_selector_to_url("dev").unwrap(),
+            "https://dev.safeclaw.pro"
+        );
+        // Anything that is not an exact first-party symbol is rejected — a
+        // hostile prompt cannot smuggle a custodian URL through `--env`.
+        assert!(env_selector_to_url("https://attacker.com").is_err());
+        assert!(env_selector_to_url("staging").is_err());
+        assert!(env_selector_to_url("").is_err());
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -67,8 +109,8 @@ struct ExchangeResp {
 }
 
 pub async fn run(args: LoginArgs) -> Result<(), String> {
-    // ── Cloud endpoint is baked (device→cloud is fixed .pro) ─────────────
-    let custodian = baked_cloud_url();
+    // ── Resolve cloud endpoint: env override > --env selector > baked ─────
+    let custodian = resolve_custodian(args.env.as_deref())?;
     let custodian = custodian.trim_end_matches('/').to_string();
 
     // ── Enforce HTTPS for the custodian URL ──────────────────────────────
@@ -78,10 +120,7 @@ pub async fn run(args: LoginArgs) -> Result<(), String> {
     // `http://` custodian leaks the token on the wire AND lets an on-path
     // attacker swap the response for an attacker-controlled daemon. Reject
     // by default; the only legitimate cleartext case is dev-loopback.
-    if !args.insecure_http
-        && !custodian.starts_with("https://")
-        && !is_localhost_http(&custodian)
-    {
+    if !args.insecure_http && !custodian.starts_with("https://") && !is_localhost_http(&custodian) {
         return Err(format!(
             "custodian URL must use HTTPS ({} is plaintext); \
              pass --insecure-http to override (test-only)",
@@ -89,10 +128,19 @@ pub async fn run(args: LoginArgs) -> Result<(), String> {
         ));
     }
 
-    // ── Resolve device name: flag > $HOSTNAME / $COMPUTERNAME > literal ──
+    // ── Resolve device name: flag > OS hostname > $HOSTNAME / $COMPUTERNAME
+    //    env > literal. The hostname syscall is the reliable source — the env
+    //    vars are unset in most non-login / non-interactive shells, which is
+    //    what used to strand a device on the "agent-device" fallback. ──
     let device_name = args
         .device_name
         .clone()
+        .or_else(|| {
+            hostname::get()
+                .ok()
+                .and_then(|h| h.into_string().ok())
+                .filter(|s| !s.is_empty())
+        })
         .or_else(|| std::env::var("HOSTNAME").ok().filter(|s| !s.is_empty()))
         .or_else(|| std::env::var("COMPUTERNAME").ok().filter(|s| !s.is_empty()))
         .unwrap_or_else(|| "agent-device".to_string());
@@ -116,7 +164,7 @@ pub async fn run(args: LoginArgs) -> Result<(), String> {
         .json(&body)
         .send()
         .await
-        .map_err(|e| format!("reach {}: {}", custodian, e))?;
+        .map_err(|e| crate::cli::neterr::reach_failed(&custodian, &e))?;
 
     let status = resp.status();
     if !status.is_success() {
@@ -127,10 +175,20 @@ pub async fn run(args: LoginArgs) -> Result<(), String> {
                 "pair-token invalid or unknown. Generate a new one at {}/dashboard (\"Connect a new agent\").",
                 custodian
             ),
-            409 => format!(
-                "pair-token already used. Generate a new one at {}/dashboard (\"Connect a new agent\").",
-                custodian
-            ),
+            // 409 = `no_vault`: the vault this token was pinned to is gone
+            // (deleted between mint and exchange), or the account has nothing
+            // sealed. The server message says which — surface it verbatim.
+            // (Historically 409 meant "already used"; that's 401 now.)
+            409 => {
+                let msg = serde_json::from_str::<serde_json::Value>(detail_trimmed)
+                    .ok()
+                    .and_then(|v| v.get("message").and_then(|m| m.as_str()).map(str::to_string))
+                    .unwrap_or_else(|| "no vault to connect".to_string());
+                format!(
+                    "{}. Generate a new install token at {}/dashboard (\"Connect a new agent\").",
+                    msg, custodian
+                )
+            }
             410 => format!(
                 "pair-token expired. Generate a new one at {}/dashboard (\"Connect a new agent\").",
                 custodian
@@ -250,8 +308,7 @@ fn write_device_key(path: &std::path::Path, device_key: &str) -> Result<(), Stri
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("mkdir {}: {}", parent.display(), e))?;
     }
-    std::fs::write(path, device_key)
-        .map_err(|e| format!("write {}: {}", path.display(), e))?;
+    std::fs::write(path, device_key).map_err(|e| format!("write {}: {}", path.display(), e))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

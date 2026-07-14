@@ -1,7 +1,0 @@
-[service]
-id = "openai"
-name = "OpenAI"
-group = "openai"
-
-hosts = ["api.openai.com"]
-secrets = ["OPENAI_API_KEY"]

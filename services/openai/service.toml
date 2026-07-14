@@ -1,0 +1,11 @@
+[service]
+id = "openai"
+name = "OpenAI"
+# Classification for browse/filter and policy tag-floors; lowercase-kebab, multi OK.
+tags = ["ai"]
+group = "openai"
+
+hosts = ["api.openai.com"]
+secrets = ["OPENAI_API_KEY"]
+# Where a human mints the secret (auxiliary; display-only helper link).
+secret_url = "https://platform.openai.com/api-keys"

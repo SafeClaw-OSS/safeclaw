@@ -1,0 +1,48 @@
+# Gmail policy — each rule declares its access decision (allow / ask /
+# ask-always / deny) directly. The user can override any rule per-connection
+# in the console. See docs/POLICY.md.
+
+# Read/write floor for requests no rule matches.
+[default]
+read = "ask"
+write = "ask-always"
+
+# ── low: read-only metadata / listings, no private body, no side effect ──
+[[rule]]
+id = "list-emails"
+label = "List emails"
+match = "GET /gmail/v1/users/me/messages"
+level = "allow"
+
+[[rule]]
+id = "list-labels"
+label = "List labels"
+match = "GET /gmail/v1/users/me/labels"
+level = "allow"
+
+# ── medium: reads private message content (privacy surface, but read-only) ──
+[[rule]]
+id = "read-email"
+label = "Read email content"
+match = "GET /gmail/v1/users/me/messages/*"
+level = "ask"
+
+# ── high: outbound / mutating / hard to undo ──
+[[rule]]
+id = "send-email"
+label = "Send email"
+match = "POST /gmail/v1/users/me/messages/send"
+level = "ask-always"
+
+[[rule]]
+id = "modify-email"
+label = "Modify labels / archive / trash"
+match = "POST /gmail/v1/users/me/messages/*/modify"
+level = "ask-always"
+
+# ── deletion: gated on every call; override to "deny" to block outright ──
+[[rule]]
+id = "delete-email"
+label = "Delete email"
+match = "DELETE /gmail/v1/users/me/messages/*"
+level = "ask-always"

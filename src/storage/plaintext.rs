@@ -26,20 +26,21 @@ use crate::error::{AppError, Result};
 /// Current schema version. Hard-fail on any other value.
 pub const PLAINTEXT_VERSION: u32 = 4;
 
-/// Reserved store IDs. These two stores are always present in every vault.
+/// Reserved store ID. `native-secrets` is always present in every vault.
 pub const NATIVE_SECRETS_ID: &str = "native-secrets";
-pub const NATIVE_FILES_ID: &str = "native-files";
 
-/// Reserved kind strings, equal to the reserved store IDs.
+/// Reserved kind string, equal to the reserved store ID.
 pub const NATIVE_SECRETS_KIND: &str = "native-secrets";
-pub const NATIVE_FILES_KIND: &str = "native-files";
 
-/// Category — value (bytes resolvable to a single secret string) vs file
-/// (blob retrieved by id). Declared per-store, not per-item.
+/// Category — how a store's items resolve. `Value` = bytes resolvable to a
+/// single secret string. `File` is a LEGACY variant, retained only so vaults
+/// sealed before the file-store removal still deserialize; no store creates it
+/// now (restore point: tag `checkpoint/file-feature`). Declared per-store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Category {
     Value,
+    /// Legacy — retained for backward-compatible deserialization only.
     File,
 }
 
@@ -52,9 +53,8 @@ pub struct Store {
     pub kind: String,
     pub category: Category,
     /// Per-item metadata. For `native-secrets`, this map is empty in `aux`
-    /// because byte values physically live in `ProtectedState.targets`.
-    /// For `native-files`, values are `{ blob_id, size }`. For external
-    /// stores (gcp / 1p / aws — Phase 2+), shape is adapter-defined.
+    /// because byte values physically live in `ProtectedState.targets`. For
+    /// external stores (gcp / 1p / aws — Phase 2+), shape is adapter-defined.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub items: BTreeMap<String, serde_json::Value>,
     /// Adapter-specific configuration (e.g. `project_id` for gcp).
@@ -74,6 +74,15 @@ pub struct Store {
 /// configured. There is no status field to drift out of sync.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Connection {
+    /// User-facing display name — the FULL string shown in lists ("GitHub ·
+    /// Work Laptop", "Gmail", "Stripe Key"), verbatim as composed/typed at
+    /// creation. Same field name + contract as a service's `name`: every
+    /// creation path writes it; it is display-only (the conn id stays the
+    /// technical handle for phantoms / policy / audit). Wire-optional ONLY
+    /// for legacy rows (pre-name, CLI-created, or written as `label` — the
+    /// serde alias) — absent = render the id.
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "label")]
+    pub name: Option<String>,
     /// The service (TYPE) this instantiates, or `None` for a **raw** connection
     /// (`sc set K --host h`) that references no service and anchors its own
     /// `hosts`. When set, hosts derive from the service (SSoT); an instance may
@@ -95,6 +104,16 @@ pub struct Connection {
     /// (including the oauth2 refresh-token KEY). One canonical answer, no drift.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secrets: Option<Vec<String>>,
+    /// Service-backed connections only: explicit `ROLE → vault KEY` bindings
+    /// (CONNECTION_SCHEMA.md §3). Sparse — a missing role binds to its own bare
+    /// mainstream name (the default connection's identity binding), so a default
+    /// connection normally stores no map at all. A NAMED connection's creator
+    /// writes one (suggested `<ROLE>_<QUALIFIER>`, see [`suggested_secret_key`])
+    /// so two accounts of one service never collide on a key; any binding may
+    /// point at an existing vault key to share it. Raw connections never use
+    /// this — their `secrets` list IS the binding (role == KEY).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keys: Option<BTreeMap<String, String>>,
 }
 
 /// An **in-flight** connect handshake — everything the daemon needs to redeem
@@ -108,10 +127,15 @@ pub struct Connection {
 /// generic identity (`service`, `hosts`) is top-level; the mechanism handshake
 /// state nests under the mechanism key (`oauth2`) so a future auth mechanism
 /// nests under ITS key without the schema getting messy. `redirect_uri` is NOT
-/// here — it's a fixed property of the OAuth client, held in the provider config.
+/// here — it's a fixed property of the OAuth client, held in the service's
+/// `[oauth2]` section.
 /// Mirrors the frontend `lib/vault-grant.ts` `Connecting` shape.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Connecting {
+    /// User-facing display name, carried through to the established
+    /// [`Connection`] on exchange (see `Connection::name`).
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "label")]
+    pub name: Option<String>,
     /// The service (TYPE) being instantiated.
     pub service: String,
     /// Exact FQDNs pinned at connect for a `*.suffix` wildcard service, carried
@@ -119,6 +143,13 @@ pub struct Connecting {
     /// for an exact-hosts service.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hosts: Option<Vec<String>>,
+    /// Explicit `ROLE → vault KEY` bindings chosen at connect, carried through
+    /// to the established [`Connection`] on exchange (see `Connection::keys`).
+    /// Absent = the daemon derives the default binding at exchange time
+    /// (identity for the default connection, [`suggested_secret_key`] for a
+    /// named one).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keys: Option<BTreeMap<String, String>>,
     /// OAuth2 (RFC 6749 authorization_code + RFC 7636 PKCE) handshake state.
     /// Nested under the mechanism key — mirrors the service.toml `[oauth2]`.
     pub oauth2: ConnectingOAuth2,
@@ -130,9 +161,22 @@ pub struct Connecting {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectingOAuth2 {
     /// The single-use authorization code from the loopback redirect (RFC 6749).
+    /// EMPTY until the code arrives — either the daemon's 8765 loopback listener
+    /// auto-catches the redirect (`crate::auth::loopback`) or the user pastes it
+    /// back (fallback). A pending entry with an empty `code` is "awaiting the
+    /// redirect", not yet exchangeable (the daemon skips it); its `state` (below)
+    /// is how the listener matches the incoming redirect to this entry.
+    #[serde(default)]
     pub code: String,
     /// The PKCE code_verifier (RFC 7636) the browser generated for this flow.
     pub code_verifier: String,
+    /// The `state` param (RFC 6749 §10.12) the browser generated for this flow.
+    /// Sealed so the daemon's shared 8765 loopback listener can match an incoming
+    /// `?code&state` redirect to THIS pending connect (one listener serves every
+    /// provider; `state` is the unguessable router key). Absent on legacy
+    /// paste-only entries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
     /// Terminal exchange failure — set by the daemon when the code→token
     /// exchange fails non-recoverably (`invalid_grant`: the authorization code
     /// expired or was already used). The console renders "connection failed,
@@ -143,19 +187,129 @@ pub struct ConnectingOAuth2 {
     pub error: Option<String>,
 }
 
-/// The vault address of a connection's secret role (CONNECTION_SCHEMA.md §3):
-/// the **bare** mainstream name for the default connection (`conn_id ==
-/// service_id`, 1:1 with env/GCP import), or `<conn_id>:<ROLE>` for a **named**
-/// one. The `:` delimiter is invalid in env-var names, so a namespaced key can
-/// never masquerade as an env var. One rule, applied everywhere a connection's
-/// secret is written (connect) or read (broker / cache bootstrap), so the two
-/// can't drift.
-pub fn secret_address(conn_id: &str, service_id: &str, role: &str) -> String {
-    if conn_id == service_id {
-        role.to_string()
-    } else {
-        format!("{conn_id}:{role}")
+/// The vault KEY a connection's secret ROLE resolves to (CONNECTION_SCHEMA.md
+/// §3). Every secret lives at a **bare**, env-valid, UPPERCASE KEY — the flat
+/// pool is one env namespace, 1:1 with env/GCP-read-through import; nothing is
+/// namespaced. The connection RECORD binds roles to keys: an explicit
+/// `keys[ROLE]` entry wins (case-insensitive on the role), otherwise the role's
+/// own mainstream name — the identity binding every default connection uses.
+/// The address is **stored data, not a computed convention**, so writer and
+/// reader can't drift.
+pub fn secret_key_for(conn: Option<&Connection>, role: &str) -> String {
+    if let Some(m) = conn.and_then(|c| c.keys.as_ref()) {
+        if let Some(k) = m.get(role) {
+            return k.clone();
+        }
+        if let Some((_, k)) = m.iter().find(|(r, _)| r.eq_ignore_ascii_case(role)) {
+            return k.clone();
+        }
     }
+    role.to_string()
+}
+
+impl Connection {
+    /// The vault KEYs this connection's secrets live at: a service-backed
+    /// connection's declared roles bound via `keys`/identity (resolved through
+    /// `reg`), or a raw connection's explicit UPPERCASE `secrets` list. A
+    /// service unknown to `reg` (e.g. a per-vault custom def not loaded) yields
+    /// no service-role addresses — the recorded `keys` bindings still surface
+    /// through [`VaultAux::connection_claims`].
+    pub fn secret_addresses(&self, reg: &crate::service::ServiceRegistry) -> Vec<String> {
+        match self.service.as_deref() {
+            Some(service) => match reg.get(service) {
+                Some(def) => def
+                    .service
+                    .secrets
+                    .iter()
+                    .map(|role| secret_key_for(Some(self), &role.to_ascii_uppercase()))
+                    .collect(),
+                None => Vec::new(),
+            },
+            None => self
+                .secrets
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|s| s.to_ascii_uppercase())
+                .collect(),
+        }
+    }
+}
+
+impl VaultAux {
+    /// Every vault KEY some connection (other than `exclude`) references, mapped
+    /// to the referencing connection ids — the shared-pool guard every deletion
+    /// flow consults (CONNECTION_SCHEMA.md §3): connections REFERENCE keys, they
+    /// don't own them, so a key another connection still references is never
+    /// deleted with this one, and deleting a key never cascades into a
+    /// connection (it just turns unconfigured). Covers raw `secrets` lists,
+    /// service `keys`-map values, and each service's declared-role identity
+    /// bindings (resolved via `reg`; a per-vault CUSTOM service's identity roles
+    /// aren't in `reg`, but its recorded `keys` bindings still count).
+    pub fn connection_claims(
+        &self,
+        reg: &crate::service::ServiceRegistry,
+        exclude: &str,
+    ) -> BTreeMap<String, Vec<String>> {
+        let mut claims: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (id, rec) in &self.connections {
+            if id == exclude {
+                continue;
+            }
+            let mut add = |key: String| {
+                let by = claims.entry(key).or_default();
+                if !by.contains(id) {
+                    by.push(id.clone());
+                }
+            };
+            match rec.service.as_deref() {
+                None => {
+                    for k in rec.secrets.clone().unwrap_or_default() {
+                        add(k.to_ascii_uppercase());
+                    }
+                }
+                Some(service) => {
+                    if let Some(def) = reg.get(service) {
+                        for role in &def.service.secrets {
+                            add(secret_key_for(Some(rec), &role.to_ascii_uppercase()));
+                        }
+                    }
+                    for k in rec.keys.clone().unwrap_or_default().into_values() {
+                        add(k);
+                    }
+                }
+            }
+        }
+        claims
+    }
+}
+
+/// Creation-time DEFAULT `keys` binding for a **named** connection's role:
+/// `<ROLE>_<QUALIFIER>` (qualifier = `conn_id` minus the `<service>_` prefix,
+/// uppercased) — distinct from the default connection's bare mainstream name so
+/// two accounts of one service never collide. A suggestion only: the creator
+/// may override (e.g. bind to an existing key); the stored record is
+/// authoritative. Identity (the bare role) for the default connection.
+pub fn suggested_secret_key(conn_id: &str, service_id: &str, role: &str) -> String {
+    if conn_id == service_id {
+        return role.to_string();
+    }
+    let qual = conn_id
+        .strip_prefix(&format!("{service_id}_"))
+        .unwrap_or(conn_id);
+    // Keep the suggestion env-valid whatever the qualifier charset: uppercase,
+    // any non-[A-Z0-9] byte → `_`.
+    let qual: String = qual
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("{role}_{qual}")
 }
 
 /// `aux` payload — everything inside `ProtectedState.aux` for v4 vaults.
@@ -164,8 +318,8 @@ pub struct VaultAux {
     pub version: u32,
     pub stores: BTreeMap<String, Store>,
     pub store_order: Vec<String>,
-    /// The policy tree — risk map, default floors, per-category, and per-
-    /// connection user policy (PROTOCOL.md §5.2 / §6.4 `M.policy`). Absent on
+    /// The policy tree — default floors, per-category, and per-connection user
+    /// policy (PROTOCOL.md §5.2 / §6.4 `M.policy`). Absent on
     /// fresh vaults → daemon uses `Policy::default()`. Replaces the old split
     /// `policy_defaults` + `service_state`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -187,8 +341,8 @@ pub struct VaultAux {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audit_retention_days: Option<u32>,
     /// Per-vault custom service definitions: `service_id → verbatim v4
-    /// service.toml source`. Validated (v4 schema, provider ∈ shipped
-    /// `_providers`, no tool-named sections) at unlock before it can broker,
+    /// service.toml source`. Validated (v4 schema, inline-complete `[oauth2]`,
+    /// no tool-named sections) at unlock before it can broker,
     /// and again at author time. Sparse — empty when the user authored none. A
     /// custom service is folded into the catalog exactly like a compiled one;
     /// it never shadows a built-in id.
@@ -197,9 +351,8 @@ pub struct VaultAux {
 }
 
 impl VaultAux {
-    /// Build the minimal initial aux for a freshly enrolled vault: both
-    /// reserved stores present and empty, with the default order
-    /// `[native-secrets, native-files]`.
+    /// Build the minimal initial aux for a freshly enrolled vault: the reserved
+    /// `native-secrets` store present and empty, order `[native-secrets]`.
     pub fn initial() -> Self {
         let mut stores = BTreeMap::new();
         stores.insert(
@@ -211,19 +364,10 @@ impl VaultAux {
                 extra: serde_json::Map::new(),
             },
         );
-        stores.insert(
-            NATIVE_FILES_ID.to_string(),
-            Store {
-                kind: NATIVE_FILES_KIND.to_string(),
-                category: Category::File,
-                items: BTreeMap::new(),
-                extra: serde_json::Map::new(),
-            },
-        );
         Self {
             version: PLAINTEXT_VERSION,
             stores,
-            store_order: vec![NATIVE_SECRETS_ID.to_string(), NATIVE_FILES_ID.to_string()],
+            store_order: vec![NATIVE_SECRETS_ID.to_string()],
             policy: None,
             connecting: BTreeMap::new(),
             connections: BTreeMap::new(),
@@ -261,7 +405,10 @@ impl VaultPlaintextView {
         for (name, val) in m.secrets.iter() {
             native_secrets.insert(name.clone(), val.as_bytes().to_vec());
         }
-        Ok(VaultPlaintextView { aux, native_secrets })
+        Ok(VaultPlaintextView {
+            aux,
+            native_secrets,
+        })
     }
 
     /// Synchronous resolve restricted to `native-secrets`. Used by the
@@ -315,7 +462,81 @@ impl VaultPlaintextView {
 mod tests {
     use super::*;
 
-    fn build_protected_state(aux_json: serde_json::Value, targets: &[(&str, &[u8])]) -> ProtectedState {
+    #[test]
+    fn connection_claims_cover_raw_keysmap_and_identity_bindings() {
+        // Registry is loaded so gmail's declared GMAIL_REFRESH_TOKEN role
+        // resolves; a raw conn owns its explicit secrets; a named conn binds via
+        // its keys map. The default gmail conn's IDENTITY binding is the case the
+        // old ad-hoc guards missed.
+        let reg = crate::service::ServiceRegistry::load();
+        let mut aux = VaultAux::initial();
+        aux.connections.insert(
+            "stripe_key".into(),
+            Connection {
+                name: None,
+                service: None,
+                hosts: None,
+                secrets: Some(vec!["SHARED_KEY".into()]),
+                keys: None,
+            },
+        );
+        aux.connections.insert(
+            "gmail".into(),
+            Connection {
+                name: None,
+                service: Some("gmail".into()),
+                hosts: None,
+                secrets: None,
+                keys: None,
+            },
+        );
+        let mut work_keys = BTreeMap::new();
+        work_keys.insert(
+            "GMAIL_REFRESH_TOKEN".into(),
+            "GMAIL_REFRESH_TOKEN_WORK".into(),
+        );
+        aux.connections.insert(
+            "gmail_work".into(),
+            Connection {
+                name: None,
+                service: Some("gmail".into()),
+                hosts: None,
+                secrets: None,
+                keys: Some(work_keys),
+            },
+        );
+
+        // Excluding the raw conn: its own key isn't a claim, but BOTH gmail
+        // conns' keys are (default via identity, named via its map).
+        let claims = aux.connection_claims(&reg, "stripe_key");
+        assert!(!claims.contains_key("SHARED_KEY"));
+        assert_eq!(
+            claims.get("GMAIL_REFRESH_TOKEN").map(Vec::as_slice),
+            Some(&["gmail".to_string()][..])
+        );
+        assert_eq!(
+            claims.get("GMAIL_REFRESH_TOKEN_WORK").map(Vec::as_slice),
+            Some(&["gmail_work".to_string()][..])
+        );
+
+        // secret_addresses: a raw conn lists its own; a named conn resolves its
+        // bound key; the default conn is the identity role.
+        let raw = &aux.connections["stripe_key"];
+        assert_eq!(raw.secret_addresses(&reg), vec!["SHARED_KEY".to_string()]);
+        assert_eq!(
+            aux.connections["gmail"].secret_addresses(&reg),
+            vec!["GMAIL_REFRESH_TOKEN".to_string()]
+        );
+        assert_eq!(
+            aux.connections["gmail_work"].secret_addresses(&reg),
+            vec!["GMAIL_REFRESH_TOKEN_WORK".to_string()]
+        );
+    }
+
+    fn build_protected_state(
+        aux_json: serde_json::Value,
+        targets: &[(&str, &[u8])],
+    ) -> ProtectedState {
         let mut m = ProtectedState::new();
         m.aux = aux_json;
         for (k, v) in targets {
@@ -324,6 +545,8 @@ mod tests {
         m
     }
 
+    // Backward-compat: a vault sealed before the file-store removal still has a
+    // `native-files` store (category "file"); it must still deserialize.
     #[test]
     fn parse_minimal_aux_succeeds() {
         let m = build_protected_state(
@@ -340,7 +563,10 @@ mod tests {
         let view = VaultPlaintextView::from_protected_state(&m).unwrap();
         assert_eq!(view.aux.version, 4);
         assert_eq!(view.aux.store_order, vec!["native-secrets", "native-files"]);
-        assert_eq!(view.resolve_value_native("openai_api_key"), Some(&b"sk-test"[..]));
+        assert_eq!(
+            view.resolve_value_native("openai_api_key"),
+            Some(&b"sk-test"[..])
+        );
         assert_eq!(view.resolve_value_native("nonexistent"), None);
     }
 
@@ -366,7 +592,57 @@ mod tests {
         let aux2: VaultAux = serde_json::from_value(json).unwrap();
         assert_eq!(aux2.version, 4);
         assert!(aux2.stores.contains_key("native-secrets"));
-        assert!(aux2.stores.contains_key("native-files"));
-        assert_eq!(aux2.store_order.len(), 2);
+        assert!(!aux2.stores.contains_key("native-files")); // file store removed
+        assert_eq!(aux2.store_order, vec!["native-secrets"]);
+    }
+
+    #[test]
+    fn secret_key_resolution_record_wins_identity_default() {
+        // No record / no map / unmapped role → identity (the bare role).
+        assert_eq!(
+            secret_key_for(None, "GMAIL_REFRESH_TOKEN"),
+            "GMAIL_REFRESH_TOKEN"
+        );
+        let bare = Connection::default();
+        assert_eq!(
+            secret_key_for(Some(&bare), "GMAIL_REFRESH_TOKEN"),
+            "GMAIL_REFRESH_TOKEN"
+        );
+        // A `keys` entry wins, matched case-insensitively on the role.
+        let mut keys = BTreeMap::new();
+        keys.insert(
+            "GMAIL_REFRESH_TOKEN".to_string(),
+            "GMAIL_REFRESH_TOKEN_BOB".to_string(),
+        );
+        let rec = Connection {
+            keys: Some(keys),
+            ..Connection::default()
+        };
+        assert_eq!(
+            secret_key_for(Some(&rec), "GMAIL_REFRESH_TOKEN"),
+            "GMAIL_REFRESH_TOKEN_BOB"
+        );
+        assert_eq!(
+            secret_key_for(Some(&rec), "gmail_refresh_token"),
+            "GMAIL_REFRESH_TOKEN_BOB"
+        );
+        assert_eq!(secret_key_for(Some(&rec), "OTHER_ROLE"), "OTHER_ROLE");
+    }
+
+    #[test]
+    fn suggested_key_identity_for_default_qualified_for_named() {
+        assert_eq!(
+            suggested_secret_key("gmail", "gmail", "GMAIL_REFRESH_TOKEN"),
+            "GMAIL_REFRESH_TOKEN"
+        );
+        assert_eq!(
+            suggested_secret_key("gmail_bob", "gmail", "GMAIL_REFRESH_TOKEN"),
+            "GMAIL_REFRESH_TOKEN_BOB"
+        );
+        // Non-`<service>_`-prefixed / odd-charset ids stay env-valid.
+        assert_eq!(
+            suggested_secret_key("work-acct", "gmail", "GMAIL_REFRESH_TOKEN"),
+            "GMAIL_REFRESH_TOKEN_WORK_ACCT"
+        );
     }
 }

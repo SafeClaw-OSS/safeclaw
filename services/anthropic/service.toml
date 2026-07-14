@@ -1,0 +1,11 @@
+[service]
+id = "anthropic"
+name = "Anthropic"
+# Classification for browse/filter and policy tag-floors; lowercase-kebab, multi OK.
+tags = ["ai"]
+group = "anthropic"
+
+hosts = ["api.anthropic.com"]
+secrets = ["ANTHROPIC_API_KEY"]
+# Where a human mints the secret (auxiliary; display-only helper link).
+secret_url = "https://console.anthropic.com/settings/keys"

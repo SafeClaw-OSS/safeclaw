@@ -1,0 +1,15 @@
+[default]
+read = "ask"
+write = "ask-always"
+
+[[rule]]
+id = "list-files"
+label = "List files"
+match = "GET /drive/v3/files"
+level = "allow"
+
+[[rule]]
+id = "delete-file"
+label = "Delete file"
+match = "DELETE /drive/v3/files/*"
+level = "ask-always"

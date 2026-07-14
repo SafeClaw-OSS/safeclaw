@@ -1,0 +1,8 @@
+[service]
+id = "wechat"
+name = "WeChat iLink"
+# Classification for browse/filter and policy tag-floors; lowercase-kebab, multi OK.
+tags = ["messaging"]
+
+hosts = ["ilinkai.weixin.qq.com"]
+secrets = ["WECHAT_API_KEY"]

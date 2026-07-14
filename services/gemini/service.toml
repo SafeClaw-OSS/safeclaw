@@ -1,0 +1,12 @@
+[service]
+id = "gemini"
+name = "Gemini"
+# Classification for browse/filter and policy tag-floors; lowercase-kebab, multi OK.
+tags = ["ai"]
+
+# Gemini takes the key as a query param (`?key=`); the agent writes the phantom
+# there — no declaration beyond host + secret.
+hosts = ["generativelanguage.googleapis.com"]
+secrets = ["GEMINI_API_KEY"]
+# Where a human mints the secret (auxiliary; display-only helper link).
+secret_url = "https://aistudio.google.com/apikey"

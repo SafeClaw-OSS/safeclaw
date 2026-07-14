@@ -1,0 +1,13 @@
+[service]
+id = "telegram"
+name = "Telegram"
+# Classification for browse/filter and policy tag-floors; lowercase-kebab, multi OK.
+tags = ["messaging"]
+
+# Telegram's Bot API carries the token in the URL path (`/bot<TOKEN>/<method>`).
+# The agent writes the phantom there; the proxy substitutes it at egress — no
+# declaration needed beyond the host + secret.
+hosts = ["api.telegram.org"]
+secrets = ["TELEGRAM_BOT_TOKEN"]
+# Where a human mints the secret (auxiliary; display-only helper link).
+secret_url = "https://t.me/BotFather"

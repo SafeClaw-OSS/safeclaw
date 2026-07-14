@@ -1,0 +1,10 @@
+[default]
+read = "allow"
+write = "allow"
+
+[[rule]]
+id = "expensive-model"
+label = "Use expensive model"
+match = "POST /v1/chat/completions"
+body = "o3|o4-mini|gpt-4\\.5"
+level = "ask"

@@ -1,0 +1,21 @@
+setup = """
+git over HTTPS (SSH is outside the broker): put the phantom in the URL as the
+credential — token in the password slot, any dummy user — so no pre-existing git
+credential helper can shadow it:
+  sc run -- git clone https://x-access-token:__sc__github__@github.com/<owner>/<repo>
+Same shape for remote add / push / fetch. Multi-account: switch the phantom value
+(__sc__github_work__).
+"""
+
+[service]
+id = "github"
+name = "GitHub"
+# Classification for browse/filter and policy tag-floors; lowercase-kebab, multi OK.
+tags = ["app"]
+
+# One GitHub connection (one PAT) backs both the REST API (api.github.com) and
+# git-over-HTTPS (github.com). Basic self-describes on the wire — no auth section.
+hosts = ["api.github.com", "github.com"]
+secrets = ["GITHUB_TOKEN"]
+# Where a human mints the secret (auxiliary; display-only helper link).
+secret_url = "https://github.com/settings/tokens?type=beta"

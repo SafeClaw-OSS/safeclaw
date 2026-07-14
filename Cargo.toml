@@ -1,6 +1,6 @@
 [package]
 name = "safeclaw"
-version = "0.9.1"
+version = "0.9.49"
 edition = "2021"
 description = "SafeClaw daemon — multi-vault passkey-gated credential vault for AI agents"
 # Functional Source License 1.1 (Apache-2.0 future). FSL is not an SPDX id,
@@ -28,12 +28,13 @@ tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 tower = "0.5"
+hostname = "0.4"
 
 # Protocol / crypto core — see [[sudp-crate]]. SafeClaw is a custodian
 # implementation; sudp provides the abstract protocol + standard cryptographic
 # profile (Hash/Kdf/Aead/KeyWrap, β computation, grant validation, WebAuthn
 # Authenticator). We keep p256 direct only for places sudp doesn't yet cover.
-sudp = { version = "0.2", features = ["std-primitives", "webauthn", "json-canonical"] }
+sudp = { version = "0.2.1", features = ["std-primitives", "webauthn", "json-canonical"] }
 hmac = "0.12"
 p256 = { version = "0.13", features = ["ecdh", "ecdsa", "jwk"] }
 sha2 = "0.10"
@@ -63,6 +64,20 @@ futures-util = "0.3"
 # BodyExt::collect for the bounded body scan.
 hudsucker = "0.24"
 http-body-util = "0.1"
+# The resident proxy's UPSTREAM (forward-hop) connector. hudsucker's built-in
+# `with_rustls_connector` dials every intercepted host DIRECTLY; to route the
+# forward hop through the device egress proxy (`sc proxy set`) we build our own
+# HttpsConnector (same rustls 0.23 / aws-lc-rs / webpki roots hudsucker uses)
+# wrapping a CONNECT-tunnel base connector. `tower-service` is the `Service<Uri>`
+# trait that base connector implements. Both are already in the tree (via
+# hudsucker + reqwest); pinned here only to name them directly. See proxy/upstream.rs.
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "tls12", "logging", "webpki-tokio"] }
+tower-service = "0.3"
+# Portable OS trust-store roots (mac Keychain / linux cert files / windows
+# store) so `sc run` can hand tools a CA bundle = broker root + system roots.
+# Without the system roots, tools with no compiled CApath fallback (cargo's
+# vendored libcurl) fail to verify passthrough (non-brokered) public hosts.
+rustls-native-certs = "0.8"
 toml = "0.8"
 dirs = "5"
 url = "2"

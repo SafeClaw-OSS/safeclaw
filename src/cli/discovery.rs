@@ -54,10 +54,17 @@ fn project(body: &Value) -> Vec<ConnRow> {
         let phantoms: Vec<String> = s
             .get("phantoms")
             .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default();
         // Only rows an agent can use right now: connected + at least one phantom.
-        let connected = s.get("connected").and_then(|v| v.as_bool()).unwrap_or(false);
+        let connected = s
+            .get("connected")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         if !connected || phantoms.is_empty() {
             continue;
         }
@@ -69,9 +76,17 @@ fn project(body: &Value) -> Vec<ConnRow> {
         let hosts: Vec<String> = s
             .get("hosts")
             .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default();
-        out.push(ConnRow { name, hosts, phantoms });
+        out.push(ConnRow {
+            name,
+            hosts,
+            phantoms,
+        });
     }
     out
 }

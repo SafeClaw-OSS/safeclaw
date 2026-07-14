@@ -1,0 +1,20 @@
+setup = """
+Supabase's Management API is REST under api.supabase.com/v1. Put the phantom in
+the bearer header; the proxy substitutes it at egress, the token never enters the
+agent:
+  sc run -- curl https://api.supabase.com/v1/projects \\
+    -H "Authorization: Bearer __sc__supabase__"
+The token is a personal access token (sbp_...). Multi-account: switch the phantom
+value (__sc__supabase_work__).
+"""
+
+[service]
+id = "supabase"
+name = "Supabase"
+# Classification for browse/filter and policy tag-floors; lowercase-kebab, multi OK.
+tags = ["app"]
+
+hosts = ["api.supabase.com"]
+secrets = ["SUPABASE_ACCESS_TOKEN"]
+# Where a human mints the secret (auxiliary; display-only helper link).
+secret_url = "https://supabase.com/dashboard/account/tokens"

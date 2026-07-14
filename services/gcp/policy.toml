@@ -1,0 +1,51 @@
+# Google Cloud policy. One cloud-platform token reaches every GCP API; the token
+# never enters the agent and egress is host-anchored, so routine work — listing,
+# creating, updating, deploying (Cloud Run, Functions), running BigQuery, reading
+# logs/metrics — rides the write=allow floor. The approval gate is spent only on
+# the few irreversible / credential-escaping actions below. Each rule is a
+# per-connection console toggle; loosen, split, or add your own (e.g. gate GKE
+# cluster delete, or an IAM setIamPolicy that grants roles).
+#
+# Deliberately NOT gated: object deletes (DELETE /storage/v1/b/*/o/* — daily file
+# churn), stop / reset / resize (POST actions, recoverable), disk deletes. Each
+# rule's match is segment-counted to hit exactly its target — a bucket delete,
+# not an object delete; a project delete, not a sub-resource delete.
+
+[default]
+read = "allow"
+write = "allow"
+
+# ── Destroy a whole project (takes every resource + all data, no undo) ────────
+# `/*/projects/*` = exactly 3 segments → the Resource Manager project delete
+# (/v1|/v3/projects/<id>); every sub-resource DELETE is a longer path and rides
+# the floor.
+[[rule]]
+id = "delete-project"
+label = "Delete a project (destroys every resource and all its data)"
+match = "DELETE /*/projects/*"
+level = "ask-always"
+
+# ── Delete a VM (loses the instance and its boot disk) ────────────────────────
+[[rule]]
+id = "delete-instance"
+label = "Delete a Compute Engine VM"
+match = "DELETE /compute/v1/projects/*/zones/*/instances/*"
+level = "ask-always"
+
+# ── Delete a storage bucket (loses every object in it) ────────────────────────
+# `*` = one segment, so this catches the bucket, not object deletes
+# (DELETE /storage/v1/b/<bucket>/o/<object>, which has more segments).
+[[rule]]
+id = "delete-bucket"
+label = "Delete a Cloud Storage bucket (loses all its objects)"
+match = "DELETE /storage/v1/b/*"
+level = "ask-always"
+
+# ── Mint a service-account KEY (a durable credential SafeClaw never sees) ──────
+# A downloadable SA key is a direct end-run around credential separation — the
+# agent minting one escapes the broker. Rare, so gating it costs nothing daily.
+[[rule]]
+id = "mint-sa-key"
+label = "Create a service-account key (a durable credential outside the broker)"
+match = "POST /v1/projects/*/serviceAccounts/*/keys"
+level = "ask-always"

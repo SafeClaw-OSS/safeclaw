@@ -1,0 +1,19 @@
+setup = """
+git over HTTPS (SSH is outside the broker): put the phantom in the URL as the
+credential — token in the password slot, user `oauth2` — so no pre-existing git
+credential helper can shadow it:
+  sc run -- git clone https://oauth2:__sc__gitlab__@gitlab.com/<owner>/<repo>
+Same shape for remote add / push / fetch. Multi-account: switch the phantom value
+(__sc__gitlab_work__).
+"""
+
+[service]
+id = "gitlab"
+name = "GitLab"
+# Classification for browse/filter and policy tag-floors; lowercase-kebab, multi OK.
+tags = ["app"]
+
+# One GitLab connection (one PAT) backs both the REST API (gitlab.com/api/v4) and
+# git-over-HTTPS (gitlab.com). Both share GITLAB_TOKEN.
+hosts = ["gitlab.com"]
+secrets = ["GITLAB_TOKEN"]

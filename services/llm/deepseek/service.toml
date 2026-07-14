@@ -1,6 +1,0 @@
-[service]
-id = "deepseek"
-name = "DeepSeek"
-
-hosts = ["api.deepseek.com"]
-secrets = ["DEEPSEEK_API_KEY"]

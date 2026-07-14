@@ -1,0 +1,52 @@
+setup = """
+Google Analytics 4 is REST over two hosts: analyticsadmin.googleapis.com (Admin
+API v1beta — create properties, data streams, key events, custom dimensions) and
+analyticsdata.googleapis.com (Data API v1beta — read-only reporting). The phantom
+resolves to a minted OAuth access token; put it in the bearer header, the proxy
+substitutes it at egress, the token never enters the agent:
+  sc run -- curl \\
+    "https://analyticsadmin.googleapis.com/v1beta/accounts" \\
+    -H "Authorization: Bearer __sc__ga4__"
+"""
+
+[service]
+id = "ga4"
+name = "Google Analytics"
+# Classification for browse/filter and policy tag-floors; lowercase-kebab, multi OK.
+tags = ["app"]
+
+# Admin API (write) + Data API (read). Neither host is claimed by another
+# connection, so this anchors both. A host may anchor only one connection.
+hosts = [
+  "analyticsadmin.googleapis.com",
+  "analyticsdata.googleapis.com",
+]
+secrets = ["GA4_REFRESH_TOKEN"]
+
+[auth]
+type = "oauth2"
+# Display label only ("Connect with Google") — carries no config.
+provider = "google"
+# analytics.edit covers Admin-API writes (create property/stream/key-event/dim);
+# analytics.readonly covers Data-API reporting. Both are Google "sensitive"
+# scopes — the consuming project's OAuth consent screen must list them.
+scopes = [
+  "https://www.googleapis.com/auth/analytics.edit",
+  "https://www.googleapis.com/auth/analytics.readonly",
+]
+refresh_token = "GA4_REFRESH_TOKEN"
+
+# Shared Google Desktop OAuth client — same PUBLIC (non-confidential) client as
+# gmail/gdrive/gcalendar/gcp; rotate all together. Canonical rationale for
+# shipping the client_secret in the clear: services/gmail/service.toml.
+authorization_url = "https://accounts.google.com/o/oauth2/v2/auth"
+token_url         = "https://oauth2.googleapis.com/token"
+pkce              = true
+client_id         = "499410884315-6m6vu98ls61i0e0cn38663mm573nu87a.apps.googleusercontent.com"
+client_secret     = "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"
+redirect_uri      = "http://127.0.0.1:8765/safeclaw/oauth/callback"
+
+# Google quirk: without these a repeat consent returns no refresh_token.
+[auth.authorize_params]
+access_type = "offline"
+prompt      = "consent"

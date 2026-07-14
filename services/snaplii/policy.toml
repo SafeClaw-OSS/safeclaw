@@ -1,0 +1,46 @@
+# Snaplii policy (A2M API, aipayment.snaplii.com/v2). The api key and the
+# minted JWT never enter the agent and egress is host-anchored, so browsing
+# the catalog, quoting a price, and checking the balance ride the allow floor.
+# The gate is spent where the money moves: a purchase is an irreversible spend
+# of pre-funded wallet balance. Snaplii's own per-key daily cap backstops
+# whatever this file misses; the two layers are complementary (their cap
+# bounds the total, our gate approves each spend).
+#
+# Paths below are ground truth from Snaplii's agent-to-merchant-payments repo
+# (github.com/Snaplii-Inc, 2026-07-09). Bill-pay endpoints exist but their
+# REST paths are not documented there yet — pin them down at e2e and add the
+# pay-step gate then; until anchored+documented they cannot be reached through
+# this connection's floor rules any differently than purchase's siblings.
+
+[default]
+read = "allow"
+write = "allow"
+
+# ── Spend wallet balance (irreversible) ──────────────────────────────────────
+# The quote (POST /v2/quote) deliberately stays on the floor: it prices a cart
+# without committing anything — gating it would put friction on the browse
+# loop while the purchase itself is already gated.
+# Small-value convenience, big-value confirmation — the contactless-payment
+# social norm (no-verification ceilings: US ~$100, EU €50, UK £100). A purchase
+# at or under the threshold is `ask` (approve once, then a reuse window), and
+# it is BOUND to its exact amount + merchant (service.toml `[requests.purchase]`)
+# — so approving "$40 to Acme" cannot be ridden by "$75 to EvilCorp" (a
+# different value re-prompts). Over the threshold escalates to `ask-always`
+# (every spend confirmed, single-use). To make even small purchases frictionless
+# (no tap at all), set this base to `allow`.
+[[rule]]
+id = "purchase"
+label = "Buy a gift card (spends wallet balance)"
+match = "POST /v2/purchase"
+level = "ask"
+
+# Over the small-value ceiling, confirm every spend, bound to amount + merchant.
+# Composes by most-restrictive-wins (a purchase over the threshold matches both
+# rules → ask-always beats ask). `vars.amount` is the bound field; an undefined
+# amount → this rule doesn't fire and the base `ask` still gates (never a bypass).
+[[rule]]
+id = "purchase-large"
+label = "Confirm a purchase over $100 (bound to amount + merchant)"
+match = "POST /v2/purchase"
+when = "vars.amount > 100"
+level = "ask-always"

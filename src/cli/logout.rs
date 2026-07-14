@@ -48,8 +48,7 @@ pub async fn run(args: LogoutArgs) -> Result<(), String> {
     if let Some(home) = dirs::home_dir() {
         let p = home.join(".safeclaw").join("device-key");
         if p.exists() {
-            std::fs::remove_file(&p)
-                .map_err(|e| format!("remove {}: {}", p.display(), e))?;
+            std::fs::remove_file(&p).map_err(|e| format!("remove {}: {}", p.display(), e))?;
         }
     }
 
@@ -61,6 +60,7 @@ pub async fn run(args: LogoutArgs) -> Result<(), String> {
     cleared.vault = None;
     cleared.cloud_backend = None;
     cleared.frontend_origin = None;
+    cleared.vault_deleted_upstream = None;
     cleared.known_vaults.clear();
     save(&cleared)?;
     crate::cli::active::clear_known_vaults()?;
@@ -71,7 +71,7 @@ pub async fn run(args: LogoutArgs) -> Result<(), String> {
         eprintln!("Nothing was paired; cleared any stale local config.");
     }
     eprintln!();
-    eprintln!("  Your agent's SAFECLAW_* env (DAEMON_URL / VAULT_ID / API_KEY / PROXY_URL) may");
+    eprintln!("  Your agent's SAFECLAW_* env (BROKER_URL / VAULT_ID / API_KEY) may");
     eprintln!("  still be persisted in its .env — it's stale now; remove it. Agent keys stay");
     eprintln!("  valid account-wide (logout revokes only this DEVICE) — revoke unused ones");
     eprintln!("  with `sc agent rm`. Re-pair with `sc login --pair-token <token>`.");
@@ -114,11 +114,14 @@ async fn revoke_device_cloud(cfg: &CliConfig) -> Result<Option<String>, String> 
         .bearer_auth(&key)
         .send()
         .await
-        .map_err(|e| format!("reach {}: {}", cloud, e))?;
+        .map_err(|e| crate::cli::neterr::reach_failed(cloud, &e))?;
     if !resp.status().is_success() {
         return Err(format!("list devices: HTTP {}", resp.status()));
     }
-    let list: DeviceList = resp.json().await.map_err(|e| format!("parse devices: {}", e))?;
+    let list: DeviceList = resp
+        .json()
+        .await
+        .map_err(|e| format!("parse devices: {}", e))?;
 
     // The device list returns each key's stable PREFIX; our full key starts with it.
     let Some(me) = list.keys.into_iter().find(|d| key.starts_with(&d.prefix)) else {
@@ -131,7 +134,7 @@ async fn revoke_device_cloud(cfg: &CliConfig) -> Result<Option<String>, String> 
         .bearer_auth(&key)
         .send()
         .await
-        .map_err(|e| format!("reach {}: {}", cloud, e))?;
+        .map_err(|e| crate::cli::neterr::reach_failed(cloud, &e))?;
     if !del.status().is_success() {
         return Err(format!("revoke: HTTP {}", del.status()));
     }

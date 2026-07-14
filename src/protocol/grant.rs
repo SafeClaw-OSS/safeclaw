@@ -164,14 +164,7 @@ pub fn validate_grant(
             ));
         }
     }
-    verify_assertion(
-        &grant.assertion,
-        &entry.x,
-        &entry.y,
-        origin,
-        rp_id,
-        &beta,
-    )?;
+    verify_assertion(&grant.assertion, &entry.x, &entry.y, origin, rp_id, &beta)?;
 
     // 7. Decode wrapping_key + credential_id raw bytes.
     //

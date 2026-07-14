@@ -12,7 +12,10 @@ use axum::{
     extract::{Path, State},
     Json,
 };
-use base64::{engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD}, Engine};
+use base64::{
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+    Engine,
+};
 use serde::Serialize;
 use serde_json::{json, Value};
 use sudp::grant::{GrantOpt, RedeemedGrant, WrappingKey};
@@ -41,6 +44,11 @@ pub struct PasskeyMeta {
     /// P-256 public key Y coordinate (base64). Used by --reuse to skip create().
     #[serde(skip_serializing_if = "Option::is_none")]
     pub public_key_y: Option<String>,
+    /// Optional key-check value (KCV, STANDARD base64). Lets the browser confirm
+    /// a re-derived `W_c` before depositing a grant, without unwrapping `K`.
+    /// Absent for credentials enrolled before the KCV existed (until backfilled).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wc_check: Option<String>,
 }
 
 pub async fn passkeys(
@@ -95,11 +103,15 @@ pub async fn passkeys(
             let pk = find_pubkey_in_registry(&registry, &cid_b64);
             PasskeyMeta {
                 credential_id: cid_b64,
-                device_name: pk.as_ref().map(|p| p.device_name.clone()).unwrap_or_default(),
+                device_name: pk
+                    .as_ref()
+                    .map(|p| p.device_name.clone())
+                    .unwrap_or_default(),
                 created_at: 0, // sudp Registry doesn't track this; future: aux side-store.
                 prf_salt: STANDARD.encode(&c.prf_salt),
                 public_key_x: pk.as_ref().map(|p| p.x.clone()),
                 public_key_y: pk.as_ref().map(|p| p.y.clone()),
+                wc_check: c.wc_check.as_ref().map(|v| STANDARD.encode(v)),
             }
         })
         .collect();
@@ -129,7 +141,10 @@ pub async fn passkeys(
 /// `sc_pk_fingerprint` lets remote clients OOB-verify the key on first pin
 /// (per PROTOCOL.md §4.2.2 trust establishment).
 pub async fn pubkey(State(state): State<Arc<AppState>>) -> Json<Value> {
-    use base64::{engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD}, Engine};
+    use base64::{
+        engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+        Engine,
+    };
     use sha2::{Digest, Sha256};
     let pk_bytes = state.sc.pk_bytes();
     let fp = Sha256::digest(&pk_bytes);
@@ -156,7 +171,22 @@ pub async fn sync_now(
         return Json(json!({ "ok": false, "error": e.to_string() }));
     }
     match crate::sync::sync_vault_now(&state, &vault_id).await {
-        Ok(pulled) => Json(json!({ "ok": true, "pulled": pulled })),
+        Ok(out) => {
+            let c = &out.connects;
+            Json(json!({
+                "ok": true,
+                "pulled": out.pulled,
+                "connects": {
+                    "completed": c.completed,
+                    "failed": c.failed.iter()
+                        .map(|(conn, reason)| json!({ "conn": conn, "reason": reason }))
+                        .collect::<Vec<_>>(),
+                    "unreached": c.unreached.iter()
+                        .map(|(conn, host)| json!({ "conn": conn, "host": host }))
+                        .collect::<Vec<_>>(),
+                },
+            }))
+        }
         Err(e) => Json(json!({ "ok": false, "error": e })),
     }
 }

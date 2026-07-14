@@ -7,10 +7,10 @@
 //! truth, `_url`s are projections):
 //!
 //! - control root  = daemon host + `CONTROL_PORT` (ceremony/write plane)
-//! - API-face root = daemon host + `PROXY_PORT`   (the agent's `DAEMON_URL`)
+//! - API-face root = daemon host + `PROXY_PORT`   (the agent's `BROKER_URL`)
 //!
 //! THE self-consistency invariant: both planes derive from ONE daemon-host
-//! value. When `$SAFECLAW_DAEMON_URL` is set (an agent's env snapshot), its
+//! value. When `$SAFECLAW_BROKER_URL` is set (an agent's env snapshot), its
 //! host wins — an agent's shelled `sc` then targets the SAME daemon the
 //! agent's own HTTP does, by construction; the two faces cannot split.
 //!
@@ -59,6 +59,32 @@ pub struct CliConfig {
     /// default.
     #[serde(default, skip_serializing_if = "Settings::is_empty")]
     pub settings: Settings,
+    /// SSE sync-stream switch (docs/SSE_SYNC_DESIGN.md): absent/"auto" =
+    /// connect the wake stream, "off" = pure long-poll. Read by the stream
+    /// dispatcher at every (re)connect, so flipping it bites within ~15 min
+    /// without a restart. `SAFECLAW_SYNC_STREAM` overrides — and, unlike this
+    /// key, survives an OLD binary's config save (which drops unknown keys),
+    /// so the env var is the robust rollback lever.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync_stream: Option<String>,
+    /// Ceremony-audit switch: absent/"auto" = the audit shipper also ships
+    /// control-plane terminal outcomes (unlock/set/connect grants) to the
+    /// cloud audit_events, "off" = Use ops only (the pre-rc.6 contract).
+    /// Read once per 30s ship tick, so flipping it bites without a restart;
+    /// while off, ceremony rows stay in the local outbox and back-ship on
+    /// re-enable (bounded by audit retention). `SAFECLAW_AUDIT_CEREMONIES`
+    /// overrides, same robustness rationale as `sync_stream` above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit_ceremonies: Option<String>,
+    /// Set when the ACTIVE vault was tombstoned cloud-side (deleted on the
+    /// web) and the sync path cleared the selection — the one case where "no
+    /// vault selected" is a surprise, not a choice. `sc status` and
+    /// `resolve_active` read it to say "your vault was deleted — re-pair"
+    /// instead of a blank zero-vault state. Cleared by the next successful
+    /// pairing/selection (`put_active*`) and by logout. A user-driven
+    /// `sc vault forget` never sets it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vault_deleted_upstream: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
@@ -111,15 +137,13 @@ pub fn load() -> Result<CliConfig, String> {
 pub fn save(cfg: &CliConfig) -> Result<PathBuf, String> {
     let path = config_path()?;
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| format!("mkdir {}: {}", parent.display(), e))?;
+        fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {}", parent.display(), e))?;
     }
-    let body = toml::to_string_pretty(cfg)
-        .map_err(|e| format!("serialize config: {}", e))?;
+    let body = toml::to_string_pretty(cfg).map_err(|e| format!("serialize config: {}", e))?;
     let tmp = path.with_extension("toml.tmp");
     {
-        let mut f = fs::File::create(&tmp)
-            .map_err(|e| format!("create {}: {}", tmp.display(), e))?;
+        let mut f =
+            fs::File::create(&tmp).map_err(|e| format!("create {}: {}", tmp.display(), e))?;
         f.write_all(body.as_bytes())
             .map_err(|e| format!("write {}: {}", tmp.display(), e))?;
     }
@@ -192,8 +216,7 @@ fn update_known_vaults<F: FnOnce(&mut Vec<KnownVault>)>(mutate: F) -> Result<(),
     mutate(&mut list);
     let path = known_vaults_path()?;
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| format!("mkdir {}: {}", parent.display(), e))?;
+        fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {}", parent.display(), e))?;
     }
     let body = toml::to_string_pretty(&KnownVaultsFile { vaults: list })
         .map_err(|e| format!("serialize known_vaults: {}", e))?;
@@ -217,7 +240,10 @@ pub fn clear_known_vaults() -> Result<(), String> {
 
 /// Dedupe-append one vault to the catalog.
 fn remember_vault(daemon: &str, vault: &str) -> Result<(), String> {
-    let new = KnownVault { daemon: daemon.to_string(), vault: vault.to_string() };
+    let new = KnownVault {
+        daemon: daemon.to_string(),
+        vault: vault.to_string(),
+    };
     if known_vaults().contains(&new) {
         return Ok(());
     }
@@ -264,6 +290,7 @@ pub fn forget_vault(vault: &str) -> Result<bool, String> {
     if cleared_active {
         cfg.daemon = None;
         cfg.vault = None;
+        cfg.vault_deleted_upstream = Some(vault.to_string());
         save(&cfg)?;
     }
     Ok(removed_known || cleared_active)
@@ -275,6 +302,7 @@ pub fn put_active(daemon: &str, vault: &str) -> Result<PathBuf, String> {
     let mut cfg = load().unwrap_or_default();
     cfg.daemon = Some(daemon.to_string());
     cfg.vault = Some(vault.to_string());
+    cfg.vault_deleted_upstream = None;
     save(&cfg)
 }
 
@@ -292,6 +320,7 @@ pub fn put_active_with_cloud(
     let mut cfg = load().unwrap_or_default();
     cfg.daemon = Some(daemon.to_string());
     cfg.vault = Some(vault.to_string());
+    cfg.vault_deleted_upstream = None;
     cfg.cloud_backend = Some(cloud_backend.to_string());
     cfg.frontend_origin = frontend_origin
         .filter(|s| !s.is_empty())
@@ -381,11 +410,23 @@ fn scheme_host(url: &str) -> Option<String> {
     Some(format!("{}://{}", scheme, host))
 }
 
-fn env_daemon_host() -> Option<String> {
-    std::env::var("SAFECLAW_DAEMON_URL")
+/// The agent's broker-face URL from the env: `$SAFECLAW_BROKER_URL` (the
+/// self-describing name — this is SafeClaw's broker/API face, NOT the control
+/// port), falling back to the legacy `$SAFECLAW_DAEMON_URL` so an env minted
+/// before the rename keeps working. Empty values are ignored.
+pub fn env_broker_url() -> Option<String> {
+    std::env::var("SAFECLAW_BROKER_URL")
         .ok()
         .filter(|s| !s.is_empty())
-        .and_then(|u| scheme_host(&u))
+        .or_else(|| {
+            std::env::var("SAFECLAW_DAEMON_URL")
+                .ok()
+                .filter(|s| !s.is_empty())
+        })
+}
+
+fn env_daemon_host() -> Option<String> {
+    env_broker_url().and_then(|u| scheme_host(&u))
 }
 
 /// The DEVICE's daemon-host atom (`scheme://host`): config's `daemon` with its
@@ -399,44 +440,74 @@ pub fn device_daemon_host(cfg: &CliConfig) -> String {
         .unwrap_or_else(|| "http://127.0.0.1".to_string())
 }
 
-/// The control root (`scheme://host:CONTROL_PORT`) every ceremony/write `sc`
-/// call targets. Env-first: `$SAFECLAW_DAEMON_URL`'s HOST wins when set (the
+/// The control root (`scheme://host:<control-port>`) every ceremony/write `sc`
+/// call targets. Env-first: `$SAFECLAW_BROKER_URL`'s HOST wins when set (the
 /// invariant — shelled `sc` and the agent's own HTTP share one daemon); else
 /// config's `daemon` VERBATIM (it may carry a hand-edited custom control
 /// port); else the loopback default. The env value carries the PROXY port,
-/// never the control port, so the control port comes from the constant — a
-/// remote daemon on a non-default control port would need a config edit
-/// (that deployment doesn't exist yet).
+/// never the control port, so the control port comes from [`control_port`]:
+/// `$SAFECLAW_PORT` when set, else the constant. This is the SAME env `sc
+/// serve` and `sc login` read, so exporting `SAFECLAW_PORT=<p>` moves the
+/// daemon, its recorded config, AND this resolution together — a coordinated
+/// port change survives even in an agent shell that carries a proxy-face
+/// `SAFECLAW_BROKER_URL`.
 pub fn control_root(cfg: &CliConfig) -> String {
-    control_root_from(env_daemon_host(), cfg.daemon.as_deref())
+    control_root_from(env_daemon_host(), cfg.daemon.as_deref(), control_port())
 }
 
-fn control_root_from(env_host: Option<String>, config_daemon: Option<&str>) -> String {
+/// The control-plane port the `sc` CLI targets: `$SAFECLAW_PORT` when set (the
+/// single override, shared with `sc serve` / `sc login`), else the constant.
+fn control_port() -> u16 {
+    std::env::var("SAFECLAW_PORT")
+        .ok()
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(crate::config::CONTROL_PORT)
+}
+
+/// The proxy-face port the `sc` CLI targets: `$SAFECLAW_PROXY_PORT` when set (the
+/// single override, shared with `sc serve`), else the constant. Mirrors
+/// [`control_port`] so a stale proxy port baked into an agent's snapshot
+/// (`$SAFECLAW_BROKER_URL` from an old `sc agent add`) never wins — a moved
+/// daemon self-heals, and a real custom port is coordinated the same way
+/// `$SAFECLAW_PORT` coordinates the control face.
+fn proxy_port() -> u16 {
+    std::env::var("SAFECLAW_PROXY_PORT")
+        .ok()
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(crate::config::PROXY_PORT)
+}
+
+fn control_root_from(env_host: Option<String>, config_daemon: Option<&str>, port: u16) -> String {
     if let Some(h) = env_host {
-        return format!("{}:{}", h, crate::config::CONTROL_PORT);
+        return format!("{}:{}", h, port);
     }
     config_daemon
         .filter(|s| !s.is_empty())
         .map(|s| s.trim_end_matches('/').to_string())
-        .unwrap_or_else(|| format!("http://127.0.0.1:{}", crate::config::CONTROL_PORT))
+        .unwrap_or_else(|| format!("http://127.0.0.1:{}", port))
 }
 
-/// The API-face root (`scheme://host:PROXY_PORT`) — the value an agent holds
-/// as `SAFECLAW_DAEMON_URL`. Env verbatim when set (the agent's snapshot,
-/// custom port included); else derived from the device atom. The env value
+/// The API-face root (`scheme://host:<proxy-port>`) — the daemon face an agent
+/// holds as `SAFECLAW_BROKER_URL`. Env-first HOST (the single-host invariant:
+/// proxy and control share one daemon host), else the device atom; the PORT is
+/// always [`proxy_port`], NEVER the snapshot's port. This is symmetric with
+/// [`control_root`], which likewise takes the env HOST but resolves the port
+/// itself — so a stale `$SAFECLAW_BROKER_URL` port from an old `sc agent add`
+/// (the daemon since moved) is ignored by BOTH faces and self-heals, instead of
+/// silently pinning the child's `HTTPS_PROXY` to a dead port. The env value
 /// passes the SAME `scheme_host` parse gate as `control_root` — a malformed
 /// value is ignored by BOTH faces, never honored by one and dropped by the
 /// other (that asymmetry would split the invariant).
 pub fn api_face_root(cfg: &CliConfig) -> String {
-    let env_url = std::env::var("SAFECLAW_DAEMON_URL").ok().filter(|s| !s.is_empty());
-    api_face_root_with(env_url, cfg)
+    api_face_root_with(env_broker_url(), cfg)
 }
 
 fn api_face_root_with(env_url: Option<String>, cfg: &CliConfig) -> String {
-    match env_url.filter(|u| scheme_host(u).is_some()) {
-        Some(u) => u.trim_end_matches('/').to_string(),
-        None => format!("{}:{}", device_daemon_host(cfg), crate::config::PROXY_PORT),
-    }
+    let host = env_url
+        .as_deref()
+        .and_then(scheme_host)
+        .unwrap_or_else(|| device_daemon_host(cfg));
+    format!("{}:{}", host, proxy_port())
 }
 
 /// The device-default vault (config default, else the single known vault) —
@@ -450,7 +521,7 @@ pub fn device_default_vault(cfg: &CliConfig) -> Option<String> {
 /// Resolve the active `(control_root, vault)` pair every short-lived `sc`
 /// command routes through — the single choke point (CREDENTIAL_BROKER.md §14).
 ///
-/// - **control root:** see [`control_root`] — the env `DAEMON_URL` HOST wins
+/// - **control root:** see [`control_root`] — the env `BROKER_URL` HOST wins
 ///   (the single-host invariant), else config, else the loopback default.
 /// - **vault precedence:** `--vault flag > $SAFECLAW_VAULT_ID (env pin) >
 ///   config default > single-vault auto-select`. The env pin is what makes an
@@ -461,9 +532,14 @@ pub fn resolve_active(vault_override: Option<&str>) -> Result<(String, String), 
     let cfg = load()?;
     let explicit = vault_override
         .map(str::to_string)
-        .or_else(|| std::env::var("SAFECLAW_VAULT_ID").ok().filter(|s| !s.is_empty()))
+        .or_else(|| {
+            std::env::var("SAFECLAW_VAULT_ID")
+                .ok()
+                .filter(|s| !s.is_empty())
+        })
         .or_else(|| cfg.vault.clone());
     if let Some(vault) = explicit {
+        validate_vault_id_arg(&vault)?;
         return Ok((control_root(&cfg), vault));
     }
     // Single-vault auto-select: the catalog entry records WHICH daemon that
@@ -472,11 +548,41 @@ pub fn resolve_active(vault_override: Option<&str>) -> Result<(String, String), 
     // still wins (invariant).
     if let Some(kv) = single_known_entry() {
         return Ok((
-            control_root_from(env_daemon_host(), Some(&kv.daemon)),
+            control_root_from(env_daemon_host(), Some(&kv.daemon), control_port()),
             kv.vault,
         ));
     }
+    // Stranded by an upstream delete, not by never having paired: name the
+    // vault and point at re-pairing instead of the generic "no vault" error.
+    if let Some(dead) = cfg.vault_deleted_upstream.as_deref() {
+        return Err(format!(
+            "vault {} was deleted on the web, so this device's pairing to it is gone — \
+             generate a new install token in the console (\"Connect a new agent\") and run `sc login`",
+            dead
+        ));
+    }
     Err("no vault selected — run `sc login` or `sc vault use`".to_string())
+}
+
+/// Client-side mirror of the daemon's vault-id rule (`op::validate_vault_id`:
+/// 1-128 chars of `[A-Za-z0-9-_]`). Catches a display NAME ("test vault2") or a
+/// typo at the argument boundary with a pointer to `sc vault ls`, instead of
+/// letting it travel to the daemon and surface as a deep, opaque
+/// "passkeys HTTP 400 Bad Request" (after the user already typed a
+/// confirmation, in `sc vault delete`'s case).
+fn validate_vault_id_arg(v: &str) -> Result<(), String> {
+    let ok = !v.is_empty()
+        && v.len() <= 128
+        && v.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if ok {
+        Ok(())
+    } else {
+        Err(format!(
+            "'{}' is not a vault id (ids use letters, digits, '-' and '_') — run `sc vault ls` and pass the id from the `/v/<id>` part of the URL",
+            v
+        ))
+    }
 }
 
 /// Single-vault auto-select (§5): exactly one known vault defaults to it, so a
@@ -498,6 +604,23 @@ fn single_known_vault() -> Option<String> {
 mod tests {
     use super::*;
 
+    /// A display name / typo passed as `--vault` must fail at the argument
+    /// boundary with the `sc vault ls` pointer — not travel to the daemon and
+    /// come back as an opaque "passkeys HTTP 400" (the `sc vault delete
+    /// "test vault2"` report).
+    #[test]
+    fn vault_id_arg_rejects_names_and_accepts_ids() {
+        assert!(validate_vault_id_arg("v-abc_123").is_ok());
+        assert!(validate_vault_id_arg("test vault2").is_err());
+        assert!(validate_vault_id_arg("").is_err());
+        assert!(validate_vault_id_arg("http://x/v/id").is_err());
+        let msg = validate_vault_id_arg("test vault2").unwrap_err();
+        assert!(
+            msg.contains("sc vault ls"),
+            "error must point at vault ls: {msg}"
+        );
+    }
+
     #[test]
     fn split_vault_url_basic() {
         assert_eq!(
@@ -514,56 +637,79 @@ mod tests {
 
     #[test]
     fn scheme_host_strips_port_and_path() {
-        assert_eq!(scheme_host("http://127.0.0.1:23294"), Some("http://127.0.0.1".into()));
+        assert_eq!(
+            scheme_host("http://127.0.0.1:23294"),
+            Some("http://127.0.0.1".into())
+        );
         assert_eq!(
             scheme_host("https://box.example.com:23294/x/y"),
             Some("https://box.example.com".into())
         );
-        assert_eq!(scheme_host("http://[::1]:23294"), Some("http://[::1]".into()));
+        assert_eq!(
+            scheme_host("http://[::1]:23294"),
+            Some("http://[::1]".into())
+        );
         assert_eq!(scheme_host("no-scheme"), None);
         assert_eq!(scheme_host("http://"), None);
     }
 
     #[test]
     fn control_root_env_host_wins_config_verbatim_else_default() {
+        use crate::config::CONTROL_PORT;
         // hand-edited custom control port in config
         let cfg_daemon = Some("http://127.0.0.1:9999");
-        // Env host set (an agent's shell): its HOST + the control-port constant —
+        // Env host set (an agent's shell): its HOST + the resolved control port —
         // the single-host invariant (proxy face and control face share a daemon).
         assert_eq!(
-            control_root_from(Some("https://box.example.com".into()), cfg_daemon),
-            format!("https://box.example.com:{}", crate::config::CONTROL_PORT)
+            control_root_from(
+                Some("https://box.example.com".into()),
+                cfg_daemon,
+                CONTROL_PORT
+            ),
+            format!("https://box.example.com:{}", CONTROL_PORT)
+        );
+        // A moved control port (SAFECLAW_PORT) rides through the env-host branch,
+        // so an agent shell carrying a proxy-face BROKER_URL still targets it.
+        assert_eq!(
+            control_root_from(Some("http://127.0.0.1".into()), cfg_daemon, 23293),
+            "http://127.0.0.1:23293"
         );
         // No env: config's control root VERBATIM (custom port preserved).
-        assert_eq!(control_root_from(None, cfg_daemon), "http://127.0.0.1:9999");
-        // Bare machine: loopback default.
         assert_eq!(
-            control_root_from(None, None),
-            format!("http://127.0.0.1:{}", crate::config::CONTROL_PORT)
+            control_root_from(None, cfg_daemon, CONTROL_PORT),
+            "http://127.0.0.1:9999"
+        );
+        // Bare machine: loopback default at the resolved port.
+        assert_eq!(
+            control_root_from(None, None, CONTROL_PORT),
+            format!("http://127.0.0.1:{}", CONTROL_PORT)
         );
     }
 
     #[test]
-    fn api_face_root_env_verbatim_else_derived() {
+    fn api_face_root_env_host_wins_port_always_resolved() {
+        use crate::config::PROXY_PORT;
         let cfg = CliConfig {
-            daemon: Some("http://box.example.com:23295".into()),
+            daemon: Some("http://box.example.com:23299".into()),
             ..Default::default()
         };
-        // The agent's snapshot wins untouched (custom proxy port included).
+        // Env host wins, but the PORT is always proxy_port() — a stale port in
+        // the agent's snapshot (`:9999`, an old daemon) is DROPPED, not pinned
+        // into the child's HTTPS_PROXY. Symmetric with control_root.
         assert_eq!(
             api_face_root_with(Some("http://box.example.com:9999/".into()), &cfg),
-            "http://box.example.com:9999"
+            format!("http://box.example.com:{}", PROXY_PORT)
         );
-        // Derived: device daemon HOST + the proxy-port constant.
+        // No env: device daemon HOST + the resolved proxy port.
         assert_eq!(
             api_face_root_with(None, &cfg),
-            format!("http://box.example.com:{}", crate::config::PROXY_PORT)
+            format!("http://box.example.com:{}", PROXY_PORT)
         );
-        // A malformed env value (no scheme) is ignored by BOTH faces — the
+        // A malformed env value (no scheme) falls back to the device HOST — the
         // same parse gate as control_root, so the two can't split on it.
         assert_eq!(
-            api_face_root_with(Some("box.example.com:23294".into()), &cfg),
-            format!("http://box.example.com:{}", crate::config::PROXY_PORT)
+            api_face_root_with(Some("box.example.com:9999".into()), &cfg),
+            format!("http://box.example.com:{}", PROXY_PORT)
         );
     }
 

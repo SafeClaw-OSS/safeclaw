@@ -1,8 +1,0 @@
-[service]
-id = "google"
-name = "Google AI"
-
-# Gemini takes the key as a query param (`?key=`); the agent writes the phantom
-# there — no declaration beyond host + secret.
-hosts = ["generativelanguage.googleapis.com"]
-secrets = ["GEMINI_API_KEY"]

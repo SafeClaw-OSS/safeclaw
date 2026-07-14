@@ -60,6 +60,7 @@ Filter to save context: `?view=summary` and/or `?ids=a,b`.
 ```
 
 Copy a phantom verbatim from a `connected: true` connection — never build one.
+CLI equivalent: `sc connection ls` lists connections, their hosts and phantoms.
 
 If `locked: true`, run `sc up` — it unlocks the vault and prints an approval
 link; surface that link (the user taps their passkey) and retry.

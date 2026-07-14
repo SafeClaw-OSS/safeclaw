@@ -110,10 +110,8 @@ pub fn put(vaults: &VaultDir, vault_id: &str, pending: &PendingPasskey) -> Resul
     let body = serde_json::to_vec_pretty(pending)
         .map_err(|e| AppError::Internal(format!("serialize pending: {}", e)))?;
     let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, &body)
-        .map_err(|e| AppError::Internal(format!("write pending tmp: {}", e)))?;
-    fs::rename(&tmp, &path)
-        .map_err(|e| AppError::Internal(format!("rename pending: {}", e)))?;
+    fs::write(&tmp, &body).map_err(|e| AppError::Internal(format!("write pending tmp: {}", e)))?;
+    fs::rename(&tmp, &path).map_err(|e| AppError::Internal(format!("rename pending: {}", e)))?;
     Ok(())
 }
 
@@ -155,8 +153,8 @@ pub fn list(vaults: &VaultDir, vault_id: &str) -> Result<Vec<PendingPasskey>> {
         return Ok(Vec::new());
     }
     let mut out = Vec::new();
-    let entries = fs::read_dir(&dir)
-        .map_err(|e| AppError::Internal(format!("read pending dir: {}", e)))?;
+    let entries =
+        fs::read_dir(&dir).map_err(|e| AppError::Internal(format!("read pending dir: {}", e)))?;
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().and_then(|s| s.to_str()) != Some("json") {
@@ -186,8 +184,7 @@ pub fn list(vaults: &VaultDir, vault_id: &str) -> Result<Vec<PendingPasskey>> {
 
 fn ensure_dir(vaults: &VaultDir, vault_id: &str) -> Result<PathBuf> {
     let dir = vaults.pending_passkeys_dir(vault_id)?;
-    fs::create_dir_all(&dir)
-        .map_err(|e| AppError::Internal(format!("mkdir pending: {}", e)))?;
+    fs::create_dir_all(&dir).map_err(|e| AppError::Internal(format!("mkdir pending: {}", e)))?;
     Ok(dir)
 }
 

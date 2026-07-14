@@ -56,7 +56,8 @@ const EVENT_CHANNEL_CAPACITY: usize = 128;
 ///     session, populated at unlock bootstrap)
 ///   - `ask` services → `expires_at = Some(unix_secs)`, filled after
 ///     `approval-confirm` with the matched rule's `ttl`
-///   - `ask-always` services → never cached (entry simply absent)
+///   - `ask-always` services → never in `entries`; their one-shot grants
+///     live in `op_grants`, keyed by the approved request tuple
 ///
 /// `cache_lookup` does lazy eviction: an entry past its `expires_at`
 /// is removed and treated as a miss. No active sweeper today —
@@ -69,7 +70,22 @@ pub struct CacheEntry {
     /// `None` = never expires within the unlocked session (allow-level).
     /// `Some(t)` = expires at unix-second `t` (ask-level TTL).
     pub expires_at: Option<u64>,
+    /// `true` = this value was pre-loaded at unlock by `bootstrap_cache_from_view`
+    /// (the connection's read floor is `allow`), NOT produced by a passkey grant.
+    /// The allow fast-path (`cache_lookup`) uses it, but the `ask` path
+    /// (`cache_lookup_grant`) must IGNORE it — a per-path ask rule has to
+    /// force a fresh approval, never ride the allow-level residency. (The
+    /// ask-always path never reads `entries` at all — see `op_grants`.) A real
+    /// grant (from `approve_op`) overwrites it with `from_bootstrap = false`.
+    pub from_bootstrap: bool,
 }
+
+/// How long an approved `ask-always` one-shot grant stays redeemable
+/// (`op_grants` expiry = approve-time + this). Generous on purpose: the
+/// replay is agent-driven, and an agent that only acts when its user next
+/// prompts it can take many minutes. Safety comes from single-use + exact
+/// request binding, not from this window.
+pub const ASK_ALWAYS_REPLAY_WINDOW_SECS: u64 = 1800;
 
 #[derive(Debug, Clone, Default)]
 pub struct SecretsCache {
@@ -93,11 +109,11 @@ pub struct SecretsCache {
     pub allow_secrets: HashMap<String, HashMap<String, Vec<u8>>>,
     /// The effective policy tree — the vault's `aux.policy` overlaid on the
     /// compiled-in `Policy::default()` at unlock/refresh (so unset parts use
-    /// safe defaults). Holds the risk map, default floors, per-category, and
-    /// per-connection user policy. Built-in per-service rules are NOT cached
-    /// here — they're read live from the service registry at eval and merged
-    /// with this tree's `connections.<id>.rules`. Rebuilt on every vault write
-    /// → a `risk` / map edit is realtime on the next request.
+    /// safe defaults). Holds default floors, per-tag, and per-connection
+    /// user policy. Built-in per-service rules are NOT cached here — they're
+    /// read live from the service registry at eval and merged with this tree's
+    /// `connections.<id>.rules`. Rebuilt on every vault write → a policy edit is
+    /// realtime on the next request.
     pub policy: crate::core::policy::Policy,
     /// Audit log retention in days. Snapshot of `aux.audit_retention_days`
     /// at unlock. `None` = keep forever. Used by `GET /v/{vid}/approvals` to
@@ -117,7 +133,7 @@ pub struct SecretsCache {
     ///   - the resolved **destination host** — an approval for host A must not
     ///     authorize host B within the TTL (host is request data in the
     ///     phantom-only model: one connection may anchor several hosts).
-    /// A category-/connection-default Ask (no rule matched) is deliberately
+    /// A tag-/connection-default Ask (no rule matched) is deliberately
     /// **not cached** — it has no author-defined path scope to bound a grant,
     /// so it re-prompts every request. Value: Unix-epoch-second expiry.
     ///
@@ -125,20 +141,66 @@ pub struct SecretsCache {
     /// lock (which zero-outs the entire cache via Default drop). Daemon
     /// restart also blows it away (vaults boot Locked, cache starts empty).
     pub rule_approvals: HashMap<(String, String, String, String), u64>,
+    /// `ask-always` one-shot grants, keyed by the REQUEST the user approved:
+    /// `(connection_id, method, host, path, scope_digest)`. Written by
+    /// `approve_op` when the op's policy level was AskAlways; consumed (removed)
+    /// by the proxy's replay exactly once. This is what makes an `ask-always`
+    /// approval mean "this action, once": a grant minted for `POST /v2/purchase`
+    /// can never be spent by a different method/host/path on the same
+    /// connection, and the ask-always path never falls back to the conn-keyed
+    /// `entries` (so it can't ride a plain-ask leftover or the allow residency).
+    ///
+    /// `scope_digest` (Phase 2) folds the values of the service's declared
+    /// `[requests]` scope fields into the identity (`""` when a service declares
+    /// none — the Phase-1 path-only key). So approving `amount=80` cannot be
+    /// replayed as `amount=180`: the redeem re-extracts the fields, the digest
+    /// differs, the grant misses (without being consumed) and re-prompts. See
+    /// `crate::service::scope_digest` and docs/REQUEST_SCOPE.md.
+    ///
+    /// Expiry is deliberately GENEROUS (`ASK_ALWAYS_REPLAY_WINDOW_SECS`, not a
+    /// short grace): an agent that only replays when its user next prompts it
+    /// (e.g. a chat agent) may take minutes to re-run. Single-use + exact
+    /// binding is what makes the long window safe — time is not the guard.
+    /// Same memory window as the rest of the cache: dropped on lock/refresh.
+    pub op_grants: HashMap<(String, String, String, String, String), CacheEntry>,
     /// Item names present in the decrypted `native-secrets` kv (names only,
     /// never values). Surface for `GET /v/{vid}/secret-keys` so the frontend
     /// can decide which services are "reachable" without paying for an
     /// external-store roundtrip. Populated at unlock; cleared on lock.
     pub native_keys: HashSet<String>,
-    /// External stores' adapter inputs, snapshotted at unlock so live
-    /// `list()` calls from `GET /v/{vid}/secret-keys` can rebuild adapters
-    /// without re-decrypting the vault. Value: (store record from aux,
-    /// resolved credential bytes from native-secrets). Sparse — only
-    /// kinds with an adapter (today: gcp-secret-manager) populate.
+    /// External stores' LIVE adapters, built once at unlock so `list()`
+    /// (`GET /v/{vid}/secret-keys`) and the allow-path lazy fill
+    /// (`lazy_fill_external`) can call out without re-decrypting the vault.
+    /// Sharing one instance per store for the whole unlocked session is
+    /// what makes the adapter's internal OAuth-token cache real (a fresh
+    /// instance per call re-mints every time). Sparse — only kinds with an
+    /// adapter (today: gcp-secret-manager) populate.
     ///
-    /// F-19: credential bytes (GCP SA JSON with RSA private key) are wrapped
-    /// in `Zeroizing` so they are zeroed on drop when the vault is locked.
-    pub external_stores: HashMap<String, (crate::storage::plaintext::Store, zeroize::Zeroizing<Vec<u8>>)>,
+    /// F-19: the adapter owns the SA private key and zeroizes it on drop,
+    /// so lock still scrubs the credential with the rest of the cache.
+    pub external_stores:
+        HashMap<String, (crate::storage::plaintext::Store, Arc<crate::store::Adapter>)>,
+    /// `aux.store_order` filtered to the stores present in
+    /// `external_stores`, preserving the vault's resolution order. The lazy
+    /// fill walks THIS (first match wins) so external residency can never
+    /// disagree with `resolve_value_async`'s store_order semantics.
+    pub external_store_order: Vec<String>,
+    /// External stores that FAILED to materialise at unlock (bad SA JSON,
+    /// missing credentials_item, …): `store_id → sanitised reason`. Fail
+    /// loudly: `secret-keys` surfaces these as `store_errors` so a
+    /// misconfigured store shows up broken in the console instead of
+    /// silently vanishing. Full error goes to the daemon log only (F-20).
+    pub external_store_errors: Vec<(String, String)>,
+    /// Key NAMES the external stores expose, enumerated in the background
+    /// right after unlock (`unlock_vault` spawns one `list()` sweep) and
+    /// amended by every successful lazy fill. Registry `connected` and the
+    /// `entries` listing read native ∪ THIS, so an external-backed
+    /// connection looks connected to agents. Shared slot (`Arc<Mutex<…>>`)
+    /// so the background sweep can write back without re-entering the
+    /// vault-states lock; names only, never values. Advisory — resolution
+    /// authority stays with the adapters (a name missing here still
+    /// lazy-fills; a stale name here just shows optimistic status).
+    pub external_keys: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     /// Derived OAuth access_tokens, keyed by service_id. These are the
     /// short-lived bearer values minted by exchanging the long-lived
     /// `refresh_token` (which lives in `entries`) at the provider's
@@ -193,6 +255,20 @@ pub enum VaultState {
     },
 }
 
+/// A loopback OAuth connect awaiting its `?code&state` redirect. Points a
+/// pending `state` (RFC 6749) at the (vault, connection) whose sealed
+/// `connecting` entry holds the matching code_verifier, and carries the
+/// loopback PORT its provider will redirect to (allowlist-checked at
+/// registration — `ServiceRegistry::loopback_allowlist`): 8765 for the
+/// canonical callback, 1455 for openai_codex's registered one.
+#[derive(Clone)]
+pub struct PendingLoopback {
+    pub vault_id: String,
+    pub conn_id: String,
+    pub port: u16,
+    inserted_at: std::time::Instant,
+}
+
 pub struct AppState {
     pub config: Config,
     pub vaults: VaultDir,
@@ -203,6 +279,16 @@ pub struct AppState {
     /// Per-vault Locked/Unlocked state. Absent entry = Locked. Lives entirely
     /// in process memory; daemon restart returns all vaults to Locked.
     pub vault_states: Mutex<HashMap<String, VaultState>>,
+    /// The hosts each vault anchored the last time it was seen Unlocked
+    /// (lowercased, refreshed on every union pass). Kept ACROSS Lock so the
+    /// proxy still recognizes — and MITMs — brokered-host traffic while the
+    /// vault is locked: a phantom then meets an explicit `vault_locked`
+    /// instead of leaking upstream through a blind tunnel. Connections live in
+    /// the sealed blob, so this memory is the only locked-time anchor
+    /// knowledge; in-memory only (a daemon restarted before any unlock stays
+    /// blind, the documented residual), dropped when the vault is deleted.
+    /// Lock order: always `vault_states` first, then this.
+    pub last_host_unions: Mutex<HashMap<String, Vec<String>>>,
     /// Per-vault audit log (PROTOCOL.md §5.3). Connections opened lazily on
     /// first write/query per vault. Survives daemon restarts — unlike
     /// `approvals` / `vault_states` which are in-memory only.
@@ -235,18 +321,74 @@ pub struct AppState {
     /// held ACROSS the refresh fetch so concurrent misses wait for the
     /// in-flight result instead of being bounced to a reject.
     pub agent_key_resync: tokio::sync::Mutex<Option<std::time::Instant>>,
+    /// Single-flight for the allow-path external-store lazy fill
+    /// (`lazy_fill_external`): a burst of first requests on a GCP-backed
+    /// connection must resolve ONCE, not once per request. tokio Mutex —
+    /// held across the store round-trip so concurrent misses wait for the
+    /// in-flight fill and then hit the cache on their re-check.
+    pub external_fill_lock: tokio::sync::Mutex<()>,
     /// OAuth connections whose refresh_token was rejected (`invalid_grant`) at
     /// /use — surfaced via `/registry` as `needs_reauth` so the console prompts a
     /// reconnect. Keyed by `(vault_id, connection_id)`. In-memory + self-healing:
     /// cleared on a successful refresh or a fresh connect; a still-dead token
     /// re-marks on the next use.
     pub oauth_reauth_needed: Mutex<std::collections::HashSet<(String, String)>>,
+    /// Authorization codes this daemon has already REDEEMED (sha256-hex → when).
+    /// An OAuth code is single-use: a stale write (a buggy web Save, a
+    /// cross-device echo, or a pull that re-introduces the `connecting` entry
+    /// before our success push lands) can resurrect a code we already consumed.
+    /// Re-exchanging it earns `invalid_grant`, which the connect state machine
+    /// would misread as a terminal failure and use to clobber the live
+    /// connection. This is the idempotency key: skip any code already here.
+    /// Daemon-local + NEVER synced (so no stale write can revert it); in-memory
+    /// (a restart empties it, by which point the cloud has converged). Entries
+    /// self-reap after `REDEEMED_CODE_TTL` (codes expire ~10min upstream).
+    pub oauth_redeemed_codes: Mutex<HashMap<String, std::time::Instant>>,
     /// Most-recent lifecycle-ceremony op this daemon has open, keyed by
     /// `(vault_id, ceremony_name)` (e.g. `vault-unlock`). When a new ceremony op
     /// is created it supersedes the prior one — the daemon withdraws the stale
     /// op from the relay so the console stops showing "1 approval waiting" after
     /// a `sc unlock` was abandoned + retried. See requester-cancel design.
     pub live_ceremony_ops: Mutex<HashMap<(String, String), String>>,
+    /// The device egress proxy the resident proxy's forward hop tunnels through,
+    /// in a swappable cell so `sc proxy set/clear` HOT-reloads it via
+    /// `/proxy/reload` — no daemon restart, no vault re-unlock. Shared with the
+    /// hudsucker forward connector (see `proxy::upstream`); the reqwest side
+    /// swaps via `core::forward::reload_egress_proxy`.
+    pub egress_proxy: crate::proxy::upstream::EgressProxyCell,
+    /// In-flight loopback OAuth connects awaiting their `?code&state` redirect on
+    /// the shared 8765 callback. `state` → the (vault, connection) whose sealed
+    /// `connecting` entry holds the matching code_verifier. Populated each sync
+    /// tick from a `connecting` entry that carries a `state` and no code yet;
+    /// consumed + removed when `auth::loopback` catches the redirect. In-memory +
+    /// daemon-local; entries self-reap at the 2h ceiling (`LOOPBACK_PENDING_TTL`)
+    /// so an abandoned consent never lingers.
+    pub oauth_pending: Mutex<HashMap<String, PendingLoopback>>,
+    /// Guard so each on-demand loopback listener runs as a SINGLE shared
+    /// instance PER PORT: a port is present while its listener task is live.
+    /// `auth::loopback::ensure_running` inserts and spawns only on a fresh
+    /// port, so N concurrent connects share ONE listener per port (the daemon
+    /// never races itself into a port conflict). A port is removed when its
+    /// task exits (idle self-close or bind failure).
+    pub oauth_listener_running: Mutex<std::collections::HashSet<u16>>,
+    /// Secret values a local CLI deposited for a pending write op
+    /// (`connection-add` / `secret-set`), keyed by their salted digest. The op
+    /// carries ONLY the digest in `act.scope` — the full op JSON rides to the
+    /// cloud op-relay for the grant page, so plaintext values must never be in
+    /// it (and the salt keeps a weak value from being brute-forced from the
+    /// public digest). Approving the op binds the digest via β; the act then
+    /// takes the stash, re-verifies the digest, and writes the values. In-memory
+    /// + daemon-local; entries self-reap after their own op-window TTL.
+    pub op_payloads: Mutex<HashMap<String, OpPayloadEntry>>,
+}
+
+/// One deposited value-set awaiting its op's approval. See
+/// [`AppState::op_payloads`].
+pub struct OpPayloadEntry {
+    inserted_at: std::time::Instant,
+    ttl: std::time::Duration,
+    nonce: [u8; 32],
+    pub values: std::collections::BTreeMap<String, String>,
 }
 
 impl AppState {
@@ -264,20 +406,204 @@ impl AppState {
             services: ServiceRegistry::load(),
             events,
             vault_states: Mutex::new(HashMap::new()),
+            last_host_unions: Mutex::new(HashMap::new()),
             audits,
             sc,
             vault_write_locks: Mutex::new(HashMap::new()),
             sse_semaphores: Mutex::new(HashMap::new()),
             agent_key_hashes: Mutex::new(std::collections::HashSet::new()),
             agent_key_resync: tokio::sync::Mutex::new(None),
+            external_fill_lock: tokio::sync::Mutex::new(()),
             oauth_reauth_needed: Mutex::new(std::collections::HashSet::new()),
+            oauth_redeemed_codes: Mutex::new(HashMap::new()),
             live_ceremony_ops: Mutex::new(HashMap::new()),
+            egress_proxy: crate::proxy::upstream::new_cell(),
+            oauth_pending: Mutex::new(HashMap::new()),
+            oauth_listener_running: Mutex::new(std::collections::HashSet::new()),
+            op_payloads: Mutex::new(HashMap::new()),
         }
     }
 
+    /// Stash-lifetime ceiling. Each entry carries its own TTL — the vault's
+    /// approval window + slack (see op_payload.rs), so the stash strictly
+    /// outlives every moment its op is still approvable. The "user approved
+    /// but the deposited value had already expired" failure was exactly a
+    /// fixed 300s here under a longer op window; per-entry TTLs from the ONE
+    /// policy knob make that class structurally impossible. The ceiling only
+    /// bounds a pathological policy value.
+    const MAX_OP_PAYLOAD_TTL: std::time::Duration = std::time::Duration::from_secs(86_460);
+    /// Flood cap. A human runs one `sc connect` at a time; 32 concurrent
+    /// pending stashes is already pathological.
+    const MAX_OP_PAYLOADS: usize = 32;
+
+    /// Salted commitment over a value-set: `sha256(DS ‖ nonce ‖ canonical(values))`.
+    /// BTreeMap serialization is key-sorted, so `to_vec` is canonical.
+    fn op_payload_digest(
+        nonce: &[u8; 32],
+        values: &std::collections::BTreeMap<String, String>,
+    ) -> String {
+        use sha2::{Digest as _, Sha256};
+        let mut h = Sha256::new();
+        h.update(b"safeclaw/v1/op-payload");
+        h.update(nonce);
+        h.update(serde_json::to_vec(values).unwrap_or_default());
+        h.finalize().iter().map(|b| format!("{:02x}", b)).collect()
+    }
+
+    /// Deposit a value-set; returns the digest the op's `act.scope` must carry.
+    /// `None` when the stash is full (flood guard).
+    pub fn op_payload_insert(
+        &self,
+        values: std::collections::BTreeMap<String, String>,
+        ttl: std::time::Duration,
+    ) -> Option<String> {
+        use rand::RngCore as _;
+        let ttl = ttl.min(Self::MAX_OP_PAYLOAD_TTL);
+        let mut m = self.op_payloads.lock().unwrap();
+        let now = std::time::Instant::now();
+        m.retain(|_, e| now.duration_since(e.inserted_at) < e.ttl);
+        if m.len() >= Self::MAX_OP_PAYLOADS {
+            return None;
+        }
+        let mut nonce = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut nonce);
+        let digest = Self::op_payload_digest(&nonce, &values);
+        m.insert(
+            digest.clone(),
+            OpPayloadEntry {
+                inserted_at: now,
+                ttl,
+                nonce,
+                values,
+            },
+        );
+        Some(digest)
+    }
+
+    /// Consume the stash for an approved op. Single-use (removed on take);
+    /// expired entries and digest mismatches (defense-in-depth recompute)
+    /// yield `None` — the caller fails the act closed.
+    pub fn op_payload_take(
+        &self,
+        digest: &str,
+    ) -> Option<std::collections::BTreeMap<String, String>> {
+        let entry = self.op_payloads.lock().unwrap().remove(digest)?;
+        if entry.inserted_at.elapsed() >= entry.ttl {
+            return None;
+        }
+        if Self::op_payload_digest(&entry.nonce, &entry.values) != digest {
+            return None;
+        }
+        Some(entry.values)
+    }
+
     /// Replace the synced account-level agent-key hash-set (sha256 hex).
-    pub fn set_agent_key_hashes(&self, hashes: std::collections::HashSet<String>) {
-        *self.agent_key_hashes.lock().unwrap() = hashes;
+    /// Returns whether the set actually changed, so the 30s refresh loop can
+    /// log only real updates instead of one line per tick.
+    pub fn set_agent_key_hashes(&self, hashes: std::collections::HashSet<String>) -> bool {
+        let mut cur = self.agent_key_hashes.lock().unwrap();
+        let changed = *cur != hashes;
+        *cur = hashes;
+        changed
+    }
+
+    /// TTL for the redeemed-code ledger. OAuth authorization codes expire
+    /// ~10min after issue; 15min covers clock skew, then entries self-reap.
+    const REDEEMED_CODE_TTL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+    /// Record that this daemon successfully redeemed `code` — the idempotency
+    /// key that stops a stale re-introduction from re-exchanging it. See
+    /// [`Self::oauth_redeemed_codes`].
+    pub fn note_code_redeemed(&self, code: &str) {
+        let mut m = self.oauth_redeemed_codes.lock().unwrap();
+        Self::reap_redeemed(&mut m);
+        m.insert(crate::api_key::sha256_hex(code), std::time::Instant::now());
+    }
+
+    /// True iff this daemon already redeemed `code` — a re-exchange would be a
+    /// no-win `invalid_grant`, so the connect machine skips it.
+    pub fn was_code_redeemed(&self, code: &str) -> bool {
+        let mut m = self.oauth_redeemed_codes.lock().unwrap();
+        Self::reap_redeemed(&mut m);
+        m.contains_key(&crate::api_key::sha256_hex(code))
+    }
+
+    fn reap_redeemed(m: &mut HashMap<String, std::time::Instant>) {
+        let now = std::time::Instant::now();
+        m.retain(|_, t| now.duration_since(*t) < Self::REDEEMED_CODE_TTL);
+    }
+
+    /// Ceiling on how long a loopback connect stays matchable while awaiting its
+    /// redirect. The primary driver is "there's an unfinished connect"; this 2h
+    /// cap is the backstop so an abandoned consent never keeps the entry alive
+    /// forever. Generous on purpose — the listener is benign (`auth::loopback`).
+    const LOOPBACK_PENDING_TTL: std::time::Duration = std::time::Duration::from_secs(2 * 60 * 60);
+
+    /// Register (or refresh) a loopback connect awaiting its `?code&state`
+    /// redirect. Idempotent — a repeated sync tick re-inserts the same mapping
+    /// harmlessly (and refreshes its 2h clock).
+    pub fn note_loopback_pending(&self, state: &str, vault_id: &str, conn_id: &str, port: u16) {
+        if state.is_empty() {
+            return;
+        }
+        let mut m = self.oauth_pending.lock().unwrap();
+        Self::reap_loopback(&mut m);
+        m.insert(
+            state.to_string(),
+            PendingLoopback {
+                vault_id: vault_id.to_string(),
+                conn_id: conn_id.to_string(),
+                port,
+                inserted_at: std::time::Instant::now(),
+            },
+        );
+    }
+
+    /// Resolve + REMOVE the (vault, connection) for a caught `state`, or `None`
+    /// if unknown/expired. Removal makes the match single-use: a replayed
+    /// redirect finds nothing (and gets the bland 404).
+    pub fn take_loopback_pending(&self, state: &str) -> Option<PendingLoopback> {
+        if state.is_empty() {
+            return None;
+        }
+        let mut m = self.oauth_pending.lock().unwrap();
+        Self::reap_loopback(&mut m);
+        m.remove(state)
+    }
+
+    /// True iff some loopback connect is awaiting a redirect on `port` (reaps
+    /// expired entries first). Drives that port's on-demand listener: non-empty
+    /// ⇒ keep (or open) its window; empty ⇒ let it self-close.
+    pub fn has_loopback_pending_on(&self, port: u16) -> bool {
+        let mut m = self.oauth_pending.lock().unwrap();
+        Self::reap_loopback(&mut m);
+        m.values().any(|p| p.port == port)
+    }
+
+    /// The distinct ports with a connect currently awaiting a redirect — one
+    /// on-demand listener per entry (`auth::loopback::ensure_running`).
+    pub fn pending_loopback_ports(&self) -> Vec<u16> {
+        let mut m = self.oauth_pending.lock().unwrap();
+        Self::reap_loopback(&mut m);
+        let mut ports: Vec<u16> = m.values().map(|p| p.port).collect();
+        ports.sort_unstable();
+        ports.dedup();
+        ports
+    }
+
+    /// Drop any pending-loopback entries for a (vault, connection) that reached a
+    /// terminal state (completed / failed), so the on-demand listener can close
+    /// promptly instead of lingering to the 2h cap. The auto-catch path already
+    /// took its entry out; this covers the paste-fallback path, whose pre-seal
+    /// registered an entry no redirect ever consumed.
+    pub fn clear_loopback_for_conn(&self, vault_id: &str, conn_id: &str) {
+        let mut m = self.oauth_pending.lock().unwrap();
+        m.retain(|_, p| !(p.vault_id == vault_id && p.conn_id == conn_id));
+    }
+
+    fn reap_loopback(m: &mut HashMap<String, PendingLoopback>) {
+        let now = std::time::Instant::now();
+        m.retain(|_, p| now.duration_since(p.inserted_at) < Self::LOOPBACK_PENDING_TTL);
     }
 
     /// Emit an event into the broadcast channel. Silently swallows the "no
@@ -307,8 +633,47 @@ impl AppState {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
+        // Background external-key enumeration: one list() per store so the
+        // registry/entries surfaces see the flat namespace without a network
+        // call on their read path. The task holds only the shared adapters
+        // and the cache's keys slot — never AppState — so a re-unlock that
+        // replaces the cache simply orphans this task's slot harmlessly.
+        // Handle::try_current keeps plain #[test] callers (no runtime) safe.
+        if !cache.external_stores.is_empty() {
+            if let Ok(rt) = tokio::runtime::Handle::try_current() {
+                let adapters: Vec<(String, Arc<crate::store::Adapter>)> = cache
+                    .external_stores
+                    .iter()
+                    .map(|(id, (_, a))| (id.clone(), a.clone()))
+                    .collect();
+                let slot = cache.external_keys.clone();
+                let vid = vault_id.clone();
+                rt.spawn(async move {
+                    let mut all = std::collections::HashSet::new();
+                    for (store_id, adapter) in adapters {
+                        match adapter.list().await {
+                            Ok(names) => all.extend(names),
+                            // Accessor-only SAs can't list — resolution still
+                            // works (lazy fill amends the slot on first use).
+                            Err(e) => tracing::warn!(vault = %vid, store = %store_id, "external key enumeration failed: {}", e),
+                        }
+                    }
+                    if !all.is_empty() {
+                        tracing::info!(vault = %vid, keys = all.len(), "external store keys enumerated");
+                        *slot.lock().unwrap() = all;
+                    }
+                });
+            }
+        }
         let mut states = self.vault_states.lock().unwrap();
-        states.insert(vault_id, VaultState::Unlocked { cache, state_key, unlocked_at });
+        states.insert(
+            vault_id,
+            VaultState::Unlocked {
+                cache,
+                state_key,
+                unlocked_at,
+            },
+        );
     }
 
     /// Clone the retained state key `K` for an Unlocked vault, or `None` when
@@ -414,9 +779,7 @@ impl AppState {
     ) -> Option<HashMap<String, Vec<u8>>> {
         let states = self.vault_states.lock().unwrap();
         match states.get(vault_id) {
-            Some(VaultState::Unlocked { cache, .. }) => {
-                cache.allow_secrets.get(conn_id).cloned()
-            }
+            Some(VaultState::Unlocked { cache, .. }) => cache.allow_secrets.get(conn_id).cloned(),
             _ => None,
         }
     }
@@ -438,18 +801,75 @@ impl AppState {
         if let Some(VaultState::Unlocked { cache, .. }) = states.get_mut(vault_id) {
             cache.entries.insert(
                 conn_id.to_string(),
-                CacheEntry { value, expires_at },
+                // A real approval grant — consumable by the ask retry path.
+                CacheEntry {
+                    value,
+                    expires_at,
+                    from_bootstrap: false,
+                },
             );
         }
     }
 
-    /// Look up AND remove a cached auth value for `(vault, connection)` —
-    /// single-use consumption. The streaming captive-portal path uses this for
-    /// `ask-always` services so each streamed operation (e.g. a `cargo publish`)
-    /// burns its approval and the next one re-prompts for a fresh passkey.
-    /// Honors TTL expiry like [`Self::cache_lookup`]; `None` when locked /
-    /// absent / expired.
-    pub fn cache_take(&self, vault_id: &str, conn_id: &str) -> Option<Vec<u8>> {
+    /// Store an `ask-always` one-shot grant, bound to the request tuple the
+    /// user's passkey approved. Overwrites a prior grant for the same tuple
+    /// (a fresh tap supersedes). No-op when the vault is locked.
+    ///
+    /// See [`ASK_ALWAYS_REPLAY_WINDOW_SECS`] for the expiry callers should use.
+    pub fn op_grant_insert(
+        &self,
+        vault_id: &str,
+        conn_id: &str,
+        method: &str,
+        host: &str,
+        path: &str,
+        scope_digest: &str,
+        value: Vec<u8>,
+        expires_at: u64,
+    ) {
+        let mut states = self.vault_states.lock().unwrap();
+        if let Some(VaultState::Unlocked { cache, .. }) = states.get_mut(vault_id) {
+            cache.op_grants.insert(
+                (
+                    conn_id.to_string(),
+                    method.to_string(),
+                    host.to_ascii_lowercase(),
+                    path.to_string(),
+                    scope_digest.to_string(),
+                ),
+                CacheEntry {
+                    value,
+                    expires_at: Some(expires_at),
+                    from_bootstrap: false,
+                },
+            );
+        }
+    }
+
+    /// Redeem the scope-bound grant for exactly this request tuple. A request
+    /// whose (method, host, path, scope_digest) differs from what the user
+    /// approved is a miss and re-prompts; there is NO fallback to the conn-keyed
+    /// `entries` (allow residency / plain-ask leftovers are not grants for a
+    /// bound action). `None` when locked / absent / expired.
+    ///
+    /// `consume` distinguishes the two bound tiers:
+    ///   - `ask-always` → `true`: single-use, removed on redeem (each request
+    ///     re-prompts).
+    ///   - a scoped `ask` → `false`: PEEK — the grant is reused for the SAME
+    ///     bound action within its window, but a DIFFERENT action (different
+    ///     digest) still misses and re-prompts. (An irreversible/spending action
+    ///     should be `ask-always`: a peeked window still lets the identical
+    ///     spend repeat, which for money is drainage.)
+    pub fn op_grant_take(
+        &self,
+        vault_id: &str,
+        conn_id: &str,
+        method: &str,
+        host: &str,
+        path: &str,
+        scope_digest: &str,
+        consume: bool,
+    ) -> Option<Vec<u8>> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -459,18 +879,70 @@ impl AppState {
             Some(VaultState::Unlocked { cache, .. }) => cache,
             _ => return None,
         };
-        let entry = cache.entries.remove(conn_id)?;
+        let key = (
+            conn_id.to_string(),
+            method.to_string(),
+            host.to_ascii_lowercase(),
+            path.to_string(),
+            scope_digest.to_string(),
+        );
+        // Peek first so an expired entry (of either tier) is dropped and a
+        // reusable ask grant survives a hit.
+        let entry = cache.op_grants.get(&key)?;
+        if entry.expires_at.is_some_and(|exp| now >= exp) {
+            cache.op_grants.remove(&key);
+            return None;
+        }
+        if consume {
+            cache.op_grants.remove(&key).map(|e| e.value)
+        } else {
+            Some(entry.value.clone())
+        }
+    }
+
+    /// Like [`Self::cache_lookup`] but **grant-only**: a bootstrap-resident value
+    /// (`from_bootstrap`) is treated as a miss. Used by the `ask` path so the
+    /// first matching request forces a passkey approval instead of riding the
+    /// connection's allow-level residency; after approval the downgraded (Allow)
+    /// retry reads the real grant via `cache_lookup`. Non-destructive; honors TTL.
+    pub fn cache_lookup_grant(&self, vault_id: &str, conn_id: &str) -> Option<Vec<u8>> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let mut states = self.vault_states.lock().unwrap();
+        let cache = match states.get_mut(vault_id) {
+            Some(VaultState::Unlocked { cache, .. }) => cache,
+            _ => return None,
+        };
+        let entry = cache.entries.get(conn_id)?;
+        if entry.from_bootstrap {
+            return None;
+        }
         if let Some(exp) = entry.expires_at {
             if now >= exp {
+                cache.entries.remove(conn_id);
                 return None;
             }
         }
-        Some(entry.value)
+        Some(entry.value.clone())
     }
 
     /// Look up a cached OAuth `access_token` by `sha256(refresh_token)` hex (§5).
     /// Returns `None` if locked, never minted, or past its expiry. Lazily evicts
     /// expired entries (same shape as `cache_lookup`).
+    /// The per-vault async write lock — serializes anything that reseals the
+    /// vault body (connect exchange, oauth refresh-token rotation) so two writers
+    /// can't clobber each other. Same map the connect + sync paths use inline.
+    pub fn vault_write_lock(&self, vault_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.vault_write_locks.lock().unwrap();
+        Arc::clone(
+            locks
+                .entry(vault_id.to_string())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+        )
+    }
+
     pub fn oauth_access_lookup(&self, vault_id: &str, refresh_hash: &str) -> Option<Vec<u8>> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -510,6 +982,8 @@ impl AppState {
                 CacheEntry {
                     value,
                     expires_at: Some(expires_at),
+                    // oauth_access has its own lookup path; the flag is unread here.
+                    from_bootstrap: false,
                 },
             );
         }
@@ -558,9 +1032,9 @@ impl AppState {
     /// Resolution (PROTOCOL.md §6.4):
     ///   - merge the service's built-in rules with this connection's
     ///     user rules (`cache.policy.connections[conn].rules`),
-    ///   - most-restrictive matching rule wins (deny-override), its `risk`
-    ///     resolved through the live risk map (`cache.policy.risk`),
-    ///   - else connection / category / global default floor, else ask-always,
+    ///   - most-restrictive matching rule wins (deny-override), each rule's
+    ///     decision being its own `level`,
+    ///   - else connection / tag / global default floor, else ask-always,
     ///   - **active `ask` approvals** — if the decision is `Ask`, a rule
     ///     matched, AND the `(connection, rule_id, method)` triple is in the
     ///     unexpired rule_approvals cache, downgrades to `Allow` so the
@@ -574,7 +1048,12 @@ impl AppState {
         path: &str,
         host: &str,
         body: Option<&str>,
-    ) -> Option<(crate::core::policy::AccessLevel, Option<String>, Option<u64>)> {
+        vars: &crate::core::policy::VarMap,
+    ) -> Option<(
+        crate::core::policy::AccessLevel,
+        Option<String>,
+        Option<u64>,
+    )> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -605,18 +1084,19 @@ impl AppState {
             conn_policy.and_then(|c| c.default.as_ref()),
             builtin_levels.as_ref(),
         );
-        // The risk map + category/global floors live in `cache.policy` (the
-        // user's `aux.policy` overlaid on compiled defaults at refresh). Read
-        // live here → a risk-map edit is realtime on the next request.
-        let category = self.services.default_category(service_id);
+        // The tag/global floors live in `cache.policy` (the user's
+        // `aux.policy` overlaid on compiled defaults at refresh). Read live
+        // here → a policy edit is realtime on the next request.
+        let tags = self.services.service_tags(service_id);
         let (level, matched_rule, ttl) = crate::core::policy::evaluate_with_match(
             method,
             path,
             body,
+            vars,
             Some(&rules),
             connection_levels.as_ref(),
             &cache.policy,
-            Some(category),
+            tags,
         );
 
         // Cache hit honors the `ask`-with-TTL semantic, but the grant is
@@ -624,7 +1104,7 @@ impl AppState {
         // for the same (service, rule, method), not yet expired, downgrades
         // this Ask to Allow so the request fast-paths without a passkey
         // prompt. Two deliberate bounds keep a window from over-reaching:
-        //   - No rule matched (category-/service-default Ask) → never a hit:
+        //   - No rule matched (tag-/service-default Ask) → never a hit:
         //     there is no author-defined path scope to bound the grant.
         //   - Method is part of the key → approving a GET cannot fast-path a
         //     later POST/DELETE inside the window.
@@ -644,11 +1124,7 @@ impl AppState {
                 );
                 if let Some(&exp) = cache.rule_approvals.get(&key) {
                     if exp > now {
-                        return Some((
-                            crate::core::policy::AccessLevel::Allow,
-                            matched_rule,
-                            ttl,
-                        ));
+                        return Some((crate::core::policy::AccessLevel::Allow, matched_rule, ttl));
                     } else {
                         cache.rule_approvals.remove(&key);
                     }
@@ -665,7 +1141,7 @@ impl AppState {
     /// `ttl` falling back to `Policy.timeout` or a safe 300s default.
     ///
     /// The grant is scoped to `(service, rule_id, method)`. Two bounds:
-    ///   - `rule_id == None` (category-/service-default Ask, no rule matched)
+    ///   - `rule_id == None` (tag-/service-default Ask, no rule matched)
     ///     is **not recorded** — without an author-defined path scope a grant
     ///     would blanket the whole service, so such ops re-prompt every time.
     ///   - `method` is part of the key, so approving one verb never lets a
@@ -703,6 +1179,26 @@ impl AppState {
         }
     }
 
+    /// The approval-hold window (seconds): how long a pending `ask` op waits
+    /// for the passkey gesture before it expires. This is the user's
+    /// `aux.policy.timeout` ("Approval timeout" in the console), or a 30-minute
+    /// default. THE one approval window (SSOT): op.rs stamps it onto every
+    /// ceremony op, the broker ask path mints with it, the op-payload stash
+    /// and the relay poll budget derive from it. DISTINCT from the post-approval `ask`-once grant window (the
+    /// rule/floor `ttl`) — a long grant window must not stretch the deadline the
+    /// user has to actually approve. Falls back to the default when the vault is
+    /// locked or sets no timeout.
+    pub fn policy_approval_hold(&self, vault_id: &str) -> u64 {
+        const DEFAULT_APPROVAL_HOLD: u64 = 1800;
+        let states = self.vault_states.lock().unwrap();
+        match states.get(vault_id) {
+            Some(VaultState::Unlocked { cache, .. }) => {
+                cache.policy.timeout.unwrap_or(DEFAULT_APPROVAL_HOLD)
+            }
+            _ => DEFAULT_APPROVAL_HOLD,
+        }
+    }
+
     // ── Proxy-facing accessors (resident phantom-only proxy) ─────────────────
 
     /// Clone a connection record out of the unlocked routing snapshot. `None`
@@ -719,6 +1215,21 @@ impl AppState {
         }
     }
 
+    /// Snapshot this vault's per-vault custom (`aux.services`) definitions from
+    /// the unlocked cache. The OAuth connect-finisher resolves a custom service's
+    /// exchange config against these — the global `self.services` registry holds
+    /// built-ins only. Empty when the vault is Locked or none are authored.
+    pub fn custom_services_snapshot(
+        &self,
+        vault_id: &str,
+    ) -> std::collections::HashMap<String, crate::service::ServiceDef> {
+        let states = self.vault_states.lock().unwrap();
+        match states.get(vault_id) {
+            Some(VaultState::Unlocked { cache, .. }) => cache.custom_services.clone(),
+            _ => Default::default(),
+        }
+    }
+
     /// The exact FQDNs a connection's credential may egress to, resolved
     /// through the compiled registry and the vault's custom services. `None`
     /// when the vault is Locked or the connection id is unknown.
@@ -730,37 +1241,71 @@ impl AppState {
         };
         let conn_rec = cache.connections.get(conn)?;
         let def = conn_rec.service.as_deref().and_then(|s| {
-            self.services
+            // custom-FIRST (see proxy::handler)
+            cache
+                .custom_services
                 .get(s)
                 .cloned()
-                .or_else(|| cache.custom_services.get(s).cloned())
+                .or_else(|| self.services.get(s).cloned())
         });
         Some(crate::core::host::resolved_hosts(conn_rec, def.as_ref()))
     }
 
     /// True iff `host` is in the union of `resolved_hosts` over the connections
-    /// of ALL currently-unlocked vaults. Decides MITM-vs-blind-tunnel at CONNECT
-    /// time: only hosts a connection anchors are decrypted; everything else is a
-    /// blind tunnel. Not vid-scoped on purpose — we MITM (and can return a
-    /// precise error) even when the CONNECT's vid userinfo is wrong or absent.
-    pub fn host_in_any_unlocked_union(&self, host: &str) -> bool {
+    /// of all unlocked vaults, OR in a locked vault's remembered union
+    /// (`last_host_unions`). Decides MITM-vs-blind-tunnel at CONNECT time: only
+    /// hosts a connection anchors are decrypted; everything else is a blind
+    /// tunnel. Including locked vaults' last-known anchors means a phantom sent
+    /// while locked reaches `pipeline`'s explicit `vault_locked` refusal instead
+    /// of tunneling to the upstream literally; phantom-less traffic to those
+    /// hosts still forwards untouched. Not vid-scoped on purpose — we MITM (and
+    /// can return a precise error) even when the CONNECT's vid userinfo is
+    /// wrong or absent.
+    pub fn host_in_any_known_union(&self, host: &str) -> bool {
         let states = self.vault_states.lock().unwrap();
-        for st in states.values() {
+        let mut remembered = self.last_host_unions.lock().unwrap();
+        let mut hit = false;
+        // Unlocked vaults are authoritative; refresh each one's remembered
+        // union in the same pass so it is current whenever the vault locks.
+        for (vid, st) in states.iter() {
             let VaultState::Unlocked { cache, .. } = st else {
                 continue;
             };
+            let mut hosts: Vec<String> = Vec::new();
             for conn_rec in cache.connections.values() {
                 let def = conn_rec.service.as_deref().and_then(|s| {
-                    self.services
+                    // custom-FIRST (see proxy::handler)
+                    cache
+                        .custom_services
                         .get(s)
                         .cloned()
-                        .or_else(|| cache.custom_services.get(s).cloned())
+                        .or_else(|| self.services.get(s).cloned())
                 });
                 for h in crate::core::host::resolved_hosts(conn_rec, def.as_ref()) {
-                    if crate::core::host::host_matches_exact(host, &h) {
-                        return true;
-                    }
+                    hosts.push(h.to_ascii_lowercase());
                 }
+            }
+            if hosts
+                .iter()
+                .any(|h| crate::core::host::host_matches_exact(host, h))
+            {
+                hit = true;
+            }
+            remembered.insert(vid.clone(), hosts);
+        }
+        if hit {
+            return true;
+        }
+        // Locked (or never-unlocked-this-boot) vaults: last-known anchors.
+        for (vid, hosts) in remembered.iter() {
+            if matches!(states.get(vid.as_str()), Some(VaultState::Unlocked { .. })) {
+                continue;
+            }
+            if hosts
+                .iter()
+                .any(|h| crate::core::host::host_matches_exact(host, h))
+            {
+                return true;
             }
         }
         false
@@ -782,7 +1327,6 @@ impl AppState {
             }
         }
     }
-
 }
 
 #[cfg(test)]
@@ -801,8 +1345,30 @@ mod tests {
             rp_id: "localhost".into(),
             admin_key: None,
             relay_url: None,
+            body_cap: crate::config::DEFAULT_BODY_CAP,
         };
         AppState::new(cfg)
+    }
+
+    /// The op-payload stash is single-use and digest-verified: a deposit is
+    /// retrievable exactly once by its returned digest, and an unknown digest
+    /// (wrong, replayed, or post-restart) fails closed.
+    #[test]
+    fn op_payload_deposit_is_single_use_and_digest_bound() {
+        let state = test_state();
+        let mut values = std::collections::BTreeMap::new();
+        values.insert("MIMO_API_TOKEN".to_string(), "s3cret".to_string());
+        let digest = state
+            .op_payload_insert(values.clone(), std::time::Duration::from_secs(300))
+            .expect("stash slot");
+        // Two deposits of the SAME values must not collide (fresh salt each).
+        let digest2 = state
+            .op_payload_insert(values.clone(), std::time::Duration::from_secs(300))
+            .expect("stash slot");
+        assert_ne!(digest, digest2, "salted digests must differ per deposit");
+        assert_eq!(state.op_payload_take(&digest), Some(values));
+        assert_eq!(state.op_payload_take(&digest), None, "single-use");
+        assert_eq!(state.op_payload_take("deadbeef"), None, "unknown digest");
     }
 
     fn unlock_with_empty_cache(state: &AppState, vault_id: &str) {
@@ -810,6 +1376,54 @@ mod tests {
             vault_id.to_string(),
             SecretsCache::default(),
             zeroize::Zeroizing::new(Vec::new()),
+        );
+    }
+
+    /// Directly seed a bootstrap-resident entry (what `bootstrap_cache_from_view`
+    /// produces for an allow-read connection) — there's no public setter since
+    /// only unlock writes these.
+    fn insert_bootstrap(state: &AppState, vault_id: &str, conn: &str, value: &[u8]) {
+        let mut states = state.vault_states.lock().unwrap();
+        if let Some(VaultState::Unlocked { cache, .. }) = states.get_mut(vault_id) {
+            cache.entries.insert(
+                conn.to_string(),
+                CacheEntry {
+                    value: value.to_vec(),
+                    expires_at: None,
+                    from_bootstrap: true,
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn bootstrap_entry_serves_allow_but_never_ask_paths() {
+        let state = test_state();
+        unlock_with_empty_cache(&state, "v1");
+        insert_bootstrap(&state, "v1", "github", b"tok");
+        // allow fast-path uses the residency…
+        assert_eq!(state.cache_lookup("v1", "github"), Some(b"tok".to_vec()));
+        // …but ask must NOT: a bootstrap value is not a grant.
+        assert_eq!(state.cache_lookup_grant("v1", "github"), None);
+        // ask-always never reads `entries` at all — the residency (and even a
+        // real conn-keyed ask grant) is invisible to op_grant_take.
+        state.cache_insert("v1", "github", b"granted".to_vec(), None);
+        assert_eq!(
+            state.op_grant_take(
+                "v1",
+                "github",
+                "DELETE",
+                "api.github.com",
+                "/repos/a/b",
+                "",
+                true
+            ),
+            None
+        );
+        // The ask path sees its grant as usual.
+        assert_eq!(
+            state.cache_lookup_grant("v1", "github"),
+            Some(b"granted".to_vec())
         );
     }
 
@@ -824,26 +1438,199 @@ mod tests {
     }
 
     #[test]
-    fn cache_take_consumes_single_use() {
-        // Backs the streaming captive-portal `ask-always` path: each stream
-        // burns its approval so the next one re-prompts for a fresh passkey.
+    fn op_grant_take_consumes_single_use() {
+        // The ask-always captive-portal contract: one approval = one replay.
         let state = test_state();
         unlock_with_empty_cache(&state, "v1");
-        state.cache_insert("v1", "svc", b"tok".to_vec(), None);
+        let far = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 600;
+        state.op_grant_insert(
+            "v1",
+            "svc",
+            "POST",
+            "api.x.com",
+            "/v2/purchase",
+            "",
+            b"tok".to_vec(),
+            far,
+        );
         // First take returns the value …
-        assert_eq!(state.cache_take("v1", "svc"), Some(b"tok".to_vec()));
-        // … and removes it: a second take and a plain lookup both miss.
-        assert_eq!(state.cache_take("v1", "svc"), None);
+        assert_eq!(
+            state.op_grant_take("v1", "svc", "POST", "api.x.com", "/v2/purchase", "", true),
+            Some(b"tok".to_vec())
+        );
+        // … and removes it: a second take misses, and nothing leaked into the
+        // conn-keyed entries for the allow/ask paths to find.
+        assert_eq!(
+            state.op_grant_take("v1", "svc", "POST", "api.x.com", "/v2/purchase", "", true),
+            None
+        );
         assert_eq!(state.cache_lookup("v1", "svc"), None);
     }
 
+    /// Security regression (the $80/$180 hole): an ask-always grant is bound
+    /// to the REQUEST the user approved. A replay whose method, host, or path
+    /// differs must miss — and the miss must NOT consume the stored grant, so
+    /// the legitimate replay still works afterwards.
     #[test]
-    fn cache_take_honors_expiry() {
+    fn op_grant_take_is_request_bound() {
         let state = test_state();
         unlock_with_empty_cache(&state, "v1");
-        state.cache_insert("v1", "svc", b"stale".to_vec(), Some(0));
-        // Expired entry is not returned (and is consumed/dropped).
-        assert_eq!(state.cache_take("v1", "svc"), None);
+        let far = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 600;
+        state.op_grant_insert(
+            "v1",
+            "svc",
+            "POST",
+            "api.x.com",
+            "/v2/purchase",
+            "",
+            b"tok".to_vec(),
+            far,
+        );
+        // Different path / method / host / connection → all miss.
+        assert_eq!(
+            state.op_grant_take("v1", "svc", "POST", "api.x.com", "/v2/refund", "", true),
+            None
+        );
+        assert_eq!(
+            state.op_grant_take("v1", "svc", "DELETE", "api.x.com", "/v2/purchase", "", true),
+            None
+        );
+        assert_eq!(
+            state.op_grant_take("v1", "svc", "POST", "api.y.com", "/v2/purchase", "", true),
+            None
+        );
+        assert_eq!(
+            state.op_grant_take("v1", "other", "POST", "api.x.com", "/v2/purchase", "", true),
+            None
+        );
+        // Host comparison is case-insensitive (hosts are lowercased at insert).
+        assert_eq!(
+            state.op_grant_take("v1", "svc", "POST", "API.X.COM", "/v2/purchase", "", true),
+            Some(b"tok".to_vec())
+        );
+    }
+
+    #[test]
+    fn op_grant_take_honors_expiry() {
+        let state = test_state();
+        unlock_with_empty_cache(&state, "v1");
+        state.op_grant_insert(
+            "v1",
+            "svc",
+            "POST",
+            "api.x.com",
+            "/p",
+            "",
+            b"stale".to_vec(),
+            0,
+        );
+        // Expired grant is not returned (and is consumed/dropped).
+        assert_eq!(
+            state.op_grant_take("v1", "svc", "POST", "api.x.com", "/p", "", true),
+            None
+        );
+    }
+
+    /// Phase 2: the scope digest is part of the key. Approving `amount=80`
+    /// (digest_80) means a replay whose fields hash to a DIFFERENT digest (the
+    /// $180 request) misses — without consuming — so the honest $80 replay still
+    /// works afterwards.
+    #[test]
+    fn op_grant_take_is_scope_digest_bound() {
+        let state = test_state();
+        unlock_with_empty_cache(&state, "v1");
+        let far = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 600;
+        let d80 = crate::service::scope_digest(&[("amount".into(), "80".into())]);
+        let d180 = crate::service::scope_digest(&[("amount".into(), "180".into())]);
+        state.op_grant_insert(
+            "v1",
+            "svc",
+            "POST",
+            "api.x.com",
+            "/v2/purchase",
+            &d80,
+            b"tok".to_vec(),
+            far,
+        );
+        // The tampered ($180) replay misses and does NOT consume…
+        assert_eq!(
+            state.op_grant_take(
+                "v1",
+                "svc",
+                "POST",
+                "api.x.com",
+                "/v2/purchase",
+                &d180,
+                true
+            ),
+            None
+        );
+        // …so the honest ($80) replay still succeeds, exactly once.
+        assert_eq!(
+            state.op_grant_take("v1", "svc", "POST", "api.x.com", "/v2/purchase", &d80, true),
+            Some(b"tok".to_vec())
+        );
+        assert_eq!(
+            state.op_grant_take("v1", "svc", "POST", "api.x.com", "/v2/purchase", &d80, true),
+            None
+        );
+    }
+
+    /// A scoped `ask` peeks (reuses within its window for the SAME bound
+    /// action), while a DIFFERENT bound value still misses — so the request
+    /// consent is never a false promise, but the identical action isn't
+    /// re-prompted every time (that's the ask-vs-ask-always distinction).
+    #[test]
+    fn op_grant_take_peek_reuses_same_action_but_not_a_different_one() {
+        let state = test_state();
+        unlock_with_empty_cache(&state, "v1");
+        let far = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 600;
+        let d_read = crate::service::scope_digest(&[("q".into(), "alpha".into())]);
+        let d_other = crate::service::scope_digest(&[("q".into(), "beta".into())]);
+        state.op_grant_insert(
+            "v1",
+            "svc",
+            "POST",
+            "api.x.com",
+            "/search",
+            &d_read,
+            b"tok".to_vec(),
+            far,
+        );
+        // Peek (consume=false) reuses the SAME action any number of times…
+        assert_eq!(
+            state.op_grant_take("v1", "svc", "POST", "api.x.com", "/search", &d_read, false),
+            Some(b"tok".to_vec())
+        );
+        assert_eq!(
+            state.op_grant_take("v1", "svc", "POST", "api.x.com", "/search", &d_read, false),
+            Some(b"tok".to_vec())
+        );
+        // …but a DIFFERENT bound value misses (re-prompt), without disturbing the grant.
+        assert_eq!(
+            state.op_grant_take("v1", "svc", "POST", "api.x.com", "/search", &d_other, false),
+            None
+        );
+        assert_eq!(
+            state.op_grant_take("v1", "svc", "POST", "api.x.com", "/search", &d_read, false),
+            Some(b"tok".to_vec())
+        );
     }
 
     #[test]
@@ -880,13 +1667,13 @@ mod tests {
     /// a single approval blanket-authorized every verb on a service.
     #[test]
     fn ask_grant_is_scoped_to_method_and_rule() {
-        use crate::core::policy::{AccessLevel, ConnectionPolicy, Policy, RiskTier, RuleConfig};
+        use crate::core::policy::{AccessLevel, ConnectionPolicy, Policy, RuleConfig};
 
-        // Inject the test rules as the connection's user rules (medium → ask).
+        // Inject the test rules as the connection's user rules (level = ask).
         // "gh" has no service definition, so built-in is empty and these are the only rules.
         let ask_rule = |pat: &str| RuleConfig {
             match_pattern: Some(pat.to_string()),
-            risk: Some(RiskTier::Medium),
+            level: Some(AccessLevel::Ask),
             ttl: Some(60),
             ..Default::default()
         };
@@ -894,9 +1681,13 @@ mod tests {
         rules.insert("read".to_string(), ask_rule("GET /x"));
         rules.insert("write".to_string(), ask_rule("POST /x"));
         let mut policy = Policy::default();
-        policy
-            .connections
-            .insert("gh".to_string(), ConnectionPolicy { default: None, rules });
+        policy.connections.insert(
+            "gh".to_string(),
+            ConnectionPolicy {
+                default: None,
+                rules,
+            },
+        );
 
         let state = test_state();
         let vid = "v-scope";
@@ -907,7 +1698,16 @@ mod tests {
         // Baseline: GET resolves to Ask under the "read" rule. (Default
         // connection: connection_id == service_id == "gh".)
         let (lvl, rule, _) = state
-            .evaluate_request_policy(vid, "gh", "gh", "GET", "/x", "api.gh.com", None)
+            .evaluate_request_policy(
+                vid,
+                "gh",
+                "gh",
+                "GET",
+                "/x",
+                "api.gh.com",
+                None,
+                &crate::core::policy::VarMap::new(),
+            )
             .unwrap();
         assert_eq!(lvl, AccessLevel::Ask);
         assert_eq!(rule.as_deref(), Some("read"));
@@ -917,14 +1717,32 @@ mod tests {
 
         // The same GET toward the same host now fast-paths (the feature works).
         let (lvl, _, _) = state
-            .evaluate_request_policy(vid, "gh", "gh", "GET", "/x", "api.gh.com", None)
+            .evaluate_request_policy(
+                vid,
+                "gh",
+                "gh",
+                "GET",
+                "/x",
+                "api.gh.com",
+                None,
+                &crate::core::policy::VarMap::new(),
+            )
             .unwrap();
         assert_eq!(lvl, AccessLevel::Allow, "approved GET should fast-path");
 
         // Same GET/rule toward a DIFFERENT host must NOT fast-path — the grant
         // is host-scoped (E2E-5 oracle: approve host A → call host B → re-ask).
         let (lvl, _, _) = state
-            .evaluate_request_policy(vid, "gh", "gh", "GET", "/x", "evil.gh.com", None)
+            .evaluate_request_policy(
+                vid,
+                "gh",
+                "gh",
+                "GET",
+                "/x",
+                "evil.gh.com",
+                None,
+                &crate::core::policy::VarMap::new(),
+            )
             .unwrap();
         assert_eq!(
             lvl,
@@ -934,7 +1752,16 @@ mod tests {
 
         // A POST is a DIFFERENT verb/rule — the GET approval must not cover it.
         let (lvl, rule, _) = state
-            .evaluate_request_policy(vid, "gh", "gh", "POST", "/x", "api.gh.com", None)
+            .evaluate_request_policy(
+                vid,
+                "gh",
+                "gh",
+                "POST",
+                "/x",
+                "api.gh.com",
+                None,
+                &crate::core::policy::VarMap::new(),
+            )
             .unwrap();
         assert_eq!(
             lvl,
@@ -943,7 +1770,7 @@ mod tests {
         );
         assert_eq!(rule.as_deref(), Some("write"));
 
-        // A category-default Ask (no rule) is never recorded, so it can never
+        // A tag-default Ask (no rule) is never recorded, so it can never
         // produce a fast-path — record is a no-op for rule_id == None.
         state.record_ask_approval(vid, "gh", None, "GET", "api.gh.com", 60);
     }

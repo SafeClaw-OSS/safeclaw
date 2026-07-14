@@ -1,6 +1,8 @@
 [service]
 id = "nodpay"
 name = "NodPay"
+# Classification for browse/filter and policy tag-floors; lowercase-kebab, multi OK.
+tags = ["wallet"]
 # Hidden for now (per-service call): vault-native web3 signing exists + works,
 # but isn't surfaced in the catalog until we decide how/whether to expose it.
 hidden = true

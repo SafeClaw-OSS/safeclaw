@@ -1,0 +1,122 @@
+# GitHub policy. Routine developer work — issues, pull requests, comments,
+# reviews, labels, merges, `git push`, creating releases, commit statuses /
+# checks — flows freely: the token never enters the agent and egress is
+# host-anchored, so the approval gate is spent only on the consequential few —
+# operations that destroy work, change who can access a repo, or feed the CI /
+# supply chain (which runs arbitrary code). Each rule is a per-connection
+# override point in the console; loosen or tighten to taste.
+#
+# git-over-HTTPS (clone / fetch / push on github.com) is not a REST path and
+# rides the write=allow floor — the phantom is substituted at egress, git never
+# sees the token. Gating it would prompt on every git object request.
+
+[default]
+read = "allow"
+write = "allow"
+
+# ── Destroy / lose work (irreversible) ───────────────────────────────────────
+[[rule]]
+id = "delete-repo"
+label = "Delete repository"
+match = "DELETE /repos/*/*"
+level = "ask-always"
+
+[[rule]]
+id = "transfer-repo"
+label = "Transfer repository to a new owner"
+match = "POST /repos/*/*/transfer"
+level = "ask-always"
+
+# ── Change who can access (security posture) ─────────────────────────────────
+[[rule]]
+id = "make-public"
+label = "Make repository public"
+match = "PATCH /repos/*/*"
+body = "\"private\"\\s*:\\s*false|\"visibility\"\\s*:\\s*\"public\""
+level = "ask-always"
+
+[[rule]]
+id = "add-collaborator"
+label = "Add or change a collaborator"
+match = "PUT /repos/*/*/collaborators/*"
+level = "ask-always"
+
+[[rule]]
+id = "remove-collaborator"
+label = "Remove a collaborator"
+match = "DELETE /repos/*/*/collaborators/*"
+level = "ask-always"
+
+[[rule]]
+id = "set-branch-protection"
+label = "Change branch protection"
+match = "PUT /repos/*/*/branches/**"
+level = "ask-always"
+
+[[rule]]
+id = "remove-branch-protection"
+label = "Remove branch protection"
+match = "DELETE /repos/*/*/branches/**"
+level = "ask-always"
+
+[[rule]]
+id = "add-deploy-key"
+label = "Add a deploy key"
+match = "POST /repos/*/*/keys"
+level = "ask-always"
+
+# ── Supply chain / code execution (CI runs arbitrary code; exfil surface) ────
+[[rule]]
+id = "add-webhook"
+label = "Add a webhook"
+match = "POST /repos/*/*/hooks"
+level = "ask-always"
+
+[[rule]]
+id = "edit-webhook"
+label = "Edit a webhook"
+match = "PATCH /repos/*/*/hooks/*"
+level = "ask-always"
+
+[[rule]]
+id = "set-actions-secret"
+label = "Set an Actions secret"
+match = "PUT /repos/*/*/actions/secrets/*"
+level = "ask-always"
+
+[[rule]]
+id = "set-org-actions-secret"
+label = "Set an org Actions secret"
+match = "PUT /orgs/*/actions/secrets/*"
+level = "ask-always"
+
+[[rule]]
+id = "dispatch-workflow"
+label = "Trigger a workflow run"
+match = "POST /repos/*/*/actions/workflows/*/dispatches"
+level = "ask-always"
+
+[[rule]]
+id = "repo-dispatch"
+label = "Trigger a repository_dispatch event"
+match = "POST /repos/*/*/dispatches"
+level = "ask-always"
+
+[[rule]]
+id = "register-runner"
+label = "Register a self-hosted runner"
+match = "POST /repos/*/*/actions/runners/registration-token"
+level = "ask-always"
+
+# ── Deletions that are recoverable → ask once, cached for the window ──────────
+[[rule]]
+id = "delete-branch"
+label = "Delete a branch or tag"
+match = "DELETE /repos/*/*/git/refs/**"
+level = "ask"
+
+[[rule]]
+id = "delete-release"
+label = "Delete a release"
+match = "DELETE /repos/*/*/releases/*"
+level = "ask"

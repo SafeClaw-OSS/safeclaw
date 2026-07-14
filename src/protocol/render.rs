@@ -21,19 +21,17 @@ pub fn render_operation(op: &Operation) -> String {
                 .unwrap_or("(new device)");
             format!("Add passkey \"{}\" to this vault.", device)
         }
-        ActType::Enroll => {
-            match as_enroll_credential(op) {
-                Ok(cred) => format!(
-                    "Set up vault with passkey \"{}\".",
-                    if cred.device_name.is_empty() {
-                        "(new device)"
-                    } else {
-                        cred.device_name.as_str()
-                    }
-                ),
-                Err(_) => "Set up vault.".to_string(),
-            }
-        }
+        ActType::Enroll => match as_enroll_credential(op) {
+            Ok(cred) => format!(
+                "Set up vault with passkey \"{}\".",
+                if cred.device_name.is_empty() {
+                    "(new device)"
+                } else {
+                    cred.device_name.as_str()
+                }
+            ),
+            Err(_) => "Set up vault.".to_string(),
+        },
         ActType::Write => "Update vault contents.".to_string(),
         ActType::Export => {
             format!(
@@ -41,10 +39,109 @@ pub fn render_operation(op: &Operation) -> String {
                 op.act.target
             )
         }
-        ActType::Use => format!(
-            "Use the secret at \"{}\" for a brokered call (target details in scope).",
-            op.act.target
-        ),
+        ActType::Use => render_use(op),
+        // Control-plane acts: ONE source of copy — the acts.toml descriptor
+        // (action line + non-empty fact rows), so the CLI prompt, audit row,
+        // and grant page can't drift. Table-less acts get the humanized slug,
+        // never a raw debug dump.
+        ActType::Custom(name) => match crate::protocol::consent::consent_for(op) {
+            Some(c) => {
+                let facts = c
+                    .facts
+                    .iter()
+                    .map(|(l, v)| format!("{}: {}", l, v))
+                    .collect::<Vec<_>>()
+                    .join(" · ");
+                if facts.is_empty() {
+                    format!("{}.", c.action)
+                } else {
+                    format!("{} ({}).", c.action, facts)
+                }
+            }
+            None => crate::protocol::consent::fallback_line(name, &op.act.target),
+        },
         other => format!("Operation: {:?}", other),
+    }
+}
+
+/// A brokered Use op. Surface the request line (method + host + path) and, for
+/// a Phase-2 scope, the consent — so a HEADLESS / CLI approver (no console)
+/// sees what the console's rich card shows, not just the target slot. The
+/// `consent` template is interpolated over the bound `scope_vars`; with none,
+/// the bound fields are listed. (A `render` hint is a console-only concern.)
+fn render_use(op: &Operation) -> String {
+    let scope = &op.act.scope;
+    let s = |k: &str| scope.get(k).and_then(|v| v.as_str()).unwrap_or("");
+    let (method, host, path) = (s("method"), s("host"), s("path"));
+
+    let bound: Vec<(String, String)> = scope
+        .get("scope_vars")
+        .and_then(|v| v.as_object())
+        .map(|m| {
+            m.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // The consent line: interpolate the template over the bound fields; with no
+    // template but some bound fields, list them.
+    let consent_line = match scope.get("consent").and_then(|v| v.as_str()) {
+        Some(t) => Some(interpolate(t, &bound)),
+        None if !bound.is_empty() => Some(
+            bound
+                .iter()
+                .map(|(k, v)| format!("{}={}", k, truncate(v, 80)))
+                .collect::<Vec<_>>()
+                .join(", "),
+        ),
+        None => None,
+    };
+
+    let request = if !method.is_empty() || !host.is_empty() || !path.is_empty() {
+        format!("{} {}{}", method, host, path).trim().to_string()
+    } else {
+        format!("the secret at \"{}\"", op.act.target)
+    };
+    match consent_line {
+        Some(c) => format!("Brokered call: {}\n{}", request, c),
+        None => format!("Use {} for a brokered call.", request),
+    }
+}
+
+/// Render a `{{ vars.x | filter }}` consent template to plain text for the CLI:
+/// interpolate each reference with its bound value (a filter is a
+/// console-display concern, so here the value is shown as-is / truncated).
+fn interpolate(template: &str, bound: &[(String, String)]) -> String {
+    let vals: std::collections::HashMap<&str, &str> = bound
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let mut out = String::new();
+    let mut rest = template;
+    while let Some(start) = rest.find("{{") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let Some(end) = after.find("}}") else {
+            out.push_str("{{");
+            rest = after;
+            continue;
+        };
+        let inner = after[..end].trim();
+        let name = inner.splitn(2, '|').next().unwrap_or("").trim();
+        if let Some(var) = name.strip_prefix("vars.").map(str::trim) {
+            out.push_str(&truncate(vals.get(var).copied().unwrap_or(""), 80));
+        }
+        rest = &after[end + 2..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn truncate(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        s.to_string()
+    } else {
+        format!("{}…", s.chars().take(n).collect::<String>())
     }
 }

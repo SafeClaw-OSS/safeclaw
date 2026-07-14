@@ -243,7 +243,11 @@ impl ItemPayload {
 
     /// A live `secret` payload (`body` = the string value).
     pub fn secret_live(name: impl Into<String>, value: &str) -> Self {
-        Self::live(ItemNs::Secret, name, serde_json::Value::String(value.to_string()))
+        Self::live(
+            ItemNs::Secret,
+            name,
+            serde_json::Value::String(value.to_string()),
+        )
     }
 
     /// A tombstone for `(ns, name)` — `status = tombstone`, `body = null`.
@@ -406,7 +410,12 @@ mod tests {
     fn ns_str_matches_serde() {
         // as_str() must equal the serde-serialized tag (both feed the id HMAC
         // / the wire on the two sides).
-        for ns in [ItemNs::Secret, ItemNs::Connection, ItemNs::Connecting, ItemNs::Aux] {
+        for ns in [
+            ItemNs::Secret,
+            ItemNs::Connection,
+            ItemNs::Connecting,
+            ItemNs::Aux,
+        ] {
             let json = serde_json::to_value(ns).unwrap();
             assert_eq!(json, serde_json::Value::String(ns.as_str().to_string()));
         }

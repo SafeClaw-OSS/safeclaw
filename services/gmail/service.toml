@@ -1,0 +1,66 @@
+[service]
+id = "gmail"
+name = "Gmail"
+# Classification for browse/filter and policy tag-floors; lowercase-kebab, multi OK.
+tags = ["app"]
+
+hosts = ["gmail.googleapis.com"]
+secrets = ["GMAIL_REFRESH_TOKEN"]
+
+# Request shapes (docs/REQUEST_SCOPE.md): binding the send body's `raw` field
+# (the base64url RFC822 message) means an approved email cannot be swapped for a
+# different one on replay — the grant is tied to this exact message.
+[requests.send]
+match = "POST /gmail/v1/users/me/messages/send"
+vars.raw = "/raw"
+scope   = ["raw"]
+# The `email` filter (console code, like git's `| basic`) decodes the bound
+# base64url `raw` into a legible From/To/Subject/Body card, raw under Advanced
+# Details. Same pipe syntax as `{{ secret.X | basic }}`.
+consent = "{{ vars.raw | email }}"
+
+[auth]
+type = "oauth2"
+# Display label only ("Connect with Google") — carries no config.
+provider = "google"
+scopes = [
+  "https://www.googleapis.com/auth/gmail.send",
+  "https://www.googleapis.com/auth/gmail.readonly",
+  "https://www.googleapis.com/auth/gmail.modify",
+]
+refresh_token = "GMAIL_REFRESH_TOKEN"
+
+# ── Shared Google Desktop OAuth client (same client in gmail/gdrive/gcalendar —
+# rotate all three together; this file holds the canonical rationale) ──
+#
+# This ships the PUBLIC Desktop OAuth client. Google's Desktop-app design treats
+# this client_secret as NON-confidential — "the client secret is obviously not
+# treated as a secret"
+# (developers.google.com/identity/protocols/oauth2/native-app) — because an
+# installed app lives on the user's machine and cannot keep secrets. The real
+# security is PKCE + the user's live Google login, not this string.
+#
+# Why it's committed, and why it CANNOT be dropped in favor of pure PKCE:
+#  - Google's Desktop client REQUIRES client_secret at the token endpoint even
+#    WITH PKCE. Verified empirically (2026-06): omitting it returns
+#    `invalid_request: "client_secret is missing."`. The docs' "Optional" does
+#    NOT apply to the Desktop client type — so the secret must ship here.
+#  - GitHub push-protection flags the `GOCSPX-` pattern; this specific value is
+#    allow-listed as a public Desktop client (non-confidential), NOT a leak.
+#
+# The CONFIDENTIAL Web-app client_secret (our cloud asset) must NEVER appear in
+# any recipe — a literal client_secret in a definition is by convention a
+# public client's (review-enforced; the old client_type = "public" assertion
+# field was retired as theater: tooling stamped it automatically).
+authorization_url = "https://accounts.google.com/o/oauth2/v2/auth"
+token_url         = "https://oauth2.googleapis.com/token"
+pkce              = true
+client_id         = "499410884315-6m6vu98ls61i0e0cn38663mm573nu87a.apps.googleusercontent.com"
+client_secret     = "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"
+redirect_uri      = "http://127.0.0.1:8765/safeclaw/oauth/callback"
+
+# Google-specific consent-URL params: without access_type=offline +
+# prompt=consent a repeat consent returns no refresh_token.
+[auth.authorize_params]
+access_type = "offline"
+prompt      = "consent"

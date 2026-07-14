@@ -16,7 +16,10 @@ use axum::{
     extract::{Path, State},
     Json,
 };
-use base64::{engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD}, Engine};
+use base64::{
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+    Engine,
+};
 
 /// HPKE `info` prefix for the pending-passkey deposit seal. The full info
 /// string is `PENDING_PASSKEY_INFO_PREFIX ‖ vault_id ‖ 0x1F ‖ cid_new` —
@@ -31,13 +34,13 @@ use crate::audit::{STATUS_APPROVED, STATUS_REJECTED};
 use crate::error::{AppError, Result};
 use crate::passkey::PasskeyEntry;
 use crate::protocol::operation::{
-    as_enroll_credential, as_export_path, as_write_patch, decode_credential_id,
-    discriminator, ActType,
+    as_enroll_credential, as_export_path, as_write_patch, decode_credential_id, discriminator,
+    ActType,
 };
 use crate::protocol::{render_operation, validate_grant, Grant};
 use crate::server::handlers::metadata::decrypt_vault_view_keep_key;
-use crate::storage::plaintext::VaultPlaintextView;
-use crate::state::{ApprovalEvent, AppState, SecretsCache};
+use crate::state::{AppState, ApprovalEvent, SecretsCache};
+use crate::storage::plaintext::{Category, VaultPlaintextView};
 use crate::storage::sealed_vault::{
     build_initial, find_pubkey, find_pubkey_in_registry, read as read_vault, read_per_item,
     replace_after_write, write_atomic,
@@ -60,10 +63,7 @@ pub async fn get_op(
     }
 }
 
-async fn get_op_json(
-    state: Arc<AppState>,
-    op_id: String,
-) -> Result<axum::response::Response> {
+async fn get_op_json(state: Arc<AppState>, op_id: String) -> Result<axum::response::Response> {
     use axum::response::IntoResponse;
     let body = op_poll_value(&state, &op_id)?;
     let pending = body.get("status").and_then(|s| s.as_str()) == Some("pending");
@@ -74,7 +74,8 @@ async fn get_op_json(
         if let Ok(v) = axum::http::HeaderValue::from_str(
             &crate::approval::store::POLL_INTERVAL_HINT_SECS.to_string(),
         ) {
-            resp.headers_mut().insert(axum::http::header::RETRY_AFTER, v);
+            resp.headers_mut()
+                .insert(axum::http::header::RETRY_AFTER, v);
         }
     }
     Ok(resp)
@@ -119,9 +120,7 @@ pub fn op_poll_value(state: &AppState, op_id: &str) -> Result<Value> {
         // secret is opaque — never parse it, even when it happens to be JSON).
         ApprovalStatus::Approved => {
             let v = rec.cached_value.clone().map(|s| match &rec.op.act.kind {
-                ActType::Use => {
-                    serde_json::from_str::<Value>(&s).unwrap_or(Value::String(s))
-                }
+                ActType::Use => serde_json::from_str::<Value>(&s).unwrap_or(Value::String(s)),
                 _ => Value::String(s),
             });
             ("ok", v)
@@ -129,10 +128,19 @@ pub fn op_poll_value(state: &AppState, op_id: &str) -> Result<Value> {
         ApprovalStatus::Rejected { .. } => ("rejected", None),
         ApprovalStatus::Consumed => unreachable!("handled above"),
     };
+    // A rejected op's reason distinguishes a USER rejection from a mechanical
+    // withdrawal ("superseded by a newer request") — the waiter renders them
+    // differently, so a superseded `sc up`/`sc lock` never reads as "the user
+    // said no" (it confused exactly that way before this field existed).
+    let reason = match &rec.status {
+        ApprovalStatus::Rejected { reason } if !reason.is_empty() => Some(reason.clone()),
+        _ => None,
+    };
     Ok(json!({
         "op_id": rec.id,
         "r": rec.r,
         "status": status,
+        "reason": reason,
         "act": act_kind,
         "path": path,
         "display": display,
@@ -141,6 +149,75 @@ pub fn op_poll_value(state: &AppState, op_id: &str) -> Result<Value> {
         "expires_at": rec.expires_at_unix,
     }))
 }
+
+/// Best-effort: if the acting credential's stored keyset row carries no KCV yet,
+/// compute it from the `W_c` that just unlocked the vault and persist it (then
+/// push the keyset row cloud-side so it survives pulls and reaches other
+/// devices). Idempotent — a credential that already has a KCV is untouched.
+/// Never fatal to the unlock; failures are logged and swallowed. Targets the
+/// per-item keyset (the current home); a legacy `vault.dat`-only vault simply
+/// skips — the browser falls back to its no-precheck path for KCV-less creds.
+fn maybe_backfill_wc_check(state: &Arc<AppState>, vault_id: &str, cid: &[u8], w_c: &[u8]) {
+    let Ok(per_item_path) = state.vaults.per_item_path(vault_id) else {
+        return;
+    };
+    let mut pv = match crate::storage::sealed_vault::read_per_item(&per_item_path) {
+        Ok(Some(pv)) => pv,
+        _ => return, // no per-item keyset (legacy or unreadable) — skip
+    };
+    let Some(cred) = pv
+        .keyset
+        .credentials
+        .iter_mut()
+        .find(|c| c.credential_id == cid)
+    else {
+        return;
+    };
+    if cred.wc_check.is_some() {
+        return; // already present (freshly enrolled with a KCV, or backfilled)
+    }
+    let wc = match sudp::primitives::wc_check_value::<sudp::primitives::HkdfSha256>(
+        w_c,
+        &cred.prf_salt,
+        cid,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(vault = %vault_id, "wc_check backfill KDF failed: {}", e);
+            return;
+        }
+    };
+    cred.wc_check = Some(wc.to_vec());
+    if let Err(e) = crate::storage::sealed_vault::write_per_item_atomic(&per_item_path, &pv) {
+        tracing::warn!(vault = %vault_id, "wc_check backfill write failed: {}", e);
+        return;
+    }
+    tracing::info!(vault = %vault_id, "backfilled wc_check for the acting credential");
+    let state = state.clone();
+    let vid = vault_id.to_string();
+    tokio::spawn(async move {
+        crate::sync::push_keys_best_effort(&state, &vid).await;
+    });
+}
+
+/// Every custom act the dispatch below handles. Keep in lockstep with the
+/// `ActType::Custom` match arms — `consent::tests::dispatch_and_table_agree`
+/// fails when this list and acts.toml drift in either direction, so an act
+/// can't ship without approval copy (and dead copy can't linger).
+pub(crate) const DISPATCHED_CUSTOM_ACTS: &[&str] = &[
+    "vault-unlock",
+    "vault-lock",
+    "vault-delete",
+    "rename-passkey",
+    "widen-host",
+    "service-ls",
+    "service-rm",
+    "service-add",
+    "secret-rm",
+    "connection-rm",
+    "connection-add",
+    "secret-set",
+];
 
 /// `POST /op/{op_id}/approve` — U submits the signed grant. T validates and
 /// dispatches the act (Enroll / Write / Export / Use).
@@ -220,10 +297,14 @@ pub async fn approve_op(
     // (Legacy local op-page ships plaintext `wrapping_key` and skips this.)
     if grant.wk_enc.is_some() || grant.wk_ct.is_some() {
         let enc_b64 = grant.wk_enc.as_deref().ok_or_else(|| {
-            AppError::BadRequest("sealed wrapping key needs both wk_enc and wk_ct (wk_enc missing)".into())
+            AppError::BadRequest(
+                "sealed wrapping key needs both wk_enc and wk_ct (wk_enc missing)".into(),
+            )
         })?;
         let ct_b64 = grant.wk_ct.as_deref().ok_or_else(|| {
-            AppError::BadRequest("sealed wrapping key needs both wk_enc and wk_ct (wk_ct missing)".into())
+            AppError::BadRequest(
+                "sealed wrapping key needs both wk_enc and wk_ct (wk_ct missing)".into(),
+            )
         })?;
         let enc = URL_SAFE_NO_PAD
             .decode(enc_b64)
@@ -234,7 +315,9 @@ pub async fn approve_op(
         let info = crate::crypto::envelope::grant_seal_info(&op_id);
         let wk = state.sc.open(&enc, &ct, &info, b"")?;
         if wk.len() != 32 {
-            return Err(AppError::BadRequest("sealed wrapping_key must be 32 bytes".into()));
+            return Err(AppError::BadRequest(
+                "sealed wrapping_key must be 32 bytes".into(),
+            ));
         }
         grant.wrapping_key = Some(STANDARD.encode(&wk));
     }
@@ -308,9 +391,9 @@ pub async fn approve_op(
                 .get("new")
                 .and_then(|n| n.get("credential_id"))
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| AppError::BadRequest(
-                    "add-passkey: scope.new.credential_id required".into(),
-                ))?
+                .ok_or_else(|| {
+                    AppError::BadRequest("add-passkey: scope.new.credential_id required".into())
+                })?
                 .to_string();
             // Pop the pending file (single-use, deleted on read).
             let pending = crate::storage::pending_passkey::load_and_consume(
@@ -351,9 +434,9 @@ pub async fn approve_op(
             let redeemed = sudp::grant::RedeemedGrant {
                 o: validated.op.clone(),
                 credential_id: validated.credential_id_bytes.clone(),
-                wrapping_key: sudp::grant::WrappingKey::from_bytes(
-                    std::mem::take(&mut validated.wrapping_key),
-                ),
+                wrapping_key: sudp::grant::WrappingKey::from_bytes(std::mem::take(
+                    &mut validated.wrapping_key,
+                )),
                 opt: sudp::grant::GrantOpt::default(),
             };
             let opened = sudp::phases::consumption::open::<sudp::primitives::StdPrimitives>(
@@ -375,19 +458,28 @@ pub async fn approve_op(
             };
             let wrapped_for_new = Wrap::wrap(&new_w_c, &opened.k[..], &binding)
                 .map_err(|e| AppError::Internal(format!("wrap K under new W_c: {}", e)))?;
-            // W_c for the new credential is no longer needed — zeroize immediately.
+            let new_prf_salt = STANDARD
+                .decode(&pending.prf_salt)
+                .map_err(|_| AppError::BadRequest("prf_salt not base64".into()))?;
+            // Key-check value for the new credential, computed while W_c is still
+            // live: it lets a browser confirm a re-derived W_c before depositing
+            // a grant, WITHOUT unwrapping K. Then W_c is done — zeroize it.
+            let new_wc_check = sudp::primitives::wc_check_value::<sudp::primitives::HkdfSha256>(
+                &new_w_c,
+                &new_prf_salt,
+                &new_cid_bytes,
+            )
+            .map_err(|e| AppError::Internal(format!("wc_check: {}", e)))?;
             let mut new_w_c = new_w_c;
             new_w_c.zeroize();
             // Append to credentials + registry, using the (x, y, prf_salt,
             // device_name) we just popped from the pending file.
             let mut updated = vault.clone();
-            let new_prf_salt = STANDARD
-                .decode(&pending.prf_salt)
-                .map_err(|_| AppError::BadRequest("prf_salt not base64".into()))?;
             updated.credentials.push(sudp::state::SealedCredential {
                 credential_id: new_cid_bytes.clone(),
                 prf_salt: new_prf_salt,
                 wrapped_key: wrapped_for_new,
+                wc_check: Some(new_wc_check.to_vec()),
             });
             let pk = sudp::passkey::WebAuthnPublicKey {
                 x: pending.x,
@@ -416,9 +508,10 @@ pub async fn approve_op(
                     "vault already initialized for this vault_id".into(),
                 ));
             }
-            let payload = grant.setup_payload.as_ref().ok_or_else(|| {
-                AppError::BadRequest("enroll grant missing setup_payload".into())
-            })?;
+            let payload = grant
+                .setup_payload
+                .as_ref()
+                .ok_or_else(|| AppError::BadRequest("enroll grant missing setup_payload".into()))?;
             let cid_bytes = decode_credential_id(&credential.credential_id)?;
             let prf_salt = STANDARD
                 .decode(&credential.prf_salt)
@@ -559,7 +652,7 @@ pub async fn approve_op(
                     // best-effort + never clobber (409 → adopt cloud, stop).
                     crate::sync::push_keys_best_effort(&state, &vid).await;
                     crate::sync::push_items_best_effort(&state, &vid).await;
-                    crate::auth::connect::process_vault_connects(&state, &vid).await;
+                    crate::auth::connect::process_vault_connects(&state, &vid, None).await;
                 });
             }
             (json!({ "ok": true, "act": "write" }), None)
@@ -575,11 +668,9 @@ pub async fn approve_op(
             // The at-least-one safeguard still catches "revoking the only
             // remaining credential".
             let target = validated.op.act.target.as_str();
-            let cid_b64 = target
-                .strip_prefix("passkeys.")
-                .ok_or_else(|| AppError::BadRequest(
-                    "revoke target must be 'passkeys.<credential_id>'".into(),
-                ))?;
+            let cid_b64 = target.strip_prefix("passkeys.").ok_or_else(|| {
+                AppError::BadRequest("revoke target must be 'passkeys.<credential_id>'".into())
+            })?;
             let mut vault = existing_vault
                 .clone()
                 .ok_or_else(|| AppError::Conflict("vault not initialized".into()))?;
@@ -602,7 +693,10 @@ pub async fn approve_op(
                 cred_count = vault.credentials.len(),
                 "vault revoke-passkey applied"
             );
-            (json!({ "ok": true, "act": "revoke", "target": target }), None)
+            (
+                json!({ "ok": true, "act": "revoke", "target": target }),
+                None,
+            )
         }
         ActType::Export => {
             // F-15: reject KEM-sealed Export until it is implemented.
@@ -633,9 +727,8 @@ pub async fn approve_op(
             if path == "env" || path.is_empty() {
                 let mut all = serde_json::Map::new();
                 for (k, v) in view.native_secrets.iter() {
-                    let s = String::from_utf8(v.clone()).map_err(|_| {
-                        AppError::Internal("native-secrets item not utf8".into())
-                    })?;
+                    let s = String::from_utf8(v.clone())
+                        .map_err(|_| AppError::Internal("native-secrets item not utf8".into()))?;
                     all.insert(k.clone(), serde_json::Value::String(s));
                 }
                 let resp = json!({
@@ -675,28 +768,87 @@ pub async fn approve_op(
                 &vault_id,
             )
             .await?;
-            let conn = validated
-                .op
-                .act
-                .scope
+            let scope = &validated.op.act.scope;
+            let conn = scope
                 .get("connection_id")
-                .or_else(|| validated.op.act.scope.get("service"))
+                .or_else(|| scope.get("service"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let ttl = state
+            let pc = state
                 .approvals
                 .lock()
                 .unwrap()
                 .get(&op_id)
-                .and_then(|r| r.policy_context.clone())
-                .map(|p| p.ttl_seconds)
-                .unwrap_or(300);
-            if !conn.is_empty() {
-                let now = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
+                .and_then(|r| r.policy_context.clone());
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let level = pc.as_ref().map(|p| p.level);
+            // Phase 2: fold the bound `[requests]` scope-field values the proxy
+            // stamped into `scope.scope_vars` (and the passkey signed) into the
+            // grant identity. Rebuild the SAME sorted pairs the redeem path
+            // re-extracts from the live request, so an approval for `amount=80`
+            // can't be spent by `amount=180`. Empty (no requests shape) ⇒ `""`.
+            let bound: Vec<(String, String)> = scope
+                .get("scope_vars")
+                .and_then(|v| v.as_object())
+                .map(|m| {
+                    let mut pairs: Vec<(String, String)> = m
+                        .iter()
+                        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                        .collect();
+                    pairs.sort_by(|a, b| a.0.cmp(&b.0));
+                    pairs
+                })
+                .unwrap_or_default();
+            let scope_digest = crate::service::scope_digest(&bound);
+            let is_ask_always = level == Some(crate::core::policy::AccessLevel::AskAlways);
+            let scoped_ask =
+                level == Some(crate::core::policy::AccessLevel::Ask) && !scope_digest.is_empty();
+            if is_ask_always || scoped_ask {
+                // Request-BOUND grant (`op_grants`), keyed by the exact request
+                // the user saw — (connection, method, host, path, scope_digest)
+                // off the op scope. Never the conn-keyed `entries`: a conn-global
+                // value would let a DIFFERENT request on this connection silently
+                // ride the approval. ask-always is single-use; a scoped ask is
+                // reusable for the SAME bound action within its window. If the
+                // binding tuple is missing (malformed scope), store NOTHING — the
+                // replay re-prompts, the safe failure.
+                let method = scope.get("method").and_then(|v| v.as_str()).unwrap_or("");
+                let path = scope.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                let host = pc
+                    .as_ref()
+                    .and_then(|p| p.host.clone())
+                    .or_else(|| scope.get("host").and_then(|v| v.as_str()).map(String::from))
+                    .unwrap_or_default();
+                let window = if is_ask_always {
+                    crate::state::ASK_ALWAYS_REPLAY_WINDOW_SECS
+                } else {
+                    pc.as_ref().map(|p| p.ttl_seconds).unwrap_or(300)
+                };
+                if !conn.is_empty() && !method.is_empty() && !host.is_empty() && !path.is_empty() {
+                    state.op_grant_insert(
+                        &vault_id,
+                        &conn,
+                        method,
+                        &host,
+                        path,
+                        &scope_digest,
+                        s_o,
+                        now + window,
+                    );
+                } else {
+                    tracing::warn!(
+                        vault = %vault_id, op = %op_id,
+                        "bound approve without a full request binding — grant not stored (replay will re-prompt)"
+                    );
+                }
+            } else if !conn.is_empty() {
+                // Unscoped ask (and legacy no-context ops): conn-keyed value with
+                // the grant-window TTL, read by the downgraded-to-Allow retry.
+                let ttl = pc.as_ref().map(|p| p.ttl_seconds).unwrap_or(300);
                 state.cache_insert(&vault_id, &conn, s_o, Some(now + ttl));
             }
             (
@@ -727,9 +879,8 @@ pub async fn approve_op(
                 // build a new aux when the user writes.
                 let mut kv = serde_json::Map::new();
                 for (k, v) in view.native_secrets.iter() {
-                    let s = String::from_utf8(v.clone()).map_err(|_| {
-                        AppError::Internal("native-secrets item not utf8".into())
-                    })?;
+                    let s = String::from_utf8(v.clone())
+                        .map_err(|_| AppError::Internal("native-secrets item not utf8".into()))?;
                     kv.insert(k.clone(), Value::String(s));
                 }
                 let aux_json = serde_json::to_value(&view.aux)?;
@@ -743,6 +894,17 @@ pub async fn approve_op(
                     "vault unlocked"
                 );
                 state.unlock_vault(vault_id.clone(), cache, unlock_key);
+                // Backfill the acting credential's key-check value if the stored
+                // keyset predates it (best-effort; we hold the write guard). This
+                // lets a later cross-device approval fail FAST in the browser
+                // (the KCV won't match a divergent W_c) instead of silently
+                // hanging on an unseal the daemon can't complete.
+                maybe_backfill_wc_check(
+                    &state,
+                    &vault_id,
+                    &validated.credential_id_bytes,
+                    &validated.wrapping_key,
+                );
                 // On unlock, complete any pending OAuth connect: a
                 // browser "Connect" may have sealed `<conn>_oauth_pending`
                 // into the vault while it was locked (or before this device
@@ -754,7 +916,7 @@ pub async fn approve_op(
                     let state = state.clone();
                     let vid = vault_id.clone();
                     tokio::spawn(async move {
-                        crate::auth::connect::process_vault_connects(&state, &vid).await;
+                        crate::auth::connect::process_vault_connects(&state, &vid, None).await;
                     });
                 }
                 let value = json!({ "kv": Value::Object(kv), "aux": aux_json });
@@ -794,13 +956,15 @@ pub async fn approve_op(
                 // approvals "from 50 minutes ago" instead of an empty log.
                 // Matches the admin DELETE path's ordering (admin.rs).
                 state.audits.forget(&vault_id);
-                state.vaults.remove(&vault_id).map_err(|e| {
-                    AppError::Internal(format!("vault dir remove: {}", e))
-                })?;
+                state
+                    .vaults
+                    .remove(&vault_id)
+                    .map_err(|e| AppError::Internal(format!("vault dir remove: {}", e)))?;
                 {
                     let mut states = state.vault_states.lock().unwrap();
                     states.remove(&vault_id);
                 }
+                state.last_host_unions.lock().unwrap().remove(&vault_id);
                 tracing::info!(vault = %vault_id, "vault deleted");
                 (json!({ "ok": true, "act": "vault-delete" }), None)
             }
@@ -815,26 +979,24 @@ pub async fn approve_op(
             // pipeline. Self-rename allowed (matches per-VM UX).
             "rename-passkey" => {
                 let target = validated.op.act.target.as_str();
-                let cid_b64 = target
-                    .strip_prefix("passkeys.")
-                    .ok_or_else(|| AppError::BadRequest(
+                let cid_b64 = target.strip_prefix("passkeys.").ok_or_else(|| {
+                    AppError::BadRequest(
                         "rename-passkey target must be 'passkeys.<credential_id>'".into(),
-                    ))?;
+                    )
+                })?;
                 let new_name = validated
                     .op
                     .act
                     .scope
                     .get("device_name")
                     .and_then(|v| v.as_str())
-                    .ok_or_else(|| AppError::BadRequest(
-                        "rename-passkey scope.device_name required".into(),
-                    ))?
+                    .ok_or_else(|| {
+                        AppError::BadRequest("rename-passkey scope.device_name required".into())
+                    })?
                     .trim()
                     .to_string();
                 if new_name.is_empty() {
-                    return Err(AppError::BadRequest(
-                        "device_name cannot be empty".into(),
-                    ));
+                    return Err(AppError::BadRequest("device_name cannot be empty".into()));
                 }
                 if new_name.len() > 120 {
                     return Err(AppError::BadRequest(
@@ -849,9 +1011,9 @@ pub async fn approve_op(
                     .registry
                     .get::<sudp::passkey::WebAuthn>(&cid_bytes)
                     .map_err(|e| AppError::Internal(format!("registry get: {}", e)))?
-                    .ok_or_else(|| AppError::BadRequest(
-                        "target credential not enrolled on this vault".into(),
-                    ))?;
+                    .ok_or_else(|| {
+                        AppError::BadRequest("target credential not enrolled on this vault".into())
+                    })?;
                 pk.device_name = new_name.clone();
                 vault
                     .registry
@@ -903,6 +1065,616 @@ pub async fn approve_op(
                     None,
                 )
             }
+            // List the vault's custom service definitions (`aux.services`) with
+            // each one's validation status + referencing connections. Read-only
+            // (opens the view under the grant's W_c, never writes). This is the
+            // only surface that shows an INVALID definition — the daemon skips
+            // those at unlock and the console only renders a def through its
+            // connections, so a broken/orphaned def is otherwise invisible.
+            "service-ls" => {
+                let (view, _k) = crate::server::handlers::metadata::open_view_for_grant_keep_key(
+                    &state,
+                    &vault_id,
+                    &validated.op,
+                    &validated.wrapping_key,
+                    &validated.credential_id_bytes,
+                    existing_vault.as_ref(),
+                )?;
+                let mut services = Vec::new();
+                for (id, toml_src) in &view.aux.services {
+                    let problems = crate::service::validate::validate_service(toml_src)
+                        .err()
+                        .unwrap_or_default();
+                    services.push(json!({
+                        "id": id,
+                        "valid": problems.is_empty(),
+                        "problems": problems,
+                        "connections": service_refs(&view, id),
+                    }));
+                }
+                let resp = json!({ "ok": true, "act": "service-ls", "services": services });
+                let cached = Some(resp.to_string());
+                (resp, cached)
+            }
+            // Delete a custom service definition. Connections referencing it are
+            // kept (their stored secrets stay resolvable) but reported so the CLI
+            // can warn. Daemon-side reseal + reconcile + push — the CLI needs no
+            // PRF key, so this works over SSH via the grant link.
+            "service-rm" => {
+                let id = validated.op.act.target.trim().to_string();
+                if id.is_empty() {
+                    return Err(AppError::BadRequest(
+                        "service-rm target (service id) required".into(),
+                    ));
+                }
+                let (mut view, k) =
+                    crate::server::handlers::metadata::open_view_for_grant_keep_key(
+                        &state,
+                        &vault_id,
+                        &validated.op,
+                        &validated.wrapping_key,
+                        &validated.credential_id_bytes,
+                        existing_vault.as_ref(),
+                    )?;
+                let refs = service_refs(&view, &id);
+                if view.aux.services.remove(&id).is_none() {
+                    return Err(AppError::BadRequest(format!(
+                        "no custom service '{}' in this vault",
+                        id
+                    )));
+                }
+                crate::auth::connect::persist_mutated_view(&state, &vault_id, &view, &k)
+                    .map_err(AppError::Internal)?;
+                {
+                    let state = state.clone();
+                    let vid = vault_id.clone();
+                    tokio::spawn(async move {
+                        crate::sync::push_keys_best_effort(&state, &vid).await;
+                        crate::sync::push_items_best_effort(&state, &vid).await;
+                    });
+                }
+                tracing::info!(vault = %vault_id, service = %id, "custom service removed");
+                let resp = json!({
+                    "ok": true, "act": "service-rm",
+                    "removed": id, "referencing_connections": refs,
+                });
+                let cached = Some(resp.to_string());
+                (resp, cached)
+            }
+            // Store a validated custom service definition (`aux.services`). The
+            // toml rides `scope.toml`; the daemon re-validates (same gate as the
+            // unlock-time check) and refuses to shadow a built-in id. Daemon-side
+            // reseal + reconcile + push, like service-rm.
+            "service-add" => {
+                let toml_src = validated
+                    .op
+                    .act
+                    .scope
+                    .get("toml")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| AppError::BadRequest("service-add scope.toml required".into()))?
+                    .to_string();
+                if let Err(problems) = crate::service::validate::validate_service(&toml_src) {
+                    return Err(AppError::BadRequest(format!(
+                        "invalid service definition: {}",
+                        problems.join("; ")
+                    )));
+                }
+                let def: crate::service::ServiceDef = toml::from_str(&toml_src)
+                    .map_err(|e| AppError::BadRequest(format!("parse: {}", e)))?;
+                let id = def.service.id.clone();
+                if state.services.get(&id).is_some() {
+                    return Err(AppError::BadRequest(format!(
+                        "'{}' shadows a built-in service id",
+                        id
+                    )));
+                }
+                let (mut view, k) =
+                    crate::server::handlers::metadata::open_view_for_grant_keep_key(
+                        &state,
+                        &vault_id,
+                        &validated.op,
+                        &validated.wrapping_key,
+                        &validated.credential_id_bytes,
+                        existing_vault.as_ref(),
+                    )?;
+                view.aux.services.insert(id.clone(), toml_src);
+                crate::auth::connect::persist_mutated_view(&state, &vault_id, &view, &k)
+                    .map_err(AppError::Internal)?;
+                {
+                    let state = state.clone();
+                    let vid = vault_id.clone();
+                    tokio::spawn(async move {
+                        crate::sync::push_keys_best_effort(&state, &vid).await;
+                        crate::sync::push_items_best_effort(&state, &vid).await;
+                    });
+                }
+                tracing::info!(vault = %vault_id, service = %id, "custom service added");
+                let resp = json!({ "ok": true, "act": "service-add", "id": id });
+                let cached = Some(resp.to_string());
+                (resp, cached)
+            }
+            // Delete a native secret KEY. Shared-pool semantics
+            // (CONNECTION_SCHEMA.md §3): never cascades into a connection — the
+            // referencing connections just turn unconfigured until the key is
+            // re-added. Returns who referenced it so the CLI can say so. The
+            // KEY name is public (rides the op), the value never does.
+            "secret-rm" => {
+                let key = validated.op.act.target.trim().to_ascii_uppercase();
+                if key.is_empty() {
+                    return Err(AppError::BadRequest(
+                        "secret-rm target (key) required".into(),
+                    ));
+                }
+                let (mut view, k) =
+                    crate::server::handlers::metadata::open_view_for_grant_keep_key(
+                        &state,
+                        &vault_id,
+                        &validated.op,
+                        &validated.wrapping_key,
+                        &validated.credential_id_bytes,
+                        existing_vault.as_ref(),
+                    )?;
+                if !view.native_secrets.contains_key(&key) {
+                    // One flat namespace, two authorities: SafeClaw OWNS
+                    // native items but only READS external stores — so an
+                    // external-hosted key gets a precise refusal, not a
+                    // misleading "not found".
+                    if view.resolve_value_async(&key).await?.is_some() {
+                        return Err(AppError::BadRequest(format!(
+                            "key '{}' is hosted by an external store — SafeClaw reads it pass-through and cannot delete it; remove it in the provider's console",
+                            key
+                        )));
+                    }
+                    return Err(AppError::BadRequest(format!(
+                        "key '{}' not found in vault",
+                        key
+                    )));
+                }
+                let referenced_by = view
+                    .aux
+                    .connection_claims(&state.services, "")
+                    .remove(&key)
+                    .unwrap_or_default();
+                view.native_secrets.remove(&key);
+                crate::auth::connect::persist_mutated_view(&state, &vault_id, &view, &k)
+                    .map_err(AppError::Internal)?;
+                {
+                    let state = state.clone();
+                    let vid = vault_id.clone();
+                    tokio::spawn(async move {
+                        crate::sync::push_keys_best_effort(&state, &vid).await;
+                        crate::sync::push_items_best_effort(&state, &vid).await;
+                    });
+                }
+                tracing::info!(vault = %vault_id, key = %key, "secret removed");
+                let resp = json!({
+                    "ok": true, "act": "secret-rm",
+                    "removed": key, "referenced_by": referenced_by,
+                });
+                let cached = Some(resp.to_string());
+                (resp, cached)
+            }
+            // Delete a connection record. Unless `scope.keep_secrets`, also
+            // deletes the secret(s) ONLY this connection references (shared-pool
+            // guard: a key another connection still claims is kept). Returns the
+            // removed + kept secret lists so the CLI can report them.
+            "connection-rm" => {
+                let id = validated.op.act.target.trim().to_string();
+                if id.is_empty() {
+                    return Err(AppError::BadRequest(
+                        "connection-rm target (connection id) required".into(),
+                    ));
+                }
+                let keep_secrets = validated
+                    .op
+                    .act
+                    .scope
+                    .get("keep_secrets")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let (mut view, k) =
+                    crate::server::handlers::metadata::open_view_for_grant_keep_key(
+                        &state,
+                        &vault_id,
+                        &validated.op,
+                        &validated.wrapping_key,
+                        &validated.credential_id_bytes,
+                        existing_vault.as_ref(),
+                    )?;
+                let rec = view.aux.connections.get(&id).cloned().ok_or_else(|| {
+                    AppError::BadRequest(format!("no connection '{}' in this vault", id))
+                })?;
+                let mut removed_secrets: Vec<String> = Vec::new();
+                let mut kept_secrets: Vec<(String, Vec<String>)> = Vec::new();
+                if !keep_secrets {
+                    let claims = view.aux.connection_claims(&state.services, &id);
+                    for addr in rec.secret_addresses(&state.services) {
+                        if let Some(by) = claims.get(&addr) {
+                            if view.native_secrets.contains_key(&addr) {
+                                kept_secrets.push((addr, by.clone()));
+                            }
+                            continue;
+                        }
+                        if view.native_secrets.remove(&addr).is_some() {
+                            removed_secrets.push(addr);
+                        }
+                    }
+                }
+                view.aux.connections.remove(&id);
+                crate::auth::connect::persist_mutated_view(&state, &vault_id, &view, &k)
+                    .map_err(AppError::Internal)?;
+                {
+                    let state = state.clone();
+                    let vid = vault_id.clone();
+                    tokio::spawn(async move {
+                        crate::sync::push_keys_best_effort(&state, &vid).await;
+                        crate::sync::push_items_best_effort(&state, &vid).await;
+                    });
+                }
+                tracing::info!(vault = %vault_id, connection = %id, "connection removed");
+                let resp = json!({
+                    "ok": true, "act": "connection-rm",
+                    "removed": id,
+                    "removed_secrets": removed_secrets,
+                    "kept_secrets": kept_secrets,
+                });
+                let cached = Some(resp.to_string());
+                (resp, cached)
+            }
+            // Create (or replace) a connection — the CLI's `sc connect`, ONE
+            // approval. `scope` carries the public shape only: hosts / service /
+            // referenced KEY names / an optional `values_digest` committing to
+            // the new secret VALUES the CLI deposited at `/v/{vid}/op-payload`
+            // (the full op rides to the cloud relay, so plaintext never can —
+            // see `AppState::op_payloads`). Daemon-side reseal + push, so this
+            // works over SSH via the grant link like the other write acts.
+            "connection-add" => {
+                let id = validated.op.act.target.trim().to_string();
+                if !crate::cli::conn::valid_conn_id(&id) {
+                    return Err(AppError::BadRequest(format!(
+                        "'{}' is not a valid connection id",
+                        id
+                    )));
+                }
+                let scope = &validated.op.act.scope;
+                let service = scope
+                    .get("service")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let hosts: Option<Vec<String>> =
+                    scope.get("hosts").and_then(|v| v.as_array()).map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_str().map(str::to_string))
+                            .collect()
+                    });
+                let referenced: Vec<String> = scope
+                    .get("secrets")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                // Referenced keys may name EXTERNAL-store secrets, whose
+                // casing/hyphens are not ours to fold — the relaxed
+                // phantom-safe charset applies here. NEW keys (deposited
+                // values) keep the strict uppercase gate below: they write
+                // into native-secrets, whose canonical form is UPPERCASE.
+                for k in &referenced {
+                    if !crate::cli::conn::valid_secret_ref(k) {
+                        return Err(AppError::BadRequest(format!(
+                            "'{}' is not a valid secret key reference",
+                            k
+                        )));
+                    }
+                }
+                let keys: Option<std::collections::BTreeMap<String, String>> =
+                    scope.get("keys").and_then(|v| v.as_object()).map(|m| {
+                        m.iter()
+                            .filter_map(|(r, k)| k.as_str().map(|k| (r.clone(), k.to_string())))
+                            .collect()
+                    });
+                // The committed value deposit (absent = no new values, e.g. a
+                // pure `--use-existing` connection). Single-use; expiry or a
+                // daemon restart between create and approve fails closed.
+                let values = match scope.get("values_digest").and_then(|v| v.as_str()) {
+                    Some(d) => Some(state.op_payload_take(d).ok_or_else(|| {
+                        AppError::BadRequest(
+                            "deposited values not found or expired — re-run the command".into(),
+                        )
+                    })?),
+                    None => None,
+                };
+                if let Some(vals) = &values {
+                    for k in vals.keys() {
+                        if !referenced.contains(k) {
+                            return Err(AppError::BadRequest(format!(
+                                "deposited key '{}' is not in the approved scope.secrets",
+                                k
+                            )));
+                        }
+                        // Deposits WRITE into native-secrets — enforce the
+                        // native canonical form (strict uppercase role).
+                        if !crate::cli::conn::valid_role(k) || k.to_ascii_uppercase() != *k {
+                            return Err(AppError::BadRequest(format!(
+                                "'{}' is not a valid UPPERCASE secret key",
+                                k
+                            )));
+                        }
+                    }
+                }
+
+                let (mut view, k) =
+                    crate::server::handlers::metadata::open_view_for_grant_keep_key(
+                        &state,
+                        &vault_id,
+                        &validated.op,
+                        &validated.wrapping_key,
+                        &validated.credential_id_bytes,
+                        existing_vault.as_ref(),
+                    )?;
+
+                let record = match &service {
+                    // RAW: anchors its own exact FQDNs; explicit `secrets` list.
+                    None => {
+                        let hosts = hosts.filter(|h| !h.is_empty()).ok_or_else(|| {
+                            AppError::BadRequest("a raw connection needs at least one host".into())
+                        })?;
+                        for h in &hosts {
+                            crate::cli::conn::validate_raw_host(h).map_err(AppError::BadRequest)?;
+                        }
+                        if referenced.is_empty() {
+                            return Err(AppError::BadRequest(
+                                "a raw connection needs at least one secret key".into(),
+                            ));
+                        }
+                        // `--use-existing` keys (referenced but not deposited)
+                        // must already be in the vault. The vault is ONE flat
+                        // namespace across every store — a key hosted in an
+                        // external store (GCP etc.) binds exactly like a
+                        // native one, so walk the full store_order, not just
+                        // native-secrets. Canonicalisation: native keys are
+                        // canonically UPPERCASE (a lowercase-typed reference
+                        // rewrites to the stored casing); external keys are
+                        // accepted exactly as named (external naming is not
+                        // ours to fold). The external probe is a network
+                        // call, but this is a ceremony (approve) path; a
+                        // store outage surfaces as the approve failing
+                        // loudly, never as a silent "no such secret".
+                        let mut canonical: Vec<String> = Vec::with_capacity(referenced.len());
+                        for key in &referenced {
+                            let deposited = values
+                                .as_ref()
+                                .map(|v| v.contains_key(key))
+                                .unwrap_or(false);
+                            if deposited || view.native_secrets.contains_key(key) {
+                                canonical.push(key.clone());
+                                continue;
+                            }
+                            if let Some((native, _)) = view
+                                .native_secrets
+                                .iter()
+                                .find(|(k, _)| k.eq_ignore_ascii_case(key))
+                            {
+                                canonical.push(native.clone());
+                                continue;
+                            }
+                            if view.resolve_value_async(key).await?.is_some() {
+                                canonical.push(key.clone());
+                                continue;
+                            }
+                            return Err(AppError::BadRequest(format!(
+                                "no such secret '{}' in the vault (checked native + external stores)",
+                                key
+                            )));
+                        }
+                        // Exact dedup only: native case-folding already
+                        // collapsed duplicates; two external keys differing
+                        // by case are DISTINCT secrets (GCP is case-
+                        // sensitive) and must both survive.
+                        let mut seen = std::collections::HashSet::new();
+                        canonical.retain(|k| seen.insert(k.clone()));
+                        crate::storage::plaintext::Connection {
+                            name: None,
+                            service: None,
+                            hosts: Some(hosts),
+                            secrets: Some(canonical),
+                            keys: None,
+                        }
+                    }
+                    // SERVICE-backed: hosts derive from the service; `hosts`
+                    // here only PINS exact FQDNs inside its `*.suffix`
+                    // wildcards. Custom-first resolution (per-vault def wins).
+                    Some(svc) => {
+                        let service_hosts: Vec<String> = match view.aux.services.get(svc) {
+                            Some(toml_src) => {
+                                toml::from_str::<crate::service::ServiceDef>(toml_src)
+                                    .map(|d| d.service.hosts)
+                                    .map_err(|e| {
+                                        AppError::BadRequest(format!(
+                                            "custom service '{}': {}",
+                                            svc, e
+                                        ))
+                                    })?
+                            }
+                            None => state
+                                .services
+                                .get(svc)
+                                .ok_or_else(|| {
+                                    AppError::BadRequest(format!("unknown service '{}'", svc))
+                                })?
+                                .service
+                                .hosts
+                                .clone(),
+                        };
+                        let pins = hosts.filter(|h| !h.is_empty());
+                        if let Some(pins) = &pins {
+                            for h in pins {
+                                crate::cli::conn::validate_raw_host(h)
+                                    .map_err(AppError::BadRequest)?;
+                                let ok = service_hosts
+                                    .iter()
+                                    .any(|e| crate::core::host::wildcard_matches(e, h));
+                                if !ok {
+                                    return Err(AppError::BadRequest(format!(
+                                        "pinned host '{}' is not within service '{}' hosts",
+                                        h, svc
+                                    )));
+                                }
+                            }
+                        }
+                        crate::storage::plaintext::Connection {
+                            name: None,
+                            service: Some(svc.clone()),
+                            hosts: pins,
+                            secrets: None,
+                            keys: keys.clone().filter(|m| !m.is_empty()),
+                        }
+                    }
+                };
+
+                let written: Vec<String> = values
+                    .as_ref()
+                    .map(|v| v.keys().cloned().collect())
+                    .unwrap_or_default();
+                if let Some(vals) = values {
+                    for (key, val) in vals {
+                        view.native_secrets.insert(key, val.into_bytes());
+                    }
+                }
+                view.aux.connections.insert(id.clone(), record);
+                crate::auth::connect::persist_mutated_view(&state, &vault_id, &view, &k)
+                    .map_err(AppError::Internal)?;
+                {
+                    let state = state.clone();
+                    let vid = vault_id.clone();
+                    tokio::spawn(async move {
+                        crate::sync::push_keys_best_effort(&state, &vid).await;
+                        crate::sync::push_items_best_effort(&state, &vid).await;
+                    });
+                }
+                tracing::info!(vault = %vault_id, connection = %id, "connection added");
+                let resp = json!({
+                    "ok": true, "act": "connection-add",
+                    "id": id, "service": service,
+                    "written": written, "referenced": referenced,
+                });
+                let cached = Some(resp.to_string());
+                (resp, cached)
+            }
+            // Store one native secret — the CLI's `sc set`, ONE approval. The
+            // value rides the local `op-payload` deposit (committed by
+            // `scope.values_digest`); `scope.hosts` optionally anchors a raw
+            // single-secret connection at the lowercased KEY (the `sc set
+            // --host` sugar), `scope.no_broker` explicitly un-brokers instead.
+            "secret-set" => {
+                let key = validated.op.act.target.trim().to_ascii_uppercase();
+                if !crate::cli::conn::valid_role(&key) {
+                    return Err(AppError::BadRequest(format!(
+                        "'{}' is not a valid secret key",
+                        key
+                    )));
+                }
+                let scope = &validated.op.act.scope;
+                let no_broker = scope
+                    .get("no_broker")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let hosts: Vec<String> = scope
+                    .get("hosts")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if no_broker && !hosts.is_empty() {
+                    return Err(AppError::BadRequest(
+                        "secret-set: no_broker and hosts are mutually exclusive".into(),
+                    ));
+                }
+                let conn = key.to_ascii_lowercase();
+                if !hosts.is_empty() {
+                    if !crate::cli::conn::valid_conn_id(&conn) {
+                        return Err(AppError::BadRequest(format!(
+                            "can't derive a connection id from '{}'",
+                            key
+                        )));
+                    }
+                    for h in &hosts {
+                        crate::cli::conn::validate_raw_host(h).map_err(AppError::BadRequest)?;
+                    }
+                }
+                let digest = scope
+                    .get("values_digest")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        AppError::BadRequest("secret-set: scope.values_digest required".into())
+                    })?;
+                let mut values = state.op_payload_take(digest).ok_or_else(|| {
+                    AppError::BadRequest(
+                        "deposited value not found or expired — re-run the command".into(),
+                    )
+                })?;
+                let value = values.remove(&key).ok_or_else(|| {
+                    AppError::BadRequest("deposited values don't match the op's key".into())
+                })?;
+                if !values.is_empty() {
+                    return Err(AppError::BadRequest(
+                        "secret-set deposit must carry exactly the op's key".into(),
+                    ));
+                }
+
+                let (mut view, k) =
+                    crate::server::handlers::metadata::open_view_for_grant_keep_key(
+                        &state,
+                        &vault_id,
+                        &validated.op,
+                        &validated.wrapping_key,
+                        &validated.credential_id_bytes,
+                        existing_vault.as_ref(),
+                    )?;
+                view.native_secrets.insert(key.clone(), value.into_bytes());
+                let mut removed_prior_anchor = false;
+                if no_broker {
+                    // Opting out must actually un-broker: drop the raw
+                    // connection a prior `sc set <key> --host …` created.
+                    removed_prior_anchor = view.aux.connections.remove(&conn).is_some();
+                } else if !hosts.is_empty() {
+                    view.aux.connections.insert(
+                        conn.clone(),
+                        crate::storage::plaintext::Connection {
+                            name: None,
+                            service: None,
+                            hosts: Some(hosts.clone()),
+                            secrets: Some(vec![key.clone()]),
+                            keys: None,
+                        },
+                    );
+                }
+                crate::auth::connect::persist_mutated_view(&state, &vault_id, &view, &k)
+                    .map_err(AppError::Internal)?;
+                {
+                    let state = state.clone();
+                    let vid = vault_id.clone();
+                    tokio::spawn(async move {
+                        crate::sync::push_keys_best_effort(&state, &vid).await;
+                        crate::sync::push_items_best_effort(&state, &vid).await;
+                    });
+                }
+                tracing::info!(vault = %vault_id, key = %key, "secret set");
+                let resp = json!({
+                    "ok": true, "act": "secret-set", "key": key,
+                    "conn": if hosts.is_empty() { Value::Null } else { json!(conn) },
+                    "hosts": hosts,
+                    "removed_prior_anchor": removed_prior_anchor,
+                });
+                let cached = Some(resp.to_string());
+                (resp, cached)
+            }
             other => {
                 return Err(AppError::BadRequest(format!(
                     "unsupported Custom act: {}",
@@ -924,9 +1696,9 @@ pub async fn approve_op(
     // short-circuit the next matching request.
     let (rec_id, rec_vault_id, response_preview, policy_ctx_for_cache) = {
         let mut store = state.approvals.lock().unwrap();
-        let rec = store.approve(&op_id, cached_value.clone()).ok_or_else(|| {
-            AppError::Conflict("op no longer pending after validation".into())
-        })?;
+        let rec = store
+            .approve(&op_id, cached_value.clone())
+            .ok_or_else(|| AppError::Conflict("op no longer pending after validation".into()))?;
         let preview = match &validated.op.act.kind {
             ActType::Use => cached_value
                 .as_deref()
@@ -951,8 +1723,20 @@ pub async fn approve_op(
     //   - The level was Allow / AskAlways / Deny (not stored)
     //   - The vault relocked between approve and now (record_ask_approval
     //     is a no-op then)
+    // A SCOPED ask does NOT use this conn-keyed downgrade window — it was bound
+    // into `op_grants` above (redeemed by peek), so writing a rule_approvals
+    // entry here would let `evaluate` downgrade it to Allow and fast-path a
+    // DIFFERENT bound value on the connection. Only an UNSCOPED ask (Phase-1)
+    // takes the window.
+    let has_scope_binding = validated
+        .op
+        .act
+        .scope
+        .get("scope_vars")
+        .and_then(|v| v.as_object())
+        .is_some_and(|m| !m.is_empty());
     if let Some(pc) = policy_ctx_for_cache {
-        if pc.level == crate::core::policy::AccessLevel::Ask {
+        if pc.level == crate::core::policy::AccessLevel::Ask && !has_scope_binding {
             // The grant is scoped to the **connection** (CONNECTION_SCHEMA.md §6):
             // approving account A's request never fast-paths account B. Falls back
             // to `service` for the default connection (conn == service).
@@ -1034,6 +1818,27 @@ pub async fn approve_op(
     Ok(Json(response))
 }
 
+/// Connection ids (established `aux.connections` + in-flight `aux.connecting`)
+/// whose `service` references `service_id` — for the `service-ls`/`service-rm`
+/// "still referenced by …" report.
+fn service_refs(
+    view: &crate::storage::plaintext::VaultPlaintextView,
+    service_id: &str,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for (cid, c) in &view.aux.connections {
+        if c.service.as_deref() == Some(service_id) {
+            out.push(cid.clone());
+        }
+    }
+    for (cid, c) in &view.aux.connecting {
+        if c.service == service_id && !out.contains(cid) {
+            out.push(cid.clone());
+        }
+    }
+    out
+}
+
 pub async fn reject_op(
     State(state): State<Arc<AppState>>,
     Path(op_id): Path<String>,
@@ -1052,7 +1857,14 @@ pub async fn reject_op(
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     if let Ok(store) = state.audits.for_vault(&rec_vault_id) {
-        if let Err(e) = store.finalize(&op_id, STATUS_REJECTED, now, None, Some("user denied"), None) {
+        if let Err(e) = store.finalize(
+            &op_id,
+            STATUS_REJECTED,
+            now,
+            None,
+            Some("user denied"),
+            None,
+        ) {
             tracing::warn!(vault = %rec_vault_id, op = %op_id, "audit finalize rejected failed: {}", e);
         }
     }
@@ -1066,9 +1878,10 @@ pub async fn reject_op(
         reason: Some("user denied".into()),
     });
 
-    Ok(Json(json!({ "ok": true, "op_id": rec_id, "status": "rejected" })))
+    Ok(Json(
+        json!({ "ok": true, "op_id": rec_id, "status": "rejected" }),
+    ))
 }
-
 
 /// Build the per-service `secrets_cache` from a decrypted v3 view. The cache
 /// carries three things per session:
@@ -1079,8 +1892,8 @@ pub async fn reject_op(
 ///      anymore: a rule-level Allow on a service whose default was Ask still
 ///      needs the bytes ready for fast-path forwarding.
 ///   2. `policy` — the effective policy tree (`aux.policy` overlaid on
-///      compiled defaults). Holds the risk map, default floors, per-category,
-///      and per-connection user policy. Built-in per-service rules are read
+///      compiled defaults). Holds default floors, per-tag, and
+///      per-connection user policy. Built-in per-service rules are read
 ///      live from the service at eval, not cached here.
 /// Build + persist the local per-item store (`vault.per-item.json`) from a
 /// just-decrypted whole-blob vault + its view. The keyset (registry +
@@ -1122,9 +1935,7 @@ fn seed_per_item_store(
         items_seq,
         keyset_seq,
     };
-    if let Err(e) =
-        pv.seed_items_from_view::<sudp::primitives::StdPrimitives>(k, vault_id, view)
-    {
+    if let Err(e) = pv.seed_items_from_view::<sudp::primitives::StdPrimitives>(k, vault_id, view) {
         tracing::warn!(vault = %vault_id, "per-item seed from view failed: {}", e);
         return;
     }
@@ -1139,16 +1950,42 @@ fn seed_per_item_store(
     );
 }
 
+/// The role KEYs cached for a service's connections: the declared `secrets`
+/// plus any oauth `[auth].exposes` roles (derived at connect, stored UPPERCASED —
+/// the phantom's lowercase segment matches case-insensitively at resolve).
+fn cacheable_roles(svc: &crate::service::ServiceDef) -> Vec<String> {
+    let mut roles: Vec<String> = svc.service.secrets.clone();
+    if let Some(o) = svc.oauth2() {
+        roles.extend(o.exposes.iter().map(|r| r.to_ascii_uppercase()));
+    }
+    roles
+}
+
 pub(crate) fn bootstrap_cache_from_view(
     view: &VaultPlaintextView,
     state: &AppState,
 ) -> SecretsCache {
     let mut cache = SecretsCache::default();
     // Effective policy = the vault's sparse `aux.policy` overlaid on compiled
-    // defaults. Rebuilt here on every unlock/refresh, so a risk-map / per-
-    // connection edit is live on the next request (PROTOCOL.md §6.2/§6.4).
-    cache.policy = crate::core::policy::Policy::effective(view.aux.policy.as_ref());
+    // defaults. Rebuilt here on every unlock/refresh, so a per-connection edit
+    // is live on the next request (PROTOCOL.md §6.2/§6.4).
+    let effective_policy = crate::core::policy::Policy::effective(view.aux.policy.as_ref());
+    cache.policy = effective_policy.clone();
     cache.audit_retention_days = view.aux.audit_retention_days;
+    // Residency mirrors the DECISION floor (`AppState::evaluate_request_policy`):
+    // a connection's credential is pre-loaded at unlock iff its effective READ
+    // floor resolves to `allow` — recipe `[default]` ⊕ the user's `aux.policy`
+    // connection override, then tag, then the global `allow` floor. This
+    // replaces the old `default_read_level(service) == Allow` gate, whose
+    // no-`[policy]` fallback was `ask-always` (contradicting the decision layer's
+    // global-`allow` floor, so the first use of a policy-less recipe always
+    // prompted) and which never consulted `aux.policy` (a user tightening a
+    // service to ask-always still got it resident — PROTOCOL.md §6.2). Reusing
+    // `evaluate` with a GET and no rules resolves exactly that read floor, so
+    // residency can't drift from the decision. `service = None` ⇒ raw connection.
+    let read_floor_allows = |service: Option<&str>, conn: &str| -> bool {
+        residency_read_floor_allows(&effective_policy, &state.services, service, conn)
+    };
     // Routing snapshot (CONNECTION_SCHEMA.md §6): `connection_id → {service,
     // config}`. The per-service loop below bootstraps every *default* connection
     // (conn == service); a second pass after it covers *named* connections.
@@ -1172,35 +2009,68 @@ pub(crate) fn bootstrap_cache_from_view(
         if store.kind != "gcp-secret-manager" {
             continue;
         }
-        let Some(creds_item) = store
-            .extra
-            .get("credentials_item")
-            .and_then(|v| v.as_str())
-        else { continue };
-        let Some(sa_json) = view.native_secrets.get(creds_item).cloned() else { continue };
-        cache
-            .external_stores
-            // F-19: wrap SA JSON bytes in Zeroizing so they are zeroed on drop.
-            .insert(store_id.clone(), (store.clone(), zeroize::Zeroizing::new(sa_json)));
+        // ONE adapter instance per store for the whole unlocked session:
+        // this is what makes the adapter's OAuth-token cache effective
+        // (F-19: the adapter zeroizes the SA private key on drop, i.e. on
+        // lock). A store that fails to materialise is skipped, same as the
+        // old missing-credential cases — its keys just aren't resident and
+        // `secret-keys` won't list it.
+        match crate::store::build_adapter(store_id, store, view) {
+            Ok(adapter) => {
+                cache.external_stores.insert(
+                    store_id.clone(),
+                    (store.clone(), std::sync::Arc::new(adapter)),
+                );
+            }
+            Err(e) => {
+                // F-20: full error in the log only; the cache carries a
+                // sanitised reason for `secret-keys` to surface.
+                tracing::warn!(store = %store_id, "unlock: external store adapter init failed: {}", e);
+                cache.external_store_errors.push((
+                    store_id.clone(),
+                    format!("store '{}' unavailable", store_id),
+                ));
+            }
+        }
     }
+    // Resolution order for the lazy fill — aux.store_order restricted to the
+    // adapters that actually materialised, so first-match-wins agrees with
+    // `resolve_value_async`.
+    cache.external_store_order = view
+        .aux
+        .store_order
+        .iter()
+        .filter(|id| {
+            cache
+                .external_stores
+                .get(*id)
+                .is_some_and(|(s, _)| s.category == Category::Value)
+        })
+        .cloned()
+        .collect();
     for (service_id, _) in state.services.iter_sorted() {
-        // PROTOCOL.md §6.2: only services whose default read level is
+        // PROTOCOL.md §6.2: only connections whose effective READ floor is
         // `allow` get their auth value loaded at unlock. ask / ask-always
-        // services have memory_ttl = rule.ttl / 0 respectively, so the
-        // bytes shouldn't sit in cache pre-approval. They're filled
-        // lazily by `approve_op` after the user passkey gesture (ask) or
-        // never (ask-always — fresh-decrypted-per-request via the
-        // grant's W_c and immediately zeroized).
-        if state.services.default_read_level(service_id)
-            == crate::core::policy::AccessLevel::Allow
-        {
-            if let Some(item_name) = state.services.service_env_key(service_id) {
-                if let Some(val) = view.resolve_value_native(&item_name) {
+        // connections don't sit in cache pre-approval — they're filled lazily
+        // by `approve_op` after the user passkey gesture (ask) or never
+        // (ask-always — fresh-decrypted-per-request via the grant's W_c and
+        // immediately zeroized). Marked `from_bootstrap` so a per-path
+        // ask/ask-always RULE on this (read-allow) connection still forces a
+        // fresh passkey instead of riding this residency.
+        if read_floor_allows(Some(service_id), service_id) {
+            // The default connection's record (usually absent) may rebind a role
+            // to an existing key (`keys` map); identity otherwise. Cache maps
+            // stay ROLE-keyed — only the storage lookup goes through the record.
+            let rec = view.aux.connections.get(service_id);
+            if let Some(role) = state.services.service_env_key(service_id) {
+                let key = crate::storage::plaintext::secret_key_for(rec, &role);
+                if let Some(val) = view.resolve_value_native(&key) {
                     cache.entries.insert(
                         service_id.to_string(),
                         crate::state::CacheEntry {
                             value: val.to_vec(),
                             expires_at: None, // allow = lives whole unlocked session
+                            from_bootstrap: true,
                         },
                     );
                 }
@@ -1209,13 +2079,16 @@ pub(crate) fn bootstrap_cache_from_view(
             // v4 multi-secret: resolve each declared `secrets` role so the
             // allow fast-path can inject multi-secret services without a vault
             // view. oauth services declare no injectable direct secret here
-            // (their access token is minted from the refresh_token at forward).
+            // (their access token is minted from the refresh_token at forward),
+            // but their `exposes` roles — derived at connect and stored
+            // UPPERCASED — ARE injectable, so they load alongside.
             if let Some(svc) = state.services.get(service_id) {
                 let mut map: std::collections::HashMap<String, Vec<u8>> =
                     std::collections::HashMap::new();
-                for name in &svc.service.secrets {
-                    if let Some(val) = view.resolve_value_native(name) {
-                        map.insert(name.clone(), val.to_vec());
+                for name in cacheable_roles(svc) {
+                    let key = crate::storage::plaintext::secret_key_for(rec, &name);
+                    if let Some(val) = view.resolve_value_native(&key) {
+                        map.insert(name, val.to_vec());
                     }
                 }
                 if !map.is_empty() {
@@ -1230,42 +2103,47 @@ pub(crate) fn bootstrap_cache_from_view(
         // `AppState::evaluate_request_policy`.
     }
 
-    // Named connections (`conn_id != service_id`) carry namespaced secrets
-    // `<conn>:<ROLE>` (CONNECTION_SCHEMA.md §3). The per-service loop above
-    // already covered every default connection (conn == service, bare name);
-    // here we add the named ones, keyed by connection_id, resolving each role at
-    // its §3 address but storing the multi-secret map under the BARE name so the
-    // proxy's phantom resolution finds each role's bytes. (Allow-level only —
-    // ask-level connections resolve lazily from the op's namespaced `target`.)
+    // Named connections (`conn_id != service_id`) bind each ROLE to its own
+    // BARE key via the record's `keys` map (CONNECTION_SCHEMA.md §3; identity
+    // when unmapped). The per-service loop above already covered every default
+    // connection; here we add the named ones, keyed by connection_id, resolving
+    // each role through its binding but storing the multi-secret map under the
+    // ROLE name so the proxy's phantom resolution finds each role's bytes.
+    // (Allow-level only — ask-level connections resolve lazily from the op's
+    // bound `target` key.)
     for (conn, c) in view.aux.connections.iter() {
         // Raw connections (service: None) have no service to bootstrap from; their
         // bytes resolve lazily at approve. Only service-backed named connections
         // are pre-bootstrapped here.
-        let Some(service) = c.service.as_deref() else { continue };
+        let Some(service) = c.service.as_deref() else {
+            continue;
+        };
         if conn == service {
             continue; // default — already bootstrapped above
         }
-        if state.services.default_read_level(service)
-            != crate::core::policy::AccessLevel::Allow
-        {
+        if !read_floor_allows(Some(service), conn) {
             continue;
         }
         if let Some(role) = state.services.service_env_key(service) {
-            let addr = crate::storage::plaintext::secret_address(conn, service, &role);
-            if let Some(val) = view.resolve_value_native(&addr) {
+            let key = crate::storage::plaintext::secret_key_for(Some(c), &role);
+            if let Some(val) = view.resolve_value_native(&key) {
                 cache.entries.insert(
                     conn.clone(),
-                    crate::state::CacheEntry { value: val.to_vec(), expires_at: None },
+                    crate::state::CacheEntry {
+                        value: val.to_vec(),
+                        expires_at: None,
+                        from_bootstrap: true,
+                    },
                 );
             }
         }
         if let Some(svc) = state.services.get(service) {
             let mut map: std::collections::HashMap<String, Vec<u8>> =
                 std::collections::HashMap::new();
-            for name in &svc.service.secrets {
-                let addr = crate::storage::plaintext::secret_address(conn, service, name);
-                if let Some(val) = view.resolve_value_native(&addr) {
-                    map.insert(name.clone(), val.to_vec());
+            for name in cacheable_roles(svc) {
+                let key = crate::storage::plaintext::secret_key_for(Some(c), &name);
+                if let Some(val) = view.resolve_value_native(&key) {
+                    map.insert(name, val.to_vec());
                 }
             }
             if !map.is_empty() {
@@ -1287,8 +2165,13 @@ pub(crate) fn bootstrap_cache_from_view(
             continue; // service-backed — handled above
         }
         let Some(keys) = &c.secrets else { continue };
-        let mut map: std::collections::HashMap<String, Vec<u8>> =
-            std::collections::HashMap::new();
+        // Same read-floor gate as service connections: a raw connection the user
+        // tightened to ask/ask-always must NOT be resident (PROTOCOL.md §6.2); an
+        // untouched raw connection floors to the global `allow` and stays resident.
+        if !read_floor_allows(None, conn) {
+            continue;
+        }
+        let mut map: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
         for key in keys {
             if let Some((_, bytes)) = view
                 .native_secrets
@@ -1302,9 +2185,14 @@ pub(crate) fn bootstrap_cache_from_view(
         // connection resolves each role from the map (role phantoms).
         if map.len() == 1 {
             let primary = map.values().next().cloned().unwrap();
-            cache
-                .entries
-                .insert(conn.clone(), crate::state::CacheEntry { value: primary, expires_at: None });
+            cache.entries.insert(
+                conn.clone(),
+                crate::state::CacheEntry {
+                    value: primary,
+                    expires_at: None,
+                    from_bootstrap: true,
+                },
+            );
         }
         if !map.is_empty() {
             cache.allow_secrets.insert(conn.clone(), map);
@@ -1314,13 +2202,12 @@ pub(crate) fn bootstrap_cache_from_view(
     // Custom (per-vault `aux.services`) definitions: validate before they can
     // broker (defense in depth — never trust the stored blob), never shadow a
     // built-in id, load only if valid. Wiped on lock with the rest of the cache.
-    let known_providers = state.services.provider_names();
     for (service_id, toml_src) in view.aux.services.iter() {
         if state.services.get(service_id).is_some() {
             tracing::warn!(service = %service_id, "custom service shadows a built-in id — skipped");
             continue;
         }
-        if let Err(e) = crate::service::validate::validate_service(toml_src, &known_providers) {
+        if let Err(e) = crate::service::validate::validate_service(toml_src) {
             tracing::warn!(service = %service_id, "custom service failed validation: {:?} — skipped", e);
             continue;
         }
@@ -1336,3 +2223,278 @@ pub(crate) fn bootstrap_cache_from_view(
     cache
 }
 
+/// Residency gate shared by the unlock bootstrap and the allow-path lazy
+/// fill: a connection's bytes may sit in the session cache iff its effective
+/// READ floor resolves to `allow` (PROTOCOL.md §6.2 — residency mirrors the
+/// decision layer, see the block comment in `bootstrap_cache_from_view`).
+/// `service = None` ⇒ raw connection.
+pub(crate) fn residency_read_floor_allows(
+    effective_policy: &crate::core::policy::Policy,
+    services: &crate::service::ServiceRegistry,
+    service: Option<&str>,
+    conn: &str,
+) -> bool {
+    let recipe = service.and_then(|s| services.default_policy_levels(s));
+    let user = effective_policy
+        .connections
+        .get(conn)
+        .and_then(|c| c.default.as_ref());
+    let conn_levels = crate::core::policy::merge_levels(user, recipe.as_ref());
+    let tags = service.map(|s| services.service_tags(s)).unwrap_or(&[]);
+    crate::core::policy::evaluate(
+        "GET",
+        "/",
+        None,
+        &crate::core::policy::VarMap::new(),
+        None,
+        conn_levels.as_ref(),
+        effective_policy,
+        tags,
+    ) == crate::core::policy::AccessLevel::Allow
+}
+
+/// Allow-path lazy residency for EXTERNAL stores (the store-agnostic half of
+/// the unlock bootstrap above). The secret model is one abstraction: a
+/// connection binds KEYS and policy gates CONNECTIONS — neither knows which
+/// store hosts the bytes. native-secrets values are resident from unlock
+/// because they're already in hand; external values are network I/O we
+/// refuse to put on the unlock path, so they load on FIRST TOUCH instead:
+/// same read-floor gate, same `from_bootstrap` marking, same
+/// whole-session lifetime — only the load moment differs.
+///
+/// Returns:
+///   - `Ok(true)`  — the cache now holds bytes for `conn`; retry the lookup.
+///   - `Ok(false)` — nothing external to load (no stores, floor not allow,
+///     or no store has the keys); fall through to the portal as before.
+///   - `Err(store_id)` — a CONFIGURED store failed (auth/network). Fail
+///     loudly (P2): the caller surfaces an explicit error, never a portal
+///     that would misread an outage as "needs approval".
+pub(crate) async fn lazy_fill_external(
+    state: &AppState,
+    vault_id: &str,
+    conn: &str,
+) -> std::result::Result<bool, String> {
+    // Single-flight: a burst of first requests fills once. Waiters re-check
+    // the cache under the lock and ride the winner's insert.
+    let _fill = state.external_fill_lock.lock().await;
+
+    let (policy, rec, adapters) = {
+        let states = state.vault_states.lock().unwrap();
+        let Some(crate::state::VaultState::Unlocked { cache, .. }) = states.get(vault_id) else {
+            return Ok(false);
+        };
+        if cache.entries.contains_key(conn) || cache.allow_secrets.contains_key(conn) {
+            return Ok(true); // another request filled while we waited
+        }
+        if cache.external_store_order.is_empty() {
+            return Ok(false);
+        }
+        let adapters: Vec<(String, Arc<crate::store::Adapter>)> = cache
+            .external_store_order
+            .iter()
+            .filter_map(|id| {
+                cache
+                    .external_stores
+                    .get(id)
+                    .map(|(_, a)| (id.clone(), a.clone()))
+            })
+            .collect();
+        (
+            cache.policy.clone(),
+            cache.connections.get(conn).cloned(),
+            adapters,
+        )
+    };
+
+    // Service resolution: explicit record binding, else the connection id
+    // names a REGISTRY service (default connection), else raw. Custom
+    // (per-vault) services deliberately follow the bootstrap's behavior —
+    // registry-blind residency, first use goes through the portal — so the
+    // two residency paths can never disagree.
+    let service = rec
+        .as_ref()
+        .and_then(|c| c.service.clone())
+        .or_else(|| state.services.get(conn).map(|_| conn.to_string()));
+
+    if !residency_read_floor_allows(&policy, &state.services, service.as_deref(), conn) {
+        return Ok(false);
+    }
+
+    // Walk stores in vault order for one key; external keys resolve EXACT
+    // (external naming is accepted as-is — no case folding). `Err(store_id)`
+    // aborts the whole fill: a configured store outage must surface, not
+    // degrade into "not found".
+    let resolve_key = |key: String| {
+        let adapters = &adapters;
+        let conn = conn.to_string();
+        async move {
+            for (store_id, adapter) in adapters {
+                match adapter.resolve(&key).await {
+                    Ok(Some(bytes)) => return Ok(Some(bytes)),
+                    Ok(None) => continue,
+                    Err(e) => {
+                        // F-20: full error server-side only; the caller
+                        // returns a sanitised message.
+                        tracing::warn!(store = %store_id, conn = %conn, "lazy external fill failed: {}", e);
+                        return Err(store_id.clone());
+                    }
+                }
+            }
+            Ok(None)
+        }
+    };
+
+    // Same shapes as the bootstrap's passes: `entries` primary from the
+    // service's env-key role; `allow_secrets` map from `cacheable_roles`
+    // (NOT the primary role — an oauth refresh token is resident for the
+    // mint path only, never in the injectable role map); raw connections
+    // map their explicit keys, sole key doubling as primary.
+    let mut primary: Option<Vec<u8>> = None;
+    let mut map: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
+    // Names that actually resolved from an external store — fed back into
+    // the cache's external_keys slot so registry/entries surfaces learn
+    // them even when the store's SA can't list().
+    let mut fetched_keys: Vec<String> = Vec::new();
+    match service.as_deref() {
+        Some(svc_id) => {
+            if let Some(role) = state.services.service_env_key(svc_id) {
+                let key = crate::storage::plaintext::secret_key_for(rec.as_ref(), &role);
+                primary = resolve_key(key.clone()).await?;
+                if primary.is_some() {
+                    fetched_keys.push(key);
+                }
+            }
+            if let Some(svc) = state.services.get(svc_id) {
+                for name in cacheable_roles(svc) {
+                    let key = crate::storage::plaintext::secret_key_for(rec.as_ref(), &name);
+                    if let Some(bytes) = resolve_key(key.clone()).await? {
+                        map.insert(name, bytes);
+                        fetched_keys.push(key);
+                    }
+                }
+            }
+        }
+        None => {
+            let Some(keys) = rec.as_ref().and_then(|c| c.secrets.clone()) else {
+                return Ok(false); // raw connection with no explicit keys
+            };
+            for key in keys {
+                if let Some(bytes) = resolve_key(key.clone()).await? {
+                    map.insert(key.clone(), bytes);
+                    fetched_keys.push(key);
+                }
+            }
+            if map.len() == 1 {
+                primary = map.values().next().cloned();
+            }
+        }
+    }
+    if primary.is_none() && map.is_empty() {
+        return Ok(false);
+    }
+    {
+        let mut states = state.vault_states.lock().unwrap();
+        let Some(crate::state::VaultState::Unlocked { cache, .. }) = states.get_mut(vault_id)
+        else {
+            return Ok(false); // locked while we were fetching — drop the bytes
+        };
+        if let Some(val) = primary {
+            cache
+                .entries
+                .entry(conn.to_string())
+                .or_insert(crate::state::CacheEntry {
+                    value: val,
+                    expires_at: None,
+                    from_bootstrap: true,
+                });
+        }
+        if !map.is_empty() {
+            cache.allow_secrets.entry(conn.to_string()).or_insert(map);
+        }
+        cache
+            .external_keys
+            .lock()
+            .unwrap()
+            .extend(fetched_keys.iter().cloned());
+    }
+    tracing::info!(conn = %conn, "external store secrets resident after lazy fill");
+    Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::plaintext::{Store, VaultAux};
+    use std::collections::BTreeMap;
+
+    fn test_state() -> AppState {
+        let cfg = crate::config::Config {
+            state_dir: std::path::PathBuf::from(format!(
+                "/tmp/safeclaw-test-approve-{}",
+                std::process::id()
+            )),
+            port: 0,
+            proxy_port: 0,
+            listen: "127.0.0.1".into(),
+            origin: "http://localhost".into(),
+            rp_id: "localhost".into(),
+            admin_key: None,
+            relay_url: None,
+            body_cap: crate::config::DEFAULT_BODY_CAP,
+        };
+        AppState::new(cfg)
+    }
+
+    fn gcp_store(creds_item: &str) -> Store {
+        let mut extra = serde_json::Map::new();
+        extra.insert(
+            "project_id".into(),
+            serde_json::Value::String("proj".into()),
+        );
+        extra.insert(
+            "credentials_item".into(),
+            serde_json::Value::String(creds_item.into()),
+        );
+        Store {
+            kind: "gcp-secret-manager".into(),
+            category: Category::Value,
+            items: BTreeMap::new(),
+            extra,
+        }
+    }
+
+    /// The unlock bootstrap materialises ONE shared adapter per external
+    /// store (a store whose credential is missing is skipped, not fatal)
+    /// and snapshots store_order restricted to what materialised — the
+    /// exact walk order `lazy_fill_external` uses.
+    #[test]
+    fn bootstrap_snapshots_external_adapters_and_order() {
+        let state = test_state();
+        let mut aux = VaultAux::initial();
+        aux.stores.insert("gcpa".into(), gcp_store("GCPA_SA_JSON"));
+        aux.stores.insert("gcpb".into(), gcp_store("MISSING_ITEM"));
+        aux.store_order = vec!["native-secrets".into(), "gcpa".into(), "gcpb".into()];
+        let mut native_secrets = BTreeMap::new();
+        native_secrets.insert(
+            "GCPA_SA_JSON".to_string(),
+            br#"{"client_email":"sa@proj.iam.gserviceaccount.com","private_key":"not-a-real-pem"}"#
+                .to_vec(),
+        );
+        let view = VaultPlaintextView {
+            aux,
+            native_secrets,
+        };
+
+        let cache = bootstrap_cache_from_view(&view, &state);
+
+        assert!(cache.external_stores.contains_key("gcpa"));
+        assert!(
+            !cache.external_stores.contains_key("gcpb"),
+            "store with a missing credential item must be skipped"
+        );
+        assert_eq!(cache.external_store_order, vec!["gcpa".to_string()]);
+        let (store, adapter) = &cache.external_stores["gcpa"];
+        assert_eq!(store.kind, "gcp-secret-manager");
+        assert_eq!(adapter.kind(), "gcp-secret-manager");
+    }
+}

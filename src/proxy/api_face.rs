@@ -10,7 +10,7 @@
 //! - `/health`, `/ca` — unauthenticated (liveness / public CA cert).
 //! - `/v/{vid}/registry`, `/op/{id}` — the agent Bearer key (§8).
 //!
-//! Writes / ceremony never appear here — they stay on the control port (23295),
+//! Writes / ceremony never appear here — they stay on the control port (23293),
 //! passkey-gated and invisible to the agent. The read projections come from the
 //! SAME functions the control plane serves (`registry::vault_registry_value`,
 //! `approve::op_poll_value`, `health::health_value`), so the two ports can't
@@ -23,6 +23,7 @@ use hudsucker::hyper::{header, HeaderMap, Method, Request, Response, StatusCode}
 use hudsucker::Body;
 use serde_json::{json, Value};
 
+use crate::error::ScCode;
 use crate::state::AppState;
 
 /// Is `req` addressed to us (the API face) rather than a proxied upstream? True
@@ -48,13 +49,16 @@ fn is_self_authority(host: &str, port: Option<u16>, proxy_port: u16) -> bool {
 /// refresh on an auth miss.
 pub async fn respond(state: &Arc<AppState>, req: &Request<Body>) -> Response<Body> {
     if req.method() != Method::GET {
-        return json(StatusCode::METHOD_NOT_ALLOWED, &json!({ "error": "method_not_allowed" }));
+        return problem(ScCode::MethodNotAllowed, "GET only");
     }
     let path = req.uri().path().to_string();
 
     // ── Unauthenticated: liveness + public CA ────────────────────────────────
     if path == "/health" {
-        return json(StatusCode::OK, &crate::server::handlers::health::health_value(state));
+        return json(
+            StatusCode::OK,
+            &crate::server::handlers::health::health_value(state),
+        );
     }
     if path == "/ca" {
         return ca_pem(state);
@@ -70,7 +74,10 @@ pub async fn respond(state: &Arc<AppState>, req: &Request<Body>) -> Response<Bod
             Err(e) => app_err(e),
         };
     }
-    if let Some(vid) = path.strip_prefix("/v/").and_then(|r| r.strip_suffix("/registry")) {
+    if let Some(vid) = path
+        .strip_prefix("/v/")
+        .and_then(|r| r.strip_suffix("/registry"))
+    {
         if let Err(r) = require_key(state, req.headers()).await {
             return r;
         }
@@ -83,7 +90,7 @@ pub async fn respond(state: &Arc<AppState>, req: &Request<Body>) -> Response<Bod
         };
     }
 
-    json(StatusCode::NOT_FOUND, &json!({ "error": "not_found" }))
+    problem(ScCode::NotFound, "Not found")
 }
 
 /// Gate a request on the agent Bearer key (§8): the same membership check the
@@ -101,9 +108,9 @@ async fn require_key(state: &Arc<AppState>, headers: &HeaderMap) -> Result<(), R
     {
         return Ok(());
     }
-    Err(json(
-        StatusCode::UNAUTHORIZED,
-        &json!({ "error": "unauthorized", "message": "missing or invalid agent api key" }),
+    Err(problem(
+        ScCode::Unauthorized,
+        "missing or invalid agent api key",
     ))
 }
 
@@ -134,15 +141,28 @@ fn ca_pem(state: &AppState) -> Response<Body> {
             .unwrap_or_else(|_| plain_500()),
         Err(e) => {
             tracing::warn!("api_face: read {} failed: {}", path.display(), e);
-            json(StatusCode::INTERNAL_SERVER_ERROR, &json!({ "error": "ca_unavailable" }))
+            problem(ScCode::CaUnavailable, "resident CA unreadable")
         }
     }
 }
 
 fn app_err(e: crate::error::AppError) -> Response<Body> {
-    let (status, code, message) = e.parts();
-    let status = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    json(status, &json!({ "error": code, "message": message }))
+    let (code, detail) = e.code();
+    problem(code, &detail)
+}
+
+/// RFC 9457 rendering for this face — the SAME `problem_body` row the control
+/// plane emits, so both ports map an error identically.
+fn problem(code: ScCode, detail: &str) -> Response<Body> {
+    let status = StatusCode::from_u16(code.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let body = serde_json::to_vec(&crate::error::problem_body(code, detail))
+        .unwrap_or_else(|_| b"{}".to_vec());
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "application/problem+json")
+        .header("x-safeclaw-error", code.as_str())
+        .body(Body::from(body))
+        .unwrap_or_else(|_| plain_500())
 }
 
 /// `/op/{id}` poll response — the shared `op_poll_value` body PLUS the same

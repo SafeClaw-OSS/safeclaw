@@ -69,7 +69,9 @@ async fn audit_ls(args: AdminAuditLsArgs) -> Result<(), String> {
         .map_err(|e| format!("reach custodian: {}", e))?;
     let status = resp.status();
     if status.as_u16() == 403 {
-        return Err("custodian returned 403 — admin key mismatch or admin endpoints disabled".into());
+        return Err(
+            "custodian returned 403 — admin key mismatch or admin endpoints disabled".into(),
+        );
     }
     if !status.is_success() {
         return Err(format!(
@@ -89,11 +91,18 @@ async fn audit_ls(args: AdminAuditLsArgs) -> Result<(), String> {
     );
     for row in &body.entries {
         let when = row.created_at.as_deref().unwrap_or("?");
-        let act = if row.act_type.is_empty() { "?" } else { &row.act_type };
-        let stat = if row.status.is_empty() { "?" } else { &row.status };
+        let act = if row.act_type.is_empty() {
+            "?"
+        } else {
+            &row.act_type
+        };
+        let stat = if row.status.is_empty() {
+            "?"
+        } else {
+            &row.status
+        };
         let tgt = row.target.as_deref().unwrap_or(&row.op_id);
         println!("  {:<24}  {:<14}  {:<10}  {}", when, act, stat, tgt);
     }
     Ok(())
 }
-

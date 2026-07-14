@@ -1,6 +1,0 @@
-[service]
-id = "wechat"
-name = "WeChat iLink"
-
-hosts = ["ilinkai.weixin.qq.com"]
-secrets = ["WECHAT_API_KEY"]

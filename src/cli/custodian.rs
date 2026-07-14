@@ -17,7 +17,11 @@ pub async fn pubkey(args: CommonArgs) -> Result<(), String> {
 /// reads. Offline by construction (`ServiceRegistry::compiled_only()`).
 pub fn registry(args: RegistryArgs) -> Result<(), String> {
     let reg = crate::service::ServiceRegistry::compiled_only();
-    let catalog = crate::server::handlers::registry::render_catalog(&reg, false, None, false)
+    // include_policy_rules = true: this catalog is the SSoT the CONSOLE reads
+    // (CI publishes it as registry.json) and the policy panel needs each
+    // service's per-action rules. The agent-facing `GET /registry` still omits
+    // them by default (lean); only this published artifact opts in.
+    let catalog = crate::server::handlers::registry::render_catalog(&reg, true, None, false)
         .map_err(|e| e.to_string())?;
     if args.json {
         println!(
@@ -25,9 +29,9 @@ pub fn registry(args: RegistryArgs) -> Result<(), String> {
             serde_json::to_string_pretty(&catalog).map_err(|e| e.to_string())?
         );
     } else {
-        println!("{:<24} {:<30} CATEGORY", "ID", "NAME");
+        println!("{:<24} {:<30} TAGS", "ID", "NAME");
         for s in &catalog.services {
-            println!("{:<24} {:<30} {}", s.id, s.name, s.category);
+            println!("{:<24} {:<30} {}", s.id, s.name, s.tags.join(","));
         }
     }
     Ok(())
@@ -53,13 +57,16 @@ async fn fetch_print(_args: CommonArgs, path: &str) -> Result<(), String> {
         ));
     }
     let body: serde_json::Value = resp.json().await.map_err(|e| format!("parse: {}", e))?;
-    println!("{}", serde_json::to_string_pretty(&body).unwrap_or_default());
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&body).unwrap_or_default()
+    );
     Ok(())
 }
 
 /// The daemon control root. `resolve_active` errs only when no vault is
 /// selected — fall back to the SAME shared derivation (env-first host), not a
-/// hardcoded localhost that would ignore an agent's `$SAFECLAW_DAEMON_URL`.
+/// hardcoded localhost that would ignore an agent's `$SAFECLAW_BROKER_URL`.
 fn resolve_daemon_url() -> Result<String, String> {
     if let Ok((c, _)) = resolve_active(None) {
         return Ok(c);

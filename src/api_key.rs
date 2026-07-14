@@ -24,16 +24,16 @@
 
 use std::sync::Arc;
 
+use crate::error::{AppError, Result};
+use crate::state::AppState;
 use axum::{
     extract::{Request, State},
     http::{header::AUTHORIZATION, HeaderMap},
     middleware::Next,
     response::{IntoResponse, Response},
 };
-use crate::error::{AppError, Result};
-use crate::state::AppState;
 
-fn sha256_hex(s: &str) -> String {
+pub(crate) fn sha256_hex(s: &str) -> String {
     use sha2::{Digest, Sha256};
     let d = Sha256::digest(s.as_bytes());
     d.iter().map(|b| format!("{:02x}", b)).collect()
@@ -99,8 +99,14 @@ mod tests {
     #[test]
     fn extract_key_bearer_only() {
         // Bearer: the token is the key (case-insensitive scheme).
-        assert_eq!(extract_key(Some("Bearer sc_agent_x")).as_deref(), Some("sc_agent_x"));
-        assert_eq!(extract_key(Some("bearer sc_agent_x")).as_deref(), Some("sc_agent_x"));
+        assert_eq!(
+            extract_key(Some("Bearer sc_agent_x")).as_deref(),
+            Some("sc_agent_x")
+        );
+        assert_eq!(
+            extract_key(Some("bearer sc_agent_x")).as_deref(),
+            Some("sc_agent_x")
+        );
         // Non-Bearer / absent → None (the daemon gate takes Bearer only).
         assert_eq!(extract_key(Some("Basic Zm9vOmJhcg==")), None);
         assert_eq!(extract_key(None), None);

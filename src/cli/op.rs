@@ -63,7 +63,7 @@ fn next_delay(retry_after: Option<&str>) -> Duration {
 
 pub async fn run_wait(args: OpWaitArgs) -> Result<(), String> {
     // Corrupt config degrades to defaults, NOT a hardcoded localhost that
-    // would ignore an agent's $SAFECLAW_DAEMON_URL (same rule as custodian.rs).
+    // would ignore an agent's $SAFECLAW_BROKER_URL (same rule as custodian.rs).
     let root = control_root(&load().unwrap_or_default());
     let poll_url = format!(
         "{}/op/{}",
@@ -101,7 +101,9 @@ pub async fn run_wait(args: OpWaitArgs) -> Result<(), String> {
                 }
             }
             Ok(resp) if resp.status().as_u16() == 404 => {
-                eprintln!("expired or unknown — re-run the original command to mint a fresh approval");
+                eprintln!(
+                    "expired or unknown — re-run the original command to mint a fresh approval"
+                );
                 std::process::exit(3);
             }
             Ok(resp) => {
@@ -124,6 +126,15 @@ pub async fn run_wait(args: OpWaitArgs) -> Result<(), String> {
                             }
                             Verdict::Rejected => {
                                 println!("{}", body);
+                                let reason =
+                                    body.get("reason").and_then(|s| s.as_str()).unwrap_or("");
+                                if reason.contains("superseded") {
+                                    eprintln!(
+                                        "superseded by a newer approval request — \
+                                         re-run the original command"
+                                    );
+                                    std::process::exit(6);
+                                }
                                 eprintln!("rejected ✗ — do not retry");
                                 std::process::exit(5);
                             }

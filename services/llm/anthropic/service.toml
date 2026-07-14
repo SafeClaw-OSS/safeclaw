@@ -1,7 +1,0 @@
-[service]
-id = "anthropic"
-name = "Anthropic"
-group = "anthropic"
-
-hosts = ["api.anthropic.com"]
-secrets = ["ANTHROPIC_API_KEY"]

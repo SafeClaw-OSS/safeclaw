@@ -10,7 +10,9 @@ use std::path::Path;
 
 use crate::cli::active::{api_face_root, load as load_config, resolve_active};
 use crate::cli::env::shell_quote;
-use crate::cli::proxy_env::{build_bundle, control_plane_up, proxy_url_for_vault, resident_ca_path};
+use crate::cli::proxy_env::{
+    build_bundle, control_plane_up, proxy_url_for_vault, resident_ca_bundle_path, resident_ca_path,
+};
 use crate::config::RunArgs;
 
 pub async fn run(args: RunArgs) -> Result<(), String> {
@@ -26,18 +28,23 @@ pub async fn run(args: RunArgs) -> Result<(), String> {
     let ca = resident_ca_path();
     preflight(&ca, &control).await?;
 
-    let proxy_url = agent_proxy_url(&vid, args.vault.is_some());
+    let proxy_url = agent_proxy_url(&vid);
     // Friendly hint (user's request): a human shell has no agent identity, so
     // credential substitution will 407. Say so once, up front — non-credential
     // traffic is unaffected, so this is a note, not an error.
     if !args.export_env && !agent_has_key() {
         eprintln!(
-            "note: no SafeClaw agent key in this shell — credential substitution will 407 \
-             (run inside your agent, which holds its own key). Non-credential traffic is unaffected."
+            "note: no SafeClaw agent key in this shell — credential substitution will 407. \
+             Load your agent env (the file holding SAFECLAW_API_KEY) and retry; this is not a \
+             daemon or port problem. Non-credential traffic is unaffected."
         );
     }
 
-    let ca_str = ca.to_string_lossy().to_string();
+    // Hand the child a bundle = broker root + OS trust-store roots (not the
+    // broker-only `ca.pem`), so tools without a compiled system-CApath fallback
+    // (cargo) can still verify passthrough public hosts. Falls back to the
+    // broker-only path on any error, so this never regresses brokered calls.
+    let ca_str = resident_ca_bundle_path().to_string_lossy().to_string();
     // Chain onto an already-configured git helper rather than clobber it.
     let parent_count = std::env::var("GIT_CONFIG_COUNT")
         .ok()
@@ -60,30 +67,27 @@ pub async fn run(args: RunArgs) -> Result<(), String> {
     exec_child(&args.cmd, &bundle)
 }
 
-/// The proxy URL the child's `HTTPS_PROXY` gets (CREDENTIAL_BROKER.md §14). Preference:
-/// the agent's OWN `$SAFECLAW_PROXY_URL` (carries its vid + api-key) copied
-/// VERBATIM — zero assembly — unless `--vault` overrode the vault, in which case
-/// build one for the resolved vid, splicing the agent's `$SAFECLAW_API_KEY` into
-/// the API-face root (same daemon host as everything else — the invariant).
-/// `sc run` never owns or persists the key; it only propagates the agent's own.
-fn agent_proxy_url(vid: &str, vault_overridden: bool) -> String {
-    if !vault_overridden {
-        if let Ok(u) = std::env::var("SAFECLAW_PROXY_URL") {
-            if !u.is_empty() {
-                return u;
-            }
-        }
-    }
-    let key = std::env::var("SAFECLAW_API_KEY").ok().filter(|s| !s.is_empty());
+/// The proxy URL the child's `HTTPS_PROXY` gets (CREDENTIAL_BROKER.md §14).
+/// Always REBUILT for the resolved vid: the agent's own `$SAFECLAW_API_KEY`
+/// spliced into the CURRENT API-face root (same daemon host as everything else —
+/// the invariant), never a pre-baked full proxy URL copied verbatim. A snapshot
+/// would pin a stale host:port from an old `sc agent add` (a moved daemon → the
+/// child's proxy points at a dead port); rebuilding tracks the live daemon and
+/// self-heals. `sc run` still never owns or persists the key — it reads the
+/// agent's own from the env and splices it in memory only.
+fn agent_proxy_url(vid: &str) -> String {
+    let key = std::env::var("SAFECLAW_API_KEY")
+        .ok()
+        .filter(|s| !s.is_empty());
     let cfg = load_config().unwrap_or_default();
     proxy_url_for_vault(&api_face_root(&cfg), vid, key.as_deref())
 }
 
-/// Does this shell carry an agent identity? A key rides either the agent's
-/// pre-baked `$SAFECLAW_PROXY_URL` (password slot) or a bare `$SAFECLAW_API_KEY`.
+/// Does this shell carry an agent identity? Its `$SAFECLAW_API_KEY`.
 fn agent_has_key() -> bool {
-    std::env::var("SAFECLAW_PROXY_URL").map(|s| !s.is_empty()).unwrap_or(false)
-        || std::env::var("SAFECLAW_API_KEY").map(|s| !s.is_empty()).unwrap_or(false)
+    std::env::var("SAFECLAW_API_KEY")
+        .map(|s| !s.is_empty())
+        .unwrap_or(false)
 }
 
 /// The CA must exist and the daemon must be up (the proxy shares its process).
@@ -98,6 +102,28 @@ async fn preflight(ca: &Path, control_root: &str) -> Result<(), String> {
     }
     if control_plane_up(control_root).await {
         return Ok(());
+    }
+    // A stale broker URL (an old `sc agent add` snapshot) points the whole
+    // resolution at a daemon HOST that has since moved — name the actual var the
+    // agent set (new `SAFECLAW_BROKER_URL` or legacy `SAFECLAW_DAEMON_URL`),
+    // rather than the misleading "isn't running" when a daemon may well be up on
+    // the default host/port. (A stale PORT alone can't reach here: `control_root`
+    // takes only the env HOST and resolves the port itself.)
+    if let Some((name, u)) = ["SAFECLAW_BROKER_URL", "SAFECLAW_DAEMON_URL"]
+        .into_iter()
+        .find_map(|k| {
+            std::env::var(k)
+                .ok()
+                .filter(|s| !s.is_empty())
+                .map(|v| (k, v))
+        })
+    {
+        return Err(format!(
+            "SafeClaw isn't answering at {control_root} (host from your agent env's \
+             {name}={u}). If the daemon moved or restarted elsewhere, unset that \
+             stale value or re-run `sc agent add` to re-mint your env, then retry. \
+             Otherwise start it with `sc up`."
+        ));
     }
     Err("SafeClaw isn't running — bring it up with `sc up`, then retry.".into())
 }

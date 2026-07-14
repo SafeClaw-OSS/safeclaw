@@ -26,7 +26,8 @@ fn run_set(key: &str, value: &str) -> Result<(), String> {
     let mut cfg = load().unwrap_or_default();
     match canonical_key(key)? {
         Key::CbPort => {
-            let n: u16 = value.parse()
+            let n: u16 = value
+                .parse()
                 .map_err(|_| format!("cb-port must be a 1..=65535 integer, got {:?}", value))?;
             cfg.settings.cb_port = Some(n);
         }
@@ -40,7 +41,10 @@ fn run_get(key: &str) -> Result<(), String> {
     let cfg = load().unwrap_or_default();
     match canonical_key(key)? {
         Key::CbPort => match cfg.settings.cb_port {
-            Some(n) => { println!("{}", n); Ok(()) }
+            Some(n) => {
+                println!("{}", n);
+                Ok(())
+            }
             None => Err(format!("{} is not set", key)),
         },
     }
@@ -79,9 +83,6 @@ enum Key {
 fn canonical_key(key: &str) -> Result<Key, String> {
     match key.replace('_', "-").to_ascii_lowercase().as_str() {
         "cb-port" => Ok(Key::CbPort),
-        other => Err(format!(
-            "unknown setting: {:?}. Known keys: cb-port",
-            other
-        )),
+        other => Err(format!("unknown setting: {:?}. Known keys: cb-port", other)),
     }
 }

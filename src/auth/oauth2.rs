@@ -1,6 +1,6 @@
 // OAuth2 wire calls: refresh + authorization-code exchange (pure, no schema).
 
-use crate::core::forward::HTTP_CLIENT;
+use crate::core::forward::http_client;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// OAuth2 refresh content type.
@@ -28,6 +28,42 @@ pub struct ExchangedTokens {
     pub access_token: String,
     /// Absolute unix-seconds expiry of `access_token`.
     pub expires_at: u64,
+    /// OIDC id_token, when the provider returned one. Source of the `exposes`
+    /// claim derivations (e.g. openai-codex's `chatgpt_account_id`) and of the
+    /// stored id_token slot when the service declares one.
+    pub id_token: Option<String>,
+}
+
+/// Read a claim from a JWT's payload without verifying the signature — fine
+/// here because the token just arrived over TLS from the provider's own /token
+/// endpoint (the same trust as every other field of that response). `path`
+/// walks nested objects (an OIDC namespace key like
+/// `https://api.openai.com/auth` is ONE segment); as a fallback the LEAF
+/// segment is also tried as a top-level claim (providers have moved claims
+/// between the two across versions). Returns the claim as a string (non-string
+/// scalars are JSON-serialized).
+pub fn id_token_claim(id_token: &str, path: &[String]) -> Option<String> {
+    use base64::Engine as _;
+    let payload_b64 = id_token.split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload_b64)
+        .ok()?;
+    let payload: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let mut cur = &payload;
+    let walked = 'walk: {
+        for seg in path {
+            match cur.get(seg) {
+                Some(v) => cur = v,
+                None => break 'walk None,
+            }
+        }
+        Some(cur)
+    };
+    let v = walked.or_else(|| path.last().and_then(|leaf| payload.get(leaf)))?;
+    match v {
+        serde_json::Value::String(s) => Some(s.clone()),
+        other => Some(other.to_string()),
+    }
 }
 
 /// Build the form-urlencoded params for an authorization_code exchange
@@ -110,9 +146,13 @@ pub async fn exchange_code(
     let resp = match style {
         OAuthStyle::Json => {
             let body = code_exchange_json_body(
-                client_id, client_secret, code, code_verifier, redirect_uri,
+                client_id,
+                client_secret,
+                code,
+                code_verifier,
+                redirect_uri,
             );
-            HTTP_CLIENT
+            http_client()
                 .post(token_url)
                 .header("Content-Type", "application/json")
                 .json(&body)
@@ -122,9 +162,13 @@ pub async fn exchange_code(
         }
         OAuthStyle::Form => {
             let form_params = code_exchange_form_params(
-                client_id, client_secret, code, code_verifier, redirect_uri,
+                client_id,
+                client_secret,
+                code,
+                code_verifier,
+                redirect_uri,
             );
-            HTTP_CLIENT
+            http_client()
                 .post(token_url)
                 .form(&form_params)
                 .send()
@@ -135,9 +179,15 @@ pub async fn exchange_code(
 
     if !resp.status().is_success() {
         let status = resp.status();
-        let body_text = resp.text().await.unwrap_or_else(|_| "<no body>".to_string());
+        let body_text = resp
+            .text()
+            .await
+            .unwrap_or_else(|_| "<no body>".to_string());
         tracing::warn!("oauth2 code-exchange error body: {}", body_text);
-        return Err(format!("oauth2 code-exchange returned HTTP {} — {}", status, body_text));
+        return Err(format!(
+            "oauth2 code-exchange returned HTTP {} — {}",
+            status, body_text
+        ));
     }
 
     let body: serde_json::Value = resp
@@ -154,6 +204,10 @@ pub async fn exchange_code(
         .get("refresh_token")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
+    let id_token = body
+        .get("id_token")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
     let expires_in = body
         .get("expires_in")
         .and_then(|v| v.as_u64())
@@ -167,6 +221,7 @@ pub async fn exchange_code(
         refresh_token,
         access_token,
         expires_at: now_secs + expires_in,
+        id_token,
     })
 }
 
@@ -175,7 +230,12 @@ pub async fn exchange_code(
 /// with per-deployment config (token_url + client_id + optional client_secret,
 /// resolved from the service definition + its provider).
 ///
-/// Returns `(access_token, absolute_expires_at_unix_secs)` on success.
+/// Returns `(access_token, absolute_expires_at_unix_secs, rotated_refresh_token)`
+/// on success. `rotated_refresh_token` is `Some` when the provider returned a
+/// NEW `refresh_token` in the refresh response (OpenAI mints a fresh one on every
+/// refresh and invalidates the old; Google does not) — the caller MUST persist it
+/// back to the vault, or the next refresh would send a dead token. `None` when the
+/// provider omitted it (the stored refresh_token stays valid).
 /// On refresh failure, returns an `Err(String)` with the provider's
 /// error body — caller inspects this to detect `invalid_grant` and
 /// surface a "needs reauth" UI flag.
@@ -185,7 +245,7 @@ pub async fn perform_refresh(
     client_secret: Option<&str>,
     refresh_token_value: &str,
     style: OAuthStyle,
-) -> Result<(String, u64), String> {
+) -> Result<(String, u64, Option<String>), String> {
     tracing::info!(
         "oauth2 refresh: token_url={} style={}",
         token_url,
@@ -202,7 +262,7 @@ pub async fn perform_refresh(
                 "refresh_token": refresh_token_value,
                 "client_id": client_id,
             });
-            HTTP_CLIENT
+            http_client()
                 .post(token_url)
                 .header("Content-Type", "application/json")
                 .json(&body)
@@ -219,7 +279,7 @@ pub async fn perform_refresh(
             if let Some(secret) = client_secret {
                 form_params.push(("client_secret", secret));
             }
-            HTTP_CLIENT
+            http_client()
                 .post(token_url)
                 .form(&form_params)
                 .send()
@@ -230,9 +290,15 @@ pub async fn perform_refresh(
 
     if !resp.status().is_success() {
         let status = resp.status();
-        let body_text = resp.text().await.unwrap_or_else(|_| "<no body>".to_string());
+        let body_text = resp
+            .text()
+            .await
+            .unwrap_or_else(|_| "<no body>".to_string());
         tracing::warn!("oauth2 refresh error body: {}", body_text);
-        return Err(format!("oauth2 refresh returned HTTP {} — {}", status, body_text));
+        return Err(format!(
+            "oauth2 refresh returned HTTP {} — {}",
+            status, body_text
+        ));
     }
 
     let body: serde_json::Value = resp
@@ -250,16 +316,65 @@ pub async fn perform_refresh(
         .and_then(|v| v.as_u64())
         .unwrap_or(3600);
 
+    // A rotating provider (OpenAI) returns a fresh refresh_token here and
+    // invalidates the one we sent; surface it so the caller can persist it.
+    let rotated_refresh = body
+        .get("refresh_token")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
     let now_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    Ok((access_token, now_secs + expires_in))
+    Ok((access_token, now_secs + expires_in, rotated_refresh))
 }
 
 #[cfg(test)]
 mod connect_request_tests {
     use super::*;
+
+    /// An unsigned JWT whose payload is `claims` (header/signature irrelevant —
+    /// id_token_claim only reads the middle segment).
+    fn jwt(claims: serde_json::Value) -> String {
+        use base64::Engine as _;
+        let enc = |v: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(v);
+        format!(
+            "{}.{}.{}",
+            enc(b"{}"),
+            enc(claims.to_string().as_bytes()),
+            enc(b"sig")
+        )
+    }
+
+    #[test]
+    fn id_token_claim_walks_namespaced_path() {
+        let t = jwt(serde_json::json!({
+            "https://api.openai.com/auth": { "chatgpt_account_id": "acct-123" }
+        }));
+        let path = vec![
+            "https://api.openai.com/auth".to_string(),
+            "chatgpt_account_id".to_string(),
+        ];
+        assert_eq!(id_token_claim(&t, &path).as_deref(), Some("acct-123"));
+    }
+
+    #[test]
+    fn id_token_claim_falls_back_to_top_level_leaf() {
+        let t = jwt(serde_json::json!({ "chatgpt_account_id": "acct-789" }));
+        let path = vec![
+            "https://api.openai.com/auth".to_string(),
+            "chatgpt_account_id".to_string(),
+        ];
+        assert_eq!(id_token_claim(&t, &path).as_deref(), Some("acct-789"));
+    }
+
+    #[test]
+    fn id_token_claim_none_when_absent_or_malformed() {
+        let t = jwt(serde_json::json!({ "sub": "x" }));
+        assert!(id_token_claim(&t, &["missing".to_string()]).is_none());
+        assert!(id_token_claim("not-a-jwt", &["a".to_string()]).is_none());
+    }
 
     // ── form (Google / default) body construction ──────────────────────────
 
@@ -287,9 +402,8 @@ mod connect_request_tests {
 
     #[test]
     fn form_params_omit_client_secret_for_pkce_only() {
-        let p = code_exchange_form_params(
-            "client-123", None, "code", "verif", "http://127.0.0.1/cb",
-        );
+        let p =
+            code_exchange_form_params("client-123", None, "code", "verif", "http://127.0.0.1/cb");
         assert!(!p.iter().any(|(k, _)| *k == "client_secret"));
         assert!(p.contains(&("grant_type", "authorization_code")));
     }
@@ -316,9 +430,7 @@ mod connect_request_tests {
 
     #[test]
     fn json_body_omits_client_secret_when_absent() {
-        let b = code_exchange_json_body(
-            "client-123", None, "code", "verif", "http://127.0.0.1/cb",
-        );
+        let b = code_exchange_json_body("client-123", None, "code", "verif", "http://127.0.0.1/cb");
         assert!(b.get("client_secret").is_none());
         assert_eq!(b["grant_type"], "authorization_code");
     }

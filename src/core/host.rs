@@ -62,7 +62,10 @@ fn strip_port(authority: &str) -> &str {
         // [ipv6]:port → the bracketed host
         return rest.split(']').next().unwrap_or(rest);
     }
-    authority.rsplit_once(':').map(|(h, _)| h).unwrap_or(authority)
+    authority
+        .rsplit_once(':')
+        .map(|(h, _)| h)
+        .unwrap_or(authority)
 }
 
 /// Exact-FQDN match for runtime enforcement: case-insensitive, port-aware.
@@ -72,7 +75,9 @@ pub fn host_matches_exact(dest_authority: &str, allowed_fqdn: &str) -> bool {
 
 /// True if `dest_authority` matches any of the `resolved` exact FQDNs.
 pub fn host_allowed(dest_authority: &str, resolved: &[String]) -> bool {
-    resolved.iter().any(|h| host_matches_exact(dest_authority, h))
+    resolved
+        .iter()
+        .any(|h| host_matches_exact(dest_authority, h))
 }
 
 /// Single-label leftmost wildcard match (TLS-cert rule): `*.suffix` matches
@@ -137,26 +142,33 @@ fn insert_direct(map: &mut BTreeMap<String, String>, conn_id: &str, roles: &[Str
 }
 
 /// The discovery `phantoms` map (injectable role → ready-made phantom string)
-/// for a service-backed connection. oauth2 → an `ACCESS` short-form phantom
-/// (the minted token) plus one role-qualified phantom per `exposes` entry; the
-/// refresh secret is NEVER in the map. Direct → the service's `secrets` (sole →
-/// short form, several → role-qualified).
+/// for a service-backed connection. A minted mechanism (`[auth]`) → an
+/// `ACCESS` short-form phantom (the minted token) plus, for oauth2, one
+/// role-qualified phantom per `exposes` entry; the mint's input secret is
+/// NEVER in the map. Static → the service's `secrets` (sole → short form,
+/// several → role-qualified).
 pub fn phantoms_for(conn_id: &str, def: &ServiceDef) -> BTreeMap<String, String> {
     let mut map = BTreeMap::new();
-    if let Some(o) = &def.oauth2 {
-        map.insert("ACCESS".to_string(), short_phantom(conn_id));
-        for role in &o.exposes {
-            map.insert(role.to_ascii_uppercase(), role_phantom(conn_id, role));
+    match &def.auth {
+        Some(crate::service::AuthDef::Oauth2(o)) => {
+            map.insert("ACCESS".to_string(), short_phantom(conn_id));
+            for role in &o.exposes {
+                map.insert(role.to_ascii_uppercase(), role_phantom(conn_id, role));
+            }
         }
-    } else {
-        insert_direct(&mut map, conn_id, &def.service.secrets);
+        // Any other minted mechanism (snaplii): the sole injectable is the
+        // minted token behind the default phantom; the input key never appears.
+        Some(_) => {
+            map.insert("ACCESS".to_string(), short_phantom(conn_id));
+        }
+        None => insert_direct(&mut map, conn_id, &def.service.secrets),
     }
     map
 }
 
 /// The `phantoms` map for a raw connection (`service: None`): its injectable
-/// secret keys are the reverse-index of the `[<conn>:]<ROLE>` namespace, passed
-/// in by the caller.
+/// secret keys are the record's explicit `secrets` list (bare KEYs), passed in
+/// by the caller.
 pub fn phantoms_for_raw(conn_id: &str, secret_keys: &[String]) -> BTreeMap<String, String> {
     let mut map = BTreeMap::new();
     insert_direct(&mut map, conn_id, secret_keys);
@@ -168,8 +180,16 @@ mod tests {
     use super::*;
 
     fn direct(id: &str, hosts: &[&str], secrets: &[&str]) -> ServiceDef {
-        let hosts = hosts.iter().map(|s| format!("\"{}\"", s)).collect::<Vec<_>>().join(", ");
-        let secrets = secrets.iter().map(|s| format!("\"{}\"", s)).collect::<Vec<_>>().join(", ");
+        let hosts = hosts
+            .iter()
+            .map(|s| format!("\"{}\"", s))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let secrets = secrets
+            .iter()
+            .map(|s| format!("\"{}\"", s))
+            .collect::<Vec<_>>()
+            .join(", ");
         let toml = format!(
             "[service]\nid = \"{}\"\nname = \"X\"\nhosts = [{}]\nsecrets = [{}]\n",
             id, hosts, secrets
@@ -188,10 +208,19 @@ mod tests {
 
     #[test]
     fn wildcard_single_label_only() {
-        assert!(wildcard_matches("*.openai.azure.com", "foo.openai.azure.com"));
-        assert!(wildcard_matches("*.openai.azure.com", "FOO.OPENAI.AZURE.COM"));
+        assert!(wildcard_matches(
+            "*.openai.azure.com",
+            "foo.openai.azure.com"
+        ));
+        assert!(wildcard_matches(
+            "*.openai.azure.com",
+            "FOO.OPENAI.AZURE.COM"
+        ));
         // two labels rejected (single-label leftmost).
-        assert!(!wildcard_matches("*.openai.azure.com", "a.b.openai.azure.com"));
+        assert!(!wildcard_matches(
+            "*.openai.azure.com",
+            "a.b.openai.azure.com"
+        ));
         // zero labels rejected.
         assert!(!wildcard_matches("*.openai.azure.com", "openai.azure.com"));
         // exact pattern is a plain compare.
@@ -204,9 +233,11 @@ mod tests {
         let mut def = direct("acme", &["api.acme.com"], &["ACME_TOKEN"]);
         def.service.hosts.push("*.acme.dev".to_string());
         let conn = Connection {
+            name: None,
             service: Some("acme".to_string()),
             hosts: Some(vec!["tenant1.acme.dev".to_string()]),
             secrets: None,
+            keys: None,
         };
         let hosts = resolved_hosts(&conn, Some(&def));
         assert!(hosts.contains(&"api.acme.com".to_string()));
@@ -216,20 +247,38 @@ mod tests {
 
     #[test]
     fn resolved_hosts_raw_uses_own_hosts() {
-        let conn = Connection { service: None, hosts: Some(vec!["api.stripe.com".to_string()]), secrets: Some(vec!["STRIPE_KEY".to_string()]) };
-        assert_eq!(resolved_hosts(&conn, None), vec!["api.stripe.com".to_string()]);
+        let conn = Connection {
+            name: None,
+            service: None,
+            hosts: Some(vec!["api.stripe.com".to_string()]),
+            secrets: Some(vec!["STRIPE_KEY".to_string()]),
+            keys: None,
+        };
+        assert_eq!(
+            resolved_hosts(&conn, None),
+            vec!["api.stripe.com".to_string()]
+        );
     }
 
     #[test]
     fn phantoms_direct_sole_and_multi() {
         let sole = direct("github", &["api.github.com"], &["GITHUB_TOKEN"]);
         let m = phantoms_for("github", &sole);
-        assert_eq!(m.get("GITHUB_TOKEN").map(String::as_str), Some("__sc__github__"));
+        assert_eq!(
+            m.get("GITHUB_TOKEN").map(String::as_str),
+            Some("__sc__github__")
+        );
 
         let multi = direct("bb", &["api.bitbucket.org"], &["USERNAME", "API_TOKEN"]);
         let m = phantoms_for("bb", &multi);
-        assert_eq!(m.get("USERNAME").map(String::as_str), Some("__sc__bb__username__"));
-        assert_eq!(m.get("API_TOKEN").map(String::as_str), Some("__sc__bb__api_token__"));
+        assert_eq!(
+            m.get("USERNAME").map(String::as_str),
+            Some("__sc__bb__username__")
+        );
+        assert_eq!(
+            m.get("API_TOKEN").map(String::as_str),
+            Some("__sc__bb__api_token__")
+        );
     }
 
     #[test]
@@ -239,7 +288,8 @@ mod tests {
 id = "gmail"
 name = "Gmail"
 hosts = ["gmail.googleapis.com"]
-[oauth2]
+[auth]
+type = "oauth2"
 provider = "google"
 refresh_token = "GMAIL_REFRESH_TOKEN"
 exposes = ["account_id"]
@@ -247,7 +297,10 @@ exposes = ["account_id"]
         let def: ServiceDef = toml::from_str(toml).unwrap();
         let m = phantoms_for("gmail", &def);
         assert_eq!(m.get("ACCESS").map(String::as_str), Some("__sc__gmail__"));
-        assert_eq!(m.get("ACCOUNT_ID").map(String::as_str), Some("__sc__gmail__account_id__"));
+        assert_eq!(
+            m.get("ACCOUNT_ID").map(String::as_str),
+            Some("__sc__gmail__account_id__")
+        );
         // The refresh secret is never surfaced as an injectable phantom.
         assert!(!m.contains_key("GMAIL_REFRESH_TOKEN"));
     }

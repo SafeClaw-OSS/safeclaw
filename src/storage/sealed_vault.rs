@@ -89,7 +89,10 @@ pub fn find_pubkey(vault: &SealedVault, credential_id_b64: &str) -> Option<Passk
 /// Same as [`find_pubkey`] but against a bare [`Registry`] — used by callers
 /// that hold a per-item [`Keyset`] (which carries its own `registry`) rather
 /// than a whole [`SealedVault`].
-pub fn find_pubkey_in_registry(registry: &Registry, credential_id_b64: &str) -> Option<PasskeyEntry> {
+pub fn find_pubkey_in_registry(
+    registry: &Registry,
+    credential_id_b64: &str,
+) -> Option<PasskeyEntry> {
     let cid_bytes = decode_credential_id(credential_id_b64).ok()?;
     let pk = registry.get::<WebAuthn>(&cid_bytes).ok().flatten()?;
     Some(PasskeyEntry {
@@ -135,6 +138,9 @@ pub fn build_initial(
         credential_id,
         prf_salt,
         wrapped_key,
+        // The client seals everything; the KCV (if any) arrives via /keys sync
+        // or the unlock backfill, not this assembly helper.
+        wc_check: None,
     };
     Ok(SealedState {
         version: CURRENT_VERSION,
@@ -215,11 +221,14 @@ mod b64url_bytes {
 pub fn decode_keys_data_field(s: &str) -> Result<Vec<u8>> {
     use base64::engine::general_purpose::STANDARD;
     use base64::Engine;
-    let std: String = s.chars().map(|c| match c {
-        '-' => '+',
-        '_' => '/',
-        other => other,
-    }).collect();
+    let std: String = s
+        .chars()
+        .map(|c| match c {
+            '-' => '+',
+            '_' => '/',
+            other => other,
+        })
+        .collect();
     let std = std.trim_end_matches('=');
     let pad = std.len() % 4;
     let padded = if pad == 0 {
@@ -245,6 +254,27 @@ pub struct StoredItem {
     /// in JSON.
     #[serde(with = "b64url_bytes")]
     pub ct: Vec<u8>,
+    /// The highest `version` of this id KNOWN to be on the cloud —
+    /// `version > synced_version` means the row is DIRTY (needs a push);
+    /// equal means clean, and the push loop skips it. Without this every sync
+    /// re-offered every already-synced row and burned one 409 round-trip per
+    /// row. Local bookkeeping only (not AAD-bound, never sent): set by the
+    /// pull/adopt path and by a successful push; `0` (the serde default, and
+    /// what an existing on-disk store loads as) = "never confirmed on cloud",
+    /// which safely re-offers the row once.
+    #[serde(default)]
+    pub synced_version: u64,
+    /// True when this row's sealed body is a tombstone (`status:"deleted"`).
+    /// Local metadata only (not AAD-bound, never sent) — it lets the push loop
+    /// order writes BEFORE deletes so a syncing observer never sees a dangling
+    /// reference. Concretely: a completed connect writes 3 rows at once (the
+    /// refresh-token secret, the `connection` record, and a tombstone for the
+    /// old `connecting` row); if the tombstone lands on the cloud first, the
+    /// console briefly sees the connect withdrawn with no connection yet and
+    /// renders "not configured". Serde-defaulted to false (an adopted or
+    /// pre-upgrade row reads as live — harmless, it only affects push order).
+    #[serde(default)]
+    pub tombstone: bool,
 }
 
 /// The passkey-wrap layer — §7's small CAS blob, unchanged in substance from
@@ -311,6 +341,8 @@ impl PerItemVault {
                     credential_id,
                     prf_salt,
                     wrapped_key,
+                    // KCV arrives via /keys sync or the unlock backfill.
+                    wc_check: None,
                 }],
                 keyset_version: 0,
             },
@@ -326,9 +358,20 @@ impl PerItemVault {
     }
 
     /// Insert or replace a raw sealed item (used by the pull/adopt path — the ct
-    /// is already sealed by whoever wrote the cloud row).
+    /// is already sealed by whoever wrote the cloud row, so by construction the
+    /// cloud has this exact version: the row lands clean). `tombstone` stays
+    /// false: an adopted row is clean and never re-pushed, so its push-order
+    /// flag is never consulted (and we hold no K here to open the ct anyway).
     pub fn put_raw(&mut self, item_id_b64: String, version: u64, ct: Vec<u8>) {
-        self.items.insert(item_id_b64, StoredItem { version, ct });
+        self.items.insert(
+            item_id_b64,
+            StoredItem {
+                version,
+                ct,
+                synced_version: version,
+                tombstone: false,
+            },
+        );
     }
 
     /// Drop a stored item outright (local GC of a fully-propagated tombstone).
@@ -358,10 +401,17 @@ impl PerItemVault {
         device_name: &str,
         prf_salt_b64: &str,
         wrapped_key_b64: &str,
+        wc_check_b64: Option<&str>,
     ) -> Result<bool> {
         let cid_bytes = decode_credential_id(cid_b64)?;
         let prf_salt = decode_keys_data_field(prf_salt_b64)?;
         let wrapped_key = decode_keys_data_field(wrapped_key_b64)?;
+        // Optional KCV (`wc_check`) — carried verbatim from the cloud row so a
+        // pull preserves a value another device (or an earlier backfill) wrote.
+        let wc_check = wc_check_b64
+            .filter(|s| !s.is_empty())
+            .map(decode_keys_data_field)
+            .transpose()?;
 
         // Registry pubkey (x/y verbatim strings — sudp keeps them as-is).
         let pk = sudp::passkey::WebAuthnPublicKey {
@@ -384,11 +434,17 @@ impl PerItemVault {
         {
             cred.prf_salt = prf_salt;
             cred.wrapped_key = wrapped_key;
+            // Only adopt a cloud-provided KCV; never clear a locally-backfilled
+            // one just because an older row omitted it.
+            if wc_check.is_some() {
+                cred.wc_check = wc_check;
+            }
         } else {
             self.keyset.credentials.push(SealedCredential {
                 credential_id: cid_bytes,
                 prf_salt,
                 wrapped_key,
+                wc_check,
             });
         }
         Ok(true)
@@ -449,7 +505,19 @@ impl PerItemVault {
         let ctx = ItemCtx::for_item::<S>(k, vault_id, ns, name, version)?;
         let ct = seal_item::<S>(k, &ctx, payload)?;
         let id = ctx.item_id_b64();
-        self.items.insert(id.clone(), StoredItem { version, ct });
+        // A local write leaves `synced_version` where it was (the new version
+        // is by definition not on the cloud yet) — the row is dirty until pushed.
+        let synced_version = self.items.get(&id).map(|s| s.synced_version).unwrap_or(0);
+        let tombstone = payload.is_tombstone();
+        self.items.insert(
+            id.clone(),
+            StoredItem {
+                version,
+                ct,
+                synced_version,
+                tombstone,
+            },
+        );
         Ok(id)
     }
 
@@ -514,31 +582,51 @@ impl PerItemVault {
         // aux subtrees → one `aux` item each (only the modeled names).
         let stores = serde_json::to_value(&view.aux.stores).map_err(AppError::from)?;
         self.seal_and_upsert::<S>(
-            k, vault_id, ItemNs::Aux, "stores", 1,
+            k,
+            vault_id,
+            ItemNs::Aux,
+            "stores",
+            1,
             &ItemPayload::live(ItemNs::Aux, "stores", stores),
         )?;
         let store_order = serde_json::to_value(&view.aux.store_order).map_err(AppError::from)?;
         self.seal_and_upsert::<S>(
-            k, vault_id, ItemNs::Aux, "store_order", 1,
+            k,
+            vault_id,
+            ItemNs::Aux,
+            "store_order",
+            1,
             &ItemPayload::live(ItemNs::Aux, "store_order", store_order),
         )?;
         if let Some(policy) = &view.aux.policy {
             let body = serde_json::to_value(policy).map_err(AppError::from)?;
             self.seal_and_upsert::<S>(
-                k, vault_id, ItemNs::Aux, "policy", 1,
+                k,
+                vault_id,
+                ItemNs::Aux,
+                "policy",
+                1,
                 &ItemPayload::live(ItemNs::Aux, "policy", body),
             )?;
         }
         if let Some(days) = view.aux.audit_retention_days {
             self.seal_and_upsert::<S>(
-                k, vault_id, ItemNs::Aux, "audit_retention_days", 1,
+                k,
+                vault_id,
+                ItemNs::Aux,
+                "audit_retention_days",
+                1,
                 &ItemPayload::live(ItemNs::Aux, "audit_retention_days", serde_json::json!(days)),
             )?;
         }
         if !view.aux.services.is_empty() {
             let body = serde_json::to_value(&view.aux.services).map_err(AppError::from)?;
             self.seal_and_upsert::<S>(
-                k, vault_id, ItemNs::Aux, "services", 1,
+                k,
+                vault_id,
+                ItemNs::Aux,
+                "services",
+                1,
                 &ItemPayload::live(ItemNs::Aux, "services", body),
             )?;
         }
@@ -571,7 +659,10 @@ impl PerItemVault {
         for (name, bytes) in &view.native_secrets {
             let value = String::from_utf8(bytes.clone())
                 .map_err(|_| AppError::Internal(format!("secret '{}' not utf8", name)))?;
-            desired.insert((ItemNs::Secret, name.clone()), serde_json::Value::String(value));
+            desired.insert(
+                (ItemNs::Secret, name.clone()),
+                serde_json::Value::String(value),
+            );
         }
         for (id, conn) in &view.aux.connections {
             desired.insert(
@@ -586,8 +677,14 @@ impl PerItemVault {
             );
         }
         for (name, body) in [
-            ("stores", serde_json::to_value(&view.aux.stores).map_err(AppError::from)?),
-            ("store_order", serde_json::to_value(&view.aux.store_order).map_err(AppError::from)?),
+            (
+                "stores",
+                serde_json::to_value(&view.aux.stores).map_err(AppError::from)?,
+            ),
+            (
+                "store_order",
+                serde_json::to_value(&view.aux.store_order).map_err(AppError::from)?,
+            ),
         ] {
             desired.insert((ItemNs::Aux, name.to_string()), body);
         }
@@ -598,7 +695,10 @@ impl PerItemVault {
             );
         }
         if let Some(days) = view.aux.audit_retention_days {
-            desired.insert((ItemNs::Aux, "audit_retention_days".to_string()), serde_json::json!(days));
+            desired.insert(
+                (ItemNs::Aux, "audit_retention_days".to_string()),
+                serde_json::json!(days),
+            );
         }
         if !view.aux.services.is_empty() {
             desired.insert(
@@ -630,7 +730,10 @@ impl PerItemVault {
         for name in mine.native_secrets.keys() {
             if !desired.contains_key(&(ItemNs::Secret, name.clone())) {
                 let (id, _v) = self.seal_and_bump::<S>(
-                    k, vault_id, ItemNs::Secret, name,
+                    k,
+                    vault_id,
+                    ItemNs::Secret,
+                    name,
                     &ItemPayload::tombstone(ItemNs::Secret, name.clone()),
                 )?;
                 changed.push(id);
@@ -639,7 +742,10 @@ impl PerItemVault {
         for id in mine.aux.connections.keys() {
             if !desired.contains_key(&(ItemNs::Connection, id.clone())) {
                 let (iid, _v) = self.seal_and_bump::<S>(
-                    k, vault_id, ItemNs::Connection, id,
+                    k,
+                    vault_id,
+                    ItemNs::Connection,
+                    id,
                     &ItemPayload::tombstone(ItemNs::Connection, id.clone()),
                 )?;
                 changed.push(iid);
@@ -648,7 +754,10 @@ impl PerItemVault {
         for id in mine.aux.connecting.keys() {
             if !desired.contains_key(&(ItemNs::Connecting, id.clone())) {
                 let (iid, _v) = self.seal_and_bump::<S>(
-                    k, vault_id, ItemNs::Connecting, id,
+                    k,
+                    vault_id,
+                    ItemNs::Connecting,
+                    id,
                     &ItemPayload::tombstone(ItemNs::Connecting, id.clone()),
                 )?;
                 changed.push(iid);
@@ -674,9 +783,9 @@ impl PerItemVault {
         k: &[u8],
         vault_id: &str,
     ) -> Result<crate::storage::plaintext::VaultPlaintextView> {
+        use crate::storage::plaintext::{VaultAux, VaultPlaintextView};
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         use base64::Engine;
-        use crate::storage::plaintext::{VaultAux, VaultPlaintextView};
 
         // Start from the fresh-vault defaults; aux items OVERRIDE their subtree,
         // secret/connection/connecting items fill their maps.
@@ -688,75 +797,92 @@ impl PerItemVault {
             // (seal-parity mismatch, a body shape from a newer client, a rotated
             // K) must NOT hide EVERY other secret. Skip + log it; keep the rest.
             let one: crate::error::Result<()> = (|| {
-            let raw_vec = URL_SAFE_NO_PAD
-                .decode(id_b64.as_bytes())
-                .map_err(|e| AppError::Internal(format!("item id base64url decode: {}", e)))?;
-            let raw: [u8; 32] = raw_vec
-                .as_slice()
-                .try_into()
-                .map_err(|_| AppError::Internal("item id is not 32 bytes".into()))?;
-            let ctx = ItemCtx::new(vault_id, raw, stored.version);
-            let payload = unseal_item::<S>(k, &ctx, &stored.ct)?;
-            if payload.is_tombstone() {
-                return Ok(());
-            }
-            let name = payload.name;
-            match payload.ns {
-                ItemNs::Secret => {
-                    let s = payload.body.as_str().ok_or_else(|| {
-                        AppError::Internal(format!("secret item '{}' body is not a string", name))
-                    })?;
-                    native_secrets.insert(name, s.as_bytes().to_vec());
+                let raw_vec = URL_SAFE_NO_PAD
+                    .decode(id_b64.as_bytes())
+                    .map_err(|e| AppError::Internal(format!("item id base64url decode: {}", e)))?;
+                let raw: [u8; 32] = raw_vec
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| AppError::Internal("item id is not 32 bytes".into()))?;
+                let ctx = ItemCtx::new(vault_id, raw, stored.version);
+                let payload = unseal_item::<S>(k, &ctx, &stored.ct)?;
+                if payload.is_tombstone() {
+                    return Ok(());
                 }
-                ItemNs::Connection => {
-                    let conn = serde_json::from_value(payload.body)
-                        .map_err(|e| AppError::Internal(format!("connection '{}' parse: {}", name, e)))?;
-                    aux.connections.insert(name, conn);
-                }
-                ItemNs::Connecting => {
-                    let c = serde_json::from_value(payload.body)
-                        .map_err(|e| AppError::Internal(format!("connecting '{}' parse: {}", name, e)))?;
-                    aux.connecting.insert(name, c);
-                }
-                ItemNs::Aux => {
-                    // One aux item per subtree (contract §2). Unknown names are
-                    // ignored (forward-compat with aux subtrees we don't model).
-                    match name.as_str() {
-                        "stores" => {
-                            aux.stores = serde_json::from_value(payload.body)
-                                .map_err(|e| AppError::Internal(format!("aux.stores parse: {}", e)))?;
-                        }
-                        "store_order" => {
-                            aux.store_order = serde_json::from_value(payload.body)
-                                .map_err(|e| AppError::Internal(format!("aux.store_order parse: {}", e)))?;
-                        }
-                        "policy" => {
-                            aux.policy = Some(serde_json::from_value(payload.body).map_err(|e| {
-                                AppError::Internal(format!("aux.policy parse: {}", e))
-                            })?);
-                        }
-                        "audit_retention_days" => {
-                            aux.audit_retention_days =
-                                serde_json::from_value(payload.body).map_err(|e| {
-                                    AppError::Internal(format!("aux.audit_retention_days parse: {}", e))
+                let name = payload.name;
+                match payload.ns {
+                    ItemNs::Secret => {
+                        let s = payload.body.as_str().ok_or_else(|| {
+                            AppError::Internal(format!(
+                                "secret item '{}' body is not a string",
+                                name
+                            ))
+                        })?;
+                        native_secrets.insert(name, s.as_bytes().to_vec());
+                    }
+                    ItemNs::Connection => {
+                        let conn = serde_json::from_value(payload.body).map_err(|e| {
+                            AppError::Internal(format!("connection '{}' parse: {}", name, e))
+                        })?;
+                        aux.connections.insert(name, conn);
+                    }
+                    ItemNs::Connecting => {
+                        let c = serde_json::from_value(payload.body).map_err(|e| {
+                            AppError::Internal(format!("connecting '{}' parse: {}", name, e))
+                        })?;
+                        aux.connecting.insert(name, c);
+                    }
+                    ItemNs::Aux => {
+                        // One aux item per subtree (contract §2). Unknown names are
+                        // ignored (forward-compat with aux subtrees we don't model).
+                        match name.as_str() {
+                            "stores" => {
+                                aux.stores = serde_json::from_value(payload.body).map_err(|e| {
+                                    AppError::Internal(format!("aux.stores parse: {}", e))
                                 })?;
+                            }
+                            "store_order" => {
+                                aux.store_order =
+                                    serde_json::from_value(payload.body).map_err(|e| {
+                                        AppError::Internal(format!("aux.store_order parse: {}", e))
+                                    })?;
+                            }
+                            "policy" => {
+                                aux.policy =
+                                    Some(serde_json::from_value(payload.body).map_err(|e| {
+                                        AppError::Internal(format!("aux.policy parse: {}", e))
+                                    })?);
+                            }
+                            "audit_retention_days" => {
+                                aux.audit_retention_days = serde_json::from_value(payload.body)
+                                    .map_err(|e| {
+                                        AppError::Internal(format!(
+                                            "aux.audit_retention_days parse: {}",
+                                            e
+                                        ))
+                                    })?;
+                            }
+                            "services" => {
+                                aux.services =
+                                    serde_json::from_value(payload.body).map_err(|e| {
+                                        AppError::Internal(format!("aux.services parse: {}", e))
+                                    })?;
+                            }
+                            _ => {}
                         }
-                        "services" => {
-                            aux.services = serde_json::from_value(payload.body)
-                                .map_err(|e| AppError::Internal(format!("aux.services parse: {}", e)))?;
-                        }
-                        _ => {}
                     }
                 }
-            }
-            Ok(())
+                Ok(())
             })();
             if let Err(e) = one {
                 tracing::warn!(item = %id_b64, "fold: skipping unreadable item: {}", e);
             }
         }
 
-        Ok(VaultPlaintextView { aux, native_secrets })
+        Ok(VaultPlaintextView {
+            aux,
+            native_secrets,
+        })
     }
 }
 
@@ -796,8 +922,8 @@ mod tests {
     use super::*;
     // Test fixture encodes credential_id with base64url-no-pad to match
     // `decode_credential_id`'s wire format (the WebAuthn convention).
-    use base64::Engine;
     use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+    use base64::Engine;
     use tempfile::tempdir;
 
     #[test]
@@ -873,7 +999,10 @@ mod tests {
             )
             .unwrap();
         // The stored key is exactly the contract's base64url item id.
-        assert_eq!(id, item_id::<StdPrimitives>(&k, "secret", "GMAIL_REFRESH_TOKEN").unwrap());
+        assert_eq!(
+            id,
+            item_id::<StdPrimitives>(&k, "secret", "GMAIL_REFRESH_TOKEN").unwrap()
+        );
         assert_eq!(pv.get_item(&id).unwrap().version, 1);
 
         // Persist and reload → the sealed ct survives the base64url JSON codec.
@@ -903,6 +1032,125 @@ mod tests {
     }
 
     #[test]
+    fn synced_version_tracks_dirty_vs_clean() {
+        use sudp::primitives::StdPrimitives;
+        let k = [0x21u8; 32];
+        let vid = "vault-dirty";
+        let mut pv = PerItemVault::build_initial(
+            b"c".to_vec(),
+            "x".into(),
+            "y".into(),
+            "Dev".into(),
+            vec![0u8; 32],
+            vec![0u8; 48],
+        )
+        .unwrap();
+
+        // A fresh local write is DIRTY (never confirmed on cloud).
+        let id = pv
+            .seal_and_upsert::<StdPrimitives>(
+                &k,
+                vid,
+                ItemNs::Secret,
+                "T",
+                1,
+                &ItemPayload::secret_live("T", "v1"),
+            )
+            .unwrap();
+        assert_eq!(
+            pv.get_item(&id).unwrap().synced_version,
+            0,
+            "local write starts dirty"
+        );
+
+        // Pull/adopt lands CLEAN — the cloud has this exact version by construction.
+        let ct = pv.get_item(&id).unwrap().ct.clone();
+        pv.put_raw(id.clone(), 1, ct);
+        assert_eq!(
+            pv.get_item(&id).unwrap().synced_version,
+            1,
+            "adopted row is clean"
+        );
+
+        // A subsequent local bump goes dirty again, KEEPING the confirmed floor.
+        pv.seal_and_upsert::<StdPrimitives>(
+            &k,
+            vid,
+            ItemNs::Secret,
+            "T",
+            2,
+            &ItemPayload::secret_live("T", "v2"),
+        )
+        .unwrap();
+        let s = pv.get_item(&id).unwrap();
+        assert_eq!(
+            (s.version, s.synced_version),
+            (2, 1),
+            "bumped row is dirty above its synced floor"
+        );
+    }
+
+    #[test]
+    fn tombstone_flag_tracks_payload_status() {
+        use sudp::primitives::StdPrimitives;
+        let k = [0x33u8; 32];
+        let vid = "vault-tomb";
+        let mut pv = PerItemVault::build_initial(
+            b"c".to_vec(),
+            "x".into(),
+            "y".into(),
+            "Dev".into(),
+            vec![0u8; 32],
+            vec![0u8; 48],
+        )
+        .unwrap();
+
+        // A live write is NOT a tombstone; a deleting write IS one — so the push
+        // loop can order writes before deletes.
+        let live = pv
+            .seal_and_bump::<StdPrimitives>(
+                &k,
+                vid,
+                ItemNs::Connection,
+                "gcp",
+                &ItemPayload::live(
+                    ItemNs::Connection,
+                    "gcp",
+                    serde_json::json!({"service": "gcp"}),
+                ),
+            )
+            .unwrap()
+            .0;
+        assert!(
+            !pv.get_item(&live).unwrap().tombstone,
+            "live row is not a tombstone"
+        );
+
+        let dead = pv
+            .seal_and_bump::<StdPrimitives>(
+                &k,
+                vid,
+                ItemNs::Connecting,
+                "gcp",
+                &ItemPayload::tombstone(ItemNs::Connecting, "gcp"),
+            )
+            .unwrap()
+            .0;
+        assert!(
+            pv.get_item(&dead).unwrap().tombstone,
+            "deleting row is a tombstone"
+        );
+
+        // Survives the JSON codec (serde-defaulted, so an old store loads false).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.per-item.json");
+        write_per_item_atomic(&path, &pv).unwrap();
+        let loaded = read_per_item(&path).unwrap().unwrap();
+        assert!(!loaded.get_item(&live).unwrap().tombstone);
+        assert!(loaded.get_item(&dead).unwrap().tombstone);
+    }
+
+    #[test]
     fn fold_view_rebuilds_secrets_connections_and_aux() {
         use sudp::primitives::StdPrimitives;
         let k = [0x42u8; 32];
@@ -920,36 +1168,68 @@ mod tests {
         // A live secret, a tombstoned secret (must be dropped), a connection,
         // and an aux store_order override.
         pv.seal_and_upsert::<StdPrimitives>(
-            &k, vid, ItemNs::Secret, "OPENAI_KEY", 1,
+            &k,
+            vid,
+            ItemNs::Secret,
+            "OPENAI_KEY",
+            1,
             &ItemPayload::secret_live("OPENAI_KEY", "sk-live"),
-        ).unwrap();
+        )
+        .unwrap();
         pv.seal_and_upsert::<StdPrimitives>(
-            &k, vid, ItemNs::Secret, "GONE", 2,
+            &k,
+            vid,
+            ItemNs::Secret,
+            "GONE",
+            2,
             &ItemPayload::tombstone(ItemNs::Secret, "GONE"),
-        ).unwrap();
+        )
+        .unwrap();
         pv.seal_and_upsert::<StdPrimitives>(
-            &k, vid, ItemNs::Connection, "gmail", 1,
+            &k,
+            vid,
+            ItemNs::Connection,
+            "gmail",
+            1,
             &ItemPayload::live(
-                ItemNs::Connection, "gmail",
+                ItemNs::Connection,
+                "gmail",
                 serde_json::json!({ "service": "gmail" }),
             ),
-        ).unwrap();
+        )
+        .unwrap();
         pv.seal_and_upsert::<StdPrimitives>(
-            &k, vid, ItemNs::Aux, "store_order", 1,
+            &k,
+            vid,
+            ItemNs::Aux,
+            "store_order",
+            1,
             &ItemPayload::live(
-                ItemNs::Aux, "store_order",
-                serde_json::json!(["native-secrets", "native-files", "gcp-1"]),
+                ItemNs::Aux,
+                "store_order",
+                serde_json::json!(["native-secrets", "gcp-1"]),
             ),
-        ).unwrap();
+        )
+        .unwrap();
 
         let view = pv.fold_view::<StdPrimitives>(&k, vid).unwrap();
-        assert_eq!(view.resolve_value_native("OPENAI_KEY"), Some(&b"sk-live"[..]));
-        assert_eq!(view.native_secrets.get("GONE"), None, "tombstone must be dropped");
         assert_eq!(
-            view.aux.connections.get("gmail").and_then(|c| c.service.as_deref()),
+            view.resolve_value_native("OPENAI_KEY"),
+            Some(&b"sk-live"[..])
+        );
+        assert_eq!(
+            view.native_secrets.get("GONE"),
+            None,
+            "tombstone must be dropped"
+        );
+        assert_eq!(
+            view.aux
+                .connections
+                .get("gmail")
+                .and_then(|c| c.service.as_deref()),
             Some("gmail")
         );
-        assert_eq!(view.aux.store_order, vec!["native-secrets", "native-files", "gcp-1"]);
+        assert_eq!(view.aux.store_order, vec!["native-secrets", "gcp-1"]);
         assert_eq!(view.aux.version, 4);
     }
 }

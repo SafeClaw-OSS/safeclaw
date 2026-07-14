@@ -11,11 +11,11 @@ pub mod ca;
 pub mod env;
 pub mod handler;
 pub mod resolver;
+pub mod upstream;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use hudsucker::rustls::crypto::aws_lc_rs;
 use hudsucker::Proxy;
 
 use crate::state::AppState;
@@ -39,9 +39,14 @@ pub async fn serve(state: Arc<AppState>) -> Result<(), String> {
     let proxy = Proxy::builder()
         .with_addr(addr)
         .with_ca(resident.authority)
-        // The proxy's OWN upstream TLS client (webpki roots) — unrelated to the
-        // daemon's reqwest clients, which target real hosts directly.
-        .with_rustls_connector(aws_lc_rs::default_provider())
+        // The proxy's OWN upstream TLS client (webpki roots). Unlike hudsucker's
+        // built-in `with_rustls_connector` (which dials every host directly),
+        // this connector routes the forward hop through the device egress proxy
+        // (`sc proxy set`) when one is configured — so a host reachable only via
+        // a corporate/on-demand proxy (e.g. Google APIs on a firewalled network)
+        // forwards through it instead of timing out on a direct dial. See
+        // proxy/upstream.rs.
+        .with_http_connector(upstream::forward_connector(state.egress_proxy.clone()))
         .with_http_handler(BrokerHandler::new(state.clone()))
         .build()
         .map_err(|e| format!("proxy build: {}", e))?;

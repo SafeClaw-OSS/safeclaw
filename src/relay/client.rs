@@ -4,15 +4,63 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use base64::{engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD}, Engine};
+use base64::{
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+    Engine,
+};
 use serde_json::{json, Value};
 
 use crate::state::AppState;
 
-/// Poll cadence + safety cap. The relay also enforces a TTL; this is the
-/// daemon-side bound so a never-approved op's task can't run forever.
-const POLL_INTERVAL: Duration = Duration::from_secs(2);
-const MAX_POLLS: u32 = 920; // 920 × 2s ≈ 1840s, just past the 1800s (30 min) op TTL
+/// Poll cadence (v1.1, mode-dependent). The wait between polls is
+/// `timeout(interval, op-event notify)`: the SSE `op` event ACCELERATES the
+/// next poll, it never replaces it — the poll response stays the source of
+/// truth for status. 15s only with PROOF the event can reach us —
+/// `op_events_for(vid)`: this vid is on the live stream AND the backend
+/// declared the `op` cap in hello. Anything short of proof (stream down,
+/// vault born after daemon start, over the vid cap, v1-only backend) keeps
+/// the legacy 2s cadence — an approval must never silently wait out a
+/// relaxed poll for an event that cannot arrive.
+const POLL_STREAMED: Duration = Duration::from_secs(15);
+const POLL_FALLBACK: Duration = Duration::from_secs(2);
+/// ★ Storm floor: an event wake never polls sooner than this after the
+/// previous poll — events accelerate the poll, they don't replace its
+/// pacing (a buggy emitter must cost ≤1 poll/s, not RTT-speed; same rule
+/// as refresh_agent_keys_on_miss's debounce).
+const POLL_FLOOR: Duration = Duration::from_secs(1);
+/// Daemon-side safety cap so a never-approved op's task can't run forever
+/// (the relay also enforces a TTL). Derived per-op from the op's own expiry
+/// (SSOT: aux.policy.timeout stamps every pending op) + slack past the
+/// in-loop `expires_at + 5` precise stop; clamped so a pathological expiry
+/// can neither stop the poll instantly nor pin a task for days.
+fn poll_budget(expires_at: u64) -> Duration {
+    Duration::from_secs(expires_at.saturating_sub(now()).clamp(60, 86_400) + 60)
+}
+
+/// Interval selection, factored for the unit test.
+fn poll_interval(op_events_reach_us: bool) -> Duration {
+    if op_events_reach_us {
+        POLL_STREAMED
+    } else {
+        POLL_FALLBACK
+    }
+}
+
+/// Park until the next poll is due: an `op` stream event for OUR op_id or
+/// the mode-sized interval, whichever first — then honor the storm floor
+/// relative to the LAST poll. `notify_one` parks a permit, so an event that
+/// fires while a poll response is in flight completes the next wait
+/// instantly instead of being lost.
+async fn next_poll_due(
+    op_wait: &crate::sync_stream::OpWaitGuard<'_>,
+    vault_id: &str,
+    last_poll: tokio::time::Instant,
+) {
+    let interval = poll_interval(crate::sync_stream::op_events_for(vault_id));
+    let _ = tokio::time::timeout(interval, op_wait.notified()).await;
+    // Past deadlines return immediately — the floor only bites event storms.
+    tokio::time::sleep_until(last_poll + POLL_FLOOR).await;
+}
 
 /// Fire-and-forget: register `op_id` with the relay and drive it to
 /// completion in a background task. No-op (returns immediately) when no relay
@@ -31,7 +79,18 @@ pub fn spawn_register_and_poll(
         None => return, // local-only daemon (no cloud pairing); nothing to do
     };
     tokio::spawn(async move {
-        if let Err(e) = run(state, &relay_url, &auth_token, &vault_id, &op_id, &op, &r, expires_at).await {
+        if let Err(e) = run(
+            state,
+            &relay_url,
+            &auth_token,
+            &vault_id,
+            &op_id,
+            &op,
+            &r,
+            expires_at,
+        )
+        .await
+        {
             tracing::warn!(op = %op_id, "relay register/poll ended: {}", e);
         }
     });
@@ -50,7 +109,7 @@ pub fn spawn_cancel(state: Arc<AppState>, vault_id: String, op_id: String) {
     let daemon_pubkey = URL_SAFE_NO_PAD.encode(state.sc.pk_bytes());
     tokio::spawn(async move {
         let url = format!("{}/v/{}/op/relay/{}/cancel", base, vault_id, op_id);
-        let client = match reqwest::Client::builder().timeout(Duration::from_secs(10)).build() {
+        let client = match crate::cli::egress_proxy::client(Duration::from_secs(10)) {
             Ok(c) => c,
             Err(_) => return,
         };
@@ -105,9 +164,13 @@ async fn run(
     expires_at: u64,
 ) -> Result<(), String> {
     let base = relay_url.trim_end_matches('/');
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(35))
-        .build()
+    // v1.1: register for `op` stream events before anything can flip the
+    // op's status. The guard IS the registration — Drop deregisters — so
+    // EVERY exit path out of this function (the early error returns below
+    // included) removes the entry; a leak here would grow the daemon-global
+    // map for the daemon's lifetime.
+    let op_wait = crate::sync_stream::op_events().register(op_id);
+    let client = crate::cli::egress_proxy::client(Duration::from_secs(35))
         .map_err(|e| format!("relay client init: {}", e))?;
 
     // 1. Register the pending op. op_summary is the full op JSON (the page
@@ -139,26 +202,52 @@ async fn run(
     }
     tracing::info!(op = %op_id, "registered with op-relay");
 
-    // 2. Poll for the deposited grant.
+    // 2. Poll for the deposited grant. Status semantics are UNCHANGED from
+    //    the pre-event loop — only the wait between polls is event-aware.
     let poll_url = format!("{}/v/{}/op/relay/{}", base, vault_id, op_id);
-    for _ in 0..MAX_POLLS {
+    let deadline = tokio::time::Instant::now() + poll_budget(expires_at);
+    while tokio::time::Instant::now() < deadline {
         if now() > expires_at + 5 {
             return Ok(()); // op expired; stop quietly
         }
+        let last_poll = tokio::time::Instant::now();
         let resp = match client.get(&poll_url).bearer_auth(auth_token).send().await {
             Ok(r) => r,
             Err(e) => {
                 tracing::debug!(op = %op_id, "relay poll transient error: {}", e);
-                tokio::time::sleep(POLL_INTERVAL).await;
+                next_poll_due(&op_wait, vault_id, last_poll).await;
                 continue;
             }
         };
         match resp.status().as_u16() {
             200 => {
                 // Approved: body carries the browser-deposited grant JSON.
-                let body: Value = resp.json().await.map_err(|e| format!("relay poll parse: {}", e))?;
+                let body: Value = resp
+                    .json()
+                    .await
+                    .map_err(|e| format!("relay poll parse: {}", e))?;
                 let grant = body.get("sealed_grant").cloned().unwrap_or(body);
-                apply_grant(state.clone(), op_id, grant).await?;
+                if let Err(e) = apply_grant(state.clone(), op_id, grant).await {
+                    // The human APPROVED but the daemon couldn't apply. The
+                    // canonical cause — a value stash dying under a longer op
+                    // window — is structurally gone (both derive from
+                    // aux.policy.timeout now); this is belt-and-suspenders.
+                    // A consent that silently evaporates is the worst UX
+                    // ("I approved — where did it go?"): terminalize the
+                    // local row as `expired` WITH the reason so it ships to
+                    // the cloud feed instead of sitting `pending`, invisible.
+                    if let Ok(audit) = state.audits.for_vault(vault_id) {
+                        let _ = audit.finalize(
+                            op_id,
+                            crate::audit::STATUS_EXPIRED,
+                            now() as i64,
+                            None,
+                            Some(&format!("approved but apply failed: {}", e)),
+                            None,
+                        );
+                    }
+                    return Err(e);
+                }
                 return Ok(());
             }
             403 => {
@@ -167,7 +256,7 @@ async fn run(
                 return Ok(());
             }
             202 => {
-                tokio::time::sleep(POLL_INTERVAL).await;
+                next_poll_due(&op_wait, vault_id, last_poll).await;
             }
             404 => return Ok(()), // unknown/expired on the relay side
             409 => {
@@ -178,7 +267,7 @@ async fn run(
             }
             other => {
                 tracing::debug!(op = %op_id, "relay poll HTTP {}", other);
-                tokio::time::sleep(POLL_INTERVAL).await;
+                next_poll_due(&op_wait, vault_id, last_poll).await;
             }
         }
     }
@@ -193,7 +282,10 @@ async fn apply_grant(state: Arc<AppState>, op_id: &str, grant: Value) -> Result<
         .timeout(Duration::from_secs(30))
         .build()
         .map_err(|e| format!("loopback client init: {}", e))?;
-    let url = format!("http://127.0.0.1:{}/op/{}/approve", state.config.port, op_id);
+    let url = format!(
+        "http://127.0.0.1:{}/op/{}/approve",
+        state.config.port, op_id
+    );
     let resp = client
         .post(&url)
         .json(&grant)
@@ -212,7 +304,10 @@ async fn apply_grant(state: Arc<AppState>, op_id: &str, grant: Value) -> Result<
 
 async fn apply_reject(state: Arc<AppState>, op_id: &str) {
     let url = format!("http://127.0.0.1:{}/op/{}/reject", state.config.port, op_id);
-    if let Ok(client) = reqwest::Client::builder().timeout(Duration::from_secs(10)).build() {
+    if let Ok(client) = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+    {
         let _ = client.post(&url).send().await;
         tracing::info!(op = %op_id, "relay grant rejected via loopback");
     }
@@ -237,4 +332,17 @@ fn now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// v1.1 mode-dependent poll interval: 15s safety net behind the stream's
+    /// `op` event, the legacy 2s when the poll is the only path.
+    #[test]
+    fn poll_interval_is_mode_dependent() {
+        assert_eq!(poll_interval(true), Duration::from_secs(15));
+        assert_eq!(poll_interval(false), Duration::from_secs(2));
+    }
 }

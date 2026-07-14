@@ -95,45 +95,64 @@ fixed property of the OAuth client, held in the provider config (§5).
 | **`service`** | Which service (TYPE) this instantiates, or **absent** for a **raw** connection. Decouples id from type → many connections per service. |
 | **`hosts`** | Anchored egress FQDNs. **Absent** when a service declares exact hosts (derived, no stored copy); the pinned exact FQDNs (⊆ the service's `*.suffix`) when the service is wildcard; **required** for a raw connection. Enforced exact-FQDN, case-insensitive; never a bare `*`. |
 | **`secrets`** | The UPPERCASE secret KEYs this connection uses. **Required for a raw connection** (answers "which secrets" directly, killing the reverse-index-by-casing hack); **omitted** for a service-backed one (derived from the service's declared `secrets`, incl. the oauth2 refresh key). |
+| **`keys`** | Service-backed only: sparse `{ROLE → KEY}` bindings (§3). A missing role binds to its bare mainstream name — so a default connection stores none; a named connection's creator writes distinct keys (suggested `<ROLE>_<QUALIFIER>`, editable / may point at an existing key). |
 
 ---
 
-## 3. Secrets — mainstream names, optional connection prefix
+## 3. Secrets — ALL keys bare; the connection RECORD binds roles to keys
 
-- Secret keys are **mainstream, UPPERCASE `[A-Z0-9_]`, community-standard** —
+- **Native** secret keys are **mainstream, UPPERCASE `[A-Z0-9_]`, community-standard** —
   `GITHUB_TOKEN`, `OPENAI_API_KEY`, `GMAIL_REFRESH_TOKEN`. **Never invented.**
   `sc set` / the console **force-uppercase** on input (a lowercase key is
-  auto-converted, never stored lowercase) — one canonical form. Connection ids and
-  secret roles are lowercase; **every key ↔ conn-id ↔ host comparison is
-  case-insensitive.** For a service-backed connection the service DEFINEs the keys
-  (§4); a raw connection names its own in `secrets` (§2).
-- A **raw** connection stores each secret **bare** at its UPPERCASE KEY (the flat
-  pool is an env namespace; two raw connections naming the same KEY share it).
-- A **service-backed** connection addresses each secret via `secret_address` =
-  **`[<connection_id>:]<ROLE>`**:
-  - **default** connection (`conn_id == service_id`) → **no prefix** → bare
-    `GMAIL_REFRESH_TOKEN`.
-  - **named** connection → `gmail_work:GMAIL_REFRESH_TOKEN`.
-- The `:` delimiter is invalid in env-var names → a namespaced key can never
-  masquerade as an env var.
-- The address resolves through the normal **`store_order`** (native secrets →
-  GCP → …) exactly as any secret today — **no per-connection store binding, no
-  new mechanism.** The optional prefix is the only connection-specific part.
+  auto-converted, never stored lowercase) — one canonical form for the pool WE own.
+- **Key resolution is case-SENSITIVE exact** (env-var / secret-manager convention).
+  It was only ever case-insensitive because `sc get` uppercased its argument and
+  native keys are stored uppercase; the resolver itself has always been an exact
+  `HashMap` lookup. `sc get` no longer uppercases, so a native key must be named
+  as stored (`GITHUB_TOKEN`, not `github_token`), and an **external** store's keys
+  (GCP Secret Manager, … — which preserve their own casing, e.g. `xh-gcp-test`)
+  are reachable ONLY verbatim.
+- Connection ids and hosts are lowercase; **conn-id ↔ host comparison is
+  case-insensitive** (keys are not — see above). For a service-backed connection
+  the service DEFINEs the roles (§4); a raw connection names its own in `secrets` (§2).
+- **Every secret lives at a bare, env-valid KEY** — the flat pool is ONE env
+  namespace; nothing is namespaced. Every key maps **1:1** to `env` import and
+  external-store read-through (GCP Secret Manager, …) via the normal
+  **`store_order`** — zero remap, for **every** connection, named ones included.
+- **The connection RECORD is the binding layer** — a connection OWNs no
+  namespace; it **references** keys:
+  - **raw** connection → its `secrets` list IS the binding (role == KEY; two
+    connections naming the same KEY share it — sharing is explicit at creation).
+  - **service-backed** connection → the sparse **`keys` map** `{ROLE → KEY}`;
+    a missing role binds to its own bare mainstream name. So a **default**
+    connection (`conn_id == service_id`) stores no map at all
+    (`GMAIL_REFRESH_TOKEN` as-is), and a **named** one is created with distinct
+    keys — suggested `<ROLE>_<QUALIFIER>` (`GMAIL_REFRESH_TOKEN_WORK`), editable:
+    the creator may pick / autocomplete any existing key to share it.
+- **The binding is stored data, never a computed convention** (`secret_key_for`
+  in `storage/plaintext.rs` is the sole resolver: record map wins, identity
+  otherwise). Writers and readers cannot drift, because there is no address
+  formula to disagree on.
 
 ```jsonc
 "secrets": {
-  "GMAIL_REFRESH_TOKEN":            "<bytes>",   // default gmail connection — bare
-  "gmail_work:GMAIL_REFRESH_TOKEN": "<bytes>",   // named service-backed connection — prefixed
-  "STRIPE_KEY":                     "<bytes>"    // raw stripe_key connection — bare
+  "GMAIL_REFRESH_TOKEN":      "<bytes>",   // default gmail connection — identity binding
+  "GMAIL_REFRESH_TOKEN_WORK": "<bytes>",   // named gmail_work conn — via its keys map
+  "STRIPE_KEY":               "<bytes>"    // raw stripe_key connection — referenced by list
+},
+"connections": {
+  "gmail":      { "service": "gmail" },
+  "gmail_work": { "service": "gmail",
+                  "keys": { "GMAIL_REFRESH_TOKEN": "GMAIL_REFRESH_TOKEN_WORK" } },
+  "stripe_key": { "hosts": ["api.stripe.com"], "secrets": ["STRIPE_KEY"] }
 }
 ```
 
-**Why default-bare (the asymmetry is principled).** It's the AWS-default-profile
-pattern. The bare mainstream name maps **1:1** to `env` import, GCP Secret
-Manager, and the wider ecosystem — **zero remap / translate**, which is the
-whole point of speaking mainstream names. A named connection's `:`-prefix is a
-**native-store-internal** detail (ecosystem-invisible); storing a *named*
-connection's secret in an external store is an edge case for later.
+**Why all-bare + record binding.** The bare mainstream name is the whole point
+of speaking mainstream names (1:1 with the ecosystem); pushing the instance
+axis into the RECORD instead of the key keeps that true for named connections
+too, and matches how every mature store separates instance from field (mount
+path / vault / SecretStore — always an outer axis, never inside the leaf key).
 
 ---
 
@@ -193,9 +212,9 @@ A connection's policy is keyed by the same `connection_id` under
 set comes from the connection's *service* recipe (`policy.toml`); the user's
 sparse edits/additions merge on top (`ConnectionPolicy { default?, rules }`). Two
 connections of the same service (`gmail`, `gmail_work`) therefore get independent
-policy overrides. The full policy model — risk tiers, the risk→level map, the
+policy overrides. The full policy model — per-action `level` decisions, the
 default floors, deny-override resolution, `ttl` — is in
-[POLICY_RISK_TIERS.md](POLICY_RISK_TIERS.md); the whole `aux.policy` tree is in
+[POLICY.md](POLICY.md); the whole `aux.policy` tree is in
 [STORES_AND_ITEMS.md §7](STORES_AND_ITEMS.md).
 
 ---
@@ -259,9 +278,9 @@ provider = "google"
 scopes   = [ "…/gmail.send", "…/gmail.readonly", "…/gmail.modify" ]
 secret   = "GMAIL_REFRESH_TOKEN"     # mainstream role this recipe injects (DEFINEd)
 
-# services/_providers/google.toml — the OAuth client's fixed redirect_uri lives here,
+# The OAuth client's fixed redirect_uri lives in the service's [oauth2] section,
 # not in each handshake:
-[provider.google]
+[oauth2]
 # … client_id / token_url / pkce …
 redirect_uri = "http://127.0.0.1:8765/safeclaw/oauth/callback"
 ```
