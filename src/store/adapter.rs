@@ -29,6 +29,16 @@ pub enum Adapter {
     Gcp(GcpSecretManagerAdapter),
 }
 
+/// The session cache (`SecretsCache`) derives Debug; never print adapter
+/// internals (credentials) — the kind tag is all a debug dump may show.
+impl std::fmt::Debug for Adapter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Adapter")
+            .field("kind", &self.kind())
+            .finish()
+    }
+}
+
 impl Adapter {
     pub fn kind(&self) -> &'static str {
         match self {

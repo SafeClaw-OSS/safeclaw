@@ -36,7 +36,6 @@ use serde_json::{json, Value};
 use crate::error::{AppError, Result};
 use crate::server::handlers::op::validate_vault_id;
 use crate::state::{AppState, VaultState};
-use crate::store::adapters::gcp::GcpSecretManagerAdapter;
 
 /// Per-store live-list timeout. Short enough that a stalled GCP call
 /// doesn't hang the page load, long enough that a normal cross-region
@@ -67,44 +66,10 @@ pub async fn secret_keys(
     let mut stores: Vec<Value> = Vec::new();
     let mut store_errors: Vec<Value> = Vec::new();
 
-    for (store_id, (store, sa_json)) in external_stores {
-        // V1: only gcp-secret-manager is wired through here. Other kinds
-        // remain `unsupported`; they'd never have been inserted into
-        // `external_stores` in the first place (bootstrap filters by
-        // kind), but we double-check for forward-compat.
-        if store.kind != "gcp-secret-manager" {
-            continue;
-        }
-        let project_id = match store
-            .extra
-            .get("project_id")
-            .and_then(|v| v.as_str())
-            .map(str::to_string)
-        {
-            Some(p) => p,
-            None => {
-                store_errors.push(json!({
-                    "store_id": store_id,
-                    "error": "missing project_id"
-                }));
-                continue;
-            }
-        };
-        // F-19: sa_json is Zeroizing<Vec<u8>>; clone the inner bytes for the adapter
-        // (GcpSecretManagerAdapter takes ownership; the local Zeroizing copy is dropped
-        // and zeroed immediately after the call).
-        let adapter = match GcpSecretManagerAdapter::new(project_id, sa_json.to_vec()) {
-            Ok(a) => a,
-            Err(e) => {
-                // F-20: log full error server-side; return sanitised message to caller.
-                tracing::warn!(store = %store_id, "secret-keys adapter init error: {}", e);
-                store_errors.push(json!({
-                    "store_id": store_id,
-                    "error": format!("store '{}' unavailable", store_id),
-                }));
-                continue;
-            }
-        };
+    for (store_id, (store, adapter)) in external_stores {
+        // The session cache holds ONE live adapter per store (built at
+        // unlock, OAuth token cached inside) — list through it instead of
+        // constructing a throwaway instance per page load.
         match tokio::time::timeout(LIST_TIMEOUT, adapter.list()).await {
             Ok(Ok(mut names)) => {
                 names.sort();
