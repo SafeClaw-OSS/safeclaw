@@ -399,6 +399,7 @@ fn build_connection(
     conn: &Connection,
     def: Option<&ServiceDef>,
     native_keys: &HashSet<String>,
+    external_keys: &HashSet<String>,
     summary: bool,
 ) -> RegistryConnection {
     let (connected, phantoms, secrets): (bool, Vec<String>, Option<Vec<String>>) = match &conn
@@ -414,7 +415,11 @@ fn build_connection(
                     required.is_empty()
                         || required.iter().all(|role| {
                             let key = secret_key_for(Some(conn), role);
+                            // One flat namespace: native (case-insensitive
+                            // canonical) OR an external store's key (exact —
+                            // external naming is case-sensitive).
                             native_keys.iter().any(|k| k.eq_ignore_ascii_case(&key))
+                                || external_keys.contains(&key)
                         })
                 })
                 .unwrap_or(false);
@@ -423,9 +428,10 @@ fn build_connection(
         None => {
             let keys = conn.secrets.clone().unwrap_or_default();
             let connected = !keys.is_empty()
-                && keys
-                    .iter()
-                    .all(|k| native_keys.iter().any(|n| n.eq_ignore_ascii_case(k)));
+                && keys.iter().all(|k| {
+                    native_keys.iter().any(|n| n.eq_ignore_ascii_case(k))
+                        || external_keys.contains(k)
+                });
             let phantoms: Vec<String> = phantoms_for_raw(conn_id, &keys).into_values().collect();
             (connected, phantoms, Some(keys))
         }
@@ -521,7 +527,8 @@ pub fn vault_registry_value(state: &AppState, vault_id: &str, q: &RegistryQuery)
     // Snapshot native_keys + connections + custom services + lock state under the
     // mutex, then drop it before rendering.
     #[allow(clippy::type_complexity)]
-    let (native_keys, custom_services, connections, locked): (
+    let (native_keys, external_keys, custom_services, connections, locked): (
+        HashSet<String>,
         HashSet<String>,
         Vec<(String, ServiceDef)>,
         std::collections::HashMap<String, Connection>,
@@ -538,12 +545,14 @@ pub fn vault_registry_value(state: &AppState, vault_id: &str, q: &RegistryQuery)
                 custom.sort_by(|a, b| a.0.cmp(&b.0));
                 (
                     cache.native_keys.clone(),
+                    cache.external_keys.lock().unwrap().clone(),
                     custom,
                     cache.connections.clone(),
                     false,
                 )
             }
             _ => (
+                HashSet::new(),
                 HashSet::new(),
                 Vec::new(),
                 std::collections::HashMap::new(),
@@ -607,7 +616,14 @@ pub fn vault_registry_value(state: &AppState, vault_id: &str, q: &RegistryQuery)
                     .map(|(_, d)| d.clone())
                     .or_else(|| state.services.get(s).cloned())
             });
-            let mut row = build_connection(conn_id, conn, def.as_ref(), &native_keys, summary);
+            let mut row = build_connection(
+                conn_id,
+                conn,
+                def.as_ref(),
+                &native_keys,
+                &external_keys,
+                summary,
+            );
             if row.connected && state.oauth_needs_reauth(vault_id, conn_id) {
                 row.needs_reauth = Some(true);
             }
@@ -620,7 +636,9 @@ pub fn vault_registry_value(state: &AppState, vault_id: &str, q: &RegistryQuery)
         Some(None)
     } else {
         let mut entries: Vec<String> = native_keys.into_iter().collect();
+        entries.extend(external_keys.iter().cloned());
         entries.sort();
+        entries.dedup();
         Some(Some(entries))
     };
 
@@ -769,15 +787,21 @@ secrets = ["GITHUB_TOKEN"]
             keys: None,
         };
         let present: HashSet<String> = ["STRIPE_KEY".to_string()].into_iter().collect();
-        let row = build_connection("stripe_key", &conn, None, &present, false);
+        let empty: HashSet<String> = HashSet::new();
+        let row = build_connection("stripe_key", &conn, None, &present, &empty, false);
         assert!(row.connected);
         assert_eq!(row.phantoms, vec!["__sc__stripe_key__".to_string()]);
         assert_eq!(row.secrets, Some(vec!["STRIPE_KEY".to_string()]));
         assert_eq!(row.service, None);
 
-        // Missing secret → not connected.
-        let empty: HashSet<String> = HashSet::new();
-        let row = build_connection("stripe_key", &conn, None, &empty, false);
+        // Missing everywhere → not connected.
+        let row = build_connection("stripe_key", &conn, None, &empty, &empty, false);
         assert!(!row.connected);
+
+        // Key hosted ONLY by an external store (exact name) → connected: the
+        // flat namespace doesn't care which store holds the bytes.
+        let external: HashSet<String> = ["STRIPE_KEY".to_string()].into_iter().collect();
+        let row = build_connection("stripe_key", &conn, None, &empty, &external, false);
+        assert!(row.connected);
     }
 }
