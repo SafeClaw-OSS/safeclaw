@@ -2,7 +2,9 @@
 //!
 //! One `BrokerHandler` is cloned per TCP connection. On a CONNECT it captures
 //! the vault id from `Proxy-Authorization` and decides MITM-vs-blind-tunnel by
-//! whether the destination host is anchored by any unlocked vault's connection.
+//! whether the destination host is anchored by any known vault's connection
+//! (unlocked live, or a locked vault's last-known anchors — so a phantom sent
+//! while locked gets an explicit `vault_locked` instead of a blind tunnel).
 //! For each intercepted inner request it: finds phantoms, resolves them to ONE
 //! connection, enforces the host anchor, evaluates policy, substitutes the real
 //! credential at egress, strips the agent's own/proxy auth, and forwards. A
@@ -20,9 +22,9 @@ use hudsucker::hyper::{header, HeaderMap, Method, Request, Response, StatusCode,
 use hudsucker::{Body, HttpContext, HttpHandler, RequestOrResponse};
 use serde_json::json;
 
+use crate::error::ScCode;
 use crate::proxy::resolver::{self, Phantom};
 use crate::state::AppState;
-
 
 /// The last-resort `ask`-once window when neither the matched rule nor any
 /// floor (`default.ttl`) pins one — the "Ask once" grant lasts this long after
@@ -80,14 +82,14 @@ impl HttpHandler for BrokerHandler {
         // (§8; a stray phantom then reaches upstream literally → clean 401, never
         // a leak). A creds-less CONNECT to a host we DO anchor was already met
         // with a 407 in handle_request (RFC 7235 challenge), so anything absent
-        // reaching here targets a host no unlocked vault anchors. Only a request
+        // reaching here targets a host no known vault anchors. Only a request
         // that NAMES a vault and targets an anchored host is a MITM candidate —
         // the precise per-vault anchor + the key check happen in `pipeline`.
         if self.vid.is_none() {
             return false;
         }
         match req.uri().host() {
-            Some(h) => self.state.host_in_any_unlocked_union(h),
+            Some(h) => self.state.host_in_any_known_union(h),
             None => false,
         }
     }
@@ -107,13 +109,13 @@ impl HttpHandler for BrokerHandler {
         // blind-tunneled — the phantom is never substituted and reaches the
         // upstream literally (a clean 401, but the credential path silently never
         // engages). Answer it with a 407 so it re-sends authenticated. Scope the
-        // challenge to a host some unlocked vault anchors: unrelated traffic still
+        // challenge to a host some known vault anchors: unrelated traffic still
         // tunnels untouched, preserving "only routed traffic is touched".
         if req.method() == Method::CONNECT {
             let (vid, _) = creds_from_proxy_auth(&req);
             if vid.is_none() {
                 if let Some(h) = req.uri().host() {
-                    if self.state.host_in_any_unlocked_union(h) {
+                    if self.state.host_in_any_known_union(h) {
                         return proxy_auth_challenge().into();
                     }
                 }
@@ -244,17 +246,16 @@ impl BrokerHandler {
             );
             match limited.collect().await {
                 Ok(collected) => body_bytes = Some(collected.to_bytes().to_vec()),
-                Err(e) if e.downcast_ref::<http_body_util::LengthLimitError>().is_some() => {
+                Err(e)
+                    if e.downcast_ref::<http_body_util::LengthLimitError>()
+                        .is_some() =>
+                {
                     return body_over_cap(0, cap).into();
                 }
                 Err(e) => {
                     tracing::warn!("proxy: body collect failed: {}", e);
-                    return err_response(
-                        StatusCode::BAD_GATEWAY,
-                        "upstream_body",
-                        "failed to read request body",
-                    )
-                    .into();
+                    return err_response(ScCode::UpstreamBody, "failed to read request body")
+                        .into();
                 }
             }
         }
@@ -291,8 +292,7 @@ impl BrokerHandler {
         // A phantom over plain HTTP can't be TLS-substituted — refuse.
         if !is_https {
             return err_response(
-                StatusCode::BAD_REQUEST,
-                "phantom_plain_http",
+                ScCode::PhantomPlainHttp,
                 "a phantom requires HTTPS (the proxy only substitutes inside TLS)",
             )
             .into();
@@ -304,8 +304,7 @@ impl BrokerHandler {
         conns.dedup();
         if conns.len() != 1 {
             return err_response(
-                StatusCode::BAD_REQUEST,
-                "multi_connection",
+                ScCode::MultiConnection,
                 &format!(
                     "one connection per request — this request names {}",
                     conns.join(", ")
@@ -329,8 +328,7 @@ impl BrokerHandler {
                 self.key.is_some() && crate::sync::refresh_agent_keys_on_miss(&self.state).await;
             if !refreshed || !self.key_is_valid() {
                 return err_response(
-                    StatusCode::PROXY_AUTHENTICATION_REQUIRED,
-                    "agent_key",
+                    ScCode::AgentKey,
                     "invalid or missing SafeClaw agent api key",
                 )
                 .into();
@@ -343,20 +341,14 @@ impl BrokerHandler {
             // than guess a vault.
             None => {
                 return err_response(
-                    StatusCode::FORBIDDEN,
-                    "no_vault",
+                    ScCode::NoVault,
                     "no vault bound — route credential traffic with `sc run`",
                 )
                 .into()
             }
         };
         if self.state.is_vault_locked(&vault_id) {
-            return err_response(
-                StatusCode::from_u16(423).unwrap(),
-                "vault_locked",
-                "vault is locked — run `sc up`",
-            )
-            .into();
+            return err_response(ScCode::VaultLocked, crate::error::VAULT_LOCKED_MSG).into();
         }
 
         // ── resolve the connection ───────────────────────────────────────────
@@ -382,8 +374,7 @@ impl BrokerHandler {
                     }
                 } else {
                     return err_response(
-                        StatusCode::BAD_REQUEST,
-                        "unknown_connection",
+                        ScCode::UnknownConnection,
                         &format!("unknown connection '{}'", conn),
                     )
                     .into();
@@ -427,8 +418,7 @@ impl BrokerHandler {
         if !crate::core::host::host_allowed(&dest_host, &resolved_hosts) {
             if !crate::service::validate::host_egress_allowed(&dest_host) {
                 return err_response(
-                    StatusCode::FORBIDDEN,
-                    "host_forbidden",
+                    ScCode::HostForbidden,
                     &format!(
                         "destination '{}' is not a permitted egress target",
                         dest_host
@@ -449,8 +439,10 @@ impl BrokerHandler {
         let req_scope = def.as_ref().and_then(|d| {
             d.extract_request_scope(&method, &path, parts.uri.query(), body_text.as_deref())
         });
-        let vars: crate::core::policy::VarMap =
-            req_scope.as_ref().map(|r| r.vars.clone()).unwrap_or_default();
+        let vars: crate::core::policy::VarMap = req_scope
+            .as_ref()
+            .map(|r| r.vars.clone())
+            .unwrap_or_default();
         let scope_digest = req_scope.as_ref().map(|r| r.digest()).unwrap_or_default();
 
         // ── policy ───────────────────────────────────────────────────────────
@@ -469,12 +461,7 @@ impl BrokerHandler {
         let (level, rule_id, ttl) = match decision {
             Some(d) => d,
             None => {
-                return err_response(
-                    StatusCode::from_u16(423).unwrap(),
-                    "vault_locked",
-                    "vault is locked — run `sc up`",
-                )
-                .into()
+                return err_response(ScCode::VaultLocked, crate::error::VAULT_LOCKED_MSG).into()
             }
         };
 
@@ -491,12 +478,7 @@ impl BrokerHandler {
                 },
                 0,
             );
-            return err_response(
-                StatusCode::FORBIDDEN,
-                "policy_denied",
-                "this request is denied by policy",
-            )
-            .into();
+            return err_response(ScCode::PolicyDenied, "this request is denied by policy").into();
         }
 
         // The credential bytes come from the session cache (the proxy has no
@@ -520,8 +502,15 @@ impl BrokerHandler {
         let (primary, secrets_map) = match level {
             // Single-use, request-bound.
             AccessLevel::AskAlways => (
-                self.state
-                    .op_grant_take(&vault_id, &conn, &method, &dest_host, &path, &scope_digest, true),
+                self.state.op_grant_take(
+                    &vault_id,
+                    &conn,
+                    &method,
+                    &dest_host,
+                    &path,
+                    &scope_digest,
+                    true,
+                ),
                 None,
             ),
             // A scoped `ask` is ALSO request-bound (peek/reuse within window),
@@ -529,8 +518,15 @@ impl BrokerHandler {
             // misses and re-prompts. An UNSCOPED ask keeps the Phase-1 conn-keyed
             // grant (the documented "usable but not fully bound" default).
             AccessLevel::Ask if scoped => (
-                self.state
-                    .op_grant_take(&vault_id, &conn, &method, &dest_host, &path, &scope_digest, false),
+                self.state.op_grant_take(
+                    &vault_id,
+                    &conn,
+                    &method,
+                    &dest_host,
+                    &path,
+                    &scope_digest,
+                    false,
+                ),
                 None,
             ),
             AccessLevel::Ask => (self.state.cache_lookup_grant(&vault_id, &conn), None),
@@ -575,8 +571,7 @@ impl BrokerHandler {
             Err(ResolveErr::Ambiguous) => {
                 let roles = phantom_role_hint(&conn, &conn_rec, def.as_ref());
                 return err_response(
-                    StatusCode::BAD_REQUEST,
-                    "ambiguous_phantom",
+                    ScCode::AmbiguousPhantom,
                     &format!(
                         "'{}' exposes several secrets — use a role phantom: {}",
                         conn, roles
@@ -586,8 +581,7 @@ impl BrokerHandler {
             }
             Err(ResolveErr::RefreshForbidden) => {
                 return err_response(
-                    StatusCode::FORBIDDEN,
-                    "refresh_forbidden",
+                    ScCode::RefreshForbidden,
                     "a refresh token never leaves the vault — this connection injects a \
                      minted access token (use its default phantom). To reveal the stored \
                      secret, the user runs `sc secret get` (passkey ceremony)",
@@ -596,19 +590,17 @@ impl BrokerHandler {
             }
             Err(ResolveErr::Exposes(role)) => {
                 return err_response(
-                    StatusCode::BAD_REQUEST,
-                    "exposes_unsupported",
+                    ScCode::ExposesUnsupported,
                     &format!("connection '{}' role '{}' is not yet mintable", conn, role),
                 )
                 .into();
             }
             Err(ResolveErr::Mint(msg)) => {
-                return err_response(StatusCode::BAD_GATEWAY, "oauth_mint", &msg).into();
+                return err_response(ScCode::OauthMint, &msg).into();
             }
             Err(ResolveErr::NotUtf8) => {
                 return err_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "secret_encoding",
+                    ScCode::SecretEncoding,
                     "resolved credential is not valid UTF-8",
                 )
                 .into();
@@ -863,6 +855,7 @@ impl BrokerHandler {
                 let mut b = Response::builder()
                     .status(StatusCode::UNAUTHORIZED)
                     .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+                    .header("x-safeclaw-error", ScCode::ApprovalNeeded.as_str())
                     .header("x-safeclaw-approve-url", approve_url.as_str())
                     .header("x-safeclaw-op-id", op_id.as_str())
                     .header(header::LOCATION, format!("/op/{}", op_id));
@@ -873,8 +866,7 @@ impl BrokerHandler {
                     .into()
             }
             Err(e) => err_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "approval_register",
+                ScCode::ApprovalRegister,
                 &format!("could not register approval: {:?}", e),
             )
             .into(),
@@ -947,7 +939,7 @@ impl BrokerHandler {
                     .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
                     .header("x-safeclaw-approve-url", approve_url.as_str())
                     .header("x-safeclaw-op-id", op_id.as_str())
-                    .header("x-safeclaw-error", "host_not_anchored")
+                    .header("x-safeclaw-error", ScCode::HostNotAnchored.as_str())
                     .body(Body::from(body))
                     .unwrap_or_else(|_| plain(StatusCode::FORBIDDEN, "host not anchored"))
                     .into();
@@ -955,8 +947,7 @@ impl BrokerHandler {
             Err(e) => format!("(could not open a widen request: {:?})", e),
         };
         err_response(
-            StatusCode::FORBIDDEN,
-            "host_not_anchored",
+            ScCode::HostNotAnchored,
             &format!(
                 "connection '{}' is not anchored to '{}' {}",
                 conn, host, approve_line
@@ -1208,8 +1199,7 @@ fn body_over_cap(declared: u64, cap: u64) -> Response<Body> {
         "streamed body".to_string()
     };
     err_response(
-        StatusCode::PAYLOAD_TOO_LARGE,
-        "broker_body_limit",
+        ScCode::BrokerBodyLimit,
         &format!(
             "this request names a phantom but its {} exceeds the broker's inspectable \
              cap ({} bytes) — the proxy will not forward a credential alongside a body \
@@ -1231,22 +1221,24 @@ fn egress_error_response(err: hudsucker::hyper_util::client::legacy::Error) -> R
     let cause = error_chain(&err);
     // Preserve the observability the default handler gave (it logged the raw err).
     tracing::error!(cause = %cause, is_connect, "forward-hop to upstream failed");
-    let (code, msg) =
-        egress_error_parts(is_connect, &cause, crate::cli::egress_proxy::effective().is_some());
-    err_response(StatusCode::BAD_GATEWAY, code, &msg)
+    let (code, msg) = egress_error_parts(
+        is_connect,
+        &cause,
+        crate::cli::egress_proxy::effective().is_some(),
+    );
+    err_response(code, &msg)
 }
 
 /// The `(x-safeclaw-error code, body)` for a forward-hop failure. Pure so the
 /// branching (connect vs not, proxy configured vs not) is testable without a
 /// `hyper_util` error, which has no public constructor. Never echoes the proxy
 /// URL — it can carry userinfo — pointing at `sc proxy show` instead.
-fn egress_error_parts(is_connect: bool, cause: &str, has_proxy: bool) -> (&'static str, String) {
+fn egress_error_parts(is_connect: bool, cause: &str, has_proxy: bool) -> (ScCode, String) {
     if !is_connect {
         return (
-            "upstream_error",
+            ScCode::UpstreamError,
             format!(
-                "SafeClaw could not complete the upstream request (not a credential \
-                 problem): {}",
+                "could not complete the upstream request (not a credential problem): {}",
                 cause
             ),
         );
@@ -1259,9 +1251,9 @@ fn egress_error_parts(is_connect: bool, cause: &str, has_proxy: bool) -> (&'stat
          proxy, run `sc proxy set <url>`."
     };
     (
-        "egress_unreachable",
+        ScCode::EgressUnreachable,
         format!(
-            "SafeClaw egress failed (not a credential problem): {}. {}",
+            "egress failed (not a credential problem): {}. {}",
             cause, hint
         ),
     )
@@ -1284,13 +1276,23 @@ fn error_chain(err: &dyn std::error::Error) -> String {
     parts.join(": ")
 }
 
-/// A plain-text 4xx/5xx with a machine-readable `x-safeclaw-error` token.
-fn err_response(status: StatusCode, code: &str, msg: &str) -> Response<Body> {
+/// A plain-text 4xx/5xx for the MITM plane. Status comes from the registry
+/// (`ScCode::row`, the same row every surface uses); the machine token rides
+/// `x-safeclaw-error` AND leads the body (`SafeClaw: <code>: <msg>`), so the
+/// error is attributable even when a tool surfaces only one of the two.
+/// text/plain is deliberate — a SafeClaw refusal must never parse as the
+/// upstream service's payload.
+fn err_response(code: ScCode, msg: &str) -> Response<Body> {
+    let status = StatusCode::from_u16(code.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     Response::builder()
         .status(status)
         .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
-        .header("x-safeclaw-error", code)
-        .body(Body::from(format!("{}\n", msg)))
+        .header("x-safeclaw-error", code.as_str())
+        .body(Body::from(format!(
+            "SafeClaw: {}: {}\n",
+            code.as_str(),
+            msg
+        )))
         .unwrap_or_else(|_| plain(status, msg))
 }
 
@@ -1393,7 +1395,10 @@ mod tests {
         }
         let e = E(
             "client error (Connect)",
-            Some(Box::new(E("forward connect to gmail.googleapis.com:443 timed out", None))),
+            Some(Box::new(E(
+                "forward connect to gmail.googleapis.com:443 timed out",
+                None,
+            ))),
         );
         assert_eq!(
             error_chain(&e),
@@ -1411,7 +1416,7 @@ mod tests {
         // Connect failure, no proxy configured: tell them how to set one, and
         // make clear it is NOT a credential problem (the agent's #1 misread).
         let (code, msg) = egress_error_parts(true, cause, false);
-        assert_eq!(code, "egress_unreachable");
+        assert_eq!(code, ScCode::EgressUnreachable);
         assert!(msg.contains(cause));
         assert!(msg.contains("not a credential problem"));
         assert!(msg.contains("sc proxy set"));
@@ -1420,7 +1425,7 @@ mod tests {
         // Connect failure WITH a proxy configured: point at the proxy, never
         // echo its URL (it can carry userinfo), offer show/clear.
         let (code, msg) = egress_error_parts(true, cause, true);
-        assert_eq!(code, "egress_unreachable");
+        assert_eq!(code, ScCode::EgressUnreachable);
         assert!(msg.contains("configured proxy"));
         assert!(msg.contains("sc proxy show"));
         assert!(msg.contains("sc proxy clear"));
@@ -1428,7 +1433,7 @@ mod tests {
         // NOT a connect failure (e.g. upstream sent a bad response): no proxy
         // hint that would misdirect, distinct token.
         let (code, msg) = egress_error_parts(false, "invalid HTTP response", false);
-        assert_eq!(code, "upstream_error");
+        assert_eq!(code, ScCode::UpstreamError);
         assert!(!msg.contains("sc proxy set"));
         assert!(msg.contains("not a credential problem"));
     }

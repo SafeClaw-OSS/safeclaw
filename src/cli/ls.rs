@@ -1,8 +1,9 @@
 //! `safeclaw ls` — list secret names known to the active vault.
 //!
 //! Hits the custodian's `GET /v/{vid}/secret-keys` (cache-driven; no passkey
-//! ceremony). Vault must be Unlocked — the custodian returns 409 otherwise,
-//! which we map to a "run `safeclaw unlock` first" hint.
+//! ceremony). Vault must be Unlocked — the custodian answers `vault_locked`
+//! (423) otherwise, rendered with the one canonical unlock hint (`sc up`;
+//! unlock is invisible by design, there is no separate unlock command).
 //!
 //! Output is one row per key with its source tag. Same key surfacing from
 //! multiple sources prints multiple rows; whichever source wins resolution
@@ -55,15 +56,13 @@ pub async fn run(args: CommonArgs) -> Result<(), String> {
         .await
         .map_err(|e| format!("reach custodian at {}: {}", custodian, e))?;
 
-    if resp.status().as_u16() == 409 {
-        return Err("vault locked — run `safeclaw unlock` first".into());
-    }
     if !resp.status().is_success() {
-        return Err(format!(
-            "custodian returned HTTP {}: {}",
-            resp.status(),
-            resp.text().await.unwrap_or_default()
-        ));
+        let status = resp.status().as_u16();
+        let body = resp.text().await.unwrap_or_default();
+        if crate::cli::apierr::is_vault_locked(status, &body) {
+            return Err(crate::error::VAULT_LOCKED_MSG.into());
+        }
+        return Err(crate::cli::apierr::line(status, &body).into());
     }
     let body: KeysKnown = resp.json().await.map_err(|e| format!("parse: {}", e))?;
 
@@ -82,8 +81,12 @@ pub async fn run(args: CommonArgs) -> Result<(), String> {
         }
         let mut printed_anything = any_native;
         for s in &body.stores {
-            if s.keys.is_empty() { continue; }
-            if printed_anything { println!(); }
+            if s.keys.is_empty() {
+                continue;
+            }
+            if printed_anything {
+                println!();
+            }
             println!("[{}: {}]", s.kind, s.id);
             for k in &s.keys {
                 println!("  {}", k);

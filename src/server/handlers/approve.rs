@@ -955,6 +955,7 @@ pub async fn approve_op(
                     let mut states = state.vault_states.lock().unwrap();
                     states.remove(&vault_id);
                 }
+                state.last_host_unions.lock().unwrap().remove(&vault_id);
                 tracing::info!(vault = %vault_id, "vault deleted");
                 (json!({ "ok": true, "act": "vault-delete" }), None)
             }
