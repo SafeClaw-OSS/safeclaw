@@ -40,7 +40,7 @@ use crate::protocol::operation::{
 use crate::protocol::{render_operation, validate_grant, Grant};
 use crate::server::handlers::metadata::decrypt_vault_view_keep_key;
 use crate::state::{AppState, ApprovalEvent, SecretsCache};
-use crate::storage::plaintext::VaultPlaintextView;
+use crate::storage::plaintext::{Category, VaultPlaintextView};
 use crate::storage::sealed_vault::{
     build_initial, find_pubkey, find_pubkey_in_registry, read as read_vault, read_per_item,
     replace_after_write, write_atomic,
@@ -1929,25 +1929,7 @@ pub(crate) fn bootstrap_cache_from_view(
     // `evaluate` with a GET and no rules resolves exactly that read floor, so
     // residency can't drift from the decision. `service = None` ⇒ raw connection.
     let read_floor_allows = |service: Option<&str>, conn: &str| -> bool {
-        let recipe = service.and_then(|s| state.services.default_policy_levels(s));
-        let user = effective_policy
-            .connections
-            .get(conn)
-            .and_then(|c| c.default.as_ref());
-        let conn_levels = crate::core::policy::merge_levels(user, recipe.as_ref());
-        let tags = service
-            .map(|s| state.services.service_tags(s))
-            .unwrap_or(&[]);
-        crate::core::policy::evaluate(
-            "GET",
-            "/",
-            None,
-            &crate::core::policy::VarMap::new(),
-            None,
-            conn_levels.as_ref(),
-            &effective_policy,
-            tags,
-        ) == crate::core::policy::AccessLevel::Allow
+        residency_read_floor_allows(&effective_policy, &state.services, service, conn)
     };
     // Routing snapshot (CONNECTION_SCHEMA.md §6): `connection_id → {service,
     // config}`. The per-service loop below bootstraps every *default* connection
@@ -1972,20 +1954,45 @@ pub(crate) fn bootstrap_cache_from_view(
         if store.kind != "gcp-secret-manager" {
             continue;
         }
-        let Some(creds_item) = store.extra.get("credentials_item").and_then(|v| v.as_str()) else {
-            continue;
-        };
-        let Some(sa_json) = view.native_secrets.get(creds_item).cloned() else {
-            continue;
-        };
-        cache
-            .external_stores
-            // F-19: wrap SA JSON bytes in Zeroizing so they are zeroed on drop.
-            .insert(
-                store_id.clone(),
-                (store.clone(), zeroize::Zeroizing::new(sa_json)),
-            );
+        // ONE adapter instance per store for the whole unlocked session:
+        // this is what makes the adapter's OAuth-token cache effective
+        // (F-19: the adapter zeroizes the SA private key on drop, i.e. on
+        // lock). A store that fails to materialise is skipped, same as the
+        // old missing-credential cases — its keys just aren't resident and
+        // `secret-keys` won't list it.
+        match crate::store::build_adapter(store_id, store, view) {
+            Ok(adapter) => {
+                cache.external_stores.insert(
+                    store_id.clone(),
+                    (store.clone(), std::sync::Arc::new(adapter)),
+                );
+            }
+            Err(e) => {
+                // F-20: full error in the log only; the cache carries a
+                // sanitised reason for `secret-keys` to surface.
+                tracing::warn!(store = %store_id, "unlock: external store adapter init failed: {}", e);
+                cache.external_store_errors.push((
+                    store_id.clone(),
+                    format!("store '{}' unavailable", store_id),
+                ));
+            }
+        }
     }
+    // Resolution order for the lazy fill — aux.store_order restricted to the
+    // adapters that actually materialised, so first-match-wins agrees with
+    // `resolve_value_async`.
+    cache.external_store_order = view
+        .aux
+        .store_order
+        .iter()
+        .filter(|id| {
+            cache
+                .external_stores
+                .get(*id)
+                .is_some_and(|(s, _)| s.category == Category::Value)
+        })
+        .cloned()
+        .collect();
     for (service_id, _) in state.services.iter_sorted() {
         // PROTOCOL.md §6.2: only connections whose effective READ floor is
         // `allow` get their auth value loaded at unlock. ask / ask-always
@@ -2159,4 +2166,266 @@ pub(crate) fn bootstrap_cache_from_view(
         }
     }
     cache
+}
+
+/// Residency gate shared by the unlock bootstrap and the allow-path lazy
+/// fill: a connection's bytes may sit in the session cache iff its effective
+/// READ floor resolves to `allow` (PROTOCOL.md §6.2 — residency mirrors the
+/// decision layer, see the block comment in `bootstrap_cache_from_view`).
+/// `service = None` ⇒ raw connection.
+pub(crate) fn residency_read_floor_allows(
+    effective_policy: &crate::core::policy::Policy,
+    services: &crate::service::ServiceRegistry,
+    service: Option<&str>,
+    conn: &str,
+) -> bool {
+    let recipe = service.and_then(|s| services.default_policy_levels(s));
+    let user = effective_policy
+        .connections
+        .get(conn)
+        .and_then(|c| c.default.as_ref());
+    let conn_levels = crate::core::policy::merge_levels(user, recipe.as_ref());
+    let tags = service.map(|s| services.service_tags(s)).unwrap_or(&[]);
+    crate::core::policy::evaluate(
+        "GET",
+        "/",
+        None,
+        &crate::core::policy::VarMap::new(),
+        None,
+        conn_levels.as_ref(),
+        effective_policy,
+        tags,
+    ) == crate::core::policy::AccessLevel::Allow
+}
+
+/// Allow-path lazy residency for EXTERNAL stores (the store-agnostic half of
+/// the unlock bootstrap above). The secret model is one abstraction: a
+/// connection binds KEYS and policy gates CONNECTIONS — neither knows which
+/// store hosts the bytes. native-secrets values are resident from unlock
+/// because they're already in hand; external values are network I/O we
+/// refuse to put on the unlock path, so they load on FIRST TOUCH instead:
+/// same read-floor gate, same `from_bootstrap` marking, same
+/// whole-session lifetime — only the load moment differs.
+///
+/// Returns:
+///   - `Ok(true)`  — the cache now holds bytes for `conn`; retry the lookup.
+///   - `Ok(false)` — nothing external to load (no stores, floor not allow,
+///     or no store has the keys); fall through to the portal as before.
+///   - `Err(store_id)` — a CONFIGURED store failed (auth/network). Fail
+///     loudly (P2): the caller surfaces an explicit error, never a portal
+///     that would misread an outage as "needs approval".
+pub(crate) async fn lazy_fill_external(
+    state: &AppState,
+    vault_id: &str,
+    conn: &str,
+) -> std::result::Result<bool, String> {
+    // Single-flight: a burst of first requests fills once. Waiters re-check
+    // the cache under the lock and ride the winner's insert.
+    let _fill = state.external_fill_lock.lock().await;
+
+    let (policy, rec, adapters) = {
+        let states = state.vault_states.lock().unwrap();
+        let Some(crate::state::VaultState::Unlocked { cache, .. }) = states.get(vault_id) else {
+            return Ok(false);
+        };
+        if cache.entries.contains_key(conn) || cache.allow_secrets.contains_key(conn) {
+            return Ok(true); // another request filled while we waited
+        }
+        if cache.external_store_order.is_empty() {
+            return Ok(false);
+        }
+        let adapters: Vec<(String, Arc<crate::store::Adapter>)> = cache
+            .external_store_order
+            .iter()
+            .filter_map(|id| {
+                cache
+                    .external_stores
+                    .get(id)
+                    .map(|(_, a)| (id.clone(), a.clone()))
+            })
+            .collect();
+        (
+            cache.policy.clone(),
+            cache.connections.get(conn).cloned(),
+            adapters,
+        )
+    };
+
+    // Service resolution: explicit record binding, else the connection id
+    // names a REGISTRY service (default connection), else raw. Custom
+    // (per-vault) services deliberately follow the bootstrap's behavior —
+    // registry-blind residency, first use goes through the portal — so the
+    // two residency paths can never disagree.
+    let service = rec
+        .as_ref()
+        .and_then(|c| c.service.clone())
+        .or_else(|| state.services.get(conn).map(|_| conn.to_string()));
+
+    if !residency_read_floor_allows(&policy, &state.services, service.as_deref(), conn) {
+        return Ok(false);
+    }
+
+    // Walk stores in vault order for one key; external keys resolve EXACT
+    // (external naming is accepted as-is — no case folding). `Err(store_id)`
+    // aborts the whole fill: a configured store outage must surface, not
+    // degrade into "not found".
+    let resolve_key = |key: String| {
+        let adapters = &adapters;
+        let conn = conn.to_string();
+        async move {
+            for (store_id, adapter) in adapters {
+                match adapter.resolve(&key).await {
+                    Ok(Some(bytes)) => return Ok(Some(bytes)),
+                    Ok(None) => continue,
+                    Err(e) => {
+                        // F-20: full error server-side only; the caller
+                        // returns a sanitised message.
+                        tracing::warn!(store = %store_id, conn = %conn, "lazy external fill failed: {}", e);
+                        return Err(store_id.clone());
+                    }
+                }
+            }
+            Ok(None)
+        }
+    };
+
+    // Same shapes as the bootstrap's passes: `entries` primary from the
+    // service's env-key role; `allow_secrets` map from `cacheable_roles`
+    // (NOT the primary role — an oauth refresh token is resident for the
+    // mint path only, never in the injectable role map); raw connections
+    // map their explicit keys, sole key doubling as primary.
+    let mut primary: Option<Vec<u8>> = None;
+    let mut map: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
+    match service.as_deref() {
+        Some(svc_id) => {
+            if let Some(role) = state.services.service_env_key(svc_id) {
+                let key = crate::storage::plaintext::secret_key_for(rec.as_ref(), &role);
+                primary = resolve_key(key).await?;
+            }
+            if let Some(svc) = state.services.get(svc_id) {
+                for name in cacheable_roles(svc) {
+                    let key = crate::storage::plaintext::secret_key_for(rec.as_ref(), &name);
+                    if let Some(bytes) = resolve_key(key).await? {
+                        map.insert(name, bytes);
+                    }
+                }
+            }
+        }
+        None => {
+            let Some(keys) = rec.as_ref().and_then(|c| c.secrets.clone()) else {
+                return Ok(false); // raw connection with no explicit keys
+            };
+            for key in keys {
+                if let Some(bytes) = resolve_key(key.clone()).await? {
+                    map.insert(key, bytes);
+                }
+            }
+            if map.len() == 1 {
+                primary = map.values().next().cloned();
+            }
+        }
+    }
+    if primary.is_none() && map.is_empty() {
+        return Ok(false);
+    }
+    {
+        let mut states = state.vault_states.lock().unwrap();
+        let Some(crate::state::VaultState::Unlocked { cache, .. }) = states.get_mut(vault_id)
+        else {
+            return Ok(false); // locked while we were fetching — drop the bytes
+        };
+        if let Some(val) = primary {
+            cache
+                .entries
+                .entry(conn.to_string())
+                .or_insert(crate::state::CacheEntry {
+                    value: val,
+                    expires_at: None,
+                    from_bootstrap: true,
+                });
+        }
+        if !map.is_empty() {
+            cache.allow_secrets.entry(conn.to_string()).or_insert(map);
+        }
+    }
+    tracing::info!(conn = %conn, "external store secrets resident after lazy fill");
+    Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::plaintext::{Store, VaultAux};
+    use std::collections::BTreeMap;
+
+    fn test_state() -> AppState {
+        let cfg = crate::config::Config {
+            state_dir: std::path::PathBuf::from(format!(
+                "/tmp/safeclaw-test-approve-{}",
+                std::process::id()
+            )),
+            port: 0,
+            proxy_port: 0,
+            listen: "127.0.0.1".into(),
+            origin: "http://localhost".into(),
+            rp_id: "localhost".into(),
+            admin_key: None,
+            relay_url: None,
+            body_cap: crate::config::DEFAULT_BODY_CAP,
+        };
+        AppState::new(cfg)
+    }
+
+    fn gcp_store(creds_item: &str) -> Store {
+        let mut extra = serde_json::Map::new();
+        extra.insert(
+            "project_id".into(),
+            serde_json::Value::String("proj".into()),
+        );
+        extra.insert(
+            "credentials_item".into(),
+            serde_json::Value::String(creds_item.into()),
+        );
+        Store {
+            kind: "gcp-secret-manager".into(),
+            category: Category::Value,
+            items: BTreeMap::new(),
+            extra,
+        }
+    }
+
+    /// The unlock bootstrap materialises ONE shared adapter per external
+    /// store (a store whose credential is missing is skipped, not fatal)
+    /// and snapshots store_order restricted to what materialised — the
+    /// exact walk order `lazy_fill_external` uses.
+    #[test]
+    fn bootstrap_snapshots_external_adapters_and_order() {
+        let state = test_state();
+        let mut aux = VaultAux::initial();
+        aux.stores.insert("gcpa".into(), gcp_store("GCPA_SA_JSON"));
+        aux.stores.insert("gcpb".into(), gcp_store("MISSING_ITEM"));
+        aux.store_order = vec!["native-secrets".into(), "gcpa".into(), "gcpb".into()];
+        let mut native_secrets = BTreeMap::new();
+        native_secrets.insert(
+            "GCPA_SA_JSON".to_string(),
+            br#"{"client_email":"sa@proj.iam.gserviceaccount.com","private_key":"not-a-real-pem"}"#
+                .to_vec(),
+        );
+        let view = VaultPlaintextView {
+            aux,
+            native_secrets,
+        };
+
+        let cache = bootstrap_cache_from_view(&view, &state);
+
+        assert!(cache.external_stores.contains_key("gcpa"));
+        assert!(
+            !cache.external_stores.contains_key("gcpb"),
+            "store with a missing credential item must be skipped"
+        );
+        assert_eq!(cache.external_store_order, vec!["gcpa".to_string()]);
+        let (store, adapter) = &cache.external_stores["gcpa"];
+        assert_eq!(store.kind, "gcp-secret-manager");
+        assert_eq!(adapter.kind(), "gcp-secret-manager");
+    }
 }

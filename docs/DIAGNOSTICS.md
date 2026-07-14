@@ -53,6 +53,7 @@ SafeClaw because it is the hop that observed them.
 | `policy_denied` | 403 | none | policy | explicit policy deny |
 | `refresh_forbidden` | 403 | fix_request | policy | refresh tokens never leave the vault |
 | `secret_encoding` | 500 | none | internal | resolved credential not valid UTF-8 |
+| `store_unavailable` | 502 | retry | upstream | an external secret store (e.g. GCP Secret Manager) failed while resolving; daemon logs have the full error |
 | `unknown_connection` | 400 | fix_request | request | phantom names no known connection |
 | `upstream_body` | 502 | retry | upstream | request body could not be read |
 | `upstream_error` | 502 | retry | upstream | upstream answered but the exchange failed (NOT a credential problem) |

@@ -168,21 +168,29 @@ pub struct SecretsCache {
     /// can decide which services are "reachable" without paying for an
     /// external-store roundtrip. Populated at unlock; cleared on lock.
     pub native_keys: HashSet<String>,
-    /// External stores' adapter inputs, snapshotted at unlock so live
-    /// `list()` calls from `GET /v/{vid}/secret-keys` can rebuild adapters
-    /// without re-decrypting the vault. Value: (store record from aux,
-    /// resolved credential bytes from native-secrets). Sparse — only
-    /// kinds with an adapter (today: gcp-secret-manager) populate.
+    /// External stores' LIVE adapters, built once at unlock so `list()`
+    /// (`GET /v/{vid}/secret-keys`) and the allow-path lazy fill
+    /// (`lazy_fill_external`) can call out without re-decrypting the vault.
+    /// Sharing one instance per store for the whole unlocked session is
+    /// what makes the adapter's internal OAuth-token cache real (a fresh
+    /// instance per call re-mints every time). Sparse — only kinds with an
+    /// adapter (today: gcp-secret-manager) populate.
     ///
-    /// F-19: credential bytes (GCP SA JSON with RSA private key) are wrapped
-    /// in `Zeroizing` so they are zeroed on drop when the vault is locked.
-    pub external_stores: HashMap<
-        String,
-        (
-            crate::storage::plaintext::Store,
-            zeroize::Zeroizing<Vec<u8>>,
-        ),
-    >,
+    /// F-19: the adapter owns the SA private key and zeroizes it on drop,
+    /// so lock still scrubs the credential with the rest of the cache.
+    pub external_stores:
+        HashMap<String, (crate::storage::plaintext::Store, Arc<crate::store::Adapter>)>,
+    /// `aux.store_order` filtered to the stores present in
+    /// `external_stores`, preserving the vault's resolution order. The lazy
+    /// fill walks THIS (first match wins) so external residency can never
+    /// disagree with `resolve_value_async`'s store_order semantics.
+    pub external_store_order: Vec<String>,
+    /// External stores that FAILED to materialise at unlock (bad SA JSON,
+    /// missing credentials_item, …): `store_id → sanitised reason`. Fail
+    /// loudly: `secret-keys` surfaces these as `store_errors` so a
+    /// misconfigured store shows up broken in the console instead of
+    /// silently vanishing. Full error goes to the daemon log only (F-20).
+    pub external_store_errors: Vec<(String, String)>,
     /// Derived OAuth access_tokens, keyed by service_id. These are the
     /// short-lived bearer values minted by exchanging the long-lived
     /// `refresh_token` (which lives in `entries`) at the provider's
@@ -303,6 +311,12 @@ pub struct AppState {
     /// held ACROSS the refresh fetch so concurrent misses wait for the
     /// in-flight result instead of being bounced to a reject.
     pub agent_key_resync: tokio::sync::Mutex<Option<std::time::Instant>>,
+    /// Single-flight for the allow-path external-store lazy fill
+    /// (`lazy_fill_external`): a burst of first requests on a GCP-backed
+    /// connection must resolve ONCE, not once per request. tokio Mutex —
+    /// held across the store round-trip so concurrent misses wait for the
+    /// in-flight fill and then hit the cache on their re-check.
+    pub external_fill_lock: tokio::sync::Mutex<()>,
     /// OAuth connections whose refresh_token was rejected (`invalid_grant`) at
     /// /use — surfaced via `/registry` as `needs_reauth` so the console prompts a
     /// reconnect. Keyed by `(vault_id, connection_id)`. In-memory + self-healing:
@@ -389,6 +403,7 @@ impl AppState {
             sse_semaphores: Mutex::new(HashMap::new()),
             agent_key_hashes: Mutex::new(std::collections::HashSet::new()),
             agent_key_resync: tokio::sync::Mutex::new(None),
+            external_fill_lock: tokio::sync::Mutex::new(()),
             oauth_reauth_needed: Mutex::new(std::collections::HashSet::new()),
             oauth_redeemed_codes: Mutex::new(HashMap::new()),
             live_ceremony_ops: Mutex::new(HashMap::new()),

@@ -536,74 +536,118 @@ impl BrokerHandler {
             ),
         };
 
-        let values = match self
-            .resolve_values(
-                &vault_id,
-                &conn,
-                &service_id,
-                mint_input.as_deref(),
-                &phantoms,
-                primary,
-                secrets_map,
-            )
-            .await
-        {
-            Ok(v) => v,
-            Err(ResolveErr::NeedsApproval) => {
-                return self
-                    .captive_portal(
-                        &vault_id,
-                        &conn,
-                        &conn_rec,
-                        &service_id,
-                        op_role.clone(),
-                        &dest_host,
-                        &method,
-                        &path,
-                        level,
-                        rule_id,
-                        ttl,
-                        req_scope.as_ref(),
-                        ip,
-                    )
-                    .await
-            }
-            Err(ResolveErr::Ambiguous) => {
-                let roles = phantom_role_hint(&conn, &conn_rec, def.as_ref());
-                return err_response(
-                    ScCode::AmbiguousPhantom,
-                    &format!(
-                        "'{}' exposes several secrets — use a role phantom: {}",
-                        conn, roles
-                    ),
+        // First touch of an external-store-backed connection: an Allow-level
+        // miss tries ONE lazy fill (fetch into the same `from_bootstrap`
+        // residency the unlock bootstrap gives native secrets — see
+        // `lazy_fill_external`), then re-reads the cache. A second miss falls
+        // through to the portal exactly as before; ask/ask-always never lazy
+        // fill (their ceremony resolves through the vault view, store-agnostic
+        // already).
+        let mut primary = primary;
+        let mut secrets_map = secrets_map;
+        let mut lazy_filled = false;
+        let values = loop {
+            match self
+                .resolve_values(
+                    &vault_id,
+                    &conn,
+                    &service_id,
+                    mint_input.as_deref(),
+                    &phantoms,
+                    primary.take(),
+                    secrets_map.take(),
                 )
-                .into();
-            }
-            Err(ResolveErr::RefreshForbidden) => {
-                return err_response(
-                    ScCode::RefreshForbidden,
-                    "a refresh token never leaves the vault — this connection injects a \
+                .await
+            {
+                Ok(v) => break v,
+                Err(ResolveErr::NeedsApproval) => {
+                    if level == AccessLevel::Allow && !lazy_filled {
+                        match crate::server::handlers::approve::lazy_fill_external(
+                            &self.state,
+                            &vault_id,
+                            &conn,
+                        )
+                        .await
+                        {
+                            Ok(true) => {
+                                lazy_filled = true;
+                                primary = self.state.cache_lookup(&vault_id, &conn);
+                                secrets_map = self.state.cache_lookup_secrets(&vault_id, &conn);
+                                continue;
+                            }
+                            Ok(false) => {}
+                            Err(store_id) => {
+                                // P2: a configured store's outage is an explicit
+                                // refusal, never a portal that would misread it
+                                // as "needs approval".
+                                return err_response(
+                                    ScCode::StoreUnavailable,
+                                    &format!(
+                                        "external store '{}' failed while resolving this \
+                                         connection's secret — check the store's credentials \
+                                         and permissions (daemon logs have the full error)",
+                                        store_id
+                                    ),
+                                )
+                                .into();
+                            }
+                        }
+                    }
+                    return self
+                        .captive_portal(
+                            &vault_id,
+                            &conn,
+                            &conn_rec,
+                            &service_id,
+                            op_role.clone(),
+                            &dest_host,
+                            &method,
+                            &path,
+                            level,
+                            rule_id,
+                            ttl,
+                            req_scope.as_ref(),
+                            ip,
+                        )
+                        .await;
+                }
+                Err(ResolveErr::Ambiguous) => {
+                    let roles = phantom_role_hint(&conn, &conn_rec, def.as_ref());
+                    return err_response(
+                        ScCode::AmbiguousPhantom,
+                        &format!(
+                            "'{}' exposes several secrets — use a role phantom: {}",
+                            conn, roles
+                        ),
+                    )
+                    .into();
+                }
+                Err(ResolveErr::RefreshForbidden) => {
+                    return err_response(
+                        ScCode::RefreshForbidden,
+                        "a refresh token never leaves the vault — this connection injects a \
                      minted access token (use its default phantom). To reveal the stored \
                      secret, the user runs `sc secret get` (passkey ceremony)",
-                )
-                .into();
-            }
-            Err(ResolveErr::Exposes(role)) => {
-                return err_response(
-                    ScCode::ExposesUnsupported,
-                    &format!("connection '{}' role '{}' is not yet mintable", conn, role),
-                )
-                .into();
-            }
-            Err(ResolveErr::Mint(msg)) => {
-                return err_response(ScCode::OauthMint, &msg).into();
-            }
-            Err(ResolveErr::NotUtf8) => {
-                return err_response(
-                    ScCode::SecretEncoding,
-                    "resolved credential is not valid UTF-8",
-                )
-                .into();
+                    )
+                    .into();
+                }
+                Err(ResolveErr::Exposes(role)) => {
+                    return err_response(
+                        ScCode::ExposesUnsupported,
+                        &format!("connection '{}' role '{}' is not yet mintable", conn, role),
+                    )
+                    .into();
+                }
+                Err(ResolveErr::Mint(msg)) => {
+                    return err_response(ScCode::OauthMint, &msg).into();
+                }
+                Err(ResolveErr::NotUtf8) => {
+                    return err_response(
+                        ScCode::SecretEncoding,
+                        "resolved credential is not valid UTF-8",
+                    )
+                    .into();
+                }
             }
         };
 

@@ -11,9 +11,12 @@
 //! GCP console). The SA's private key is RSA; we use `jsonwebtoken` to
 //! sign the bearer JWT.
 //!
-//! The OAuth access token is cached in-memory (per-adapter instance, so
-//! per-request — fine for now; if /use latency becomes a problem move
-//! the cache up into AppState).
+//! The OAuth access token is cached in-memory per-adapter instance. The
+//! session cache holds ONE shared instance per configured store for the
+//! whole unlocked session (`SecretsCache::external_stores`), so the token
+//! survives across calls and dies with the cache on lock. Paths that build
+//! a throwaway adapter from a live vault view (`resolve_value_async`) pay
+//! a fresh mint — they are ceremony-paced, so that's fine.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -39,6 +42,16 @@ struct ServiceAccountKey {
     private_key: String,
     #[allow(dead_code)]
     private_key_id: Option<String>,
+}
+
+/// F-19: the RSA private key must not linger in freed memory. Adapter
+/// instances now live for the whole unlocked session inside the secrets
+/// cache, so this fires on lock alongside the rest of the cache's zeroize.
+impl Drop for ServiceAccountKey {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.private_key.zeroize();
+    }
 }
 
 /// JWT claims for the SA-to-OAuth2 token exchange (Google's JWT-bearer
