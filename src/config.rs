@@ -253,8 +253,9 @@ pub struct ConnectArgs {
     #[arg(long)]
     pub secret: Vec<String>,
     /// Back this connection with an EXISTING vault secret named KEY (no new
-    /// value). Only valid when that secret's name lowercases to `<id>` (the
-    /// raw single-secret reverse-index) — i.e. promoting a `--no-broker` item.
+    /// value). KEY is matched as typed: native keys fold to their stored
+    /// UPPERCASE form; an external store's key (e.g. a lowercase GCP secret
+    /// id) is matched exactly. Repeatable.
     #[arg(long)]
     pub use_existing: Vec<String>,
     #[arg(long)]

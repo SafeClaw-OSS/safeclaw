@@ -1347,10 +1347,15 @@ pub async fn approve_op(
                             .collect()
                     })
                     .unwrap_or_default();
+                // Referenced keys may name EXTERNAL-store secrets, whose
+                // casing/hyphens are not ours to fold — the relaxed
+                // phantom-safe charset applies here. NEW keys (deposited
+                // values) keep the strict uppercase gate below: they write
+                // into native-secrets, whose canonical form is UPPERCASE.
                 for k in &referenced {
-                    if !crate::cli::conn::valid_role(k) || k.to_ascii_uppercase() != *k {
+                    if !crate::cli::conn::valid_secret_ref(k) {
                         return Err(AppError::BadRequest(format!(
-                            "'{}' is not a valid UPPERCASE secret key",
+                            "'{}' is not a valid secret key reference",
                             k
                         )));
                     }
@@ -1377,6 +1382,14 @@ pub async fn approve_op(
                         if !referenced.contains(k) {
                             return Err(AppError::BadRequest(format!(
                                 "deposited key '{}' is not in the approved scope.secrets",
+                                k
+                            )));
+                        }
+                        // Deposits WRITE into native-secrets — enforce the
+                        // native canonical form (strict uppercase role).
+                        if !crate::cli::conn::valid_role(k) || k.to_ascii_uppercase() != *k {
+                            return Err(AppError::BadRequest(format!(
+                                "'{}' is not a valid UPPERCASE secret key",
                                 k
                             )));
                         }
@@ -1412,30 +1425,52 @@ pub async fn approve_op(
                         // namespace across every store — a key hosted in an
                         // external store (GCP etc.) binds exactly like a
                         // native one, so walk the full store_order, not just
-                        // native-secrets. The external probe is a network
+                        // native-secrets. Canonicalisation: native keys are
+                        // canonically UPPERCASE (a lowercase-typed reference
+                        // rewrites to the stored casing); external keys are
+                        // accepted exactly as named (external naming is not
+                        // ours to fold). The external probe is a network
                         // call, but this is a ceremony (approve) path; a
                         // store outage surfaces as the approve failing
                         // loudly, never as a silent "no such secret".
+                        let mut canonical: Vec<String> = Vec::with_capacity(referenced.len());
                         for key in &referenced {
                             let deposited = values
                                 .as_ref()
                                 .map(|v| v.contains_key(key))
                                 .unwrap_or(false);
                             if deposited || view.native_secrets.contains_key(key) {
+                                canonical.push(key.clone());
                                 continue;
                             }
-                            if view.resolve_value_async(key).await?.is_none() {
-                                return Err(AppError::BadRequest(format!(
-                                    "no such secret '{}' in the vault (checked native + external stores)",
-                                    key
-                                )));
+                            if let Some((native, _)) = view
+                                .native_secrets
+                                .iter()
+                                .find(|(k, _)| k.eq_ignore_ascii_case(key))
+                            {
+                                canonical.push(native.clone());
+                                continue;
                             }
+                            if view.resolve_value_async(key).await?.is_some() {
+                                canonical.push(key.clone());
+                                continue;
+                            }
+                            return Err(AppError::BadRequest(format!(
+                                "no such secret '{}' in the vault (checked native + external stores)",
+                                key
+                            )));
                         }
+                        // Exact dedup only: native case-folding already
+                        // collapsed duplicates; two external keys differing
+                        // by case are DISTINCT secrets (GCP is case-
+                        // sensitive) and must both survive.
+                        let mut seen = std::collections::HashSet::new();
+                        canonical.retain(|k| seen.insert(k.clone()));
                         crate::storage::plaintext::Connection {
                             name: None,
                             service: None,
                             hosts: Some(hosts),
-                            secrets: Some(referenced.clone()),
+                            secrets: Some(canonical),
                             keys: None,
                         }
                     }

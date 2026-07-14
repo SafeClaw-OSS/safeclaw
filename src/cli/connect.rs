@@ -491,10 +491,19 @@ fn gather_secrets(
     use_existing: &[String],
 ) -> Result<Gathered, String> {
     let mut new_values: Vec<(String, String)> = Vec::new();
-    let existing: Vec<String> = use_existing
-        .iter()
-        .map(|k| k.trim().to_ascii_uppercase())
-        .collect();
+    // `--use-existing` keys pass through AS TYPED: an external store's key
+    // (GCP allows lowercase/hyphens) must reach the daemon exactly as named.
+    // The daemon canonicalises — a native key typed in the wrong case is
+    // folded to its stored (uppercase) form at approve.
+    let existing: Vec<String> = use_existing.iter().map(|k| k.trim().to_string()).collect();
+    for k in &existing {
+        if !crate::cli::conn::valid_secret_ref(k) {
+            return Err(format!(
+                "--use-existing '{}': not a valid secret key (ASCII letters/digits/_/-, no '__')",
+                k
+            ));
+        }
+    }
 
     if !secret_flags.is_empty() {
         for s in secret_flags {
