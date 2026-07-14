@@ -490,8 +490,9 @@ pub enum AgentSubcommand {
     Add(AgentAddArgs),
     /// List this account's agents (name, key prefix, last-used).
     Ls,
-    /// Revoke an agent by name (or key prefix / id). Stops working on every
-    /// device after each device's next sync.
+    /// Revoke an agent by name (or key prefix / id). Propagates to every
+    /// device in under a second over the sync stream (one poll cycle when a
+    /// device is offline or unstreamed).
     Rm(AgentRmArgs),
 }
 

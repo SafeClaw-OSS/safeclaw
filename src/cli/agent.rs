@@ -181,7 +181,7 @@ async fn rm(args: AgentRmArgs) -> Result<(), String> {
         return Err(format!("revoke failed: HTTP {}", resp.status()));
     }
     eprintln!(
-        "Revoked agent '{}'. It stops working on every device after that device's next sync.",
+        "Revoked agent '{}'. Streaming devices drop it within a second; an offline device drops it on its next sync.",
         args.name
     );
     Ok(())
