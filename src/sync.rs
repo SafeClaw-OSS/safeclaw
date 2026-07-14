@@ -23,6 +23,7 @@ use std::time::Duration;
 use crate::cli::active;
 use crate::state::AppState;
 use crate::storage::sealed_vault::{self, SealedVault};
+use crate::sync_stream::{Mode, StreamHealth, VaultStatus, WakeCell};
 
 /// Outcome of a single blob `pull`. The cloud envelope's clear-text `status`
 /// field (`"live"` | `"deleted"`) is the lifecycle channel; this enum is its
@@ -282,6 +283,16 @@ fn synced_vault_ids(cfg: &crate::cli::active::CliConfig) -> Vec<String> {
 /// vault is kept live, not just the active one. Gated like the rest of sync —
 /// no-op for a local-only/unpaired daemon. Vaults added after start are picked
 /// up on the next daemon (re)start.
+///
+/// SSE sync push (docs/SSE_SYNC_DESIGN.md): ONE dispatcher task owns the
+/// event stream for the whole daemon; each vault task gets a merged
+/// pending-wake cell plus the global health watch, and picks its select!
+/// shape per round from the cell's mode. The dispatcher holds only WEAK refs
+/// to the cells — a vault task that exits (tombstone) drops the sole strong
+/// ref, which is how the dispatcher knows to prune the vid from `?vids` at
+/// its next reconnect. The dispatcher is spawned even when `sync_stream=off`:
+/// it re-reads the switch at every (re)connect, so a runtime flip in either
+/// direction takes effect without a restart.
 pub fn spawn_watchers(state: Arc<AppState>) {
     let cfg = match active::load() {
         Ok(c) => c,
@@ -296,8 +307,22 @@ pub fn spawn_watchers(state: Arc<AppState>) {
         return;
     };
     let cloud = cloud.trim_end_matches('/').to_string();
+    let (health_tx, health_rx) = tokio::sync::watch::channel(StreamHealth::Down);
+    let mut cells: Vec<(String, std::sync::Weak<WakeCell>)> = Vec::new();
     for vault in synced_vault_ids(&cfg) {
-        tokio::spawn(watch_loop(state.clone(), vault, cloud.clone(), dk.clone()));
+        let cell = Arc::new(WakeCell::new());
+        cells.push((vault.clone(), Arc::downgrade(&cell)));
+        tokio::spawn(watch_loop(
+            state.clone(),
+            vault,
+            cloud.clone(),
+            dk.clone(),
+            cell,
+            health_rx.clone(),
+        ));
+    }
+    if !cells.is_empty() {
+        tokio::spawn(crate::sync_stream::dispatcher(cloud, dk, cells, health_tx));
     }
 }
 
@@ -978,6 +1003,16 @@ fn retention_cutoff(days: u32) -> Option<i64> {
 /// task, so `pull_items`' read-modify-write of the per-item store stays
 /// single-flight per vault — same serialization as the old one-channel loop.
 ///
+/// THIRD SHAPE (docs/SSE_SYNC_DESIGN.md): when the SSE dispatcher's hello has
+/// confirmed this vault (`cell.mode() == Sse`), the round holds NO long-polls
+/// at all — it selects over the cell's wake / an event-independent 300s
+/// reconcile deadline / the global stream-health watch, and reacts to merged
+/// hints by running the SAME pull paths (blob `?since` probe through the
+/// shared `handle_blob_wake_body`, then `pull_and_process`). The mode is
+/// re-read every round, so the task flips shapes the moment the dispatcher
+/// demotes it (stream death) or promotes it (hello). Everything stays
+/// cursor-gated, so duplicate/stale/echoed events are no-ops by construction.
+///
 /// The `since` cursors are what make parking work: the server answers the
 /// instant its version/seq exceeds `since`. A cursor that never advances
 /// (the pre-0.9.36 per-item bug — lifecycle markers skipped the sidecar
@@ -985,7 +1020,14 @@ fn retention_cutoff(days: u32) -> Option<i64> {
 /// Best-effort + detached: a local-only/unpaired/offline daemon just no-ops or
 /// backs off, and any failure here NEVER affects serving. See
 /// [[project_realtime_sync_v1_decision]].
-pub async fn watch_loop(state: Arc<AppState>, vault: String, cloud: String, dk: String) {
+pub async fn watch_loop(
+    state: Arc<AppState>,
+    vault: String,
+    cloud: String,
+    dk: String,
+    cell: Arc<WakeCell>,
+    mut health_rx: tokio::sync::watch::Receiver<StreamHealth>,
+) {
     let state_dir = state.config.state_dir.clone();
     // Read-timeout MUST exceed the server's long-poll hold (~25s) plus slack.
     const WATCH_TIMEOUT: Duration = Duration::from_secs(40);
@@ -1009,6 +1051,11 @@ pub async fn watch_loop(state: Arc<AppState>, vault: String, cloud: String, dk: 
         /// cloud >1h while the daemon's channels stayed silent; `sc sync`
         /// adopted it instantly).
         Reconcile,
+        /// The SSE dispatcher flipped stream health. Nothing to pull — the
+        /// point is to drop the held long-polls and re-read the cell's mode
+        /// at the loop top NOW, instead of waiting out a full ~25s hold
+        /// before noticing a recovered stream.
+        Health,
     }
 
     /// Upper bound on how stale a wedged watcher can go. Long-poll wakes are
@@ -1037,9 +1084,199 @@ pub async fn watch_loop(state: Arc<AppState>, vault: String, cloud: String, dk: 
     let mut backoff = Duration::from_secs(2);
     let mut consec_errs = 0u32;
     let mut items_channel = true; // false after a 404 (backend without /items/wait)
+                                  // ★ SSE-shape reconcile clock, INDEPENDENT of event traffic: under
+                                  // long-poll the loop-top cursor read + 25s turnover WAS the implicit
+                                  // reconcile; the SSE shape holds no polls, so it must carry its own bound
+                                  // (pg_cron-class writes, missed emits) that steady events cannot starve.
+    let mut last_reconcile = std::time::Instant::now();
     loop {
         let round_wall = std::time::SystemTime::now();
         let round_mono = std::time::Instant::now();
+
+        // ── Third shape: SSE wake cell (docs/SSE_SYNC_DESIGN.md) ──────────
+        // Mode is set only by the dispatcher: Sse while the stream's hello
+        // covers this vault, Fallback otherwise. Every branch below ends in
+        // `continue` (or `return` on tombstone), so the long-poll code after
+        // this block is untouched when the shape is active.
+        if cell.mode() == Mode::Sse {
+            // Arm the wake BEFORE reading the cell — the standard
+            // missed-wakeup pattern: a merge landing between the check and
+            // the park is captured as a stored Notify permit and completes
+            // the select instantly.
+            let notified = cell.notified();
+            if !cell.has_work() {
+                let deadline = last_reconcile + RECONCILE_INTERVAL;
+                let until_reconcile = deadline.saturating_duration_since(std::time::Instant::now());
+                tokio::select! {
+                    _ = notified => {}
+                    _ = tokio::time::sleep(until_reconcile) => {}
+                    r = health_rx.changed() => {
+                        if r.is_err() {
+                            // Dispatcher gone (should never happen): fall
+                            // back to long-poll for good rather than idling
+                            // on a stream nobody feeds.
+                            cell.set_mode(Mode::Fallback);
+                        }
+                        continue; // re-pick the shape at the loop top
+                    }
+                }
+            }
+
+            // Suspend detection runs per round in BOTH shapes (an SSE round =
+            // wake-to-wake). No per-task HTTP client to rebuild here — the
+            // dispatcher's own 45s no-bytes liveness reconnects the stream
+            // ≤45s after resume; this task just catches up on content.
+            let wall = round_wall.elapsed().unwrap_or_default();
+            let mono = round_mono.elapsed();
+            if wall > mono + SUSPEND_SLACK {
+                tracing::info!(
+                    vault = %vault,
+                    slept_secs = (wall - mono).as_secs(),
+                    "cloud sync watch: system suspend detected mid-round — reconciling"
+                );
+                pull_and_process(&state, &state_dir, &cloud, &vault, &dk, "resume").await;
+                backoff = Duration::from_secs(2);
+                continue; // pending work (if any) is still in the cell
+            }
+
+            let work = cell.take_work();
+            let mut clean = true;
+            let mut auth_park = false;
+
+            // Pending vault slot. In Sse mode the vault EVENT is the
+            // lifecycle authority (design doc) — the same trust as the blob
+            // channel's body (authenticated TLS to our own backend), and an
+            // explicit "deleted" stays the ONLY local-state destroyer.
+            if let Some((version, status)) = work.vault {
+                if status == VaultStatus::Deleted {
+                    drop_local_vault_locked(&state, &vault).await;
+                    tracing::info!(vault = %vault, "cloud sync: vault deleted upstream; dropped local state");
+                    // Task exit drops the sole strong ref to the cell; the
+                    // dispatcher prunes this vid from `?vids` at its next
+                    // reconnect.
+                    return;
+                }
+                // ★ Cursor re-read from disk at use time, never cached across
+                // parks — the loop-top discipline the long-poll shape gets
+                // for free.
+                if version > read_local_version(&state_dir, &vault) {
+                    match probe_blob_and_handle(
+                        &state,
+                        &state_dir,
+                        &cloud,
+                        &vault,
+                        &dk,
+                        "sse-vault",
+                    )
+                    .await
+                    {
+                        Ok(BlobWake::Stopped) => return,
+                        Ok(BlobWake::Unchanged) => {}
+                        Ok(BlobWake::Handled {
+                            persist_failed,
+                            pulls_ok,
+                        }) => clean = clean && !persist_failed && pulls_ok,
+                        Err(ProbeError::Auth) => auth_park = true,
+                        Err(ProbeError::Other(e)) => {
+                            tracing::debug!(vault = %vault, "cloud sync watch: sse blob probe failed: {}", e);
+                            clean = false;
+                        }
+                    }
+                }
+            }
+
+            // items/keys flags → the shared serial pull block (pull_keys
+            // runs first inside it, as today).
+            if !auth_park
+                && (work.items || work.keys)
+                && !pull_and_process(&state, &state_dir, &cloud, &vault, &dk, "sse-wake").await
+            {
+                clean = false;
+            }
+
+            // ★ The reconcile floor fires on schedule even under steady
+            // events (see `last_reconcile`): blob `?since` probe through the
+            // shared handler, plus the pull block.
+            if !auth_park && last_reconcile.elapsed() >= RECONCILE_INTERVAL {
+                let mut ok = true;
+                match probe_blob_and_handle(
+                    &state,
+                    &state_dir,
+                    &cloud,
+                    &vault,
+                    &dk,
+                    "sse-reconcile",
+                )
+                .await
+                {
+                    Ok(BlobWake::Stopped) => return,
+                    Ok(BlobWake::Unchanged) => {
+                        // Blob row is current; the reconcile still owns
+                        // items/keys staleness — run the pull block
+                        // (cursor-gated, mostly `{unchanged}`-cheap).
+                        ok = pull_and_process(
+                            &state,
+                            &state_dir,
+                            &cloud,
+                            &vault,
+                            &dk,
+                            "sse-reconcile",
+                        )
+                        .await;
+                    }
+                    Ok(BlobWake::Handled {
+                        persist_failed,
+                        pulls_ok,
+                    }) => ok = !persist_failed && pulls_ok,
+                    Err(ProbeError::Auth) => auth_park = true,
+                    Err(ProbeError::Other(e)) => {
+                        tracing::debug!(vault = %vault, "cloud sync watch: sse reconcile probe failed: {}", e);
+                        ok = false;
+                    }
+                }
+                if ok {
+                    last_reconcile = std::time::Instant::now();
+                } else {
+                    // Deadline NOT advanced: the bounded retry below re-runs
+                    // it on the backoff, not in another 300s.
+                    clean = false;
+                }
+            }
+
+            if auth_park {
+                // 401/403 parking semantics preserved from the long-poll
+                // shape: park, don't die — a transient 403 (backend deploy,
+                // auth migration) must not end this device's sync until
+                // restart. Real deletion arrives as a vault event, never as
+                // a 403.
+                cell.reinject(work);
+                tracing::warn!(
+                    vault = %vault,
+                    "cloud sync watch: auth rejected on sse pull; retrying in {}s",
+                    AUTH_RETRY.as_secs()
+                );
+                tokio::time::sleep(AUTH_RETRY).await;
+                continue;
+            }
+
+            if clean {
+                backoff = Duration::from_secs(2);
+            } else {
+                // ★ Bounded pull-failure retry (design doc): the long-poll
+                // shape gets re-delivery for free — an unadvanced cursor
+                // makes the server answer the re-armed hold instantly — but
+                // SSE consumed this event ONCE, so a failed pull must retry
+                // here. Re-inject the taken work (the cell's monotone merge
+                // keeps any racing fresher event on top) and eat the existing
+                // 2s→60s backoff instead of waiting out the reconcile floor.
+                cell.reinject(work);
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_secs(60));
+            }
+            continue;
+        }
+
+        // ── Fallback shapes: the pre-SSE long-poll rounds, unchanged ──────
         let local_ver = read_local_version(&state_dir, &vault);
         let blob_url = format!("{}/v/{}/blob/wait?since={}", cloud, vault, local_ver);
         let blob_fut = client.get(&blob_url).bearer_auth(&dk).send();
@@ -1062,11 +1299,13 @@ pub async fn watch_loop(state: Arc<AppState>, vault: String, cloud: String, dk: 
                     r = blob_fut => Wake::Blob(r),
                     r = items_fut => Wake::Items(r),
                     _ = tokio::time::sleep(RECONCILE_INTERVAL) => Wake::Reconcile,
+                    _ = health_changed(&mut health_rx) => Wake::Health,
                 }
             }
             None => tokio::select! {
                 r = blob_fut => Wake::Blob(r),
                 _ = tokio::time::sleep(RECONCILE_INTERVAL) => Wake::Reconcile,
+                _ = health_changed(&mut health_rx) => Wake::Health,
             },
         };
 
@@ -1104,65 +1343,35 @@ pub async fn watch_loop(state: Arc<AppState>, vault: String, cloud: String, dk: 
                             continue;
                         }
                     };
-                    // Tombstone: the vault was deleted cloud-side. Drop ALL local
-                    // state (zeroize K, remove vault.dat + sidecar, close audit,
-                    // forget from CLI config) and STOP this watcher — there is no
-                    // vault left to watch. This is the fix for "web delete →
-                    // daemon no-op". Only an explicit tombstone reaches here; a
-                    // live-but-undecryptable blob is log-only (refresh_after_pull).
-                    if body.get("status").and_then(|v| v.as_str()) == Some("deleted") {
-                        // Drop under the per-vault write lock so the destroy can't
-                        // race a concurrent approve.rs / connect write to vault.dat.
-                        drop_local_vault_locked(&state, &vault).await;
-                        tracing::info!(vault = %vault, "cloud sync: vault deleted upstream; dropped local state");
-                        return;
-                    }
-                    if body
-                        .get("unchanged")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false)
+                    // Body handling lives in the SHARED handler (also fed by
+                    // the SSE shape's blob probes) — behavior here is the
+                    // pre-SSE arm verbatim: tombstone → drop + stop;
+                    // unchanged → re-poll; else persist-under-lock / marker
+                    // cursor advance, then the serial pull block; a persist
+                    // failure never advanced the cursor, so it must eat a
+                    // backoff or the instant re-answer becomes a hot loop.
+                    match handle_blob_wake_body(
+                        &state, &state_dir, &cloud, &vault, &dk, &body, "blob",
+                    )
+                    .await
                     {
-                        // Long-poll window elapsed with no change — re-poll.
-                        continue;
-                    }
-                    let version = body.get("version").and_then(|v| v.as_u64()).unwrap_or(0);
-                    // Persist the whole-blob body to vault.dat ONLY when it's a real
-                    // SealedState. A per-item vault's /blob is a lifecycle marker
-                    // ({lifecycle, version}), NOT a SealedState — so skip persist for
-                    // it and, crucially, DON'T `continue`: fall through to the
-                    // per-item keyset/item pulls, since the content lives in /keys +
-                    // /items, not the blob. A persist error on a real blob doesn't
-                    // starve those pulls either — but it must NOT advance the cursor
-                    // (the un-persisted blob would never be re-offered) and must eat
-                    // a backoff below, or the instant re-answer becomes a hot loop.
-                    let mut persist_failed = false;
-                    if let Some(blob) = body.get("blob").filter(|b| b.get("lifecycle").is_none()) {
-                        // Serialize against approve.rs's vault.dat writes.
-                        let lock = {
-                            let mut locks = state.vault_write_locks.lock().unwrap();
-                            Arc::clone(
-                                locks
-                                    .entry(vault.clone())
-                                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
-                            )
-                        };
-                        let _guard = lock.lock().await;
-                        if let Err(e) = persist_blob(&state_dir, &vault, blob, version) {
-                            tracing::warn!(vault = %vault, "cloud sync watch: persist failed: {}", e);
-                            persist_failed = true;
-                        } else {
-                            refresh_after_pull(&state, &vault);
+                        BlobWake::Stopped => return,
+                        BlobWake::Unchanged => {
+                            // Long-poll window elapsed with no change — re-poll.
+                            continue;
                         }
-                    } else {
-                        // Lifecycle marker (or blob absent): nothing to persist, but
-                        // the cursor MUST advance or this long-poll answers instantly
-                        // forever — the ~1.5s spin this fix is about.
-                        record_blob_version(&state_dir, &vault, version);
-                    }
-                    pull_and_process(&state, &state_dir, &cloud, &vault, &dk, "blob").await;
-                    if persist_failed {
-                        tokio::time::sleep(backoff).await;
-                        backoff = (backoff * 2).min(Duration::from_secs(60));
+                        BlobWake::Handled { persist_failed, .. } => {
+                            // A blob answer + the pull block ≡ a reconcile;
+                            // stamping it keeps the SSE shape's clock fresh
+                            // across a later mode flip (no behavior change in
+                            // this shape — sub-pull errors stay best-effort
+                            // here, exactly as before).
+                            last_reconcile = std::time::Instant::now();
+                            if persist_failed {
+                                tokio::time::sleep(backoff).await;
+                                backoff = (backoff * 2).min(Duration::from_secs(60));
+                            }
+                        }
                     }
                 }
                 404 => {
@@ -1233,6 +1442,13 @@ pub async fn watch_loop(state: Arc<AppState>, vault: String, cloud: String, dk: 
                 // channels fresh next round.
                 tracing::info!(vault = %vault, "cloud sync watch: no wake for {}s — reconciling", RECONCILE_INTERVAL.as_secs());
                 pull_and_process(&state, &state_dir, &cloud, &vault, &dk, "reconcile").await;
+                last_reconcile = std::time::Instant::now();
+            }
+            Wake::Health => {
+                // The SSE dispatcher flipped stream health; the cell's mode
+                // is already set. Dropping the held long-polls and re-reading
+                // the mode at the loop top IS the reaction — without this arm
+                // a Fallback→Sse promotion would wait out a full ~25s hold.
             }
             Wake::Blob(Err(e)) | Wake::Items(Err(e)) => {
                 // Transient (timeout/offline). The 40s read-timeout exceeds the
@@ -1264,6 +1480,163 @@ pub async fn watch_loop(state: Arc<AppState>, vault: String, cloud: String, dk: 
     }
 }
 
+/// Park the select arm forever when the health channel is CLOSED (dispatcher
+/// exited — only possible once every vault task is gone, or on a dispatcher
+/// panic). A raw `changed()` would resolve `Err` immediately and forever,
+/// turning the fallback select into a hot loop; pending-forever makes the arm
+/// simply go quiet while the long-poll arms keep working.
+async fn health_changed(rx: &mut tokio::sync::watch::Receiver<StreamHealth>) {
+    if rx.changed().await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
+
+/// Outcome of [`handle_blob_wake_body`] — the shared blob-body handler.
+enum BlobWake {
+    /// Tombstone: all local state dropped (under the write lock); the
+    /// caller's watch task must exit.
+    Stopped,
+    /// `{unchanged:true}` freshness-probe answer — nothing to do; the pull
+    /// block did NOT run (matches the long-poll arm's bare re-poll).
+    Unchanged,
+    /// Body handled and the serial pull block ran. `persist_failed` = a real
+    /// blob failed to write; the cursor was NOT advanced, so the caller must
+    /// back off (long-poll: the instant re-answer would hot-loop; SSE: the
+    /// bounded retry re-arms it). `pulls_ok` = the keyset+item sub-pulls
+    /// inside `pull_and_process` all succeeded — only the SSE shape acts on
+    /// it (long-poll gets re-delivery for free and stays best-effort).
+    Handled {
+        persist_failed: bool,
+        pulls_ok: bool,
+    },
+}
+
+/// ★ The ONE runtime blob-body handler (docs/SSE_SYNC_DESIGN.md §Core,
+/// "shared blob-body handler"), factored from the long-poll blob-200 arm so
+/// the SSE shape reuses it verbatim. Deliberately NOT `classify_pull_body`:
+/// that path (`pull` / `sc sync` parity) persists WITHOUT the per-vault write
+/// lock — fine pre-serve, a race at watch time (a concurrent approve.rs
+/// re-seal could interleave with the persist's tmp+rename). This handler
+/// persists UNDER `vault_write_locks`, and holds the lock ONLY across the
+/// persist — never across network calls or `process_vault_connects` (which
+/// takes it itself; the invariant the whole sync module rests on).
+///
+/// Behavior is the pre-SSE arm verbatim:
+///  1. `status:"deleted"` → drop ALL local state (zeroize K, remove
+///     vault.dat + sidecar, close audit, forget CLI config) → `Stopped`.
+///     Only an explicit tombstone destroys; a live-but-undecryptable blob is
+///     log-only (refresh_after_pull).
+///  2. `{unchanged:true}` → `Unchanged`, no pulls.
+///  3. A real SealedState blob → persist under the lock (+ cache refresh); a
+///     per-item lifecycle marker (or absent blob) → `record_blob_version`
+///     ONLY — the cursor MUST advance or the wait channel answers instantly
+///     forever (the pre-0.9.36 ~1.5s spin). Then the unconditional serial
+///     pull block (`pull_and_process`) — content lives in /keys + /items.
+async fn handle_blob_wake_body(
+    state: &Arc<AppState>,
+    state_dir: &Path,
+    cloud: &str,
+    vault: &str,
+    dk: &str,
+    body: &serde_json::Value,
+    channel: &str,
+) -> BlobWake {
+    if body.get("status").and_then(|v| v.as_str()) == Some("deleted") {
+        // Drop under the per-vault write lock so the destroy can't race a
+        // concurrent approve.rs / connect write to vault.dat.
+        drop_local_vault_locked(state, vault).await;
+        tracing::info!(vault = %vault, "cloud sync: vault deleted upstream; dropped local state");
+        return BlobWake::Stopped;
+    }
+    if body
+        .get("unchanged")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return BlobWake::Unchanged;
+    }
+    let version = body.get("version").and_then(|v| v.as_u64()).unwrap_or(0);
+    let mut persist_failed = false;
+    if let Some(blob) = body.get("blob").filter(|b| b.get("lifecycle").is_none()) {
+        // Serialize against approve.rs's vault.dat writes.
+        let lock = {
+            let mut locks = state.vault_write_locks.lock().unwrap();
+            Arc::clone(
+                locks
+                    .entry(vault.to_string())
+                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+            )
+        };
+        let _guard = lock.lock().await;
+        if let Err(e) = persist_blob(state_dir, vault, blob, version) {
+            tracing::warn!(vault = %vault, "cloud sync watch: persist failed: {}", e);
+            persist_failed = true;
+        } else {
+            refresh_after_pull(state, vault);
+        }
+    } else {
+        // Lifecycle marker (or blob absent): nothing to persist, but the
+        // cursor MUST advance (see the fn doc).
+        record_blob_version(state_dir, vault, version);
+    }
+    let pulls_ok = pull_and_process(state, state_dir, cloud, vault, dk, channel).await;
+    BlobWake::Handled {
+        persist_failed,
+        pulls_ok,
+    }
+}
+
+/// Why [`probe_blob_and_handle`] couldn't produce a body.
+enum ProbeError {
+    /// 401/403 — the caller applies the long-poll AUTH_RETRY parking.
+    Auth,
+    /// Network/decode/unexpected status — the caller's bounded 2s→60s retry.
+    Other(String),
+}
+
+/// The SSE shape's blob fetch (design doc: "fetches with a plain 15s-client
+/// `GET /v/{vid}/blob?since=<cursor>` ... and feeds the body to that
+/// helper"): cursor re-read from disk at call time, client built fresh (the
+/// proxy hot-reload contract, same as `pull`), body → the shared handler.
+/// The network call NEVER runs under the vault write lock — the handler
+/// takes it only around its persist. A 404 keeps its long-standing "never
+/// sealed" meaning (a tombstone is always a 200 with `status:"deleted"`).
+async fn probe_blob_and_handle(
+    state: &Arc<AppState>,
+    state_dir: &Path,
+    cloud: &str,
+    vault: &str,
+    dk: &str,
+    channel: &str,
+) -> Result<BlobWake, ProbeError> {
+    let since = read_local_version(state_dir, vault);
+    let url = format!(
+        "{}/v/{}/blob?since={}",
+        cloud.trim_end_matches('/'),
+        vault,
+        since
+    );
+    let client = crate::cli::egress_proxy::client(Duration::from_secs(15))
+        .map_err(|e| ProbeError::Other(format!("http client init: {}", e)))?;
+    let resp = client
+        .get(&url)
+        .bearer_auth(dk)
+        .send()
+        .await
+        .map_err(|e| ProbeError::Other(format!("reach {}: {}", cloud, e)))?;
+    match resp.status().as_u16() {
+        200 => {}
+        404 => return Ok(BlobWake::Unchanged),
+        401 | 403 => return Err(ProbeError::Auth),
+        other => return Err(ProbeError::Other(format!("blob GET HTTP {}", other))),
+    }
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| ProbeError::Other(format!("parse blob response: {}", e)))?;
+    Ok(handle_blob_wake_body(state, state_dir, cloud, vault, dk, &body, channel).await)
+}
+
 /// The shared wake block, run serially in the vault's watcher task: pull the
 /// KEYSET (`/keys`) FIRST so the item fold sees a fresh K-wrap layer, then pull
 /// item rows (refreshing the unlocked cache when anything was adopted), then
@@ -1273,6 +1646,12 @@ pub async fn watch_loop(state: Arc<AppState>, vault: String, cloud: String, dk: 
 /// explicit `sc sync` path). Best-effort throughout; `process_vault_connects`
 /// takes the vault write lock itself (not reentrant), so callers must not hold
 /// it. `channel` is only for the trace line.
+///
+/// Returns whether BOTH sub-pulls succeeded. Long-poll callers ignore it (a
+/// missed wake re-delivers itself via the unadvanced cursor); the SSE shape
+/// uses it for its ★ bounded retry, because the stream delivered the hint
+/// exactly once. Connect processing is not counted — it has its own
+/// state-machine retries and never gates sync.
 async fn pull_and_process(
     state: &Arc<AppState>,
     state_dir: &Path,
@@ -1280,13 +1659,17 @@ async fn pull_and_process(
     vault: &str,
     dk: &str,
     channel: &str,
-) {
+) -> bool {
+    let mut ok = true;
     match pull_keys(state_dir, cloud, vault, dk).await {
         Ok(n) if n > 0 => {
             tracing::info!(vault = %vault, adopted = n, "cloud sync watch: pulled keyset rows")
         }
         Ok(_) => {}
-        Err(e) => tracing::debug!(vault = %vault, "cloud sync watch: keyset pull failed: {}", e),
+        Err(e) => {
+            tracing::debug!(vault = %vault, "cloud sync watch: keyset pull failed: {}", e);
+            ok = false;
+        }
     }
     match pull_items(state_dir, cloud, vault, dk).await {
         Ok(n) if n > 0 => {
@@ -1297,10 +1680,14 @@ async fn pull_and_process(
             refresh_after_item_pull(state, vault);
         }
         Ok(_) => {}
-        Err(e) => tracing::debug!(vault = %vault, "cloud sync watch: per-item pull failed: {}", e),
+        Err(e) => {
+            tracing::debug!(vault = %vault, "cloud sync watch: per-item pull failed: {}", e);
+            ok = false;
+        }
     }
     crate::auth::connect::process_vault_connects(state, vault, None).await;
     tracing::debug!(vault = %vault, channel = channel, "cloud sync watch: wake processed");
+    ok
 }
 
 // ─────────────────────────────────────────────────────────────────────────

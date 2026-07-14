@@ -59,6 +59,14 @@ pub struct CliConfig {
     /// default.
     #[serde(default, skip_serializing_if = "Settings::is_empty")]
     pub settings: Settings,
+    /// SSE sync-stream switch (docs/SSE_SYNC_DESIGN.md): absent/"auto" =
+    /// connect the wake stream, "off" = pure long-poll. Read by the stream
+    /// dispatcher at every (re)connect, so flipping it bites within ~15 min
+    /// without a restart. `SAFECLAW_SYNC_STREAM` overrides — and, unlike this
+    /// key, survives an OLD binary's config save (which drops unknown keys),
+    /// so the env var is the robust rollback lever.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync_stream: Option<String>,
     /// Set when the ACTIVE vault was tombstoned cloud-side (deleted on the
     /// web) and the sync path cleared the selection — the one case where "no
     /// vault selected" is a surprise, not a choice. `sc status` and

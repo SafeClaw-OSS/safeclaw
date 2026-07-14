@@ -4,6 +4,7 @@ pub mod audit;
 pub mod auth;
 pub mod cli;
 pub mod sync;
+pub mod sync_stream;
 pub mod config;
 pub mod core;
 pub mod crypto;

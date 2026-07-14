@@ -171,6 +171,17 @@ pub fn client(timeout: std::time::Duration) -> reqwest::Result<reqwest::Client> 
     apply_effective(reqwest::Client::builder().timeout(timeout)).build()
 }
 
+/// The constructor for the daemon's STREAMING cloud connection (the SSE sync
+/// stream, docs/SSE_SYNC_DESIGN.md): same fresh-proxy contract as [`client`]
+/// — built per (re)connect, so a runtime `sc proxy set` is honoured at the
+/// very next dial — but with ONLY a connect budget. A total `.timeout()` here
+/// would be a bug: it fires mid-body and would kill a healthy held-open
+/// stream at the deadline. Liveness on the open stream is the caller's job
+/// (sync_stream's 45s no-bytes watchdog).
+pub fn client_streaming(connect: std::time::Duration) -> reqwest::Result<reqwest::Client> {
+    apply_effective(reqwest::Client::builder().connect_timeout(connect)).build()
+}
+
 /// The first non-empty proxy set in THIS process's env right now. Read once by
 /// `apply_to_env` before it shapes env, so it reflects the operator's shell.
 fn shell_proxy_now() -> Option<String> {
