@@ -56,7 +56,7 @@ pub async fn secret_keys(
         let states = state.vault_states.lock().unwrap();
         let cache = match states.get(&vault_id) {
             Some(VaultState::Unlocked { cache, .. }) => cache,
-            _ => return Err(AppError::Conflict("vault locked — unlock first".into())),
+            _ => return Err(AppError::VaultLocked),
         };
         let native: Vec<String> = cache.native_keys.iter().cloned().collect();
         let external = cache.external_stores.clone();

@@ -261,6 +261,16 @@ pub struct AppState {
     /// Per-vault Locked/Unlocked state. Absent entry = Locked. Lives entirely
     /// in process memory; daemon restart returns all vaults to Locked.
     pub vault_states: Mutex<HashMap<String, VaultState>>,
+    /// The hosts each vault anchored the last time it was seen Unlocked
+    /// (lowercased, refreshed on every union pass). Kept ACROSS Lock so the
+    /// proxy still recognizes — and MITMs — brokered-host traffic while the
+    /// vault is locked: a phantom then meets an explicit `vault_locked`
+    /// instead of leaking upstream through a blind tunnel. Connections live in
+    /// the sealed blob, so this memory is the only locked-time anchor
+    /// knowledge; in-memory only (a daemon restarted before any unlock stays
+    /// blind, the documented residual), dropped when the vault is deleted.
+    /// Lock order: always `vault_states` first, then this.
+    pub last_host_unions: Mutex<HashMap<String, Vec<String>>>,
     /// Per-vault audit log (PROTOCOL.md §5.3). Connections opened lazily on
     /// first write/query per vault. Survives daemon restarts — unlike
     /// `approvals` / `vault_states` which are in-memory only.
@@ -371,6 +381,7 @@ impl AppState {
             services: ServiceRegistry::load(),
             events,
             vault_states: Mutex::new(HashMap::new()),
+            last_host_unions: Mutex::new(HashMap::new()),
             audits,
             sc,
             vault_write_locks: Mutex::new(HashMap::new()),
@@ -1173,16 +1184,26 @@ impl AppState {
     }
 
     /// True iff `host` is in the union of `resolved_hosts` over the connections
-    /// of ALL currently-unlocked vaults. Decides MITM-vs-blind-tunnel at CONNECT
-    /// time: only hosts a connection anchors are decrypted; everything else is a
-    /// blind tunnel. Not vid-scoped on purpose — we MITM (and can return a
-    /// precise error) even when the CONNECT's vid userinfo is wrong or absent.
-    pub fn host_in_any_unlocked_union(&self, host: &str) -> bool {
+    /// of all unlocked vaults, OR in a locked vault's remembered union
+    /// (`last_host_unions`). Decides MITM-vs-blind-tunnel at CONNECT time: only
+    /// hosts a connection anchors are decrypted; everything else is a blind
+    /// tunnel. Including locked vaults' last-known anchors means a phantom sent
+    /// while locked reaches `pipeline`'s explicit `vault_locked` refusal instead
+    /// of tunneling to the upstream literally; phantom-less traffic to those
+    /// hosts still forwards untouched. Not vid-scoped on purpose — we MITM (and
+    /// can return a precise error) even when the CONNECT's vid userinfo is
+    /// wrong or absent.
+    pub fn host_in_any_known_union(&self, host: &str) -> bool {
         let states = self.vault_states.lock().unwrap();
-        for st in states.values() {
+        let mut remembered = self.last_host_unions.lock().unwrap();
+        let mut hit = false;
+        // Unlocked vaults are authoritative; refresh each one's remembered
+        // union in the same pass so it is current whenever the vault locks.
+        for (vid, st) in states.iter() {
             let VaultState::Unlocked { cache, .. } = st else {
                 continue;
             };
+            let mut hosts: Vec<String> = Vec::new();
             for conn_rec in cache.connections.values() {
                 let def = conn_rec.service.as_deref().and_then(|s| {
                     // custom-FIRST (see proxy::handler)
@@ -1193,10 +1214,30 @@ impl AppState {
                         .or_else(|| self.services.get(s).cloned())
                 });
                 for h in crate::core::host::resolved_hosts(conn_rec, def.as_ref()) {
-                    if crate::core::host::host_matches_exact(host, &h) {
-                        return true;
-                    }
+                    hosts.push(h.to_ascii_lowercase());
                 }
+            }
+            if hosts
+                .iter()
+                .any(|h| crate::core::host::host_matches_exact(host, h))
+            {
+                hit = true;
+            }
+            remembered.insert(vid.clone(), hosts);
+        }
+        if hit {
+            return true;
+        }
+        // Locked (or never-unlocked-this-boot) vaults: last-known anchors.
+        for (vid, hosts) in remembered.iter() {
+            if matches!(states.get(vid.as_str()), Some(VaultState::Unlocked { .. })) {
+                continue;
+            }
+            if hosts
+                .iter()
+                .any(|h| crate::core::host::host_matches_exact(host, h))
+            {
+                return true;
             }
         }
         false

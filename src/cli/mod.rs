@@ -7,6 +7,7 @@
 pub mod active;
 pub mod admin;
 pub mod agent;
+pub mod apierr;
 pub mod approve;
 pub mod config;
 pub mod conn;
@@ -18,9 +19,9 @@ pub mod egress_proxy;
 pub mod env;
 pub mod git_credential;
 pub mod help;
+pub mod logging;
 pub mod login;
 pub mod logout;
-pub mod logging;
 pub mod ls;
 pub mod neterr;
 pub mod op;
