@@ -227,7 +227,7 @@ pub async fn run(args: UpgradeArgs) -> Result<(), String> {
     if current_hash.as_deref() == Some(actual.as_str()) && !args.force {
         eprintln!(
             "Already up to date — safeclaw {} ({}).",
-            env!("CARGO_PKG_VERSION"),
+            crate::build_version(),
             &actual[..12]
         );
         return Ok(());
@@ -274,7 +274,7 @@ pub async fn run(args: UpgradeArgs) -> Result<(), String> {
     match &new_version {
         Some(v) => eprintln!(
             "Upgraded safeclaw {} → {} ({}).",
-            env!("CARGO_PKG_VERSION"),
+            crate::build_version(),
             v.strip_prefix("safeclaw ").unwrap_or(v),
             &actual[..12]
         ),

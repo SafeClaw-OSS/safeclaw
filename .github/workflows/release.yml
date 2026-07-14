@@ -33,6 +33,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # build.rs embeds this as SC_BUILD_TAG so the binary self-reports the
+      # full release identity (incl. -rc.N) — a file, not an env var, so it
+      # reaches cross's build container via the workspace mount.
+      - name: Stamp build tag
+        run: echo "${{ github.ref_name }}" > .build-tag
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:

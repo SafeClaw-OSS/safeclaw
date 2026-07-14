@@ -37,6 +37,9 @@ pub struct AuditPending {
     pub service: String,
     pub method: String,
     pub path: String,
+    /// Agent attribution for the audit row: prefix of the CONNECT-authenticated
+    /// agent api-key (see `audit::agent_key_prefix`). Never the full key.
+    pub agent_prefix: Option<String>,
 }
 
 #[derive(Clone)]
@@ -484,6 +487,7 @@ impl BrokerHandler {
                     service: service_id.clone(),
                     method: method.clone(),
                     path: path.clone(),
+                    agent_prefix: self.key.as_deref().map(crate::audit::agent_key_prefix),
                 },
                 0,
             );
@@ -651,6 +655,7 @@ impl BrokerHandler {
             service: service_id,
             method,
             path,
+            agent_prefix: self.key.as_deref().map(crate::audit::agent_key_prefix),
         });
         Request::from_parts(parts, out_body).into()
     }
@@ -824,6 +829,7 @@ impl BrokerHandler {
             op,
             Some(pc),
             ip,
+            self.key.as_deref().map(crate::audit::agent_key_prefix),
         ) {
             Ok((op_id, _r, expires_at)) => {
                 let approve_url = crate::cli::active::grant_url(&op_id);
@@ -909,6 +915,7 @@ impl BrokerHandler {
             op,
             None,
             ip,
+            self.key.as_deref().map(crate::audit::agent_key_prefix),
         ) {
             Ok((op_id, _r, exp)) => {
                 let approve_url = crate::cli::active::grant_url(&op_id);
@@ -1339,6 +1346,7 @@ fn write_forward_audit(state: &AppState, p: &AuditPending, upstream_status: u16)
         } else {
             Some(upstream_status as i64)
         },
+        agent_prefix: p.agent_prefix.clone(),
     };
     if let Err(e) = store.insert(&row) {
         tracing::warn!(vault = %p.vault_id, "proxy audit insert failed: {}", e);
