@@ -191,6 +191,16 @@ pub struct SecretsCache {
     /// misconfigured store shows up broken in the console instead of
     /// silently vanishing. Full error goes to the daemon log only (F-20).
     pub external_store_errors: Vec<(String, String)>,
+    /// Key NAMES the external stores expose, enumerated in the background
+    /// right after unlock (`unlock_vault` spawns one `list()` sweep) and
+    /// amended by every successful lazy fill. Registry `connected` and the
+    /// `entries` listing read native ∪ THIS, so an external-backed
+    /// connection looks connected to agents. Shared slot (`Arc<Mutex<…>>`)
+    /// so the background sweep can write back without re-entering the
+    /// vault-states lock; names only, never values. Advisory — resolution
+    /// authority stays with the adapters (a name missing here still
+    /// lazy-fills; a stale name here just shows optimistic status).
+    pub external_keys: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     /// Derived OAuth access_tokens, keyed by service_id. These are the
     /// short-lived bearer values minted by exchanging the long-lived
     /// `refresh_token` (which lives in `entries`) at the provider's
@@ -623,6 +633,38 @@ impl AppState {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
+        // Background external-key enumeration: one list() per store so the
+        // registry/entries surfaces see the flat namespace without a network
+        // call on their read path. The task holds only the shared adapters
+        // and the cache's keys slot — never AppState — so a re-unlock that
+        // replaces the cache simply orphans this task's slot harmlessly.
+        // Handle::try_current keeps plain #[test] callers (no runtime) safe.
+        if !cache.external_stores.is_empty() {
+            if let Ok(rt) = tokio::runtime::Handle::try_current() {
+                let adapters: Vec<(String, Arc<crate::store::Adapter>)> = cache
+                    .external_stores
+                    .iter()
+                    .map(|(id, (_, a))| (id.clone(), a.clone()))
+                    .collect();
+                let slot = cache.external_keys.clone();
+                let vid = vault_id.clone();
+                rt.spawn(async move {
+                    let mut all = std::collections::HashSet::new();
+                    for (store_id, adapter) in adapters {
+                        match adapter.list().await {
+                            Ok(names) => all.extend(names),
+                            // Accessor-only SAs can't list — resolution still
+                            // works (lazy fill amends the slot on first use).
+                            Err(e) => tracing::warn!(vault = %vid, store = %store_id, "external key enumeration failed: {}", e),
+                        }
+                    }
+                    if !all.is_empty() {
+                        tracing::info!(vault = %vid, keys = all.len(), "external store keys enumerated");
+                        *slot.lock().unwrap() = all;
+                    }
+                });
+            }
+        }
         let mut states = self.vault_states.lock().unwrap();
         states.insert(
             vault_id,

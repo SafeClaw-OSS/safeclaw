@@ -1216,6 +1216,16 @@ pub async fn approve_op(
                         existing_vault.as_ref(),
                     )?;
                 if !view.native_secrets.contains_key(&key) {
+                    // One flat namespace, two authorities: SafeClaw OWNS
+                    // native items but only READS external stores — so an
+                    // external-hosted key gets a precise refusal, not a
+                    // misleading "not found".
+                    if view.resolve_value_async(&key).await?.is_some() {
+                        return Err(AppError::BadRequest(format!(
+                            "key '{}' is hosted by an external store — SafeClaw reads it pass-through and cannot delete it; remove it in the provider's console",
+                            key
+                        )));
+                    }
                     return Err(AppError::BadRequest(format!(
                         "key '{}' not found in vault",
                         key
@@ -2341,17 +2351,25 @@ pub(crate) async fn lazy_fill_external(
     // map their explicit keys, sole key doubling as primary.
     let mut primary: Option<Vec<u8>> = None;
     let mut map: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
+    // Names that actually resolved from an external store — fed back into
+    // the cache's external_keys slot so registry/entries surfaces learn
+    // them even when the store's SA can't list().
+    let mut fetched_keys: Vec<String> = Vec::new();
     match service.as_deref() {
         Some(svc_id) => {
             if let Some(role) = state.services.service_env_key(svc_id) {
                 let key = crate::storage::plaintext::secret_key_for(rec.as_ref(), &role);
-                primary = resolve_key(key).await?;
+                primary = resolve_key(key.clone()).await?;
+                if primary.is_some() {
+                    fetched_keys.push(key);
+                }
             }
             if let Some(svc) = state.services.get(svc_id) {
                 for name in cacheable_roles(svc) {
                     let key = crate::storage::plaintext::secret_key_for(rec.as_ref(), &name);
-                    if let Some(bytes) = resolve_key(key).await? {
+                    if let Some(bytes) = resolve_key(key.clone()).await? {
                         map.insert(name, bytes);
+                        fetched_keys.push(key);
                     }
                 }
             }
@@ -2362,7 +2380,8 @@ pub(crate) async fn lazy_fill_external(
             };
             for key in keys {
                 if let Some(bytes) = resolve_key(key.clone()).await? {
-                    map.insert(key, bytes);
+                    map.insert(key.clone(), bytes);
+                    fetched_keys.push(key);
                 }
             }
             if map.len() == 1 {
@@ -2392,6 +2411,11 @@ pub(crate) async fn lazy_fill_external(
         if !map.is_empty() {
             cache.allow_secrets.entry(conn.to_string()).or_insert(map);
         }
+        cache
+            .external_keys
+            .lock()
+            .unwrap()
+            .extend(fetched_keys.iter().cloned());
     }
     tracing::info!(conn = %conn, "external store secrets resident after lazy fill");
     Ok(true)
