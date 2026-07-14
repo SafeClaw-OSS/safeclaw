@@ -1043,9 +1043,18 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// Merge `more` into `acc`, de-duplicating on `raw` in O(1) per element and
+/// capped at [`resolver::MAX_PHANTOMS_PER_SITE`]. Each scan site
+/// (`collect_phantoms`) is already capped and O(N); this keeps the cross-site
+/// union bounded too, so no attacker-chosen body can drive quadratic work here.
 fn merge_phantoms(acc: &mut Vec<Phantom>, more: Vec<Phantom>) {
+    let mut seen: std::collections::HashSet<String> =
+        acc.iter().map(|p| p.raw.clone()).collect();
     for p in more {
-        if !acc.iter().any(|x| x.raw == p.raw) {
+        if acc.len() >= resolver::MAX_PHANTOMS_PER_SITE {
+            break;
+        }
+        if seen.insert(p.raw.clone()) {
             acc.push(p);
         }
     }
