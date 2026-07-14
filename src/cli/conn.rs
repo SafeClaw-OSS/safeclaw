@@ -73,6 +73,27 @@ pub fn valid_role(s: &str) -> bool {
     first_ok && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+/// A REFERENCED (already-existing) secret key — native canonical form or an
+/// external store's name. External naming is not ours to fold (GCP allows
+/// lowercase and hyphens), but the key still rides consent cards, connection
+/// records, and phantom-adjacent strings, so keep it printable and
+/// phantom-safe: ASCII alnum / `_` / `-`, starts alphanumeric, no `__`, no
+/// trailing `_`, ≤255 chars. NEW keys (deposits) stay on the strict
+/// uppercase `valid_role` — this relaxation is for referencing only.
+pub fn valid_secret_ref(s: &str) -> bool {
+    if s.is_empty() || s.len() > 255 || s.contains("__") || s.ends_with('_') {
+        return false;
+    }
+    let first_ok = s
+        .chars()
+        .next()
+        .map(|c| c.is_ascii_alphanumeric())
+        .unwrap_or(false);
+    first_ok
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
 /// Validate a raw connection's anchor host: an exact FQDN — no scheme / path /
 /// port, no wildcard, and not a private / metadata / loopback target. (Raw
 /// connections pin exact FQDNs; `*.suffix` lives only in a curated service
@@ -242,6 +263,22 @@ mod tests {
         assert!(!valid_role("A B")); // space
         assert!(!valid_role("_X")); // leading underscore
         assert!(!valid_role("X_")); // trailing underscore fuses the delimiter
+    }
+
+    #[test]
+    fn secret_ref_rules() {
+        // Native canonical + external naming both pass.
+        assert!(valid_secret_ref("GITHUB_TOKEN"));
+        assert!(valid_secret_ref("xh-gcp-test")); // lowercase + hyphens (GCP)
+        assert!(valid_secret_ref("1password-item")); // digit start is fine for a reference
+                                                     // Phantom safety + shape still enforced.
+        assert!(!valid_secret_ref("")); // empty
+        assert!(!valid_secret_ref("a__b")); // double underscore (phantom delimiter)
+        assert!(!valid_secret_ref("key_")); // trailing underscore fuses the delimiter
+        assert!(!valid_secret_ref("-key")); // must start alphanumeric
+        assert!(!valid_secret_ref("a b")); // space
+        assert!(!valid_secret_ref("a/b")); // path-ish
+        assert!(!valid_secret_ref(&"x".repeat(256))); // length cap
     }
 
     #[test]
