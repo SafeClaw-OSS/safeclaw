@@ -936,7 +936,8 @@ pub struct CommonArgs {
 
 #[derive(Debug, Args)]
 pub struct GetArgs {
-    /// Native-secrets key name to reveal (`safeclaw read OPENAI_API_KEY`).
+    /// Secret key to reveal, from any store (native or external), matched
+    /// case-SENSITIVELY (`sc get OPENAI_API_KEY`; external keys verbatim).
     pub key: String,
 
     #[arg(long)]

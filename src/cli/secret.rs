@@ -254,9 +254,14 @@ pub async fn run_rm(args: RmArgs) -> Result<(), String> {
 
 pub async fn run_get(args: GetArgs) -> Result<(), String> {
     let (custodian, vault) = resolve_active(args.vault.as_deref())?;
-    // §1: secret KEYs are canonical uppercase — normalize on input so a human
-    // `sc get github_token` resolves the stored `GITHUB_TOKEN`.
-    let key = args.key.trim().to_ascii_uppercase();
+    // Case-SENSITIVE exact match — the mainstream convention for env vars and
+    // secret managers (GCP/AWS/Vault). `get` reads across ALL stores: native
+    // keys are canonical UPPERCASE, but external stores (GCP Secret Manager)
+    // preserve their own casing, so a lowercase name like `xh-gcp-test` is only
+    // reachable verbatim. We do NOT uppercase here (that would make external
+    // lowercase secrets unreadable); `sc get github_token` must be typed as the
+    // stored `GITHUB_TOKEN`.
+    let key = args.key.trim().to_string();
     if key.is_empty() {
         return Err("key cannot be empty".into());
     }

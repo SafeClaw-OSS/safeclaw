@@ -101,13 +101,20 @@ fixed property of the OAuth client, held in the provider config (§5).
 
 ## 3. Secrets — ALL keys bare; the connection RECORD binds roles to keys
 
-- Secret keys are **mainstream, UPPERCASE `[A-Z0-9_]`, community-standard** —
+- **Native** secret keys are **mainstream, UPPERCASE `[A-Z0-9_]`, community-standard** —
   `GITHUB_TOKEN`, `OPENAI_API_KEY`, `GMAIL_REFRESH_TOKEN`. **Never invented.**
   `sc set` / the console **force-uppercase** on input (a lowercase key is
-  auto-converted, never stored lowercase) — one canonical form. Connection ids and
-  secret roles are lowercase; **every key ↔ conn-id ↔ host comparison is
-  case-insensitive.** For a service-backed connection the service DEFINEs the roles
-  (§4); a raw connection names its own in `secrets` (§2).
+  auto-converted, never stored lowercase) — one canonical form for the pool WE own.
+- **Key resolution is case-SENSITIVE exact** (env-var / secret-manager convention).
+  It was only ever case-insensitive because `sc get` uppercased its argument and
+  native keys are stored uppercase; the resolver itself has always been an exact
+  `HashMap` lookup. `sc get` no longer uppercases, so a native key must be named
+  as stored (`GITHUB_TOKEN`, not `github_token`), and an **external** store's keys
+  (GCP Secret Manager, … — which preserve their own casing, e.g. `xh-gcp-test`)
+  are reachable ONLY verbatim.
+- Connection ids and hosts are lowercase; **conn-id ↔ host comparison is
+  case-insensitive** (keys are not — see above). For a service-backed connection
+  the service DEFINEs the roles (§4); a raw connection names its own in `secrets` (§2).
 - **Every secret lives at a bare, env-valid KEY** — the flat pool is ONE env
   namespace; nothing is namespaced. Every key maps **1:1** to `env` import and
   external-store read-through (GCP Secret Manager, …) via the normal
