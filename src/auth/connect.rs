@@ -113,6 +113,23 @@ pub fn resolve_exchange_config(
     })
 }
 
+/// The loopback port a `service`'s consent redirect will land on — resolved
+/// from its def with the SAME custom-FIRST rule as the exchange (a vault-
+/// authored def wins over a same-id registry service), because that resolved
+/// redirect_uri is what the console baked into the consent URL. `None` for a
+/// non-oauth service or a non-loopback/portless redirect. The caller gates the
+/// result on `ServiceRegistry::loopback_allowlist` — resolution says where the
+/// redirect will land, the allowlist says whether we may listen there.
+fn loopback_port_for(
+    services: &crate::service::ServiceRegistry,
+    custom: &std::collections::HashMap<String, crate::service::ServiceDef>,
+    service: &str,
+) -> Option<u16> {
+    let svc = custom.get(service).or_else(|| services.get(service))?;
+    let oauth = svc.oauth2()?;
+    crate::service::loopback_port(&services.resolve_oauth_config(oauth).redirect_uri)
+}
+
 /// Read a `connection_id → T` map out of `m.aux[<key>]`. Empty when the key is
 /// absent or doesn't parse (forward-compat: a newer schema we can't read yields
 /// no entries — never an error).
@@ -595,27 +612,46 @@ pub(crate) async fn apply_pending_connects(
     };
 
     // Register every loopback connect still AWAITING its redirect (carries a
-    // `state`, no code yet) so the shared 8765 listener can match an incoming
-    // `?code&state` to this (vault, connection). Runs each ordinary sync tick,
-    // keeping the in-memory index fresh (self-reaps at the 2h ceiling). Skipped
-    // on the injected path (the completion call for an entry we already took out
-    // of the index) so a just-completed connect isn't re-registered stale.
+    // `state`, no code yet) so the on-demand listener can match an incoming
+    // `?code&state` to this (vault, connection). The listen PORT comes from the
+    // connect's service def (custom-FIRST, same resolution the exchange uses)
+    // and must sit in the allowlist parsed from LOCALLY-INSTALLED defs — vault
+    // content picks among shipped targets (8765 canonical, 1455 openai_codex),
+    // it can never open a new port. Off-allowlist redirect ⇒ paste-only.
+    // Runs each ordinary sync tick, keeping the in-memory index fresh
+    // (self-reaps at the 2h ceiling). Skipped on the injected path (the
+    // completion call for an entry we already took out of the index) so a
+    // just-completed connect isn't re-registered stale.
     if injected.is_none() {
+        let custom = state.custom_services_snapshot(vault_id);
+        let allowed = state.services.loopback_allowlist();
         for (conn_id, c) in aux_map::<Connecting>(&m, "connecting") {
             if c.oauth2.code.is_empty() {
                 if let Some(st) = &c.oauth2.state {
-                    state.note_loopback_pending(st, vault_id, &conn_id);
+                    match loopback_port_for(&state.services, &custom, &c.service) {
+                        Some(port) if allowed.contains(&port) => {
+                            state.note_loopback_pending(st, vault_id, &conn_id, port);
+                        }
+                        Some(port) => tracing::debug!(
+                            conn = %conn_id, port,
+                            "oauth connect: redirect port not in the local-def allowlist; paste-only"
+                        ),
+                        None => tracing::debug!(
+                            conn = %conn_id,
+                            "oauth connect: no loopback redirect target; paste-only"
+                        ),
+                    }
                 }
             }
         }
-        // Open the shared 8765 listener ON DEMAND — only while some connect is
-        // awaiting its redirect. Idempotent + single-instance: N concurrent
-        // connects (across all vaults) share ONE listener (`ensure_running`
-        // no-ops if already up, so the daemon never races itself into a port
-        // conflict); it self-closes when the last pending clears. No pending ⇒
-        // 8765 never opens.
-        if state.has_loopback_pending() {
-            crate::auth::loopback::ensure_running(state.clone());
+        // Open each pending port's listener ON DEMAND — only while some connect
+        // is awaiting its redirect there. Idempotent + single-instance per port:
+        // N concurrent connects (across all vaults) share ONE listener per port
+        // (`ensure_running` no-ops if already up, so the daemon never races
+        // itself into a port conflict); each self-closes when its last pending
+        // clears. No pending ⇒ nothing opens.
+        for port in state.pending_loopback_ports() {
+            crate::auth::loopback::ensure_running(state.clone(), port);
         }
     }
 
