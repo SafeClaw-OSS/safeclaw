@@ -325,8 +325,12 @@ impl AuditStore {
     }
 
     /// Transition a pending row to a terminal status (approved | rejected
-    /// | expired | denied). No-op if the row doesn't exist (e.g., audit
-    /// was disabled when the pending was created).
+    /// | expired | denied | cancelled). No-op if the row doesn't exist
+    /// (e.g., audit was disabled when the pending was created) — and no-op
+    /// on a row that is ALREADY terminal: terminal states are immutable, so
+    /// a supersede-cancel landing after a reject/approve can't rewrite
+    /// history (seen live 2026-07-14: a re-run `sc up` turned a REJECTED
+    /// unlock into `cancelled` in the cloud feed).
     pub fn finalize(
         &self,
         id: &str,
@@ -343,7 +347,7 @@ impl AuditStore {
                  credential_id=COALESCE(?3, credential_id),
                  reason=COALESCE(?4, reason),
                  upstream_status=COALESCE(?5, upstream_status)
-             WHERE id=?6",
+             WHERE id=?6 AND status = 'pending'",
             params![
                 status,
                 decided_at,

@@ -29,11 +29,13 @@ const POLL_FALLBACK: Duration = Duration::from_secs(2);
 /// as refresh_agent_keys_on_miss's debounce).
 const POLL_FLOOR: Duration = Duration::from_secs(1);
 /// Daemon-side safety cap so a never-approved op's task can't run forever
-/// (the relay also enforces a TTL). Was `MAX_POLLS: u32 = 920` (920 × 2s ≈
-/// 1840s): with the interval now variable a COUNT no longer encodes a time
-/// budget, so the cap is a DEADLINE of the same value — just past the 1800s
-/// (30 min) op TTL.
-const POLL_BUDGET: Duration = Duration::from_secs(1840);
+/// (the relay also enforces a TTL). Derived per-op from the op's own expiry
+/// (SSOT: aux.policy.timeout stamps every pending op) + slack past the
+/// in-loop `expires_at + 5` precise stop; clamped so a pathological expiry
+/// can neither stop the poll instantly nor pin a task for days.
+fn poll_budget(expires_at: u64) -> Duration {
+    Duration::from_secs(expires_at.saturating_sub(now()).clamp(60, 86_400) + 60)
+}
 
 /// Interval selection, factored for the unit test.
 fn poll_interval(op_events_reach_us: bool) -> Duration {
@@ -203,7 +205,7 @@ async fn run(
     // 2. Poll for the deposited grant. Status semantics are UNCHANGED from
     //    the pre-event loop — only the wait between polls is event-aware.
     let poll_url = format!("{}/v/{}/op/relay/{}", base, vault_id, op_id);
-    let deadline = tokio::time::Instant::now() + POLL_BUDGET;
+    let deadline = tokio::time::Instant::now() + poll_budget(expires_at);
     while tokio::time::Instant::now() < deadline {
         if now() > expires_at + 5 {
             return Ok(()); // op expired; stop quietly
@@ -225,7 +227,27 @@ async fn run(
                     .await
                     .map_err(|e| format!("relay poll parse: {}", e))?;
                 let grant = body.get("sealed_grant").cloned().unwrap_or(body);
-                apply_grant(state.clone(), op_id, grant).await?;
+                if let Err(e) = apply_grant(state.clone(), op_id, grant).await {
+                    // The human APPROVED but the daemon couldn't apply. The
+                    // canonical cause — a value stash dying under a longer op
+                    // window — is structurally gone (both derive from
+                    // aux.policy.timeout now); this is belt-and-suspenders.
+                    // A consent that silently evaporates is the worst UX
+                    // ("I approved — where did it go?"): terminalize the
+                    // local row as `expired` WITH the reason so it ships to
+                    // the cloud feed instead of sitting `pending`, invisible.
+                    if let Ok(audit) = state.audits.for_vault(vault_id) {
+                        let _ = audit.finalize(
+                            op_id,
+                            crate::audit::STATUS_EXPIRED,
+                            now() as i64,
+                            None,
+                            Some(&format!("approved but apply failed: {}", e)),
+                            None,
+                        );
+                    }
+                    return Err(e);
+                }
                 return Ok(());
             }
             403 => {

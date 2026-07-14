@@ -48,6 +48,20 @@ pub async fn create(
     if !is_lifecycle_bypass && state.is_vault_locked(&vault_id) {
         return Err(AppError::VaultLocked);
     }
+    // ONE approval window (SSOT, user decision 2026-07-14): ops that arrive
+    // without an explicit Valid window — the CLI ceremonies (unlock / set /
+    // connect) — inherit the vault's `aux.policy.timeout`, the SAME knob the
+    // broker's ask path uses, so the grant-page countdown, the value stash,
+    // and the op's own expiry can never disagree. A locked vault (the unlock
+    // ceremony) can't read its policy and takes the 30-min default.
+    let mut op = op;
+    if op.valid.exp.is_none() {
+        let now_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        op.valid.exp = Some(now_unix + state.policy_approval_hold(&vault_id));
+    }
     let ip: IpAddr = addr.ip();
     let r = {
         let mut store = state.challenges.lock().unwrap();

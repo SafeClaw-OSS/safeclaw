@@ -63,8 +63,12 @@ pub async fn create(
         }
         values.insert(k.clone(), val.to_string());
     }
+    // Stash lifetime = the SAME approval window the op created right after
+    // this deposit will get (op.rs stamps it from aux.policy.timeout), plus
+    // slack so the stash strictly outlives the op's approvability.
+    let ttl = std::time::Duration::from_secs(state.policy_approval_hold(&vault_id) + 60);
     let digest = state
-        .op_payload_insert(values)
+        .op_payload_insert(values, ttl)
         .ok_or(AppError::TooManyRequests)?;
     Ok(Json(json!({ "values_digest": digest })))
 }

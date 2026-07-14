@@ -85,6 +85,13 @@ impl ApprovalRecord {
 /// tap their passkey before it expires. 30 minutes.
 pub const DEFAULT_TTL: Duration = Duration::from_secs(1800);
 
+/// Absolute ceiling on a record's lifetime, however generous the op's own
+/// window: bounds zombie waiters if a caller mints a huge exp. User-tuned
+/// approval windows (aux.policy.timeout) pass through untouched below this
+/// — the old cap at DEFAULT_TTL silently clipped them, advertising a grant
+/// window the record couldn't honor.
+pub const MAX_TTL: Duration = Duration::from_secs(86_400);
+
 /// Suggested agent poll pacing for a pending op, surfaced as `Retry-After` and
 /// `approval.interval` (the RFC 8628 / async-request-reply convention) so
 /// agents don't invent their own loop cadence.
@@ -126,7 +133,7 @@ impl ApprovalStore {
             .map(|d| d.as_secs())
             .unwrap_or(0);
         // The record's lifetime tracks the op's own Valid window (capped by
-        // the default): a pending record that outlives its op advertises an
+        // MAX_TTL): a pending record that outlives its op advertises an
         // `expires_at` no passkey tap can meet — a waiter would spin on a
         // zombie. Ops without an exp keep the default ceiling.
         let ttl_secs = op
@@ -134,7 +141,7 @@ impl ApprovalStore {
             .exp
             .map(|e| e.saturating_sub(now_unix))
             .filter(|&s| s > 0)
-            .map(|s| s.min(DEFAULT_TTL.as_secs()))
+            .map(|s| s.min(MAX_TTL.as_secs()))
             .unwrap_or(DEFAULT_TTL.as_secs());
         let rec = ApprovalRecord {
             id: id.clone(),
@@ -291,5 +298,16 @@ mod tests {
         // No exp (fake_op default) keeps the default ceiling.
         let id2 = s.create("vault1".into(), fake_op(), "r".into());
         assert_eq!(s.get(&id2).unwrap().ttl, DEFAULT_TTL);
+
+        // A user-widened window (aux.policy.timeout > default) passes
+        // through — only the MAX_TTL ceiling clips. (Was: silently clipped
+        // to DEFAULT_TTL — the grant page then promised a window the record
+        // wouldn't honor.)
+        let mut wide = fake_op();
+        wide.valid = Valid::single_use(now, Some(now + 7200));
+        let id3 = s.create("vault1".into(), wide, "r".into());
+        let rec3 = s.get(&id3).unwrap();
+        assert!(rec3.ttl > Duration::from_secs(7100));
+        assert!(rec3.ttl <= Duration::from_secs(7200));
     }
 }
