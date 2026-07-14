@@ -1959,7 +1959,13 @@ pub(crate) fn bootstrap_cache_from_view(
                 );
             }
             Err(e) => {
+                // F-20: full error in the log only; the cache carries a
+                // sanitised reason for `secret-keys` to surface.
                 tracing::warn!(store = %store_id, "unlock: external store adapter init failed: {}", e);
+                cache.external_store_errors.push((
+                    store_id.clone(),
+                    format!("store '{}' unavailable", store_id),
+                ));
             }
         }
     }

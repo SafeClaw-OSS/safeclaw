@@ -185,6 +185,12 @@ pub struct SecretsCache {
     /// fill walks THIS (first match wins) so external residency can never
     /// disagree with `resolve_value_async`'s store_order semantics.
     pub external_store_order: Vec<String>,
+    /// External stores that FAILED to materialise at unlock (bad SA JSON,
+    /// missing credentials_item, …): `store_id → sanitised reason`. Fail
+    /// loudly: `secret-keys` surfaces these as `store_errors` so a
+    /// misconfigured store shows up broken in the console instead of
+    /// silently vanishing. Full error goes to the daemon log only (F-20).
+    pub external_store_errors: Vec<(String, String)>,
     /// Derived OAuth access_tokens, keyed by service_id. These are the
     /// short-lived bearer values minted by exchanging the long-lived
     /// `refresh_token` (which lives in `entries`) at the provider's

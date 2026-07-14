@@ -51,7 +51,7 @@ pub async fn secret_keys(
     // Snapshot what we need under the lock, then drop it before any
     // network work — list() is async and we don't want to hold the
     // vault-states mutex across an await.
-    let (mut native_keys, external_stores) = {
+    let (mut native_keys, external_stores, init_errors) = {
         let states = state.vault_states.lock().unwrap();
         let cache = match states.get(&vault_id) {
             Some(VaultState::Unlocked { cache, .. }) => cache,
@@ -59,12 +59,17 @@ pub async fn secret_keys(
         };
         let native: Vec<String> = cache.native_keys.iter().cloned().collect();
         let external = cache.external_stores.clone();
-        (native, external)
+        (native, external, cache.external_store_errors.clone())
     };
     native_keys.sort();
 
     let mut stores: Vec<Value> = Vec::new();
     let mut store_errors: Vec<Value> = Vec::new();
+    // Stores that never materialised at unlock (bad credentials/config)
+    // stay visible as errors — a broken store must look broken, not absent.
+    for (store_id, reason) in init_errors {
+        store_errors.push(json!({ "store_id": store_id, "error": reason }));
+    }
 
     for (store_id, (store, adapter)) in external_stores {
         // The session cache holds ONE live adapter per store (built at
