@@ -318,6 +318,12 @@ pub fn spawn_watchers(state: Arc<AppState>) {
     };
     let cloud = cloud.trim_end_matches('/').to_string();
     let (health_tx, health_rx) = tokio::sync::watch::channel(StreamHealth::Down);
+    // v1.1: re-expose the health read daemon-wide — the agent-hash loop's
+    // cadence and the relay pollers' interval key off it, and both live
+    // outside the vault tasks this channel was built for. See
+    // `sync_stream::publish_stream_health` for why a OnceLock set HERE beats
+    // creating the channel at AppState construction.
+    crate::sync_stream::publish_stream_health(health_rx.clone());
     let mut cells: Vec<(String, std::sync::Weak<WakeCell>)> = Vec::new();
     for vault in synced_vault_ids(&cfg) {
         let cell = Arc::new(WakeCell::new());
@@ -826,12 +832,44 @@ pub async fn refresh_agent_keys_on_miss(state: &Arc<AppState>) -> bool {
     true
 }
 
+/// Agent-hash poll cadence while the SSE stream is healthy (v1.1): the
+/// stream's `agent_hashes` event plus the resync-on-reconnect fire are the
+/// propagation path, so this poll is pure belt-and-suspenders — 600s keeps
+/// the documented bound ("revocation: instant, worst case 10 min"; Railway's
+/// ≤15-min rotation forces the reconnect resync regardless). Add-key latency
+/// is independent of the cadence either way: `refresh_agent_keys_on_miss`
+/// refetches on first sight of an unknown key.
+const AGENT_KEYS_CADENCE_STREAMED: Duration = Duration::from_secs(600);
+/// Stream down or `sync_stream=off`: the pre-v1.1 30s — degraded
+/// environments keep the poll as their ONLY propagation path.
+const AGENT_KEYS_CADENCE_POLL: Duration = Duration::from_secs(30);
+
+/// Cadence selection, factored for the unit test.
+fn agent_keys_cadence(stream_healthy: bool) -> Duration {
+    if stream_healthy {
+        AGENT_KEYS_CADENCE_STREAMED
+    } else {
+        AGENT_KEYS_CADENCE_POLL
+    }
+}
+
 /// Periodically refresh the agent-key hash-set so a dashboard revoke / a newly
-/// added agent takes effect within ~30s on this daemon. Detached, best-effort.
+/// added agent takes effect on this daemon. Detached, best-effort. v1.1:
+/// event-driven — the SSE dispatcher fires the agent-hash notify on an
+/// `agent_hashes` stream event AND after every reconnect hello, either of
+/// which resyncs immediately; the sleep is the fallback bound, mode-sized by
+/// stream health. Logging stays inside `sync_agent_keys_once` (only on a
+/// hash-set CHANGE), so neither wake source adds idle chatter.
 pub async fn sync_agent_keys_loop(state: Arc<AppState>) {
     loop {
         sync_agent_keys_once(&state).await;
-        tokio::time::sleep(Duration::from_secs(30)).await;
+        // Arm AFTER the fetch: `notify_one` parks a permit, so an event that
+        // fired mid-fetch completes this wait instantly (one redundant
+        // cursor-cheap refetch at worst, never a lost revoke).
+        tokio::select! {
+            _ = crate::sync_stream::agent_hashes_notified() => {}
+            _ = tokio::time::sleep(agent_keys_cadence(crate::sync_stream::stream_healthy())) => {}
+        }
     }
 }
 
@@ -2628,6 +2666,15 @@ mod peritem_tests {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    /// v1.1 mode-dependent agent-hash cadence: 600s while the stream carries
+    /// the events (poll = belt-and-suspenders), the legacy 30s when the poll
+    /// is the only propagation path.
+    #[test]
+    fn agent_keys_cadence_is_mode_dependent() {
+        assert_eq!(agent_keys_cadence(true), Duration::from_secs(600));
+        assert_eq!(agent_keys_cadence(false), Duration::from_secs(30));
+    }
 
     /// The browser assembles the blob client-side; this guards that the exact
     /// shape it produces (compact JSON, registry value field order

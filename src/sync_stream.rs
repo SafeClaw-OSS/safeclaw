@@ -16,9 +16,16 @@
 //!   Pre-stream failures are plain JSON with 401/400/429/503. Railway
 //!   hard-caps any request at ~15 min: stream EOF after a healthy run is
 //!   ROTATION, not failure — see the state machine in [`dispatcher`].
+//!
+//! v1.1 adds two ACCOUNT-scoped event kinds on the same stream —
+//! `agent_hashes` (api_keys changed) and `op` (an op_relay grant flipped) —
+//! which have no vault cell to land in and route to the daemon-global
+//! signals below instead. Same hints-not-data rule: the signals carry
+//! nothing; the consumers re-run their existing fetch/poll paths, which stay
+//! the source of truth.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use tokio::sync::{watch, Notify};
@@ -147,6 +154,145 @@ pub enum VaultStatus {
 pub enum StreamHealth {
     Up,
     Down,
+}
+
+// ── Daemon-global signals (v1.1 — op_relay + agent-hash eventing) ───────────
+
+/// Wakes `sync::sync_agent_keys_loop`. Fired on an `agent_hashes` stream
+/// event and after EVERY reconnect hello (resync-on-reconnect, see
+/// `run_stream`). A static, not AppState plumbing: the producers
+/// (`dispatch_record` / `run_stream`) are free functions with no AppState
+/// handle, and the sole consumer is spawned in main.rs BEFORE
+/// `spawn_watchers` builds any stream state.
+static AGENT_HASH_EVENTS: Notify = Notify::const_new();
+
+/// Arm a wake on the agent-hash signal. `notify_one` semantics: a fire with
+/// no waiter parks a permit, so an event landing while the consumer is
+/// mid-fetch completes its NEXT wait instantly instead of being lost.
+pub fn agent_hashes_notified() -> tokio::sync::futures::Notified<'static> {
+    AGENT_HASH_EVENTS.notified()
+}
+
+fn notify_agent_hashes() {
+    AGENT_HASH_EVENTS.notify_one();
+}
+
+/// Live op-relay pollers, keyed by op_id. A relay client registers before
+/// its poll loop and deregisters via [`OpWaitGuard`]'s Drop — the guard IS
+/// the registration, so no exit path (early error returns included) can
+/// leak an entry into this daemon-lifetime map. The dispatcher notifies on
+/// a matching `op` event; unknown op_ids are ignored (forward compatible:
+/// another device's ceremony, an event racing a poller's exit, or an op
+/// kind this build doesn't poll).
+pub struct OpRegistry {
+    // std Mutex, locked only inside these sync methods — never held across
+    // an await (the module invariant shared with WakeCell).
+    map: Mutex<HashMap<String, Arc<Notify>>>,
+}
+
+impl OpRegistry {
+    fn new() -> Self {
+        Self {
+            map: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Register interest in `op_id`. Dropping the returned guard
+    /// deregisters.
+    pub fn register(&self, op_id: &str) -> OpWaitGuard<'_> {
+        let notify = Arc::new(Notify::new());
+        self.map
+            .lock()
+            .unwrap()
+            .insert(op_id.to_string(), Arc::clone(&notify));
+        OpWaitGuard {
+            registry: self,
+            op_id: op_id.to_string(),
+            notify,
+        }
+    }
+
+    /// Wake the poller registered for `op_id`, if any; says whether one was
+    /// (the caller's log cue). Unknown ids are a silent no-op by design.
+    fn notify(&self, op_id: &str) -> bool {
+        let notify = self.map.lock().unwrap().get(op_id).map(Arc::clone);
+        // Lock already dropped — signal outside it.
+        match notify {
+            Some(n) => {
+                n.notify_one();
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+/// A live [`OpRegistry`] registration (guard pattern — Drop deregisters).
+pub struct OpWaitGuard<'a> {
+    registry: &'a OpRegistry,
+    op_id: String,
+    notify: Arc<Notify>,
+}
+
+impl OpWaitGuard<'_> {
+    /// Arm a wake for this op's next stream event. `notify_one` parks a
+    /// permit, so an event that fires between waits (while the poll response
+    /// is in flight) completes the next wait instantly.
+    pub fn notified(&self) -> tokio::sync::futures::Notified<'_> {
+        self.notify.notified()
+    }
+}
+
+impl Drop for OpWaitGuard<'_> {
+    fn drop(&mut self) {
+        let mut map = self.registry.map.lock().unwrap();
+        // Remove only OUR registration: if the same op_id was re-registered
+        // (shouldn't happen — one poll task per op — but cheap to be exact),
+        // the newer entry must survive this older guard's drop.
+        if map
+            .get(&self.op_id)
+            .is_some_and(|n| Arc::ptr_eq(n, &self.notify))
+        {
+            map.remove(&self.op_id);
+        }
+    }
+}
+
+/// The daemon-global op-event registry (relay pollers ↔ dispatcher).
+pub fn op_events() -> &'static OpRegistry {
+    static OP_EVENTS: LazyLock<OpRegistry> = LazyLock::new(OpRegistry::new);
+    &OP_EVENTS
+}
+
+/// The dispatcher's health watch, re-exposed daemon-wide. Set once by
+/// `sync::spawn_watchers` — the only place that knows whether streaming
+/// exists for this daemon at all — and read through [`stream_healthy`] by
+/// the consumers OUTSIDE the vault tasks (the agent-hash loop's cadence,
+/// the relay pollers' interval). A OnceLock set by spawn_watchers rather
+/// than a channel built at AppState construction because (a) main.rs spawns
+/// `sync_agent_keys_loop` BEFORE `spawn_watchers`, and relay pollers spawn
+/// at arbitrary times, so consumers can never assume the channel exists;
+/// (b) an UNSET cell already reads as Down, which is the right answer in
+/// every no-stream world (local-only daemon, unpaired device, watchers not
+/// yet started) — AppState would have to fabricate a dead channel to say
+/// the same thing, and thread sync_stream types through state.rs for it.
+static STREAM_HEALTH: OnceLock<watch::Receiver<StreamHealth>> = OnceLock::new();
+
+/// Called by `sync::spawn_watchers` right after it creates the health
+/// channel. First caller wins (spawn_watchers runs once per process).
+pub fn publish_stream_health(rx: watch::Receiver<StreamHealth>) {
+    let _ = STREAM_HEALTH.set(rx);
+}
+
+/// Cheap point-read: is the stream currently proven up? Consumers use it to
+/// pick a CADENCE, never as a data channel — a race with a health flip
+/// costs one mis-sized sleep at worst, inside the bounds both cadences
+/// already promise.
+pub fn stream_healthy() -> bool {
+    STREAM_HEALTH
+        .get()
+        .map(|rx| *rx.borrow() == StreamHealth::Up)
+        .unwrap_or(false)
 }
 
 /// The drained portion of a cell — what one watch-task round processes.
@@ -722,6 +868,14 @@ async fn run_stream(
     // the Up edge re-reads its mode at the loop top and must see the final
     // value, never a stale Fallback.
     let n = apply_hello(cells, &hello);
+    // ★ Resync-on-reconnect (v1.1): the dominant way to LOSE an
+    // `agent_hashes` event is a stream disconnect — and the reconnect the
+    // loss forces is exactly where we stand now, so firing the notify here
+    // turns the failure mode into the recovery. With Railway rotating every
+    // stream ≤15 min, the platform itself becomes the revocation backstop: a
+    // revoke whose event fell into a gap goes unseen for at most one
+    // rotation before this resync picks it up.
+    notify_agent_hashes();
     health.send_if_modified(|h| {
         if *h == StreamHealth::Up {
             false
@@ -840,11 +994,21 @@ fn apply_hello(cells: &HashMap<String, Arc<WakeCell>>, hello: &serde_json::Value
     n
 }
 
-/// Route one parsed record into its vault's cell. Unknown event kinds and
-/// unknown vids are ignored (forward compatibility — hints are best-effort by
-/// design). `items.seq` is deliberately unused: the hint means "just pull";
-/// the pull's own cursor decides what is new.
+/// Route one parsed record into its vault's cell, or (v1.1) an
+/// account-scoped event into its daemon-global signal. Unknown event kinds,
+/// unknown vids and unknown op_ids are ignored (forward compatibility —
+/// hints are best-effort by design). `items.seq` is deliberately unused: the
+/// hint means "just pull"; the pull's own cursor decides what is new. Same
+/// rule for the v1.1 payloads: nothing beyond ROUTING is trusted — the
+/// consumers re-fetch/re-poll and their responses are the truth.
 fn dispatch_record(cells: &HashMap<String, Arc<WakeCell>>, rec: &SseRecord) {
+    // Account-scoped, payload-free: `data` is `{}` today and deliberately
+    // not parsed (the consumer re-fetches the WHOLE hash-set regardless), so
+    // this routes before the JSON gate — a garbled body must still wake it.
+    if rec.event == "agent_hashes" {
+        notify_agent_hashes();
+        return;
+    }
     let Ok(data) = serde_json::from_str::<serde_json::Value>(&rec.data) else {
         tracing::debug!(event = %rec.event, "sync stream: undecodable event data; ignoring");
         return;
@@ -853,6 +1017,21 @@ fn dispatch_record(cells: &HashMap<String, Arc<WakeCell>>, rec: &SseRecord) {
         // Not expected mid-stream, but folding it like a fresh snapshot is
         // strictly harmless (merges are monotone).
         apply_hello(cells, &data);
+        return;
+    }
+    if rec.event == "op" {
+        // {"vid","op_id","status"} — op_id routes; status is log color only
+        // (the poller's next poll response is the real status either way).
+        if let Some(op_id) = data.get("op_id").and_then(|v| v.as_str()) {
+            if op_events().notify(op_id) {
+                // Event-driven by construction: one line per grant flip.
+                tracing::debug!(
+                    op = %op_id,
+                    status = data.get("status").and_then(|s| s.as_str()).unwrap_or("?"),
+                    "sync stream: op event; waking relay poller"
+                );
+            }
+        }
         return;
     }
     let Some(cell) = data
@@ -1102,5 +1281,104 @@ mod tests {
         let again = c.take_work();
         assert_eq!(again.vault, Some((8, VaultStatus::Live)));
         assert!(again.items && !again.keys);
+    }
+
+    // ── Daemon-global signals (v1.1) ──
+    // `now_or_never` polls once with a noop waker: Some(()) ⇔ a notify_one
+    // permit was parked — exactly the between-waits semantics the consumers
+    // rely on (no runtime needed; Notify is pure synchronization).
+
+    use futures_util::FutureExt;
+
+    #[test]
+    fn op_registry_register_notify_deregister_on_drop() {
+        let reg = OpRegistry::new();
+        let guard = reg.register("op-a");
+        assert!(reg.notify("op-a"), "registered id must be known");
+        // The fire above had no waiter armed: the permit must carry over.
+        assert!(guard.notified().now_or_never().is_some());
+        assert!(
+            guard.notified().now_or_never().is_none(),
+            "permit is one-shot"
+        );
+        assert!(!reg.notify("op-unknown"), "unknown op_id is a no-op");
+        drop(guard);
+        assert!(!reg.notify("op-a"), "drop must deregister");
+    }
+
+    /// A stale guard's drop must not evict a fresher registration for the
+    /// same op_id (the Arc::ptr_eq check in Drop).
+    #[test]
+    fn op_registry_stale_guard_drop_keeps_fresh_entry() {
+        let reg = OpRegistry::new();
+        let stale = reg.register("op-a");
+        let fresh = reg.register("op-a");
+        drop(stale);
+        assert!(reg.notify("op-a"), "fresh registration survives stale drop");
+        assert!(fresh.notified().now_or_never().is_some());
+    }
+
+    /// `agent_hashes` routes to the daemon-global notify — even with an
+    /// undecodable payload (it is payload-free by design; the consumer
+    /// re-fetches the whole set regardless). This is the only test touching
+    /// the global notify, so parallel test runs can't race the permit.
+    #[test]
+    fn dispatch_routes_agent_hashes_to_global_notify() {
+        let cells = HashMap::new();
+        dispatch_record(
+            &cells,
+            &SseRecord {
+                event: "agent_hashes".into(),
+                data: "not json".into(),
+            },
+        );
+        assert!(agent_hashes_notified().now_or_never().is_some());
+        assert!(
+            agent_hashes_notified().now_or_never().is_none(),
+            "permit consumed"
+        );
+    }
+
+    /// `op` events route by op_id to the registered poller; unknown or
+    /// missing op_ids are ignored without effect (forward compatible).
+    #[test]
+    fn dispatch_routes_op_event_to_registered_poller() {
+        let cells = HashMap::new();
+        // Globally-unique id: the registry is the process-wide static.
+        let guard = op_events().register("test-dispatch-op-8c11");
+        dispatch_record(
+            &cells,
+            &SseRecord {
+                event: "op".into(),
+                data: r#"{"vid":"v1","op_id":"test-dispatch-op-8c11","status":"approved"}"#.into(),
+            },
+        );
+        assert!(guard.notified().now_or_never().is_some());
+        // Unknown op_id and missing op_id: no panic, no wake.
+        dispatch_record(
+            &cells,
+            &SseRecord {
+                event: "op".into(),
+                data: r#"{"vid":"v1","op_id":"test-dispatch-op-nobody","status":"rejected"}"#
+                    .into(),
+            },
+        );
+        dispatch_record(
+            &cells,
+            &SseRecord {
+                event: "op".into(),
+                data: "{}".into(),
+            },
+        );
+        assert!(guard.notified().now_or_never().is_none());
+    }
+
+    /// Health read defaults to NOT-healthy while unset — the correct answer
+    /// for every no-stream world (local-only, unpaired, watchers not yet
+    /// started). The set-path is exercised in-process by the daemon itself;
+    /// setting the global here would poison parallel tests.
+    #[test]
+    fn stream_health_unset_reads_down() {
+        assert!(!stream_healthy());
     }
 }
