@@ -5,8 +5,9 @@
 > `[[api]]` multi-step engine, and the two-port model with **Admin 23294 /
 > Proxy 23295** — is retired. Canon for credential flow = the resident
 > phantom-only local HTTPS proxy in [docs/CREDENTIAL_BROKER.md](./docs/CREDENTIAL_BROKER.md).
-> Ports are now **control/API 23295 (`CONTROL_PORT`) / credential proxy 23294
-> (`PROXY_PORT`)** — swapped from what this doc shows. The crypto primitives,
+> Ports are now **control/API 23293 (`CONTROL_PORT`) / credential proxy 23294
+> (`PROXY_PORT`)** — the control port also moved off the old `23295` (`0x5AFF`),
+> which collided with a dev tool; see `src/config.rs`. The crypto primitives,
 > vault state machine, passkey/auth boundary, sync, and op/approval flow remain
 > accurate.
 

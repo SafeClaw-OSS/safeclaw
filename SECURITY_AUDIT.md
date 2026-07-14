@@ -1,5 +1,14 @@
 # SafeClaw Daemon — Security Audit
 
+> **⚠️ HISTORICAL (pre-phantom-only).** This scope doc predates the 2026-07-03
+> pivot. Two facts are now inverted or wrong and must not be trusted here: the
+> port model is **control/API 23293 / credential proxy 23294** (this doc's
+> "admin 23294 public / proxy 23295 internal" is stale AND backwards — today the
+> proxy is loopback-only and the control plane is the browser/CLI-facing one),
+> and the `/use` forward-proxy plane it audits is retired (canon =
+> `docs/CREDENTIAL_BROKER.md`). The crypto/auth/op-flow items below still read
+> true. Kept for provenance.
+
 **Branch under review:** `v1/crypto-redesign` (the multi-tenant SUDP daemon at `safeclaw/safeclaw`)
 **Out of scope:** the per-VM `dev` branch (legacy stack, being deprecated), SaaS pro-backend, frontend.
 
