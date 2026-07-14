@@ -62,7 +62,7 @@ pub async fn run(args: CommonArgs) -> Result<(), String> {
         Mark::Ok,
         format!(
             "safeclaw {} ({}/{})",
-            env!("CARGO_PKG_VERSION"),
+            crate::build_version(),
             std::env::consts::OS,
             std::env::consts::ARCH,
         ),

@@ -56,6 +56,21 @@ fn main() {
 
     // Tell cargo to re-run if services/ changes
     println!("cargo:rerun-if-changed=services");
+
+    // Release CI stamps the pushed git tag into `.build-tag` (release.yml)
+    // before building; embed it so the binary self-reports its pre-release
+    // identity (`sc version` → "0.9.48-rc.6" — Cargo.toml stays bare by the
+    // release-channel convention). No file (local/dev builds) → env unset →
+    // build_version() falls back to CARGO_PKG_VERSION. A plain file rather
+    // than a CI env var so it also reaches cross's build container via the
+    // workspace mount.
+    if let Ok(tag) = fs::read_to_string(".build-tag") {
+        let tag = tag.trim();
+        if !tag.is_empty() {
+            println!("cargo:rustc-env=SC_BUILD_TAG={}", tag);
+        }
+    }
+    println!("cargo:rerun-if-changed=.build-tag");
 }
 
 fn scan_services(

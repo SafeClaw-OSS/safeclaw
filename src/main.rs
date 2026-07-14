@@ -257,7 +257,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             })
         }
         Command::Version => {
-            println!("safeclaw {}", env!("CARGO_PKG_VERSION"));
+            println!("safeclaw {}", safeclaw::build_version());
             Ok(())
         }
     }
