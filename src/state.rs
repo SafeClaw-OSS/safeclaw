@@ -354,7 +354,7 @@ pub struct AppState {
     /// it (and the salt keeps a weak value from being brute-forced from the
     /// public digest). Approving the op binds the digest via β; the act then
     /// takes the stash, re-verifies the digest, and writes the values. In-memory
-    /// + daemon-local; entries self-reap after `OP_PAYLOAD_TTL` (the op TTL).
+    /// + daemon-local; entries self-reap after their own op-window TTL.
     pub op_payloads: Mutex<HashMap<String, OpPayloadEntry>>,
 }
 
@@ -362,6 +362,7 @@ pub struct AppState {
 /// [`AppState::op_payloads`].
 pub struct OpPayloadEntry {
     inserted_at: std::time::Instant,
+    ttl: std::time::Duration,
     nonce: [u8; 32],
     pub values: std::collections::BTreeMap<String, String>,
 }
@@ -398,9 +399,14 @@ impl AppState {
         }
     }
 
-    /// Stash lifetime — matches the pending-op TTL (300s): a payload only
-    /// exists to be consumed by the approval of the op created right after it.
-    const OP_PAYLOAD_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+    /// Stash-lifetime ceiling. Each entry carries its own TTL — the vault's
+    /// approval window + slack (see op_payload.rs), so the stash strictly
+    /// outlives every moment its op is still approvable. The "user approved
+    /// but the deposited value had already expired" failure was exactly a
+    /// fixed 300s here under a longer op window; per-entry TTLs from the ONE
+    /// policy knob make that class structurally impossible. The ceiling only
+    /// bounds a pathological policy value.
+    const MAX_OP_PAYLOAD_TTL: std::time::Duration = std::time::Duration::from_secs(86_460);
     /// Flood cap. A human runs one `sc connect` at a time; 32 concurrent
     /// pending stashes is already pathological.
     const MAX_OP_PAYLOADS: usize = 32;
@@ -424,11 +430,13 @@ impl AppState {
     pub fn op_payload_insert(
         &self,
         values: std::collections::BTreeMap<String, String>,
+        ttl: std::time::Duration,
     ) -> Option<String> {
         use rand::RngCore as _;
+        let ttl = ttl.min(Self::MAX_OP_PAYLOAD_TTL);
         let mut m = self.op_payloads.lock().unwrap();
         let now = std::time::Instant::now();
-        m.retain(|_, e| now.duration_since(e.inserted_at) < Self::OP_PAYLOAD_TTL);
+        m.retain(|_, e| now.duration_since(e.inserted_at) < e.ttl);
         if m.len() >= Self::MAX_OP_PAYLOADS {
             return None;
         }
@@ -439,6 +447,7 @@ impl AppState {
             digest.clone(),
             OpPayloadEntry {
                 inserted_at: now,
+                ttl,
                 nonce,
                 values,
             },
@@ -454,7 +463,7 @@ impl AppState {
         digest: &str,
     ) -> Option<std::collections::BTreeMap<String, String>> {
         let entry = self.op_payloads.lock().unwrap().remove(digest)?;
-        if entry.inserted_at.elapsed() >= Self::OP_PAYLOAD_TTL {
+        if entry.inserted_at.elapsed() >= entry.ttl {
             return None;
         }
         if Self::op_payload_digest(&entry.nonce, &entry.values) != digest {
@@ -1115,13 +1124,15 @@ impl AppState {
 
     /// The approval-hold window (seconds): how long a pending `ask` op waits
     /// for the passkey gesture before it expires. This is the user's
-    /// `aux.policy.timeout` ("Approval timeout" in the console), or a 5-minute
-    /// default. DISTINCT from the post-approval `ask`-once grant window (the
+    /// `aux.policy.timeout` ("Approval timeout" in the console), or a 30-minute
+    /// default. THE one approval window (SSOT): op.rs stamps it onto every
+    /// ceremony op, the broker ask path mints with it, the op-payload stash
+    /// and the relay poll budget derive from it. DISTINCT from the post-approval `ask`-once grant window (the
     /// rule/floor `ttl`) — a long grant window must not stretch the deadline the
     /// user has to actually approve. Falls back to the default when the vault is
     /// locked or sets no timeout.
     pub fn policy_approval_hold(&self, vault_id: &str) -> u64 {
-        const DEFAULT_APPROVAL_HOLD: u64 = 300;
+        const DEFAULT_APPROVAL_HOLD: u64 = 1800;
         let states = self.vault_states.lock().unwrap();
         match states.get(vault_id) {
             Some(VaultState::Unlocked { cache, .. }) => {
@@ -1290,9 +1301,13 @@ mod tests {
         let state = test_state();
         let mut values = std::collections::BTreeMap::new();
         values.insert("MIMO_API_TOKEN".to_string(), "s3cret".to_string());
-        let digest = state.op_payload_insert(values.clone()).expect("stash slot");
+        let digest = state
+            .op_payload_insert(values.clone(), std::time::Duration::from_secs(300))
+            .expect("stash slot");
         // Two deposits of the SAME values must not collide (fresh salt each).
-        let digest2 = state.op_payload_insert(values.clone()).expect("stash slot");
+        let digest2 = state
+            .op_payload_insert(values.clone(), std::time::Duration::from_secs(300))
+            .expect("stash slot");
         assert_ne!(digest, digest2, "salted digests must differ per deposit");
         assert_eq!(state.op_payload_take(&digest), Some(values));
         assert_eq!(state.op_payload_take(&digest), None, "single-use");

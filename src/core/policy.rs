@@ -253,7 +253,11 @@ impl Default for Policy {
         categories.insert("ai".into(), allow_rw());
         categories.insert("messaging".into(), allow_rw());
         Self {
-            timeout: Some(300),
+            // ONE approval window (SSOT, user decision 2026-07-14): every
+            // pending-op surface derives from this — broker asks, CLI
+            // ceremonies (op.rs stamps it), the value stash, the relay poll
+            // budget, and the grant-page countdown.
+            timeout: Some(1800),
             default: Some(allow_rw()),
             categories,
             connections: HashMap::new(),

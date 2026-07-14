@@ -899,7 +899,9 @@ impl BrokerHandler {
                 redeemer: vault_id.to_string(),
                 recipient: None,
             },
-            valid: Valid::single_use(now, Some(now + 900)),
+            // Portal pendings inherit the SAME approval window as every
+            // other pending op (aux.policy.timeout; SSOT) — was a fixed 15 min.
+            valid: Valid::single_use(now, Some(now + self.state.policy_approval_hold(vault_id))),
         };
         let approve_line = match crate::server::broker_flow::register_pending_use(
             &self.state,
