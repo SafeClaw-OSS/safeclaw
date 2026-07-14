@@ -487,6 +487,7 @@ pub async fn dispatcher(
     let mut never_healthy: u32 = 0;
     let mut rotating = false;
     let mut announced_old_backend = false;
+    let mut announced_off = false;
     tracing::debug!(vaults = cells.len(), "sync stream: dispatcher started");
     loop {
         // Prune: a tombstoned vault's task exited and dropped its cell.
@@ -502,13 +503,20 @@ pub async fn dispatcher(
 
         // ★★ The switch is read at EVERY (re)connect.
         if !sync_stream_enabled() {
-            if go_down(&health, live.iter().map(|(_, c)| c)) {
+            // Announced on ENTERING the off state, not keyed on the health
+            // edge — at boot health is already Down and go_down() reports no
+            // flip, which would leave the operator's rollback flip with zero
+            // acknowledgment in the logs.
+            go_down(&health, live.iter().map(|(_, c)| c));
+            if !announced_off {
+                announced_off = true;
                 tracing::info!("sync stream: disabled (sync_stream=off); long-poll only");
             }
             rotating = false;
             tokio::time::sleep(OFF_RECHECK).await;
             continue;
         }
+        announced_off = false; // re-entering off later announces again
 
         // This attempt's vid set (see MAX_STREAM_VIDS for why we filter).
         let mut stream_cells: HashMap<String, Arc<WakeCell>> = HashMap::new();
