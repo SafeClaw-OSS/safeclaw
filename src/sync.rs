@@ -844,9 +844,12 @@ const AGENT_KEYS_CADENCE_STREAMED: Duration = Duration::from_secs(600);
 /// environments keep the poll as their ONLY propagation path.
 const AGENT_KEYS_CADENCE_POLL: Duration = Duration::from_secs(30);
 
-/// Cadence selection, factored for the unit test.
-fn agent_keys_cadence(stream_healthy: bool) -> Duration {
-    if stream_healthy {
+/// Cadence selection, factored for the unit test. The relaxed cadence needs
+/// PROOF the events can reach us (`agent_hash_events_live()`: live stream
+/// AND the backend declared the cap in hello) — bare stream health would
+/// relax the poll against a v1-only backend that never emits the event.
+fn agent_keys_cadence(agent_hash_events_live: bool) -> Duration {
+    if agent_hash_events_live {
         AGENT_KEYS_CADENCE_STREAMED
     } else {
         AGENT_KEYS_CADENCE_POLL
@@ -861,15 +864,27 @@ fn agent_keys_cadence(stream_healthy: bool) -> Duration {
 /// stream health. Logging stays inside `sync_agent_keys_once` (only on a
 /// hash-set CHANGE), so neither wake source adds idle chatter.
 pub async fn sync_agent_keys_loop(state: Arc<AppState>) {
+    /// ★ Storm floor, mirroring `refresh_agent_keys_on_miss`'s 2s debounce:
+    /// a chatty/buggy stream costs ≤1 hash-set fetch per 2s, never
+    /// RTT-speed refetching (each fetch builds a fresh client = TLS).
+    const FETCH_FLOOR: Duration = Duration::from_secs(2);
     loop {
         sync_agent_keys_once(&state).await;
+        let fetched = tokio::time::Instant::now();
         // Arm AFTER the fetch: `notify_one` parks a permit, so an event that
         // fired mid-fetch completes this wait instantly (one redundant
         // cursor-cheap refetch at worst, never a lost revoke).
-        tokio::select! {
-            _ = crate::sync_stream::agent_hashes_notified() => {}
-            _ = tokio::time::sleep(agent_keys_cadence(crate::sync_stream::stream_healthy())) => {}
+        loop {
+            tokio::select! {
+                _ = crate::sync_stream::agent_hashes_notified() => break,
+                _ = tokio::time::sleep(agent_keys_cadence(crate::sync_stream::agent_hash_events_live())) => break,
+                // A health flip mid-sleep re-sizes the wait: a 600s streamed
+                // sleep must not ride across an Up→Down flip — the 30s
+                // Down-mode promise is per-mode, not per-cycle.
+                _ = crate::sync_stream::stream_health_edge() => continue,
+            }
         }
+        tokio::time::sleep_until(fetched + FETCH_FLOOR).await;
     }
 }
 

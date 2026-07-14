@@ -231,6 +231,67 @@ missed in-process wake is the existing ~25s deadline answer + reconnect fresh
 read — the same bound the system already lives with. Rolling-deploy dual-instance
 writes lose cross-instance wakes for the overlap window; same 25s bound applies.
 
+## v1.1 — op_relay + agent-hash eventing (2026-07-14 evening, user-approved)
+
+Two new event kinds on the SAME stream, same hints-not-data semantics, each
+with its poll kept as fallback:
+
+```
+event: agent_hashes   data: {}                              (api_keys changed for this account)
+event: op             data: {"vid":"...","op_id":"...","status":"approved|rejected"}
+```
+
+**Backend:**
+- `sseEmitAccount(accountId, kind, payload)` — the registry already stores
+  accountId per conn; fan out to every stream of the account.
+- `agent_hashes` emits at exactly the three sites that already invalidate
+  agentHashCache (generateApiKey / revokeApiKey / renameApiKey in vault.mjs) —
+  cache-invalidation and eventing stay symmetric by construction.
+- `op` emits at every op_relay write that flips grant_status
+  (deposit→approved, reject; enumerate ALL `.from('op_relay')` writes and
+  classify — register INSERTs are NOT evented, the daemon that registered is
+  the one polling).
+
+**Core:**
+- Dispatcher routes `agent_hashes` → a daemon-global Notify; `op` → a
+  registry `Map<op_id, Notify>` that relay clients register into (unknown
+  op_id = ignored, forward-compatible).
+- ★ Resync-on-reconnect: after every apply_hello, fire the agent-hash notify
+  — the dominant loss cause for an event IS a disconnect, and the reconnect
+  it forces becomes the recovery. With Railway's ≤15-min rotation this makes
+  the platform itself a ≤15-min revocation backstop.
+- agent-hash loop cadence is MODE-DEPENDENT: stream healthy → 600s poll
+  (pure belt-and-suspenders under the rotation resync; the number that goes
+  in the security docs is "revocation: instant, worst case 10 min"); stream
+  down / sync_stream=off → today's 30s unchanged (degraded environments keep
+  the poll as their only propagation path). Add-key latency is independent
+  of all this: refresh_agent_keys_on_miss already refetches on first sight
+  of an unknown key.
+- Relay client: the 2s `POLL_INTERVAL` sleep becomes `timeout(interval,
+  notified)` — event-driven when streamed (interval stretches to 15s as a
+  safety net), 2s legacy cadence when the stream is down. Poll count for an
+  approval ceremony drops from ~30/min to ~4/min idle + instant completion.
+
+**★★ Capability gating (post-review):** relaxing a cadence needs PROOF the
+event can reach this daemon, and "stream healthy" is strictly weaker than
+that — `op` events are delivered per-vid (a vault born after daemon start,
+over the 32-vid cap, or hello-rejected never hears them), and a v1-stream
+backend emits neither new kind at all (version skew / rollback). hello now
+carries `caps:["op","agent_hashes"]`; the daemon keeps the hello-confirmed
+vid set + caps in a process-global, cleared on every go_down. Relay uses
+15s only for `op_events_for(vid)`; the agent-hash loop uses 600s only for
+`agent_hash_events_live()`; anything short of proof keeps legacy cadences.
+
+**★★ Storm floors (post-review):** events accelerate polls, they never
+replace pacing — a buggy emitter must be bounded client-side (the 0.9.36
+lesson). Relay: ≥1s between polls regardless of event wakes (and note the
+old MAX_POLLS count became a wall-clock POLL_BUDGET deadline, so the floor
+is what bounds request COUNT now). Agent-hash: ≥2s between fetches,
+mirroring refresh_agent_keys_on_miss's debounce. Plus: the agent-hash
+loop's armed sleep re-sizes on a health flip (stream_health_edge) instead
+of riding a 600s timer across an Up→Down transition; mid-stream hellos
+fire the resync notify exactly like connect hellos.
+
 ## Non-goals (v1)
 
 No WebSocket / Socket.IO / Centrifugo / NATS / Redis. No multi-instance fan-out

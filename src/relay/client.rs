@@ -15,10 +15,19 @@ use crate::state::AppState;
 /// Poll cadence (v1.1, mode-dependent). The wait between polls is
 /// `timeout(interval, op-event notify)`: the SSE `op` event ACCELERATES the
 /// next poll, it never replaces it — the poll response stays the source of
-/// truth for status. Stream healthy → 15s (a safety net behind the event);
-/// stream down / `sync_stream=off` → the legacy 2s cadence.
+/// truth for status. 15s only with PROOF the event can reach us —
+/// `op_events_for(vid)`: this vid is on the live stream AND the backend
+/// declared the `op` cap in hello. Anything short of proof (stream down,
+/// vault born after daemon start, over the vid cap, v1-only backend) keeps
+/// the legacy 2s cadence — an approval must never silently wait out a
+/// relaxed poll for an event that cannot arrive.
 const POLL_STREAMED: Duration = Duration::from_secs(15);
 const POLL_FALLBACK: Duration = Duration::from_secs(2);
+/// ★ Storm floor: an event wake never polls sooner than this after the
+/// previous poll — events accelerate the poll, they don't replace its
+/// pacing (a buggy emitter must cost ≤1 poll/s, not RTT-speed; same rule
+/// as refresh_agent_keys_on_miss's debounce).
+const POLL_FLOOR: Duration = Duration::from_secs(1);
 /// Daemon-side safety cap so a never-approved op's task can't run forever
 /// (the relay also enforces a TTL). Was `MAX_POLLS: u32 = 920` (920 × 2s ≈
 /// 1840s): with the interval now variable a COUNT no longer encodes a time
@@ -27,8 +36,8 @@ const POLL_FALLBACK: Duration = Duration::from_secs(2);
 const POLL_BUDGET: Duration = Duration::from_secs(1840);
 
 /// Interval selection, factored for the unit test.
-fn poll_interval(stream_healthy: bool) -> Duration {
-    if stream_healthy {
+fn poll_interval(op_events_reach_us: bool) -> Duration {
+    if op_events_reach_us {
         POLL_STREAMED
     } else {
         POLL_FALLBACK
@@ -36,12 +45,19 @@ fn poll_interval(stream_healthy: bool) -> Duration {
 }
 
 /// Park until the next poll is due: an `op` stream event for OUR op_id or
-/// the mode-sized interval, whichever first. `notify_one` parks a permit, so
-/// an event that fires while a poll response is in flight completes the next
-/// wait instantly instead of being lost.
-async fn next_poll_due(op_wait: &crate::sync_stream::OpWaitGuard<'_>) {
-    let interval = poll_interval(crate::sync_stream::stream_healthy());
+/// the mode-sized interval, whichever first — then honor the storm floor
+/// relative to the LAST poll. `notify_one` parks a permit, so an event that
+/// fires while a poll response is in flight completes the next wait
+/// instantly instead of being lost.
+async fn next_poll_due(
+    op_wait: &crate::sync_stream::OpWaitGuard<'_>,
+    vault_id: &str,
+    last_poll: tokio::time::Instant,
+) {
+    let interval = poll_interval(crate::sync_stream::op_events_for(vault_id));
     let _ = tokio::time::timeout(interval, op_wait.notified()).await;
+    // Past deadlines return immediately — the floor only bites event storms.
+    tokio::time::sleep_until(last_poll + POLL_FLOOR).await;
 }
 
 /// Fire-and-forget: register `op_id` with the relay and drive it to
@@ -192,11 +208,12 @@ async fn run(
         if now() > expires_at + 5 {
             return Ok(()); // op expired; stop quietly
         }
+        let last_poll = tokio::time::Instant::now();
         let resp = match client.get(&poll_url).bearer_auth(auth_token).send().await {
             Ok(r) => r,
             Err(e) => {
                 tracing::debug!(op = %op_id, "relay poll transient error: {}", e);
-                next_poll_due(&op_wait).await;
+                next_poll_due(&op_wait, vault_id, last_poll).await;
                 continue;
             }
         };
@@ -217,7 +234,7 @@ async fn run(
                 return Ok(());
             }
             202 => {
-                next_poll_due(&op_wait).await;
+                next_poll_due(&op_wait, vault_id, last_poll).await;
             }
             404 => return Ok(()), // unknown/expired on the relay side
             409 => {
@@ -228,7 +245,7 @@ async fn run(
             }
             other => {
                 tracing::debug!(op = %op_id, "relay poll HTTP {}", other);
-                next_poll_due(&op_wait).await;
+                next_poll_due(&op_wait, vault_id, last_poll).await;
             }
         }
     }

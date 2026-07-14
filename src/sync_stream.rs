@@ -295,6 +295,73 @@ pub fn stream_healthy() -> bool {
         .unwrap_or(false)
 }
 
+/// Await the NEXT health flip (either direction); pends forever when no
+/// stream world exists. For consumers whose armed sleeps are mode-sized
+/// (the agent-hash loop): a 600s streamed sleep must not ride across an
+/// Up→Down flip — the 30s Down-mode promise is per-mode, not per-cycle.
+pub async fn stream_health_edge() {
+    let Some(rx) = STREAM_HEALTH.get() else {
+        return std::future::pending::<()>().await;
+    };
+    let mut rx = rx.clone();
+    // A fresh clone can carry an UNSEEN historical version — mark the
+    // current value seen so this awaits the NEXT flip, not an old one
+    // (else the caller's select would fire instantly, forever).
+    let _ = rx.borrow_and_update();
+    if rx.changed().await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
+
+/// What the CURRENT stream actually delivers: the hello-confirmed vid set
+/// plus the backend's declared optional event capabilities (`caps` in
+/// hello). Consumers gate their RELAXED cadences on this, never on bare
+/// health — "stream healthy" is strictly weaker than "the event I'm
+/// waiting for can reach me": a v1-stream backend emits no `op` events at
+/// all (version skew / rollback), and `op` events are delivered per-vid,
+/// so a vault outside the streamed set (born after daemon start, over the
+/// 32-vid cap, hello-rejected) never hears them either. Cleared on every
+/// go_down; kept across a rotation (the gap is one re-dial budget, inside
+/// the poll floors).
+#[derive(Default)]
+struct StreamCaps {
+    vids: std::collections::HashSet<String>,
+    op_events: bool,
+    agent_hash_events: bool,
+}
+
+static STREAM_CAPS: LazyLock<Mutex<StreamCaps>> =
+    LazyLock::new(|| Mutex::new(StreamCaps::default()));
+
+/// Can THIS vault's `op` events actually reach this daemon right now?
+/// Gates the relay poller's relaxed 15s cadence; anything short of proof
+/// keeps the legacy 2s poll.
+pub fn op_events_for(vid: &str) -> bool {
+    let c = STREAM_CAPS.lock().unwrap();
+    c.op_events && c.vids.contains(vid)
+}
+
+/// Does the connected backend emit `agent_hashes` events? Gates the
+/// agent-hash loop's relaxed 600s cadence.
+pub fn agent_hash_events_live() -> bool {
+    STREAM_CAPS.lock().unwrap().agent_hash_events
+}
+
+fn set_stream_caps(vids: std::collections::HashSet<String>, caps: Option<&serde_json::Value>) {
+    let list: Vec<&str> = caps
+        .and_then(|c| c.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+    let mut s = STREAM_CAPS.lock().unwrap();
+    s.op_events = list.contains(&"op");
+    s.agent_hash_events = list.contains(&"agent_hashes");
+    s.vids = vids;
+}
+
+fn clear_stream_caps() {
+    *STREAM_CAPS.lock().unwrap() = StreamCaps::default();
+}
+
 /// The drained portion of a cell — what one watch-task round processes.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Work {
@@ -642,6 +709,7 @@ pub async fn dispatcher(
             .filter_map(|(vid, w)| w.upgrade().map(|c| (vid.clone(), c)))
             .collect();
         if live.is_empty() {
+            clear_stream_caps();
             let _ = health.send(StreamHealth::Down);
             tracing::debug!("sync stream: no vaults left to stream; dispatcher exiting");
             return;
@@ -978,10 +1046,12 @@ where
 fn apply_hello(cells: &HashMap<String, Arc<WakeCell>>, hello: &serde_json::Value) -> usize {
     let vaults = hello.get("vaults").and_then(|v| v.as_object());
     let mut n = 0usize;
+    let mut confirmed = std::collections::HashSet::new();
     for (vid, cell) in cells {
         match vaults.and_then(|m| m.get(vid)) {
             Some(row) => {
                 n += 1;
+                confirmed.insert(vid.clone());
                 let (version, status) = parse_vault_hint(row);
                 cell.merge_vault(version, status);
                 cell.set_items();
@@ -991,6 +1061,10 @@ fn apply_hello(cells: &HashMap<String, Arc<WakeCell>>, hello: &serde_json::Value
             None => cell.set_mode(Mode::Fallback),
         }
     }
+    // Publish what this stream can actually deliver (confirmed vids + the
+    // backend's declared caps) BEFORE health flips Up — a consumer woken by
+    // the Up edge must never read stale reach.
+    set_stream_caps(confirmed, hello.get("caps"));
     n
 }
 
@@ -1015,8 +1089,11 @@ fn dispatch_record(cells: &HashMap<String, Arc<WakeCell>>, rec: &SseRecord) {
     };
     if rec.event == "hello" {
         // Not expected mid-stream, but folding it like a fresh snapshot is
-        // strictly harmless (merges are monotone).
+        // strictly harmless (merges are monotone) — and it counts as a
+        // resync point, so fire the agent-hash notify exactly like the
+        // connect-time hello does (design: after EVERY apply_hello).
         apply_hello(cells, &data);
+        notify_agent_hashes();
         return;
     }
     if rec.event == "op" {
@@ -1076,6 +1153,9 @@ fn go_down<'a>(
     health: &watch::Sender<StreamHealth>,
     cells: impl Iterator<Item = &'a Arc<WakeCell>>,
 ) -> bool {
+    // Reach first: consumers must stop trusting the stream's event delivery
+    // before (or at worst, at the same wake as) they see the health edge.
+    clear_stream_caps();
     for c in cells {
         c.set_mode(Mode::Fallback);
     }
@@ -1121,6 +1201,27 @@ fn vid_shape_ok(v: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // NOTE: this is the ONLY test that touches the process-global
+    // STREAM_CAPS (parallel test threads would race a second one).
+    #[test]
+    fn stream_caps_gate_relaxed_cadences() {
+        clear_stream_caps();
+        assert!(!op_events_for("aaaa"));
+        assert!(!agent_hash_events_live());
+        let vids: std::collections::HashSet<String> = ["aaaa".to_string()].into_iter().collect();
+        set_stream_caps(vids, Some(&serde_json::json!(["op", "agent_hashes"])));
+        assert!(op_events_for("aaaa"));
+        assert!(!op_events_for("bbbb")); // vid not on the stream → no proof
+        assert!(agent_hash_events_live());
+        // v1 backend: hello carries no caps → confirmed vids alone must NOT
+        // relax any cadence (the version-skew case this mechanism exists for).
+        let vids: std::collections::HashSet<String> = ["aaaa".to_string()].into_iter().collect();
+        set_stream_caps(vids, None);
+        assert!(!op_events_for("aaaa"));
+        assert!(!agent_hash_events_live());
+        clear_stream_caps();
+    }
 
     // ── SSE parser ──
 
