@@ -1408,15 +1408,25 @@ pub async fn approve_op(
                             ));
                         }
                         // `--use-existing` keys (referenced but not deposited)
-                        // must already be in the vault.
+                        // must already be in the vault. The vault is ONE flat
+                        // namespace across every store — a key hosted in an
+                        // external store (GCP etc.) binds exactly like a
+                        // native one, so walk the full store_order, not just
+                        // native-secrets. The external probe is a network
+                        // call, but this is a ceremony (approve) path; a
+                        // store outage surfaces as the approve failing
+                        // loudly, never as a silent "no such secret".
                         for key in &referenced {
                             let deposited = values
                                 .as_ref()
                                 .map(|v| v.contains_key(key))
                                 .unwrap_or(false);
-                            if !deposited && !view.native_secrets.contains_key(key) {
+                            if deposited || view.native_secrets.contains_key(key) {
+                                continue;
+                            }
+                            if view.resolve_value_async(key).await?.is_none() {
                                 return Err(AppError::BadRequest(format!(
-                                    "no such secret '{}' in the vault",
+                                    "no such secret '{}' in the vault (checked native + external stores)",
                                     key
                                 )));
                             }
