@@ -23,7 +23,17 @@ use std::time::Duration;
 use crate::cli::active;
 use crate::state::AppState;
 use crate::storage::sealed_vault::{self, SealedVault};
-use crate::sync_stream::{Mode, StreamHealth, VaultStatus, WakeCell};
+use crate::sync_stream::{Mode, StreamHealth, VaultStatus, WakeCell, Work};
+
+/// How long an auth-rejected (401/403) sync path parks before retrying. The
+/// pre-parking behavior — `return`, killing sync for the daemon's lifetime —
+/// meant ONE transient 403 (a backend deploy / auth-table migration) silently
+/// ended a device's sync forever. A genuinely revoked device now burns one
+/// cheap request per interval instead; real deletion still arrives as the
+/// blob channel's tombstone. Module-scope and shared with the SSE
+/// dispatcher's PARK_AUTH so the two shapes recover from an auth blip at the
+/// same speed BY CONSTRUCTION — tune it once, both move.
+pub(crate) const AUTH_RETRY: Duration = Duration::from_secs(600);
 
 /// Outcome of a single blob `pull`. The cloud envelope's clear-text `status`
 /// field (`"live"` | `"deleted"`) is the lifecycle channel; this enum is its
@@ -1069,13 +1079,6 @@ pub async fn watch_loop(
     /// while a fresh one works — seen live 2026-07-13: a laptop watcher went
     /// silent for >1h while a fresh `sc sync` client adopted rows instantly.
     const REBUILD_AFTER_ERRS: u32 = 3;
-    /// How long an auth-rejected (401/403) watcher parks before retrying. The
-    /// old behavior — `return`, killing sync for the daemon's lifetime — meant
-    /// ONE transient 403 (a backend deploy / auth-table migration) silently
-    /// ended a device's sync forever. A genuinely revoked device now burns one
-    /// cheap request per interval instead; real deletion still arrives as the
-    /// blob channel's tombstone.
-    const AUTH_RETRY: Duration = Duration::from_secs(600);
     /// Wall-vs-monotonic divergence that reads as "the system slept mid-round".
     /// macOS/Linux monotonic clocks exclude suspend, so a lid-close shows up as
     /// wall time far ahead of monotonic time for the same round.
@@ -1142,6 +1145,11 @@ pub async fn watch_loop(
             let work = cell.take_work();
             let mut clean = true;
             let mut auth_park = false;
+            // Whether the vault-event branch already ran the serial pull
+            // block (it runs unconditionally inside handle_blob_wake_body) —
+            // a write that emitted BOTH a vault and an items hint must not
+            // pay for the pulls twice in the same wake.
+            let mut pulled = false;
 
             // Pending vault slot. In Sse mode the vault EVENT is the
             // lifecycle authority (design doc) — the same trust as the blob
@@ -1160,6 +1168,8 @@ pub async fn watch_loop(
                 // parks — the loop-top discipline the long-poll shape gets
                 // for free.
                 if version > read_local_version(&state_dir, &vault) {
+                    // MIRROR: the sse-reconcile branch below folds the same
+                    // probe outcomes — keep the arms in step.
                     match probe_blob_and_handle(
                         &state,
                         &state_dir,
@@ -1175,7 +1185,20 @@ pub async fn watch_loop(
                         Ok(BlobWake::Handled {
                             persist_failed,
                             pulls_ok,
-                        }) => clean = clean && !persist_failed && pulls_ok,
+                        }) => {
+                            pulled = true;
+                            if !persist_failed && pulls_ok {
+                                // A clean Handled round ≡ a reconcile (blob
+                                // `?since` probe + the full pull block — the
+                                // exact requests the 300s floor issues), so
+                                // stamp the clock like the fallback blob arm
+                                // does; under steady vault events the floor
+                                // would otherwise re-run an identical round
+                                // every 300s for nothing.
+                                last_reconcile = std::time::Instant::now();
+                            }
+                            clean = clean && !persist_failed && pulls_ok;
+                        }
                         Err(ProbeError::Auth) => auth_park = true,
                         Err(ProbeError::Other(e)) => {
                             tracing::debug!(vault = %vault, "cloud sync watch: sse blob probe failed: {}", e);
@@ -1186,12 +1209,13 @@ pub async fn watch_loop(
             }
 
             // items/keys flags → the shared serial pull block (pull_keys
-            // runs first inside it, as today).
-            if !auth_park
-                && (work.items || work.keys)
-                && !pull_and_process(&state, &state_dir, &cloud, &vault, &dk, "sse-wake").await
-            {
-                clean = false;
+            // runs first inside it, as today) — skipped when the vault
+            // branch just ran it (`pulled`); the flags' work rode along.
+            if !auth_park && !pulled && (work.items || work.keys) {
+                pulled = true;
+                if !pull_and_process(&state, &state_dir, &cloud, &vault, &dk, "sse-wake").await {
+                    clean = false;
+                }
             }
 
             // ★ The reconcile floor fires on schedule even under steady
@@ -1209,20 +1233,25 @@ pub async fn watch_loop(
                 )
                 .await
                 {
+                    // MIRROR: keep these arms in step with the sse-vault
+                    // branch above — same probe, same outcome policy; only
+                    // the Unchanged handling differs by design.
                     Ok(BlobWake::Stopped) => return,
                     Ok(BlobWake::Unchanged) => {
                         // Blob row is current; the reconcile still owns
                         // items/keys staleness — run the pull block
-                        // (cursor-gated, mostly `{unchanged}`-cheap).
-                        ok = pull_and_process(
-                            &state,
-                            &state_dir,
-                            &cloud,
-                            &vault,
-                            &dk,
-                            "sse-reconcile",
-                        )
-                        .await;
+                        // (cursor-gated, mostly `{unchanged}`-cheap), unless
+                        // this very round already ran it cleanly.
+                        ok = (pulled && clean)
+                            || pull_and_process(
+                                &state,
+                                &state_dir,
+                                &cloud,
+                                &vault,
+                                &dk,
+                                "sse-reconcile",
+                            )
+                            .await;
                     }
                     Ok(BlobWake::Handled {
                         persist_failed,
@@ -1269,7 +1298,16 @@ pub async fn watch_loop(
                 // here. Re-inject the taken work (the cell's monotone merge
                 // keeps any racing fresher event on top) and eat the existing
                 // 2s→60s backoff instead of waiting out the reconcile floor.
-                cell.reinject(work);
+                // The pull FLAGS are forced on: the blob probe may already
+                // have advanced the cursor before a sub-pull failed, which
+                // would version-gate a bare vault slot into a no-op retry —
+                // the retry's job is precisely to re-run the pull block, and
+                // a spurious re-pull is one cheap cursor-gated {unchanged}.
+                cell.reinject(Work {
+                    vault: work.vault,
+                    items: true,
+                    keys: true,
+                });
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(Duration::from_secs(60));
             }

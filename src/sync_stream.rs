@@ -35,8 +35,15 @@ const CONNECT_HEADERS_BUDGET: Duration = Duration::from_secs(10);
 /// behind them; anything slower is a middlebox sitting on the stream).
 const HELLO_BUDGET: Duration = Duration::from_secs(5);
 /// ★★ A rotation re-dial gets ONE attempt with this TOTAL budget (dial +
-/// hello) before health flips Down (design doc: rotation-not-failure).
-const ROTATION_REDIAL_BUDGET: Duration = Duration::from_secs(5);
+/// hello) before health flips Down (design doc: rotation-not-failure). Sized
+/// to the full first-connect budget (10s headers + 5s hello): on a slow
+/// corporate-proxy link where the TLS dial alone takes >5s, a tighter budget
+/// would fail EVERY ~15-min rotation and churn all vault tasks through the
+/// fallback shape — the exact churn the rotation rule exists to avoid. The
+/// cost of the wider window is nil: vault tasks are parked on their cells
+/// either way, and any write landing in the gap is covered by the next
+/// hello's reconcile.
+const ROTATION_REDIAL_BUDGET: Duration = Duration::from_secs(15);
 /// No-bytes liveness: heartbeats arrive every 20s, so 45s of silence (two
 /// missed heartbeats + slack) means the stream is dead even if the socket
 /// hasn't noticed (laptop suspend, NAT table drop).
@@ -50,10 +57,11 @@ const BACKOFF_MIN: Duration = Duration::from_secs(2);
 const BACKOFF_MAX: Duration = Duration::from_secs(60);
 /// 404 = backend without the route (version skew; the backend ships first).
 const PARK_OLD_BACKEND: Duration = Duration::from_secs(600);
-/// 401/403 — mirrors the long-poll watcher's AUTH_RETRY parking: park, never
-/// die; a transient auth blip (deploy, migration) must not end SSE for the
-/// daemon's lifetime.
-const PARK_AUTH: Duration = Duration::from_secs(600);
+/// 401/403 — THE long-poll watcher's AUTH_RETRY, shared by construction so
+/// the two shapes can never recover from an auth blip at different speeds:
+/// park, never die; a transient blip (deploy, migration) must not end SSE
+/// for the daemon's lifetime.
+const PARK_AUTH: Duration = crate::sync::AUTH_RETRY;
 /// 429 — the backend's per-account/global stream cap.
 const PARK_CAP: Duration = Duration::from_secs(300);
 /// ★★ Never-healthy escalation: after this many consecutive attempts none of
@@ -86,7 +94,26 @@ pub fn sync_stream_enabled() -> bool {
                 .and_then(|c| c.sync_stream)
                 .map(|s| s.trim().to_ascii_lowercase())
         });
-    v.as_deref() != Some("off")
+    match v.as_deref() {
+        None | Some("auto" | "on") => true,
+        // A rollback lever that only accepts one spelling silently fails the
+        // operator who reaches for "false"/"0" mid-incident — take the usual
+        // synonyms.
+        Some("off" | "0" | "false" | "no" | "disabled") => false,
+        Some(other) => {
+            // Unrecognized value: stay in the default (auto/on), but say so
+            // ONCE — a misspelled kill switch must fail loudly, not silently.
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            let other = other.to_string();
+            WARNED.call_once(|| {
+                tracing::warn!(
+                    value = %other,
+                    "sync_stream: unrecognized value (expected auto|off); treating as auto"
+                );
+            });
+            true
+        }
+    }
 }
 
 // ── Per-vault merged pending-wake cell ───────────────────────────────────────
@@ -336,8 +363,15 @@ impl SseParser {
             self.consume_line(&line, &mut out);
         }
         self.buf.drain(..pos);
-        if self.buf.len() > PARSER_BUF_CAP {
-            // Pathological line with no terminator — drop it (see cap note).
+        // The cap must count the HALF-BUILT RECORD too, not just unparsed
+        // bytes: endless well-terminated `data:` lines with no blank-line
+        // record boundary drain `buf` on every push while `data` grows
+        // without bound (a garbling middlebox or a peer bug — the daemon
+        // must not OOM on either).
+        let pending = self.buf.len() + self.data.as_ref().map_or(0, |d| d.len());
+        if pending > PARSER_BUF_CAP {
+            // Pathological input — drop it (see cap note); the parser
+            // resyncs at the next record boundary.
             self.buf.clear();
             self.event = None;
             self.data = None;
@@ -517,6 +551,12 @@ pub async fn dispatcher(
                         why = %why,
                         "sync stream: rotation — re-dialing immediately"
                     );
+                    // Sub-second jittered spread, not a backoff: a deploy
+                    // drain closes the WHOLE fleet's streams in the same
+                    // instant, and every healthy daemon classifies that as
+                    // rotation — without jitter they re-dial in lockstep
+                    // against the instance that is mid-drain or just booting.
+                    tokio::time::sleep(jittered(Duration::from_millis(750))).await;
                     continue;
                 }
                 // Died young (post-hello, < PROVEN_HEALTHY): something on the
@@ -526,7 +566,11 @@ pub async fn dispatcher(
                 rotating = false;
                 let flipped = go_down(&health, stream_cells.values());
                 let delay = park_or_backoff(&mut backoff, never_healthy);
-                if flipped {
+                // First death of the streak only: every died-young attempt
+                // reached hello and flipped health Up, so `flipped` is true
+                // EVERY cycle here — gating the warn on it alone would spam
+                // one warn per attempt against a stream-killing middlebox.
+                if flipped && never_healthy == 1 {
                     tracing::warn!(
                         healthy_secs = healthy_for.as_secs(),
                         why = %why,
@@ -776,12 +820,7 @@ fn apply_hello(cells: &HashMap<String, Arc<WakeCell>>, hello: &serde_json::Value
         match vaults.and_then(|m| m.get(vid)) {
             Some(row) => {
                 n += 1;
-                let version = row.get("version").and_then(|v| v.as_u64()).unwrap_or(0);
-                let status = if row.get("status").and_then(|s| s.as_str()) == Some("deleted") {
-                    VaultStatus::Deleted
-                } else {
-                    VaultStatus::Live
-                };
+                let (version, status) = parse_vault_hint(row);
                 cell.merge_vault(version, status);
                 cell.set_items();
                 cell.set_keys();
@@ -817,18 +856,29 @@ fn dispatch_record(cells: &HashMap<String, Arc<WakeCell>>, rec: &SseRecord) {
     };
     match rec.event.as_str() {
         "vault" => {
-            let version = data.get("version").and_then(|v| v.as_u64()).unwrap_or(0);
-            let status = if data.get("status").and_then(|s| s.as_str()) == Some("deleted") {
-                VaultStatus::Deleted
-            } else {
-                VaultStatus::Live
-            };
+            let (version, status) = parse_vault_hint(&data);
             cell.merge_vault(version, status);
         }
         "items" => cell.set_items(),
         "keys" => cell.set_keys(),
         _ => {}
     }
+}
+
+/// The ONE decode of a wire vault row/event `{version, status}` — hello rows
+/// and live `vault` events are the same wire object and MUST classify
+/// identically (a decode edited in one place only would make hello and events
+/// disagree on a vault's lifecycle, and the monotone merge would quietly mask
+/// the divergence). Absent/odd version → 0 (merges as no-op); anything but an
+/// explicit "deleted" is Live — only an explicit tombstone ever destroys.
+fn parse_vault_hint(v: &serde_json::Value) -> (u64, VaultStatus) {
+    let version = v.get("version").and_then(|x| x.as_u64()).unwrap_or(0);
+    let status = if v.get("status").and_then(|x| x.as_str()) == Some("deleted") {
+        VaultStatus::Deleted
+    } else {
+        VaultStatus::Live
+    };
+    (version, status)
 }
 
 /// Demote every given cell to Fallback FIRST, then flip health — a task woken
@@ -886,6 +936,28 @@ mod tests {
     use super::*;
 
     // ── SSE parser ──
+
+    #[test]
+    fn parser_caps_unbounded_data_accumulation() {
+        // Endless well-terminated `data:` lines with no blank-line record
+        // boundary drain `buf` every push — the cap must count the half-built
+        // record's `data` too, or a garbling middlebox OOMs the daemon.
+        let mut p = SseParser::new();
+        let line = format!("data: {}\n", "x".repeat(1024));
+        for _ in 0..(PARSER_BUF_CAP / 1024 + 8) {
+            assert!(p.push(line.as_bytes()).is_empty());
+            // THE property: retained memory stays bounded near the cap at
+            // every point, no matter how long the hostile stream runs.
+            let held = p.buf.len() + p.data.as_ref().map_or(0, |d| d.len());
+            assert!(held <= PARSER_BUF_CAP + 2 * 1024, "held {} bytes", held);
+        }
+        // Resync: a record after the next boundary still parses; any residue
+        // accumulated since the cap-drop dispatches first, far below the cap.
+        let recs = p.push(b"\nevent: items\ndata: {\"vid\":\"a\"}\n\n");
+        let last = recs.last().expect("fresh record parses after resync");
+        assert_eq!(last.event, "items");
+        assert!(recs.iter().all(|r| r.data.len() < PARSER_BUF_CAP / 2));
+    }
 
     #[test]
     fn parser_multiple_records_and_comments_one_chunk() {
