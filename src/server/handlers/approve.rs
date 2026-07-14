@@ -128,10 +128,19 @@ pub fn op_poll_value(state: &AppState, op_id: &str) -> Result<Value> {
         ApprovalStatus::Rejected { .. } => ("rejected", None),
         ApprovalStatus::Consumed => unreachable!("handled above"),
     };
+    // A rejected op's reason distinguishes a USER rejection from a mechanical
+    // withdrawal ("superseded by a newer request") — the waiter renders them
+    // differently, so a superseded `sc up`/`sc lock` never reads as "the user
+    // said no" (it confused exactly that way before this field existed).
+    let reason = match &rec.status {
+        ApprovalStatus::Rejected { reason } if !reason.is_empty() => Some(reason.clone()),
+        _ => None,
+    };
     Ok(json!({
         "op_id": rec.id,
         "r": rec.r,
         "status": status,
+        "reason": reason,
         "act": act_kind,
         "path": path,
         "display": display,

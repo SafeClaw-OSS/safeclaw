@@ -58,7 +58,15 @@ SafeClaw because it is the hop that observed them.
 | `upstream_error` | 502 | retry | upstream | upstream answered but the exchange failed (NOT a credential problem) |
 
 CLI exit codes: 0 ok, 1 error, 2 usage; `sc op wait`: 0 approved, 3 timeout,
-4 op error, 5 rejected. `sc doctor` exits non-zero if any check fails.
+4 op error, 5 rejected, 6 superseded. `sc doctor` exits non-zero if any check
+fails.
+
+Op terminal states: the poll body's `status` stays `pending | ok | consumed |
+rejected`; a rejected op carries `reason`, and waiters distinguish a USER
+rejection from a mechanical withdrawal ("superseded by a newer request") —
+a superseded ceremony says so and asks for a re-run, never "rejected".
+First-class wire statuses (`cancelled` / `superseded` / `expired`) need the
+console's chips to change in the same release — parked as follow-up.
 
 ## Blind spots (the broker cannot yell here)
 

@@ -186,7 +186,20 @@ async fn remote_approve(custodian: &str, op_id: &str, label: &str) -> Result<Val
                 eprintln!("  approved ✓");
                 return Ok(body);
             }
-            "rejected" => return Err("approval was rejected".into()),
+            "rejected" => {
+                let reason = body.get("reason").and_then(|v| v.as_str()).unwrap_or("");
+                if reason.contains("superseded") {
+                    return Err(
+                        "approval superseded by a newer request (not a user rejection) — \
+                         re-run the command"
+                            .into(),
+                    );
+                }
+                if !reason.is_empty() {
+                    return Err(format!("approval was rejected: {}", reason).into());
+                }
+                return Err("approval was rejected".into());
+            }
             _ => {} // pending — keep polling
         }
     }

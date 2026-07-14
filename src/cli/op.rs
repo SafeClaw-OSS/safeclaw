@@ -126,6 +126,15 @@ pub async fn run_wait(args: OpWaitArgs) -> Result<(), String> {
                             }
                             Verdict::Rejected => {
                                 println!("{}", body);
+                                let reason =
+                                    body.get("reason").and_then(|s| s.as_str()).unwrap_or("");
+                                if reason.contains("superseded") {
+                                    eprintln!(
+                                        "superseded by a newer approval request — \
+                                         re-run the original command"
+                                    );
+                                    std::process::exit(6);
+                                }
                                 eprintln!("rejected ✗ — do not retry");
                                 std::process::exit(5);
                             }
