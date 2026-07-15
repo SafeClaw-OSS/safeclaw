@@ -1049,6 +1049,15 @@ impl AppState {
         host: &str,
         body: Option<&str>,
         vars: &crate::core::policy::VarMap,
+        // True when the service declares a `[requests]` scope SHAPE for this
+        // path (i.e. the proxy resolved a `RequestScope`), regardless of whether
+        // this particular request populated any values. A scoped path binds its
+        // approval per-value through `op_grants`, so it must NEVER ride the
+        // coarse connection-window downgrade below — otherwise a value-less
+        // (empty-body) ask, approved once, would write a scope-blind window key
+        // that a later, differently-valued request could ride without a fresh
+        // passkey (approving a blank purchase then spending any amount).
+        has_scope_shape: bool,
     ) -> Option<(
         crate::core::policy::AccessLevel,
         Option<String>,
@@ -1111,7 +1120,13 @@ impl AppState {
         // Passive cleanup: if expired, drop the entry instead of returning a
         // hit. `ask-always` and `deny` never consult or write the cache;
         // `allow` doesn't need to.
-        if level == crate::core::policy::AccessLevel::Ask {
+        //
+        // Scoped paths are excluded: a `[requests]`-shaped path binds its
+        // approval to the exact field VALUES via `op_grants` (a $40-to-Acme
+        // grant never redeems a $75-to-EvilCorp request), so it must not also
+        // have a coarse, value-blind connection window that a differently-valued
+        // request could ride. Only a genuinely scope-less rule uses this window.
+        if level == crate::core::policy::AccessLevel::Ask && !has_scope_shape {
             if let Some(rule_id) = matched_rule.clone() {
                 // The grant is scoped to the **connection** (not the service),
                 // the matched rule, the method, AND the resolved host: an
@@ -1707,6 +1722,7 @@ mod tests {
                 "api.gh.com",
                 None,
                 &crate::core::policy::VarMap::new(),
+                false, // unscoped rule: coarse connection-window applies
             )
             .unwrap();
         assert_eq!(lvl, AccessLevel::Ask);
@@ -1726,6 +1742,7 @@ mod tests {
                 "api.gh.com",
                 None,
                 &crate::core::policy::VarMap::new(),
+                false, // unscoped rule: coarse connection-window applies
             )
             .unwrap();
         assert_eq!(lvl, AccessLevel::Allow, "approved GET should fast-path");
@@ -1742,6 +1759,7 @@ mod tests {
                 "evil.gh.com",
                 None,
                 &crate::core::policy::VarMap::new(),
+                false, // unscoped rule: coarse connection-window applies
             )
             .unwrap();
         assert_eq!(
@@ -1761,6 +1779,7 @@ mod tests {
                 "api.gh.com",
                 None,
                 &crate::core::policy::VarMap::new(),
+                false, // unscoped rule: coarse connection-window applies
             )
             .unwrap();
         assert_eq!(
@@ -1773,5 +1792,86 @@ mod tests {
         // A tag-default Ask (no rule) is never recorded, so it can never
         // produce a fast-path — record is a no-op for rule_id == None.
         state.record_ask_approval(vid, "gh", None, "GET", "api.gh.com", 60);
+    }
+
+    // A path that declares a `[requests]` scope shape must bind its approval
+    // per-value (op_grants) and NEVER ride the coarse connection-window
+    // downgrade — otherwise approving one value-less (empty-body) ask would let
+    // any later value ride it (approve a blank purchase, then spend anything).
+    #[test]
+    fn scoped_path_never_rides_the_coarse_window() {
+        use crate::core::policy::{AccessLevel, ConnectionPolicy, Policy, RuleConfig};
+
+        let mut rules = std::collections::HashMap::new();
+        rules.insert(
+            "purchase".to_string(),
+            RuleConfig {
+                match_pattern: Some("POST /buy".to_string()),
+                level: Some(AccessLevel::Ask),
+                ttl: Some(60),
+                ..Default::default()
+            },
+        );
+        let mut policy = Policy::default();
+        policy.connections.insert(
+            "shop".to_string(),
+            ConnectionPolicy {
+                default: None,
+                rules,
+            },
+        );
+        let state = test_state();
+        let vid = "v-scoped";
+        let mut cache = SecretsCache::default();
+        cache.policy = policy;
+        state.unlock_vault(vid.to_string(), cache, zeroize::Zeroizing::new(Vec::new()));
+
+        // A value-less ask on this rule/conn/method/host got approved, seeding
+        // the coarse connection-window key (exactly the empty-body path).
+        state.record_ask_approval(
+            vid,
+            "shop",
+            Some("purchase".to_string()),
+            "POST",
+            "api.shop.com",
+            60,
+        );
+
+        // A scope-less caller still fast-paths — the legitimate coarse window.
+        let (lvl, _, _) = state
+            .evaluate_request_policy(
+                vid,
+                "shop",
+                "shop",
+                "POST",
+                "/buy",
+                "api.shop.com",
+                None,
+                &crate::core::policy::VarMap::new(),
+                false,
+            )
+            .unwrap();
+        assert_eq!(lvl, AccessLevel::Allow, "an unscoped rule still uses the window");
+
+        // A SCOPED path must NOT ride that value-blind window — it re-asks so its
+        // per-value op_grant binds the amount/merchant.
+        let (lvl, _, _) = state
+            .evaluate_request_policy(
+                vid,
+                "shop",
+                "shop",
+                "POST",
+                "/buy",
+                "api.shop.com",
+                None,
+                &crate::core::policy::VarMap::new(),
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            lvl,
+            AccessLevel::Ask,
+            "a scoped path must never fast-path via the coarse window"
+        );
     }
 }

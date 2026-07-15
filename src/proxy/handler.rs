@@ -457,6 +457,10 @@ impl BrokerHandler {
             &dest_host,
             body_for_policy,
             &vars,
+            // A declared `[requests]` shape (even with no resolved values) makes
+            // this a scoped path: bind per-value via op_grants, never the coarse
+            // connection-window downgrade.
+            req_scope.is_some(),
         );
         let (level, rule_id, ttl) = match decision {
             Some(d) => d,
@@ -825,6 +829,11 @@ impl BrokerHandler {
         // the grant-identity digest. Values are STRINGS — the canonical (JCS)
         // encoder rejects floats, and it keeps approve/redeem digests byte-equal.
         if let Some(rs) = req_scope {
+            // Mark this a scoped path (a `[requests]` shape matched), so approve
+            // never records a value-blind coarse-window key for it — even when
+            // NO field values resolved (an empty-body ask). Without this, one
+            // approved blank ask would open a window any later value could ride.
+            scope["scoped"] = serde_json::Value::Bool(true);
             if !rs.bound.is_empty() {
                 let obj: serde_json::Map<String, serde_json::Value> = rs
                     .bound

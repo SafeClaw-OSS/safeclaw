@@ -1738,17 +1738,21 @@ pub async fn approve_op(
     // A SCOPED ask does NOT use this conn-keyed downgrade window — it was bound
     // into `op_grants` above (redeemed by peek), so writing a rule_approvals
     // entry here would let `evaluate` downgrade it to Allow and fast-path a
-    // DIFFERENT bound value on the connection. Only an UNSCOPED ask (Phase-1)
-    // takes the window.
-    let has_scope_binding = validated
+    // DIFFERENT bound value on the connection. Only a genuinely UNSCOPED ask
+    // (no `[requests]` shape on the path) takes the window. We key off the
+    // proxy-stamped `scoped` marker, NOT the presence of resolved values — an
+    // empty-body ask on a scoped path is still scoped and must not open a
+    // value-blind window (the "approve a blank purchase, then spend anything"
+    // bypass).
+    let is_scoped_path = validated
         .op
         .act
         .scope
-        .get("scope_vars")
-        .and_then(|v| v.as_object())
-        .is_some_and(|m| !m.is_empty());
+        .get("scoped")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     if let Some(pc) = policy_ctx_for_cache {
-        if pc.level == crate::core::policy::AccessLevel::Ask && !has_scope_binding {
+        if pc.level == crate::core::policy::AccessLevel::Ask && !is_scoped_path {
             // The grant is scoped to the **connection** (CONNECTION_SCHEMA.md §6):
             // approving account A's request never fast-paths account B. Falls back
             // to `service` for the default connection (conn == service).
