@@ -5,7 +5,6 @@
 //! client side. Same binary, different mode.
 
 pub mod active;
-pub mod admin;
 pub mod agent;
 pub mod apierr;
 pub mod approve;

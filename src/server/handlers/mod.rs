@@ -1,5 +1,3 @@
-pub mod admin;
-pub mod approvals;
 pub mod approve;
 pub mod events;
 pub mod health;

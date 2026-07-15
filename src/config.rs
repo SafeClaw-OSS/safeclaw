@@ -125,10 +125,6 @@ pub enum Command {
     /// shortcuts). Symmetric with `sc agent *` — both are account-level,
     /// device-key/pair-token authed, cloud-backed.
     Device(DeviceArgs),
-    /// Operator-only commands. Each subcommand requires `$SAFECLAW_ADMIN_KEY`
-    /// to be set on the CLI side AND match the daemon's `SAFECLAW_ADMIN_KEY`
-    /// env. In SaaS deployments only the SafeClaw team holds this key.
-    Admin(AdminArgs),
     /// Print `export` lines for the HUMAN's shell (`eval "$(sc env)"`):
     /// SAFECLAW_BROKER_URL + SAFECLAW_VAULT_ID projected from this device's
     /// config — never a key. An AGENT's complete env (incl. its key) is minted
@@ -561,41 +557,6 @@ pub struct PasskeyRenameArgs {
     pub vault: Option<String>,
 }
 
-#[derive(Debug, Args)]
-pub struct AdminArgs {
-    #[command(subcommand)]
-    pub sub: AdminSubcommand,
-}
-
-#[derive(Debug, Subcommand)]
-pub enum AdminSubcommand {
-    /// Tail the daemon's audit log for a specific vault. Calls
-    /// `GET /v/{vid}/approvals` with operator credentials.
-    Audit(AdminAuditArgs),
-}
-
-#[derive(Debug, Args)]
-pub struct AdminAuditArgs {
-    #[command(subcommand)]
-    pub sub: AdminAuditSubcommand,
-}
-
-#[derive(Debug, Subcommand)]
-pub enum AdminAuditSubcommand {
-    /// List approvals (op-history) for a vault. Default: last 50 rows.
-    Ls(AdminAuditLsArgs),
-}
-
-#[derive(Debug, Args)]
-pub struct AdminAuditLsArgs {
-    /// Vault id to inspect. Defaults to the active vault from config.
-    #[arg(long)]
-    pub vault: Option<String>,
-    /// Max rows to print. Daemon caps at 200 — bigger values silently
-    /// truncate.
-    #[arg(long, default_value = "50")]
-    pub limit: u32,
-}
 
 #[derive(Debug, Subcommand)]
 pub enum VaultSubcommand {
@@ -770,8 +731,7 @@ pub struct ServeArgs {
     /// The control plane port (`CONTROL_PORT`). The `sc` CLI, op-approval
     /// polling, ceremonies, `/events`, and any reverse proxy talk to the
     /// daemon here; the agent's own traffic uses only the proxy port
-    /// (`$SAFECLAW_BROKER_URL`). (Not "admin port" — the admin surface is
-    /// just the `/admin/*` subset, gated by --admin-key.)
+    /// (`$SAFECLAW_BROKER_URL`).
     #[arg(long, env = "SAFECLAW_PORT", default_value_t = CONTROL_PORT)]
     pub port: u16,
 
@@ -799,11 +759,14 @@ pub struct ServeArgs {
     #[arg(long, env = "SAFECLAW_RP_ID")]
     pub rp_id: Option<String>,
 
-    /// Shared secret gating the `/admin/*` surface (today: vault
-    /// deletion for SaaS demo-cleanup). When unset, `/admin/*` is
-    /// disabled and returns 403. Set on the daemon AND on any caller
-    /// that needs admin access (the SaaS pro-backend); the values must
-    /// match. Rotate by changing the env var and redeploying.
+    /// Shared secret that authenticates this daemon to the cloud op-relay
+    /// (see `--relay-url`): the daemon presents it as the bearer token when it
+    /// registers a pending op and polls for the browser-deposited grant. When
+    /// unset, the daemon can't reach the relay, so web approval is off (it
+    /// falls back to local-only). Set on the daemon AND matched on the relay.
+    /// Rotate by changing the env var and redeploying. (Named `admin_key` for
+    /// historical reasons — the old `/admin/*` HTTP surface it also gated is
+    /// gone; today it is purely the relay credential.)
     #[arg(long, env = "SAFECLAW_ADMIN_KEY")]
     pub admin_key: Option<String>,
 
