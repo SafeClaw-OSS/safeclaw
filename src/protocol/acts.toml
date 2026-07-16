@@ -16,23 +16,23 @@
 
 [acts.vault-unlock]
 action = "Unlock vault"
-action_zh = "解锁保险库"
+action_zh = "解锁 vault"
 explain = "Brings your vault online so your agent can use its stored credentials this session. No secret leaves SafeClaw."
-explain_zh = "让您的保险库上线，以便您的智能体在本次会话中使用其存储的凭证。没有任何凭证会离开 SafeClaw。"
+explain_zh = "让你的 vault 上线，这个会话里你的 agent 就能用里面存的凭证。任何凭证都不会离开 SafeClaw。"
 tone = "neutral"
 
 [acts.vault-lock]
 action = "Lock vault"
-action_zh = "锁定保险库"
+action_zh = "锁定 vault"
 explain = "Takes your vault offline. Your agent can no longer use stored credentials until you unlock again."
-explain_zh = "让您的保险库下线。在您再次解锁之前，您的智能体将无法使用存储的凭证。"
+explain_zh = "让你的 vault 下线。在你再次解锁之前，你的 agent 无法使用存储的凭证。"
 tone = "neutral"
 
 [acts.vault-delete]
 action = "Delete vault"
-action_zh = "删除保险库"
+action_zh = "删除 vault"
 explain = "Permanently erases this vault and everything in it. This cannot be undone. You would have to set it up again from scratch."
-explain_zh = "永久抹除此保险库及其中的一切内容。此操作无法撤销，之后只能从头重新设置。"
+explain_zh = "永久抹除此 vault 及其中的一切内容。此操作无法撤销，之后只能从头重新设置。"
 tone = "danger"
 
 [acts.rename-passkey]
@@ -49,7 +49,7 @@ facts = [
 action = "Permanently allow {{vars.scope.host}}"
 action_zh = "永久允许 {{vars.scope.host}}"
 explain = "Adds this exact host to the connection's allowed destinations forever. Every future brokered request may send its credential here without asking again. Grant only a host you trust."
-explain_zh = "将此确切主机永久添加到该连接的允许目标。今后每个代理请求都可能不再询问就把凭证发送到这里。仅授权您信任的主机。"
+explain_zh = "将此确切主机永久添加到该连接的允许目标。今后每个代理请求都可能不再询问就把凭证发送到这里。仅授权你信任的主机。"
 tone = "danger"
 facts = [
   { label = "Connection", label_zh = "连接", value = "{{vars.scope.connection_id}}" },
@@ -60,14 +60,14 @@ facts = [
 action = "List custom services"
 action_zh = "列出自定义服务"
 explain = "Reads the names and validity of this vault's custom service definitions. Nothing changes and no secret is revealed."
-explain_zh = "读取此保险库自定义服务定义的名称与有效性。不做任何更改，也不泄露任何密钥。"
+explain_zh = "读取此 vault 的自定义服务定义名称与有效性。不做任何更改，也不泄露任何密钥。"
 tone = "neutral"
 
 [acts.service-add]
 action = "Add a custom service definition"
 action_zh = "添加自定义服务定义"
 explain = "Stores a service definition (hosts, auth shape, request rules) in your vault. It only takes effect for connections you explicitly create with it."
-explain_zh = "将一个服务定义（主机、认证方式、请求规则）存入保险库。仅当您显式用它创建连接时才会生效。"
+explain_zh = "将一个服务定义（主机、认证方式、请求规则）存入 vault。仅当你显式用它创建连接时才会生效。"
 tone = "neutral"
 
 [acts.service-rm]
@@ -81,14 +81,14 @@ tone = "danger"
 action = "Remove secret {{vars.target}}"
 action_zh = "移除密钥 {{vars.target}}"
 explain = "Deletes this secret's value from your vault. Connections referencing it stop working until the key is re-added."
-explain_zh = "从保险库中删除该密钥的值。引用它的连接将无法工作，直到重新添加。"
+explain_zh = "从 vault 中删除该密钥的值。引用它的连接将无法工作，直到重新添加。"
 tone = "danger"
 
 [acts.connection-rm]
 action = "Remove connection {{vars.target}}"
 action_zh = "移除连接 {{vars.target}}"
 explain = "Removes this connection and any secret only it references. Your agent loses access immediately."
-explain_zh = "移除此连接，及仅被它引用的密钥。您的智能体将立即失去访问。"
+explain_zh = "移除此连接，及仅被它引用的密钥。你的 agent 将立即失去访问。"
 tone = "danger"
 facts = [
   { label = "Secrets kept", label_zh = "保留密钥", value = "{{vars.scope.keep_secrets}}" },
@@ -98,7 +98,7 @@ facts = [
 action = "Add connection {{vars.target}}"
 action_zh = "添加连接 {{vars.target}}"
 explain = "Stores the listed secret key(s) in your vault and anchors them to the destination above. The values never left your device; this page only checks their fingerprint."
-explain_zh = "将列出的密钥存入您的保险库，并锚定到上方的目标。密钥值从未离开您的设备，本页面只核对它的指纹。"
+explain_zh = "将列出的密钥存入你的 vault，并锚定到上方的目标。密钥值从未离开你的设备，本页面只核对它的指纹。"
 tone = "neutral"
 facts = [
   { label = "Service", label_zh = "服务", value = "{{vars.scope.service}}" },
@@ -110,7 +110,7 @@ facts = [
 action = "Store secret {{vars.target}}"
 action_zh = "保存密钥 {{vars.target}}"
 explain = "Stores this secret in your vault. If a host is shown above it is anchored there for brokered agent use; with no host, your agent cannot use it. The value never left your device."
-explain_zh = "将该密钥存入您的保险库。上方显示主机时会锚定给智能体经代理使用；未显示主机则智能体无法使用。密钥值从未离开您的设备。"
+explain_zh = "将该密钥存入你的 vault。上方显示主机时会锚定给 agent 经代理使用；未显示主机则 agent 无法使用。密钥值从未离开你的设备。"
 tone = "neutral"
 facts = [
   { label = "Host", label_zh = "主机", value = "{{vars.scope.hosts}}" },
