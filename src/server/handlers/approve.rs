@@ -86,7 +86,7 @@ async fn get_op_json(state: Arc<AppState>, op_id: String) -> Result<axum::respon
 /// sees identical JSON whether it hit the control plane or the proxy port. Pure
 /// read — briefly locks `approvals`, no I/O.
 pub fn op_poll_value(state: &AppState, op_id: &str) -> Result<Value> {
-    let store = state.approvals.lock().unwrap();
+    let mut store = state.approvals.lock().unwrap();
     let rec = store.get(op_id).ok_or(AppError::NotFound)?;
     // Consumed ops: the approve window is closed. Return a minimal tombstone
     // — no op content — to limit the exposure window for the agent request
@@ -107,6 +107,15 @@ pub fn op_poll_value(state: &AppState, op_id: &str) -> Result<Value> {
         _ => None,
     };
     let op_json = serde_json::to_value(&rec.op)?;
+    // Whether this op reveals a raw secret (Export). Its plaintext must be
+    // SINGLE-USE: handed to the one poll that delivers it, then tombstoned —
+    // `sc secret get`'s remote arm reads `value` from exactly this poll, and the
+    // op was minted `multiplicity: one`. Leaving it re-readable let a co-resident
+    // process re-fetch the secret for the op's whole TTL.
+    let is_export = matches!(rec.op.act.kind, ActType::Export);
+    let id = rec.id.clone();
+    let r = rec.r.clone();
+    let expires_at_unix = rec.expires_at_unix;
     let (status, value) = match &rec.status {
         ApprovalStatus::Pending => ("pending", None),
         // "ok" is the skill-documented terminal (done — result in `value`). The
@@ -136,9 +145,16 @@ pub fn op_poll_value(state: &AppState, op_id: &str) -> Result<Value> {
         ApprovalStatus::Rejected { reason } if !reason.is_empty() => Some(reason.clone()),
         _ => None,
     };
+    // Consume an Export's plaintext on delivery (single-use). Only Export —
+    // a Use result is the agent's own upstream reply, which its poll loop may
+    // legitimately re-read; consuming it would break an interrupted retry. The
+    // `rec` borrow ends above (everything below is owned), so the &mut is clean.
+    if is_export && value.is_some() {
+        store.consume(&id);
+    }
     Ok(json!({
-        "op_id": rec.id,
-        "r": rec.r,
+        "op_id": id,
+        "r": r,
         "status": status,
         "reason": reason,
         "act": act_kind,
@@ -146,7 +162,7 @@ pub fn op_poll_value(state: &AppState, op_id: &str) -> Result<Value> {
         "display": display,
         "op": op_json,
         "value": value,
-        "expires_at": rec.expires_at_unix,
+        "expires_at": expires_at_unix,
     }))
 }
 
@@ -720,24 +736,19 @@ pub async fn approve_op(
                 existing_vault.as_ref(),
             )?;
 
-            // Editor reveal-all: target = "env" (legacy alias) or "" surfaces
-            // every native-secrets item as a plaintext UTF-8 string map.
-            // Per-item Export goes through the else branch and looks up a
-            // single item by name (no `env.` prefix in v3).
+            // RETIRED: whole-vault reveal-all (`target = "env"` / "").
+            // An Export must name ONE secret so its plaintext egress stays
+            // scope-constrained (and single-use). The console editor no longer
+            // uses a daemon reveal-all — it derives its `{kv, aux}` view
+            // client-side (`revealAllVault = unlockVault`), and `sc secret get`
+            // always names a specific key. Refuse the unbounded form outright so
+            // no path can dump the whole vault's plaintext through one op.
             if path == "env" || path.is_empty() {
-                let mut all = serde_json::Map::new();
-                for (k, v) in view.native_secrets.iter() {
-                    let s = String::from_utf8(v.clone())
-                        .map_err(|_| AppError::Internal("native-secrets item not utf8".into()))?;
-                    all.insert(k.clone(), serde_json::Value::String(s));
-                }
-                let resp = json!({
-                    "ok": true, "act": "export", "path": path,
-                    "value": serde_json::Value::Object(all),
-                });
-                let cached = Some(resp["value"].to_string());
-                (resp, cached)
-            } else {
+                return Err(AppError::BadRequest(
+                    "reveal-all export is retired — export a specific secret by name".into(),
+                ));
+            }
+            {
                 let raw = view
                     .resolve_value_async(path)
                     .await?
@@ -874,19 +885,23 @@ pub async fn approve_op(
                         &validated.credential_id_bytes,
                         existing_vault.as_ref(),
                     )?;
-                // Editor response: native-secrets items as utf8 strings + the
-                // full v3 aux so the editor can render the stores list and
-                // build a new aux when the user writes.
-                let mut kv = serde_json::Map::new();
-                for (k, v) in view.native_secrets.iter() {
-                    let s = String::from_utf8(v.clone())
-                        .map_err(|_| AppError::Internal("native-secrets item not utf8".into()))?;
-                    kv.insert(k.clone(), Value::String(s));
-                }
-                let aux_json = serde_json::to_value(&view.aux)?;
-                // Bootstrap cache: every allow-policy service's auth value
-                // resolved via the v3 store_order. Native-only at unlock time
-                // — external adapters (gcp/1p/aws) fetch lazily at /use time.
+                // vault-unlock is a pure STATE TRANSITION: it uses the grant's
+                // W_c to open the vault, bootstrap the daemon's in-memory
+                // secrets cache, and flip the vault unlocked. It deliberately
+                // returns NO secret material. The console editor derives its
+                // `{kv, aux}` view entirely client-side (it pulls the sealed
+                // per-item rows and unseals them under its own passkey PRF —
+                // `unlockVault` in the frontend), the CLI reads only the ok
+                // status, and the grant page discards the response body. A
+                // cached plaintext here served no consumer and was readable via
+                // the (capability-gated) op-poll — so a routine unlock left the
+                // whole vault's plaintext retrievable. Plaintext leaves the
+                // daemon ONLY through a scope-constrained, single-use `Export`
+                // op (the passkey-gated `sc secret get` / reveal path), never
+                // here. Bootstrap the cache from `view` (every allow-policy
+                // service's auth value via the v3 store_order; native-only at
+                // unlock — external adapters fetch lazily at /use); never
+                // materialize kv.
                 let cache = bootstrap_cache_from_view(&view, &state);
                 tracing::info!(
                     vault = %vault_id,
@@ -919,13 +934,10 @@ pub async fn approve_op(
                         crate::auth::connect::process_vault_connects(&state, &vid, None).await;
                     });
                 }
-                let value = json!({ "kv": Value::Object(kv), "aux": aux_json });
-                let resp = json!({
-                    "ok": true, "act": "vault-unlock",
-                    "value": value,
-                });
-                let cached = Some(resp["value"].to_string());
-                (resp, cached)
+                let resp = json!({ "ok": true, "act": "vault-unlock" });
+                // No cached value: unlock returns no secret, so nothing is
+                // stashed for the op-poll to hand back.
+                (resp, None)
             }
             // Lifecycle op: drop the cache and flip Locked. No vault read
             // needed — pure state transition. Requires a fresh grant so an
@@ -1726,17 +1738,21 @@ pub async fn approve_op(
     // A SCOPED ask does NOT use this conn-keyed downgrade window — it was bound
     // into `op_grants` above (redeemed by peek), so writing a rule_approvals
     // entry here would let `evaluate` downgrade it to Allow and fast-path a
-    // DIFFERENT bound value on the connection. Only an UNSCOPED ask (Phase-1)
-    // takes the window.
-    let has_scope_binding = validated
+    // DIFFERENT bound value on the connection. Only a genuinely UNSCOPED ask
+    // (no `[requests]` shape on the path) takes the window. We key off the
+    // proxy-stamped `scoped` marker, NOT the presence of resolved values — an
+    // empty-body ask on a scoped path is still scoped and must not open a
+    // value-blind window (the "approve a blank purchase, then spend anything"
+    // bypass).
+    let is_scoped_path = validated
         .op
         .act
         .scope
-        .get("scope_vars")
-        .and_then(|v| v.as_object())
-        .is_some_and(|m| !m.is_empty());
+        .get("scoped")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     if let Some(pc) = policy_ctx_for_cache {
-        if pc.level == crate::core::policy::AccessLevel::Ask && !has_scope_binding {
+        if pc.level == crate::core::policy::AccessLevel::Ask && !is_scoped_path {
             // The grant is scoped to the **connection** (CONNECTION_SCHEMA.md §6):
             // approving account A's request never fast-paths account B. Falls back
             // to `service` for the default connection (conn == service).
@@ -2496,5 +2512,76 @@ mod tests {
         let (store, adapter) = &cache.external_stores["gcpa"];
         assert_eq!(store.kind, "gcp-secret-manager");
         assert_eq!(adapter.kind(), "gcp-secret-manager");
+    }
+
+    fn export_op(target: &str) -> crate::protocol::operation::Operation {
+        use crate::protocol::operation::{Act, ActType, Bind, Operation, Valid};
+        Operation {
+            act: Act {
+                kind: ActType::Export,
+                target: target.into(),
+                scope: serde_json::Value::Null,
+            },
+            bind: Bind {
+                redeemer: "v1".into(),
+                recipient: None,
+            },
+            valid: Valid::single_use(0, None),
+        }
+    }
+
+    // An Export reveals a raw secret; its plaintext must be handed to exactly
+    // ONE poll and then tombstoned, so a co-resident process can't re-fetch it
+    // for the op's remaining TTL.
+    #[test]
+    fn export_plaintext_is_single_use_via_poll() {
+        let state = test_state();
+        let op_id = {
+            let mut s = state.approvals.lock().unwrap();
+            let id = s.create("v1".into(), export_op("GITHUB_TOKEN"), "r".into());
+            s.approve(&id, Some("ghp_SECRET".into()));
+            id
+        };
+
+        let first = op_poll_value(&state, &op_id).unwrap();
+        assert_eq!(first["status"], "ok");
+        assert_eq!(first["value"], "ghp_SECRET");
+
+        // Second read: consumed tombstone, the plaintext is gone.
+        let second = op_poll_value(&state, &op_id).unwrap();
+        assert_eq!(second["status"], "consumed");
+        assert!(second.get("value").and_then(|v| v.as_str()).is_none());
+    }
+
+    // A Use result is the agent's own upstream reply, which its poll loop may
+    // legitimately re-read after an interrupted retry — it must NOT be consumed.
+    #[test]
+    fn use_result_survives_repeat_poll() {
+        use crate::protocol::operation::{Act, ActType, Bind, Operation, Valid};
+        let state = test_state();
+        let op = Operation {
+            act: Act {
+                kind: ActType::Use,
+                target: "github".into(),
+                scope: serde_json::Value::Null,
+            },
+            bind: Bind {
+                redeemer: "v1".into(),
+                recipient: None,
+            },
+            valid: Valid::single_use(0, None),
+        };
+        let op_id = {
+            let mut s = state.approvals.lock().unwrap();
+            let id = s.create("v1".into(), op, "r".into());
+            s.approve(&id, Some("{\"status\":200}".into()));
+            id
+        };
+
+        for _ in 0..2 {
+            let body = op_poll_value(&state, &op_id).unwrap();
+            assert_eq!(body["status"], "ok");
+            assert_eq!(body["value"]["status"], 200);
+        }
     }
 }

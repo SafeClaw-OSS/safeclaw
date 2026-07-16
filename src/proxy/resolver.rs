@@ -74,18 +74,35 @@ pub fn contains_phantom(input: &str) -> bool {
     input.contains("__sc__") && PHANTOM_RE.is_match(input)
 }
 
-/// Every distinct phantom in `input`, in first-seen order.
+/// Upper bound on the number of DISTINCT phantoms collected from a single scan
+/// site. A legitimate request resolves to ONE connection with a handful of role
+/// phantoms (the pipeline rejects multi-connection requests outright), so this
+/// ceiling is orders of magnitude above any real payload. Its job is to bound
+/// the work an untrusted body can trigger: without it a ~32 MB body of millions
+/// of distinct phantoms would allocate a huge `Vec` and (before the HashSet
+/// dedup below) run quadratically. Reaching the cap means the caller is
+/// pathological, not legitimate; we stop scanning and let the pipeline's
+/// single-connection / policy gates reject it.
+pub const MAX_PHANTOMS_PER_SITE: usize = 256;
+
+/// Every distinct phantom in `input`, in first-seen order (capped at
+/// [`MAX_PHANTOMS_PER_SITE`]). De-duplication is O(1) per match via a seen-set,
+/// so a body packed with distinct phantoms can't drive quadratic CPU.
 pub fn collect_phantoms(input: &str) -> Vec<Phantom> {
     let mut out: Vec<Phantom> = Vec::new();
     if !input.contains("__sc__") {
         return out;
     }
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for m in PHANTOM_RE.find_iter(input) {
         // parse_phantom is the validator — the regex over-matches `___`, which
         // parse rejects, so a malformed token is skipped, not injected.
         if let Some(ph) = parse_phantom(m.as_str()) {
-            if !out.iter().any(|p| p.raw == ph.raw) {
+            if seen.insert(ph.raw.clone()) {
                 out.push(ph);
+                if out.len() >= MAX_PHANTOMS_PER_SITE {
+                    break;
+                }
             }
         }
     }
@@ -181,6 +198,19 @@ mod tests {
         let s = "a=__sc__github__ b=__sc__bb__username__ c=__sc__github__";
         let got = collect_phantoms(s);
         assert_eq!(got, vec![p("github", None), p("bb", Some("username"))]);
+    }
+
+    #[test]
+    fn collect_caps_distinct_phantoms() {
+        // A pathological body of many distinct phantoms is bounded, not
+        // collected wholesale (algorithmic-complexity DoS guard). Build well
+        // past the cap and confirm we stop at it.
+        let mut s = String::new();
+        for i in 0..(MAX_PHANTOMS_PER_SITE + 50) {
+            s.push_str(&format!("__sc__c{i}__ "));
+        }
+        let got = collect_phantoms(&s);
+        assert_eq!(got.len(), MAX_PHANTOMS_PER_SITE);
     }
 
     #[test]

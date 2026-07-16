@@ -14,7 +14,6 @@
 //! POST /op/{op_id}/reject       U denies
 //! GET  /health                  custodian health
 //! GET  /pubkey                  custodian HPKE bootstrap key (placeholder)
-//! GET  /admin/vaults            list all vault ids on this daemon (admin-gated)
 //! GET  /skill.md                skill file for agents (?agent=claude|cursor|codex)
 //! ```
 //!
@@ -34,22 +33,22 @@ use std::sync::Arc;
 
 use axum::{
     extract::DefaultBodyLimit,
-    routing::{delete, get, post},
+    routing::{get, post},
     Router,
 };
 
 use crate::state::AppState;
 
-/// Maximum request body size for all admin endpoints.
+/// Maximum request body size for all control-plane endpoints.
 /// 256 KB is ample for any legitimate operation descriptor or grant.
 const MAX_BODY_BYTES: usize = 256 * 1024;
 
 pub fn app_router(state: Arc<AppState>) -> Router {
     // ── Control plane ────────────────────────────────────────────────────
-    // Vault lifecycle, op approval, passkeys, registry, admin. NOT agent-key
-    // gated: op/approve is gated by the op_id + passkey signature (the passkey
-    // wall); admin by X-Admin-Key; registry/passkeys are auth-free localhost
-    // reads. This is exactly the surface the old admin port carried.
+    // Vault lifecycle, op approval, passkeys, registry. NOT agent-key gated:
+    // op/approve is gated by the op_id capability + passkey signature (the
+    // passkey wall); registry/passkeys are auth-free localhost reads. This is
+    // exactly the surface the old admin port carried.
     let mut router = Router::new()
         // Custodian-level (no vault context).
         .route("/health", get(handlers::health::health))
@@ -69,7 +68,6 @@ pub fn app_router(state: Arc<AppState>) -> Router {
             post(handlers::pending_passkey::create),
         )
         .route("/v/{vid}/events", get(handlers::events::stream))
-        .route("/v/{vid}/approvals", get(handlers::approvals::list))
         .route(
             "/v/{vid}/secret-keys",
             get(handlers::secret_keys::secret_keys),
@@ -93,9 +91,6 @@ pub fn app_router(state: Arc<AppState>) -> Router {
         .route("/op/{op_id}", get(handlers::approve::get_op))
         .route("/op/{op_id}/approve", post(handlers::approve::approve_op))
         .route("/op/{op_id}/reject", post(handlers::approve::reject_op))
-        // Admin (X-Admin-Key gated; off when SAFECLAW_ADMIN_KEY unset).
-        .route("/admin/vaults", get(handlers::admin::list_vaults))
-        .route("/admin/vaults/{vid}", delete(handlers::admin::delete_vault))
         .with_state(state.clone());
     router = router.layer(DefaultBodyLimit::max(MAX_BODY_BYTES));
 

@@ -154,14 +154,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     e.into()
                 })
         }
-        Command::Admin(args) => {
-            cli::admin::run(args.sub)
-                .await
-                .map_err(|e| -> Box<dyn std::error::Error> {
-                    eprintln!("safeclaw admin: {}", e);
-                    e.into()
-                })
-        }
         Command::Env => cli::env::run().map_err(|e| -> Box<dyn std::error::Error> {
             eprintln!("safeclaw env: {}", e);
             e.into()
