@@ -1,157 +1,133 @@
 <p align="center">
-  <img src="docs/logo.png" alt="SafeClaw" width="72" />
+  <img src="docs/logo.png" alt="SafeClaw" width="80" />
 </p>
 
 <h1 align="center">SafeClaw</h1>
-<p align="center">Protect your API keys with passkeys. Your AI agent uses your credentials — without ever holding them.</p>
 
-SafeClaw is a local daemon + credential proxy for AI agents. Your keys are
-encrypted under your passkey (WebAuthn). The agent never sees them: it writes a
-**phantom** — a placeholder like `__sc__github__` — where the credential belongs,
-and runs the command through `sc run --`. The proxy swaps the phantom for the
-real value at egress, only toward that connection's own hosts, and sensitive
-uses wait for your passkey approval. A compromised agent or skill can't
-exfiltrate a key it never held.
+<p align="center"><b>Let your AI agent use your API keys. It never holds them.</b></p>
 
-```
-Your AI Agent ──► SafeClaw proxy (localhost) ──► OpenAI / Anthropic / GitHub / …
-  sc run --             │
-  __sc__github__        ├─ swaps the phantom for the real credential from your encrypted vault
-                        └─ sensitive uses wait for your passkey approval
-```
+<p align="center">
+  <a href="https://github.com/SafeClaw-OSS/safeclaw/releases"><img src="https://img.shields.io/github/v/release/SafeClaw-OSS/safeclaw?label=release&color=2ea44f" alt="release"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-FSL--1.1--ALv2-blue" alt="license"></a>
+  <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-555" alt="platforms">
+</p>
 
-`safeclaw` and `sc` are the **same binary** (two names). The daemon runs on your
-machine; the control plane (encrypted vault backup, cross-device sync, web-based
-approvals, multi-vault) lives at **[safeclaw.pro](https://safeclaw.pro)**, which
-this binary is the open client of.
+<p align="center">
+  <a href="https://safeclaw.pro">safeclaw.pro</a> ·
+  <a href="#quickstart">Quickstart</a> ·
+  <a href="#how-it-works">How it works</a> ·
+  <a href="#faq">FAQ</a> ·
+  <a href="docs/guides/README.md">Guides</a>
+</p>
 
-## Why
+<!-- demo GIF goes here once recorded: see demo/README.md -->
 
-- **No plaintext keys** — encrypted at rest; decrypted only in the daemon's memory while unlocked.
-- **No passwords** — approve with Touch ID, Windows Hello, or a security key (WebAuthn).
-- **The agent never holds secrets** — it writes a phantom; the proxy injects the real key at egress, pinned to that service's own hosts.
-- **You approve what matters** — every brokered call is policy-checked; sensitive ones wait for your passkey tap. A compromised agent still can't spend your keys unsupervised.
-- **Single static binary** — ~5 MB, no runtime deps.
-
-## Install
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/SafeClaw-OSS/safeclaw/main/install.sh | sh
-```
-
-Installs the `sc` binary to `~/.local/bin`. It only downloads the prebuilt
-release binary for your platform and verifies its `SHA256SUMS`; no sudo, no system
-changes. Each release also carries a sigstore build-provenance attestation
-(`gh attestation verify ~/.local/bin/sc --repo SafeClaw-OSS/safeclaw`).
-
-Or build from source: `cargo build --release` (binaries at `target/release/{sc,safeclaw}`).
-
-## Connect an agent
-
-From the **[safeclaw.pro](https://safeclaw.pro)** dashboard, "Connect a new agent"
-mints a one-time pair token and an install prompt you paste to your agent. The
-flow the agent runs on your machine:
-
-```bash
-sc login --pair-token spt_…   # pair this machine; brings the daemon up + unlocks
-                              #   (prints a passkey-approval link you open in a browser)
-sc agent add my-agent         # mint the agent's env — BROKER_URL / VAULT_ID / API_KEY
-                              #   (the install prompt covers both steps)
-```
-
-The agent then follows the **skill**
-([static/safeclaw-skill.md](static/safeclaw-skill.md)): list what's connected
-(`sc connection ls` or `GET $SAFECLAW_BROKER_URL/v/$SAFECLAW_VAULT_ID/registry`),
-put the phantom where the credential belongs, and route the command through the
-proxy:
+Pasting an API key into an agent's env hands it to every prompt injection, rogue skill, and log line downstream. SafeClaw takes the key out of the agent's hands entirely:
 
 ```bash
 GITHUB_TOKEN=__sc__github__ sc run -- gh pr list
 ```
 
-The proxy substitutes the real credential on the way out; the agent gets the
-response, never the key. Only traffic routed through `sc run` is touched — a
-phantom sent anywhere else reaches the upstream as a literal string (a clean
-401), never a leak.
+`__sc__github__` is a **phantom**: a placeholder the agent uses instead of the credential. SafeClaw's local proxy swaps it for the real token at the network edge, only toward that service's own hosts. The agent gets the API response, never the key. Sensitive calls pause until you approve them with a passkey tap (Touch ID, Windows Hello, or a security key).
 
-## Daily use
+## Why
 
-- **Up** (`sc up`) — get the daemon running and the vault unlocked (one passkey tap). Idempotent.
-- **Work** — the agent runs its commands through `sc run --`; you approve the sensitive ones.
-- **Lock** (`sc lock`) — wipe keys from the daemon's memory (or `sc down` to stop it).
-
-## CLI
-
-```bash
-sc login --pair-token <spt>   # pair this machine (then brings the daemon up + unlocks)
-sc logout                     # unpair this machine; revokes its device key cloud-side too
-sc up | down | restart        # daemon lifecycle (Linux systemd / macOS launchd); up re-unlocks
-sc status | logs | doctor     # status, daemon logs, health + reachability checks
-sc run -- <cmd…>              # run a command through the credential proxy
-sc connection add | ls | rm   # connections: secret(s) + host anchor → phantom
-sc registry                   # the service catalog
-sc set | get | ls | rm        # native secrets in the active vault
-sc agent add | ls | rm        # agent identities (API keys; one per agent, account-level)
-sc vault ls | use | create    # multi-vault selection
-sc unlock | lock              # decrypt / wipe the vault in the daemon's memory
-sc upgrade                    # self-update to the latest release
-```
-
-`sc --help` shows the full grouped list; `sc <cmd> --help` for details.
-
-## Configuration
-
-State lives under `~/.safeclaw/` (config, device key, vault state, crypto keys).
-The three env vars an agent uses — minted as one block by `sc agent add` (or the
-dashboard's install prompt):
-
-| Env var | Meaning |
-|---------|---------|
-| `SAFECLAW_BROKER_URL` | The local broker, e.g. `http://127.0.0.1:23294`. |
-| `SAFECLAW_VAULT_ID`   | Which vault this agent's requests resolve against. |
-| `SAFECLAW_API_KEY`    | The agent's bearer token (one per agent, account-level). |
-
-Ports default to `23293` (control plane: CLI, approvals, events) and `23294`
-(the credential proxy `sc run` routes traffic through). See `sc serve --help`
-for the full set (`SAFECLAW_PORT`, `SAFECLAW_PROXY_PORT`, `SAFECLAW_LISTEN`, …).
-
-### Env vs config — who picks the vault
-
-Those env vars belong to the **agent process**. The `sc` CLI (you) reads its
-active vault from `~/.safeclaw/config.toml` — set by `sc login` / `sc vault use`,
-overridable per-command with `--vault` — never from the agent's env, so a stale
-agent env can't hijack your CLI commands. The daemon hosts **all** your vaults
-at once: which vault a request hits is the `/v/<id>` in that request (a
-per-request choice), not daemon state, and one `SAFECLAW_API_KEY` works for any
-of your vaults.
+- **The agent never sees a secret.** It writes phantoms; the proxy injects real values at egress, pinned to each service's own hosts.
+- **No plaintext at rest, anywhere.** Keys are sealed under your passkey. The cloud syncs the sealed blob and cannot decrypt it. Plaintext exists only in the daemon's memory while unlocked; `sc lock` wipes it.
+- **You approve what matters.** Every brokered call is policy-checked; sensitive ones wait for your passkey tap. A compromised agent can't spend your keys unsupervised, and can't exfiltrate what it never held.
+- **No passwords.** Passkeys only (WebAuthn).
+- **One ~5 MB static binary.** No runtime deps.
 
 ## How it works
 
-The approval surfaces speak **SUDP**, a passkey-signed single-use-grant
-protocol: a brokered call that needs consent registers a pending op, you sign
-the approval with your passkey, and only then does the daemon inject the
-credential and forward the call. The vault blob is sealed client-side under your
-passkey-derived key — the cloud stores and syncs it blind.
+```
+AI agent ──── sc run -- gh pr list ────► SafeClaw proxy ── real token ──► api.github.com
+ holds only                               (localhost)
+ __sc__github__                                │
+                                               ├─ vault: sealed under your passkey;
+                                               │  plaintext only in daemon memory
+                                               └─ sensitive calls wait for your
+                                                  passkey tap
+```
 
-See [docs/PROTOCOL.md](docs/PROTOCOL.md) for the cryptographic protocol,
-[docs/SERVICES.md](docs/SERVICES.md) for the declarative service definitions
-(`services/*/service.toml`), [docs/CONNECTION_SCHEMA.md](docs/CONNECTION_SCHEMA.md)
-for the connection data schema, and [docs/DIAGNOSTICS.md](docs/DIAGNOSTICS.md)
-for every error the broker can surface and what to do about it.
+`safeclaw` and `sc` are the same binary. The daemon runs on your machine; the control plane at [safeclaw.pro](https://safeclaw.pro) handles encrypted vault backup, cross-device sync, and web approvals, and this binary is its open client.
 
-## Remote / self-host
+Only traffic routed through `sc run` is touched. A phantom sent anywhere else reaches the upstream as a literal string and fails with a clean 401: nothing to leak.
 
-WebAuthn requires HTTPS for non-localhost origins. To run the daemon behind TLS,
-set `--origin https://your.host` and `--rp-id your.host` (they must match the URL
-your browser sees). The managed control plane is safeclaw.pro; the daemon here is
-its open client.
+GitHub, OpenAI, Anthropic, Gemini, Gmail, Google Drive, GCP, Supabase, Railway, GitLab, npm, crates.io, Telegram and more ship in [the catalog](docs/SERVICES.md); any other HTTPS API works as a custom connection.
+
+## Quickstart
+
+**1. Install.** Downloads the prebuilt binary for your platform to `~/.local/bin` and verifies its `SHA256SUMS`; no sudo, no system changes. (Or `cargo build --release`.)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/SafeClaw-OSS/safeclaw/main/install.sh | sh
+```
+
+Each release also carries a sigstore build-provenance attestation: `gh attestation verify ~/.local/bin/sc --repo SafeClaw-OSS/safeclaw`.
+
+**2. Create your vault** at [safeclaw.pro](https://safeclaw.pro): sign in and register a passkey. No password to invent, nothing to remember.
+
+**3. Connect your agent.** The dashboard's "Connect a new agent" mints a one-time pair token and an install prompt you paste to your agent. Under the hood it runs:
+
+```bash
+sc login --pair-token spt_…   # pair this machine; brings the daemon up + unlocks
+sc agent add my-agent         # mint the agent's env (BROKER_URL / VAULT_ID / API_KEY)
+```
+
+**4. Add a credential.** In the dashboard's Connections tab (values are encrypted in your browser before upload), or at your terminal:
+
+```bash
+sc set HF_TOKEN --host huggingface.co   # prompts for the value; one passkey approval
+                                        # mints the phantom __sc__hf_token__
+```
+
+Entered this way, the value never leaves your machine.
+
+**5. Use it.** The agent puts the phantom where the credential belongs and routes the command through the proxy:
+
+```bash
+HF_TOKEN=__sc__hf_token__ sc run -- python train.py
+```
+
+Full walkthrough: [docs/guides/quickstart.md](docs/guides/quickstart.md).
+
+## Teach your agent
+
+Agents learn SafeClaw from one file: [static/safeclaw-skill.md](static/safeclaw-skill.md). The dashboard's install prompt already includes it; to hand it to an agent yourself, see [docs/guides/for-your-agent.md](docs/guides/for-your-agent.md). The one habit that matters: **phantoms, not values**. An agent never needs `sc get`; see [docs/guides/sc-run.md](docs/guides/sc-run.md).
+
+## CLI
+
+```text
+Setup         sc login · logout · up · down · restart · status
+Secrets       sc set · get · ls · rm              (aliases of sc secret …)
+Connections   sc connection add|ls|rm · sc run -- <cmd> · sc registry · sc store
+Account       sc agent · sc device · sc passkey · sc vault
+Maintenance   sc unlock · lock · sync · logs · doctor · upgrade · proxy · op
+```
+
+`sc --help` shows the grouped list; `sc <cmd> --help` for details. Ports default to `23293` (control) and `23294` (the proxy `sc run` routes through); state lives under `~/.safeclaw/`.
+
+## FAQ
+
+**Where do my keys actually live?** Sealed under a key derived from your passkey. The cloud stores and syncs the sealed blob and cannot decrypt it. Plaintext exists in exactly one place: the daemon's memory on your machine, while unlocked. Details: [docs/guides/security-model.md](docs/guides/security-model.md).
+
+**Can't the agent just run `sc get`?** Every `sc get` is passkey-gated; it exists for you at a terminal, not for agents. An agent never needs the raw value: the phantom + `sc run` path uses a credential without revealing it. Patterns and anti-patterns: [docs/guides/sc-run.md](docs/guides/sc-run.md).
+
+**What about traffic I don't route through `sc run`?** Untouched. SafeClaw is not a machine-wide MITM; only commands you deliberately route are brokered, and a phantom sent unrouted is a worthless string.
+
+**What can a compromised agent do?** Spend credentials only through the proxy, only toward each connection's own hosts, under your policy, with sensitive actions blocked on your passkey. It cannot read the values, and outside the proxy its phantoms are inert.
+
+## Docs
+
+| | |
+|---|---|
+| [Guides](docs/guides/README.md) | Quickstart, `sc run` patterns, security model, agent setup |
+| [PROTOCOL.md](docs/PROTOCOL.md) | The cryptographic protocol (SUDP: passkey-signed single-use grants) |
+| [SERVICES.md](docs/SERVICES.md) | Declarative service definitions (`services/*/service.toml`) |
+| [CONNECTION_SCHEMA.md](docs/CONNECTION_SCHEMA.md) | Connection data schema |
+| [DIAGNOSTICS.md](docs/DIAGNOSTICS.md) | Every error the broker can surface, and what to do |
 
 ## License
 
-[Functional Source License 1.1 (Apache-2.0 future)](LICENSE) — **FSL-1.1-ALv2**.
-
-You can download, run, study, modify, and self-host SafeClaw freely for any
-purpose **except a Competing Use** — offering it (or a derivative) to others as a
-commercial product that substitutes for SafeClaw. Each release converts to
-Apache-2.0 two years after it ships. SafeClaw is the open **client** of a
-cloud-connected product; the cloud service stays proprietary.
+[Functional Source License 1.1 (Apache-2.0 future)](LICENSE), **FSL-1.1-ALv2**. Download, run, study, modify, and self-host freely for any purpose except a Competing Use: offering SafeClaw (or a derivative) to others as a commercial substitute. Each release converts to Apache-2.0 two years after it ships. This repo is the open client of a cloud-connected product; the cloud service stays proprietary.
