@@ -1,7 +1,7 @@
 # For your agent
 
 Agents learn SafeClaw from one file:
-[`static/safeclaw-skill.md`](https://github.com/SafeClaw-OSS/safeclaw/blob/main/static/safeclaw-skill.md). It is the single
+[`safeclaw-skill.md`](https://github.com/SafeClaw-OSS/safeclaw/blob/main/static/safeclaw-skill.md). It is the single
 source of truth for agent behavior: discovery, phantom placement, `sc run`,
 approvals. This page is only about handing it over.
 
