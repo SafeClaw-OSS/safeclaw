@@ -155,7 +155,7 @@ pub struct SecretsCache {
     /// none — the Phase-1 path-only key). So approving `amount=80` cannot be
     /// replayed as `amount=180`: the redeem re-extracts the fields, the digest
     /// differs, the grant misses (without being consumed) and re-prompts. See
-    /// `crate::service::scope_digest` and docs/REQUEST_SCOPE.md.
+    /// `crate::service::scope_digest` and docs/internals/request-scope.md.
     ///
     /// Expiry is deliberately GENEROUS (`ASK_ALWAYS_REPLAY_WINDOW_SECS`, not a
     /// short grace): an agent that only replays when its user next prompts it

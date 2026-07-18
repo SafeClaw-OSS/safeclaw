@@ -6,8 +6,8 @@
 > cutover.
 > **Mechanism-only** — positioning/market strategy lives in the PRIVATE
 > `safeclaw-pro-backend/docs/STRATEGY.md`, never here.
-> Grounded in: [CONNECTION_SCHEMA.md](./CONNECTION_SCHEMA.md),
-> [SERVICES.md](./SERVICES.md), [PROTOCOL.md](./PROTOCOL.md) §6.
+> Grounded in: [connection-schema.md](connection-schema.md),
+> [../reference/services.md](../reference/services.md), [protocol.md](protocol.md) §6.
 
 ---
 
@@ -101,7 +101,7 @@ security-relevant field, and the settled tuple already makes it first-class):
 //          service-backed connection: its keys derive from the service's declared
 //          `secrets` (incl. the oauth2 refresh key). Values live in the flat
 //          pool at BARE env-valid keys; the record's sparse `keys` map binds
-//          role → KEY (identity when unmapped — CONNECTION_SCHEMA.md §3), so a
+//          role → KEY (identity when unmapped — connection-schema.md §3), so a
 //          named connection stores at distinct suggested keys
 //          (GMAIL_REFRESH_TOKEN_WORK) and may bind to an existing key to share.
 // policy:  NOT here — aux.policy.connections.<conn_id>.
@@ -274,7 +274,7 @@ __sc__<conn>__                   // DEFAULT shorthand — the connection's sole 
 - `<conn>` is the id the user gave at connect time and sees in the UI
   (`github`, `gmail_work`) — nothing new to learn. Connect enforces env-safe ids.
 - Storage keys are ALL bare env-valid names; the connection record's `keys`
-  map binds role → KEY (CONNECTION_SCHEMA.md §3). The phantom stays the only
+  map binds role → KEY (connection-schema.md §3). The phantom stays the only
   SafeClaw-invented string on any surface.
 - The `__sc__…__` shell is a **leak breadcrumb**: an un-substituted phantom is
   recognizable in logs/upstream errors.
@@ -339,7 +339,7 @@ traffic" — matters for the trust phase), performance, and unrelated
 cert-pinned tools are untouched. The union covers unlocked vaults live, plus
 each locked vault's last-known anchors (in-memory, remembered across Lock) —
 so a phantom sent while locked meets an explicit `vault_locked` instead of
-tunneling to the upstream literally (docs/DIAGNOSTICS.md).
+tunneling to the upstream literally (docs/../reference/diagnostics.md).
 
 **Scopes** — same bundle, three reaches (the only real degree of freedom):
 

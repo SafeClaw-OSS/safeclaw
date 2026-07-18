@@ -2,7 +2,7 @@
 
 > 状态:**已实现 (safeclaw v0.9.2)**。源码即权威:`src/core/policy.rs`(类型 + 求值)、
 > `src/service/mod.rs`(recipe 解析)、`src/storage/plaintext.rs`(`VaultAux.policy`)。
-> 关联 `docs/PROTOCOL.md §6`、`docs/STORES_AND_ITEMS.md §7`、`docs/CONNECTION_SCHEMA.md`。
+> 关联 `docs/../internals/protocol.md §6`、`docs/../internals/stores-and-items.md §7`、`docs/../internals/connection-schema.md`。
 
 ## 1. 设计:为什么没有 "risk level"
 
@@ -54,7 +54,7 @@ level = "ask"
 `match` = `"METHOD /path"` 或 `"/path"`(任意方法);`*` 匹配一个 path segment。
 **无 `level` 的 rule 被静默跳过**(它永远无法决策)。
 
-## 4. 解析顺序(`PROTOCOL.md §6.4`)
+## 4. 解析顺序(`../internals/protocol.md §6.4`)
 
 对一个请求 `(method, path, body)`:
 

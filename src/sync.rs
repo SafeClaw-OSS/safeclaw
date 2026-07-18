@@ -45,7 +45,7 @@ pub(crate) const AUTH_RETRY: Duration = Duration::from_secs(600);
 ///   to `vault.dat`; `version` is the cloud-stamped revision now on disk.
 /// - `Deleted` — the cloud row is a tombstone (`status:"deleted"`). This is the
 ///   ONLY signal that destroys local vault state (see `drop_local_vault`); a
-///   live-but-undecryptable blob is deliberately NOT a delete (docs/SYNC.md §4
+///   live-but-undecryptable blob is deliberately NOT a delete (docs/internals/sync.md §4
 ///   case 3 — log only).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PullOutcome {
@@ -294,7 +294,7 @@ fn synced_vault_ids(cfg: &crate::cli::active::CliConfig) -> Vec<String> {
 /// no-op for a local-only/unpaired daemon. Vaults added after start are picked
 /// up on the next daemon (re)start.
 ///
-/// SSE sync push (docs/SSE_SYNC_DESIGN.md): ONE dispatcher task owns the
+/// SSE sync push (docs/internals/sse-sync.md): ONE dispatcher task owns the
 /// event stream for the whole daemon; each vault task gets a merged
 /// pending-wake cell plus the global health watch, and picks its select!
 /// shape per round from the cell's mode. The dispatcher holds only WEAK refs
@@ -512,7 +512,7 @@ fn drop_local_vault_disk(state_dir: &Path, vault: &str) {
 /// Drop ALL local state for a vault that was deleted (tombstoned) cloud-side.
 /// This is the sole code path that destroys local vault state, and it is only
 /// reached on an explicit `status:"deleted"` tombstone (never on a decrypt
-/// failure — see docs/SYNC.md §4 case 3). Order matters:
+/// failure — see docs/internals/sync.md §4 case 3). Order matters:
 ///  1. `lock_vault` — transition to Locked, which DROPS the `Unlocked` variant
 ///     and thereby zeroizes the retained state key `K` (`Zeroizing<Vec<u8>>`)
 ///     and the whole secrets cache. Done first so K is gone before we touch the
@@ -1109,7 +1109,7 @@ fn retention_cutoff(days: u32) -> Option<i64> {
 /// task, so `pull_items`' read-modify-write of the per-item store stays
 /// single-flight per vault — same serialization as the old one-channel loop.
 ///
-/// THIRD SHAPE (docs/SSE_SYNC_DESIGN.md): when the SSE dispatcher's hello has
+/// THIRD SHAPE (docs/internals/sse-sync.md): when the SSE dispatcher's hello has
 /// confirmed this vault (`cell.mode() == Sse`), the round holds NO long-polls
 /// at all — it selects over the cell's wake / an event-independent 300s
 /// reconcile deadline / the global stream-health watch, and reacts to merged
@@ -1192,7 +1192,7 @@ pub async fn watch_loop(
         let round_wall = std::time::SystemTime::now();
         let round_mono = std::time::Instant::now();
 
-        // ── Third shape: SSE wake cell (docs/SSE_SYNC_DESIGN.md) ──────────
+        // ── Third shape: SSE wake cell (docs/internals/sse-sync.md) ──────────
         // Mode is set only by the dispatcher: Sse while the stream's hello
         // covers this vault, Fallback otherwise. Every branch below ends in
         // `continue` (or `return` on tombstone), so the long-poll code after
@@ -1645,7 +1645,7 @@ enum BlobWake {
     },
 }
 
-/// ★ The ONE runtime blob-body handler (docs/SSE_SYNC_DESIGN.md §Core,
+/// ★ The ONE runtime blob-body handler (docs/internals/sse-sync.md §Core,
 /// "shared blob-body handler"), factored from the long-poll blob-200 arm so
 /// the SSE shape reuses it verbatim. Deliberately NOT `classify_pull_body`:
 /// that path (`pull` / `sc sync` parity) persists WITHOUT the per-vault write

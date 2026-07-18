@@ -46,5 +46,5 @@ nothing the command spawns, ever observes plaintext.
 A brokered request that can't proceed says so in the command's own output
 with a stable `SafeClaw: <code>` line: vault locked, approval needed (with
 the link), host outside the anchor, store unreachable. Every code is
-catalogued with its fix in [DIAGNOSTICS.md](../DIAGNOSTICS.md). The broker
+catalogued with its fix in [DIAGNOSTICS.md](reference/diagnostics.md). The broker
 never swallows a refusal into a mystery timeout, and never fakes a success.

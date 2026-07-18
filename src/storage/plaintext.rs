@@ -1,4 +1,4 @@
-//! v4 vault plaintext shape — per `docs/STORES_AND_ITEMS.md`.
+//! v4 vault plaintext shape — per `docs/internals/stores-and-items.md`.
 //!
 //! Physical layout (Design B): the decrypted protected state `M` =
 //! `sudp::state::ProtectedState { targets, peers, aux }` carries:
@@ -67,7 +67,7 @@ pub struct Store {
 /// connected. Keyed (in `VaultAux.connections`) by `connection_id`: a slug that
 /// is the user's handle AND the routing/cache/audit unit. `== service_id` for
 /// the default (unprefixed) connection; a distinct slug for a named one
-/// (see `docs/CONNECTION_SCHEMA.md` §2).
+/// (see `docs/internals/connection-schema.md` §2).
 ///
 /// Status is **DERIVED**, never stored: present in `connections` with its
 /// required secret(s) present → Connected; a required secret missing → Partly

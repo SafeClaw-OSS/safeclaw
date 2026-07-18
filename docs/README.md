@@ -1,8 +1,9 @@
-# SafeClaw Wiki
+# SafeClaw Docs
 
 A systematic tour of SafeClaw, one module per page. Concepts explain how the
 product thinks; guides get a task done; security answers the questions that
-decide trust. Pages are deliberately short and will deepen over time.
+decide trust. `reference/` and `internals/` hold the deep layers. Pages are
+deliberately short and will deepen over time.
 
 New here? Read [Overview](overview.md), then do the
 [Quickstart](quickstart.md).
@@ -35,8 +36,18 @@ New here? Read [Overview](overview.md), then do the
 
 ## Reference
 
-Engineering detail lives beside this wiki in `docs/`:
-[PROTOCOL.md](../PROTOCOL.md) (the cryptographic protocol),
-[SERVICES.md](../SERVICES.md) (declarative service definitions),
-[CONNECTION_SCHEMA.md](../CONNECTION_SCHEMA.md) (connection data schema),
-[DIAGNOSTICS.md](../DIAGNOSTICS.md) (every error code, with fixes).
+For users and service authors, in [`reference/`](reference/):
+[services.md](reference/services.md) (writing a `service.toml`),
+[policy.md](reference/policy.md) (per-action decisions),
+[diagnostics.md](reference/diagnostics.md) (every error code, with fixes),
+[consent-templates.md](reference/consent-templates.md) (approval-copy grammar).
+
+## Internals
+
+For contributors reading the source, in [`internals/`](internals/):
+[protocol.md](internals/protocol.md) (SUDP cryptographic profile),
+[credential-broker.md](internals/credential-broker.md) (the broker architecture),
+[connection-schema.md](internals/connection-schema.md) (vault data shapes),
+[sync.md](internals/sync.md) / [sse-sync.md](internals/sse-sync.md) (cloud sync),
+[request-scope.md](internals/request-scope.md) (approval scope binding),
+[stores-and-items.md](internals/stores-and-items.md) (stores and vault content model).

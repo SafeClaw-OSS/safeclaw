@@ -29,7 +29,7 @@ secret shapes, OAuth wiring, and human-labeled policy rules. GitHub, OpenAI,
 Anthropic, Gemini, Gmail, Google Drive, GCP, Supabase, Railway, GitLab, npm,
 crates.io, Telegram and more are built in; agents discover what's connected
 through the registry (`sc connection ls`, or `GET /v/<vault>/registry`).
-Adding a service is a TOML file, not a plugin: [SERVICES.md](../SERVICES.md).
+Adding a service is a TOML file, not a plugin: [SERVICES.md](reference/services.md).
 
 ## Ways to connect
 

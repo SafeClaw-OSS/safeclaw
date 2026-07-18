@@ -10,8 +10,8 @@
 > connecting→connections OAuth lifecycle and the cloud-blind connect stay valid.
 > The recipe **config-slot / `{{template}}`** mechanism (§4, §8) is retired — a
 > self-hosted upstream is now just a **raw connection**. Canon =
-> [CREDENTIAL_BROKER.md](./CREDENTIAL_BROKER.md); toml rules =
-> [SERVICES.md](./SERVICES.md) v4.
+> [credential-broker.md](credential-broker.md); toml rules =
+> [../reference/services.md](../reference/services.md) v4.
 
 > THE data-schema reference for *connections* — the exact shapes in a vault and
 > how secrets, status, and routing derive from them.
@@ -213,8 +213,8 @@ sparse edits/additions merge on top (`ConnectionPolicy { default?, rules }`). Tw
 connections of the same service (`gmail`, `gmail_work`) therefore get independent
 policy overrides. The full policy model — per-action `level` decisions, the
 default floors, deny-override resolution, `ttl` — is in
-[POLICY.md](POLICY.md); the whole `aux.policy` tree is in
-[STORES_AND_ITEMS.md §7](STORES_AND_ITEMS.md).
+[../reference/policy.md](../reference/policy.md); the whole `aux.policy` tree is in
+[stores-and-items.md §7](stores-and-items.md).
 
 ---
 
@@ -223,7 +223,7 @@ default floors, deny-override resolution, `ttl` — is in
 - A connection is **not addressed by URL** — the **phantom**
   `__sc__<connection_id>__[<role>__]` carries the intent, and the traffic goes
   through the local HTTPS proxy (`/use` / `/stream` endpoints are retired). See
-  [CREDENTIAL_BROKER.md](./CREDENTIAL_BROKER.md).
+  [credential-broker.md](credential-broker.md).
 - The proxy resolves **phantom → `connection_id` → its secret(s)**, validates the
   destination host against the connection's `resolved_hosts`, then substitutes at
   egress.
@@ -263,7 +263,7 @@ Lifecycle of `gmail_work`: consent → `connecting["gmail_work"] = {service, oau
 
 > **RETIRED shape — kept for history.** The `[upstream.auth] secret=` /
 > `{{oauth.access_token}}` / `{{connection.host}}` recipe-template toml below is
-> superseded by **service.toml v4** ([SERVICES.md](./SERVICES.md)): `[oauth2]` with
+> superseded by **service.toml v4** ([../reference/services.md](../reference/services.md)): `[oauth2]` with
 > RFC field names (`refresh_token = "<KEY>"`), a uniform top-level `secrets`, no
 > `[upstream.*]`, no templates. A self-hosted upstream is a **raw connection**, not
 > a `{{connection.host}}` slot.

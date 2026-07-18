@@ -8,7 +8,7 @@ use serde_json::json;
 /// THE error-code registry — every error SafeClaw raises on any surface
 /// (control-plane JSON, proxy text plane, CLI stderr) names exactly one of
 /// these. Codes are snake_case and self-describing (an agent never needs a
-/// lookup table); `docs/DIAGNOSTICS.md` is this enum's rendered table and must
+/// lookup table); `docs/reference/diagnostics.md` is this enum's rendered table and must
 /// change in the same commit. Status/action/cause are pure functions of the
 /// code so every surface maps an error identically.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
