@@ -1,7 +1,7 @@
 # Stores and Items — Design Proposal (v3)
 
 **Status**: Proposal — 2026-05-24 (revised post-discussion)
-**Builds on**: [SERVICES.md](./SERVICES.md) v2, [DESIGN.md](../DESIGN.md) (dev branch)
+**Builds on**: [SERVICES.md](./SERVICES.md) v2
 **Supersedes**: `SOURCE_ABSTRACTION.md` (stub)
 
 This document is the canonical specification for SafeClaw's stores/items
@@ -628,5 +628,3 @@ Things I decided but flagged for re-review:
 - [`PROTOCOL.md`](./PROTOCOL.md) — wire protocol; §5.2 references this
   doc as canonical for M (vault plaintext) content; `/c/registry`
   `required_items` is derived from template scan
-- [`../DESIGN.md`](../DESIGN.md) — implementation reference (key
-  hierarchy, file vault, on-disk artifacts; dev-branch doc)

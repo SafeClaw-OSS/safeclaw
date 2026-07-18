@@ -14,8 +14,6 @@
 >
 > **配套文档**：
 > - SUDP paper: `safeclaw-paper-nips/sections/{main,appendix}/0[3-9]-*.tex`（canonical 抽象协议）
-> - System design + SUDP-aligned 决策: `../SAFECLAW_V1_DESIGN_HANDOFF.md`
-> - CLI architecture: `../CLI_DESIGN_HANDOFF.md`
 > - Service TOML schema: `./SERVICES.md`（service.toml v3）
 > - Vault content schema: `./STORES_AND_ITEMS.md`（stores / items / adapter contract — §5.2 引用此为 M 的 canonical 定义）
 
@@ -1019,8 +1017,6 @@ Step 5: server validate + 走 Phase III.3:
 | WebAuthn assertion verify | `src/passkey/webauthn.rs` |
 | Policy engine | `src/core/policy.rs` |
 | Approval workflow | `src/core/approval.rs` |
-| CLI architecture | `../CLI_DESIGN_HANDOFF.md` |
-| 整体设计 + SUDP 对齐决策 | `../SAFECLAW_V1_DESIGN_HANDOFF.md` |
 
 ---
 

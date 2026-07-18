@@ -7,8 +7,7 @@
 > **Mechanism-only** — positioning/market strategy lives in the PRIVATE
 > `safeclaw-pro-backend/docs/STRATEGY.md`, never here.
 > Grounded in: [CONNECTION_SCHEMA.md](./CONNECTION_SCHEMA.md),
-> [CONNECTIONS_AND_AUTH.md](./CONNECTIONS_AND_AUTH.md), [SERVICES.md](./SERVICES.md),
-> [PROTOCOL.md](./PROTOCOL.md) §6, [STREAMING_APPROVAL.md](./STREAMING_APPROVAL.md).
+> [SERVICES.md](./SERVICES.md), [PROTOCOL.md](./PROTOCOL.md) §6.
 
 ---
 
