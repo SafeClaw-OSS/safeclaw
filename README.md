@@ -68,14 +68,14 @@ Each release also carries a sigstore build-provenance attestation: `gh attestati
 
 **2. Create your vault** at [safeclaw.pro](https://safeclaw.pro): sign in and register a passkey. No password to invent, nothing to remember.
 
-**3. Connect your agent.** The dashboard's "Connect a new agent" mints a one-time pair token and an install prompt you paste to your agent. Under the hood it runs:
+**3. Connect your agent.** The console's "Connect a new agent" mints a one-time pair token and an install prompt you paste to your agent. Under the hood it runs:
 
 ```bash
 sc login --pair-token spt_…   # pair this machine; brings the daemon up + unlocks
 sc agent add my-agent         # mint the agent's env (BROKER_URL / VAULT_ID / API_KEY)
 ```
 
-**4. Add a credential.** In the dashboard's Connections tab (values are encrypted in your browser before upload), or at your terminal:
+**4. Add a credential.** In the console's Connections tab (values are encrypted in your browser before upload), or at your terminal:
 
 ```bash
 sc set HF_TOKEN --host huggingface.co   # prompts for the value; one passkey approval
@@ -94,7 +94,7 @@ Full walkthrough: [docs/quickstart.md](docs/quickstart.md).
 
 ## Teach your agent
 
-Agents learn SafeClaw from one file: [safeclaw-skill.md](static/safeclaw-skill.md). The dashboard's install prompt already includes it; to hand it to an agent yourself, see [docs/for-your-agent.md](docs/for-your-agent.md). The one habit that matters: **phantoms, not values**. An agent never needs `sc get`; see [docs/sc-run.md](docs/sc-run.md).
+Agents learn SafeClaw from one file: [safeclaw-skill.md](static/safeclaw-skill.md). The console's install prompt already includes it; to hand it to an agent yourself, see [docs/for-your-agent.md](docs/for-your-agent.md). The one habit that matters: **phantoms, not values**. An agent never needs `sc get`; see [docs/sc-run.md](docs/sc-run.md).
 
 ## CLI
 
