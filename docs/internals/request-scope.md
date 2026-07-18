@@ -1,7 +1,7 @@
 # Request scope — per-service `vars` / `scope` / `when` / `consent`
 
-Phase 2 of the ask-always binding work ([CREDENTIAL_BROKER.md](./CREDENTIAL_BROKER.md)
-§14 one-shot; [POLICY.md](./POLICY.md) for the level vocabulary). Phase 1 bound an
+Phase 2 of the ask-always binding work ([credential-broker.md](credential-broker.md)
+§14 one-shot; [../reference/policy.md](./../reference/policy.md) for the level vocabulary). Phase 1 bound an
 `ask-always` approval to `(connection, method, host, path)`. Phase 2 lets a
 service declare the **body/query fields** that further identify an action, so:
 

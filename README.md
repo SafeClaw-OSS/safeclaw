@@ -17,7 +17,7 @@
   <a href="#quickstart">Quickstart</a> ·
   <a href="#how-it-works">How it works</a> ·
   <a href="#faq">FAQ</a> ·
-  <a href="docs/wiki/README.md">Wiki</a>
+  <a href="docs/README.md">Docs</a>
 </p>
 
 <!-- demo GIF goes here once recorded: see demo/README.md -->
@@ -54,7 +54,7 @@ AI agent ──── sc run -- gh pr list ────► SafeClaw proxy ──
 
 Only traffic routed through `sc run` is touched. A phantom sent anywhere else reaches the upstream as a literal string and fails with a clean 401: nothing to leak.
 
-GitHub, OpenAI, Anthropic, Gemini, Gmail, Google Drive, GCP, Supabase, Railway, GitLab, npm, crates.io, Telegram and more ship in [the catalog](docs/SERVICES.md); any other HTTPS API works as a custom connection.
+GitHub, OpenAI, Anthropic, Gemini, Gmail, Google Drive, GCP, Supabase, Railway, GitLab, npm, crates.io, Telegram and more ship in [the catalog](docs/reference/services.md); any other HTTPS API works as a custom connection.
 
 ## Quickstart
 
@@ -90,11 +90,11 @@ Entered this way, the value never leaves your machine.
 HF_TOKEN=__sc__hf_token__ sc run -- python train.py
 ```
 
-Full walkthrough: [docs/wiki/quickstart.md](docs/wiki/quickstart.md).
+Full walkthrough: [docs/quickstart.md](docs/quickstart.md).
 
 ## Teach your agent
 
-Agents learn SafeClaw from one file: [static/safeclaw-skill.md](static/safeclaw-skill.md). The dashboard's install prompt already includes it; to hand it to an agent yourself, see [docs/wiki/for-your-agent.md](docs/wiki/for-your-agent.md). The one habit that matters: **phantoms, not values**. An agent never needs `sc get`; see [docs/wiki/sc-run.md](docs/wiki/sc-run.md).
+Agents learn SafeClaw from one file: [static/safeclaw-skill.md](static/safeclaw-skill.md). The dashboard's install prompt already includes it; to hand it to an agent yourself, see [docs/for-your-agent.md](docs/for-your-agent.md). The one habit that matters: **phantoms, not values**. An agent never needs `sc get`; see [docs/sc-run.md](docs/sc-run.md).
 
 ## CLI
 
@@ -110,9 +110,9 @@ Maintenance   sc unlock · lock · sync · logs · doctor · upgrade · proxy ·
 
 ## FAQ
 
-**Where do my keys actually live?** Sealed under a key derived from your passkey. The cloud stores and syncs the sealed blob and cannot decrypt it. Plaintext exists in exactly one place: the daemon's memory on your machine, while unlocked. Details: [docs/wiki/security-model.md](docs/wiki/security-model.md).
+**Where do my keys actually live?** Sealed under a key derived from your passkey. The cloud stores and syncs the sealed blob and cannot decrypt it. Plaintext exists in exactly one place: the daemon's memory on your machine, while unlocked. Details: [docs/security-model.md](docs/security-model.md).
 
-**Can't the agent just run `sc get`?** Every `sc get` is passkey-gated; it exists for you at a terminal, not for agents. An agent never needs the raw value: the phantom + `sc run` path uses a credential without revealing it. Patterns and anti-patterns: [docs/wiki/sc-run.md](docs/wiki/sc-run.md).
+**Can't the agent just run `sc get`?** Every `sc get` is passkey-gated; it exists for you at a terminal, not for agents. An agent never needs the raw value: the phantom + `sc run` path uses a credential without revealing it. Patterns and anti-patterns: [docs/sc-run.md](docs/sc-run.md).
 
 **What about traffic I don't route through `sc run`?** Untouched. SafeClaw is not a machine-wide MITM; only commands you deliberately route are brokered, and a phantom sent unrouted is a worthless string.
 
@@ -122,11 +122,9 @@ Maintenance   sc unlock · lock · sync · logs · doctor · upgrade · proxy ·
 
 | | |
 |---|---|
-| [Wiki](docs/wiki/README.md) | The product, module by module: concepts, guides, security |
-| [PROTOCOL.md](docs/PROTOCOL.md) | The cryptographic protocol (SUDP: passkey-signed single-use grants) |
-| [SERVICES.md](docs/SERVICES.md) | Declarative service definitions (`services/*/service.toml`) |
-| [CONNECTION_SCHEMA.md](docs/CONNECTION_SCHEMA.md) | Connection data schema |
-| [DIAGNOSTICS.md](docs/DIAGNOSTICS.md) | Every error the broker can surface, and what to do |
+| [Docs](docs/README.md) | The product, module by module: concepts, guides, security |
+| [Reference](docs/reference/) | Service definitions, policy, error codes, consent templates |
+| [Internals](docs/internals/) | For contributors: protocol, broker architecture, schemas, sync |
 
 ## License
 

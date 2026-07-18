@@ -2,7 +2,7 @@
 
 Straight answers to the questions that decide whether you trust a credential
 broker. The cryptographic detail behind each one is in
-[PROTOCOL.md](../PROTOCOL.md).
+[PROTOCOL.md](internals/protocol.md).
 
 ## Where is the plaintext?
 

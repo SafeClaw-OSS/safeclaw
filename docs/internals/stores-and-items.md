@@ -1,7 +1,7 @@
 # Stores and Items — Design Proposal (v3)
 
 **Status**: Proposal — 2026-05-24 (revised post-discussion)
-**Builds on**: [SERVICES.md](./SERVICES.md) v2
+**Builds on**: [../reference/services.md](../reference/services.md) v2
 **Supersedes**: `SOURCE_ABSTRACTION.md` (stub)
 
 This document is the canonical specification for SafeClaw's stores/items
@@ -227,11 +227,11 @@ Adapter resolves the referenced item recursively (terminates at
     "native-files"
   ],
 
-  // ─── Connections (CONNECTION_SCHEMA.md) — orthogonal to this design ─
+  // ─── Connections (connection-schema.md) — orthogonal to this design ─
   "connecting":  { /* in-flight OAuth handshakes, keyed by connection_id */ },
   "connections": { /* established connections, keyed by connection_id */ },
 
-  // ─── Policy — ONE tree (POLICY.md) ────────────────────────────
+  // ─── Policy — ONE tree (../reference/policy.md) ────────────────────────────
   "policy": {
     "timeout": 300,
     "default":    { "read": "allow", "write": "allow" },
@@ -262,9 +262,9 @@ Every top-level field has a documented reason. No dead fields.
 | `version` | new (v3) | required | Schema-version negotiation |
 | `stores` | new (this design) | required | Connected backends + their data |
 | `store_order` | new (this design) | required | Resolution priority |
-| `connecting` | connections layer | sparse | In-flight OAuth handshakes, keyed by `connection_id`. See [CONNECTION_SCHEMA.md](CONNECTION_SCHEMA.md). |
-| `connections` | connections layer | sparse | Established connections, keyed by `connection_id`. Status is derived. See [CONNECTION_SCHEMA.md](CONNECTION_SCHEMA.md). |
-| `policy` | new (replaces split) | optional | The whole policy tree — `timeout`, the read/write `default` floor, per-`category` floors, and per-`connection` user policy. Rules carry their access `level` directly. Sparse; absent on fresh vaults → daemon uses `Policy::default()`. The canonical reference is [POLICY.md](POLICY.md). **Replaces the old split `service_state` + `policy_defaults`.** |
+| `connecting` | connections layer | sparse | In-flight OAuth handshakes, keyed by `connection_id`. See [connection-schema.md](connection-schema.md). |
+| `connections` | connections layer | sparse | Established connections, keyed by `connection_id`. Status is derived. See [connection-schema.md](connection-schema.md). |
+| `policy` | new (replaces split) | optional | The whole policy tree — `timeout`, the read/write `default` floor, per-`category` floors, and per-`connection` user policy. Rules carry their access `level` directly. Sparse; absent on fresh vaults → daemon uses `Policy::default()`. The canonical reference is [../reference/policy.md](../reference/policy.md). **Replaces the old split `service_state` + `policy_defaults`.** |
 | `audit_retention_days` | new | optional | Audit-log retention in days. `None` = keep forever. |
 | `push_subscriptions` | dev's `notifications.subscriptions` (flattened) | required | Per-user web-push endpoints; sensitive (deanonymizing). Renamed because dev's two-level nesting (`notifications.subscriptions`) carried no information. |
 | `vapid_private_key` | dev (unchanged) | required | Server-side push signing key |
@@ -276,7 +276,7 @@ every layer:
 - `default` — global read/write floor (`Levels { read?, write?, ttl? }`) when no
   rule and no more-specific default matches. Values are access **decisions**
   (`allow | ask | ask-always | deny`). The read/write split is the method-derived
-  base (`is_write_method`). See [POLICY.md](POLICY.md).
+  base (`is_write_method`). See [../reference/policy.md](../reference/policy.md).
 - `categories` — per-category floor (e.g. `llm`, `channel`); beats `default`.
 - `connections.<connection_id>` — per-**connection** user policy
   (`ConnectionPolicy { default?, rules }`). The built-in rule set comes from the
@@ -284,7 +284,7 @@ every layer:
   rule id where each `RuleConfig { match?, label?, body?, level?, ttl? }` either
   **overrides** a built-in rule by id (set `level`/`ttl`), or (if it carries
   `match`) **adds** a new rule. Connections are addressed by `connection_id`, NOT
-  per-service — see [CONNECTION_SCHEMA.md](CONNECTION_SCHEMA.md).
+  per-service — see [connection-schema.md](connection-schema.md).
 
 ### 7.2 What's removed from v2/dev
 
@@ -623,8 +623,8 @@ Things I decided but flagged for re-review:
 
 ## 19. Related
 
-- [`SERVICES.md`](./SERVICES.md) — service.toml v3 schema; uses items
+- [`../reference/services.md`](../reference/services.md) — service.toml v3 schema; uses items
   via `{{X}}` templates per §10
-- [`PROTOCOL.md`](./PROTOCOL.md) — wire protocol; §5.2 references this
+- [`protocol.md`](protocol.md) — wire protocol; §5.2 references this
   doc as canonical for M (vault plaintext) content; `/c/registry`
   `required_items` is derived from template scan

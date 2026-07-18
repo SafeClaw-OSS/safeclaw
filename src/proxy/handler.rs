@@ -429,7 +429,7 @@ impl BrokerHandler {
             return self.widen_deny(&vault_id, &conn, &dest_host, ip).await;
         }
 
-        // ── request scope (Phase 2, docs/REQUEST_SCOPE.md) ─────────────────────
+        // ── request scope (Phase 2, docs/internals/request-scope.md) ─────────────────────
         // Resolve the matching `[requests]` shape and extract its vars from the
         // SAME buffered body view (unified boundary) + the URL query. Feeds
         // three consumers: the policy `when` predicate (`vars`), the ask-always

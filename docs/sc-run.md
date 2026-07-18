@@ -72,4 +72,4 @@ Check in order:
 2. Is the phantom verbatim from `sc connection ls` (or the registry)?
 3. Is the destination one of that connection's hosts?
 4. Still failing: `sc doctor`, and the error's `SafeClaw: <code>` line maps to
-   a fix in [DIAGNOSTICS.md](../DIAGNOSTICS.md).
+   a fix in [DIAGNOSTICS.md](reference/diagnostics.md).

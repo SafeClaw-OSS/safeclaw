@@ -43,7 +43,7 @@ your behalf. Rules state objective facts (what an action is, read or write);
 levels state *your* decision. Third-party vibes are not a security input.
 
 **10. Fail loudly.** Every refusal carries a stable `SafeClaw: <code>` line
-and a documented fix ([DIAGNOSTICS.md](../DIAGNOSTICS.md)). No swallowed
+and a documented fix ([DIAGNOSTICS.md](reference/diagnostics.md)). No swallowed
 errors, no mystery timeouts, no fake successes. A system you can't debug is
 a system you'll route around, and routing around SafeClaw is the one failure
 we can't accept.

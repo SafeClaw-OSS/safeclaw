@@ -183,7 +183,7 @@ base_version=local}`. On `409`, pull → re-apply → re-seal → retry (bounded
   `vault_blobs.status` column migration **before** the backend serves the new code
   (an unapplied column makes every PUT 500). Land backend envelope + daemon state
   machine + frontend lifecycle together; wipe existing dev vaults and re-enroll.
-  Touches the crypto/`K` boundary — `PROTOCOL.md §6` is ground truth.
+  Touches the crypto/`K` boundary — `protocol.md §6` is ground truth.
 
 ## 9. Open decisions
 

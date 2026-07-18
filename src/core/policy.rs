@@ -139,7 +139,7 @@ pub struct PolicyRule {
     /// resolved from the request's matching `[requests]` shape (service.toml);
     /// an UNDEFINED var makes the condition — and so the rule — not match
     /// (policy is an explicit contract, we never fabricate a decision). See
-    /// [`Condition`] and docs/REQUEST_SCOPE.md.
+    /// [`Condition`] and docs/internals/request-scope.md.
     #[serde(default)]
     pub when: Option<String>,
     /// The access decision when this rule matches.

@@ -1,7 +1,7 @@
 # Service TOML reference (v4)
 
 How to write a SafeClaw service definition. Design rationale lives in
-[CREDENTIAL_BROKER.md](./CREDENTIAL_BROKER.md); this page is the authoring
+[../internals/credential-broker.md](./../internals/credential-broker.md); this page is the authoring
 reference only.
 
 A service is a folder `services/{id}/` — flat, so the filesystem itself
@@ -10,7 +10,7 @@ enforces id uniqueness. Classification is data (`tags`), not layout.
 ```
 services/github/
   service.toml     # this page
-  policy.toml      # per-action rules (each declares a level) — see POLICY.md; rules match (host, path, method)
+  policy.toml      # per-action rules (each declares a level) — see policy.md; rules match (host, path, method)
 ```
 
 Format: TOML (authored by humans/agents; CI publishes `registry.json`).
