@@ -6,7 +6,7 @@
 //! tractable for the 3-5 stores we expect to ship and avoids the
 //! `Box<dyn>` + `async-trait` dance for two adapter kinds.
 //!
-//! See `safeclaw/docs/internals/stores-and-items.md` §6 for the adapter contract.
+//! See `safeclaw/design/stores-and-items.md` §6 for the adapter contract.
 
 mod adapter;
 pub mod adapters;

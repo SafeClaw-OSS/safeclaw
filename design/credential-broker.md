@@ -7,7 +7,7 @@
 > **Mechanism-only** — positioning/market strategy lives in the PRIVATE
 > `safeclaw-pro-backend/docs/STRATEGY.md`, never here.
 > Grounded in: [connection-schema.md](connection-schema.md),
-> [../reference/services.md](../reference/services.md), [protocol.md](protocol.md) §6.
+> [services.md](../docs/reference/services.md), [protocol.md](protocol.md) §6.
 
 ---
 
@@ -339,7 +339,7 @@ traffic" — matters for the trust phase), performance, and unrelated
 cert-pinned tools are untouched. The union covers unlocked vaults live, plus
 each locked vault's last-known anchors (in-memory, remembered across Lock) —
 so a phantom sent while locked meets an explicit `vault_locked` instead of
-tunneling to the upstream literally (docs/../reference/diagnostics.md).
+tunneling to the upstream literally (docs/../docs/reference/diagnostics.md).
 
 **Scopes** — same bundle, three reaches (the only real degree of freedom):
 

@@ -43,7 +43,7 @@ pub struct ServiceDef {
     /// service's endpoints expose, which of them identify an action for
     /// binding (`scope`), and how to phrase them (`consent`). Opt-in — absent
     /// ⇒ the body is not part of any grant identity (Phase-1 behavior). See
-    /// docs/internals/request-scope.md and [`RequestShape`].
+    /// design/request-scope.md and [`RequestShape`].
     #[serde(default)]
     pub requests: HashMap<String, RequestShape>,
 }
@@ -429,7 +429,7 @@ impl PolicyDef {
     }
 }
 
-// ── Request shapes: `[requests.<name>]` (docs/internals/request-scope.md) ──────────────
+// ── Request shapes: `[requests.<name>]` (design/request-scope.md) ──────────────
 
 /// One request shape: a method+path matcher plus the body/query fields it
 /// exposes (`vars`), which of them bind the grant (`scope`), and how to phrase
@@ -709,7 +709,7 @@ pub struct PolicyFileRule {
     pub body: Option<String>,
     /// Structured field condition (`"vars.amount > 80"`), AND-combined with
     /// `match`/`body`. Vars come from the service's `[requests]`. See core
-    /// [`crate::core::policy::Condition`] and docs/internals/request-scope.md.
+    /// [`crate::core::policy::Condition`] and design/request-scope.md.
     #[serde(default)]
     pub when: Option<String>,
     /// Access decision (`allow` | `ask` | `ask-always` | `deny`) when this rule

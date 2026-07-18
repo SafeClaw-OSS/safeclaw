@@ -331,7 +331,7 @@ fn validate_service_inner(toml_str: &str) -> Result<(), Vec<String>> {
         }
     }
 
-    // [requests] shapes (docs/internals/request-scope.md). Intra-service invariants — the
+    // [requests] shapes (design/request-scope.md). Intra-service invariants — the
     // cross-file "when-var ∈ requests" check needs the paired policy.toml and
     // lives in `validate_service_policy` / the compiled-defs test.
     for (name, shape) in &def.requests {

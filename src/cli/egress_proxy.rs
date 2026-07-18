@@ -172,7 +172,7 @@ pub fn client(timeout: std::time::Duration) -> reqwest::Result<reqwest::Client> 
 }
 
 /// The constructor for the daemon's STREAMING cloud connection (the SSE sync
-/// stream, docs/internals/sse-sync.md): same fresh-proxy contract as [`client`]
+/// stream, design/sse-sync.md): same fresh-proxy contract as [`client`]
 /// — built per (re)connect, so a runtime `sc proxy set` is honoured at the
 /// very next dial — but with ONLY a connect budget. A total `.timeout()` here
 /// would be a bug: it fires mid-body and would kill a healthy held-open

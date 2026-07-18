@@ -1,4 +1,4 @@
-//! SSE sync push — the daemon (Core) side of docs/internals/sse-sync.md.
+//! SSE sync push — the daemon (Core) side of design/sse-sync.md.
 //!
 //! ONE `text/event-stream` connection per daemon replaces the per-vault PAIR
 //! of ~25s long-polls as the wake TRANSPORT. Long-poll stays intact as the
@@ -30,7 +30,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{watch, Notify};
 
-// ── Tunables (each one traces to a rule in docs/internals/sse-sync.md) ─────────
+// ── Tunables (each one traces to a rule in design/sse-sync.md) ─────────
 
 /// Backend `SSE_MAX_VIDS`. The route 400s the WHOLE request on any excess or
 /// shape-violating vid, so the dispatcher filters here — an excluded vault
@@ -681,7 +681,7 @@ enum ConnectFail {
 /// exits (tombstone) drops the sole strong ref, and the failed upgrade at the
 /// next (re)connect is how the vid leaves `?vids` — no back-channel needed.
 ///
-/// State machine (docs/internals/sse-sync.md, backoff/flap discipline):
+/// State machine (design/sse-sync.md, backoff/flap discipline):
 ///  - connect budget 10s-to-headers + 5s-to-hello; 45s no-bytes liveness.
 ///  - ★★ death after ≥60s healthy = ROTATION (Railway's ~15-min cap):
 ///    immediate re-dial, no backoff, health STAYS Up; Down only if that one

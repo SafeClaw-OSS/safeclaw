@@ -14,7 +14,7 @@
 >
 > **配套文档**：
 > - SUDP paper: `safeclaw-paper-nips/sections/{main,appendix}/0[3-9]-*.tex`（canonical 抽象协议）
-> - Service TOML schema: `../reference/services.md`（service.toml v3）
+> - Service TOML schema: `../docs/reference/services.md`（service.toml v3）
 > - Vault content schema: `stores-and-items.md`（stores / items / adapter contract — §5.2 引用此为 M 的 canonical 定义）
 
 ---

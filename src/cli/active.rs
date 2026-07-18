@@ -59,7 +59,7 @@ pub struct CliConfig {
     /// default.
     #[serde(default, skip_serializing_if = "Settings::is_empty")]
     pub settings: Settings,
-    /// SSE sync-stream switch (docs/internals/sse-sync.md): absent/"auto" =
+    /// SSE sync-stream switch (design/sse-sync.md): absent/"auto" =
     /// connect the wake stream, "off" = pure long-poll. Read by the stream
     /// dispatcher at every (re)connect, so flipping it bites within ~15 min
     /// without a restart. `SAFECLAW_SYNC_STREAM` overrides — and, unlike this

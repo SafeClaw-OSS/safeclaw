@@ -124,7 +124,7 @@ Maintenance   sc unlock · lock · sync · logs · doctor · upgrade · proxy ·
 |---|---|
 | [Docs](docs/README.md) | The product, module by module: concepts, guides, security |
 | [Reference](docs/reference/) | Service definitions, policy, error codes, consent templates |
-| [Internals](docs/internals/) | For contributors: protocol, broker architecture, schemas, sync |
+| [Design docs](design/) | For contributors: protocol, broker architecture, schemas, sync |
 
 ## License
 

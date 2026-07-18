@@ -1,7 +1,7 @@
 # Service TOML reference (v4)
 
 How to write a SafeClaw service definition. Design rationale lives in
-[../internals/credential-broker.md](./../internals/credential-broker.md); this page is the authoring
+[credential-broker.md](https://github.com/SafeClaw-OSS/safeclaw/blob/main/design/credential-broker.md); this page is the authoring
 reference only.
 
 A service is a folder `services/{id}/` — flat, so the filesystem itself
