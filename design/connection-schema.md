@@ -11,7 +11,7 @@
 > The recipe **config-slot / `{{template}}`** mechanism (§4, §8) is retired — a
 > self-hosted upstream is now just a **raw connection**. Canon =
 > [credential-broker.md](credential-broker.md); toml rules =
-> [../reference/services.md](../reference/services.md) v4.
+> [services.md](../docs/reference/services.md) v4.
 
 > THE data-schema reference for *connections* — the exact shapes in a vault and
 > how secrets, status, and routing derive from them.
@@ -213,7 +213,7 @@ sparse edits/additions merge on top (`ConnectionPolicy { default?, rules }`). Tw
 connections of the same service (`gmail`, `gmail_work`) therefore get independent
 policy overrides. The full policy model — per-action `level` decisions, the
 default floors, deny-override resolution, `ttl` — is in
-[../reference/policy.md](../reference/policy.md); the whole `aux.policy` tree is in
+[policy.md](../docs/reference/policy.md); the whole `aux.policy` tree is in
 [stores-and-items.md §7](stores-and-items.md).
 
 ---
@@ -263,7 +263,7 @@ Lifecycle of `gmail_work`: consent → `connecting["gmail_work"] = {service, oau
 
 > **RETIRED shape — kept for history.** The `[upstream.auth] secret=` /
 > `{{oauth.access_token}}` / `{{connection.host}}` recipe-template toml below is
-> superseded by **service.toml v4** ([../reference/services.md](../reference/services.md)): `[oauth2]` with
+> superseded by **service.toml v4** ([services.md](../docs/reference/services.md)): `[oauth2]` with
 > RFC field names (`refresh_token = "<KEY>"`), a uniform top-level `secrets`, no
 > `[upstream.*]`, no templates. A self-hosted upstream is a **raw connection**, not
 > a `{{connection.host}}` slot.

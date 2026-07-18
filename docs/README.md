@@ -2,8 +2,9 @@
 
 A systematic tour of SafeClaw, one module per page. Concepts explain how the
 product thinks; guides get a task done; security answers the questions that
-decide trust. `reference/` and `internals/` hold the deep layers. Pages are
-deliberately short and will deepen over time.
+decide trust. `reference/` holds the lookup layer; contributor design docs
+live outside this tree in [`design/`](https://github.com/SafeClaw-OSS/safeclaw/tree/main/design).
+Pages are deliberately short and will deepen over time.
 
 New here? Read [Overview](overview.md), then do the
 [Quickstart](quickstart.md).
@@ -42,12 +43,13 @@ For users and service authors, in [`reference/`](reference/):
 [diagnostics.md](reference/diagnostics.md) (every error code, with fixes),
 [consent-templates.md](reference/consent-templates.md) (approval-copy grammar).
 
-## Internals
+## Design docs
 
-For contributors reading the source, in [`internals/`](internals/):
-[protocol.md](internals/protocol.md) (SUDP cryptographic profile),
-[credential-broker.md](internals/credential-broker.md) (the broker architecture),
-[connection-schema.md](internals/connection-schema.md) (vault data shapes),
-[sync.md](internals/sync.md) / [sse-sync.md](internals/sse-sync.md) (cloud sync),
-[request-scope.md](internals/request-scope.md) (approval scope binding),
-[stores-and-items.md](internals/stores-and-items.md) (stores and vault content model).
+For contributors reading the source, outside this tree in
+[`design/`](https://github.com/SafeClaw-OSS/safeclaw/tree/main/design):
+[protocol.md](https://github.com/SafeClaw-OSS/safeclaw/blob/main/design/protocol.md) (SUDP cryptographic profile),
+[credential-broker.md](https://github.com/SafeClaw-OSS/safeclaw/blob/main/design/credential-broker.md) (the broker architecture),
+[connection-schema.md](https://github.com/SafeClaw-OSS/safeclaw/blob/main/design/connection-schema.md) (vault data shapes),
+[sync.md](https://github.com/SafeClaw-OSS/safeclaw/blob/main/design/sync.md) / [sse-sync.md](https://github.com/SafeClaw-OSS/safeclaw/blob/main/design/sse-sync.md) (cloud sync),
+[request-scope.md](https://github.com/SafeClaw-OSS/safeclaw/blob/main/design/request-scope.md) (approval scope binding),
+[stores-and-items.md](https://github.com/SafeClaw-OSS/safeclaw/blob/main/design/stores-and-items.md) (stores and vault content model).

@@ -3,7 +3,7 @@
 //! - `sealed_vault`: thin wrapper around `sudp::state::SealedState` for
 //!   on-disk vault.dat (Phase 3b.M, 2026-05-21).
 //! - `plaintext`: decrypted vault shape (v3 stores+items per
-//!   `docs/internals/stores-and-items.md`).
+//!   `design/stores-and-items.md`).
 //! - `vault_dir`: state-dir layout helpers (vaults/<id>/vault.dat).
 
 pub mod item;
