@@ -94,7 +94,7 @@ Full walkthrough: [docs/quickstart.md](docs/quickstart.md).
 
 ## Teach your agent
 
-Agents learn SafeClaw from one file: [static/safeclaw-skill.md](static/safeclaw-skill.md). The dashboard's install prompt already includes it; to hand it to an agent yourself, see [docs/for-your-agent.md](docs/for-your-agent.md). The one habit that matters: **phantoms, not values**. An agent never needs `sc get`; see [docs/sc-run.md](docs/sc-run.md).
+Agents learn SafeClaw from one file: [safeclaw-skill.md](static/safeclaw-skill.md). The dashboard's install prompt already includes it; to hand it to an agent yourself, see [docs/for-your-agent.md](docs/for-your-agent.md). The one habit that matters: **phantoms, not values**. An agent never needs `sc get`; see [docs/sc-run.md](docs/sc-run.md).
 
 ## CLI
 
