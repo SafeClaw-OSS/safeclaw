@@ -1,0 +1,123 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1040 720" width="1040" height="720" role="img">
+  <title>How a brokered request flows through SafeClaw: the agent holds a phantom, the local broker swaps in the real value at egress, the vault stays sealed by your passkey, the cloud syncs only an encrypted blob and relays approvals.</title>
+  <style>
+    text { font-family: -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; }
+    .cap  { font-size: 11px; letter-spacing: .16em; fill: #8f7a52; font-weight: 600; }
+    .zone { font-size: 10.5px; letter-spacing: .14em; fill: #71717a; font-weight: 600; text-anchor: middle; }
+    .bt   { font-size: 15.5px; font-weight: 600; fill: #e7e7ea; }
+    .bd   { font-size: 12.5px; fill: #a1a1aa; }
+    .ck   { font-size: 13px; fill: #a1a1aa; }
+    .lb   { font-size: 11px; fill: #8a8a93; }
+    .gl   { font-size: 11px; fill: #c9a96e; }
+    .gd   { font-size: 11px; fill: #b99c66; }
+    .dim  { font-size: 11px; fill: #6b6b74; }
+    .mono { font-family: ui-monospace, 'SF Mono', 'Cascadia Mono', Menlo, Consolas, monospace; }
+    .code { font-size: 11.5px; fill: #d4d4d8; }
+    .num  { font-size: 11px; font-weight: 600; fill: #c9a96e; text-anchor: middle; }
+    .mid  { text-anchor: middle; }
+  </style>
+  <defs>
+    <marker id="mGray" viewBox="0 0 10 10" refX="7" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0 0 L10 5 L0 10 Z" fill="#6b6b74"/>
+    </marker>
+    <marker id="mDim" viewBox="0 0 10 10" refX="7" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0 0 L10 5 L0 10 Z" fill="#52525b"/>
+    </marker>
+    <marker id="mGold" viewBox="0 0 10 10" refX="7" refY="5" markerWidth="7.5" markerHeight="7.5" orient="auto">
+      <path d="M0 0 L10 5 L0 10 Z" fill="#c9a96e"/>
+    </marker>
+  </defs>
+
+  <!-- card -->
+  <rect x="0.5" y="0.5" width="1039" height="719" rx="16" fill="#0c0c0e" stroke="#26262b"/>
+
+  <!-- header -->
+  <text class="cap" x="44" y="48">SAFECLAW · ONE BROKERED REQUEST, END TO END</text>
+  <line x1="782" y1="40" x2="810" y2="40" stroke="#c9a96e" stroke-width="2.5"/>
+  <text class="lb" x="818" y="44">where the real value travels</text>
+  <line x1="782" y1="62" x2="810" y2="62" stroke="#6b6b74" stroke-width="2"/>
+  <text class="lb" x="818" y="66">what the agent handles</text>
+
+  <!-- machine boundary -->
+  <rect x="352" y="104" width="308" height="452" rx="14" fill="none" stroke="#3f3f46" stroke-width="1.4" stroke-dasharray="5 6"/>
+  <text class="zone" x="506" y="134">YOUR MACHINE</text>
+
+  <!-- agent -->
+  <rect x="44" y="160" width="220" height="186" rx="12" fill="#141417" stroke="#2c2c33"/>
+  <text class="bt" x="60" y="190">Your agent</text>
+  <text class="mono code" x="60" y="222">GITHUB_TOKEN=__sc__github__</text>
+  <text class="mono code" x="60" y="241">sc run -- gh pr list</text>
+  <text class="bd" x="60" y="284">knows the phantom,</text>
+  <text class="bd" x="60" y="302">never the value</text>
+
+  <!-- broker -->
+  <rect x="380" y="160" width="252" height="186" rx="12" fill="#141417" stroke="#2c2c33"/>
+  <text class="bt" x="396" y="190">The broker</text>
+  <text class="mono" x="396" y="209" font-size="10.5" fill="#8f7a52">sc run · the one egress point</text>
+  <text class="ck" x="396" y="246">phantom → connection github</text>
+  <text class="ck" x="396" y="272">destination ∈ github's hosts?</text>
+  <text class="ck" x="396" y="298">policy: allow · ask · deny</text>
+  <circle cx="608" cy="182" r="10" fill="#1a1a1e" stroke="#8f7a52"/>
+  <text class="num" x="608" y="186">2</text>
+
+  <!-- vault -->
+  <rect x="380" y="448" width="252" height="78" rx="12" fill="#15130f" stroke="#4a3f2c"/>
+  <rect x="396" y="463" width="11" height="8.5" rx="2" fill="none" stroke="#c9a96e" stroke-width="1.4"/>
+  <path d="M398.5 463 v-3 a3 3 0 0 1 6 0 v3" fill="none" stroke="#c9a96e" stroke-width="1.4"/>
+  <text class="bt" x="414" y="472">Vault</text>
+  <text class="bd" x="396" y="498">sealed under your passkey</text>
+
+  <!-- service -->
+  <rect x="804" y="160" width="192" height="186" rx="12" fill="#141417" stroke="#2c2c33"/>
+  <text class="bt" x="820" y="190">The service</text>
+  <text class="mono code" x="820" y="218">api.github.com</text>
+  <text class="bd" x="820" y="258">an ordinary request,</text>
+  <text class="bd" x="820" y="276">real token inside</text>
+
+  <!-- cloud -->
+  <rect x="352" y="600" width="308" height="76" rx="12" fill="#141417" stroke="#2c2c33"/>
+  <text class="bt" x="368" y="628">SafeClaw cloud</text>
+  <text class="bd" x="368" y="650">syncs the sealed blob, relays approvals</text>
+  <text x="368" y="667" font-size="12" fill="#c9a96e">it cannot decrypt your vault</text>
+
+  <!-- passkey -->
+  <rect x="804" y="600" width="192" height="76" rx="12" fill="#141417" stroke="#2c2c33"/>
+  <text class="bt" x="820" y="628">Your passkey</text>
+  <text class="bd" x="820" y="650">one tap approves</text>
+  <text class="bd" x="820" y="666">exactly one operation</text>
+
+  <!-- 1: request with phantom -->
+  <line x1="264" y1="222" x2="372" y2="222" stroke="#6b6b74" stroke-width="1.8" marker-end="url(#mGray)"/>
+  <circle cx="316" cy="198" r="10" fill="#1a1a1e" stroke="#8f7a52"/>
+  <text class="num" x="316" y="202">1</text>
+  <text class="lb mid" x="316" y="246">the phantom,</text>
+  <text class="lb mid" x="316" y="261">not the key</text>
+
+  <!-- 3: egress swap (gold) -->
+  <line x1="632" y1="222" x2="796" y2="222" stroke="#c9a96e" stroke-width="2.4" marker-end="url(#mGold)"/>
+  <circle cx="714" cy="198" r="10" fill="#1a1a1e" stroke="#8f7a52"/>
+  <text class="num" x="714" y="202">3</text>
+  <text class="gl mid" x="714" y="246">real value swapped in</text>
+  <text class="gl mid" x="714" y="261">at the last hop</text>
+  <text class="mono mid" x="714" y="281" font-size="10" fill="#8f7a52">Authorization: ghp_····</text>
+
+  <!-- 4: response returns -->
+  <line x1="804" y1="310" x2="640" y2="310" stroke="#52525b" stroke-width="1.6" marker-end="url(#mDim)"/>
+  <circle cx="714" cy="310" r="10" fill="#1a1a1e" stroke="#8f7a52"/>
+  <text class="num" x="714" y="314">4</text>
+  <text class="lb mid" x="714" y="334">the response returns,</text>
+  <text class="lb mid" x="714" y="349">the value never does</text>
+  <line x1="372" y1="310" x2="272" y2="310" stroke="#52525b" stroke-width="1.6" marker-end="url(#mDim)"/>
+  <text class="dim mid" x="322" y="334">response</text>
+
+  <!-- vault feeds the broker (gold) -->
+  <line x1="506" y1="448" x2="506" y2="356" stroke="#c9a96e" stroke-width="2.2" marker-end="url(#mGold)"/>
+  <text class="gd" x="518" y="398">the only plaintext,</text>
+  <text class="gd" x="518" y="413">in daemon memory</text>
+
+  <!-- machine to cloud, cloud to passkey -->
+  <line x1="506" y1="556" x2="506" y2="600" stroke="#3f3f46" stroke-width="1.4" stroke-dasharray="4 5"/>
+  <text class="dim" x="518" y="582">sealed blob · approvals</text>
+  <line x1="660" y1="638" x2="804" y2="638" stroke="#3f3f46" stroke-width="1.4" stroke-dasharray="4 5"/>
+  <text class="dim mid" x="732" y="626">grant page</text>
+</svg>
