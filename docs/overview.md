@@ -3,7 +3,7 @@
 SafeClaw gives an agent the **use** of a credential without ever letting it
 **hold** the credential.
 
-![One brokered request, end to end: the agent holds only a phantom, the local broker resolves it, checks host and policy, and swaps in the real value at the last hop; the vault stays sealed under your passkey, and the cloud syncs only an encrypted blob it cannot decrypt](assets/architecture.svg)
+![One brokered request, end to end: the agent holds only a phantom, the local broker resolves it, checks host and policy, and swaps in the real value at the last hop; the vault stays sealed under your passkey, and the cloud syncs only sealed data it cannot decrypt](assets/architecture.svg)
 
 ## The problem
 
@@ -38,9 +38,9 @@ itself: no password exists anywhere in the system.
 
 - **Not a machine-wide interceptor.** Only `sc run` traffic is brokered; the
   phantom is the only trigger.
-- **Not cloud custody.** The cloud syncs a blob sealed under your passkey and
-  cannot decrypt it. Plaintext exists only in the daemon's memory, on your
-  machine, while unlocked.
+- **Not cloud custody.** The cloud syncs the vault sealed under your passkey
+  and cannot decrypt it. Plaintext exists only in the daemon's memory, on
+  your machine, while unlocked.
 - **Not an approval treadmill.** Policy is a gate, not a nag: reads flow,
   boundaries refuse loudly, and only defined-sensitive actions ask.
 
