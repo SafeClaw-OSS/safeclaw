@@ -6,7 +6,7 @@ gets its own API key; what any agent may *do* is decided elsewhere, by
 
 ## The identity
 
-`sc agent add <name>` (or the dashboard's install prompt) mints one env
+`sc agent add <name>` (or the console's install prompt) mints one env
 block:
 
 | Var | Meaning |
@@ -39,5 +39,5 @@ is exactly what the audit trail records. Costs and limits in detail:
 
 ## Handing it over
 
-The dashboard install prompt delivers pairing, env, and skill in one paste.
+The console install prompt delivers pairing, env, and skill in one paste.
 Doing it by hand: [For your agent](for-your-agent.md).

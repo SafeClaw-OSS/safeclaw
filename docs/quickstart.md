@@ -21,7 +21,7 @@ There is no password.
 
 ## 3. Pair this machine and your agent
 
-In the dashboard, "Connect a new agent" mints a one-time pair token and an
+In the console, "Connect a new agent" mints a one-time pair token and an
 install prompt. Paste the prompt to your agent and it does the rest. What it
 runs:
 
@@ -39,7 +39,7 @@ browser. After this, `sc status` shows the daemon up and the vault unlocked.
 
 Two doors, same result: a **connection** with hosts and a **phantom**.
 
-**Dashboard** (recommended for OAuth services like GitHub or Gmail): open your
+**Console** (recommended for OAuth services like GitHub or Gmail): open your
 vault's Connections tab, pick the service, sign in or paste the key. Values
 you type there are encrypted in your browser before upload.
 

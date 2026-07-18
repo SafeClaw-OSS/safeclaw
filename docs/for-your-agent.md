@@ -7,7 +7,7 @@ approvals. This page is only about handing it over.
 
 ## The easy way
 
-The dashboard's "Connect a new agent" install prompt already pairs the
+The console's "Connect a new agent" install prompt already pairs the
 machine, mints the agent's env, and delivers the skill. If you went through
 [Quickstart](quickstart.md) step 3, you are done; this page is for doing it by
 hand.
