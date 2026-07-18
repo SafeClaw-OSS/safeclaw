@@ -2,7 +2,7 @@
 
 > **Single source of truth for how a vault's sealed state moves between a
 > device's daemon and the cloud.** Supersedes the scattered notes in
-> `src/sync.rs`, `CONNECTIONS_AND_AUTH.md` §4a, and the session memories.
+> `src/sync.rs` and the session memories.
 >
 > Status tags below: **[SHIPPED]** = live today · **[GAP]** = a known hole this
 > redesign closes · **[PROPOSED]** = the target design (not yet built).

@@ -14,8 +14,7 @@
 > [SERVICES.md](./SERVICES.md) v4.
 
 > THE data-schema reference for *connections* — the exact shapes in a vault and
-> how secrets, status, and routing derive from them. Companion to
-> [CONNECTIONS_AND_AUTH.md](CONNECTIONS_AND_AUTH.md) (lifecycle + rationale).
+> how secrets, status, and routing derive from them.
 >
 > **Pre-launch: no migration.** This supersedes the minimal shape shipped in
 > v1.0.20/.21 (§8). Landing = **delete the vault, recreate, re-test.** No
