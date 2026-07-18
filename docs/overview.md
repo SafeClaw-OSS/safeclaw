@@ -3,6 +3,8 @@
 SafeClaw gives an agent the **use** of a credential without ever letting it
 **hold** the credential.
 
+![One brokered request, end to end: the agent holds only a phantom, the local broker resolves it, checks host and policy, and swaps in the real value at the last hop; the vault stays sealed under your passkey, and the cloud syncs only an encrypted blob it cannot decrypt](assets/architecture.svg)
+
 ## The problem
 
 Agents need your API keys to do real work, and today they get them the worst
@@ -31,16 +33,6 @@ back; the value never does. Traffic you don't route is untouched.
 flow; sensitive ones pause until you approve them with a passkey tap, and one
 tap authorizes exactly one operation. The same passkey seals the vault
 itself: no password exists anywhere in the system.
-
-## One request, end to end
-
-```
-agent:   GITHUB_TOKEN=__sc__github__ sc run -- gh pr list
-broker:  phantom → connection "github" → secret; destination ∈ github's hosts?
-policy:  "list PRs" = read = allow          (a delete would wait for your tap)
-egress:  header rewritten with the real token, request forwarded
-agent:   sees the PR list, never the token
-```
 
 ## What SafeClaw is not
 

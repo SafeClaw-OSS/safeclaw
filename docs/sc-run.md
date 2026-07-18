@@ -6,33 +6,16 @@ where the credential would go, prefix the command with `sc run --`, and the
 proxy substitutes the real value at egress, only toward that connection's own
 hosts.
 
-## The anti-pattern
-
-If you learned other secret managers first, this feels natural:
-
-```bash
-HF_TOKEN=$(sc get HF_TOKEN) python train.py     # don't
-```
-
-It runs, but it defeats the point. The plaintext now sits in the process
-environment where the agent, `python`, and every child process can read it,
-and you paid a passkey ceremony for the privilege: every `sc get` is
-approval-gated because it reveals a value. You have reproduced "paste the key
-into the env" with extra steps.
-
-`sc get` exists for *you* at a terminal: a one-off `curl` you type yourself,
-checking what's stored, migrating away. It is not an agent primitive.
-
 ## The pattern
 
 ```bash
 HF_TOKEN=__sc__hf_token__ sc run -- python train.py
 ```
 
-Same command shape, but the env var carries the phantom. Nothing in the
-agent's world ever holds the token; the swap happens inside the proxy, on the
-way to `huggingface.co` and nowhere else. No approval ceremony per read,
-because nothing is revealed.
+The env var carries the phantom, not a value. Nothing in the agent's world
+ever holds the token; the swap happens inside the proxy, on the way to
+`huggingface.co` and nowhere else. No approval ceremony per read, because
+nothing is revealed.
 
 Three steps, always the same:
 
@@ -62,6 +45,23 @@ A policy-gated use fails the command with an approval link in its error
 output. Open the link, tap your passkey, re-run the exact same command; the
 approval is cached. Agents background `sc op wait <op_id>` and treat its exit
 as the signal (0 = approved).
+
+## The anti-pattern: `$(sc get)`
+
+If you learned other secret managers first, this feels natural:
+
+```bash
+HF_TOKEN=$(sc get HF_TOKEN) python train.py     # don't
+```
+
+It runs, but it defeats the point. The plaintext now sits in the process
+environment where the agent, `python`, and every child process can read it,
+and you paid a passkey ceremony for the privilege: every `sc get` is
+approval-gated because it reveals a value. You have reproduced "paste the key
+into the env" with extra steps.
+
+`sc get` exists for *you* at a terminal: a one-off `curl` you type yourself,
+checking what's stored, migrating away. It is not an agent primitive.
 
 ## Debugging a 401/403
 
