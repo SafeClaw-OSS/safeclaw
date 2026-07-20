@@ -11,7 +11,7 @@ Purchases (POST /v2/purchase) ask for approval by default.
 id = "snaplii"
 name = "Snaplii"
 # Classification for browse/filter and policy tag-floors; lowercase-kebab, multi OK.
-tags = ["wallet"]
+tags = ["payment"]
 
 # One AI-payment api key (snp_sk_live_…, minted in the Snaplii app under
 # More → Payment Methods → AI Payment Management) backs the whole A2M API.
