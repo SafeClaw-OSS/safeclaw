@@ -11,7 +11,7 @@ approve link surfaces in cargo's error output. Tap it, then re-run the command.
 id = "cratesio"
 name = "crates.io"
 # Classification for browse/filter and policy tag-floors; lowercase-kebab, multi OK.
-tags = ["app"]
+tags = ["dev"]
 
 hosts = ["crates.io"]
 secrets = ["CARGO_REGISTRY_TOKEN"]
