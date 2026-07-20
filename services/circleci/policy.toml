@@ -1,0 +1,27 @@
+# CircleCI policy. The token never enters the agent and egress is host-anchored,
+# so routine reads (pipelines, jobs, workflows, insights, env-var listing) ride
+# the floor. The gate is spent on the two consequential ones: triggering a
+# pipeline runs arbitrary CI code (a supply-chain / code-execution surface), and
+# writing a project env var plants a value the build will read. Each rule is a
+# per-connection console toggle; loosen or tighten to taste.
+#
+# Paths are relative to host circleci.com; the project slug is one URL-encoded
+# segment (e.g. gh%2Forg%2Frepo), so `**` covers both encoded and literal forms.
+
+[default]
+read = "allow"
+write = "allow"
+
+# ── Supply chain / code execution ────────────────────────────────────────────
+[[rule]]
+id = "trigger-pipeline"
+label = "Trigger a pipeline (runs arbitrary CI code)"
+match = "POST /api/v2/project/**/pipeline"
+level = "ask"
+
+# ── Plant a secret the build will read ───────────────────────────────────────
+[[rule]]
+id = "create-env-var"
+label = "Create or overwrite a project environment variable"
+match = "POST /api/v2/project/**/envvar"
+level = "ask"

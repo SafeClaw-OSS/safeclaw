@@ -1,0 +1,50 @@
+# Vercel policy. The token never enters the agent and egress is host-anchored, so
+# routine work (reads, deploys, config, env changes) rides the write floor. The
+# gate is spent on the few that destroy infrastructure, change who can get in,
+# or open an exfil path. Each rule is a per-connection console toggle.
+#
+# Paths carry Vercel's version prefix (/v9, /v13, …); `/v*/` keeps a rule valid
+# across version bumps. Single `*` = one path segment.
+
+[default]
+read = "allow"
+write = "allow"
+
+# ── Destroy (irreversible) ───────────────────────────────────────────────────
+[[rule]]
+id = "delete-project"
+label = "Delete a project"
+match = "DELETE /v*/projects/*"
+level = "ask-always"
+
+[[rule]]
+id = "delete-deployment"
+label = "Delete a deployment"
+match = "DELETE /v*/deployments/*"
+level = "ask"
+
+[[rule]]
+id = "delete-domain"
+label = "Remove a domain"
+match = "DELETE /v*/domains/*"
+level = "ask-always"
+
+# ── Change who can get in (access posture) ───────────────────────────────────
+[[rule]]
+id = "remove-member"
+label = "Remove a team member"
+match = "DELETE /v*/teams/*/members/*"
+level = "ask-always"
+
+# ── Supply chain / exfil (a webhook streams project events to an outside URL) ─
+[[rule]]
+id = "create-webhook"
+label = "Create a webhook"
+match = "POST /v*/webhooks"
+level = "ask-always"
+
+[[rule]]
+id = "delete-integration"
+label = "Remove an integration configuration"
+match = "DELETE /v*/integrations/configuration/*"
+level = "ask"

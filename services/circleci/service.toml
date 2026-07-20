@@ -1,0 +1,18 @@
+setup = """
+CircleCI's v2 API takes the token in a Circle-Token header. Put the phantom
+there; the proxy substitutes it at egress, the token never enters the agent:
+  sc run -- curl https://circleci.com/api/v2/me \\
+    -H "Circle-Token: __sc__circleci__"
+Multi-account: switch the phantom value (__sc__circleci_work__).
+"""
+
+[service]
+id = "circleci"
+name = "CircleCI"
+# Classification for browse/filter and policy tag-floors; lowercase-kebab, multi OK.
+tags = ["app"]
+
+hosts = ["circleci.com"]
+secrets = ["CIRCLECI_API_TOKEN"]
+# Where a human mints the secret (auxiliary; display-only helper link).
+secret_url = "https://app.circleci.com/settings/user/tokens"

@@ -1,0 +1,24 @@
+setup = """
+Netlify's API takes a bearer personal access token. Put the phantom in the
+header; the proxy substitutes it at egress, the token never enters the agent:
+  sc run -- curl https://api.netlify.com/api/v1/sites \\
+    -H "Authorization: Bearer __sc__netlify__"
+Multi-account: switch the phantom value (__sc__netlify_work__).
+"""
+
+[service]
+id = "netlify"
+name = "Netlify"
+# Classification for browse/filter and policy tag-floors; lowercase-kebab, multi OK.
+tags = ["app"]
+
+hosts = ["api.netlify.com"]
+secrets = ["NETLIFY_API_TOKEN"]
+# Where a human mints the secret (auxiliary; display-only helper link).
+secret_url = "https://app.netlify.com/user/applications#personal-access-tokens"
+
+# NOTE (policy): no policy.toml yet. Netlify's destructive endpoints (delete a
+# site, delete a deploy, rotate build hooks) were not verified against the API
+# reference at add time, so per SafeClaw's "ground truth, not guessed" rule the
+# danger rules are deliberately omitted rather than approximated. The service
+# runs on the global allow floor until a verified policy is written.

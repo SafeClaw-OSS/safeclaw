@@ -1,0 +1,15 @@
+# Google Tasks policy. Token never enters the agent; egress is host-anchored.
+# Creating/editing/completing tasks rides the write floor. The one operation
+# worth a look is deleting a whole task list, which drops every task under it in
+# a single call. Deleting individual tasks stays on the floor (low blast radius).
+
+[default]
+read = "allow"
+write = "allow"
+
+# ── Lose a batch of work in one call ─────────────────────────────────────────
+[[rule]]
+id = "delete-tasklist"
+label = "Delete a task list (drops all its tasks)"
+match = "DELETE /tasks/v1/users/@me/lists/*"
+level = "ask"

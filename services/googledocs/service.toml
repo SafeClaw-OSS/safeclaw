@@ -1,0 +1,33 @@
+[service]
+id = "googledocs"
+name = "Google Docs"
+# Classification for browse/filter and policy tag-floors; lowercase-kebab, multi OK.
+tags = ["app"]
+
+hosts = ["docs.googleapis.com"]
+secrets = ["GOOGLE_DOCS_REFRESH_TOKEN"]
+
+[auth]
+type = "oauth2"
+# Display label only ("Connect with Google") — carries no config.
+provider = "google"
+scopes = [
+  "https://www.googleapis.com/auth/documents",
+  "https://www.googleapis.com/auth/documents.readonly",
+]
+refresh_token = "GOOGLE_DOCS_REFRESH_TOKEN"
+
+# Shared Google Desktop OAuth client — same PUBLIC (non-confidential) client as
+# gmail/gcalendar/gdrive; rotate all together. Canonical rationale for shipping
+# the client_secret in the clear: services/gmail/service.toml.
+authorization_url = "https://accounts.google.com/o/oauth2/v2/auth"
+token_url         = "https://oauth2.googleapis.com/token"
+pkce              = true
+client_id         = "499410884315-6m6vu98ls61i0e0cn38663mm573nu87a.apps.googleusercontent.com"
+client_secret     = "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"
+redirect_uri      = "http://127.0.0.1:8765/safeclaw/oauth/callback"
+
+# Google quirk: without these a repeat consent returns no refresh_token.
+[auth.authorize_params]
+access_type = "offline"
+prompt      = "consent"
