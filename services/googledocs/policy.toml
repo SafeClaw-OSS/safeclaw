@@ -1,0 +1,11 @@
+# Google Docs policy. The Docs API edits document content in place — its
+# destructive operations (deleteContentRange, deleteNamedRange, deletePositioned-
+# Object, …) all travel inside a `documents.batchUpdate` request BODY, not as
+# distinct URL paths, so there is no path-level operation to gate here; and
+# deleting the document itself happens on Drive (a different host/service, gated
+# there). Everything rides the write floor. If you want batchUpdate edits to
+# prompt, tighten this per-connection in the console.
+
+[default]
+read = "allow"
+write = "allow"

@@ -95,13 +95,15 @@ pub fn validate_grant(
     rp_id: &str,
     credential_lookup: impl FnOnce(&str) -> Option<PasskeyEntry>,
 ) -> Result<ValidatedGrant> {
-    // 1. Consume r (single-use, must be issued by us).
-    {
-        if !challenge_store.verify(&grant.r) {
-            return Err(AppError::Unauthorized(
-                "invalid or expired challenge `r`".into(),
-            ));
-        }
+    // 1. Gate on r (must be issued by us and unexpired) but do NOT consume it
+    //    yet — a cheap peek. Consuming here (before the signature is verified)
+    //    would let anyone who learned the op's `r` burn a live op's single-use
+    //    challenge with a bogus grant, breaking the real approval. The challenge
+    //    is consumed only after the WebAuthn signature checks out (step 8).
+    if !challenge_store.peek(&grant.r) {
+        return Err(AppError::Unauthorized(
+            "invalid or expired challenge `r`".into(),
+        ));
     }
 
     // 2. Validity window.
@@ -190,6 +192,11 @@ pub fn validate_grant(
     let mut wk_str = wrapping_key_b64.to_string();
     unsafe { wk_str.as_bytes_mut().zeroize() };
     drop(wk_str);
+
+    // 8. Grant fully validated (signature + all fields) — NOW consume the
+    //    single-use challenge, so a valid grant can't be replayed and a bogus
+    //    one never got this far to burn it.
+    challenge_store.consume(&grant.r);
 
     Ok(ValidatedGrant {
         op: grant.o.clone(),

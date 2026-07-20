@@ -1,0 +1,10 @@
+# Google Slides policy. Like Docs and Sheets, the destructive operations
+# (deleteObject, deleteText, deleteTableRow, …) travel inside a
+# `presentations.batchUpdate` request BODY, not as distinct URL paths, so there is
+# no path-level operation to gate here; and deleting the presentation file itself
+# happens on Drive (a different host/service, gated there). Everything rides the
+# write floor. Tighten per-connection in the console if you want edits to prompt.
+
+[default]
+read = "allow"
+write = "allow"

@@ -280,7 +280,7 @@ pub struct ServiceMeta {
     pub id: String,
     pub name: String,
     /// Classification tags (lowercase-kebab, multiple allowed) — e.g. "ai",
-    /// "app", "messaging", "wallet". Replaces the old directory-derived single
+    /// "app", "messaging", "payment". Replaces the old directory-derived single
     /// category. Dual use: browse/filter metadata on the registry wire, and
     /// policy tag-floor matching (`Policy.categories` keys; when several tags
     /// hit floors the most restrictive wins). Absent (per-vault custom

@@ -67,6 +67,23 @@ impl ChallengeStore {
         }
     }
 
+    /// Check a challenge is present and unexpired WITHOUT consuming it. Lets a
+    /// caller cheaply reject a bogus/expired `r` before running expensive
+    /// signature verification, then [`consume`](Self::consume) it only once the
+    /// grant fully validates — so a bogus submit can't burn a live challenge.
+    pub fn peek(&self, challenge_b64: &str) -> bool {
+        self.challenges
+            .get(challenge_b64)
+            .map(|(issued_at, _ip)| Instant::now().duration_since(*issued_at).as_secs() < TTL_SECS)
+            .unwrap_or(false)
+    }
+
+    /// Remove a challenge (single-use) after its grant has fully validated.
+    /// Idempotent — a second call is a no-op.
+    pub fn consume(&mut self, challenge_b64: &str) {
+        self.challenges.remove(challenge_b64);
+    }
+
     /// Remove expired challenges and stale rate limit entries.
     pub fn cleanup(&mut self) {
         let now = Instant::now();

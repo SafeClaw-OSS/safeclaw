@@ -1,0 +1,10 @@
+# Google Sheets policy. Like Docs, the destructive Sheets operations (deleteSheet,
+# deleteDimension, deleteRange, clearValues, …) travel inside a
+# `spreadsheets.batchUpdate` request BODY, not as distinct URL paths, so there is
+# no path-level operation to gate here; and deleting the spreadsheet file itself
+# happens on Drive (a different host/service, gated there). Everything rides the
+# write floor. Tighten per-connection in the console if you want edits to prompt.
+
+[default]
+read = "allow"
+write = "allow"

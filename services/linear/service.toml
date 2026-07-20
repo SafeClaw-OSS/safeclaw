@@ -1,0 +1,28 @@
+setup = """
+Linear's GraphQL API takes the personal API key directly in the Authorization
+header (no "Bearer" prefix). Put the phantom there; the proxy substitutes it at
+egress, the key never enters the agent:
+  sc run -- curl https://api.linear.app/graphql \\
+    -H "Authorization: __sc__linear__" \\
+    -H "Content-Type: application/json" \\
+    -d '{"query":"{ viewer { name } }"}'
+Multi-account: switch the phantom value (__sc__linear_work__).
+"""
+
+[service]
+id = "linear"
+name = "Linear"
+# Classification for browse/filter and policy tag-floors; lowercase-kebab, multi OK.
+tags = ["app"]
+
+hosts = ["api.linear.app"]
+secrets = ["LINEAR_API_KEY"]
+# Where a human mints the secret (auxiliary; display-only helper link).
+secret_url = "https://linear.app/settings/api"
+
+# NOTE (policy): no policy.toml yet. Linear's whole API is one GraphQL endpoint
+# (POST /graphql), so danger has to be matched by mutation name in the request
+# body (the pattern railway/policy.toml uses). Those mutation names need to come
+# from live schema introspection, not memory — per SafeClaw's "ground truth, not
+# guessed" rule the policy is deferred rather than approximated. Runs on the
+# global allow floor until a verified policy is written.

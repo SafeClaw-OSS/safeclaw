@@ -1,0 +1,32 @@
+# Cloudflare DNS policy. The token never enters the agent and egress is
+# host-anchored. Reads and creating records ride the floor. The gate is spent on
+# the changes that can silently hijack traffic: deleting a record can take a
+# service offline, and overwriting an existing A/MX/CNAME can re-point web or
+# mail traffic to an attacker. Each rule is a per-connection console toggle.
+#
+# Paths are relative to host api.cloudflare.com (base /client/v4). Cloudflare
+# exposes both PUT (overwrite) and PATCH (partial update) on a record; both can
+# re-point, so both are gated.
+
+[default]
+read = "allow"
+write = "allow"
+
+# ── Re-point / remove traffic ────────────────────────────────────────────────
+[[rule]]
+id = "delete-dns-record"
+label = "Delete a DNS record"
+match = "DELETE /client/v4/zones/*/dns_records/*"
+level = "ask-always"
+
+[[rule]]
+id = "overwrite-dns-record"
+label = "Overwrite a DNS record (can re-point traffic)"
+match = "PUT /client/v4/zones/*/dns_records/*"
+level = "ask-always"
+
+[[rule]]
+id = "patch-dns-record"
+label = "Update a DNS record (can re-point traffic)"
+match = "PATCH /client/v4/zones/*/dns_records/*"
+level = "ask-always"

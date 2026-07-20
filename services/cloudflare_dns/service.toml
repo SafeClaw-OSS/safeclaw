@@ -1,0 +1,19 @@
+setup = """
+Cloudflare's v4 API takes a bearer API token. Put the phantom in the header; the
+proxy substitutes it at egress, the token never enters the agent:
+  sc run -- curl https://api.cloudflare.com/client/v4/user/tokens/verify \\
+    -H "Authorization: Bearer __sc__cloudflare_dns__"
+Scope the token to Zone.DNS when you mint it. Multi-account: switch the phantom
+value (__sc__cloudflare_dns_work__).
+"""
+
+[service]
+id = "cloudflare_dns"
+name = "Cloudflare DNS"
+# Classification for browse/filter and policy tag-floors; lowercase-kebab, multi OK.
+tags = ["app"]
+
+hosts = ["api.cloudflare.com"]
+secrets = ["CLOUDFLARE_API_TOKEN"]
+# Where a human mints the secret (auxiliary; display-only helper link).
+secret_url = "https://dash.cloudflare.com/profile/api-tokens"
