@@ -290,10 +290,44 @@ pub enum ConnectionSubcommand {
     /// Remove a connection and its secret(s) from the vault (two passkey
     /// gestures: unlock + write). Mirrors the console's "Disconnect".
     Rm(ConnectionRmArgs),
+    /// Propose adding a host to an existing connection's anchor — an exact FQDN
+    /// or a leftmost `*.domain` wildcard (covers every subdomain). Passkey-gated:
+    /// it mints an approval the vault owner confirms (an agent surfaces the
+    /// link), then the host is added DURABLY. The self-service twin of the
+    /// proxy's one-tap host widen — how an agent that hit a host it can't reach
+    /// asks for access instead of a human editing the vault by hand.
+    #[command(name = "add-host")]
+    AddHost(ConnectionHostArgs),
+    /// Propose REMOVING a host from a connection's anchor (tighten access) — the
+    /// inverse of `add-host`. Same passkey approval; idempotent (a host not on
+    /// the anchor reports nothing removed).
+    #[command(name = "rm-host")]
+    RmHost(ConnectionHostArgs),
 }
 
 #[derive(Debug, Args)]
 pub struct ConnectionLsArgs {}
+
+/// Args for `sc connection add-host` / `rm-host` — one passkey-approved host
+/// edit on an existing connection's anchor.
+#[derive(Debug, Args)]
+pub struct ConnectionHostArgs {
+    /// The connection to edit (see `sc connection ls`). Free text is slugified
+    /// the same way `add` mints the id.
+    #[arg(value_name = "ID")]
+    pub id: String,
+    /// The host: an exact FQDN (`api.example.com`) or a leftmost `*.domain`
+    /// wildcard (`*.example.com`) covering every subdomain.
+    #[arg(value_name = "HOST")]
+    pub host: String,
+    #[arg(long)]
+    pub no_browser: bool,
+    /// Fixed port for the localhost callback server (for SSH port-forwarding).
+    #[arg(long, env = "SAFECLAW_CB_PORT")]
+    pub cb_port: Option<u16>,
+    #[arg(long, default_value = "120")]
+    pub timeout: u64,
+}
 
 #[derive(Debug, Args)]
 pub struct ConnectionRmArgs {

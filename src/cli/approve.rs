@@ -148,9 +148,20 @@ async fn remote_approve(custodian: &str, op_id: &str, label: &str) -> Result<Val
     let mut deadline_from_op = false;
     loop {
         if Instant::now() >= deadline {
+            if deadline_from_op {
+                // We read the op's real expiry and waited its whole window out.
+                return Err(format!(
+                    "the approval window expired — re-run the command for a fresh link (was {})",
+                    url
+                ));
+            }
+            // Never got a clean status read (daemon busy / restarting) — but the
+            // op WAS registered and its cloud link is almost certainly still
+            // live, so don't claim it expired.
             return Err(format!(
-                "the approval window expired — re-run the command for a fresh link (was {})",
-                url
+                "stopped waiting after {}s — if you haven't approved it yet the link is still \
+                 live; approve it then re-run, or `sc op wait {}` to keep waiting. link: {}",
+                REMOTE_APPROVE_TIMEOUT_SECS, op_id, url
             ));
         }
         tokio::time::sleep(REMOTE_POLL_INTERVAL).await;
@@ -158,8 +169,12 @@ async fn remote_approve(custodian: &str, op_id: &str, label: &str) -> Result<Val
             Ok(r) => r,
             Err(_) => continue, // transient; keep polling
         };
+        // A 404 is NOT proof of expiry: the daemon may be restarting, or the op
+        // record was momentarily reaped while the cloud op (and its relay
+        // applier) is still live and approvable. Treat it as transient and keep
+        // polling — the deadline (the op's own expires_at) is what decides.
         if resp.status().as_u16() == 404 {
-            return Err("approval expired before it was completed".into());
+            continue;
         }
         let body: Value = match resp.json().await {
             Ok(v) => v,

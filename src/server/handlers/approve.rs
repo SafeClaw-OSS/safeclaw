@@ -226,6 +226,7 @@ pub(crate) const DISPATCHED_CUSTOM_ACTS: &[&str] = &[
     "vault-delete",
     "rename-passkey",
     "widen-host",
+    "narrow-host",
     "service-ls",
     "service-rm",
     "service-add",
@@ -1108,10 +1109,127 @@ pub async fn approve_op(
                         "widen-host scope needs connection_id + host".into(),
                     ));
                 }
+                // Session snapshot first, so the agent's immediate retry passes
+                // the anchor, then persist DURABLY into `aux.connections[conn]`
+                // so the grant survives a restart / re-unlock — the same
+                // open -> mutate -> reseal -> push path connection-add/secret-set
+                // use. The grant already carries W_c (every approve path attaches
+                // it, act-agnostic: cli/approve.rs + fe vault-grant.ts), so this
+                // opens + reseals the vault like any other mutating custom act.
                 state.widen_connection_host(&vault_id, &conn, &host);
-                tracing::info!(vault = %vault_id, conn = %conn, host = %host, "host widened (session)");
+                crate::cli::conn::validate_raw_host(&host).map_err(AppError::BadRequest)?;
+                let (mut view, k) =
+                    crate::server::handlers::metadata::open_view_for_grant_keep_key(
+                        &state,
+                        &vault_id,
+                        &validated.op,
+                        &validated.wrapping_key,
+                        &validated.credential_id_bytes,
+                        existing_vault.as_ref(),
+                    )?;
+                match view.aux.connections.get_mut(&conn) {
+                    Some(rec) => {
+                        let hosts = rec.hosts.get_or_insert_with(Vec::new);
+                        if !hosts.iter().any(|h| h.eq_ignore_ascii_case(&host)) {
+                            hosts.push(host.clone());
+                        }
+                    }
+                    // No explicit record = a synthesized default connection
+                    // (`conn` names a catalog/custom service, brokered off its
+                    // declared hosts). Materialise a record that keeps the
+                    // service binding and pins the just-approved host.
+                    None => {
+                        let bound_service = (view.aux.services.contains_key(&conn)
+                            || state.services.get(&conn).is_some())
+                        .then(|| conn.clone());
+                        view.aux.connections.insert(
+                            conn.clone(),
+                            crate::storage::plaintext::Connection {
+                                name: None,
+                                service: bound_service,
+                                hosts: Some(vec![host.clone()]),
+                                secrets: None,
+                                keys: None,
+                            },
+                        );
+                    }
+                }
+                crate::auth::connect::persist_mutated_view(&state, &vault_id, &view, &k)
+                    .map_err(AppError::Internal)?;
+                {
+                    let state = state.clone();
+                    let vid = vault_id.clone();
+                    tokio::spawn(async move {
+                        crate::sync::push_keys_best_effort(&state, &vid).await;
+                        crate::sync::push_items_best_effort(&state, &vid).await;
+                    });
+                }
+                tracing::info!(vault = %vault_id, conn = %conn, host = %host, "host widened (durable)");
                 (
                     json!({ "ok": true, "act": "widen-host", "connection_id": conn, "host": host }),
+                    None,
+                )
+            }
+            // Inverse of widen-host — remove a host from a connection's anchor
+            // (tighten access). Minted by `sc connection rm-host`; passkey-gated
+            // like every vault mutation. Durable: open under the grant, drop the
+            // host from aux.connections[conn].hosts, reseal + push (the re-bootstrap
+            // in persist refreshes the routing snapshot, so no session call).
+            // Idempotent — a host not on the anchor is a no-op (removed = false).
+            "narrow-host" => {
+                let conn = validated
+                    .op
+                    .act
+                    .scope
+                    .get("connection_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let host = validated
+                    .op
+                    .act
+                    .scope
+                    .get("host")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if conn.is_empty() || host.is_empty() {
+                    return Err(AppError::BadRequest(
+                        "narrow-host scope needs connection_id + host".into(),
+                    ));
+                }
+                let (mut view, k) =
+                    crate::server::handlers::metadata::open_view_for_grant_keep_key(
+                        &state,
+                        &vault_id,
+                        &validated.op,
+                        &validated.wrapping_key,
+                        &validated.credential_id_bytes,
+                        existing_vault.as_ref(),
+                    )?;
+                let mut removed = false;
+                if let Some(rec) = view.aux.connections.get_mut(&conn) {
+                    if let Some(hosts) = rec.hosts.as_mut() {
+                        let before = hosts.len();
+                        hosts.retain(|h| !h.eq_ignore_ascii_case(&host));
+                        removed = hosts.len() != before;
+                    }
+                }
+                if removed {
+                    crate::auth::connect::persist_mutated_view(&state, &vault_id, &view, &k)
+                        .map_err(AppError::Internal)?;
+                    {
+                        let state = state.clone();
+                        let vid = vault_id.clone();
+                        tokio::spawn(async move {
+                            crate::sync::push_keys_best_effort(&state, &vid).await;
+                            crate::sync::push_items_best_effort(&state, &vid).await;
+                        });
+                    }
+                }
+                tracing::info!(vault = %vault_id, conn = %conn, host = %host, removed, "host narrowed");
+                (
+                    json!({ "ok": true, "act": "narrow-host", "connection_id": conn, "host": host, "removed": removed }),
                     None,
                 )
             }
