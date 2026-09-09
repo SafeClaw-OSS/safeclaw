@@ -1,0 +1,6 @@
+# Payments API: reads (list products/customers/subscriptions) flow freely; any
+# write (create a charge/checkout, refund, cancel a subscription) moves money, so
+# it takes a passkey. Per-connection override in the console if you automate it.
+[default]
+read = "allow"
+write = "ask"

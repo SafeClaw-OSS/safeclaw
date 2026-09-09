@@ -1,0 +1,13 @@
+[service]
+id = "etherscan"
+name = "Etherscan"
+# Classification for browse/filter and policy tag-floors; lowercase-kebab, multi OK.
+tags = ["dev"]
+
+# Etherscan V2 (one multichain endpoint). The API key rides a URL query param
+# (?apikey=<key>) — the agent writes the phantom there and the broker
+# substitutes at egress.
+hosts = ["api.etherscan.io"]
+secrets = ["ETHERSCAN_API_KEY"]
+# Where a human mints the secret (auxiliary; display-only helper link).
+secret_url = "https://etherscan.io/myapikey"

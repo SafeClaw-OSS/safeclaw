@@ -1,0 +1,14 @@
+[service]
+id = "bitquery"
+name = "Bitquery"
+# Classification for browse/filter and policy tag-floors; lowercase-kebab, multi OK.
+tags = ["dev"]
+
+# Bitquery V2 GraphQL. The credential is a static access token used as a Bearer
+# (Authorization header) — the agent writes the phantom, the broker substitutes
+# at egress. (V2's OAuth2 client-credentials flow is a separate mechanism, not
+# modeled here; a static token from the access-tokens page is what this anchors.)
+hosts = ["streaming.bitquery.io"]
+secrets = ["BITQUERY_API_KEY"]
+# Where a human mints the secret (auxiliary; display-only helper link).
+secret_url = "https://account.bitquery.io/user/api_v2/access_tokens"

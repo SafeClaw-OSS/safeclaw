@@ -1,0 +1,12 @@
+[service]
+id = "anysearch"
+name = "AnySearch"
+# Classification for browse/filter and policy tag-floors; lowercase-kebab, multi OK.
+tags = ["ai"]
+
+# Real-time search API for AI agents. The key is a Bearer token (Authorization
+# header) — the agent writes the phantom, the broker substitutes at egress.
+hosts = ["api.anysearch.com"]
+secrets = ["ANYSEARCH_API_KEY"]
+# Where a human mints the secret (auxiliary; display-only helper link).
+secret_url = "https://www.anysearch.com/console/api-keys"
