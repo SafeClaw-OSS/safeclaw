@@ -1,0 +1,3 @@
+[default]
+read = "allow"
+write = "allow"

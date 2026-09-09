@@ -1,0 +1,13 @@
+[service]
+id = "creem"
+name = "Creem"
+# Classification for browse/filter and policy tag-floors; lowercase-kebab, multi OK.
+tags = ["payment"]
+
+# Payments API. The key rides the `x-api-key` header — the agent writes the
+# phantom, the broker substitutes at egress. api.creem.io is production;
+# test-api.creem.io is the sandbox (a creem_test_ key).
+hosts = ["api.creem.io", "test-api.creem.io"]
+secrets = ["CREEM_API_KEY"]
+# Where a human mints the secret (auxiliary; display-only helper link).
+secret_url = "https://www.creem.io/dashboard/developers"

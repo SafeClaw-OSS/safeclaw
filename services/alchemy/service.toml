@@ -1,0 +1,14 @@
+[service]
+id = "alchemy"
+name = "Alchemy"
+# Classification for browse/filter and policy tag-floors; lowercase-kebab, multi OK.
+tags = ["dev"]
+
+# Alchemy exposes one host per network (eth-mainnet, polygon-mainnet, base-mainnet
+# …), so the service anchors the wildcard and the connection pins the exact
+# network host it uses. The API key rides the URL path (/v2/<key>) — the agent
+# writes the phantom there and the broker substitutes at egress.
+hosts = ["*.g.alchemy.com"]
+secrets = ["ALCHEMY_API_KEY"]
+# Where a human mints the secret (auxiliary; display-only helper link).
+secret_url = "https://dashboard.alchemy.com/apps"
