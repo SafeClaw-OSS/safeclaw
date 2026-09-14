@@ -20,7 +20,12 @@ use crate::config::{GetArgs, RmArgs, SetArgs};
 
 /// What `sc set` does with the item's broker binding.
 enum BrokerIntent {
-    /// Store the value with no host — human-only, invisible to the agent.
+    /// Blank Enter at the prompt: write the VALUE only and leave any existing
+    /// host binding exactly as it is (a new key simply has none yet). This is
+    /// the rotation fast-path — never touches the trust surface.
+    Unspecified,
+    /// Explicit `none` / `--no-broker`: store with NO host, REMOVING any prior
+    /// anchor — human-only, invisible to the agent.
     NoBroker,
     /// Create a raw connection anchored to these exact FQDNs.
     Host(Vec<String>),
@@ -72,6 +77,7 @@ pub async fn run_set(args: SetArgs) -> Result<(), String> {
     // needs the grant ceremony below (which unlocks + writes). The value rides
     // the local control plane only, never the cloud.
     let (hosts_arg, no_broker_arg) = match &intent {
+        BrokerIntent::Unspecified => (Vec::new(), false), // value only, binding untouched
         BrokerIntent::NoBroker => (Vec::new(), true),
         BrokerIntent::Host(h) => (h.clone(), false),
     };
@@ -97,6 +103,9 @@ pub async fn run_set(args: SetArgs) -> Result<(), String> {
 
     let mut scope = json!({ "values_digest": digest });
     match &intent {
+        // Unspecified: neither flag — the daemon writes the value and leaves
+        // any existing binding exactly as it is.
+        BrokerIntent::Unspecified => {}
         BrokerIntent::NoBroker => scope["no_broker"] = json!(true),
         BrokerIntent::Host(hosts) => scope["hosts"] = json!(hosts),
     }
@@ -129,6 +138,25 @@ pub async fn run_set(args: SetArgs) -> Result<(), String> {
 /// both shapes expose that flag, so one printer serves both write paths.
 fn print_set_result(key: &str, conn: &str, intent: &BrokerIntent, result: &serde_json::Value) {
     match intent {
+        BrokerIntent::Unspecified => {
+            // Value-only write. The fast-path response echoes the connection's
+            // CURRENT anchors (untouched); the ceremony response has none.
+            let hosts: Vec<&str> = result
+                .get("hosts")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|x| x.as_str()).collect())
+                .unwrap_or_default();
+            if hosts.is_empty() {
+                eprintln!("  stored · host binding unchanged (none anchored — the agent can't use it until you set a host)");
+            } else {
+                eprintln!(
+                    "  connection '{}' → {} (unchanged) · phantom __sc__{}__",
+                    conn,
+                    hosts.join(", "),
+                    conn
+                );
+            }
+        }
         BrokerIntent::NoBroker => {
             // The daemon dropped any raw connection a prior `sc set <key>
             // --host …` created (opting out must actually un-broker).
@@ -175,10 +203,14 @@ fn resolve_broker_intent(
     }
     if std::io::stdin().is_terminal() {
         let entered = prompt_host(key)?;
-        // Blank Enter (or the `none` sentinel) opts out: store the value with no
-        // host anchor. The agent can't use it; a human can `sc secret get` it.
-        if entered.is_empty() || entered.eq_ignore_ascii_case("none") {
-            eprintln!("  stored without a host · agent cannot use this item");
+        // Blank Enter = "skip this question": write the value, leave any
+        // existing binding untouched (a rotation must never silently drop the
+        // anchor). Removing a binding stays EXPLICIT: `none` / `--no-broker`.
+        if entered.is_empty() {
+            return Ok(BrokerIntent::Unspecified);
+        }
+        if entered.eq_ignore_ascii_case("none") {
+            eprintln!("  removing the host binding · agent won't be able to use this item");
             return Ok(BrokerIntent::NoBroker);
         }
         Ok(BrokerIntent::Host(vec![entered]))
@@ -206,13 +238,13 @@ fn prompt_secret_value(key: &str) -> Result<String, String> {
     Ok(v)
 }
 
-/// Host prompt. Blank is a first-class answer (store without a host — the agent
-/// can't use it, a human can `sc secret get` it), so pressing Enter never errors.
-/// Echoes the intent so an arg-order slip is visible.
+/// Host prompt. Blank is a first-class answer (value only, existing binding
+/// untouched), so pressing Enter never errors. Echoes the intent so an
+/// arg-order slip is visible.
 fn prompt_host(key: &str) -> Result<String, String> {
     use std::io::Write as _;
     eprintln!("Anchor a host for '{}' so the agent can use it.", key);
-    eprint!("Host (the API's exact domain, e.g. api.stripe.com) — leave blank to store without a host (agent can't use it): ");
+    eprint!("Host (the API's exact domain, e.g. api.stripe.com; Enter = value only, keep binding as is; 'none' = remove binding): ");
     std::io::stderr().flush().ok();
     let mut line = String::new();
     std::io::stdin()

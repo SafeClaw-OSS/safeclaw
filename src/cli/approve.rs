@@ -146,10 +146,27 @@ pub async fn set_secret_unlocked(
         .and_then(|v| v.as_bool())
         .unwrap_or(false)
     {
-        Ok(Some(body))
-    } else {
-        Ok(None) // locked — caller falls back to the passkey ceremony
+        return Ok(Some(body));
     }
+    // Anchoring a NEW egress host is a trust-surface widening (same act as
+    // widen-host) — the daemon never writes it passkey-free. Say why before
+    // the ceremony starts so the fallback doesn't read as a malfunction.
+    if body
+        .get("needs_approval")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        let hosts: Vec<&str> = body
+            .get("new_hosts")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_str()).collect())
+            .unwrap_or_default();
+        eprintln!(
+            "  anchoring a new host ({}) needs one passkey approval",
+            hosts.join(", ")
+        );
+    }
+    Ok(None) // locked or needs-approval — fall back to the passkey ceremony
 }
 
 /// Create `op` on the daemon and drive it to a passkey approval. Returns the

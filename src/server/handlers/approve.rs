@@ -1860,6 +1860,18 @@ pub async fn approve_op(
                     &hosts,
                     no_broker,
                 );
+                // A value-only write (no hosts, no opt-out) echoes the
+                // connection's CURRENT (untouched) anchors, same as the
+                // unlocked fast-path response.
+                let echo_hosts: Vec<String> = if hosts.is_empty() && !no_broker {
+                    view.aux
+                        .connections
+                        .get(&conn)
+                        .and_then(|c| c.hosts.clone())
+                        .unwrap_or_default()
+                } else {
+                    hosts.clone()
+                };
                 crate::auth::connect::persist_mutated_view(&state, &vault_id, &view, &k)
                     .map_err(AppError::Internal)?;
                 {
@@ -1874,7 +1886,7 @@ pub async fn approve_op(
                 let resp = json!({
                     "ok": true, "act": "secret-set", "key": key,
                     "conn": if hosts.is_empty() { Value::Null } else { json!(conn) },
-                    "hosts": hosts,
+                    "hosts": echo_hosts,
                     "removed_prior_anchor": removed_prior_anchor,
                 });
                 let cached = Some(resp.to_string());
