@@ -402,7 +402,6 @@ pub fn acquire_k_from_keyset(
     uik_root.open_k(vault_id, &entry.k_encapped, &entry.k_ct)
 }
 
-
 /// Per-item analogue of [`decrypt_vault_view`]: unwrap `K` from the keyset via
 /// the grant, then fold all live item rows into a [`VaultPlaintextView`]. Used
 /// by the per-item Export path. Discards `K` after the fold (read-only).
@@ -503,6 +502,36 @@ pub fn open_view_for_grant_keep_key(
     // Whole-blob fallback — see open_view_for_grant.
     let vault = vault.ok_or_else(|| AppError::Conflict("vault not initialized".into()))?;
     decrypt_vault_view_keep_key(op, wrapping_key, credential_id_bytes, vault)
+}
+
+/// Open the CURRENT vault view with the RETAINED state key `K` — no grant, no
+/// passkey — for a local write while the vault is unlocked. Handles both stores
+/// (per-item first, whole-blob fallback), the same split as
+/// [`open_view_for_grant`]. The caller mutates the view and re-seals it under
+/// the same `K` via [`crate::auth::connect::persist_mutated_view`]. Mirrors the
+/// OAuth connect-completion path (which also writes to the open vault under `K`).
+pub fn open_view_with_state_key(
+    state: &AppState,
+    vault_id: &str,
+    k: &[u8],
+) -> Result<VaultPlaintextView> {
+    if let Ok(path) = state.vaults.per_item_path(vault_id) {
+        if let Ok(Some(pv)) = crate::storage::sealed_vault::read_per_item(&path) {
+            return decrypt_vault_view_peritem_with_key(k, &pv, vault_id);
+        }
+    }
+    // Whole-blob fallback — a daemon-side Enroll/Write vault.
+    let vault_path = state
+        .config
+        .state_dir
+        .join("vaults")
+        .join(vault_id)
+        .join("vault.dat");
+    let vault = crate::storage::sealed_vault::read(&vault_path)
+        .ok()
+        .flatten()
+        .ok_or_else(|| AppError::Conflict("vault not initialized".into()))?;
+    decrypt_vault_view_with_key(k, &vault)
 }
 
 /// Open the vault body to the RAW [`sudp::state::ProtectedState`] with a

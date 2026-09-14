@@ -61,6 +61,10 @@ pub fn app_router(state: Arc<AppState>) -> Router {
         // op itself carries only a salted digest (its JSON rides to the cloud
         // relay for the grant page; plaintext values never do).
         .route("/v/{vid}/op-payload", post(handlers::op_payload::create))
+        // Local unlocked-only secret write (no passkey while the vault is open —
+        // see secret_set_local.rs). `sc set` tries this first; a locked vault
+        // answers `{written:false,locked:true}` and the CLI falls back to the op.
+        .route("/v/{vid}/secret", post(handlers::secret_set_local::create))
         .route("/v/{vid}/sync", post(handlers::metadata::sync_now))
         .route("/v/{vid}/passkeys", get(handlers::metadata::passkeys))
         .route(

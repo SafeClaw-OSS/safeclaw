@@ -67,8 +67,30 @@ pub async fn run_set(args: SetArgs) -> Result<(), String> {
         }
     }
 
-    // Deposit the value with the LOCAL daemon; only its salted digest rides the
-    // op (the op JSON travels to the cloud grant page — the value must not).
+    // Fast-path: while the vault is UNLOCKED the daemon writes the secret
+    // directly under its resident K — no op, no passkey. Only a LOCKED vault
+    // needs the grant ceremony below (which unlocks + writes). The value rides
+    // the local control plane only, never the cloud.
+    let (hosts_arg, no_broker_arg) = match &intent {
+        BrokerIntent::NoBroker => (Vec::new(), true),
+        BrokerIntent::Host(h) => (h.clone(), false),
+    };
+    if let Some(body) = crate::cli::approve::set_secret_unlocked(
+        &custodian,
+        &vault,
+        &key,
+        &value,
+        &hosts_arg,
+        no_broker_arg,
+    )
+    .await?
+    {
+        print_set_result(&key, &conn, &intent, &body);
+        return Ok(());
+    }
+
+    // Locked → deposit the value with the LOCAL daemon; only its salted digest
+    // rides the op (the op JSON travels to the cloud grant page — value must not).
     let mut values = BTreeMap::new();
     values.insert(key.clone(), value);
     let digest = deposit_values(&custodian, &vault, &values).await?;
@@ -98,6 +120,14 @@ pub async fn run_set(args: SetArgs) -> Result<(), String> {
     .await?;
 
     let result = act_result(&body);
+    print_set_result(&key, &conn, &intent, &result);
+    Ok(())
+}
+
+/// Print the `sc set` outcome. `result` carries `removed_prior_anchor` — the
+/// unlocked fast-path response verbatim, or the ceremony's `act_result(body)`;
+/// both shapes expose that flag, so one printer serves both write paths.
+fn print_set_result(key: &str, conn: &str, intent: &BrokerIntent, result: &serde_json::Value) {
     match intent {
         BrokerIntent::NoBroker => {
             // The daemon dropped any raw connection a prior `sc set <key>
@@ -121,7 +151,6 @@ pub async fn run_set(args: SetArgs) -> Result<(), String> {
         }
     }
     eprintln!("safeclaw set — {} written", key);
-    Ok(())
 }
 
 /// Decide the broker binding for `sc set`. Host is a REQUIRED answer (spec §11):
@@ -146,7 +175,9 @@ fn resolve_broker_intent(
     }
     if std::io::stdin().is_terminal() {
         let entered = prompt_host(key)?;
-        if entered.eq_ignore_ascii_case("none") {
+        // Blank Enter (or the `none` sentinel) opts out: store the value with no
+        // host anchor. The agent can't use it; a human can `sc secret get` it.
+        if entered.is_empty() || entered.eq_ignore_ascii_case("none") {
             eprintln!("  stored without a host · agent cannot use this item");
             return Ok(BrokerIntent::NoBroker);
         }
@@ -175,23 +206,19 @@ fn prompt_secret_value(key: &str) -> Result<String, String> {
     Ok(v)
 }
 
-/// Required host prompt. Echoes the intent so an arg-order slip is visible.
+/// Host prompt. Blank is a first-class answer (store without a host — the agent
+/// can't use it, a human can `sc secret get` it), so pressing Enter never errors.
+/// Echoes the intent so an arg-order slip is visible.
 fn prompt_host(key: &str) -> Result<String, String> {
     use std::io::Write as _;
-    eprintln!("'{}' needs an egress host so the agent can use it.", key);
-    eprint!("Host (the API's exact domain, e.g. api.stripe.com; 'none' = store for humans only): ");
+    eprintln!("Anchor a host for '{}' so the agent can use it.", key);
+    eprint!("Host (the API's exact domain, e.g. api.stripe.com) — leave blank to store without a host (agent can't use it): ");
     std::io::stderr().flush().ok();
     let mut line = String::new();
     std::io::stdin()
         .read_line(&mut line)
         .map_err(|e| format!("read host: {}", e))?;
-    let h = line.trim().to_string();
-    if h.is_empty() {
-        return Err(
-            "a host is required (or `none` / `--no-broker` to store for humans only)".into(),
-        );
-    }
-    Ok(h)
+    Ok(line.trim().to_string())
 }
 
 pub async fn run_rm(args: RmArgs) -> Result<(), String> {
