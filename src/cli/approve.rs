@@ -97,6 +97,78 @@ pub async fn deposit_values(
         .ok_or_else(|| "no values_digest in response".into())
 }
 
+/// Try the unlocked local fast-path for `sc set`: while the vault is OPEN the
+/// daemon writes the secret directly under its resident `K` — no op, no passkey.
+/// Returns `Some(response)` when written, `None` when the daemon reports the
+/// vault is LOCKED (the caller then falls back to the passkey ceremony). Any
+/// other failure is a real error. The value rides the local control plane only.
+pub async fn set_secret_unlocked(
+    custodian: &str,
+    vault: &str,
+    key: &str,
+    value: &str,
+    hosts: &[String],
+    no_broker: bool,
+) -> Result<Option<Value>, String> {
+    let client = http_client()?;
+    let url = format!(
+        "{}/v/{}/secret",
+        custodian.trim_end_matches('/'),
+        urlencoding::encode(vault)
+    );
+    let resp = client
+        .post(&url)
+        .json(&json!({
+            "key": key,
+            "value": value,
+            "hosts": hosts,
+            "no_broker": no_broker,
+        }))
+        .send()
+        .await
+        .map_err(|e| format!("set secret: {}", e))?;
+    // An OLDER running daemon has no /v/{vid}/secret route (404/405) — e.g.
+    // right after `sc upgrade`, before the daemon restarts. Fall back to the
+    // ceremony instead of failing the whole set on a route miss.
+    if matches!(resp.status().as_u16(), 404 | 405) {
+        return Ok(None);
+    }
+    if !resp.status().is_success() {
+        return Err(format!(
+            "set secret HTTP {}: {}",
+            resp.status(),
+            resp.text().await.unwrap_or_default()
+        ));
+    }
+    let body: Value = resp.json().await.map_err(|e| format!("parse: {}", e))?;
+    if body
+        .get("written")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return Ok(Some(body));
+    }
+    // Anchoring a NEW egress host is a trust-surface widening (same act as
+    // widen-host) — the daemon never writes it passkey-free. Say why before
+    // the ceremony starts so the fallback doesn't read as a malfunction.
+    if body
+        .get("needs_approval")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        let hosts: Vec<&str> = body
+            .get("new_hosts")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_str()).collect())
+            .unwrap_or_default();
+        eprintln!(
+            "  anchoring a new host ({}) needs one passkey approval",
+            hosts.join(", ")
+        );
+    }
+    Ok(None) // locked or needs-approval — fall back to the passkey ceremony
+}
+
 /// Create `op` on the daemon and drive it to a passkey approval. Returns the
 /// daemon's approve response JSON (e.g. the unlock's `{kv, aux}` value) on
 /// success. `label` is a human verb ("Unlock vault") used in prompts.

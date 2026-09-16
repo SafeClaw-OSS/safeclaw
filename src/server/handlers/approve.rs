@@ -236,6 +236,75 @@ pub(crate) const DISPATCHED_CUSTOM_ACTS: &[&str] = &[
     "secret-set",
 ];
 
+/// Validate a `secret-set`'s KEY + host binding and return the normalized
+/// (uppercase KEY, hosts). Shared by the grant-approve path and the unlocked
+/// local write path so the two can't diverge on what a valid set is.
+pub(crate) fn validate_secret_set(
+    key_raw: &str,
+    hosts: &[String],
+    no_broker: bool,
+) -> Result<(String, Vec<String>)> {
+    let key = key_raw.trim().to_ascii_uppercase();
+    if !crate::cli::conn::valid_role(&key) {
+        return Err(AppError::BadRequest(format!(
+            "'{}' is not a valid secret key",
+            key_raw.trim()
+        )));
+    }
+    if no_broker && !hosts.is_empty() {
+        return Err(AppError::BadRequest(
+            "secret-set: no_broker and hosts are mutually exclusive".into(),
+        ));
+    }
+    if !hosts.is_empty() {
+        let conn = key.to_ascii_lowercase();
+        if !crate::cli::conn::valid_conn_id(&conn) {
+            return Err(AppError::BadRequest(format!(
+                "can't derive a connection id from '{}'",
+                key
+            )));
+        }
+        for h in hosts {
+            crate::cli::conn::validate_raw_host(h).map_err(AppError::BadRequest)?;
+        }
+    }
+    Ok((key, hosts.to_vec()))
+}
+
+/// Apply a `secret-set` to an open vault view: write the value at its bare KEY
+/// and (un)anchor its raw connection. Returns whether a prior host anchor was
+/// removed. The KEY/hosts must already be [`validate_secret_set`]-normalized.
+/// Shared by the grant-approve path and the unlocked local write path.
+pub(crate) fn apply_secret_set_to_view(
+    view: &mut crate::storage::plaintext::VaultPlaintextView,
+    key: &str,
+    value: Vec<u8>,
+    hosts: &[String],
+    no_broker: bool,
+) -> bool {
+    let conn = key.to_ascii_lowercase();
+    view.native_secrets.insert(key.to_string(), value);
+    if no_broker {
+        // Opting out must actually un-broker: drop the raw connection a prior
+        // `sc set <key> --host …` created.
+        view.aux.connections.remove(&conn).is_some()
+    } else if !hosts.is_empty() {
+        view.aux.connections.insert(
+            conn,
+            crate::storage::plaintext::Connection {
+                name: None,
+                service: None,
+                hosts: Some(hosts.to_vec()),
+                secrets: Some(vec![key.to_string()]),
+                keys: None,
+            },
+        );
+        false
+    } else {
+        false
+    }
+}
+
 /// `POST /op/{op_id}/approve` — U submits the signed grant. T validates and
 /// dispatches the act (Enroll / Write / Export / Use).
 pub async fn approve_op(
@@ -1738,19 +1807,12 @@ pub async fn approve_op(
             // single-secret connection at the lowercased KEY (the `sc set
             // --host` sugar), `scope.no_broker` explicitly un-brokers instead.
             "secret-set" => {
-                let key = validated.op.act.target.trim().to_ascii_uppercase();
-                if !crate::cli::conn::valid_role(&key) {
-                    return Err(AppError::BadRequest(format!(
-                        "'{}' is not a valid secret key",
-                        key
-                    )));
-                }
                 let scope = &validated.op.act.scope;
                 let no_broker = scope
                     .get("no_broker")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
-                let hosts: Vec<String> = scope
+                let hosts_in: Vec<String> = scope
                     .get("hosts")
                     .and_then(|v| v.as_array())
                     .map(|a| {
@@ -1759,23 +1821,9 @@ pub async fn approve_op(
                             .collect()
                     })
                     .unwrap_or_default();
-                if no_broker && !hosts.is_empty() {
-                    return Err(AppError::BadRequest(
-                        "secret-set: no_broker and hosts are mutually exclusive".into(),
-                    ));
-                }
+                let (key, hosts) =
+                    validate_secret_set(&validated.op.act.target, &hosts_in, no_broker)?;
                 let conn = key.to_ascii_lowercase();
-                if !hosts.is_empty() {
-                    if !crate::cli::conn::valid_conn_id(&conn) {
-                        return Err(AppError::BadRequest(format!(
-                            "can't derive a connection id from '{}'",
-                            key
-                        )));
-                    }
-                    for h in &hosts {
-                        crate::cli::conn::validate_raw_host(h).map_err(AppError::BadRequest)?;
-                    }
-                }
                 let digest = scope
                     .get("values_digest")
                     .and_then(|v| v.as_str())
@@ -1805,24 +1853,25 @@ pub async fn approve_op(
                         &validated.credential_id_bytes,
                         existing_vault.as_ref(),
                     )?;
-                view.native_secrets.insert(key.clone(), value.into_bytes());
-                let mut removed_prior_anchor = false;
-                if no_broker {
-                    // Opting out must actually un-broker: drop the raw
-                    // connection a prior `sc set <key> --host …` created.
-                    removed_prior_anchor = view.aux.connections.remove(&conn).is_some();
-                } else if !hosts.is_empty() {
-                    view.aux.connections.insert(
-                        conn.clone(),
-                        crate::storage::plaintext::Connection {
-                            name: None,
-                            service: None,
-                            hosts: Some(hosts.clone()),
-                            secrets: Some(vec![key.clone()]),
-                            keys: None,
-                        },
-                    );
-                }
+                let removed_prior_anchor = apply_secret_set_to_view(
+                    &mut view,
+                    &key,
+                    value.into_bytes(),
+                    &hosts,
+                    no_broker,
+                );
+                // A value-only write (no hosts, no opt-out) echoes the
+                // connection's CURRENT (untouched) anchors, same as the
+                // unlocked fast-path response.
+                let echo_hosts: Vec<String> = if hosts.is_empty() && !no_broker {
+                    view.aux
+                        .connections
+                        .get(&conn)
+                        .and_then(|c| c.hosts.clone())
+                        .unwrap_or_default()
+                } else {
+                    hosts.clone()
+                };
                 crate::auth::connect::persist_mutated_view(&state, &vault_id, &view, &k)
                     .map_err(AppError::Internal)?;
                 {
@@ -1837,7 +1886,7 @@ pub async fn approve_op(
                 let resp = json!({
                     "ok": true, "act": "secret-set", "key": key,
                     "conn": if hosts.is_empty() { Value::Null } else { json!(conn) },
-                    "hosts": hosts,
+                    "hosts": echo_hosts,
                     "removed_prior_anchor": removed_prior_anchor,
                 });
                 let cached = Some(resp.to_string());
@@ -2634,6 +2683,75 @@ mod tests {
             body_cap: crate::config::DEFAULT_BODY_CAP,
         };
         AppState::new(cfg)
+    }
+
+    fn empty_view() -> crate::storage::plaintext::VaultPlaintextView {
+        let mut m = sudp::state::ProtectedState::new();
+        m.aux = serde_json::to_value(VaultAux::initial()).unwrap();
+        crate::storage::plaintext::VaultPlaintextView::from_protected_state(&m).unwrap()
+    }
+
+    // The shared secret-set mutation is the SSOT for BOTH write paths (grant
+    // approve + unlocked local write); assert new/overwrite/anchor/no-broker.
+    #[test]
+    fn secret_set_apply_new_overwrite_anchor_and_no_broker() {
+        let mut view = empty_view();
+
+        // New key + host anchor → value written, raw connection created.
+        let removed = apply_secret_set_to_view(
+            &mut view,
+            "FOO_KEY",
+            b"v1".to_vec(),
+            &["api.foo.com".into()],
+            false,
+        );
+        assert!(!removed);
+        assert_eq!(
+            view.native_secrets.get("FOO_KEY").map(Vec::as_slice),
+            Some(&b"v1"[..])
+        );
+        let conn = view.aux.connections.get("foo_key").expect("anchor created");
+        assert_eq!(
+            conn.hosts.as_deref(),
+            Some(&["api.foo.com".to_string()][..])
+        );
+        assert_eq!(conn.secrets.as_deref(), Some(&["FOO_KEY".to_string()][..]));
+
+        // Overwrite: value + host list both replaced.
+        apply_secret_set_to_view(
+            &mut view,
+            "FOO_KEY",
+            b"v2".to_vec(),
+            &["api2.foo.com".into()],
+            false,
+        );
+        assert_eq!(
+            view.native_secrets.get("FOO_KEY").map(Vec::as_slice),
+            Some(&b"v2"[..])
+        );
+        assert_eq!(
+            view.aux.connections["foo_key"].hosts.as_deref(),
+            Some(&["api2.foo.com".to_string()][..])
+        );
+
+        // no_broker → drop the raw connection (removed=true), keep the value.
+        let removed = apply_secret_set_to_view(&mut view, "FOO_KEY", b"v3".to_vec(), &[], true);
+        assert!(removed);
+        assert!(!view.aux.connections.contains_key("foo_key"));
+        assert_eq!(
+            view.native_secrets.get("FOO_KEY").map(Vec::as_slice),
+            Some(&b"v3"[..])
+        );
+    }
+
+    #[test]
+    fn secret_set_validate_key_and_hosts() {
+        let (k, h) = validate_secret_set("foo_key", &[], false).unwrap();
+        assert_eq!(k, "FOO_KEY"); // uppercased
+        assert!(h.is_empty());
+        assert!(validate_secret_set("bad key!", &[], false).is_err()); // bad key
+        assert!(validate_secret_set("FOO", &["api.x.com".into()], true).is_err()); // no_broker+hosts
+        assert!(validate_secret_set("FOO", &["api.x.com".into()], false).is_ok());
     }
 
     fn gcp_store(creds_item: &str) -> Store {
