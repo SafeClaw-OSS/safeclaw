@@ -2070,12 +2070,23 @@ fn service_refs(
 pub async fn reject_op(
     State(state): State<Arc<AppState>>,
     Path(op_id): Path<String>,
+    body: Option<Json<Value>>,
 ) -> Result<Json<Value>> {
+    // Default = a human said no. A caller may carry the REAL cause instead
+    // (the relay client's apply-failure path does): recording an apply
+    // failure as "user denied" misled every reader — the approver saw their
+    // own approval come back as a denial, and the agent was told not to
+    // retry a request the user in fact allowed.
+    let reason: String = body
+        .as_ref()
+        .and_then(|b| b.get("reason"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.chars().take(300).collect::<String>())
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "user denied".to_string());
     let (rec_id, rec_vault_id) = {
         let mut store = state.approvals.lock().unwrap();
-        let rec = store
-            .reject(&op_id, "user denied")
-            .ok_or(AppError::NotFound)?;
+        let rec = store.reject(&op_id, &reason).ok_or(AppError::NotFound)?;
         (rec.id.clone(), rec.vault_id.clone())
     };
 
@@ -2090,7 +2101,7 @@ pub async fn reject_op(
             STATUS_REJECTED,
             now,
             None,
-            Some("user denied"),
+            Some(reason.as_str()),
             None,
         ) {
             tracing::warn!(vault = %rec_vault_id, op = %op_id, "audit finalize rejected failed: {}", e);
@@ -2103,7 +2114,7 @@ pub async fn reject_op(
         kind: "rejected".into(),
         op_summary: None,
         response_preview: None,
-        reason: Some("user denied".into()),
+        reason: Some(reason),
     });
 
     Ok(Json(

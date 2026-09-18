@@ -123,7 +123,11 @@ pub fn spawn_cancel(state: Arc<AppState>, vault_id: String, op_id: String) {
         match client
             .post(&url)
             .bearer_auth(&auth_token)
-            .dik_pop("POST", &url, &serde_json::to_vec(&cancel_body).unwrap_or_default())
+            .dik_pop(
+                "POST",
+                &url,
+                &serde_json::to_vec(&cancel_body).unwrap_or_default(),
+            )
             .json(&cancel_body)
             .send()
             .await
@@ -207,7 +211,11 @@ async fn run(
     let reg = client
         .post(&reg_url)
         .bearer_auth(auth_token)
-        .dik_pop("POST", &reg_url, &serde_json::to_vec(&reg_body).unwrap_or_default())
+        .dik_pop(
+            "POST",
+            &reg_url,
+            &serde_json::to_vec(&reg_body).unwrap_or_default(),
+        )
         .json(&reg_body)
         .send()
         .await
@@ -268,14 +276,22 @@ async fn run(
                         );
                     }
                     tracing::warn!(op = %op_id, "approved grant could not be applied ({}); rejecting so the CLI fails clearly instead of hanging", e);
-                    apply_reject(state.clone(), op_id).await;
+                    // Carry the REAL cause: this is an apply failure after a
+                    // genuine user approval, and must never read back as
+                    // "user denied" (it did, and misled approver and agent).
+                    apply_reject(
+                        state.clone(),
+                        op_id,
+                        Some(&format!("approved, but applying it failed: {}", e)),
+                    )
+                    .await;
                     return Ok(());
                 }
                 return Ok(());
             }
             403 => {
                 // Rejected by the user.
-                apply_reject(state.clone(), op_id).await;
+                apply_reject(state.clone(), op_id, None).await;
                 return Ok(());
             }
             202 => {
@@ -325,13 +341,20 @@ async fn apply_grant(state: Arc<AppState>, op_id: &str, grant: Value) -> Result<
     }
 }
 
-async fn apply_reject(state: Arc<AppState>, op_id: &str) {
+/// `reason: None` = a genuine user denial (the endpoint's default). `Some` =
+/// the true cause of a non-user rejection (apply failure), recorded verbatim
+/// so `sc op wait` and the console never dress it up as "user denied".
+async fn apply_reject(state: Arc<AppState>, op_id: &str, reason: Option<&str>) {
     let url = format!("http://127.0.0.1:{}/op/{}/reject", state.config.port, op_id);
     if let Ok(client) = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
     {
-        let _ = client.post(&url).send().await;
+        let req = match reason {
+            Some(r) => client.post(&url).json(&serde_json::json!({ "reason": r })),
+            None => client.post(&url),
+        };
+        let _ = req.send().await;
         tracing::info!(op = %op_id, "relay grant rejected via loopback");
     }
 }

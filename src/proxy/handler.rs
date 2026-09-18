@@ -95,7 +95,11 @@ impl HttpHandler for BrokerHandler {
         // table) happens in `pipeline`. Dual-auth: a non-PoP password (a legacy
         // Basic api-key) leaves `agent_id` None and takes the hash-set path, so
         // nothing bricks. Only the crypto (signature + freshness) is checked here.
-        self.agent_id = match (self.vid.as_deref(), self.key.as_deref(), req.uri().authority()) {
+        self.agent_id = match (
+            self.vid.as_deref(),
+            self.key.as_deref(),
+            req.uri().authority(),
+        ) {
             (Some(vid), Some(key), Some(authority)) => crate::agent_pop::verify_agent_proxy_pop(
                 key,
                 vid,
@@ -277,11 +281,12 @@ impl BrokerHandler {
                 }
             }
         }
-        let scan_body = header_phantoms
-            || (body_is_text(&parts.headers)
-                && content_length(&parts.headers)
-                    .map(|n| n <= cap)
-                    .unwrap_or(false));
+        // Buffer the body ONLY for a brokered (phantom-bearing) request, whose
+        // policy may match `[requests]` shapes against body fields. A body is
+        // never an injection site (service/mod.rs: header/query/URL/Basic), so a
+        // phantom-less request is no longer buffered to hunt for a body-only
+        // phantom — that path is gone.
+        let scan_body = header_phantoms;
 
         let mut body_bytes: Option<Vec<u8>> = None;
         if scan_body {
@@ -310,12 +315,12 @@ impl BrokerHandler {
         // One lossy view serves BOTH the phantom scan and policy below, so a
         // binary(ish) body is not a blind spot: rules evaluate against what is
         // actually there. Forwarding still uses the untouched raw bytes.
+        // The body view feeds POLICY only (`[requests]` var extraction below).
+        // It is deliberately NOT scanned for phantoms: the body is not an
+        // injection site, so a phantom there is left inert (see the forward path).
         let body_text: Option<String> = body_bytes
             .as_deref()
             .map(|b| String::from_utf8_lossy(b).into_owned());
-        if let Some(s) = body_text.as_deref() {
-            merge_phantoms(&mut phantoms, resolver::collect_phantoms(s));
-        }
 
         // No phantom anywhere → forward untouched (rebuild body if we buffered).
         if phantoms.is_empty() {
@@ -391,7 +396,8 @@ impl BrokerHandler {
                 let hint = format!(
                     "this agent isn't authorized on this vault yet — authorize it in the \
                      SafeClaw console (Agents tab), then retry: {}/vault/{}/agents",
-                    self.state.config.origin, self.vid.as_deref().unwrap_or_default(),
+                    self.state.config.origin,
+                    self.vid.as_deref().unwrap_or_default(),
                 );
                 return err_response(ScCode::AgentNotAuthorized, &hint).into();
             }
@@ -517,7 +523,18 @@ impl BrokerHandler {
         // `target` a captive-portal (ask) approval resolves + stashes, so a
         // custom `[oauth2]` service (registry miss) still names its real secret
         // instead of falling back to the connection id.
-        let op_role = def.as_ref().and_then(|d| d.env_role());
+        //
+        // No def (raw connection): the request's own phantom names the role. A
+        // role-qualified `__sc__<conn>__<role>__` on a multi-secret raw
+        // connection MUST flow into the op target — without it the approval
+        // resolved a secret named after the CONNECTION, 400'd at apply, and the
+        // relay then recorded the op rejected: the user's real approval read
+        // back as "user denied". Several roles in one request: the first is the
+        // stashed primary (the same order substitution scans).
+        let op_role = def
+            .as_ref()
+            .and_then(|d| d.env_role())
+            .or_else(|| phantoms.iter().find_map(|p| p.role.clone()));
         // The service id policy/mint use; for a raw connection there is none so
         // the conn id stands in (registry lookups miss → global default floor).
         let service_id = conn_rec.service.clone().unwrap_or_else(|| conn.clone());
@@ -653,7 +670,8 @@ impl BrokerHandler {
                 None,
             ),
             AccessLevel::Ask => (
-                self.state.cache_lookup_grant(&vault_id, &conn, &agent_prefix),
+                self.state
+                    .cache_lookup_grant(&vault_id, &conn, &agent_prefix),
                 None,
             ),
             _ => (
@@ -794,21 +812,46 @@ impl BrokerHandler {
         }
 
         // Headers: substitute values, decode/re-encode Basic, strip proxy/agent
-        // auth, drop hop-by-hop; content-length is dropped only if we rewrote
-        // the body (hyper re-derives it from the sized body).
-        let body_rewritten = body_bytes.is_some();
-        let new_headers = rewrite_headers(&parts.headers, &values, body_rewritten);
+        // auth, drop hop-by-hop. The body is never rewritten (not an injection
+        // site), so its content-length is always preserved.
+        let new_headers = rewrite_headers(&parts.headers, &values, false);
         parts.headers = new_headers;
 
-        // Body: substitute if we buffered it.
+        // Egress guard — never emit an unresolved phantom in a credential
+        // position. `substitute` leaves a phantom it can't fill verbatim, so
+        // re-scan the wire-bound URL + headers (incl. decoded Basic). A survivor
+        // means a header/URL phantom the resolver declined; block it rather than
+        // let the literal `__sc__…__` reach upstream (which returns a bare 401 the
+        // agent misreads as a dead credential). The body is intentionally NOT
+        // scanned: a phantom there is inert placeholder text, never a secret.
+        let leaked_phantom = {
+            let pq_now = parts.uri.path_and_query().map(|x| x.as_str()).unwrap_or("");
+            resolver::contains_phantom(pq_now)
+                || parts
+                    .headers
+                    .values()
+                    .any(|v| v.to_str().map(resolver::contains_phantom).unwrap_or(false))
+                || basic_auth_decoded(&parts.headers)
+                    .as_deref()
+                    .map(resolver::contains_phantom)
+                    .unwrap_or(false)
+        };
+        if leaked_phantom {
+            return err_response(
+                ScCode::PhantomUnresolved,
+                "a SafeClaw phantom in this request could not be resolved, so the request was \
+                 blocked before the placeholder could reach upstream — check the connection/role \
+                 name (`sc registry`), or run `sc unlock` if the vault is locked",
+            )
+            .into();
+        }
+
+        // Body: forwarded byte-for-byte (never an injection site). A phantom in
+        // the body passes through as inert placeholder text — never substituted
+        // (so a real secret can't be written into a persisted/readable field) and
+        // never blocked (so discussing the schema in a body stays untouched).
         let out_body = match body_bytes {
-            Some(bytes) => match std::str::from_utf8(&bytes) {
-                Ok(s) => {
-                    let (ns, _) = resolver::substitute(s, |ph| values.get(&ph.raw).cloned());
-                    Body::from(ns.into_bytes())
-                }
-                Err(_) => Body::from(bytes),
-            },
+            Some(bytes) => Body::from(bytes),
             None => orig_body.take().unwrap_or_else(Body::empty),
         };
 
@@ -934,8 +977,23 @@ impl BrokerHandler {
         // connection has none, so the connection id stands in.
         let role = op_role.unwrap_or_else(|| service_id.to_string());
         // The op `target` is the role's bound BARE key (record `keys` map,
-        // identity default) — the same slot every writer uses.
-        let target = crate::storage::plaintext::secret_key_for(Some(conn_rec), &role);
+        // identity default) — the same slot every writer uses. A raw record
+        // lists its KEYs verbatim (uppercase) while a phantom role is
+        // lowercase, so canonicalize against the record's own list; a
+        // role-less phantom on a raw connection means its SOLE key (a
+        // multi-secret role-less phantom already failed ambiguous_phantom
+        // long before an op is minted).
+        let target = {
+            let bound = crate::storage::plaintext::secret_key_for(Some(conn_rec), &role);
+            match conn_rec.secrets.as_deref() {
+                Some(ks) => ks
+                    .iter()
+                    .find(|k| k.eq_ignore_ascii_case(&bound))
+                    .cloned()
+                    .unwrap_or_else(|| if ks.len() == 1 { ks[0].clone() } else { bound }),
+                None => bound,
+            }
+        };
 
         let mut scope = json!({
             "connection_id": conn,
@@ -1191,8 +1249,7 @@ fn now_secs() -> u64 {
 /// (`collect_phantoms`) is already capped and O(N); this keeps the cross-site
 /// union bounded too, so no attacker-chosen body can drive quadratic work here.
 fn merge_phantoms(acc: &mut Vec<Phantom>, more: Vec<Phantom>) {
-    let mut seen: std::collections::HashSet<String> =
-        acc.iter().map(|p| p.raw.clone()).collect();
+    let mut seen: std::collections::HashSet<String> = acc.iter().map(|p| p.raw.clone()).collect();
     for p in more {
         if acc.len() >= resolver::MAX_PHANTOMS_PER_SITE {
             break;
@@ -1264,22 +1321,6 @@ fn content_length(headers: &HeaderMap) -> Option<u64> {
         .trim()
         .parse()
         .ok()
-}
-
-fn body_is_text(headers: &HeaderMap) -> bool {
-    match headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-    {
-        Some(ct) => {
-            let ct = ct.to_ascii_lowercase();
-            ct.contains("json")
-                || ct.starts_with("text/")
-                || ct.contains("x-www-form-urlencoded")
-                || ct.contains("xml")
-        }
-        None => false,
-    }
 }
 
 /// Rebuild the header map: substitute phantom values, decode/re-encode Basic,

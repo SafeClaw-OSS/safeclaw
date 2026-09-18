@@ -135,7 +135,17 @@ pub async fn run_wait(args: OpWaitArgs) -> Result<(), String> {
                                     );
                                     std::process::exit(6);
                                 }
-                                eprintln!("rejected ✗ — do not retry");
+                                if !reason.is_empty() && reason != "user denied" {
+                                    // Not a human saying no (e.g. "approved,
+                                    // but applying it failed: …") — retrying
+                                    // after the cause is fixed is legitimate.
+                                    eprintln!(
+                                        "rejected ✗ ({}); fix the cause, then re-run",
+                                        reason
+                                    );
+                                } else {
+                                    eprintln!("rejected ✗ — do not retry");
+                                }
                                 std::process::exit(5);
                             }
                             Verdict::Pending => {}
