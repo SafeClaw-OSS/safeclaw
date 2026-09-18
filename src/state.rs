@@ -341,10 +341,15 @@ pub struct AppState {
     /// vault is locked: a phantom then meets an explicit `vault_locked`
     /// instead of leaking upstream through a blind tunnel. Connections live in
     /// the sealed blob, so this memory is the only locked-time anchor
-    /// knowledge; in-memory only (a daemon restarted before any unlock stays
-    /// blind, the documented residual), dropped when the vault is deleted.
+    /// knowledge; persisted to a cleartext `host-anchors.json` (host names only,
+    /// non-sensitive) so it survives a daemon restart while a vault stays locked,
+    /// and pruned when the vault is deleted.
     /// Lock order: always `vault_states` first, then this.
     pub last_host_unions: Mutex<HashMap<String, Vec<String>>>,
+    /// The canonical JSON of `last_host_unions` last written to disk, so the hot
+    /// CONNECT path rewrites the durable cache only when the anchor set actually
+    /// changes. Host names only — non-sensitive.
+    pub host_unions_persisted: Mutex<String>,
     /// Per-vault audit log (PROTOCOL.md §5.3). Connections opened lazily on
     /// first write/query per vault. Survives daemon restarts — unlike
     /// `approvals` / `vault_states` which are in-memory only.
@@ -447,6 +452,41 @@ pub struct OpPayloadEntry {
     pub values: std::collections::BTreeMap<String, String>,
 }
 
+fn host_anchors_path(state_dir: &std::path::Path) -> std::path::PathBuf {
+    state_dir.join("host-anchors.json")
+}
+
+/// Deterministic (sorted vids + hosts) JSON of the host-anchor union, so an
+/// unchanged set has a stable string for the skip-rewrite compare and the file
+/// on disk is stable across boots.
+fn canonical_unions_json(map: &HashMap<String, Vec<String>>) -> String {
+    let sorted: std::collections::BTreeMap<&str, Vec<&str>> = map
+        .iter()
+        .map(|(k, v)| {
+            let mut hs: Vec<&str> = v.iter().map(|s| s.as_str()).collect();
+            hs.sort_unstable();
+            (k.as_str(), hs)
+        })
+        .collect();
+    serde_json::to_string(&sorted).unwrap_or_default()
+}
+
+/// Load the durable host-anchor union (host names only — non-sensitive). Best
+/// effort: any read/parse error yields an empty map (falls back to the
+/// pre-persistence behaviour of blind-until-unlock).
+fn load_host_unions(state_dir: &std::path::Path) -> (HashMap<String, Vec<String>>, String) {
+    match std::fs::read(host_anchors_path(state_dir)) {
+        Ok(bytes) => match serde_json::from_slice::<HashMap<String, Vec<String>>>(&bytes) {
+            Ok(map) => {
+                let json = canonical_unions_json(&map);
+                (map, json)
+            }
+            Err(_) => (HashMap::new(), String::new()),
+        },
+        Err(_) => (HashMap::new(), String::new()),
+    }
+}
+
 impl AppState {
     /// Inject the closed `safeclaw-ee` team hooks (team-edition §9). The open
     /// build leaves the [`crate::team_hooks::NoopHooks`] default; the overlay's
@@ -462,6 +502,9 @@ impl AppState {
 
     pub fn new(config: Config) -> Self {
         let vaults = VaultDir::new(&config.state_dir);
+        // Durable host-anchor union (host names only): lets a daemon restarted
+        // while a vault is still locked keep MITMing that vault's brokered hosts.
+        let (loaded_unions, loaded_unions_json) = load_host_unions(&config.state_dir);
         let (events, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let audits = AuditRegistry::new(vaults.clone());
         let sc = crate::crypto::envelope::ScKeyPair::load_or_generate()
@@ -480,7 +523,8 @@ impl AppState {
             services: ServiceRegistry::load(),
             events,
             vault_states: Mutex::new(HashMap::new()),
-            last_host_unions: Mutex::new(HashMap::new()),
+            last_host_unions: Mutex::new(loaded_unions),
+            host_unions_persisted: Mutex::new(loaded_unions_json),
             audits,
             sc,
             vault_write_locks: Mutex::new(HashMap::new()),
@@ -1599,6 +1643,8 @@ impl AppState {
                     hosts.push(h.to_ascii_lowercase());
                 }
             }
+            hosts.sort_unstable();
+            hosts.dedup();
             if hosts
                 .iter()
                 .any(|h| crate::core::host::host_anchor_matches(host, h))
@@ -1606,6 +1652,23 @@ impl AppState {
                 hit = true;
             }
             remembered.insert(vid.clone(), hosts);
+        }
+        // Forget vaults that no longer exist so the durable cache never grows
+        // stale/unbounded, then persist (host names only — non-sensitive) so the
+        // union survives a daemon restart while a vault stays locked.
+        remembered.retain(|vid, _| states.contains_key(vid.as_str()));
+        {
+            let json = canonical_unions_json(&remembered);
+            let mut persisted = self.host_unions_persisted.lock().unwrap();
+            if *persisted != json {
+                if let Err(e) =
+                    std::fs::write(host_anchors_path(&self.config.state_dir), json.as_bytes())
+                {
+                    tracing::warn!("proxy: persist host-anchors failed: {}", e);
+                } else {
+                    *persisted = json;
+                }
+            }
         }
         if hit {
             return true;

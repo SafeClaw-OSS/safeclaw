@@ -73,25 +73,78 @@ pub fn host_matches_exact(dest_authority: &str, allowed_fqdn: &str) -> bool {
     strip_port(dest_authority).eq_ignore_ascii_case(strip_port(allowed_fqdn))
 }
 
-/// Match a destination authority against ONE anchor entry, honoring a leftmost
-/// `*.suffix` wildcard at RUNTIME. Unlike the connect-time single-label
-/// [`wildcard_matches`] (TLS-cert rule), a raw-connection wildcard anchor covers
-/// a subdomain at ANY depth so a user who doesn't know the exact API host can
-/// anchor the whole domain: `*.bitquery.io` matches `api.bitquery.io` and
-/// `a.b.bitquery.io`, but NEVER the bare apex `bitquery.io` nor a label-boundary
-/// fake like `notbitquery.io`. A non-wildcard entry is the exact, port-aware,
-/// case-insensitive compare.
+/// Match a destination authority against ONE anchor entry at RUNTIME.
+///
+/// - `*.suffix` (explicit wildcard): a subdomain at ANY depth, never the bare
+///   apex nor a label-boundary fake — `*.bitquery.io` covers `api.bitquery.io`
+///   and `a.b.bitquery.io`, not `bitquery.io` nor `notbitquery.io`.
+/// - a BARE anchor: the apex AND every subdomain under it, so a user who enters
+///   `drpc.org` naturally covers `api.drpc.org`, `lb.drpc.org`, … (they no longer
+///   have to type `*.`). The ONE exception: a bare anchor that is itself a public
+///   suffix whose children are third-party controlled (`github.io`, `pages.dev`,
+///   an S3 host) stays EXACT, so a credential can never be sent to a stranger's
+///   sibling subdomain; `*.suffix` still opts INTO those subdomains explicitly.
+///
+/// Both are port-aware and case-insensitive. Downward only: a sibling, parent,
+/// or lookalike of the anchor never matches.
 pub fn host_anchor_matches(dest_authority: &str, anchor: &str) -> bool {
     if let Some(suffix) = anchor.strip_prefix("*.") {
-        let dest = strip_port(dest_authority).to_ascii_lowercase();
-        let suffix = suffix.to_ascii_lowercase();
-        dest.strip_suffix(&suffix)
-            .and_then(|pre| pre.strip_suffix('.'))
-            .map(|pre| !pre.is_empty())
-            .unwrap_or(false)
+        subdomain_of(dest_authority, suffix)
+    } else if host_matches_exact(dest_authority, anchor) {
+        true
     } else {
-        host_matches_exact(dest_authority, anchor)
+        !is_public_suffix(&strip_port(anchor).to_ascii_lowercase())
+            && subdomain_of(dest_authority, anchor)
     }
+}
+
+/// True iff `dest` is a subdomain (≥1 label, any depth) of `parent`. Port-aware,
+/// case-insensitive, label-boundary safe (`notbitquery.io` never matches
+/// `bitquery.io`).
+fn subdomain_of(dest_authority: &str, parent: &str) -> bool {
+    let dest = strip_port(dest_authority).to_ascii_lowercase();
+    let parent = strip_port(parent).to_ascii_lowercase();
+    dest.strip_suffix(&parent)
+        .and_then(|pre| pre.strip_suffix('.'))
+        .map(|pre| !pre.is_empty())
+        .unwrap_or(false)
+}
+
+/// A curated subset of the Public Suffix List: suffixes whose immediate children
+/// are third-party controlled (user pages, buckets, serverless apps). A BARE
+/// anchor equal to one of these does NOT auto-expand to subdomains — expanding
+/// would let a credential reach an attacker's sibling subdomain. It's a subset,
+/// not the full PSL: a bare anchor that IS a registrable vendor domain (the
+/// common case: `drpc.org`, `alchemy.com`) expands; the full `psl` crate can
+/// replace this if broader coverage is ever needed. Entries are lowercase, no
+/// leading dot.
+fn is_public_suffix(host: &str) -> bool {
+    const PUBLIC_SUFFIXES: &[&str] = &[
+        // code hosting user pages
+        "github.io",
+        "gitlab.io",
+        "githubusercontent.com",
+        // static / serverless hosting (user-owned subdomains)
+        "pages.dev",
+        "workers.dev",
+        "r2.dev",
+        "vercel.app",
+        "netlify.app",
+        "web.app",
+        "firebaseapp.com",
+        "herokuapp.com",
+        "onrender.com",
+        "fly.dev",
+        "azurewebsites.net",
+        "cloudfunctions.net",
+        "cloudfront.net",
+        // object storage (bucket == subdomain, cross-tenant)
+        "s3.amazonaws.com",
+        "blob.core.windows.net",
+        "storage.googleapis.com",
+        "digitaloceanspaces.com",
+    ];
+    PUBLIC_SUFFIXES.contains(&host)
 }
 
 /// True if `dest_authority` matches any of the `resolved` anchor entries — an
@@ -246,6 +299,30 @@ mod tests {
         let exact = vec!["api.bitquery.io".to_string()];
         assert!(host_allowed("api.bitquery.io", &exact));
         assert!(!host_allowed("streaming.bitquery.io", &exact));
+    }
+
+    #[test]
+    fn bare_anchor_covers_apex_and_subtree_except_public_suffix() {
+        // A bare registrable domain now covers apex AND any-depth subdomain.
+        let resolved = vec!["drpc.org".to_string()];
+        assert!(host_allowed("drpc.org", &resolved)); // apex
+        assert!(host_allowed("api.drpc.org", &resolved)); // child
+        assert!(host_allowed("lb.eth.drpc.org:443", &resolved)); // deep + port
+        assert!(host_allowed("API.DrpC.org", &resolved)); // case-insensitive
+                                                          // downward only: sibling/parent/lookalike never match.
+        assert!(!host_allowed("notdrpc.org", &resolved));
+        assert!(!host_allowed("drpc.org.evil.com", &resolved));
+        assert!(!host_allowed("org", &resolved));
+        assert!(!host_allowed("evil.com", &resolved));
+        // A bare PUBLIC SUFFIX stays EXACT (children are third-party): a
+        // credential for `github.io` can't be sent to a stranger's subdomain.
+        let pages = vec!["github.io".to_string()];
+        assert!(host_allowed("github.io", &pages));
+        assert!(!host_allowed("evil.github.io", &pages));
+        // `*.` still opts INTO subdomains of a public suffix explicitly.
+        let star = vec!["*.github.io".to_string()];
+        assert!(host_allowed("mine.github.io", &star));
+        assert!(!host_allowed("github.io", &star)); // wildcard excludes apex
     }
 
     #[test]
