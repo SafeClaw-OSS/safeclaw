@@ -230,29 +230,25 @@ async fn preflight(ca: &Path, control_root: &str) -> Result<(), String> {
     if control_plane_up(control_root).await {
         return Ok(());
     }
-    // A stale broker URL (an old `sc agent add` snapshot) points the whole
-    // resolution at a daemon HOST that has since moved — name the actual var the
-    // agent set (new `SAFECLAW_BROKER_URL` or legacy `SAFECLAW_DAEMON_URL`),
-    // rather than the misleading "isn't running" when a daemon may well be up on
-    // the default host/port. (A stale PORT alone can't reach here: `control_root`
-    // takes only the env HOST and resolves the port itself.)
-    if let Some((name, u)) = ["SAFECLAW_BROKER_URL", "SAFECLAW_DAEMON_URL"]
+    // The COMMON cause is simply a stopped (or never-started) local daemon, so
+    // LEAD with `sc up`. Leading instead with the stale-URL hypothesis makes an
+    // agent misread a plain down-daemon as a wrong port / drifted endpoint (the
+    // reported confusion). The moved-host case is demoted to a parenthetical and
+    // names the env var only, never its value (URL-shaped vars can carry creds).
+    // (A stale PORT alone can't reach here: `control_root` takes only the env
+    // HOST and resolves the port itself.)
+    if let Some(name) = ["SAFECLAW_BROKER_URL", "SAFECLAW_DAEMON_URL"]
         .into_iter()
-        .find_map(|k| {
-            std::env::var(k)
-                .ok()
-                .filter(|s| !s.is_empty())
-                .map(|v| (k, v))
-        })
+        .find_map(|k| std::env::var(k).ok().filter(|s| !s.is_empty()).map(|_| k))
     {
         return Err(format!(
-            "SafeClaw isn't answering at {control_root} (host from your agent env's \
-             {name}={u}). If the daemon moved or restarted elsewhere, unset that \
-             stale value or re-run `sc agent add` to re-mint your env, then retry. \
-             Otherwise start it with `sc up`."
+            "SafeClaw daemon isn't answering at {control_root}. It's most likely \
+             just not running: start it with `sc up`, then retry. (If instead you \
+             moved the daemon to another host, your agent env's {name} is stale; \
+             unset it or re-run `sc agent add`.)"
         ));
     }
-    Err("SafeClaw isn't running — bring it up with `sc up`, then retry.".into())
+    Err("SafeClaw daemon isn't running. Bring it up with `sc up`, then retry.".into())
 }
 
 /// Tell the LOCAL daemon our live shell egress proxy (`POST /proxy/ambient`) so
