@@ -215,10 +215,19 @@ pub fn validate_batch_grant(
             "batch grant must not carry a top-level assertion".into(),
         ));
     }
+    // Expired window and unknown credential stay TERMINAL (per-op parity:
+    // the same grant would die the same way on the plain path, and neither
+    // is recoverable by a per-op retry with the same material).
     check_now(&grant.o.valid)?;
     let entry = credential_lookup(&grant.credential_id)
         .ok_or_else(|| AppError::Unauthorized("unknown credential".into()))?;
 
+    // EVERY core failure on a batch grant — challenge peek, credential-id
+    // mismatch, ASSERTION/ROOT verification, malformed r/wk — must surface
+    // as `batch_verify_failed` (design §Daemon verify 7): the relay client
+    // recovers by re-registering the op, and a tampered or cross-language-
+    // divergent root must never re-open Rev 1's mass-reject through the
+    // 401/400 seam.
     validate_grant_core(
         grant,
         &batch.assertion,
@@ -228,6 +237,10 @@ pub fn validate_batch_grant(
         origin,
         rp_id,
     )
+    .map_err(|e| match e {
+        AppError::Unauthorized(msg) | AppError::BadRequest(msg) => AppError::BatchVerify(msg),
+        other => other,
+    })
 }
 
 /// Shared validation tail for both arms: challenge peek → assertion verify
@@ -312,4 +325,136 @@ fn validate_grant_core(
         wrapping_key,
         r_bytes,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::passkey::challenge::ChallengeStore;
+    use crate::protocol::operation::{Act, Bind, Valid};
+    use base64::{engine::general_purpose::STANDARD as B64, Engine};
+
+    fn use_op() -> Operation {
+        Operation {
+            act: Act {
+                kind: ActType::Use,
+                target: "github".into(),
+                scope: serde_json::json!({ "method": "GET", "host": "api.github.com", "path": "/user" }),
+            },
+            bind: Bind {
+                redeemer: "v1".into(),
+                recipient: None,
+            },
+            valid: Valid::single_use(0, None),
+        }
+    }
+
+    fn dummy_entry() -> PasskeyEntry {
+        PasskeyEntry {
+            x: B64.encode([1u8; 32]),
+            y: B64.encode([2u8; 32]),
+            device_name: "test".into(),
+            created_at: 0,
+        }
+    }
+
+    fn batch_grant(r: &str) -> Grant {
+        Grant {
+            o: use_op(),
+            r: r.into(),
+            credential_id: B64.encode([7u8; 16]),
+            wrapping_key: Some(B64.encode([9u8; 32])),
+            wk_enc: None,
+            wk_ct: None,
+            assertion: None,
+            batch: Some(BatchProof {
+                op_ids: vec!["a".into(), "b".into()],
+                assertion: AssertionData {
+                    credential_id: None,
+                    authenticator_data: B64.encode([0u8; 37]),
+                    client_data_json: B64.encode(b"{}"),
+                    signature: B64.encode([0u8; 8]),
+                },
+            }),
+            setup_payload: None,
+            opt: None,
+        }
+    }
+
+    /// The load-bearing §7 guarantee: a batch grant whose assertion does NOT
+    /// verify against the expected (root-derived) challenge must surface as
+    /// `batch_verify_failed` (recoverable), never as the 401/400 the plain
+    /// path would emit — that seam was Rev 1's mass-reject.
+    #[test]
+    fn batch_assertion_failure_is_batch_verify_failed() {
+        let mut chs = ChallengeStore::new();
+        let r = chs.issue("127.0.0.1".parse().unwrap()).unwrap();
+        let grant = batch_grant(&r);
+        let err = validate_batch_grant(
+            &grant,
+            &[0x42u8; 32],
+            &mut chs,
+            "http://localhost",
+            "localhost",
+            |_| Some(dummy_entry()),
+        );
+        let err = match err {
+            Err(e) => e,
+            Ok(_) => panic!("expected error"),
+        };
+        assert!(
+            matches!(err, AppError::BatchVerify(_)),
+            "wrong-root/bad-assertion must be recoverable, got: {}",
+            err
+        );
+        let (code, _) = err.code();
+        assert_eq!(code.as_str(), "batch_verify_failed");
+        assert_eq!(code.status(), 409);
+        // The single-use challenge must SURVIVE a failed batch verify (peek
+        // only; consume happens after a successful verify) so the per-op
+        // retry after re-register can still redeem it.
+        assert!(
+            chs.peek(&r),
+            "r must not be consumed by a failed batch verify"
+        );
+    }
+
+    /// A batch-shaped grant on the PLAIN path fails closed.
+    #[test]
+    fn plain_path_rejects_batch_grants() {
+        let mut chs = ChallengeStore::new();
+        let r = chs.issue("127.0.0.1".parse().unwrap()).unwrap();
+        let grant = batch_grant(&r);
+        let err = validate_grant(&grant, &mut chs, "http://localhost", "localhost", |_| {
+            Some(dummy_entry())
+        });
+        let err = match err {
+            Err(e) => e,
+            Ok(_) => panic!("expected error"),
+        };
+        assert!(matches!(err, AppError::BadRequest(_)));
+    }
+
+    /// A batch grant carrying a top-level assertion is rejected before any
+    /// crypto (an old daemon would verify it against β and burn fail_count).
+    #[test]
+    fn batch_with_top_level_assertion_rejected() {
+        let mut chs = ChallengeStore::new();
+        let r = chs.issue("127.0.0.1".parse().unwrap()).unwrap();
+        let mut grant = batch_grant(&r);
+        grant.assertion = grant.batch.as_ref().map(|b| b.assertion.clone());
+        let err = validate_batch_grant(
+            &grant,
+            &[0x42u8; 32],
+            &mut chs,
+            "http://localhost",
+            "localhost",
+            |_| Some(dummy_entry()),
+        );
+        let err = match err {
+            Err(e) => e,
+            Ok(_) => panic!("expected error"),
+        };
+        assert!(matches!(err, AppError::BatchVerify(_)));
+    }
 }

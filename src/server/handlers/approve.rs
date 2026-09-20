@@ -425,13 +425,17 @@ pub async fn approve_op(
         (rec.vault_id.clone(), rec.op.clone(), rec.r.clone())
     };
 
-    // 2. grant.o must equal the stored op (canonical equality).
+    // 2. grant.o must equal the stored op (canonical equality). Batch arm:
+    // recoverable, like its twin `grant.r` check below (design §7 lists the
+    // o/r equalities under batch_verify_failed).
     let canonical_grant_op = serde_json::to_value(&grant.o)?;
     let canonical_stored_op = serde_json::to_value(&approval_op)?;
     if canonical_grant_op != canonical_stored_op {
-        return Err(AppError::BadRequest(
-            "grant.o does not match the stored op".into(),
-        ));
+        return Err(if grant.batch.is_some() {
+            AppError::BatchVerify("grant.o does not match the stored op".into())
+        } else {
+            AppError::BadRequest("grant.o does not match the stored op".into())
+        });
     }
 
     // 2b. grant.r must equal THIS op's stored challenge — REQUIRED in both

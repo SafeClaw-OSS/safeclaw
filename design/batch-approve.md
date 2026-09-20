@@ -153,10 +153,14 @@ For an incoming grant carrying `batch`:
    `op_ids` order, build the root, derive the tagged challenge, verify
    `batch.assertion` — the same WebAuthn verify as today, different challenge
    source.
-5. Verify-once cache: on success, cache the byte-exact key
-   `(credential_id, op_ids array, assertion signature bytes) → verified root`
-   with TTL = max sibling expiry. A cache hit skips ONLY the sibling loads,
-   the root rebuild, and the WebAuthn verify — nothing else: the challenge
+5. Verify-once cache — AS BUILT, strictly stronger than specified: the memo
+   keys on `(credential_id, op_ids)` and stores only the root DERIVATION (a
+   pure function of the daemon's own op store), and the WebAuthn verify is
+   NEVER skipped — it runs on every row against the memo'd root, so a stale
+   or adversarial entry can only fail a signature, never approve anything.
+   The original spec (hit may also skip the verify, keyed with assertion
+   bytes) remains sound but is not what shipped. A hit skips ONLY the
+   sibling loads and the root rebuild — nothing else: the challenge
    peek→consume, `check_now(o.valid)`, the wk_enc/wk_ct open, the
    `grant.o == stored op` / `grant.r == stored r` equalities and every other
    per-row check run unchanged on every row. Entries are written only after
@@ -173,7 +177,10 @@ For an incoming grant carrying `batch`:
      sibling, root mismatch, `r`/`o` equality, assertion failure) returns a
      machine-readable `ScCode` (RFC-9457, existing convention) —
      `batch_verify_failed`. The relay client switches on the CODE, never on
-     body text.
+     body text. As built, two failures stay TERMINAL by design (per-op
+     parity — the same material dies the same way per-op, and a retry with
+     it cannot succeed): an expired validity window and an unknown
+     credential.
    - On that code the relay client does NOT `apply_reject`. It RE-REGISTERS
      the op with the relay (the existing register upsert on `op_id` resets
      `grant_status` to `pending` — daemon-authenticated, vault-owned, zero
