@@ -186,6 +186,18 @@ impl ApprovalStore {
         self.inner.get(id).filter(|r| !r.is_expired())
     }
 
+    /// Raw lookup — ANY status, expiry IGNORED. Exists for exactly one
+    /// caller: the batch-approve sibling rebuild (design/batch-approve.md
+    /// §Daemon verify 3). Batch rows arrive and apply at independent times,
+    /// so by row k the earlier siblings are already Approved/Consumed and a
+    /// short-TTL sibling may have expired — a signed β is immutable and each
+    /// sibling's own application is separately gated by its own pending
+    /// check, so only a genuinely ABSENT record may fail the rebuild. Never
+    /// use this for approval decisions.
+    pub fn get_any(&self, id: &str) -> Option<&ApprovalRecord> {
+        self.inner.get(id)
+    }
+
     pub fn approve(&mut self, id: &str, value: Option<String>) -> Option<&ApprovalRecord> {
         if let Some(rec) = self.inner.get_mut(id) {
             if !matches!(rec.status, ApprovalStatus::Pending) || rec.is_expired() {

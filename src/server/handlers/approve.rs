@@ -37,7 +37,7 @@ use crate::protocol::operation::{
     as_enroll_credential, as_export_path, as_write_patch, decode_credential_id, discriminator,
     ActType,
 };
-use crate::protocol::{render_operation, validate_grant, Grant};
+use crate::protocol::{render_operation, validate_batch_grant, validate_grant, Grant};
 use crate::server::handlers::metadata::decrypt_vault_view_keep_key;
 use crate::state::{AppState, ApprovalEvent, SecretsCache};
 use crate::storage::plaintext::{Category, VaultPlaintextView};
@@ -307,13 +307,113 @@ pub(crate) fn apply_secret_set_to_view(
 
 /// `POST /op/{op_id}/approve` — U submits the signed grant. T validates and
 /// dispatches the act (Enroll / Write / Export / Use).
+/// Batch-arm pre-verification (design/batch-approve.md §Daemon verify 1-5):
+/// bounds BEFORE any record load, then rebuild the Merkle root from the
+/// daemon's OWN stored (o, r) pairs in `op_ids` order and derive the tagged
+/// challenge. Sibling lookup is status- and expiry-agnostic (`get_any`) —
+/// rows apply at independent times, so earlier siblings are legitimately
+/// Approved/Consumed/expired by the time later rows arrive; only a genuinely
+/// absent record fails the rebuild. The root memo in `state.batch_roots`
+/// makes later rows of an honest batch O(1) here; the WebAuthn verify and
+/// every per-row check still run in the shared validation core.
+fn batch_expected_challenge(
+    state: &AppState,
+    op_id: &str,
+    vault_id: &str,
+    grant: &Grant,
+) -> Result<[u8; 32]> {
+    use crate::crypto::batch::{batch_challenge, batch_root, BATCH_MAX, BATCH_MIN};
+    use crate::crypto::binding::{binding_for_op, DOMAIN_STANDARD};
+
+    let batch = grant
+        .batch
+        .as_ref()
+        .ok_or_else(|| AppError::BatchVerify("grant carries no batch proof".into()))?;
+    let n = batch.op_ids.len();
+    if !(BATCH_MIN..=BATCH_MAX).contains(&n) {
+        return Err(AppError::BatchVerify(format!(
+            "batch size {} outside {}..={}",
+            n, BATCH_MIN, BATCH_MAX
+        )));
+    }
+    {
+        let mut seen = std::collections::HashSet::with_capacity(n);
+        for id in &batch.op_ids {
+            if !seen.insert(id.as_str()) {
+                return Err(AppError::BatchVerify("duplicate op id in batch".into()));
+            }
+        }
+    }
+    if !batch.op_ids.iter().any(|i| i == op_id) {
+        return Err(AppError::BatchVerify(
+            "op is not a member of its own batch".into(),
+        ));
+    }
+
+    let now_s = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let cache_key = format!("{}|{}", grant.credential_id, batch.op_ids.join(","));
+    if let Some((root, exp)) = state.batch_roots.lock().unwrap().get(&cache_key).copied() {
+        if exp >= now_s {
+            return Ok(batch_challenge(&root));
+        }
+    }
+
+    let (root, max_exp) = {
+        let store = state.approvals.lock().unwrap();
+        let mut betas: Vec<[u8; 32]> = Vec::with_capacity(n);
+        let mut max_exp = 0u64;
+        for id in &batch.op_ids {
+            let rec = store
+                .get_any(id)
+                .ok_or_else(|| AppError::BatchVerify(format!("unknown batch member op {}", id)))?;
+            if rec.vault_id != vault_id {
+                return Err(AppError::BatchVerify("batch spans vaults".into()));
+            }
+            // The consent boundary, not an optimization: lifecycle and
+            // high-consequence kinds keep the per-op ceremony.
+            if rec.op.act.kind != ActType::Use {
+                return Err(AppError::BatchVerify(
+                    "batch may contain only `use` ops".into(),
+                ));
+            }
+            let r_bytes = STANDARD
+                .decode(&rec.r)
+                .map_err(|_| AppError::BatchVerify("stored r not base64".into()))?;
+            let op_value = serde_json::to_value(&rec.op)?;
+            betas.push(binding_for_op(DOMAIN_STANDARD, &r_bytes, &op_value)?);
+            max_exp = max_exp.max(rec.expires_at_unix);
+        }
+        let root = batch_root(&betas).ok_or_else(|| AppError::BatchVerify("empty batch".into()))?;
+        (root, max_exp)
+    };
+
+    {
+        let mut cache = state.batch_roots.lock().unwrap();
+        cache.retain(|_, (_, exp)| *exp >= now_s);
+        if cache.len() >= 64 {
+            if let Some(k) = cache
+                .iter()
+                .min_by_key(|(_, (_, e))| *e)
+                .map(|(k, _)| k.clone())
+            {
+                cache.remove(&k);
+            }
+        }
+        cache.insert(cache_key, (root, max_exp));
+    }
+    Ok(batch_challenge(&root))
+}
+
 pub async fn approve_op(
     State(state): State<Arc<AppState>>,
     Path(op_id): Path<String>,
     Json(mut grant): Json<Grant>,
 ) -> Result<Json<Value>> {
     // 1. Look up the pending op.
-    let (vault_id, approval_op) = {
+    let (vault_id, approval_op, stored_r) = {
         let store = state.approvals.lock().unwrap();
         let rec = store.get(&op_id).ok_or(AppError::NotFound)?;
         if !matches!(rec.status, ApprovalStatus::Pending) {
@@ -322,7 +422,7 @@ pub async fn approve_op(
         if rec.fail_count >= crate::approval::store::MAX_APPROVE_ATTEMPTS {
             return Err(AppError::TooManyRequests);
         }
-        (rec.vault_id.clone(), rec.op.clone())
+        (rec.vault_id.clone(), rec.op.clone(), rec.r.clone())
     };
 
     // 2. grant.o must equal the stored op (canonical equality).
@@ -333,6 +433,43 @@ pub async fn approve_op(
             "grant.o does not match the stored op".into(),
         ));
     }
+
+    // 2b. grant.r must equal THIS op's stored challenge — REQUIRED in both
+    // arms (design/batch-approve.md §Daemon verify 2). The batch assertion
+    // covers STORED r's, not the wire r; and even in the plain arm the
+    // challenge store is daemon-global, so a relay-swapped `r` would
+    // otherwise still verify (β binds whatever wire r the console was fed)
+    // while consuming a SIBLING op's live single-use challenge.
+    if grant.r != stored_r {
+        let auto_rejected = state.approvals.lock().unwrap().record_failure(&op_id);
+        if auto_rejected {
+            tracing::warn!(op = %op_id, "op auto-rejected after too many failed approve attempts");
+        }
+        return Err(if grant.batch.is_some() {
+            AppError::BatchVerify("grant.r does not match this op's challenge".into())
+        } else {
+            AppError::BadRequest("grant.r does not match this op's challenge".into())
+        });
+    }
+
+    // 2c. Batch arm — rebuild the Merkle root from OUR OWN stored ops and
+    // derive the expected challenge (design/batch-approve.md §Daemon verify).
+    // Failures here are `batch_verify_failed`: RECOVERABLE (the relay client
+    // re-registers the op instead of rejecting it), never terminal.
+    let batch_challenge_bytes: Option<[u8; 32]> = if grant.batch.is_some() {
+        match batch_expected_challenge(&state, &op_id, &vault_id, &grant) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                let auto_rejected = state.approvals.lock().unwrap().record_failure(&op_id);
+                if auto_rejected {
+                    tracing::warn!(op = %op_id, "op auto-rejected after too many failed approve attempts");
+                }
+                return Err(e);
+            }
+        }
+    } else {
+        None
+    };
 
     // 3. Serialize vault reads/writes per vault (F-17).
     // Two concurrent approve calls on the same vault both read the same
@@ -440,13 +577,25 @@ pub async fn approve_op(
     let mut validated = {
         let result = {
             let mut chs = state.challenges.lock().unwrap();
-            validate_grant(
-                &grant,
-                &mut chs,
-                &state.config.origin,
-                &state.config.rp_id,
-                lookup_credential,
-            )
+            match &batch_challenge_bytes {
+                // Batch arm: same shared validation core, challenge = the
+                // domain-tagged root rebuilt above from our own op store.
+                Some(chal) => validate_batch_grant(
+                    &grant,
+                    chal,
+                    &mut chs,
+                    &state.config.origin,
+                    &state.config.rp_id,
+                    lookup_credential,
+                ),
+                None => validate_grant(
+                    &grant,
+                    &mut chs,
+                    &state.config.origin,
+                    &state.config.rp_id,
+                    lookup_credential,
+                ),
+            }
         };
         match result {
             Ok(v) => v,
@@ -2888,5 +3037,190 @@ mod tests {
             assert_eq!(body["status"], "ok");
             assert_eq!(body["value"]["status"], 200);
         }
+    }
+
+    // ── batch-approve pre-verification (design/batch-approve.md) ────────────
+
+    fn use_op(vault: &str, path: &str) -> crate::protocol::operation::Operation {
+        use crate::protocol::operation::{Act, Bind, Valid};
+        crate::protocol::operation::Operation {
+            act: Act {
+                kind: ActType::Use,
+                target: "github".into(),
+                scope: json!({ "method": "GET", "host": "api.github.com", "path": path }),
+            },
+            bind: Bind {
+                redeemer: vault.into(),
+                recipient: None,
+            },
+            valid: Valid::single_use(0, None),
+        }
+    }
+
+    fn batch_grant(
+        op: crate::protocol::operation::Operation,
+        r: &str,
+        op_ids: Vec<String>,
+    ) -> Grant {
+        Grant {
+            o: op,
+            r: r.into(),
+            credential_id: "cred1".into(),
+            wrapping_key: None,
+            wk_enc: None,
+            wk_ct: None,
+            assertion: None,
+            batch: Some(crate::protocol::grant::BatchProof {
+                op_ids,
+                assertion: crate::passkey::webauthn::AssertionData {
+                    credential_id: None,
+                    authenticator_data: String::new(),
+                    client_data_json: String::new(),
+                    signature: String::new(),
+                },
+            }),
+            setup_payload: None,
+            opt: None,
+        }
+    }
+
+    fn b64r(seed: u8) -> String {
+        use base64::{engine::general_purpose::STANDARD as B64, Engine};
+        B64.encode([seed; 16])
+    }
+
+    #[test]
+    fn batch_challenge_bounds_membership_and_kind() {
+        let state = test_state();
+        let mut ids = Vec::new();
+        for i in 0..3u8 {
+            let mut s = state.approvals.lock().unwrap();
+            ids.push(s.create("v1".into(), use_op("v1", &format!("/r/{}", i)), b64r(i)));
+        }
+
+        // Too small.
+        let g = batch_grant(use_op("v1", "/r/0"), &b64r(0), vec![ids[0].clone()]);
+        let e = batch_expected_challenge(&state, &ids[0], "v1", &g).unwrap_err();
+        assert!(matches!(e, AppError::BatchVerify(_)), "size floor: {}", e);
+
+        // Duplicate member.
+        let g = batch_grant(
+            use_op("v1", "/r/0"),
+            &b64r(0),
+            vec![ids[0].clone(), ids[0].clone()],
+        );
+        assert!(matches!(
+            batch_expected_challenge(&state, &ids[0], "v1", &g).unwrap_err(),
+            AppError::BatchVerify(_)
+        ));
+
+        // Target not a member of its own batch.
+        let g = batch_grant(
+            use_op("v1", "/r/0"),
+            &b64r(0),
+            vec![ids[1].clone(), ids[2].clone()],
+        );
+        assert!(matches!(
+            batch_expected_challenge(&state, &ids[0], "v1", &g).unwrap_err(),
+            AppError::BatchVerify(_)
+        ));
+
+        // Unknown sibling.
+        let g = batch_grant(
+            use_op("v1", "/r/0"),
+            &b64r(0),
+            vec![ids[0].clone(), "nope".into()],
+        );
+        assert!(matches!(
+            batch_expected_challenge(&state, &ids[0], "v1", &g).unwrap_err(),
+            AppError::BatchVerify(_)
+        ));
+
+        // Non-Use sibling (Export) — the consent boundary.
+        let export_id = {
+            let mut s = state.approvals.lock().unwrap();
+            let mut op = use_op("v1", "/x");
+            op.act.kind = ActType::Export;
+            s.create("v1".into(), op, b64r(9))
+        };
+        let g = batch_grant(
+            use_op("v1", "/r/0"),
+            &b64r(0),
+            vec![ids[0].clone(), export_id],
+        );
+        assert!(matches!(
+            batch_expected_challenge(&state, &ids[0], "v1", &g).unwrap_err(),
+            AppError::BatchVerify(_)
+        ));
+
+        // Cross-vault sibling.
+        let other_vault_id = {
+            let mut s = state.approvals.lock().unwrap();
+            s.create("v2".into(), use_op("v2", "/y"), b64r(8))
+        };
+        let g = batch_grant(
+            use_op("v1", "/r/0"),
+            &b64r(0),
+            vec![ids[0].clone(), other_vault_id],
+        );
+        assert!(matches!(
+            batch_expected_challenge(&state, &ids[0], "v1", &g).unwrap_err(),
+            AppError::BatchVerify(_)
+        ));
+    }
+
+    #[test]
+    fn batch_challenge_matches_manual_rebuild_and_survives_sibling_status() {
+        use crate::crypto::batch::{batch_challenge, batch_root};
+        use crate::crypto::binding::{binding_for_op, DOMAIN_STANDARD};
+        use base64::{engine::general_purpose::STANDARD as B64, Engine};
+
+        let state = test_state();
+        let mut ids = Vec::new();
+        for i in 0..3u8 {
+            let mut s = state.approvals.lock().unwrap();
+            ids.push(s.create("v1".into(), use_op("v1", &format!("/p/{}", i)), b64r(i)));
+        }
+
+        // Manual root over the STORED (o, r) pairs in op_ids order.
+        let manual = {
+            let s = state.approvals.lock().unwrap();
+            let betas: Vec<[u8; 32]> = ids
+                .iter()
+                .map(|id| {
+                    let rec = s.get_any(id).unwrap();
+                    let r = B64.decode(&rec.r).unwrap();
+                    binding_for_op(DOMAIN_STANDARD, &r, &serde_json::to_value(&rec.op).unwrap())
+                        .unwrap()
+                })
+                .collect();
+            batch_challenge(&batch_root(&betas).unwrap())
+        };
+
+        let g = batch_grant(use_op("v1", "/p/0"), &b64r(0), ids.clone());
+        let got = batch_expected_challenge(&state, &ids[0], "v1", &g).unwrap();
+        assert_eq!(got, manual);
+
+        // Order is part of the commitment: permuted op_ids → different root.
+        let mut rev = ids.clone();
+        rev.reverse();
+        let g_rev = batch_grant(use_op("v1", "/p/0"), &b64r(0), rev);
+        assert_ne!(
+            batch_expected_challenge(&state, &ids[0], "v1", &g_rev).unwrap(),
+            manual
+        );
+
+        // Sibling status must not matter: approve one, reject another —
+        // later rows still rebuild the same root (get_any is status-blind).
+        {
+            let mut s = state.approvals.lock().unwrap();
+            s.approve(&ids[1], None);
+            s.reject(&ids[2], "user denied");
+        }
+        let got_after = batch_expected_challenge(&state, &ids[0], "v1", &g).unwrap();
+        assert_eq!(got_after, manual, "status-agnostic sibling rebuild");
+
+        // Batch grant must not carry a top-level assertion (checked in the
+        // validation arm, not the challenge rebuild — see validate_batch_grant).
     }
 }

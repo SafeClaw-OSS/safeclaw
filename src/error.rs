@@ -36,6 +36,12 @@ pub enum ScCode {
     AmbiguousPhantom,
     ApprovalNeeded,
     ApprovalRegister,
+    /// A batch-approve grant failed BATCH verification (bounds, unknown
+    /// sibling op, root mismatch, r/o inequality) — design/batch-approve.md.
+    /// RECOVERABLE by re-approving per-op: the relay client re-registers the
+    /// op instead of rejecting it, so this must stay a distinct code (the
+    /// client switches on it, never on message text).
+    BatchVerifyFailed,
     BrokerBodyLimit,
     EgressUnreachable,
     ExposesUnsupported,
@@ -120,6 +126,13 @@ impl ScCode {
                 "Approval needed",
                 "approve",
                 "policy",
+            ),
+            BatchVerifyFailed => (
+                409,
+                "batch_verify_failed",
+                "Batch approval could not be verified",
+                "retry",
+                "request",
             ),
             ApprovalRegister => (
                 503,
@@ -293,6 +306,9 @@ pub enum AppError {
     VaultLocked,
     TooManyRequests,
     Internal(String),
+    /// Batch-approve verification failure (recoverable; see
+    /// `ScCode::BatchVerifyFailed`). Never use for per-op apply failures.
+    BatchVerify(String),
 }
 
 impl AppError {
@@ -308,6 +324,7 @@ impl AppError {
             AppError::Conflict(msg) => (ScCode::Conflict, msg.clone()),
             AppError::VaultLocked => (ScCode::VaultLocked, VAULT_LOCKED_MSG.to_string()),
             AppError::TooManyRequests => (ScCode::RateLimited, "Rate limit exceeded".to_string()),
+            AppError::BatchVerify(msg) => (ScCode::BatchVerifyFailed, msg.clone()),
             AppError::Internal(msg) => {
                 tracing::error!("internal error: {}", msg);
                 (ScCode::Internal, "Internal server error".to_string())
@@ -350,6 +367,7 @@ impl std::fmt::Display for AppError {
             AppError::VaultLocked => write!(f, "Vault locked"),
             AppError::TooManyRequests => write!(f, "Rate limit exceeded"),
             AppError::Internal(msg) => write!(f, "Internal error: {}", msg),
+            AppError::BatchVerify(msg) => write!(f, "Batch verification failed: {}", msg),
         }
     }
 }
@@ -400,6 +418,7 @@ mod tests {
             AmbiguousPhantom,
             ApprovalNeeded,
             ApprovalRegister,
+            BatchVerifyFailed,
             BrokerBodyLimit,
             EgressUnreachable,
             ExposesUnsupported,

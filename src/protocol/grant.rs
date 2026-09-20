@@ -41,8 +41,20 @@ pub struct Grant {
     /// HPKE-sealed `W*` ciphertext + tag (base64url-no-pad). Paired with `wk_enc`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wk_ct: Option<String>,
-    /// WebAuthn assertion.
-    pub assertion: AssertionData,
+    /// WebAuthn assertion. Present on every PLAIN grant (challenge = β).
+    /// ABSENT on a batch grant — the shared proof rides in `batch` instead,
+    /// and a batch grant carrying a top-level assertion is rejected outright
+    /// (an old daemon would verify it against β, fail, and march
+    /// `fail_count` to auto-reject; see design/batch-approve.md §Wire).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assertion: Option<AssertionData>,
+    /// Batch-approve proof (design/batch-approve.md): ONE assertion whose
+    /// challenge is SHA-256(tag ‖ MerkleRoot(β_1..β_N)) over the ops named in
+    /// `op_ids` (leaf order). Deposited once per op row; the daemon rebuilds
+    /// the root from its OWN stored ops and verifies via
+    /// `validate_batch_grant`. Mutually exclusive with `assertion`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch: Option<BatchProof>,
     /// TLS-bound side payload — sealed bytes that depend on `W*` and so
     /// cannot be hashed into β at the moment the WebAuthn assertion is
     /// generated. Channel integrity is provided by TLS. Currently only used
@@ -52,6 +64,17 @@ pub struct Grant {
     /// Optional rotation payload (`W*_next` for write/rotate/enroll/revoke).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub opt: Option<serde_json::Value>,
+}
+
+/// The shared batch proof carried by each of a batch's grant rows.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchProof {
+    /// The batch's op ids in LEAF ORDER (= the exact ordered set the user's
+    /// gesture signed). 2..=32 entries, no duplicates, must contain the op
+    /// this grant is deposited on.
+    pub op_ids: Vec<String>,
+    /// The one WebAuthn assertion over the domain-tagged Merkle root.
+    pub assertion: AssertionData,
 }
 
 /// Side payload for `Act::Enroll`. Carried out-of-band of the canonical op so
@@ -83,7 +106,9 @@ impl Drop for ValidatedGrant {
     }
 }
 
-/// Validate a grant. The challenge `r` is consumed (single-use).
+/// Validate a PLAIN grant (challenge = the op's own β). The challenge `r` is
+/// consumed (single-use). Rejects batch-shaped grants outright — the batch
+/// arm goes through [`validate_batch_grant`] with a caller-computed challenge.
 ///
 /// `credential_lookup` returns the credential's public key entry or `None` if
 /// unknown. For `setup`, the credential is taken from the operation body
@@ -95,21 +120,20 @@ pub fn validate_grant(
     rp_id: &str,
     credential_lookup: impl FnOnce(&str) -> Option<PasskeyEntry>,
 ) -> Result<ValidatedGrant> {
-    // 1. Gate on r (must be issued by us and unexpired) but do NOT consume it
-    //    yet — a cheap peek. Consuming here (before the signature is verified)
-    //    would let anyone who learned the op's `r` burn a live op's single-use
-    //    challenge with a bogus grant, breaking the real approval. The challenge
-    //    is consumed only after the WebAuthn signature checks out (step 8).
-    if !challenge_store.peek(&grant.r) {
-        return Err(AppError::Unauthorized(
-            "invalid or expired challenge `r`".into(),
+    if grant.batch.is_some() {
+        return Err(AppError::BadRequest(
+            "batch grant not accepted on this path".into(),
         ));
     }
+    let assertion = grant
+        .assertion
+        .as_ref()
+        .ok_or_else(|| AppError::BadRequest("grant carries no assertion".into()))?;
 
-    // 2. Validity window.
+    // Validity window.
     check_now(&grant.o.valid)?;
 
-    // 3. Resolve credential public key:
+    // Resolve credential public key:
     //    - first-time Enroll (target empty): pubkey comes from the op body
     //      (no enrolled credential to look up yet), DOMAIN_SETUP.
     //    - add-passkey Enroll (target == "passkeys"): signed by an EXISTING
@@ -146,7 +170,88 @@ pub fn validate_grant(
         }
     };
 
-    // 4. Decode r.
+    // Decode r and compute β over canonical(o) (strict float-rejecting
+    // encoder) — the plain arm's expected challenge.
+    let r_bytes = STANDARD
+        .decode(&grant.r)
+        .map_err(|_| AppError::BadRequest("r not base64".into()))?;
+    if r_bytes.len() < 16 {
+        return Err(AppError::BadRequest("r too short".into()));
+    }
+    let op_value = serde_json::to_value(&grant.o)?;
+    let beta = binding_for_op(domain, &r_bytes, &op_value)?;
+
+    validate_grant_core(
+        grant,
+        assertion,
+        &entry,
+        &beta,
+        challenge_store,
+        origin,
+        rp_id,
+    )
+}
+
+/// Validate a BATCH grant (design/batch-approve.md). The caller (the approve
+/// handler) has already rebuilt the Merkle root from the daemon's OWN stored
+/// ops and derived `expected_challenge` = SHA-256(tag ‖ root); this arm
+/// resolves the credential (standard lookup only — batches are Use-only, so
+/// no Enroll special cases) and runs the same shared core as the plain arm:
+/// ONE validator, different challenge source, sudp untouched.
+pub fn validate_batch_grant(
+    grant: &Grant,
+    expected_challenge: &[u8; 32],
+    challenge_store: &mut crate::passkey::challenge::ChallengeStore,
+    origin: &str,
+    rp_id: &str,
+    credential_lookup: impl FnOnce(&str) -> Option<PasskeyEntry>,
+) -> Result<ValidatedGrant> {
+    let batch = grant
+        .batch
+        .as_ref()
+        .ok_or_else(|| AppError::BatchVerify("grant carries no batch proof".into()))?;
+    if grant.assertion.is_some() {
+        return Err(AppError::BatchVerify(
+            "batch grant must not carry a top-level assertion".into(),
+        ));
+    }
+    check_now(&grant.o.valid)?;
+    let entry = credential_lookup(&grant.credential_id)
+        .ok_or_else(|| AppError::Unauthorized("unknown credential".into()))?;
+
+    validate_grant_core(
+        grant,
+        &batch.assertion,
+        &entry,
+        expected_challenge,
+        challenge_store,
+        origin,
+        rp_id,
+    )
+}
+
+/// Shared validation tail for both arms: challenge peek → assertion verify
+/// against `expected_challenge` → wrapping-key decode → challenge consume.
+/// Every check here runs identically for plain and batch grants.
+fn validate_grant_core(
+    grant: &Grant,
+    assertion: &AssertionData,
+    entry: &PasskeyEntry,
+    expected_challenge: &[u8; 32],
+    challenge_store: &mut crate::passkey::challenge::ChallengeStore,
+    origin: &str,
+    rp_id: &str,
+) -> Result<ValidatedGrant> {
+    // 1. Gate on r (must be issued by us and unexpired) but do NOT consume it
+    //    yet — a cheap peek. Consuming here (before the signature is verified)
+    //    would let anyone who learned the op's `r` burn a live op's single-use
+    //    challenge with a bogus grant, breaking the real approval. The challenge
+    //    is consumed only after the WebAuthn signature checks out (step 8).
+    if !challenge_store.peek(&grant.r) {
+        return Err(AppError::Unauthorized(
+            "invalid or expired challenge `r`".into(),
+        ));
+    }
     let r_bytes = STANDARD
         .decode(&grant.r)
         .map_err(|_| AppError::BadRequest("r not base64".into()))?;
@@ -154,19 +259,22 @@ pub fn validate_grant(
         return Err(AppError::BadRequest("r too short".into()));
     }
 
-    // 5. Compute β over canonical(o) using strict float-rejecting encoder.
-    let op_value = serde_json::to_value(&grant.o)?;
-    let beta = binding_for_op(domain, &r_bytes, &op_value)?;
-
     // 6. Verify WebAuthn assertion against credential's public key.
-    if let Some(ref a_cred_id) = grant.assertion.credential_id {
+    if let Some(ref a_cred_id) = assertion.credential_id {
         if a_cred_id != &grant.credential_id {
             return Err(AppError::Unauthorized(
                 "assertion.credential_id != grant.credential_id".into(),
             ));
         }
     }
-    verify_assertion(&grant.assertion, &entry.x, &entry.y, origin, rp_id, &beta)?;
+    verify_assertion(
+        assertion,
+        &entry.x,
+        &entry.y,
+        origin,
+        rp_id,
+        expected_challenge,
+    )?;
 
     // 7. Decode wrapping_key + credential_id raw bytes.
     //

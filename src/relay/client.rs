@@ -9,6 +9,7 @@ use base64::{
     Engine,
 };
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use crate::device_auth::DikRequestExt;
 use crate::state::AppState;
@@ -203,6 +204,13 @@ async fn run(
         "passkeys": passkeys,
         "r": r,
         "expires_at": expires_at,
+        // Batch-approve capability advertisement (design/batch-approve.md
+        // §Version gating): the console offers "Approve all xN" only when
+        // every op in a group carries a supporting version. Relay-asserted
+        // and deliberately UNAUTHENTICATED - forging it down forces per-op
+        // fallback (UX cost only); forging it up buys nothing the relay's
+        // existing bare-403 reject power doesn't already have.
+        "daemon_version": env!("CARGO_PKG_VERSION"),
         // WHO triggered this op — the agent the local broker authenticated.
         // Advisory attribution for the approve page (the backend resolves it to
         // a label); null for user-initiated lifecycle ceremonies.
@@ -229,6 +237,13 @@ async fn run(
     //    the pre-event loop — only the wait between polls is event-aware.
     let poll_url = format!("{}/v/{}/op/relay/{}", base, vault_id, op_id);
     let deadline = tokio::time::Instant::now() + poll_budget(expires_at);
+    // Full-body hash of the last grant that failed BATCH verification: skip
+    // re-applying a byte-identical redelivery in the gap before our
+    // re-register flips the relay row back to pending. Full body, not the
+    // assertion: a same-set retry has the same root and a deterministic
+    // authenticator may repeat the assertion byte-for-byte — what guarantees
+    // an honest retry differs is the fresh HPKE ephemeral in wk_enc/wk_ct.
+    let mut last_batch_failed: Option<[u8; 32]> = None;
     while tokio::time::Instant::now() < deadline {
         if now() > expires_at + 5 {
             return Ok(()); // op expired; stop quietly
@@ -256,7 +271,53 @@ async fn run(
                     .await
                     .map_err(|e| format!("relay poll parse: {}", e))?;
                 let grant = body.get("sealed_grant").cloned().unwrap_or(body);
+                let grant_hash: [u8; 32] =
+                    Sha256::digest(serde_json::to_vec(&grant).unwrap_or_default()).into();
+                if last_batch_failed == Some(grant_hash) {
+                    // Same bad batch grant re-served before our re-register
+                    // landed — wait, don't spin (and don't march fail_count).
+                    next_poll_due(&op_wait, vault_id, last_poll).await;
+                    continue;
+                }
                 if let Err(e) = apply_grant(state.clone(), op_id, grant).await {
+                    if e.batch_verify_failed {
+                        // RECOVERABLE (design/batch-approve.md §Daemon verify
+                        // 7): never reject a user-approved op over a failed
+                        // BATCH rebuild (daemon restart, version skew,
+                        // tampered rows). Re-register the op — the register
+                        // upsert resets the relay row to `pending`, making a
+                        // fresh per-op deposit possible again (deposits are
+                        // first-write-wins, so without this reset no retry
+                        // could ever land) — and keep polling until the op's
+                        // own expiry.
+                        last_batch_failed = Some(grant_hash);
+                        tracing::warn!(op = %op_id, "batch grant failed verification ({}); re-registering op so per-op approval works again", e.detail);
+                        let rr = client
+                            .post(&reg_url)
+                            .bearer_auth(auth_token)
+                            .dik_pop(
+                                "POST",
+                                &reg_url,
+                                &serde_json::to_vec(&reg_body).unwrap_or_default(),
+                            )
+                            .json(&reg_body)
+                            .send()
+                            .await;
+                        match rr {
+                            Ok(r) if r.status().is_success() => {
+                                tracing::info!(op = %op_id, "op re-registered as pending after batch verify failure");
+                            }
+                            Ok(r) => {
+                                tracing::warn!(op = %op_id, "re-register after batch failure: HTTP {}", r.status());
+                            }
+                            Err(err) => {
+                                tracing::warn!(op = %op_id, "re-register after batch failure: {}", err);
+                            }
+                        }
+                        next_poll_due(&op_wait, vault_id, last_poll).await;
+                        continue;
+                    }
+                    let e = e.detail;
                     // The human APPROVED but the daemon can't apply this grant.
                     // The canonical cause now is a tapped passkey that isn't in
                     // THIS vault's keyset ("unknown credential"), after the approve
@@ -316,11 +377,28 @@ async fn run(
 /// Apply a relay-fetched grant by replaying it through the daemon's own
 /// `/op/{id}/approve` endpoint over localhost. This reuses the full approve
 /// path (incl. the §4.2 W_c unseal) verbatim — no logic is duplicated.
-async fn apply_grant(state: Arc<AppState>, op_id: &str, grant: Value) -> Result<(), String> {
+/// Why a loopback approve failed. `batch_verify_failed` is switched on by
+/// the poll loop's recovery arm — detected via the RFC-9457 `code` member,
+/// NEVER by matching message text (design/batch-approve.md §Daemon verify 7).
+struct ApplyFailure {
+    batch_verify_failed: bool,
+    detail: String,
+}
+
+impl ApplyFailure {
+    fn transport(detail: String) -> Self {
+        ApplyFailure {
+            batch_verify_failed: false,
+            detail,
+        }
+    }
+}
+
+async fn apply_grant(state: Arc<AppState>, op_id: &str, grant: Value) -> Result<(), ApplyFailure> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
-        .map_err(|e| format!("loopback client init: {}", e))?;
+        .map_err(|e| ApplyFailure::transport(format!("loopback client init: {}", e)))?;
     let url = format!(
         "http://127.0.0.1:{}/op/{}/approve",
         state.config.port, op_id
@@ -330,14 +408,20 @@ async fn apply_grant(state: Arc<AppState>, op_id: &str, grant: Value) -> Result<
         .json(&grant)
         .send()
         .await
-        .map_err(|e| format!("loopback approve: {}", e))?;
+        .map_err(|e| ApplyFailure::transport(format!("loopback approve: {}", e)))?;
     let status = resp.status();
     if status.is_success() {
         tracing::info!(op = %op_id, "relay grant applied via loopback approve");
         Ok(())
     } else {
         let body = resp.text().await.unwrap_or_default();
-        Err(format!("loopback approve HTTP {}: {}", status, body))
+        let code = serde_json::from_str::<Value>(&body)
+            .ok()
+            .and_then(|v| v.get("code").and_then(|c| c.as_str()).map(String::from));
+        Err(ApplyFailure {
+            batch_verify_failed: code.as_deref() == Some("batch_verify_failed"),
+            detail: format!("loopback approve HTTP {}: {}", status, body),
+        })
     }
 }
 

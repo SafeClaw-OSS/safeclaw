@@ -330,6 +330,16 @@ pub struct AppState {
     pub pending_config_ids: Mutex<HashMap<String, Vec<String>>>,
     pub challenges: Mutex<ChallengeStore>,
     pub approvals: Mutex<ApprovalStore>,
+    /// Batch-approve root memo (design/batch-approve.md §Daemon verify 5):
+    /// `credential_id ‖ "|" ‖ op_ids.join(",")` → (Merkle root over the
+    /// batch's stored β's, expiry = max sibling expiry). PURE MEMO of a
+    /// function of the daemon's own op store — it only skips the sibling
+    /// loads + rebuild on later rows of the same batch; the WebAuthn verify
+    /// and every per-row check still run on every row, so a stale or
+    /// adversarial entry can never approve anything (a wrong root just fails
+    /// signature verification). Bounded: entries expire with their batch and
+    /// the map is hard-capped (oldest-expiry evicted).
+    pub batch_roots: Mutex<HashMap<String, ([u8; 32], u64)>>,
     pub services: ServiceRegistry,
     pub events: broadcast::Sender<ApprovalEvent>,
     /// Per-vault Locked/Unlocked state. Absent entry = Locked. Lives entirely
@@ -520,6 +530,7 @@ impl AppState {
             pending_config_ids: Mutex::new(HashMap::new()),
             challenges: Mutex::new(ChallengeStore::new()),
             approvals: Mutex::new(ApprovalStore::new()),
+            batch_roots: Mutex::new(HashMap::new()),
             services: ServiceRegistry::load(),
             events,
             vault_states: Mutex::new(HashMap::new()),
