@@ -2245,6 +2245,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rs_merkle"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bb09b49230ba22e8c676e7b75dfe2887dea8121f18b530ae0ba519ce442d2b21"
+dependencies = [
+ "sha2",
+]
+
+[[package]]
 name = "rtoolbox"
 version = "0.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2391,6 +2400,7 @@ dependencies = [
  "regex",
  "reqwest",
  "rpassword",
+ "rs_merkle",
  "rusqlite",
  "rustls-native-certs",
  "serde",
