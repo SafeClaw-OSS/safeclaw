@@ -330,6 +330,15 @@ pub enum WriterRole {
 }
 
 impl ItemNs {
+    /// Same-item conflicts in this namespace KEEP BOTH (§4): user-visible items
+    /// a person can compare and resolve. Everything else (singletons,
+    /// `connecting`, legacy aux …) takes the writer's value, where a
+    /// "(conflict copy)" row would be invisible to the fold and undeletable.
+    /// Console parity: `KEEP_BOTH_NS` in `lib/vault-grant.ts`.
+    pub fn keeps_both_on_conflict(self) -> bool {
+        matches!(self, ItemNs::Secret | ItemNs::Connection)
+    }
+
     /// The lowercase wire string (matches the serde rename and the TS side).
     pub fn as_str(self) -> &'static str {
         match self {

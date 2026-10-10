@@ -1086,8 +1086,12 @@ impl ViewBase {
         self.items.contains_key(&(ns, name.to_string()))
     }
 
+    fn digest(&self, ns: ItemNs, name: &str) -> Option<&[u8; 32]> {
+        self.items.get(&(ns, name.to_string()))
+    }
+
     fn unchanged(&self, ns: ItemNs, name: &str, body: &serde_json::Value) -> bool {
-        self.items.get(&(ns, name.to_string())) == Some(&body_digest(body))
+        self.digest(ns, name) == Some(&body_digest(body))
     }
 }
 
@@ -1600,6 +1604,36 @@ impl PerItemVault {
         Ok(out)
     }
 
+    /// Keep-both (§4), locally: store `ours` as the conflict copy beside THEIR row
+    /// at `their_version` (the console's `putConflictCopy` id/name, version 1),
+    /// DIRTY (`synced_version` 0) so the next push sends it as a create. Inserted
+    /// only if absent (idempotent). Returns the copy id when it was inserted.
+    fn put_local_conflict_copy<S: PrimitiveSuite>(
+        &mut self,
+        keys: VaultKeys,
+        vault_id: &str,
+        ours: &ItemPayload,
+        their_version: u64,
+    ) -> Result<Option<String>> {
+        let (copy_id, ct) =
+            crate::storage::item::seal_conflict_copy::<S>(keys, vault_id, ours, their_version)?;
+        if self.items.contains_key(&copy_id) {
+            return Ok(None);
+        }
+        self.items.insert(
+            copy_id.clone(),
+            StoredItem {
+                version: crate::storage::item::CONFLICT_COPY_VERSION,
+                ct,
+                synced_version: 0,
+                tombstone: false,
+                sig: None,
+                signer: None,
+            },
+        );
+        Ok(Some(copy_id))
+    }
+
     /// A view's reconcilable items as `(ns, name) → body`: every native secret,
     /// connection and in-flight connect, plus (`with_aux`) the aux config
     /// subtrees at legacy `aux:<name>`. Shared by [`Self::reconcile_from_view`]
@@ -1688,6 +1722,31 @@ impl PerItemVault {
                 continue;
             }
             let payload = ItemPayload::live(*ns, name.clone(), body.clone());
+            // §4 same-item conflict: the caller changed it AND the stored row no
+            // longer matches the base (a pull changed or deleted it meanwhile,
+            // e.g. during a connect's token exchange). Keep-both namespaces keep
+            // THEIRS at the canonical id and OURS as a local dirty conflict copy;
+            // the rest take the caller's write (console parity).
+            if let ReconcileBase::Since(b) = base {
+                let wire = wire_id_for::<S>(keys.id_seed, *ns, name)?;
+                if let Some(their_version) = self.items.get(&wire).map(|s| s.version) {
+                    let theirs = existing
+                        .as_ref()
+                        .filter(|p| !p.is_tombstone())
+                        .map(|p| body_digest(&p.body));
+                    if ns.keeps_both_on_conflict() && theirs.as_ref() != b.digest(*ns, name) {
+                        if let Some(copy) = self.put_local_conflict_copy::<S>(
+                            keys,
+                            vault_id,
+                            &payload,
+                            their_version,
+                        )? {
+                            changed.push(copy);
+                        }
+                        continue;
+                    }
+                }
+            }
             let (id, _v) = self.seal_and_bump::<S>(keys, vault_id, *ns, name, &payload)?;
             changed.push(id);
         }
@@ -2858,6 +2917,82 @@ mod tests {
         pv.reconcile_from_view::<StdPrimitives>(keys, vid, &view, ReconcileBase::OwnFold)
             .unwrap();
         assert_eq!(live(&pv), pairs(&[("C", "old"), ("D", "d2")]));
+    }
+
+    // §4 under `Since`: the caller changed K while a pull changed K too (the
+    // stored row no longer matches the base). A keep-both ns keeps THEIRS at the
+    // canonical id and OURS as a local DIRTY conflict copy (console id/name,
+    // version 1); other namespaces take the caller's write. Idempotent.
+    #[test]
+    fn reconcile_keeps_both_on_a_concurrent_same_item_change() {
+        use crate::storage::item::{self as il, ItemPayload};
+        use crate::storage::plaintext::{VaultAux, VaultPlaintextView};
+        use sudp::primitives::StdPrimitives;
+        let k = [0x57u8; 32];
+        let vid = "vault-kb";
+        let keys = VaultKeys::single(&k);
+        let view_of = |k_val: &str, days: u32| {
+            let mut aux = VaultAux::initial();
+            aux.audit_retention_days = Some(days);
+            VaultPlaintextView {
+                aux,
+                native_secrets: [("K".to_string(), k_val.as_bytes().to_vec())].into(),
+                legacy_addressing: false,
+            }
+        };
+        let mut pv = PerItemVault::build_initial(
+            b"c".to_vec(),
+            "x".into(),
+            "y".into(),
+            "Dev".into(),
+            vec![0u8; 32],
+            vec![0u8; 48],
+        )
+        .unwrap();
+        // The store holds THEIR values (pulled after the base): K, retention 14.
+        pv.seed_items_from_view::<StdPrimitives>(keys, vid, &view_of("theirs", 14))
+            .unwrap();
+        for s in pv.items.values_mut() {
+            s.synced_version = s.version;
+        }
+        let k_id = il::wire_id_for::<StdPrimitives>(&k, ItemNs::Secret, "K").unwrap();
+        let their_k = pv.get_item(&k_id).unwrap().clone();
+
+        // The caller read the base (K "base", 7) and changed both.
+        let base = ViewBase::of(&view_of("base", 7)).unwrap();
+        let view = view_of("ours", 30);
+        pv.reconcile_from_view::<StdPrimitives>(keys, vid, &view, ReconcileBase::Since(&base))
+            .unwrap();
+
+        // K: theirs untouched (still clean); ours is a dirty local conflict copy.
+        let k_now = pv.get_item(&k_id).unwrap();
+        assert_eq!(
+            (k_now.version, k_now.synced_version, k_now.ct.clone()),
+            (their_k.version, their_k.version, their_k.ct.clone())
+        );
+        let (copy_id, _) = il::seal_conflict_copy::<StdPrimitives>(
+            keys,
+            vid,
+            &ItemPayload::secret_live("K", "ours"),
+            their_k.version,
+        )
+        .unwrap();
+        let copy = pv.get_item(&copy_id).expect("local conflict copy").clone();
+        assert_eq!(
+            (copy.version, copy.synced_version),
+            (il::CONFLICT_COPY_VERSION, 0)
+        );
+        let folded = pv.fold_view::<StdPrimitives>(keys, vid).unwrap();
+        assert_eq!(folded.native_secrets["K"], b"theirs");
+        assert_eq!(folded.native_secrets[&il::conflict_copy_name("K")], b"ours");
+        // Not a keep-both ns: the caller's write wins.
+        assert_eq!(folded.aux.audit_retention_days, Some(30));
+
+        // Idempotent: a second reconcile adds no second copy.
+        let n = pv.items.len();
+        pv.reconcile_from_view::<StdPrimitives>(keys, vid, &view, ReconcileBase::Since(&base))
+            .unwrap();
+        assert_eq!(pv.items.len(), n);
     }
 
     // The daemon NEVER writes authorized-agents rows (any spelling, live or

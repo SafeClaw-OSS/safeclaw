@@ -2776,10 +2776,7 @@ enum ConflictAction {
 /// the fold and undeletable. Console parity: `KEEP_BOTH_NS` in
 /// `lib/vault-grant.ts`.
 fn is_keep_both_ns(ns: item_layer::ItemNs) -> bool {
-    matches!(
-        ns,
-        item_layer::ItemNs::Secret | item_layer::ItemNs::Connection
-    )
+    ns.keeps_both_on_conflict()
 }
 
 /// The §4 decision for OUR dirty row vs THEIR current row (`None` = gone).
