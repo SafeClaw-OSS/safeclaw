@@ -5,9 +5,12 @@ WIRE between the three components so they can be built in parallel. Field
 names are exact. All new fields are optional on read (old peers omit them).
 
 ## Versions
-- Daemon/CLI release: `0.10.7-rc.1` (bump Cargo.toml in the core repo).
-- Console constant `EXPORT_BATCH_MIN = 0.10.7` (batches containing an Export
-  need it); `use`-only batches keep the 0.10.6 floor.
+- Daemon/CLI release: `0.11.0-rc.2` (core dev was already at the tagged
+  `0.11.0-rc.1`, which lacks E1/D2; `0.10.7` would sort below it).
+- Console constant `EXPORT_BATCH_MIN = 0.11.0-rc.2` (batches containing an
+  Export need it); `use`-only batches keep the 0.10.6 floor. The comparison
+  MUST be prerelease-aware (semver §11: `0.11.0-rc.1 < 0.11.0-rc.2 <
+  0.11.0`); a comparator that strips the prerelease would admit rc.1.
 
 ## Requester triad (new product requirement, all surfaces)
 Every approval row/card shows THREE roles: **user** (the human account that
@@ -21,8 +24,13 @@ for signing or default-check).
 ## 1. Daemon ↔ CLI (local loopback)
 
 ### Use op scope (signed, in β) — new keys
-- `level`: `"ask"` | `"ask-always"` (from PolicyContext.level at mint)
-- `window_s`: integer seconds, present only for `"ask"` (= pc.ttl_seconds)
+- `level`: `"ask"` | `"ask-always"` | `"allow"` (from PolicyContext.level at
+  mint). `"allow"` = an allow-level request whose secret was not resident (a
+  cache miss); its apply opens the connection-keyed window exactly like an
+  UNSCOPED `ask`, and the console renders it that way ("opens <connection>
+  for <agent> for N min"). Never default-checked.
+- `window_s`: integer seconds (= pc.ttl_seconds), present for `"ask"` and
+  `"allow"`; absent for `"ask-always"`
 Apply asserts `scope.level == pc.level` and, when `window_s` present,
 `window_s == pc.ttl_seconds`; mismatch → refuse (BadRequest, plain arm;
 BatchVerify in batch arm).
@@ -68,6 +76,12 @@ existing "no value in response" error.
 - `reason`: `"satisfied"` | `"rejected"` | `"withdrawn"` | `"abandoned"`
 - `satisfied_by`: op_id (with reason `satisfied`)
 (Existing callers send no reason → backend stores null, behaves as today.)
+
+### `GET /v/{vid}/op/relay/{op_id}` poll — 403 semantics (daemon side)
+The daemon treats a poll 403 as a USER rejection (which now resolves the
+whole intent chain) ONLY when the body is `{"error":"rejected"}`. Any other
+403 (`forbidden_tier`, `vault_mismatch`, key-binding refusals, bare 403) ends
+that poll without rejecting the op; it stays pending locally until expiry.
 
 ## 3. Backend storage (op_relay new columns; dev ALTER now, prod at promote)
 - `registered_key_id text` (auth.keyId of the registering device key)
