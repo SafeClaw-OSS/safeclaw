@@ -2451,14 +2451,16 @@ async fn pull_and_process(
 //
 // PULL adopts server truth (§5): a newer version replaces the local row, a
 // tombstone is stored (fold_view drops it), the cursor advances to max(seq).
-// PUSH is per-item CAS (§4); 409 → reconcile — re-apply on the fresh item if the
-// edit is independent, else write a conflict-copy (never last-writer-wins).
+// PUSH is per-item CAS (§4); 409 → reconcile under K (never last-writer-wins):
+// secret/connection keep both (ours → conflict copy), other ns re-apply ours on
+// the fresh version, a delete wins over an edit. See `push_items_best_effort`.
 //
 // Backing HTTP is only exercised once the backend `/items` endpoints are live;
 // until then these are wired but a 404 leaves the local per-item store as the
 // authoritative content (stubbed[]).
 // ─────────────────────────────────────────────────────────────────────────
 
+use crate::storage::item as item_layer;
 use crate::storage::sealed_vault::{self as pv_store, PerItemVault};
 
 /// One row of a `/items` pull.
@@ -2496,7 +2498,8 @@ fn write_per_item_store(state_dir: &Path, vault: &str, pv: &PerItemVault) -> Res
 }
 
 /// Adopt a batch of pulled item rows into the local store (server-authoritative,
-/// §5): a strictly-newer `version` replaces the local row; the cursor advances
+/// §5): a strictly-newer `version` replaces a CLEAN local row (a dirty one is
+/// left for the push-side 409 reconcile); the cursor advances
 /// to the max `seq` seen. Tombstones are stored like any other row — `fold_view`
 /// drops them at read time, and a later GC hard-deletes them. Returns the number
 /// of rows adopted.
@@ -2507,9 +2510,14 @@ fn adopt_item_rows(pv: &mut PerItemVault, rows: &[ItemRow], max_seq: u64) -> Res
     for row in rows {
         // Only adopt a strictly-newer version (server is authoritative, but a
         // stale replay must not clobber a fresher local row we already pushed).
+        // NEVER adopt over a DIRTY local row (a local write not yet confirmed on
+        // the cloud): that would silently drop our edit. A dirty row is owned by
+        // the push side, whose 409 reconcile (`push_items_best_effort`) compares
+        // ours with theirs and keeps both / re-applies; while the vault is locked
+        // it stays dirty and is reconciled on the first push after unlock.
         let keep = pv
             .get_item(&row.item_id)
-            .map(|s| row.version > s.version)
+            .map(|s| row.version > s.version && s.version <= s.synced_version)
             .unwrap_or(true);
         if !keep {
             continue;
@@ -2524,6 +2532,53 @@ fn adopt_item_rows(pv: &mut PerItemVault, rows: &[ItemRow], max_seq: u64) -> Res
         pv.items_seq = max_seq;
     }
     Ok(adopted)
+}
+
+/// GET `/v/{vault}/items?since=<since>` → `Ok(Some((rows, max_seq)))`, or
+/// `Ok(None)` when the `/items` endpoint isn't live (404). `max_seq` is the
+/// cursor the caller should hold next (`since` unchanged when nothing is newer).
+/// `since = 0` is a full snapshot (the 409 reconcile reads THEIR current row
+/// from it, independent of the local cursor).
+async fn fetch_item_rows(
+    cloud: &str,
+    vault: &str,
+    device_key: &str,
+    since: u64,
+) -> Result<Option<(Vec<ItemRow>, u64)>, String> {
+    let url = format!(
+        "{}/v/{}/items?since={}",
+        cloud.trim_end_matches('/'),
+        vault,
+        since
+    );
+    let client = crate::cli::egress_proxy::client(Duration::from_secs(15))
+        .map_err(|e| format!("http client init: {}", e))?;
+    let resp = client
+        .get(&url)
+        .bearer_auth(device_key)
+        .dik_pop("GET", &url, &[])
+        .send()
+        .await
+        .map_err(|e| format!("reach {}: {}", cloud, e))?;
+    match resp.status().as_u16() {
+        200 => {}
+        404 => return Ok(None), // /items not live yet — no-op (stubbed[])
+        401 | 403 => return Err(format!("cloud auth rejected (HTTP {})", resp.status())),
+        other => return Err(format!("items GET HTTP {}", other)),
+    }
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("parse items response: {}", e))?;
+    let rows: Vec<ItemRow> = body
+        .get("items")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|e| format!("parse items array: {}", e))?
+        .unwrap_or_default();
+    let max_seq = body.get("seq").and_then(|v| v.as_u64()).unwrap_or(since);
+    Ok(Some((rows, max_seq)))
 }
 
 /// Pull item rows changed since the local `.items_seq` cursor and adopt them.
@@ -2543,42 +2598,10 @@ pub async fn pull_items(
     let Some(mut pv) = read_per_item_store(state_dir, vault) else {
         return Ok(0); // no per-item store yet (vault not enrolled per-item)
     };
-    let url = format!(
-        "{}/v/{}/items?since={}",
-        cloud.trim_end_matches('/'),
-        vault,
-        pv.items_seq
-    );
-    let client = crate::cli::egress_proxy::client(Duration::from_secs(15))
-        .map_err(|e| format!("http client init: {}", e))?;
-    let resp = client
-        .get(&url)
-        .bearer_auth(device_key)
-        .dik_pop("GET", &url, &[])
-        .send()
-        .await
-        .map_err(|e| format!("reach {}: {}", cloud, e))?;
-    match resp.status().as_u16() {
-        200 => {}
-        404 => return Ok(0), // /items not live yet — no-op (stubbed[])
-        401 | 403 => return Err(format!("cloud auth rejected (HTTP {})", resp.status())),
-        other => return Err(format!("items GET HTTP {}", other)),
-    }
-    let body: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("parse items response: {}", e))?;
-    let rows: Vec<ItemRow> = body
-        .get("items")
-        .cloned()
-        .map(serde_json::from_value)
-        .transpose()
-        .map_err(|e| format!("parse items array: {}", e))?
-        .unwrap_or_default();
-    let max_seq = body
-        .get("seq")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(pv.items_seq);
+    let Some((rows, max_seq)) = fetch_item_rows(cloud, vault, device_key, pv.items_seq).await?
+    else {
+        return Ok(0); // /items not live yet — no-op (stubbed[])
+    };
     let adopted = adopt_item_rows(&mut pv, &rows, max_seq)?;
     if adopted > 0 || max_seq > 0 {
         write_per_item_store(state_dir, vault, &pv)?;
@@ -2687,21 +2710,433 @@ pub async fn gc_item(
     }
 }
 
-/// Push every LOCAL item whose version is ahead of what the cloud last confirmed
-/// (tracked by the per-item store's own rows). Each row is pushed with CAS; a
-/// 409 is reconciled per §4:
-///   - independent edit (the cloud's newer row is a DIFFERENT logical item, i.e.
-///     our push targeted a row the cloud doesn't have or has at a lower version)
-///     → adopt the cloud row and retry with the fresh base;
-///   - genuine same-item conflict (both wrote the same id) → leave theirs, write
-///     OURS as a conflict-copy (deterministic id via `conflict_copy_id`, so a
-///     retry can't spawn a second) — needs `K`, so it runs only for an UNLOCKED
-///     vault; a locked vault defers the conflict-copy to the next unlock.
+/// One DIRTY local row (`version > synced_version`) snapshotted for a push, so
+/// the store isn't held across awaits.
+struct DirtyRow {
+    id: String,
+    version: u64,
+    synced_version: u64,
+    ct: Vec<u8>,
+    tombstone: bool,
+}
+
+/// `base_version` to push a dirty row with: the last version KNOWN to be on the
+/// cloud (`synced_version`), so several local bumps between pushes still CAS
+/// against the row the cloud actually holds instead of 409ing on themselves.
+/// `synced_version == 0` ("never confirmed": a fresh local create, or a row from
+/// a store that predates the tracking) falls back to `version - 1`; a version-1
+/// row is a create.
+fn push_base_version(version: u64, synced_version: u64) -> Option<u64> {
+    if synced_version > 0 {
+        Some(synced_version)
+    } else if version > 1 {
+        Some(version - 1)
+    } else {
+        None
+    }
+}
+
+/// How a same-item 409 resolves (§4). Never last-writer-wins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConflictAction {
+    /// Theirs already says what ours says (same live body, or both deleted):
+    /// adopt theirs, write nothing.
+    Adopt,
+    /// Keep both: theirs stays at the canonical id, ours is written as a
+    /// conflict copy; the local store converges to theirs + the copy.
+    KeepBoth,
+    /// Re-apply ours on top of theirs (CAS on their version), or re-create it
+    /// when their row is gone.
+    Reapply,
+}
+
+/// Namespaces whose same-item conflicts keep both: user-visible items a person
+/// can compare and resolve. Everything else (singletons, `connecting`, legacy
+/// aux …) re-applies ours, where a "(conflict copy)" row would be invisible to
+/// the fold and undeletable. Console parity: `KEEP_BOTH_NS` in
+/// `lib/vault-grant.ts`.
+fn is_keep_both_ns(ns: item_layer::ItemNs) -> bool {
+    matches!(
+        ns,
+        item_layer::ItemNs::Secret | item_layer::ItemNs::Connection
+    )
+}
+
+/// The §4 decision for OUR dirty row vs THEIR current row (`None` = gone).
+/// Delete wins over a concurrent edit (our tombstone is re-applied); an equal
+/// live body is a no-op adopt; otherwise keep-both for [`is_keep_both_ns`] and
+/// re-apply for the rest (incl. their tombstone vs our edit in a keep-both ns:
+/// the copy keeps our value, their delete stands, as in the console).
+fn decide_conflict(
+    ours: &item_layer::ItemPayload,
+    theirs: Option<&item_layer::ItemPayload>,
+) -> ConflictAction {
+    let Some(theirs) = theirs else {
+        return ConflictAction::Reapply;
+    };
+    if ours.is_tombstone() {
+        return if theirs.is_tombstone() {
+            ConflictAction::Adopt
+        } else {
+            ConflictAction::Reapply
+        };
+    }
+    if !theirs.is_tombstone()
+        && theirs.ns == ours.ns
+        && theirs.name == ours.name
+        && theirs.body == ours.body
+    {
+        return ConflictAction::Adopt;
+    }
+    if is_keep_both_ns(ours.ns) {
+        ConflictAction::KeepBoth
+    } else {
+        ConflictAction::Reapply
+    }
+}
+
+/// A local-store change produced by the push loop, applied after it to a
+/// FRESHLY re-read store (see [`apply_local_fixes`]).
+enum LocalFix {
+    /// Our push landed at `version` → the row is clean.
+    Synced { id: String, version: u64 },
+    /// Replace the row at `id` with `row` iff it is still at version `expect`
+    /// (theirs adopted, or ours re-sealed at a fresh version and landed).
+    Replace {
+        id: String,
+        expect: u64,
+        row: pv_store::StoredItem,
+    },
+    /// A row known to be on the cloud (a conflict copy) → insert iff absent.
+    InsertIfAbsent {
+        id: String,
+        row: pv_store::StoredItem,
+    },
+}
+
+/// A clean row exactly as the cloud holds it (`synced_version == version`).
+fn clean_row(
+    version: u64,
+    ct: Vec<u8>,
+    tombstone: bool,
+    sig: Option<String>,
+    signer: Option<String>,
+) -> pv_store::StoredItem {
+    pv_store::StoredItem {
+        version,
+        ct,
+        synced_version: version,
+        tombstone,
+        sig,
+        signer,
+    }
+}
+
+/// Apply the push loop's [`LocalFix`]es. Every change is version-guarded so a
+/// writer that raced the push (bumped a row meanwhile) is never clobbered: its
+/// newer row stays dirty and goes out on the next push. Returns `(changed,
+/// content_changed)`; `content_changed` = a row's sealed content was replaced or
+/// added (the unlocked cache needs a refresh).
+fn apply_local_fixes(pv: &mut PerItemVault, fixes: Vec<LocalFix>) -> (bool, bool) {
+    let mut changed = false;
+    let mut content_changed = false;
+    for fix in fixes {
+        match fix {
+            LocalFix::Synced { id, version } => {
+                if let Some(s) = pv.items.get_mut(&id) {
+                    if s.version == version && s.synced_version < version {
+                        s.synced_version = version;
+                        changed = true;
+                    }
+                }
+            }
+            LocalFix::Replace { id, expect, row } => {
+                if pv.items.get(&id).map(|s| s.version) == Some(expect) {
+                    pv.items.insert(id, row);
+                    changed = true;
+                    content_changed = true;
+                }
+            }
+            LocalFix::InsertIfAbsent { id, row } => {
+                if !pv.items.contains_key(&id) {
+                    pv.items.insert(id, row);
+                    changed = true;
+                    content_changed = true;
+                }
+            }
+        }
+    }
+    (changed, content_changed)
+}
+
+/// THEIR rows for the 409 reconcile: one full `/items` snapshot, fetched lazily
+/// on the first resolvable conflict of a push and shared by the rest.
+enum TheirRows {
+    Unfetched,
+    Fetched(std::collections::HashMap<String, ItemRow>),
+    Unavailable,
+}
+
+/// Outcome of reconciling one 409.
+enum Resolved {
+    /// Resolved on the cloud; apply these to the local store.
+    Fixed(Vec<LocalFix>),
+    /// Not resolvable now (unreadable row, network error, raced again): the row
+    /// stays dirty and is reconciled on the next push.
+    LeaveDirty,
+    /// `/items` is not live (404): stop the push.
+    EndpointMissing,
+}
+
+/// Replace our dirty row with THEIR row (clean), guarded on our version.
+fn adopt_fix(ours: &DirtyRow, theirs: &ItemRow, ct: Vec<u8>, tombstone: bool) -> LocalFix {
+    LocalFix::Replace {
+        id: ours.id.clone(),
+        expect: ours.version,
+        row: clean_row(
+            theirs.version,
+            ct,
+            tombstone,
+            theirs.sig.clone(),
+            theirs.signer.clone(),
+        ),
+    }
+}
+
+/// Reconcile one 409 on OUR dirty row (§4) under `K` (`keys`): open ours, read
+/// THEIR current row from the full snapshot, then per [`decide_conflict`]:
+///   - `Adopt`    → take theirs locally;
+///   - `KeepBoth` → write ours as the conflict copy (CREATE at version 1 under
+///     `conflict_copy_id(id_seed, ns, name, their_version)`; a 409 on it means
+///     an earlier attempt already wrote it), then take theirs locally;
+///   - `Reapply`  → re-seal ours at `their_version + 1` and CAS on their version
+///     (their row gone → re-create ours as-is).
 ///
-/// NOTE: the full conflict-copy branch requires K + the item's (ns,name), which
-/// we recover by unsealing the local row. Where the vault is locked, the row is
-/// left ahead and retried next unlock (documented in stubbed[]).
+/// At most ONE extra write per item per push: a second 409 leaves the row dirty
+/// for the next push (bounded, no loop). Nothing local changes unless the cloud
+/// write it depends on landed, so a retry re-derives the same decision and the
+/// same copy id (idempotent).
+async fn resolve_conflict(
+    cloud: &str,
+    vault_id: &str,
+    dk: &str,
+    keys: item_layer::VaultKeys<'_>,
+    their_rows: &mut TheirRows,
+    ours_row: &DirtyRow,
+    current_version: u64,
+) -> Resolved {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    type S = sudp::primitives::StdPrimitives;
+
+    let ours = match item_layer::open_wire_item::<S>(
+        keys,
+        vault_id,
+        &ours_row.id,
+        ours_row.version,
+        &ours_row.ct,
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(vault = %vault_id, item = %ours_row.id, "per-item 409: can't open our row ({}); left dirty", e);
+            return Resolved::LeaveDirty;
+        }
+    };
+
+    // THEIR current row. `currentVersion == 0` ⇒ the row is gone (a GC'd
+    // tombstone): nothing to compare against.
+    let theirs_row: Option<ItemRow> = if current_version == 0 {
+        None
+    } else {
+        if matches!(their_rows, TheirRows::Unfetched) {
+            *their_rows = match fetch_item_rows(cloud, vault_id, dk, 0).await {
+                Ok(Some((rows, _))) => {
+                    TheirRows::Fetched(rows.into_iter().map(|r| (r.item_id.clone(), r)).collect())
+                }
+                Ok(None) => return Resolved::EndpointMissing,
+                Err(e) => {
+                    tracing::warn!(vault = %vault_id, "per-item 409: snapshot fetch failed ({}); conflicts left dirty", e);
+                    TheirRows::Unavailable
+                }
+            };
+        }
+        match &*their_rows {
+            TheirRows::Fetched(map) => map.get(&ours_row.id).cloned(),
+            _ => return Resolved::LeaveDirty,
+        }
+    };
+    let theirs = match theirs_row {
+        None => None,
+        Some(r) => {
+            let opened = URL_SAFE_NO_PAD
+                .decode(r.ct.as_bytes())
+                .map_err(|e| e.to_string())
+                .and_then(|ct| {
+                    item_layer::open_wire_item::<S>(keys, vault_id, &r.item_id, r.version, &ct)
+                        .map(|p| (ct, p))
+                        .map_err(|e| e.to_string())
+                });
+            match opened {
+                Ok((ct, p)) => Some((r, ct, p)),
+                Err(e) => {
+                    tracing::warn!(vault = %vault_id, item = %ours_row.id, "per-item 409: can't open their row ({}); left dirty", e);
+                    return Resolved::LeaveDirty;
+                }
+            }
+        }
+    };
+
+    match decide_conflict(&ours, theirs.as_ref().map(|(_, _, p)| p)) {
+        ConflictAction::Adopt => {
+            let Some((r, ct, p)) = theirs else {
+                return Resolved::LeaveDirty;
+            };
+            Resolved::Fixed(vec![adopt_fix(ours_row, &r, ct, p.is_tombstone())])
+        }
+        ConflictAction::KeepBoth => {
+            let Some((r, ct, p)) = theirs else {
+                return Resolved::LeaveDirty;
+            };
+            let (copy_id, copy_ct) = match item_layer::seal_conflict_copy::<S>(
+                keys, vault_id, &ours, r.version,
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(vault = %vault_id, item = %ours_row.id, "per-item 409: seal conflict copy failed ({}); left dirty", e);
+                    return Resolved::LeaveDirty;
+                }
+            };
+            let mut fixes = Vec::new();
+            match push_item(
+                cloud,
+                vault_id,
+                dk,
+                &copy_id,
+                None,
+                item_layer::CONFLICT_COPY_VERSION,
+                &URL_SAFE_NO_PAD.encode(&copy_ct),
+            )
+            .await
+            {
+                Ok(PushOutcome::Ok { .. }) => fixes.push(LocalFix::InsertIfAbsent {
+                    id: copy_id.clone(),
+                    row: clean_row(
+                        item_layer::CONFLICT_COPY_VERSION,
+                        copy_ct,
+                        false,
+                        None,
+                        None,
+                    ),
+                }),
+                Ok(PushOutcome::Conflict { .. }) => {
+                    // The copy already exists (an earlier attempt wrote it):
+                    // idempotent. Mirror it locally if the snapshot has it.
+                    if let TheirRows::Fetched(map) = &*their_rows {
+                        if let Some(c) = map.get(&copy_id) {
+                            if let Ok(cct) = URL_SAFE_NO_PAD.decode(c.ct.as_bytes()) {
+                                fixes.push(LocalFix::InsertIfAbsent {
+                                    id: copy_id.clone(),
+                                    row: clean_row(
+                                        c.version,
+                                        cct,
+                                        false,
+                                        c.sig.clone(),
+                                        c.signer.clone(),
+                                    ),
+                                });
+                            }
+                        }
+                    }
+                }
+                Ok(PushOutcome::EndpointMissing) => return Resolved::EndpointMissing,
+                Err(e) => {
+                    // Ours stays dirty; the retry re-targets the same copy id.
+                    tracing::warn!(vault = %vault_id, item = %ours_row.id, "per-item 409: conflict copy write failed ({}); left dirty", e);
+                    return Resolved::LeaveDirty;
+                }
+            }
+            tracing::info!(
+                vault = %vault_id, item = %ours_row.id, copy = %copy_id, their_version = r.version,
+                "per-item 409: kept both (theirs canonical, ours as conflict copy)"
+            );
+            fixes.push(adopt_fix(ours_row, &r, ct, p.is_tombstone()));
+            Resolved::Fixed(fixes)
+        }
+        ConflictAction::Reapply => {
+            let (base, version, ct) = match &theirs {
+                None => (None, ours_row.version, ours_row.ct.clone()),
+                Some((r, _, _)) => {
+                    let v = r.version + 1;
+                    match item_layer::seal_wire_item::<S>(keys, vault_id, &ours_row.id, v, &ours) {
+                        Ok(ct) => (Some(r.version), v, ct),
+                        Err(e) => {
+                            tracing::warn!(vault = %vault_id, item = %ours_row.id, "per-item 409: re-seal failed ({}); left dirty", e);
+                            return Resolved::LeaveDirty;
+                        }
+                    }
+                }
+            };
+            match push_item(
+                cloud,
+                vault_id,
+                dk,
+                &ours_row.id,
+                base,
+                version,
+                &URL_SAFE_NO_PAD.encode(&ct),
+            )
+            .await
+            {
+                Ok(PushOutcome::Ok { .. }) => {
+                    let fix = if version == ours_row.version {
+                        LocalFix::Synced {
+                            id: ours_row.id.clone(),
+                            version,
+                        }
+                    } else {
+                        LocalFix::Replace {
+                            id: ours_row.id.clone(),
+                            expect: ours_row.version,
+                            row: clean_row(version, ct, ours.is_tombstone(), None, None),
+                        }
+                    };
+                    Resolved::Fixed(vec![fix])
+                }
+                // Raced again: one retry per item per push; the next push reconciles.
+                Ok(PushOutcome::Conflict { .. }) => Resolved::LeaveDirty,
+                Ok(PushOutcome::EndpointMissing) => Resolved::EndpointMissing,
+                Err(e) => {
+                    tracing::warn!(vault = %vault_id, item = %ours_row.id, "per-item 409: re-apply failed ({}); left dirty", e);
+                    Resolved::LeaveDirty
+                }
+            }
+        }
+    }
+}
+
+/// Push every LOCAL item whose version is ahead of what the cloud last confirmed
+/// (`version > synced_version`), each with per-item CAS against the last version
+/// known to be on the cloud ([`push_base_version`]). Writes go before deletes.
+///
+/// A 409 (someone else wrote the same item) is reconciled inline by
+/// [`resolve_conflict`], never last-writer-wins:
+///   - `secret` / `connection`: if theirs equals ours, adopt it; otherwise KEEP
+///     BOTH: theirs stays at the canonical id, ours is written as a conflict
+///     copy (`"<name> (conflict copy)"`, version 1, id
+///     `conflict_copy_id(id_seed, ns, name, their_version)`, byte-identical to
+///     the console's `putConflictCopy`), and the local store converges to
+///     theirs + the copy;
+///   - every other namespace: re-apply ours on their fresh version;
+///   - our tombstone vs their edit: delete wins (our tombstone is re-applied).
+///
+/// Reconciling needs `K` (open ours/theirs, seal the copy), taken from the
+/// unlocked session ([`AppState::cloned_state_key`]). A LOCKED vault leaves the
+/// row dirty (nothing dropped, nothing copied); the pull side never adopts over
+/// a dirty row, so it is reconciled on the first push after unlock. One
+/// conflict never stops the loop for the other items.
 pub async fn push_items_best_effort(state: &Arc<AppState>, vault_id: &str) {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
     let Ok(cfg) = active::load() else { return };
     let Some(cloud) = cfg.cloud_backend.as_deref().filter(|s| !s.is_empty()) else {
         return;
@@ -2717,21 +3152,19 @@ pub async fn push_items_best_effort(state: &Arc<AppState>, vault_id: &str) {
     // the store across awaits. Clean rows (already confirmed on the cloud) are
     // skipped outright — re-offering them cost one 409 round-trip PER ROW on
     // EVERY sync (the "sc sync is slow and nothing even changed" bug).
-    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    use base64::Engine;
-    let mut rows: Vec<(String, u64, String, bool)> = pv
+    let mut rows: Vec<DirtyRow> = pv
         .items
         .iter()
         .filter(|(_, s)| s.version > s.synced_version)
-        .map(|(id, s)| {
-            (
-                id.clone(),
-                s.version,
-                URL_SAFE_NO_PAD.encode(&s.ct),
-                s.tombstone,
-            )
+        .map(|(id, s)| DirtyRow {
+            id: id.clone(),
+            version: s.version,
+            synced_version: s.synced_version,
+            ct: s.ct.clone(),
+            tombstone: s.tombstone,
         })
         .collect();
+    drop(pv);
     if rows.is_empty() {
         return;
     }
@@ -2741,65 +3174,104 @@ pub async fn push_items_best_effort(state: &Arc<AppState>, vault_id: &str) {
     // in one batch; if the tombstone reached the cloud first, a syncing console
     // would briefly see the connect withdrawn with no connection yet ("not
     // configured"). Ordering the delete last means every intermediate snapshot
-    // is either still-connecting or fully-connected, never a dangling gap.
-    rows.sort_by_key(|(_, _, _, tombstone)| *tombstone);
+    // is either still-connecting or fully-connected, never a dangling gap. A
+    // 409 is reconciled inline, so the ordering holds for re-applied rows too.
+    rows.sort_by_key(|r| r.tombstone);
+
+    // K for the 409 reconcile — present only while the vault is unlocked.
+    let k = state.cloned_state_key(vault_id);
+    let keys = k
+        .as_ref()
+        .map(|m| item_layer::VaultKeys::from_material(m.as_slice()));
 
     // A conflict/error on ONE item says nothing about the others (each item_id
     // is independent), so we NEVER stop the loop early — doing so would strand
-    // every item ordered after the first conflict. We push what we can, adopt
-    // server truth for the conflicting items with a single pull afterward, and
-    // leave any genuine same-item conflict to `reconcile_conflicts_after_pull`
-    // at unlock (needs K + (ns,name)).
-    let mut conflicted = false;
+    // every item ordered after the first conflict.
+    let mut their_rows = TheirRows::Unfetched;
     let mut endpoint_missing = false;
-    let mut pushed: Vec<(String, u64)> = Vec::new();
-    for (id, version, ct_b64, _tombstone) in rows {
-        // base_version = version-1 for an update; a version-1 row is a create.
-        let base_version = if version > 1 { Some(version - 1) } else { None };
-        match push_item(cloud, vault_id, &dk, &id, base_version, version, &ct_b64).await {
-            Ok(PushOutcome::Ok { .. }) => pushed.push((id, version)),
+    let mut left_dirty = 0usize;
+    let mut fixes: Vec<LocalFix> = Vec::new();
+    for row in &rows {
+        let base_version = push_base_version(row.version, row.synced_version);
+        let ct_b64 = URL_SAFE_NO_PAD.encode(&row.ct);
+        match push_item(
+            cloud,
+            vault_id,
+            &dk,
+            &row.id,
+            base_version,
+            row.version,
+            &ct_b64,
+        )
+        .await
+        {
+            Ok(PushOutcome::Ok { .. }) => fixes.push(LocalFix::Synced {
+                id: row.id.clone(),
+                version: row.version,
+            }),
             Ok(PushOutcome::EndpointMissing) => {
                 endpoint_missing = true;
                 break; // the whole /items endpoint is down — nothing more to try
             }
             Ok(PushOutcome::Conflict { current_version }) => {
-                tracing::debug!(
-                    vault = %vault_id, item = %id, current_version,
-                    "per-item push: 409 conflict; skipping item, adopting server truth after loop"
-                );
-                conflicted = true;
-            }
-            Err(e) => {
-                // Transient — skip this item, keep trying the others.
-                tracing::warn!(vault = %vault_id, item = %id, "per-item push failed: {}", e);
-            }
-        }
-    }
-    // Mark what landed as clean — re-read the store (a writer may have raced us)
-    // and only stamp rows still at the exact version we pushed; a row bumped
-    // meanwhile stays dirty and goes out on the next sync.
-    if !pushed.is_empty() {
-        if let Some(mut pv) = read_per_item_store(state_dir, vault_id) {
-            let mut changed = false;
-            for (id, version) in &pushed {
-                if let Some(s) = pv.items.get_mut(id) {
-                    if s.version == *version && s.synced_version < *version {
-                        s.synced_version = *version;
-                        changed = true;
+                let Some(keys) = keys else {
+                    tracing::debug!(
+                        vault = %vault_id, item = %row.id, current_version,
+                        "per-item push: 409 on a locked vault; left dirty until unlock"
+                    );
+                    left_dirty += 1;
+                    continue;
+                };
+                match resolve_conflict(
+                    cloud,
+                    vault_id,
+                    &dk,
+                    keys,
+                    &mut their_rows,
+                    row,
+                    current_version,
+                )
+                .await
+                {
+                    Resolved::Fixed(f) => fixes.extend(f),
+                    Resolved::LeaveDirty => left_dirty += 1,
+                    Resolved::EndpointMissing => {
+                        endpoint_missing = true;
+                        break;
                     }
                 }
             }
+            Err(e) => {
+                // Transient — skip this item, keep trying the others.
+                tracing::warn!(vault = %vault_id, item = %row.id, "per-item push failed: {}", e);
+            }
+        }
+    }
+    // Apply what landed — re-read the store (a writer may have raced us); every
+    // change is guarded on the exact version we pushed, so a row bumped
+    // meanwhile stays dirty and goes out on the next sync.
+    let mut content_changed = false;
+    if !fixes.is_empty() {
+        if let Some(mut pv) = read_per_item_store(state_dir, vault_id) {
+            let (changed, content) = apply_local_fixes(&mut pv, fixes);
             if changed {
-                if let Err(e) = write_per_item_store(state_dir, vault_id, &pv) {
-                    tracing::warn!(vault = %vault_id, "per-item push: synced-version write-back failed: {}", e);
+                match write_per_item_store(state_dir, vault_id, &pv) {
+                    Ok(()) => content_changed = content,
+                    Err(e) => {
+                        tracing::warn!(vault = %vault_id, "per-item push: local write-back failed: {}", e)
+                    }
                 }
             }
         }
     }
-    if conflicted && !endpoint_missing {
-        let _ = pull_items(state_dir, cloud, vault_id, &dk).await;
+    // Adopted theirs / added a conflict copy → serve it without a re-unlock.
+    if content_changed {
+        refresh_after_item_pull(state, vault_id);
     }
-    tracing::debug!(vault = %vault_id, "per-item push: dirty items pushed");
+    tracing::debug!(
+        vault = %vault_id, left_dirty, endpoint_missing,
+        "per-item push: dirty items pushed"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -3577,8 +4049,8 @@ fn adopt_rekey_meta(
 
 /// Push the daemon's keyset credentials ahead of the cloud after a daemon-side
 /// mutation of the acting credential (a Write rotates its `prf_salt`/`wrapped_key`
-/// via `replace_after_write`; a connect re-seals through the same `K`). Mirrors
-/// `push_items_best_effort`'s 409/adopt handling — NEVER clobber: on a 409 we
+/// via `replace_after_write`; a connect re-seals through the same `K`). Like
+/// `push_items_best_effort`, NEVER clobber: on a 409 we
 /// adopt the cloud's rows (via `pull_keys`) and stop rather than force-overwrite.
 ///
 /// The daemon keeps no on-disk per-cred version, so we CAS with `base_version` =
@@ -3872,6 +4344,8 @@ mod peritem_tests {
                 &crate::storage::item::ItemPayload::secret_live("A", "local"),
             )
             .unwrap();
+        // ...confirmed on the cloud (clean): only a clean row is adoptable.
+        pv.items.get_mut(&id).unwrap().synced_version = 2;
 
         // A stale row (version 1) must NOT replace it.
         let stale = ItemRow {
@@ -3904,6 +4378,198 @@ mod peritem_tests {
         assert_eq!(pv.get_item(&id).unwrap().version, 3);
         assert_eq!(pv.get_item(&id).unwrap().ct, vec![1u8, 2, 3, 4]);
         assert_eq!(pv.items_seq, 9);
+    }
+
+    /// A pull NEVER adopts over a DIRTY local row (an unpushed local write):
+    /// that silently dropped our edit. The push-side 409 reconcile owns it; the
+    /// cursor still advances.
+    #[test]
+    fn adopt_never_clobbers_dirty_row() {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        let k = [0x42u8; 32];
+        let mut pv = empty_pv();
+        let id = pv
+            .seal_and_upsert::<StdPrimitives>(
+                VaultKeys::single(&k),
+                "v",
+                ItemNs::Secret,
+                "A",
+                2,
+                &crate::storage::item::ItemPayload::secret_live("A", "ours"),
+            )
+            .unwrap();
+        pv.items.get_mut(&id).unwrap().synced_version = 1; // v2 = local edit, not pushed
+        let ours_ct = pv.get_item(&id).unwrap().ct.clone();
+        let theirs = ItemRow {
+            item_id: id.clone(),
+            version: 3,
+            seq: 9,
+            ct: URL_SAFE_NO_PAD.encode([9u8; 4]),
+            sig: None,
+            signer: None,
+        };
+        let n = adopt_item_rows(&mut pv, std::slice::from_ref(&theirs), 9).unwrap();
+        assert_eq!(n, 0, "dirty row is left to the push reconcile");
+        assert_eq!(pv.get_item(&id).unwrap().version, 2);
+        assert_eq!(pv.get_item(&id).unwrap().ct, ours_ct);
+        assert_eq!(pv.items_seq, 9, "cursor still advances");
+    }
+
+    /// base_version = the last version known on the cloud, so N local bumps
+    /// between pushes CAS against the cloud's row (no self-inflicted 409 → no
+    /// spurious conflict copy). Unknown (0) falls back to version-1 / create.
+    #[test]
+    fn push_base_version_uses_synced_version() {
+        assert_eq!(push_base_version(5, 4), Some(4), "single bump");
+        assert_eq!(
+            push_base_version(7, 4),
+            Some(4),
+            "several bumps since last sync"
+        );
+        assert_eq!(push_base_version(1, 0), None, "fresh local create");
+        assert_eq!(
+            push_base_version(3, 0),
+            Some(2),
+            "pre-tracking row: legacy guess"
+        );
+    }
+
+    /// The §4 decision table (console parity: KEEP_BOTH_NS = secret, connection).
+    #[test]
+    fn decide_conflict_table() {
+        use crate::storage::item::ItemPayload;
+        let live = |ns, name: &str, v: serde_json::Value| ItemPayload::live(ns, name, v);
+        let tomb = |ns, name: &str| ItemPayload::tombstone(ns, name);
+        let s_ours = live(ItemNs::Secret, "T", serde_json::json!("ours"));
+        let s_theirs = live(ItemNs::Secret, "T", serde_json::json!("theirs"));
+        let s_same = live(ItemNs::Secret, "T", serde_json::json!("ours"));
+
+        // Equal live body → adopt, no copy.
+        assert_eq!(
+            decide_conflict(&s_ours, Some(&s_same)),
+            ConflictAction::Adopt
+        );
+        // Genuine same-item conflict in a keep-both ns → keep both.
+        assert_eq!(
+            decide_conflict(&s_ours, Some(&s_theirs)),
+            ConflictAction::KeepBoth
+        );
+        let c_ours = live(ItemNs::Connection, "gmail", serde_json::json!({"a": 1}));
+        let c_theirs = live(ItemNs::Connection, "gmail", serde_json::json!({"a": 2}));
+        assert_eq!(
+            decide_conflict(&c_ours, Some(&c_theirs)),
+            ConflictAction::KeepBoth
+        );
+        // Their delete vs our edit (keep-both ns) → copy keeps ours, delete stands.
+        assert_eq!(
+            decide_conflict(&s_ours, Some(&tomb(ItemNs::Secret, "T"))),
+            ConflictAction::KeepBoth
+        );
+        // Other namespaces re-apply ours on the fresh version.
+        for ns in [
+            ItemNs::Policy,
+            ItemNs::Stores,
+            ItemNs::StoreOrder,
+            ItemNs::Connecting,
+        ] {
+            let ours = live(ns, "", serde_json::json!({"x": 1}));
+            let theirs = live(ns, "", serde_json::json!({"x": 2}));
+            assert_eq!(
+                decide_conflict(&ours, Some(&theirs)),
+                ConflictAction::Reapply,
+                "{ns:?}"
+            );
+            assert_eq!(
+                decide_conflict(&ours, Some(&ours.clone())),
+                ConflictAction::Adopt,
+                "{ns:?}"
+            );
+        }
+        // Our delete vs their edit → delete wins (re-apply the tombstone).
+        assert_eq!(
+            decide_conflict(&tomb(ItemNs::Secret, "T"), Some(&s_theirs)),
+            ConflictAction::Reapply
+        );
+        // Both deleted → adopt.
+        assert_eq!(
+            decide_conflict(&tomb(ItemNs::Secret, "T"), Some(&tomb(ItemNs::Secret, "T"))),
+            ConflictAction::Adopt
+        );
+        // Their row is gone → re-create ours.
+        assert_eq!(decide_conflict(&s_ours, None), ConflictAction::Reapply);
+    }
+
+    /// Post-push local fixes are version-guarded: a row a writer bumped during
+    /// the push is never clobbered (it stays dirty for the next push), and a
+    /// conflict copy is inserted only if absent (idempotent on retry).
+    #[test]
+    fn apply_local_fixes_is_guarded_and_idempotent() {
+        let k = [0x42u8; 32];
+        let mut pv = empty_pv();
+        let put = |pv: &mut PerItemVault, name: &str, v: u64| {
+            pv.seal_and_upsert::<StdPrimitives>(
+                VaultKeys::single(&k),
+                "v",
+                ItemNs::Secret,
+                name,
+                v,
+                &crate::storage::item::ItemPayload::secret_live(name, "x"),
+            )
+            .unwrap()
+        };
+        let a = put(&mut pv, "A", 2);
+        let b = put(&mut pv, "B", 5); // raced: pushed at 4, bumped to 5 meanwhile
+        let c = put(&mut pv, "C", 3);
+
+        let fixes = vec![
+            // A: theirs adopted at v3 (we pushed/held v2).
+            LocalFix::Replace {
+                id: a.clone(),
+                expect: 2,
+                row: clean_row(3, vec![7u8; 4], false, None, None),
+            },
+            // B: adopt guarded on v4, but the row is now v5 → untouched.
+            LocalFix::Replace {
+                id: b.clone(),
+                expect: 4,
+                row: clean_row(6, vec![8u8; 4], false, None, None),
+            },
+            // C: our push landed.
+            LocalFix::Synced {
+                id: c.clone(),
+                version: 3,
+            },
+            // A conflict copy, inserted once.
+            LocalFix::InsertIfAbsent {
+                id: "copy".into(),
+                row: clean_row(1, vec![1u8; 4], false, None, None),
+            },
+        ];
+        let (changed, content) = apply_local_fixes(&mut pv, fixes);
+        assert!(changed && content);
+        let ra = pv.get_item(&a).unwrap();
+        assert_eq!(
+            (ra.version, ra.synced_version, ra.ct.clone()),
+            (3, 3, vec![7u8; 4])
+        );
+        let rb = pv.get_item(&b).unwrap();
+        assert_eq!(rb.version, 5);
+        assert!(rb.version > rb.synced_version, "raced row stays dirty");
+        let rc = pv.get_item(&c).unwrap();
+        assert_eq!(rc.synced_version, 3);
+        assert_eq!(pv.get_item("copy").unwrap().version, 1);
+
+        // Retry: the copy is already there → no-op; nothing else changes.
+        let (changed2, content2) = apply_local_fixes(
+            &mut pv,
+            vec![LocalFix::InsertIfAbsent {
+                id: "copy".into(),
+                row: clean_row(1, vec![2u8; 4], false, None, None),
+            }],
+        );
+        assert!(!changed2 && !content2);
+        assert_eq!(pv.get_item("copy").unwrap().ct, vec![1u8; 4]);
     }
 
     /// A `/keys` row `data` JSON shaped EXACTLY as the frontend writes it
