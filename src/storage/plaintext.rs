@@ -497,6 +497,12 @@ pub struct VaultPlaintextView {
     /// because the view's lifetime is the request, not the protocol
     /// boundary — sudp's zeroize is preserved up to the moment we copy.
     pub native_secrets: BTreeMap<String, Vec<u8>>,
+    /// User notes on native secrets: `item_name → notes`, only for secrets that
+    /// have them. Kept OUT of `native_secrets` so every value consumer stays
+    /// untouched; the item write paths re-attach a secret's notes when they
+    /// re-seal its value, so a daemon-side rewrite (an OAuth token refresh,
+    /// `sc set`) never drops them.
+    pub native_secret_notes: BTreeMap<String, String>,
     /// True when the fold saw any live legacy `aux:*` item — the trigger for
     /// the one-shot addressing migration (team §8.3). Always false for views
     /// opened from a whole-blob `ProtectedState` (no addressing there).
@@ -521,6 +527,7 @@ impl VaultPlaintextView {
         Ok(VaultPlaintextView {
             aux,
             native_secrets,
+            native_secret_notes: BTreeMap::new(),
             legacy_addressing: false,
         })
     }

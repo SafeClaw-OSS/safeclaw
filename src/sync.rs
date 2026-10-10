@@ -780,6 +780,19 @@ fn decode_sig64(s: &str) -> Option<[u8; 64]> {
     Some(a)
 }
 
+/// Highest vault data format this build understands (`vaults.format`, carried
+/// in the signed envelope). 1 = legacy personal, 2 = membership triple + unified
+/// addressing, 3 = secret items may carry `{ value, notes }`. A vault the server
+/// says is NEWER than this fails loudly (`sc upgrade`) instead of being read
+/// with parts silently missing. Bump together with the backend's per-format
+/// daemon floor whenever the sealed data shape changes.
+pub(crate) const SUPPORTED_VAULT_FORMAT: u64 = 3;
+
+/// Whether a (signature-verified) vault format is beyond what this build reads.
+fn vault_format_too_new(format: u64) -> bool {
+    format > SUPPORTED_VAULT_FORMAT
+}
+
 /// Apply the server-signed operational envelope (team §9 — "谁是权威谁签名"):
 /// trust `kind` and advance the offline-lease contact clock ONLY from a signature
 /// we can verify against the pinned server key. A present-but-invalid signature
@@ -823,6 +836,19 @@ fn apply_verified_envelope(state: &Arc<AppState>, vault: &str, body: &serde_json
             return;
         }
         state.set_vault_shared(vault, kind == "shared");
+        // Data format newer than this build: refuse the vault loudly (the proxy
+        // returns SC_UPGRADE_REQUIRED to the agent) rather than serve a partial
+        // view. The 200 that delivered this envelope cleared the flag first, so
+        // setting it here is the final word for this sync.
+        if vault_format_too_new(format) {
+            state.set_vault_upgrade_required(vault, true);
+            tracing::warn!(
+                vault = %vault,
+                format,
+                supported = SUPPORTED_VAULT_FORMAT,
+                "cloud sync: vault uses a newer data format than this SafeClaw reads; run `sc upgrade`"
+            );
+        }
     } else if let Some(shared) = parse_shared_from_body(body) {
         // Legacy server (no `env` signature): trust the plain `kind` field.
         state.set_vault_shared(vault, shared);
@@ -5837,6 +5863,16 @@ mod peritem_tests {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    /// The format gate reads every format up to and including the one this
+    /// build knows, and only a NEWER one trips the loud upgrade path.
+    #[test]
+    fn vault_format_gate_trips_only_above_supported() {
+        for f in 0..=SUPPORTED_VAULT_FORMAT {
+            assert!(!vault_format_too_new(f), "format {f} is readable");
+        }
+        assert!(vault_format_too_new(SUPPORTED_VAULT_FORMAT + 1));
+    }
 
     /// v1.1 mode-dependent agent-hash cadence: 600s while the stream carries
     /// the events (poll = belt-and-suspenders), the legacy 30s when the poll

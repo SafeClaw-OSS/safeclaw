@@ -2892,6 +2892,7 @@ mod tests {
         let view = VaultPlaintextView {
             aux,
             native_secrets,
+            native_secret_notes: BTreeMap::new(),
             legacy_addressing: false,
         };
 

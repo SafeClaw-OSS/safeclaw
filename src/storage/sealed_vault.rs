@@ -28,9 +28,25 @@ use crate::error::{AppError, Result};
 use crate::passkey::PasskeyEntry;
 use crate::protocol::operation::decode_credential_id;
 use crate::storage::item::{
-    aad_id_from_wire, item_id, item_id_bytes, seal_item, unseal_item, wire_id_for, ItemCtx, ItemNs,
-    ItemPayload, VaultKeys,
+    aad_id_from_wire, item_id, item_id_bytes, parse_secret_body, seal_item, secret_body,
+    unseal_item, wire_id_for, ItemCtx, ItemNs, ItemPayload, VaultKeys,
 };
+
+/// Per-vault count of items the LAST fold had to skip (unreadable at a format
+/// this build supports: corrupt, malformed, or sealed under a key we lack).
+/// Process-wide because the fold has no `AppState`; `/health` reports the total
+/// so `sc doctor` can warn. Diagnostic only, never a security decision.
+static UNREADABLE_ITEMS: std::sync::Mutex<BTreeMap<String, usize>> =
+    std::sync::Mutex::new(BTreeMap::new());
+
+/// Total items skipped by the most recent fold of each vault (see
+/// [`UNREADABLE_ITEMS`]).
+pub fn unreadable_item_total() -> usize {
+    UNREADABLE_ITEMS
+        .lock()
+        .map(|m| m.values().sum())
+        .unwrap_or(0)
+}
 
 /// On-disk vault is exactly the sudp sealed-state JSON.
 pub type SealedVault = SealedState;
@@ -1540,7 +1556,9 @@ impl PerItemVault {
         for (name, bytes) in &view.native_secrets {
             let value = String::from_utf8(bytes.clone())
                 .map_err(|_| AppError::Internal(format!("secret '{}' not utf8", name)))?;
-            let payload = ItemPayload::secret_live(name.clone(), &value);
+            let notes = view.native_secret_notes.get(name).map(String::as_str);
+            let payload =
+                ItemPayload::live(ItemNs::Secret, name.clone(), secret_body(&value, notes));
             self.seal_and_upsert::<S>(keys, vault_id, ItemNs::Secret, name, 1, &payload)?;
         }
         // established connections → one `connection` item each.
@@ -1649,10 +1667,9 @@ impl PerItemVault {
         for (name, bytes) in &view.native_secrets {
             let value = String::from_utf8(bytes.clone())
                 .map_err(|_| AppError::Internal(format!("secret '{}' not utf8", name)))?;
-            out.insert(
-                (ItemNs::Secret, name.clone()),
-                serde_json::Value::String(value),
-            );
+            // Re-attach the secret's notes: a value rewrite must not drop them.
+            let notes = view.native_secret_notes.get(name).map(String::as_str);
+            out.insert((ItemNs::Secret, name.clone()), secret_body(&value, notes));
         }
         for (id, conn) in &view.aux.connections {
             out.insert(
@@ -2108,6 +2125,7 @@ impl PerItemVault {
         // `seen_new`, not item order (the id map iterates in hash order).
         let mut aux = VaultAux::initial();
         let mut native_secrets: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+        let mut native_secret_notes: BTreeMap<String, String> = BTreeMap::new();
         #[derive(Default)]
         struct SeenNew {
             stores: bool,
@@ -2143,6 +2161,7 @@ impl PerItemVault {
             ));
         }
 
+        let mut unreadable = 0usize;
         for (id_b64, stored) in &self.items {
             // Fold each item independently: a single unreadable/unparseable item
             // (seal-parity mismatch, a body shape from a newer client, a rotated
@@ -2159,13 +2178,13 @@ impl PerItemVault {
                 let name = payload.name;
                 match payload.ns {
                     ItemNs::Secret => {
-                        let s = payload.body.as_str().ok_or_else(|| {
-                            AppError::Internal(format!(
-                                "secret item '{}' body is not a string",
-                                name
-                            ))
+                        let (value, notes) = parse_secret_body(&payload.body).map_err(|e| {
+                            AppError::Internal(format!("secret item '{}': {}", name, e))
                         })?;
-                        native_secrets.insert(name, s.as_bytes().to_vec());
+                        if let Some(n) = notes {
+                            native_secret_notes.insert(name.clone(), n);
+                        }
+                        native_secrets.insert(name, value.into_bytes());
                     }
                     ItemNs::Connection => {
                         let conn = serde_json::from_value(payload.body).map_err(|e| {
@@ -2416,7 +2435,17 @@ impl PerItemVault {
                 Ok(())
             })();
             if let Err(e) = one {
-                tracing::warn!(item = %id_b64, "fold: skipping unreadable item: {}", e);
+                // Not a version problem (a too-new vault format is refused before
+                // this, via the signed envelope): this record is unreadable as is.
+                unreadable += 1;
+                tracing::warn!(vault = %vault_id, item = %id_b64, "fold: skipping unreadable item: {}", e);
+            }
+        }
+        if let Ok(mut m) = UNREADABLE_ITEMS.lock() {
+            if unreadable > 0 {
+                m.insert(vault_id.to_string(), unreadable);
+            } else {
+                m.remove(vault_id);
             }
         }
 
@@ -2460,6 +2489,7 @@ impl PerItemVault {
         Ok(VaultPlaintextView {
             aux,
             native_secrets,
+            native_secret_notes,
             legacy_addressing,
         })
     }
@@ -2866,6 +2896,7 @@ mod tests {
                 .iter()
                 .map(|(n, v)| (n.to_string(), v.as_bytes().to_vec()))
                 .collect(),
+            native_secret_notes: Default::default(),
             legacy_addressing: false,
         };
         // The store: A, B (pulled), C at its NEWER pulled value, D.
@@ -2939,6 +2970,7 @@ mod tests {
             VaultPlaintextView {
                 aux,
                 native_secrets: [("K".to_string(), k_val.as_bytes().to_vec())].into(),
+                native_secret_notes: Default::default(),
                 legacy_addressing: false,
             }
         };
@@ -3033,6 +3065,7 @@ mod tests {
         let view = crate::storage::plaintext::VaultPlaintextView {
             aux,
             native_secrets: std::collections::BTreeMap::new(),
+            native_secret_notes: std::collections::BTreeMap::new(),
             legacy_addressing: false,
         };
         pv.seed_items_from_view::<StdPrimitives>(VaultKeys::single(&k), vid, &view)
@@ -3080,6 +3113,7 @@ mod tests {
         let mut view2 = crate::storage::plaintext::VaultPlaintextView {
             aux: view.aux.clone(),
             native_secrets: view.native_secrets.clone(),
+            native_secret_notes: view.native_secret_notes.clone(),
             legacy_addressing: false,
         };
         view2.aux.agents.remove("ag_bob");
@@ -3186,6 +3220,85 @@ mod tests {
             names.contains(&ag.to_string()),
             "cleartext agent shows in live_names_in_ns(Agent)"
         );
+    }
+
+    /// Notes ride a secret's body; the fold splits them off, and a daemon-side
+    /// rewrite of the VALUE (an OAuth refresh, `sc set`) re-attaches them, so the
+    /// daemon never silently drops what the user wrote.
+    #[test]
+    fn secret_notes_survive_a_daemon_value_rewrite() {
+        use sudp::primitives::StdPrimitives;
+        let k = [0x43u8; 32];
+        let vid = "vault-notes";
+        let mut pv = PerItemVault::build_initial(
+            b"c".to_vec(),
+            "x".into(),
+            "y".into(),
+            "Dev".into(),
+            vec![0u8; 32],
+            vec![0u8; 48],
+        )
+        .unwrap();
+        pv.seal_and_upsert::<StdPrimitives>(
+            VaultKeys::single(&k),
+            vid,
+            ItemNs::Secret,
+            "TOKEN",
+            1,
+            &ItemPayload::live(
+                ItemNs::Secret,
+                "TOKEN",
+                secret_body("old", Some("prod key")),
+            ),
+        )
+        .unwrap();
+        pv.seal_and_upsert::<StdPrimitives>(
+            VaultKeys::single(&k),
+            vid,
+            ItemNs::Secret,
+            "PLAIN",
+            1,
+            &ItemPayload::secret_live("PLAIN", "p"),
+        )
+        .unwrap();
+
+        let mut view = pv
+            .fold_view::<StdPrimitives>(VaultKeys::single(&k), vid)
+            .unwrap();
+        assert_eq!(
+            view.native_secrets.get("TOKEN").map(Vec::as_slice),
+            Some(&b"old"[..])
+        );
+        assert_eq!(
+            view.native_secret_notes.get("TOKEN").map(String::as_str),
+            Some("prod key")
+        );
+        assert!(!view.native_secret_notes.contains_key("PLAIN"));
+
+        // The daemon rewrites only the value.
+        view.native_secrets.insert("TOKEN".into(), b"new".to_vec());
+        pv.reconcile_from_view::<StdPrimitives>(
+            VaultKeys::single(&k),
+            vid,
+            &view,
+            ReconcileBase::OwnFold,
+        )
+        .unwrap();
+
+        let token = pv
+            .open_item::<StdPrimitives>(VaultKeys::single(&k), vid, ItemNs::Secret, "TOKEN")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            token.body,
+            serde_json::json!({ "value": "new", "notes": "prod key" })
+        );
+        // A note-less secret keeps the original bare-string shape.
+        let plain = pv
+            .open_item::<StdPrimitives>(VaultKeys::single(&k), vid, ItemNs::Secret, "PLAIN")
+            .unwrap()
+            .unwrap();
+        assert_eq!(plain.body, serde_json::Value::String("p".into()));
     }
 
     #[test]

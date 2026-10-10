@@ -182,6 +182,19 @@ pub async fn run(json: bool) -> Result<(), String> {
                         version, count
                     ),
                 );
+                let unreadable = body
+                    .get("unreadable_items")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                if unreadable > 0 {
+                    report.push(
+                        Mark::Warn,
+                        format!(
+                            "vault data: {} record(s) could not be read and were skipped (details in ~/.safeclaw/daemon.log)",
+                            unreadable
+                        ),
+                    );
+                }
             } else {
                 report.push(
                     Mark::Fail,

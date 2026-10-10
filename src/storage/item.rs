@@ -280,7 +280,8 @@ impl ItemCtx {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ItemNs {
-    /// `body` = the secret string.
+    /// `body` = the secret string, or `{ value, notes }` when the secret
+    /// carries user notes (see [`secret_body`] / [`parse_secret_body`]).
     Secret,
     /// `body` = `{ service, config }`.
     Connection,
@@ -401,6 +402,46 @@ pub enum ItemStatus {
     Tombstone,
 }
 
+/// The object form of a `secret` body: the value plus the user's free-text
+/// notes (1Password's item `notesPlain`). STRICT: exactly these fields, both
+/// strings, so a body from a future shape (or a malformed one) is an error,
+/// never half-read.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SecretBodyObject {
+    value: String,
+    #[serde(default)]
+    notes: Option<String>,
+}
+
+/// Encode a `secret` body. Without notes it stays the bare value string (the
+/// original shape, byte-for-byte), so a vault that never uses notes is
+/// unchanged; with notes it is `{ "value": …, "notes": … }`. Empty notes count
+/// as none.
+pub fn secret_body(value: &str, notes: Option<&str>) -> serde_json::Value {
+    match notes.filter(|n| !n.is_empty()) {
+        None => serde_json::Value::String(value.to_string()),
+        Some(n) => serde_json::json!({ "value": value, "notes": n }),
+    }
+}
+
+/// Decode a `secret` body into `(value, notes)`. Accepts exactly the two
+/// shapes [`secret_body`] writes; anything else (a number, an object with an
+/// unknown or non-string field) is an error the caller surfaces, not a guess.
+pub fn parse_secret_body(body: &serde_json::Value) -> Result<(String, Option<String>)> {
+    match body {
+        serde_json::Value::String(s) => Ok((s.clone(), None)),
+        serde_json::Value::Object(_) => {
+            let o: SecretBodyObject = serde_json::from_value(body.clone())
+                .map_err(|e| AppError::Internal(format!("secret body: {}", e)))?;
+            Ok((o.value, o.notes.filter(|n| !n.is_empty())))
+        }
+        _ => Err(AppError::Internal(
+            "secret body is neither a string nor { value, notes }".into(),
+        )),
+    }
+}
+
 /// The sealed JSON payload of a content item (contract §2). This is exactly the
 /// plaintext handed to [`seal_record`]; the cloud never sees it (it can't even
 /// tell a tombstone from a live item — `status` is inside the ct).
@@ -430,7 +471,7 @@ impl ItemPayload {
         }
     }
 
-    /// A live `secret` payload (`body` = the string value).
+    /// A live `secret` payload (`body` = the string value, no notes).
     pub fn secret_live(name: impl Into<String>, value: &str) -> Self {
         Self::live(
             ItemNs::Secret,
@@ -555,6 +596,51 @@ pub fn seal_conflict_copy<S: PrimitiveSuite>(
 mod tests {
     use super::*;
     use sudp::primitives::StdPrimitives;
+
+    #[test]
+    fn secret_body_round_trips_both_shapes() {
+        // No notes (or empty notes) keeps the original bare-string body.
+        assert_eq!(secret_body("v", None), serde_json::json!("v"));
+        assert_eq!(secret_body("v", Some("")), serde_json::json!("v"));
+        assert_eq!(
+            parse_secret_body(&secret_body("v", None)).unwrap(),
+            ("v".into(), None)
+        );
+        // With notes it is the object form, and decodes back losslessly.
+        let b = secret_body("v", Some("line1\nline2"));
+        assert_eq!(
+            b,
+            serde_json::json!({ "value": "v", "notes": "line1\nline2" })
+        );
+        assert_eq!(
+            parse_secret_body(&b).unwrap(),
+            ("v".into(), Some("line1\nline2".into()))
+        );
+        // `notes` is optional in the object form; empty normalizes to none.
+        assert_eq!(
+            parse_secret_body(&serde_json::json!({ "value": "v" })).unwrap(),
+            ("v".into(), None)
+        );
+        assert_eq!(
+            parse_secret_body(&serde_json::json!({ "value": "v", "notes": "" })).unwrap(),
+            ("v".into(), None)
+        );
+    }
+
+    #[test]
+    fn secret_body_rejects_every_other_shape() {
+        for bad in [
+            serde_json::json!(null),
+            serde_json::json!(42),
+            serde_json::json!(["v"]),
+            serde_json::json!({}),                             // no value
+            serde_json::json!({ "value": 1 }),                 // non-string value
+            serde_json::json!({ "value": "v", "notes": 1 }),   // non-string notes
+            serde_json::json!({ "value": "v", "extra": "x" }), // unknown field
+        ] {
+            assert!(parse_secret_body(&bad).is_err(), "must reject {bad}");
+        }
+    }
 
     #[test]
     fn write_allowed_role_x_type() {
