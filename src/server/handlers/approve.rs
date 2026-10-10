@@ -881,10 +881,9 @@ pub async fn approve_op(
                 // PER-ITEM: re-shard the post-write ProtectedState into the local
                 // per-item store (same K). A browser Write still ships one sealed
                 // ciphertext; re-seeding keeps the item rows in step so a later
-                // per-item push/pull carries the change. Best-effort. NOTE: this
-                // re-derives EVERY item at version 1 rather than diffing to the
-                // changed item(s) + bumping only those — a proper per-item PUT
-                // diff (contract §3) is stubbed[] pending the browser cut-over.
+                // per-item push/pull carries the change. Best-effort. An existing
+                // store is reconciled (only changed rows bumped), never re-derived
+                // at version 1 (see `per_item_from_view`).
                 seed_per_item_store(&state, &vault_id, &vault, &view, &k);
                 let cache = bootstrap_cache_from_view(&view, &state);
                 tracing::info!(
@@ -2304,7 +2303,7 @@ fn seed_per_item_store(
     view: &VaultPlaintextView,
     k: &[u8],
 ) {
-    use crate::storage::sealed_vault::{Keyset, PerItemVault};
+    use crate::storage::sealed_vault::Keyset;
     let Ok(per_item_path) = state.vaults.per_item_path(vault_id) else {
         return;
     };
@@ -2329,31 +2328,26 @@ fn seed_per_item_store(
     }
     // Carry the keyset cursor forward if a per-item file already exists, so a
     // re-seed after a write doesn't reset the CAS cursors the sync layer tracks.
-    let (keyset_version, items_seq, keyset_seq) = existing
-        .map(|pv| (pv.keyset.keyset_version, pv.items_seq, pv.keyset_seq))
-        .unwrap_or((0, 0, 0));
-    let mut pv = PerItemVault {
-        keyset: Keyset {
-            version: vault.version,
-            registry: vault.registry.clone(),
-            credentials: vault.credentials.clone(),
-            keyset_version,
-            // Bootstrapped from a v1 whole-blob vault → v1 keyset (a v2 vault is
-            // born directly as a per-item store in the ceremony, never here).
-            uik: None,
-        },
-        items: std::collections::BTreeMap::new(),
-        items_seq,
-        keyset_seq,
+    let keyset_version = existing
+        .as_ref()
+        .map(|pv| pv.keyset.keyset_version)
+        .unwrap_or(0);
+    let keyset = Keyset {
+        version: vault.version,
+        registry: vault.registry.clone(),
+        credentials: vault.credentials.clone(),
+        keyset_version,
+        // Bootstrapped from a v1 whole-blob vault → v1 keyset (a v2 vault is
+        // born directly as a per-item store in the ceremony, never here).
+        uik: None,
     };
-    if let Err(e) = pv.seed_items_from_view::<sudp::primitives::StdPrimitives>(
-        crate::storage::item::VaultKeys::single(k),
-        vault_id,
-        view,
-    ) {
-        tracing::warn!(vault = %vault_id, "per-item seed from view failed: {}", e);
-        return;
-    }
+    let pv = match per_item_from_view(existing, keyset, vault_id, view, k) {
+        Ok(pv) => pv,
+        Err(e) => {
+            tracing::warn!(vault = %vault_id, "per-item seed from view failed: {}", e);
+            return;
+        }
+    };
     if let Err(e) = crate::storage::sealed_vault::write_per_item_atomic(&per_item_path, &pv) {
         tracing::warn!(vault = %vault_id, "per-item store write failed: {}", e);
         return;
@@ -2363,6 +2357,53 @@ fn seed_per_item_store(
         items = pv.items.len(),
         "per-item store seeded"
     );
+}
+
+/// The per-item store a whole-blob Enroll/Write lands as. An EXISTING store is
+/// reconciled INTO ([`PerItemVault::reconcile_from_view`], as connect does): only
+/// rows whose value changed are bumped, on top of their current versions, and
+/// unchanged rows keep their `synced_version`, so the next push CASes just the
+/// change on the cloud's version. Rebuilding every row at version 1 / unsynced
+/// instead made that push 409 and keep-both write the user's NEW value as the
+/// conflict copy while adopting the cloud's OLD one. Built from scratch only
+/// when no store exists, or its rows can't be reconciled under `k` (the cursors
+/// are carried either way).
+fn per_item_from_view(
+    existing: Option<crate::storage::sealed_vault::PerItemVault>,
+    keyset: crate::storage::sealed_vault::Keyset,
+    vault_id: &str,
+    view: &VaultPlaintextView,
+    k: &[u8],
+) -> Result<crate::storage::sealed_vault::PerItemVault, String> {
+    use crate::storage::sealed_vault::PerItemVault;
+    type S = sudp::primitives::StdPrimitives;
+    let keys = crate::storage::item::VaultKeys::single(k);
+    let (items_seq, keyset_seq) = existing
+        .as_ref()
+        .map(|pv| (pv.items_seq, pv.keyset_seq))
+        .unwrap_or((0, 0));
+    if let Some(mut pv) = existing {
+        pv.keyset = keyset.clone();
+        match pv.reconcile_from_view::<S>(keys, vault_id, view) {
+            Ok(changed) => {
+                tracing::debug!(vault = %vault_id, changed = changed.len(), "per-item store reconciled from view");
+                return Ok(pv);
+            }
+            Err(e) => tracing::warn!(
+                vault = %vault_id,
+                "per-item reconcile into the existing store failed ({}); re-seeding it", e
+            ),
+        }
+    }
+    let mut pv = PerItemVault {
+        keyset,
+        items: std::collections::BTreeMap::new(),
+        items_seq,
+        keyset_seq,
+    };
+    pv.seed_items_from_view::<S>(keys, vault_id, view)
+        .map_err(|e| e.to_string())?;
+    Ok(pv)
 }
 
 /// The role KEYs cached for a service's connections: the declared `secrets`
@@ -3242,5 +3283,74 @@ mod tests {
 
         // Batch grant must not carry a top-level assertion (checked in the
         // validation arm, not the challenge rebuild — see validate_batch_grant).
+    }
+
+    /// A whole-blob Write reconciles INTO an existing per-item store: only the
+    /// changed row is bumped on top of its version (dirty, so the push CASes it
+    /// on the cloud's version) and unchanged rows stay clean. Rebuilding every
+    /// row at v1/unsynced made keep-both turn the user's NEW value into the
+    /// conflict copy and adopt the cloud's OLD one.
+    #[test]
+    fn write_reconciles_into_existing_per_item_store() {
+        use crate::storage::item::{ItemNs, VaultKeys};
+        use crate::storage::sealed_vault::PerItemVault;
+        type S = sudp::primitives::StdPrimitives;
+        let k = [0x42u8; 32];
+        let vid = "v";
+        let mut view = empty_view();
+        view.native_secrets.insert("A".into(), b"one".to_vec());
+        view.native_secrets.insert("B".into(), b"two".to_vec());
+        let keyset = PerItemVault::build_initial(
+            b"c".to_vec(),
+            "x".into(),
+            "y".into(),
+            "Dev".into(),
+            vec![0u8; 32],
+            vec![0u8; 48],
+        )
+        .unwrap()
+        .keyset;
+
+        // No store yet → built from scratch: every row v1, unsynced.
+        let mut pv = per_item_from_view(None, keyset.clone(), vid, &view, &k).unwrap();
+        assert!(!pv.items.is_empty());
+        assert!(pv
+            .items
+            .values()
+            .all(|s| s.version == 1 && s.synced_version == 0));
+        // ...then pushed: every row confirmed on the cloud.
+        for s in pv.items.values_mut() {
+            s.synced_version = s.version;
+        }
+        pv.items_seq = 7;
+        let before = pv.items.clone();
+
+        // A Write that changes B only.
+        view.native_secrets.insert("B".into(), b"three".to_vec());
+        let pv = per_item_from_view(Some(pv), keyset, vid, &view, &k).unwrap();
+        assert_eq!(pv.items_seq, 7, "pull cursor carried");
+        let dirty: Vec<_> = pv
+            .items
+            .iter()
+            .filter(|(_, s)| s.version > s.synced_version)
+            .collect();
+        assert_eq!(dirty.len(), 1, "only the changed row is dirty");
+        let (b_id, b) = dirty[0];
+        assert_eq!(
+            (b.version, b.synced_version),
+            (2, 1),
+            "bumped on its version"
+        );
+        for (id, s) in &before {
+            if id != b_id {
+                assert_eq!(pv.items[id].version, s.version, "unchanged row kept");
+                assert_eq!(pv.items[id].synced_version, s.synced_version);
+            }
+        }
+        let opened = pv
+            .open_item::<S>(VaultKeys::single(&k), vid, ItemNs::Secret, "B")
+            .unwrap()
+            .unwrap();
+        assert_eq!(opened.body, serde_json::json!("three"));
     }
 }

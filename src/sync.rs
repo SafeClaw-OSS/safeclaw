@@ -2616,10 +2616,21 @@ pub async fn pull_items(
 ///
 /// `PushOutcome::EndpointMissing` (a 404) means the backend `/items` route isn't
 /// live yet — the caller treats it as a no-op (stubbed[]).
+/// `PushOutcome::Rejected` is a TERMINAL refusal ([`is_terminal_put_status`]):
+/// the same bytes can never land, so retrying them is pointless.
 pub enum PushOutcome {
     Ok { version: u64, seq: u64 },
     Conflict { current_version: u64 },
     EndpointMissing,
+    Rejected { status: u16, error: String },
+}
+
+/// A non-2xx item PUT status the server returns for the write ITSELF (bad
+/// request, plan freeze 402, owner-only / agent / record-signature gates 403,
+/// too large, unprocessable): retrying the same bytes never lands. Everything
+/// else non-2xx (5xx, 503 `agent_authz_unavailable`, 429 …) is transient.
+fn is_terminal_put_status(status: u16) -> bool {
+    matches!(status, 400 | 402 | 403 | 413 | 422)
 }
 
 pub async fn push_item(
@@ -2663,16 +2674,30 @@ pub async fn push_item(
             })
         }
         409 => {
+            // Backend: `{conflict, currentVersion}` (0 = the row is gone). Read
+            // `currentVersion ?? version` like the console.
             let b: serde_json::Value = resp.json().await.unwrap_or_default();
             let current = b
                 .get("currentVersion")
                 .and_then(|v| v.as_u64())
+                .or_else(|| b.get("version").and_then(|v| v.as_u64()))
                 .unwrap_or(version);
             Ok(PushOutcome::Conflict {
                 current_version: current,
             })
         }
         404 => Ok(PushOutcome::EndpointMissing),
+        other if is_terminal_put_status(other) => {
+            let b: serde_json::Value = resp.json().await.unwrap_or_default();
+            Ok(PushOutcome::Rejected {
+                status: other,
+                error: b
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            })
+        }
         other => Err(format!("item PUT HTTP {}", other)),
     }
 }
@@ -2724,16 +2749,11 @@ struct DirtyRow {
 /// cloud (`synced_version`), so several local bumps between pushes still CAS
 /// against the row the cloud actually holds instead of 409ing on themselves.
 /// `synced_version == 0` ("never confirmed": a fresh local create, or a row from
-/// a store that predates the tracking) falls back to `version - 1`; a version-1
-/// row is a create.
-fn push_base_version(version: u64, synced_version: u64) -> Option<u64> {
-    if synced_version > 0 {
-        Some(synced_version)
-    } else if version > 1 {
-        Some(version - 1)
-    } else {
-        None
-    }
+/// a store that predates the tracking) is a CREATE: if the cloud has the row,
+/// that 409s into the reconcile. Guessing `version - 1` instead could CAS-match
+/// another device's row and silently overwrite its content.
+fn push_base_version(synced_version: u64) -> Option<u64> {
+    (synced_version > 0).then_some(synced_version)
 }
 
 /// How a same-item 409 resolves (§4). Never last-writer-wins.
@@ -2903,49 +2923,39 @@ fn adopt_fix(ours: &DirtyRow, theirs: &ItemRow, ct: Vec<u8>, tombstone: bool) ->
     }
 }
 
-/// Reconcile one 409 on OUR dirty row (§4) under `K` (`keys`): open ours, read
-/// THEIR current row from the full snapshot, then per [`decide_conflict`]:
-///   - `Adopt`    → take theirs locally;
-///   - `KeepBoth` → write ours as the conflict copy (CREATE at version 1 under
-///     `conflict_copy_id(id_seed, ns, name, their_version)`; a 409 on it means
-///     an earlier attempt already wrote it), then take theirs locally;
-///   - `Reapply`  → re-seal ours at `their_version + 1` and CAS on their version
-///     (their row gone → re-create ours as-is).
-///
-/// At most ONE extra write per item per push: a second 409 leaves the row dirty
-/// for the next push (bounded, no loop). Nothing local changes unless the cloud
-/// write it depends on landed, so a retry re-derives the same decision and the
-/// same copy id (idempotent).
-async fn resolve_conflict(
+/// THEIR current row opened under `K`: `(row, raw ct, payload)`.
+type TheirItem = (ItemRow, Vec<u8>, item_layer::ItemPayload);
+
+/// Open OUR dirty row and read THEIR current row (`None` = gone) from the full
+/// `/items` snapshot (fetched once per push, shared via [`TheirRows`]).
+/// `current_version == Some(0)` (a 409 on a GC'd row) skips the fetch. `Err`
+/// says how to leave the row (unreadable, snapshot unavailable, endpoint gone).
+async fn load_conflict_pair(
     cloud: &str,
     vault_id: &str,
     dk: &str,
     keys: item_layer::VaultKeys<'_>,
     their_rows: &mut TheirRows,
     ours_row: &DirtyRow,
-    current_version: u64,
-) -> Resolved {
+    current_version: Option<u64>,
+) -> Result<(item_layer::ItemPayload, Option<TheirItem>), Resolved> {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
     type S = sudp::primitives::StdPrimitives;
 
-    let ours = match item_layer::open_wire_item::<S>(
+    let ours = item_layer::open_wire_item::<S>(
         keys,
         vault_id,
         &ours_row.id,
         ours_row.version,
         &ours_row.ct,
-    ) {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::warn!(vault = %vault_id, item = %ours_row.id, "per-item 409: can't open our row ({}); left dirty", e);
-            return Resolved::LeaveDirty;
-        }
-    };
+    )
+    .map_err(|e| {
+        tracing::warn!(vault = %vault_id, item = %ours_row.id, "per-item reconcile: can't open our row ({}); left dirty", e);
+        Resolved::LeaveDirty
+    })?;
 
-    // THEIR current row. `currentVersion == 0` ⇒ the row is gone (a GC'd
-    // tombstone): nothing to compare against.
-    let theirs_row: Option<ItemRow> = if current_version == 0 {
+    let theirs_row: Option<ItemRow> = if current_version == Some(0) {
         None
     } else {
         if matches!(their_rows, TheirRows::Unfetched) {
@@ -2953,16 +2963,16 @@ async fn resolve_conflict(
                 Ok(Some((rows, _))) => {
                     TheirRows::Fetched(rows.into_iter().map(|r| (r.item_id.clone(), r)).collect())
                 }
-                Ok(None) => return Resolved::EndpointMissing,
+                Ok(None) => return Err(Resolved::EndpointMissing),
                 Err(e) => {
-                    tracing::warn!(vault = %vault_id, "per-item 409: snapshot fetch failed ({}); conflicts left dirty", e);
+                    tracing::warn!(vault = %vault_id, "per-item reconcile: snapshot fetch failed ({}); rows left dirty", e);
                     TheirRows::Unavailable
                 }
             };
         }
         match &*their_rows {
             TheirRows::Fetched(map) => map.get(&ours_row.id).cloned(),
-            _ => return Resolved::LeaveDirty,
+            _ => return Err(Resolved::LeaveDirty),
         }
     };
     let theirs = match theirs_row {
@@ -2979,11 +2989,144 @@ async fn resolve_conflict(
             match opened {
                 Ok((ct, p)) => Some((r, ct, p)),
                 Err(e) => {
-                    tracing::warn!(vault = %vault_id, item = %ours_row.id, "per-item 409: can't open their row ({}); left dirty", e);
-                    return Resolved::LeaveDirty;
+                    tracing::warn!(vault = %vault_id, item = %ours_row.id, "per-item reconcile: can't open their row ({}); left dirty", e);
+                    return Err(Resolved::LeaveDirty);
                 }
             }
         }
+    };
+    Ok((ours, theirs))
+}
+
+/// Local fixes for a TERMINAL rejection of OUR dirty row
+/// ([`is_terminal_put_status`]). The server will never take these bytes, and
+/// the pull cursor has already moved past THEIR row (a pull never adopts over a
+/// dirty row), so just leaving ours dirty would pin the canonical id to a value
+/// only this device holds and re-offer it forever. Instead THEIR row becomes
+/// the canonical one locally and, for a differing live value in a keep-both
+/// namespace, OURS moves to a LOCAL conflict-copy row (the id the console would
+/// use) that stays DIRTY: it is re-offered on every push and lands once the
+/// entitlement returns (e.g. the plan is unfrozen). A refused delete, an equal
+/// value, or another namespace (owner-only config, where a copy row would be
+/// invisible to the fold) just takes theirs. `None` = nothing to take (no row
+/// of theirs: a refused create), so ours stays dirty where it is.
+fn rejection_fixes(
+    keys: item_layer::VaultKeys<'_>,
+    vault_id: &str,
+    ours_row: &DirtyRow,
+    ours: &item_layer::ItemPayload,
+    theirs: Option<TheirItem>,
+) -> Option<Vec<LocalFix>> {
+    type S = sudp::primitives::StdPrimitives;
+    let (r, ct, p) = theirs?;
+    let mut fixes = Vec::new();
+    if decide_conflict(ours, Some(&p)) == ConflictAction::KeepBoth {
+        match item_layer::seal_conflict_copy::<S>(keys, vault_id, ours, r.version) {
+            Ok((copy_id, copy_ct)) => fixes.push(LocalFix::InsertIfAbsent {
+                id: copy_id,
+                // Dirty (`synced_version` 0): pushed as a create next time.
+                row: pv_store::StoredItem {
+                    version: item_layer::CONFLICT_COPY_VERSION,
+                    ct: copy_ct,
+                    synced_version: 0,
+                    tombstone: false,
+                    sig: None,
+                    signer: None,
+                },
+            }),
+            Err(e) => {
+                tracing::warn!(vault = %vault_id, item = %ours_row.id, "per-item rejection: seal local conflict copy failed ({}); left dirty", e);
+                return None;
+            }
+        }
+    }
+    fixes.push(adopt_fix(ours_row, &r, ct, p.is_tombstone()));
+    Some(fixes)
+}
+
+/// Reconcile a TERMINAL rejection of OUR dirty row: see [`rejection_fixes`].
+async fn resolve_rejection(
+    cloud: &str,
+    vault_id: &str,
+    dk: &str,
+    keys: item_layer::VaultKeys<'_>,
+    their_rows: &mut TheirRows,
+    ours_row: &DirtyRow,
+) -> Resolved {
+    let (ours, theirs) =
+        match load_conflict_pair(cloud, vault_id, dk, keys, their_rows, ours_row, None).await {
+            Ok(pair) => pair,
+            Err(r) => return r,
+        };
+    match rejection_fixes(keys, vault_id, ours_row, &ours, theirs) {
+        Some(f) => Resolved::Fixed(f),
+        None => Resolved::LeaveDirty,
+    }
+}
+
+/// Warn ONCE per (vault, item, version, status) about a terminal rejection: a
+/// row the server keeps refusing (a refused create on a frozen plan) is
+/// re-offered on every push and must not flood the log.
+fn warn_rejected_once(vault_id: &str, item: &str, version: u64, status: u16, error: &str) {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let key = format!("{}/{}@{}:{}", vault_id, item, version, status);
+    let first = SEEN
+        .get_or_init(Default::default)
+        .lock()
+        .map(|mut seen| seen.insert(key))
+        .unwrap_or(true);
+    if first {
+        tracing::warn!(
+            vault = %vault_id, item = %item, version, status, error = %error,
+            "per-item push: rejected by the server (not retryable); theirs kept canonical, ours kept as a local conflict copy where possible"
+        );
+    } else {
+        tracing::debug!(vault = %vault_id, item = %item, version, status, "per-item push: rejected again");
+    }
+}
+
+/// Reconcile one 409 on OUR dirty row (§4) under `K` (`keys`): open ours, read
+/// THEIR current row from the full snapshot, then per [`decide_conflict`]:
+///   - `Adopt`    → take theirs locally;
+///   - `KeepBoth` → write ours as the conflict copy (CREATE at version 1 under
+///     `conflict_copy_id(id_seed, ns, name, their_version)`; a 409 on it means
+///     an earlier attempt already wrote it), then take theirs locally;
+///   - `Reapply`  → re-seal ours at `their_version + 1` and CAS on their version
+///     (their row gone → re-create ours as-is).
+///
+/// A terminal rejection of the extra write falls back to [`rejection_fixes`].
+/// At most ONE extra write per item per push: a second 409 leaves the row dirty
+/// for the next push (bounded, no loop). Nothing local changes unless the cloud
+/// write it depends on landed (or was refused for good), so a retry re-derives
+/// the same decision and the same copy id (idempotent).
+async fn resolve_conflict(
+    cloud: &str,
+    vault_id: &str,
+    dk: &str,
+    keys: item_layer::VaultKeys<'_>,
+    their_rows: &mut TheirRows,
+    ours_row: &DirtyRow,
+    current_version: u64,
+) -> Resolved {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    type S = sudp::primitives::StdPrimitives;
+
+    let (ours, theirs) = match load_conflict_pair(
+        cloud,
+        vault_id,
+        dk,
+        keys,
+        their_rows,
+        ours_row,
+        Some(current_version),
+    )
+    .await
+    {
+        Ok(pair) => pair,
+        Err(r) => return r,
     };
 
     match decide_conflict(&ours, theirs.as_ref().map(|(_, _, p)| p)) {
@@ -3049,6 +3192,22 @@ async fn resolve_conflict(
                     }
                 }
                 Ok(PushOutcome::EndpointMissing) => return Resolved::EndpointMissing,
+                Ok(PushOutcome::Rejected { status, error }) => {
+                    // The copy itself is refused for good (a NEW item on a frozen
+                    // plan): keep it as a LOCAL dirty copy and take theirs.
+                    warn_rejected_once(
+                        vault_id,
+                        &copy_id,
+                        item_layer::CONFLICT_COPY_VERSION,
+                        status,
+                        &error,
+                    );
+                    return match rejection_fixes(keys, vault_id, ours_row, &ours, Some((r, ct, p)))
+                    {
+                        Some(f) => Resolved::Fixed(f),
+                        None => Resolved::LeaveDirty,
+                    };
+                }
                 Err(e) => {
                     // Ours stays dirty; the retry re-targets the same copy id.
                     tracing::warn!(vault = %vault_id, item = %ours_row.id, "per-item 409: conflict copy write failed ({}); left dirty", e);
@@ -3064,6 +3223,12 @@ async fn resolve_conflict(
         }
         ConflictAction::Reapply => {
             let (base, version, ct) = match &theirs {
+                // Their row is gone (GC'd): re-create ours as-is, at OUR version
+                // with its existing ct (sealed at that version, so the AAD
+                // matches). The backend takes a create at any version
+                // (`coalesce(p_version, 1)`); re-creating at 1 like the console
+                // would be ignored by a device still holding the GC'd row at a
+                // higher version (a pull adopts strictly-newer only).
                 None => (None, ours_row.version, ours_row.ct.clone()),
                 Some((r, _, _)) => {
                     let v = r.version + 1;
@@ -3105,6 +3270,13 @@ async fn resolve_conflict(
                 // Raced again: one retry per item per push; the next push reconciles.
                 Ok(PushOutcome::Conflict { .. }) => Resolved::LeaveDirty,
                 Ok(PushOutcome::EndpointMissing) => Resolved::EndpointMissing,
+                Ok(PushOutcome::Rejected { status, error }) => {
+                    warn_rejected_once(vault_id, &ours_row.id, version, status, &error);
+                    match rejection_fixes(keys, vault_id, ours_row, &ours, theirs) {
+                        Some(f) => Resolved::Fixed(f),
+                        None => Resolved::LeaveDirty,
+                    }
+                }
                 Err(e) => {
                     tracing::warn!(vault = %vault_id, item = %ours_row.id, "per-item 409: re-apply failed ({}); left dirty", e);
                     Resolved::LeaveDirty
@@ -3128,6 +3300,10 @@ async fn resolve_conflict(
 ///     theirs + the copy;
 ///   - every other namespace: re-apply ours on their fresh version;
 ///   - our tombstone vs their edit: delete wins (our tombstone is re-applied).
+///
+/// A TERMINAL rejection (400/402/403/413/422) is reconciled by
+/// [`resolve_rejection`]: theirs is taken at the canonical id and ours, where it
+/// differs, is kept as a LOCAL dirty conflict copy (warned once).
 ///
 /// Reconciling needs `K` (open ours/theirs, seal the copy), taken from the
 /// unlocked session ([`AppState::cloned_state_key`]). A LOCKED vault leaves the
@@ -3192,7 +3368,7 @@ pub async fn push_items_best_effort(state: &Arc<AppState>, vault_id: &str) {
     let mut left_dirty = 0usize;
     let mut fixes: Vec<LocalFix> = Vec::new();
     for row in &rows {
-        let base_version = push_base_version(row.version, row.synced_version);
+        let base_version = push_base_version(row.synced_version);
         let ct_b64 = URL_SAFE_NO_PAD.encode(&row.ct);
         match push_item(
             cloud,
@@ -3233,6 +3409,24 @@ pub async fn push_items_best_effort(state: &Arc<AppState>, vault_id: &str) {
                 )
                 .await
                 {
+                    Resolved::Fixed(f) => fixes.extend(f),
+                    Resolved::LeaveDirty => left_dirty += 1,
+                    Resolved::EndpointMissing => {
+                        endpoint_missing = true;
+                        break;
+                    }
+                }
+            }
+            Ok(PushOutcome::Rejected { status, error }) => {
+                // Terminal (400/402/403/413/422): these bytes never land. Take
+                // theirs, keep ours as a local dirty conflict copy (see
+                // `rejection_fixes`); locked (no K) → left dirty.
+                warn_rejected_once(vault_id, &row.id, row.version, status, &error);
+                let Some(keys) = keys else {
+                    left_dirty += 1;
+                    continue;
+                };
+                match resolve_rejection(cloud, vault_id, &dk, keys, &mut their_rows, row).await {
                     Resolved::Fixed(f) => fixes.extend(f),
                     Resolved::LeaveDirty => left_dirty += 1,
                     Resolved::EndpointMissing => {
@@ -4208,6 +4402,10 @@ pub async fn push_keys_best_effort(state: &Arc<AppState>, vault_id: &str) {
                 let _ = pull_keys(state_dir, cloud, vault_id, &dk).await;
                 return;
             }
+            Ok(PushOutcome::Rejected { status, error }) => {
+                tracing::warn!(vault = %vault_id, cid = %cid_b64, "keyset push rejected: HTTP {} {}", status, error);
+                return;
+            }
             Err(e) => {
                 tracing::warn!(vault = %vault_id, cid = %cid_b64, "keyset push failed: {}", e);
                 return;
@@ -4418,21 +4616,115 @@ mod peritem_tests {
 
     /// base_version = the last version known on the cloud, so N local bumps
     /// between pushes CAS against the cloud's row (no self-inflicted 409 → no
-    /// spurious conflict copy). Unknown (0) falls back to version-1 / create.
+    /// spurious conflict copy). Never confirmed (0) is a CREATE, never a
+    /// `version - 1` guess that could CAS-clobber another device's row.
     #[test]
     fn push_base_version_uses_synced_version() {
-        assert_eq!(push_base_version(5, 4), Some(4), "single bump");
+        assert_eq!(push_base_version(4), Some(4), "last confirmed version");
+        assert_eq!(push_base_version(0), None, "never confirmed → create");
+    }
+
+    /// Terminal status classification: only the server's refusals of the write
+    /// itself are terminal; 5xx / 503 / 429 / 401 stay transient.
+    #[test]
+    fn terminal_put_statuses() {
+        for s in [400u16, 402, 403, 413, 422] {
+            assert!(is_terminal_put_status(s), "{s}");
+        }
+        for s in [401u16, 404, 409, 429, 500, 502, 503] {
+            assert!(!is_terminal_put_status(s), "{s}");
+        }
+    }
+
+    /// A terminal rejection takes THEIRS at the canonical id and keeps OURS as
+    /// a LOCAL, DIRTY conflict copy (re-offered on every push); a refused
+    /// create with no row of theirs stays dirty; a refused delete just adopts.
+    #[test]
+    fn rejection_keeps_ours_as_local_dirty_copy() {
+        use crate::storage::item::{self as il, ItemPayload};
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        let k = [0x42u8; 32];
+        let vid = "v";
+        let keys = VaultKeys::single(&k);
+        let mut pv = empty_pv();
+        // Ours: local edit at v3 (cloud last confirmed v2).
+        let id = pv
+            .seal_and_upsert::<StdPrimitives>(
+                keys,
+                vid,
+                ItemNs::Secret,
+                "A",
+                3,
+                &ItemPayload::secret_live("A", "ours"),
+            )
+            .unwrap();
+        pv.items.get_mut(&id).unwrap().synced_version = 2;
+        let s = pv.get_item(&id).unwrap().clone();
+        let dirty = DirtyRow {
+            id: id.clone(),
+            version: s.version,
+            synced_version: s.synced_version,
+            ct: s.ct.clone(),
+            tombstone: false,
+        };
+        let ours = il::open_wire_item::<StdPrimitives>(keys, vid, &id, 3, &s.ct).unwrap();
+        // Theirs: v5 on the cloud with a different value.
+        let their_payload = ItemPayload::secret_live("A", "theirs");
+        let their_ct =
+            il::seal_wire_item::<StdPrimitives>(keys, vid, &id, 5, &their_payload).unwrap();
+        let their_row = ItemRow {
+            item_id: id.clone(),
+            version: 5,
+            seq: 9,
+            ct: URL_SAFE_NO_PAD.encode(&their_ct),
+            sig: None,
+            signer: None,
+        };
+
+        // Refused create (no row of theirs): nothing to take, ours stays dirty.
+        assert!(rejection_fixes(keys, vid, &dirty, &ours, None).is_none());
+
+        let fixes = rejection_fixes(
+            keys,
+            vid,
+            &dirty,
+            &ours,
+            Some((their_row.clone(), their_ct.clone(), their_payload.clone())),
+        )
+        .unwrap();
+        let (changed, content) = apply_local_fixes(&mut pv, fixes);
+        assert!(changed && content);
+        // Canonical id = theirs, clean.
+        let canon = pv.get_item(&id).unwrap();
+        assert_eq!((canon.version, canon.synced_version), (5, 5));
+        assert_eq!(canon.ct, their_ct);
+        // Ours lives on as a DIRTY local conflict copy at the console's id.
+        let (copy_id, _) = il::seal_conflict_copy::<StdPrimitives>(keys, vid, &ours, 5).unwrap();
+        let copy = pv.get_item(&copy_id).expect("local conflict copy");
         assert_eq!(
-            push_base_version(7, 4),
-            Some(4),
-            "several bumps since last sync"
+            (copy.version, copy.synced_version),
+            (il::CONFLICT_COPY_VERSION, 0)
         );
-        assert_eq!(push_base_version(1, 0), None, "fresh local create");
-        assert_eq!(
-            push_base_version(3, 0),
-            Some(2),
-            "pre-tracking row: legacy guess"
-        );
+        let opened =
+            il::open_wire_item::<StdPrimitives>(keys, vid, &copy_id, copy.version, &copy.ct)
+                .unwrap();
+        assert_eq!(opened.name, il::conflict_copy_name("A"));
+        assert_eq!(opened.body, ours.body);
+        // Next push offers it as a create.
+        assert_eq!(push_base_version(copy.synced_version), None);
+
+        // A refused DELETE just adopts theirs (no copy of a tombstone).
+        let tomb = ItemPayload::tombstone(ItemNs::Secret, "A");
+        let fixes = rejection_fixes(
+            keys,
+            vid,
+            &dirty,
+            &tomb,
+            Some((their_row, their_ct, their_payload)),
+        )
+        .unwrap();
+        assert_eq!(fixes.len(), 1, "adopt only");
     }
 
     /// The §4 decision table (console parity: KEEP_BOTH_NS = secret, connection).
