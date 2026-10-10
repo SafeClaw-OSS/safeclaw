@@ -158,6 +158,21 @@ pub async fn create_op(
     vault: &str,
     op: &Value,
 ) -> Result<(String, String), String> {
+    let c = create_op_full(custodian, vault, op).await?;
+    Ok((c.op_id, c.r))
+}
+
+/// A created op as the daemon returned it. `waiter_secret` is present for an
+/// Export only (E1): the one credential that releases its value and lets this
+/// process withdraw it. Never printed or logged.
+pub struct CreatedOp {
+    pub op_id: String,
+    pub r: String,
+    pub waiter_secret: Option<String>,
+}
+
+/// [`create_op`] keeping the Export `waiter_secret`.
+pub async fn create_op_full(custodian: &str, vault: &str, op: &Value) -> Result<CreatedOp, String> {
     let client = http_client()?;
     let url = format!(
         "{}/v/{}/op",
@@ -184,7 +199,12 @@ pub async fn create_op(
     let body: Value = resp.json().await.map_err(|e| format!("parse: {}", e))?;
     let op_id = body["op_id"].as_str().ok_or("no op_id")?.to_string();
     let r = body["r"].as_str().ok_or("no r")?.to_string();
-    Ok((op_id, r))
+    let waiter_secret = body["waiter_secret"].as_str().map(str::to_string);
+    Ok(CreatedOp {
+        op_id,
+        r,
+        waiter_secret,
+    })
 }
 
 pub fn compute_beta(r: &[u8], op: &Value) -> Result<Vec<u8>, String> {

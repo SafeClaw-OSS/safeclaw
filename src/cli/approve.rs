@@ -184,22 +184,130 @@ pub async fn approve_op(
     let meta = fetch_passkey_meta(custodian, vault).await?;
 
     // Create the op. On a paired daemon this ALSO registers it with the cloud
-    // op-relay + starts the daemon's background poll (op.rs handles that).
-    let (op_id, r) = create_op(custodian, vault, op).await?;
+    // op-relay + starts the daemon's background poll (op.rs handles that). An
+    // Export comes back with its waiter secret (E1): the only credential that
+    // releases the value, kept in memory, never printed.
+    let created = create_op_full(custodian, vault, op).await?;
+    let waiter = created.waiter_secret.as_deref();
 
     // Paired ⇒ the user is (potentially) on another machine and can only reach
     // the cloud approval page. Local ⇒ the on-box ceremony.
     if crate::cli::active::frontend_origin().is_some() {
-        remote_approve(custodian, &op_id, label).await
+        remote_approve(custodian, &created.op_id, label, waiter).await
     } else {
-        local_ceremony(custodian, &op_id, &r, op, &meta, label, opts).await
+        let ceremony = local_ceremony(
+            custodian,
+            &created.op_id,
+            &created.r,
+            op,
+            &meta,
+            label,
+            opts,
+        );
+        // The local gesture has no poll loop of its own: keep an Export's
+        // waiter alive for the daemon's liveness backstop while it runs.
+        let heartbeat = waiter.map(|w| {
+            let url = op_url(custodian, &created.op_id);
+            let w = w.to_string();
+            tokio::spawn(async move {
+                let Ok(client) = http_client() else { return };
+                loop {
+                    let _ = client.get(&url).header(WAITER_HEADER, &w).send().await;
+                    tokio::time::sleep(WAITER_HEARTBEAT).await;
+                }
+            })
+        });
+        let res = tokio::select! {
+            r = ceremony => r,
+            _ = shutdown_signal() => Err("interrupted".to_string()),
+        };
+        if let Some(h) = heartbeat {
+            h.abort();
+        }
+        if let Err(e) = res {
+            // Stopped waiting (interrupt, gesture timeout, failed approve):
+            // withdraw our own op so it doesn't linger as a pending request.
+            if cancel_op(custodian, &created.op_id, waiter).await {
+                return Err(format!("{} (request withdrawn)", e));
+            }
+            return Err(e);
+        }
+        res
     }
+}
+
+/// Request header carrying an Export's waiter secret (mirror of the daemon's
+/// `approve::WAITER_HEADER`).
+const WAITER_HEADER: &str = "x-safeclaw-waiter";
+/// Local-arm keep-alive cadence; well under the daemon's 60 s backstop.
+const WAITER_HEARTBEAT: Duration = Duration::from_secs(5);
+
+fn op_url(custodian: &str, op_id: &str) -> String {
+    format!(
+        "{}/op/{}",
+        custodian.trim_end_matches('/'),
+        urlencoding::encode(op_id)
+    )
+}
+
+/// Resolves on Ctrl-C or SIGTERM. A signal handler that can't be installed
+/// never resolves (it must not read as an interrupt).
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        if tokio::signal::ctrl_c().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    };
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = ctrl_c => {}
+                    _ = term.recv() => {}
+                }
+            }
+            Err(_) => ctrl_c.await,
+        }
+    }
+    #[cfg(not(unix))]
+    ctrl_c.await;
+}
+
+/// Requester withdrawal (`POST /op/{id}/cancel`): best-effort, short timeout.
+/// Returns true when the daemon withdrew the op. Never a user rejection.
+async fn cancel_op(custodian: &str, op_id: &str, waiter: Option<&str>) -> bool {
+    let Ok(client) = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+    else {
+        return false;
+    };
+    let body = match waiter {
+        Some(w) => json!({ "waiter_secret": w }),
+        None => json!({}),
+    };
+    matches!(
+        client
+            .post(format!("{}/cancel", op_url(custodian, op_id)))
+            .json(&body)
+            .send()
+            .await,
+        Ok(r) if r.status().is_success()
+    )
 }
 
 /// Remote arm: surface the cloud `/grant/{op_id}` link and poll the local
 /// daemon until the op resolves (its relay poller applies the browser-deposited
-/// grant via loopback approve).
-async fn remote_approve(custodian: &str, op_id: &str, label: &str) -> Result<Value, String> {
+/// grant via loopback approve). Ctrl-C, SIGTERM or giving up withdraws the op
+/// (`POST /op/{id}/cancel`), so an abandoned wait never lingers in the inbox.
+async fn remote_approve(
+    custodian: &str,
+    op_id: &str,
+    label: &str,
+    waiter: Option<&str>,
+) -> Result<Value, String> {
     let url = crate::cli::active::grant_url(op_id);
     eprintln!();
     eprintln!(
@@ -210,16 +318,22 @@ async fn remote_approve(custodian: &str, op_id: &str, label: &str) -> Result<Val
     eprintln!();
     eprintln!("Waiting for approval…");
 
-    let client = http_client()?;
-    let poll_url = format!(
-        "{}/op/{}",
-        custodian.trim_end_matches('/'),
-        urlencoding::encode(op_id)
-    );
-    let mut deadline = Instant::now() + Duration::from_secs(REMOTE_APPROVE_TIMEOUT_SECS);
-    let mut deadline_from_op = false;
-    loop {
-        if Instant::now() >= deadline {
+    let outcome = tokio::select! {
+        r = remote_wait(custodian, op_id, waiter) => r,
+        _ = shutdown_signal() => {
+            let withdrawn = cancel_op(custodian, op_id, waiter).await;
+            return Err(if withdrawn {
+                "interrupted — the approval request was withdrawn".into()
+            } else {
+                "interrupted".into()
+            });
+        }
+    };
+    match outcome {
+        Ok(v) => Ok(v),
+        Err(RemoteWaitErr::Failed(e)) => Err(e),
+        Err(RemoteWaitErr::TimedOut { deadline_from_op }) => {
+            let withdrawn = cancel_op(custodian, op_id, waiter).await;
             if deadline_from_op {
                 // We read the op's real expiry and waited its whole window out.
                 return Err(format!(
@@ -227,17 +341,54 @@ async fn remote_approve(custodian: &str, op_id: &str, label: &str) -> Result<Val
                     url
                 ));
             }
+            if withdrawn {
+                return Err(format!(
+                    "stopped waiting after {}s and withdrew the request — re-run the command \
+                     for a fresh link",
+                    REMOTE_APPROVE_TIMEOUT_SECS
+                ));
+            }
             // Never got a clean status read (daemon busy / restarting) — but the
             // op WAS registered and its cloud link is almost certainly still
             // live, so don't claim it expired.
-            return Err(format!(
+            Err(format!(
                 "stopped waiting after {}s — if you haven't approved it yet the link is still \
                  live; approve it then re-run, or `sc op wait {}` to keep waiting. link: {}",
                 REMOTE_APPROVE_TIMEOUT_SECS, op_id, url
-            ));
+            ))
+        }
+    }
+}
+
+enum RemoteWaitErr {
+    /// The op resolved negatively (rejected / superseded).
+    Failed(String),
+    /// We gave up waiting.
+    TimedOut { deadline_from_op: bool },
+}
+
+/// The remote arm's poll loop. Sends the waiter header on every poll (an
+/// Export's value is released only to it, and each such poll keeps the op
+/// alive against the daemon's abandoned-waiter backstop).
+async fn remote_wait(
+    custodian: &str,
+    op_id: &str,
+    waiter: Option<&str>,
+) -> Result<Value, RemoteWaitErr> {
+    let client = http_client().map_err(RemoteWaitErr::Failed)?;
+    let poll_url = op_url(custodian, op_id);
+    let mut deadline = Instant::now() + Duration::from_secs(REMOTE_APPROVE_TIMEOUT_SECS);
+    let mut deadline_from_op = false;
+    loop {
+        if Instant::now() >= deadline {
+            return Err(RemoteWaitErr::TimedOut { deadline_from_op });
         }
         tokio::time::sleep(REMOTE_POLL_INTERVAL).await;
-        let resp = match client.get(&poll_url).send().await {
+        let mut req = client.get(&poll_url);
+        if let Some(w) = waiter {
+            req = req.header(WAITER_HEADER, w);
+        }
+        let resp = match req.send().await {
             Ok(r) => r,
             Err(_) => continue, // transient; keep polling
         };
@@ -276,16 +427,19 @@ async fn remote_approve(custodian: &str, op_id: &str, label: &str) -> Result<Val
             "rejected" => {
                 let reason = body.get("reason").and_then(|v| v.as_str()).unwrap_or("");
                 if reason.contains("superseded") {
-                    return Err(
+                    return Err(RemoteWaitErr::Failed(
                         "approval superseded by a newer request (not a user rejection) — \
                          re-run the command"
                             .into(),
-                    );
+                    ));
                 }
                 if !reason.is_empty() {
-                    return Err(format!("approval was rejected: {}", reason).into());
+                    return Err(RemoteWaitErr::Failed(format!(
+                        "approval was rejected: {}",
+                        reason
+                    )));
                 }
-                return Err("approval was rejected".into());
+                return Err(RemoteWaitErr::Failed("approval was rejected".into()));
             }
             _ => {} // pending — keep polling
         }

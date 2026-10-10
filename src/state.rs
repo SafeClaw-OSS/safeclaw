@@ -421,6 +421,11 @@ pub struct AppState {
     /// op from the relay so the console stops showing "1 approval waiting" after
     /// a `sc unlock` was abandoned + retried. See requester-cancel design.
     pub live_ceremony_ops: Mutex<HashMap<(String, String), String>>,
+    /// Random per daemon PROCESS (hex). Rides every op-relay register so the
+    /// backend can cancel a previous process's pending rows: the op store is
+    /// in-memory and poll tasks spawn only at mint, so a pre-restart row can
+    /// never apply (design/approvals-inbox.md D1, restart zombies).
+    pub boot_id: String,
     /// The device egress proxy the resident proxy's forward hop tunnels through,
     /// in a swappable cell so `sc proxy set/clear` HOT-reloads it via
     /// `/proxy/reload` — no daemon restart, no vault re-unlock. Shared with the
@@ -546,6 +551,12 @@ impl AppState {
             oauth_reauth_needed: Mutex::new(std::collections::HashSet::new()),
             oauth_redeemed_codes: Mutex::new(HashMap::new()),
             live_ceremony_ops: Mutex::new(HashMap::new()),
+            boot_id: {
+                use rand::RngCore as _;
+                let mut b = [0u8; 16];
+                rand::rngs::OsRng.fill_bytes(&mut b);
+                b.iter().map(|x| format!("{:02x}", x)).collect()
+            },
             egress_proxy: crate::proxy::upstream::new_cell(),
             oauth_pending: Mutex::new(HashMap::new()),
             oauth_listener_running: Mutex::new(std::collections::HashSet::new()),

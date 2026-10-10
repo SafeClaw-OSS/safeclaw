@@ -72,20 +72,22 @@ pub fn register_pending_use(
         store.issue(ip).ok_or(AppError::TooManyRequests)?
     };
 
-    let (op_id, expires_at) = {
+    let (op_id, expires_at, supersedes) = {
         let mut store = state.approvals.lock().unwrap();
         // Op-agent binding (team §C1): the triggering agent's prefix lands on
         // the record so every consumption surface can enforce "only the agent
-        // this was approved FOR can use it".
-        let id = store.create_bound(
+        // this was approved FOR can use it". A `use` op also joins its intent
+        // chain here (design/approvals-inbox.md D1): live byte-identical
+        // retries are marked superseded by this one — display only, they stay
+        // approvable — in the same store mutation as the create.
+        let c = store.create_chained(
             vault_id.to_string(),
             op.clone(),
             r.clone(),
             policy_context,
             agent_prefix.clone(),
         );
-        let exp = store.get(&id).map(|rec| rec.expires_at_unix).unwrap_or(0);
-        (id, exp)
+        (c.id, c.expires_at_unix, c.supersedes)
     };
 
     if let Ok(audit_store) = state.audits.for_vault(vault_id) {
@@ -104,6 +106,7 @@ pub fn register_pending_use(
         r.clone(),
         expires_at,
         agent_prefix,
+        supersedes,
     );
 
     state.emit_event(ApprovalEvent {

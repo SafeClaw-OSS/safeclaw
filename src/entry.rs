@@ -378,6 +378,13 @@ async fn run_daemon(
     // show activity without a cloud daemon. Best-effort + gated like blob sync.
     tokio::spawn(crate::sync::ship_audit_loop(state.clone()));
 
+    // E1 liveness backstop (design/approvals-inbox.md D1-E): a pending Export
+    // whose creating `sc get` stopped polling (kill -9) is withdrawn as
+    // abandoned, so it leaves the inbox without anyone rejecting it.
+    tokio::spawn(crate::server::handlers::op::reap_abandoned_exports_loop(
+        state.clone(),
+    ));
+
     // Install the process-wide rustls crypto provider ONCE (aws-lc-rs, never
     // OpenSSL) before the proxy's TLS stacks touch it. Ignore "already set" —
     // some transitive dep may have installed it first; ours is identical.

@@ -67,9 +67,26 @@ pub async fn create(
         let mut store = state.challenges.lock().unwrap();
         store.issue(ip).ok_or(AppError::TooManyRequests)?
     };
+    // E1 (design/approvals-inbox.md D2): an Export's plaintext is bound to the
+    // process that created it. A random per-op waiter secret goes back ONLY in
+    // this response (never in SSE, never to the relay, never logged); the
+    // record keeps its SHA-256, and `GET /op/{id}` releases the value only to
+    // a poll presenting it.
+    let waiter_secret: Option<String> = if op.act.kind == ActType::Export {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+        use rand::RngCore as _;
+        let mut b = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut b);
+        Some(URL_SAFE_NO_PAD.encode(b))
+    } else {
+        None
+    };
     let (op_id, expires_at) = {
         let mut store = state.approvals.lock().unwrap();
         let id = store.create(vault_id.clone(), op.clone(), r.clone());
+        if let Some(secret) = &waiter_secret {
+            store.set_waiter(&id, secret);
+        }
         let exp = store.get(&id).map(|r| r.expires_at_unix).unwrap_or(0);
         (id, exp)
     };
@@ -110,7 +127,8 @@ pub async fn create(
         serde_json::to_value(&op).unwrap_or(Value::Null),
         r.clone(),
         expires_at,
-        None, // user-initiated lifecycle ceremony — no triggering agent
+        None,   // user-initiated lifecycle ceremony — no triggering agent
+        vec![], // only `use` ops join intent chains
     );
 
     // Requester-side supersede: a lifecycle ceremony (unlock/lock) is a
@@ -141,11 +159,15 @@ pub async fn create(
         reason: None,
     });
 
-    Ok(Json(json!({
+    let mut resp = json!({
         "op_id": op_id,
         "r": r,
         "expires_at": expires_at,
-    })))
+    });
+    if let Some(secret) = waiter_secret {
+        resp["waiter_secret"] = json!(secret);
+    }
+    Ok(Json(resp))
 }
 
 /// Withdraw a ceremony op that a newer one just superseded. Local: flip the
@@ -180,7 +202,145 @@ fn cancel_superseded(state: &Arc<AppState>, vault_id: &str, op_id: &str, now: i6
             reason: Some(REASON.into()),
         });
     }
-    crate::relay::client::spawn_cancel(state.clone(), vault_id.to_string(), op_id.to_string());
+    crate::relay::client::spawn_cancel(
+        state.clone(),
+        vault_id.to_string(),
+        op_id.to_string(),
+        None, // legacy reason-less withdraw (contract §2)
+    );
+}
+
+/// Local record reason for a requester withdrawal (contract §1).
+pub const WITHDRAWN_REASON: &str = "withdrawn by requester";
+/// Local record reason for the E1 liveness backstop.
+pub const ABANDONED_REASON: &str = "abandoned by requester";
+
+/// Liveness backstop window: a pending Export whose waiter has not polled
+/// (with its secret) for this long is withdrawn as abandoned (design
+/// D1-E). The CLI polls every ≤ 5 s, well inside it.
+pub const WAITER_IDLE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Withdraw a pending op on its requester's behalf: terminal
+/// `Rejected{reason}` locally, audit `cancelled`, SSE `cancelled`, relay row
+/// cancelled with `relay_reason`. NEVER `reject_op` — that reads as a user
+/// denial (and resolves an intent chain); a withdrawal is neither. Returns
+/// whether the op was still pending.
+fn withdraw(
+    state: &Arc<AppState>,
+    vault_id: &str,
+    op_id: &str,
+    reason: &str,
+    relay_reason: crate::relay::client::CancelReason,
+) -> bool {
+    let was_pending = {
+        let mut store = state.approvals.lock().unwrap();
+        store.reject(op_id, reason).is_some()
+    };
+    if !was_pending {
+        return false;
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    if let Ok(store) = state.audits.for_vault(vault_id) {
+        if let Err(e) = store.finalize(
+            op_id,
+            audit::STATUS_CANCELLED,
+            now,
+            None,
+            Some(reason),
+            None,
+        ) {
+            tracing::warn!(vault = %vault_id, op = %op_id, "audit finalize cancelled failed: {}", e);
+        }
+    }
+    state.emit_event(ApprovalEvent {
+        vault_id: vault_id.to_string(),
+        approval_id: op_id.to_string(),
+        kind: "cancelled".into(),
+        op_summary: None,
+        response_preview: None,
+        reason: Some(reason.into()),
+    });
+    crate::relay::client::spawn_cancel(
+        state.clone(),
+        vault_id.to_string(),
+        op_id.to_string(),
+        Some(relay_reason),
+    );
+    true
+}
+
+/// `POST /op/{op_id}/cancel` — requester withdrawal (design D1-E, contract
+/// §1). Body `{ "waiter_secret"?: string }`; an op that has a waiter secret
+/// (every Export) can be withdrawn only by presenting it (constant-time).
+/// `sc get` and every `remote_approve` waiter call this on Ctrl-C, SIGTERM
+/// and timeout, so dead retries leave the inbox without any intent matching.
+pub async fn cancel(
+    State(state): State<Arc<AppState>>,
+    Path(op_id): Path<String>,
+    body: Option<Json<Value>>,
+) -> Result<Json<Value>> {
+    let secret = body
+        .as_ref()
+        .and_then(|b| b.get("waiter_secret"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let vault_id = {
+        let store = state.approvals.lock().unwrap();
+        let rec = store.get(&op_id).ok_or(AppError::NotFound)?;
+        if rec.waiter_hash.is_some() && !rec.waiter_matches(secret.as_deref()) {
+            return Err(AppError::Forbidden(
+                "this request can be withdrawn only by the process that created it".into(),
+            ));
+        }
+        if !matches!(rec.status, crate::approval::ApprovalStatus::Pending) {
+            return Err(AppError::Conflict("op not pending".into()));
+        }
+        rec.vault_id.clone()
+    };
+    if !withdraw(
+        &state,
+        &vault_id,
+        &op_id,
+        WITHDRAWN_REASON,
+        crate::relay::client::CancelReason::Withdrawn,
+    ) {
+        return Err(AppError::Conflict("op not pending".into()));
+    }
+    Ok(Json(
+        json!({ "ok": true, "op_id": op_id, "status": "rejected", "reason": WITHDRAWN_REASON }),
+    ))
+}
+
+/// One reaper pass: withdraw every pending Export whose waiter has been
+/// silent for `idle` (kill -9'd `sc get`). Returns the withdrawn ids.
+pub fn reap_abandoned_exports(state: &Arc<AppState>, idle: std::time::Duration) -> Vec<String> {
+    let stale = state.approvals.lock().unwrap().abandoned_exports(idle);
+    let mut out = Vec::new();
+    for (op_id, vault_id) in stale {
+        if withdraw(
+            state,
+            &vault_id,
+            &op_id,
+            ABANDONED_REASON,
+            crate::relay::client::CancelReason::Abandoned,
+        ) {
+            tracing::info!(op = %op_id, "export waiter went silent; request withdrawn (abandoned)");
+            out.push(op_id);
+        }
+    }
+    out
+}
+
+/// Background liveness backstop for E1 (spawned once at daemon start).
+pub async fn reap_abandoned_exports_loop(state: Arc<AppState>) {
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(10));
+    loop {
+        tick.tick().await;
+        reap_abandoned_exports(&state, WAITER_IDLE);
+    }
 }
 
 /// Reject op kinds that are broker-plane primitives. Today: `Use`.
@@ -337,6 +497,14 @@ mod tests {
             body.get("r").is_some(),
             "pending Export must carry a challenge `r`, got {body}"
         );
+        // E1: the creator (and only the creator) gets a waiter secret.
+        assert!(
+            body.get("waiter_secret")
+                .and_then(|v| v.as_str())
+                .map(|s| s.len())
+                == Some(43),
+            "Export create must return a 32-byte base64url waiter_secret, got {body}"
+        );
         // Nothing executed inline: no raw secret / reveal payload leaked.
         for leak in ["value", "secret", "plaintext", "revealed"] {
             assert!(
@@ -344,5 +512,174 @@ mod tests {
                 "Export create must NOT reveal '{leak}' inline (allow default leaked into Export!): {body}"
             );
         }
+    }
+
+    fn export_op() -> Operation {
+        use crate::protocol::operation::{Act, Bind, Valid};
+        Operation {
+            act: Act {
+                kind: ActType::Export,
+                target: "GITHUB_TOKEN".into(),
+                scope: Value::Null,
+            },
+            bind: Bind {
+                redeemer: "v1".into(),
+                recipient: None,
+            },
+            valid: Valid::single_use(0, Some(u64::MAX / 2)),
+        }
+    }
+
+    async fn create_unlocked(state: &Arc<AppState>, op: Operation) -> Value {
+        if state.is_vault_locked("v1") {
+            state.unlock_vault(
+                "v1".into(),
+                crate::state::SecretsCache::default(),
+                zeroize::Zeroizing::new(Vec::new()),
+            );
+        }
+        let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+        create(
+            State(state.clone()),
+            ConnectInfo(addr),
+            Path("v1".into()),
+            Json(op),
+        )
+        .await
+        .unwrap()
+        .0
+    }
+
+    fn status_of(state: &AppState, id: &str) -> crate::approval::ApprovalStatus {
+        state
+            .approvals
+            .lock()
+            .unwrap()
+            .get(id)
+            .unwrap()
+            .status
+            .clone()
+    }
+
+    /// Only Export ops get a waiter secret; the record keeps its hash only.
+    #[tokio::test]
+    async fn waiter_secret_only_for_export_and_stored_hashed() {
+        let state = Arc::new(test_state());
+        let body = create_unlocked(&state, export_op()).await;
+        let id = body["op_id"].as_str().unwrap().to_string();
+        let secret = body["waiter_secret"].as_str().unwrap().to_string();
+        {
+            let s = state.approvals.lock().unwrap();
+            let rec = s.get(&id).unwrap();
+            assert_eq!(
+                rec.waiter_hash,
+                Some(crate::approval::store::waiter_digest(&secret))
+            );
+        }
+        let mut lock = export_op();
+        lock.act.kind = ActType::Custom("vault-lock".into());
+        lock.act.target = String::new();
+        let body = create_unlocked(&state, lock).await;
+        assert!(body.get("waiter_secret").is_none(), "{body}");
+    }
+
+    /// `POST /op/{id}/cancel`: an Export needs its waiter secret; success is a
+    /// requester withdrawal (`withdrawn by requester`), never a user reject.
+    #[tokio::test]
+    async fn cancel_requires_waiter_secret_and_withdraws() {
+        let state = Arc::new(test_state());
+        let body = create_unlocked(&state, export_op()).await;
+        let id = body["op_id"].as_str().unwrap().to_string();
+        let secret = body["waiter_secret"].as_str().unwrap().to_string();
+
+        for bad in [
+            None,
+            Some(json!({})),
+            Some(json!({ "waiter_secret": "nope" })),
+        ] {
+            let err = cancel(State(state.clone()), Path(id.clone()), bad.map(Json))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, AppError::Forbidden(_)), "{err}");
+            assert!(matches!(
+                status_of(&state, &id),
+                crate::approval::ApprovalStatus::Pending
+            ));
+        }
+        let ok = cancel(
+            State(state.clone()),
+            Path(id.clone()),
+            Some(Json(json!({ "waiter_secret": secret }))),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ok.0["reason"], WITHDRAWN_REASON);
+        match status_of(&state, &id) {
+            crate::approval::ApprovalStatus::Rejected { reason } => {
+                assert_eq!(reason, WITHDRAWN_REASON)
+            }
+            other => panic!("expected withdrawn, got {other:?}"),
+        }
+        // Already resolved → 409, nothing changes.
+        let err = cancel(
+            State(state.clone()),
+            Path(id.clone()),
+            Some(Json(json!({ "waiter_secret": secret }))),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, AppError::Conflict(_)));
+
+        // A non-Export op (no waiter secret on record) is withdrawable by id.
+        let mut lock = export_op();
+        lock.act.kind = ActType::Custom("vault-lock".into());
+        lock.act.target = String::new();
+        let body = create_unlocked(&state, lock).await;
+        let lid = body["op_id"].as_str().unwrap().to_string();
+        let _ = cancel(State(state.clone()), Path(lid.clone()), None)
+            .await
+            .unwrap();
+        assert!(matches!(
+            status_of(&state, &lid),
+            crate::approval::ApprovalStatus::Rejected { .. }
+        ));
+    }
+
+    /// The liveness reaper withdraws a pending Export whose waiter went silent
+    /// past the window (kill -9'd `sc get`) as `abandoned`, and leaves a live
+    /// one alone.
+    #[tokio::test]
+    async fn reaper_withdraws_abandoned_exports() {
+        let state = Arc::new(test_state());
+        let stale = create_unlocked(&state, export_op()).await["op_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let live = create_unlocked(&state, export_op()).await["op_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        state
+            .approvals
+            .lock()
+            .unwrap()
+            .get_mut_for_test(&stale)
+            .unwrap()
+            .last_waiter_poll = std::time::Instant::now() - std::time::Duration::from_secs(61);
+
+        let reaped = reap_abandoned_exports(&state, WAITER_IDLE);
+        assert_eq!(reaped, vec![stale.clone()]);
+        match status_of(&state, &stale) {
+            crate::approval::ApprovalStatus::Rejected { reason } => {
+                assert_eq!(reason, ABANDONED_REASON)
+            }
+            other => panic!("expected abandoned, got {other:?}"),
+        }
+        assert!(matches!(
+            status_of(&state, &live),
+            crate::approval::ApprovalStatus::Pending
+        ));
+        // Idempotent: nothing left to reap.
+        assert!(reap_abandoned_exports(&state, WAITER_IDLE).is_empty());
     }
 }

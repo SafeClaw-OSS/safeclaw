@@ -12,6 +12,7 @@
 //! GET  /op/{op_id}              poll op status + cached value
 //! POST /op/{op_id}/approve      U submits grant G → T validates, dispatches act
 //! POST /op/{op_id}/reject       U denies
+//! POST /op/{op_id}/cancel       requester withdraws its own op
 //! GET  /health                  custodian health
 //! GET  /pubkey                  custodian HPKE bootstrap key (placeholder)
 //! GET  /skill.md                skill file for agents (?agent=claude|cursor|codex)
@@ -99,6 +100,10 @@ pub fn app_router(state: Arc<AppState>) -> Router {
         .route("/op/{op_id}", get(handlers::approve::get_op))
         .route("/op/{op_id}/approve", post(handlers::approve::approve_op))
         .route("/op/{op_id}/reject", post(handlers::approve::reject_op))
+        // Requester withdrawal (design/approvals-inbox.md D1-E): the CLI that
+        // created an op voids it on Ctrl-C / SIGTERM / timeout. Never a user
+        // rejection; an Export needs its waiter secret.
+        .route("/op/{op_id}/cancel", post(handlers::op::cancel))
         .with_state(state.clone());
     router = router.layer(DefaultBodyLimit::max(MAX_BODY_BYTES));
 

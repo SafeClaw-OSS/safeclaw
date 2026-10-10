@@ -1011,6 +1011,7 @@ impl BrokerHandler {
         if let Some(prefix) = self.agent_attribution() {
             scope["agent"] = serde_json::Value::String(prefix);
         }
+        stamp_signed_level(&mut scope, level, grant_ttl);
         // Phase 2: fold the bound `[requests]` scope-field VALUES and the consent
         // template into the op scope. They are signed into β (the user's passkey
         // authorizes exactly the fields shown) and re-derived at approve to build
@@ -1201,6 +1202,22 @@ impl BrokerHandler {
             ),
         )
         .into()
+    }
+}
+
+/// Stamp the policy level a Use op is minted under into its (signed) scope, so
+/// what the approver reads ("this one request" vs "N min") is what apply
+/// grants: `level` always, `window_s` (integer seconds — JCS rejects floats)
+/// only for `ask`, equal to the PolicyContext ttl. approve asserts both
+/// against the record's PolicyContext (design/approvals-inbox.md D1).
+fn stamp_signed_level(
+    scope: &mut serde_json::Value,
+    level: crate::core::policy::AccessLevel,
+    grant_ttl: u64,
+) {
+    scope["level"] = serde_json::Value::String(level.to_string());
+    if level == crate::core::policy::AccessLevel::Ask {
+        scope["window_s"] = serde_json::Value::from(grant_ttl);
     }
 }
 
@@ -1624,6 +1641,23 @@ mod tests {
         // Chunked variant (length unknown while buffering) still explains.
         let resp = body_over_cap(0, 1024);
         assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    /// The signed Use scope carries the mint-time level; `window_s` only for
+    /// `ask` (ask-always is one request, no window), as an integer.
+    #[test]
+    fn signed_level_stamp() {
+        use crate::core::policy::AccessLevel;
+        let mut ask = json!({ "method": "GET" });
+        stamp_signed_level(&mut ask, AccessLevel::Ask, 900);
+        assert_eq!(ask["level"], "ask");
+        assert_eq!(ask["window_s"], 900);
+        assert!(ask["window_s"].is_u64());
+
+        let mut always = json!({ "method": "GET" });
+        stamp_signed_level(&mut always, AccessLevel::AskAlways, 900);
+        assert_eq!(always["level"], "ask-always");
+        assert!(always.get("window_s").is_none());
     }
 
     #[test]

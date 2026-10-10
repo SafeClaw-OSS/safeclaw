@@ -99,7 +99,13 @@ pub async fn respond(state: &Arc<AppState>, req: &Request<Body>) -> Response<Bod
                 }
             }
         }
-        return match crate::server::handlers::approve::op_poll_value(state, op_id) {
+        // Same E1 gate as the control plane: an Export value is released only
+        // with its waiter secret, so the two faces stay byte-identical.
+        let waiter = req
+            .headers()
+            .get(crate::server::handlers::approve::WAITER_HEADER)
+            .and_then(|v| v.to_str().ok());
+        return match crate::server::handlers::approve::op_poll_value(state, op_id, waiter) {
             Ok(v) => op_poll_response(&v),
             Err(e) => app_err(e),
         };

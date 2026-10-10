@@ -54,17 +54,30 @@ use crate::storage::sealed_vault::{
 pub async fn get_op(
     State(state): State<Arc<AppState>>,
     Path(op_id): Path<String>,
+    headers: axum::http::HeaderMap,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
-    match get_op_json(state, op_id).await {
+    let waiter = headers
+        .get(WAITER_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    match get_op_json(state, op_id, waiter.as_deref()).await {
         Ok(resp) => resp,
         Err(e) => e.into_response(),
     }
 }
 
-async fn get_op_json(state: Arc<AppState>, op_id: String) -> Result<axum::response::Response> {
+/// Request header carrying an Export's waiter secret (E1,
+/// design/approvals-inbox.md D2). Never logged.
+pub const WAITER_HEADER: &str = "x-safeclaw-waiter";
+
+async fn get_op_json(
+    state: Arc<AppState>,
+    op_id: String,
+    waiter: Option<&str>,
+) -> Result<axum::response::Response> {
     use axum::response::IntoResponse;
-    let body = op_poll_value(&state, &op_id)?;
+    let body = op_poll_value(&state, &op_id, waiter)?;
     let pending = body.get("status").and_then(|s| s.as_str()) == Some("pending");
     let mut resp = Json(body).into_response();
     // Pending → advertise the poll pacing (Retry-After, matching the 202's
@@ -84,9 +97,14 @@ async fn get_op_json(state: Arc<AppState>, op_id: String) -> Result<axum::respon
 /// (above) and the 23294 API face (`proxy::api_face`), so the agent's poll loop
 /// sees identical JSON whether it hit the control plane or the proxy port. Pure
 /// read — briefly locks `approvals`, no I/O.
-pub fn op_poll_value(state: &AppState, op_id: &str) -> Result<Value> {
+///
+/// `waiter` = the `x-safeclaw-waiter` header, if any. An Export's plaintext is
+/// released (and consumed) ONLY to a poll presenting the op's waiter secret
+/// (E1): every other poll sees status but no `value`, and consumes nothing.
+pub fn op_poll_value(state: &AppState, op_id: &str, waiter: Option<&str>) -> Result<Value> {
     let mut store = state.approvals.lock().unwrap();
     let rec = store.get(op_id).ok_or(AppError::NotFound)?;
+    let waiter_ok = rec.waiter_matches(waiter);
     // Consumed ops: the approve window is closed. Return a minimal tombstone
     // — no op content — to limit the exposure window for the agent request
     // body and upstream URL that live in op.act.scope. The op_id's 122-bit
@@ -115,6 +133,9 @@ pub fn op_poll_value(state: &AppState, op_id: &str) -> Result<Value> {
     let id = rec.id.clone();
     let r = rec.r.clone();
     let expires_at_unix = rec.expires_at_unix;
+    let superseded_by = rec.superseded_by.clone();
+    let satisfied_by = rec.satisfied_by.clone();
+    let retry_count = rec.retry_count.max(1);
     let (status, value) = match &rec.status {
         ApprovalStatus::Pending => ("pending", None),
         // "ok" is the skill-documented terminal (done — result in `value`). The
@@ -136,6 +157,10 @@ pub fn op_poll_value(state: &AppState, op_id: &str) -> Result<Value> {
         ApprovalStatus::Rejected { .. } => ("rejected", None),
         ApprovalStatus::Consumed => unreachable!("handled above"),
     };
+    // E1: an Export's value reaches only its creating process. Without the
+    // waiter secret the poll reports status alone and the plaintext stays
+    // put (not consumed) for the creator.
+    let value = if is_export && !waiter_ok { None } else { value };
     // A rejected op's reason distinguishes a USER rejection from a mechanical
     // withdrawal ("superseded by a newer request") — the waiter renders them
     // differently, so a superseded `sc up`/`sc lock` never reads as "the user
@@ -151,6 +176,11 @@ pub fn op_poll_value(state: &AppState, op_id: &str) -> Result<Value> {
     if is_export && value.is_some() {
         store.consume(&id);
     }
+    // Liveness: a poll carrying the valid waiter secret proves the creator
+    // is still waiting (the abandoned-Export reaper keys off this).
+    if waiter_ok {
+        store.touch_waiter(&id);
+    }
     Ok(json!({
         "op_id": id,
         "r": r,
@@ -162,7 +192,77 @@ pub fn op_poll_value(state: &AppState, op_id: &str) -> Result<Value> {
         "op": op_json,
         "value": value,
         "expires_at": expires_at_unix,
+        // Intent chain (design/approvals-inbox.md D1). Display only: a
+        // superseded op is still `pending` and still approvable; a satisfied
+        // one mirrors the applied op's body plus the pointer.
+        "superseded_by": superseded_by,
+        "satisfied_by": satisfied_by,
+        "retry_count": retry_count,
     }))
+}
+
+/// Apply-time assertion (design/approvals-inbox.md D1): the SIGNED Use scope's
+/// `level` must equal the record's PolicyContext level and, when present,
+/// `window_s` must equal `pc.ttl_seconds` — so what the approver was shown is
+/// exactly what apply grants. `ask-always` omits `window_s` while its record
+/// still carries a ttl, hence the compare-only-when-present rule. A scope
+/// without `level` predates the field (older mint) and is left to the existing
+/// pc-driven apply. `Err` carries the human reason; the caller picks the arm's
+/// error variant.
+fn assert_signed_level(
+    scope: &Value,
+    pc: Option<&crate::approval::PolicyContext>,
+) -> std::result::Result<(), String> {
+    let Some(signed) = scope.get("level") else {
+        return Ok(());
+    };
+    let pc = pc.ok_or("signed level on an op with no policy context")?;
+    let signed = signed.as_str().ok_or("signed level is not a string")?;
+    if signed != pc.level.to_string() {
+        return Err(format!(
+            "signed level '{}' does not match the policy this op was minted under ('{}')",
+            signed, pc.level
+        ));
+    }
+    if let Some(w) = scope.get("window_s") {
+        let w = w.as_u64().ok_or("signed window_s is not an integer")?;
+        if w != pc.ttl_seconds {
+            return Err(format!(
+                "signed window_s {} does not match the policy window ({}s)",
+                w, pc.ttl_seconds
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The per-op Export checks — run on EVERY Export apply, plain or batch arm
+/// (design/approvals-inbox.md D2: batching changes the gesture, never these).
+/// Returns the export path.
+fn export_precheck(op: &crate::protocol::operation::Operation) -> Result<&str> {
+    // F-15: reject KEM-sealed Export until it is implemented.
+    // If a client submits a grant with bind.recipient set, the raw-reveal
+    // path would silently ignore it and return the secret in plain TLS.
+    // Block this until a proper HPKE-sealed Export path is available.
+    if op.bind.recipient.is_some() {
+        return Err(AppError::BadRequest(
+            "KEM-sealed Export not yet implemented; omit bind.recipient".into(),
+        ));
+    }
+    let path = as_export_path(op)?;
+    // RETIRED: whole-vault reveal-all (`target = "env"` / "").
+    // An Export must name ONE secret so its plaintext egress stays
+    // scope-constrained (and single-use). The console editor no longer
+    // uses a daemon reveal-all — it derives its `{kv, aux}` view
+    // client-side (`revealAllVault = unlockVault`), and `sc secret get`
+    // always names a specific key. Refuse the unbounded form outright so
+    // no path can dump the whole vault's plaintext through one op.
+    if path == "env" || path.is_empty() {
+        return Err(AppError::BadRequest(
+            "reveal-all export is retired — export a specific secret by name".into(),
+        ));
+    }
+    Ok(path)
 }
 
 /// Best-effort: if the acting credential's stored keyset row carries no KCV yet,
@@ -372,10 +472,13 @@ fn batch_expected_challenge(
                 return Err(AppError::BatchVerify("batch spans vaults".into()));
             }
             // The consent boundary, not an optimization: lifecycle and
-            // high-consequence kinds keep the per-op ceremony.
-            if rec.op.act.kind != ActType::Use {
+            // high-consequence kinds keep the per-op ceremony. Export joins
+            // behind E1 (design/approvals-inbox.md D2) — its value reaches
+            // only the creating waiter — and every per-op Export check still
+            // runs at this row's own apply (`export_precheck`).
+            if !matches!(rec.op.act.kind, ActType::Use | ActType::Export) {
                 return Err(AppError::BatchVerify(
-                    "batch may contain only `use` ops".into(),
+                    "batch may contain only `use` and `export` ops".into(),
                 ));
             }
             let r_bytes = STANDARD
@@ -411,8 +514,10 @@ pub async fn approve_op(
     Path(op_id): Path<String>,
     Json(mut grant): Json<Grant>,
 ) -> Result<Json<Value>> {
-    // 1. Look up the pending op.
-    let (vault_id, approval_op, stored_r) = {
+    // 1. Look up the pending op. A SUPERSEDED op is still `Pending` and still
+    // approvable (design/approvals-inbox.md D1): supersede is display state,
+    // and the grant verifies against this op's OWN stored (o, r).
+    let (vault_id, approval_op, stored_r, stored_pc) = {
         let store = state.approvals.lock().unwrap();
         let rec = store.get(&op_id).ok_or(AppError::NotFound)?;
         if !matches!(rec.status, ApprovalStatus::Pending) {
@@ -421,7 +526,12 @@ pub async fn approve_op(
         if rec.fail_count >= crate::approval::store::MAX_APPROVE_ATTEMPTS {
             return Err(AppError::TooManyRequests);
         }
-        (rec.vault_id.clone(), rec.op.clone(), rec.r.clone())
+        (
+            rec.vault_id.clone(),
+            rec.op.clone(),
+            rec.r.clone(),
+            rec.policy_context.clone(),
+        )
     };
 
     // 2. grant.o must equal the stored op (canonical equality). Batch arm:
@@ -453,6 +563,19 @@ pub async fn approve_op(
         } else {
             AppError::BadRequest("grant.r does not match this op's challenge".into())
         });
+    }
+
+    // 2b'. A Use op's SIGNED level/window must match the policy it was minted
+    // under (design/approvals-inbox.md D1), so the approver's rendered scope
+    // ("this one request" / "N min") is exactly what apply grants.
+    if approval_op.act.kind == ActType::Use {
+        if let Err(msg) = assert_signed_level(&approval_op.act.scope, stored_pc.as_ref()) {
+            return Err(if grant.batch.is_some() {
+                AppError::BatchVerify(msg)
+            } else {
+                AppError::BadRequest(msg)
+            });
+        }
     }
 
     // 2c. Batch arm — rebuild the Merkle root from OUR OWN stored ops and
@@ -488,6 +611,22 @@ pub async fn approve_op(
         )
     };
     let _vault_write_guard = vault_write_lock.lock().await;
+
+    // 3a. Re-check UNDER the vault write lock (design/approvals-inbox.md D1,
+    // atomic apply). One intent chain is always one vault (redeemer ==
+    // vault_id), and a chain's resolution flips every live sibling in the same
+    // `approvals` critical section as the applying op's own approve — so "still
+    // pending here" is exactly "this chain has not been resolved". Two grants
+    // for one chain arriving together: the second waits on this lock, finds
+    // the chain resolved, and its relay poll ends quietly on the 409.
+    {
+        let store = state.approvals.lock().unwrap();
+        match store.get(&op_id) {
+            Some(rec) if matches!(rec.status, ApprovalStatus::Pending) => {}
+            Some(_) => return Err(AppError::Conflict("op not pending".into())),
+            None => return Err(AppError::NotFound),
+        }
+    }
 
     // 3b. Resolve credential pubkey lookup.
     //
@@ -880,16 +1019,7 @@ pub async fn approve_op(
             )
         }
         ActType::Export => {
-            // F-15: reject KEM-sealed Export until it is implemented.
-            // If a client submits a grant with bind.recipient set, the raw-reveal
-            // path would silently ignore it and return the secret in plain TLS.
-            // Block this until a proper HPKE-sealed Export path is available.
-            if validated.op.bind.recipient.is_some() {
-                return Err(AppError::BadRequest(
-                    "KEM-sealed Export not yet implemented; omit bind.recipient".into(),
-                ));
-            }
-            let path = as_export_path(&validated.op)?;
+            let path = export_precheck(&validated.op)?;
             // Read seam: per-item store first, whole-blob vault.dat as fallback
             // (Option — a web-enrolled per-item vault has no vault.dat).
             let view = crate::server::handlers::metadata::open_view_for_grant(
@@ -900,19 +1030,6 @@ pub async fn approve_op(
                 &validated.credential_id_bytes,
                 existing_vault.as_ref(),
             )?;
-
-            // RETIRED: whole-vault reveal-all (`target = "env"` / "").
-            // An Export must name ONE secret so its plaintext egress stays
-            // scope-constrained (and single-use). The console editor no longer
-            // uses a daemon reveal-all — it derives its `{kv, aux}` view
-            // client-side (`revealAllVault = unlockVault`), and `sc secret get`
-            // always names a specific key. Refuse the unbounded form outright so
-            // no path can dump the whole vault's plaintext through one op.
-            if path == "env" || path.is_empty() {
-                return Err(AppError::BadRequest(
-                    "reveal-all export is retired — export a specific secret by name".into(),
-                ));
-            }
             {
                 let raw = view
                     .resolve_value_async(path)
@@ -1985,10 +2102,23 @@ pub async fn approve_op(
     // the record before mutation so we can write into the rule-approvals
     // cache below — without this, an `ask`-with-TTL approval would never
     // short-circuit the next matching request.
-    let (rec_id, rec_vault_id, response_preview, policy_ctx_for_cache, rec_agent_prefix) = {
+    //
+    // Intent chain (design/approvals-inbox.md D1): the applying op's approve
+    // and the resolution of every other live op of its chain (approved,
+    // `satisfied_by` = this op, no value of its own) happen in this ONE
+    // `approvals` acquisition. Their relay withdrawals are spawned below,
+    // after it is released. One applied op = one grant, exactly as before.
+    let (
+        rec_id,
+        rec_vault_id,
+        response_preview,
+        policy_ctx_for_cache,
+        rec_agent_prefix,
+        satisfied_siblings,
+    ) = {
         let mut store = state.approvals.lock().unwrap();
-        let rec = store
-            .approve(&op_id, cached_value.clone())
+        let (rec, siblings) = store
+            .approve_chain(&op_id, cached_value.clone())
             .ok_or_else(|| AppError::Conflict("op no longer pending after validation".into()))?;
         let preview = match &validated.op.act.kind {
             ActType::Use => cached_value
@@ -2010,6 +2140,7 @@ pub async fn approve_op(
             preview,
             pc,
             rec.agent_prefix.clone().unwrap_or_default(),
+            siblings,
         )
     };
 
@@ -2110,14 +2241,88 @@ pub async fn approve_op(
 
     state.emit_event(ApprovalEvent {
         vault_id: rec_vault_id,
-        approval_id: rec_id,
+        approval_id: rec_id.clone(),
         kind: "approved".into(),
         op_summary: None,
         response_preview,
         reason: None,
     });
 
+    finish_chain_siblings(
+        &state,
+        &satisfied_siblings,
+        &ChainOutcome::Satisfied { by: &rec_id },
+    );
+
     Ok(Json(response))
+}
+
+/// How an intent chain resolved its siblings.
+pub(crate) enum ChainOutcome<'a> {
+    /// `by` applied; the siblings resolved approved with `satisfied_by = by`.
+    Satisfied { by: &'a str },
+    /// The user rejected `by`; the siblings resolved rejected.
+    Rejected { by: &'a str },
+}
+
+/// Bookkeeping for intent-chain siblings ALREADY resolved in the store
+/// (`approve_chain` / `reject_chain`): audit row, SSE event, and the relay
+/// withdrawal with its reason. Called after the `approvals` mutex is
+/// released. The audit row is `cancelled` (a non-access outcome: the sibling
+/// itself touched no credential — the applied op is the one approval of
+/// record) with the pointer in its reason, matching the relay row's cancel.
+pub(crate) fn finish_chain_siblings(
+    state: &Arc<AppState>,
+    siblings: &[crate::approval::ChainSibling],
+    outcome: &ChainOutcome<'_>,
+) {
+    if siblings.is_empty() {
+        return;
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    for sib in siblings {
+        let (audit_reason, kind, relay_reason) = match outcome {
+            ChainOutcome::Satisfied { by } => (
+                format!("satisfied by {}", by),
+                "approved",
+                crate::relay::client::CancelReason::Satisfied { by: by.to_string() },
+            ),
+            ChainOutcome::Rejected { by } => (
+                format!("rejected with {}", by),
+                "rejected",
+                crate::relay::client::CancelReason::Rejected,
+            ),
+        };
+        if let Ok(store) = state.audits.for_vault(&sib.vault_id) {
+            if let Err(e) = store.finalize(
+                &sib.id,
+                crate::audit::STATUS_CANCELLED,
+                now,
+                None,
+                Some(&audit_reason),
+                None,
+            ) {
+                tracing::warn!(vault = %sib.vault_id, op = %sib.id, "audit finalize chain sibling failed: {}", e);
+            }
+        }
+        state.emit_event(ApprovalEvent {
+            vault_id: sib.vault_id.clone(),
+            approval_id: sib.id.clone(),
+            kind: kind.into(),
+            op_summary: None,
+            response_preview: None,
+            reason: Some(audit_reason),
+        });
+        crate::relay::client::spawn_cancel(
+            state.clone(),
+            sib.vault_id.clone(),
+            sib.id.clone(),
+            Some(relay_reason),
+        );
+    }
 }
 
 /// Connection ids (established `aux.connections` + in-flight `aux.connecting`)
@@ -2151,17 +2356,23 @@ pub async fn reject_op(
     // failure as a human "no" misled every reader — the approver saw their
     // own approval come back as a denial, and the agent was told not to
     // retry a request the user in fact allowed.
-    let reason: String = body
+    let explicit: Option<String> = body
         .as_ref()
         .and_then(|b| b.get("reason"))
         .and_then(|v| v.as_str())
         .map(|s| s.chars().take(300).collect::<String>())
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "user rejected".to_string());
-    let (rec_id, rec_vault_id) = {
+        .filter(|s| !s.trim().is_empty());
+    // Only a USER rejection (no carried cause) resolves the whole intent chain
+    // (design/approvals-inbox.md D1): an apply failure is about THIS grant,
+    // never the human's answer to the request.
+    let user_rejection = explicit.is_none();
+    let reason = explicit.unwrap_or_else(|| "user rejected".to_string());
+    let (rec_id, rec_vault_id, rejected_siblings) = {
         let mut store = state.approvals.lock().unwrap();
-        let rec = store.reject(&op_id, &reason).ok_or(AppError::NotFound)?;
-        (rec.id.clone(), rec.vault_id.clone())
+        let (rec, siblings) = store
+            .reject_chain(&op_id, &reason, user_rejection)
+            .ok_or(AppError::NotFound)?;
+        (rec.id.clone(), rec.vault_id.clone(), siblings)
     };
 
     // Audit: pending → rejected.
@@ -2190,6 +2401,12 @@ pub async fn reject_op(
         response_preview: None,
         reason: Some(reason),
     });
+
+    finish_chain_siblings(
+        &state,
+        &rejected_siblings,
+        &ChainOutcome::Rejected { by: &rec_id },
+    );
 
     Ok(Json(
         json!({ "ok": true, "op_id": rec_id, "status": "rejected" }),
@@ -2934,18 +3151,90 @@ mod tests {
         let op_id = {
             let mut s = state.approvals.lock().unwrap();
             let id = s.create("v1".into(), export_op("GITHUB_TOKEN"), "r".into());
+            s.set_waiter(&id, "w-secret");
             s.approve(&id, Some("ghp_SECRET".into()));
             id
         };
 
-        let first = op_poll_value(&state, &op_id).unwrap();
+        let first = op_poll_value(&state, &op_id, Some("w-secret")).unwrap();
         assert_eq!(first["status"], "ok");
         assert_eq!(first["value"], "ghp_SECRET");
 
         // Second read: consumed tombstone, the plaintext is gone.
-        let second = op_poll_value(&state, &op_id).unwrap();
+        let second = op_poll_value(&state, &op_id, Some("w-secret")).unwrap();
         assert_eq!(second["status"], "consumed");
         assert!(second.get("value").and_then(|v| v.as_str()).is_none());
+    }
+
+    // E1: whoever polls first no longer gets the plaintext. Without (or with a
+    // wrong) waiter secret the poll sees status only and consumes NOTHING;
+    // the creator's poll still gets the value afterwards.
+    #[test]
+    fn export_value_released_only_with_waiter_secret() {
+        let state = test_state();
+        let op_id = {
+            let mut s = state.approvals.lock().unwrap();
+            let id = s.create("v1".into(), export_op("GITHUB_TOKEN"), "r".into());
+            s.set_waiter(&id, "w-secret");
+            s.approve(&id, Some("ghp_SECRET".into()));
+            id
+        };
+        for bad in [None, Some("wrong"), Some("")] {
+            let body = op_poll_value(&state, &op_id, bad).unwrap();
+            assert_eq!(body["status"], "ok", "status is still visible");
+            assert!(
+                body["value"].is_null(),
+                "no value without the secret: {body}"
+            );
+        }
+        let good = op_poll_value(&state, &op_id, Some("w-secret")).unwrap();
+        assert_eq!(
+            good["value"], "ghp_SECRET",
+            "not consumed by the status-only polls"
+        );
+
+        // An Export with NO waiter secret on record never releases its value.
+        let bare = {
+            let mut s = state.approvals.lock().unwrap();
+            let id = s.create("v1".into(), export_op("X"), "r".into());
+            s.approve(&id, Some("plain".into()));
+            id
+        };
+        let body = op_poll_value(&state, &bare, Some("anything")).unwrap();
+        assert!(body["value"].is_null());
+    }
+
+    // Liveness: only a poll carrying the valid secret refreshes the clock.
+    #[test]
+    fn waiter_poll_refreshes_liveness() {
+        let state = test_state();
+        let op_id = {
+            let mut s = state.approvals.lock().unwrap();
+            let id = s.create("v1".into(), export_op("K"), "r".into());
+            s.set_waiter(&id, "w");
+            s.get_mut_for_test(&id).unwrap().last_waiter_poll =
+                std::time::Instant::now() - std::time::Duration::from_secs(90);
+            id
+        };
+        let idle = std::time::Duration::from_secs(60);
+        op_poll_value(&state, &op_id, None).unwrap();
+        op_poll_value(&state, &op_id, Some("nope")).unwrap();
+        assert_eq!(
+            state
+                .approvals
+                .lock()
+                .unwrap()
+                .abandoned_exports(idle)
+                .len(),
+            1
+        );
+        op_poll_value(&state, &op_id, Some("w")).unwrap();
+        assert!(state
+            .approvals
+            .lock()
+            .unwrap()
+            .abandoned_exports(idle)
+            .is_empty());
     }
 
     // A Use result is the agent's own upstream reply, which its poll loop may
@@ -2974,7 +3263,7 @@ mod tests {
         };
 
         for _ in 0..2 {
-            let body = op_poll_value(&state, &op_id).unwrap();
+            let body = op_poll_value(&state, &op_id, None).unwrap();
             assert_eq!(body["status"], "ok");
             assert_eq!(body["value"]["status"], 200);
         }
@@ -3077,22 +3366,37 @@ mod tests {
             AppError::BatchVerify(_)
         ));
 
-        // Non-Use sibling (Export) — the consent boundary.
-        let export_id = {
+        // Lifecycle / high-consequence sibling — the consent boundary.
+        let custom_id = {
             let mut s = state.approvals.lock().unwrap();
             let mut op = use_op("v1", "/x");
-            op.act.kind = ActType::Export;
+            op.act.kind = ActType::Custom("vault-delete".into());
             s.create("v1".into(), op, b64r(9))
+        };
+        let g = batch_grant(
+            use_op("v1", "/r/0"),
+            &b64r(0),
+            vec![ids[0].clone(), custom_id],
+        );
+        assert!(matches!(
+            batch_expected_challenge(&state, &ids[0], "v1", &g).unwrap_err(),
+            AppError::BatchVerify(_)
+        ));
+
+        // Export joins the batch arm (design/approvals-inbox.md D2, behind E1).
+        let export_id = {
+            let mut s = state.approvals.lock().unwrap();
+            s.create("v1".into(), export_op("GITHUB_TOKEN"), b64r(7))
         };
         let g = batch_grant(
             use_op("v1", "/r/0"),
             &b64r(0),
             vec![ids[0].clone(), export_id],
         );
-        assert!(matches!(
-            batch_expected_challenge(&state, &ids[0], "v1", &g).unwrap_err(),
-            AppError::BatchVerify(_)
-        ));
+        assert!(
+            batch_expected_challenge(&state, &ids[0], "v1", &g).is_ok(),
+            "a use+export batch must rebuild its root"
+        );
 
         // Cross-vault sibling.
         let other_vault_id = {
@@ -3163,6 +3467,283 @@ mod tests {
 
         // Batch grant must not carry a top-level assertion (checked in the
         // validation arm, not the challenge rebuild — see validate_batch_grant).
+    }
+
+    // ── approvals inbox (design/approvals-inbox.md) ─────────────────────────
+
+    /// Batching never relaxes an Export's own checks: every one still runs
+    /// at the row's apply (the same `export_precheck` both arms reach).
+    #[test]
+    fn export_precheck_enforced_regardless_of_arm() {
+        assert_eq!(
+            export_precheck(&export_op("GITHUB_TOKEN")).unwrap(),
+            "GITHUB_TOKEN"
+        );
+        for bad in ["env", ""] {
+            assert!(matches!(
+                export_precheck(&export_op(bad)),
+                Err(AppError::BadRequest(_))
+            ));
+        }
+        let mut sealed = export_op("GITHUB_TOKEN");
+        sealed.bind.recipient = Some(sudp::RecipientPk {
+            alg: "x".into(),
+            bytes: "y".into(),
+        });
+        assert!(matches!(
+            export_precheck(&sealed),
+            Err(AppError::BadRequest(_))
+        ));
+        let mut wrong_kind = export_op("GITHUB_TOKEN");
+        wrong_kind.act.kind = ActType::Use;
+        assert!(export_precheck(&wrong_kind).is_err());
+    }
+
+    fn pc(level: crate::core::policy::AccessLevel, ttl: u64) -> crate::approval::PolicyContext {
+        crate::approval::PolicyContext {
+            level,
+            rule_id: None,
+            ttl_seconds: ttl,
+            host: Some("api.github.com".into()),
+        }
+    }
+
+    #[test]
+    fn signed_level_assertion() {
+        use crate::core::policy::AccessLevel;
+        let ask = pc(AccessLevel::Ask, 900);
+        let always = pc(AccessLevel::AskAlways, 900);
+        // ask + matching window.
+        assert!(assert_signed_level(&json!({"level":"ask","window_s":900}), Some(&ask)).is_ok());
+        // ask-always omits window_s while its record still carries a ttl.
+        assert!(assert_signed_level(&json!({"level":"ask-always"}), Some(&always)).is_ok());
+        // Level mismatch either way.
+        assert!(
+            assert_signed_level(&json!({"level":"ask","window_s":900}), Some(&always)).is_err()
+        );
+        assert!(assert_signed_level(&json!({"level":"ask-always"}), Some(&ask)).is_err());
+        // Window mismatch / non-integer window.
+        assert!(assert_signed_level(&json!({"level":"ask","window_s":60}), Some(&ask)).is_err());
+        assert!(assert_signed_level(&json!({"level":"ask","window_s":"900"}), Some(&ask)).is_err());
+        // A signed level with no policy context can't be honoured.
+        assert!(assert_signed_level(&json!({"level":"ask"}), None).is_err());
+        // Pre-field scope: left to the existing pc-driven apply.
+        assert!(assert_signed_level(&json!({"method":"GET"}), Some(&ask)).is_ok());
+        assert!(assert_signed_level(&Value::Null, None).is_ok());
+    }
+
+    fn leveled_use_op(level: &str, window: Option<u64>) -> crate::protocol::operation::Operation {
+        let mut op = use_op("v1", "/user");
+        op.act.scope["level"] = json!(level);
+        if let Some(w) = window {
+            op.act.scope["window_s"] = json!(w);
+        }
+        op
+    }
+
+    fn plain_grant(op: crate::protocol::operation::Operation, r: &str) -> Grant {
+        let mut g = batch_grant(op, r, vec![]);
+        g.batch = None;
+        g.assertion = Some(crate::passkey::webauthn::AssertionData {
+            credential_id: None,
+            authenticator_data: String::new(),
+            client_data_json: String::new(),
+            signature: String::new(),
+        });
+        g
+    }
+
+    /// Apply-time: a stored op whose signed level disagrees with the policy it
+    /// was minted under is refused before any crypto or vault access —
+    /// BadRequest on the plain arm, recoverable BatchVerify on the batch arm.
+    #[tokio::test]
+    async fn approve_refuses_signed_level_mismatch() {
+        use crate::core::policy::AccessLevel;
+        let state = Arc::new(test_state());
+        let op = leveled_use_op("ask-always", None);
+        let id = {
+            let mut s = state.approvals.lock().unwrap();
+            s.create_with_policy(
+                "v1".into(),
+                op.clone(),
+                b64r(1),
+                Some(pc(AccessLevel::Ask, 900)),
+            )
+        };
+        let err = approve_op(
+            State(state.clone()),
+            Path(id.clone()),
+            Json(plain_grant(op.clone(), &b64r(1))),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&err, AppError::BadRequest(m) if m.contains("level")),
+            "{err}"
+        );
+
+        let err = approve_op(
+            State(state.clone()),
+            Path(id.clone()),
+            Json(batch_grant(op, &b64r(1), vec![id.clone(), "other".into()])),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&err, AppError::BatchVerify(m) if m.contains("level")),
+            "{err}"
+        );
+
+        // ask with a window that doesn't match pc.ttl_seconds.
+        let op = leveled_use_op("ask", Some(60));
+        let id = {
+            let mut s = state.approvals.lock().unwrap();
+            s.create_with_policy(
+                "v1".into(),
+                op.clone(),
+                b64r(2),
+                Some(pc(AccessLevel::Ask, 900)),
+            )
+        };
+        let err = approve_op(
+            State(state.clone()),
+            Path(id),
+            Json(plain_grant(op, &b64r(2))),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&err, AppError::BadRequest(m) if m.contains("window_s")),
+            "{err}"
+        );
+    }
+
+    fn chained(state: &AppState, path: &str, r: &str) -> crate::approval::ChainedCreate {
+        let mut op = use_op("v1", path);
+        op.act.scope["level"] = json!("ask");
+        op.act.scope["window_s"] = json!(900);
+        state.approvals.lock().unwrap().create_chained(
+            "v1".into(),
+            op,
+            r.into(),
+            Some(pc(crate::core::policy::AccessLevel::Ask, 900)),
+            Some("ag_x".into()),
+        )
+    }
+
+    /// GET /op/{id}: a superseded op stays `pending` with its pointer; once a
+    /// sibling applies it mirrors the applied op's body (`ok`, no value) plus
+    /// `satisfied_by`.
+    #[test]
+    fn chain_poll_bodies() {
+        let state = test_state();
+        let a = chained(&state, "/user", &b64r(1));
+        let b = chained(&state, "/user", &b64r(2));
+
+        let pa = op_poll_value(&state, &a.id, None).unwrap();
+        assert_eq!(pa["status"], "pending");
+        assert_eq!(pa["superseded_by"], json!(b.id));
+        assert_eq!(pa["retry_count"], 1);
+        assert!(pa["satisfied_by"].is_null());
+        let pb = op_poll_value(&state, &b.id, None).unwrap();
+        assert_eq!(pb["status"], "pending");
+        assert!(pb["superseded_by"].is_null());
+        assert_eq!(pb["retry_count"], 2);
+
+        // Apply B (the head) the way approve_op's step 5 does.
+        state
+            .approvals
+            .lock()
+            .unwrap()
+            .approve_chain(&b.id, None)
+            .unwrap();
+        let applied = op_poll_value(&state, &b.id, None).unwrap();
+        let sat = op_poll_value(&state, &a.id, None).unwrap();
+        for k in ["status", "value", "reason", "act"] {
+            assert_eq!(sat[k], applied[k], "satisfied sibling mirrors `{k}`");
+        }
+        assert_eq!(sat["status"], "ok");
+        assert!(sat["value"].is_null());
+        assert_eq!(sat["satisfied_by"], json!(b.id));
+        assert!(applied["satisfied_by"].is_null());
+    }
+
+    /// A second grant for an already-resolved chain is a 409 at the pre-lock
+    /// check — no validation, no fail_count — and the relay client ends that
+    /// poll quietly.
+    #[tokio::test]
+    async fn approve_on_resolved_chain_member_is_conflict() {
+        let state = Arc::new(test_state());
+        let a = chained(&state, "/user", &b64r(1));
+        let b = chained(&state, "/user", &b64r(2));
+        state
+            .approvals
+            .lock()
+            .unwrap()
+            .approve_chain(&b.id, None)
+            .unwrap();
+        let op = state
+            .approvals
+            .lock()
+            .unwrap()
+            .get(&a.id)
+            .unwrap()
+            .op
+            .clone();
+        let err = approve_op(
+            State(state.clone()),
+            Path(a.id.clone()),
+            Json(plain_grant(op, &b64r(1))),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, AppError::Conflict(_)), "{err}");
+        assert_eq!(
+            state
+                .approvals
+                .lock()
+                .unwrap()
+                .get(&a.id)
+                .unwrap()
+                .fail_count,
+            0
+        );
+    }
+
+    /// reject_op: a USER rejection (no carried reason) resolves every live op
+    /// of the chain; an apply-failure rejection touches only its own op.
+    #[tokio::test]
+    async fn reject_op_propagates_user_rejection_to_chain() {
+        let state = Arc::new(test_state());
+        let a = chained(&state, "/user", &b64r(1));
+        let b = chained(&state, "/user", &b64r(2));
+        let _ = reject_op(
+            State(state.clone()),
+            Path(b.id.clone()),
+            Some(Json(
+                json!({ "reason": "approved, but applying it failed: boom" }),
+            )),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            op_poll_value(&state, &a.id, None).unwrap()["status"],
+            "pending"
+        );
+
+        let c = chained(&state, "/user", &b64r(3));
+        let _ = reject_op(State(state.clone()), Path(c.id.clone()), None)
+            .await
+            .unwrap();
+        let pa = op_poll_value(&state, &a.id, None).unwrap();
+        assert_eq!(pa["status"], "rejected");
+        assert_eq!(pa["reason"], "user rejected");
+        // Unrelated request untouched.
+        let other = chained(&state, "/repos", &b64r(4));
+        assert_eq!(
+            op_poll_value(&state, &other.id, None).unwrap()["status"],
+            "pending"
+        );
     }
 
     /// Enroll seeds a per-item store ONLY for a new vault: an existing store

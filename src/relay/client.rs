@@ -79,6 +79,10 @@ pub fn spawn_register_and_poll(
     // relay so the approve page can name WHO asked. None for user-initiated
     // lifecycle ceremonies (unlock/lock/delete).
     agent_id: Option<String>,
+    // The live ops this op just superseded in its intent chain
+    // (design/approvals-inbox.md D1). The backend marks exactly these ids;
+    // it never supersedes by key match. Empty for everything but `use`.
+    supersedes: Vec<String>,
 ) {
     let (relay_url, auth_token) = match resolve_relay(&state) {
         Some(v) => v,
@@ -95,6 +99,7 @@ pub fn spawn_register_and_poll(
             &r,
             expires_at,
             agent_id.as_deref(),
+            &supersedes,
         )
         .await
         {
@@ -103,12 +108,57 @@ pub fn spawn_register_and_poll(
     });
 }
 
+/// Why a relay row is withdrawn (contract §2 cancel body `reason`). `None` at
+/// the call site = the legacy reason-less cancel (lifecycle supersede).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CancelReason {
+    /// Another op of the same intent chain applied.
+    Satisfied { by: String },
+    /// The user rejected another op of the same intent chain.
+    Rejected,
+    /// The requester withdrew its own op (`POST /op/{id}/cancel`).
+    Withdrawn,
+    /// The Export waiter stopped polling (E1 liveness backstop).
+    Abandoned,
+}
+
+impl CancelReason {
+    fn as_str(&self) -> &'static str {
+        match self {
+            CancelReason::Satisfied { .. } => "satisfied",
+            CancelReason::Rejected => "rejected",
+            CancelReason::Withdrawn => "withdrawn",
+            CancelReason::Abandoned => "abandoned",
+        }
+    }
+}
+
+/// The relay cancel body: `daemon_pubkey` as before, plus `reason` and (for
+/// `satisfied`) `satisfied_by`. A reason-less cancel sends neither, so the
+/// backend stores null and behaves as today.
+fn cancel_body(daemon_pubkey: &str, reason: Option<&CancelReason>) -> Value {
+    let mut body = json!({ "daemon_pubkey": daemon_pubkey });
+    if let Some(r) = reason {
+        body["reason"] = json!(r.as_str());
+        if let CancelReason::Satisfied { by } = r {
+            body["satisfied_by"] = json!(by);
+        }
+    }
+    body
+}
+
 /// Fire-and-forget: withdraw a still-pending op from the relay (device-key
-/// auth). Called when a new ceremony op supersedes a stale one — the requester
-/// voids its OWN prior request. No passkey/W_c involved (nothing was granted).
+/// auth). Called when the requester voids its OWN request (a superseding
+/// ceremony, `POST /op/{id}/cancel`, an abandoned Export) or when an intent
+/// chain resolves its siblings. No passkey/W_c involved (nothing was granted).
 /// The backend only flips `pending → cancelled`, so an already-approved op is
 /// untouched. No-op when there's no cloud relay configured.
-pub fn spawn_cancel(state: Arc<AppState>, vault_id: String, op_id: String) {
+pub fn spawn_cancel(
+    state: Arc<AppState>,
+    vault_id: String,
+    op_id: String,
+    reason: Option<CancelReason>,
+) {
     let (base, auth_token) = match resolve_relay(&state) {
         Some(v) => v,
         None => return,
@@ -120,7 +170,7 @@ pub fn spawn_cancel(state: Arc<AppState>, vault_id: String, op_id: String) {
             Ok(c) => c,
             Err(_) => return,
         };
-        let cancel_body = json!({ "daemon_pubkey": daemon_pubkey });
+        let cancel_body = cancel_body(&daemon_pubkey, reason.as_ref());
         match client
             .post(&url)
             .bearer_auth(&auth_token)
@@ -134,7 +184,7 @@ pub fn spawn_cancel(state: Arc<AppState>, vault_id: String, op_id: String) {
             .await
         {
             Ok(r) if r.status().is_success() => {
-                tracing::info!(op = %op_id, "superseded op withdrawn from relay");
+                tracing::info!(op = %op_id, "op withdrawn from relay");
             }
             Ok(r) => tracing::debug!(op = %op_id, "relay cancel HTTP {}", r.status()),
             Err(e) => tracing::debug!(op = %op_id, "relay cancel error: {}", e),
@@ -176,6 +226,7 @@ async fn run(
     r: &str,
     expires_at: u64,
     agent_id: Option<&str>,
+    supersedes: &[String],
 ) -> Result<(), String> {
     let base = relay_url.trim_end_matches('/');
     // v1.1: register for `op` stream events before anything can flip the
@@ -197,7 +248,7 @@ async fn run(
     let op_summary = STANDARD.encode(serde_json::to_vec(op).unwrap_or_default());
     let passkeys = fetch_passkeys(&client, state.config.port, vault_id).await;
     let reg_url = format!("{}/v/{}/op/relay/register", base, vault_id);
-    let reg_body = json!({
+    let base_body = json!({
         "op_id": op_id,
         "daemon_pubkey": daemon_pubkey,
         "op_summary": op_summary,
@@ -216,6 +267,7 @@ async fn run(
         // a label); null for user-initiated lifecycle ceremonies.
         "agent_id": agent_id,
     });
+    let reg_body = register_body(&state, &base_body, op_id, supersedes);
     let reg = client
         .post(&reg_url)
         .bearer_auth(auth_token)
@@ -279,7 +331,22 @@ async fn run(
                     next_poll_due(&op_wait, vault_id, last_poll).await;
                     continue;
                 }
+                // Already resolved locally (an intent-chain sibling applied or
+                // the user rejected the chain, design/approvals-inbox.md D1):
+                // a late grant for it ends the poll quietly — no reject, no
+                // "approved but apply failed" audit row.
+                if resolved_locally(&state, op_id) {
+                    tracing::info!(op = %op_id, "grant arrived for an op already resolved locally; poll ending");
+                    return Ok(());
+                }
                 if let Err(e) = apply_grant(state.clone(), op_id, grant).await {
+                    // Lost the race (a second grant for one chain, or a
+                    // sibling resolved it mid-apply): the 409 is not a
+                    // failure of THIS approval — end quietly.
+                    if resolved_locally(&state, op_id) {
+                        tracing::info!(op = %op_id, "op resolved locally while its grant applied; poll ending");
+                        return Ok(());
+                    }
                     if e.batch_verify_failed {
                         // RECOVERABLE (design/batch-approve.md §Daemon verify
                         // 7): never reject a user-approved op over a failed
@@ -292,6 +359,9 @@ async fn run(
                         // own expiry.
                         last_batch_failed = Some(grant_hash);
                         tracing::warn!(op = %op_id, "batch grant failed verification ({}); re-registering op so per-op approval works again", e.detail);
+                        // Recovery re-register: `supersedes: []` (nothing was
+                        // just marked), the op's CURRENT superseded_by.
+                        let reg_body = register_body(&state, &base_body, op_id, &[]);
                         let rr = client
                             .post(&reg_url)
                             .bearer_auth(auth_token)
@@ -360,8 +430,9 @@ async fn run(
             }
             404 => return Ok(()), // unknown/expired on the relay side
             409 => {
-                // Cancelled: the requester (this daemon, via a superseding op)
-                // withdrew it. Stop polling — nothing more will arrive.
+                // Cancelled: this daemon withdrew it (a superseding ceremony, a
+                // requester cancel, an abandoned Export, or its intent chain
+                // resolved). Stop polling — nothing more will arrive.
                 tracing::info!(op = %op_id, "relay op cancelled by requester; poll stopping");
                 return Ok(());
             }
@@ -372,6 +443,39 @@ async fn run(
         }
     }
     Ok(())
+}
+
+/// The register body: the op's static fields plus the intent-chain state the
+/// backend mirrors (design/approvals-inbox.md D1, contract §2): this
+/// process's `boot_id`, the ids this op just superseded, and the op's CURRENT
+/// `superseded_by` + `retry_count` read from the store at send time (register
+/// tasks can land out of order; the backend applies pointers monotonically).
+fn register_body(state: &AppState, base: &Value, op_id: &str, supersedes: &[String]) -> Value {
+    let (superseded_by, retry_count) = {
+        let store = state.approvals.lock().unwrap();
+        store
+            .get_any(op_id)
+            .map(|r| (r.superseded_by.clone(), r.retry_count))
+            .unwrap_or((None, 1))
+    };
+    let mut body = base.clone();
+    body["boot_id"] = json!(state.boot_id);
+    body["supersedes"] = json!(supersedes);
+    body["superseded_by"] = json!(superseded_by);
+    body["retry_count"] = json!(retry_count.max(1));
+    body
+}
+
+/// True when the local op record exists and is no longer pending (approved,
+/// satisfied by a chain sibling, rejected, withdrawn, consumed).
+fn resolved_locally(state: &AppState, op_id: &str) -> bool {
+    state
+        .approvals
+        .lock()
+        .unwrap()
+        .get_any(op_id)
+        .map(|r| !matches!(r.status, crate::approval::ApprovalStatus::Pending))
+        .unwrap_or(false)
 }
 
 /// Apply a relay-fetched grant by replaying it through the daemon's own
@@ -474,5 +578,121 @@ mod tests {
     fn poll_interval_is_mode_dependent() {
         assert_eq!(poll_interval(true), Duration::from_secs(15));
         assert_eq!(poll_interval(false), Duration::from_secs(2));
+    }
+
+    fn test_state() -> AppState {
+        AppState::new(crate::config::Config {
+            state_dir: std::path::PathBuf::from(format!(
+                "/tmp/safeclaw-test-relay-{}",
+                std::process::id()
+            )),
+            port: 0,
+            proxy_port: 0,
+            listen: "127.0.0.1".into(),
+            origin: "http://localhost".into(),
+            rp_id: "localhost".into(),
+            admin_key: None,
+            relay_url: None,
+            body_cap: crate::config::DEFAULT_BODY_CAP,
+        })
+    }
+
+    /// Contract §2: reason + satisfied_by ride the cancel body; a legacy
+    /// reason-less cancel sends neither (backend stores null, as today).
+    #[test]
+    fn cancel_body_carries_reason_and_pointer() {
+        assert_eq!(cancel_body("pk", None), json!({ "daemon_pubkey": "pk" }));
+        assert_eq!(
+            cancel_body("pk", Some(&CancelReason::Satisfied { by: "op-b".into() })),
+            json!({ "daemon_pubkey": "pk", "reason": "satisfied", "satisfied_by": "op-b" })
+        );
+        for (r, s) in [
+            (CancelReason::Rejected, "rejected"),
+            (CancelReason::Withdrawn, "withdrawn"),
+            (CancelReason::Abandoned, "abandoned"),
+        ] {
+            let b = cancel_body("pk", Some(&r));
+            assert_eq!(b["reason"], s);
+            assert!(b.get("satisfied_by").is_none());
+        }
+    }
+
+    /// Contract §2: the register body carries this process's boot_id, the ids
+    /// just superseded, and the op's CURRENT pointer + retry_count read at
+    /// send time; recovery re-register passes `supersedes: []`.
+    #[test]
+    fn register_body_carries_chain_state() {
+        use crate::core::policy::AccessLevel;
+        use crate::protocol::operation::{Act, ActType, Bind, Operation, Valid};
+        let state = test_state();
+        let op = Operation {
+            act: Act {
+                kind: ActType::Use,
+                target: "GITHUB_TOKEN".into(),
+                scope: json!({ "method": "GET", "host": "h", "path": "/p", "level": "ask", "window_s": 60 }),
+            },
+            bind: Bind {
+                redeemer: "v1".into(),
+                recipient: None,
+            },
+            valid: Valid::single_use(0, None),
+        };
+        let pc = crate::approval::PolicyContext {
+            level: AccessLevel::Ask,
+            rule_id: None,
+            ttl_seconds: 60,
+            host: Some("h".into()),
+        };
+        let (a, b) = {
+            let mut s = state.approvals.lock().unwrap();
+            let a = s.create_chained("v1".into(), op.clone(), "r1".into(), Some(pc.clone()), None);
+            let b = s.create_chained("v1".into(), op, "r2".into(), Some(pc), None);
+            (a, b)
+        };
+        let base = json!({ "op_id": "x", "daemon_version": "v" });
+
+        let head = register_body(&state, &base, &b.id, &b.supersedes);
+        assert_eq!(head["boot_id"], json!(state.boot_id));
+        assert_eq!(state.boot_id.len(), 32);
+        assert_eq!(head["supersedes"], json!([a.id.clone()]));
+        assert!(head["superseded_by"].is_null());
+        assert_eq!(head["retry_count"], 2);
+        assert_eq!(head["daemon_version"], "v", "static fields preserved");
+
+        // A's (late) register / recovery re-register: no supersedes, but its
+        // current pointer so the backend converges on one head.
+        let old = register_body(&state, &base, &a.id, &[]);
+        assert_eq!(old["supersedes"], json!([]));
+        assert_eq!(old["superseded_by"], json!(b.id));
+        assert_eq!(old["retry_count"], 1);
+    }
+
+    /// A late grant for an op the chain already resolved ends the relay poll
+    /// quietly (no reject, no apply-failure audit).
+    #[test]
+    fn resolved_locally_tracks_status() {
+        use crate::protocol::operation::{Act, ActType, Bind, Operation, Valid};
+        let state = test_state();
+        let op = Operation {
+            act: Act {
+                kind: ActType::Export,
+                target: "K".into(),
+                scope: Value::Null,
+            },
+            bind: Bind {
+                redeemer: "v1".into(),
+                recipient: None,
+            },
+            valid: Valid::single_use(0, None),
+        };
+        let id = state
+            .approvals
+            .lock()
+            .unwrap()
+            .create("v1".into(), op, "r".into());
+        assert!(!resolved_locally(&state, &id));
+        assert!(!resolved_locally(&state, "unknown"));
+        state.approvals.lock().unwrap().approve(&id, None);
+        assert!(resolved_locally(&state, &id));
     }
 }
