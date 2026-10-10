@@ -1716,7 +1716,11 @@ refresh_token = "REFRESH_TOKEN"
 
         // vault.dat: the stale mirror, OPENAI_API_KEY = "old".
         let mut m_old = ProtectedState::new();
-        m_old.aux = serde_json::json!({ "version": 3, "stores": {}, "store_order": [] });
+        m_old.aux = serde_json::json!({
+            "version": crate::storage::plaintext::PLAINTEXT_VERSION,
+            "stores": {},
+            "store_order": []
+        });
         m_old.put_secret("OPENAI_API_KEY", b"old".to_vec());
         let mut vault = crate::storage::sealed_vault::build_initial(
             b"c".to_vec(),
