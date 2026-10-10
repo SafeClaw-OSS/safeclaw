@@ -1095,9 +1095,11 @@ impl ViewBase {
     }
 }
 
+/// SHA-256 of the body's JCS canonical form (sorted keys), so the digest never
+/// depends on map ordering (e.g. a `preserve_order` serde_json feature).
 fn body_digest(body: &serde_json::Value) -> [u8; 32] {
     use sha2::{Digest, Sha256};
-    Sha256::digest(serde_json::to_vec(body).unwrap_or_default()).into()
+    Sha256::digest(crate::crypto::canonical::canonicalize(body)).into()
 }
 
 /// The daemon's per-item on-disk vault: keyset blob + N sealed item records.

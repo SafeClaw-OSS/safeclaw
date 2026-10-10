@@ -710,6 +710,9 @@ pub(crate) async fn apply_pending_connects(
     // per-item vault this is the ONLY durable write. Per-item upserts are
     // version-bumped for CAS, so a concurrent browser edit to a DIFFERENT item
     // never collides (contract §4).
+    // What the cache serves: the store as reconciled (see
+    // `reconcile_per_item_after_connect`), else the caller's view.
+    let served;
     if let Some(mut vault) = vault_dat {
         if let Err(e) = crate::server::handlers::metadata::reseal_body_with_key(&k, &mut vault, &m)
         {
@@ -720,7 +723,7 @@ pub(crate) async fn apply_pending_connects(
             tracing::warn!(vault = %vault_id, "oauth connect: write vault.dat failed: {}", e);
             return ConnectReport::default();
         }
-        reconcile_per_item_after_connect(
+        served = reconcile_per_item_after_connect(
             state,
             vault_id,
             Some(&vault),
@@ -729,7 +732,7 @@ pub(crate) async fn apply_pending_connects(
             ReconcileBase::Since(&base),
         );
     } else {
-        reconcile_per_item_after_connect(
+        served = reconcile_per_item_after_connect(
             state,
             vault_id,
             None,
@@ -747,7 +750,10 @@ pub(crate) async fn apply_pending_connects(
 
     // Refresh the in-memory cache so /use sees the new refresh_token without a
     // manual lock/unlock. Best-effort.
-    let cache = crate::server::handlers::approve::bootstrap_cache_from_view(&view, state);
+    let cache = crate::server::handlers::approve::bootstrap_cache_from_view(
+        served.as_ref().unwrap_or(&view),
+        state,
+    );
     state.unlock_vault(vault_id.to_string(), cache, k);
 
     report
@@ -813,6 +819,9 @@ pub(crate) async fn persist_rotated_refresh_locked(
             return false;
         }
     };
+    // What the cache serves: the store as reconciled (see
+    // `reconcile_per_item_after_connect`), else the caller's view.
+    let served;
     if let Some(mut vault) = vault_dat {
         if let Err(e) = crate::server::handlers::metadata::reseal_body_with_key(&k, &mut vault, &m)
         {
@@ -823,7 +832,7 @@ pub(crate) async fn persist_rotated_refresh_locked(
             tracing::warn!(vault = %vault_id, "oauth rotate: write vault.dat failed: {}", e);
             return false;
         }
-        reconcile_per_item_after_connect(
+        served = reconcile_per_item_after_connect(
             state,
             vault_id,
             Some(&vault),
@@ -832,7 +841,7 @@ pub(crate) async fn persist_rotated_refresh_locked(
             ReconcileBase::Since(&base),
         );
     } else {
-        reconcile_per_item_after_connect(
+        served = reconcile_per_item_after_connect(
             state,
             vault_id,
             None,
@@ -842,7 +851,10 @@ pub(crate) async fn persist_rotated_refresh_locked(
         );
     }
 
-    let cache = crate::server::handlers::approve::bootstrap_cache_from_view(&view, state);
+    let cache = crate::server::handlers::approve::bootstrap_cache_from_view(
+        served.as_ref().unwrap_or(&view),
+        state,
+    );
     state.unlock_vault(vault_id.to_string(), cache, k);
     tracing::info!(vault = %vault_id, conn = %conn_id, "oauth refresh: rotated refresh_token persisted");
     true
@@ -931,12 +943,15 @@ pub(crate) fn persist_mutated_view(
     let vault_dat = crate::storage::sealed_vault::read(&vault_path)
         .ok()
         .flatten();
+    // What the cache serves: the store as reconciled (see
+    // `reconcile_per_item_after_connect`), else the caller's view.
+    let served;
     if let Some(mut vault) = vault_dat {
         crate::server::handlers::metadata::reseal_body_with_key(k, &mut vault, &m)
             .map_err(|e| format!("reseal vault.dat: {}", e))?;
         crate::storage::sealed_vault::write_atomic(&vault_path, &vault)
             .map_err(|e| format!("write vault.dat: {}", e))?;
-        reconcile_per_item_after_connect(
+        served = reconcile_per_item_after_connect(
             state,
             vault_id,
             Some(&vault),
@@ -945,7 +960,7 @@ pub(crate) fn persist_mutated_view(
             ReconcileBase::Since(base),
         );
     } else {
-        reconcile_per_item_after_connect(
+        served = reconcile_per_item_after_connect(
             state,
             vault_id,
             None,
@@ -954,7 +969,10 @@ pub(crate) fn persist_mutated_view(
             ReconcileBase::Since(base),
         );
     }
-    let cache = crate::server::handlers::approve::bootstrap_cache_from_view(view, state);
+    let cache = crate::server::handlers::approve::bootstrap_cache_from_view(
+        served.as_ref().unwrap_or(view),
+        state,
+    );
     state.unlock_vault(
         vault_id.to_string(),
         cache,
@@ -967,6 +985,12 @@ pub(crate) fn persist_mutated_view(
 /// connections MOVE) to the local per-item store as version-bumped item
 /// upserts/tombstones, then persist it. Best-effort; logs and returns on any
 /// error (the whole-blob vault.dat already holds the durable state).
+///
+/// Returns the store's fold after a successful reconcile: what the cache must
+/// serve. It can differ from `view` (a keep-both conflict leaves THEIRS at the
+/// canonical name and ours in a copy row), so serving the caller's view would
+/// hand out ours until the next pull/unlock. `None` (no store, or it failed) →
+/// the caller serves its own view.
 fn reconcile_per_item_after_connect(
     state: &Arc<AppState>,
     vault_id: &str,
@@ -974,10 +998,10 @@ fn reconcile_per_item_after_connect(
     view: &crate::storage::plaintext::VaultPlaintextView,
     k: &[u8],
     base: ReconcileBase<'_>,
-) {
+) -> Option<crate::storage::plaintext::VaultPlaintextView> {
     use crate::storage::sealed_vault::{Keyset, PerItemVault};
     let Ok(path) = state.vaults.per_item_path(vault_id) else {
-        return;
+        return None;
     };
     // Reuse the existing per-item store if present (so versions/cursors are
     // preserved); otherwise bootstrap one from the whole-blob keyset. A
@@ -989,10 +1013,10 @@ fn reconcile_per_item_after_connect(
         // bootstrapped v1 keyset (that would downgrade it to integrity-only NoUik).
         Err(e) => {
             tracing::warn!(vault = %vault_id, "per-item connect reconcile skipped: store unreadable: {}", e);
-            return;
+            return None;
         }
         Ok(None) => {
-            let Some(vault) = vault else { return };
+            let Some(vault) = vault else { return None };
             PerItemVault {
                 keyset: Keyset {
                     version: vault.version,
@@ -1015,21 +1039,32 @@ fn reconcile_per_item_after_connect(
         base,
     ) {
         Ok(changed) => {
-            if changed.is_empty() {
-                return;
+            if !changed.is_empty() {
+                if let Err(e) = crate::storage::sealed_vault::write_per_item_atomic(&path, &pv) {
+                    tracing::warn!(vault = %vault_id, "per-item connect reconcile write failed: {}", e);
+                    return None;
+                }
+                tracing::info!(
+                    vault = %vault_id,
+                    changed = changed.len(),
+                    "per-item store updated after connect (refresh-token + connection MOVE)"
+                );
             }
-            if let Err(e) = crate::storage::sealed_vault::write_per_item_atomic(&path, &pv) {
-                tracing::warn!(vault = %vault_id, "per-item connect reconcile write failed: {}", e);
-                return;
+            // Fold even when nothing changed: an existing conflict copy (an
+            // idempotent no-op) still means the store differs from `view`.
+            match crate::server::handlers::metadata::decrypt_vault_view_peritem_with_key(
+                k, &pv, vault_id,
+            ) {
+                Ok(folded) => Some(folded),
+                Err(e) => {
+                    tracing::warn!(vault = %vault_id, "per-item fold after reconcile failed (serving the caller's view): {}", e);
+                    None
+                }
             }
-            tracing::info!(
-                vault = %vault_id,
-                changed = changed.len(),
-                "per-item store updated after connect (refresh-token + connection MOVE)"
-            );
         }
         Err(e) => {
             tracing::warn!(vault = %vault_id, "per-item connect reconcile failed: {}", e);
+            None
         }
     }
 }
@@ -1744,14 +1779,15 @@ refresh_token = "REFRESH_TOKEN"
         // The refresh writes only its own secret.
         m.put_secret("GMAIL_REFRESH_TOKEN", b"rt".to_vec());
         let view = crate::storage::plaintext::VaultPlaintextView::from_protected_state(&m).unwrap();
-        reconcile_per_item_after_connect(
+        let served = reconcile_per_item_after_connect(
             &state,
             vid,
             Some(&vault),
             &view,
             &k,
             ReconcileBase::Since(&base),
-        );
+        )
+        .expect("the store's fold is what the cache serves");
 
         let pv = crate::storage::sealed_vault::read_per_item(&pi_path)
             .unwrap()
@@ -1759,6 +1795,26 @@ refresh_token = "REFRESH_TOKEN"
         let folded = pv.fold_view::<S>(keys, vid).unwrap();
         assert_eq!(folded.native_secrets["OPENAI_API_KEY"], b"newer");
         assert_eq!(folded.native_secrets["GMAIL_REFRESH_TOKEN"], b"rt");
+        assert_eq!(served.native_secrets, folded.native_secrets);
+
+        // Keep-both: the caller (base still "new") now edits OPENAI_API_KEY too.
+        // The cache must serve THEIRS at the canonical name, ours as the copy.
+        m.put_secret("OPENAI_API_KEY", b"mine".to_vec());
+        let view = crate::storage::plaintext::VaultPlaintextView::from_protected_state(&m).unwrap();
+        let served = reconcile_per_item_after_connect(
+            &state,
+            vid,
+            Some(&vault),
+            &view,
+            &k,
+            ReconcileBase::Since(&base),
+        )
+        .unwrap();
+        assert_eq!(served.native_secrets["OPENAI_API_KEY"], b"newer");
+        assert_eq!(
+            served.native_secrets[&crate::storage::item::conflict_copy_name("OPENAI_API_KEY")],
+            b"mine"
+        );
         let _ = std::fs::remove_dir_all(state.vaults.dir_for(vid).unwrap());
     }
 }
