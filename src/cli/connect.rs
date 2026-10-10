@@ -26,7 +26,7 @@ use serde_json::{json, Value};
 use crate::cli::active::resolve_active;
 use crate::cli::approve::{act_result, approve_op, deposit_values, ApproveOpts};
 use crate::cli::conn::{slugify_conn_id, valid_role, validate_raw_host};
-use crate::cli::webauthn::now_unix;
+use crate::cli::daemon_op::now_unix;
 use crate::config::{ConnectArgs, ConnectionHostArgs, ConnectionRmArgs};
 use crate::service::ServiceRegistry;
 use crate::storage::plaintext::suggested_secret_key;

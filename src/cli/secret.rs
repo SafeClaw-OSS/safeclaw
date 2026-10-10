@@ -15,7 +15,7 @@ use serde_json::json;
 use crate::cli::active::resolve_active;
 use crate::cli::approve::{act_result, approve_op, deposit_values, ApproveOpts};
 use crate::cli::conn::{valid_conn_id, valid_role, validate_raw_host};
-use crate::cli::webauthn::*;
+use crate::cli::daemon_op::*;
 use crate::config::{GetArgs, RmArgs, SetArgs};
 
 /// What `sc set` does with the item's broker binding.

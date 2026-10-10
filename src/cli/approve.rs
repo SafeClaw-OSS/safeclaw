@@ -1,42 +1,25 @@
 //! Shared passkey-approval driver for control-plane ops.
 //!
 //! ONE code path for every CLI command that needs the user to authorize an op
-//! with their passkey. Two arms, picked by whether the daemon is cloud-paired:
+//! with their passkey: the user approves in the console at
+//! `{frontend_origin}/grant/{op_id}`. The daemon registered the op with the
+//! backend at create time (`op.rs` → `ops::client::spawn_register_and_poll`);
+//! the browser seals the vault's K bundle to this device's admitted enc key and
+//! deposits the grant; the daemon polls, opens it and applies it. The CLI
+//! surfaces the link and polls the daemon for the op to resolve.
 //!
-//!   • **Remote** (cloud-paired): the user approves in a browser at
-//!     `{frontend_origin}/grant/{op_id}` — the ONLY surface a user on a
-//!     different machine than this zero-inbound localhost daemon can reach.
-//!     The daemon registered the op with the cloud op-relay at create time
-//!     (`op.rs` → `relay::client::spawn_register_and_poll`); the browser
-//!     derives + HPKE-seals W_c and deposits the grant; the daemon polls the
-//!     relay and applies it. The CLI just surfaces the link and polls the
-//!     daemon for the op to resolve — no local gesture, no CLI-side W_c.
-//!
-//!   • **Local** (self-host, no cloud pairing): the on-box ceremony — the
-//!     daemon serves the WebAuthn page on localhost, the CLI spawns a
-//!     localhost callback, derives W_c from the PRF result, and submits the
-//!     grant. Only reachable when the user is on the daemon's machine.
-//!
-//! Both arms drive the SAME op through the SAME `/op/{id}/approve` endpoint;
-//! they differ only in WHERE the passkey gesture happens and how W_c reaches
-//! the daemon. This is the single path the design demands — `unlock`/`lock`
-//! (and any future approval-only op) route through here so the link is correct
-//! everywhere by construction.
+//! There is no on-box ceremony (trust-reset D3/D8): a machine that is not
+//! paired cannot get an approval, so it is told to run `sc login`.
 
 use std::time::{Duration, Instant};
 
-use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
-use base64::Engine;
 use serde_json::{json, Value};
 
-use crate::cli::webauthn::*;
+use crate::cli::daemon_op::*;
 
-/// Unwrap the daemon act's result object from an [`approve_op`] response. The
-/// REMOTE arm returns the poll body `{status, value:<json-string>}` (value =
-/// the op's `cached_value`); the LOCAL arm returns the act result object
-/// directly. Both collapse to the same object when the daemon op sets
-/// `cached_value = result.to_string()` (as the `service-*` / `secret-rm` /
-/// `connection-rm` ops do).
+/// Unwrap the daemon act's result object from an [`approve_op`] response: the
+/// poll body `{status, value:<json-string>}` (value = the op's
+/// `cached_value`), or an act result object as-is.
 pub(crate) fn act_result(body: &Value) -> Value {
     match body.get("value") {
         Some(Value::String(s)) => serde_json::from_str(s).unwrap_or(Value::Null),
@@ -45,12 +28,13 @@ pub(crate) fn act_result(body: &Value) -> Value {
     }
 }
 
-/// Browser-gesture knobs threaded from the calling command (the local arm
-/// uses them; the remote arm ignores them — the gesture is in the browser).
+/// Browser-gesture knobs threaded from the calling command. The approval
+/// always happens in the console now, so none of them changes the flow; they
+/// stay only because the commands still accept the flags.
 pub struct ApproveOpts {
     pub no_browser: bool,
     pub cb_port: Option<u16>,
-    /// Local on-box gesture timeout (seconds).
+    /// Former on-box gesture timeout (seconds).
     pub timeout: u64,
 }
 
@@ -177,70 +161,30 @@ pub async fn approve_op(
     vault: &str,
     op: &Value,
     label: &str,
-    opts: &ApproveOpts,
+    _opts: &ApproveOpts,
 ) -> Result<Value, String> {
-    // Fetch passkey material — also the check that the vault actually exists on
-    // this daemon (clear error instead of a later opaque create-op failure).
-    let meta = fetch_passkey_meta(custodian, vault).await?;
-
-    // Create the op. On a paired daemon this ALSO registers it with the cloud
-    // op-relay + starts the daemon's background poll (op.rs handles that). An
-    // Export comes back with its waiter secret (E1): the only credential that
-    // releases the value, kept in memory, never printed.
-    let created = create_op_full(custodian, vault, op).await?;
-    let waiter = created.waiter_secret.as_deref();
-
-    // Paired ⇒ the user is (potentially) on another machine and can only reach
-    // the cloud approval page. Local ⇒ the on-box ceremony.
-    if crate::cli::active::frontend_origin().is_some() {
-        remote_approve(custodian, &created.op_id, label, waiter).await
-    } else {
-        let ceremony = local_ceremony(
-            custodian,
-            &created.op_id,
-            &created.r,
-            op,
-            &meta,
-            label,
-            opts,
-        );
-        // The local gesture has no poll loop of its own: keep an Export's
-        // waiter alive for the daemon's liveness backstop while it runs.
-        let heartbeat = waiter.map(|w| {
-            let url = op_url(custodian, &created.op_id);
-            let w = w.to_string();
-            tokio::spawn(async move {
-                let Ok(client) = http_client() else { return };
-                loop {
-                    let _ = client.get(&url).header(WAITER_HEADER, &w).send().await;
-                    tokio::time::sleep(WAITER_HEARTBEAT).await;
-                }
-            })
-        });
-        let res = tokio::select! {
-            r = ceremony => r,
-            _ = shutdown_signal() => Err("interrupted".to_string()),
-        };
-        if let Some(h) = heartbeat {
-            h.abort();
-        }
-        if let Err(e) = res {
-            // Stopped waiting (interrupt, gesture timeout, failed approve):
-            // withdraw our own op so it doesn't linger as a pending request.
-            if cancel_op(custodian, &created.op_id, waiter).await {
-                return Err(format!("{} (request withdrawn)", e));
-            }
-            return Err(e);
-        }
-        res
+    // Only a paired machine can get an approval: the console is the one place
+    // a passkey can sign one, and it seals K to this device's admitted key.
+    if crate::cli::active::frontend_origin().is_none() {
+        return Err(crate::device::NOT_PAIRED.into());
     }
+    // Create the op. The daemon stamps it with this device + person and
+    // registers it with the backend (op.rs). An Export comes back with its
+    // waiter secret (E1): the only credential that releases the value, kept
+    // in memory, never printed.
+    let created = create_op_full(custodian, vault, op).await?;
+    remote_approve(
+        custodian,
+        &created.op_id,
+        label,
+        created.waiter_secret.as_deref(),
+    )
+    .await
 }
 
 /// Request header carrying an Export's waiter secret (mirror of the daemon's
 /// `approve::WAITER_HEADER`).
 const WAITER_HEADER: &str = "x-safeclaw-waiter";
-/// Local-arm keep-alive cadence; well under the daemon's 60 s backstop.
-const WAITER_HEARTBEAT: Duration = Duration::from_secs(5);
 
 fn op_url(custodian: &str, op_id: &str) -> String {
     format!(
@@ -444,91 +388,4 @@ async fn remote_wait(
             _ => {} // pending — keep polling
         }
     }
-}
-
-/// Local arm: the on-box WebAuthn ceremony. CLI receives the PRF result over a
-/// localhost callback, derives W_c, and submits a plaintext-W_c grant (the
-/// transport never leaves the machine). For approval-only ops the daemon does
-/// all the work from this grant's W_c.
-async fn local_ceremony(
-    custodian: &str,
-    op_id: &str,
-    r: &str,
-    op: &Value,
-    meta: &PasskeyMeta,
-    label: &str,
-    opts: &ApproveOpts,
-) -> Result<Value, String> {
-    let r_bytes = STANDARD.decode(r).map_err(|e| format!("decode r: {}", e))?;
-    let beta = compute_beta(&r_bytes, op)?;
-
-    eprintln!("safeclaw {} — touch passkey…", label.to_lowercase());
-    let result = do_browser_gesture(
-        custodian,
-        op_id,
-        &beta,
-        Some(PRF_EVAL_SALT),
-        &meta.credential_id,
-        label,
-        opts.no_browser,
-        opts.timeout,
-        false,
-        opts.cb_port,
-    )
-    .await?;
-
-    let prf_first = result
-        .prf_first
-        .clone()
-        .ok_or("gesture didn't return prf_first")?;
-    let prf_first_bytes = URL_SAFE_NO_PAD
-        .decode(&prf_first)
-        .map_err(|e| format!("decode prf_first: {}", e))?;
-    let user_key = prf_to_user_key(&prf_first_bytes)?;
-    let cred_id_raw = URL_SAFE_NO_PAD
-        .decode(&meta.credential_id)
-        .map_err(|e| format!("decode cred_id: {}", e))?;
-    let prf_salt_bytes = STANDARD
-        .decode(&meta.prf_salt)
-        .or_else(|_| URL_SAFE_NO_PAD.decode(&meta.prf_salt))
-        .map_err(|e| format!("decode prf_salt: {}", e))?;
-    let wrapping_key = crate::crypto::kdf::derive_wrapping_key(
-        &user_key,
-        &prf_salt_bytes,
-        &cred_id_raw,
-        crate::crypto::kdf::WRAP_VERSION,
-    )
-    .map_err(|e| format!("derive wrapping key: {}", e))?;
-
-    let grant = json!({
-        "o": op,
-        "r": r,
-        "credential_id": meta.credential_id,
-        "wrapping_key": STANDARD.encode(&wrapping_key),
-        "assertion": assertion_json(
-            &result.credential_id,
-            &result.authenticator_data,
-            &result.client_data_json,
-            &result.signature,
-        ),
-    });
-    let client = http_client()?;
-    let resp = client
-        .post(format!(
-            "{}/op/{}/approve",
-            custodian.trim_end_matches('/'),
-            urlencoding::encode(op_id)
-        ))
-        .json(&grant)
-        .send()
-        .await
-        .map_err(|e| format!("approve: {}", e))?;
-    if !resp.status().is_success() {
-        return Err(format!(
-            "approve HTTP {}: {}",
-            resp.status(),
-            resp.text().await.unwrap_or_default()
-        ));
-    }
-    Ok(resp.json().await.unwrap_or(Value::Null))
 }

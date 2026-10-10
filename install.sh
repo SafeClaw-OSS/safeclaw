@@ -54,7 +54,7 @@ case ":${PATH}:" in
 esac
 echo
 echo "Next:"
-echo "  1. sc login --pair-token <token>     # pair this host to your vault"
+echo "  1. sc login                           # pair this host (type the code it prints at safeclaw.pro/admit)"
 echo "  2. sc up                             # start SafeClaw + unlock (one passkey tap)"
 echo "  3. sc status                         # your connections, their phantoms, and 'routed'"
 echo

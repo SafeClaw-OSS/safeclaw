@@ -167,6 +167,16 @@ fn launchd_converge(plist_arg: &str) -> Result<(), String> {
     }
 }
 
+/// Is `k` daemon configuration the service unit should carry? Every
+/// `SAFECLAW_*` variable of the calling shell is, except the agent-side ones:
+/// an agent's identity-file path, and a pre-0.12 agent key left in a profile
+/// (a stale secret that must never be written into a unit file).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn is_daemon_env(k: &str) -> bool {
+    const AGENT_SIDE: &[&str] = &["SAFECLAW_AGENT_IDENTITY", "SAFECLAW_API_KEY"];
+    k.starts_with("SAFECLAW_") && !AGENT_SIDE.contains(&k)
+}
+
 #[cfg(target_os = "linux")]
 pub async fn run_start_systemd(force: bool) -> Result<(), String> {
     let bin =
@@ -179,20 +189,15 @@ pub async fn run_start_systemd(force: bool) -> Result<(), String> {
     // (they'd be invisible after install, which is worse).
     let mut env_lines = Vec::new();
     for (k, v) in std::env::vars() {
-        // Don't leak the agent-facing SAFECLAW_API_KEY into the daemon's
-        // env — the daemon reads its api-key from the FILE `~/.safeclaw/api-key`
-        // (provisioned below), and a stray/foreign value in the operator's
-        // shell must not be adopted as the broker key.
-        if k.starts_with("SAFECLAW_") && k != "SAFECLAW_API_KEY" {
+        if is_daemon_env(&k) {
             // systemd unit syntax: quote the value to allow spaces/=.
             // Escape any " inside.
             let v_escaped = v.replace('"', "\\\"");
             env_lines.push(format!("Environment=\"{}={}\"", k, v_escaped));
         }
     }
-    // Broker auth is the cloud-synced agent-key hash-set (agent ≡ api-key),
-    // refreshed at runtime by `crate::sync` — there's no machine-local key file
-    // to provision here. See [[project_vault_agent_architecture_2026_06_25]].
+    // Agents authenticate by AIK proof of possession against authorized-agents
+    // records synced per vault; there is no key file to provision here.
     let env_block = if env_lines.is_empty() {
         String::new()
     } else {
@@ -261,9 +266,9 @@ pub async fn run_start_systemd(force: bool) -> Result<(), String> {
     if !env_lines.is_empty() {
         eprintln!("  env:      {} SAFECLAW_* var(s) embedded", env_lines.len());
     }
-    eprintln!("  broker:   requires an agent key (synced from your account); mint one with `sc agent add` or the dashboard's \"Connect a new agent\"");
+    eprintln!("  broker:   agents authenticate by their identity; add one with `sc agent add`");
     eprintln!();
-    eprintln!("  next: `sc login --pair-token <token>` to connect this daemon to your vault (token from the dashboard)");
+    eprintln!("  next: `sc login` to pair this machine with your account");
     eprintln!("        `sc log -f` to tail, `sc down` to stop, `sc restart` to reload");
     Ok(())
 }
@@ -276,10 +281,10 @@ pub async fn run_start_systemd(force: bool) -> Result<(), String> {
 
     // Same policy as the systemd path: the daemon inherits SAFECLAW_* set in
     // the calling shell (so `SAFECLAW_PORT=<p> sc up` moves the port and it
-    // sticks across restarts), EXCEPT the agent-facing SAFECLAW_API_KEY.
+    // sticks across restarts), EXCEPT the agent-side variables.
     let mut env_entries = Vec::new();
     for (k, v) in std::env::vars() {
-        if k.starts_with("SAFECLAW_") && k != "SAFECLAW_API_KEY" {
+        if is_daemon_env(&k) {
             env_entries.push(format!(
                 "    <key>{}</key><string>{}</string>",
                 xml_escape(&k),
@@ -378,7 +383,7 @@ pub async fn run_start_systemd(force: bool) -> Result<(), String> {
     }
     eprintln!("  logs:     {}", log_str);
     eprintln!();
-    eprintln!("  next: `sc login --pair-token <token>` to connect this daemon to your vault (token from the dashboard)");
+    eprintln!("  next: `sc login` to pair this machine with your account");
     eprintln!("        `sc log -f` to tail, `sc down` to stop, `sc restart` to reload");
     Ok(())
 }

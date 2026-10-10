@@ -3,9 +3,10 @@
 //! Read-only. Reports on:
 //!   - active profile (which custodian + vault)
 //!   - custodian reachability (`/health`)
-//!   - whether the vault dir exists on the custodian (vault id resolves)
-//!   - whether `$SAFECLAW_API_KEY` is set (informational — the agent's
-//!     identity; required for credential substitution, §8)
+//!   - whether the vault exists on the custodian on a verified member record
+//!   - this machine's device identity (`dv_`) and the account it is paired to
+//!   - whether `$SAFECLAW_AGENT_IDENTITY` is set (informational — the agent's
+//!     AIK identity file; required for credential substitution, §8)
 //!
 //! Each check prints a single line `[ok|warn|fail] message`. Exits with
 //! non-zero status if any line is `fail` — so CI scripts can gate on it.
@@ -99,7 +100,7 @@ pub async fn run(json: bool) -> Result<(), String> {
     // recurring cause of "why is it talking to the wrong port/host?" — a leftover
     // override silently wins over config. List the routing/location vars that are
     // actually set (names + values; these carry no secrets). Secrets are never
-    // printed here — $SAFECLAW_API_KEY has its own row below.
+    // printed here.
     {
         const OVERRIDE_VARS: &[&str] = &[
             "SAFECLAW_PORT",
@@ -223,12 +224,21 @@ pub async fn run(json: bool) -> Result<(), String> {
                 .and_then(|v| v.as_array())
                 .map(|a| a.len())
                 .unwrap_or(0);
-            if exists {
-                report.push(Mark::Ok, format!("vault: enrolled ({} passkey(s))", n));
+            let record = body.get("record").and_then(|v| v.as_bool()).unwrap_or(true);
+            if exists && record {
+                report.push(
+                    Mark::Ok,
+                    format!("vault: on this machine ({} passkey(s) can approve)", n),
+                );
+            } else if exists {
+                report.push(
+                    Mark::Warn,
+                    "vault: needs an upgrade before it can be used (upgrade this vault in the console)",
+                );
             } else {
                 report.push(
                     Mark::Warn,
-                    "vault: not yet enrolled (use the console /try or /vault to set one up)",
+                    "vault: not on this machine yet (create vaults in the console, then `sc sync`)",
                 );
             }
         }
@@ -236,26 +246,37 @@ pub async fn run(json: bool) -> Result<(), String> {
         Err(e) => report.push(Mark::Warn, format!("vault probe: {}", e)),
     }
 
-    // Agent identity (informational): a current agent authenticates by its AIK
-    // (`SAFECLAW_AGENT_IDENTITY`, a path to an identity file `sc run` signs with);
-    // a legacy agent may instead carry `SAFECLAW_API_KEY`. Either one lets this
-    // shell broker credentials, and a human shell needs neither. Report whichever
-    // is present so a fully set-up keyless agent is never told it has no agent env.
+    // Device identity: the DIK + enc key pair `sc login` minted, and the person
+    // it is paired to. Without it the daemon never contacts the cloud.
+    match crate::device::load_optional() {
+        Ok(Some(d)) => {
+            let cfg = crate::cli::active::load().unwrap_or_default();
+            report.push(
+                Mark::Ok,
+                format!(
+                    "device: {} paired to {} ({})",
+                    d.id(),
+                    cfg.account_email.as_deref().unwrap_or("?"),
+                    cfg.person.as_deref().unwrap_or("?"),
+                ),
+            )
+        }
+        Ok(None) => report.push(Mark::Warn, format!("device: {}", crate::device::NOT_PAIRED)),
+        Err(e) => report.push(Mark::Fail, format!("device identity unreadable: {}", e)),
+    }
+
+    // Agent identity (informational): an agent authenticates by its AIK
+    // (`SAFECLAW_AGENT_IDENTITY`, a path to an identity file `sc run` signs
+    // with). A human shell needs none.
     match std::env::var("SAFECLAW_AGENT_IDENTITY") {
         Ok(v) if !v.is_empty() => {
             report.push(Mark::Ok, format!("$SAFECLAW_AGENT_IDENTITY: set ({})", v))
         }
-        _ => match std::env::var("SAFECLAW_API_KEY") {
-            Ok(v) if !v.is_empty() => report.push(
-                Mark::Ok,
-                format!("$SAFECLAW_API_KEY: set ({} chars, legacy)", v.len()),
-            ),
-            _ => report.push(
-                Mark::Ok,
-                "agent identity: none in this shell (fine for a human shell; an \
-                 agent gets one from `sc agent add`)",
-            ),
-        },
+        _ => report.push(
+            Mark::Ok,
+            "agent identity: none in this shell (fine for a human shell; an \
+             agent gets one from `sc agent add`)",
+        ),
     }
 
     // Egress proxy (informational): the one upstream the daemon + this CLI use to
@@ -308,10 +329,7 @@ pub async fn run(json: bool) -> Result<(), String> {
                     ),
                 }
             }
-            None => report.push(
-                Mark::Warn,
-                "cloud backend: not paired — run `sc login --pair-token <token>`",
-            ),
+            None => report.push(Mark::Warn, "cloud backend: not paired — run `sc login`"),
         },
         // A config-load failure already surfaced as a `fail` row above.
         Err(_) => {}

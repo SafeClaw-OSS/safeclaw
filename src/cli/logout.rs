@@ -1,163 +1,189 @@
-//! `sc logout` — unpair this machine: the inverse of `sc login`.
+//! `sc logout` — unpair this machine (trust-reset contract 5).
 //!
-//! `sc login` writes three things: the `~/.safeclaw/device-key` (this host's
-//! cloud credential), the active pairing in `config.toml` (custodian, vault,
-//! cloud_backend, frontend_origin), and the `known_vaults` history. `logout`
-//! undoes all of it and stops the daemon, so a re-pair starts clean and the
-//! daemon stops syncing / log-spamming on now-orphaned vaults.
+//!   1. `POST /device/self-revoke`, signed by the DIK, FIRST: it needs the key
+//!      we are about to delete. The server stops serving this device; the
+//!      device stays in the person's ledger until a passkey signs its revoke in
+//!      the console (only the person's UIK can write the ledger).
+//!   2. Delete the DIK and the enc key (the device pair).
+//!   3. Stop the daemon (it drops K and stops syncing), wipe the local sealed
+//!      vault state, and clear the pairing from the config.
+//!   4. Say how to finish: "Revoke it in the console to remove it from your
+//!      ledger".
 //!
-//! By default it revokes the cloud-side device-key row too: once the local
-//! file is gone its plaintext is unrecoverable, so the server row could never
-//! be matched again — leaving it would just accumulate dead "paired devices"
-//! in the dashboard. `--keep-remote` skips the cloud revoke (rare; only when
-//! something external still manages that key).
+//! The self-revoke is best-effort: offline, or a device the server no longer
+//! knows, must not leave the keys on disk. The local wipe always happens.
 //!
-//! What we deliberately DON'T touch: the agent's `SAFECLAW_VAULT_URL` /
-//! `SAFECLAW_API_KEY` env in the user's shell profile. That's the user's file
-//! to edit (per their config-ownership) — we print a reminder instead.
+//! Not touched: an agent's `SAFECLAW_*` env in the user's own files (theirs to
+//! edit), and the agent identities under `~/.safeclaw/agents/`.
 
-use serde::Deserialize;
-
-use crate::cli::active::{load, save, CliConfig};
 use crate::config::LogoutArgs;
-use crate::device_auth::DikRequestExt;
 
-pub async fn run(args: LogoutArgs) -> Result<(), String> {
-    let cfg = load().unwrap_or_default();
-    let was_paired =
-        cfg.daemon.is_some() || cfg.cloud_backend.is_some() || crate::sync::device_key().is_some();
+/// Outcome of the server-side self-revoke.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SelfRevoke {
+    Done,
+    NotPaired,
+    Failed(String),
+}
 
-    // 1. Revoke the device-key cloud-side (default) — BEFORE we drop the local
-    //    credential we'd need to authenticate the revoke. Best-effort: a failure
-    //    (e.g. offline) must not block the local unpair. `--keep-remote` skips it.
-    if !args.keep_remote {
-        match revoke_device_cloud(&cfg).await {
-            Ok(Some(label)) => eprintln!("✓ revoked this device cloud-side ({label})"),
-            Ok(None) => eprintln!("  (no matching device found cloud-side — nothing to revoke)"),
-            Err(e) => eprintln!("  couldn't revoke cloud-side ({e}); continuing with local unpair"),
+pub async fn run(_args: LogoutArgs) -> Result<(), String> {
+    let device = crate::device::load_optional().unwrap_or(None);
+    let device_id = device.as_ref().map(|d| d.id().to_string());
+
+    // 1. Self-revoke while we still hold the DIK.
+    let revoke = match device {
+        None => SelfRevoke::NotPaired,
+        Some(device) => match crate::cloud::configured_backend() {
+            Err(_) => SelfRevoke::NotPaired,
+            Ok(base) => self_revoke(&crate::cloud::DeviceClient::new(base, device)).await,
+        },
+    };
+    match &revoke {
+        SelfRevoke::Done => eprintln!("Signed this device out of SafeClaw."),
+        SelfRevoke::NotPaired => {}
+        SelfRevoke::Failed(e) => {
+            eprintln!("  couldn't reach SafeClaw to sign this device out ({e}); deleting its keys anyway.")
         }
     }
 
-    // 2. Stop the daemon so it stops serving/syncing this account's vaults and
-    //    drops in-memory K. Cross-platform: macOS previously skipped this, so a
-    //    self-logout left the daemon running (K in memory, vault.dat on disk) and
-    //    kept substituting secrets — the "unpair -> this machine can't use
-    //    secrets" expectation has to hold for self-logout too. Best-effort.
+    // 2. Delete the device pair.
+    crate::device::wipe()?;
+
+    // 3. Stop the daemon, wipe local vault state, clear the pairing.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         let _ = crate::cli::service::run_stop();
     }
-
-    // 2b. Wipe local sealed vault state (`<state_dir>/vaults/`). Unpair means this
-    //    machine is out; the sealed blobs are ciphertext (no leak), but leaving
-    //    them is untidy and a re-pair re-pulls them from the cloud. Best-effort —
-    //    a wipe failure must not block the unpair.
-    {
-        let vaults_dir = crate::config::default_state_dir().join("vaults");
-        if vaults_dir.exists() {
-            let _ = std::fs::remove_dir_all(&vaults_dir);
-        }
+    let vaults_dir = crate::config::default_state_dir().join("vaults");
+    if vaults_dir.exists() {
+        let _ = std::fs::remove_dir_all(&vaults_dir);
     }
+    crate::cli::active::clear_pairing()?;
 
-    // 3. Remove the device-key file (this host's identity to the cloud).
-    if let Some(home) = dirs::home_dir() {
-        let p = home.join(".safeclaw").join("device-key");
-        if p.exists() {
-            std::fs::remove_file(&p).map_err(|e| format!("remove {}: {}", p.display(), e))?;
+    // 4. How to finish.
+    match device_id {
+        Some(id) => {
+            eprintln!("Deleted this device's keys ({id}) and stopped SafeClaw here.");
+            eprintln!("Revoke it in the console to remove it from your ledger.");
         }
-    }
-
-    // 4. Clear the pairing from config.toml: active vault, cloud backend,
-    //    frontend origin, and the known-vaults catalog (its own file; incl. any
-    //    orphans). Preserve user `settings` (e.g. cb_port) — not pairing state.
-    let mut cleared = load().unwrap_or_default();
-    cleared.daemon = None;
-    cleared.vault = None;
-    cleared.cloud_backend = None;
-    cleared.frontend_origin = None;
-    cleared.account_id = None;
-    cleared.account_uik = None;
-    cleared.vault_deleted_upstream = None;
-    cleared.known_vaults.clear();
-    save(&cleared)?;
-    crate::cli::active::clear_known_vaults()?;
-
-    if was_paired {
-        eprintln!("Unpaired this machine — daemon stopped, local pairing cleared.");
-    } else {
-        eprintln!("Nothing was paired; cleared any stale local config.");
+        None => eprintln!("This machine had no device identity; cleared any local pairing."),
     }
     eprintln!();
-    eprintln!("  Your agent's SAFECLAW_* env (BROKER_URL / AGENT_IDENTITY) may");
-    eprintln!("  still be persisted in its .env — it's stale now; remove it. Agents stay");
-    eprintln!("  valid account-wide (logout revokes only this DEVICE) — revoke unused ones");
-    eprintln!("  with `sc agent rm`. Re-pair with `sc login`.");
+    eprintln!("  Agents on this machine keep their identity files; remove one with");
+    eprintln!("  `sc agent rm <name>`. Pair again with `sc login`.");
     Ok(())
 }
 
-#[derive(Deserialize)]
-struct DeviceKey {
-    id: String,
-    prefix: String,
-    #[serde(default)]
-    label: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct DeviceList {
-    #[serde(default)]
-    keys: Vec<DeviceKey>,
-}
-
-/// Find this host's device-key in the account's device list (match on prefix)
-/// and DELETE it cloud-side. `Ok(None)` if no row matches (already gone). Uses
-/// the same device-key bearer + `/api/vault/devices` endpoints as `sc agent`.
-async fn revoke_device_cloud(cfg: &CliConfig) -> Result<Option<String>, String> {
-    let cloud = cfg
-        .cloud_backend
-        .clone()
-        .filter(|s| !s.is_empty())
-        .ok_or("this device isn't cloud-paired")?;
-    let cloud = cloud.trim_end_matches('/');
-    let key = crate::sync::device_key().ok_or("no device-key to revoke")?;
-
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .map_err(|e| format!("http client init: {}", e))?;
-
-    let list_url = format!("{}/api/vault/devices", cloud);
-    let resp = client
-        .get(&list_url)
-        .bearer_auth(&key)
-        .dik_pop("GET", &list_url, &[])
-        .send()
+/// `POST /device/self-revoke` (contract 8.4).
+pub async fn self_revoke(client: &crate::cloud::DeviceClient) -> SelfRevoke {
+    let resp = match client
+        .post(
+            "/device/self-revoke",
+            &serde_json::json!({}),
+            std::time::Duration::from_secs(15),
+        )
         .await
-        .map_err(|e| crate::cli::neterr::reach_failed(cloud, &e))?;
-    if !resp.status().is_success() {
-        return Err(format!("list devices: HTTP {}", resp.status()));
-    }
-    let list: DeviceList = resp
-        .json()
-        .await
-        .map_err(|e| format!("parse devices: {}", e))?;
-
-    // The device list returns each key's stable PREFIX; our full key starts with it.
-    let Some(me) = list.keys.into_iter().find(|d| key.starts_with(&d.prefix)) else {
-        return Ok(None);
+    {
+        Ok(r) => r,
+        Err(e) => return SelfRevoke::Failed(e),
     };
-    let label = me.label.clone().unwrap_or_else(|| me.prefix.clone());
-
-    let del_url = format!("{}/api/vault/devices/{}", cloud, me.id);
-    let del = client
-        .delete(&del_url)
-        .bearer_auth(&key)
-        .dik_pop("DELETE", &del_url, &[])
-        .send()
-        .await
-        .map_err(|e| crate::cli::neterr::reach_failed(cloud, &e))?;
-    if !del.status().is_success() {
-        return Err(format!("revoke: HTTP {}", del.status()));
+    let status = resp.status().as_u16();
+    if (200..300).contains(&status) {
+        return SelfRevoke::Done;
     }
-    Ok(Some(label))
+    // Unknown to the server (401) or already revoked (403): nothing to sign out.
+    if status == 401 || status == 403 {
+        let body: serde_json::Value = resp.json().await.unwrap_or_default();
+        return match crate::cloud::refusal(status, &body) {
+            Some(crate::cloud::Refusal::UpgradeRequired) => {
+                SelfRevoke::Failed(crate::cloud::Refusal::UpgradeRequired.message())
+            }
+            _ => SelfRevoke::NotPaired,
+        };
+    }
+    SelfRevoke::Failed(crate::cloud::error_text(resp, "self-revoke").await)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{http::HeaderMap, http::StatusCode, routing::post, Json, Router};
+
+    /// A fake backend answering `POST /device/self-revoke` with `status` and
+    /// `body`; it 400s a request that is not DIK-signed by `dv`.
+    async fn backend(status: u16, body: serde_json::Value, dv: String) -> String {
+        let app = Router::new().route(
+            "/device/self-revoke",
+            post(move |h: HeaderMap| {
+                let body = body.clone();
+                let dv = dv.clone();
+                async move {
+                    let signed = h
+                        .get(crate::device_auth::HDR_DEVICE_ID)
+                        .map(|v| v.as_bytes())
+                        == Some(dv.as_bytes())
+                        && h.contains_key(crate::device_auth::HDR_DEVICE_SIG)
+                        && h.contains_key(crate::device_auth::HDR_DEVICE_TS)
+                        && h.contains_key(crate::cloud::HDR_VERSION);
+                    if !signed {
+                        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({})));
+                    }
+                    (StatusCode::from_u16(status).unwrap(), Json(body))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{}", addr)
+    }
+
+    fn client(base: String) -> crate::cloud::DeviceClient {
+        crate::cloud::DeviceClient::new(base, crate::device::tests_support::device(0x61))
+    }
+
+    /// `sc logout` signs the self-revoke with the DIK it is about to delete;
+    /// an unknown or already revoked device has nothing to sign out, and an
+    /// upgrade refusal is reported (the keys are deleted either way).
+    #[tokio::test]
+    async fn self_revoke_is_signed_and_its_refusals_classified() {
+        let dv = crate::device::tests_support::device(0x61).id().to_string();
+        let ok = backend(200, serde_json::json!({"ok": true}), dv.clone()).await;
+        assert_eq!(self_revoke(&client(ok)).await, SelfRevoke::Done);
+
+        let unknown = backend(
+            401,
+            serde_json::json!({"error": "unknown_device"}),
+            dv.clone(),
+        )
+        .await;
+        assert_eq!(self_revoke(&client(unknown)).await, SelfRevoke::NotPaired);
+
+        let revoked = backend(
+            403,
+            serde_json::json!({"code": "SC_DEVICE_REVOKED"}),
+            dv.clone(),
+        )
+        .await;
+        assert_eq!(self_revoke(&client(revoked)).await, SelfRevoke::NotPaired);
+
+        let old = backend(
+            403,
+            serde_json::json!({"code": "SC_UPGRADE_REQUIRED"}),
+            dv.clone(),
+        )
+        .await;
+        match self_revoke(&client(old)).await {
+            SelfRevoke::Failed(m) => assert!(m.contains("sc upgrade"), "{m}"),
+            other => panic!("{other:?}"),
+        }
+
+        let down = backend(500, serde_json::json!({"message": "boom"}), dv).await;
+        assert!(matches!(
+            self_revoke(&client(down)).await,
+            SelfRevoke::Failed(_)
+        ));
+    }
 }

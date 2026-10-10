@@ -2,45 +2,34 @@
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::{Deserialize, Serialize};
-use zeroize::Zeroize;
 
-use crate::crypto::binding::{binding_for_op, DOMAIN_SETUP, DOMAIN_STANDARD};
+use crate::crypto::binding::{binding_for_op, DOMAIN_STANDARD};
 use crate::error::{AppError, Result};
 use crate::passkey::webauthn::{verify_assertion, AssertionData};
 use crate::passkey::PasskeyEntry;
-use crate::protocol::operation::{
-    as_enroll_credential, check_now, decode_credential_id, ActType, Operation,
-};
+use crate::protocol::operation::{check_now, decode_credential_id, Operation};
 
-/// Grant submitted to `POST /grant` (or to `/approve/{id}/confirm`).
+/// Grant deposited by the console for an op (contract 8.5, design D6):
+/// `{o, r, credential_id, k_enc, k_ct, assertion | batch}`.
 ///
-/// Matches the SUDP paper §5.5 wire shape `G := (o, r, cid_{c*}, W*, σ*, opt)`
-/// — `wrapping_key` is `W*` (= `W_c` for the acting credential), derived on
-/// the client from `userKey` and shipped over the confidential TLS leg.
+/// The secret is the vault's 64-byte K bundle, HPKE-sealed to THIS device's
+/// admitted enc key with `info = grant_seal_info(op_id)` (contract 1.7); the
+/// backend carrying it never sees K. No custody secret (UIK root, `W_c`, a
+/// plaintext wrapping key) ever travels.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Grant {
     /// Operation contract.
     pub o: Operation,
     /// Server-issued challenge (base64, 16+ bytes).
     pub r: String,
-    /// Acting credential id (base64).
+    /// Acting credential id (base64url).
     pub credential_id: String,
-    /// `W*` — wrapping key for the acting credential (base64 STANDARD, 32B raw),
-    /// in **plaintext**. Transitional: the legacy local op-page (served over
-    /// localhost, no intermediary) ships W* here. When `wk_enc`/`wk_ct` are
-    /// present, W* is HPKE-sealed instead and the approve handler populates
-    /// this field after opening the seal. Exactly one form must be present.
+    /// HPKE encapped key of the sealed K bundle (base64url-no-pad).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub wrapping_key: Option<String>,
-    /// HPKE-sealed `W*` encapped key (base64url-no-pad). Paired with `wk_ct`.
-    /// Sealed by the browser to the daemon's `sc_pk` with
-    /// `info = grant_seal_info(op_id)`, so a cloud op-relay carrying the grant
-    /// never sees `W*`. The approve handler opens it before validation.
+    pub k_enc: Option<String>,
+    /// HPKE ciphertext + tag of the sealed K bundle (base64url-no-pad).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub wk_enc: Option<String>,
-    /// HPKE-sealed `W*` ciphertext + tag (base64url-no-pad). Paired with `wk_enc`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub wk_ct: Option<String>,
+    pub k_ct: Option<String>,
     /// WebAuthn assertion. Present on every PLAIN grant (challenge = β).
     /// ABSENT on a batch grant — the shared proof rides in `batch` instead,
     /// and a batch grant carrying a top-level assertion is rejected outright
@@ -55,15 +44,6 @@ pub struct Grant {
     /// `validate_batch_grant`. Mutually exclusive with `assertion`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub batch: Option<BatchProof>,
-    /// TLS-bound side payload — sealed bytes that depend on `W*` and so
-    /// cannot be hashed into β at the moment the WebAuthn assertion is
-    /// generated. Channel integrity is provided by TLS. Currently only used
-    /// by `Act::Enroll` (initial setup).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub setup_payload: Option<SetupPayload>,
-    /// Optional rotation payload (`W*_next` for write/rotate/enroll/revoke).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub opt: Option<serde_json::Value>,
 }
 
 /// The shared batch proof carried by each of a batch's grant rows.
@@ -77,33 +57,15 @@ pub struct BatchProof {
     pub assertion: AssertionData,
 }
 
-/// Side payload for `Act::Enroll`. Carried out-of-band of the canonical op so
-/// that β = SHA-256(domain ‖ 0x00 ‖ r ‖ SHA-256(canonical(o))) can be
-/// pre-computed before the PRF-bearing WebAuthn `.get()` runs.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SetupPayload {
-    /// Base64 of `K̂_c = Wrap_{W_c}(K)` — the wrapped state-encryption key.
-    /// AAD is sudp's `WrapBinding ‖ cid ‖ ver_be`.
-    pub wrapped_key: String,
-    /// Base64 of `C = Enc_K(canonical(ProtectedState); DS_seal ‖ ver_be)`.
-    pub ciphertext: String,
-}
-
-/// Output of `validate_grant` — what the act dispatcher uses.
+/// Output of `validate_grant` — what the act dispatcher uses. The K bundle is
+/// opened separately ([`crate::server::handlers::approve`]), after the assertion
+/// verified.
 pub struct ValidatedGrant {
     pub op: Operation,
     /// Acting credential id (raw bytes).
     pub credential_id_bytes: Vec<u8>,
-    /// 32-byte wrapping key `W*` (zeroized on drop).
-    pub wrapping_key: Vec<u8>,
     /// `r` consumed (raw bytes).
     pub r_bytes: Vec<u8>,
-}
-
-impl Drop for ValidatedGrant {
-    fn drop(&mut self) {
-        self.wrapping_key.zeroize();
-    }
 }
 
 /// Validate a PLAIN grant (challenge = the op's own β). The challenge `r` is
@@ -111,8 +73,7 @@ impl Drop for ValidatedGrant {
 /// arm goes through [`validate_batch_grant`] with a caller-computed challenge.
 ///
 /// `credential_lookup` returns the credential's public key entry or `None` if
-/// unknown. For `setup`, the credential is taken from the operation body
-/// instead of the lookup.
+/// unknown (the caller resolves it from the approver member's ledger).
 pub fn validate_grant(
     grant: &Grant,
     challenge_store: &mut crate::passkey::challenge::ChallengeStore,
@@ -133,42 +94,12 @@ pub fn validate_grant(
     // Validity window.
     check_now(&grant.o.valid)?;
 
-    // Resolve credential public key:
-    //    - first-time Enroll (target empty): pubkey comes from the op body
-    //      (no enrolled credential to look up yet), DOMAIN_SETUP.
-    //    - add-passkey Enroll (target == "passkeys"): signed by an EXISTING
-    //      acting credential — the new credential's pubkey rides in
-    //      scope.new and only gets installed on the approve path. Use the
-    //      standard lookup + DOMAIN_STANDARD to match what the frontend's
-    //      addPasskey actually signs with.
-    //    - everything else: standard lookup.
-    let (entry, domain) = match &grant.o.act.kind {
-        ActType::Enroll if grant.o.act.target == "passkeys" => {
-            let entry = credential_lookup(&grant.credential_id)
-                .ok_or_else(|| AppError::Unauthorized("unknown credential".into()))?;
-            (entry, DOMAIN_STANDARD)
-        }
-        ActType::Enroll => {
-            let credential = as_enroll_credential(&grant.o)?;
-            if credential.credential_id != grant.credential_id {
-                return Err(AppError::BadRequest(
-                    "grant.credential_id != enroll.credential.credential_id".into(),
-                ));
-            }
-            let entry = PasskeyEntry {
-                x: credential.public_key_x.clone(),
-                y: credential.public_key_y.clone(),
-                device_name: credential.device_name.clone(),
-                created_at: 0,
-            };
-            (entry, DOMAIN_SETUP)
-        }
-        _ => {
-            let entry = credential_lookup(&grant.credential_id)
-                .ok_or_else(|| AppError::Unauthorized("unknown credential".into()))?;
-            (entry, DOMAIN_STANDARD)
-        }
-    };
+    let entry = credential_lookup(&grant.credential_id).ok_or_else(|| {
+        AppError::Unauthorized(
+            "this passkey isn't admitted in the ledger of any member of this vault".into(),
+        )
+    })?;
+    let domain = DOMAIN_STANDARD;
 
     // Decode r and compute β over canonical(o) (strict float-rejecting
     // encoder) — the plain arm's expected challenge.
@@ -219,8 +150,11 @@ pub fn validate_batch_grant(
     // the same grant would die the same way on the plain path, and neither
     // is recoverable by a per-op retry with the same material).
     check_now(&grant.o.valid)?;
-    let entry = credential_lookup(&grant.credential_id)
-        .ok_or_else(|| AppError::Unauthorized("unknown credential".into()))?;
+    let entry = credential_lookup(&grant.credential_id).ok_or_else(|| {
+        AppError::Unauthorized(
+            "this passkey isn't admitted in the ledger of any member of this vault".into(),
+        )
+    })?;
 
     // EVERY core failure on a batch grant — challenge peek, credential-id
     // mismatch, ASSERTION/ROOT verification, malformed r/wk — must surface
@@ -244,8 +178,8 @@ pub fn validate_batch_grant(
 }
 
 /// Shared validation tail for both arms: challenge peek → assertion verify
-/// against `expected_challenge` → wrapping-key decode → challenge consume.
-/// Every check here runs identically for plain and batch grants.
+/// against `expected_challenge` → challenge consume. Every check here runs
+/// identically for plain and batch grants.
 fn validate_grant_core(
     grant: &Grant,
     assertion: &AssertionData,
@@ -289,30 +223,8 @@ fn validate_grant_core(
         expected_challenge,
     )?;
 
-    // 7. Decode wrapping_key + credential_id raw bytes.
-    //
-    // By this point W* must be present as plaintext base64 in `wrapping_key`:
-    // either the legacy local op-page shipped it directly, or the approve
-    // handler HPKE-opened `wk_enc`/`wk_ct` and populated this field. A grant
-    // with neither is malformed.
+    // 7. The credential id's raw bytes (the K bundle is opened by the caller).
     let credential_id_bytes = decode_credential_id(&grant.credential_id)?;
-    let wrapping_key_b64 = grant.wrapping_key.as_deref().ok_or_else(|| {
-        AppError::BadRequest("grant carries no wrapping_key (and no opened seal)".into())
-    })?;
-    let wrapping_key = STANDARD
-        .decode(wrapping_key_b64)
-        .map_err(|_| AppError::BadRequest("wrapping_key not base64".into()))?;
-    if wrapping_key.len() != 32 {
-        return Err(AppError::BadRequest("wrapping_key must be 32 bytes".into()));
-    }
-    // F-04: zeroize the source base64 String so W* doesn't linger on the heap.
-    // We can't mutate grant (it's `&Grant`) — clone a local copy, zeroize it,
-    // then drop it.
-    // SAFETY: zeroing valid UTF-8 bytes with 0x00; the String is immediately
-    // dropped after this block and never used as a &str again.
-    let mut wk_str = wrapping_key_b64.to_string();
-    unsafe { wk_str.as_bytes_mut().zeroize() };
-    drop(wk_str);
 
     // 8. Grant fully validated (signature + all fields) — NOW consume the
     //    single-use challenge, so a valid grant can't be replayed and a bogus
@@ -322,7 +234,6 @@ fn validate_grant_core(
     Ok(ValidatedGrant {
         op: grant.o.clone(),
         credential_id_bytes,
-        wrapping_key,
         r_bytes,
     })
 }
@@ -331,7 +242,7 @@ fn validate_grant_core(
 mod tests {
     use super::*;
     use crate::passkey::challenge::ChallengeStore;
-    use crate::protocol::operation::{Act, Bind, Valid};
+    use crate::protocol::operation::{Act, ActType, Bind, Valid};
     use base64::{engine::general_purpose::STANDARD as B64, Engine};
 
     fn use_op() -> Operation {
@@ -363,9 +274,8 @@ mod tests {
             o: use_op(),
             r: r.into(),
             credential_id: B64.encode([7u8; 16]),
-            wrapping_key: Some(B64.encode([9u8; 32])),
-            wk_enc: None,
-            wk_ct: None,
+            k_enc: None,
+            k_ct: None,
             assertion: None,
             batch: Some(BatchProof {
                 op_ids: vec!["a".into(), "b".into()],
@@ -376,8 +286,6 @@ mod tests {
                     signature: B64.encode([0u8; 8]),
                 },
             }),
-            setup_payload: None,
-            opt: None,
         }
     }
 

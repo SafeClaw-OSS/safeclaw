@@ -7,7 +7,7 @@ use serde_json::json;
 
 use crate::cli::active::resolve_active;
 use crate::cli::approve::{act_result, approve_op, ApproveOpts};
-use crate::cli::webauthn::now_unix;
+use crate::cli::daemon_op::now_unix;
 use crate::config::{ServiceAddArgs, ServiceLsArgs, ServiceRmArgs, ServiceValidateArgs};
 use crate::service::validate::validate_recipe;
 use crate::service::ServiceDef;

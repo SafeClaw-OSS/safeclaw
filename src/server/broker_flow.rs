@@ -50,18 +50,21 @@ pub fn is_hop_by_hop(name_lc: &str) -> bool {
 
 /// Shared tail of the Use pending-op flow: issue the challenge `r`, create the
 /// `ApprovalRecord` (stamped with the policy context the approve handler reads
-/// for its cache write), persist the `pending` audit row, register with the
-/// cloud op-relay, and emit the `pending` SSE event. Returns
+/// for its cache write, and with `act.scope.requester`), persist the `pending`
+/// audit row, register the op with the backend, and emit the `pending` SSE event. Returns
 /// `(op_id, r, expires_at)`. Ingress-agnostic by design — the proxy compiles an
 /// `authorize_only` Use `Operation` and funnels it through here.
 pub fn register_pending_use(
     state: &Arc<AppState>,
     vault_id: &str,
-    op: Operation,
+    mut op: Operation,
     policy_context: Option<crate::approval::PolicyContext>,
     ip: IpAddr,
     agent_prefix: Option<String>,
 ) -> Result<(String, String, u64)> {
+    // Bind the op to this device and person (contract 1.6) BEFORE it is
+    // stored: the stored op is what the grant's binding covers.
+    crate::ops::stamp_own_requester(state, &mut op)?;
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -98,7 +101,7 @@ pub fn register_pending_use(
         }
     }
 
-    crate::relay::client::spawn_register_and_poll(
+    crate::ops::client::spawn_register_and_poll(
         state.clone(),
         vault_id.to_string(),
         op_id.clone(),

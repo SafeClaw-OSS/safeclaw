@@ -4,7 +4,8 @@
 //! <state-dir>/
 //! └── vaults/
 //!     └── <vault_id>/
-//!         └── vault.dat
+//!         ├── vault.per-item.json   (verified member record + sealed items)
+//!         └── audit.db
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -41,14 +42,8 @@ impl VaultDir {
         Ok(self.root.join(vault_id))
     }
 
-    pub fn vault_path(&self, vault_id: &str) -> Result<PathBuf> {
-        Ok(self.dir_for(vault_id)?.join("vault.dat"))
-    }
-
     /// `vaults/{vid}/vault.per-item.json` — the per-item on-disk store
-    /// (`PerItemVault` = keyset blob + N sealed item records). Landing target
-    /// that supersedes `vault.dat` for content; see
-    /// `wt-merge-spec/docs/PER_ITEM_SYNC.md` §11.B.
+    /// (`PerItemVault` = the verified member record + N sealed item records).
     pub fn per_item_path(&self, vault_id: &str) -> Result<PathBuf> {
         Ok(self.dir_for(vault_id)?.join("vault.per-item.json"))
     }
@@ -57,21 +52,14 @@ impl VaultDir {
         Ok(self.dir_for(vault_id)?.join("audit.db"))
     }
 
-    /// `vaults/{vid}/pending-passkeys/` — transient store for cross-device
-    /// add-passkey deposits, one file per pending credential id. Files are
-    /// deleted on Stage 2 consumption or by TTL sweep (1h).
-    pub fn pending_passkeys_dir(&self, vault_id: &str) -> Result<PathBuf> {
-        Ok(self.dir_for(vault_id)?.join("pending-passkeys"))
-    }
-
     pub fn ensure_dir(&self, vault_id: &str) -> Result<PathBuf> {
         let d = self.dir_for(vault_id)?;
         std::fs::create_dir_all(&d)?;
         Ok(d)
     }
 
-    /// Recursively delete the vault's directory (vault.dat + any files/
-    /// blobs alongside). Idempotent: no error if the directory is already
+    /// Recursively delete the vault's directory (the per-item store, the audit
+    /// db and anything alongside). Idempotent: no error if the directory is already
     /// missing. Caller is responsible for any in-memory state cleanup
     /// (e.g. flushing the vault_states cache).
     pub fn remove(&self, vault_id: &str) -> Result<()> {

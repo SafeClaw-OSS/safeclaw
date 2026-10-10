@@ -1,6 +1,6 @@
 //! On-disk identity files for the **AIK** (agent) and **DIK** (device) — the
-//! possession-proven keypair identities that replace the two BEARER credentials
-//! (the agent api-key and the device pair token). Symmetric by design
+//! possession-proven keypair identities, the only agent and device credentials
+//! (design D8: no bearer token exists). Symmetric by design
 //! (`design/agent-device-identity-mtls.md` §5): same JSON shape, same 0600
 //! discipline, same "the seed is the secret, the id is the derived handle"
 //! contract. This is the identity-wave's Phase 2 foundation — minting + on-disk
@@ -10,10 +10,11 @@
 //! Paths (§5):
 //!   - AIK: `~/.safeclaw/agents/<name>/identity` — selected per wrapped child via
 //!     the env var `SAFECLAW_AGENT_IDENTITY` (a PATH, not a secret).
-//!   - DIK: `~/.safeclaw/device/identity` — daemon-local, one per machine, no env
-//!     (migrated from the legacy `~/.safeclaw/device-key` bearer file).
+//!   - DIK: `~/.safeclaw/device/identity` — daemon-local, one per machine, no env.
+//!     A pre-trust-reset file whose stored id is a retired `dev_…` id is treated
+//!     as absent ([`load_device`]): the machine mints a fresh DIK and pairs again.
 //!
-//! File = 0600 JSON `{ "v":1, "kind":"agent"|"device", "id":"ag_…|dev_…",
+//! File = 0600 JSON `{ "v":1, "kind":"agent"|"device", "id":"ag_…|dv_…",
 //! "seed":"<base64-32>" }`. The `seed` is the 32-byte secret; `id` is stored for
 //! human readability but is RECOMPUTED from the seed on load (the seed is
 //! authoritative — a mismatch means corruption).
@@ -172,6 +173,33 @@ pub fn load(path: &Path) -> Result<LoadedIdentity, String> {
     })
 }
 
+/// Load the device identity (DIK) at `path`. `Ok(None)` when the file does not
+/// exist, or when it is a pre-trust-reset identity whose stored id carries the
+/// retired `dev_` prefix: such a device was paired under the old model and is
+/// treated as never paired, so `sc login` mints a fresh DIK. A file that is
+/// neither (wrong kind, corrupt) is an error.
+pub fn load_device(path: &Path) -> Result<Option<LoadedIdentity>, String> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("read {}: {}", path.display(), e)),
+    };
+    let rec: OnDisk =
+        serde_json::from_slice(&bytes).map_err(|e| format!("parse {}: {}", path.display(), e))?;
+    if rec.kind == "device" && rec.id.starts_with("dev_") {
+        return Ok(None);
+    }
+    let loaded = load(path)?;
+    if loaded.kind != IdKind::Device {
+        return Err(format!(
+            "{} is not a device identity (kind {:?})",
+            path.display(),
+            kind_str(loaded.kind)
+        ));
+    }
+    Ok(Some(loaded))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,10 +216,45 @@ mod tests {
     #[test]
     fn device_id_is_direct_ed25519() {
         let (seed, id) = mint(IdKind::Device);
-        assert!(id.starts_with("dev_"));
+        assert!(id.starts_with("dv_"));
         let (si, id2) = resolve(IdKind::Device, &seed);
         assert_eq!(id, id2);
         assert_eq!(id, si.id(IdKind::Device));
+    }
+
+    #[test]
+    fn legacy_dev_identity_is_absent() {
+        let dir = std::env::temp_dir().join(format!("scid-dev-{}", std::process::id()));
+        let path = dir.join("identity");
+        std::fs::create_dir_all(&dir).unwrap();
+        // A pre-cutover file: the stored id carries the retired `dev_` prefix.
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "v": 1, "kind": "device",
+                "id": "dev_alketiy7xmthzdzvf2mwrj46hzp4sxa3",
+                "seed": BASE64.encode(&[5u8; 32]),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            load_device(&path).unwrap().is_none(),
+            "dev_ identity is absent"
+        );
+        // A current dv_ identity loads.
+        let (seed, id) = mint(IdKind::Device);
+        write(&path, IdKind::Device, &seed).unwrap();
+        let loaded = load_device(&path).unwrap().expect("dv_ identity loads");
+        assert_eq!(loaded.id, id);
+        // No file at all is absent, not an error.
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(load_device(&path).unwrap().is_none());
+        // An agent identity at the device path is refused loudly.
+        let (aseed, _) = mint(IdKind::Agent);
+        write(&path, IdKind::Agent, &aseed).unwrap();
+        assert!(load_device(&path).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

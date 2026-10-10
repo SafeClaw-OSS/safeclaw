@@ -45,7 +45,7 @@ binds one per launched command (`sc run --vault <id> -- <cmd>` to pick).
 
 One identity per agent keeps the audit trail attributable; don't share an
 identity file across agents, and don't re-run `sc agent add` when the env already
-exists (it registers a duplicate).
+exists (it admits a second identity).
 
 These vars steer the *agent's* requests only. Your own `sc` commands read the
 active vault from `~/.safeclaw/config.toml` (set by `sc login` / `sc vault

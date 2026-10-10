@@ -26,8 +26,8 @@
 //! - **AIK** = an agent principal: one per agent, derived from a single root
 //!   seed. The private key is resident in the daemon/`sc` component and NEVER
 //!   enters the agent's environment or crosses a machine. `agent_id =
-//!   derive_id(Agent, aik_pub)`; the wire bearer is a separate HKDF output so
-//!   bearer rotation (epoch bump) is decoupled from identity continuity.
+//!   derive_id(Agent, aik_pub)`. There is no agent bearer: the agent proves
+//!   possession of the AIK on every request (design D8).
 //!
 //! This module is the identity half only: keypairs, ids, and the byte-exact
 //! signing inputs. The custody→UIK→K wrap graph lives in the vault key layer;
@@ -75,15 +75,6 @@ pub const DS_DELEGATION: &[u8] = b"safeclaw/v1/delegation-event";
 /// [`root_succession_input`].
 pub const DS_ROOT_SUCCESSION: &[u8] = b"safeclaw/v1/root-succession";
 
-/// An owner-signed account principal-ledger event (§15,
-/// design/agent-device-identity-mtls.md): the account owner (UIK) ADMITs or
-/// REVOKEs an account-scoped principal (a device `dev_…` or an agent `ag_…`). The
-/// ACCOUNT-level analog of [`DS_DELEGATION`] (which is per-vault): the anchor is
-/// the account's own owner-UIK (the account id self-certifies it,
-/// `derive_id(User, uik_pub) == account_id`), so a daemon verifies the ledger
-/// against the UIK it already learned at pairing. See [`principal_event_input`].
-pub const DS_PRINCIPAL_EVENT: &[u8] = b"safeclaw/v1/principal-event";
-
 /// Domain tag for a vault-DELETE tombstone (§15 leg A, per-vault drop). The vault
 /// OWNER signs this so a daemon destroys local state on OWNER intent, not a server
 /// flipping a cleartext `status:"deleted"` field. Verified against the vault's
@@ -95,19 +86,24 @@ pub const DS_VAULT_TOMBSTONE: &[u8] = b"safeclaw/v1/vault-tombstone";
 /// [`succession_input`].
 pub const DS_SUCCESSION: &[u8] = b"safeclaw/v1/uik-succession";
 
-/// Server-key signature over the whole sync envelope. See [`server_envelope_input`].
-pub const DS_SERVER_ENVELOPE: &[u8] = b"safeclaw/v1/server-envelope";
-
-/// Server-key signature over a fresh "last real contact" token. See
-/// [`contact_token_input`].
-pub const DS_CONTACT_TOKEN: &[u8] = b"safeclaw/v1/contact-token";
-
 /// A device's per-request proof-of-possession over a daemon→cloud request (the
 /// DIK half of mutual mTLS, hop-B). Railway terminates TLS, so hop-B can't be a
 /// real client-cert handshake — instead the daemon signs each request with its
 /// DIK and the Node backend verifies the signature against the device's
-/// registered `dev_` pubkey. See [`device_request_signature_input`].
+/// registered `dv_` pubkey. See [`device_request_signature_input`].
 pub const DS_DEVICE_REQ: &[u8] = b"safeclaw/v1/device-req";
+
+/// A person's UIK self-signature binding their X25519 `enc_pub` to their `us_`
+/// (trust-reset contract 1.1, identity Layer 1). See [`enc_bind_input`].
+pub const DS_UIK_ENC_BIND: &[u8] = b"safeclaw/v1/uik-enc-bind";
+
+/// A person's UIK-signed ledger v2 event: admit / revoke of a device, passkey or
+/// vault pin (trust-reset contract 1.3). See [`ledger_event_input`].
+pub const DS_LEDGER_EVENT: &[u8] = b"safeclaw/v1/ledger-event";
+
+/// The full-bundle K commitment carried in the rekey proof (trust-reset contract
+/// 1.5). See [`k_commitment`].
+pub const DS_K_COMMIT: &[u8] = b"safeclaw/v1/k-commit";
 
 /// An agent's per-CONNECT proof-of-possession over the local forward proxy (the
 /// AIK half of mutual mTLS, hop-A). A standard client can't present a client cert
@@ -127,15 +123,12 @@ pub const DS_ITEM_SIG: &[u8] = b"sudp/v1/item-sig";
 /// HKDF `info` deriving an agent's Ed25519 identity seed from its root seed.
 const AIK_IDENTITY_INFO: &[u8] = b"safeclaw/v1/agent-identity";
 
-/// HKDF `info` (prefix, before the big-endian epoch) deriving an agent's wire
-/// bearer from its root seed. Pinned label (memory: single-root keyring).
-const AIK_BEARER_INFO: &[u8] = b"sc/agent-bearer";
-
 /// Append a length-prefixed field: `u32_be(len) ‖ bytes`. Identical to
 /// [`storage::item`](crate::storage::item)'s `push_lp` and sudp's `record_aad`
 /// so all length-prefixed constructions agree byte-for-byte. Length-prefixing
-/// removes splicing ambiguity between adjacent variable-length fields.
-fn push_lp(out: &mut Vec<u8>, field: &[u8]) {
+/// removes splicing ambiguity between adjacent variable-length fields. This is
+/// the `lp()` of the trust-reset contract (section 0).
+pub(crate) fn push_lp(out: &mut Vec<u8>, field: &[u8]) {
     out.extend_from_slice(&(field.len() as u32).to_be_bytes());
     out.extend_from_slice(field);
 }
@@ -155,8 +148,9 @@ pub enum IdKind {
     /// An agent principal (AIK). Prints as `ag_…`.
     Agent,
     /// A device principal (DIK) — one machine's identity to the cloud. Prints as
-    /// `dev_…`. Symmetric with AIK (design/agent-device-identity-mtls.md §0);
-    /// replaces the bearer device pair token.
+    /// `dv_…` (renamed from `dev_` in the trust reset; old audit strings keep
+    /// `dev_` as history). Symmetric with AIK (design/agent-device-identity-mtls.md
+    /// §0); replaces the bearer device pair token.
     Device,
 }
 
@@ -165,13 +159,13 @@ impl IdKind {
         match self {
             IdKind::User => "us",
             IdKind::Agent => "ag",
-            IdKind::Device => "dev",
+            IdKind::Device => "dv",
         }
     }
 }
 
 /// Derive the self-certifying id of a principal from its Ed25519 public key:
-/// `"{us|ag}_" ‖ base32_lower_nopad(SHA-256(pubkey)[..20])`.
+/// `"{us|ag|dv}_" ‖ base32_lower_nopad(SHA-256(pubkey)[..20])`.
 ///
 /// The id IS a commitment to the pubkey (ETH-address / SSH-fingerprint style),
 /// so a colluding server cannot swap the key behind an id. 20 bytes → 32 base32
@@ -180,6 +174,25 @@ pub fn derive_id(kind: IdKind, pubkey: &[u8; 32]) -> String {
     let digest = sha256(pubkey);
     let body = BASE32_NOPAD.encode(&digest[..20]).to_lowercase();
     format!("{}_{}", kind.prefix(), body)
+}
+
+/// The kind of a well-formed self-certifying id: exactly `us_`/`ag_`/`dv_`
+/// followed by 32 lowercase RFC 4648 base32 characters (`[a-z2-7]`). Anything
+/// else (the retired `dev_` prefix, upper case, wrong length) is `None`. This is
+/// a FORMAT check only; binding an id to a key is `derive_id(kind, pub) == id`.
+pub fn parse_id(id: &str) -> Option<IdKind> {
+    let (prefix, body) = id.split_once('_')?;
+    let kind = match prefix {
+        "us" => IdKind::User,
+        "ag" => IdKind::Agent,
+        "dv" => IdKind::Device,
+        _ => return None,
+    };
+    let well_formed = body.len() == 32
+        && body
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || (b'2'..=b'7').contains(&b));
+    well_formed.then_some(kind)
 }
 
 // ── Signing principal (UIK, or a resolved AIK) ─────────────────────────────
@@ -228,6 +241,12 @@ impl SigningIdentity {
     pub fn user_id(&self) -> String {
         self.id(IdKind::User)
     }
+
+    /// As a UIK, self-sign the binding of this person's X25519 `enc_pub` to their
+    /// own `us_` (trust-reset contract 1.1). See [`enc_bind_input`].
+    pub fn sign_enc_bind(&self, enc_pub: &[u8; 32]) -> [u8; 64] {
+        self.sign(&enc_bind_input(&self.user_id(), enc_pub))
+    }
 }
 
 /// Verify a detached Ed25519 signature over `msg` by `pubkey`. Uses
@@ -244,10 +263,9 @@ pub fn verify(pubkey: &[u8; 32], msg: &[u8], sig: &[u8; 64]) -> bool {
 
 // ── Agent root (AIK single-root derivation) ────────────────────────────────
 
-/// An agent's single root seed. Everything about the agent derives from this one
-/// secret: its Ed25519 identity keypair (⇒ `agent_id`) and its per-epoch wire
-/// bearer. Storing one root per agent (memory: keyring `{seed, epoch, name}`)
-/// keeps identity and bearer rotation independent while sharing no second secret.
+/// An agent's single root seed: its Ed25519 identity keypair (⇒ `agent_id`)
+/// derives from it. There is no agent bearer (design D8): the agent proves
+/// possession of this identity on every request.
 pub struct AgentRoot {
     root: Zeroizing<[u8; 32]>,
 }
@@ -273,21 +291,11 @@ impl AgentRoot {
             .expect("HKDF-SHA256 derive_32 is infallible for a 32-byte root")
     }
 
-    /// The agent's Ed25519 identity, derived from the root (domain-separated
-    /// from the bearer). The private key stays in this process.
+    /// The agent's Ed25519 identity, derived from the root. The private key
+    /// stays in this process.
     pub fn identity(&self) -> SigningIdentity {
         let seed = Zeroizing::new(self.hkdf(AIK_IDENTITY_INFO));
         SigningIdentity::from_seed(&seed)
-    }
-
-    /// The wire bearer for `epoch`: `HKDF(root, "sc/agent-bearer" ‖ u32_be(epoch))`.
-    /// Rotating the bearer = bumping the epoch; the identity (and thus `agent_id`)
-    /// is unchanged.
-    pub fn bearer(&self, epoch: u32) -> [u8; 32] {
-        let mut info = Vec::with_capacity(AIK_BEARER_INFO.len() + 4);
-        info.extend_from_slice(AIK_BEARER_INFO);
-        info.extend_from_slice(&epoch.to_be_bytes());
-        self.hkdf(&info)
     }
 
     /// The agent's self-certifying id `ag_…`.
@@ -352,7 +360,7 @@ pub fn config_sig_input(
 /// to the decrypted record. `status` = `1` live / `0` tombstone (a delete is a
 /// signed record state; the signer+type decide who may delete). `item_id` is the
 /// blinded HMAC id (unchanged addressing). `principal_id` = the signer's self-id
-/// (`us_`/`dev_`/`ag_`) — a UIK for human writes, the DIK/AIK for automatic
+/// (`us_`/`dv_`/`ag_`) — a UIK for human writes, the DIK/AIK for automatic
 /// (daemon/agent) writes (A2). One signature does all three jobs: authorization
 /// (role×type), integrity/author identity, and rollback resistance (version is
 /// bound + the caller keeps version monotone).
@@ -378,15 +386,15 @@ pub fn record_signature_input(
     out
 }
 
-/// Signing input for a **device request proof-of-possession** (hop-B of the
-/// mutual-mTLS transport, `design/agent-device-identity-mtls.md` §9.1). The
-/// daemon signs every cloud request with its DIK so the Node backend can verify
-/// "this request really came from an authorized device" WITHOUT a client-cert
-/// handshake (Railway terminates TLS before the app ever sees the connection).
+/// Signing input for a **device request proof-of-possession** (trust-reset
+/// contract 1.4). The daemon signs every cloud request with its DIK so the Node
+/// backend can verify "this request really came from an admitted device" WITHOUT
+/// a client-cert handshake (Railway terminates TLS before the app ever sees the
+/// connection).
 ///
 /// ```text
-/// lp(DS_DEVICE_REQ) ‖ lp(method) ‖ lp(path) ‖ u64_be(timestamp)
-///   ‖ lp(SHA-256(body)) ‖ lp(device_id)
+/// lp(DS_DEVICE_REQ) ‖ lp(method) ‖ lp(path_with_query) ‖ u64_be(timestamp)
+///   ‖ lp(SHA-256(body)) ‖ lp(device_id) ‖ lp(canonical_host)
 /// ```
 ///
 /// Every field binds so a captured signature can't be replayed onto a different
@@ -394,21 +402,20 @@ pub fn record_signature_input(
 /// string, exactly as it appears on the wire, so it matches byte-for-byte at the
 /// verifier), `timestamp` (unix seconds) bounds the replay window, the body hash
 /// pins the payload (use `&[]` for a bodyless GET — its SHA-256 is a fixed
-/// constant both sides compute), and `device_id` (the `dev_…` self-id) tells the
-/// verifier which registered pubkey to check. This is a SafeClaw transport-auth
+/// constant both sides compute), `device_id` (the `dv_…` self-id) tells the
+/// verifier which registered pubkey to check, and `canonical_host` pins the
+/// deployment: it is the CONFIGURED backend host in WHATWG `URL.host` form
+/// ([`crate::device_auth::canonical_host`]), never the incoming `Host` header, so a
+/// dev capture can't be replayed against prod. This is a SafeClaw transport-auth
 /// concern, not part of the SUDP sealed-record protocol, so it lives in the
 /// `safeclaw/v1/*` domain (unlike the `sudp/v1/item-sig` record signature).
-///
-/// hop-B is ADDITIVE: the daemon keeps sending its bearer device-key too, so an
-/// un-upgraded backend (that ignores the signature header) still authenticates,
-/// and a backend that has not yet migrated the device pubkey column verifies
-/// nothing and falls back to the bearer. Nothing bricks in any upgrade order.
 pub fn device_request_signature_input(
     method: &str,
     path: &str,
     timestamp: u64,
     body: &[u8],
     device_id: &str,
+    canonical_host: &str,
 ) -> Vec<u8> {
     let body_hash = sha256(body);
     let mut out = Vec::new();
@@ -418,7 +425,90 @@ pub fn device_request_signature_input(
     out.extend_from_slice(&timestamp.to_be_bytes());
     push_lp(&mut out, &body_hash);
     push_lp(&mut out, device_id.as_bytes());
+    push_lp(&mut out, canonical_host.as_bytes());
     out
+}
+
+/// Signing input for a person's **`enc_sig`** (trust-reset contract 1.1): the UIK
+/// self-signs the binding of its X25519 encryption key to its own id, so no
+/// server can swap or fill the `enc_pub` a client seals to.
+///
+/// ```text
+/// lp(DS_UIK_ENC_BIND) ‖ lp(user_id) ‖ lp(enc_pub)
+/// ```
+pub fn enc_bind_input(user_id: &str, enc_pub: &[u8; 32]) -> Vec<u8> {
+    let mut out = Vec::new();
+    push_lp(&mut out, DS_UIK_ENC_BIND);
+    push_lp(&mut out, user_id.as_bytes());
+    push_lp(&mut out, enc_pub);
+    out
+}
+
+/// Verify a person's `enc_sig`: valid iff `derive_id(User, sig_pub) == user_id`
+/// AND the signature verifies over [`enc_bind_input`]. Both checks, always: a
+/// valid signature by a key that does not fold to `user_id` is a forgery of
+/// someone else's binding.
+pub fn verify_enc_sig(
+    user_id: &str,
+    sig_pub: &[u8; 32],
+    enc_pub: &[u8; 32],
+    sig: &[u8; 64],
+) -> bool {
+    derive_id(IdKind::User, sig_pub) == user_id
+        && verify(sig_pub, &enc_bind_input(user_id, enc_pub), sig)
+}
+
+/// Signing input for a **ledger v2 event** (trust-reset contract 1.3), signed by
+/// the person's UIK:
+///
+/// ```text
+/// lp(DS_LEDGER_EVENT) ‖ lp(us_) ‖ lp(op) ‖ lp(kind) ‖ lp(principal)
+///   ‖ lp(sig_pub) ‖ lp(enc_pub) ‖ lp(label) ‖ u64_be(seq)
+/// ```
+///
+/// `op` ∈ {`admit`, `revoke`}; `kind` ∈ {`device`, `passkey`, `pin`}. Field
+/// meaning per kind, the parser and the fold live in [`crate::crypto::ledger`].
+#[allow(clippy::too_many_arguments)]
+pub fn ledger_event_input(
+    us: &str,
+    op: &str,
+    kind: &str,
+    principal: &str,
+    sig_pub: &[u8],
+    enc_pub: &[u8],
+    label: &str,
+    seq: u64,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    push_lp(&mut out, DS_LEDGER_EVENT);
+    push_lp(&mut out, us.as_bytes());
+    push_lp(&mut out, op.as_bytes());
+    push_lp(&mut out, kind.as_bytes());
+    push_lp(&mut out, principal.as_bytes());
+    push_lp(&mut out, sig_pub);
+    push_lp(&mut out, enc_pub);
+    push_lp(&mut out, label.as_bytes());
+    out.extend_from_slice(&seq.to_be_bytes());
+    out
+}
+
+/// The **full-bundle K commitment** (trust-reset contract 1.5), carried in the
+/// rekey proof (`rekey_sig_input`'s `k_commitment`), generation 0 included:
+///
+/// ```text
+/// SHA-256( lp(DS_K_COMMIT) ‖ lp(vault_id) ‖ u64_be(generation) ‖ lp(bundle64) )
+/// ```
+///
+/// `bundle` is the whole 64-byte K (`id_seed ‖ content`), so a server can't pair
+/// a committed content key with a substituted `id_seed`. Console and daemon both
+/// check it before using or retaining a bundle.
+pub fn k_commitment(vault_id: &str, generation: u64, bundle: &[u8; 64]) -> [u8; 32] {
+    let mut buf = Vec::new();
+    push_lp(&mut buf, DS_K_COMMIT);
+    push_lp(&mut buf, vault_id.as_bytes());
+    buf.extend_from_slice(&generation.to_be_bytes());
+    push_lp(&mut buf, bundle);
+    sha256(&buf)
 }
 
 /// Signing input for an **agent proxy-connect proof-of-possession** (hop-A of the
@@ -601,46 +691,6 @@ pub fn delegation_event_input(
     out
 }
 
-/// Signing input for an owner-signed **account principal-ledger event** (§15,
-/// design/agent-device-identity-mtls.md): the account owner ADMITs or REVOKEs an
-/// account-scoped principal (device / agent). The ACCOUNT-level counterpart of
-/// [`delegation_event_input`] — same shape (append-only, owner-signed, monotone
-/// `seq`), but anchored to the ACCOUNT's owner-UIK instead of a vault genesis
-/// root: devices/agents are account-scoped and must stay revocable even with 0
-/// vaults, so they cannot ride a per-vault anchor.
-///
-/// ```text
-/// lp(DS_PRINCIPAL_EVENT) ‖ lp(account_id) ‖ lp(op) ‖ lp(principal_id)
-///   ‖ u64_be(seq) ‖ lp(owner_id)
-/// ```
-///
-/// `op` ∈ {`"admit"`, `"revoke"`}. `principal_id` is the self-certifying `dev_…`/
-/// `ag_…` id, which already commits to the principal's pubkey — so the event binds
-/// the key WITHOUT carrying it (the principal presents its pubkey at connect time
-/// and the daemon checks `derive_id(kind, pubkey) == principal_id ∈` the folded
-/// ledger). `owner_id` is the signing account owner's `us_…`; the daemon honors
-/// the event iff `owner_id`'s UIK is the account anchor (`derive_id(User,
-/// uik_pub) == account_id`). `seq` is monotone (rollback guard): a daemon refuses
-/// a ledger that drops a higher-seq `revoke`. On a VERIFIED `revoke` of ITSELF, a
-/// device locks + wipes all local vaults + logs out (killing the bearer
-/// device-key alone only parks — delivery-before-hard-kill).
-pub fn principal_event_input(
-    account_id: &str,
-    op: &str,
-    principal_id: &str,
-    seq: u64,
-    owner_id: &str,
-) -> Vec<u8> {
-    let mut out = Vec::new();
-    push_lp(&mut out, DS_PRINCIPAL_EVENT);
-    push_lp(&mut out, account_id.as_bytes());
-    push_lp(&mut out, op.as_bytes());
-    push_lp(&mut out, principal_id.as_bytes());
-    out.extend_from_slice(&seq.to_be_bytes());
-    push_lp(&mut out, owner_id.as_bytes());
-    out
-}
-
 /// Canonical bytes a vault OWNER signs to tombstone (delete) a vault (§15 leg A):
 ///
 /// ```text
@@ -653,8 +703,7 @@ pub fn principal_event_input(
 /// signer is an owner in the vault's fold-owner set — the same genesis-anchored
 /// authority that gates [`delegation_event_input`]. This raises "delete a vault
 /// locally" from "the server flips a cleartext status field" to "forge an owner
-/// signature": [`DS_SERVER_ENVELOPE`] is server-signed and does NOT cover `status`,
-/// so the destroy signal needed its own OWNER-signed channel.
+/// signature".
 pub fn vault_tombstone_input(vault_id: &str) -> Vec<u8> {
     let mut out = Vec::new();
     push_lp(&mut out, DS_VAULT_TOMBSTONE);
@@ -708,60 +757,6 @@ pub fn succession_input(old_id: &str, new_id: &str, new_pubkey: &[u8; 32]) -> Ve
     push_lp(&mut out, old_id.as_bytes());
     push_lp(&mut out, new_id.as_bytes());
     push_lp(&mut out, new_pubkey);
-    out
-}
-
-/// Signing input for the server-signed sync envelope (server key signs; daemon
-/// verifies against a pinned server public key).
-///
-/// ```text
-/// lp(DS_SERVER_ENVELOPE) ‖ lp(vault_id) ‖ lp(kind) ‖ u64_be(format)
-///   ‖ u64_be(membership_epoch) ‖ u64_be(issued_at) ‖ lp(nonce)
-/// ```
-///
-/// Signs the server-authoritative operational facts (SM §9): sharedness `kind`,
-/// format version, membership epoch, freshness. Defends the daemon's local cache
-/// against local tampering (flip a bool / forge a value) — NOT against a
-/// malicious server (which is the authority here).
-pub fn server_envelope_input(
-    vault_id: &str,
-    kind: &str,
-    format: u64,
-    membership_epoch: u64,
-    issued_at: u64,
-    nonce: &[u8],
-) -> Vec<u8> {
-    let mut out = Vec::new();
-    push_lp(&mut out, DS_SERVER_ENVELOPE);
-    push_lp(&mut out, vault_id.as_bytes());
-    push_lp(&mut out, kind.as_bytes());
-    out.extend_from_slice(&format.to_be_bytes());
-    out.extend_from_slice(&membership_epoch.to_be_bytes());
-    out.extend_from_slice(&issued_at.to_be_bytes());
-    push_lp(&mut out, nonce);
-    out
-}
-
-/// Signing input for a fresh "last real contact" token (server key signs). The
-/// offline lease computes staleness from the newest VALID token, so a daemon
-/// that forges its local `last_contact` clock cannot extend the lease — it can't
-/// mint a token without the server key (SM §9 "真正的防绕点是联系时间戳").
-///
-/// ```text
-/// lp(DS_CONTACT_TOKEN) ‖ lp(vault_id) ‖ lp(account_id) ‖ u64_be(issued_at) ‖ lp(nonce)
-/// ```
-pub fn contact_token_input(
-    vault_id: &str,
-    account_id: &str,
-    issued_at: u64,
-    nonce: &[u8],
-) -> Vec<u8> {
-    let mut out = Vec::new();
-    push_lp(&mut out, DS_CONTACT_TOKEN);
-    push_lp(&mut out, vault_id.as_bytes());
-    push_lp(&mut out, account_id.as_bytes());
-    out.extend_from_slice(&issued_at.to_be_bytes());
-    push_lp(&mut out, nonce);
     out
 }
 
@@ -821,20 +816,12 @@ mod tests {
     }
 
     #[test]
-    fn aik_bearer_rotates_identity_stable() {
+    fn aik_identity_is_stable_per_root() {
         let root = AgentRoot::from_seed([0x11; 32]);
         let id0 = root.agent_id();
         assert!(id0.starts_with("ag_"));
-        // Identity (hence id) is stable across bearer epochs.
-        assert_eq!(id0, root.agent_id());
-        // Distinct epochs give distinct bearers; identity unchanged.
-        assert_ne!(root.bearer(0), root.bearer(1));
-        assert_eq!(root.bearer(3), AgentRoot::from_seed([0x11; 32]).bearer(3));
-        // Bearer is domain-separated from the identity seed (no accidental reuse).
-        assert_ne!(
-            root.bearer(0).to_vec(),
-            root.identity().public_bytes().to_vec()
-        );
+        assert_eq!(id0, AgentRoot::from_seed([0x11; 32]).agent_id());
+        assert_ne!(id0, AgentRoot::from_seed([0x12; 32]).agent_id());
     }
 
     #[test]
@@ -862,7 +849,7 @@ mod tests {
         assert_ne!(base, record_signature_input("secret", b"\x01\x02", 3, "v2", b"ct", true, "us_a"), "vault binds");
         assert_ne!(base, record_signature_input("secret", b"\x01\x02", 3, "v1", b"ct", false, "us_a"), "status (live/tombstone) binds");
         assert_ne!(base, record_signature_input("secret", b"\x01\x02", 3, "v1", b"CT", true, "us_a"), "sealed body binds");
-        assert_ne!(base, record_signature_input("secret", b"\x01\x02", 3, "v1", b"ct", true, "dev_a"), "principal binds");
+        assert_ne!(base, record_signature_input("secret", b"\x01\x02", 3, "v1", b"ct", true, "dv_a"), "principal binds");
         assert_eq!(base, record_signature_input("secret", b"\x01\x02", 3, "v1", b"ct", true, "us_a"), "deterministic");
     }
 
@@ -891,45 +878,40 @@ mod tests {
 
     #[test]
     fn device_request_signature_input_every_field_binds() {
-        let base = device_request_signature_input("GET", "/p", 1, b"body", "dev_a");
-        assert_ne!(base, device_request_signature_input("PUT", "/p", 1, b"body", "dev_a"), "method binds");
-        assert_ne!(base, device_request_signature_input("GET", "/q", 1, b"body", "dev_a"), "path binds");
-        assert_ne!(base, device_request_signature_input("GET", "/p", 2, b"body", "dev_a"), "timestamp binds");
-        assert_ne!(base, device_request_signature_input("GET", "/p", 1, b"BODY", "dev_a"), "body binds");
-        assert_ne!(base, device_request_signature_input("GET", "/p", 1, b"body", "dev_b"), "device_id binds");
-        assert_eq!(base, device_request_signature_input("GET", "/p", 1, b"body", "dev_a"), "deterministic");
+        let h = "api.dev.safeclaw.pro";
+        let base = device_request_signature_input("GET", "/p", 1, b"body", "dv_a", h);
+        assert_ne!(base, device_request_signature_input("PUT", "/p", 1, b"body", "dv_a", h), "method binds");
+        assert_ne!(base, device_request_signature_input("GET", "/q", 1, b"body", "dv_a", h), "path binds");
+        assert_ne!(base, device_request_signature_input("GET", "/p", 2, b"body", "dv_a", h), "timestamp binds");
+        assert_ne!(base, device_request_signature_input("GET", "/p", 1, b"BODY", "dv_a", h), "body binds");
+        assert_ne!(base, device_request_signature_input("GET", "/p", 1, b"body", "dv_b", h), "device_id binds");
+        assert_ne!(base, device_request_signature_input("GET", "/p", 1, b"body", "dv_a", "api.safeclaw.pro"), "canonical host binds");
+        assert_eq!(base, device_request_signature_input("GET", "/p", 1, b"body", "dv_a", h), "deterministic");
     }
 
     #[test]
     fn device_request_signature_input_lp_ambiguity_resolved() {
         // ("GET","/p") vs ("GE","T/p") for (method, path) would collide without
         // length prefixes; with them the inputs differ.
-        let a = device_request_signature_input("GET", "/p", 1, b"", "d");
-        let b = device_request_signature_input("GE", "T/p", 1, b"", "d");
+        let a = device_request_signature_input("GET", "/p", 1, b"", "d", "h");
+        let b = device_request_signature_input("GE", "T/p", 1, b"", "d", "h");
         assert_ne!(a, b);
     }
 
     #[test]
     fn device_request_roundtrip_and_path_tamper() {
         // The daemon signs a request with its DIK; the backend verifies over the
-        // SAME input rebuilt from the wire (method/path/ts/body/device_id).
-        // Replaying the signature onto a different path must fail — the DIK
-        // signature binds the request, not just the device.
+        // SAME input rebuilt from the wire (method/path/ts/body/device_id) plus
+        // its configured host. Replaying the signature onto a different path
+        // must fail — the DIK signature binds the request, not just the device.
         let dik = SigningIdentity::from_seed(&UIK_SEED);
-        let dev_id = derive_id(IdKind::Device, &dik.public_bytes());
-        let input = device_request_signature_input("PUT", "/v/vault-x/membership", 1_700_000_000, b"{}", &dev_id);
+        let dv_id = derive_id(IdKind::Device, &dik.public_bytes());
+        let h = "api.dev.safeclaw.pro";
+        let input = device_request_signature_input("PUT", "/device/vaults/x/items", 1_700_000_000, b"{}", &dv_id, h);
         let sig = dik.sign(&input);
         assert!(verify(&dik.public_bytes(), &input, &sig), "own signature verifies");
-        let tampered = device_request_signature_input("PUT", "/v/vault-y/membership", 1_700_000_000, b"{}", &dev_id);
+        let tampered = device_request_signature_input("PUT", "/device/vaults/y/items", 1_700_000_000, b"{}", &dv_id, h);
         assert!(!verify(&dik.public_bytes(), &tampered, &sig), "a swapped path must not verify");
-    }
-
-    #[test]
-    fn pinned_device_request_signature_input() {
-        // K-vector: GET, path "/api/vault/agents/hashes", ts 1700000000, empty
-        // body, device "dev_box". The Node backend mirror pins the same bytes.
-        let input = device_request_signature_input("GET", "/api/vault/agents/hashes", 1_700_000_000, b"", "dev_box");
-        assert_eq!(hex(&input), "0000001673616665636c61772f76312f6465766963652d72657100000003474554000000182f6170692f7661756c742f6167656e74732f686173686573000000006553f10000000020e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855000000076465765f626f78");
     }
 
     #[test]
@@ -1009,50 +991,30 @@ mod tests {
     }
 
     #[test]
-    fn pinned_aik_identity_and_bearer() {
+    fn pinned_aik_identity() {
         let root = AgentRoot::from_seed(AIK_ROOT);
         assert_eq!(
             hex(&root.identity().public_bytes()),
             "2a25e722dc68abfe33f7d78adc91904ed0c9b7f74b17c52e8338968c87e2357b"
         );
         assert_eq!(root.agent_id(), "ag_n7smudy334mfsttpye6oedc3fqp7pjrf");
-        assert_eq!(
-            hex(&root.bearer(0)),
-            "48922af2f82a4ba05581440fec31d0ef06f22571f0c5f59117d06b656ab6e4b3"
-        );
     }
 
-    #[test]
-    fn pinned_server_envelope_input() {
-        // K-vector: vault "vault-7", kind "shared", format 2, membership_epoch 1,
-        // issued_at 1000, nonce = 0xAA*12. The server key signs this exact
-        // layout; the Node backend mirror pins the same hex.
-        let input = server_envelope_input("vault-7", "shared", 2, 1, 1000, &[0xAA; 12]);
-        assert_eq!(hex(&input), "0000001b73616665636c61772f76312f7365727665722d656e76656c6f7065000000077661756c742d37000000067368617265640000000000000002000000000000000100000000000003e80000000caaaaaaaaaaaaaaaaaaaaaaaa");
-    }
 
-    #[test]
-    fn pinned_contact_token_input() {
-        // K-vector: vault "vault-7", account "acc-1", issued_at 1000,
-        // nonce = 0xBB*12. Mirrored by the Node backend.
-        let input = contact_token_input("vault-7", "acc-1", 1000, &[0xBB; 12]);
-        assert_eq!(hex(&input), "0000001973616665636c61772f76312f636f6e746163742d746f6b656e000000077661756c742d37000000056163632d3100000000000003e80000000cbbbbbbbbbbbbbbbbbbbbbbbb");
-    }
 
     #[test]
     fn pinned_rekey_vectors() {
-        // DP-S1 re-key golden vectors (Part 2). FIXED inputs:
-        //   vault "vault-7", generation 5, content = 0x9a*32, signer "us_owner",
-        //   k_commitment = rekey_commitment(content).
-        // The browser mirror (lib/uik-crypto.ts) pins the SAME hex in
-        // scripts/verify-uik-crypto.mts. Do NOT edit an expected value to make a
-        // test pass — find why Rust ↔ TS diverged.
-        let content = [0x9au8; 32];
-        let commit = crate::storage::sealed_vault::rekey_commitment(&content);
-        assert_eq!(
-            hex(&commit),
-            "9f3fe20e9995e64c9403e734e2a3dce8fd7a8659cc05d9995cbd277c27d6f499"
-        );
+        // DP-S1 re-key golden vectors (Part 2). FIXED inputs: vault "vault-7",
+        // generation 5, signer "us_owner", and a fixed 32-byte commitment (the
+        // value a retired content-only commitment produced; the rekey input only
+        // carries 32 opaque bytes, and the full-bundle `k_commitment` has its own
+        // shared vectors). Do NOT edit an expected value to make a test pass —
+        // find why Rust ↔ TS diverged.
+        let commit: [u8; 32] = [
+            0x9f, 0x3f, 0xe2, 0x0e, 0x99, 0x95, 0xe6, 0x4c, 0x94, 0x03, 0xe7, 0x34, 0xe2, 0xa3,
+            0xdc, 0xe8, 0xfd, 0x7a, 0x86, 0x59, 0xcc, 0x05, 0xd9, 0x99, 0x5c, 0xbd, 0x27, 0x7c,
+            0x27, 0xd6, 0xf4, 0x99,
+        ];
         // Membership anti-rollback commitment over an EMPTY log prefix (membership_len 0).
         let membership = membership_commitment(&[]);
         assert_eq!(
@@ -1107,6 +1069,13 @@ mod tests {
             derive_id(IdKind::User, &[0x22u8; 32]),
             "us_t5zoudhusu3ohrtmpb7xaumg36neg6ai"
         );
+        // Trust reset: the device prefix is `dv` (was `dev`).
+        assert_eq!(
+            derive_id(IdKind::Device, &[0x11u8; 32]),
+            "dv_alketiy7xmthzdzvf2mwrj46hzp4sxa3"
+        );
+        assert_eq!(parse_id("dv_alketiy7xmthzdzvf2mwrj46hzp4sxa3"), Some(IdKind::Device));
+        assert_eq!(parse_id("dev_alketiy7xmthzdzvf2mwrj46hzp4sxa3"), None);
     }
 
     #[test]
@@ -1166,50 +1135,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn principal_event_input_every_field_binds() {
-        let base = principal_event_input("us_acct", "admit", "dev_box", 5, "us_acct");
-        assert_ne!(base, principal_event_input("us_other", "admit", "dev_box", 5, "us_acct"), "account binds");
-        assert_ne!(base, principal_event_input("us_acct", "revoke", "dev_box", 5, "us_acct"), "op binds");
-        assert_ne!(base, principal_event_input("us_acct", "admit", "ag_bot", 5, "us_acct"), "principal binds");
-        assert_ne!(base, principal_event_input("us_acct", "admit", "dev_box", 6, "us_acct"), "seq binds");
-        assert_ne!(base, principal_event_input("us_acct", "admit", "dev_box", 5, "us_other"), "owner binds");
-        assert_eq!(base, principal_event_input("us_acct", "admit", "dev_box", 5, "us_acct"), "deterministic");
-    }
 
-    #[test]
-    fn principal_event_input_lp_ambiguity_resolved() {
-        // ("ab","c") vs ("a","bc") for (account, op) would collide without length
-        // prefixes; with them the inputs differ.
-        let a = principal_event_input("ab", "c", "d", 1, "s");
-        let b = principal_event_input("a", "bc", "d", 1, "s");
-        assert_ne!(a, b);
-    }
 
-    #[test]
-    fn principal_event_roundtrip_and_op_tamper() {
-        // The account owner signs an admit/revoke with their UIK; the daemon
-        // rebuilds the input and verifies against the account anchor (the UIK that
-        // self-certifies account_id). Replaying an `admit` signature as a `revoke`
-        // (or vice versa) must fail — op is bound.
-        let uik = SigningIdentity::from_seed(&UIK_SEED);
-        let acct = uik.user_id();
-        let input = principal_event_input(&acct, "revoke", "dev_box", 9, &acct);
-        let sig = uik.sign(&input);
-        assert!(verify(&uik.public_bytes(), &input, &sig), "own signature verifies");
-        let flipped = principal_event_input(&acct, "admit", "dev_box", 9, &acct);
-        assert!(!verify(&uik.public_bytes(), &flipped, &sig), "a swapped op must not verify");
-    }
 
-    #[test]
-    fn pinned_principal_event_input() {
-        // §15 account principal-ledger golden vector. FIXED inputs: account
-        // "us_acct", op "revoke", principal "dev_box", seq 7, owner "us_acct".
-        // The TS mirror (Phase 3) pins the SAME hex. Do NOT edit an expected value
-        // to make a test pass — find why Rust ↔ TS diverged.
-        let input = principal_event_input("us_acct", "revoke", "dev_box", 7, "us_acct");
-        assert_eq!(hex(&input), "0000001b73616665636c61772f76312f7072696e636970616c2d6576656e740000000775735f61636374000000067265766f6b65000000076465765f626f7800000000000000070000000775735f61636374");
-    }
 
     #[test]
     fn pinned_vault_tombstone_input() {

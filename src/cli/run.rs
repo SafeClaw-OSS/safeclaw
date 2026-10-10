@@ -38,15 +38,13 @@ pub async fn run(args: RunArgs) -> Result<(), String> {
     report_ambient_proxy(&control).await;
 
     let proxy_url = agent_proxy_url(&vid);
-    // Friendly hint (user's request): a shell with NEITHER an AIK identity nor a
-    // legacy api-key can't authenticate credential substitution, so it will 407.
-    // Say so once, up front. An AIK agent (SAFECLAW_AGENT_IDENTITY) takes the shim
-    // path below and needs no key, so the note must recognize it too, or a keyless
-    // agent that is fully set up gets a misleading warning.
-    if !args.export_env && !agent_has_key() && load_agent_signer().is_none() {
+    // Friendly hint (user's request): a shell without an AIK identity can't
+    // authenticate credential substitution, so it will 407. Say so once, up
+    // front. An AIK agent (SAFECLAW_AGENT_IDENTITY) takes the shim path below.
+    if !args.export_env && load_agent_signer().is_none() {
         eprintln!(
             "note: this shell carries no SafeClaw agent identity, so credential substitution \
-             will 407. Load your agent env (SAFECLAW_AGENT_IDENTITY, or a legacy SAFECLAW_API_KEY) \
+             will 407. Load your agent env (SAFECLAW_AGENT_IDENTITY, printed by `sc agent add`) \
              and retry. This is not a daemon or port problem; non-credential traffic is unaffected."
         );
     }
@@ -85,11 +83,9 @@ pub async fn run(args: RunArgs) -> Result<(), String> {
     // hop-A (design/agent-device-identity-mtls.md §9.1): if this shell carries an
     // AIK identity (`SAFECLAW_AGENT_IDENTITY` → an agent identity file), route the
     // child through the sc-transport shim so NO credential lands in the child env
-    // — the shim holds the AIK (mints a per-CONNECT PoP) and the api-key (injected
-    // as the api-face Bearer), and we strip the inherited key from the child.
-    // ADDITIVE / dual-auth: with no AIK identity file this is skipped entirely and
-    // the child takes today's direct exec path, so nothing changes for existing
-    // agents (none set `SAFECLAW_AGENT_IDENTITY`).
+    // — the shim holds the AIK and mints a per-CONNECT PoP (and the api-face
+    // Bearer proof). Without an identity the child takes the direct exec path,
+    // where the proxy refuses credential substitution (no agent proof).
     if let Some(signer) = load_agent_signer() {
         return run_via_shim(&args.cmd, &vid, &ca_str, parent_count, signer).await;
     }
@@ -149,10 +145,9 @@ fn authority_of(url: &str) -> String {
 
 /// Run the child through the sc-transport shim (hop-A). Starts the shim on an
 /// ephemeral loopback port, points the child's `*_PROXY` at it with NO creds in
-/// the URL, STRIPS the inherited `SAFECLAW_API_KEY` from the child env (the shim
-/// authenticates by AIK PoP, so the child needs — and gets — no credential at
-/// all), then SPAWNS (not execs) the child so the shim task keeps serving in this
-/// process, waits, and propagates the exit code.
+/// the URL (the shim authenticates by AIK PoP, so the child needs, and gets, no
+/// credential at all), then SPAWNS (not execs) the child so the shim task keeps
+/// serving in this process, waits, and propagates the exit code.
 async fn run_via_shim(
     cmd: &[String],
     vid: &str,
@@ -178,11 +173,6 @@ async fn run_via_shim(
     let (prog, rest) = cmd.split_first().ok_or("no command to run")?;
     let mut c = tokio::process::Command::new(prog);
     c.args(rest);
-    // The whole point of hop-A: the injectable api-key must NOT be in the child
-    // env. The parent shell exported it (that's how a legacy agent authenticates);
-    // the shim authenticates by AIK PoP instead, so strip the key from what the
-    // child inherits — the child carries no credential at all.
-    c.env_remove("SAFECLAW_API_KEY");
     for (k, v) in &bundle {
         c.env(k, v);
     }
@@ -194,27 +184,13 @@ async fn run_via_shim(
     std::process::exit(status.code().unwrap_or(1));
 }
 
-/// The proxy URL the child's `HTTPS_PROXY` gets (CREDENTIAL_BROKER.md §14).
-/// Always REBUILT for the resolved vid: the agent's own `$SAFECLAW_API_KEY`
-/// spliced into the CURRENT API-face root (same daemon host as everything else —
-/// the invariant), never a pre-baked full proxy URL copied verbatim. A snapshot
-/// would pin a stale host:port from an old `sc agent add` (a moved daemon → the
-/// child's proxy points at a dead port); rebuilding tracks the live daemon and
-/// self-heals. `sc run` still never owns or persists the key — it reads the
-/// agent's own from the env and splices it in memory only.
+/// The proxy URL the child's `HTTPS_PROXY` gets on the direct path
+/// (CREDENTIAL_BROKER.md §14). Always REBUILT for the resolved vid against the
+/// CURRENT API-face root, never a pre-baked URL: a snapshot would pin a stale
+/// host:port (a moved daemon → a dead port); rebuilding tracks the live daemon.
 fn agent_proxy_url(vid: &str) -> String {
-    let key = std::env::var("SAFECLAW_API_KEY")
-        .ok()
-        .filter(|s| !s.is_empty());
     let cfg = load_config().unwrap_or_default();
-    proxy_url_for_vault(&api_face_root(&cfg), vid, key.as_deref())
-}
-
-/// Does this shell carry an agent identity? Its `$SAFECLAW_API_KEY`.
-fn agent_has_key() -> bool {
-    std::env::var("SAFECLAW_API_KEY")
-        .map(|s| !s.is_empty())
-        .unwrap_or(false)
+    proxy_url_for_vault(&api_face_root(&cfg), vid)
 }
 
 /// The CA must exist and the daemon must be up (the proxy shares its process).

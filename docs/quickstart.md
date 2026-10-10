@@ -22,19 +22,20 @@ There is no password.
 
 ## 3. Pair this machine and your agent
 
-In the console, "Connect a new agent" mints a one-time pair token and an
-install prompt. Paste the prompt to your agent and it does the rest. What it
-runs:
+Each command prints a one-time code. Open the console's Admit page
+(`/admit`), type the code and approve with your passkey. The code is shown
+only in your terminal and never travels in a link.
 
 ```bash
-sc login                      # pair this machine; brings the daemon up and
-                              # prints a passkey-approval link you open once
-sc agent add my-agent         # mint the agent's env file:
+sc login                      # pair this machine; asks you to confirm the
+                              # account, then brings the daemon up
+sc agent add my-agent         # admit an agent the same way; prints its env:
                               # SAFECLAW_BROKER_URL / SAFECLAW_AGENT_IDENTITY
 ```
 
-The approval is a passkey tap in your browser. After this, `sc status` shows
-the daemon up and the vault unlocked.
+After this, `sc status` shows the daemon up. `sc logout` signs this machine
+out and deletes its keys; revoke it in the console to remove it from your
+ledger.
 
 ## 4. Add a credential
 

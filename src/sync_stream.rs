@@ -9,20 +9,20 @@
 //! react by running their existing cursor-gated pull paths, so a duplicated,
 //! stale, or echoed event is a no-op by construction.
 //!
-//! Wire (backend `handleSyncStream`):
-//!   `GET {cloud}/api/vault/sync/stream?vids=a,b,c` (Bearer device key) →
-//!   `event: hello` with `{"vaults":{vid:{version,status}}}`, then `vault` /
-//!   `items` / `keys` hint frames, `:ka` comment heartbeats every 20s.
-//!   Pre-stream failures are plain JSON with 401/400/429/503. Railway
-//!   hard-caps any request at ~15 min: stream EOF after a healthy run is
-//!   ROTATION, not failure — see the state machine in [`dispatcher`].
+//! Wire (contract 8.4):
+//!   `GET {backend}/device/stream?vids=a,b,c` (DIK-signed) → `event: hello`
+//!   with `{"vaults":{vid:{…}}, "caps":[…]}`, then hint frames `state` /
+//!   `members` / `items` / `op` / `ledger`, each carrying `{vid?, us?, seq?}`,
+//!   and `:ka` comment heartbeats every 20s. Pre-stream failures are plain JSON
+//!   (401/403 device refusals, 400/429/503). Railway hard-caps any request at
+//!   ~15 min: stream EOF after a healthy run is ROTATION, not failure — see the
+//!   state machine in [`dispatcher`].
 //!
-//! v1.1 adds two ACCOUNT-scoped event kinds on the same stream —
-//! `agent_hashes` (api_keys changed) and `op` (an op_relay grant flipped) —
-//! which have no vault cell to land in and route to the daemon-global
-//! signals below instead. Same hints-not-data rule: the signals carry
-//! nothing; the consumers re-run their existing fetch/poll paths, which stay
-//! the source of truth.
+//! `op` and `ledger` events have no vault cell to land in and route to the
+//! daemon-global signals below. Same hints-not-data rule: the signals carry
+//! nothing; the consumers re-run their fetch/poll paths, which stay the source
+//! of truth (a `ledger` hint only makes the daemon re-read and re-verify its own
+//! ledger).
 
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex, OnceLock, Weak};
@@ -30,7 +30,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{watch, Notify};
 
-use crate::device_auth::DikRequestExt;
+use crate::cloud::DeviceClient;
 
 // ── Tunables (each one traces to a rule in design/sse-sync.md) ─────────
 
@@ -136,10 +136,9 @@ pub enum Mode {
     Fallback,
 }
 
-/// Cleartext lifecycle carried by a vault event / hello row — the projection
-/// of the blob envelope's `status` field. `Deleted` is the tombstone, and in
-/// Sse mode the EVENT is the lifecycle authority (same trust as the long-poll
-/// body: authenticated TLS to our own backend).
+/// Cleartext lifecycle hint carried by a `state` event / hello row. `Deleted`
+/// is only a hint: the vault task re-reads `/state` and drops local state ONLY
+/// on an owner-signed tombstone that verifies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VaultStatus {
     Live,
@@ -160,23 +159,19 @@ pub enum StreamHealth {
 
 // ── Daemon-global signals (v1.1 — op_relay + agent-hash eventing) ───────────
 
-/// Wakes `sync::sync_agent_keys_loop`. Fired on an `agent_hashes` stream
-/// event and after EVERY reconnect hello (resync-on-reconnect, see
-/// `run_stream`). A static, not AppState plumbing: the producers
-/// (`dispatch_record` / `run_stream`) are free functions with no AppState
-/// handle, and the sole consumer is spawned in main.rs BEFORE
-/// `spawn_watchers` builds any stream state.
-static AGENT_HASH_EVENTS: Notify = Notify::const_new();
+/// Wakes the own-ledger loop (`sync::own_ledger_loop`): fired on a `ledger`
+/// event for this person, after EVERY reconnect hello (a revoke whose event
+/// fell into a gap is re-read within one rotation), and by a
+/// `SC_DEVICE_REVOKED` refusal. `notify_one` parks a permit, so a fire while the
+/// loop is mid-fetch completes its next wait instantly.
+static OWN_LEDGER_EVENTS: Notify = Notify::const_new();
 
-/// Arm a wake on the agent-hash signal. `notify_one` semantics: a fire with
-/// no waiter parks a permit, so an event landing while the consumer is
-/// mid-fetch completes its NEXT wait instantly instead of being lost.
-pub fn agent_hashes_notified() -> tokio::sync::futures::Notified<'static> {
-    AGENT_HASH_EVENTS.notified()
+pub fn own_ledger_notified() -> tokio::sync::futures::Notified<'static> {
+    OWN_LEDGER_EVENTS.notified()
 }
 
-fn notify_agent_hashes() {
-    AGENT_HASH_EVENTS.notify_one();
+pub fn notify_own_ledger() {
+    OWN_LEDGER_EVENTS.notify_one();
 }
 
 /// Live op-relay pollers, keyed by op_id. A relay client registers before
@@ -211,6 +206,14 @@ impl OpRegistry {
             registry: self,
             op_id: op_id.to_string(),
             notify,
+        }
+    }
+
+    /// Wake every registered poller (an `op` event that names no op id).
+    fn notify_all(&self) {
+        let all: Vec<Arc<Notify>> = self.map.lock().unwrap().values().cloned().collect();
+        for n in all {
+            n.notify_one();
         }
     }
 
@@ -260,7 +263,7 @@ impl Drop for OpWaitGuard<'_> {
     }
 }
 
-/// The daemon-global op-event registry (relay pollers ↔ dispatcher).
+/// The daemon-global op-event registry (op pollers ↔ dispatcher).
 pub fn op_events() -> &'static OpRegistry {
     static OP_EVENTS: LazyLock<OpRegistry> = LazyLock::new(OpRegistry::new);
     &OP_EVENTS
@@ -329,7 +332,6 @@ pub async fn stream_health_edge() {
 struct StreamCaps {
     vids: std::collections::HashSet<String>,
     op_events: bool,
-    agent_hash_events: bool,
 }
 
 static STREAM_CAPS: LazyLock<Mutex<StreamCaps>> =
@@ -343,12 +345,6 @@ pub fn op_events_for(vid: &str) -> bool {
     c.op_events && c.vids.contains(vid)
 }
 
-/// Does the connected backend emit `agent_hashes` events? Gates the
-/// agent-hash loop's relaxed 600s cadence.
-pub fn agent_hash_events_live() -> bool {
-    STREAM_CAPS.lock().unwrap().agent_hash_events
-}
-
 fn set_stream_caps(vids: std::collections::HashSet<String>, caps: Option<&serde_json::Value>) {
     let list: Vec<&str> = caps
         .and_then(|c| c.as_array())
@@ -356,7 +352,6 @@ fn set_stream_caps(vids: std::collections::HashSet<String>, caps: Option<&serde_
         .unwrap_or_default();
     let mut s = STREAM_CAPS.lock().unwrap();
     s.op_events = list.contains(&"op");
-    s.agent_hash_events = list.contains(&"agent_hashes");
     s.vids = vids;
 }
 
@@ -367,22 +362,22 @@ fn clear_stream_caps() {
 /// The drained portion of a cell — what one watch-task round processes.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Work {
-    pub vault: Option<(u64, VaultStatus)>,
+    pub state: Option<(u64, VaultStatus)>,
+    pub members: bool,
     pub items: bool,
-    pub keys: bool,
 }
 
 impl Work {
     pub fn is_empty(&self) -> bool {
-        self.vault.is_none() && !self.items && !self.keys
+        self.state.is_none() && !self.items && !self.members
     }
 }
 
 #[derive(Debug)]
 struct Pending {
-    vault: Option<(u64, VaultStatus)>,
+    state: Option<(u64, VaultStatus)>,
     items: bool,
-    keys: bool,
+    members: bool,
     mode: Mode,
     /// ★★ "deleted" is STICKY for the cell's LIFETIME (survives `take_work`):
     /// backend emits from concurrent write handlers aren't serialized with
@@ -414,9 +409,9 @@ impl WakeCell {
     pub fn new() -> Self {
         Self {
             pending: Mutex::new(Pending {
-                vault: None,
+                state: None,
                 items: false,
-                keys: false,
+                members: false,
                 mode: Mode::Fallback,
                 deleted_sticky: false,
             }),
@@ -452,15 +447,15 @@ impl WakeCell {
         }
     }
 
-    /// ★★ MONOTONE merge of the vault slot: keep the HIGHER version, and
+    /// ★★ MONOTONE merge of the state slot: keep the HIGHER version, and
     /// "deleted" wins over "live" forever (see `deleted_sticky`). hello rows
     /// go through here exactly like live events — hello is only the
     /// connect-budget sentinel and mode-setter, never a gate on event
     /// processing or a fresher-than-events truth.
-    pub fn merge_vault(&self, version: u64, status: VaultStatus) {
+    pub fn merge_state(&self, version: u64, status: VaultStatus) {
         {
             let mut p = self.pending.lock().unwrap();
-            merge_vault_locked(&mut p, version, status);
+            merge_state_locked(&mut p, version, status);
         }
         self.notify.notify_one();
     }
@@ -470,23 +465,23 @@ impl WakeCell {
         self.notify.notify_one();
     }
 
-    pub fn set_keys(&self) {
-        self.pending.lock().unwrap().keys = true;
+    pub fn set_members(&self) {
+        self.pending.lock().unwrap().members = true;
         self.notify.notify_one();
     }
 
     pub fn has_work(&self) -> bool {
         let p = self.pending.lock().unwrap();
-        p.vault.is_some() || p.items || p.keys
+        p.state.is_some() || p.items || p.members
     }
 
     /// Drain the pending work (mode and the deleted-sticky bit stay).
     pub fn take_work(&self) -> Work {
         let mut p = self.pending.lock().unwrap();
         Work {
-            vault: p.vault.take(),
+            state: p.state.take(),
             items: std::mem::take(&mut p.items),
-            keys: std::mem::take(&mut p.keys),
+            members: std::mem::take(&mut p.members),
         }
     }
 
@@ -501,25 +496,25 @@ impl WakeCell {
             return;
         }
         let mut p = self.pending.lock().unwrap();
-        if let Some((version, status)) = w.vault {
-            merge_vault_locked(&mut p, version, status);
+        if let Some((version, status)) = w.state {
+            merge_state_locked(&mut p, version, status);
         }
         p.items |= w.items;
-        p.keys |= w.keys;
+        p.members |= w.members;
     }
 }
 
-fn merge_vault_locked(p: &mut Pending, version: u64, status: VaultStatus) {
+fn merge_state_locked(p: &mut Pending, version: u64, status: VaultStatus) {
     if status == VaultStatus::Deleted {
         p.deleted_sticky = true;
     }
-    let v = p.vault.map(|(v, _)| v.max(version)).unwrap_or(version);
+    let v = p.state.map(|(v, _)| v.max(version)).unwrap_or(version);
     let s = if p.deleted_sticky {
         VaultStatus::Deleted
     } else {
         VaultStatus::Live
     };
-    p.vault = Some((v, s));
+    p.state = Some((v, s));
 }
 
 // ── SSE wire parser ──────────────────────────────────────────────────────────
@@ -692,12 +687,11 @@ enum ConnectFail {
 ///    ★★ 5 consecutive never-healthy attempts → 600s parks. 404 → 600s,
 ///    401/403 → 600s, 429 → 300s.
 pub async fn dispatcher(
-    cloud: String,
-    dk: String,
+    client: DeviceClient,
+    own_us: String,
     cells: Vec<(String, Weak<WakeCell>)>,
     health: watch::Sender<StreamHealth>,
 ) {
-    let cloud = cloud.trim_end_matches('/').to_string();
     let mut backoff = BACKOFF_MIN;
     let mut never_healthy: u32 = 0;
     let mut rotating = false;
@@ -756,7 +750,16 @@ pub async fn dispatcher(
         vids.sort_unstable(); // stable param across reconnects
         let vids_param = vids.join(",");
 
-        match run_stream(&cloud, &dk, &stream_cells, &vids_param, &health, rotating).await {
+        match run_stream(
+            &client,
+            &own_us,
+            &stream_cells,
+            &vids_param,
+            &health,
+            rotating,
+        )
+        .await
+        {
             StreamEnd::Died { healthy_for, why } => {
                 announced_old_backend = false; // hello proved the route exists
                 if healthy_for >= PROVEN_HEALTHY {
@@ -871,8 +874,8 @@ pub async fn dispatcher(
 /// dispatcher loop). `rotating` selects the tighter one-shot budget and the
 /// debug-level reconnect log.
 async fn run_stream(
-    cloud: &str,
-    dk: &str,
+    client_dev: &DeviceClient,
+    own_us: &str,
     cells: &HashMap<String, Arc<WakeCell>>,
     vids_param: &str,
     health: &watch::Sender<StreamHealth>,
@@ -887,23 +890,18 @@ async fn run_stream(
         Ok(c) => c,
         Err(e) => return StreamEnd::Failed(ConnectFail::Transient(format!("client init: {}", e))),
     };
-    let url = format!("{}/api/vault/sync/stream?vids={}", cloud, vids_param);
+    let path = format!("/device/stream?vids={}", vids_param);
     let started = Instant::now();
     let headers_budget = if rotating {
         ROTATION_REDIAL_BUDGET
     } else {
         CONNECT_HEADERS_BUDGET
     };
-    let resp = match tokio::time::timeout(
-        headers_budget,
-        client
-            .get(&url)
-            .bearer_auth(dk)
-            .dik_pop("GET", &url, &[])
-            .send(),
-    )
-    .await
-    {
+    let req = match client_dev.request(&client, reqwest::Method::GET, &path, None) {
+        Ok(r) => r,
+        Err(e) => return StreamEnd::Failed(ConnectFail::Transient(e)),
+    };
+    let resp = match tokio::time::timeout(headers_budget, req.send()).await {
         Err(_) => {
             return StreamEnd::Failed(ConnectFail::Transient(
                 "no response headers within budget".into(),
@@ -930,7 +928,7 @@ async fn run_stream(
     };
     let hello = match tokio::time::timeout(
         hello_wait,
-        read_until_hello(&mut stream, &mut parser, cells),
+        read_until_hello(&mut stream, &mut parser, cells, own_us),
     )
     .await
     {
@@ -945,14 +943,11 @@ async fn run_stream(
     // the Up edge re-reads its mode at the loop top and must see the final
     // value, never a stale Fallback.
     let n = apply_hello(cells, &hello);
-    // ★ Resync-on-reconnect (v1.1): the dominant way to LOSE an
-    // `agent_hashes` event is a stream disconnect — and the reconnect the
-    // loss forces is exactly where we stand now, so firing the notify here
-    // turns the failure mode into the recovery. With Railway rotating every
-    // stream ≤15 min, the platform itself becomes the revocation backstop: a
-    // revoke whose event fell into a gap goes unseen for at most one
-    // rotation before this resync picks it up.
-    notify_agent_hashes();
+    // ★ Resync-on-reconnect: the dominant way to LOSE a `ledger` event is a
+    // stream disconnect, and the reconnect is where we stand now — re-read
+    // the own ledger, so a revoke whose event fell into a gap is seen within
+    // one rotation.
+    notify_own_ledger();
     health.send_if_modified(|h| {
         if *h == StreamHealth::Up {
             false
@@ -997,7 +992,7 @@ async fn run_stream(
             }
             Ok(Some(Ok(chunk))) => {
                 for rec in parser.push(chunk.as_ref()) {
-                    dispatch_record(cells, &rec);
+                    dispatch_record(cells, &rec, own_us);
                 }
             }
         }
@@ -1015,6 +1010,7 @@ async fn read_until_hello<S, B>(
     stream: &mut S,
     parser: &mut SseParser,
     cells: &HashMap<String, Arc<WakeCell>>,
+    own_us: &str,
 ) -> Result<serde_json::Value, String>
 where
     S: futures_util::Stream<Item = Result<B, reqwest::Error>> + Unpin,
@@ -1035,7 +1031,7 @@ where
                         .map_err(|e| format!("undecodable hello: {}", e))?,
                 );
             } else {
-                dispatch_record(cells, &rec);
+                dispatch_record(cells, &rec, own_us);
             }
         }
         if let Some(h) = hello {
@@ -1061,10 +1057,10 @@ fn apply_hello(cells: &HashMap<String, Arc<WakeCell>>, hello: &serde_json::Value
             Some(row) => {
                 n += 1;
                 confirmed.insert(vid.clone());
-                let (version, status) = parse_vault_hint(row);
-                cell.merge_vault(version, status);
+                let (version, status) = parse_state_hint(row);
+                cell.merge_state(version, status);
                 cell.set_items();
-                cell.set_keys();
+                cell.set_members();
                 cell.set_mode(Mode::Sse);
             }
             None => cell.set_mode(Mode::Fallback),
@@ -1077,48 +1073,44 @@ fn apply_hello(cells: &HashMap<String, Arc<WakeCell>>, hello: &serde_json::Value
     n
 }
 
-/// Route one parsed record into its vault's cell, or (v1.1) an
-/// account-scoped event into its daemon-global signal. Unknown event kinds,
-/// unknown vids and unknown op_ids are ignored (forward compatibility —
-/// hints are best-effort by design). `items.seq` is deliberately unused: the
-/// hint means "just pull"; the pull's own cursor decides what is new. Same
-/// rule for the v1.1 payloads: nothing beyond ROUTING is trusted — the
-/// consumers re-fetch/re-poll and their responses are the truth.
-fn dispatch_record(cells: &HashMap<String, Arc<WakeCell>>, rec: &SseRecord) {
-    // Account-scoped, payload-free: `data` is `{}` today and deliberately
-    // not parsed (the consumer re-fetches the WHOLE hash-set regardless), so
-    // this routes before the JSON gate — a garbled body must still wake it.
-    if rec.event == "agent_hashes" {
-        notify_agent_hashes();
-        return;
-    }
+/// Route one parsed record into its vault's cell, or an account-scoped event
+/// into its daemon-global signal. Unknown event kinds, unknown vids and unknown
+/// op ids are ignored (hints are best-effort by design). Nothing beyond ROUTING
+/// is trusted: the consumers re-fetch and verify.
+fn dispatch_record(cells: &HashMap<String, Arc<WakeCell>>, rec: &SseRecord, own_us: &str) {
     let Ok(data) = serde_json::from_str::<serde_json::Value>(&rec.data) else {
         tracing::debug!(event = %rec.event, "sync stream: undecodable event data; ignoring");
         return;
     };
-    if rec.event == "hello" {
-        // Not expected mid-stream, but folding it like a fresh snapshot is
-        // strictly harmless (merges are monotone) — and it counts as a
-        // resync point, so fire the agent-hash notify exactly like the
-        // connect-time hello does (design: after EVERY apply_hello).
-        apply_hello(cells, &data);
-        notify_agent_hashes();
-        return;
-    }
-    if rec.event == "op" {
-        // {"vid","op_id","status"} — op_id routes; status is log color only
-        // (the poller's next poll response is the real status either way).
-        if let Some(op_id) = data.get("op_id").and_then(|v| v.as_str()) {
-            if op_events().notify(op_id) {
-                // Event-driven by construction: one line per grant flip.
-                tracing::debug!(
-                    op = %op_id,
-                    status = data.get("status").and_then(|s| s.as_str()).unwrap_or("?"),
-                    "sync stream: op event; waking relay poller"
-                );
-            }
+    match rec.event.as_str() {
+        "hello" => {
+            // Not expected mid-stream; folding it is harmless (monotone merges)
+            // and it is a resync point like the connect-time hello.
+            apply_hello(cells, &data);
+            notify_own_ledger();
+            return;
         }
-        return;
+        "ledger" => {
+            // Only this person's ledger matters to the daemon (other members'
+            // ledgers are re-read on demand when an approval needs them).
+            let us = data.get("us").and_then(|v| v.as_str());
+            if us.is_none() || us == Some(own_us) {
+                notify_own_ledger();
+            }
+            return;
+        }
+        "op" => {
+            match data.get("op_id").and_then(|v| v.as_str()) {
+                Some(op_id) => {
+                    if op_events().notify(op_id) {
+                        tracing::debug!(op = %op_id, "sync stream: op event; waking poller");
+                    }
+                }
+                None => op_events().notify_all(),
+            }
+            return;
+        }
+        _ => {}
     }
     let Some(cell) = data
         .get("vid")
@@ -1128,24 +1120,25 @@ fn dispatch_record(cells: &HashMap<String, Arc<WakeCell>>, rec: &SseRecord) {
         return;
     };
     match rec.event.as_str() {
-        "vault" => {
-            let (version, status) = parse_vault_hint(&data);
-            cell.merge_vault(version, status);
+        "state" => {
+            let (version, status) = parse_state_hint(&data);
+            cell.merge_state(version, status);
         }
         "items" => cell.set_items(),
-        "keys" => cell.set_keys(),
+        "members" => cell.set_members(),
         _ => {}
     }
 }
 
-/// The ONE decode of a wire vault row/event `{version, status}` — hello rows
-/// and live `vault` events are the same wire object and MUST classify
-/// identically (a decode edited in one place only would make hello and events
-/// disagree on a vault's lifecycle, and the monotone merge would quietly mask
-/// the divergence). Absent/odd version → 0 (merges as no-op); anything but an
-/// explicit "deleted" is Live — only an explicit tombstone ever destroys.
-fn parse_vault_hint(v: &serde_json::Value) -> (u64, VaultStatus) {
-    let version = v.get("version").and_then(|x| x.as_u64()).unwrap_or(0);
+/// The ONE decode of a `state` event / hello row: `{seq|version, status}`.
+/// Absent/odd version → 0 (merges as no-op); anything but an explicit
+/// "deleted" is Live.
+fn parse_state_hint(v: &serde_json::Value) -> (u64, VaultStatus) {
+    let version = v
+        .get("seq")
+        .or_else(|| v.get("version"))
+        .and_then(|x| x.as_u64())
+        .unwrap_or(0);
     let status = if v.get("status").and_then(|x| x.as_str()) == Some("deleted") {
         VaultStatus::Deleted
     } else {
@@ -1217,18 +1210,15 @@ mod tests {
     fn stream_caps_gate_relaxed_cadences() {
         clear_stream_caps();
         assert!(!op_events_for("aaaa"));
-        assert!(!agent_hash_events_live());
         let vids: std::collections::HashSet<String> = ["aaaa".to_string()].into_iter().collect();
-        set_stream_caps(vids, Some(&serde_json::json!(["op", "agent_hashes"])));
+        set_stream_caps(vids, Some(&serde_json::json!(["op", "ledger"])));
         assert!(op_events_for("aaaa"));
         assert!(!op_events_for("bbbb")); // vid not on the stream → no proof
-        assert!(agent_hash_events_live());
-        // v1 backend: hello carries no caps → confirmed vids alone must NOT
-        // relax any cadence (the version-skew case this mechanism exists for).
+                                         // v1 backend: hello carries no caps → confirmed vids alone must NOT
+                                         // relax any cadence (the version-skew case this mechanism exists for).
         let vids: std::collections::HashSet<String> = ["aaaa".to_string()].into_iter().collect();
         set_stream_caps(vids, None);
         assert!(!op_events_for("aaaa"));
-        assert!(!agent_hash_events_live());
         clear_stream_caps();
     }
 
@@ -1344,10 +1334,10 @@ mod tests {
     #[test]
     fn cell_merge_is_monotone_across_stale_hello() {
         let c = WakeCell::new();
-        c.merge_vault(7, VaultStatus::Live); // pre-hello event
-        c.merge_vault(5, VaultStatus::Live); // stale hello row
+        c.merge_state(7, VaultStatus::Live); // pre-hello event
+        c.merge_state(5, VaultStatus::Live); // stale hello row
         let w = c.take_work();
-        assert_eq!(w.vault, Some((7, VaultStatus::Live)));
+        assert_eq!(w.state, Some((7, VaultStatus::Live)));
         assert!(!c.has_work());
     }
 
@@ -1357,11 +1347,11 @@ mod tests {
     #[test]
     fn cell_deleted_is_sticky_for_cell_lifetime() {
         let c = WakeCell::new();
-        c.merge_vault(4, VaultStatus::Deleted);
-        c.merge_vault(9, VaultStatus::Live);
-        assert_eq!(c.take_work().vault, Some((9, VaultStatus::Deleted)));
-        c.merge_vault(10, VaultStatus::Live);
-        assert_eq!(c.take_work().vault, Some((10, VaultStatus::Deleted)));
+        c.merge_state(4, VaultStatus::Deleted);
+        c.merge_state(9, VaultStatus::Live);
+        assert_eq!(c.take_work().state, Some((9, VaultStatus::Deleted)));
+        c.merge_state(10, VaultStatus::Live);
+        assert_eq!(c.take_work().state, Some((10, VaultStatus::Deleted)));
     }
 
     #[test]
@@ -1370,9 +1360,9 @@ mod tests {
         assert_eq!(c.mode(), Mode::Fallback);
         c.set_mode(Mode::Sse);
         c.set_items();
-        c.set_keys();
+        c.set_members();
         let w = c.take_work();
-        assert!(w.items && w.keys && w.vault.is_none());
+        assert!(w.items && w.members && w.state.is_none());
         assert!(!c.has_work());
         assert_eq!(c.mode(), Mode::Sse);
     }
@@ -1382,15 +1372,15 @@ mod tests {
     #[test]
     fn cell_reinject_restores_unprocessed_work() {
         let c = WakeCell::new();
-        c.merge_vault(3, VaultStatus::Live);
+        c.merge_state(3, VaultStatus::Live);
         c.set_items();
         let w = c.take_work();
         assert!(!c.has_work());
-        c.merge_vault(8, VaultStatus::Live); // fresher event raced the retry
+        c.merge_state(8, VaultStatus::Live); // fresher event raced the retry
         c.reinject(w);
         let again = c.take_work();
-        assert_eq!(again.vault, Some((8, VaultStatus::Live)));
-        assert!(again.items && !again.keys);
+        assert_eq!(again.state, Some((8, VaultStatus::Live)));
+        assert!(again.items && !again.members);
     }
 
     // ── Daemon-global signals (v1.1) ──
@@ -1428,25 +1418,62 @@ mod tests {
         assert!(fresh.notified().now_or_never().is_some());
     }
 
-    /// `agent_hashes` routes to the daemon-global notify — even with an
-    /// undecodable payload (it is payload-free by design; the consumer
-    /// re-fetches the whole set regardless). This is the only test touching
-    /// the global notify, so parallel test runs can't race the permit.
+    /// A `ledger` event for THIS person (or one naming no person) wakes the
+    /// own-ledger loop; another person's does not. Undecodable data is ignored.
+    /// The only test touching that global notify, so parallel runs can't race
+    /// the permit.
     #[test]
-    fn dispatch_routes_agent_hashes_to_global_notify() {
+    fn dispatch_routes_own_ledger_events_to_the_global_notify() {
         let cells = HashMap::new();
+        let me = "us_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let rec = |data: &str| SseRecord {
+            event: "ledger".into(),
+            data: data.into(),
+        };
         dispatch_record(
             &cells,
-            &SseRecord {
-                event: "agent_hashes".into(),
-                data: "not json".into(),
-            },
+            &rec(r#"{"us":"us_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","seq":3}"#),
+            me,
         );
-        assert!(agent_hashes_notified().now_or_never().is_some());
         assert!(
-            agent_hashes_notified().now_or_never().is_none(),
+            own_ledger_notified().now_or_never().is_none(),
+            "another person's ledger"
+        );
+        dispatch_record(&cells, &rec("not json"), me);
+        assert!(
+            own_ledger_notified().now_or_never().is_none(),
+            "undecodable"
+        );
+        dispatch_record(&cells, &rec(&format!(r#"{{"us":"{}","seq":4}}"#, me)), me);
+        assert!(own_ledger_notified().now_or_never().is_some());
+        assert!(
+            own_ledger_notified().now_or_never().is_none(),
             "permit consumed"
         );
+    }
+
+    /// `state` / `members` / `items` events land in their vault's cell.
+    #[test]
+    fn dispatch_routes_vault_events_to_cells() {
+        let cell = Arc::new(WakeCell::new());
+        let mut cells = HashMap::new();
+        cells.insert("v1".to_string(), Arc::clone(&cell));
+        let me = "us_x";
+        let rec = |event: &str, data: &str| SseRecord {
+            event: event.into(),
+            data: data.into(),
+        };
+        dispatch_record(
+            &cells,
+            &rec("state", r#"{"vid":"v1","seq":5,"status":"deleted"}"#),
+            me,
+        );
+        dispatch_record(&cells, &rec("members", r#"{"vid":"v1","seq":2}"#), me);
+        dispatch_record(&cells, &rec("items", r#"{"vid":"v1","seq":9}"#), me);
+        dispatch_record(&cells, &rec("items", r#"{"vid":"other","seq":9}"#), me);
+        let w = cell.take_work();
+        assert_eq!(w.state, Some((5, VaultStatus::Deleted)));
+        assert!(w.members && w.items);
     }
 
     /// `op` events route by op_id to the registered poller; unknown or
@@ -1462,9 +1489,10 @@ mod tests {
                 event: "op".into(),
                 data: r#"{"vid":"v1","op_id":"test-dispatch-op-8c11","status":"approved"}"#.into(),
             },
+            "us_x",
         );
         assert!(guard.notified().now_or_never().is_some());
-        // Unknown op_id and missing op_id: no panic, no wake.
+        // Unknown op_id: no panic, no wake.
         dispatch_record(
             &cells,
             &SseRecord {
@@ -1472,15 +1500,20 @@ mod tests {
                 data: r#"{"vid":"v1","op_id":"test-dispatch-op-nobody","status":"rejected"}"#
                     .into(),
             },
+            "us_x",
         );
+        assert!(guard.notified().now_or_never().is_none());
+        // An op event naming no op id (contract 8.4 `{vid?, us?, seq?}`) wakes
+        // every poller: each re-polls its own op, which stays the truth.
         dispatch_record(
             &cells,
             &SseRecord {
                 event: "op".into(),
-                data: "{}".into(),
+                data: r#"{"vid":"v1","seq":4}"#.into(),
             },
+            "us_x",
         );
-        assert!(guard.notified().now_or_never().is_none());
+        assert!(guard.notified().now_or_never().is_some());
     }
 
     /// Health read defaults to NOT-healthy while unset — the correct answer

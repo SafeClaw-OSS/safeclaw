@@ -41,18 +41,14 @@ pub struct CliConfig {
     /// migrates entries over and clears this field.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub known_vaults: Vec<KnownVault>,
-    /// Cloud pro-backend origin for sealed-blob sync (Slice 3) AND the
-    /// op-relay (web approval). Set by `sc login`; the daemon pulls
-    /// `{cloud_backend}/v/{vault}/blob` and registers pending ops at
-    /// `{cloud_backend}/v/{vault}/op/relay/*`. Distinct from `daemon`,
-    /// which after login points at the LOCAL daemon the agent talks to.
-    /// See [[project_slice3_design]].
+    /// The backend base URL every DIK-signed `/device/*` request goes to (and
+    /// whose host is the canonical host the signature binds, contract 1.4). Set
+    /// by `sc login`. Distinct from `daemon`, the LOCAL daemon the agent talks to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cloud_backend: Option<String>,
     /// Cloud FRONTEND origin (where the human taps their passkey: the web
-    /// approval page at `{frontend_origin}/grant/{op_id}`). Returned by the
-    /// pair-token exchange as `console_url`. Distinct from `cloud_backend`
-    /// (the API host, typically `api.<frontend>`). Set by `sc login`.
+    /// approval page at `{frontend_origin}/grant/{op_id}`). Distinct from
+    /// `cloud_backend` (the API host, typically `api.<frontend>`). Set by `sc login`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frontend_origin: Option<String>,
     /// Persistent user preferences. Set via `sc config set <key> <value>`.
@@ -86,37 +82,25 @@ pub struct CliConfig {
     /// `sc vault forget` never sets it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vault_deleted_upstream: Option<String>,
-    /// The account's Supabase UUID, captured at `sc login`. ROLE = logging / debug /
-    /// support identification ONLY: it matches the id shown in the web console, so a
-    /// human can tie this machine to an account. It is NOT an identity or verification
-    /// anchor — a database UUID cannot be checked against a signature. Everything that
-    /// verifies OWNER intent (the principal ledger, membership, tombstones) uses
-    /// `account_uik` (the self-certifying `us_…`) below. Keeping the two apart is the
-    /// fix for the Fix-0 confusion: an earlier build wrongly pinned THIS UUID as the
-    /// ledger anchor, so `derive_id(uik_pub) == account_id` never matched and nothing
-    /// verified. Cleared by logout / self-revoke.
+    /// The person (`us_…`) this device is paired to — the account ANCHOR pinned
+    /// by `sc login` after the admission mac verified under the code the human
+    /// typed (trust-reset design D2). Every ledger and member record this device
+    /// trusts folds from it. Cleared by `sc logout` and a verified self-revoke.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub account_id: Option<String>,
-    /// §15: the account's owner-UIK id (`us_…`) — the REAL principal-ledger anchor
-    /// (the `account_id` above is the Supabase UUID, NOT the anchor). Self-certifying:
-    /// `derive_id(User, uik_pub) == account_uik`. Delivered + pinned at pairing; the
-    /// daemon verifies the ledger anchor + its own per-vault membership against it.
-    /// Absent on an older backend / pre-UIK account (the ledger loop then doesn't run).
+    pub person: Option<String>,
+    /// The person's UIK signing pub (unpadded base64url, 32 bytes); must fold to
+    /// `person`. Pinned with it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub account_uik: Option<String>,
-    /// §15 principal-ledger enforcement switch: DEFAULT OFF — a verified revoke of
-    /// THIS device only locks+wipes when this is "on". `SAFECLAW_PRINCIPAL_ENFORCE`
-    /// overrides (and survives an old binary's config save). Flipped on at the P6
-    /// cutover. See [`crate::principal_ledger::principal_enforce_enabled`].
+    pub person_sign_pub: Option<String>,
+    /// The account email the approver's console reported (mac'd with the anchor),
+    /// for display only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub principal_enforce: Option<String>,
-    /// §15 leg-A require-signed-tombstone switch: DEFAULT OFF — an unsigned
-    /// `status:"deleted"` still drops local state (legacy). When "on", the daemon drops
-    /// only on an owner-signed tombstone that verifies against the vault fold-owner set.
-    /// `SAFECLAW_REQUIRE_SIGNED_TOMBSTONE` overrides. Flipped on at the P6 cutover. See
-    /// [`crate::principal_ledger::require_signed_tombstone`].
+    pub account_email: Option<String>,
+    /// The person this machine was LAST paired to. Survives `sc logout` so the
+    /// next `sc login` can warn when it would pair the machine to a different
+    /// account.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub require_signed_tombstone: Option<String>,
+    pub last_paired_person: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
@@ -397,15 +381,16 @@ pub fn put_active(daemon: &str, vault: &str) -> Result<PathBuf, String> {
 /// the daemon auto-discovers the account's vaults on start, a single one
 /// auto-selects, and a multi-vault account is resolved by the user (`sc vault
 /// use`) or per command (`--vault`). The agent talks to the local `daemon`; the
-/// daemon syncs against the cloud (`cloud_backend`). Leaves `config.vault` as it
-/// was: a fresh machine has none (auto-select decides), and a re-pair keeps an
-/// explicit default the user already set.
+/// daemon syncs against the cloud (`cloud_backend`). Pins the person anchor
+/// (`us_` + UIK sign pub, already verified by the caller). Leaves `config.vault`
+/// as it was.
 pub fn put_cloud_coords(
     daemon: &str,
     cloud_backend: &str,
     frontend_origin: Option<&str>,
-    account_id: Option<&str>,
-    account_uik: Option<&str>,
+    person: &str,
+    person_sign_pub: &[u8; 32],
+    account_email: &str,
 ) -> Result<PathBuf, String> {
     let mut cfg = load().unwrap_or_default();
     cfg.daemon = Some(daemon.to_string());
@@ -414,44 +399,31 @@ pub fn put_cloud_coords(
     cfg.frontend_origin = frontend_origin
         .filter(|s| !s.is_empty())
         .map(|s| s.trim_end_matches('/').to_string());
-    // §15: persist the paired account UUID (reference) + the owner-UIK us_ (the
-    // real, self-certifying principal-ledger anchor). Keep prior values if this
-    // pairing response omits them (older backend / pre-UIK account).
-    if let Some(a) = account_id.filter(|s| !s.is_empty()) {
-        cfg.account_id = Some(a.to_string());
-    }
-    if let Some(u) = account_uik.filter(|s| !s.is_empty()) {
-        cfg.account_uik = Some(u.to_string());
-    }
+    cfg.person = Some(person.to_string());
+    cfg.person_sign_pub = Some(data_encoding::BASE64URL_NOPAD.encode(person_sign_pub));
+    cfg.account_email = Some(account_email.to_string()).filter(|s| !s.is_empty());
+    cfg.last_paired_person = Some(person.to_string());
     save(&cfg)
 }
 
-/// The account's Supabase UUID, for logging / debug / support display ONLY (matching a
-/// daemon to a console account). NEVER an identity or verification anchor — use
-/// [`account_uik`] for anything that checks owner intent. `None` for a local-only daemon.
-pub fn account_id() -> Option<String> {
-    load().ok()?.account_id.filter(|s| !s.is_empty())
-}
-
-/// The account's owner-UIK id (`us_…`) captured at pairing — the §15 principal-ledger
-/// ANCHOR + the daemon's own per-vault member identity. `None` on an older backend /
-/// pre-UIK account (the ledger loop then doesn't start; membership-loss wipe is skipped).
-pub fn account_uik() -> Option<String> {
-    load().ok()?.account_uik.filter(|s| !s.is_empty())
+/// The person (`us_…`) this device is paired to. `None` when unpaired.
+pub fn person() -> Option<String> {
+    load().ok()?.person.filter(|s| !s.is_empty())
 }
 
 /// Clear the cloud pairing from config + the known-vaults catalog (the inverse of
-/// [`put_cloud_coords`]): drop daemon/vault/cloud_backend/frontend_origin/account_id
-/// + known_vaults, preserve user `settings`. Used by the §15 self-revoke wipe so it
-/// leaves the same state `sc logout` does.
+/// [`put_cloud_coords`]): drop daemon/vault/cloud_backend/frontend_origin and the
+/// person anchor + known_vaults; preserve user `settings` and
+/// `last_paired_person`. Shared by `sc logout` and the self-revoke wipe.
 pub fn clear_pairing() -> Result<(), String> {
     let mut cfg = load().unwrap_or_default();
     cfg.daemon = None;
     cfg.vault = None;
     cfg.cloud_backend = None;
     cfg.frontend_origin = None;
-    cfg.account_id = None;
-    cfg.account_uik = None;
+    cfg.person = None;
+    cfg.person_sign_pub = None;
+    cfg.account_email = None;
     cfg.vault_deleted_upstream = None;
     cfg.known_vaults.clear();
     save(&cfg)?;
@@ -490,7 +462,7 @@ pub fn grant_url(op_id: &str) -> String {
 /// leading `api.` on the host; everything else (scheme, port, path) is kept.
 /// A backend host without an `api.` prefix is returned unchanged (self-host
 /// where frontend == backend).
-fn derive_frontend_from_backend(backend: &str) -> String {
+pub fn derive_frontend_from_backend(backend: &str) -> String {
     let trimmed = backend.trim_end_matches('/');
     let (scheme, rest) = match trimmed.split_once("://") {
         Some((s, r)) => (s, r),
@@ -701,8 +673,7 @@ pub fn resolve_active(vault_override: Option<&str>) -> Result<(String, String), 
     // vault and point at re-pairing instead of the generic "no vault" error.
     if let Some(dead) = cfg.vault_deleted_upstream.as_deref() {
         return Err(format!(
-            "vault {} was deleted on the web, so this device's pairing to it is gone — \
-             generate a new install token in the console (\"Connect a new agent\") and run `sc login`",
+            "vault {} was deleted on the web — pick another with `sc vault use`, or create one in the console",
             dead
         ));
     }

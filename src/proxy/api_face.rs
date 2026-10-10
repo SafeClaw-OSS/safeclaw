@@ -8,13 +8,14 @@
 //! agent wrongly routed discovery through its own proxy) is the loop-guard case,
 //! also handled here. Everything is a plain READ:
 //! - `/health`, `/ca` — unauthenticated (liveness / public CA cert).
-//! - `/v/{vid}/registry`, `/op/{id}` — the agent Bearer key (§8).
+//! - `/v/{vid}/registry`, `/op/{id}` — the agent's AIK proof (`scpop1…` in the
+//!   Bearer slot, §8).
 //!
 //! Writes / ceremony never appear here — they stay on the control port (23293),
 //! passkey-gated and invisible to the agent. The read projections come from the
 //! SAME functions the control plane serves (`registry::vault_registry_value`,
 //! `approve::op_poll_value`, `health::health_value`), so the two ports can't
-//! drift; auth reuses the pure `api_key::check_token`. Both shared surfaces are
+//! drift. Both shared surfaces are
 //! `Value`/`&str`-typed, so this module never touches axum's `http` types.
 
 use std::sync::Arc;
@@ -45,8 +46,7 @@ fn is_self_authority(host: &str, port: Option<u16>, proxy_port: u16) -> bool {
 }
 
 /// Self-answer an API-face request. GET-only; unknown paths → 404. Every
-/// projection is a synchronous read; the only await is the debounced hash
-/// refresh on an auth miss.
+/// projection is a synchronous read.
 pub async fn respond(state: &Arc<AppState>, req: &Request<Body>) -> Response<Body> {
     if req.method() != Method::GET {
         return problem(ScCode::MethodNotAllowed, "GET only");
@@ -74,7 +74,7 @@ pub async fn respond(state: &Arc<AppState>, req: &Request<Body>) -> Response<Bod
 
     // ── Bearer-gated reads (§8) ──────────────────────────────────────────────
     if let Some(op_id) = path.strip_prefix("/op/") {
-        let caller = match require_agent(state, req.headers(), &pq).await {
+        let caller = match require_agent(state, req.headers(), &pq) {
             Ok(a) => a,
             Err(r) => return r,
         };
@@ -83,9 +83,8 @@ pub async fn respond(state: &Arc<AppState>, req: &Request<Body>) -> Response<Bod
         // same shape as an unknown op, so this face leaks nothing about other
         // agents' pending work. Ops with no agent stamp (ceremonies) stay
         // reachable by any valid agent, matching today's user-surface semantics.
-        // `caller` is the resolved attribution (hop-A `ag_` or legacy key prefix),
-        // the SAME id the proxy path stamped on the op at creation — so the two
-        // faces compare like-for-like across the dual-auth window.
+        // `caller` is the resolved `ag_`, the SAME id the proxy path stamped on
+        // the op at creation, so the two faces compare like-for-like.
         {
             let bound = state
                 .approvals
@@ -118,7 +117,7 @@ pub async fn respond(state: &Arc<AppState>, req: &Request<Body>) -> Response<Bod
     // is the address the agent puts on the wire (proxy auth / URL); item
     // names stay bare and resolve inside the chosen vault.
     if path == "/vaults" {
-        let agent = match require_agent(state, req.headers(), &pq).await {
+        let agent = match require_agent(state, req.headers(), &pq) {
             Ok(a) => a,
             Err(r) => return r,
         };
@@ -157,7 +156,7 @@ pub async fn respond(state: &Arc<AppState>, req: &Request<Body>) -> Response<Bod
         .strip_prefix("/v/")
         .and_then(|r| r.strip_suffix("/registry"))
     {
-        let agent = match require_agent(state, req.headers(), &pq).await {
+        let agent = match require_agent(state, req.headers(), &pq) {
             Ok(a) => a,
             Err(r) => return r,
         };
@@ -180,86 +179,46 @@ pub async fn respond(state: &Arc<AppState>, req: &Request<Body>) -> Response<Bod
     problem(ScCode::NotFound, "Not found")
 }
 
-/// Gate an api-face request and resolve the caller's attribution (§8). Dual-auth:
-///
-/// - **hop-A AIK PoP** — a `scpop1…` token in the Bearer slot (the `sc` transport
-///   holds the AIK and mints it, keeping the key out of the child env). Crypto-
-///   verified against the request-line target (`apiface:<pq>`, account-scoped
-///   `vault=""`; the api-face is account-scoped, exactly like the legacy shared
-///   key hash-set), then authorized by `ag_` ∈ ANY unlocked vault's authorized-
-///   agents table. A `scpop1…` that doesn't verify/authorize is a 401 — it's not
-///   an api-key, so there's nothing to fall back to. Returns the resolved `ag_`.
-/// - **legacy Bearer api-key** — the same membership check the control plane uses
-///   via the pure `check_token`. On a miss with a key PRESENT, one debounced hash
-///   refresh (a just-minted `sc agent add` key must not 401 for the 30s sync
-///   loop), then re-check. Returns the key prefix (never the full key).
-///
-/// The returned id is the SAME attribution the proxy path stamps
-/// (`BrokerHandler::agent_attribution`), so op-binding, reach masks, and registry
-/// annotation agree across both faces. `Err` carries the ready 401.
-async fn require_agent(
+/// Gate an api-face request and resolve the caller's attribution (§8). AIK
+/// proof of possession only (design D8: the agent bearer key is deleted): a
+/// `scpop1…` token in the Bearer slot (the `sc` transport holds the AIK and
+/// mints it, keeping the key out of the child env), crypto-verified against the
+/// request-line target (`apiface:<pq>`, account-scoped `vault=""`), then
+/// authorized by `ag_` in ANY unlocked vault's authorized-agents table. Returns
+/// the resolved `ag_`, the SAME attribution the proxy path stamps, so
+/// op-binding, reach masks and registry annotation agree across both faces.
+/// `Err` carries the ready refusal.
+fn require_agent(
     state: &Arc<AppState>,
     headers: &HeaderMap,
     pq: &str,
 ) -> Result<String, Response<Body>> {
     let token = bearer_token(headers);
-    // hop-A: an AIK PoP in the Bearer slot (`scpop1.…`) is unambiguous vs. an
-    // `sc_…` api-key — verify + authorize here; on failure it's a hard 401 (a
-    // PoP string is never a hash-set member, so no api-key fallback applies).
-    if let Some(tok) = token.as_deref() {
-        if tok.starts_with(&format!("{}.", crate::agent_pop::TOKEN_PREFIX)) {
-            let target = crate::agent_pop::apiface_target(pq);
-            return match crate::agent_pop::verify_agent_proxy_pop(
-                tok,
-                "",
-                &target,
-                crate::util::now_unix(),
-                crate::agent_pop::DEFAULT_MAX_SKEW_SECS,
-            ) {
-                // Verified AIK, authorized on some unlocked vault → attribution.
-                Some(ag) if state.agent_is_authorized_any(&ag) => Ok(ag),
-                // Verified AIK but NOT authorized anywhere yet: distinct from a bad
-                // credential — the fix is a Console authorize (Agents tab), not a
-                // key change (same fail-loudly posture as the proxy path).
-                Some(_) => Err(problem(
-                    ScCode::AgentNotAuthorized,
-                    "this agent isn't authorized on any of your vaults yet — \
-                     authorize it in the SafeClaw console (Agents tab)",
-                )),
-                // Not a valid/fresh PoP at all → generic 401 (no api-key fallback:
-                // a `scpop1…` string is never a hash-set member).
-                None => Err(problem(
-                    ScCode::Unauthorized,
-                    "missing or invalid agent api key",
-                )),
-            };
-        }
+    let target = crate::agent_pop::apiface_target(pq);
+    let verified = token.as_deref().and_then(|tok| {
+        crate::agent_pop::verify_agent_proxy_pop(
+            tok,
+            "",
+            &target,
+            crate::util::now_unix(),
+            crate::agent_pop::DEFAULT_MAX_SKEW_SECS,
+        )
+    });
+    match verified {
+        // Verified AIK, authorized on some unlocked vault → attribution.
+        Some(ag) if state.agent_is_authorized_any(&ag) => Ok(ag),
+        // Verified AIK but NOT authorized anywhere yet: distinct from a bad
+        // credential — the fix is a console authorize (Agents tab).
+        Some(_) => Err(problem(
+            ScCode::AgentNotAuthorized,
+            "this agent isn't authorized on any of your vaults yet — \
+             authorize it in the SafeClaw console (Agents tab)",
+        )),
+        None => Err(problem(
+            ScCode::Unauthorized,
+            crate::proxy::handler::AGENT_PROOF_HINT,
+        )),
     }
-    // Legacy Bearer api-key (dual-auth) — unchanged, incl. the debounced refresh.
-    if key_in_set(state, token.as_deref()) {
-        return Ok(legacy_attribution(token.as_deref()));
-    }
-    if token.is_some()
-        && crate::sync::refresh_agent_keys_on_miss(state).await
-        && key_in_set(state, token.as_deref())
-    {
-        return Ok(legacy_attribution(token.as_deref()));
-    }
-    Err(problem(
-        ScCode::Unauthorized,
-        "missing or invalid agent api key",
-    ))
-}
-
-/// The legacy attribution id for a Bearer api-key: its prefix (never the full
-/// key/token), matching the proxy path's `legacy_key_prefix`.
-fn legacy_attribution(token: Option<&str>) -> String {
-    token.map(crate::audit::agent_key_prefix).unwrap_or_default()
-}
-
-fn key_in_set(state: &AppState, token: Option<&str>) -> bool {
-    let hashes = state.agent_key_hashes.lock().unwrap();
-    crate::api_key::check_token(&hashes, token).is_ok()
 }
 
 fn bearer_token(headers: &HeaderMap) -> Option<String> {

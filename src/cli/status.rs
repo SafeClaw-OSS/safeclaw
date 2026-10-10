@@ -26,7 +26,7 @@ pub enum VaultState {
 
 /// Snapshot of the local daemon: is it up, and (if so) how many vaults
 /// does it know about? Lets us give precise post-`sc start` guidance
-/// like "daemon is up with 0 vaults — run `sc vault create`". ~400ms.
+/// like "daemon is up with 0 vaults — create one in the console". ~400ms.
 pub struct LocalDaemon {
     pub up: bool,
     pub version: Option<String>,
@@ -277,16 +277,15 @@ pub async fn run(json: bool) -> Result<(), String> {
             if let Some(dead) = cfg.vault_deleted_upstream.as_deref() {
                 // Stranded by an upstream delete — "no vaults yet" would read
                 // as if this device was never set up, when the truth is its
-                // vault was deleted on the web. Name it and point at re-pairing.
+                // vault was deleted on the web. Name it and point at the fix.
+                println!("  note:  vault {} was deleted on the web", dead);
                 println!(
-                    "  note:  vault {} was deleted on the web; this device's pairing to it is gone",
-                    dead
+                    "  hint:  pick another vault with `sc vault use`, or create one in the console"
                 );
-                println!("  hint:  generate a new install token in the console (\"Connect a new agent\"), then `sc login`");
             } else if d.vault_count == Some(0) {
-                println!("  hint:  no vaults yet — seal one on the web, then `sc login`");
+                println!("  hint:  no vaults yet — create one in the console (a paired machine picks it up)");
             } else if crate::cli::active::known_vaults().is_empty() {
-                println!("  hint:  pick one with `sc vault use`, or `sc vault create`");
+                println!("  hint:  pick one with `sc vault use`, or create one in the console");
             } else {
                 println!("  hint:  pick one with `sc vault use` (`sc vault ls` to list)");
             }
@@ -407,7 +406,7 @@ pub fn print_status(s: &VaultStatus) {
             }
         }
         VaultState::NotFound => {
-            println!("  state:    not found (run `sc vault create`, or pick a different URL with `sc vault use`)");
+            println!("  state:    not found (create it in the console and `sc sync`, or pick another with `sc vault use`)");
         }
         VaultState::Locked { passkeys } => {
             println!("  state:    locked (run `sc unlock`)");

@@ -35,16 +35,6 @@ explain = "Permanently erases this vault and everything in it. This cannot be un
 explain_zh = "永久抹除此 vault 及其中的一切内容。此操作无法撤销，之后只能从头重新设置。"
 tone = "danger"
 
-[acts.rename-passkey]
-action = "Rename a passkey"
-action_zh = "重命名 Passkey"
-explain = "Changes a passkey's display name. Keys and access are unchanged."
-explain_zh = "仅更改 Passkey 的显示名称，密钥与访问权限不变。"
-tone = "neutral"
-facts = [
-  { label = "New name", label_zh = "新名称", value = "{{vars.scope.new_name}}" },
-]
-
 [acts.widen-host]
 action = "Permanently allow {{vars.scope.host}}"
 action_zh = "永久允许 {{vars.scope.host}}"

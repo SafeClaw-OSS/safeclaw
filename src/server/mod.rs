@@ -4,8 +4,8 @@
 //! `[[architecture-final-2026-05-27]]`):
 //!
 //! ```text
-//! POST /v/{vid}/op              R-side op creation (or U-direct: Enroll/Write/Export)
-//! GET  /v/{vid}/passkeys        list enrolled credentials for this vault
+//! POST /v/{vid}/op              op creation (lifecycle, Use, Export)
+//! GET  /v/{vid}/passkeys        the vault members' passkeys (from their ledgers)
 //! GET  /v/{vid}/events          SSE lifecycle stream
 //! GET  /registry                static service catalog (no vault contents)
 //! GET  /v/{vid}/registry        per-vault live view (catalog + connected state)
@@ -14,11 +14,14 @@
 //! POST /op/{op_id}/reject       U denies
 //! POST /op/{op_id}/cancel       requester withdraws its own op
 //! GET  /health                  custodian health
-//! GET  /pubkey                  custodian HPKE bootstrap key (placeholder)
 //! GET  /skill.md                skill file for agents (?agent=claude|cursor|codex)
 //! ```
 //!
-//! Public root paths (`/health`, `/registry`, `/pubkey`, `/skill.md`) were originally
+//! Deleted in the trust reset (contract 4): `/pubkey`, `POST
+//! /v/{vid}/pending-passkeys` and the `POST /v/{vid}/export/{key}` stub (with
+//! it the last agent-gated control route).
+//!
+//! Public root paths (`/health`, `/registry`, `/skill.md`) were originally
 //! prefixed `/c/*`; the prefix was dropped 2026-05-27 to align with the
 //! "zero remapping" backend story (SaaS proxy forwards the same URLs).
 //!
@@ -46,14 +49,13 @@ const MAX_BODY_BYTES: usize = 256 * 1024;
 
 pub fn app_router(state: Arc<AppState>) -> Router {
     // ── Control plane ────────────────────────────────────────────────────
-    // Vault lifecycle, op approval, passkeys, registry. NOT agent-key gated:
+    // Vault lifecycle, op approval, passkeys, registry. Not agent-gated:
     // op/approve is gated by the op_id capability + passkey signature (the
     // passkey wall); registry/passkeys are auth-free localhost reads. This is
     // exactly the surface the old admin port carried.
     let mut router = Router::new()
         // Custodian-level (no vault context).
         .route("/health", get(handlers::health::health))
-        .route("/pubkey", get(handlers::metadata::pubkey))
         .route("/registry", get(handlers::registry::catalog))
         .route("/skill.md", get(handlers::skill::skill_md))
         // Vault-scoped.
@@ -68,10 +70,6 @@ pub fn app_router(state: Arc<AppState>) -> Router {
         .route("/v/{vid}/secret", post(handlers::secret_set_local::create))
         .route("/v/{vid}/sync", post(handlers::metadata::sync_now))
         .route("/v/{vid}/passkeys", get(handlers::metadata::passkeys))
-        .route(
-            "/v/{vid}/pending-passkeys",
-            post(handlers::pending_passkey::create),
-        )
         .route("/v/{vid}/events", get(handlers::events::stream))
         .route(
             "/v/{vid}/secret-keys",
@@ -104,19 +102,8 @@ pub fn app_router(state: Arc<AppState>) -> Router {
         // created an op voids it on Ctrl-C / SIGTERM / timeout. Never a user
         // rejection; an Export needs its waiter secret.
         .route("/op/{op_id}/cancel", post(handlers::op::cancel))
-        .with_state(state.clone());
+        .with_state(state);
     router = router.layer(DefaultBodyLimit::max(MAX_BODY_BYTES));
-
-    // ── Agent-surface control routes ─────────────────────────────────────
-    // The only agent-facing HTTP route left on the control plane is the
-    // `/export` disabled stub (raw-secret exfil off the agent surface — the
-    // op-plane Export ceremony is the human path). Live credential traffic no
-    // longer goes through an HTTP route: it rides the resident phantom-only
-    // proxy (S2, a separate listener). This sub-router carries the agent-key
-    // gate (`require_api_key`) so the stub stays scoped like the old broker
-    // surface without touching the passkey/admin-gated control routes.
-    let broker = broker_router(state);
-    router = router.merge(broker);
 
     // CORS: the only browser inbound was the embedded op-page, now deleted —
     // approval happens on safeclaw.pro, not against the daemon. With no browser
@@ -124,23 +111,4 @@ pub fn app_router(state: Arc<AppState>) -> Router {
     // anyway — F-25). Self-host dev that fronts the daemon with a browser can
     // still terminate CORS at its reverse proxy.
     router
-}
-
-/// The agent-key-gated broker sub-router. Split out so the gate is a layer on
-/// these broker routes only — the control routes in `app_router` keep their own
-/// (passkey / X-Admin-Key / auth-free-localhost) gating untouched.
-fn broker_router(state: Arc<AppState>) -> Router {
-    use crate::proxy::env;
-
-    Router::new()
-        // /export → disabled stub (raw-secret export off the agent surface; the
-        // op-plane Export ceremony is the human path).
-        .route("/v/{vid}/export/{key}", post(env::disabled))
-        // Agent-key gate — scoped to exactly this route.
-        .layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            crate::api_key::require_api_key,
-        ))
-        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
-        .with_state(state)
 }

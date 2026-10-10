@@ -1,24 +1,22 @@
-//! Daemon HPKE outer envelope — `sc_pk` / `sc_sk` lifecycle (PROTOCOL.md §4.2.1 M1).
+//! The device encryption key (trust-reset design D2: a device's pair is its DIK
+//! plus this X25519 key) and the HPKE suite every grant seal uses.
 //!
-//! A single X25519 keypair per daemon, **role-strict**: used only for HPKE
-//! outer envelope (currently: cross-device pending-passkey seals; future:
-//! grant submission confidentiality on `[HPKE: MUST]` endpoints). **Not**
-//! involved in any KEK derivation or SUDP key hierarchy.
+//! A grant delivers the vault's K bundle HPKE-sealed to the requesting
+//! device's admitted `enc_pub` with `info = grant_seal_info(op_id)` (contract
+//! 1.7); the daemon opens it here. The key is minted by `sc login` together with
+//! the DIK, admitted into the person's ledger with it, and deleted by
+//! `sc logout`. It is never regenerated behind the ledger's back: changing it
+//! makes the machine a new device that must pair again.
 //!
-//! Suite (matches PROTOCOL.md §4.2):
+//! Suite (contract 0):
 //!   KEM:  DHKEM(X25519, HKDF-SHA-256)
 //!   KDF:  HKDF-SHA-256
 //!   AEAD: ChaCha20-Poly1305
 //!
-//! Storage:
-//!   `~/.safeclaw/crypto/sc_sk.bin` — raw 32-byte X25519 scalar
-//!
-//! Lifecycle: generated once on first daemon start, persists across restarts.
-//! Loss = clients pinning the old `sc_pk` see a fingerprint mismatch on next
-//! connect and must re-pin. Vault data is unaffected (sc_sk is NOT a KEK).
+//! Storage: `~/.safeclaw/crypto/sc_sk.bin`, the raw 32-byte X25519 scalar, 0600.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use hpke::{
     aead::ChaCha20Poly1305, kdf::HkdfSha256, kem::X25519HkdfSha256, Deserializable, Kem, OpModeR,
@@ -32,12 +30,11 @@ pub type SuiteKem = X25519HkdfSha256;
 pub type SuiteAead = ChaCha20Poly1305;
 pub type SuiteKdf = HkdfSha256;
 
-/// HPKE `info` prefix for sealing a grant's wrapping key `W_c` to `sc_pk`.
+/// HPKE `info` prefix for sealing a grant's K bundle to the requesting device.
 ///
-/// The browser seals `W_c` with `info = GRANT_SEAL_INFO_PREFIX ‖ 0x1f ‖ op_id`,
-/// binding the seal to exactly one op so a captured seal can't be replayed
-/// against a different op. Mirrors the pending-passkey info-binding precedent
-/// (`approve.rs` cross-device deposit). The daemon opens with the same `info`.
+/// The console seals with `info = GRANT_SEAL_INFO_PREFIX ‖ 0x1f ‖ op_id`, binding
+/// the seal to exactly one op so a captured seal can't be replayed against a
+/// different op. The daemon opens with the same `info`.
 pub const GRANT_SEAL_INFO_PREFIX: &[u8] = b"safeclaw/v1/grant-seal";
 
 /// Build the grant-seal HPKE `info` bound to `op_id`. Seal and open MUST use
@@ -51,9 +48,9 @@ pub fn grant_seal_info(op_id: &str) -> Vec<u8> {
 }
 
 /// HPKE single-shot seal to a recipient public key. Returns
-/// `(encapped_key, ciphertext)`, both raw bytes. The daemon never needs to
-/// seal in production (it only `open`s the browser's seal); this exists for
-/// round-trip tests and for tooling that produces material the daemon opens.
+/// `(encapped_key, ciphertext)`, both raw bytes. The daemon never seals a grant
+/// in production (it only opens the console's seal); this exists for round-trip
+/// tests and for tooling that produces material the daemon opens.
 pub fn seal_to(
     recipient_pk: &[u8],
     plaintext: &[u8],
@@ -75,43 +72,59 @@ pub fn seal_to(
     Ok((encapped.to_bytes().to_vec(), ct))
 }
 
-/// Daemon's static HPKE keypair, loaded once at startup.
-pub struct ScKeyPair {
-    pub sk: <SuiteKem as Kem>::PrivateKey,
-    pub pk: <SuiteKem as Kem>::PublicKey,
+/// The device's X25519 encryption key (the `enc_pub` half of the device pair).
+pub struct DeviceEncKey {
+    sk: <SuiteKem as Kem>::PrivateKey,
+    pk: <SuiteKem as Kem>::PublicKey,
 }
 
-impl ScKeyPair {
-    /// Load from disk, or generate + persist if missing. Idempotent.
-    pub fn load_or_generate() -> Result<Self> {
-        let path = sk_path()?;
-        if path.exists() {
-            let bytes =
-                fs::read(&path).map_err(|e| AppError::Internal(format!("read sc_sk: {}", e)))?;
-            let sk = <SuiteKem as Kem>::PrivateKey::from_bytes(&bytes)
-                .map_err(|e| AppError::Internal(format!("sc_sk deserialize: {}", e)))?;
-            let pk = <SuiteKem as Kem>::sk_to_pk(&sk);
-            return Ok(Self { sk, pk });
-        }
-        // Generate fresh keypair + persist with restrictive perms.
+impl DeviceEncKey {
+    /// Mint a fresh key from the OS CSPRNG. Nothing is written.
+    pub fn generate() -> Self {
         let (sk, pk) = <SuiteKem as Kem>::gen_keypair(&mut OsRng);
-        let sk_bytes = sk.to_bytes();
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| AppError::Internal(format!("mkdir crypto: {}", e)))?;
-        }
-        write_secret(&path, &sk_bytes)?;
-        tracing::info!(path = %path.display(), "generated fresh sc_sk");
+        Self { sk, pk }
+    }
+
+    /// Adopt a raw 32-byte X25519 scalar.
+    pub fn from_secret_bytes(bytes: &[u8]) -> Result<Self> {
+        let sk = <SuiteKem as Kem>::PrivateKey::from_bytes(bytes)
+            .map_err(|e| AppError::Internal(format!("device enc key: {}", e)))?;
+        let pk = <SuiteKem as Kem>::sk_to_pk(&sk);
         Ok(Self { sk, pk })
     }
 
-    /// Public key in raw 32-byte form (X25519 little-endian).
-    pub fn pk_bytes(&self) -> Vec<u8> {
-        self.pk.to_bytes().to_vec()
+    /// Load the key at `path`. `Ok(None)` when the file does not exist.
+    pub fn load(path: &Path) -> Result<Option<Self>> {
+        match fs::read(path) {
+            Ok(bytes) => Self::from_secret_bytes(&bytes).map(Some),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(AppError::Internal(format!(
+                "read {}: {}",
+                path.display(),
+                e
+            ))),
+        }
     }
 
-    /// HPKE single-shot open. `info` MUST commit to any deployment context
-    /// the sender bound the seal to (for pending-passkeys: vault_id ‖ cid).
+    /// Persist the key at `path` (0600), replacing any previous key.
+    pub fn write(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| AppError::Internal(format!("mkdir {}: {}", parent.display(), e)))?;
+        }
+        let _ = fs::remove_file(path);
+        write_secret(path, self.sk.to_bytes())
+    }
+
+    /// The public key in raw 32-byte form (X25519 little-endian).
+    pub fn public_bytes(&self) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&self.pk.to_bytes());
+        out
+    }
+
+    /// HPKE single-shot open. `info` must equal the sender's (for a grant:
+    /// [`grant_seal_info`] of the op id).
     pub fn open(
         &self,
         encapped_key: &[u8],
@@ -133,7 +146,8 @@ impl ScKeyPair {
     }
 }
 
-fn sk_path() -> Result<PathBuf> {
+/// `~/.safeclaw/crypto/sc_sk.bin`, the device encryption key.
+pub fn enc_key_path() -> Result<PathBuf> {
     let home = dirs::home_dir().ok_or_else(|| AppError::Internal("no home dir".into()))?;
     Ok(home.join(".safeclaw").join("crypto").join("sc_sk.bin"))
 }
@@ -142,9 +156,8 @@ fn sk_path() -> Result<PathBuf> {
 mod tests {
     use super::*;
 
-    fn ephemeral() -> ScKeyPair {
-        let (sk, pk) = <SuiteKem as Kem>::gen_keypair(&mut OsRng);
-        ScKeyPair { sk, pk }
+    fn ephemeral() -> DeviceEncKey {
+        DeviceEncKey::generate()
     }
 
     #[test]
@@ -152,7 +165,7 @@ mod tests {
         let kp = ephemeral();
         let w_c = [7u8; 32];
         let info = grant_seal_info("op-abc-123");
-        let (enc, ct) = seal_to(&kp.pk_bytes(), &w_c, &info, b"").unwrap();
+        let (enc, ct) = seal_to(&kp.public_bytes(), &w_c, &info, b"").unwrap();
         let opened = kp.open(&enc, &ct, &info, b"").unwrap();
         assert_eq!(opened, w_c);
     }
@@ -161,7 +174,13 @@ mod tests {
     fn grant_seal_wrong_op_id_fails() {
         // A seal bound to one op must not open under another op's info.
         let kp = ephemeral();
-        let (enc, ct) = seal_to(&kp.pk_bytes(), &[9u8; 32], &grant_seal_info("op-A"), b"").unwrap();
+        let (enc, ct) = seal_to(
+            &kp.public_bytes(),
+            &[9u8; 32],
+            &grant_seal_info("op-A"),
+            b"",
+        )
+        .unwrap();
         assert!(kp.open(&enc, &ct, &grant_seal_info("op-B"), b"").is_err());
     }
 
@@ -170,7 +189,7 @@ mod tests {
         let kp1 = ephemeral();
         let kp2 = ephemeral();
         let info = grant_seal_info("op-x");
-        let (enc, ct) = seal_to(&kp1.pk_bytes(), &[3u8; 32], &info, b"").unwrap();
+        let (enc, ct) = seal_to(&kp1.public_bytes(), &[3u8; 32], &info, b"").unwrap();
         assert!(kp2.open(&enc, &ct, &info, b"").is_err());
     }
 
@@ -186,7 +205,7 @@ mod tests {
     }
 }
 
-fn write_secret<B: AsRef<[u8]>>(path: &PathBuf, bytes: B) -> Result<()> {
+fn write_secret<B: AsRef<[u8]>>(path: &Path, bytes: B) -> Result<()> {
     use std::io::Write;
     let mut opts = fs::OpenOptions::new();
     opts.write(true).create_new(true);
@@ -197,8 +216,8 @@ fn write_secret<B: AsRef<[u8]>>(path: &PathBuf, bytes: B) -> Result<()> {
     }
     let mut f = opts
         .open(path)
-        .map_err(|e| AppError::Internal(format!("create sc_sk: {}", e)))?;
+        .map_err(|e| AppError::Internal(format!("create {}: {}", path.display(), e)))?;
     f.write_all(bytes.as_ref())
-        .map_err(|e| AppError::Internal(format!("write sc_sk: {}", e)))?;
+        .map_err(|e| AppError::Internal(format!("write {}: {}", path.display(), e)))?;
     Ok(())
 }

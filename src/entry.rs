@@ -89,7 +89,6 @@ pub async fn run_cli(hooks: Arc<dyn TeamHooks>) -> Result<(), Box<dyn std::error
                 })
         }
         Command::Log(args) => cli::service::run_log(args).map_err(daemon_err),
-        Command::Pubkey(args) => cli::custodian::pubkey(args).await.map_err(daemon_err),
         Command::Registry(_args) => cli::custodian::registry(json).map_err(daemon_err),
         Command::Up => {
             // `sc up` = make SafeClaw ready: ensure the daemon is running, then
@@ -339,15 +338,10 @@ async fn run_daemon(
     std::fs::create_dir_all(&config.state_dir)?;
     std::fs::create_dir_all(config.state_dir.join("vaults"))?;
 
-    // Slice 3: pull the active vault's sealed blob from the cloud before
-    // serving, so a freshly-paired device serves a vault sealed in the
-    // browser. Best-effort — a local-only or offline daemon serves whatever
-    // vault.dat is already on disk.
     // Record this build's team-serve identity so the sync path can leave SHARED
     // (team) vaults to the official SafeClaw build. A no-op for the official build
     // (which serves team, so nothing is filtered). team-edition §9.
     crate::team_hooks::init_serves_shared(hooks.serves_shared_vaults());
-    crate::sync::pull_on_start(&config.state_dir).await;
 
     // Inject the team-edition hooks (team-edition §9): the open build passes
     // `NoopHooks`, the closed `safeclaw-ee` overlay its real ones. This is the
@@ -360,16 +354,17 @@ async fn run_daemon(
     // team-edition §9.
     state.hydrate_shared_from_catalog();
 
-    // Agent-centric auth: sync the account-level agent-key hash-set once
-    // before serving (so account agent-keys are accepted from the start),
-    // then keep it fresh in the background (revokes/new agents land in ~30s).
-    crate::sync::sync_agent_keys_once(&state).await;
-    tokio::spawn(crate::sync::sync_agent_keys_loop(state.clone()));
+    // The device identity (trust-reset D8): the daemon's ONLY channel to the
+    // backend is DIK-signed `/device/*`. Without a device identity the daemon
+    // serves local vaults and never contacts the cloud.
+    match crate::cloud::DeviceClient::load() {
+        Ok(client) => state.set_cloud(Some(client)),
+        Err(e) => tracing::info!("cloud sync off: {}", e),
+    }
 
-    // Slice 3 realtime sync: one detached long-poll watcher PER synced vault
-    // (active ∪ known_vaults — all vaults stay live, not just the active one).
-    // Best-effort — NOT in the serve select!, so a sync-loop exit never takes
-    // the daemon down.
+    // Realtime sync: the own-ledger loop, then one detached watcher PER synced
+    // vault (active ∪ known_vaults) plus the SSE dispatcher. Best-effort, NOT in
+    // the serve select!, so a sync-loop exit never takes the daemon down.
     crate::sync::spawn_watchers(state.clone());
 
     // De-daemon (DE_DAEMON.md §4): local-first audit outbox. The daemon writes

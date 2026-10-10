@@ -12,3 +12,12 @@ pub fn now_unix() -> u64 {
         .map(|d| d.as_secs())
         .unwrap_or(0)
 }
+
+/// Lowercase hex SHA-256 of a string.
+pub fn sha256_hex(s: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(s.as_bytes())
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect()
+}

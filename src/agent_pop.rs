@@ -18,24 +18,23 @@
 //! The `sc` transport (which holds the AIK, keeping it OUT of the agent's env)
 //! signs one token per CONNECT with [`AgentProxyPopSigner`]; the daemon parses +
 //! verifies it with [`verify_agent_proxy_pop`] and then checks the resolved
-//! `ag_id` against the vault's authorized-agents table. ADDITIVE / dual-auth: a
-//! non-PoP password falls back to the legacy api-key hash-set, so nothing bricks.
+//! `ag_id` against the vault's authorized-agents table. It is the agent's only
+//! credential (design D8): any other password is refused.
 //!
 //! Wire format of the `Proxy-Authorization` password slot:
 //! ```text
 //! scpop1.<b64url(aik_pubkey[32])>.<unix_ts>.<b64url(sig[64])>
 //! ```
-//! `.`-separated (b64url has no `.`), and the prefix `scpop1.` is unambiguous vs.
-//! an `sc_…` api-key. The pubkey is carried so the token is self-verifying (the
-//! daemon derives `ag_id` from it); `vault_id`/`target` are NOT carried — they
+//! `.`-separated (b64url has no `.`), with the scheme prefix `scpop1.`. The
+//! pubkey is carried so the token is self-verifying (the daemon derives
+//! `ag_id` from it); `vault_id`/`target` are NOT carried — they
 //! come from the CONNECT context and the daemon rebuilds the signing input, so a
 //! token can't be lifted to a different vault or destination.
 
 use crate::identity::{agent_proxy_pop_input, derive_id, verify, IdKind, SigningIdentity};
 use data_encoding::BASE64URL_NOPAD;
 
-/// Token scheme tag — the first `.`-segment. Distinguishes a PoP token from a
-/// legacy `sc_…` api-key in the same password slot (dual-auth).
+/// Token scheme tag — the first `.`-segment.
 pub const TOKEN_PREFIX: &str = "scpop1";
 
 /// Default freshness window (± seconds) the daemon accepts a token's timestamp
@@ -92,10 +91,10 @@ impl AgentProxyPopSigner {
 /// resolved `ag_…` id iff the token is well-formed, its signature verifies under
 /// the carried pubkey over the rebuilt input (`vault_id`+`target`+`ts`+`ag_id`),
 /// and it is fresh (`|now - ts| <= max_skew`). Returns `None` for anything that
-/// isn't a valid, fresh PoP token — a legacy api-key, a malformed token, a bad
-/// signature, or a stale one — so the caller falls back to the api-key hash-set
-/// (dual-auth). Never panics. Does NOT check authorization: the caller must still
-/// confirm the returned `ag_id` is in the vault's authorized-agents table.
+/// isn't a valid, fresh PoP token — an old bearer key, a malformed token, a bad
+/// signature, or a stale one — and the caller refuses the request. Never
+/// panics. Does NOT check authorization: the caller must still confirm the
+/// returned `ag_id` is in the vault's authorized-agents table.
 pub fn verify_agent_proxy_pop(
     token: &str,
     vault_id: &str,
@@ -189,10 +188,24 @@ mod tests {
     }
 
     #[test]
-    fn legacy_api_key_is_not_a_pop_token() {
-        // A non-PoP password (an api-key) → None, so the caller falls back to the
-        // api-key hash-set (dual-auth, nothing bricks).
-        assert!(verify_agent_proxy_pop("sc_agent_alice", "vault-x", "api.x:443", 1_700_000_000, 300).is_none());
-        assert!(verify_agent_proxy_pop("scpop1.garbage", "vault-x", "api.x:443", 1_700_000_000, 300).is_none());
+    fn old_bearer_key_is_not_a_pop_token() {
+        // A non-PoP password (a pre-0.12 bearer key) → None: refused, never a
+        // fallback (design D8).
+        assert!(verify_agent_proxy_pop(
+            "sc_agent_alice",
+            "vault-x",
+            "api.x:443",
+            1_700_000_000,
+            300
+        )
+        .is_none());
+        assert!(verify_agent_proxy_pop(
+            "scpop1.garbage",
+            "vault-x",
+            "api.x:443",
+            1_700_000_000,
+            300
+        )
+        .is_none());
     }
 }

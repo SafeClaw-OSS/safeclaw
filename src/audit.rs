@@ -3,8 +3,8 @@
 //! Append-only SQLite at `<state>/vaults/<vid>/audit.db`. Records every
 //! op lifecycle event — pending creation, terminal decision, cache-hit
 //! auto-forward. Only operational metadata (service / method / path /
-//! status / timestamps / credential_id / agent key PREFIX); **no secret
-//! values, full api-keys, request bodies, or response bodies** ever land
+//! status / timestamps / credential_id / the agent's `ag_` id); **no secret
+//! values, request bodies, or response bodies** ever land
 //! on disk. That keeps the audit
 //! file at the same trust level as a web-server access log — useful for
 //! "what did my agent do" without needing SUDP-grade encryption.
@@ -64,9 +64,9 @@ CREATE TABLE IF NOT EXISTS approvals (
     reason          TEXT,
     credential_id   TEXT,
     upstream_status INTEGER,
-    -- Agent attribution: first 16 chars of the agent api-key that produced a
-    -- Use row (= api_keys.prefix in the cloud). NULL for ceremonies and
-    -- CLI-initiated ops. Never the full key.
+    -- Agent attribution: the `ag_` id whose AIK proof produced a Use row.
+    -- NULL for ceremonies and CLI-initiated ops. (Rows written before the
+    -- trust reset hold a 16-char api-key prefix.)
     agent_prefix    TEXT,
     -- De-daemon (DE_DAEMON.md §4): cloud audit-shipper outbox flag.
     -- 0 = not yet shipped to the cloud `audit_events` table; 1 = shipped.
@@ -103,13 +103,6 @@ pub struct ApprovalRow {
     pub upstream_status: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_prefix: Option<String>,
-}
-
-/// First 16 chars of an agent api-key — the non-secret identity handle the
-/// cloud stores as `api_keys.prefix` (backend PREFIX_LEN = 16; keep in step).
-/// Char-boundary safe; shorter inputs pass through whole.
-pub fn agent_key_prefix(key: &str) -> String {
-    key.chars().take(16).collect()
 }
 
 /// Derive an audit row from an `Operation` at the moment of op creation

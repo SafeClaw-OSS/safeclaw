@@ -5,6 +5,7 @@
 //! client side. Same binary, different mode.
 
 pub mod active;
+pub mod admit;
 pub mod agent;
 pub mod agent_shim;
 pub mod apierr;
@@ -13,6 +14,7 @@ pub mod config;
 pub mod conn;
 pub mod connect;
 pub mod custodian;
+pub mod daemon_op;
 pub mod discovery;
 pub mod doctor;
 pub mod egress_proxy;
@@ -39,4 +41,4 @@ pub mod unlock;
 pub mod up;
 pub mod upgrade;
 pub mod vault;
-pub mod webauthn;
+

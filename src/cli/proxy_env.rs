@@ -93,32 +93,28 @@ fn der_to_pem(der: &[u8]) -> String {
     out
 }
 
-/// The proxy URL a child's `HTTPS_PROXY` points at: the API-face root
-/// (`scheme://host:port`, from `active::api_face_root`) with `<vid>:<key>`
-/// spliced into the userinfo. The vid (username) routes to a vault; the key
-/// (password) is the agent's identity, verified by the proxy before any
-/// substitution (§8). An absent key leaves the password slot empty
-/// (`<vid>:@`) — the proxy 407s such a request (participating but
-/// unauthenticated), the human-without-an-agent-key case. Deriving from the
-/// API-face root keeps proxy and control on ONE daemon host (the invariant).
-pub fn proxy_url_for_vault(api_root: &str, vid: &str, key: Option<&str>) -> String {
-    let key_enc = key
-        .map(|k| urlencoding::encode(k).into_owned())
-        .unwrap_or_default();
+/// The proxy URL a child's `HTTPS_PROXY` points at on the direct (shim-less)
+/// path: the API-face root (`scheme://host:port`, from `active::api_face_root`)
+/// with `<vid>:` in the userinfo. The vid (username) routes to a vault; the
+/// password slot stays empty because the agent's only credential is its AIK
+/// proof, which only the `sc run` shim mints per connection (design D8). The
+/// proxy therefore refuses credential substitution on this path (participating
+/// but unauthenticated). Deriving from the API-face root keeps proxy and
+/// control on ONE daemon host (the invariant).
+pub fn proxy_url_for_vault(api_root: &str, vid: &str) -> String {
     let (scheme, rest) = api_root.split_once("://").unwrap_or(("http", api_root));
     format!(
-        "{}://{}:{}@{}",
+        "{}://{}:@{}",
         scheme,
         urlencoding::encode(vid),
-        key_enc,
         rest.trim_end_matches('/')
     )
 }
 
 /// The env bundle that routes a child through the resident proxy and trusts its
-/// CA. `proxy_url` is the full `http://<vid>:<key>@127.0.0.1:<port>` the child's
-/// `HTTPS_PROXY` gets — built by `sc run` from the resolved vault + the agent's
-/// key against the current daemon face. `parent_git_config_count` is the
+/// CA. `proxy_url` is the full proxy URL the child's `HTTPS_PROXY` gets (the
+/// shim's, or `http://<vid>:@127.0.0.1:<port>` on the direct path).
+/// `parent_git_config_count` is the
 /// inherited `GIT_CONFIG_COUNT` (if any) so our credential-helper registration
 /// CHAINS at the next free index rather than clobbering an already-configured
 /// helper. Returns ordered `(key, value)` pairs — no plaintext secret is ever
@@ -241,28 +237,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn proxy_url_carries_vault_and_key() {
-        // vid in the username, api-key in the password, spliced into the
-        // API-face root (same host as every other derived URL).
+    fn proxy_url_carries_vault_and_no_credential() {
+        // vid in the username, an empty password slot (no bearer exists; the
+        // shim proves the AIK), spliced into the API-face root.
         assert_eq!(
-            proxy_url_for_vault("http://127.0.0.1:23294", "default", Some("sc_agent_k9")),
-            "http://default:sc_agent_k9@127.0.0.1:23294"
-        );
-        // No key → empty password slot (the proxy 407s it).
-        assert_eq!(
-            proxy_url_for_vault("http://127.0.0.1:23294", "default", None),
+            proxy_url_for_vault("http://127.0.0.1:23294", "default"),
             "http://default:@127.0.0.1:23294"
         );
         // A remote API-face root keeps its host AND custom port.
         assert_eq!(
-            proxy_url_for_vault("https://box.example.com:9999/", "v1", Some("k")),
-            "https://v1:k@box.example.com:9999"
+            proxy_url_for_vault("https://box.example.com:9999/", "v1"),
+            "https://v1:@box.example.com:9999"
         );
     }
 
     #[test]
     fn bundle_has_full_family_and_helper() {
-        let proxy = proxy_url_for_vault("http://127.0.0.1:23294", "abc", Some("k1"));
+        let proxy = proxy_url_for_vault("http://127.0.0.1:23294", "abc");
         let b = build_bundle(&proxy, "/x/ca.pem", None);
         let get = |k: &str| b.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
         // Whole family, both cases (curl-plaintext + ALL_PROXY-only tools).
@@ -359,7 +350,7 @@ mod tests {
     #[test]
     fn bundle_chains_git_config_indices() {
         // Parent already set two entries → we append at index 2, count becomes 3.
-        let proxy = proxy_url_for_vault("http://127.0.0.1:23294", "abc", Some("k1"));
+        let proxy = proxy_url_for_vault("http://127.0.0.1:23294", "abc");
         let b = build_bundle(&proxy, "/x/ca.pem", Some(2));
         let get = |k: &str| b.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
         assert_eq!(get("GIT_CONFIG_COUNT").unwrap(), "4");

@@ -37,7 +37,7 @@ SafeClaw because it is the hop that observed them.
 | `rate_limited` | 429 | retry | request | slow down |
 | `internal` | 500 | retry | internal | daemon bug/failure |
 | `ca_unavailable` | 500 | retry | internal | resident CA unreadable |
-| `agent_key` | 407 | configure | auth | phantom-bearing request without a valid agent api key |
+| `agent_proof` | 407 | configure | auth | phantom-bearing request without a valid agent identity proof |
 | `ambiguous_phantom` | 400 | fix_request | request | bare phantom on a multi-secret connection; use a role phantom |
 | `approval_needed` | 401 | approve | policy | policy asks; body carries approve/poll URLs + op id |
 | `approval_register` | 503 | retry | internal | could not open the approval op |

@@ -162,7 +162,6 @@ pub async fn create(
         let state = state.clone();
         let vid = vault_id.clone();
         tokio::spawn(async move {
-            crate::sync::push_keys_best_effort(&state, &vid).await;
             crate::sync::push_items_best_effort(&state, &vid).await;
         });
     }

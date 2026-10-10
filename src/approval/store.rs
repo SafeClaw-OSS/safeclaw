@@ -51,10 +51,10 @@ pub struct ApprovalRecord {
     /// next matching request. Daemon-internal: never appears on the wire,
     /// never signed into the grant.
     pub policy_context: Option<PolicyContext>,
-    /// Prefix of the agent api-key that TRIGGERED this op (op-agent binding,
+    /// The `ag_` id of the agent that TRIGGERED this op (op-agent binding,
     /// team §C1) — the daemon-side enforcement handle. Every agent-facing
     /// consumption surface (proxy op poll, op_grants redeem, ask-cache
-    /// write/read) compares the acting key against this. The same value rides
+    /// write/read) compares the acting agent against this. The same value rides
     /// in `o.act.scope.agent` so the human's signature covers it; this copy
     /// exists so enforcement never re-parses the signed op. `None` = op not
     /// created by an agent request (ceremonies) — no agent gate applies.

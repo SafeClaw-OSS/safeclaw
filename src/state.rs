@@ -245,11 +245,8 @@ pub struct SecretsCache {
     /// The vault's **authorized-agents table** (design §11.1), keyed by `ag_id`
     /// (`derive_id(Agent, pubkey)`). Snapshot of `view.aux.agents` at
     /// unlock/refresh. **Presence = authorized**; an `ag_id` with no entry is not
-    /// in the table. Consulted ONLY on the AIK (PoP) path where the daemon knows
-    /// the presented `ag_id`; the legacy Basic api-key path (dual-auth window)
-    /// carries an api-key prefix, which is never in this `ag_`-keyed table → the
-    /// mask lookup misses → the caller falls to the legacy allow (nothing bricks
-    /// until bearers retire).
+    /// in the table. Consulted on the AIK (PoP) path, where the daemon knows the
+    /// presented `ag_id` (the only agent credential, design D8).
     pub agents: std::collections::BTreeMap<String, crate::storage::plaintext::AgentEntry>,
     /// Custom (per-vault `aux.services`) service definitions, validated at
     /// unlock. Wiped on lock (Default drop). A custom service folds into
@@ -299,7 +296,7 @@ pub struct AppState {
     /// the lease window.
     pub cloud_contact: Mutex<HashMap<String, std::time::Instant>>,
     /// Server-authoritative vault sharedness (team §4: explicit `kind`, default
-    /// private), delivered on the `/blob` sync envelope OUTSIDE the sealed body —
+    /// private), from `GET /device/vaults` discovery OUTSIDE the sealed body —
     /// `kind` is a server operational fact, never E2E. `true` = shared, `false` =
     /// private; an ABSENT entry (never synced, or an old server that omits the
     /// field) reads as private via `vault_is_shared` — the fail-safe default so a
@@ -308,26 +305,26 @@ pub struct AppState {
     /// only, repopulated on each pull — same restart-softness as `cloud_contact`,
     /// which the offline lease already accepts (it is a soft backstop).
     pub vault_shared: Mutex<HashMap<String, bool>>,
-    /// Vaults whose cloud sync returned `SC_UPGRADE_REQUIRED` — this daemon is too
-    /// old for their (newer) item format (design 甲). While set, the broker refuses
-    /// with [`crate::error::ScCode::UpgradeRequired`] so the AGENT gets an actionable
-    /// "run `sc upgrade`" instead of a silent parked-sync failure. In-memory only,
-    /// (re)set by the sync path; cleared when a sync succeeds again.
+    /// Vaults flagged too new for this build. While set, the broker refuses with
+    /// [`crate::error::ScCode::UpgradeRequired`] ("run `sc upgrade`").
     pub vault_upgrade_required: Mutex<std::collections::HashSet<String>>,
+    /// The backend answered `SC_UPGRADE_REQUIRED` (this build is below the
+    /// server's floor): every vault's broker path says "run `sc upgrade`". Set
+    /// by the sync path on that refusal, cleared by the next accepted request.
+    pub upgrade_required_global: std::sync::atomic::AtomicBool,
+    /// The trust chain: the own ledger, other members' ledgers, refused vaults
+    /// ([`crate::trust`]).
+    pub trust: crate::trust::TrustCache,
+    /// The signed backend client for this device. `None` when this machine has
+    /// no device identity or pairing; set once by the daemon at startup (tests
+    /// inject one).
+    pub cloud: std::sync::RwLock<Option<crate::cloud::DeviceClient>>,
     /// Team-edition extension hooks (team-edition §9 open/closed split). The
     /// open build leaves the [`crate::team_hooks::NoopHooks`] default (no team
     /// policy); the closed `safeclaw-ee` overlay injects real ones via
     /// [`AppState::with_team_hooks`]. Serve-time team policy (the offline lease,
     /// etc.) lives behind these, never inline in open core.
     pub team: std::sync::Arc<dyn crate::team_hooks::TeamHooks>,
-    /// Vaults whose addressing migration completed locally but whose cloud
-    /// `format=2` mark hasn't landed yet — the sync loop drains this after a
-    /// successful item push (团队 §8.3: mark only after the rows are up).
-    pub pending_format_mark: Mutex<std::collections::HashSet<String>>,
-    /// Owner lock-list registrations awaiting delivery: vault → blinded ids of
-    /// the config singletons (computed at unlock while K was in hand; the sync
-    /// loop POSTs them once for SHARED vaults). §5.15 two-tier write model.
-    pub pending_config_ids: Mutex<HashMap<String, Vec<String>>>,
     pub challenges: Mutex<ChallengeStore>,
     pub approvals: Mutex<ApprovalStore>,
     /// Batch-approve root memo (design/batch-approve.md §Daemon verify 5):
@@ -364,10 +361,6 @@ pub struct AppState {
     /// first write/query per vault. Survives daemon restarts — unlike
     /// `approvals` / `vault_states` which are in-memory only.
     pub audits: AuditRegistry,
-    /// Daemon HPKE outer-envelope keypair (PROTOCOL.md §4.2.1 M1). Loaded
-    /// once at startup, used to open pending-passkey seals (cross-device
-    /// add-passkey) and — in future — `[HPKE: MUST]` grant submissions.
-    pub sc: crate::crypto::envelope::ScKeyPair,
     /// Per-vault async mutex serializing vault.dat read-modify-write cycles.
     /// Two concurrent approve calls on the same vault both read the pre-write
     /// state and race to rename the tmpfile — the second write wins silently.
@@ -378,20 +371,6 @@ pub struct AppState {
     /// OwnedSemaphorePermit is stored in each live stream; dropping the
     /// stream drops the permit, automatically releasing the slot.
     pub sse_semaphores: Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>,
-    /// Account-level set of broker-authorizing agent-key HASHES (sha256 hex),
-    /// synced from the cloud (`/api/vault/agents/hashes`). This is the SOLE
-    /// broker auth (agent ≡ api-key): a presented key is valid iff sha256(key)
-    /// is a member. Empty ⇒ reject (a paired daemon requires an agent key; an
-    /// unpaired/local-only daemon has no broker plane to gate). See
-    /// [[project_vault_agent_architecture_2026_06_25]].
-    pub agent_key_hashes: Mutex<std::collections::HashSet<String>>,
-    /// Serializer + debounce stamp for the on-auth-miss hash refresh
-    /// (`sync::refresh_agent_keys_on_miss`): a key minted seconds ago
-    /// (`sc agent add` → immediate use) must not wait out the 30s sync loop,
-    /// but a bad-key flood must not hammer the backend either. tokio Mutex —
-    /// held ACROSS the refresh fetch so concurrent misses wait for the
-    /// in-flight result instead of being bounced to a reject.
-    pub agent_key_resync: tokio::sync::Mutex<Option<std::time::Instant>>,
     /// Single-flight for the allow-path external-store lazy fill
     /// (`lazy_fill_external`): a burst of first requests on a GCP-backed
     /// connection must resolve ONCE, not once per request. tokio Mutex —
@@ -522,17 +501,16 @@ impl AppState {
         let (loaded_unions, loaded_unions_json) = load_host_unions(&config.state_dir);
         let (events, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let audits = AuditRegistry::new(vaults.clone());
-        let sc = crate::crypto::envelope::ScKeyPair::load_or_generate()
-            .expect("sc_sk load/generate failed — check ~/.safeclaw/crypto perms");
         Self {
             config,
             vaults,
             cloud_contact: Mutex::new(HashMap::new()),
             vault_shared: Mutex::new(HashMap::new()),
             vault_upgrade_required: Mutex::new(std::collections::HashSet::new()),
+            upgrade_required_global: std::sync::atomic::AtomicBool::new(false),
+            trust: crate::trust::TrustCache::default(),
+            cloud: std::sync::RwLock::new(None),
             team: std::sync::Arc::new(crate::team_hooks::NoopHooks),
-            pending_format_mark: Mutex::new(std::collections::HashSet::new()),
-            pending_config_ids: Mutex::new(HashMap::new()),
             challenges: Mutex::new(ChallengeStore::new()),
             approvals: Mutex::new(ApprovalStore::new()),
             batch_roots: Mutex::new(HashMap::new()),
@@ -542,11 +520,8 @@ impl AppState {
             last_host_unions: Mutex::new(loaded_unions),
             host_unions_persisted: Mutex::new(loaded_unions_json),
             audits,
-            sc,
             vault_write_locks: Mutex::new(HashMap::new()),
             sse_semaphores: Mutex::new(HashMap::new()),
-            agent_key_hashes: Mutex::new(std::collections::HashSet::new()),
-            agent_key_resync: tokio::sync::Mutex::new(None),
             external_fill_lock: tokio::sync::Mutex::new(()),
             oauth_reauth_needed: Mutex::new(std::collections::HashSet::new()),
             oauth_redeemed_codes: Mutex::new(HashMap::new()),
@@ -637,14 +612,25 @@ impl AppState {
         Some(entry.values)
     }
 
-    /// Replace the synced account-level agent-key hash-set (sha256 hex).
-    /// Returns whether the set actually changed, so the 30s refresh loop can
-    /// log only real updates instead of one line per tick.
-    pub fn set_agent_key_hashes(&self, hashes: std::collections::HashSet<String>) -> bool {
-        let mut cur = self.agent_key_hashes.lock().unwrap();
-        let changed = *cur != hashes;
-        *cur = hashes;
-        changed
+    /// The signed backend client, if this machine is paired.
+    pub fn cloud(&self) -> Option<crate::cloud::DeviceClient> {
+        self.cloud.read().unwrap().clone()
+    }
+
+    /// Install (or clear) the signed backend client.
+    pub fn set_cloud(&self, client: Option<crate::cloud::DeviceClient>) {
+        *self.cloud.write().unwrap() = client;
+    }
+
+    /// Did the backend answer `SC_UPGRADE_REQUIRED`?
+    pub fn upgrade_required(&self) -> bool {
+        self.upgrade_required_global
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn set_upgrade_required(&self, v: bool) {
+        self.upgrade_required_global
+            .store(v, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// TTL for the redeemed-code ledger. OAuth authorization codes expire
@@ -657,7 +643,7 @@ impl AppState {
     pub fn note_code_redeemed(&self, code: &str) {
         let mut m = self.oauth_redeemed_codes.lock().unwrap();
         Self::reap_redeemed(&mut m);
-        m.insert(crate::api_key::sha256_hex(code), std::time::Instant::now());
+        m.insert(crate::util::sha256_hex(code), std::time::Instant::now());
     }
 
     /// True iff this daemon already redeemed `code` — a re-exchange would be a
@@ -665,7 +651,7 @@ impl AppState {
     pub fn was_code_redeemed(&self, code: &str) -> bool {
         let mut m = self.oauth_redeemed_codes.lock().unwrap();
         Self::reap_redeemed(&mut m);
-        m.contains_key(&crate::api_key::sha256_hex(code))
+        m.contains_key(&crate::util::sha256_hex(code))
     }
 
     fn reap_redeemed(m: &mut HashMap<String, std::time::Instant>) {
@@ -1447,12 +1433,14 @@ impl AppState {
         }
     }
 
-    /// Is this vault flagged `SC_UPGRADE_REQUIRED` (daemon too old for its format)?
+    /// Is this vault (or the whole daemon) flagged `SC_UPGRADE_REQUIRED`?
     pub fn is_vault_upgrade_required(&self, vault_id: &str) -> bool {
-        self.vault_upgrade_required
-            .lock()
-            .unwrap()
-            .contains(vault_id)
+        self.upgrade_required()
+            || self
+                .vault_upgrade_required
+                .lock()
+                .unwrap()
+                .contains(vault_id)
     }
 
     /// Does this vault's reach mask let `agent_id` use `connection_id`?
@@ -1462,10 +1450,8 @@ impl AppState {
     ///     mask denies this connection (the only denial the proxy acts on).
     ///   - `Some(true)` — in the table, mask allows.
     ///   - `None` — vault locked, OR `agent_id` is not in the `ag_`-keyed table.
-    ///     The caller treats `None` as "no mask restriction" (allow): this is the
-    ///     legacy Basic-auth path (api-key prefix, never in an `ag_`-keyed table)
-    ///     during the dual-auth window. True fail-closed ("not in table = deny")
-    ///     is enforced by the AIK proxy path once bearers retire (§11.6).
+    ///     Agents authenticate by AIK only and the proxy admits only an `ag_`
+    ///     that IS in the table, so `None` here means "locked" in practice.
     pub fn agent_mask_allows(
         &self,
         vault_id: &str,
@@ -1488,10 +1474,7 @@ impl AppState {
     /// PoP proxy path to decide whether a crypto-verified `ag_…` may use this
     /// vault at all — distinct from [`agent_mask_allows`], which only restricts
     /// WHICH connections an already-authorized agent may reach. `false` when the
-    /// vault is locked or the agent isn't in the table (fail-closed — the AIK path
-    /// is opt-in and dual-authed with the legacy api-key, so this never bricks a
-    /// legacy agent, whose api-key prefix simply isn't an `ag_` and takes the
-    /// hash-set path instead).
+    /// vault is locked or the agent isn't in the table (fail-closed).
     pub fn agent_is_authorized(&self, vault_id: &str, agent_id: &str) -> bool {
         let states = self.vault_states.lock().unwrap();
         match states.get(vault_id) {
@@ -1506,7 +1489,7 @@ impl AppState {
     /// single vault, so a hop-A AIK PoP that proves possession of `ag_…` is a
     /// valid agent of this account for those cross-vault reads iff it's
     /// authorized on at least one vault. `false` if no unlocked vault authorizes
-    /// it (fail-closed; dual-auth with the legacy api-key covers the transition).
+    /// it (fail-closed).
     pub fn agent_is_authorized_any(&self, agent_id: &str) -> bool {
         let states = self.vault_states.lock().unwrap();
         states.values().any(|s| match s {
@@ -1520,9 +1503,8 @@ impl AppState {
     /// identically (team §8.1 ONE pipeline: same verdict as the proxy deny).
     /// `Some(set)` = the subset of `candidates` reachable under this agent's mask;
     /// `None` = vault locked OR `agent_id` is not in the authorized-agents table
-    /// (the caller masks nothing — the legacy allow of the dual-auth window, since
-    /// a legacy api-key prefix is never in the `ag_`-keyed table). Used by the
-    /// registry/vaults surfaces to annotate rows without N lock round-trips.
+    /// (the caller masks nothing). Used by the registry/vaults surfaces to
+    /// annotate rows without N lock round-trips.
     pub fn agent_allowed_connections(
         &self,
         vault_id: &str,
@@ -1742,8 +1724,6 @@ mod tests {
             listen: "127.0.0.1".into(),
             origin: "http://localhost".into(),
             rp_id: "localhost".into(),
-            admin_key: None,
-            relay_url: None,
             body_cap: crate::config::DEFAULT_BODY_CAP,
         };
         AppState::new(cfg)

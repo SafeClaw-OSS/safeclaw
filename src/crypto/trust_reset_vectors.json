@@ -1,0 +1,2933 @@
+{
+  "description": "SafeClaw trust-reset cross-language vectors (design/trust-reset-contract.md sections 0-1). Identical copies: core src/crypto/trust_reset_vectors.json, console lib/trust-reset-vectors.json, backend test/trust-reset-vectors.json. All binary values are lowercase hex unless the key says otherwise. Generated once by an independent Python (cryptography) implementation. NEVER edit an expected value to make a test pass; find why the implementations diverged.",
+  "version": 1,
+  "lp": [
+    {
+      "in": "",
+      "out": "00000000"
+    },
+    {
+      "in": "616263",
+      "out": "00000003616263"
+    },
+    {
+      "in": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+      "out": "0000012c000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+    }
+  ],
+  "derive_id": [
+    {
+      "kind": "user",
+      "pub": "1111111111111111111111111111111111111111111111111111111111111111",
+      "id": "us_alketiy7xmthzdzvf2mwrj46hzp4sxa3"
+    },
+    {
+      "kind": "agent",
+      "pub": "1111111111111111111111111111111111111111111111111111111111111111",
+      "id": "ag_alketiy7xmthzdzvf2mwrj46hzp4sxa3"
+    },
+    {
+      "kind": "device",
+      "pub": "1111111111111111111111111111111111111111111111111111111111111111",
+      "id": "dv_alketiy7xmthzdzvf2mwrj46hzp4sxa3"
+    },
+    {
+      "kind": "user",
+      "pub": "2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12",
+      "id": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p"
+    },
+    {
+      "kind": "device",
+      "pub": "6ee091fd280a9b68554fa73c588125d47d3425c68a26ba236b4dad90f90a8f92",
+      "id": "dv_h3a4gbna4xcdwjuqabvmuosjsnyufc6g"
+    },
+    {
+      "kind": "agent",
+      "pub": "bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5",
+      "id": "ag_omff5xbiyl4nv4wz3tr2ahk7ebpdlzkv"
+    }
+  ],
+  "id_kind": [
+    {
+      "id": "dv_h3a4gbna4xcdwjuqabvmuosjsnyufc6g",
+      "kind": "device"
+    },
+    {
+      "id": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+      "kind": "user"
+    },
+    {
+      "id": "ag_omff5xbiyl4nv4wz3tr2ahk7ebpdlzkv",
+      "kind": "agent"
+    },
+    {
+      "id": "dev_h3a4gbna4xcdwjuqabvmuosjsnyufc6g",
+      "kind": null
+    },
+    {
+      "id": "dv_H3A4GBNA4XCDWJUQABVMUOSJSNYUFC6G",
+      "kind": null
+    },
+    {
+      "id": "dv_h3a4gbna4xcdwjuqabvmuosjsnyufc6",
+      "kind": null
+    },
+    {
+      "id": "dv_h3a4gbna4xcdwjuqabvmuosjsnyufc6ga",
+      "kind": null
+    },
+    {
+      "id": "dv_h3a4gbna4xcdwjuqabvmuosjsnyufc61",
+      "kind": null
+    },
+    {
+      "id": "xx_h3a4gbna4xcdwjuqabvmuosjsnyufc6g",
+      "kind": null
+    },
+    {
+      "id": "dvh3a4gbna4xcdwjuqabvmuosjsnyufc6g",
+      "kind": null
+    },
+    {
+      "id": "",
+      "kind": null
+    }
+  ],
+  "enc_sig": {
+    "uik_seed": "4242424242424242424242424242424242424242424242424242424242424242",
+    "sign": {
+      "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+      "sig_pub": "2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12",
+      "enc_pub": "ff5d87907f1394b3a131985b894f513de72778ce27b8c10b32f93982a87cda47",
+      "input": "0000001873616665636c61772f76312f75696b2d656e632d62696e640000002375735f67636c36667878637a6e66646a6e6a79696467336f626e6f323469677071337000000020ff5d87907f1394b3a131985b894f513de72778ce27b8c10b32f93982a87cda47",
+      "sig": "8f93e5d8788be3087d93e2d82177e5852bebf3e8f310b8bef7558132c4dafe5b64531db3d75d6edc7cb4971b7927d0b982bad2a733dd339d57cd77e304310807"
+    },
+    "verify": [
+      {
+        "name": "valid",
+        "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+        "sig_pub": "2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12",
+        "enc_pub": "ff5d87907f1394b3a131985b894f513de72778ce27b8c10b32f93982a87cda47",
+        "sig": "8f93e5d8788be3087d93e2d82177e5852bebf3e8f310b8bef7558132c4dafe5b64531db3d75d6edc7cb4971b7927d0b982bad2a733dd339d57cd77e304310807",
+        "valid": true
+      },
+      {
+        "name": "sig_tampered",
+        "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+        "sig_pub": "2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12",
+        "enc_pub": "ff5d87907f1394b3a131985b894f513de72778ce27b8c10b32f93982a87cda47",
+        "sig": "8f93e5d8788be3087d93e3d82177e5852bebf3e8f310b8bef7558132c4dafe5b64531db3d75d6edc7cb4971b7927d0b982bad2a733dd339d57cd77e304310807",
+        "valid": false
+      },
+      {
+        "name": "enc_pub_swapped",
+        "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+        "sig_pub": "2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12",
+        "enc_pub": "4c2817a9d668ed844d2f95b93b69ecb8485095783a015a424164b0d09702894f",
+        "sig": "8f93e5d8788be3087d93e2d82177e5852bebf3e8f310b8bef7558132c4dafe5b64531db3d75d6edc7cb4971b7927d0b982bad2a733dd339d57cd77e304310807",
+        "valid": false
+      },
+      {
+        "name": "sig_pub_not_folding_to_us",
+        "us": "us_pwylahzz2f42vt33apn5pxm5oh3ecwml",
+        "sig_pub": "2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12",
+        "enc_pub": "ff5d87907f1394b3a131985b894f513de72778ce27b8c10b32f93982a87cda47",
+        "sig": "c8d1bea23cb2130b97dd83547979d926ca6eb64600cef7e0e2f2b3527e83c216f580ffcab079bf18ca839a45f2139c429f83cbdea9f0a82d7391d647c5a8660c",
+        "valid": false
+      },
+      {
+        "name": "other_key_claims_us",
+        "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+        "sig_pub": "22fc297792f0b6ffc0bfcfdb7edb0c0aa14e025a365ec0e342e86e3829cb74b6",
+        "enc_pub": "ff5d87907f1394b3a131985b894f513de72778ce27b8c10b32f93982a87cda47",
+        "sig": "67cad7c1c0768bbb6cb69161024a610d4287844cea13d4ebcda6901e151955d410a7a9bef05cee73a72239ae7d55ff87352585f551025248719b03fe2b7bd403",
+        "valid": false
+      },
+      {
+        "name": "enc_pub_31_bytes",
+        "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+        "sig_pub": "2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12",
+        "enc_pub": "ff5d87907f1394b3a131985b894f513de72778ce27b8c10b32f93982a87cda",
+        "sig": "8f93e5d8788be3087d93e2d82177e5852bebf3e8f310b8bef7558132c4dafe5b64531db3d75d6edc7cb4971b7927d0b982bad2a733dd339d57cd77e304310807",
+        "valid": false
+      }
+    ]
+  },
+  "admit_code": {
+    "alphabet": "0123456789ABCDEFGHJKMNPQRSTVWXYZ",
+    "labels": {
+      "lookup": "safeclaw/v1/admit-lookup",
+      "commit": "safeclaw/v1/admit-commit",
+      "mac": "safeclaw/v1/admit-mac"
+    },
+    "codes": [
+      {
+        "s": "00000000000000000000",
+        "display": "0000-0000-0000-0000",
+        "lookup": "ab955fbfaff3974044f74951ca5f07ba",
+        "commit_key": "d7954251c17e57182032e9032360ff06688ea66e4ee47cf921f1e0dccfbdf7a5",
+        "mac_key": "5054399472909c7baa4b25699bab059be90df5f0ce1c9d97ace4821000b45fbc"
+      },
+      {
+        "s": "ffffffffffffffffffff",
+        "display": "ZZZZ-ZZZZ-ZZZZ-ZZZZ",
+        "lookup": "0877e9581c3a99db30f790b1614266b3",
+        "commit_key": "e65468d6d853ee9f17d0e9a2eaad1e8e064adf0796879b20d780b9518aabbc9f",
+        "mac_key": "5b2e82c95f792d4f6ce0aa3dd4dc9ffda6b10b634d9004b64adf888c32c8c026"
+      },
+      {
+        "s": "00010203040506070809",
+        "display": "000G-40R4-0M30-E209",
+        "lookup": "aa46bb03ce23fc94d1ee22390e1440ef",
+        "commit_key": "896ac466aaef20b3d972e62969561211dfd248d3b2f129c9ac84e9dc2b5872bc",
+        "mac_key": "a64ce3dcfdabddf593b437ca3a8457f9b6270d5588d284f5d7cb2c6e6e253892"
+      },
+      {
+        "s": "8f3a1c5e7b9d2f4061a3",
+        "display": "HWX1-RQKV-KMQM-0RD3",
+        "lookup": "01d85f640077e8934fdae4c2cd048b9d",
+        "commit_key": "877b1cb718be9fed88a7cface4e710c2f6e854bef3715985b42e5425c2c8d18d",
+        "mac_key": "657f56469aefb6bcfaccb789f7683bc0bbbc0f99d30ca663aa5376de08ab473e"
+      }
+    ],
+    "normalize": [
+      {
+        "input": "HWX1-RQKV-KMQM-0RD3",
+        "normalized": "HWX1RQKVKMQM0RD3",
+        "s": "8f3a1c5e7b9d2f4061a3"
+      },
+      {
+        "input": "HWX1RQKVKMQM0RD3",
+        "normalized": "HWX1RQKVKMQM0RD3",
+        "s": "8f3a1c5e7b9d2f4061a3"
+      },
+      {
+        "input": "hwx1rqkvkmqm0rd3",
+        "normalized": "HWX1RQKVKMQM0RD3",
+        "s": "8f3a1c5e7b9d2f4061a3"
+      },
+      {
+        "input": "hwx1 rqkv kmqm 0rd3",
+        "normalized": "HWX1RQKVKMQM0RD3",
+        "s": "8f3a1c5e7b9d2f4061a3"
+      },
+      {
+        "input": "HWXlRQKVKMQMoRD3",
+        "normalized": "HWX1RQKVKMQM0RD3",
+        "s": "8f3a1c5e7b9d2f4061a3"
+      },
+      {
+        "input": "HWXIRQKVKMQMORD3",
+        "normalized": "HWX1RQKVKMQM0RD3",
+        "s": "8f3a1c5e7b9d2f4061a3"
+      },
+      {
+        "input": "-HWX1-RQKV-KMQM-0RD3-",
+        "normalized": "HWX1RQKVKMQM0RD3",
+        "s": "8f3a1c5e7b9d2f4061a3"
+      },
+      {
+        "input": "HWX1RQKVKMQM0RD",
+        "normalized": null,
+        "s": null
+      },
+      {
+        "input": "HWX1RQKVKMQM0RD30",
+        "normalized": null,
+        "s": null
+      },
+      {
+        "input": "HWX1RQKVKMQM0RDU",
+        "normalized": null,
+        "s": null
+      },
+      {
+        "input": "HWX1RQKVKMQM0RD_",
+        "normalized": null,
+        "s": null
+      },
+      {
+        "input": "HWX1RQKV\tKMQM0RD3",
+        "normalized": null,
+        "s": null
+      },
+      {
+        "input": "HWX1RQKV\nKMQM0RD3",
+        "normalized": null,
+        "s": null
+      },
+      {
+        "input": "HWX1RQKVKMQM0RDı",
+        "normalized": null,
+        "s": null
+      },
+      {
+        "input": "HWX1RQKVKMQM0RDſ",
+        "normalized": null,
+        "s": null
+      },
+      {
+        "input": "",
+        "normalized": null,
+        "s": null
+      }
+    ],
+    "fields_check": [
+      {
+        "name": "device_ok",
+        "fields": {
+          "kind": "device",
+          "sig_pub": "6ee091fd280a9b68554fa73c588125d47d3425c68a26ba236b4dad90f90a8f92",
+          "enc_pub": "4c2817a9d668ed844d2f95b93b69ecb8485095783a015a424164b0d09702894f",
+          "label": "MacBook Pro",
+          "extra": ""
+        },
+        "valid": true
+      },
+      {
+        "name": "agent_ok",
+        "fields": {
+          "kind": "agent",
+          "sig_pub": "bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5",
+          "enc_pub": "",
+          "label": "claude-code",
+          "extra": ""
+        },
+        "valid": true
+      },
+      {
+        "name": "passkey_ok",
+        "fields": {
+          "kind": "passkey",
+          "sig_pub": "39adc6c1cd751dba913adcc36c85ebf67a6f2819a40efddd95f63ad9dceb03d738b785e0534e8c7935303a76a1a0090497073689756ad96b2cdae28627eda45c",
+          "enc_pub": "2d98377b0faac966233242c517b804789dac2670c1aad86417752060d5f0203c",
+          "label": "iPhone • Safari",
+          "extra": "fbffc1c1c1c1c1c1c1c1c1c1c1c1c1c1"
+        },
+        "valid": true
+      },
+      {
+        "name": "device_sig_pub_31",
+        "fields": {
+          "kind": "device",
+          "sig_pub": "6ee091fd280a9b68554fa73c588125d47d3425c68a26ba236b4dad90f90a8f",
+          "enc_pub": "4c2817a9d668ed844d2f95b93b69ecb8485095783a015a424164b0d09702894f",
+          "label": "MacBook Pro",
+          "extra": ""
+        },
+        "valid": false
+      },
+      {
+        "name": "device_no_enc_pub",
+        "fields": {
+          "kind": "device",
+          "sig_pub": "6ee091fd280a9b68554fa73c588125d47d3425c68a26ba236b4dad90f90a8f92",
+          "enc_pub": "",
+          "label": "MacBook Pro",
+          "extra": ""
+        },
+        "valid": false
+      },
+      {
+        "name": "device_extra_set",
+        "fields": {
+          "kind": "device",
+          "sig_pub": "6ee091fd280a9b68554fa73c588125d47d3425c68a26ba236b4dad90f90a8f92",
+          "enc_pub": "4c2817a9d668ed844d2f95b93b69ecb8485095783a015a424164b0d09702894f",
+          "label": "MacBook Pro",
+          "extra": "01"
+        },
+        "valid": false
+      },
+      {
+        "name": "agent_enc_pub_set",
+        "fields": {
+          "kind": "agent",
+          "sig_pub": "bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5",
+          "enc_pub": "4c2817a9d668ed844d2f95b93b69ecb8485095783a015a424164b0d09702894f",
+          "label": "claude-code",
+          "extra": ""
+        },
+        "valid": false
+      },
+      {
+        "name": "passkey_xy_32",
+        "fields": {
+          "kind": "passkey",
+          "sig_pub": "39adc6c1cd751dba913adcc36c85ebf67a6f2819a40efddd95f63ad9dceb03d7",
+          "enc_pub": "2d98377b0faac966233242c517b804789dac2670c1aad86417752060d5f0203c",
+          "label": "iPhone • Safari",
+          "extra": "fbffc1c1c1c1c1c1c1c1c1c1c1c1c1c1"
+        },
+        "valid": false
+      },
+      {
+        "name": "passkey_no_cid",
+        "fields": {
+          "kind": "passkey",
+          "sig_pub": "39adc6c1cd751dba913adcc36c85ebf67a6f2819a40efddd95f63ad9dceb03d738b785e0534e8c7935303a76a1a0090497073689756ad96b2cdae28627eda45c",
+          "enc_pub": "2d98377b0faac966233242c517b804789dac2670c1aad86417752060d5f0203c",
+          "label": "iPhone • Safari",
+          "extra": ""
+        },
+        "valid": false
+      },
+      {
+        "name": "passkey_no_eph",
+        "fields": {
+          "kind": "passkey",
+          "sig_pub": "39adc6c1cd751dba913adcc36c85ebf67a6f2819a40efddd95f63ad9dceb03d738b785e0534e8c7935303a76a1a0090497073689756ad96b2cdae28627eda45c",
+          "enc_pub": "",
+          "label": "iPhone • Safari",
+          "extra": "fbffc1c1c1c1c1c1c1c1c1c1c1c1c1c1"
+        },
+        "valid": false
+      },
+      {
+        "name": "unknown_kind",
+        "fields": {
+          "kind": "pin",
+          "sig_pub": "6ee091fd280a9b68554fa73c588125d47d3425c68a26ba236b4dad90f90a8f92",
+          "enc_pub": "4c2817a9d668ed844d2f95b93b69ecb8485095783a015a424164b0d09702894f",
+          "label": "MacBook Pro",
+          "extra": ""
+        },
+        "valid": false
+      }
+    ],
+    "commit": [
+      {
+        "s": "8f3a1c5e7b9d2f4061a3",
+        "fields": {
+          "kind": "device",
+          "sig_pub": "6ee091fd280a9b68554fa73c588125d47d3425c68a26ba236b4dad90f90a8f92",
+          "enc_pub": "4c2817a9d668ed844d2f95b93b69ecb8485095783a015a424164b0d09702894f",
+          "label": "MacBook Pro",
+          "extra": ""
+        },
+        "input": "00000006646576696365000000206ee091fd280a9b68554fa73c588125d47d3425c68a26ba236b4dad90f90a8f92000000204c2817a9d668ed844d2f95b93b69ecb8485095783a015a424164b0d09702894f0000000b4d6163426f6f6b2050726f00000000",
+        "commit": "7f071e17e67c0faf59c1f556607f9736e477cf29a535821f0c5e5881f45d7282"
+      },
+      {
+        "s": "8f3a1c5e7b9d2f4061a3",
+        "fields": {
+          "kind": "agent",
+          "sig_pub": "bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5",
+          "enc_pub": "",
+          "label": "claude-code",
+          "extra": ""
+        },
+        "input": "000000056167656e7400000020bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5000000000000000b636c617564652d636f646500000000",
+        "commit": "6417614f648547d6b289892f5c4192ceb243c6e268d5e30eb6c7cdffa8b508e1"
+      },
+      {
+        "s": "8f3a1c5e7b9d2f4061a3",
+        "fields": {
+          "kind": "passkey",
+          "sig_pub": "39adc6c1cd751dba913adcc36c85ebf67a6f2819a40efddd95f63ad9dceb03d738b785e0534e8c7935303a76a1a0090497073689756ad96b2cdae28627eda45c",
+          "enc_pub": "2d98377b0faac966233242c517b804789dac2670c1aad86417752060d5f0203c",
+          "label": "iPhone • Safari",
+          "extra": "fbffc1c1c1c1c1c1c1c1c1c1c1c1c1c1"
+        },
+        "input": "00000007706173736b65790000004039adc6c1cd751dba913adcc36c85ebf67a6f2819a40efddd95f63ad9dceb03d738b785e0534e8c7935303a76a1a0090497073689756ad96b2cdae28627eda45c000000202d98377b0faac966233242c517b804789dac2670c1aad86417752060d5f0203c000000116950686f6e6520e280a22053616661726900000010fbffc1c1c1c1c1c1c1c1c1c1c1c1c1c1",
+        "commit": "1fa60154e160f6c66806a442bf1d658666dcd7f6e59e4ef9776068685f0e8898"
+      }
+    ],
+    "mac": [
+      {
+        "kind": "device",
+        "s": "8f3a1c5e7b9d2f4061a3",
+        "effect": "0000001873616665636c61772f76312f6c65646765722d6576656e740000002375735f67636c36667878637a6e66646a6e6a79696467336f626e6f32346967707133700000000561646d6974000000066465766963650000002364765f6833613467626e6134786364776a75716162766d756f736a736e797566633667000000206ee091fd280a9b68554fa73c588125d47d3425c68a26ba236b4dad90f90a8f92000000204c2817a9d668ed844d2f95b93b69ecb8485095783a015a424164b0d09702894f0000000b4d6163426f6f6b2050726f0000000000000003",
+        "uik_sign_pub": "2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12",
+        "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+        "email": "alice@example.com",
+        "input": "000000dc0000001873616665636c61772f76312f6c65646765722d6576656e740000002375735f67636c36667878637a6e66646a6e6a79696467336f626e6f32346967707133700000000561646d6974000000066465766963650000002364765f6833613467626e6134786364776a75716162766d756f736a736e797566633667000000206ee091fd280a9b68554fa73c588125d47d3425c68a26ba236b4dad90f90a8f92000000204c2817a9d668ed844d2f95b93b69ecb8485095783a015a424164b0d09702894f0000000b4d6163426f6f6b2050726f0000000000000003000000202152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db120000002375735f67636c36667878637a6e66646a6e6a79696467336f626e6f323469677071337000000011616c696365406578616d706c652e636f6d",
+        "mac": "5adbc267b63a87385d5fa3acf72f175a73617cb4ab0d126aba54f05c8306bcb2"
+      },
+      {
+        "kind": "agent",
+        "s": "8f3a1c5e7b9d2f4061a3",
+        "effect": "6417614f648547d6b289892f5c4192ceb243c6e268d5e30eb6c7cdffa8b508e1",
+        "uik_sign_pub": "2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12",
+        "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+        "email": "alice@example.com",
+        "input": "000000206417614f648547d6b289892f5c4192ceb243c6e268d5e30eb6c7cdffa8b508e1000000202152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db120000002375735f67636c36667878637a6e66646a6e6a79696467336f626e6f323469677071337000000011616c696365406578616d706c652e636f6d",
+        "mac": "8bad908103de5eaacbcf948943caa3e88c833e13992e7c053ad9c3181a2acc7c"
+      },
+      {
+        "kind": "passkey",
+        "s": "8f3a1c5e7b9d2f4061a3",
+        "effect": "0000001873616665636c61772f76312f6c65646765722d6576656e740000002375735f67636c36667878637a6e66646a6e6a79696467336f626e6f32346967707133700000000561646d697400000007706173736b6579000000162d5f5f427763484277634842776348427763484277510000004039adc6c1cd751dba913adcc36c85ebf67a6f2819a40efddd95f63ad9dceb03d738b785e0534e8c7935303a76a1a0090497073689756ad96b2cdae28627eda45c00000000000000116950686f6e6520e280a2205361666172690000000000000004",
+        "uik_sign_pub": "2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12",
+        "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+        "email": "alice@example.com",
+        "input": "000000d60000001873616665636c61772f76312f6c65646765722d6576656e740000002375735f67636c36667878637a6e66646a6e6a79696467336f626e6f32346967707133700000000561646d697400000007706173736b6579000000162d5f5f427763484277634842776348427763484277510000004039adc6c1cd751dba913adcc36c85ebf67a6f2819a40efddd95f63ad9dceb03d738b785e0534e8c7935303a76a1a0090497073689756ad96b2cdae28627eda45c00000000000000116950686f6e6520e280a2205361666172690000000000000004000000202152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db120000002375735f67636c36667878637a6e66646a6e6a79696467336f626e6f323469677071337000000011616c696365406578616d706c652e636f6d",
+        "mac": "518cb421ef6cc3f84cc9a9bf41980a0c9783d63ea1eab3ea614de8438341b309"
+      }
+    ],
+    "admission_result": [
+      {
+        "name": "device_ok",
+        "s": "8f3a1c5e7b9d2f4061a3",
+        "fields": {
+          "kind": "device",
+          "sig_pub": "6ee091fd280a9b68554fa73c588125d47d3425c68a26ba236b4dad90f90a8f92",
+          "enc_pub": "4c2817a9d668ed844d2f95b93b69ecb8485095783a015a424164b0d09702894f",
+          "label": "MacBook Pro",
+          "extra": ""
+        },
+        "effect": "0000001873616665636c61772f76312f6c65646765722d6576656e740000002375735f67636c36667878637a6e66646a6e6a79696467336f626e6f32346967707133700000000561646d6974000000066465766963650000002364765f6833613467626e6134786364776a75716162766d756f736a736e797566633667000000206ee091fd280a9b68554fa73c588125d47d3425c68a26ba236b4dad90f90a8f92000000204c2817a9d668ed844d2f95b93b69ecb8485095783a015a424164b0d09702894f0000000b4d6163426f6f6b2050726f0000000000000003",
+        "uik_sign_pub": "2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12",
+        "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+        "email": "alice@example.com",
+        "mac": "5adbc267b63a87385d5fa3acf72f175a73617cb4ab0d126aba54f05c8306bcb2",
+        "valid": true
+      },
+      {
+        "name": "agent_ok",
+        "s": "8f3a1c5e7b9d2f4061a3",
+        "fields": {
+          "kind": "agent",
+          "sig_pub": "bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5",
+          "enc_pub": "",
+          "label": "claude-code",
+          "extra": ""
+        },
+        "effect": "6417614f648547d6b289892f5c4192ceb243c6e268d5e30eb6c7cdffa8b508e1",
+        "uik_sign_pub": "2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12",
+        "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+        "email": "alice@example.com",
+        "mac": "8bad908103de5eaacbcf948943caa3e88c833e13992e7c053ad9c3181a2acc7c",
+        "valid": true
+      },
+      {
+        "name": "passkey_ok",
+        "s": "8f3a1c5e7b9d2f4061a3",
+        "fields": {
+          "kind": "passkey",
+          "sig_pub": "39adc6c1cd751dba913adcc36c85ebf67a6f2819a40efddd95f63ad9dceb03d738b785e0534e8c7935303a76a1a0090497073689756ad96b2cdae28627eda45c",
+          "enc_pub": "2d98377b0faac966233242c517b804789dac2670c1aad86417752060d5f0203c",
+          "label": "iPhone • Safari",
+          "extra": "fbffc1c1c1c1c1c1c1c1c1c1c1c1c1c1"
+        },
+        "effect": "0000001873616665636c61772f76312f6c65646765722d6576656e740000002375735f67636c36667878637a6e66646a6e6a79696467336f626e6f32346967707133700000000561646d697400000007706173736b6579000000162d5f5f427763484277634842776348427763484277510000004039adc6c1cd751dba913adcc36c85ebf67a6f2819a40efddd95f63ad9dceb03d738b785e0534e8c7935303a76a1a0090497073689756ad96b2cdae28627eda45c00000000000000116950686f6e6520e280a2205361666172690000000000000004",
+        "uik_sign_pub": "2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12",
+        "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+        "email": "alice@example.com",
+        "mac": "518cb421ef6cc3f84cc9a9bf41980a0c9783d63ea1eab3ea614de8438341b309",
+        "valid": true
+      },
+      {
+        "name": "passkey_label_changed_by_approver_ok",
+        "s": "8f3a1c5e7b9d2f4061a3",
+        "fields": {
+          "kind": "passkey",
+          "sig_pub": "39adc6c1cd751dba913adcc36c85ebf67a6f2819a40efddd95f63ad9dceb03d738b785e0534e8c7935303a76a1a0090497073689756ad96b2cdae28627eda45c",
+          "enc_pub": "2d98377b0faac966233242c517b804789dac2670c1aad86417752060d5f0203c",
+          "label": "iPhone • Safari",
+          "extra": "fbffc1c1c1c1c1c1c1c1c1c1c1c1c1c1"
+        },
+        "effect": "0000001873616665636c61772f76312f6c65646765722d6576656e740000002375735f67636c36667878637a6e66646a6e6a79696467336f626e6f32346967707133700000000561646d697400000007706173736b6579000000162d5f5f427763484277634842776348427763484277510000004039adc6c1cd751dba913adcc36c85ebf67a6f2819a40efddd95f63ad9dceb03d738b785e0534e8c7935303a76a1a0090497073689756ad96b2cdae28627eda45c000000000000001352656e616d656420627920617070726f7665720000000000000004",
+        "uik_sign_pub": "2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12",
+        "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+        "email": "alice@example.com",
+        "mac": "7de93ac94ee7d4e42d246b7a8aa89b36e892d700da86adbdfc4d31743df5027b",
+        "valid": true
+      },
+      {
+        "name": "device_mac_tampered",
+        "s": "8f3a1c5e7b9d2f4061a3",
+        "fields": {
+          "kind": "device",
+          "sig_pub": "6ee091fd280a9b68554fa73c588125d47d3425c68a26ba236b4dad90f90a8f92",
+          "enc_pub": "4c2817a9d668ed844d2f95b93b69ecb8485095783a015a424164b0d09702894f",
+          "label": "MacBook Pro",
+          "extra": ""
+        },
+        "effect": "0000001873616665636c61772f76312f6c65646765722d6576656e740000002375735f67636c36667878637a6e66646a6e6a79696467336f626e6f32346967707133700000000561646d6974000000066465766963650000002364765f6833613467626e6134786364776a75716162766d756f736a736e797566633667000000206ee091fd280a9b68554fa73c588125d47d3425c68a26ba236b4dad90f90a8f92000000204c2817a9d668ed844d2f95b93b69ecb8485095783a015a424164b0d09702894f0000000b4d6163426f6f6b2050726f0000000000000003",
+        "uik_sign_pub": "2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12",
+        "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+        "email": "alice@example.com",
+        "mac": "5bdbc267b63a87385d5fa3acf72f175a73617cb4ab0d126aba54f05c8306bcb2",
+        "valid": false
+      },
+      {
+        "name": "device_wrong_code",
+        "s": "00010203040506070809",
+        "fields": {
+          "kind": "device",
+          "sig_pub": "6ee091fd280a9b68554fa73c588125d47d3425c68a26ba236b4dad90f90a8f92",
+          "enc_pub": "4c2817a9d668ed844d2f95b93b69ecb8485095783a015a424164b0d09702894f",
+          "label": "MacBook Pro",
+          "extra": ""
+        },
+        "effect": "0000001873616665636c61772f76312f6c65646765722d6576656e740000002375735f67636c36667878637a6e66646a6e6a79696467336f626e6f32346967707133700000000561646d6974000000066465766963650000002364765f6833613467626e6134786364776a75716162766d756f736a736e797566633667000000206ee091fd280a9b68554fa73c588125d47d3425c68a26ba236b4dad90f90a8f92000000204c2817a9d668ed844d2f95b93b69ecb8485095783a015a424164b0d09702894f0000000b4d6163426f6f6b2050726f0000000000000003",
+        "uik_sign_pub": "2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12",
+        "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+        "email": "alice@example.com",
+        "mac": "5adbc267b63a87385d5fa3acf72f175a73617cb4ab0d126aba54f05c8306bcb2",
+        "valid": false
+      },
+      {
+        "name": "device_effect_other_enc_pub",
+        "s": "8f3a1c5e7b9d2f4061a3",
+        "fields": {
+          "kind": "device",
+          "sig_pub": "6ee091fd280a9b68554fa73c588125d47d3425c68a26ba236b4dad90f90a8f92",
+          "enc_pub": "4c2817a9d668ed844d2f95b93b69ecb8485095783a015a424164b0d09702894f",
+          "label": "MacBook Pro",
+          "extra": ""
+        },
+        "effect": "0000001873616665636c61772f76312f6c65646765722d6576656e740000002375735f67636c36667878637a6e66646a6e6a79696467336f626e6f32346967707133700000000561646d6974000000066465766963650000002364765f6833613467626e6134786364776a75716162766d756f736a736e797566633667000000206ee091fd280a9b68554fa73c588125d47d3425c68a26ba236b4dad90f90a8f920000002019d80204bf85f3e1118e1b23410c88f0d0eeced5156f4c5bdf347b14ed7ec63f0000000b4d6163426f6f6b2050726f0000000000000003",
+        "uik_sign_pub": "2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12",
+        "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+        "email": "alice@example.com",
+        "mac": "07622aa9c7f89cb018e7113be6dc587f8070ca89e11d381e981c7ef83a414492",
+        "valid": false
+      },
+      {
+        "name": "device_effect_is_revoke",
+        "s": "8f3a1c5e7b9d2f4061a3",
+        "fields": {
+          "kind": "device",
+          "sig_pub": "6ee091fd280a9b68554fa73c588125d47d3425c68a26ba236b4dad90f90a8f92",
+          "enc_pub": "4c2817a9d668ed844d2f95b93b69ecb8485095783a015a424164b0d09702894f",
+          "label": "MacBook Pro",
+          "extra": ""
+        },
+        "effect": "0000001873616665636c61772f76312f6c65646765722d6576656e740000002375735f67636c36667878637a6e66646a6e6a79696467336f626e6f3234696770713370000000067265766f6b65000000066465766963650000002364765f6833613467626e6134786364776a75716162766d756f736a736e797566633667000000206ee091fd280a9b68554fa73c588125d47d3425c68a26ba236b4dad90f90a8f92000000204c2817a9d668ed844d2f95b93b69ecb8485095783a015a424164b0d09702894f0000000b4d6163426f6f6b2050726f0000000000000003",
+        "uik_sign_pub": "2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12",
+        "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+        "email": "alice@example.com",
+        "mac": "9c4863578f5a3e49c7797f66293c840aa64fc25c0769b367afbe368c3ceccf3e",
+        "valid": false
+      },
+      {
+        "name": "device_effect_other_person",
+        "s": "8f3a1c5e7b9d2f4061a3",
+        "fields": {
+          "kind": "device",
+          "sig_pub": "6ee091fd280a9b68554fa73c588125d47d3425c68a26ba236b4dad90f90a8f92",
+          "enc_pub": "4c2817a9d668ed844d2f95b93b69ecb8485095783a015a424164b0d09702894f",
+          "label": "MacBook Pro",
+          "extra": ""
+        },
+        "effect": "0000001873616665636c61772f76312f6c65646765722d6576656e740000002375735f7077796c61687a7a326634327674333361706e3570786d356f68336563776d6c0000000561646d6974000000066465766963650000002364765f6833613467626e6134786364776a75716162766d756f736a736e797566633667000000206ee091fd280a9b68554fa73c588125d47d3425c68a26ba236b4dad90f90a8f92000000204c2817a9d668ed844d2f95b93b69ecb8485095783a015a424164b0d09702894f0000000b4d6163426f6f6b2050726f0000000000000003",
+        "uik_sign_pub": "2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12",
+        "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+        "email": "alice@example.com",
+        "mac": "73feee1f0c258d3f4bcf79c7ae4e3334f6d7650dab7bd5265ef82e9d071bf96c",
+        "valid": false
+      },
+      {
+        "name": "uik_pub_not_folding_to_us",
+        "s": "8f3a1c5e7b9d2f4061a3",
+        "fields": {
+          "kind": "device",
+          "sig_pub": "6ee091fd280a9b68554fa73c588125d47d3425c68a26ba236b4dad90f90a8f92",
+          "enc_pub": "4c2817a9d668ed844d2f95b93b69ecb8485095783a015a424164b0d09702894f",
+          "label": "MacBook Pro",
+          "extra": ""
+        },
+        "effect": "0000001873616665636c61772f76312f6c65646765722d6576656e740000002375735f67636c36667878637a6e66646a6e6a79696467336f626e6f32346967707133700000000561646d6974000000066465766963650000002364765f6833613467626e6134786364776a75716162766d756f736a736e797566633667000000206ee091fd280a9b68554fa73c588125d47d3425c68a26ba236b4dad90f90a8f92000000204c2817a9d668ed844d2f95b93b69ecb8485095783a015a424164b0d09702894f0000000b4d6163426f6f6b2050726f0000000000000003",
+        "uik_sign_pub": "2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12",
+        "us": "us_pwylahzz2f42vt33apn5pxm5oh3ecwml",
+        "email": "alice@example.com",
+        "mac": "cca6fde690bdcbb27071fa633d8f2a48612124f93d4b429c899d647013fd4427",
+        "valid": false
+      },
+      {
+        "name": "email_changed",
+        "s": "8f3a1c5e7b9d2f4061a3",
+        "fields": {
+          "kind": "device",
+          "sig_pub": "6ee091fd280a9b68554fa73c588125d47d3425c68a26ba236b4dad90f90a8f92",
+          "enc_pub": "4c2817a9d668ed844d2f95b93b69ecb8485095783a015a424164b0d09702894f",
+          "label": "MacBook Pro",
+          "extra": ""
+        },
+        "effect": "0000001873616665636c61772f76312f6c65646765722d6576656e740000002375735f67636c36667878637a6e66646a6e6a79696467336f626e6f32346967707133700000000561646d6974000000066465766963650000002364765f6833613467626e6134786364776a75716162766d756f736a736e797566633667000000206ee091fd280a9b68554fa73c588125d47d3425c68a26ba236b4dad90f90a8f92000000204c2817a9d668ed844d2f95b93b69ecb8485095783a015a424164b0d09702894f0000000b4d6163426f6f6b2050726f0000000000000003",
+        "uik_sign_pub": "2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12",
+        "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+        "email": "mallory@example.com",
+        "mac": "5adbc267b63a87385d5fa3acf72f175a73617cb4ab0d126aba54f05c8306bcb2",
+        "valid": false
+      },
+      {
+        "name": "passkey_effect_other_cid",
+        "s": "8f3a1c5e7b9d2f4061a3",
+        "fields": {
+          "kind": "passkey",
+          "sig_pub": "39adc6c1cd751dba913adcc36c85ebf67a6f2819a40efddd95f63ad9dceb03d738b785e0534e8c7935303a76a1a0090497073689756ad96b2cdae28627eda45c",
+          "enc_pub": "2d98377b0faac966233242c517b804789dac2670c1aad86417752060d5f0203c",
+          "label": "iPhone • Safari",
+          "extra": "fbffc1c1c1c1c1c1c1c1c1c1c1c1c1c1"
+        },
+        "effect": "0000001873616665636c61772f76312f6c65646765722d6576656e740000002375735f67636c36667878637a6e66646a6e6a79696467336f626e6f32346967707133700000000561646d697400000007706173736b6579000000164367734d44634c4377734c4377734c4377734c4377670000004039adc6c1cd751dba913adcc36c85ebf67a6f2819a40efddd95f63ad9dceb03d738b785e0534e8c7935303a76a1a0090497073689756ad96b2cdae28627eda45c00000000000000066950686f6e650000000000000004",
+        "uik_sign_pub": "2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12",
+        "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+        "email": "alice@example.com",
+        "mac": "a5522f4f11c4815f0c257b2deffa40d1aed792ad545613a6de020c972194b97c",
+        "valid": false
+      },
+      {
+        "name": "agent_effect_not_commit",
+        "s": "8f3a1c5e7b9d2f4061a3",
+        "fields": {
+          "kind": "agent",
+          "sig_pub": "bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5",
+          "enc_pub": "",
+          "label": "claude-code",
+          "extra": ""
+        },
+        "effect": "0000000000000000000000000000000000000000000000000000000000000000",
+        "uik_sign_pub": "2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12",
+        "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+        "email": "alice@example.com",
+        "mac": "2195b5b045fe94e9989f52d107603344dde1c0209e4a4896757a79c426c949ce",
+        "valid": false
+      },
+      {
+        "name": "agent_effect_is_ledger_event",
+        "s": "8f3a1c5e7b9d2f4061a3",
+        "fields": {
+          "kind": "agent",
+          "sig_pub": "bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5",
+          "enc_pub": "",
+          "label": "claude-code",
+          "extra": ""
+        },
+        "effect": "0000001873616665636c61772f76312f6c65646765722d6576656e740000002375735f67636c36667878637a6e66646a6e6a79696467336f626e6f32346967707133700000000561646d6974000000066465766963650000002364765f6833613467626e6134786364776a75716162766d756f736a736e797566633667000000206ee091fd280a9b68554fa73c588125d47d3425c68a26ba236b4dad90f90a8f92000000204c2817a9d668ed844d2f95b93b69ecb8485095783a015a424164b0d09702894f0000000b4d6163426f6f6b2050726f0000000000000003",
+        "uik_sign_pub": "2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12",
+        "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+        "email": "alice@example.com",
+        "mac": "5adbc267b63a87385d5fa3acf72f175a73617cb4ab0d126aba54f05c8306bcb2",
+        "valid": false
+      }
+    ],
+    "lookup_format": [
+      {
+        "s": "01d85f640077e8934fdae4c2cd048b9d",
+        "valid": true
+      },
+      {
+        "s": "01D85F640077E8934FDAE4C2CD048B9D",
+        "valid": false
+      },
+      {
+        "s": "01d85f640077e8934fdae4c2cd048b9",
+        "valid": false
+      },
+      {
+        "s": "01d85f640077e8934fdae4c2cd048b9d0",
+        "valid": false
+      },
+      {
+        "s": "01d85f640077e8934fdae4c2cd048b9g",
+        "valid": false
+      },
+      {
+        "s": "",
+        "valid": false
+      }
+    ]
+  },
+  "ledger_parse": [
+    {
+      "name": "ok",
+      "input": "0000001873616665636c61772f76312f6c65646765722d6576656e740000002375735f67636c36667878637a6e66646a6e6a79696467336f626e6f32346967707133700000000561646d6974000000066465766963650000002364765f6833613467626e6134786364776a75716162766d756f736a736e797566633667000000206ee091fd280a9b68554fa73c588125d47d3425c68a26ba236b4dad90f90a8f92000000204c2817a9d668ed844d2f95b93b69ecb8485095783a015a424164b0d09702894f0000000b4d6163426f6f6b2050726f0000000000000001",
+      "valid": true
+    },
+    {
+      "name": "trailing_byte",
+      "input": "0000001873616665636c61772f76312f6c65646765722d6576656e740000002375735f67636c36667878637a6e66646a6e6a79696467336f626e6f32346967707133700000000561646d6974000000066465766963650000002364765f6833613467626e6134786364776a75716162766d756f736a736e797566633667000000206ee091fd280a9b68554fa73c588125d47d3425c68a26ba236b4dad90f90a8f92000000204c2817a9d668ed844d2f95b93b69ecb8485095783a015a424164b0d09702894f0000000b4d6163426f6f6b2050726f000000000000000100",
+      "valid": false
+    },
+    {
+      "name": "truncated_seq",
+      "input": "0000001873616665636c61772f76312f6c65646765722d6576656e740000002375735f67636c36667878637a6e66646a6e6a79696467336f626e6f32346967707133700000000561646d6974000000066465766963650000002364765f6833613467626e6134786364776a75716162766d756f736a736e797566633667000000206ee091fd280a9b68554fa73c588125d47d3425c68a26ba236b4dad90f90a8f92000000204c2817a9d668ed844d2f95b93b69ecb8485095783a015a424164b0d09702894f0000000b4d6163426f6f6b2050726f00000000000000",
+      "valid": false
+    },
+    {
+      "name": "wrong_domain",
+      "input": "0000001873616665636c61772f76312f6c65646765722d6576656e540000002375735f67636c36667878637a6e66646a6e6a79696467336f626e6f32346967707133700000000561646d6974000000066465766963650000002364765f6833613467626e6134786364776a75716162766d756f736a736e797566633667000000206ee091fd280a9b68554fa73c588125d47d3425c68a26ba236b4dad90f90a8f92000000204c2817a9d668ed844d2f95b93b69ecb8485095783a015a424164b0d09702894f0000000b4d6163426f6f6b2050726f0000000000000001",
+      "valid": false
+    },
+    {
+      "name": "len_overflow",
+      "input": "0000001873616665636c61772f76312f6c65646765722d6576656e74ffffffff",
+      "valid": false
+    },
+    {
+      "name": "bad_utf8_label",
+      "input": "0000001873616665636c61772f76312f6c65646765722d6576656e740000002375735f67636c36667878637a6e66646a6e6a79696467336f626e6f32346967707133700000000561646d6974000000066465766963650000002364765f6833613467626e6134786364776a75716162766d756f736a736e797566633667000000206ee091fd280a9b68554fa73c588125d47d3425c68a26ba236b4dad90f90a8f92000000204c2817a9d668ed844d2f95b93b69ecb8485095783a015a424164b0d09702894f00000002fffe0000000000000001",
+      "valid": false
+    },
+    {
+      "name": "empty",
+      "input": "",
+      "valid": false
+    },
+    {
+      "name": "seq_above_2_53",
+      "input": "0000001873616665636c61772f76312f6c65646765722d6576656e740000002375735f67636c36667878637a6e66646a6e6a79696467336f626e6f32346967707133700000000561646d6974000000066465766963650000002364765f6833613467626e6134786364776a75716162766d756f736a736e797566633667000000206ee091fd280a9b68554fa73c588125d47d3425c68a26ba236b4dad90f90a8f92000000204c2817a9d668ed844d2f95b93b69ecb8485095783a015a424164b0d09702894f0000000b4d6163426f6f6b2050726f0020000000000000",
+      "valid": false
+    },
+    {
+      "name": "bom_prefixed_label",
+      "input": "0000001873616665636c61772f76312f6c65646765722d6576656e740000002375735f67636c36667878637a6e66646a6e6a79696467336f626e6f32346967707133700000000561646d6974000000066465766963650000002364765f6833613467626e6134786364776a75716162766d756f736a736e797566633667000000206ee091fd280a9b68554fa73c588125d47d3425c68a26ba236b4dad90f90a8f92000000204c2817a9d668ed844d2f95b93b69ecb8485095783a015a424164b0d09702894f0000000aefbbbf4d6163426f6f6b0000000000000001",
+      "valid": true
+    }
+  ],
+  "ledger_event": [
+    {
+      "name": "device_admit",
+      "signer_seed": "4242424242424242424242424242424242424242424242424242424242424242",
+      "signer_pub": "2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12",
+      "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+      "op": "admit",
+      "kind": "device",
+      "principal": "dv_h3a4gbna4xcdwjuqabvmuosjsnyufc6g",
+      "sig_pub": "6ee091fd280a9b68554fa73c588125d47d3425c68a26ba236b4dad90f90a8f92",
+      "enc_pub": "4c2817a9d668ed844d2f95b93b69ecb8485095783a015a424164b0d09702894f",
+      "label": "MacBook Pro",
+      "seq": 1,
+      "sig": "106e631f2213fdd61ae8c931899383aec55612082737770e4c14d5c4afb7bccdba9364218698a1df4f012bc7917b24e44c07aebf2d9d7ae4a555d80833412e09",
+      "input": "0000001873616665636c61772f76312f6c65646765722d6576656e740000002375735f67636c36667878637a6e66646a6e6a79696467336f626e6f32346967707133700000000561646d6974000000066465766963650000002364765f6833613467626e6134786364776a75716162766d756f736a736e797566633667000000206ee091fd280a9b68554fa73c588125d47d3425c68a26ba236b4dad90f90a8f92000000204c2817a9d668ed844d2f95b93b69ecb8485095783a015a424164b0d09702894f0000000b4d6163426f6f6b2050726f0000000000000001",
+      "hash": "e794262afbc59899558d9ec0c348f9c9564494009efaff19a25f1cde1c3a9e21"
+    },
+    {
+      "name": "passkey_admit",
+      "signer_seed": "4242424242424242424242424242424242424242424242424242424242424242",
+      "signer_pub": "2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12",
+      "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+      "op": "admit",
+      "kind": "passkey",
+      "principal": "-__BwcHBwcHBwcHBwcHBwQ",
+      "sig_pub": "39adc6c1cd751dba913adcc36c85ebf67a6f2819a40efddd95f63ad9dceb03d738b785e0534e8c7935303a76a1a0090497073689756ad96b2cdae28627eda45c",
+      "enc_pub": "",
+      "label": "iPhone",
+      "seq": 0,
+      "sig": "a9c54d46f483e11e164ee1f287571e223b2af6d03e7c164728ae06072e7ff1c240d6f60b595f3631dfe423e7e7bff001046917dad248e06d559c3f0191855e0a",
+      "input": "0000001873616665636c61772f76312f6c65646765722d6576656e740000002375735f67636c36667878637a6e66646a6e6a79696467336f626e6f32346967707133700000000561646d697400000007706173736b6579000000162d5f5f427763484277634842776348427763484277510000004039adc6c1cd751dba913adcc36c85ebf67a6f2819a40efddd95f63ad9dceb03d738b785e0534e8c7935303a76a1a0090497073689756ad96b2cdae28627eda45c00000000000000066950686f6e650000000000000000",
+      "hash": "989c2cd61fe1e420fc0ebefe1f9e409995eb86657e3548928d6ced797f31eae9"
+    },
+    {
+      "name": "pin_admit",
+      "signer_seed": "4242424242424242424242424242424242424242424242424242424242424242",
+      "signer_pub": "2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12",
+      "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+      "op": "admit",
+      "kind": "pin",
+      "principal": "7d3f5a1e-0000-4000-8000-000000000001",
+      "sig_pub": "d759793bbc13a2819a827c76adb6fba8a49aee007f49f2d0992d99b825ad2c48",
+      "enc_pub": "",
+      "label": "team-prod",
+      "seq": 2,
+      "sig": "93869011794f68ca40d4e74c838311563236649187c3919ff05085d9faf1b4567df81fc1be7a5f684136b049a2cd59d25a9ac724ef7289d95a9e7fb3c105e302",
+      "input": "0000001873616665636c61772f76312f6c65646765722d6576656e740000002375735f67636c36667878637a6e66646a6e6a79696467336f626e6f32346967707133700000000561646d69740000000370696e0000002437643366356131652d303030302d343030302d383030302d30303030303030303030303100000020d759793bbc13a2819a827c76adb6fba8a49aee007f49f2d0992d99b825ad2c4800000000000000097465616d2d70726f640000000000000002",
+      "hash": "73dad04c50c396d5d51aab38790d9a372a3e9a8efa4883930cccaae7f5e87f48"
+    },
+    {
+      "name": "device_revoke",
+      "signer_seed": "4242424242424242424242424242424242424242424242424242424242424242",
+      "signer_pub": "2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12",
+      "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+      "op": "revoke",
+      "kind": "device",
+      "principal": "dv_h3a4gbna4xcdwjuqabvmuosjsnyufc6g",
+      "sig_pub": "6ee091fd280a9b68554fa73c588125d47d3425c68a26ba236b4dad90f90a8f92",
+      "enc_pub": "4c2817a9d668ed844d2f95b93b69ecb8485095783a015a424164b0d09702894f",
+      "label": "MacBook Pro",
+      "seq": 9,
+      "sig": "3aaceb72afde4507f3d4a5200e1104a7c6c0e783affce7fda51847be03be434fd7b4a6240959bc3f8e8e84b2b66d97d6c9faec1a0c029e71115fe4080b50cb01",
+      "input": "0000001873616665636c61772f76312f6c65646765722d6576656e740000002375735f67636c36667878637a6e66646a6e6a79696467336f626e6f3234696770713370000000067265766f6b65000000066465766963650000002364765f6833613467626e6134786364776a75716162766d756f736a736e797566633667000000206ee091fd280a9b68554fa73c588125d47d3425c68a26ba236b4dad90f90a8f92000000204c2817a9d668ed844d2f95b93b69ecb8485095783a015a424164b0d09702894f0000000b4d6163426f6f6b2050726f0000000000000009",
+      "hash": "7b5f99b6329648503d7065cd2be4b7699fac96f4efd7ca76e23e755d3d8df817"
+    },
+    {
+      "name": "pin_revoke",
+      "signer_seed": "4242424242424242424242424242424242424242424242424242424242424242",
+      "signer_pub": "2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12",
+      "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+      "op": "revoke",
+      "kind": "pin",
+      "principal": "7d3f5a1e-0000-4000-8000-000000000001",
+      "sig_pub": "d759793bbc13a2819a827c76adb6fba8a49aee007f49f2d0992d99b825ad2c48",
+      "enc_pub": "",
+      "label": "team-prod",
+      "seq": 12,
+      "sig": "63cc746bd3f1a496e431c5e695a7861ada15f5211b83e4df857477a53459ae7330ed190292ec7770651301d82cb8dbf2ed4dab0288618fb1814c5169f931b601",
+      "input": "0000001873616665636c61772f76312f6c65646765722d6576656e740000002375735f67636c36667878637a6e66646a6e6a79696467336f626e6f3234696770713370000000067265766f6b650000000370696e0000002437643366356131652d303030302d343030302d383030302d30303030303030303030303100000020d759793bbc13a2819a827c76adb6fba8a49aee007f49f2d0992d99b825ad2c4800000000000000097465616d2d70726f64000000000000000c",
+      "hash": "4e18050463867ce12e6eb990de4f0d609e18dcc41afceedaf781835497df4281"
+    }
+  ],
+  "ledger_fold": [
+    {
+      "name": "empty",
+      "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+      "uik_pub": "2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12",
+      "events": [],
+      "expect": {
+        "ok": true,
+        "next_seq": 0,
+        "head_hash": null,
+        "devices": [],
+        "passkeys": [],
+        "pins": [],
+        "revoked_devices": [],
+        "revoked_passkeys": []
+      }
+    },
+    {
+      "name": "valid_chain",
+      "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+      "uik_pub": "2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12",
+      "events": [
+        {
+          "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "op": "admit",
+          "kind": "passkey",
+          "principal": "-__BwcHBwcHBwcHBwcHBwQ",
+          "sig_pub": "39adc6c1cd751dba913adcc36c85ebf67a6f2819a40efddd95f63ad9dceb03d738b785e0534e8c7935303a76a1a0090497073689756ad96b2cdae28627eda45c",
+          "enc_pub": "",
+          "label": "iPhone",
+          "seq": 0,
+          "sig": "a9c54d46f483e11e164ee1f287571e223b2af6d03e7c164728ae06072e7ff1c240d6f60b595f3631dfe423e7e7bff001046917dad248e06d559c3f0191855e0a"
+        },
+        {
+          "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "op": "admit",
+          "kind": "device",
+          "principal": "dv_h3a4gbna4xcdwjuqabvmuosjsnyufc6g",
+          "sig_pub": "6ee091fd280a9b68554fa73c588125d47d3425c68a26ba236b4dad90f90a8f92",
+          "enc_pub": "4c2817a9d668ed844d2f95b93b69ecb8485095783a015a424164b0d09702894f",
+          "label": "MacBook Pro",
+          "seq": 1,
+          "sig": "106e631f2213fdd61ae8c931899383aec55612082737770e4c14d5c4afb7bccdba9364218698a1df4f012bc7917b24e44c07aebf2d9d7ae4a555d80833412e09"
+        },
+        {
+          "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "op": "admit",
+          "kind": "pin",
+          "principal": "7d3f5a1e-0000-4000-8000-000000000001",
+          "sig_pub": "d759793bbc13a2819a827c76adb6fba8a49aee007f49f2d0992d99b825ad2c48",
+          "enc_pub": "",
+          "label": "team-prod",
+          "seq": 2,
+          "sig": "93869011794f68ca40d4e74c838311563236649187c3919ff05085d9faf1b4567df81fc1be7a5f684136b049a2cd59d25a9ac724ef7289d95a9e7fb3c105e302"
+        },
+        {
+          "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "op": "admit",
+          "kind": "device",
+          "principal": "dv_l4arshov3wtzod5eu3y6uufprgsr2hqt",
+          "sig_pub": "41e8fde132ad670e534cd8b275d2cd7eec77733c66f8db48a1cada7fabfc4555",
+          "enc_pub": "19d80204bf85f3e1118e1b23410c88f0d0eeced5156f4c5bdf347b14ed7ec63f",
+          "label": "build box",
+          "seq": 3,
+          "sig": "abdc8765a3f8588b75e0ba8016752549a61e89a4335ec9821d471c3ca4e37e99d390515d9ea4de97a21c8c415deec885633f8cb050245433a53c619c847dd90c"
+        },
+        {
+          "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "op": "admit",
+          "kind": "device",
+          "principal": "dv_h3a4gbna4xcdwjuqabvmuosjsnyufc6g",
+          "sig_pub": "6ee091fd280a9b68554fa73c588125d47d3425c68a26ba236b4dad90f90a8f92",
+          "enc_pub": "4c2817a9d668ed844d2f95b93b69ecb8485095783a015a424164b0d09702894f",
+          "label": "MacBook Pro (work)",
+          "seq": 4,
+          "sig": "f72a4f4b25f9e0ef20e9fa0d4caa5edb600a9261852f19359fc2a099202fe7d7cea1f5da6c861781f784b76bbe6e9bc538717bb29251d93b913632280b6a5f05"
+        },
+        {
+          "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "op": "revoke",
+          "kind": "device",
+          "principal": "dv_l4arshov3wtzod5eu3y6uufprgsr2hqt",
+          "sig_pub": "41e8fde132ad670e534cd8b275d2cd7eec77733c66f8db48a1cada7fabfc4555",
+          "enc_pub": "19d80204bf85f3e1118e1b23410c88f0d0eeced5156f4c5bdf347b14ed7ec63f",
+          "label": "build box",
+          "seq": 5,
+          "sig": "3c13f596a5c2d23ee4efe09ab5b2a085e7ba5bc7370a28bd2e4344e27afda6e7750f464ac2220c2b9f4c432f45af59046f0ed70035f23de4f989ecc60d166f01"
+        },
+        {
+          "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "op": "admit",
+          "kind": "passkey",
+          "principal": "CgsMDcLCwsLCwsLCwsLCwg",
+          "sig_pub": "7f6ff388acb6a5ea5415914fe7abe5b632f21783831c65e707a2072f92c77d28e51b53c3e5cf92fd1c29b3ef268138fb0993cb4c0486840d3f03314a01df327f",
+          "enc_pub": "",
+          "label": "YubiKey",
+          "seq": 6,
+          "sig": "a50dd166bbb6f7028b2668a6419112981e4a7b1babe8eb63e7679b810c8e68987c5731eded3cc3109af2cef82c96f61abc70e15a318c740dd18174bca692170f"
+        },
+        {
+          "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "op": "revoke",
+          "kind": "passkey",
+          "principal": "-__BwcHBwcHBwcHBwcHBwQ",
+          "sig_pub": "39adc6c1cd751dba913adcc36c85ebf67a6f2819a40efddd95f63ad9dceb03d738b785e0534e8c7935303a76a1a0090497073689756ad96b2cdae28627eda45c",
+          "enc_pub": "",
+          "label": "iPhone",
+          "seq": 7,
+          "sig": "f95883ec41e560e484ceba27165df75857b575fb38b6db3e29fa79230565833892cee153ee378c1f272c2e243147828552c3754657b7829869dfb6df01346302"
+        },
+        {
+          "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "op": "admit",
+          "kind": "pin",
+          "principal": "7d3f5a1e-0000-4000-8000-000000000002",
+          "sig_pub": "6355691c178a8ff91007a7478afb955ef7352c63e7b25703984cf78b26e21a56",
+          "enc_pub": "",
+          "label": "personal",
+          "seq": 8,
+          "sig": "ad1e2c043d75652062e45f9e9a2569978cbf228351faee97f1efa94de5878d1fe1367f930f71c2d11ac64646437b954490a92534e8b64896f3df7fbaad0c810f"
+        }
+      ],
+      "expect": {
+        "ok": true,
+        "next_seq": 9,
+        "head_hash": "8864acd65fe2fd42384077cfce440b60270039b14661cdaa322d41234f25f731",
+        "devices": [
+          {
+            "id": "dv_h3a4gbna4xcdwjuqabvmuosjsnyufc6g",
+            "sig_pub": "6ee091fd280a9b68554fa73c588125d47d3425c68a26ba236b4dad90f90a8f92",
+            "enc_pub": "4c2817a9d668ed844d2f95b93b69ecb8485095783a015a424164b0d09702894f",
+            "label": "MacBook Pro (work)"
+          }
+        ],
+        "passkeys": [
+          {
+            "cid": "CgsMDcLCwsLCwsLCwsLCwg",
+            "xy": "7f6ff388acb6a5ea5415914fe7abe5b632f21783831c65e707a2072f92c77d28e51b53c3e5cf92fd1c29b3ef268138fb0993cb4c0486840d3f03314a01df327f",
+            "label": "YubiKey"
+          }
+        ],
+        "pins": [
+          {
+            "vault": "7d3f5a1e-0000-4000-8000-000000000001",
+            "anchor": "d759793bbc13a2819a827c76adb6fba8a49aee007f49f2d0992d99b825ad2c48",
+            "label": "team-prod"
+          },
+          {
+            "vault": "7d3f5a1e-0000-4000-8000-000000000002",
+            "anchor": "6355691c178a8ff91007a7478afb955ef7352c63e7b25703984cf78b26e21a56",
+            "label": "personal"
+          }
+        ],
+        "revoked_devices": [
+          {
+            "id": "dv_l4arshov3wtzod5eu3y6uufprgsr2hqt",
+            "seq": 5
+          }
+        ],
+        "revoked_passkeys": [
+          {
+            "cid": "-__BwcHBwcHBwcHBwcHBwQ",
+            "seq": 7
+          }
+        ]
+      }
+    },
+    {
+      "name": "bad_owner",
+      "us": "us_pwylahzz2f42vt33apn5pxm5oh3ecwml",
+      "uik_pub": "2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12",
+      "events": [
+        {
+          "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "op": "admit",
+          "kind": "passkey",
+          "principal": "-__BwcHBwcHBwcHBwcHBwQ",
+          "sig_pub": "39adc6c1cd751dba913adcc36c85ebf67a6f2819a40efddd95f63ad9dceb03d738b785e0534e8c7935303a76a1a0090497073689756ad96b2cdae28627eda45c",
+          "enc_pub": "",
+          "label": "iPhone",
+          "seq": 0,
+          "sig": "a9c54d46f483e11e164ee1f287571e223b2af6d03e7c164728ae06072e7ff1c240d6f60b595f3631dfe423e7e7bff001046917dad248e06d559c3f0191855e0a"
+        }
+      ],
+      "expect": {
+        "ok": false,
+        "error": "bad_owner",
+        "index": null
+      }
+    },
+    {
+      "name": "seq_starts_at_one",
+      "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+      "uik_pub": "2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12",
+      "events": [
+        {
+          "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "op": "admit",
+          "kind": "passkey",
+          "principal": "-__BwcHBwcHBwcHBwcHBwQ",
+          "sig_pub": "39adc6c1cd751dba913adcc36c85ebf67a6f2819a40efddd95f63ad9dceb03d738b785e0534e8c7935303a76a1a0090497073689756ad96b2cdae28627eda45c",
+          "enc_pub": "",
+          "label": "iPhone",
+          "seq": 1,
+          "sig": "b08c063e521d3e74678102cfa3716c8bb41d7836d848f8c50b2db3673295f602cbc8b6b297c4ed9a21cc0bd75c7d44e0ceafb258bf1be574e393a0c4add7540d"
+        }
+      ],
+      "expect": {
+        "ok": false,
+        "error": "seq_gap",
+        "index": 0
+      }
+    },
+    {
+      "name": "seq_gap",
+      "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+      "uik_pub": "2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12",
+      "events": [
+        {
+          "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "op": "admit",
+          "kind": "passkey",
+          "principal": "-__BwcHBwcHBwcHBwcHBwQ",
+          "sig_pub": "39adc6c1cd751dba913adcc36c85ebf67a6f2819a40efddd95f63ad9dceb03d738b785e0534e8c7935303a76a1a0090497073689756ad96b2cdae28627eda45c",
+          "enc_pub": "",
+          "label": "iPhone",
+          "seq": 0,
+          "sig": "a9c54d46f483e11e164ee1f287571e223b2af6d03e7c164728ae06072e7ff1c240d6f60b595f3631dfe423e7e7bff001046917dad248e06d559c3f0191855e0a"
+        },
+        {
+          "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "op": "admit",
+          "kind": "device",
+          "principal": "dv_h3a4gbna4xcdwjuqabvmuosjsnyufc6g",
+          "sig_pub": "6ee091fd280a9b68554fa73c588125d47d3425c68a26ba236b4dad90f90a8f92",
+          "enc_pub": "4c2817a9d668ed844d2f95b93b69ecb8485095783a015a424164b0d09702894f",
+          "label": "MacBook Pro",
+          "seq": 2,
+          "sig": "1bf8542cb2c0cf6d3a57da503cc0d80ce440ccd3986903b26fe27ac98437213f44d4a3e93ec240ecc8684ec0945d62175d3411d25bebe46c341a114bcbc72008"
+        }
+      ],
+      "expect": {
+        "ok": false,
+        "error": "seq_gap",
+        "index": 1
+      }
+    },
+    {
+      "name": "seq_duplicate",
+      "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+      "uik_pub": "2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12",
+      "events": [
+        {
+          "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "op": "admit",
+          "kind": "passkey",
+          "principal": "-__BwcHBwcHBwcHBwcHBwQ",
+          "sig_pub": "39adc6c1cd751dba913adcc36c85ebf67a6f2819a40efddd95f63ad9dceb03d738b785e0534e8c7935303a76a1a0090497073689756ad96b2cdae28627eda45c",
+          "enc_pub": "",
+          "label": "iPhone",
+          "seq": 0,
+          "sig": "a9c54d46f483e11e164ee1f287571e223b2af6d03e7c164728ae06072e7ff1c240d6f60b595f3631dfe423e7e7bff001046917dad248e06d559c3f0191855e0a"
+        },
+        {
+          "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "op": "admit",
+          "kind": "device",
+          "principal": "dv_h3a4gbna4xcdwjuqabvmuosjsnyufc6g",
+          "sig_pub": "6ee091fd280a9b68554fa73c588125d47d3425c68a26ba236b4dad90f90a8f92",
+          "enc_pub": "4c2817a9d668ed844d2f95b93b69ecb8485095783a015a424164b0d09702894f",
+          "label": "MacBook Pro",
+          "seq": 1,
+          "sig": "106e631f2213fdd61ae8c931899383aec55612082737770e4c14d5c4afb7bccdba9364218698a1df4f012bc7917b24e44c07aebf2d9d7ae4a555d80833412e09"
+        },
+        {
+          "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "op": "admit",
+          "kind": "device",
+          "principal": "dv_l4arshov3wtzod5eu3y6uufprgsr2hqt",
+          "sig_pub": "41e8fde132ad670e534cd8b275d2cd7eec77733c66f8db48a1cada7fabfc4555",
+          "enc_pub": "19d80204bf85f3e1118e1b23410c88f0d0eeced5156f4c5bdf347b14ed7ec63f",
+          "label": "build box",
+          "seq": 1,
+          "sig": "812eacff94a05a14569dc1d8a1aad34e1887f2c5c43ad3ca7189a0ae7091f6d84482182e0fd42192481b1c436a457830a70580e27ded14e78c03810864eed60e"
+        }
+      ],
+      "expect": {
+        "ok": false,
+        "error": "seq_duplicate",
+        "index": 2
+      }
+    },
+    {
+      "name": "bad_sig",
+      "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+      "uik_pub": "2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12",
+      "events": [
+        {
+          "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "op": "admit",
+          "kind": "passkey",
+          "principal": "-__BwcHBwcHBwcHBwcHBwQ",
+          "sig_pub": "39adc6c1cd751dba913adcc36c85ebf67a6f2819a40efddd95f63ad9dceb03d738b785e0534e8c7935303a76a1a0090497073689756ad96b2cdae28627eda45c",
+          "enc_pub": "",
+          "label": "iPhone",
+          "seq": 0,
+          "sig": "a9c54d46f483e11e164ee1f287571e223b2af6d03e7c164728ae06072e7ff1c240d6f60b595f3631dfe423e7e7bff001046917dad248e06d559c3f0191855e0a"
+        },
+        {
+          "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "op": "admit",
+          "kind": "device",
+          "principal": "dv_h3a4gbna4xcdwjuqabvmuosjsnyufc6g",
+          "sig_pub": "6ee091fd280a9b68554fa73c588125d47d3425c68a26ba236b4dad90f90a8f92",
+          "enc_pub": "4c2817a9d668ed844d2f95b93b69ecb8485095783a015a424164b0d09702894f",
+          "label": "x",
+          "seq": 1,
+          "sig": "d048969745129c6e1bc366cd028c4a9900db7d3d3dd2044172595973faf782eed43ed6bd585f579bd2cefc99701f1a2203426bca764eb4599416bacdbcd9a107"
+        }
+      ],
+      "expect": {
+        "ok": false,
+        "error": "bad_sig",
+        "index": 1
+      }
+    },
+    {
+      "name": "signed_by_other_key",
+      "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+      "uik_pub": "2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12",
+      "events": [
+        {
+          "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "op": "admit",
+          "kind": "passkey",
+          "principal": "-__BwcHBwcHBwcHBwcHBwQ",
+          "sig_pub": "39adc6c1cd751dba913adcc36c85ebf67a6f2819a40efddd95f63ad9dceb03d738b785e0534e8c7935303a76a1a0090497073689756ad96b2cdae28627eda45c",
+          "enc_pub": "",
+          "label": "iPhone",
+          "seq": 0,
+          "sig": "a9c54d46f483e11e164ee1f287571e223b2af6d03e7c164728ae06072e7ff1c240d6f60b595f3631dfe423e7e7bff001046917dad248e06d559c3f0191855e0a"
+        },
+        {
+          "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "op": "admit",
+          "kind": "device",
+          "principal": "dv_h3a4gbna4xcdwjuqabvmuosjsnyufc6g",
+          "sig_pub": "6ee091fd280a9b68554fa73c588125d47d3425c68a26ba236b4dad90f90a8f92",
+          "enc_pub": "4c2817a9d668ed844d2f95b93b69ecb8485095783a015a424164b0d09702894f",
+          "label": "x",
+          "seq": 1,
+          "sig": "a2b48afd78408e3161927c1baea3cc4fae6bc619f66448c03b563f29716632304dea7bb7f9a52f02efdcf621de123f4253fab0723ad197da211ab8e1979de105"
+        }
+      ],
+      "expect": {
+        "ok": false,
+        "error": "bad_sig",
+        "index": 1
+      }
+    },
+    {
+      "name": "wrong_person",
+      "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+      "uik_pub": "2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12",
+      "events": [
+        {
+          "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "op": "admit",
+          "kind": "passkey",
+          "principal": "-__BwcHBwcHBwcHBwcHBwQ",
+          "sig_pub": "39adc6c1cd751dba913adcc36c85ebf67a6f2819a40efddd95f63ad9dceb03d738b785e0534e8c7935303a76a1a0090497073689756ad96b2cdae28627eda45c",
+          "enc_pub": "",
+          "label": "iPhone",
+          "seq": 0,
+          "sig": "a9c54d46f483e11e164ee1f287571e223b2af6d03e7c164728ae06072e7ff1c240d6f60b595f3631dfe423e7e7bff001046917dad248e06d559c3f0191855e0a"
+        },
+        {
+          "us": "us_pwylahzz2f42vt33apn5pxm5oh3ecwml",
+          "op": "admit",
+          "kind": "device",
+          "principal": "dv_h3a4gbna4xcdwjuqabvmuosjsnyufc6g",
+          "sig_pub": "6ee091fd280a9b68554fa73c588125d47d3425c68a26ba236b4dad90f90a8f92",
+          "enc_pub": "4c2817a9d668ed844d2f95b93b69ecb8485095783a015a424164b0d09702894f",
+          "label": "x",
+          "seq": 1,
+          "sig": "3343d7f9da47cc10175c8c91f335310fbe3af847ea6c8fcfe8a0454a97f74b156bceeb88640d785f1f17e1ddc259e504798aef6b900f77632ccf417ba6310b01"
+        }
+      ],
+      "expect": {
+        "ok": false,
+        "error": "wrong_person",
+        "index": 1
+      }
+    },
+    {
+      "name": "bad_op",
+      "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+      "uik_pub": "2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12",
+      "events": [
+        {
+          "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "op": "admit",
+          "kind": "passkey",
+          "principal": "-__BwcHBwcHBwcHBwcHBwQ",
+          "sig_pub": "39adc6c1cd751dba913adcc36c85ebf67a6f2819a40efddd95f63ad9dceb03d738b785e0534e8c7935303a76a1a0090497073689756ad96b2cdae28627eda45c",
+          "enc_pub": "",
+          "label": "iPhone",
+          "seq": 0,
+          "sig": "a9c54d46f483e11e164ee1f287571e223b2af6d03e7c164728ae06072e7ff1c240d6f60b595f3631dfe423e7e7bff001046917dad248e06d559c3f0191855e0a"
+        },
+        {
+          "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "op": "rename",
+          "kind": "device",
+          "principal": "dv_h3a4gbna4xcdwjuqabvmuosjsnyufc6g",
+          "sig_pub": "6ee091fd280a9b68554fa73c588125d47d3425c68a26ba236b4dad90f90a8f92",
+          "enc_pub": "4c2817a9d668ed844d2f95b93b69ecb8485095783a015a424164b0d09702894f",
+          "label": "x",
+          "seq": 1,
+          "sig": "cbc8375eb813edef6e0192a918fd54f7fc5738efc5565c7e55a92bc0dab4066e5a5b475a74f8d04791fb4511d32b4c85f5134d4b1bdab94c587614fff52e1809"
+        }
+      ],
+      "expect": {
+        "ok": false,
+        "error": "bad_op",
+        "index": 1
+      }
+    },
+    {
+      "name": "bad_kind_agent",
+      "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+      "uik_pub": "2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12",
+      "events": [
+        {
+          "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "op": "admit",
+          "kind": "passkey",
+          "principal": "-__BwcHBwcHBwcHBwcHBwQ",
+          "sig_pub": "39adc6c1cd751dba913adcc36c85ebf67a6f2819a40efddd95f63ad9dceb03d738b785e0534e8c7935303a76a1a0090497073689756ad96b2cdae28627eda45c",
+          "enc_pub": "",
+          "label": "iPhone",
+          "seq": 0,
+          "sig": "a9c54d46f483e11e164ee1f287571e223b2af6d03e7c164728ae06072e7ff1c240d6f60b595f3631dfe423e7e7bff001046917dad248e06d559c3f0191855e0a"
+        },
+        {
+          "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "op": "admit",
+          "kind": "agent",
+          "principal": "ag_omff5xbiyl4nv4wz3tr2ahk7ebpdlzkv",
+          "sig_pub": "bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5",
+          "enc_pub": "",
+          "label": "x",
+          "seq": 1,
+          "sig": "3134c07012ad2de1d292aa564fe1cdeddde93a29f00259b58bf7f4448b63ed9b5fe1a1b3d9971dd7dfa53bf3aa3a3f1f648366fd3cbb44a9d00b7b949d492800"
+        }
+      ],
+      "expect": {
+        "ok": false,
+        "error": "bad_kind",
+        "index": 1
+      }
+    },
+    {
+      "name": "device_id_not_folding",
+      "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+      "uik_pub": "2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12",
+      "events": [
+        {
+          "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "op": "admit",
+          "kind": "passkey",
+          "principal": "-__BwcHBwcHBwcHBwcHBwQ",
+          "sig_pub": "39adc6c1cd751dba913adcc36c85ebf67a6f2819a40efddd95f63ad9dceb03d738b785e0534e8c7935303a76a1a0090497073689756ad96b2cdae28627eda45c",
+          "enc_pub": "",
+          "label": "iPhone",
+          "seq": 0,
+          "sig": "a9c54d46f483e11e164ee1f287571e223b2af6d03e7c164728ae06072e7ff1c240d6f60b595f3631dfe423e7e7bff001046917dad248e06d559c3f0191855e0a"
+        },
+        {
+          "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "op": "admit",
+          "kind": "device",
+          "principal": "dv_l4arshov3wtzod5eu3y6uufprgsr2hqt",
+          "sig_pub": "6ee091fd280a9b68554fa73c588125d47d3425c68a26ba236b4dad90f90a8f92",
+          "enc_pub": "4c2817a9d668ed844d2f95b93b69ecb8485095783a015a424164b0d09702894f",
+          "label": "x",
+          "seq": 1,
+          "sig": "736a97ca1f1df753ac444d42801fc60773b0875ac469f4592bbe109c3319a307cdcc2d35001be2a7b2bbeb92f191cc93fee96060579f79aec462a7683be5fa0c"
+        }
+      ],
+      "expect": {
+        "ok": false,
+        "error": "bad_fields",
+        "index": 1
+      }
+    },
+    {
+      "name": "device_dev_prefix",
+      "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+      "uik_pub": "2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12",
+      "events": [
+        {
+          "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "op": "admit",
+          "kind": "passkey",
+          "principal": "-__BwcHBwcHBwcHBwcHBwQ",
+          "sig_pub": "39adc6c1cd751dba913adcc36c85ebf67a6f2819a40efddd95f63ad9dceb03d738b785e0534e8c7935303a76a1a0090497073689756ad96b2cdae28627eda45c",
+          "enc_pub": "",
+          "label": "iPhone",
+          "seq": 0,
+          "sig": "a9c54d46f483e11e164ee1f287571e223b2af6d03e7c164728ae06072e7ff1c240d6f60b595f3631dfe423e7e7bff001046917dad248e06d559c3f0191855e0a"
+        },
+        {
+          "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "op": "admit",
+          "kind": "device",
+          "principal": "dev_h3a4gbna4xcdwjuqabvmuosjsnyufc6g",
+          "sig_pub": "6ee091fd280a9b68554fa73c588125d47d3425c68a26ba236b4dad90f90a8f92",
+          "enc_pub": "4c2817a9d668ed844d2f95b93b69ecb8485095783a015a424164b0d09702894f",
+          "label": "x",
+          "seq": 1,
+          "sig": "e383adefe07fa237c8e8da1c15b49ee8a971450f5c38af4f7359fc94373913342f3efb4f0f1c1088fb444dd59d845abdd6e67ae4614f9564ac82adc6f2d4b30b"
+        }
+      ],
+      "expect": {
+        "ok": false,
+        "error": "bad_fields",
+        "index": 1
+      }
+    },
+    {
+      "name": "device_missing_enc_pub",
+      "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+      "uik_pub": "2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12",
+      "events": [
+        {
+          "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "op": "admit",
+          "kind": "passkey",
+          "principal": "-__BwcHBwcHBwcHBwcHBwQ",
+          "sig_pub": "39adc6c1cd751dba913adcc36c85ebf67a6f2819a40efddd95f63ad9dceb03d738b785e0534e8c7935303a76a1a0090497073689756ad96b2cdae28627eda45c",
+          "enc_pub": "",
+          "label": "iPhone",
+          "seq": 0,
+          "sig": "a9c54d46f483e11e164ee1f287571e223b2af6d03e7c164728ae06072e7ff1c240d6f60b595f3631dfe423e7e7bff001046917dad248e06d559c3f0191855e0a"
+        },
+        {
+          "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "op": "admit",
+          "kind": "device",
+          "principal": "dv_h3a4gbna4xcdwjuqabvmuosjsnyufc6g",
+          "sig_pub": "6ee091fd280a9b68554fa73c588125d47d3425c68a26ba236b4dad90f90a8f92",
+          "enc_pub": "",
+          "label": "x",
+          "seq": 1,
+          "sig": "42389952b6db23171076b330b63bc2774c4238158516e9136c4eb5eab2cd1e4a7f8596a66449154a627a92c9089a8fca1e720e06e93f7b04a98be3fbf96e8902"
+        }
+      ],
+      "expect": {
+        "ok": false,
+        "error": "bad_fields",
+        "index": 1
+      }
+    },
+    {
+      "name": "passkey_cid_non_canonical",
+      "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+      "uik_pub": "2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12",
+      "events": [
+        {
+          "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "op": "admit",
+          "kind": "passkey",
+          "principal": "-__BwcHBwcHBwcHBwcHBwR",
+          "sig_pub": "39adc6c1cd751dba913adcc36c85ebf67a6f2819a40efddd95f63ad9dceb03d738b785e0534e8c7935303a76a1a0090497073689756ad96b2cdae28627eda45c",
+          "enc_pub": "",
+          "label": "x",
+          "seq": 0,
+          "sig": "02cdd663ecc92ff148f6880c6553e956e54f2b63bd01f922216ea8b84c56d9e401e4862c959ca61011f0d47aa472eefdf7b8bb41620a73faa26a0fc5e9709406"
+        }
+      ],
+      "expect": {
+        "ok": false,
+        "error": "bad_fields",
+        "index": 0
+      }
+    },
+    {
+      "name": "passkey_cid_padded",
+      "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+      "uik_pub": "2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12",
+      "events": [
+        {
+          "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "op": "admit",
+          "kind": "passkey",
+          "principal": "-__BwcHBwcHBwcHBwcHBwQ==",
+          "sig_pub": "39adc6c1cd751dba913adcc36c85ebf67a6f2819a40efddd95f63ad9dceb03d738b785e0534e8c7935303a76a1a0090497073689756ad96b2cdae28627eda45c",
+          "enc_pub": "",
+          "label": "x",
+          "seq": 0,
+          "sig": "c8979ec53d0f6009e3e03489f7685dd2fe739ae19a5e0ffef98c90bef36260477ef6b3bc8e3603d0ec31e0c239ae8476aafbaff04397ebe58f97fced15d4d006"
+        }
+      ],
+      "expect": {
+        "ok": false,
+        "error": "bad_fields",
+        "index": 0
+      }
+    },
+    {
+      "name": "passkey_cid_std_alphabet",
+      "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+      "uik_pub": "2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12",
+      "events": [
+        {
+          "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "op": "admit",
+          "kind": "passkey",
+          "principal": "+/_BwcHBwcHBwcHBwcHBwQ",
+          "sig_pub": "39adc6c1cd751dba913adcc36c85ebf67a6f2819a40efddd95f63ad9dceb03d738b785e0534e8c7935303a76a1a0090497073689756ad96b2cdae28627eda45c",
+          "enc_pub": "",
+          "label": "x",
+          "seq": 0,
+          "sig": "802c7bf9bf5c795ba9f44d05538a5a783b4abb74fc8b37993c82271e02c9f6523695ddf86b965d07adf8ab86ec931702259718446b108ec7995fb9ba9650790c"
+        }
+      ],
+      "expect": {
+        "ok": false,
+        "error": "bad_fields",
+        "index": 0
+      }
+    },
+    {
+      "name": "passkey_with_enc_pub",
+      "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+      "uik_pub": "2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12",
+      "events": [
+        {
+          "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "op": "admit",
+          "kind": "passkey",
+          "principal": "-__BwcHBwcHBwcHBwcHBwQ",
+          "sig_pub": "39adc6c1cd751dba913adcc36c85ebf67a6f2819a40efddd95f63ad9dceb03d738b785e0534e8c7935303a76a1a0090497073689756ad96b2cdae28627eda45c",
+          "enc_pub": "2d98377b0faac966233242c517b804789dac2670c1aad86417752060d5f0203c",
+          "label": "x",
+          "seq": 0,
+          "sig": "916aaff08a1c18555146cdb918b238cca81d6f37f7a413713d33a8a553c5bcbd7c7a565375ad96c7de7b86fe49623ff910c248eac986f24b7ec8876bfd9d760c"
+        }
+      ],
+      "expect": {
+        "ok": false,
+        "error": "bad_fields",
+        "index": 0
+      }
+    },
+    {
+      "name": "pin_with_enc_pub",
+      "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+      "uik_pub": "2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12",
+      "events": [
+        {
+          "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "op": "admit",
+          "kind": "passkey",
+          "principal": "-__BwcHBwcHBwcHBwcHBwQ",
+          "sig_pub": "39adc6c1cd751dba913adcc36c85ebf67a6f2819a40efddd95f63ad9dceb03d738b785e0534e8c7935303a76a1a0090497073689756ad96b2cdae28627eda45c",
+          "enc_pub": "",
+          "label": "iPhone",
+          "seq": 0,
+          "sig": "a9c54d46f483e11e164ee1f287571e223b2af6d03e7c164728ae06072e7ff1c240d6f60b595f3631dfe423e7e7bff001046917dad248e06d559c3f0191855e0a"
+        },
+        {
+          "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "op": "admit",
+          "kind": "pin",
+          "principal": "7d3f5a1e-0000-4000-8000-000000000001",
+          "sig_pub": "d759793bbc13a2819a827c76adb6fba8a49aee007f49f2d0992d99b825ad2c48",
+          "enc_pub": "4c2817a9d668ed844d2f95b93b69ecb8485095783a015a424164b0d09702894f",
+          "label": "x",
+          "seq": 1,
+          "sig": "fc958654ce9e5ab9cfc0760b2181314471270df1ff04855d6e21ebe9b441ca81234f1257dadc964bf51168d155ea3e7405fbc1aba40b4482e2878781d5082605"
+        }
+      ],
+      "expect": {
+        "ok": false,
+        "error": "bad_fields",
+        "index": 1
+      }
+    },
+    {
+      "name": "pin_empty_vault",
+      "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+      "uik_pub": "2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12",
+      "events": [
+        {
+          "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "op": "admit",
+          "kind": "passkey",
+          "principal": "-__BwcHBwcHBwcHBwcHBwQ",
+          "sig_pub": "39adc6c1cd751dba913adcc36c85ebf67a6f2819a40efddd95f63ad9dceb03d738b785e0534e8c7935303a76a1a0090497073689756ad96b2cdae28627eda45c",
+          "enc_pub": "",
+          "label": "iPhone",
+          "seq": 0,
+          "sig": "a9c54d46f483e11e164ee1f287571e223b2af6d03e7c164728ae06072e7ff1c240d6f60b595f3631dfe423e7e7bff001046917dad248e06d559c3f0191855e0a"
+        },
+        {
+          "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "op": "admit",
+          "kind": "pin",
+          "principal": "",
+          "sig_pub": "d759793bbc13a2819a827c76adb6fba8a49aee007f49f2d0992d99b825ad2c48",
+          "enc_pub": "",
+          "label": "x",
+          "seq": 1,
+          "sig": "60fdcce134bb914616474c6827f06ce5ee64324d852827bf7b4246c82f2f87815e1f23b30c9054f5e071234f08805e717949789f40697ae24d085464d73d9607"
+        }
+      ],
+      "expect": {
+        "ok": false,
+        "error": "bad_fields",
+        "index": 1
+      }
+    },
+    {
+      "name": "device_admit_after_revoke",
+      "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+      "uik_pub": "2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12",
+      "events": [
+        {
+          "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "op": "admit",
+          "kind": "passkey",
+          "principal": "-__BwcHBwcHBwcHBwcHBwQ",
+          "sig_pub": "39adc6c1cd751dba913adcc36c85ebf67a6f2819a40efddd95f63ad9dceb03d738b785e0534e8c7935303a76a1a0090497073689756ad96b2cdae28627eda45c",
+          "enc_pub": "",
+          "label": "iPhone",
+          "seq": 0,
+          "sig": "a9c54d46f483e11e164ee1f287571e223b2af6d03e7c164728ae06072e7ff1c240d6f60b595f3631dfe423e7e7bff001046917dad248e06d559c3f0191855e0a"
+        },
+        {
+          "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "op": "admit",
+          "kind": "device",
+          "principal": "dv_h3a4gbna4xcdwjuqabvmuosjsnyufc6g",
+          "sig_pub": "6ee091fd280a9b68554fa73c588125d47d3425c68a26ba236b4dad90f90a8f92",
+          "enc_pub": "4c2817a9d668ed844d2f95b93b69ecb8485095783a015a424164b0d09702894f",
+          "label": "MacBook Pro",
+          "seq": 1,
+          "sig": "106e631f2213fdd61ae8c931899383aec55612082737770e4c14d5c4afb7bccdba9364218698a1df4f012bc7917b24e44c07aebf2d9d7ae4a555d80833412e09"
+        },
+        {
+          "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "op": "revoke",
+          "kind": "device",
+          "principal": "dv_h3a4gbna4xcdwjuqabvmuosjsnyufc6g",
+          "sig_pub": "6ee091fd280a9b68554fa73c588125d47d3425c68a26ba236b4dad90f90a8f92",
+          "enc_pub": "4c2817a9d668ed844d2f95b93b69ecb8485095783a015a424164b0d09702894f",
+          "label": "MacBook Pro",
+          "seq": 2,
+          "sig": "285375b5155ed0a531da44fac8b9534b5132e5d603e76f4c9495f6b4e613867be031a09e94b5f96191a103378237b0858f7021c4e171dcb8004625254ea78609"
+        },
+        {
+          "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "op": "admit",
+          "kind": "device",
+          "principal": "dv_h3a4gbna4xcdwjuqabvmuosjsnyufc6g",
+          "sig_pub": "6ee091fd280a9b68554fa73c588125d47d3425c68a26ba236b4dad90f90a8f92",
+          "enc_pub": "4c2817a9d668ed844d2f95b93b69ecb8485095783a015a424164b0d09702894f",
+          "label": "MacBook Pro",
+          "seq": 3,
+          "sig": "17375808465b3045b479881a6fe29ff7c8c56cc423aaaa30d418f5c12d1a70a4d7c0e4d57dfb536331fb10258487a56cb38ffcf748a5577d06622ad82bfe030b"
+        }
+      ],
+      "expect": {
+        "ok": false,
+        "error": "revoked_terminal",
+        "index": 3
+      }
+    },
+    {
+      "name": "passkey_admit_after_revoke",
+      "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+      "uik_pub": "2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12",
+      "events": [
+        {
+          "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "op": "admit",
+          "kind": "passkey",
+          "principal": "-__BwcHBwcHBwcHBwcHBwQ",
+          "sig_pub": "39adc6c1cd751dba913adcc36c85ebf67a6f2819a40efddd95f63ad9dceb03d738b785e0534e8c7935303a76a1a0090497073689756ad96b2cdae28627eda45c",
+          "enc_pub": "",
+          "label": "iPhone",
+          "seq": 0,
+          "sig": "a9c54d46f483e11e164ee1f287571e223b2af6d03e7c164728ae06072e7ff1c240d6f60b595f3631dfe423e7e7bff001046917dad248e06d559c3f0191855e0a"
+        },
+        {
+          "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "op": "admit",
+          "kind": "passkey",
+          "principal": "CgsMDcLCwsLCwsLCwsLCwg",
+          "sig_pub": "7f6ff388acb6a5ea5415914fe7abe5b632f21783831c65e707a2072f92c77d28e51b53c3e5cf92fd1c29b3ef268138fb0993cb4c0486840d3f03314a01df327f",
+          "enc_pub": "",
+          "label": "YubiKey",
+          "seq": 1,
+          "sig": "81c60d447f395179d6d38ad450fac52333e17ed17fe7b1d2135c69b51d07aa946feb8f3e0d3bd6e39378b6990780c582a0f538065d3c19b197e37a9a58c40309"
+        },
+        {
+          "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "op": "revoke",
+          "kind": "passkey",
+          "principal": "-__BwcHBwcHBwcHBwcHBwQ",
+          "sig_pub": "39adc6c1cd751dba913adcc36c85ebf67a6f2819a40efddd95f63ad9dceb03d738b785e0534e8c7935303a76a1a0090497073689756ad96b2cdae28627eda45c",
+          "enc_pub": "",
+          "label": "iPhone",
+          "seq": 2,
+          "sig": "4a46741666c7d8ca92d7c244d98fd9b1abfdb5d0f975f0fadbb7ac47f9025a3a7058f9684c0d25bf69f265cef0d34fe72555ebcc982162dedc79d0a9d3f80c0b"
+        },
+        {
+          "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "op": "admit",
+          "kind": "passkey",
+          "principal": "-__BwcHBwcHBwcHBwcHBwQ",
+          "sig_pub": "39adc6c1cd751dba913adcc36c85ebf67a6f2819a40efddd95f63ad9dceb03d738b785e0534e8c7935303a76a1a0090497073689756ad96b2cdae28627eda45c",
+          "enc_pub": "",
+          "label": "iPhone",
+          "seq": 3,
+          "sig": "2392244154256b6a6e6ef1d96c75c4904cd36fc91ba93d4b84707d5c5c680359ece9cde385fe865041c4e7806290ea728976ad14ad889be8dbbb564e18cf2e03"
+        }
+      ],
+      "expect": {
+        "ok": false,
+        "error": "revoked_terminal",
+        "index": 3
+      }
+    },
+    {
+      "name": "rename_with_changed_enc_pub",
+      "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+      "uik_pub": "2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12",
+      "events": [
+        {
+          "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "op": "admit",
+          "kind": "passkey",
+          "principal": "-__BwcHBwcHBwcHBwcHBwQ",
+          "sig_pub": "39adc6c1cd751dba913adcc36c85ebf67a6f2819a40efddd95f63ad9dceb03d738b785e0534e8c7935303a76a1a0090497073689756ad96b2cdae28627eda45c",
+          "enc_pub": "",
+          "label": "iPhone",
+          "seq": 0,
+          "sig": "a9c54d46f483e11e164ee1f287571e223b2af6d03e7c164728ae06072e7ff1c240d6f60b595f3631dfe423e7e7bff001046917dad248e06d559c3f0191855e0a"
+        },
+        {
+          "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "op": "admit",
+          "kind": "device",
+          "principal": "dv_h3a4gbna4xcdwjuqabvmuosjsnyufc6g",
+          "sig_pub": "6ee091fd280a9b68554fa73c588125d47d3425c68a26ba236b4dad90f90a8f92",
+          "enc_pub": "4c2817a9d668ed844d2f95b93b69ecb8485095783a015a424164b0d09702894f",
+          "label": "MacBook Pro",
+          "seq": 1,
+          "sig": "106e631f2213fdd61ae8c931899383aec55612082737770e4c14d5c4afb7bccdba9364218698a1df4f012bc7917b24e44c07aebf2d9d7ae4a555d80833412e09"
+        },
+        {
+          "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "op": "admit",
+          "kind": "device",
+          "principal": "dv_h3a4gbna4xcdwjuqabvmuosjsnyufc6g",
+          "sig_pub": "6ee091fd280a9b68554fa73c588125d47d3425c68a26ba236b4dad90f90a8f92",
+          "enc_pub": "e94beb11d94ab9e25d5ed916cb5ec67b78b65727a8eecd16ebd7ed5a2efc260e",
+          "label": "renamed",
+          "seq": 2,
+          "sig": "51a4daa3af870a6d196ce2ee8984e328da56beb21bbb4838098323ba7e888384839f13fba9cc3ab0dfabe803e74c19008e9a0e0091c4f7b4b313dbaae745b709"
+        }
+      ],
+      "expect": {
+        "ok": false,
+        "error": "key_change",
+        "index": 2
+      }
+    },
+    {
+      "name": "passkey_rename_with_changed_xy",
+      "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+      "uik_pub": "2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12",
+      "events": [
+        {
+          "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "op": "admit",
+          "kind": "passkey",
+          "principal": "-__BwcHBwcHBwcHBwcHBwQ",
+          "sig_pub": "39adc6c1cd751dba913adcc36c85ebf67a6f2819a40efddd95f63ad9dceb03d738b785e0534e8c7935303a76a1a0090497073689756ad96b2cdae28627eda45c",
+          "enc_pub": "",
+          "label": "iPhone",
+          "seq": 0,
+          "sig": "a9c54d46f483e11e164ee1f287571e223b2af6d03e7c164728ae06072e7ff1c240d6f60b595f3631dfe423e7e7bff001046917dad248e06d559c3f0191855e0a"
+        },
+        {
+          "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "op": "admit",
+          "kind": "passkey",
+          "principal": "-__BwcHBwcHBwcHBwcHBwQ",
+          "sig_pub": "7f6ff388acb6a5ea5415914fe7abe5b632f21783831c65e707a2072f92c77d28e51b53c3e5cf92fd1c29b3ef268138fb0993cb4c0486840d3f03314a01df327f",
+          "enc_pub": "",
+          "label": "x",
+          "seq": 1,
+          "sig": "473152aecf2dbec436dcbf8e80d102115ba4caf0a6f7bedd15c623314369f3d6d6a5cd495dbc9169015c29e54ff25ca54d27be028c7d483239e644d345f2610a"
+        }
+      ],
+      "expect": {
+        "ok": false,
+        "error": "key_change",
+        "index": 1
+      }
+    },
+    {
+      "name": "revoke_never_admitted",
+      "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+      "uik_pub": "2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12",
+      "events": [
+        {
+          "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "op": "admit",
+          "kind": "passkey",
+          "principal": "-__BwcHBwcHBwcHBwcHBwQ",
+          "sig_pub": "39adc6c1cd751dba913adcc36c85ebf67a6f2819a40efddd95f63ad9dceb03d738b785e0534e8c7935303a76a1a0090497073689756ad96b2cdae28627eda45c",
+          "enc_pub": "",
+          "label": "iPhone",
+          "seq": 0,
+          "sig": "a9c54d46f483e11e164ee1f287571e223b2af6d03e7c164728ae06072e7ff1c240d6f60b595f3631dfe423e7e7bff001046917dad248e06d559c3f0191855e0a"
+        },
+        {
+          "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "op": "revoke",
+          "kind": "device",
+          "principal": "dv_l4arshov3wtzod5eu3y6uufprgsr2hqt",
+          "sig_pub": "41e8fde132ad670e534cd8b275d2cd7eec77733c66f8db48a1cada7fabfc4555",
+          "enc_pub": "19d80204bf85f3e1118e1b23410c88f0d0eeced5156f4c5bdf347b14ed7ec63f",
+          "label": "build box",
+          "seq": 1,
+          "sig": "a2c693b3b5b1b08ad246ce0433a13a77639ceb3b596a7a8ee565ad47c137cba0c09c5f10e9feada3e7b80e41b4fd399b878264e3d1d3dacb0efa4691cbc29305"
+        }
+      ],
+      "expect": {
+        "ok": false,
+        "error": "not_live",
+        "index": 1
+      }
+    },
+    {
+      "name": "double_revoke",
+      "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+      "uik_pub": "2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12",
+      "events": [
+        {
+          "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "op": "admit",
+          "kind": "passkey",
+          "principal": "-__BwcHBwcHBwcHBwcHBwQ",
+          "sig_pub": "39adc6c1cd751dba913adcc36c85ebf67a6f2819a40efddd95f63ad9dceb03d738b785e0534e8c7935303a76a1a0090497073689756ad96b2cdae28627eda45c",
+          "enc_pub": "",
+          "label": "iPhone",
+          "seq": 0,
+          "sig": "a9c54d46f483e11e164ee1f287571e223b2af6d03e7c164728ae06072e7ff1c240d6f60b595f3631dfe423e7e7bff001046917dad248e06d559c3f0191855e0a"
+        },
+        {
+          "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "op": "admit",
+          "kind": "device",
+          "principal": "dv_h3a4gbna4xcdwjuqabvmuosjsnyufc6g",
+          "sig_pub": "6ee091fd280a9b68554fa73c588125d47d3425c68a26ba236b4dad90f90a8f92",
+          "enc_pub": "4c2817a9d668ed844d2f95b93b69ecb8485095783a015a424164b0d09702894f",
+          "label": "MacBook Pro",
+          "seq": 1,
+          "sig": "106e631f2213fdd61ae8c931899383aec55612082737770e4c14d5c4afb7bccdba9364218698a1df4f012bc7917b24e44c07aebf2d9d7ae4a555d80833412e09"
+        },
+        {
+          "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "op": "revoke",
+          "kind": "device",
+          "principal": "dv_h3a4gbna4xcdwjuqabvmuosjsnyufc6g",
+          "sig_pub": "6ee091fd280a9b68554fa73c588125d47d3425c68a26ba236b4dad90f90a8f92",
+          "enc_pub": "4c2817a9d668ed844d2f95b93b69ecb8485095783a015a424164b0d09702894f",
+          "label": "MacBook Pro",
+          "seq": 2,
+          "sig": "285375b5155ed0a531da44fac8b9534b5132e5d603e76f4c9495f6b4e613867be031a09e94b5f96191a103378237b0858f7021c4e171dcb8004625254ea78609"
+        },
+        {
+          "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "op": "revoke",
+          "kind": "device",
+          "principal": "dv_h3a4gbna4xcdwjuqabvmuosjsnyufc6g",
+          "sig_pub": "6ee091fd280a9b68554fa73c588125d47d3425c68a26ba236b4dad90f90a8f92",
+          "enc_pub": "4c2817a9d668ed844d2f95b93b69ecb8485095783a015a424164b0d09702894f",
+          "label": "MacBook Pro",
+          "seq": 3,
+          "sig": "7417a09374059ab24a3b7324a100a52674d2b4a9cfb23b0108149c0b96c467e4e2bbb8f6b2832eae24e0457017f5b5c9b993e695a815c95aa69820a9bc7bdb0c"
+        }
+      ],
+      "expect": {
+        "ok": false,
+        "error": "not_live",
+        "index": 3
+      }
+    },
+    {
+      "name": "revoke_with_other_keys",
+      "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+      "uik_pub": "2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12",
+      "events": [
+        {
+          "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "op": "admit",
+          "kind": "passkey",
+          "principal": "-__BwcHBwcHBwcHBwcHBwQ",
+          "sig_pub": "39adc6c1cd751dba913adcc36c85ebf67a6f2819a40efddd95f63ad9dceb03d738b785e0534e8c7935303a76a1a0090497073689756ad96b2cdae28627eda45c",
+          "enc_pub": "",
+          "label": "iPhone",
+          "seq": 0,
+          "sig": "a9c54d46f483e11e164ee1f287571e223b2af6d03e7c164728ae06072e7ff1c240d6f60b595f3631dfe423e7e7bff001046917dad248e06d559c3f0191855e0a"
+        },
+        {
+          "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "op": "admit",
+          "kind": "device",
+          "principal": "dv_h3a4gbna4xcdwjuqabvmuosjsnyufc6g",
+          "sig_pub": "6ee091fd280a9b68554fa73c588125d47d3425c68a26ba236b4dad90f90a8f92",
+          "enc_pub": "4c2817a9d668ed844d2f95b93b69ecb8485095783a015a424164b0d09702894f",
+          "label": "MacBook Pro",
+          "seq": 1,
+          "sig": "106e631f2213fdd61ae8c931899383aec55612082737770e4c14d5c4afb7bccdba9364218698a1df4f012bc7917b24e44c07aebf2d9d7ae4a555d80833412e09"
+        },
+        {
+          "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "op": "revoke",
+          "kind": "device",
+          "principal": "dv_h3a4gbna4xcdwjuqabvmuosjsnyufc6g",
+          "sig_pub": "6ee091fd280a9b68554fa73c588125d47d3425c68a26ba236b4dad90f90a8f92",
+          "enc_pub": "e94beb11d94ab9e25d5ed916cb5ec67b78b65727a8eecd16ebd7ed5a2efc260e",
+          "label": "MacBook Pro",
+          "seq": 2,
+          "sig": "5b4e7d5b23cd6bd0c7cf187a2a2868482298b936013ce05a28e6dc7ca4d5bac76a6cb5c4346529ac8b07bc7a5f1d5fb0561ba7daeba2f0cba8a4fb6142eaba0f"
+        }
+      ],
+      "expect": {
+        "ok": false,
+        "error": "revoke_key_mismatch",
+        "index": 2
+      }
+    },
+    {
+      "name": "revoke_last_passkey",
+      "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+      "uik_pub": "2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12",
+      "events": [
+        {
+          "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "op": "admit",
+          "kind": "passkey",
+          "principal": "-__BwcHBwcHBwcHBwcHBwQ",
+          "sig_pub": "39adc6c1cd751dba913adcc36c85ebf67a6f2819a40efddd95f63ad9dceb03d738b785e0534e8c7935303a76a1a0090497073689756ad96b2cdae28627eda45c",
+          "enc_pub": "",
+          "label": "iPhone",
+          "seq": 0,
+          "sig": "a9c54d46f483e11e164ee1f287571e223b2af6d03e7c164728ae06072e7ff1c240d6f60b595f3631dfe423e7e7bff001046917dad248e06d559c3f0191855e0a"
+        },
+        {
+          "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "op": "admit",
+          "kind": "device",
+          "principal": "dv_h3a4gbna4xcdwjuqabvmuosjsnyufc6g",
+          "sig_pub": "6ee091fd280a9b68554fa73c588125d47d3425c68a26ba236b4dad90f90a8f92",
+          "enc_pub": "4c2817a9d668ed844d2f95b93b69ecb8485095783a015a424164b0d09702894f",
+          "label": "MacBook Pro",
+          "seq": 1,
+          "sig": "106e631f2213fdd61ae8c931899383aec55612082737770e4c14d5c4afb7bccdba9364218698a1df4f012bc7917b24e44c07aebf2d9d7ae4a555d80833412e09"
+        },
+        {
+          "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "op": "revoke",
+          "kind": "passkey",
+          "principal": "-__BwcHBwcHBwcHBwcHBwQ",
+          "sig_pub": "39adc6c1cd751dba913adcc36c85ebf67a6f2819a40efddd95f63ad9dceb03d738b785e0534e8c7935303a76a1a0090497073689756ad96b2cdae28627eda45c",
+          "enc_pub": "",
+          "label": "iPhone",
+          "seq": 2,
+          "sig": "4a46741666c7d8ca92d7c244d98fd9b1abfdb5d0f975f0fadbb7ac47f9025a3a7058f9684c0d25bf69f265cef0d34fe72555ebcc982162dedc79d0a9d3f80c0b"
+        }
+      ],
+      "expect": {
+        "ok": false,
+        "error": "last_passkey",
+        "index": 2
+      }
+    },
+    {
+      "name": "pin_conflict",
+      "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+      "uik_pub": "2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12",
+      "events": [
+        {
+          "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "op": "admit",
+          "kind": "passkey",
+          "principal": "-__BwcHBwcHBwcHBwcHBwQ",
+          "sig_pub": "39adc6c1cd751dba913adcc36c85ebf67a6f2819a40efddd95f63ad9dceb03d738b785e0534e8c7935303a76a1a0090497073689756ad96b2cdae28627eda45c",
+          "enc_pub": "",
+          "label": "iPhone",
+          "seq": 0,
+          "sig": "a9c54d46f483e11e164ee1f287571e223b2af6d03e7c164728ae06072e7ff1c240d6f60b595f3631dfe423e7e7bff001046917dad248e06d559c3f0191855e0a"
+        },
+        {
+          "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "op": "admit",
+          "kind": "pin",
+          "principal": "7d3f5a1e-0000-4000-8000-000000000001",
+          "sig_pub": "d759793bbc13a2819a827c76adb6fba8a49aee007f49f2d0992d99b825ad2c48",
+          "enc_pub": "",
+          "label": "team-prod",
+          "seq": 1,
+          "sig": "dc21471f8d051c63e37bceda7bfff74fb1452ceb8a29ed72e7813f737bdf7ae152b3a8e2a0a1c838521f8e209eac784d12ea2dbcff1dea0a91a7676fd834db0f"
+        },
+        {
+          "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "op": "admit",
+          "kind": "pin",
+          "principal": "7d3f5a1e-0000-4000-8000-000000000001",
+          "sig_pub": "6355691c178a8ff91007a7478afb955ef7352c63e7b25703984cf78b26e21a56",
+          "enc_pub": "",
+          "label": "team-prod",
+          "seq": 2,
+          "sig": "412b04219f9b7dbc69378adc242f504568e28298a94745e1de14627ed064061155f37337bf0f3391b24d32c76bdb2cb7da1f1af62858b215633a4b0148c6340c"
+        }
+      ],
+      "expect": {
+        "ok": false,
+        "error": "pin_conflict",
+        "index": 2
+      }
+    },
+    {
+      "name": "pin_same_anchor_relabel",
+      "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+      "uik_pub": "2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12",
+      "events": [
+        {
+          "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "op": "admit",
+          "kind": "passkey",
+          "principal": "-__BwcHBwcHBwcHBwcHBwQ",
+          "sig_pub": "39adc6c1cd751dba913adcc36c85ebf67a6f2819a40efddd95f63ad9dceb03d738b785e0534e8c7935303a76a1a0090497073689756ad96b2cdae28627eda45c",
+          "enc_pub": "",
+          "label": "iPhone",
+          "seq": 0,
+          "sig": "a9c54d46f483e11e164ee1f287571e223b2af6d03e7c164728ae06072e7ff1c240d6f60b595f3631dfe423e7e7bff001046917dad248e06d559c3f0191855e0a"
+        },
+        {
+          "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "op": "admit",
+          "kind": "pin",
+          "principal": "7d3f5a1e-0000-4000-8000-000000000001",
+          "sig_pub": "d759793bbc13a2819a827c76adb6fba8a49aee007f49f2d0992d99b825ad2c48",
+          "enc_pub": "",
+          "label": "team-prod",
+          "seq": 1,
+          "sig": "dc21471f8d051c63e37bceda7bfff74fb1452ceb8a29ed72e7813f737bdf7ae152b3a8e2a0a1c838521f8e209eac784d12ea2dbcff1dea0a91a7676fd834db0f"
+        },
+        {
+          "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "op": "admit",
+          "kind": "pin",
+          "principal": "7d3f5a1e-0000-4000-8000-000000000001",
+          "sig_pub": "d759793bbc13a2819a827c76adb6fba8a49aee007f49f2d0992d99b825ad2c48",
+          "enc_pub": "",
+          "label": "team-prod (renamed)",
+          "seq": 2,
+          "sig": "5c966a8b7b0417e17c05f4b64628520b7e4f922211d627dac7f0f0a40b6bbb133ee6848650e7898232d5fa4089b0b06aa6bea3a126b5737fcd6eb50d84d8980e"
+        }
+      ],
+      "expect": {
+        "ok": true,
+        "next_seq": 3,
+        "head_hash": "3bde8dbb2a88c0a8815883ad3424c3b7931cb50f78af5107bf81ef6d3ec91b8c",
+        "devices": [],
+        "passkeys": [
+          {
+            "cid": "-__BwcHBwcHBwcHBwcHBwQ",
+            "xy": "39adc6c1cd751dba913adcc36c85ebf67a6f2819a40efddd95f63ad9dceb03d738b785e0534e8c7935303a76a1a0090497073689756ad96b2cdae28627eda45c",
+            "label": "iPhone"
+          }
+        ],
+        "pins": [
+          {
+            "vault": "7d3f5a1e-0000-4000-8000-000000000001",
+            "anchor": "d759793bbc13a2819a827c76adb6fba8a49aee007f49f2d0992d99b825ad2c48",
+            "label": "team-prod (renamed)"
+          }
+        ],
+        "revoked_devices": [],
+        "revoked_passkeys": []
+      }
+    },
+    {
+      "name": "pin_revoke_then_new_pin",
+      "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+      "uik_pub": "2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12",
+      "events": [
+        {
+          "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "op": "admit",
+          "kind": "passkey",
+          "principal": "-__BwcHBwcHBwcHBwcHBwQ",
+          "sig_pub": "39adc6c1cd751dba913adcc36c85ebf67a6f2819a40efddd95f63ad9dceb03d738b785e0534e8c7935303a76a1a0090497073689756ad96b2cdae28627eda45c",
+          "enc_pub": "",
+          "label": "iPhone",
+          "seq": 0,
+          "sig": "a9c54d46f483e11e164ee1f287571e223b2af6d03e7c164728ae06072e7ff1c240d6f60b595f3631dfe423e7e7bff001046917dad248e06d559c3f0191855e0a"
+        },
+        {
+          "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "op": "admit",
+          "kind": "pin",
+          "principal": "7d3f5a1e-0000-4000-8000-000000000001",
+          "sig_pub": "d759793bbc13a2819a827c76adb6fba8a49aee007f49f2d0992d99b825ad2c48",
+          "enc_pub": "",
+          "label": "team-prod",
+          "seq": 1,
+          "sig": "dc21471f8d051c63e37bceda7bfff74fb1452ceb8a29ed72e7813f737bdf7ae152b3a8e2a0a1c838521f8e209eac784d12ea2dbcff1dea0a91a7676fd834db0f"
+        },
+        {
+          "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "op": "revoke",
+          "kind": "pin",
+          "principal": "7d3f5a1e-0000-4000-8000-000000000001",
+          "sig_pub": "d759793bbc13a2819a827c76adb6fba8a49aee007f49f2d0992d99b825ad2c48",
+          "enc_pub": "",
+          "label": "team-prod",
+          "seq": 2,
+          "sig": "f50f8d7c046036b24572b6c7d8606551bf885cdefb75812ec6c4dea638f6c28a171dc4248aec61660049d1e0831f341e607195d0b50d4fd2be69ab7921e1a80b"
+        },
+        {
+          "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "op": "admit",
+          "kind": "pin",
+          "principal": "7d3f5a1e-0000-4000-8000-000000000001",
+          "sig_pub": "6355691c178a8ff91007a7478afb955ef7352c63e7b25703984cf78b26e21a56",
+          "enc_pub": "",
+          "label": "team-prod",
+          "seq": 3,
+          "sig": "4ec25c22213cb49bc0ad34364db39b29b4a1beb6b622ecac49ef6d18289dc43b8850704d466c23d6f5866ca4cf50d109fc93a5f8f3627635853f4d9b13fe7608"
+        }
+      ],
+      "expect": {
+        "ok": true,
+        "next_seq": 4,
+        "head_hash": "0f29ee69a363de6897a504d4cc64590b71f243e3b3a1f177098c1e2343d3f436",
+        "devices": [],
+        "passkeys": [
+          {
+            "cid": "-__BwcHBwcHBwcHBwcHBwQ",
+            "xy": "39adc6c1cd751dba913adcc36c85ebf67a6f2819a40efddd95f63ad9dceb03d738b785e0534e8c7935303a76a1a0090497073689756ad96b2cdae28627eda45c",
+            "label": "iPhone"
+          }
+        ],
+        "pins": [
+          {
+            "vault": "7d3f5a1e-0000-4000-8000-000000000001",
+            "anchor": "6355691c178a8ff91007a7478afb955ef7352c63e7b25703984cf78b26e21a56",
+            "label": "team-prod"
+          }
+        ],
+        "revoked_devices": [],
+        "revoked_passkeys": []
+      }
+    },
+    {
+      "name": "pin_revoke_other_anchor",
+      "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+      "uik_pub": "2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12",
+      "events": [
+        {
+          "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "op": "admit",
+          "kind": "passkey",
+          "principal": "-__BwcHBwcHBwcHBwcHBwQ",
+          "sig_pub": "39adc6c1cd751dba913adcc36c85ebf67a6f2819a40efddd95f63ad9dceb03d738b785e0534e8c7935303a76a1a0090497073689756ad96b2cdae28627eda45c",
+          "enc_pub": "",
+          "label": "iPhone",
+          "seq": 0,
+          "sig": "a9c54d46f483e11e164ee1f287571e223b2af6d03e7c164728ae06072e7ff1c240d6f60b595f3631dfe423e7e7bff001046917dad248e06d559c3f0191855e0a"
+        },
+        {
+          "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "op": "admit",
+          "kind": "pin",
+          "principal": "7d3f5a1e-0000-4000-8000-000000000001",
+          "sig_pub": "d759793bbc13a2819a827c76adb6fba8a49aee007f49f2d0992d99b825ad2c48",
+          "enc_pub": "",
+          "label": "team-prod",
+          "seq": 1,
+          "sig": "dc21471f8d051c63e37bceda7bfff74fb1452ceb8a29ed72e7813f737bdf7ae152b3a8e2a0a1c838521f8e209eac784d12ea2dbcff1dea0a91a7676fd834db0f"
+        },
+        {
+          "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "op": "revoke",
+          "kind": "pin",
+          "principal": "7d3f5a1e-0000-4000-8000-000000000001",
+          "sig_pub": "6355691c178a8ff91007a7478afb955ef7352c63e7b25703984cf78b26e21a56",
+          "enc_pub": "",
+          "label": "team-prod",
+          "seq": 2,
+          "sig": "d288bf5e82aec439221988d2582fde6fb0b0cf1278386ae3127578d0a7a791cec11e5cef8eadfd396b503835f861f4cea8476afb87a3a9f5738cc39c32b0f901"
+        }
+      ],
+      "expect": {
+        "ok": false,
+        "error": "revoke_key_mismatch",
+        "index": 2
+      }
+    },
+    {
+      "name": "pin_revoke_unknown_vault",
+      "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+      "uik_pub": "2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12",
+      "events": [
+        {
+          "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "op": "admit",
+          "kind": "passkey",
+          "principal": "-__BwcHBwcHBwcHBwcHBwQ",
+          "sig_pub": "39adc6c1cd751dba913adcc36c85ebf67a6f2819a40efddd95f63ad9dceb03d738b785e0534e8c7935303a76a1a0090497073689756ad96b2cdae28627eda45c",
+          "enc_pub": "",
+          "label": "iPhone",
+          "seq": 0,
+          "sig": "a9c54d46f483e11e164ee1f287571e223b2af6d03e7c164728ae06072e7ff1c240d6f60b595f3631dfe423e7e7bff001046917dad248e06d559c3f0191855e0a"
+        },
+        {
+          "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "op": "revoke",
+          "kind": "pin",
+          "principal": "7d3f5a1e-0000-4000-8000-000000000002",
+          "sig_pub": "d759793bbc13a2819a827c76adb6fba8a49aee007f49f2d0992d99b825ad2c48",
+          "enc_pub": "",
+          "label": "team-prod",
+          "seq": 1,
+          "sig": "6553b0883c85d98202f6f757125471f3727dee0c4d25c486bdf7b89e7602dfbb6006dcd6a6c210d351be9c63c04a3550349c24976bc9271b3afd9419806a6801"
+        }
+      ],
+      "expect": {
+        "ok": false,
+        "error": "not_live",
+        "index": 1
+      }
+    },
+    {
+      "name": "revoked_device_prefix_readable",
+      "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+      "uik_pub": "2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12",
+      "events": [
+        {
+          "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "op": "admit",
+          "kind": "passkey",
+          "principal": "-__BwcHBwcHBwcHBwcHBwQ",
+          "sig_pub": "39adc6c1cd751dba913adcc36c85ebf67a6f2819a40efddd95f63ad9dceb03d738b785e0534e8c7935303a76a1a0090497073689756ad96b2cdae28627eda45c",
+          "enc_pub": "",
+          "label": "iPhone",
+          "seq": 0,
+          "sig": "a9c54d46f483e11e164ee1f287571e223b2af6d03e7c164728ae06072e7ff1c240d6f60b595f3631dfe423e7e7bff001046917dad248e06d559c3f0191855e0a"
+        },
+        {
+          "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "op": "admit",
+          "kind": "device",
+          "principal": "dv_h3a4gbna4xcdwjuqabvmuosjsnyufc6g",
+          "sig_pub": "6ee091fd280a9b68554fa73c588125d47d3425c68a26ba236b4dad90f90a8f92",
+          "enc_pub": "4c2817a9d668ed844d2f95b93b69ecb8485095783a015a424164b0d09702894f",
+          "label": "MacBook Pro",
+          "seq": 1,
+          "sig": "106e631f2213fdd61ae8c931899383aec55612082737770e4c14d5c4afb7bccdba9364218698a1df4f012bc7917b24e44c07aebf2d9d7ae4a555d80833412e09"
+        },
+        {
+          "us": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "op": "revoke",
+          "kind": "device",
+          "principal": "dv_h3a4gbna4xcdwjuqabvmuosjsnyufc6g",
+          "sig_pub": "6ee091fd280a9b68554fa73c588125d47d3425c68a26ba236b4dad90f90a8f92",
+          "enc_pub": "4c2817a9d668ed844d2f95b93b69ecb8485095783a015a424164b0d09702894f",
+          "label": "MacBook Pro",
+          "seq": 2,
+          "sig": "285375b5155ed0a531da44fac8b9534b5132e5d603e76f4c9495f6b4e613867be031a09e94b5f96191a103378237b0858f7021c4e171dcb8004625254ea78609"
+        }
+      ],
+      "expect": {
+        "ok": true,
+        "next_seq": 3,
+        "head_hash": "785c63f3e404befa106b2078efb43c5fd7586a218d2e648d1bb72a09efb1d605",
+        "devices": [],
+        "passkeys": [
+          {
+            "cid": "-__BwcHBwcHBwcHBwcHBwQ",
+            "xy": "39adc6c1cd751dba913adcc36c85ebf67a6f2819a40efddd95f63ad9dceb03d738b785e0534e8c7935303a76a1a0090497073689756ad96b2cdae28627eda45c",
+            "label": "iPhone"
+          }
+        ],
+        "pins": [],
+        "revoked_devices": [
+          {
+            "id": "dv_h3a4gbna4xcdwjuqabvmuosjsnyufc6g",
+            "seq": 2
+          }
+        ],
+        "revoked_passkeys": []
+      }
+    }
+  ],
+  "device_request": {
+    "window_sec": 300,
+    "sign": [
+      {
+        "name": "get_state",
+        "method": "GET",
+        "path": "/device/vaults/7d3f5a1e-0000-4000-8000-000000000001/state?wait=1",
+        "ts": 1760000000,
+        "body": "",
+        "device_id": "dv_h3a4gbna4xcdwjuqabvmuosjsnyufc6g",
+        "canonical_host": "api.dev.safeclaw.pro",
+        "input": "0000001673616665636c61772f76312f6465766963652d72657100000003474554000000402f6465766963652f7661756c74732f37643366356131652d303030302d343030302d383030302d3030303030303030303030312f73746174653f776169743d310000000068e7780000000020e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b8550000002364765f6833613467626e6134786364776a75716162766d756f736a736e797566633667000000146170692e6465762e73616665636c61772e70726f",
+        "dik_seed": "d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1",
+        "sig_pub": "6ee091fd280a9b68554fa73c588125d47d3425c68a26ba236b4dad90f90a8f92",
+        "sig": "1e76cba1f603fa40b26e1aa76a10788c9b8d0f5f04105cb80897f89ee99c9b92ec202de5de3cfbb78dac65439c400ebe1abbea473cb0dad7ed9d30c9ecefbc00",
+        "sig_header": "HnbLofYD-kCybhqnahB4jJuND18EEFy4CJf4numcm5LsIC3l3jz7t42sZUOcQA6-GrvqRzyw2tftnTDJ7O-8AA"
+      },
+      {
+        "name": "post_ops",
+        "method": "POST",
+        "path": "/device/vaults/7d3f5a1e-0000-4000-8000-000000000001/ops",
+        "ts": 1760000005,
+        "body": "7b226f70223a7b22616374223a7b226b696e64223a22757365227d7d7d",
+        "device_id": "dv_h3a4gbna4xcdwjuqabvmuosjsnyufc6g",
+        "canonical_host": "api.dev.safeclaw.pro",
+        "input": "0000001673616665636c61772f76312f6465766963652d72657100000004504f5354000000372f6465766963652f7661756c74732f37643366356131652d303030302d343030302d383030302d3030303030303030303030312f6f70730000000068e778050000002057e0da0b04f0a5076798a72759718f80932fa2cf2a61d3db1f4e37dd5f5296e30000002364765f6833613467626e6134786364776a75716162766d756f736a736e797566633667000000146170692e6465762e73616665636c61772e70726f",
+        "dik_seed": "d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1",
+        "sig_pub": "6ee091fd280a9b68554fa73c588125d47d3425c68a26ba236b4dad90f90a8f92",
+        "sig": "8cbdb2bf2d532537ec7d18ba9a10f15207cc4f2bfa93ba78ef451347c64fa5ba22f87ca3608bf112eb23ce904bf9a070a43438ba4b3ccaaa718bd8ffc0cbbf0b",
+        "sig_header": "jL2yvy1TJTfsfRi6mhDxUgfMTyv6k7p470UTR8ZPpboi-HyjYIvxEusjzpBL-aBwpDQ4uks8yqpxi9j_wMu_Cw"
+      }
+    ],
+    "verify": [
+      {
+        "method": "GET",
+        "path": "/device/vaults/7d3f5a1e-0000-4000-8000-000000000001/state?wait=1",
+        "body": "",
+        "device_id": "dv_h3a4gbna4xcdwjuqabvmuosjsnyufc6g",
+        "canonical_host": "api.dev.safeclaw.pro",
+        "sig_pub": "6ee091fd280a9b68554fa73c588125d47d3425c68a26ba236b4dad90f90a8f92",
+        "ts_header": "1760000000",
+        "sig_header": "HnbLofYD-kCybhqnahB4jJuND18EEFy4CJf4numcm5LsIC3l3jz7t42sZUOcQA6-GrvqRzyw2tftnTDJ7O-8AA",
+        "name": "fresh",
+        "now": 1760000010,
+        "expect": "ok"
+      },
+      {
+        "method": "GET",
+        "path": "/device/vaults/7d3f5a1e-0000-4000-8000-000000000001/state?wait=1",
+        "body": "",
+        "device_id": "dv_h3a4gbna4xcdwjuqabvmuosjsnyufc6g",
+        "canonical_host": "api.dev.safeclaw.pro",
+        "sig_pub": "6ee091fd280a9b68554fa73c588125d47d3425c68a26ba236b4dad90f90a8f92",
+        "ts_header": "1760000000",
+        "sig_header": "HnbLofYD-kCybhqnahB4jJuND18EEFy4CJf4numcm5LsIC3l3jz7t42sZUOcQA6-GrvqRzyw2tftnTDJ7O-8AA",
+        "name": "window_edge_future",
+        "now": 1759999700,
+        "expect": "ok"
+      },
+      {
+        "method": "GET",
+        "path": "/device/vaults/7d3f5a1e-0000-4000-8000-000000000001/state?wait=1",
+        "body": "",
+        "device_id": "dv_h3a4gbna4xcdwjuqabvmuosjsnyufc6g",
+        "canonical_host": "api.dev.safeclaw.pro",
+        "sig_pub": "6ee091fd280a9b68554fa73c588125d47d3425c68a26ba236b4dad90f90a8f92",
+        "ts_header": "1760000000",
+        "sig_header": "HnbLofYD-kCybhqnahB4jJuND18EEFy4CJf4numcm5LsIC3l3jz7t42sZUOcQA6-GrvqRzyw2tftnTDJ7O-8AA",
+        "name": "window_edge_past",
+        "now": 1760000300,
+        "expect": "ok"
+      },
+      {
+        "method": "GET",
+        "path": "/device/vaults/7d3f5a1e-0000-4000-8000-000000000001/state?wait=1",
+        "body": "",
+        "device_id": "dv_h3a4gbna4xcdwjuqabvmuosjsnyufc6g",
+        "canonical_host": "api.dev.safeclaw.pro",
+        "sig_pub": "6ee091fd280a9b68554fa73c588125d47d3425c68a26ba236b4dad90f90a8f92",
+        "ts_header": "1760000000",
+        "sig_header": "HnbLofYD-kCybhqnahB4jJuND18EEFy4CJf4numcm5LsIC3l3jz7t42sZUOcQA6-GrvqRzyw2tftnTDJ7O-8AA",
+        "name": "stale_past",
+        "now": 1760000301,
+        "expect": "stale"
+      },
+      {
+        "method": "GET",
+        "path": "/device/vaults/7d3f5a1e-0000-4000-8000-000000000001/state?wait=1",
+        "body": "",
+        "device_id": "dv_h3a4gbna4xcdwjuqabvmuosjsnyufc6g",
+        "canonical_host": "api.dev.safeclaw.pro",
+        "sig_pub": "6ee091fd280a9b68554fa73c588125d47d3425c68a26ba236b4dad90f90a8f92",
+        "ts_header": "1760000000",
+        "sig_header": "HnbLofYD-kCybhqnahB4jJuND18EEFy4CJf4numcm5LsIC3l3jz7t42sZUOcQA6-GrvqRzyw2tftnTDJ7O-8AA",
+        "name": "stale_future",
+        "now": 1759999699,
+        "expect": "stale"
+      },
+      {
+        "method": "GET",
+        "path": "/device/vaults/7d3f5a1e-0000-4000-8000-000000000001/state?wait=1",
+        "body": "",
+        "device_id": "dv_h3a4gbna4xcdwjuqabvmuosjsnyufc6g",
+        "canonical_host": "api.safeclaw.pro",
+        "sig_pub": "6ee091fd280a9b68554fa73c588125d47d3425c68a26ba236b4dad90f90a8f92",
+        "ts_header": "1760000000",
+        "sig_header": "HnbLofYD-kCybhqnahB4jJuND18EEFy4CJf4numcm5LsIC3l3jz7t42sZUOcQA6-GrvqRzyw2tftnTDJ7O-8AA",
+        "name": "other_host",
+        "now": 1760000000,
+        "expect": "bad_sig"
+      },
+      {
+        "method": "GET",
+        "path": "/device/vaults/7d3f5a1e-0000-4000-8000-000000000001/state?wait=1",
+        "body": "",
+        "device_id": "dv_h3a4gbna4xcdwjuqabvmuosjsnyufc6g",
+        "canonical_host": "api.dev.safeclaw.pro:443",
+        "sig_pub": "6ee091fd280a9b68554fa73c588125d47d3425c68a26ba236b4dad90f90a8f92",
+        "ts_header": "1760000000",
+        "sig_header": "HnbLofYD-kCybhqnahB4jJuND18EEFy4CJf4numcm5LsIC3l3jz7t42sZUOcQA6-GrvqRzyw2tftnTDJ7O-8AA",
+        "name": "raw_host_header_with_port",
+        "now": 1760000000,
+        "expect": "bad_sig"
+      },
+      {
+        "method": "GET",
+        "path": "/device/vaults/7d3f5a1e-0000-4000-8000-000000000002/state?wait=1",
+        "body": "",
+        "device_id": "dv_h3a4gbna4xcdwjuqabvmuosjsnyufc6g",
+        "canonical_host": "api.dev.safeclaw.pro",
+        "sig_pub": "6ee091fd280a9b68554fa73c588125d47d3425c68a26ba236b4dad90f90a8f92",
+        "ts_header": "1760000000",
+        "sig_header": "HnbLofYD-kCybhqnahB4jJuND18EEFy4CJf4numcm5LsIC3l3jz7t42sZUOcQA6-GrvqRzyw2tftnTDJ7O-8AA",
+        "name": "path_tampered",
+        "now": 1760000000,
+        "expect": "bad_sig"
+      },
+      {
+        "method": "GET",
+        "path": "/device/vaults/7d3f5a1e-0000-4000-8000-000000000001/state",
+        "body": "",
+        "device_id": "dv_h3a4gbna4xcdwjuqabvmuosjsnyufc6g",
+        "canonical_host": "api.dev.safeclaw.pro",
+        "sig_pub": "6ee091fd280a9b68554fa73c588125d47d3425c68a26ba236b4dad90f90a8f92",
+        "ts_header": "1760000000",
+        "sig_header": "HnbLofYD-kCybhqnahB4jJuND18EEFy4CJf4numcm5LsIC3l3jz7t42sZUOcQA6-GrvqRzyw2tftnTDJ7O-8AA",
+        "name": "query_dropped",
+        "now": 1760000000,
+        "expect": "bad_sig"
+      },
+      {
+        "method": "get",
+        "path": "/device/vaults/7d3f5a1e-0000-4000-8000-000000000001/state?wait=1",
+        "body": "",
+        "device_id": "dv_h3a4gbna4xcdwjuqabvmuosjsnyufc6g",
+        "canonical_host": "api.dev.safeclaw.pro",
+        "sig_pub": "6ee091fd280a9b68554fa73c588125d47d3425c68a26ba236b4dad90f90a8f92",
+        "ts_header": "1760000000",
+        "sig_header": "HnbLofYD-kCybhqnahB4jJuND18EEFy4CJf4numcm5LsIC3l3jz7t42sZUOcQA6-GrvqRzyw2tftnTDJ7O-8AA",
+        "name": "method_lowercase",
+        "now": 1760000000,
+        "expect": "bad_sig"
+      },
+      {
+        "method": "GET",
+        "path": "/device/vaults/7d3f5a1e-0000-4000-8000-000000000001/state?wait=1",
+        "body": "7b7d",
+        "device_id": "dv_h3a4gbna4xcdwjuqabvmuosjsnyufc6g",
+        "canonical_host": "api.dev.safeclaw.pro",
+        "sig_pub": "6ee091fd280a9b68554fa73c588125d47d3425c68a26ba236b4dad90f90a8f92",
+        "ts_header": "1760000000",
+        "sig_header": "HnbLofYD-kCybhqnahB4jJuND18EEFy4CJf4numcm5LsIC3l3jz7t42sZUOcQA6-GrvqRzyw2tftnTDJ7O-8AA",
+        "name": "body_added",
+        "now": 1760000000,
+        "expect": "bad_sig"
+      },
+      {
+        "method": "GET",
+        "path": "/device/vaults/7d3f5a1e-0000-4000-8000-000000000001/state?wait=1",
+        "body": "",
+        "device_id": "dv_h3a4gbna4xcdwjuqabvmuosjsnyufc6g",
+        "canonical_host": "api.dev.safeclaw.pro",
+        "sig_pub": "41e8fde132ad670e534cd8b275d2cd7eec77733c66f8db48a1cada7fabfc4555",
+        "ts_header": "1760000000",
+        "sig_header": "HnbLofYD-kCybhqnahB4jJuND18EEFy4CJf4numcm5LsIC3l3jz7t42sZUOcQA6-GrvqRzyw2tftnTDJ7O-8AA",
+        "name": "other_device_key",
+        "now": 1760000000,
+        "expect": "bad_sig"
+      },
+      {
+        "method": "GET",
+        "path": "/device/vaults/7d3f5a1e-0000-4000-8000-000000000001/state?wait=1",
+        "body": "",
+        "device_id": "dv_h3a4gbna4xcdwjuqabvmuosjsnyufc6g",
+        "canonical_host": "api.dev.safeclaw.pro",
+        "sig_pub": "6ee091fd280a9b68554fa73c588125d47d3425c68a26ba236b4dad90f90a8f92",
+        "ts_header": "1.76e9",
+        "sig_header": "HnbLofYD-kCybhqnahB4jJuND18EEFy4CJf4numcm5LsIC3l3jz7t42sZUOcQA6-GrvqRzyw2tftnTDJ7O-8AA",
+        "name": "ts_header_float",
+        "now": 1760000000,
+        "expect": "bad_header"
+      },
+      {
+        "method": "GET",
+        "path": "/device/vaults/7d3f5a1e-0000-4000-8000-000000000001/state?wait=1",
+        "body": "",
+        "device_id": "dv_h3a4gbna4xcdwjuqabvmuosjsnyufc6g",
+        "canonical_host": "api.dev.safeclaw.pro",
+        "sig_pub": "6ee091fd280a9b68554fa73c588125d47d3425c68a26ba236b4dad90f90a8f92",
+        "ts_header": "+1760000000",
+        "sig_header": "HnbLofYD-kCybhqnahB4jJuND18EEFy4CJf4numcm5LsIC3l3jz7t42sZUOcQA6-GrvqRzyw2tftnTDJ7O-8AA",
+        "name": "ts_header_signed",
+        "now": 1760000000,
+        "expect": "bad_header"
+      },
+      {
+        "method": "GET",
+        "path": "/device/vaults/7d3f5a1e-0000-4000-8000-000000000001/state?wait=1",
+        "body": "",
+        "device_id": "dv_h3a4gbna4xcdwjuqabvmuosjsnyufc6g",
+        "canonical_host": "api.dev.safeclaw.pro",
+        "sig_pub": "6ee091fd280a9b68554fa73c588125d47d3425c68a26ba236b4dad90f90a8f92",
+        "ts_header": " 1760000000",
+        "sig_header": "HnbLofYD-kCybhqnahB4jJuND18EEFy4CJf4numcm5LsIC3l3jz7t42sZUOcQA6-GrvqRzyw2tftnTDJ7O-8AA",
+        "name": "ts_header_space",
+        "now": 1760000000,
+        "expect": "bad_header"
+      },
+      {
+        "method": "GET",
+        "path": "/device/vaults/7d3f5a1e-0000-4000-8000-000000000001/state?wait=1",
+        "body": "",
+        "device_id": "dv_h3a4gbna4xcdwjuqabvmuosjsnyufc6g",
+        "canonical_host": "api.dev.safeclaw.pro",
+        "sig_pub": "6ee091fd280a9b68554fa73c588125d47d3425c68a26ba236b4dad90f90a8f92",
+        "ts_header": "1760000000",
+        "sig_header": "HnbLofYD-kCybhqnahB4jJuND18EEFy4CJf4numcm5LsIC3l3jz7t42sZUOcQA6-GrvqRzyw2tftnTDJ7O-8AA==",
+        "name": "sig_header_padded",
+        "now": 1760000000,
+        "expect": "bad_header"
+      },
+      {
+        "method": "GET",
+        "path": "/device/vaults/7d3f5a1e-0000-4000-8000-000000000001/state?wait=1",
+        "body": "",
+        "device_id": "dv_h3a4gbna4xcdwjuqabvmuosjsnyufc6g",
+        "canonical_host": "api.dev.safeclaw.pro",
+        "sig_pub": "6ee091fd280a9b68554fa73c588125d47d3425c68a26ba236b4dad90f90a8f92",
+        "ts_header": "1760000000",
+        "sig_header": "HnbLofYD+kCybhqnahB4jJuND18EEFy4CJf4numcm5LsIC3l3jz7t42sZUOcQA6+GrvqRzyw2tftnTDJ7O+8AA==",
+        "name": "sig_header_std_base64",
+        "now": 1760000000,
+        "expect": "bad_header"
+      },
+      {
+        "method": "GET",
+        "path": "/device/vaults/7d3f5a1e-0000-4000-8000-000000000001/state?wait=1",
+        "body": "",
+        "device_id": "dv_h3a4gbna4xcdwjuqabvmuosjsnyufc6g",
+        "canonical_host": "api.dev.safeclaw.pro",
+        "sig_pub": "6ee091fd280a9b68554fa73c588125d47d3425c68a26ba236b4dad90f90a8f92",
+        "ts_header": "1760000000",
+        "sig_header": "HnbLofYD-kCybhqnahB4jJuND18EEFy4CJf4numcm5LsIC3l3jz7t42sZUOcQA6-GrvqRzyw2tftnTDJ7O-8",
+        "name": "sig_header_short",
+        "now": 1760000000,
+        "expect": "bad_header"
+      },
+      {
+        "method": "GET",
+        "path": "/device/vaults/7d3f5a1e-0000-4000-8000-000000000001/state?wait=1",
+        "body": "",
+        "device_id": "dev_h3a4gbna4xcdwjuqabvmuosjsnyufc6g",
+        "canonical_host": "api.dev.safeclaw.pro",
+        "sig_pub": "6ee091fd280a9b68554fa73c588125d47d3425c68a26ba236b4dad90f90a8f92",
+        "ts_header": "1760000000",
+        "sig_header": "HnbLofYD-kCybhqnahB4jJuND18EEFy4CJf4numcm5LsIC3l3jz7t42sZUOcQA6-GrvqRzyw2tftnTDJ7O-8AA",
+        "name": "device_id_dev_prefix",
+        "now": 1760000000,
+        "expect": "bad_header"
+      }
+    ],
+    "canonical_host": [
+      {
+        "url": "https://api.dev.safeclaw.pro",
+        "host": "api.dev.safeclaw.pro"
+      },
+      {
+        "url": "https://API.Dev.SafeClaw.pro/device/me?x=1",
+        "host": "api.dev.safeclaw.pro"
+      },
+      {
+        "url": "https://api.dev.safeclaw.pro:443/",
+        "host": "api.dev.safeclaw.pro"
+      },
+      {
+        "url": "https://api.dev.safeclaw.pro:8443/",
+        "host": "api.dev.safeclaw.pro:8443"
+      },
+      {
+        "url": "http://localhost:8787/api",
+        "host": "localhost:8787"
+      },
+      {
+        "url": "http://127.0.0.1:80/",
+        "host": "127.0.0.1"
+      },
+      {
+        "url": "not a url",
+        "host": null
+      }
+    ]
+  },
+  "k_commitment": [
+    {
+      "vault_id": "7d3f5a1e-0000-4000-8000-000000000001",
+      "generation": 0,
+      "bundle": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+      "input": "0000001473616665636c61772f76312f6b2d636f6d6d69740000002437643366356131652d303030302d343030302d383030302d303030303030303030303031000000000000000000000040000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+      "commitment": "c84ba2eb0db230051573ca5e0ffa237b784df9434444d99353ebc42dc15defbe"
+    },
+    {
+      "vault_id": "7d3f5a1e-0000-4000-8000-000000000001",
+      "generation": 5,
+      "bundle": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+      "input": "0000001473616665636c61772f76312f6b2d636f6d6d69740000002437643366356131652d303030302d343030302d383030302d303030303030303030303031000000000000000500000040000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+      "commitment": "0adf670c6c73aec3e6da0e8b563750bb622133d0d17101d6dbcdf5ad6cdfd5ac"
+    },
+    {
+      "vault_id": "7d3f5a1e-0000-4000-8000-000000000002",
+      "generation": 0,
+      "bundle": "9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c",
+      "input": "0000001473616665636c61772f76312f6b2d636f6d6d69740000002437643366356131652d303030302d343030302d383030302d3030303030303030303030320000000000000000000000409a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c",
+      "commitment": "bd1e90fd971b11d72e24cda09cb87e840f86958a4aebb7509807d657e5b3de71"
+    }
+  ],
+  "rekey_gen0": {
+    "vault_id": "7d3f5a1e-0000-4000-8000-000000000001",
+    "generation": 0,
+    "bundle": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+    "k_commitment": "c84ba2eb0db230051573ca5e0ffa237b784df9434444d99353ebc42dc15defbe",
+    "signer_seed": "2121212121212121212121212121212121212121212121212121212121212121",
+    "signer_pub": "884b8857f4eaa1613c61504db34d4beaf346517a0e31de3cddd4d9b4201d9d0b",
+    "signer_id": "us_jdgks74jsp725pfms4unp6kpofcpdaeq",
+    "membership_len": 0,
+    "membership_hash": "2f12a37c5a33eff8fca2c3623090a825c377cd051cf786dddfc5dd3286d631af",
+    "input": "0000001173616665636c61772f76312f72656b65790000002437643366356131652d303030302d343030302d383030302d303030303030303030303031000000000000000000000020c84ba2eb0db230051573ca5e0ffa237b784df9434444d99353ebc42dc15defbe0000002375735f6a64676b7337346a737037323570666d7334756e70366b706f666370646165710000000000000000000000202f12a37c5a33eff8fca2c3623090a825c377cd051cf786dddfc5dd3286d631af",
+    "sig": "2ab59bd0a7dd565a9d6076957e0c491c75292301880475080c09e6acb4e22c5214155ad8a08b207f0840261e561d13ae471060ecd06d54b93134f10c256bda03"
+  },
+  "op_requester": [
+    {
+      "name": "use_scope",
+      "scope": {
+        "method": "GET",
+        "requester": {
+          "device": "dv_h3a4gbna4xcdwjuqabvmuosjsnyufc6g",
+          "member": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p"
+        }
+      },
+      "requester": {
+        "device": "dv_h3a4gbna4xcdwjuqabvmuosjsnyufc6g",
+        "member": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p"
+      }
+    },
+    {
+      "name": "requester_only",
+      "scope": {
+        "requester": {
+          "device": "dv_h3a4gbna4xcdwjuqabvmuosjsnyufc6g",
+          "member": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p"
+        }
+      },
+      "requester": {
+        "device": "dv_h3a4gbna4xcdwjuqabvmuosjsnyufc6g",
+        "member": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p"
+      }
+    },
+    {
+      "name": "scope_string",
+      "scope": "GET /x",
+      "requester": null
+    },
+    {
+      "name": "scope_null",
+      "scope": null,
+      "requester": null
+    },
+    {
+      "name": "scope_array",
+      "scope": [
+        {
+          "device": "dv_h3a4gbna4xcdwjuqabvmuosjsnyufc6g",
+          "member": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p"
+        }
+      ],
+      "requester": null
+    },
+    {
+      "name": "missing_requester",
+      "scope": {
+        "method": "GET"
+      },
+      "requester": null
+    },
+    {
+      "name": "requester_not_object",
+      "scope": {
+        "requester": "dv_h3a4gbna4xcdwjuqabvmuosjsnyufc6g"
+      },
+      "requester": null
+    },
+    {
+      "name": "missing_member",
+      "scope": {
+        "requester": {
+          "device": "dv_h3a4gbna4xcdwjuqabvmuosjsnyufc6g"
+        }
+      },
+      "requester": null
+    },
+    {
+      "name": "device_dev_prefix",
+      "scope": {
+        "requester": {
+          "device": "dev_h3a4gbna4xcdwjuqabvmuosjsnyufc6g",
+          "member": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p"
+        }
+      },
+      "requester": null
+    },
+    {
+      "name": "device_is_user_id",
+      "scope": {
+        "requester": {
+          "device": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "member": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p"
+        }
+      },
+      "requester": null
+    },
+    {
+      "name": "member_is_device_id",
+      "scope": {
+        "requester": {
+          "device": "dv_h3a4gbna4xcdwjuqabvmuosjsnyufc6g",
+          "member": "dv_h3a4gbna4xcdwjuqabvmuosjsnyufc6g"
+        }
+      },
+      "requester": null
+    },
+    {
+      "name": "device_number",
+      "scope": {
+        "requester": {
+          "device": 7,
+          "member": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p"
+        }
+      },
+      "requester": null
+    },
+    {
+      "name": "extra_key",
+      "scope": {
+        "requester": {
+          "device": "dv_h3a4gbna4xcdwjuqabvmuosjsnyufc6g",
+          "member": "us_gcl6fxxcznfdjnjyidg3obno24igpq3p",
+          "agent": "ag_x"
+        }
+      },
+      "requester": null
+    }
+  ],
+  "es256_assertion": [
+    {
+      "name": "valid",
+      "xy": "39adc6c1cd751dba913adcc36c85ebf67a6f2819a40efddd95f63ad9dceb03d738b785e0534e8c7935303a76a1a0090497073689756ad96b2cdae28627eda45c",
+      "authenticator_data": "12a09f50fcf6d4263ca5c4ea0bc8c9a8585d581fcbd4c2312a10eeb64b7a26510500000007",
+      "client_data_json": "{\"type\":\"webauthn.get\",\"challenge\":\"9aY-0WmxFRo06kEbiWNKl12WGqKqHFnn-bKWIzReuDo\",\"origin\":\"https://dev.safeclaw.pro\",\"crossOrigin\":false}",
+      "signature": "3045022100fd0121fe24182b4980e694baeb31f176ffba0801fd69730beae827225fc8d87c022026a6800f9c3d569c68808518438ea25a7b9e31b0cbdd661a05aa1c780127c0a0",
+      "challenge": "f5a63ed169b1151a34ea411b89634a975d961aa2aa1c59e7f9b29623345eb83a",
+      "origin": "https://dev.safeclaw.pro",
+      "rp_id": "dev.safeclaw.pro",
+      "valid": true,
+      "reason": null
+    },
+    {
+      "name": "signature_mutated",
+      "xy": "39adc6c1cd751dba913adcc36c85ebf67a6f2819a40efddd95f63ad9dceb03d738b785e0534e8c7935303a76a1a0090497073689756ad96b2cdae28627eda45c",
+      "authenticator_data": "12a09f50fcf6d4263ca5c4ea0bc8c9a8585d581fcbd4c2312a10eeb64b7a26510500000007",
+      "client_data_json": "{\"type\":\"webauthn.get\",\"challenge\":\"9aY-0WmxFRo06kEbiWNKl12WGqKqHFnn-bKWIzReuDo\",\"origin\":\"https://dev.safeclaw.pro\",\"crossOrigin\":false}",
+      "signature": "3045022100fd0121fe24182b4980e694baeb31f176ffba0801fd69730beae827225fc8d87c022026a6800f9c3d569c68808518438ea25a7b9e31b0cbdd661a05aa1c780127c0a1",
+      "challenge": "f5a63ed169b1151a34ea411b89634a975d961aa2aa1c59e7f9b29623345eb83a",
+      "origin": "https://dev.safeclaw.pro",
+      "rp_id": "dev.safeclaw.pro",
+      "valid": false,
+      "reason": "signature"
+    },
+    {
+      "name": "authenticator_data_mutated",
+      "xy": "39adc6c1cd751dba913adcc36c85ebf67a6f2819a40efddd95f63ad9dceb03d738b785e0534e8c7935303a76a1a0090497073689756ad96b2cdae28627eda45c",
+      "authenticator_data": "12a09f50fcf6d4263ca5c4ea0bc8c9a8585d581fcbd4c2312a10eeb64b7a26510500000006",
+      "client_data_json": "{\"type\":\"webauthn.get\",\"challenge\":\"9aY-0WmxFRo06kEbiWNKl12WGqKqHFnn-bKWIzReuDo\",\"origin\":\"https://dev.safeclaw.pro\",\"crossOrigin\":false}",
+      "signature": "3045022100fd0121fe24182b4980e694baeb31f176ffba0801fd69730beae827225fc8d87c022026a6800f9c3d569c68808518438ea25a7b9e31b0cbdd661a05aa1c780127c0a0",
+      "challenge": "f5a63ed169b1151a34ea411b89634a975d961aa2aa1c59e7f9b29623345eb83a",
+      "origin": "https://dev.safeclaw.pro",
+      "rp_id": "dev.safeclaw.pro",
+      "valid": false,
+      "reason": "signature"
+    },
+    {
+      "name": "origin_related_domain",
+      "xy": "39adc6c1cd751dba913adcc36c85ebf67a6f2819a40efddd95f63ad9dceb03d738b785e0534e8c7935303a76a1a0090497073689756ad96b2cdae28627eda45c",
+      "authenticator_data": "12a09f50fcf6d4263ca5c4ea0bc8c9a8585d581fcbd4c2312a10eeb64b7a26510500000007",
+      "client_data_json": "{\"type\":\"webauthn.get\",\"challenge\":\"9aY-0WmxFRo06kEbiWNKl12WGqKqHFnn-bKWIzReuDo\",\"origin\":\"https://nodpay.ai\",\"crossOrigin\":false}",
+      "signature": "30450220465ec6295fa4d9ead660d089c18bf3b66e94930088aab39dd2ed6325c7b7d1e20221008514b16b4040e37f75f2991926014092c3cb310799e6865c08b92326d5ebd21d",
+      "challenge": "f5a63ed169b1151a34ea411b89634a975d961aa2aa1c59e7f9b29623345eb83a",
+      "origin": "https://dev.safeclaw.pro",
+      "rp_id": "dev.safeclaw.pro",
+      "valid": false,
+      "reason": "origin"
+    },
+    {
+      "name": "challenge_mismatch",
+      "xy": "39adc6c1cd751dba913adcc36c85ebf67a6f2819a40efddd95f63ad9dceb03d738b785e0534e8c7935303a76a1a0090497073689756ad96b2cdae28627eda45c",
+      "authenticator_data": "12a09f50fcf6d4263ca5c4ea0bc8c9a8585d581fcbd4c2312a10eeb64b7a26510500000007",
+      "client_data_json": "{\"type\":\"webauthn.get\",\"challenge\":\"2SmKENGwc1g33EvYXaxkGw887yekfl1TpU8vP1svz_o\",\"origin\":\"https://dev.safeclaw.pro\",\"crossOrigin\":false}",
+      "signature": "304502206910b2177b232af7f9c071b0cb78f38a2aad40e649f5d238badf783856adb990022100c67f893f48ed13f84a6c18360785a20f102de72637407389ce8913e91d2991f4",
+      "challenge": "f5a63ed169b1151a34ea411b89634a975d961aa2aa1c59e7f9b29623345eb83a",
+      "origin": "https://dev.safeclaw.pro",
+      "rp_id": "dev.safeclaw.pro",
+      "valid": false,
+      "reason": "challenge"
+    },
+    {
+      "name": "type_create",
+      "xy": "39adc6c1cd751dba913adcc36c85ebf67a6f2819a40efddd95f63ad9dceb03d738b785e0534e8c7935303a76a1a0090497073689756ad96b2cdae28627eda45c",
+      "authenticator_data": "12a09f50fcf6d4263ca5c4ea0bc8c9a8585d581fcbd4c2312a10eeb64b7a26510500000007",
+      "client_data_json": "{\"type\":\"webauthn.create\",\"challenge\":\"9aY-0WmxFRo06kEbiWNKl12WGqKqHFnn-bKWIzReuDo\",\"origin\":\"https://dev.safeclaw.pro\",\"crossOrigin\":false}",
+      "signature": "3046022100c542e7be2574cc2f1578a90fa47c5c3c5ceffb5b3f38756e6c1d3e77ca4cf7a0022100867fb55c646b8fcacf3fcaae6808ea5d7d45d5702250aa971d7383d315dd7c92",
+      "challenge": "f5a63ed169b1151a34ea411b89634a975d961aa2aa1c59e7f9b29623345eb83a",
+      "origin": "https://dev.safeclaw.pro",
+      "rp_id": "dev.safeclaw.pro",
+      "valid": false,
+      "reason": "type"
+    },
+    {
+      "name": "cross_origin_true",
+      "xy": "39adc6c1cd751dba913adcc36c85ebf67a6f2819a40efddd95f63ad9dceb03d738b785e0534e8c7935303a76a1a0090497073689756ad96b2cdae28627eda45c",
+      "authenticator_data": "12a09f50fcf6d4263ca5c4ea0bc8c9a8585d581fcbd4c2312a10eeb64b7a26510500000007",
+      "client_data_json": "{\"type\":\"webauthn.get\",\"challenge\":\"9aY-0WmxFRo06kEbiWNKl12WGqKqHFnn-bKWIzReuDo\",\"origin\":\"https://dev.safeclaw.pro\",\"crossOrigin\":true}",
+      "signature": "304502202252166108983a866335d4fc1fad4f2fc8682bcb6c8ef583e2ac44d28be400c0022100b6cce71b83acae641125d5ff7131a74258952021b2d37628619fb072019fd02d",
+      "challenge": "f5a63ed169b1151a34ea411b89634a975d961aa2aa1c59e7f9b29623345eb83a",
+      "origin": "https://dev.safeclaw.pro",
+      "rp_id": "dev.safeclaw.pro",
+      "valid": false,
+      "reason": "cross_origin"
+    },
+    {
+      "name": "rp_id_hash_mismatch",
+      "xy": "39adc6c1cd751dba913adcc36c85ebf67a6f2819a40efddd95f63ad9dceb03d738b785e0534e8c7935303a76a1a0090497073689756ad96b2cdae28627eda45c",
+      "authenticator_data": "8f1c81681c29e17013a07f83dc6c9a78f9dd7f8922f56df7a514eceae8986dd40500000007",
+      "client_data_json": "{\"type\":\"webauthn.get\",\"challenge\":\"9aY-0WmxFRo06kEbiWNKl12WGqKqHFnn-bKWIzReuDo\",\"origin\":\"https://dev.safeclaw.pro\",\"crossOrigin\":false}",
+      "signature": "3046022100e5480c2744c70e5c17ada04bfdec5df3edd3a3ba927f3cb2e1f0602d58d732440221008b42037d8d1933d32b94d0ed4313e95c5f5977dbefa95a1a0b1b9802f7ea019a",
+      "challenge": "f5a63ed169b1151a34ea411b89634a975d961aa2aa1c59e7f9b29623345eb83a",
+      "origin": "https://dev.safeclaw.pro",
+      "rp_id": "dev.safeclaw.pro",
+      "valid": false,
+      "reason": "rp_id"
+    },
+    {
+      "name": "user_not_present",
+      "xy": "39adc6c1cd751dba913adcc36c85ebf67a6f2819a40efddd95f63ad9dceb03d738b785e0534e8c7935303a76a1a0090497073689756ad96b2cdae28627eda45c",
+      "authenticator_data": "12a09f50fcf6d4263ca5c4ea0bc8c9a8585d581fcbd4c2312a10eeb64b7a26510400000007",
+      "client_data_json": "{\"type\":\"webauthn.get\",\"challenge\":\"9aY-0WmxFRo06kEbiWNKl12WGqKqHFnn-bKWIzReuDo\",\"origin\":\"https://dev.safeclaw.pro\",\"crossOrigin\":false}",
+      "signature": "3045022100b509a42c57848b1e5da6696c6ea075b6a05734bffc8aefbfc7aef4861c57e33e02207cbaec6289694a547c5825ca8b7442aac3e0913f93bc3945fbbbca0ee684a79d",
+      "challenge": "f5a63ed169b1151a34ea411b89634a975d961aa2aa1c59e7f9b29623345eb83a",
+      "origin": "https://dev.safeclaw.pro",
+      "rp_id": "dev.safeclaw.pro",
+      "valid": false,
+      "reason": "user_presence"
+    },
+    {
+      "name": "user_not_verified",
+      "xy": "39adc6c1cd751dba913adcc36c85ebf67a6f2819a40efddd95f63ad9dceb03d738b785e0534e8c7935303a76a1a0090497073689756ad96b2cdae28627eda45c",
+      "authenticator_data": "12a09f50fcf6d4263ca5c4ea0bc8c9a8585d581fcbd4c2312a10eeb64b7a26510100000007",
+      "client_data_json": "{\"type\":\"webauthn.get\",\"challenge\":\"9aY-0WmxFRo06kEbiWNKl12WGqKqHFnn-bKWIzReuDo\",\"origin\":\"https://dev.safeclaw.pro\",\"crossOrigin\":false}",
+      "signature": "3045022100f503f695657c0eba3d44b7856afe41ffa5e7d82d48092a973babf6d4ea809af002206df9f2ee6bdeefe886b8768dce95dd51b359d5c6b4451431975b99738461b80b",
+      "challenge": "f5a63ed169b1151a34ea411b89634a975d961aa2aa1c59e7f9b29623345eb83a",
+      "origin": "https://dev.safeclaw.pro",
+      "rp_id": "dev.safeclaw.pro",
+      "valid": false,
+      "reason": "user_verification"
+    },
+    {
+      "name": "other_credential_key",
+      "xy": "7f6ff388acb6a5ea5415914fe7abe5b632f21783831c65e707a2072f92c77d28e51b53c3e5cf92fd1c29b3ef268138fb0993cb4c0486840d3f03314a01df327f",
+      "authenticator_data": "12a09f50fcf6d4263ca5c4ea0bc8c9a8585d581fcbd4c2312a10eeb64b7a26510500000007",
+      "client_data_json": "{\"type\":\"webauthn.get\",\"challenge\":\"9aY-0WmxFRo06kEbiWNKl12WGqKqHFnn-bKWIzReuDo\",\"origin\":\"https://dev.safeclaw.pro\",\"crossOrigin\":false}",
+      "signature": "30450221009431f0945123849546c918b27a3b95f580589de70fc0f22523601b8e718cb86b022019f9451fb7daa17377b6dab46270039bc4b257a485573cc6b3a651729fb5e7bd",
+      "challenge": "f5a63ed169b1151a34ea411b89634a975d961aa2aa1c59e7f9b29623345eb83a",
+      "origin": "https://dev.safeclaw.pro",
+      "rp_id": "dev.safeclaw.pro",
+      "valid": false,
+      "reason": "signature"
+    },
+    {
+      "name": "public_key_not_on_curve",
+      "xy": "39adc6c1cd751dba913adcc36c85ebf67a6f2819a40efddd95f63ad9dceb03d738b785e0534e8c7935303a76a1a0090497073689756ad96b2cdae28627eda45d",
+      "authenticator_data": "12a09f50fcf6d4263ca5c4ea0bc8c9a8585d581fcbd4c2312a10eeb64b7a26510500000007",
+      "client_data_json": "{\"type\":\"webauthn.get\",\"challenge\":\"9aY-0WmxFRo06kEbiWNKl12WGqKqHFnn-bKWIzReuDo\",\"origin\":\"https://dev.safeclaw.pro\",\"crossOrigin\":false}",
+      "signature": "3045022100fd0121fe24182b4980e694baeb31f176ffba0801fd69730beae827225fc8d87c022026a6800f9c3d569c68808518438ea25a7b9e31b0cbdd661a05aa1c780127c0a0",
+      "challenge": "f5a63ed169b1151a34ea411b89634a975d961aa2aa1c59e7f9b29623345eb83a",
+      "origin": "https://dev.safeclaw.pro",
+      "rp_id": "dev.safeclaw.pro",
+      "valid": false,
+      "reason": "public_key"
+    },
+    {
+      "name": "client_data_not_json",
+      "xy": "39adc6c1cd751dba913adcc36c85ebf67a6f2819a40efddd95f63ad9dceb03d738b785e0534e8c7935303a76a1a0090497073689756ad96b2cdae28627eda45c",
+      "authenticator_data": "12a09f50fcf6d4263ca5c4ea0bc8c9a8585d581fcbd4c2312a10eeb64b7a26510500000007",
+      "client_data_json": "{not json",
+      "signature": "3046022100ca9476e6b2b5d6a94e0f586a9daa7068e2d7f5d3bdf114bc1cdf1bdfb91af238022100c750443ef9f041e5b3eb9e6ff1765c130397366e1e21fbfc2a7df90af41ca3da",
+      "challenge": "f5a63ed169b1151a34ea411b89634a975d961aa2aa1c59e7f9b29623345eb83a",
+      "origin": "https://dev.safeclaw.pro",
+      "rp_id": "dev.safeclaw.pro",
+      "valid": false,
+      "reason": "client_data"
+    },
+    {
+      "name": "authenticator_data_short",
+      "xy": "39adc6c1cd751dba913adcc36c85ebf67a6f2819a40efddd95f63ad9dceb03d738b785e0534e8c7935303a76a1a0090497073689756ad96b2cdae28627eda45c",
+      "authenticator_data": "12a09f50fcf6d4263ca5c4ea0bc8c9a8585d581fcbd4c2312a10eeb64b7a265105000000",
+      "client_data_json": "{\"type\":\"webauthn.get\",\"challenge\":\"9aY-0WmxFRo06kEbiWNKl12WGqKqHFnn-bKWIzReuDo\",\"origin\":\"https://dev.safeclaw.pro\",\"crossOrigin\":false}",
+      "signature": "304502204a6f0b4753a73adef63c449ccde6e4b6f866c5e7f7d9fa2ccda993914f0a0e36022100de195defc341b8b8dda0aaf2652455889423110c62fca18d400d7d084cef1590",
+      "challenge": "f5a63ed169b1151a34ea411b89634a975d961aa2aa1c59e7f9b29623345eb83a",
+      "origin": "https://dev.safeclaw.pro",
+      "rp_id": "dev.safeclaw.pro",
+      "valid": false,
+      "reason": "authenticator_data"
+    },
+    {
+      "name": "signature_not_der",
+      "xy": "39adc6c1cd751dba913adcc36c85ebf67a6f2819a40efddd95f63ad9dceb03d738b785e0534e8c7935303a76a1a0090497073689756ad96b2cdae28627eda45c",
+      "authenticator_data": "12a09f50fcf6d4263ca5c4ea0bc8c9a8585d581fcbd4c2312a10eeb64b7a26510500000007",
+      "client_data_json": "{\"type\":\"webauthn.get\",\"challenge\":\"9aY-0WmxFRo06kEbiWNKl12WGqKqHFnn-bKWIzReuDo\",\"origin\":\"https://dev.safeclaw.pro\",\"crossOrigin\":false}",
+      "signature": "fd0121fe24182b4980e694baeb31f176ffba0801fd69730beae827225fc8d87c26a6800f9c3d569c68808518438ea25a7b9e31b0cbdd661a05aa1c780127c0a0",
+      "challenge": "f5a63ed169b1151a34ea411b89634a975d961aa2aa1c59e7f9b29623345eb83a",
+      "origin": "https://dev.safeclaw.pro",
+      "rp_id": "dev.safeclaw.pro",
+      "valid": false,
+      "reason": "signature"
+    }
+  ]
+}

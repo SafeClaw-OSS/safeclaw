@@ -4,8 +4,10 @@
 //! - `POST /op/{op_id}/approve`    — U submits grant G; T validates, dispatches act
 //! - `POST /op/{op_id}/reject`     — U denies
 //!
-//! All act kinds (Enroll, Write, Export, Use) flow through `approve_op`; the
-//! act-specific dispatch is inlined per the SUDP protocol.
+//! Every act (Export, Use, and the control-plane `Custom` acts) flows through
+//! `approve_op`: the console's grant carries the vault's K bundle sealed to THIS
+//! device (contract 1.7), checked against the member record's owner-signed
+//! commitment before it is used.
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -20,30 +22,16 @@ use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
     Engine,
 };
-
-/// HPKE `info` prefix for the pending-passkey deposit seal. The full info
-/// string is `PENDING_PASSKEY_INFO_PREFIX ‖ vault_id ‖ 0x1F ‖ cid_new` —
-/// binding the seal to (vault, cid) so a deposit prepared for one pairing
-/// can't be opened against another. Frontend builds the same string in
-/// `lib/passkey-vault-primitive.ts`.
-const PENDING_PASSKEY_INFO_PREFIX: &[u8] = b"safeclaw/v1/pending-passkey";
 use serde_json::{json, Value};
 
 use crate::approval::ApprovalStatus;
 use crate::audit::{STATUS_APPROVED, STATUS_REJECTED};
 use crate::error::{AppError, Result};
-use crate::passkey::PasskeyEntry;
-use crate::protocol::operation::{
-    as_enroll_credential, as_export_path, decode_credential_id, discriminator, ActType,
-};
+use crate::protocol::operation::{as_export_path, discriminator, op_bound_to_device, ActType};
 use crate::protocol::{render_operation, validate_batch_grant, validate_grant, Grant};
-use crate::server::handlers::metadata::decrypt_vault_view_keep_key;
 use crate::state::{AppState, ApprovalEvent, SecretsCache};
 use crate::storage::plaintext::{Category, VaultPlaintextView};
-use crate::storage::sealed_vault::{
-    build_initial, find_pubkey, find_pubkey_in_registry, read as read_vault, read_per_item,
-    write_atomic,
-};
+use crate::storage::sealed_vault::read_per_item;
 
 /// `GET /op/{op_id}` — JSON poll: status + cached value + render(o).
 ///
@@ -265,65 +253,15 @@ fn export_precheck(op: &crate::protocol::operation::Operation) -> Result<&str> {
     Ok(path)
 }
 
-/// Best-effort: if the acting credential's stored keyset row carries no KCV yet,
-/// compute it from the `W_c` that just unlocked the vault and persist it (then
-/// push the keyset row cloud-side so it survives pulls and reaches other
-/// devices). Idempotent — a credential that already has a KCV is untouched.
-/// Never fatal to the unlock; failures are logged and swallowed. Targets the
-/// per-item keyset (the current home); a legacy `vault.dat`-only vault simply
-/// skips — the browser falls back to its no-precheck path for KCV-less creds.
-fn maybe_backfill_wc_check(state: &Arc<AppState>, vault_id: &str, cid: &[u8], w_c: &[u8]) {
-    let Ok(per_item_path) = state.vaults.per_item_path(vault_id) else {
-        return;
-    };
-    let mut pv = match crate::storage::sealed_vault::read_per_item(&per_item_path) {
-        Ok(Some(pv)) => pv,
-        _ => return, // no per-item keyset (legacy or unreadable) — skip
-    };
-    let Some(cred) = pv
-        .keyset
-        .credentials
-        .iter_mut()
-        .find(|c| c.credential_id == cid)
-    else {
-        return;
-    };
-    if cred.wc_check.is_some() {
-        return; // already present (freshly enrolled with a KCV, or backfilled)
-    }
-    let wc = match sudp::primitives::wc_check_value::<sudp::primitives::HkdfSha256>(
-        w_c,
-        &cred.prf_salt,
-        cid,
-    ) {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::warn!(vault = %vault_id, "wc_check backfill KDF failed: {}", e);
-            return;
-        }
-    };
-    cred.wc_check = Some(wc.to_vec());
-    if let Err(e) = crate::storage::sealed_vault::write_per_item_atomic(&per_item_path, &pv) {
-        tracing::warn!(vault = %vault_id, "wc_check backfill write failed: {}", e);
-        return;
-    }
-    tracing::info!(vault = %vault_id, "backfilled wc_check for the acting credential");
-    let state = state.clone();
-    let vid = vault_id.to_string();
-    tokio::spawn(async move {
-        crate::sync::push_keys_best_effort(&state, &vid).await;
-    });
-}
-
 /// Every custom act the dispatch below handles. Keep in lockstep with the
 /// `ActType::Custom` match arms — `consent::tests::dispatch_and_table_agree`
 /// fails when this list and acts.toml drift in either direction, so an act
 /// can't ship without approval copy (and dead copy can't linger).
+#[cfg(test)]
 pub(crate) const DISPATCHED_CUSTOM_ACTS: &[&str] = &[
     "vault-unlock",
     "vault-lock",
     "vault-delete",
-    "rename-passkey",
     "widen-host",
     "narrow-host",
     "service-ls",
@@ -404,8 +342,6 @@ pub(crate) fn apply_secret_set_to_view(
     }
 }
 
-/// `POST /op/{op_id}/approve` — U submits the signed grant. T validates and
-/// dispatches the act (Enroll / Write / Export / Use).
 /// Batch-arm pre-verification (design/batch-approve.md §Daemon verify 1-5):
 /// bounds BEFORE any record load, then rebuild the Merkle root from the
 /// daemon's OWN stored (o, r) pairs in `op_ids` order and derive the tagged
@@ -509,10 +445,75 @@ fn batch_expected_challenge(
     Ok(batch_challenge(&root))
 }
 
+/// The K bundle a grant delivers (contract 1.7): HPKE-open `k_enc`/`k_ct` with
+/// THIS device's enc key under `info = grant_seal_info(op_id)`, require exactly
+/// 64 bytes, and require it to match the member record's owner-signed
+/// commitment for the record's current generation — before it is used or
+/// retained. Any failure refuses the approval.
+fn open_grant_k(
+    state: &AppState,
+    op_id: &str,
+    grant: &Grant,
+    record: &crate::storage::sealed_vault::MemberRecord,
+    vault_id: &str,
+) -> Result<zeroize::Zeroizing<Vec<u8>>> {
+    let enc_b64 = grant
+        .k_enc
+        .as_deref()
+        .ok_or_else(|| AppError::BadRequest("grant carries no sealed K (k_enc missing)".into()))?;
+    let ct_b64 = grant
+        .k_ct
+        .as_deref()
+        .ok_or_else(|| AppError::BadRequest("grant carries no sealed K (k_ct missing)".into()))?;
+    let enc = URL_SAFE_NO_PAD
+        .decode(enc_b64)
+        .map_err(|_| AppError::BadRequest("k_enc not base64url".into()))?;
+    let ct = URL_SAFE_NO_PAD
+        .decode(ct_b64)
+        .map_err(|_| AppError::BadRequest("k_ct not base64url".into()))?;
+    let client = state
+        .cloud()
+        .ok_or_else(|| AppError::Conflict(crate::device::NOT_PAIRED.into()))?;
+    let info = crate::crypto::envelope::grant_seal_info(op_id);
+    let bundle =
+        zeroize::Zeroizing::new(client.device().enc().open(&enc, &ct, &info, b"").map_err(
+            |_| AppError::Unauthorized("the sealed K does not open for this device".into()),
+        )?);
+    if bundle.len() != 64 {
+        return Err(AppError::BadRequest(
+            "the sealed K must be the 64-byte bundle".into(),
+        ));
+    }
+    if !record.k_matches(vault_id, &bundle) {
+        return Err(AppError::Unauthorized(
+            "the delivered K does not match the vault's owner-signed commitment".into(),
+        ));
+    }
+    Ok(bundle)
+}
+
+/// Fold the vault with a verified K bundle and run the team unlock hook.
+/// Returns the view and a copy of K for the caller to retain or drop.
+fn open_with_k(
+    state: &AppState,
+    vault_id: &str,
+    k: &zeroize::Zeroizing<Vec<u8>>,
+) -> Result<(VaultPlaintextView, zeroize::Zeroizing<Vec<u8>>)> {
+    let view = crate::server::handlers::metadata::open_view_with_state_key(state, vault_id, k)?;
+    state.team.on_vault_unlocked(state, vault_id, k);
+    Ok((view, k.clone()))
+}
+
+/// `POST /op/{op_id}/approve` — the console's grant arrives (via the ops
+/// poller's loopback). The daemon checks: the op is pending and bound to THIS
+/// device (`act.scope.requester.device`), `o`/`r` are the stored ones, the
+/// assertion verifies against a passkey admitted in a current member's ledger,
+/// and the delivered K matches the member record's commitment. Then it
+/// dispatches the act (Export / Use / the control-plane `Custom` acts).
 pub async fn approve_op(
     State(state): State<Arc<AppState>>,
     Path(op_id): Path<String>,
-    Json(mut grant): Json<Grant>,
+    Json(grant): Json<Grant>,
 ) -> Result<Json<Value>> {
     // 1. Look up the pending op. A SUPERSEDED op is still `Pending` and still
     // approvable (design/approvals-inbox.md D1): supersede is display state,
@@ -563,6 +564,21 @@ pub async fn approve_op(
         } else {
             AppError::BadRequest("grant.r does not match this op's challenge".into())
         });
+    }
+
+    // 2a. The op must be bound to THIS device (contract 1.6): the grant's K is
+    // sealed to the requester device's enc key, and a daemon never applies an
+    // approval minted for another device.
+    {
+        let own = state.cloud().map(|c| c.device().id().to_string());
+        let bound = own
+            .as_deref()
+            .is_some_and(|dv| op_bound_to_device(&approval_op.act, dv));
+        if !bound {
+            return Err(AppError::Forbidden(
+                "this approval is for another device (act.scope.requester.device)".into(),
+            ));
+        }
     }
 
     // 2b'. A Use op's SIGNED level/window must match the policy it was minted
@@ -628,97 +644,41 @@ pub async fn approve_op(
         }
     }
 
-    // 3b. Resolve credential pubkey lookup.
-    //
-    // For Enroll, the credential is brand-new (not in vault yet) — pubkey is
-    // taken from the op's scope. For Write/Export/Use, the credential must be
-    // already enrolled — look it up in the existing vault.
-    let vault_path = state.vaults.vault_path(&vault_id)?;
-    let existing_vault = read_vault(&vault_path)?;
-    // A web-enrolled vault synced down as per-item rows (vault.per-item.json)
-    // has NO vault.dat — its keyset (credential pubkeys) lives in the per-item
-    // store. Read it once so credential lookup + the read grants (Unlock / Use /
-    // Export) below work for those vaults too.
-    let mut existing_per_item = state
+    // 3b. The vault must sit on a member record verified against this
+    // person's pin (design D5), and no hard trust failure may be pending.
+    if let Some(why) = state.trust.refusal(&vault_id) {
+        return Err(AppError::Forbidden(why));
+    }
+    let record = state
         .vaults
         .per_item_path(&vault_id)
         .ok()
-        .and_then(|p| read_per_item(&p).ok().flatten());
-    // SELF-HEAL a stale keyset registry before validating. If the credential this
-    // grant is signed with isn't resolvable yet, force a FULL membership re-pull
-    // and re-read. An out-of-band x/y backfill (a credential's WebAuthn pubkey
-    // added to an already-synced membership) does NOT bump the membership seq, so
-    // the daemon never re-pulled and `credential_lookup` misses it even though the
-    // cloud offers it ("unknown credential"). Best-effort: a failed re-pull just
-    // leaves the original miss to surface (now as a clear rejection, not a hang).
-    let cred_resolvable = existing_vault
-        .as_ref()
-        .and_then(|v| find_pubkey(v, &grant.credential_id))
-        .or_else(|| {
-            existing_per_item
-                .as_ref()
-                .and_then(|pv| find_pubkey_in_registry(&pv.keyset.registry, &grant.credential_id))
-        })
-        .is_some();
-    if !cred_resolvable {
-        match crate::sync::resync_membership_now(&state, &vault_id).await {
-            Ok(n) => {
-                tracing::info!(op = %op_id, vault = %vault_id, adopted = n, "approve self-heal: re-pulled membership for unresolved credential");
-                existing_per_item = state
-                    .vaults
-                    .per_item_path(&vault_id)
-                    .ok()
-                    .and_then(|p| read_per_item(&p).ok().flatten());
-            }
-            Err(e) => tracing::debug!(op = %op_id, "approve self-heal re-pull failed: {}", e),
-        }
-    }
-    let lookup_credential = |cred_id_b64: &str| -> Option<PasskeyEntry> {
-        existing_vault
-            .as_ref()
-            .and_then(|v| find_pubkey(v, cred_id_b64))
-            .or_else(|| {
-                existing_per_item
-                    .as_ref()
-                    .and_then(|pv| find_pubkey_in_registry(&pv.keyset.registry, cred_id_b64))
-            })
-    };
-    // 3c. HPKE-unseal W_c if the grant carries a sealed wrapping key (the web /
-    // op-relay path). The browser sealed W* to our `sc_pk` with
-    // `info = grant_seal_info(op_id)` so any cloud intermediary carrying the
-    // grant never saw W*. Populate `grant.wrapping_key` with the opened bytes
-    // so the rest of validation is identical to the legacy plaintext path.
-    // (Legacy local op-page ships plaintext `wrapping_key` and skips this.)
-    if grant.wk_enc.is_some() || grant.wk_ct.is_some() {
-        let enc_b64 = grant.wk_enc.as_deref().ok_or_else(|| {
-            AppError::BadRequest(
-                "sealed wrapping key needs both wk_enc and wk_ct (wk_enc missing)".into(),
-            )
-        })?;
-        let ct_b64 = grant.wk_ct.as_deref().ok_or_else(|| {
-            AppError::BadRequest(
-                "sealed wrapping key needs both wk_enc and wk_ct (wk_ct missing)".into(),
-            )
-        })?;
-        let enc = URL_SAFE_NO_PAD
-            .decode(enc_b64)
-            .map_err(|_| AppError::BadRequest("wk_enc not base64url".into()))?;
-        let ct = URL_SAFE_NO_PAD
-            .decode(ct_b64)
-            .map_err(|_| AppError::BadRequest("wk_ct not base64url".into()))?;
-        let info = crate::crypto::envelope::grant_seal_info(&op_id);
-        let wk = state.sc.open(&enc, &ct, &info, b"")?;
-        if wk.len() != 32 {
-            return Err(AppError::BadRequest(
-                "sealed wrapping_key must be 32 bytes".into(),
-            ));
-        }
-        grant.wrapping_key = Some(STANDARD.encode(&wk));
-    }
+        .and_then(|p| read_per_item(&p).ok().flatten())
+        .and_then(|pv| pv.record)
+        .ok_or_else(|| AppError::Conflict(crate::storage::sealed_vault::NO_RECORD.into()))?;
+    // The store is not a trust root (design D7): the held record must fold
+    // under the anchor this person's ledger pins for the vault, for this
+    // person, and be the one this process last latched, before it picks the
+    // approver's passkey or the K commitment.
+    crate::trust::check_held_record(&state.trust, &vault_id, &record)
+        .map_err(|e| AppError::Forbidden(e.to_string()))?;
 
-    let mut validated = {
+    // 3c. The approver's passkey: admitted in the ledger of a CURRENT member
+    // of that record (design D5.3) — never a pub the backend serves.
+    let approver = crate::trust::approver_passkey(
+        &state.trust,
+        state.cloud().as_ref(),
+        &state.config.state_dir,
+        &record,
+        &vault_id,
+        &grant.credential_id,
+    )
+    .await;
+
+    let validated = {
         let result = {
             let mut chs = state.challenges.lock().unwrap();
+            let lookup = |_: &str| approver.clone();
             match &batch_challenge_bytes {
                 // Batch arm: same shared validation core, challenge = the
                 // domain-tagged root rebuilt above from our own op store.
@@ -728,14 +688,14 @@ pub async fn approve_op(
                     &mut chs,
                     &state.config.origin,
                     &state.config.rp_id,
-                    lookup_credential,
+                    lookup,
                 ),
                 None => validate_grant(
                     &grant,
                     &mut chs,
                     &state.config.origin,
                     &state.config.rp_id,
-                    lookup_credential,
+                    lookup,
                 ),
             }
         };
@@ -752,19 +712,19 @@ pub async fn approve_op(
         }
     };
 
-    // 3b. Verify bind.redeemer matches the vault this op was created for.
-    // SUDP §4 binds an op to a specific custodian/vault via bind.redeemer;
-    // failing to check this would let a grant authorized for vault A be
-    // submitted against vault B's approve endpoint.
+    // 3d. Verify bind.redeemer matches the vault this op was created for
+    // (SUDP §4): a grant for vault A can't be submitted against vault B.
     if validated.op.bind.redeemer != vault_id {
         return Err(AppError::Unauthorized(
             "grant.o.bind.redeemer does not match vault".into(),
         ));
     }
 
-    // 4. Act dispatch — same logic that previously lived in grant.rs.
-    // Captured here for the audit row finalize at the bottom (Use's upstream
-    // status code; None for all other act kinds).
+    // 3e. Open the K bundle sealed to THIS device (contract 1.7) and check it
+    // against the record's owner-signed commitment BEFORE using or retaining it.
+    let k = open_grant_k(&state, &op_id, &grant, &record, &vault_id)?;
+
+    // 4. Act dispatch.
     let audit_upstream_status: Option<i64> = None;
     // A Use apply's grant/cache write is DEFERRED until the op is actually
     // marked approved (step 5): any status flip that bypasses the vault write
@@ -773,269 +733,9 @@ pub async fn approve_op(
     // grant behind an op that reads rejected.
     let mut deferred_grant: Option<DeferredGrant> = None;
     let (response, cached_value) = match &validated.op.act.kind {
-        ActType::Enroll if validated.op.act.target == "passkeys" => {
-            // Add-passkey-to-existing-vault path. PROTOCOL.md §3.4 maps
-            // `target = "passkeys"` to "register a new credential against
-            // the already-enrolled vault". K stays the same (no state-key
-            // rotation), but a new SealedCredential entry gets appended
-            // with K wrapped under the new credential's W_c.
-            //
-            // Same- and cross-device add-passkey both go through the
-            // pending-passkey deposit (`storage::pending_passkey`):
-            //   - Stage 1 (any device with the new credential): POST
-            //     /v/{vid}/pending-passkeys with HPKE-sealed user_key_initial.
-            //   - Stage 2 (any device with an existing vault-enrolled
-            //     credential, possibly the same device): this op, with
-            //     `scope.new = { credential_id }` referring to the pending.
-            //
-            // grant.opt is NOT consulted — the new credential's W_c lives
-            // exclusively in the daemon-stored pending-passkey blob.
-            let vault = existing_vault.clone().ok_or_else(|| {
-                AppError::Conflict("vault not initialized — first-time enroll required".into())
-            })?;
-            // scope.new should just carry { credential_id } — that's the
-            // pointer to the pending-passkey file. No public-key / W_c
-            // material inline.
-            let new_cid_str = validated
-                .op
-                .act
-                .scope
-                .get("new")
-                .and_then(|n| n.get("credential_id"))
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| {
-                    AppError::BadRequest("add-passkey: scope.new.credential_id required".into())
-                })?
-                .to_string();
-            // Pop the pending file (single-use, deleted on read).
-            let pending = crate::storage::pending_passkey::load_and_consume(
-                &state.vaults,
-                &vault_id,
-                &new_cid_str,
-            )
-            .map_err(|_| AppError::NotFound)?;
-            // HPKE-open the sealed user_key_initial with daemon's sc_sk.
-            // info binds the seal to (vault_id, cid) — the Stage 1 device
-            // committed to those at seal time, so a deposit prepared for
-            // (vault_A, cidA) can't be replayed against a different vault
-            // or cid.
-            let enc = URL_SAFE_NO_PAD
-                .decode(&pending.enc)
-                .map_err(|_| AppError::BadRequest("pending.enc not base64url".into()))?;
-            let ct = URL_SAFE_NO_PAD
-                .decode(&pending.ct)
-                .map_err(|_| AppError::BadRequest("pending.ct not base64url".into()))?;
-            let mut info: Vec<u8> = Vec::with_capacity(
-                PENDING_PASSKEY_INFO_PREFIX.len() + vault_id.len() + new_cid_str.len() + 2,
-            );
-            info.extend_from_slice(PENDING_PASSKEY_INFO_PREFIX);
-            info.extend_from_slice(vault_id.as_bytes());
-            info.push(0x1f); // unit separator
-            info.extend_from_slice(new_cid_str.as_bytes());
-            let new_w_c = state.sc.open(&enc, &ct, &info, b"")?;
-            if new_w_c.len() != 32 {
-                return Err(AppError::BadRequest(
-                    "sealed user_key_initial must be 32 bytes after open".into(),
-                ));
-            }
-            // Open the vault to recover K. We deliberately don't reuse
-            // decrypt_vault_view here because we need K itself, not the
-            // ProtectedState view.
-            // F-05: move W_c bytes into RedeemedGrant instead of cloning so
-            // there is only one copy of the key on the heap at a time.
-            let redeemed = sudp::grant::RedeemedGrant {
-                o: validated.op.clone(),
-                credential_id: validated.credential_id_bytes.clone(),
-                wrapping_key: sudp::grant::WrappingKey::from_bytes(std::mem::take(
-                    &mut validated.wrapping_key,
-                )),
-                opt: sudp::grant::GrantOpt::default(),
-            };
-            let opened = sudp::phases::consumption::open::<sudp::primitives::StdPrimitives>(
-                &redeemed, &vault,
-            )
-            .map_err(|e| AppError::Unauthorized(format!("vault open: {}", e)))?;
-            // Wrap K under the new W_c with sudp's canonical wrap primitive.
-            use sudp::primitives::{KeyWrap as _KeyWrap, WrapBinding};
-            type Wrap = <sudp::primitives::StdPrimitives as sudp::primitives::PrimitiveSuite>::Wrap;
-            let new_cid_bytes = decode_credential_id(&new_cid_str)?;
-            if vault.find_credential(&new_cid_bytes).is_some() {
-                return Err(AppError::Conflict(
-                    "credential already enrolled on this vault".into(),
-                ));
-            }
-            let binding = WrapBinding {
-                credential_id: &new_cid_bytes,
-                version: vault.version,
-            };
-            let wrapped_for_new = Wrap::wrap(&new_w_c, &opened.k[..], &binding)
-                .map_err(|e| AppError::Internal(format!("wrap K under new W_c: {}", e)))?;
-            let new_prf_salt = STANDARD
-                .decode(&pending.prf_salt)
-                .map_err(|_| AppError::BadRequest("prf_salt not base64".into()))?;
-            // Key-check value for the new credential, computed while W_c is still
-            // live: it lets a browser confirm a re-derived W_c before depositing
-            // a grant, WITHOUT unwrapping K. Then W_c is done — zeroize it.
-            let new_wc_check = sudp::primitives::wc_check_value::<sudp::primitives::HkdfSha256>(
-                &new_w_c,
-                &new_prf_salt,
-                &new_cid_bytes,
-            )
-            .map_err(|e| AppError::Internal(format!("wc_check: {}", e)))?;
-            let mut new_w_c = new_w_c;
-            new_w_c.zeroize();
-            // Append to credentials + registry, using the (x, y, prf_salt,
-            // device_name) we just popped from the pending file.
-            let mut updated = vault.clone();
-            updated.credentials.push(sudp::state::SealedCredential {
-                credential_id: new_cid_bytes.clone(),
-                prf_salt: new_prf_salt,
-                wrapped_key: wrapped_for_new,
-                wc_check: Some(new_wc_check.to_vec()),
-            });
-            let pk = sudp::passkey::WebAuthnPublicKey {
-                x: pending.x,
-                y: pending.y,
-                device_name: pending.device_name,
-            };
-            updated
-                .registry
-                .insert::<sudp::passkey::WebAuthn>(&new_cid_bytes, &pk)
-                .map_err(|e| AppError::Internal(format!("registry insert: {}", e)))?;
-            write_atomic(&vault_path, &updated)?;
-            tracing::info!(
-                vault = %vault_id,
-                cred_count = updated.credentials.len(),
-                "vault add-passkey applied (pending-passkey consumed)"
-            );
-            (
-                json!({ "ok": true, "act": "enroll", "target": "passkeys" }),
-                None,
-            )
-        }
-        ActType::Enroll => {
-            let credential = as_enroll_credential(&validated.op)?;
-            if existing_vault.is_some() || per_item_store_exists(&state, &vault_id) {
-                return Err(AppError::Conflict(
-                    "vault already initialized for this vault_id".into(),
-                ));
-            }
-            let payload = grant
-                .setup_payload
-                .as_ref()
-                .ok_or_else(|| AppError::BadRequest("enroll grant missing setup_payload".into()))?;
-            let cid_bytes = decode_credential_id(&credential.credential_id)?;
-            let prf_salt = STANDARD
-                .decode(&credential.prf_salt)
-                .map_err(|_| AppError::BadRequest("prf_salt not base64".into()))?;
-            let wrapped_key = STANDARD
-                .decode(&payload.wrapped_key)
-                .map_err(|_| AppError::BadRequest("wrapped_key not base64".into()))?;
-            let ciphertext = STANDARD
-                .decode(&payload.ciphertext)
-                .map_err(|_| AppError::BadRequest("ciphertext not base64".into()))?;
-            let vault = build_initial(
-                cid_bytes,
-                credential.public_key_x,
-                credential.public_key_y,
-                credential.device_name,
-                prf_salt,
-                wrapped_key,
-                ciphertext,
-            )?;
-            state.vaults.ensure_dir(&vault_id)?;
-            write_atomic(&vault_path, &vault)?;
-            tracing::info!(vault = %vault_id, "vault enroll complete");
-            // Auto-unlock after Enroll: the user just proved their passkey,
-            // and we already hold W_c. Bootstrapping the cache inline here
-            // saves /try (and any first-time-setup flow) a second passkey
-            // ceremony before the agent's first /use call. Best-effort — a
-            // bootstrap failure leaves the vault Locked (user can manually
-            // unlock later) rather than failing the enroll.
-            if let Ok((view, k)) = decrypt_vault_view_keep_key(
-                &validated.op,
-                &validated.wrapping_key,
-                &validated.credential_id_bytes,
-                &vault,
-            ) {
-                // PER-ITEM: seed the local per-item store from the just-enrolled
-                // ProtectedState. The browser still hands ONE sealed ciphertext
-                // at enroll; the daemon re-shards it into N `seal_record` item
-                // rows under the SAME K, so the per-item read path (Use/Export/
-                // unlock) can serve from items. Best-effort: a failure leaves
-                // only the whole-blob vault.dat, which the read paths still fall
-                // back to (stubbed[]).
-                seed_per_item_store(&state, &vault_id, &vault, &view, &k);
-                let cache = bootstrap_cache_from_view(&view, &state);
-                tracing::info!(
-                    vault = %vault_id,
-                    cached_services = cache.entries.len(),
-                    "vault auto-unlocked after enroll"
-                );
-                state.unlock_vault(vault_id.clone(), cache, k);
-            }
-            (
-                json!({ "ok": true, "vault_id": vault_id, "act": "enroll" }),
-                None,
-            )
-        }
-        // Retired (also refused at op creation): see WHOLE_BLOB_WRITE_RETIRED.
-        ActType::Write => {
-            return Err(AppError::BadRequest(WHOLE_BLOB_WRITE_RETIRED.into()));
-        }
-        ActType::Revoke => {
-            // Remove-passkey. `target = "passkeys.<cid_b64>"`. K stays
-            // the same — we only drop the named credential's SealedCredential
-            // entry and Registry record. At-least-one safeguard prevents
-            // locking the user out of their own vault.
-            //
-            // Acting credential CAN revoke itself (matches per-VM and 1P
-            // behavior — user might want to remove a compromised device).
-            // The at-least-one safeguard still catches "revoking the only
-            // remaining credential".
-            let target = validated.op.act.target.as_str();
-            let cid_b64 = target.strip_prefix("passkeys.").ok_or_else(|| {
-                AppError::BadRequest("revoke target must be 'passkeys.<credential_id>'".into())
-            })?;
-            let mut vault = existing_vault
-                .clone()
-                .ok_or_else(|| AppError::Conflict("vault not initialized".into()))?;
-            if vault.credentials.len() <= 1 {
-                return Err(AppError::BadRequest(
-                    "cannot remove the last passkey — add another one first".into(),
-                ));
-            }
-            let cid_bytes = decode_credential_id(cid_b64)?;
-            if vault.find_credential(&cid_bytes).is_none() {
-                return Err(AppError::BadRequest(
-                    "target credential not enrolled on this vault".into(),
-                ));
-            }
-            vault.credentials.retain(|c| c.credential_id != cid_bytes);
-            vault.registry.remove(&cid_bytes);
-            write_atomic(&vault_path, &vault)?;
-            tracing::info!(
-                vault = %vault_id,
-                cred_count = vault.credentials.len(),
-                "vault revoke-passkey applied"
-            );
-            (
-                json!({ "ok": true, "act": "revoke", "target": target }),
-                None,
-            )
-        }
         ActType::Export => {
             let path = export_precheck(&validated.op)?;
-            // Read seam: per-item store first, whole-blob vault.dat as fallback
-            // (Option — a web-enrolled per-item vault has no vault.dat).
-            let view = crate::server::handlers::metadata::open_view_for_grant(
-                &state,
-                &vault_id,
-                &validated.op,
-                &validated.wrapping_key,
-                &validated.credential_id_bytes,
-                existing_vault.as_ref(),
-            )?;
+            let (view, _k) = open_with_k(&state, &vault_id, &k)?;
             {
                 let raw = view
                     .resolve_value_async(path)
@@ -1050,23 +750,13 @@ pub async fn approve_op(
             }
         }
         ActType::Use => {
-            // Read seam (per-item first, whole-blob Option fallback) lives inside
-            // the broker resolve call — so a web-enrolled per-item vault
-            // (no vault.dat) resolves without the old "vault not initialized" bail.
             // Phantom-only: an approved Use op is ALWAYS authorize_only — the
             // resident proxy serves live traffic and retries the real request
             // after approval. Resolve the connection's primary secret with the
-            // verified grant and stash it so the retry fast-paths; never forward
-            // here (there is no buffered request on the op plane).
-            let s_o = crate::server::broker::resolve_use_primary(
-                &validated.op,
-                &validated.wrapping_key,
-                &validated.credential_id_bytes,
-                existing_vault.as_ref(),
-                &state,
-                &vault_id,
-            )
-            .await?;
+            // delivered K and stash it so the retry fast-paths.
+            let s_o =
+                crate::server::broker::resolve_use_primary(&validated.op, &k, &state, &vault_id)
+                    .await?;
             let scope = &validated.op.act.scope;
             let conn = scope
                 .get("connection_id")
@@ -1171,19 +861,9 @@ pub async fn approve_op(
             // shape Export-with-target="env" returned, so /try's editor
             // doesn't need a separate reveal call).
             "vault-unlock" => {
-                // Read seam: per-item store first (a web-enrolled vault has only
-                // vault.per-item.json, no vault.dat), whole-blob as Option fallback.
-                let (view, unlock_key) =
-                    crate::server::handlers::metadata::open_view_for_grant_keep_key(
-                        &state,
-                        &vault_id,
-                        &validated.op,
-                        &validated.wrapping_key,
-                        &validated.credential_id_bytes,
-                        existing_vault.as_ref(),
-                    )?;
+                let (view, unlock_key) = open_with_k(&state, &vault_id, &k)?;
                 // vault-unlock is a pure STATE TRANSITION: it uses the grant's
-                // W_c to open the vault, bootstrap the daemon's in-memory
+                // K to open the vault, bootstrap the daemon's in-memory
                 // secrets cache, and flip the vault unlocked. It deliberately
                 // returns NO secret material. The console editor derives its
                 // `{kv, aux}` view entirely client-side (it pulls the sealed
@@ -1206,17 +886,6 @@ pub async fn approve_op(
                     "vault unlocked"
                 );
                 state.unlock_vault(vault_id.clone(), cache, unlock_key);
-                // Backfill the acting credential's key-check value if the stored
-                // keyset predates it (best-effort; we hold the write guard). This
-                // lets a later cross-device approval fail FAST in the browser
-                // (the KCV won't match a divergent W_c) instead of silently
-                // hanging on an unseal the daemon can't complete.
-                maybe_backfill_wc_check(
-                    &state,
-                    &vault_id,
-                    &validated.credential_id_bytes,
-                    &validated.wrapping_key,
-                );
                 // On unlock, complete any pending OAuth connect: a
                 // browser "Connect" may have sealed `<conn>_oauth_pending`
                 // into the vault while it was locked (or before this device
@@ -1252,9 +921,6 @@ pub async fn approve_op(
             // approved, this is irreversible — the user must re-enroll to
             // get a new vault.
             "vault-delete" => {
-                if existing_vault.is_none() {
-                    return Err(AppError::Conflict("vault not initialized".into()));
-                }
                 // Close the cached AuditStore SQLite handle BEFORE removing
                 // the directory. On Linux, unlinking a file that still has
                 // an open fd leaves the inode alive: any subsequent
@@ -1276,68 +942,6 @@ pub async fn approve_op(
                 state.last_host_unions.lock().unwrap().remove(&vault_id);
                 tracing::info!(vault = %vault_id, "vault deleted");
                 (json!({ "ok": true, "act": "vault-delete" }), None)
-            }
-            // Rename a passkey's `device_name`. Pure registry update — K,
-            // M, and credentials list stay untouched. Modeled as Custom
-            // (not Write/Rotate) because it doesn't mutate the protected
-            // state, just an opaque public-info field.
-            //
-            // Wire shape: `target = "passkeys.<cid_b64>"`,
-            // `scope = { device_name: "<new name>" }`.
-            // Acting credential authenticates via the standard grant
-            // pipeline. Self-rename allowed (matches per-VM UX).
-            "rename-passkey" => {
-                let target = validated.op.act.target.as_str();
-                let cid_b64 = target.strip_prefix("passkeys.").ok_or_else(|| {
-                    AppError::BadRequest(
-                        "rename-passkey target must be 'passkeys.<credential_id>'".into(),
-                    )
-                })?;
-                let new_name = validated
-                    .op
-                    .act
-                    .scope
-                    .get("device_name")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| {
-                        AppError::BadRequest("rename-passkey scope.device_name required".into())
-                    })?
-                    .trim()
-                    .to_string();
-                if new_name.is_empty() {
-                    return Err(AppError::BadRequest("device_name cannot be empty".into()));
-                }
-                if new_name.len() > 120 {
-                    return Err(AppError::BadRequest(
-                        "device_name too long (max 120 chars)".into(),
-                    ));
-                }
-                let mut vault = existing_vault
-                    .clone()
-                    .ok_or_else(|| AppError::Conflict("vault not initialized".into()))?;
-                let cid_bytes = decode_credential_id(cid_b64)?;
-                let mut pk = vault
-                    .registry
-                    .get::<sudp::passkey::WebAuthn>(&cid_bytes)
-                    .map_err(|e| AppError::Internal(format!("registry get: {}", e)))?
-                    .ok_or_else(|| {
-                        AppError::BadRequest("target credential not enrolled on this vault".into())
-                    })?;
-                pk.device_name = new_name.clone();
-                vault
-                    .registry
-                    .insert::<sudp::passkey::WebAuthn>(&cid_bytes, &pk)
-                    .map_err(|e| AppError::Internal(format!("registry insert: {}", e)))?;
-                write_atomic(&vault_path, &vault)?;
-                tracing::info!(
-                    vault = %vault_id,
-                    cred = %cid_b64,
-                    "passkey rename applied"
-                );
-                (
-                    json!({ "ok": true, "act": "rename-passkey", "target": target, "device_name": new_name }),
-                    None,
-                )
             }
             // Component C — one-tap host widen. The agent hit a destination the
             // connection doesn't anchor; the user approves adding that exact
@@ -1371,20 +975,11 @@ pub async fn approve_op(
                 // the anchor, then persist DURABLY into `aux.connections[conn]`
                 // so the grant survives a restart / re-unlock — the same
                 // open -> mutate -> reseal -> push path connection-add/secret-set
-                // use. The grant already carries W_c (every approve path attaches
-                // it, act-agnostic: cli/approve.rs + fe vault-grant.ts), so this
-                // opens + reseals the vault like any other mutating custom act.
+                // use. The grant carries K, so this opens + reseals the vault like
+                // any other mutating custom act.
                 state.widen_connection_host(&vault_id, &conn, &host);
                 crate::cli::conn::validate_raw_host(&host).map_err(AppError::BadRequest)?;
-                let (mut view, k) =
-                    crate::server::handlers::metadata::open_view_for_grant_keep_key(
-                        &state,
-                        &vault_id,
-                        &validated.op,
-                        &validated.wrapping_key,
-                        &validated.credential_id_bytes,
-                        existing_vault.as_ref(),
-                    )?;
+                let (mut view, k) = open_with_k(&state, &vault_id, &k)?;
                 let base = crate::storage::sealed_vault::ViewBase::of(&view)?;
                 match view.aux.connections.get_mut(&conn) {
                     Some(rec) => {
@@ -1419,7 +1014,6 @@ pub async fn approve_op(
                     let state = state.clone();
                     let vid = vault_id.clone();
                     tokio::spawn(async move {
-                        crate::sync::push_keys_best_effort(&state, &vid).await;
                         crate::sync::push_items_best_effort(&state, &vid).await;
                     });
                 }
@@ -1457,15 +1051,7 @@ pub async fn approve_op(
                         "narrow-host scope needs connection_id + host".into(),
                     ));
                 }
-                let (mut view, k) =
-                    crate::server::handlers::metadata::open_view_for_grant_keep_key(
-                        &state,
-                        &vault_id,
-                        &validated.op,
-                        &validated.wrapping_key,
-                        &validated.credential_id_bytes,
-                        existing_vault.as_ref(),
-                    )?;
+                let (mut view, k) = open_with_k(&state, &vault_id, &k)?;
                 let base = crate::storage::sealed_vault::ViewBase::of(&view)?;
                 let mut removed = false;
                 if let Some(rec) = view.aux.connections.get_mut(&conn) {
@@ -1482,7 +1068,6 @@ pub async fn approve_op(
                         let state = state.clone();
                         let vid = vault_id.clone();
                         tokio::spawn(async move {
-                            crate::sync::push_keys_best_effort(&state, &vid).await;
                             crate::sync::push_items_best_effort(&state, &vid).await;
                         });
                     }
@@ -1495,19 +1080,12 @@ pub async fn approve_op(
             }
             // List the vault's custom service definitions (`aux.services`) with
             // each one's validation status + referencing connections. Read-only
-            // (opens the view under the grant's W_c, never writes). This is the
+            // (opens the view under the grant's K, never writes). This is the
             // only surface that shows an INVALID definition — the daemon skips
             // those at unlock and the console only renders a def through its
             // connections, so a broken/orphaned def is otherwise invisible.
             "service-ls" => {
-                let (view, _k) = crate::server::handlers::metadata::open_view_for_grant_keep_key(
-                    &state,
-                    &vault_id,
-                    &validated.op,
-                    &validated.wrapping_key,
-                    &validated.credential_id_bytes,
-                    existing_vault.as_ref(),
-                )?;
+                let (view, _k) = open_with_k(&state, &vault_id, &k)?;
                 let mut services = Vec::new();
                 for (id, toml_src) in &view.aux.services {
                     let problems = crate::service::validate::validate_service(toml_src)
@@ -1535,15 +1113,7 @@ pub async fn approve_op(
                         "service-rm target (service id) required".into(),
                     ));
                 }
-                let (mut view, k) =
-                    crate::server::handlers::metadata::open_view_for_grant_keep_key(
-                        &state,
-                        &vault_id,
-                        &validated.op,
-                        &validated.wrapping_key,
-                        &validated.credential_id_bytes,
-                        existing_vault.as_ref(),
-                    )?;
+                let (mut view, k) = open_with_k(&state, &vault_id, &k)?;
                 let base = crate::storage::sealed_vault::ViewBase::of(&view)?;
                 let refs = service_refs(&view, &id);
                 if view.aux.services.remove(&id).is_none() {
@@ -1558,7 +1128,6 @@ pub async fn approve_op(
                     let state = state.clone();
                     let vid = vault_id.clone();
                     tokio::spawn(async move {
-                        crate::sync::push_keys_best_effort(&state, &vid).await;
                         crate::sync::push_items_best_effort(&state, &vid).await;
                     });
                 }
@@ -1598,15 +1167,7 @@ pub async fn approve_op(
                         id
                     )));
                 }
-                let (mut view, k) =
-                    crate::server::handlers::metadata::open_view_for_grant_keep_key(
-                        &state,
-                        &vault_id,
-                        &validated.op,
-                        &validated.wrapping_key,
-                        &validated.credential_id_bytes,
-                        existing_vault.as_ref(),
-                    )?;
+                let (mut view, k) = open_with_k(&state, &vault_id, &k)?;
                 let base = crate::storage::sealed_vault::ViewBase::of(&view)?;
                 view.aux.services.insert(id.clone(), toml_src);
                 crate::auth::connect::persist_mutated_view(&state, &vault_id, &base, &view, &k)
@@ -1615,7 +1176,6 @@ pub async fn approve_op(
                     let state = state.clone();
                     let vid = vault_id.clone();
                     tokio::spawn(async move {
-                        crate::sync::push_keys_best_effort(&state, &vid).await;
                         crate::sync::push_items_best_effort(&state, &vid).await;
                     });
                 }
@@ -1636,15 +1196,7 @@ pub async fn approve_op(
                         "secret-rm target (key) required".into(),
                     ));
                 }
-                let (mut view, k) =
-                    crate::server::handlers::metadata::open_view_for_grant_keep_key(
-                        &state,
-                        &vault_id,
-                        &validated.op,
-                        &validated.wrapping_key,
-                        &validated.credential_id_bytes,
-                        existing_vault.as_ref(),
-                    )?;
+                let (mut view, k) = open_with_k(&state, &vault_id, &k)?;
                 let base = crate::storage::sealed_vault::ViewBase::of(&view)?;
                 if !view.native_secrets.contains_key(&key) {
                     // One flat namespace, two authorities: SafeClaw OWNS
@@ -1674,7 +1226,6 @@ pub async fn approve_op(
                     let state = state.clone();
                     let vid = vault_id.clone();
                     tokio::spawn(async move {
-                        crate::sync::push_keys_best_effort(&state, &vid).await;
                         crate::sync::push_items_best_effort(&state, &vid).await;
                     });
                 }
@@ -1704,15 +1255,7 @@ pub async fn approve_op(
                     .get("keep_secrets")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
-                let (mut view, k) =
-                    crate::server::handlers::metadata::open_view_for_grant_keep_key(
-                        &state,
-                        &vault_id,
-                        &validated.op,
-                        &validated.wrapping_key,
-                        &validated.credential_id_bytes,
-                        existing_vault.as_ref(),
-                    )?;
+                let (mut view, k) = open_with_k(&state, &vault_id, &k)?;
                 let base = crate::storage::sealed_vault::ViewBase::of(&view)?;
                 let rec = view.aux.connections.get(&id).cloned().ok_or_else(|| {
                     AppError::BadRequest(format!("no connection '{}' in this vault", id))
@@ -1740,7 +1283,6 @@ pub async fn approve_op(
                     let state = state.clone();
                     let vid = vault_id.clone();
                     tokio::spawn(async move {
-                        crate::sync::push_keys_best_effort(&state, &vid).await;
                         crate::sync::push_items_best_effort(&state, &vid).await;
                     });
                 }
@@ -1838,15 +1380,7 @@ pub async fn approve_op(
                     }
                 }
 
-                let (mut view, k) =
-                    crate::server::handlers::metadata::open_view_for_grant_keep_key(
-                        &state,
-                        &vault_id,
-                        &validated.op,
-                        &validated.wrapping_key,
-                        &validated.credential_id_bytes,
-                        existing_vault.as_ref(),
-                    )?;
+                let (mut view, k) = open_with_k(&state, &vault_id, &k)?;
                 let base = crate::storage::sealed_vault::ViewBase::of(&view)?;
 
                 let record = match &service {
@@ -1984,7 +1518,6 @@ pub async fn approve_op(
                     let state = state.clone();
                     let vid = vault_id.clone();
                     tokio::spawn(async move {
-                        crate::sync::push_keys_best_effort(&state, &vid).await;
                         crate::sync::push_items_best_effort(&state, &vid).await;
                     });
                 }
@@ -2040,15 +1573,7 @@ pub async fn approve_op(
                     ));
                 }
 
-                let (mut view, k) =
-                    crate::server::handlers::metadata::open_view_for_grant_keep_key(
-                        &state,
-                        &vault_id,
-                        &validated.op,
-                        &validated.wrapping_key,
-                        &validated.credential_id_bytes,
-                        existing_vault.as_ref(),
-                    )?;
+                let (mut view, k) = open_with_k(&state, &vault_id, &k)?;
                 let base = crate::storage::sealed_vault::ViewBase::of(&view)?;
                 let removed_prior_anchor = apply_secret_set_to_view(
                     &mut view,
@@ -2075,7 +1600,6 @@ pub async fn approve_op(
                     let state = state.clone();
                     let vid = vault_id.clone();
                     tokio::spawn(async move {
-                        crate::sync::push_keys_best_effort(&state, &vid).await;
                         crate::sync::push_items_best_effort(&state, &vid).await;
                     });
                 }
@@ -2394,11 +1918,11 @@ pub(crate) fn finish_chain_siblings(
         let (audit_reason, relay_reason) = match outcome {
             ChainOutcome::Satisfied { by } => (
                 format!("satisfied by {}", by),
-                crate::relay::client::CancelReason::Satisfied { by: by.to_string() },
+                crate::ops::client::CancelReason::Satisfied { by: by.to_string() },
             ),
             ChainOutcome::Rejected { by } => (
                 format!("rejected with {}", by),
-                crate::relay::client::CancelReason::Rejected,
+                crate::ops::client::CancelReason::Rejected,
             ),
         };
         if let Ok(store) = state.audits.for_vault(&sib.vault_id) {
@@ -2423,7 +1947,7 @@ pub(crate) fn finish_chain_siblings(
             response_preview: None,
             reason: Some(audit_reason),
         });
-        crate::relay::client::spawn_cancel(
+        crate::ops::client::spawn_cancel(
             state.clone(),
             sib.vault_id.clone(),
             sib.id.clone(),
@@ -2520,88 +2044,6 @@ pub async fn reject_op(
     ))
 }
 
-/// Build the per-service `secrets_cache` from a decrypted v3 view. The cache
-/// carries three things per session:
-///   1. `entries` — resolved auth bytes for every service whose required
-///      item is currently available (any store). Per-rule evaluation at /use
-///      time decides whether to USE them (Allow), prompt (Ask / AskAlways),
-///      or block (Deny) — so we don't pre-filter to allow-default services
-///      anymore: a rule-level Allow on a service whose default was Ask still
-///      needs the bytes ready for fast-path forwarding.
-///   2. `policy` — the effective policy tree (`aux.policy` overlaid on
-///      compiled defaults). Holds default floors, per-tag, and
-///      per-connection user policy. Built-in per-service rules are read
-///      live from the service at eval, not cached here.
-/// Build + persist the local per-item store (`vault.per-item.json`) for a NEW
-/// vault from its just-decrypted Enroll view. The keyset (registry + credentials
-/// + wrapped_key) is copied verbatim from the whole-blob `SealedVault` (it's
-/// what gives you `K`); the content is sharded from `view` into N `seal_record`
-/// item rows under the same `K` (contract §2/§4).
-///
-/// Never touches an EXISTING store (any format): a whole-blob view has no
-/// base, so writing it over a live store could neither tell "absent" from
-/// "deleted" nor "older" from "changed". The Enroll arm already refuses a
-/// vault id that has one ([`per_item_store_exists`]); this is the backstop.
-/// Best-effort: a failure logs and leaves only `vault.dat`, which the read
-/// paths fall back to.
-fn seed_per_item_store(
-    state: &AppState,
-    vault_id: &str,
-    vault: &crate::storage::SealedVault,
-    view: &VaultPlaintextView,
-    k: &[u8],
-) {
-    use crate::storage::sealed_vault::{Keyset, PerItemVault};
-    let Ok(per_item_path) = state.vaults.per_item_path(vault_id) else {
-        return;
-    };
-    if per_item_path.exists() {
-        tracing::warn!(vault = %vault_id, "per-item seed skipped: a per-item store already exists");
-        return;
-    }
-    let mut pv = PerItemVault {
-        keyset: Keyset {
-            version: vault.version,
-            registry: vault.registry.clone(),
-            credentials: vault.credentials.clone(),
-            keyset_version: 0,
-            // Bootstrapped from a v1 whole-blob vault → v1 keyset (a v2 vault is
-            // born directly as a per-item store in the ceremony, never here).
-            uik: None,
-        },
-        items: std::collections::BTreeMap::new(),
-        items_seq: 0,
-        keyset_seq: 0,
-    };
-    if let Err(e) = pv.seed_items_from_view::<sudp::primitives::StdPrimitives>(
-        crate::storage::item::VaultKeys::single(k),
-        vault_id,
-        view,
-    ) {
-        tracing::warn!(vault = %vault_id, "per-item seed from view failed: {}", e);
-        return;
-    }
-    if let Err(e) = crate::storage::sealed_vault::write_per_item_atomic(&per_item_path, &pv) {
-        tracing::warn!(vault = %vault_id, "per-item store write failed: {}", e);
-        return;
-    }
-    tracing::info!(
-        vault = %vault_id,
-        items = pv.items.len(),
-        "per-item store seeded"
-    );
-}
-
-/// A per-item store file exists for `vault_id` (readable or not). A vault id
-/// that has one is already initialized: Enroll must not seed over it.
-fn per_item_store_exists(state: &AppState, vault_id: &str) -> bool {
-    state
-        .vaults
-        .per_item_path(vault_id)
-        .map(|p| p.exists())
-        .unwrap_or(false)
-}
-
 /// The refusal for a whole-blob `ActType::Write`. No current client sends one
 /// (console writes are per-item; the CLI writes through grant-approved
 /// mutations), and applying a base-less full replacement would revert or drop
@@ -2620,6 +2062,18 @@ fn cacheable_roles(svc: &crate::service::ServiceDef) -> Vec<String> {
     roles
 }
 
+/// Build the per-service `secrets_cache` from a decrypted v3 view. The cache
+/// carries three things per session:
+///   1. `entries` — resolved auth bytes for every service whose required
+///      item is currently available (any store). Per-rule evaluation at /use
+///      time decides whether to USE them (Allow), prompt (Ask / AskAlways),
+///      or block (Deny) — so we don't pre-filter to allow-default services
+///      anymore: a rule-level Allow on a service whose default was Ask still
+///      needs the bytes ready for fast-path forwarding.
+///   2. `policy` — the effective policy tree (`aux.policy` overlaid on
+///      compiled defaults). Holds default floors, per-tag, and
+///      per-connection user policy. Built-in per-service rules are read
+///      live from the service at eval, not cached here.
 pub(crate) fn bootstrap_cache_from_view(
     view: &VaultPlaintextView,
     state: &AppState,
@@ -2713,7 +2167,7 @@ pub(crate) fn bootstrap_cache_from_view(
         // `allow` get their auth value loaded at unlock. ask / ask-always
         // connections don't sit in cache pre-approval — they're filled lazily
         // by `approve_op` after the user passkey gesture (ask) or never
-        // (ask-always — fresh-decrypted-per-request via the grant's W_c and
+        // (ask-always — fresh-decrypted-per-request via the grant's K and
         // immediately zeroized). Marked `from_bootstrap` so a per-path
         // ask/ask-always RULE on this (read-allow) connection still forces a
         // fresh passkey instead of riding this residency.
@@ -3091,6 +2545,17 @@ mod tests {
     use crate::storage::plaintext::{Store, VaultAux};
     use std::collections::BTreeMap;
 
+    /// This daemon's device in every test state.
+    const DEVICE_SEED: u8 = 0x51;
+
+    /// The vault owner fixture as a person whose ledger tests grow.
+    fn owner_person() -> crate::trust::test_support::Person {
+        crate::trust::test_support::Person::from_identity(
+            crate::storage::sealed_vault::test_support::owner().signing(),
+        )
+    }
+
+    /// A state paired as [`DEVICE_SEED`], admitted by the vault-owner fixture.
     fn test_state() -> AppState {
         let cfg = crate::config::Config {
             state_dir: std::path::PathBuf::from(format!(
@@ -3102,11 +2567,28 @@ mod tests {
             listen: "127.0.0.1".into(),
             origin: "http://localhost".into(),
             rp_id: "localhost".into(),
-            admin_key: None,
-            relay_url: None,
             body_cap: crate::config::DEFAULT_BODY_CAP,
         };
-        AppState::new(cfg)
+        let state = AppState::new(cfg);
+        crate::ops::test_support::pair_person(&state, DEVICE_SEED, owner_person());
+        state
+    }
+
+    /// The requester every op this test daemon mints carries.
+    fn me() -> crate::protocol::operation::OpRequester {
+        crate::protocol::operation::OpRequester {
+            device: crate::device::tests_support::device(DEVICE_SEED)
+                .id()
+                .to_string(),
+            member: crate::storage::sealed_vault::test_support::owner().user_id(),
+        }
+    }
+
+    fn stamped(
+        mut op: crate::protocol::operation::Operation,
+    ) -> crate::protocol::operation::Operation {
+        crate::protocol::operation::stamp_requester(&mut op.act, &me()).unwrap();
+        op
     }
 
     fn empty_view() -> crate::storage::plaintext::VaultPlaintextView {
@@ -3234,19 +2716,23 @@ mod tests {
     }
 
     fn export_op(target: &str) -> crate::protocol::operation::Operation {
+        export_op_in("v1", target)
+    }
+
+    fn export_op_in(vault: &str, target: &str) -> crate::protocol::operation::Operation {
         use crate::protocol::operation::{Act, ActType, Bind, Operation, Valid};
-        Operation {
+        stamped(Operation {
             act: Act {
                 kind: ActType::Export,
                 target: target.into(),
                 scope: serde_json::Value::Null,
             },
             bind: Bind {
-                redeemer: "v1".into(),
+                redeemer: vault.into(),
                 recipient: None,
             },
             valid: Valid::single_use(0, None),
-        }
+        })
     }
 
     // An Export reveals a raw secret; its plaintext must be handed to exactly
@@ -3380,7 +2866,7 @@ mod tests {
 
     fn use_op(vault: &str, path: &str) -> crate::protocol::operation::Operation {
         use crate::protocol::operation::{Act, Bind, Valid};
-        crate::protocol::operation::Operation {
+        stamped(crate::protocol::operation::Operation {
             act: Act {
                 kind: ActType::Use,
                 target: "github".into(),
@@ -3391,7 +2877,7 @@ mod tests {
                 recipient: None,
             },
             valid: Valid::single_use(0, None),
-        }
+        })
     }
 
     fn batch_grant(
@@ -3403,9 +2889,8 @@ mod tests {
             o: op,
             r: r.into(),
             credential_id: "cred1".into(),
-            wrapping_key: None,
-            wk_enc: None,
-            wk_ct: None,
+            k_enc: None,
+            k_ct: None,
             assertion: None,
             batch: Some(crate::protocol::grant::BatchProof {
                 op_ids,
@@ -3416,8 +2901,6 @@ mod tests {
                     signature: String::new(),
                 },
             }),
-            setup_payload: None,
-            opt: None,
         }
     }
 
@@ -3982,41 +3465,424 @@ mod tests {
         assert_eq!(op_poll_value(&state, &a.id, None).unwrap()["status"], "ok");
     }
 
-    /// Enroll seeds a per-item store ONLY for a new vault: an existing store
-    /// file (any format, even unreadable) is never written over, and its
-    /// presence marks the vault id as initialized.
-    #[test]
-    fn enroll_seed_never_touches_an_existing_store() {
-        let state = test_state();
-        let vid = format!("seed-guard-{}", std::process::id());
-        let k = [0x42u8; 32];
+    // ── K-only grants (contract 1.6 / 1.7, design D5 / D6) ──────────────────
+
+    /// A passkey the tests sign with: a P-256 key, its raw credential id, and
+    /// its ledger admission (`principal = b64url(cid)`, `sig_pub = x‖y`).
+    struct TestPasskey {
+        sk: p256::ecdsa::SigningKey,
+        cid: Vec<u8>,
+    }
+
+    impl TestPasskey {
+        fn new(seed: u8, cid: &[u8]) -> Self {
+            Self {
+                sk: p256::ecdsa::SigningKey::from_bytes(&[seed; 32].into()).unwrap(),
+                cid: cid.to_vec(),
+            }
+        }
+        fn cid_b64u(&self) -> String {
+            URL_SAFE_NO_PAD.encode(&self.cid)
+        }
+        fn xy(&self) -> Vec<u8> {
+            let pt = p256::ecdsa::VerifyingKey::from(&self.sk).to_encoded_point(false);
+            let mut xy = pt.x().unwrap().to_vec();
+            xy.extend_from_slice(pt.y().unwrap());
+            xy
+        }
+        /// A WebAuthn assertion over `challenge` for origin/rp `localhost`.
+        fn assert(&self, challenge: &[u8; 32]) -> crate::passkey::webauthn::AssertionData {
+            use base64::engine::general_purpose::STANDARD as B64;
+            use p256::ecdsa::signature::Signer as _;
+            use sha2::{Digest, Sha256};
+            let cdj = serde_json::to_vec(&json!({
+                "type": "webauthn.get",
+                "challenge": URL_SAFE_NO_PAD.encode(challenge),
+                "origin": "http://localhost",
+            }))
+            .unwrap();
+            let mut auth = Sha256::digest(b"localhost").to_vec();
+            auth.push(0x05); // UP | UV
+            auth.extend_from_slice(&[0, 0, 0, 1]);
+            let mut signed = auth.clone();
+            signed.extend_from_slice(&Sha256::digest(&cdj));
+            let sig: p256::ecdsa::Signature = self.sk.sign(&signed);
+            crate::passkey::webauthn::AssertionData {
+                credential_id: None,
+                authenticator_data: B64.encode(&auth),
+                client_data_json: B64.encode(&cdj),
+                signature: B64.encode(sig.to_der().as_bytes()),
+            }
+        }
+    }
+
+    /// The owner's ledger: this device, plus each given passkey.
+    /// The owner's ledger: this device, a pin of `vault` to the owner fixture's
+    /// anchor (as the console writes at create/upgrade), and each passkey.
+    fn admit_passkeys(state: &AppState, vault: &str, passkeys: &[&TestPasskey]) {
+        use crate::crypto::ledger::{KIND_DEVICE, KIND_PASSKEY, KIND_PIN, OP_ADMIT};
+        let device = crate::device::tests_support::device(DEVICE_SEED);
+        let mut person = owner_person();
+        person.push(
+            OP_ADMIT,
+            KIND_DEVICE,
+            device.id().to_string(),
+            device.sig_pub().to_vec(),
+            device.enc_pub().to_vec(),
+        );
+        person.push(
+            OP_ADMIT,
+            KIND_PIN,
+            vault.to_string(),
+            crate::storage::sealed_vault::test_support::owner()
+                .signing()
+                .public_bytes()
+                .to_vec(),
+            Vec::new(),
+        );
+        for pk in passkeys {
+            person.push(OP_ADMIT, KIND_PASSKEY, pk.cid_b64u(), pk.xy(), Vec::new());
+        }
+        state.trust.set_own_ledger(person.fold());
+    }
+
+    /// A vault on a verified record over `bundle`, holding `GITHUB_TOKEN`.
+    fn seed_vault(state: &AppState, vault: &str, bundle: &[u8; 64]) {
         let mut view = empty_view();
-        view.native_secrets.insert("A".into(), b"one".to_vec());
-        let vault = build_initial(
-            b"c".to_vec(),
-            "x".into(),
-            "y".into(),
-            "Dev".into(),
-            vec![0u8; 32],
-            vec![0u8; 48],
-            vec![0u8; 16],
+        view.native_secrets
+            .insert("GITHUB_TOKEN".into(), b"ghp_k_only".to_vec());
+        let mut pv = crate::storage::sealed_vault::test_support::store_for(vault, bundle);
+        pv.seed_items_from_view::<sudp::primitives::StdPrimitives>(
+            crate::storage::item::VaultKeys::from_material(bundle),
+            vault,
+            &view,
         )
         .unwrap();
-        let path = state.vaults.per_item_path(&vid).unwrap();
-        let _ = std::fs::remove_file(&path);
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        state.vaults.ensure_dir(vault).unwrap();
+        crate::storage::sealed_vault::write_per_item_atomic(
+            &state.vaults.per_item_path(vault).unwrap(),
+            &pv,
+        )
+        .unwrap();
+    }
 
-        // No store: Enroll may seed one.
-        assert!(!per_item_store_exists(&state, &vid));
-        seed_per_item_store(&state, &vid, &vault, &view, &k);
-        let seeded = read_per_item(&path).unwrap().expect("seeded");
-        assert!(!seeded.items.is_empty());
+    /// Park `op` as pending with a freshly issued challenge; returns (id, r).
+    fn park(
+        state: &AppState,
+        vault: &str,
+        op: &crate::protocol::operation::Operation,
+    ) -> (String, String) {
+        let r = state
+            .challenges
+            .lock()
+            .unwrap()
+            .issue("127.0.0.1".parse().unwrap())
+            .unwrap();
+        let id = state
+            .approvals
+            .lock()
+            .unwrap()
+            .create(vault.into(), op.clone(), r.clone());
+        (id, r)
+    }
 
-        // A store exists: initialized; a second seed leaves it byte-identical.
-        assert!(per_item_store_exists(&state, &vid));
-        std::fs::write(&path, b"not json").unwrap();
-        seed_per_item_store(&state, &vid, &vault, &view, &k);
-        assert_eq!(std::fs::read(&path).unwrap(), b"not json");
-        let _ = std::fs::remove_file(&path);
+    /// The console's grant: `bundle` sealed to `enc_pub` under the op's seal
+    /// info, and `passkey`'s assertion over the op's β.
+    fn k_grant(
+        op: &crate::protocol::operation::Operation,
+        op_id: &str,
+        r: &str,
+        bundle: &[u8],
+        enc_pub: &[u8],
+        passkey: &TestPasskey,
+    ) -> Grant {
+        use base64::engine::general_purpose::STANDARD as B64;
+        let beta = crate::crypto::binding::binding_for_op(
+            crate::crypto::binding::DOMAIN_STANDARD,
+            &B64.decode(r).unwrap(),
+            &serde_json::to_value(op).unwrap(),
+        )
+        .unwrap();
+        let (enc, ct) = crate::crypto::envelope::seal_to(
+            enc_pub,
+            bundle,
+            &crate::crypto::envelope::grant_seal_info(op_id),
+            b"",
+        )
+        .unwrap();
+        Grant {
+            o: op.clone(),
+            r: r.into(),
+            credential_id: passkey.cid_b64u(),
+            k_enc: Some(URL_SAFE_NO_PAD.encode(&enc)),
+            k_ct: Some(URL_SAFE_NO_PAD.encode(&ct)),
+            assertion: Some(passkey.assert(&beta)),
+            batch: None,
+        }
+    }
+
+    fn bundle() -> [u8; 64] {
+        std::array::from_fn(|i| i as u8)
+    }
+
+    fn own_enc_pub() -> [u8; 32] {
+        crate::device::tests_support::device(DEVICE_SEED).enc_pub()
+    }
+
+    /// The whole K-only path: an Export bound to this device, approved by a
+    /// passkey admitted in a member's ledger, delivering the 64-byte K bundle
+    /// sealed to this device's enc key, reveals the secret (single use).
+    #[tokio::test]
+    async fn k_only_export_reveals_with_a_sealed_bundle() {
+        let state = Arc::new(test_state());
+        let vault = format!("kexp-{}", std::process::id());
+        let pk = TestPasskey::new(7, b"cred-k-only");
+        admit_passkeys(&state, &vault, &[&pk]);
+        seed_vault(&state, &vault, &bundle());
+        let op = export_op_in(&vault, "GITHUB_TOKEN");
+        let (id, r) = park(&state, &vault, &op);
+        let grant = k_grant(&op, &id, &r, &bundle(), &own_enc_pub(), &pk);
+        let resp = approve_op(State(state.clone()), Path(id.clone()), Json(grant))
+            .await
+            .expect("K-only Export approves");
+        assert_eq!(resp.0["value"], "ghp_k_only");
+        let _ = std::fs::remove_dir_all(
+            state
+                .vaults
+                .per_item_path(&vault)
+                .unwrap()
+                .parent()
+                .unwrap(),
+        );
+    }
+
+    /// The delivered K must match the record's owner-signed commitment: a
+    /// sealed bundle that is not the vault's K is refused, nothing revealed.
+    #[tokio::test]
+    async fn k_only_refuses_a_bundle_that_misses_the_commitment() {
+        let state = Arc::new(test_state());
+        let vault = format!("kwrong-{}", std::process::id());
+        let pk = TestPasskey::new(7, b"cred-k-only");
+        admit_passkeys(&state, &vault, &[&pk]);
+        seed_vault(&state, &vault, &bundle());
+        let op = export_op_in(&vault, "GITHUB_TOKEN");
+        let (id, r) = park(&state, &vault, &op);
+        let mut wrong = bundle();
+        wrong[63] ^= 1;
+        let grant = k_grant(&op, &id, &r, &wrong, &own_enc_pub(), &pk);
+        let err = approve_op(State(state.clone()), Path(id), Json(grant))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, AppError::Unauthorized(m) if m.contains("commitment")),
+            "{err}"
+        );
+        // A 32-byte K (the pre-reset shape) is refused too.
+        let op = export_op_in(&vault, "GITHUB_TOKEN");
+        let (id, r) = park(&state, &vault, &op);
+        let grant = k_grant(&op, &id, &r, &bundle()[..32], &own_enc_pub(), &pk);
+        let err = approve_op(State(state.clone()), Path(id), Json(grant))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, AppError::BadRequest(m) if m.contains("64-byte")),
+            "{err}"
+        );
+        let _ = std::fs::remove_dir_all(
+            state
+                .vaults
+                .per_item_path(&vault)
+                .unwrap()
+                .parent()
+                .unwrap(),
+        );
+    }
+
+    /// K sealed to another device's key does not open here.
+    #[tokio::test]
+    async fn k_only_refuses_a_bundle_sealed_to_another_device() {
+        let state = Arc::new(test_state());
+        let vault = format!("kother-{}", std::process::id());
+        let pk = TestPasskey::new(7, b"cred-k-only");
+        admit_passkeys(&state, &vault, &[&pk]);
+        seed_vault(&state, &vault, &bundle());
+        let op = export_op_in(&vault, "GITHUB_TOKEN");
+        let (id, r) = park(&state, &vault, &op);
+        let other = crate::device::tests_support::device(0x77).enc_pub();
+        let grant = k_grant(&op, &id, &r, &bundle(), &other, &pk);
+        let err = approve_op(State(state.clone()), Path(id), Json(grant))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, AppError::Unauthorized(m) if m.contains("does not open")),
+            "{err}"
+        );
+        let _ = std::fs::remove_dir_all(
+            state
+                .vaults
+                .per_item_path(&vault)
+                .unwrap()
+                .parent()
+                .unwrap(),
+        );
+    }
+
+    /// The approver's passkey must be admitted in the ledger of a CURRENT
+    /// member of the vault's record: a passkey nobody admitted is refused,
+    /// however valid its signature.
+    #[tokio::test]
+    async fn k_only_refuses_a_passkey_no_member_admitted() {
+        let state = Arc::new(test_state());
+        let vault = format!("kstranger-{}", std::process::id());
+        let admitted = TestPasskey::new(7, b"cred-k-only");
+        let stranger = TestPasskey::new(9, b"cred-stranger");
+        admit_passkeys(&state, &vault, &[&admitted]);
+        seed_vault(&state, &vault, &bundle());
+        let op = export_op_in(&vault, "GITHUB_TOKEN");
+        let (id, r) = park(&state, &vault, &op);
+        let grant = k_grant(&op, &id, &r, &bundle(), &own_enc_pub(), &stranger);
+        let err = approve_op(State(state.clone()), Path(id), Json(grant))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, AppError::Unauthorized(m) if m.contains("ledger")),
+            "{err}"
+        );
+        let _ = std::fs::remove_dir_all(
+            state
+                .vaults
+                .per_item_path(&vault)
+                .unwrap()
+                .parent()
+                .unwrap(),
+        );
+    }
+
+    /// An approval minted for another device (act.scope.requester.device) is
+    /// refused before any crypto, and so is an op with no requester at all.
+    #[tokio::test]
+    async fn approve_refuses_an_op_bound_to_another_device() {
+        use crate::protocol::operation::OpRequester;
+        let state = Arc::new(test_state());
+        let mut op = export_op("GITHUB_TOKEN");
+        crate::protocol::operation::stamp_requester(
+            &mut op.act,
+            &OpRequester {
+                device: crate::device::tests_support::device(0x77).id().to_string(),
+                member: me().member,
+            },
+        )
+        .unwrap();
+        let (id, r) = park(&state, "v1", &op);
+        let err = approve_op(State(state.clone()), Path(id), Json(plain_grant(op, &r)))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, AppError::Forbidden(m) if m.contains("another device")),
+            "{err}"
+        );
+
+        let mut bare = export_op("GITHUB_TOKEN");
+        bare.act.scope = Value::Null;
+        let (id, r) = park(&state, "v1", &bare);
+        let err = approve_op(State(state.clone()), Path(id), Json(plain_grant(bare, &r)))
+            .await
+            .unwrap_err();
+        assert!(matches!(&err, AppError::Forbidden(_)), "{err}");
+    }
+
+    /// A vault without a verified member record is refused with the
+    /// actionable "upgrade this vault in the console".
+    #[tokio::test]
+    async fn approve_refuses_a_vault_without_a_member_record() {
+        let state = Arc::new(test_state());
+        let vault = format!("kbare-{}", std::process::id());
+        let op = export_op_in(&vault, "GITHUB_TOKEN");
+        let (id, r) = park(&state, &vault, &op);
+        let err = approve_op(State(state.clone()), Path(id), Json(plain_grant(op, &r)))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, AppError::Conflict(m) if m.contains("upgrade this vault in the console")),
+            "{err}"
+        );
+    }
+
+    /// The store is not a trust root (design D7): a record on disk that does
+    /// not fold under the anchor this person's ledger pins for the vault (a
+    /// tampered or foreign record), or a vault the ledger doesn't pin, can't
+    /// steer an approval, however valid the grant.
+    #[tokio::test]
+    async fn approve_refuses_a_held_record_that_does_not_match_the_pin() {
+        use crate::storage::sealed_vault::{test_support, write_per_item_atomic};
+        let state = Arc::new(test_state());
+        let vault = format!("kpin-{}", std::process::id());
+        let pk = TestPasskey::new(7, b"cred-k-only");
+        seed_vault(&state, &vault, &bundle());
+
+        // No pin for this vault in the own ledger: refused.
+        admit_passkeys(&state, "some-other-vault", &[&pk]);
+        let op = export_op_in(&vault, "GITHUB_TOKEN");
+        let (id, r) = park(&state, &vault, &op);
+        let grant = k_grant(&op, &id, &r, &bundle(), &own_enc_pub(), &pk);
+        let err = approve_op(State(state.clone()), Path(id), Json(grant))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, AppError::Forbidden(m) if m.contains("pinned")),
+            "{err}"
+        );
+
+        // Pinned, but the store's record was swapped for one anchored at
+        // someone else (self-consistent, signed by its own anchor): refused.
+        admit_passkeys(&state, &vault, &[&pk]);
+        let path = state.vaults.per_item_path(&vault).unwrap();
+        let mut pv = read_per_item(&path).unwrap().unwrap();
+        let foreign = crate::crypto::vault_key::UikRoot::from_root([0x5e; 32]);
+        let mut forged = test_support::record_for(&vault, &bundle());
+        forged.anchor = foreign.signing().public_bytes().to_vec();
+        pv.record = Some(forged);
+        write_per_item_atomic(&path, &pv).unwrap();
+        let op = export_op_in(&vault, "GITHUB_TOKEN");
+        let (id, r) = park(&state, &vault, &op);
+        let grant = k_grant(&op, &id, &r, &bundle(), &own_enc_pub(), &pk);
+        let err = approve_op(State(state.clone()), Path(id), Json(grant))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, AppError::Forbidden(m) if m.contains("different owner")),
+            "{err}"
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// A held record that is not the one this process latched (edited or
+    /// rolled back on disk after sync verified it) is refused until a sync.
+    #[tokio::test]
+    async fn approve_refuses_a_held_record_that_changed_since_the_latch() {
+        use crate::storage::sealed_vault::write_per_item_atomic;
+        let state = Arc::new(test_state());
+        let vault = format!("klatch-{}", std::process::id());
+        let pk = TestPasskey::new(7, b"cred-k-only");
+        admit_passkeys(&state, &vault, &[&pk]);
+        seed_vault(&state, &vault, &bundle());
+        let path = state.vaults.per_item_path(&vault).unwrap();
+        let mut pv = read_per_item(&path).unwrap().unwrap();
+        state
+            .trust
+            .latch_record(&vault, pv.record.as_ref().unwrap());
+        pv.record.as_mut().unwrap().hash = vec![1, 2, 3];
+        write_per_item_atomic(&path, &pv).unwrap();
+        let op = export_op_in(&vault, "GITHUB_TOKEN");
+        let (id, r) = park(&state, &vault, &op);
+        let grant = k_grant(&op, &id, &r, &bundle(), &own_enc_pub(), &pk);
+        let err = approve_op(State(state.clone()), Path(id), Json(grant))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, AppError::Forbidden(m) if m.contains("sc sync")),
+            "{err}"
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }

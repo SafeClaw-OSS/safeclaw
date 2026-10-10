@@ -4,11 +4,10 @@
 //! the daemon on `PROXY_PORT`. It decrypts ONLY connections whose host a
 //! connection anchors (everything else is a blind tunnel), substitutes a phantom
 //! for the real credential at egress, and never returns the value to the agent.
-//! The one HTTP route still on the control plane is the `/export` disabled stub.
+//! Agents authenticate by AIK proof of possession only (no bearer key).
 
 pub mod api_face;
 pub mod ca;
-pub mod env;
 pub mod handler;
 pub mod resolver;
 pub mod upstream;

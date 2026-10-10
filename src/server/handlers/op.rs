@@ -4,8 +4,10 @@
 //! approval, issues a fresh challenge `r`, and returns `{ op_id, r, expires_at }`.
 //! U later authorizes via `POST /op/{op_id}/approve` (binding β computed over r).
 //!
-//! All flows route through here — R-driven (Use/Export) AND U-direct
-//! (Enroll/Write/console-Export). The two-RTT shape is uniform.
+//! Lifecycle ceremonies and Export route through here (a Use op is minted by
+//! the proxy). Every op is stamped with `act.scope.requester = {device,
+//! member}` (contract 1.6) before it is stored; an unpaired daemon mints none.
+//! Enroll and whole-blob Write are refused: vaults are created in the console.
 
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -40,11 +42,10 @@ pub async fn create(
         ));
     }
     // Locked-state gate (H3 / PROTOCOL.md §6.3): when the vault is Locked,
-    // only the unlock ceremony (and first-time Enroll, which auto-unlocks)
-    // is admissible. Everything else gets a canned 409 so the caller knows
+    // only the unlock ceremony is admissible. Everything else gets a canned 409 so the caller knows
     // to drive a `Custom("vault-unlock")` op first.
-    let is_lifecycle_bypass = matches!(&op.act.kind, ActType::Enroll)
-        || matches!(&op.act.kind, ActType::Custom(name) if name == "vault-unlock");
+    let is_lifecycle_bypass =
+        matches!(&op.act.kind, ActType::Custom(name) if name == "vault-unlock");
     if !is_lifecycle_bypass && state.is_vault_locked(&vault_id) {
         return Err(AppError::VaultLocked);
     }
@@ -55,6 +56,7 @@ pub async fn create(
     // and the op's own expiry can never disagree. A locked vault (the unlock
     // ceremony) can't read its policy and takes the 30-min default.
     let mut op = op;
+    crate::ops::stamp_own_requester(&state, &mut op)?;
     if op.valid.exp.is_none() {
         let now_unix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -117,10 +119,9 @@ pub async fn create(
         }
     }
 
-    // Slice-2 web approval: if a cloud op-relay is configured, register this
-    // pending op and poll for the browser-deposited grant in the background.
-    // No-op when relay_url is unset (purely local daemon).
-    crate::relay::client::spawn_register_and_poll(
+    // Web approval: register this pending op with the backend and poll for the
+    // console-deposited grant in the background.
+    crate::ops::client::spawn_register_and_poll(
         state.clone(),
         vault_id.clone(),
         op_id.clone(),
@@ -172,7 +173,7 @@ pub async fn create(
 
 /// Withdraw a ceremony op that a newer one just superseded. Local: flip the
 /// stale in-memory record terminal + stamp its audit row `cancelled`. Cloud:
-/// withdraw it from the relay (device-key auth, no passkey — no credential is
+/// withdraw it from the backend (DIK-signed, no passkey — no credential is
 /// touched). All best-effort; the backend cancel only affects a `pending` op.
 fn cancel_superseded(state: &Arc<AppState>, vault_id: &str, op_id: &str, now: i64) {
     const REASON: &str = "superseded by a newer request";
@@ -202,7 +203,7 @@ fn cancel_superseded(state: &Arc<AppState>, vault_id: &str, op_id: &str, now: i6
             reason: Some(REASON.into()),
         });
     }
-    crate::relay::client::spawn_cancel(
+    crate::ops::client::spawn_cancel(
         state.clone(),
         vault_id.to_string(),
         op_id.to_string(),
@@ -230,7 +231,7 @@ fn withdraw(
     vault_id: &str,
     op_id: &str,
     reason: &str,
-    relay_reason: crate::relay::client::CancelReason,
+    relay_reason: crate::ops::client::CancelReason,
 ) -> bool {
     let was_pending = {
         let mut store = state.approvals.lock().unwrap();
@@ -263,7 +264,7 @@ fn withdraw(
         response_preview: None,
         reason: Some(reason.into()),
     });
-    crate::relay::client::spawn_cancel(
+    crate::ops::client::spawn_cancel(
         state.clone(),
         vault_id.to_string(),
         op_id.to_string(),
@@ -305,7 +306,7 @@ pub async fn cancel(
         &vault_id,
         &op_id,
         WITHDRAWN_REASON,
-        crate::relay::client::CancelReason::Withdrawn,
+        crate::ops::client::CancelReason::Withdrawn,
     ) {
         return Err(AppError::Conflict("op not pending".into()));
     }
@@ -325,7 +326,7 @@ pub fn reap_abandoned_exports(state: &Arc<AppState>, idle: std::time::Duration) 
             &vault_id,
             &op_id,
             ABANDONED_REASON,
-            crate::relay::client::CancelReason::Abandoned,
+            crate::ops::client::CancelReason::Abandoned,
         ) {
             tracing::info!(op = %op_id, "export waiter went silent; request withdrawn (abandoned)");
             out.push(op_id);
@@ -351,17 +352,25 @@ pub async fn reap_abandoned_exports_loop(state: Arc<AppState>) {
 /// crypto-gate deployment) — never from the control-plane endpoint, which
 /// has no billing gate by construction.
 ///
-/// Control-plane ops (Enroll, Write, Export, Custom("vault-unlock"/...))
-/// pass through; they're user-initiated state changes authorized by a
-/// passkey-signed grant.
+/// Control-plane ops (Export, Custom("vault-unlock"/...)) pass through;
+/// they're user-initiated and authorized by a passkey-signed grant. Enroll and
+/// Write are refused.
 fn reject_broker_kind(kind: &ActType) -> Result<()> {
     if matches!(kind, ActType::Use) {
         return Err(AppError::BadRequest(
             "Use ops must be created via the broker path, not the control-plane op endpoint".into(),
         ));
     }
-    // A whole-blob Write is retired: refuse it up front so nobody is asked to
-    // approve an op that can't apply (approve refuses it too).
+    // Vaults are created in the console (trust-reset D3): the daemon applies
+    // no Enroll. A whole-blob Write is retired. Refuse both up front so nobody
+    // is asked to approve an op that can't apply.
+    if matches!(kind, ActType::Enroll) {
+        return Err(AppError::BadRequest(
+            "creating a vault from the CLI is no longer supported: create it in the SafeClaw \
+             console"
+                .into(),
+        ));
+    }
     if matches!(kind, ActType::Write) {
         return Err(AppError::BadRequest(
             crate::server::handlers::approve::WHOLE_BLOB_WRITE_RETIRED.into(),
@@ -403,10 +412,18 @@ mod tests {
         }
     }
 
+    /// Vaults are created in the console: the daemon refuses an Enroll op.
+    #[test]
+    fn reject_enroll() {
+        match reject_broker_kind(&ActType::Enroll) {
+            Err(AppError::BadRequest(msg)) => assert!(msg.contains("console"), "{msg}"),
+            other => panic!("Enroll must be refused, got {:?}", other.is_ok()),
+        }
+    }
+
     #[test]
     fn accept_control_plane_kinds() {
         for kind in [
-            ActType::Enroll,
             ActType::Export,
             ActType::Custom("vault-unlock".into()),
             ActType::Custom("vault-lock".into()),
@@ -431,11 +448,11 @@ mod tests {
             listen: "127.0.0.1".into(),
             origin: "http://localhost".into(),
             rp_id: "localhost".into(),
-            admin_key: None,
-            relay_url: None,
             body_cap: crate::config::DEFAULT_BODY_CAP,
         };
-        AppState::new(cfg)
+        let state = AppState::new(cfg);
+        crate::ops::test_support::pair(&state, 0x41, 0x42);
+        state
     }
 
     /// RED LINE (verified invariant — see the export/allow discussion): an

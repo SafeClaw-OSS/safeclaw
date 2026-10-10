@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1040 720" width="1040" height="720" role="img">
-  <title>How a brokered request flows through SafeClaw: the agent holds a phantom, the local broker swaps in the real value at egress, the vault stays sealed by your passkey, the cloud syncs only an encrypted blob and relays approvals.</title>
+  <title>How a brokered request flows through SafeClaw: the agent holds a phantom, the local broker swaps in the real value at egress, the vault stays sealed by your passkey, the cloud syncs only an encrypted blob and carries approval requests.</title>
   <style>
     text { font-family: -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; }
     .cap  { font-size: 11px; letter-spacing: .16em; fill: #8f7a52; font-weight: 600; }
@@ -77,7 +77,7 @@
   <!-- cloud -->
   <rect x="352" y="600" width="308" height="76" rx="12" fill="#141417" stroke="#2c2c33"/>
   <text class="bt" x="368" y="628">SafeClaw cloud</text>
-  <text class="bd" x="368" y="650">syncs the sealed vault, relays approvals</text>
+  <text class="bd" x="368" y="650">syncs the sealed vault, carries approval requests</text>
   <text x="368" y="667" font-size="12" fill="#c9a96e">it cannot decrypt your vault</text>
 
   <!-- passkey -->

@@ -39,8 +39,8 @@ pub struct AuditPending {
     pub service: String,
     pub method: String,
     pub path: String,
-    /// Agent attribution for the audit row: prefix of the CONNECT-authenticated
-    /// agent api-key (see `audit::agent_key_prefix`). Never the full key.
+    /// Agent attribution for the audit row: the `ag_` id the CONNECT's AIK
+    /// proof verified.
     pub agent_prefix: Option<String>,
 }
 
@@ -50,17 +50,14 @@ pub struct BrokerHandler {
     /// Vault id captured from the CONNECT's `Proxy-Authorization` username,
     /// inherited by every inner-request clone of this handler.
     pub vid: Option<String>,
-    /// Agent api-key captured from the CONNECT's `Proxy-Authorization` PASSWORD
-    /// (§8) — the agent's identity, verified in `pipeline` before any phantom
-    /// substitution. Inherited by inner-request clones alongside `vid`.
-    pub key: Option<String>,
     /// The `ag_…` id of a CRYPTO-VERIFIED agent PoP token (hop-A), resolved at
     /// CONNECT time in `should_intercept` (that's where the CONNECT authority the
     /// token binds is available) and inherited by inner-request clones. `Some`
     /// only when the `Proxy-Authorization` password was a valid, fresh `scpop1…`
-    /// token for this vault+target; `None` for the legacy Basic api-key path. The
-    /// authorization check (this `ag_` ∈ the vault's authorized-agents table) is
-    /// still done in `pipeline` — this field is only "who proved possession".
+    /// token for this vault+target. There is no other agent credential (design
+    /// D8: the agent bearer key is deleted). The authorization check (this `ag_`
+    /// in the vault's authorized-agents table) is done in `pipeline`; this field
+    /// is only "who proved possession".
     pub agent_id: Option<String>,
     /// Set on the allow/forward path; consumed by `handle_response`.
     pub pending: Option<AuditPending>,
@@ -71,7 +68,6 @@ impl BrokerHandler {
         Self {
             state,
             vid: None,
-            key: None,
             agent_id: None,
             pending: None,
         }
@@ -80,28 +76,20 @@ impl BrokerHandler {
 
 impl HttpHandler for BrokerHandler {
     async fn should_intercept(&mut self, _ctx: &HttpContext, req: &Request<Body>) -> bool {
-        // The agent's (vid, api-key) ride the CONNECT's Proxy-Authorization
-        // userinfo (`base64("<vid>:<key>")`); capture both so inner-request clones
-        // inherit them (read-only). The key is VERIFIED later in `pipeline`,
-        // before any substitution — here we only need vid PRESENCE.
-        let (vid, key) = creds_from_proxy_auth(req);
+        // The agent's (vid, proof) ride the CONNECT's Proxy-Authorization
+        // userinfo (`base64("<vid>:<scpop1…>")`). The proof is crypto-verified
+        // HERE: the CONNECT authority it binds (`host:port`) is only available at
+        // CONNECT time (the inner-request pipeline sees a bare host). A valid,
+        // fresh token for THIS vault + target resolves the `ag_` id, which
+        // inner-request clones inherit; the authorization check (`ag_` in the
+        // vault's authorized-agents table) happens in `pipeline`. Any other
+        // password (an old `sc_agent_` bearer key included) resolves nothing and
+        // is refused there.
+        let (vid, proof) = creds_from_proxy_auth(req);
         self.vid = vid;
-        self.key = key;
-        // hop-A: if the Proxy-Auth password is an agent PoP token (`scpop1…`),
-        // crypto-verify it HERE — the CONNECT authority it binds (`host:port`) is
-        // only available at CONNECT time (the inner-request pipeline sees a bare
-        // host). A valid, fresh token for THIS vault + target resolves the `ag_`
-        // id; the authorization check (`ag_` ∈ the vault's authorized-agents
-        // table) happens in `pipeline`. Dual-auth: a non-PoP password (a legacy
-        // Basic api-key) leaves `agent_id` None and takes the hash-set path, so
-        // nothing bricks. Only the crypto (signature + freshness) is checked here.
-        self.agent_id = match (
-            self.vid.as_deref(),
-            self.key.as_deref(),
-            req.uri().authority(),
-        ) {
-            (Some(vid), Some(key), Some(authority)) => crate::agent_pop::verify_agent_proxy_pop(
-                key,
+        self.agent_id = match (self.vid.as_deref(), proof.as_deref(), req.uri().authority()) {
+            (Some(vid), Some(proof), Some(authority)) => crate::agent_pop::verify_agent_proxy_pop(
+                proof,
                 vid,
                 authority.as_str(),
                 crate::util::now_unix(),
@@ -115,7 +103,7 @@ impl HttpHandler for BrokerHandler {
         // with a 407 in handle_request (RFC 7235 challenge), so anything absent
         // reaching here targets a host no known vault anchors. Only a request
         // that NAMES a vault and targets an anchored host is a MITM candidate —
-        // the precise per-vault anchor + the key check happen in `pipeline`.
+        // the precise per-vault anchor + the agent check happen in `pipeline`.
         if self.vid.is_none() {
             return false;
         }
@@ -195,34 +183,21 @@ impl HttpHandler for BrokerHandler {
 }
 
 impl BrokerHandler {
-    /// Is the captured agent key (CONNECT Proxy-Auth password) a member of the
-    /// synced hash-set (§8)? The proxy authenticates the AGENT — not "localhost"
-    /// — before injecting any credential. Same membership check the control
-    /// plane + API face use, via the pure `check_token`.
-    fn key_is_valid(&self) -> bool {
-        // hop-A path: a crypto-verified agent PoP (resolved in `should_intercept`)
-        // is valid iff its `ag_` is in THIS vault's authorized-agents table
-        // (§11 presence = authorized). Dual-auth: if there's no PoP, or it isn't
-        // authorized for this vault, fall back to the legacy synced api-key
-        // hash-set — so a legacy Basic api-key keeps working unchanged.
-        if let (Some(ag), Some(vid)) = (self.agent_id.as_deref(), self.vid.as_deref()) {
-            if self.state.agent_is_authorized(vid, ag) {
-                return true;
-            }
+    /// Did the CONNECT prove possession of an AIK (resolved in
+    /// `should_intercept`) whose `ag_` is in THIS vault's authorized-agents
+    /// table (presence = authorized)? The proxy authenticates the AGENT, not
+    /// "localhost", before injecting any credential.
+    fn agent_is_valid(&self) -> bool {
+        match (self.agent_id.as_deref(), self.vid.as_deref()) {
+            (Some(ag), Some(vid)) => self.state.agent_is_authorized(vid, ag),
+            _ => false,
         }
-        let hashes = self.state.agent_key_hashes.lock().unwrap();
-        crate::api_key::check_token(&hashes, self.key.as_deref()).is_ok()
     }
 
-    /// Stable attribution id for the current agent — used for audit rows, the
-    /// mask lookup, and the grant cache key. For a hop-A PoP agent it's the
-    /// resolved `ag_` (so approvals cache + replay correctly, and mask is
-    /// ag_-keyed per §11); for the legacy Basic path it's the api-key prefix
-    /// (never the full key/token). One helper so all three surfaces agree.
+    /// Stable attribution id for the current agent (the verified `ag_`), used
+    /// for audit rows, the mask lookup and the grant cache key.
     fn agent_attribution(&self) -> Option<String> {
-        self.agent_id
-            .clone()
-            .or_else(|| legacy_key_prefix(self.key.as_deref()))
+        self.agent_id.clone()
     }
 
     async fn pipeline(&mut self, ctx: &HttpContext, req: Request<Body>) -> RequestOrResponse {
@@ -367,25 +342,19 @@ impl BrokerHandler {
         }
         let conn = conns[0].to_string();
 
-        // ── verify the agent key, then bind the vault (§8) ───────────────────
-        // A phantom-bearing request MUST present a valid agent api-key: the proxy
-        // is the credential injector and localhost is NOT a trust boundary, so
-        // verify the AGENT's identity BEFORE resolving/substituting. The key rode
-        // the CONNECT's Proxy-Auth password; `should_intercept` already
-        // blind-tunnels absent-auth, so reaching here means Proxy-Auth was present
-        // — a bad/missing key is an explicit 407, never a silent fallback. On a
-        // miss with a key PRESENT, refresh the hash-set once (debounced): a key
-        // minted seconds ago by `sc agent add` must not 407 for the 30s loop.
-        if !self.key_is_valid() {
-            // A cryptographically-VALID AIK PoP (agent_id resolved in
-            // should_intercept) that isn't authorized on THIS vault is a distinct
-            // case from a bad/absent credential: `agent_id.is_some()` here means the
-            // signature + freshness checked out but `ag_ ∉` the vault's
-            // authorized-agents table. The api-key hash-set refresh can't help (the
-            // password slot is a `scpop1…` token, never a key), and calling it "bad
-            // key" sends the user debugging the wrong thing. Fail LOUDLY with the
-            // real fix: authorize it in the Console (Agents tab), then retry (the
-            // grant syncs into the vault's agents table within seconds).
+        // ── verify the agent, then bind the vault (§8) ───────────────────────
+        // A phantom-bearing request MUST come from an agent that proved
+        // possession of its AIK: the proxy is the credential injector and
+        // localhost is NOT a trust boundary, so verify the AGENT's identity
+        // BEFORE resolving/substituting. `should_intercept` already blind-tunnels
+        // absent-auth, so reaching here means Proxy-Auth was present: a bad or
+        // missing proof is an explicit refusal, never a silent fallback.
+        if !self.agent_is_valid() {
+            // A cryptographically-VALID AIK PoP that isn't authorized on THIS
+            // vault is a distinct case from a bad/absent credential: the
+            // signature + freshness checked out but `ag_` is not in the vault's
+            // authorized-agents table. Fail LOUDLY with the real fix: authorize it
+            // in the console (Agents tab), then retry.
             if self.agent_id.is_some() {
                 // Deep-link straight to THIS vault's Agents tab so the agent can
                 // relay a one-click fix. The daemon owns both pieces (origin from
@@ -401,15 +370,7 @@ impl BrokerHandler {
                 );
                 return err_response(ScCode::AgentNotAuthorized, &hint).into();
             }
-            let refreshed =
-                self.key.is_some() && crate::sync::refresh_agent_keys_on_miss(&self.state).await;
-            if !refreshed || !self.key_is_valid() {
-                return err_response(
-                    ScCode::AgentKey,
-                    "invalid or missing SafeClaw agent api key",
-                )
-                .into();
-            }
+            return err_response(ScCode::AgentProof, AGENT_PROOF_HINT).into();
         }
         let vault_id = match self.vid.clone() {
             Some(v) => v,
@@ -443,9 +404,8 @@ impl BrokerHandler {
         // `locked` in the registry, and a named use gets THIS explicit,
         // actionable refusal — never a silent 404, never a policy prompt.
         {
-            // Mask lookup key = the agent's attribution id (resolved `ag_` for a
-            // hop-A PoP agent — table+mask are ag_-keyed since §11 — else the
-            // legacy api-key prefix for the dual-auth Basic path).
+            // Mask lookup key = the agent's verified `ag_` (table and mask are
+            // ag_-keyed since §11).
             let mask_agent = self.agent_attribution().unwrap_or_default();
             if self.state.agent_mask_allows(&vault_id, &mask_agent, &conn) == Some(false) {
                 return err_response(
@@ -579,7 +539,7 @@ impl BrokerHandler {
         // The same lossy view the phantom scan used (unified boundary).
         let body_for_policy = body_text.as_deref();
         // Op-agent binding: every approval/grant surface below keys on the
-        // requesting agent (the pipeline validated self.key before secrets).
+        // requesting agent (the pipeline verified the agent before secrets).
         let agent_prefix = self.agent_attribution().unwrap_or_default();
         let decision = self.state.evaluate_request_policy(
             &vault_id,
@@ -1281,20 +1241,17 @@ fn merge_phantoms(acc: &mut Vec<Phantom>, more: Vec<Phantom>) {
     }
 }
 
-/// The legacy Basic api-key attribution prefix (never the full key). Factored out
-/// of [`BrokerHandler::agent_attribution`] so that helper can reference it without
-/// the raw-prefix expression appearing at the call sites (all of which now go
-/// through `agent_attribution` so PoP `ag_` and legacy prefixes resolve uniformly).
-fn legacy_key_prefix(key: Option<&str>) -> Option<String> {
-    key.map(crate::audit::agent_key_prefix)
-}
+/// The refusal for a request whose CONNECT carried no valid agent proof.
+pub const AGENT_PROOF_HINT: &str = "missing or invalid SafeClaw agent proof: run the agent \
+     through `sc run` (it proves the agent's identity on each connection), or set \
+     SAFECLAW_AGENT_IDENTITY to the identity file `sc agent add` printed";
 
-/// Read `(vid, api-key)` from a CONNECT's `Proxy-Authorization: Basic
-/// base64("<vid>:<key>")`. The vid (username) routes the request to a vault; the
-/// key (password) is the agent's identity (§8). Each is `None` when
+/// Read `(vid, proof)` from a CONNECT's `Proxy-Authorization: Basic
+/// base64("<vid>:<scpop1…>")`. The vid (username) routes the request to a
+/// vault; the password is the agent's AIK proof (§8). Each is `None` when
 /// absent/empty. A `None` vid means no Proxy-Auth at all ⇒ non-participating
-/// traffic (`should_intercept` blind-tunnels it). The key is NOT trimmed (it's
-/// an opaque token hashed for the membership check); the vid is.
+/// traffic (`should_intercept` blind-tunnels it). The proof is NOT trimmed;
+/// the vid is.
 fn creds_from_proxy_auth(req: &Request<Body>) -> (Option<String>, Option<String>) {
     let Some(text) = req
         .headers()
@@ -1731,25 +1688,22 @@ mod tests {
     }
 
     #[test]
-    fn creds_from_proxy_auth_splits_vid_and_key() {
-        // vid:key → both captured (the key is the agent's identity, §8).
+    fn creds_from_proxy_auth_splits_vid_and_proof() {
+        // vid:proof → both captured (the proof is the agent's identity, §8).
         let req = Request::builder()
             .uri("api.github.com:443")
             .header(
                 header::PROXY_AUTHORIZATION,
-                format!("Basic {}", b64(b"vault-abc:sc_agent_k9")),
+                format!("Basic {}", b64(b"vault-abc:scpop1.k9")),
             )
             .body(Body::empty())
             .unwrap();
         assert_eq!(
             creds_from_proxy_auth(&req),
-            (
-                Some("vault-abc".to_string()),
-                Some("sc_agent_k9".to_string())
-            )
+            (Some("vault-abc".to_string()), Some("scpop1.k9".to_string()))
         );
 
-        // Legacy empty password (`vid:`) → vid present, key None (→ 407 later,
+        // Empty password (`vid:`) → vid present, proof None (→ 407 later,
         // it's participating but unauthenticated).
         let no_key = Request::builder()
             .uri("api.github.com:443")
@@ -1773,12 +1727,12 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         assert_eq!(creds_from_proxy_auth(&none), (None, None));
-        // Empty vid (`:key`) is not a routing hint → vid None.
+        // Empty vid (`:proof`) is not a routing hint → vid None.
         let empty_vid = Request::builder()
             .uri("api.github.com:443")
             .header(
                 header::PROXY_AUTHORIZATION,
-                format!("Basic {}", b64(b":sc_agent_k9")),
+                format!("Basic {}", b64(b":scpop1.k9")),
             )
             .body(Body::empty())
             .unwrap();

@@ -14,14 +14,15 @@ pub fn build_version() -> &'static str {
 }
 
 pub mod agent_pop;
-pub mod api_key;
 pub mod approval;
 pub mod audit;
 pub mod auth;
 pub mod cli;
+pub mod cloud;
 pub mod config;
 pub mod core;
 pub mod crypto;
+pub mod device;
 pub mod device_auth;
 pub mod entry;
 pub mod error;
@@ -29,10 +30,9 @@ mod generated_services;
 pub mod identity;
 pub mod identity_file;
 pub mod passkey;
-pub mod principal_ledger;
 pub mod protocol;
 pub mod proxy;
-pub mod relay;
+pub mod ops;
 pub mod server;
 pub mod service;
 pub mod state;
@@ -41,4 +41,5 @@ pub mod store;
 pub mod sync;
 pub mod sync_stream;
 pub mod team_hooks;
+pub mod trust;
 pub mod util;

@@ -1,17 +1,14 @@
-//! op-relay egress client: register an op, poll for the deposited grant, and
-//! apply it locally. See `relay/mod.rs` for the why.
+//! Ops egress client: register an op, poll for the deposited grant, and apply
+//! it locally. See `ops/mod.rs` for the why.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use base64::{
-    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
-    Engine,
-};
+use base64::{engine::general_purpose::STANDARD, Engine};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use crate::device_auth::DikRequestExt;
+use crate::cloud::DeviceClient;
 use crate::state::AppState;
 
 /// Poll cadence (v1.1, mode-dependent). The wait between polls is
@@ -31,7 +28,7 @@ const POLL_FALLBACK: Duration = Duration::from_secs(2);
 /// as refresh_agent_keys_on_miss's debounce).
 const POLL_FLOOR: Duration = Duration::from_secs(1);
 /// Daemon-side safety cap so a never-approved op's task can't run forever
-/// (the relay also enforces a TTL). Derived per-op from the op's own expiry
+/// (the backend also enforces a TTL). Derived per-op from the op's own expiry
 /// (SSOT: aux.policy.timeout stamps every pending op) + slack past the
 /// in-loop `expires_at + 5` precise stop; clamped so a pathological expiry
 /// can neither stop the poll instantly nor pin a task for days.
@@ -64,10 +61,9 @@ async fn next_poll_due(
     tokio::time::sleep_until(last_poll + POLL_FLOOR).await;
 }
 
-/// Fire-and-forget: register `op_id` with the relay and drive it to
-/// completion in a background task. No-op (returns immediately) when no relay
-/// is configured. Never blocks op creation; all failures are logged, not
-/// propagated — the local path still works without the relay.
+/// Fire-and-forget: register `op_id` with the backend and drive it to
+/// completion in a background task. No-op when this machine isn't paired.
+/// Never blocks op creation; failures are logged, not propagated.
 pub fn spawn_register_and_poll(
     state: Arc<AppState>,
     vault_id: String,
@@ -75,8 +71,8 @@ pub fn spawn_register_and_poll(
     op: Value,
     r: String,
     expires_at: u64,
-    // The triggering agent's id (api-key prefix / AIK id), forwarded to the
-    // relay so the approve page can name WHO asked. None for user-initiated
+    // The triggering agent's `ag_` id, forwarded to the
+    // backend so the approve page can name WHO asked. None for user-initiated
     // lifecycle ceremonies (unlock/lock/delete).
     agent_id: Option<String>,
     // The live ops this op just superseded in its intent chain
@@ -84,15 +80,13 @@ pub fn spawn_register_and_poll(
     // it never supersedes by key match. Empty for everything but `use`.
     supersedes: Vec<String>,
 ) {
-    let (relay_url, auth_token) = match resolve_relay(&state) {
-        Some(v) => v,
-        None => return, // local-only daemon (no cloud pairing); nothing to do
+    let Some(client) = state.cloud() else {
+        return; // not paired: nothing to register with
     };
     tokio::spawn(async move {
         if let Err(e) = run(
             state,
-            &relay_url,
-            &auth_token,
+            &client,
             &vault_id,
             &op_id,
             &op,
@@ -103,12 +97,12 @@ pub fn spawn_register_and_poll(
         )
         .await
         {
-            tracing::warn!(op = %op_id, "relay register/poll ended: {}", e);
+            tracing::warn!(op = %op_id, "op register/poll ended: {}", e);
         }
     });
 }
 
-/// Why a relay row is withdrawn (contract §2 cancel body `reason`). `None` at
+/// Why an op row is withdrawn (contract §2 cancel body `reason`). `None` at
 /// the call site = the legacy reason-less cancel (lifecycle supersede).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CancelReason {
@@ -133,11 +127,11 @@ impl CancelReason {
     }
 }
 
-/// The relay cancel body: `daemon_pubkey` as before, plus `reason` and (for
-/// `satisfied`) `satisfied_by`. A reason-less cancel sends neither, so the
-/// backend stores null and behaves as today.
-fn cancel_body(daemon_pubkey: &str, reason: Option<&CancelReason>) -> Value {
-    let mut body = json!({ "daemon_pubkey": daemon_pubkey });
+/// The cancel body: `reason` and (for `satisfied`) `satisfied_by`. A
+/// reason-less cancel sends `{}` (the backend stores null). The registrar is
+/// the signing device; no key rides the body.
+fn cancel_body(reason: Option<&CancelReason>) -> Value {
+    let mut body = json!({});
     if let Some(r) = reason {
         body["reason"] = json!(r.as_str());
         if let CancelReason::Satisfied { by } = r {
@@ -147,79 +141,36 @@ fn cancel_body(daemon_pubkey: &str, reason: Option<&CancelReason>) -> Value {
     body
 }
 
-/// Fire-and-forget: withdraw a still-pending op from the relay (device-key
-/// auth). Called when the requester voids its OWN request (a superseding
-/// ceremony, `POST /op/{id}/cancel`, an abandoned Export) or when an intent
-/// chain resolves its siblings. No passkey/W_c involved (nothing was granted).
-/// The backend only flips `pending → cancelled`, so an already-approved op is
-/// untouched. No-op when there's no cloud relay configured.
+/// Fire-and-forget: withdraw a still-pending op (DIK-signed). Called when the
+/// requester voids its OWN request (a superseding ceremony, `POST
+/// /op/{id}/cancel`, an abandoned Export) or when an intent chain resolves its
+/// siblings. The backend only flips `pending → cancelled`, so an
+/// already-approved op is untouched. No-op when this machine isn't paired.
 pub fn spawn_cancel(
     state: Arc<AppState>,
     vault_id: String,
     op_id: String,
     reason: Option<CancelReason>,
 ) {
-    let (base, auth_token) = match resolve_relay(&state) {
-        Some(v) => v,
-        None => return,
+    let Some(client) = state.cloud() else {
+        return;
     };
-    let daemon_pubkey = URL_SAFE_NO_PAD.encode(state.sc.pk_bytes());
     tokio::spawn(async move {
-        let url = format!("{}/v/{}/op/relay/{}/cancel", base, vault_id, op_id);
-        let client = match crate::cli::egress_proxy::client(Duration::from_secs(10)) {
-            Ok(c) => c,
-            Err(_) => return,
-        };
-        let cancel_body = cancel_body(&daemon_pubkey, reason.as_ref());
-        match client
-            .post(&url)
-            .bearer_auth(&auth_token)
-            .dik_pop(
-                "POST",
-                &url,
-                &serde_json::to_vec(&cancel_body).unwrap_or_default(),
-            )
-            .json(&cancel_body)
-            .send()
-            .await
-        {
+        let path = format!("/device/vaults/{}/ops/{}/cancel", vault_id, op_id);
+        let body = cancel_body(reason.as_ref());
+        match client.post(&path, &body, Duration::from_secs(10)).await {
             Ok(r) if r.status().is_success() => {
-                tracing::info!(op = %op_id, "op withdrawn from relay");
+                tracing::info!(op = %op_id, "op withdrawn");
             }
-            Ok(r) => tracing::debug!(op = %op_id, "relay cancel HTTP {}", r.status()),
-            Err(e) => tracing::debug!(op = %op_id, "relay cancel error: {}", e),
+            Ok(r) => tracing::debug!(op = %op_id, "op cancel HTTP {}", r.status()),
+            Err(e) => tracing::debug!(op = %op_id, "op cancel error: {}", e),
         }
     });
 }
 
-/// Resolve `(relay_base, auth_token)` for op-relay registration.
-///
-/// Primary (the local-daemon pivot): a paired daemon dials its cloud backend
-/// (`cloud_backend`, persisted at `sc login`) and authenticates as itself with
-/// the `sc_device_` device-key — exactly the channel the Slice-3 blob sync
-/// already uses. Backend gate: `resolveAuth` + `isOwnedVaultId`.
-///
-/// Fallback: an operator-supplied `SAFECLAW_RELAY_URL` + `SAFECLAW_ADMIN_KEY`
-/// (self-host / SaaS-custodian deployments that pre-date pairing).
-///
-/// `None` ⇒ no relay ⇒ purely local daemon; the local op-page ceremony stands.
-fn resolve_relay(state: &AppState) -> Option<(String, String)> {
-    if let Ok(cfg) = crate::cli::active::load() {
-        if let Some(base) = cfg.cloud_backend.as_deref().filter(|s| !s.is_empty()) {
-            if let Some(dk) = crate::sync::device_key() {
-                return Some((base.trim_end_matches('/').to_string(), dk));
-            }
-        }
-    }
-    let base = state.config.relay_url.clone().filter(|s| !s.is_empty())?;
-    let key = state.config.admin_key.clone().filter(|s| !s.is_empty())?;
-    Some((base.trim_end_matches('/').to_string(), key))
-}
-
 async fn run(
     state: Arc<AppState>,
-    relay_url: &str,
-    auth_token: &str,
+    client_dev: &DeviceClient,
     vault_id: &str,
     op_id: &str,
     op: &Value,
@@ -228,7 +179,6 @@ async fn run(
     agent_id: Option<&str>,
     supersedes: &[String],
 ) -> Result<(), String> {
-    let base = relay_url.trim_end_matches('/');
     // v1.1: register for `op` stream events before anything can flip the
     // op's status. The guard IS the registration — Drop deregisters — so
     // EVERY exit path out of this function (the early error returns below
@@ -236,62 +186,29 @@ async fn run(
     // map for the daemon's lifetime.
     let op_wait = crate::sync_stream::op_events().register(op_id);
     let client = crate::cli::egress_proxy::client(Duration::from_secs(35))
-        .map_err(|e| format!("relay client init: {}", e))?;
+        .map_err(|e| format!("ops client init: {}", e))?;
 
-    // 1. Register the pending op. op_summary is the full op JSON (the page
-    //    renders it AND uses it + r to recompute the WebAuthn binding β).
-    //    We also include the vault's passkey public material (cid + prf_salt)
-    //    so the browser — which can't reach this localhost daemon's
-    //    /v/{vid}/passkeys — can pick the credential and derive W_c. cid and
-    //    prf_salt are public per PROTOCOL.md §4.3.
-    let daemon_pubkey = URL_SAFE_NO_PAD.encode(state.sc.pk_bytes());
-    let op_summary = STANDARD.encode(serde_json::to_vec(op).unwrap_or_default());
-    let passkeys = fetch_passkeys(&client, state.config.port, vault_id).await;
-    let reg_url = format!("{}/v/{}/op/relay/register", base, vault_id);
-    let base_body = json!({
-        "op_id": op_id,
-        "daemon_pubkey": daemon_pubkey,
-        "op_summary": op_summary,
-        "passkeys": passkeys,
-        "r": r,
-        "expires_at": expires_at,
-        // Batch-approve capability advertisement (design/batch-approve.md
-        // §Version gating): the console offers "Approve all xN" only when
-        // every op in a group carries a supporting version. Relay-asserted
-        // and deliberately UNAUTHENTICATED - forging it down forces per-op
-        // fallback (UX cost only); forging it up buys nothing the relay's
-        // existing bare-403 reject power doesn't already have.
-        "daemon_version": env!("CARGO_PKG_VERSION"),
-        // WHO triggered this op — the agent the local broker authenticated.
-        // Advisory attribution for the approve page (the backend resolves it to
-        // a label); null for user-initiated lifecycle ceremonies.
-        "agent_id": agent_id,
-    });
+    // 1. Register the pending op ([`base_register_body`]).
+    let reg_path = format!("/device/vaults/{}/ops", vault_id);
+    let base_body = base_register_body(op_id, op, r, expires_at, agent_id);
     let reg_body = register_body(&state, &base_body, op_id, supersedes);
-    let reg = client
-        .post(&reg_url)
-        .bearer_auth(auth_token)
-        .dik_pop(
-            "POST",
-            &reg_url,
-            &serde_json::to_vec(&reg_body).unwrap_or_default(),
-        )
-        .json(&reg_body)
+    let reg = client_dev
+        .request(&client, reqwest::Method::POST, &reg_path, Some(&reg_body))?
         .send()
         .await
-        .map_err(|e| format!("relay register: {}", e))?;
+        .map_err(|e| format!("op register: {}", e))?;
     if !reg.status().is_success() {
-        return Err(format!("relay register HTTP {}", reg.status()));
+        return Err(crate::cloud::error_text(reg, "op register").await);
     }
-    tracing::info!(op = %op_id, "registered with op-relay");
+    tracing::info!(op = %op_id, "op registered");
 
     // 2. Poll for the deposited grant. Status semantics are UNCHANGED from
     //    the pre-event loop — only the wait between polls is event-aware.
-    let poll_url = format!("{}/v/{}/op/relay/{}", base, vault_id, op_id);
+    let poll_path = format!("/device/vaults/{}/ops/{}", vault_id, op_id);
     let deadline = tokio::time::Instant::now() + poll_budget(expires_at);
     // Full-body hash of the last grant that failed BATCH verification: skip
     // re-applying a byte-identical redelivery in the gap before our
-    // re-register flips the relay row back to pending. Full body, not the
+    // re-register flips the op row back to pending. Full body, not the
     // assertion: a same-set retry has the same root and a deterministic
     // authenticator may repeat the assertion byte-for-byte — what guarantees
     // an honest retry differs is the fresh HPKE ephemeral in wk_enc/wk_ct.
@@ -301,16 +218,14 @@ async fn run(
             return Ok(()); // op expired; stop quietly
         }
         let last_poll = tokio::time::Instant::now();
-        let resp = match client
-            .get(&poll_url)
-            .bearer_auth(auth_token)
-            .dik_pop("GET", &poll_url, &[])
-            .send()
-            .await
-        {
+        let sent = match client_dev.request(&client, reqwest::Method::GET, &poll_path, None) {
+            Ok(rb) => rb.send().await.map_err(|e| e.to_string()),
+            Err(e) => Err(e),
+        };
+        let resp = match sent {
             Ok(r) => r,
             Err(e) => {
-                tracing::debug!(op = %op_id, "relay poll transient error: {}", e);
+                tracing::debug!(op = %op_id, "op poll transient error: {}", e);
                 next_poll_due(&op_wait, vault_id, last_poll).await;
                 continue;
             }
@@ -321,8 +236,12 @@ async fn run(
                 let body: Value = resp
                     .json()
                     .await
-                    .map_err(|e| format!("relay poll parse: {}", e))?;
-                let grant = body.get("sealed_grant").cloned().unwrap_or(body);
+                    .map_err(|e| format!("op poll parse: {}", e))?;
+                let grant = body
+                    .get("grant")
+                    .or_else(|| body.get("sealed_grant"))
+                    .cloned()
+                    .unwrap_or(body);
                 let grant_hash: [u8; 32] =
                     Sha256::digest(serde_json::to_vec(&grant).unwrap_or_default()).into();
                 if last_batch_failed == Some(grant_hash) {
@@ -352,7 +271,7 @@ async fn run(
                         // 7): never reject a user-approved op over a failed
                         // BATCH rebuild (daemon restart, version skew,
                         // tampered rows). Re-register the op — the register
-                        // upsert resets the relay row to `pending`, making a
+                        // upsert resets the op row to `pending`, making a
                         // fresh per-op deposit possible again (deposits are
                         // first-write-wins, so without this reset no retry
                         // could ever land) — and keep polling until the op's
@@ -362,17 +281,15 @@ async fn run(
                         // Recovery re-register: `supersedes: []` (nothing was
                         // just marked), the op's CURRENT superseded_by.
                         let reg_body = register_body(&state, &base_body, op_id, &[]);
-                        let rr = client
-                            .post(&reg_url)
-                            .bearer_auth(auth_token)
-                            .dik_pop(
-                                "POST",
-                                &reg_url,
-                                &serde_json::to_vec(&reg_body).unwrap_or_default(),
-                            )
-                            .json(&reg_body)
-                            .send()
-                            .await;
+                        let rr = match client_dev.request(
+                            &client,
+                            reqwest::Method::POST,
+                            &reg_path,
+                            Some(&reg_body),
+                        ) {
+                            Ok(rb) => rb.send().await.map_err(|e| e.to_string()),
+                            Err(e) => Err(e),
+                        };
                         match rr {
                             Ok(r) if r.status().is_success() => {
                                 tracing::info!(op = %op_id, "op re-registered as pending after batch verify failure");
@@ -388,13 +305,12 @@ async fn run(
                         continue;
                     }
                     let e = e.detail;
-                    // The human APPROVED but the daemon can't apply this grant.
-                    // The canonical cause now is a tapped passkey that isn't in
-                    // THIS vault's keyset ("unknown credential"), after the approve
-                    // path's self-heal re-pull still couldn't resolve it. Record the
-                    // reason locally, then REJECT the op so `sc unlock` / `sc op
-                    // wait` returns a definitive, actionable error. Ending the poll
-                    // with Err instead (the old behavior) left the relay op
+                    // The human APPROVED but the daemon can't apply this grant
+                    // (a passkey no member's ledger admits, a K that doesn't match
+                    // the member record's commitment, …). Record the reason
+                    // locally, then REJECT the op so `sc unlock` / `sc op wait`
+                    // returns a definitive, actionable error. Ending the poll
+                    // with Err instead (the old behavior) left the op
                     // 'approved' and hung the CLI forever on "Waiting for approval".
                     if let Ok(audit) = state.audits.for_vault(vault_id) {
                         let _ = audit.finalize(
@@ -420,39 +336,71 @@ async fn run(
                 }
                 return Ok(());
             }
-            403 => {
+            401 | 403 => {
                 // ONLY the backend's explicit user-rejection body is a human
-                // "no" — and a user rejection now resolves the whole intent
-                // chain (design/approvals-inbox.md D1). Any other 403 (tier
-                // gate, vault mismatch, key binding, …) is an auth/routing
-                // refusal of THIS poll: end it without rejecting anything; the
-                // op stays pending locally until its own expiry.
+                // "no" — and a user rejection resolves the whole intent chain
+                // (design/approvals-inbox.md D1). Any other refusal (a device
+                // refusal, vault gate, …) ends THIS poll without rejecting
+                // anything; the op stays pending locally until its own expiry.
+                let status = resp.status().as_u16();
                 let body = resp.text().await.unwrap_or_default();
-                if is_user_rejection(&body) {
+                if status == 403 && is_user_rejection(&body) {
                     apply_reject(state.clone(), op_id, None).await;
                 } else {
-                    tracing::warn!(op = %op_id, "relay poll refused (HTTP 403, not a user rejection): {}; poll ending, op left pending", body.chars().take(200).collect::<String>());
+                    let v: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+                    let why = crate::cloud::refusal(status, &v)
+                        .map(|r| r.message())
+                        .unwrap_or_else(|| body.chars().take(200).collect());
+                    tracing::warn!(op = %op_id, "op poll refused (HTTP {}): {}; poll ending, op left pending", status, why);
                 }
                 return Ok(());
             }
             202 => {
                 next_poll_due(&op_wait, vault_id, last_poll).await;
             }
-            404 => return Ok(()), // unknown/expired on the relay side
+            404 => return Ok(()), // unknown/expired on the backend
             409 => {
                 // Cancelled: this daemon withdrew it (a superseding ceremony, a
                 // requester cancel, an abandoned Export, or its intent chain
                 // resolved). Stop polling — nothing more will arrive.
-                tracing::info!(op = %op_id, "relay op cancelled by requester; poll stopping");
+                tracing::info!(op = %op_id, "op cancelled by requester; poll stopping");
                 return Ok(());
             }
             other => {
-                tracing::debug!(op = %op_id, "relay poll HTTP {}", other);
+                tracing::debug!(op = %op_id, "op poll HTTP {}", other);
                 next_poll_due(&op_wait, vault_id, last_poll).await;
             }
         }
     }
     Ok(())
+}
+
+/// The register body (contract 8.4: today's body minus `daemon_pubkey`, the
+/// backend takes this device's enc key from its ledger; 8.8: no `passkeys`,
+/// the grant's passkeys come from the database). `op_summary` is the full op
+/// JSON (the page renders it AND uses it + r to recompute the binding β).
+fn base_register_body(
+    op_id: &str,
+    op: &Value,
+    r: &str,
+    expires_at: u64,
+    agent_id: Option<&str>,
+) -> Value {
+    json!({
+        "op_id": op_id,
+        "op_summary": STANDARD.encode(serde_json::to_vec(op).unwrap_or_default()),
+        "r": r,
+        "expires_at": expires_at,
+        // Batch-approve capability advertisement (design/batch-approve.md
+        // §Version gating): the console offers "Approve all xN" only when
+        // every op in a group carries a supporting version. Unauthenticated by
+        // design: forging it down forces per-op fallback (UX cost only).
+        "daemon_version": env!("CARGO_PKG_VERSION"),
+        // WHO triggered this op — the agent the local broker authenticated.
+        // Advisory attribution for the approve page; null for user-initiated
+        // lifecycle ceremonies.
+        "agent_id": agent_id,
+    })
 }
 
 /// The register body: the op's static fields plus the intent-chain state the
@@ -476,7 +424,7 @@ fn register_body(state: &AppState, base: &Value, op_id: &str, supersedes: &[Stri
     body
 }
 
-/// Is a relay poll's 403 body the backend's USER rejection
+/// Is an op poll's 403 body the backend's USER rejection
 /// (`{"error":"rejected"}`)? Anything else — other error codes, non-JSON, an
 /// empty body — is not.
 fn is_user_rejection(body: &str) -> bool {
@@ -502,9 +450,6 @@ fn resolved_locally(state: &AppState, op_id: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Apply a relay-fetched grant by replaying it through the daemon's own
-/// `/op/{id}/approve` endpoint over localhost. This reuses the full approve
-/// path (incl. the §4.2 W_c unseal) verbatim — no logic is duplicated.
 /// Why a loopback approve failed. `batch_verify_failed` is switched on by
 /// the poll loop's recovery arm — detected via the RFC-9457 `code` member,
 /// NEVER by matching message text (design/batch-approve.md §Daemon verify 7).
@@ -522,6 +467,9 @@ impl ApplyFailure {
     }
 }
 
+/// Apply a fetched grant by replaying it through the daemon's own
+/// `/op/{id}/approve` endpoint over localhost: the full approve path (the K
+/// unseal, the commitment and requester checks) runs verbatim.
 async fn apply_grant(state: Arc<AppState>, op_id: &str, grant: Value) -> Result<(), ApplyFailure> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
@@ -539,7 +487,7 @@ async fn apply_grant(state: Arc<AppState>, op_id: &str, grant: Value) -> Result<
         .map_err(|e| ApplyFailure::transport(format!("loopback approve: {}", e)))?;
     let status = resp.status();
     if status.is_success() {
-        tracing::info!(op = %op_id, "relay grant applied via loopback approve");
+        tracing::info!(op = %op_id, "grant applied via loopback approve");
         Ok(())
     } else {
         let body = resp.text().await.unwrap_or_default();
@@ -567,21 +515,7 @@ async fn apply_reject(state: Arc<AppState>, op_id: &str, reason: Option<&str>) {
             None => client.post(&url),
         };
         let _ = req.send().await;
-        tracing::info!(op = %op_id, "relay grant rejected via loopback");
-    }
-}
-
-/// Loopback-fetch the vault's passkey public material (cid + prf_salt + pubkey)
-/// so the relay can hand it to the browser. Returns `[]` on any failure — the
-/// page then reports "no passkeys" rather than the whole op failing.
-async fn fetch_passkeys(client: &reqwest::Client, port: u16, vault_id: &str) -> Value {
-    let url = format!("http://127.0.0.1:{}/v/{}/passkeys", port, vault_id);
-    match client.get(&url).send().await {
-        Ok(resp) if resp.status().is_success() => match resp.json::<Value>().await {
-            Ok(v) => v.get("passkeys").cloned().unwrap_or_else(|| json!([])),
-            Err(_) => json!([]),
-        },
-        _ => json!([]),
+        tracing::info!(op = %op_id, "grant rejected via loopback");
     }
 }
 
@@ -607,7 +541,7 @@ mod tests {
     fn test_state() -> AppState {
         AppState::new(crate::config::Config {
             state_dir: std::path::PathBuf::from(format!(
-                "/tmp/safeclaw-test-relay-{}",
+                "/tmp/safeclaw-test-ops-{}",
                 std::process::id()
             )),
             port: 0,
@@ -615,8 +549,6 @@ mod tests {
             listen: "127.0.0.1".into(),
             origin: "http://localhost".into(),
             rp_id: "localhost".into(),
-            admin_key: None,
-            relay_url: None,
             body_cap: crate::config::DEFAULT_BODY_CAP,
         })
     }
@@ -625,17 +557,17 @@ mod tests {
     /// reason-less cancel sends neither (backend stores null, as today).
     #[test]
     fn cancel_body_carries_reason_and_pointer() {
-        assert_eq!(cancel_body("pk", None), json!({ "daemon_pubkey": "pk" }));
+        assert_eq!(cancel_body(None), json!({}));
         assert_eq!(
-            cancel_body("pk", Some(&CancelReason::Satisfied { by: "op-b".into() })),
-            json!({ "daemon_pubkey": "pk", "reason": "satisfied", "satisfied_by": "op-b" })
+            cancel_body(Some(&CancelReason::Satisfied { by: "op-b".into() })),
+            json!({ "reason": "satisfied", "satisfied_by": "op-b" })
         );
         for (r, s) in [
             (CancelReason::Rejected, "rejected"),
             (CancelReason::Withdrawn, "withdrawn"),
             (CancelReason::Abandoned, "abandoned"),
         ] {
-            let b = cancel_body("pk", Some(&r));
+            let b = cancel_body(Some(&r));
             assert_eq!(b["reason"], s);
             assert!(b.get("satisfied_by").is_none());
         }
@@ -644,6 +576,22 @@ mod tests {
     /// Contract §2: the register body carries this process's boot_id, the ids
     /// just superseded, and the op's CURRENT pointer + retry_count read at
     /// send time; recovery re-register passes `supersedes: []`.
+    /// The register body names the op and its challenge, and carries neither
+    /// `passkeys` (8.8) nor `daemon_pubkey` (8.4).
+    #[test]
+    fn register_body_has_no_passkeys_or_daemon_pubkey() {
+        let op = json!({ "act": { "type": "export", "target": "K" } });
+        let b = base_register_body("op1", &op, "cg==", 99, Some("ag_x"));
+        assert_eq!(b["op_id"], "op1");
+        assert_eq!(b["r"], "cg==");
+        assert_eq!(b["expires_at"], 99);
+        assert_eq!(b["agent_id"], "ag_x");
+        let summary = STANDARD.decode(b["op_summary"].as_str().unwrap()).unwrap();
+        assert_eq!(serde_json::from_slice::<Value>(&summary).unwrap(), op);
+        assert!(b.get("passkeys").is_none());
+        assert!(b.get("daemon_pubkey").is_none());
+    }
+
     #[test]
     fn register_body_carries_chain_state() {
         use crate::core::policy::AccessLevel;
@@ -713,7 +661,7 @@ mod tests {
         }
     }
 
-    /// A late grant for an op the chain already resolved ends the relay poll
+    /// A late grant for an op the chain already resolved ends the op poll
     /// quietly (no reject, no apply-failure audit).
     #[test]
     fn resolved_locally_tracks_status() {

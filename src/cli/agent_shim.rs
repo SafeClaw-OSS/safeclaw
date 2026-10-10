@@ -3,10 +3,11 @@
 //!
 //! `sc run` starts this tiny local forward proxy on loopback and points the
 //! child's `*_PROXY` env at IT (not the daemon directly). The shim HOLDS the
-//! agent's AIK so the child's env carries NO credential at all — no api-key, no
-//! key — which closes the injectable-env-bearer gap, hop-A's core local value.
-//! Every daemon-bound channel authenticates by a FRESH AIK proof-of-possession
-//! ([`crate::agent_pop`]); the shim never carries the api-key. Per connection:
+//! agent's AIK so the child's env carries NO credential at all, which closes the
+//! injectable-env-bearer gap, hop-A's core local value. Every daemon-bound
+//! channel authenticates by a FRESH AIK proof-of-possession
+//! ([`crate::agent_pop`]); there is no agent bearer key (design D8). Per
+//! connection:
 //!
 //!   - **CONNECT `host:port`** (an https tunnel) → mint a fresh per-CONNECT PoP
 //!     over the target and forward with `Proxy-Authorization: Basic
@@ -27,13 +28,11 @@
 //! accept-loop + relay is a thin `tokio::io::copy_bidirectional` over the
 //! classified streams.
 //!
-//! ADDITIVE: `sc run` only routes through the shim when an AIK identity file
-//! exists; with no AIK it falls back to today's direct key-in-the-proxy-URL env.
-//! Note the shim's CONNECT was already PoP-only (the api-key never rode it), so
-//! an `ag_` must be authorized on the vault for the shim path to work at all —
-//! moving api-face to PoP imposes no NEW requirement. The api-key hash-set stays
-//! on the daemon only for LEGACY DIRECT (non-shim) agents, until the forced
-//! upgrade retires it (`design/compat-sunset.md` #2).
+//! `sc run` routes through the shim when an AIK identity file exists; without
+//! one the child gets the direct proxy URL with an empty password slot, and the
+//! proxy refuses credential substitution (no agent proof). An `ag_` must be
+//! authorized on the vault (a console-signed authorized-agents record) for the
+//! shim path to inject anything.
 
 use std::sync::Arc;
 
@@ -70,7 +69,7 @@ pub enum ShimReq {
 /// it isn't a well-formed request line we handle. The CRITICAL split is
 /// upstream-bound (CONNECT / absolute-form → `Proxy-Authorization`) vs
 /// daemon-terminated (origin-form → `Authorization`): only the latter may carry
-/// the api-key in `Authorization`, or the credential leaks to the origin.
+/// the AIK proof in `Authorization`, or the proof leaks to the origin.
 pub fn classify_request_line(first_line: &str) -> Option<ShimReq> {
     let mut parts = first_line.split(' ');
     let method = parts.next()?;
@@ -177,8 +176,8 @@ const MAX_HEAD: usize = 64 * 1024;
 
 /// Everything the shim needs to authenticate one child's traffic. Built once by
 /// `sc run` from the resolved vault + the loaded AIK, then shared across
-/// connections. Holds NO api-key: every daemon-bound channel authenticates by a
-/// fresh AIK PoP (or, for a plain-HTTP passthrough, nothing at all).
+/// connections. Every daemon-bound channel authenticates by a fresh AIK PoP
+/// (or, for a plain-HTTP passthrough, nothing at all).
 pub struct ShimConfig {
     /// Vault id — the proxy-auth username, and part of every CONNECT PoP signature.
     pub vid: String,
@@ -327,27 +326,37 @@ mod tests {
         // CONNECT (https tunnel, upstream) — case-insensitive method.
         assert_eq!(
             classify_request_line("CONNECT api.openai.com:443 HTTP/1.1"),
-            Some(ShimReq::Connect { authority: "api.openai.com:443".to_string() })
+            Some(ShimReq::Connect {
+                authority: "api.openai.com:443".to_string()
+            })
         );
         assert_eq!(
             classify_request_line("connect x:443 HTTP/1.1"),
-            Some(ShimReq::Connect { authority: "x:443".to_string() })
+            Some(ShimReq::Connect {
+                authority: "x:443".to_string()
+            })
         );
         // origin-form (path) → the daemon api-face (daemon-terminated); the exact
         // target rides along so the PoP binds it.
         assert_eq!(
             classify_request_line("GET /v/abc/registry?x=1 HTTP/1.1"),
-            Some(ShimReq::ApiFace { target: "/v/abc/registry?x=1".to_string() })
+            Some(ShimReq::ApiFace {
+                target: "/v/abc/registry?x=1".to_string()
+            })
         );
-        // absolute-form plain-HTTP → forwarded UPSTREAM (must NOT get the api-key
+        // absolute-form plain-HTTP → forwarded UPSTREAM (must NOT get the proof
         // in Authorization — the whole point of the Forward split).
         assert_eq!(
             classify_request_line("GET http://api.example.com/v1/x?q=1 HTTP/1.1"),
-            Some(ShimReq::Forward { authority: "api.example.com".to_string() })
+            Some(ShimReq::Forward {
+                authority: "api.example.com".to_string()
+            })
         );
         assert_eq!(
             classify_request_line("POST http://host:8080/p HTTP/1.1"),
-            Some(ShimReq::Forward { authority: "host:8080".to_string() })
+            Some(ShimReq::Forward {
+                authority: "host:8080".to_string()
+            })
         );
         // Malformed → None (caller closes the connection).
         assert_eq!(classify_request_line("CONNECT"), None);

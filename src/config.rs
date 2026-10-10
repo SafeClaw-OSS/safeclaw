@@ -98,9 +98,6 @@ pub enum Command {
     /// whose entry-point IS `sc serve`. Config via SAFECLAW_* env + flags;
     /// Ctrl-C to stop.
     Serve(ServeArgs),
-    /// HPKE outer-envelope public key (diagnostic).
-    #[command(hide = true)]
-    Pubkey(CommonArgs),
     /// Public service catalog. Renders the compiled-in services offline (no
     /// running daemon), the exact shape `GET /registry` serves. `--json` for CI.
     Registry(RegistryArgs),
@@ -123,42 +120,39 @@ pub enum Command {
     /// its forward hop, since the background daemon doesn't inherit your shell's
     /// `HTTPS_PROXY`.
     Proxy(ProxyArgs),
-    /// Manage the active vault's enrolled passkeys. `ls` is read-only;
-    /// `add` / `rm` / `rename` need crypto ceremonies and are deferred
-    /// to a later session. Short: `sc p`.
+    /// The passkeys that can approve for the active vault (your account's
+    /// passkeys, read from your verified ledger). `ls` only: add, rename and
+    /// remove passkeys in the console. Short: `sc p`.
     #[command(alias = "p")]
     Passkey(PasskeyArgs),
-    /// Manage this account's agents (agent ≡ api-key). `add` mints a key
-    /// (works on any paired device), `ls` lists them, `rm` revokes. Short: `sc a`.
+    /// Manage the agents on this machine. `add` mints an agent identity and
+    /// admits it with a code you approve in the console; `ls` lists the local
+    /// identities; `rm` deletes one. Short: `sc a`.
     #[command(alias = "a")]
     Agent(AgentArgs),
     /// The DEVICE axis of the account plane: `sc device login/logout` are the
     /// canonical spellings of top-level `sc login`/`sc logout` (kept as
-    /// shortcuts). Symmetric with `sc agent *` — both are account-level,
-    /// device-key/pair-token authed, cloud-backed.
+    /// shortcuts). Symmetric with `sc agent *`: both admit a key by code.
     Device(DeviceArgs),
     /// Print `export` lines for the HUMAN's shell (`eval "$(sc env)"`):
     /// SAFECLAW_BROKER_URL projected from this device's config — never a key,
     /// never a vault pin (vault follows `sc vault use`; per-call override is
-    /// `--vault`). An AGENT's env (incl. its key) is minted by `sc agent add`.
+    /// `--vault`). An AGENT's env (its identity path) is minted by `sc agent add`.
     Env,
     /// Self-update: download the latest release binary for this platform,
     /// verify its sha256, and replace the running binary in place. No-op when
     /// already current. This is also how the baked cloud domain changes ship.
     Upgrade(UpgradeArgs),
-    /// Pair this host to your vault: exchange a one-shot pair-token (from
-    /// safeclaw.pro's "Connect a new agent" modal) for this host's persistent
-    /// cloud-side daemon credential. Writes `~/.safeclaw/device-key` (0600) and
-    /// sets the active vault. Run once per host (re-run to repair/re-pair).
-    /// `sc login` then brings the daemon up and unlocks for you; `sc up` is the
-    /// everyday "make sure it's running" afterwards.
+    /// Pair this machine to your SafeClaw account: generates this device's keys
+    /// and a one-time code, prints the console page to approve it at, and waits.
+    /// Type the code there and tap your passkey; this machine then verifies the
+    /// approval against the code and asks you to confirm the account. Run once
+    /// per machine; `sc up` is the everyday "make sure it's running" afterwards.
     Login(LoginArgs),
-    /// Unpair this host: the inverse of `sc login`. Stops the daemon, clears the
-    /// local pairing (active vault, cloud backend, known vaults), removes the
-    /// `~/.safeclaw/device-key`, and revokes that device-key cloud-side (its
-    /// plaintext is gone locally, so the server row is dead weight otherwise).
-    /// `--keep-remote` skips the cloud revoke. Your agent's `SAFECLAW_*` shell
-    /// env is yours to remove (we can't edit your profile).
+    /// Unpair this machine: the inverse of `sc login`. Signs this device out on
+    /// the server, deletes its keys, stops the daemon and clears the local
+    /// pairing. Revoke it in the console to remove it from your ledger. Your
+    /// agent's `SAFECLAW_*` env is yours to remove (we can't edit your profile).
     Logout(LogoutArgs),
     /// Manage external stores connected to the active vault. Today: list.
     /// Connect / disconnect are deferred until the Write op lands in the
@@ -192,8 +186,8 @@ pub enum Command {
     Connect(ConnectArgs),
     /// Print the safeclaw binary version.
     Version,
-    /// Health + reachability checks: daemon connectivity, active
-    /// profile, API key presence. Read-only; no vault state mutation.
+    /// Health + reachability checks: daemon connectivity, pairing, the agent
+    /// identity. Read-only; no vault state mutation.
     Doctor(CommonArgs),
     /// Work with service.toml definitions. Today: `service validate <path>`
     /// runs the static safety checks the console upload editor enforces.
@@ -494,7 +488,7 @@ pub struct PasskeyArgs {
     pub sub: PasskeySubcommand,
 }
 
-/// `sc agent` — manage this account's agent api-keys (agent ≡ api-key).
+/// `sc agent` — the agents on this machine (each an AIK, admitted by code).
 #[derive(Debug, Args)]
 pub struct AgentArgs {
     #[command(subcommand)]
@@ -503,17 +497,16 @@ pub struct AgentArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum AgentSubcommand {
-    /// Mint a new agent identity and print its env: two non-secret dotenv lines,
-    /// SAFECLAW_BROKER_URL + SAFECLAW_AGENT_IDENTITY (a file path, not a secret),
-    /// which the agent appends to its own `.env`. No vault line: vault is per-call,
-    /// not identity (design/vault-addressing.md). Account-level: works on any of
-    /// your paired devices.
+    /// Mint a new agent identity (AIK), admit it with a one-time code you type
+    /// into the console, and print its env: two non-secret dotenv lines,
+    /// SAFECLAW_BROKER_URL + SAFECLAW_AGENT_IDENTITY (a file path, not a
+    /// secret). No vault line: vault is per-call, and which vaults the agent may
+    /// use is ticked in the console when you approve it.
     Add(AgentAddArgs),
-    /// List this account's agents (name, key prefix, last-used).
+    /// List the agent identities on this machine (name, `ag_` id).
     Ls,
-    /// Revoke an agent by name (or key prefix / id). Propagates to every
-    /// device in under a second over the sync stream (one poll cycle when a
-    /// device is offline or unstreamed).
+    /// Delete an agent identity from this machine. Its vault access is removed
+    /// in the console (Agents).
     Rm(AgentRmArgs),
 }
 
@@ -523,11 +516,15 @@ pub struct AgentAddArgs {
     /// (e.g. "Claude Code", "Cursor", "deploy-bot"), not a generic one, so you
     /// can recognize it later in the console's Access list.
     pub name: String,
+    /// Answer yes to the "Admit the agent … to <email> (<id>)?" confirmation
+    /// (scripts). The admission is still verified against the code.
+    #[arg(long, short = 'y')]
+    pub yes: bool,
 }
 
 #[derive(Debug, Args)]
 pub struct AgentRmArgs {
-    /// Agent name, key prefix, or id (see `sc agent ls`).
+    /// Agent name or `ag_` id (see `sc agent ls`).
     pub name: String,
 }
 
@@ -540,7 +537,7 @@ pub struct DeviceArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum DeviceSubcommand {
-    /// Pair this host to your vault (same as top-level `sc login`).
+    /// Pair this machine to your account (same as top-level `sc login`).
     Login(LoginArgs),
     /// Unpair this host (same as top-level `sc logout`).
     Logout(LogoutArgs),
@@ -548,31 +545,9 @@ pub enum DeviceSubcommand {
 
 #[derive(Debug, Subcommand)]
 pub enum PasskeySubcommand {
-    /// List passkeys enrolled on the active vault (public metadata only:
-    /// credential id, device name, transports, timestamps). No vault
-    /// unlock or passkey gesture required.
+    /// List the passkeys that can approve for the active vault (your account's
+    /// ledger-admitted passkeys: credential id, label). No gesture required.
     Ls(CommonArgs),
-    /// Add a new passkey (cross-device or same-device). NOT YET
-    /// IMPLEMENTED, needs the daemon-side `/cli/auth?op=enroll-passkey`
-    /// page and the same crypto vendoring as `sc setup`.
-    Add(CommonArgs),
-    /// Remove an enrolled passkey by credential id. NOT YET IMPLEMENTED.
-    Rm(PasskeyRemoveArgs),
-    /// Rename an enrolled passkey's `device_name`. NOT YET IMPLEMENTED —
-    /// daemon currently has no metadata-update endpoint.
-    Rename(PasskeyRenameArgs),
-}
-
-#[derive(Debug, Args)]
-pub struct PasskeyRemoveArgs {
-    /// base64url credential id (as shown in `passkeys ls`).
-    pub credential_id: String,
-}
-
-#[derive(Debug, Args)]
-pub struct PasskeyRenameArgs {
-    pub credential_id: String,
-    pub new_name: String,
 }
 
 #[derive(Debug, Args)]
@@ -593,11 +568,6 @@ pub enum VaultSubcommand {
     /// Remove a vault from the local known list (does NOT touch the
     /// daemon, for that use `sc vault rm`). Pass URL or index.
     Forget(VaultForgetArgs),
-    /// Create a new vault. Default = local (http://localhost:23293,
-    /// vault id "default"). Pass --remote <URL> to create on a remote
-    /// custodian (auto-generates a UUID). Saves to config and makes
-    /// the new vault active.
-    Create(VaultCreateArgs),
     /// Irreversibly delete a vault's daemon-side state. Passkey-gated
     /// via the standard `/op/{op_id}` browser-callback ceremony.
     Rm(VaultDeleteArgs),
@@ -627,26 +597,6 @@ pub struct VaultForgetArgs {
     /// A vault URL (`<daemon>/v/<vault_id>`) or numeric index from
     /// `sc vault ls`. If omitted, an interactive prompt lists known vaults.
     pub url_or_idx: Option<String>,
-}
-
-#[derive(Debug, Args)]
-pub struct VaultCreateArgs {
-    /// Create on a remote custodian (default is local). Pass the
-    /// custodian root URL like `https://custodian.dev.safeclaw.pro`.
-    #[arg(long)]
-    pub remote: Option<String>,
-    #[arg(long)]
-    pub no_browser: bool,
-    /// Fixed port for the localhost callback server (for SSH forwarding).
-    #[arg(long, env = "SAFECLAW_CB_PORT")]
-    pub cb_port: Option<u16>,
-    #[arg(long, default_value = "120")]
-    pub timeout: u64,
-    /// Reuse an existing registered passkey instead of registering a new one.
-    /// Skips the create() ceremony; uses get() PRF from an already-enrolled
-    /// vault. Saves a browser gesture when the hardware key is already set up.
-    #[arg(long)]
-    pub reuse_passkey: bool,
 }
 
 #[derive(Debug, Args)]
@@ -779,25 +729,6 @@ pub struct ServeArgs {
     #[arg(long, env = "SAFECLAW_RP_ID")]
     pub rp_id: Option<String>,
 
-    /// Shared secret that authenticates this daemon to the cloud op-relay
-    /// (see `--relay-url`): the daemon presents it as the bearer token when it
-    /// registers a pending op and polls for the browser-deposited grant. When
-    /// unset, the daemon can't reach the relay, so web approval is off (it
-    /// falls back to local-only). Set on the daemon AND matched on the relay.
-    /// Rotate by changing the env var and redeploying. (Named `admin_key` for
-    /// historical reasons — the old `/admin/*` HTTP surface it also gated is
-    /// gone; today it is purely the relay credential.)
-    #[arg(long, env = "SAFECLAW_ADMIN_KEY")]
-    pub admin_key: Option<String>,
-
-    /// Cloud op-relay base URL (e.g. `https://api.dev.safeclaw.pro`). When set,
-    /// the daemon registers each pending op with the relay and polls for the
-    /// browser-deposited (HPKE-sealed) grant — this is what enables web
-    /// approval for a zero-inbound localhost daemon. When unset, the daemon is
-    /// local-only (legacy embedded op-page). Auth uses `--admin-key`.
-    #[arg(long, env = "SAFECLAW_RELAY_URL")]
-    pub relay_url: Option<String>,
-
     /// Max body size (bytes) the broker will buffer for a phantom-bearing
     /// request. Over the cap the request is refused with a clear 413 — the
     /// proxy never forwards a credential alongside a body policy couldn't
@@ -856,14 +787,8 @@ pub struct UpgradeArgs {
 /// Args for `sc login`.
 #[derive(Debug, Args)]
 pub struct LoginArgs {
-    /// One-shot pair-token from safeclaw.pro → Connect-a-new-agent modal
-    /// (single-use, format `spt_...`). OMIT it to use Device Flow instead:
-    /// `sc login` with no token asks the cloud for a short code you approve in
-    /// your browser — nothing secret touches the prompt (design §12).
-    #[arg(long)]
-    pub pair_token: Option<String>,
-    /// Friendly label shown for this host in the dashboard's device list.
-    /// Defaults to the machine's hostname, else `agent-device`.
+    /// Friendly label shown for this host in your device list. Defaults to the
+    /// machine's hostname, else `agent-device`.
     #[arg(long)]
     pub device_name: Option<String>,
     /// First-party environment selector: `prod` (default) or `dev`. Resolves
@@ -873,28 +798,19 @@ pub struct LoginArgs {
     /// install prompt appends `--profile dev`.
     #[arg(long)]
     pub profile: Option<String>,
-    /// Test-only: allow a plaintext `http://` custodian URL. Without this,
-    /// `sc login` refuses non-HTTPS URLs to keep the pair-token off the wire
-    /// in cleartext (a malicious skill prompt could otherwise smuggle in an
-    /// attacker's device-key by suggesting an `http://` custodian).
-    /// `http://localhost:*` and `http://127.0.0.1:*` are exempt, that's the
-    /// common dev-loopback case and is on-host plaintext.
+    /// Test-only: allow a plaintext `http://` server URL (`SAFECLAW_CLOUD_URL`).
+    /// `http://localhost:*` and `http://127.0.0.1:*` are exempt (on-host).
     #[arg(long)]
     pub insecure: bool,
+    /// Answer yes to the "Pair to <email> (<id>)?" confirmation (scripts). The
+    /// admission is still verified against the code; only the prompt is skipped.
+    #[arg(long, short = 'y')]
+    pub yes: bool,
 }
 
 /// Args for `sc logout`.
 #[derive(Debug, Args)]
-pub struct LogoutArgs {
-    /// Keep this host's device-key registered on the server (don't revoke it
-    /// cloud-side). By default logout DELETES the cloud-side key too: once the
-    /// local `device-key` file is gone its plaintext is unrecoverable, so the
-    /// server row could never be used again — leaving it just clutters your
-    /// dashboard's device list. Use `--keep-remote` only if something external
-    /// still manages that key.
-    #[arg(long)]
-    pub keep_remote: bool,
-}
+pub struct LogoutArgs {}
 
 /// Reusable arg set for read-only short-lived commands. The daemon control
 /// root comes from the shared derivation (env `$SAFECLAW_BROKER_URL` host >
@@ -978,8 +894,6 @@ pub struct Config {
     pub listen: String,
     pub origin: String,
     pub rp_id: String,
-    pub admin_key: Option<String>,
-    pub relay_url: Option<String>,
     /// See `ServeArgs::body_cap` / [`DEFAULT_BODY_CAP`].
     pub body_cap: u64,
 }
@@ -1015,8 +929,6 @@ impl Config {
             listen: args.listen,
             origin,
             rp_id,
-            admin_key: args.admin_key,
-            relay_url: args.relay_url,
             body_cap: args.body_cap,
         }
     }
