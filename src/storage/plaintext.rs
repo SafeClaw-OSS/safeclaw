@@ -379,7 +379,7 @@ impl AgentMask {
 }
 
 /// One row of a vault's **authorized-agents table** — the item body under
-/// `aux:agent/<ag_id>` (design/agent-device-identity-mtls.md §11.1). It records
+/// native `agent:<ag_id>` (design/agent-device-identity-mtls.md §11.1). It records
 /// the agent's self-certifying pubkey, the owning member (`us_…`) whose UIK
 /// authority admits it, and the connection reach mask.
 ///
@@ -389,12 +389,13 @@ impl AgentMask {
 /// re-key — the agent never held K). There is no separate admission mode: an
 /// `ag_id` with no item is simply not authorized.
 ///
-/// Each item is **UIK-signed** and folded through [`crate::identity::config_sig_input`]
-/// under the logical name `agent/<ag_id>`; the fold verifies the signer is
-/// EITHER this `owner` (a member authorizing their OWN agent) OR any owner
-/// (owner override). Because the daemon holds only PUBLIC keys, it cannot
-/// re-sign a folded row, so the verified signed wrapper is retained in
-/// [`Self::signed_body`] and re-emitted byte-identically.
+/// Each item is a NATIVE `agent` row at wire id == `ag_id`, carrying a **UIK
+/// sidecar signature** (`record_signature_input`, type `"agent"`); on a v2 vault
+/// the fold honors it only if the signer is EITHER this `owner` (a member
+/// authorizing their OWN agent) OR any owner (owner override); an unsigned row is
+/// dropped there (honored only on a legacy single-person NoUik vault). Legacy
+/// `aux:agent/<ag_id>` rows are never folded. The daemon holds only PUBLIC keys,
+/// so it never writes agent rows; the console does.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AgentEntry {
     /// The agent's Ed25519 signing pubkey (base64url-nopad). Self-certifying:
@@ -410,13 +411,6 @@ pub struct AgentEntry {
     /// Connection reach mask (deny-list; `All` = unrestricted).
     #[serde(default)]
     pub connections: AgentMask,
-    /// The verified signed wrapper (`{ data, uik_sig, uik_sign_pub }`) exactly as
-    /// folded from cloud, retained so the daemon can re-emit this row
-    /// byte-identically (it holds only PUBLIC keys and cannot re-sign). `None` for
-    /// a legacy raw (unsigned) row → the daemon re-emits the raw body. Never
-    /// serialized as a struct field; consulted directly by the seal path.
-    #[serde(skip)]
-    pub signed_body: Option<serde_json::Value>,
 }
 
 /// `aux` payload — everything inside `ProtectedState.aux` for v4 vaults.
@@ -458,8 +452,8 @@ pub struct VaultAux {
     /// The vault's **authorized-agents table** (design §11.1), keyed by `ag_id`
     /// (`derive_id(Agent, pubkey)`). **Presence = authorized**; an `ag_id` with no
     /// entry is not authorized (there is no admission mode). Each [`AgentEntry`] is
-    /// UIK-signed. Sliced to `aux:agent/<ag_id>` items (one per agent = independent
-    /// CAS, same pattern as connections). Team §8.1 / identity §11.
+    /// a native `agent:<ag_id>` item, UIK-signed by the console (one per agent =
+    /// independent CAS). Read-only for the daemon. Team §8.1 / identity §11.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub agents: BTreeMap<String, AgentEntry>,
 }

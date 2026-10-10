@@ -948,7 +948,13 @@ fn reconcile_per_item_after_connect(
     // and the bootstrap branch is only reached on the vault.dat path.
     let mut pv = match crate::storage::sealed_vault::read_per_item(&path) {
         Ok(Some(pv)) => pv,
-        _ => {
+        // An unreadable store may be a v2 (UIK) one: never overwrite it with a
+        // bootstrapped v1 keyset (that would downgrade it to integrity-only NoUik).
+        Err(e) => {
+            tracing::warn!(vault = %vault_id, "per-item connect reconcile skipped: store unreadable: {}", e);
+            return;
+        }
+        Ok(None) => {
             let Some(vault) = vault else { return };
             PerItemVault {
                 keyset: Keyset {

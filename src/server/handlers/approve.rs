@@ -2308,14 +2308,30 @@ fn seed_per_item_store(
     let Ok(per_item_path) = state.vaults.per_item_path(vault_id) else {
         return;
     };
+    let existing = match crate::storage::sealed_vault::read_per_item(&per_item_path) {
+        Ok(existing) => existing,
+        // Unreadable: it may be a v2 store, so never overwrite it (fail closed).
+        Err(e) => {
+            tracing::warn!(vault = %vault_id, "per-item seed skipped: existing store unreadable: {}", e);
+            return;
+        }
+    };
+    // Anti-downgrade: this re-seed rebuilds the keyset as v1 (`uik: None`). Never
+    // let it overwrite a store that already carries a UIK layer: that would flip the
+    // vault to `NoUik` (integrity-only) and re-open unsigned owner-config / agent
+    // acceptance. A v2 vault's store is owned by the ceremony + sync, not here.
+    if existing.as_ref().is_some_and(|pv| pv.keyset.uik.is_some()) {
+        tracing::warn!(
+            vault = %vault_id,
+            "per-item seed skipped: existing store is v2 (UIK); refusing to downgrade it to a v1 keyset"
+        );
+        return;
+    }
     // Carry the keyset cursor forward if a per-item file already exists, so a
     // re-seed after a write doesn't reset the CAS cursors the sync layer tracks.
-    let (keyset_version, items_seq, keyset_seq) =
-        crate::storage::sealed_vault::read_per_item(&per_item_path)
-            .ok()
-            .flatten()
-            .map(|pv| (pv.keyset.keyset_version, pv.items_seq, pv.keyset_seq))
-            .unwrap_or((0, 0, 0));
+    let (keyset_version, items_seq, keyset_seq) = existing
+        .map(|pv| (pv.keyset.keyset_version, pv.items_seq, pv.keyset_seq))
+        .unwrap_or((0, 0, 0));
     let mut pv = PerItemVault {
         keyset: Keyset {
             version: vault.version,
