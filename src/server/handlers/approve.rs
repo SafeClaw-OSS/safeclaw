@@ -1262,7 +1262,7 @@ pub async fn approve_op(
                         &validated.credential_id_bytes,
                         existing_vault.as_ref(),
                     )?;
-                let base = crate::storage::sealed_vault::ViewNames::of(&view);
+                let base = crate::storage::sealed_vault::ViewBase::of(&view)?;
                 match view.aux.connections.get_mut(&conn) {
                     Some(rec) => {
                         let hosts = rec.hosts.get_or_insert_with(Vec::new);
@@ -1343,7 +1343,7 @@ pub async fn approve_op(
                         &validated.credential_id_bytes,
                         existing_vault.as_ref(),
                     )?;
-                let base = crate::storage::sealed_vault::ViewNames::of(&view);
+                let base = crate::storage::sealed_vault::ViewBase::of(&view)?;
                 let mut removed = false;
                 if let Some(rec) = view.aux.connections.get_mut(&conn) {
                     if let Some(hosts) = rec.hosts.as_mut() {
@@ -1421,7 +1421,7 @@ pub async fn approve_op(
                         &validated.credential_id_bytes,
                         existing_vault.as_ref(),
                     )?;
-                let base = crate::storage::sealed_vault::ViewNames::of(&view);
+                let base = crate::storage::sealed_vault::ViewBase::of(&view)?;
                 let refs = service_refs(&view, &id);
                 if view.aux.services.remove(&id).is_none() {
                     return Err(AppError::BadRequest(format!(
@@ -1484,7 +1484,7 @@ pub async fn approve_op(
                         &validated.credential_id_bytes,
                         existing_vault.as_ref(),
                     )?;
-                let base = crate::storage::sealed_vault::ViewNames::of(&view);
+                let base = crate::storage::sealed_vault::ViewBase::of(&view)?;
                 view.aux.services.insert(id.clone(), toml_src);
                 crate::auth::connect::persist_mutated_view(&state, &vault_id, &base, &view, &k)
                     .map_err(AppError::Internal)?;
@@ -1522,7 +1522,7 @@ pub async fn approve_op(
                         &validated.credential_id_bytes,
                         existing_vault.as_ref(),
                     )?;
-                let base = crate::storage::sealed_vault::ViewNames::of(&view);
+                let base = crate::storage::sealed_vault::ViewBase::of(&view)?;
                 if !view.native_secrets.contains_key(&key) {
                     // One flat namespace, two authorities: SafeClaw OWNS
                     // native items but only READS external stores — so an
@@ -1590,7 +1590,7 @@ pub async fn approve_op(
                         &validated.credential_id_bytes,
                         existing_vault.as_ref(),
                     )?;
-                let base = crate::storage::sealed_vault::ViewNames::of(&view);
+                let base = crate::storage::sealed_vault::ViewBase::of(&view)?;
                 let rec = view.aux.connections.get(&id).cloned().ok_or_else(|| {
                     AppError::BadRequest(format!("no connection '{}' in this vault", id))
                 })?;
@@ -1724,7 +1724,7 @@ pub async fn approve_op(
                         &validated.credential_id_bytes,
                         existing_vault.as_ref(),
                     )?;
-                let base = crate::storage::sealed_vault::ViewNames::of(&view);
+                let base = crate::storage::sealed_vault::ViewBase::of(&view)?;
 
                 let record = match &service {
                     // RAW: anchors its own exact FQDNs; explicit `secrets` list.
@@ -1926,7 +1926,7 @@ pub async fn approve_op(
                         &validated.credential_id_bytes,
                         existing_vault.as_ref(),
                     )?;
-                let base = crate::storage::sealed_vault::ViewNames::of(&view);
+                let base = crate::storage::sealed_vault::ViewBase::of(&view)?;
                 let removed_prior_anchor = apply_secret_set_to_view(
                     &mut view,
                     &key,

@@ -42,7 +42,7 @@ use sudp::state::ProtectedState;
 use crate::auth::oauth2::{ExchangedTokens, OAuthStyle};
 use crate::state::AppState;
 use crate::storage::plaintext::{secret_key_for, suggested_secret_key, Connecting, Connection};
-use crate::storage::sealed_vault::{ViewDeletions, ViewNames};
+use crate::storage::sealed_vault::{ReconcileBase, ViewBase};
 
 /// The OAuth client/endpoint a pending connect resolves to before exchange, plus
 /// the service's secret role (so we know where to write the result).
@@ -563,11 +563,6 @@ pub(crate) async fn apply_pending_connects(
         .join("vaults")
         .join(vault_id)
         .join("vault.dat");
-    // Open the vault body from whichever store backs it. A daemon-side
-    // Enroll/Write vault has a whole-blob vault.dat; a WEB-enrolled vault has
-    // ONLY the per-item store (vault.per-item.json) — for that we fold the item
-    // rows into a view and rebuild the ProtectedState M the connect machine runs
-    // on (inverse of VaultPlaintextView::from_protected_state).
     let vault_dat = match crate::storage::sealed_vault::read(&vault_path) {
         Ok(v) => v,
         Err(e) => {
@@ -575,50 +570,18 @@ pub(crate) async fn apply_pending_connects(
             None
         }
     };
-    let mut m = if let Some(vault) = &vault_dat {
-        match crate::server::handlers::metadata::open_protected_state_with_key(&k, vault) {
-            Ok(m) => m,
-            Err(_) => {
-                // Rotated K — a re-unlock heals. Trace it: this return also
-                // silently skips loopback-listener arming, so without a line
-                // here a skipped scan is indistinguishable from "no pending
-                // connect".
-                tracing::debug!(vault = %vault_id, "oauth connect: vault.dat undecryptable with retained K — skipping scan (re-unlock heals)");
-                return ConnectReport::default();
-            }
-        }
-    } else {
-        let Ok(pi_path) = state.vaults.per_item_path(vault_id) else {
+    // `M` + the base it was read from (per-item store first: see
+    // `open_m_for_write`). Not openable → skip; a re-unlock heals a rotated K.
+    // Trace it: this return also silently skips loopback-listener arming, so
+    // without a line here a skipped scan is indistinguishable from "no pending
+    // connect".
+    let (mut m, base) = match open_m_for_write(state, vault_id, &k, vault_dat.as_ref()) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::debug!(vault = %vault_id, "oauth connect: skipping scan: {}", e);
             return ConnectReport::default();
-        };
-        let Ok(Some(pv)) = crate::storage::sealed_vault::read_per_item(&pi_path) else {
-            return ConnectReport::default(); // neither vault.dat nor a per-item store
-        };
-        let view = match crate::server::handlers::metadata::decrypt_vault_view_peritem_with_key(
-            &k, &pv, vault_id,
-        ) {
-            Ok(v) => v,
-            Err(_) => {
-                tracing::debug!(vault = %vault_id, "oauth connect: per-item view undecryptable with retained K — skipping scan (re-unlock heals)");
-                return ConnectReport::default();
-            }
-        };
-        match build_m_from_view(&view) {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::warn!(vault = %vault_id, "oauth connect: rebuild M from per-item failed: {}", e);
-                return ConnectReport::default();
-            }
         }
     };
-    // The base the connect machine mutates FROM. `M` may come from vault.dat,
-    // which lags the per-item store (a pull adopts rows into the store only), so
-    // "absent from the post-connect view" is NOT "deleted": only rows this base
-    // had and the connect dropped (the connecting→connection MOVE) are
-    // tombstoned. Unbuildable → upsert-only.
-    let base_view = crate::storage::plaintext::VaultPlaintextView::from_protected_state(&m)
-        .ok()
-        .map(|v| ViewNames::of(&v));
 
     // Register every loopback connect still AWAITING its redirect (carries a
     // `state`, no code yet) so the on-demand listener can match an incoming
@@ -763,7 +726,7 @@ pub(crate) async fn apply_pending_connects(
             Some(&vault),
             &view,
             &k,
-            connect_deletions(base_view.as_ref()),
+            ReconcileBase::Since(&base),
         );
     } else {
         reconcile_per_item_after_connect(
@@ -772,7 +735,7 @@ pub(crate) async fn apply_pending_connects(
             None,
             &view,
             &k,
-            connect_deletions(base_view.as_ref()),
+            ReconcileBase::Since(&base),
         );
     }
     tracing::info!(
@@ -827,30 +790,11 @@ pub(crate) async fn persist_rotated_refresh_locked(
             None
         }
     };
-    let mut m = if let Some(vault) = &vault_dat {
-        match crate::server::handlers::metadata::open_protected_state_with_key(&k, vault) {
-            Ok(m) => m,
-            Err(_) => return false, // rotated K — next unlock re-reads
-        }
-    } else {
-        let Ok(pi_path) = state.vaults.per_item_path(vault_id) else {
-            return false;
-        };
-        let Ok(Some(pv)) = crate::storage::sealed_vault::read_per_item(&pi_path) else {
-            return false;
-        };
-        let view = match crate::server::handlers::metadata::decrypt_vault_view_peritem_with_key(
-            &k, &pv, vault_id,
-        ) {
-            Ok(v) => v,
-            Err(_) => return false,
-        };
-        match build_m_from_view(&view) {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::warn!(vault = %vault_id, "oauth rotate: rebuild M failed: {}", e);
-                return false;
-            }
+    let (mut m, base) = match open_m_for_write(state, vault_id, &k, vault_dat.as_ref()) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::debug!(vault = %vault_id, "oauth rotate: skipped: {}", e);
+            return false; // next unlock re-reads
         }
     };
 
@@ -879,18 +823,23 @@ pub(crate) async fn persist_rotated_refresh_locked(
             tracing::warn!(vault = %vault_id, "oauth rotate: write vault.dat failed: {}", e);
             return false;
         }
-        // A rotation only writes a secret: never tombstone (its `M` may be the
-        // lagging vault.dat).
         reconcile_per_item_after_connect(
             state,
             vault_id,
             Some(&vault),
             &view,
             &k,
-            ViewDeletions::Never,
+            ReconcileBase::Since(&base),
         );
     } else {
-        reconcile_per_item_after_connect(state, vault_id, None, &view, &k, ViewDeletions::Never);
+        reconcile_per_item_after_connect(
+            state,
+            vault_id,
+            None,
+            &view,
+            &k,
+            ReconcileBase::Since(&base),
+        );
     }
 
     let cache = crate::server::handlers::approve::bootstrap_cache_from_view(&view, state);
@@ -899,9 +848,41 @@ pub(crate) async fn persist_rotated_refresh_locked(
     true
 }
 
-/// Tombstones for a connect: only rows its base view had (see `base_view`).
-fn connect_deletions(base: Option<&ViewNames>) -> ViewDeletions<'_> {
-    base.map_or(ViewDeletions::Never, ViewDeletions::RemovedSince)
+/// Open the vault body `M` a daemon-side write mutates, plus the
+/// [`ViewBase`] it was read from. The per-item store is the LIVE content
+/// (pulls land there only), so it wins whenever it exists, exactly as
+/// `open_view_for_grant_keep_key` / `open_view_with_state_key` read; `vault.dat`
+/// is the fallback for a vault without one (and otherwise only a write-through
+/// mirror the caller re-seals). Reading a lagging vault.dat first made a
+/// connect/refresh write its stale values back over newer pulled ones. An
+/// unreadable store is an error, never a silent fall back to vault.dat.
+fn open_m_for_write(
+    state: &Arc<AppState>,
+    vault_id: &str,
+    k: &[u8],
+    vault_dat: Option<&crate::storage::SealedVault>,
+) -> Result<(ProtectedState, ViewBase), String> {
+    let pv = match state.vaults.per_item_path(vault_id) {
+        Ok(p) => crate::storage::sealed_vault::read_per_item(&p)
+            .map_err(|e| format!("per-item store unreadable: {}", e))?,
+        Err(_) => None,
+    };
+    let (m, view) = if let Some(pv) = pv {
+        let view = crate::server::handlers::metadata::decrypt_vault_view_peritem_with_key(
+            k, &pv, vault_id,
+        )
+        .map_err(|e| format!("per-item view undecryptable with retained K: {}", e))?;
+        (build_m_from_view(&view)?, view)
+    } else {
+        let vault = vault_dat.ok_or("neither a per-item store nor vault.dat")?;
+        let m = crate::server::handlers::metadata::open_protected_state_with_key(k, vault)
+            .map_err(|e| format!("vault.dat undecryptable with retained K: {}", e))?;
+        let view = crate::storage::plaintext::VaultPlaintextView::from_protected_state(&m)
+            .map_err(|e| format!("view rebuild failed: {}", e))?;
+        (m, view)
+    };
+    let base = ViewBase::of(&view).map_err(|e| format!("view base: {}", e))?;
+    Ok((m, base))
 }
 
 /// Rebuild a [`ProtectedState`] `M` from a folded per-item view — the inverse of
@@ -926,17 +907,17 @@ fn build_m_from_view(
 /// contract §4), and refreshes the in-memory cache so the change is live for the
 /// broker. Does NOT push — the caller spawns the sync fan-out AFTER its write
 /// guard drops (the push path re-takes the per-vault write lock, which is not
-/// reentrant). `base` is [`ViewNames::of`] the view as opened, captured BEFORE
-/// the caller mutated it: only items it had and the caller removed are
-/// tombstoned, so a row a concurrent pull adopted (pull does not take the write
-/// lock) is never dropped. `k` is the state key recovered
+/// reentrant). `base` is [`ViewBase::of`] the view as opened, captured BEFORE
+/// the caller mutated it: only what the caller changed or removed relative to
+/// it is written, so a row a concurrent pull changed or adopted (pull does not
+/// take the write lock) is neither reverted nor dropped. `k` is the state key recovered
 /// from the grant's `W_c` (via `open_view_for_grant_keep_key`), so the CLI never
 /// touches the PRF-derived user key — a `sc service` write works over SSH
 /// through the plain grant link.
 pub(crate) fn persist_mutated_view(
     state: &Arc<AppState>,
     vault_id: &str,
-    base: &ViewNames,
+    base: &ViewBase,
     view: &crate::storage::plaintext::VaultPlaintextView,
     k: &[u8],
 ) -> Result<(), String> {
@@ -961,7 +942,7 @@ pub(crate) fn persist_mutated_view(
             Some(&vault),
             view,
             k,
-            ViewDeletions::RemovedSince(base),
+            ReconcileBase::Since(base),
         );
     } else {
         reconcile_per_item_after_connect(
@@ -970,7 +951,7 @@ pub(crate) fn persist_mutated_view(
             None,
             view,
             k,
-            ViewDeletions::RemovedSince(base),
+            ReconcileBase::Since(base),
         );
     }
     let cache = crate::server::handlers::approve::bootstrap_cache_from_view(view, state);
@@ -992,7 +973,7 @@ fn reconcile_per_item_after_connect(
     vault: Option<&crate::storage::SealedVault>,
     view: &crate::storage::plaintext::VaultPlaintextView,
     k: &[u8],
-    deletions: ViewDeletions,
+    base: ReconcileBase<'_>,
 ) {
     use crate::storage::sealed_vault::{Keyset, PerItemVault};
     let Ok(path) = state.vaults.per_item_path(vault_id) else {
@@ -1031,7 +1012,7 @@ fn reconcile_per_item_after_connect(
         crate::storage::item::VaultKeys::single(k),
         vault_id,
         view,
-        deletions,
+        base,
     ) {
         Ok(changed) => {
             if changed.is_empty() {
@@ -1666,5 +1647,118 @@ refresh_token = "REFRESH_TOKEN"
         // The CUSTOM endpoint + client win, not the registry's Google ones.
         assert_eq!(cfg.token_url, "https://shadow.test/token");
         assert_eq!(cfg.client_id, "shadow-client");
+    }
+
+    /// A connect / token refresh never writes a stale value back over one a
+    /// pull landed in the per-item store: `M` is read from the store (not the
+    /// lagging vault.dat), and only the caller's change vs that base is written,
+    /// even when another pull lands between the read and the reconcile (a
+    /// connect awaits a token exchange in between).
+    #[test]
+    fn connect_write_never_reverts_a_pulled_value() {
+        use crate::storage::item::{ItemNs, ItemPayload, VaultKeys};
+        use crate::storage::sealed_vault::PerItemVault;
+        type S = sudp::primitives::StdPrimitives;
+        let cfg = crate::config::Config {
+            state_dir: std::path::PathBuf::from(format!(
+                "/tmp/safeclaw-test-connect-prec-{}",
+                std::process::id()
+            )),
+            port: 0,
+            proxy_port: 0,
+            listen: "127.0.0.1".into(),
+            origin: "http://localhost".into(),
+            rp_id: "localhost".into(),
+            admin_key: None,
+            relay_url: None,
+            body_cap: crate::config::DEFAULT_BODY_CAP,
+        };
+        let state = Arc::new(AppState::new(cfg));
+        let vid = "conn-prec";
+        let k = [0x42u8; 32];
+        let keys = VaultKeys::single(&k);
+        let _ = std::fs::remove_dir_all(state.vaults.dir_for(vid).unwrap());
+
+        // vault.dat: the stale mirror, OPENAI_API_KEY = "old".
+        let mut m_old = ProtectedState::new();
+        m_old.aux = serde_json::json!({ "version": 3, "stores": {}, "store_order": [] });
+        m_old.put_secret("OPENAI_API_KEY", b"old".to_vec());
+        let mut vault = crate::storage::sealed_vault::build_initial(
+            b"c".to_vec(),
+            "x".into(),
+            "y".into(),
+            "Dev".into(),
+            vec![0u8; 32],
+            vec![0u8; 48],
+            vec![],
+        )
+        .unwrap();
+        crate::server::handlers::metadata::reseal_body_with_key(&k, &mut vault, &m_old).unwrap();
+        crate::storage::sealed_vault::write_atomic(&state.vaults.vault_path(vid).unwrap(), &vault)
+            .unwrap();
+
+        // Per-item store: seeded from the old state, then a pull landed "new" at v2.
+        let pi_path = state.vaults.per_item_path(vid).unwrap();
+        let mut pv = PerItemVault::build_initial(
+            b"c".to_vec(),
+            "x".into(),
+            "y".into(),
+            "Dev".into(),
+            vec![0u8; 32],
+            vec![0u8; 48],
+        )
+        .unwrap();
+        let old_view =
+            crate::storage::plaintext::VaultPlaintextView::from_protected_state(&m_old).unwrap();
+        pv.seed_items_from_view::<S>(keys, vid, &old_view).unwrap();
+        let pull = |pv: &mut PerItemVault, v: u64, value: &str| {
+            let id = pv
+                .seal_and_upsert::<S>(
+                    keys,
+                    vid,
+                    ItemNs::Secret,
+                    "OPENAI_API_KEY",
+                    v,
+                    &ItemPayload::secret_live("OPENAI_API_KEY", value),
+                )
+                .unwrap();
+            pv.items.get_mut(&id).unwrap().synced_version = v;
+        };
+        for s in pv.items.values_mut() {
+            s.synced_version = s.version;
+        }
+        pull(&mut pv, 2, "new");
+        crate::storage::sealed_vault::write_per_item_atomic(&pi_path, &pv).unwrap();
+
+        // Read: the store wins over vault.dat.
+        let (mut m, base) = open_m_for_write(&state, vid, &k, Some(&vault)).unwrap();
+        assert_eq!(m.secret("OPENAI_API_KEY").unwrap(), b"new");
+
+        // Another pull lands while the "exchange" runs: "newer" at v3.
+        let mut pv = crate::storage::sealed_vault::read_per_item(&pi_path)
+            .unwrap()
+            .unwrap();
+        pull(&mut pv, 3, "newer");
+        crate::storage::sealed_vault::write_per_item_atomic(&pi_path, &pv).unwrap();
+
+        // The refresh writes only its own secret.
+        m.put_secret("GMAIL_REFRESH_TOKEN", b"rt".to_vec());
+        let view = crate::storage::plaintext::VaultPlaintextView::from_protected_state(&m).unwrap();
+        reconcile_per_item_after_connect(
+            &state,
+            vid,
+            Some(&vault),
+            &view,
+            &k,
+            ReconcileBase::Since(&base),
+        );
+
+        let pv = crate::storage::sealed_vault::read_per_item(&pi_path)
+            .unwrap()
+            .unwrap();
+        let folded = pv.fold_view::<S>(keys, vid).unwrap();
+        assert_eq!(folded.native_secrets["OPENAI_API_KEY"], b"newer");
+        assert_eq!(folded.native_secrets["GMAIL_REFRESH_TOKEN"], b"rt");
+        let _ = std::fs::remove_dir_all(state.vaults.dir_for(vid).unwrap());
     }
 }

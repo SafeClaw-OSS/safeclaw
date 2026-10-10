@@ -1050,40 +1050,50 @@ fn membership_prefix_ok(uik: &KeysetUik, vault_id: &str) -> bool {
     crate::identity::membership_commitment(&prefix_sigs).as_slice() == proof.membership_hash.as_slice()
 }
 
-/// Which items absent from a view [`PerItemVault::reconcile_from_view`] may
-/// tombstone. Absence only means "deleted" relative to a known base.
+/// What [`PerItemVault::reconcile_from_view`] treats as the CALLER's change.
+/// Only a difference from the view's base is one: a row a concurrent pull
+/// changed or adopted after the base was taken (pull does not take the vault
+/// write lock, and a connect awaits a token exchange in between) is neither
+/// reverted nor dropped.
 #[derive(Clone, Copy)]
-pub enum ViewDeletions<'a> {
-    /// Upsert-only: the view has no base, so an absent item may be one this
-    /// writer never saw.
-    Never,
-    /// Only items the base (the view the change was made FROM, captured before
-    /// mutating it) had. A row a concurrent pull adopted after that capture is
-    /// in neither, so it is never dropped.
-    RemovedSince(&'a ViewNames),
-    /// Every item missing from the view: ONLY when the view is this store's own
-    /// fold taken inside the same `&mut self` call (no pull can interleave).
-    MissingFromFold,
+pub enum ReconcileBase<'a> {
+    /// The view was derived from `base` (captured before mutating it): upsert
+    /// only items whose body differs from the base, tombstone only items the
+    /// base had and the view dropped.
+    Since(&'a ViewBase),
+    /// The view IS this store's own fold, taken inside the same `&mut self`
+    /// call (nothing can interleave): every difference is the caller's.
+    OwnFold,
 }
 
-/// The tombstonable item names of a view (secret / connection / connecting),
-/// captured as a [`ViewDeletions::RemovedSince`] base. Names only: no secret
-/// values are copied.
+/// A view's items as `(ns, name) → SHA-256(body)`, captured as a
+/// [`ReconcileBase::Since`] base. Digests only: no secret values are copied.
 #[derive(Debug, Clone, Default)]
-pub struct ViewNames {
-    pub secrets: std::collections::BTreeSet<String>,
-    pub connections: std::collections::BTreeSet<String>,
-    pub connecting: std::collections::BTreeSet<String>,
+pub struct ViewBase {
+    items: BTreeMap<(ItemNs, String), [u8; 32]>,
 }
 
-impl ViewNames {
-    pub fn of(view: &crate::storage::plaintext::VaultPlaintextView) -> Self {
-        Self {
-            secrets: view.native_secrets.keys().cloned().collect(),
-            connections: view.aux.connections.keys().cloned().collect(),
-            connecting: view.aux.connecting.keys().cloned().collect(),
-        }
+impl ViewBase {
+    pub fn of(view: &crate::storage::plaintext::VaultPlaintextView) -> Result<Self> {
+        let items = PerItemVault::view_items(view, true)?
+            .into_iter()
+            .map(|(k, body)| (k, body_digest(&body)))
+            .collect();
+        Ok(Self { items })
     }
+
+    fn has(&self, ns: ItemNs, name: &str) -> bool {
+        self.items.contains_key(&(ns, name.to_string()))
+    }
+
+    fn unchanged(&self, ns: ItemNs, name: &str, body: &serde_json::Value) -> bool {
+        self.items.get(&(ns, name.to_string())) == Some(&body_digest(body))
+    }
+}
+
+fn body_digest(body: &serde_json::Value) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(serde_json::to_vec(body).unwrap_or_default()).into()
 }
 
 /// The daemon's per-item on-disk vault: keyset blob + N sealed item records.
@@ -1590,6 +1600,44 @@ impl PerItemVault {
         Ok(out)
     }
 
+    /// A view's reconcilable items as `(ns, name) → body`: every native secret,
+    /// connection and in-flight connect, plus (`with_aux`) the aux config
+    /// subtrees at legacy `aux:<name>`. Shared by [`Self::reconcile_from_view`]
+    /// and [`ViewBase::of`] so a base and a view are always compared on the
+    /// same representation.
+    fn view_items(
+        view: &crate::storage::plaintext::VaultPlaintextView,
+        with_aux: bool,
+    ) -> Result<BTreeMap<(ItemNs, String), serde_json::Value>> {
+        let mut out: BTreeMap<(ItemNs, String), serde_json::Value> = BTreeMap::new();
+        for (name, bytes) in &view.native_secrets {
+            let value = String::from_utf8(bytes.clone())
+                .map_err(|_| AppError::Internal(format!("secret '{}' not utf8", name)))?;
+            out.insert(
+                (ItemNs::Secret, name.clone()),
+                serde_json::Value::String(value),
+            );
+        }
+        for (id, conn) in &view.aux.connections {
+            out.insert(
+                (ItemNs::Connection, id.clone()),
+                serde_json::to_value(conn).map_err(AppError::from)?,
+            );
+        }
+        for (id, c) in &view.aux.connecting {
+            out.insert(
+                (ItemNs::Connecting, id.clone()),
+                serde_json::to_value(c).map_err(AppError::from)?,
+            );
+        }
+        if with_aux {
+            for (name, body) in Self::aux_blob_bodies(&view.aux)? {
+                out.insert((ItemNs::Aux, name.to_string()), body);
+            }
+        }
+        Ok(out)
+    }
+
     /// Reconcile the item rows toward a freshly-decrypted [`VaultPlaintextView`]
     /// (the post-connect / post-write state), applying ONLY the changes with a
     /// monotonic version bump so the sync layer's per-item CAS sees a strictly
@@ -1602,53 +1650,33 @@ impl PerItemVault {
     ///     connect MOVEs its `connecting` entry away → tombstone the old row).
     ///
     /// This is the daemon-side, single-writer equivalent of "PUT the changed
-    /// items" (contract §5 `writeVault` diff). Which missing items become
-    /// tombstones is the caller's [`ViewDeletions`]: only a view with a known
-    /// base can tell "deleted" from "never seen". Returns the ids that changed.
+    /// items" (contract §5 `writeVault` diff). What counts as changed is
+    /// relative to the caller's [`ReconcileBase`]: only a view with a known base
+    /// can tell "the caller changed/deleted it" from "someone else changed it
+    /// since". Returns the ids that changed.
     pub fn reconcile_from_view<S: PrimitiveSuite>(
         &mut self,
         keys: VaultKeys,
         vault_id: &str,
         view: &crate::storage::plaintext::VaultPlaintextView,
-        deletions: ViewDeletions,
+        base: ReconcileBase<'_>,
     ) -> Result<Vec<String>> {
         let mut changed: Vec<String> = Vec::new();
-
-        // Build the desired (ns, name) → body set from the view.
-        let mut desired: BTreeMap<(ItemNs, String), serde_json::Value> = BTreeMap::new();
-        for (name, bytes) in &view.native_secrets {
-            let value = String::from_utf8(bytes.clone())
-                .map_err(|_| AppError::Internal(format!("secret '{}' not utf8", name)))?;
-            desired.insert(
-                (ItemNs::Secret, name.clone()),
-                serde_json::Value::String(value),
-            );
-        }
-        for (id, conn) in &view.aux.connections {
-            desired.insert(
-                (ItemNs::Connection, id.clone()),
-                serde_json::to_value(conn).map_err(AppError::from)?,
-            );
-        }
-        for (id, c) in &view.aux.connecting {
-            desired.insert(
-                (ItemNs::Connecting, id.clone()),
-                serde_json::to_value(c).map_err(AppError::from)?,
-            );
-        }
         // aux config subtrees at legacy `aux:<name>` — ONLY on a NoUik (fmt1)
         // keyset. On a v2 keyset owner-config is honored only when owner-signed,
         // and the daemon holds no UIK: an unsigned copy would be dropped by every
         // fold, and re-writing it could clobber an owner-signed row (or replace a
         // dropped one with the safe default). Agents are never emitted at all.
-        if self.keyset.uik.is_none() {
-            for (name, body) in Self::aux_blob_bodies(&view.aux)? {
-                desired.insert((ItemNs::Aux, name.to_string()), body);
-            }
-        }
+        let desired = Self::view_items(view, self.keyset.uik.is_none())?;
 
-        // Upsert every desired item whose sealed body differs from what we hold.
+        // Upsert every desired item the caller changed (vs its base) whose sealed
+        // body differs from what we hold.
         for ((ns, name), body) in &desired {
+            if let ReconcileBase::Since(b) = base {
+                if b.unchanged(*ns, name, body) {
+                    continue;
+                }
+            }
             // `open_item` is unconverted (single-key); id_seed == content here so
             // the read is byte-identical either way.
             let existing = self.open_item::<S>(keys, vault_id, *ns, name)?;
@@ -1664,28 +1692,16 @@ impl PerItemVault {
             changed.push(id);
         }
 
-        // Tombstone secret/connection/connecting rows the view dropped. Our own
+        // Tombstone secret/connection/connecting rows the caller dropped. Our own
         // folded view gives the currently-live (ns, name) set; tombstone any not
-        // in `desired` that `deletions` says the caller removed (a completed
-        // connect MOVEs its `connecting` entry, so the old connecting row must
-        // become a tombstone).
-        if matches!(deletions, ViewDeletions::Never) {
-            return Ok(changed);
-        }
+        // in `desired` that the base had (a completed connect MOVEs its
+        // `connecting` entry, so the old connecting row must become a tombstone).
         let removed = |ns: ItemNs, name: &String| -> bool {
-            if desired.contains_key(&(ns, name.clone())) {
-                return false;
-            }
-            match deletions {
-                ViewDeletions::Never => false,
-                ViewDeletions::MissingFromFold => true,
-                ViewDeletions::RemovedSince(base) => match ns {
-                    ItemNs::Secret => base.secrets.contains(name),
-                    ItemNs::Connection => base.connections.contains(name),
-                    ItemNs::Connecting => base.connecting.contains(name),
-                    _ => false,
-                },
-            }
+            !desired.contains_key(&(ns, name.clone()))
+                && match base {
+                    ReconcileBase::Since(b) => b.has(ns, name),
+                    ReconcileBase::OwnFold => true,
+                }
         };
         let mine = self.fold_view::<S>(keys, vault_id)?;
         for name in mine.native_secrets.keys() {
@@ -2407,7 +2423,7 @@ impl PerItemVault {
         // Reconcile writes every config singleton at its NEW address (the
         // mapping lives in `singleton_bodies`, shared with seed).
         let mut changed =
-            self.reconcile_from_view::<S>(keys, vault_id, &view, ViewDeletions::MissingFromFold)?;
+            self.reconcile_from_view::<S>(keys, vault_id, &view, ReconcileBase::OwnFold)?;
         // Tombstone every live legacy aux row (known + unknown names alike —
         // the namespace is retired wholesale).
         // Legacy `aux:agent/*` rows are skipped: the daemon never writes agent rows
@@ -2772,27 +2788,26 @@ mod tests {
         );
     }
 
-    // The daemon NEVER writes authorized-agents rows (any spelling, live or
-    // tombstone): it holds no UIK, so it cannot sign one. Seed + reconcile from a
-    // view that carries agents emit only config; dropping an agent from the view
-    // `ViewDeletions`: only a view with a known base may turn "absent" into a
-    // tombstone. B was pulled into the store but is in neither the base nor the
-    // view (the writer never saw it): it survives everything but MissingFromFold.
+    // `ReconcileBase`: only a difference from the view's base is the caller's.
+    // B was pulled into the store after the base was taken (in neither base nor
+    // view) and C was changed by a pull to a newer value the stale base/view
+    // still holds the old one of: neither is dropped or reverted under `Since`.
     #[test]
-    fn reconcile_deletions_respect_the_base() {
+    fn reconcile_is_relative_to_the_base() {
         use crate::storage::plaintext::{VaultAux, VaultPlaintextView};
         use sudp::primitives::StdPrimitives;
         let k = [0x56u8; 32];
         let vid = "vault-del";
         let keys = VaultKeys::single(&k);
-        let view_of = |names: &[&str]| VaultPlaintextView {
+        let view_of = |pairs: &[(&str, &str)]| VaultPlaintextView {
             aux: VaultAux::initial(),
-            native_secrets: names
+            native_secrets: pairs
                 .iter()
-                .map(|n| (n.to_string(), b"v".to_vec()))
+                .map(|(n, v)| (n.to_string(), v.as_bytes().to_vec()))
                 .collect(),
             legacy_addressing: false,
         };
+        // The store: A, B (pulled), C at its NEWER pulled value, D.
         let store = || {
             let mut pv = PerItemVault::build_initial(
                 b"c".to_vec(),
@@ -2803,42 +2818,51 @@ mod tests {
                 vec![0u8; 48],
             )
             .unwrap();
-            pv.seed_items_from_view::<StdPrimitives>(keys, vid, &view_of(&["A", "B", "C"]))
-                .unwrap();
+            pv.seed_items_from_view::<StdPrimitives>(
+                keys,
+                vid,
+                &view_of(&[("A", "a"), ("B", "b"), ("C", "new"), ("D", "d")]),
+            )
+            .unwrap();
             pv
         };
-        let live = |pv: &PerItemVault| -> Vec<String> {
+        let live = |pv: &PerItemVault| -> Vec<(String, String)> {
             pv.fold_view::<StdPrimitives>(keys, vid)
                 .unwrap()
                 .native_secrets
-                .keys()
-                .cloned()
+                .into_iter()
+                .map(|(n, v)| (n, String::from_utf8(v).unwrap()))
                 .collect()
         };
-        let base = ViewNames::of(&view_of(&["A", "C"]));
-        let view = view_of(&["C"]); // the caller deleted A
+        let pairs = |v: &[(&str, &str)]| -> Vec<(String, String)> {
+            v.iter()
+                .map(|(a, b)| (a.to_string(), b.to_string()))
+                .collect()
+        };
+        // The caller's base predates the pulls (no B, old C); it deletes A and
+        // sets D.
+        let base = ViewBase::of(&view_of(&[("A", "a"), ("C", "old"), ("D", "d")])).unwrap();
+        let view = view_of(&[("C", "old"), ("D", "d2")]);
 
         let mut pv = store();
-        pv.reconcile_from_view::<StdPrimitives>(keys, vid, &view, ViewDeletions::Never)
+        pv.reconcile_from_view::<StdPrimitives>(keys, vid, &view, ReconcileBase::Since(&base))
             .unwrap();
-        assert_eq!(live(&pv), ["A", "B", "C"], "upsert-only");
+        assert_eq!(
+            live(&pv),
+            pairs(&[("B", "b"), ("C", "new"), ("D", "d2")]),
+            "only the caller's delete (A) and edit (D) apply; pulled B and C survive"
+        );
 
+        // OwnFold: every difference is the caller's.
         let mut pv = store();
-        pv.reconcile_from_view::<StdPrimitives>(
-            keys,
-            vid,
-            &view,
-            ViewDeletions::RemovedSince(&base),
-        )
-        .unwrap();
-        assert_eq!(live(&pv), ["B", "C"], "only what the base had is dropped");
-
-        let mut pv = store();
-        pv.reconcile_from_view::<StdPrimitives>(keys, vid, &view, ViewDeletions::MissingFromFold)
+        pv.reconcile_from_view::<StdPrimitives>(keys, vid, &view, ReconcileBase::OwnFold)
             .unwrap();
-        assert_eq!(live(&pv), ["C"]);
+        assert_eq!(live(&pv), pairs(&[("C", "old"), ("D", "d2")]));
     }
 
+    // The daemon NEVER writes authorized-agents rows (any spelling, live or
+    // tombstone): it holds no UIK, so it cannot sign one. Seed + reconcile from a
+    // view that carries agents emit only config; dropping an agent from the view
     // writes no tombstone; and the seal primitive itself refuses agent rows.
     #[test]
     fn daemon_never_writes_agent_rows() {
@@ -2908,7 +2932,7 @@ mod tests {
                 VaultKeys::single(&k),
                 vid,
                 &view,
-                ViewDeletions::MissingFromFold,
+                ReconcileBase::OwnFold,
             )
             .unwrap();
         assert!(
@@ -2927,7 +2951,7 @@ mod tests {
                 VaultKeys::single(&k),
                 vid,
                 &view2,
-                ViewDeletions::MissingFromFold,
+                ReconcileBase::OwnFold,
             )
             .unwrap();
         assert!(changed.is_empty(), "dropping an agent writes no tombstone");

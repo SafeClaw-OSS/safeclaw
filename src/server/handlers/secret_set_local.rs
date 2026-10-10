@@ -119,7 +119,7 @@ pub async fn create(
         let _guard = lock.lock().await;
         let mut view =
             crate::server::handlers::metadata::open_view_with_state_key(&state, &vault_id, &k)?;
-        let base = crate::storage::sealed_vault::ViewNames::of(&view);
+        let base = crate::storage::sealed_vault::ViewBase::of(&view)?;
         // Egress gate: a host this connection doesn't already anchor VERBATIM
         // is a trust-surface widening (same act as `widen-host`) — never free.
         // The check lives HERE, on the daemon against the just-opened view, so
