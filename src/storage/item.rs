@@ -483,6 +483,65 @@ pub fn unseal_item<S: PrimitiveSuite>(
     ItemPayload::from_json_bytes(&pt)
 }
 
+/// Open a stored/pulled row addressed by its WIRE id (row PK) at `version`:
+/// recover the 32-byte AAD id ([`aad_id_from_wire`], stable id-seed) and unseal
+/// with the current content key. The one read used by the push-side 409
+/// reconcile for both OUR local row and THEIR fresh cloud row.
+pub fn open_wire_item<S: PrimitiveSuite>(
+    keys: VaultKeys,
+    vault_id: &str,
+    wire_id: &str,
+    version: u64,
+    sealed: &[u8],
+) -> Result<ItemPayload> {
+    let raw = aad_id_from_wire::<S>(keys.id_seed, wire_id)?;
+    unseal_item::<S>(keys.content, &ItemCtx::new(vault_id, raw, version), sealed)
+}
+
+/// Seal `payload` for the row at WIRE id `wire_id` at `version` (the inverse of
+/// [`open_wire_item`]) — re-sealing an existing row at a fresh CAS version.
+pub fn seal_wire_item<S: PrimitiveSuite>(
+    keys: VaultKeys,
+    vault_id: &str,
+    wire_id: &str,
+    version: u64,
+    payload: &ItemPayload,
+) -> Result<Vec<u8>> {
+    let raw = aad_id_from_wire::<S>(keys.id_seed, wire_id)?;
+    seal_item::<S>(keys.content, &ItemCtx::new(vault_id, raw, version), payload)
+}
+
+/// CAS version a conflict copy is written at: always a CREATE at version 1 (no
+/// `base_version`), so a retry of the same conflict 409s on the existing copy
+/// instead of spawning a second one. Byte-parity with the console
+/// (`lib/vault-grant.ts` `putConflictCopy`).
+pub const CONFLICT_COPY_VERSION: u64 = 1;
+
+/// Display name of a conflict copy: `"<name> (conflict copy)"` (console parity).
+pub fn conflict_copy_name(name: &str) -> String {
+    format!("{} (conflict copy)", name)
+}
+
+/// Keep-both (§4): seal OURS as the conflict copy of `(ours.ns, ours.name)`
+/// beside THEIR row at `theirs_version`. Returns `(copy_wire_id, ct)`. Exactly
+/// the console's `putConflictCopy`: id = [`conflict_copy_id`] under the id-seed
+/// with `loser_version = theirs_version`, payload `{ns, "<name> (conflict
+/// copy)", live, ours.body}`, sealed under the content key at
+/// [`CONFLICT_COPY_VERSION`] with the copy id as AAD.
+pub fn seal_conflict_copy<S: PrimitiveSuite>(
+    keys: VaultKeys,
+    vault_id: &str,
+    ours: &ItemPayload,
+    theirs_version: u64,
+) -> Result<(String, Vec<u8>)> {
+    let id_bytes =
+        conflict_copy_id_bytes::<S>(keys.id_seed, ours.ns.as_str(), &ours.name, theirs_version)?;
+    let copy = ItemPayload::live(ours.ns, conflict_copy_name(&ours.name), ours.body.clone());
+    let ctx = ItemCtx::new(vault_id, id_bytes, CONFLICT_COPY_VERSION);
+    let ct = seal_item::<S>(keys.content, &ctx, &copy)?;
+    Ok((URL_SAFE_NO_PAD.encode(id_bytes), ct))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -647,6 +706,53 @@ mod tests {
         assert_eq!(c1, c1_again, "same inputs → same id (idempotent)");
         assert_ne!(c1, canonical, "conflict copy never collides with canonical");
         assert_ne!(c1, c2, "different loser version → different id");
+    }
+
+    /// The daemon's conflict copy is the console's `putConflictCopy`: id =
+    /// `conflict_copy_id(id_seed, ns, name, theirs_version)`, sealed at version 1
+    /// under the content key with the copy id as AAD, payload name
+    /// `"<name> (conflict copy)"`, same ns + body. Deterministic id → a retry
+    /// lands on the same row.
+    #[test]
+    fn seal_conflict_copy_matches_console_shape() {
+        let id_seed = [0x42u8; 32];
+        let content = [0x24u8; 32];
+        let keys = VaultKeys {
+            id_seed: &id_seed,
+            content: &content,
+        };
+        let ours = ItemPayload::secret_live("GMAIL_REFRESH_TOKEN", "mine");
+        let (id, ct) = seal_conflict_copy::<StdPrimitives>(keys, "v", &ours, 2).unwrap();
+        assert_eq!(
+            id, "hBVW1yFYQ9aIxjcB-PeisTpr_EYtjQFXysiLCq7bN6k",
+            "pinned copy-id vector"
+        );
+        let (id_again, _) = seal_conflict_copy::<StdPrimitives>(keys, "v", &ours, 2).unwrap();
+        assert_eq!(id, id_again, "idempotent retry targets the same row");
+
+        let opened =
+            open_wire_item::<StdPrimitives>(keys, "v", &id, CONFLICT_COPY_VERSION, &ct).unwrap();
+        assert_eq!(opened.ns, ItemNs::Secret);
+        assert_eq!(opened.name, "GMAIL_REFRESH_TOKEN (conflict copy)");
+        assert!(!opened.is_tombstone());
+        assert_eq!(opened.body, serde_json::json!("mine"));
+        // Bound to version 1 (a create), not to their version.
+        assert!(open_wire_item::<StdPrimitives>(keys, "v", &id, 2, &ct).is_err());
+    }
+
+    /// `seal_wire_item` / `open_wire_item` round-trip a re-seal at a fresh version
+    /// for the row's existing wire id (the reapply path).
+    #[test]
+    fn wire_item_reseal_roundtrip() {
+        let k = [0x42u8; 32];
+        let keys = VaultKeys::single(&k);
+        let wire = item_id::<StdPrimitives>(&k, "policy", "").unwrap();
+        let p = ItemPayload::live(ItemNs::Policy, "", serde_json::json!({"a": 1}));
+        let ct = seal_wire_item::<StdPrimitives>(keys, "v", &wire, 7, &p).unwrap();
+        let back = open_wire_item::<StdPrimitives>(keys, "v", &wire, 7, &ct).unwrap();
+        assert_eq!(back.ns, ItemNs::Policy);
+        assert_eq!(back.body, serde_json::json!({"a": 1}));
+        assert!(open_wire_item::<StdPrimitives>(keys, "v", &wire, 6, &ct).is_err());
     }
 
     #[test]
