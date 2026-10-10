@@ -34,8 +34,7 @@ use crate::audit::{STATUS_APPROVED, STATUS_REJECTED};
 use crate::error::{AppError, Result};
 use crate::passkey::PasskeyEntry;
 use crate::protocol::operation::{
-    as_enroll_credential, as_export_path, as_write_patch, decode_credential_id, discriminator,
-    ActType,
+    as_enroll_credential, as_export_path, decode_credential_id, discriminator, ActType,
 };
 use crate::protocol::{render_operation, validate_batch_grant, validate_grant, Grant};
 use crate::server::handlers::metadata::decrypt_vault_view_keep_key;
@@ -43,7 +42,7 @@ use crate::state::{AppState, ApprovalEvent, SecretsCache};
 use crate::storage::plaintext::{Category, VaultPlaintextView};
 use crate::storage::sealed_vault::{
     build_initial, find_pubkey, find_pubkey_in_registry, read as read_vault, read_per_item,
-    replace_after_write, write_atomic,
+    write_atomic,
 };
 
 /// `GET /op/{op_id}` — JSON poll: status + cached value + render(o).
@@ -771,7 +770,7 @@ pub async fn approve_op(
         }
         ActType::Enroll => {
             let credential = as_enroll_credential(&validated.op)?;
-            if existing_vault.is_some() {
+            if existing_vault.is_some() || per_item_store_exists(&state, &vault_id) {
                 return Err(AppError::Conflict(
                     "vault already initialized for this vault_id".into(),
                 ));
@@ -835,94 +834,9 @@ pub async fn approve_op(
                 None,
             )
         }
+        // Retired (also refused at op creation): see WHOLE_BLOB_WRITE_RETIRED.
         ActType::Write => {
-            let patch = as_write_patch(&validated.op)?;
-            let mut vault = existing_vault
-                .clone()
-                .ok_or_else(|| AppError::Conflict("vault not initialized".into()))?;
-            let new_prf_salt = STANDARD
-                .decode(&patch.prf_salt_next)
-                .map_err(|_| AppError::BadRequest("prf_salt_next not base64".into()))?;
-            let new_wrapped_key = STANDARD
-                .decode(&patch.wrapped_key)
-                .map_err(|_| AppError::BadRequest("wrapped_key not base64".into()))?;
-            let new_ciphertext = STANDARD
-                .decode(&patch.ciphertext)
-                .map_err(|_| AppError::BadRequest("ciphertext not base64".into()))?;
-            replace_after_write(
-                &mut vault,
-                &grant.credential_id,
-                new_prf_salt,
-                new_wrapped_key,
-                new_ciphertext,
-            )?;
-            write_atomic(&vault_path, &vault)?;
-            tracing::info!(vault = %vault_id, "vault write applied");
-            // Auto-refresh cache from the new ciphertext using the same
-            // wrapping_key the grant carries (Write doesn't rotate W_c
-            // unless paired with a passkey op). Without this, the
-            // daemon's `entries` / `native_keys` / `external_stores`
-            // snapshots stay stuck on the pre-Write state until the
-            // user manually locks + unlocks — most visible symptom is
-            // a freshly-Connected GCP store whose `list()` keys never
-            // surface in /v/{vid}/secret-keys. Best-effort: a rotation-
-            // case decrypt failure leaves the cache stale but doesn't
-            // fail the Write.
-            if state.is_vault_locked(&vault_id) {
-                // Vault was Locked when this Write arrived. Don't
-                // auto-unlock from a Write — the user expects unlock
-                // to be a deliberate ceremony.
-            } else if let Ok((view, k)) = decrypt_vault_view_keep_key(
-                &validated.op,
-                &validated.wrapping_key,
-                &validated.credential_id_bytes,
-                &vault,
-            ) {
-                // PER-ITEM: re-shard the post-write ProtectedState into the local
-                // per-item store (same K). A browser Write still ships one sealed
-                // ciphertext; re-seeding keeps the item rows in step so a later
-                // per-item push/pull carries the change. Best-effort. An existing
-                // store is reconciled (only changed rows bumped), never re-derived
-                // at version 1 (see `per_item_from_view`).
-                seed_per_item_store(&state, &vault_id, &vault, &view, &k);
-                let cache = bootstrap_cache_from_view(&view, &state);
-                tracing::info!(
-                    vault = %vault_id,
-                    cached_services = cache.entries.len(),
-                    external_stores = cache.external_stores.len(),
-                    "vault cache re-bootstrapped after write"
-                );
-                state.unlock_vault(vault_id.clone(), cache, k);
-            } else {
-                tracing::warn!(
-                    vault = %vault_id,
-                    "post-write cache refresh skipped — decrypt failed (rotation?); user must lock+unlock to see new state",
-                );
-            }
-            // A Write may have sealed a `<conn>_oauth_pending` from a browser
-            // "Connect" — complete the OAuth code→token exchange NOW instead of
-            // waiting for the next unlock or cloud-sync pull (the symptom this
-            // fixes: the web UI sticks on "Connecting…" after paste because the
-            // Write path never kicked the exchange). CONNECTIONS_AND_AUTH.md §4a.
-            // Detached + best-effort: process_vault_connects acquires the
-            // per-vault write lock itself (not reentrant, so it must run AFTER
-            // this handler's guard drops) and no-ops if the vault is locked.
-            {
-                let state = state.clone();
-                let vid = vault_id.clone();
-                tokio::spawn(async move {
-                    // A daemon-side Write rotated the acting credential's
-                    // prf_salt/wrapped_key (replace_after_write) and re-sharded
-                    // the content. Propagate BOTH ahead of the cloud so OTHER
-                    // devices can still unwrap K and see the new content: the
-                    // keyset rides `/keys`, the content rides `/items`. Both are
-                    // best-effort + never clobber (409 → adopt cloud, stop).
-                    crate::sync::push_keys_best_effort(&state, &vid).await;
-                    crate::sync::push_items_best_effort(&state, &vid).await;
-                    crate::auth::connect::process_vault_connects(&state, &vid, None).await;
-                });
-            }
-            (json!({ "ok": true, "act": "write" }), None)
+            return Err(AppError::BadRequest(WHOLE_BLOB_WRITE_RETIRED.into()));
         }
         ActType::Revoke => {
             // Remove-passkey. `target = "passkeys.<cid_b64>"`. K stays
@@ -1348,6 +1262,7 @@ pub async fn approve_op(
                         &validated.credential_id_bytes,
                         existing_vault.as_ref(),
                     )?;
+                let base = crate::storage::sealed_vault::ViewNames::of(&view);
                 match view.aux.connections.get_mut(&conn) {
                     Some(rec) => {
                         let hosts = rec.hosts.get_or_insert_with(Vec::new);
@@ -1375,7 +1290,7 @@ pub async fn approve_op(
                         );
                     }
                 }
-                crate::auth::connect::persist_mutated_view(&state, &vault_id, &view, &k)
+                crate::auth::connect::persist_mutated_view(&state, &vault_id, &base, &view, &k)
                     .map_err(AppError::Internal)?;
                 {
                     let state = state.clone();
@@ -1428,6 +1343,7 @@ pub async fn approve_op(
                         &validated.credential_id_bytes,
                         existing_vault.as_ref(),
                     )?;
+                let base = crate::storage::sealed_vault::ViewNames::of(&view);
                 let mut removed = false;
                 if let Some(rec) = view.aux.connections.get_mut(&conn) {
                     if let Some(hosts) = rec.hosts.as_mut() {
@@ -1437,7 +1353,7 @@ pub async fn approve_op(
                     }
                 }
                 if removed {
-                    crate::auth::connect::persist_mutated_view(&state, &vault_id, &view, &k)
+                    crate::auth::connect::persist_mutated_view(&state, &vault_id, &base, &view, &k)
                         .map_err(AppError::Internal)?;
                     {
                         let state = state.clone();
@@ -1505,6 +1421,7 @@ pub async fn approve_op(
                         &validated.credential_id_bytes,
                         existing_vault.as_ref(),
                     )?;
+                let base = crate::storage::sealed_vault::ViewNames::of(&view);
                 let refs = service_refs(&view, &id);
                 if view.aux.services.remove(&id).is_none() {
                     return Err(AppError::BadRequest(format!(
@@ -1512,7 +1429,7 @@ pub async fn approve_op(
                         id
                     )));
                 }
-                crate::auth::connect::persist_mutated_view(&state, &vault_id, &view, &k)
+                crate::auth::connect::persist_mutated_view(&state, &vault_id, &base, &view, &k)
                     .map_err(AppError::Internal)?;
                 {
                     let state = state.clone();
@@ -1567,8 +1484,9 @@ pub async fn approve_op(
                         &validated.credential_id_bytes,
                         existing_vault.as_ref(),
                     )?;
+                let base = crate::storage::sealed_vault::ViewNames::of(&view);
                 view.aux.services.insert(id.clone(), toml_src);
-                crate::auth::connect::persist_mutated_view(&state, &vault_id, &view, &k)
+                crate::auth::connect::persist_mutated_view(&state, &vault_id, &base, &view, &k)
                     .map_err(AppError::Internal)?;
                 {
                     let state = state.clone();
@@ -1604,6 +1522,7 @@ pub async fn approve_op(
                         &validated.credential_id_bytes,
                         existing_vault.as_ref(),
                     )?;
+                let base = crate::storage::sealed_vault::ViewNames::of(&view);
                 if !view.native_secrets.contains_key(&key) {
                     // One flat namespace, two authorities: SafeClaw OWNS
                     // native items but only READS external stores — so an
@@ -1626,7 +1545,7 @@ pub async fn approve_op(
                     .remove(&key)
                     .unwrap_or_default();
                 view.native_secrets.remove(&key);
-                crate::auth::connect::persist_mutated_view(&state, &vault_id, &view, &k)
+                crate::auth::connect::persist_mutated_view(&state, &vault_id, &base, &view, &k)
                     .map_err(AppError::Internal)?;
                 {
                     let state = state.clone();
@@ -1671,6 +1590,7 @@ pub async fn approve_op(
                         &validated.credential_id_bytes,
                         existing_vault.as_ref(),
                     )?;
+                let base = crate::storage::sealed_vault::ViewNames::of(&view);
                 let rec = view.aux.connections.get(&id).cloned().ok_or_else(|| {
                     AppError::BadRequest(format!("no connection '{}' in this vault", id))
                 })?;
@@ -1691,7 +1611,7 @@ pub async fn approve_op(
                     }
                 }
                 view.aux.connections.remove(&id);
-                crate::auth::connect::persist_mutated_view(&state, &vault_id, &view, &k)
+                crate::auth::connect::persist_mutated_view(&state, &vault_id, &base, &view, &k)
                     .map_err(AppError::Internal)?;
                 {
                     let state = state.clone();
@@ -1804,6 +1724,7 @@ pub async fn approve_op(
                         &validated.credential_id_bytes,
                         existing_vault.as_ref(),
                     )?;
+                let base = crate::storage::sealed_vault::ViewNames::of(&view);
 
                 let record = match &service {
                     // RAW: anchors its own exact FQDNs; explicit `secrets` list.
@@ -1934,7 +1855,7 @@ pub async fn approve_op(
                     }
                 }
                 view.aux.connections.insert(id.clone(), record);
-                crate::auth::connect::persist_mutated_view(&state, &vault_id, &view, &k)
+                crate::auth::connect::persist_mutated_view(&state, &vault_id, &base, &view, &k)
                     .map_err(AppError::Internal)?;
                 {
                     let state = state.clone();
@@ -2005,6 +1926,7 @@ pub async fn approve_op(
                         &validated.credential_id_bytes,
                         existing_vault.as_ref(),
                     )?;
+                let base = crate::storage::sealed_vault::ViewNames::of(&view);
                 let removed_prior_anchor = apply_secret_set_to_view(
                     &mut view,
                     &key,
@@ -2024,7 +1946,7 @@ pub async fn approve_op(
                 } else {
                     hosts.clone()
                 };
-                crate::auth::connect::persist_mutated_view(&state, &vault_id, &view, &k)
+                crate::auth::connect::persist_mutated_view(&state, &vault_id, &base, &view, &k)
                     .map_err(AppError::Internal)?;
                 {
                     let state = state.clone();
@@ -2286,16 +2208,18 @@ pub async fn reject_op(
 ///      compiled defaults). Holds default floors, per-tag, and
 ///      per-connection user policy. Built-in per-service rules are read
 ///      live from the service at eval, not cached here.
-/// Build + persist the local per-item store (`vault.per-item.json`) from a
-/// just-decrypted whole-blob vault + its view. The keyset (registry +
-/// credentials + wrapped_key) is copied verbatim from the whole-blob
-/// `SealedVault` (it's what gives you `K`); the content is re-sharded from
-/// `view` into N `seal_record` item rows under the same `K` (contract §2/§4).
+/// Build + persist the local per-item store (`vault.per-item.json`) for a NEW
+/// vault from its just-decrypted Enroll view. The keyset (registry + credentials
+/// + wrapped_key) is copied verbatim from the whole-blob `SealedVault` (it's
+/// what gives you `K`); the content is sharded from `view` into N `seal_record`
+/// item rows under the same `K` (contract §2/§4).
 ///
-/// Best-effort by design: a failure logs and leaves only `vault.dat`, which the
-/// per-item read path falls back to. This is the ADDITIVE landing seam — enroll
-/// and write call it so the daemon holds items alongside the whole blob until
-/// the browser cut-over retires the blob (stubbed[]).
+/// Never touches an EXISTING store (any format): a whole-blob view has no
+/// base, so writing it over a live store could neither tell "absent" from
+/// "deleted" nor "older" from "changed". The Enroll arm already refuses a
+/// vault id that has one ([`per_item_store_exists`]); this is the backstop.
+/// Best-effort: a failure logs and leaves only `vault.dat`, which the read
+/// paths fall back to.
 fn seed_per_item_store(
     state: &AppState,
     vault_id: &str,
@@ -2303,51 +2227,36 @@ fn seed_per_item_store(
     view: &VaultPlaintextView,
     k: &[u8],
 ) {
-    use crate::storage::sealed_vault::Keyset;
+    use crate::storage::sealed_vault::{Keyset, PerItemVault};
     let Ok(per_item_path) = state.vaults.per_item_path(vault_id) else {
         return;
     };
-    let existing = match crate::storage::sealed_vault::read_per_item(&per_item_path) {
-        Ok(existing) => existing,
-        // Unreadable: it may be a v2 store, so never overwrite it (fail closed).
-        Err(e) => {
-            tracing::warn!(vault = %vault_id, "per-item seed skipped: existing store unreadable: {}", e);
-            return;
-        }
-    };
-    // Anti-downgrade: this re-seed rebuilds the keyset as v1 (`uik: None`). Never
-    // let it overwrite a store that already carries a UIK layer: that would flip the
-    // vault to `NoUik` (integrity-only) and re-open unsigned owner-config / agent
-    // acceptance. A v2 vault's store is owned by the ceremony + sync, not here.
-    if existing.as_ref().is_some_and(|pv| pv.keyset.uik.is_some()) {
-        tracing::warn!(
-            vault = %vault_id,
-            "per-item seed skipped: existing store is v2 (UIK); refusing to downgrade it to a v1 keyset"
-        );
+    if per_item_path.exists() {
+        tracing::warn!(vault = %vault_id, "per-item seed skipped: a per-item store already exists");
         return;
     }
-    // Carry the keyset cursor forward if a per-item file already exists, so a
-    // re-seed after a write doesn't reset the CAS cursors the sync layer tracks.
-    let keyset_version = existing
-        .as_ref()
-        .map(|pv| pv.keyset.keyset_version)
-        .unwrap_or(0);
-    let keyset = Keyset {
-        version: vault.version,
-        registry: vault.registry.clone(),
-        credentials: vault.credentials.clone(),
-        keyset_version,
-        // Bootstrapped from a v1 whole-blob vault → v1 keyset (a v2 vault is
-        // born directly as a per-item store in the ceremony, never here).
-        uik: None,
+    let mut pv = PerItemVault {
+        keyset: Keyset {
+            version: vault.version,
+            registry: vault.registry.clone(),
+            credentials: vault.credentials.clone(),
+            keyset_version: 0,
+            // Bootstrapped from a v1 whole-blob vault → v1 keyset (a v2 vault is
+            // born directly as a per-item store in the ceremony, never here).
+            uik: None,
+        },
+        items: std::collections::BTreeMap::new(),
+        items_seq: 0,
+        keyset_seq: 0,
     };
-    let pv = match per_item_from_view(existing, keyset, vault_id, view, k) {
-        Ok(pv) => pv,
-        Err(e) => {
-            tracing::warn!(vault = %vault_id, "per-item seed from view failed: {}", e);
-            return;
-        }
-    };
+    if let Err(e) = pv.seed_items_from_view::<sudp::primitives::StdPrimitives>(
+        crate::storage::item::VaultKeys::single(k),
+        vault_id,
+        view,
+    ) {
+        tracing::warn!(vault = %vault_id, "per-item seed from view failed: {}", e);
+        return;
+    }
     if let Err(e) = crate::storage::sealed_vault::write_per_item_atomic(&per_item_path, &pv) {
         tracing::warn!(vault = %vault_id, "per-item store write failed: {}", e);
         return;
@@ -2359,58 +2268,22 @@ fn seed_per_item_store(
     );
 }
 
-/// The per-item store a whole-blob Enroll/Write lands as. An EXISTING store is
-/// reconciled INTO ([`PerItemVault::reconcile_from_view`]), UPSERT-ONLY: rows
-/// whose value changed (or are new) are bumped on top of their current versions,
-/// unchanged rows keep their `synced_version`, and NOTHING is tombstoned: a
-/// whole-blob view has no base, so an item absent from it may be one the writer
-/// never saw (e.g. pulled from another device). Rebuilding every row at version
-/// 1 / unsynced instead made the next push 409 and keep-both write the user's
-/// NEW value as the conflict copy while adopting the cloud's OLD one. Built from
-/// scratch only when no store exists, or its rows can't be reconciled under `k`
-/// (the cursors are carried either way).
-fn per_item_from_view(
-    existing: Option<crate::storage::sealed_vault::PerItemVault>,
-    keyset: crate::storage::sealed_vault::Keyset,
-    vault_id: &str,
-    view: &VaultPlaintextView,
-    k: &[u8],
-) -> Result<crate::storage::sealed_vault::PerItemVault, String> {
-    use crate::storage::sealed_vault::PerItemVault;
-    type S = sudp::primitives::StdPrimitives;
-    let keys = crate::storage::item::VaultKeys::single(k);
-    let (items_seq, keyset_seq) = existing
-        .as_ref()
-        .map(|pv| (pv.items_seq, pv.keyset_seq))
-        .unwrap_or((0, 0));
-    if let Some(mut pv) = existing {
-        pv.keyset = keyset.clone();
-        match pv.reconcile_from_view::<S>(
-            keys,
-            vault_id,
-            view,
-            crate::storage::sealed_vault::ViewDeletions::Never,
-        ) {
-            Ok(changed) => {
-                tracing::debug!(vault = %vault_id, changed = changed.len(), "per-item store reconciled from view");
-                return Ok(pv);
-            }
-            Err(e) => tracing::warn!(
-                vault = %vault_id,
-                "per-item reconcile into the existing store failed ({}); re-seeding it", e
-            ),
-        }
-    }
-    let mut pv = PerItemVault {
-        keyset,
-        items: std::collections::BTreeMap::new(),
-        items_seq,
-        keyset_seq,
-    };
-    pv.seed_items_from_view::<S>(keys, vault_id, view)
-        .map_err(|e| e.to_string())?;
-    Ok(pv)
+/// A per-item store file exists for `vault_id` (readable or not). A vault id
+/// that has one is already initialized: Enroll must not seed over it.
+fn per_item_store_exists(state: &AppState, vault_id: &str) -> bool {
+    state
+        .vaults
+        .per_item_path(vault_id)
+        .map(|p| p.exists())
+        .unwrap_or(false)
 }
+
+/// The refusal for a whole-blob `ActType::Write`. No current client sends one
+/// (console writes are per-item; the CLI writes through grant-approved
+/// mutations), and applying a base-less full replacement would revert or drop
+/// items another device changed since.
+pub(crate) const WHOLE_BLOB_WRITE_RETIRED: &str = "whole-vault write ops are no longer supported: \
+     this client is out of date. Upgrade the SafeClaw console/CLI (`sc upgrade`) and retry.";
 
 /// The role KEYs cached for a service's connections: the declared `secrets`
 /// plus any oauth `[auth].exposes` roles (derived at connect, stored UPPERCASED —
@@ -3291,90 +3164,41 @@ mod tests {
         // validation arm, not the challenge rebuild — see validate_batch_grant).
     }
 
-    /// A whole-blob Write reconciles INTO an existing per-item store: only the
-    /// changed row is bumped on top of its version (dirty, so the push CASes it
-    /// on the cloud's version), unchanged rows stay clean, and a row the blob
-    /// lacks (pulled from another device) is never tombstoned. Rebuilding every
-    /// row at v1/unsynced made keep-both turn the user's NEW value into the
-    /// conflict copy and adopt the cloud's OLD one.
+    /// Enroll seeds a per-item store ONLY for a new vault: an existing store
+    /// file (any format, even unreadable) is never written over, and its
+    /// presence marks the vault id as initialized.
     #[test]
-    fn write_reconciles_into_existing_per_item_store() {
-        use crate::storage::item::{ItemNs, VaultKeys};
-        use crate::storage::sealed_vault::PerItemVault;
-        type S = sudp::primitives::StdPrimitives;
+    fn enroll_seed_never_touches_an_existing_store() {
+        let state = test_state();
+        let vid = format!("seed-guard-{}", std::process::id());
         let k = [0x42u8; 32];
-        let vid = "v";
         let mut view = empty_view();
         view.native_secrets.insert("A".into(), b"one".to_vec());
-        view.native_secrets.insert("B".into(), b"two".to_vec());
-        let keyset = PerItemVault::build_initial(
+        let vault = build_initial(
             b"c".to_vec(),
             "x".into(),
             "y".into(),
             "Dev".into(),
             vec![0u8; 32],
             vec![0u8; 48],
-        )
-        .unwrap()
-        .keyset;
-
-        // No store yet → built from scratch: every row v1, unsynced.
-        let mut pv = per_item_from_view(None, keyset.clone(), vid, &view, &k).unwrap();
-        assert!(!pv.items.is_empty());
-        assert!(pv
-            .items
-            .values()
-            .all(|s| s.version == 1 && s.synced_version == 0));
-        // C arrives from another device by pull: in the store, NOT in the blob.
-        pv.seal_and_upsert::<S>(
-            VaultKeys::single(&k),
-            vid,
-            ItemNs::Secret,
-            "C",
-            1,
-            &crate::storage::item::ItemPayload::secret_live("C", "pulled"),
+            vec![0u8; 16],
         )
         .unwrap();
-        // ...then pushed: every row confirmed on the cloud.
-        for s in pv.items.values_mut() {
-            s.synced_version = s.version;
-        }
-        pv.items_seq = 7;
-        let before = pv.items.clone();
+        let path = state.vaults.per_item_path(&vid).unwrap();
+        let _ = std::fs::remove_file(&path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
 
-        // A Write that changes B only.
-        view.native_secrets.insert("B".into(), b"three".to_vec());
-        let pv = per_item_from_view(Some(pv), keyset, vid, &view, &k).unwrap();
-        assert_eq!(pv.items_seq, 7, "pull cursor carried");
-        let dirty: Vec<_> = pv
-            .items
-            .iter()
-            .filter(|(_, s)| s.version > s.synced_version)
-            .collect();
-        assert_eq!(dirty.len(), 1, "only the changed row is dirty");
-        let (b_id, b) = dirty[0];
-        assert_eq!(
-            (b.version, b.synced_version),
-            (2, 1),
-            "bumped on its version"
-        );
-        for (id, s) in &before {
-            if id != b_id {
-                assert_eq!(pv.items[id].version, s.version, "unchanged row kept");
-                assert_eq!(pv.items[id].synced_version, s.synced_version);
-            }
-        }
-        let opened = pv
-            .open_item::<S>(VaultKeys::single(&k), vid, ItemNs::Secret, "B")
-            .unwrap()
-            .unwrap();
-        assert_eq!(opened.body, serde_json::json!("three"));
-        // Upsert-only: C, absent from the base-less blob, is NOT tombstoned.
-        let c = pv
-            .open_item::<S>(VaultKeys::single(&k), vid, ItemNs::Secret, "C")
-            .unwrap()
-            .unwrap();
-        assert!(!c.is_tombstone());
-        assert_eq!(c.body, serde_json::json!("pulled"));
+        // No store: Enroll may seed one.
+        assert!(!per_item_store_exists(&state, &vid));
+        seed_per_item_store(&state, &vid, &vault, &view, &k);
+        let seeded = read_per_item(&path).unwrap().expect("seeded");
+        assert!(!seeded.items.is_empty());
+
+        // A store exists: initialized; a second seed leaves it byte-identical.
+        assert!(per_item_store_exists(&state, &vid));
+        std::fs::write(&path, b"not json").unwrap();
+        seed_per_item_store(&state, &vid, &vault, &view, &k);
+        assert_eq!(std::fs::read(&path).unwrap(), b"not json");
+        let _ = std::fs::remove_file(&path);
     }
 }

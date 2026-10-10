@@ -42,7 +42,7 @@ use sudp::state::ProtectedState;
 use crate::auth::oauth2::{ExchangedTokens, OAuthStyle};
 use crate::state::AppState;
 use crate::storage::plaintext::{secret_key_for, suggested_secret_key, Connecting, Connection};
-use crate::storage::sealed_vault::ViewDeletions;
+use crate::storage::sealed_vault::{ViewDeletions, ViewNames};
 
 /// The OAuth client/endpoint a pending connect resolves to before exchange, plus
 /// the service's secret role (so we know where to write the result).
@@ -616,7 +616,9 @@ pub(crate) async fn apply_pending_connects(
     // "absent from the post-connect view" is NOT "deleted": only rows this base
     // had and the connect dropped (the connecting→connection MOVE) are
     // tombstoned. Unbuildable → upsert-only.
-    let base_view = crate::storage::plaintext::VaultPlaintextView::from_protected_state(&m).ok();
+    let base_view = crate::storage::plaintext::VaultPlaintextView::from_protected_state(&m)
+        .ok()
+        .map(|v| ViewNames::of(&v));
 
     // Register every loopback connect still AWAITING its redirect (carries a
     // `state`, no code yet) so the on-demand listener can match an incoming
@@ -898,9 +900,7 @@ pub(crate) async fn persist_rotated_refresh_locked(
 }
 
 /// Tombstones for a connect: only rows its base view had (see `base_view`).
-fn connect_deletions(
-    base: Option<&crate::storage::plaintext::VaultPlaintextView>,
-) -> ViewDeletions<'_> {
+fn connect_deletions(base: Option<&ViewNames>) -> ViewDeletions<'_> {
     base.map_or(ViewDeletions::Never, ViewDeletions::RemovedSince)
 }
 
@@ -926,13 +926,17 @@ fn build_m_from_view(
 /// contract §4), and refreshes the in-memory cache so the change is live for the
 /// broker. Does NOT push — the caller spawns the sync fan-out AFTER its write
 /// guard drops (the push path re-takes the per-vault write lock, which is not
-/// reentrant), exactly as `ActType::Write` does. `k` is the state key recovered
+/// reentrant). `base` is [`ViewNames::of`] the view as opened, captured BEFORE
+/// the caller mutated it: only items it had and the caller removed are
+/// tombstoned, so a row a concurrent pull adopted (pull does not take the write
+/// lock) is never dropped. `k` is the state key recovered
 /// from the grant's `W_c` (via `open_view_for_grant_keep_key`), so the CLI never
 /// touches the PRF-derived user key — a `sc service` write works over SSH
 /// through the plain grant link.
 pub(crate) fn persist_mutated_view(
     state: &Arc<AppState>,
     vault_id: &str,
+    base: &ViewNames,
     view: &crate::storage::plaintext::VaultPlaintextView,
     k: &[u8],
 ) -> Result<(), String> {
@@ -951,16 +955,13 @@ pub(crate) fn persist_mutated_view(
             .map_err(|e| format!("reseal vault.dat: {}", e))?;
         crate::storage::sealed_vault::write_atomic(&vault_path, &vault)
             .map_err(|e| format!("write vault.dat: {}", e))?;
-        // `view` was opened from the per-item store's own fold whenever one
-        // exists (`open_view_*` prefers it), so a missing item is one the caller
-        // removed. With no store, the bootstrap below is empty: nothing to drop.
         reconcile_per_item_after_connect(
             state,
             vault_id,
             Some(&vault),
             view,
             k,
-            ViewDeletions::MissingFromFold,
+            ViewDeletions::RemovedSince(base),
         );
     } else {
         reconcile_per_item_after_connect(
@@ -969,7 +970,7 @@ pub(crate) fn persist_mutated_view(
             None,
             view,
             k,
-            ViewDeletions::MissingFromFold,
+            ViewDeletions::RemovedSince(base),
         );
     }
     let cache = crate::server::handlers::approve::bootstrap_cache_from_view(view, state);

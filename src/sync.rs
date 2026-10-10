@@ -4242,8 +4242,8 @@ fn adopt_rekey_meta(
 }
 
 /// Push the daemon's keyset credentials ahead of the cloud after a daemon-side
-/// mutation of the acting credential (a Write rotates its `prf_salt`/`wrapped_key`
-/// via `replace_after_write`; a connect re-seals through the same `K`). Like
+/// keyset mutation (e.g. an Enroll / add-passkey; a connect re-seals through the
+/// same `K`). Like
 /// `push_items_best_effort`, NEVER clobber: on a 409 we
 /// adopt the cloud's rows (via `pull_keys`) and stop rather than force-overwrite.
 ///

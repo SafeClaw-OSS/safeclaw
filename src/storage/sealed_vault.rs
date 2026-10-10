@@ -151,27 +151,6 @@ pub fn build_initial(
     })
 }
 
-/// Rotate the acting credential's `(prf_salt, wrapped_key)` after a Write and
-/// replace the body ciphertext. Used by the write handler.
-pub fn replace_after_write(
-    vault: &mut SealedVault,
-    credential_id_b64: &str,
-    new_prf_salt: Vec<u8>,
-    new_wrapped_key: Vec<u8>,
-    new_ciphertext: Vec<u8>,
-) -> Result<()> {
-    let cid_bytes = decode_credential_id(credential_id_b64)?;
-    let cred = vault
-        .credentials
-        .iter_mut()
-        .find(|c| c.credential_id == cid_bytes)
-        .ok_or_else(|| AppError::Unauthorized("unknown credential for write".into()))?;
-    cred.prf_salt = new_prf_salt;
-    cred.wrapped_key = new_wrapped_key;
-    vault.ciphertext = new_ciphertext;
-    Ok(())
-}
-
 // ─────────────────────────────────────────────────────────────────────────
 // PER-ITEM LOCAL STORE  (PER_ITEM_SYNC.md §11.B step 1 / build contract §4)
 //
@@ -1075,16 +1054,36 @@ fn membership_prefix_ok(uik: &KeysetUik, vault_id: &str) -> bool {
 /// tombstone. Absence only means "deleted" relative to a known base.
 #[derive(Clone, Copy)]
 pub enum ViewDeletions<'a> {
-    /// Upsert-only: the view has no base (a whole-blob Enroll/Write), so an
-    /// absent item may be one this writer never saw.
+    /// Upsert-only: the view has no base, so an absent item may be one this
+    /// writer never saw.
     Never,
-    /// Only items present in `base` (the view the change was made from).
-    RemovedSince(&'a crate::storage::plaintext::VaultPlaintextView),
-    /// Every item missing from the view: ONLY for a view the caller opened
-    /// from this store's own fold and then mutated. (A pull adopting a NEW row
-    /// between that open and this reconcile is not excluded: pull does not take
-    /// the vault write lock.)
+    /// Only items the base (the view the change was made FROM, captured before
+    /// mutating it) had. A row a concurrent pull adopted after that capture is
+    /// in neither, so it is never dropped.
+    RemovedSince(&'a ViewNames),
+    /// Every item missing from the view: ONLY when the view is this store's own
+    /// fold taken inside the same `&mut self` call (no pull can interleave).
     MissingFromFold,
+}
+
+/// The tombstonable item names of a view (secret / connection / connecting),
+/// captured as a [`ViewDeletions::RemovedSince`] base. Names only: no secret
+/// values are copied.
+#[derive(Debug, Clone, Default)]
+pub struct ViewNames {
+    pub secrets: std::collections::BTreeSet<String>,
+    pub connections: std::collections::BTreeSet<String>,
+    pub connecting: std::collections::BTreeSet<String>,
+}
+
+impl ViewNames {
+    pub fn of(view: &crate::storage::plaintext::VaultPlaintextView) -> Self {
+        Self {
+            secrets: view.native_secrets.keys().cloned().collect(),
+            connections: view.aux.connections.keys().cloned().collect(),
+            connecting: view.aux.connecting.keys().cloned().collect(),
+        }
+    }
 }
 
 /// The daemon's per-item on-disk vault: keyset blob + N sealed item records.
@@ -1681,9 +1680,9 @@ impl PerItemVault {
                 ViewDeletions::Never => false,
                 ViewDeletions::MissingFromFold => true,
                 ViewDeletions::RemovedSince(base) => match ns {
-                    ItemNs::Secret => base.native_secrets.contains_key(name),
-                    ItemNs::Connection => base.aux.connections.contains_key(name),
-                    ItemNs::Connecting => base.aux.connecting.contains_key(name),
+                    ItemNs::Secret => base.secrets.contains(name),
+                    ItemNs::Connection => base.connections.contains(name),
+                    ItemNs::Connecting => base.connecting.contains(name),
                     _ => false,
                 },
             }
@@ -2816,7 +2815,7 @@ mod tests {
                 .cloned()
                 .collect()
         };
-        let base = view_of(&["A", "C"]);
+        let base = ViewNames::of(&view_of(&["A", "C"]));
         let view = view_of(&["C"]); // the caller deleted A
 
         let mut pv = store();

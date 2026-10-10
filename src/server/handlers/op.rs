@@ -200,6 +200,13 @@ fn reject_broker_kind(kind: &ActType) -> Result<()> {
             "Use ops must be created via the broker path, not the control-plane op endpoint".into(),
         ));
     }
+    // A whole-blob Write is retired: refuse it up front so nobody is asked to
+    // approve an op that can't apply (approve refuses it too).
+    if matches!(kind, ActType::Write) {
+        return Err(AppError::BadRequest(
+            crate::server::handlers::approve::WHOLE_BLOB_WRITE_RETIRED.into(),
+        ));
+    }
     Ok(())
 }
 
@@ -229,10 +236,17 @@ mod tests {
     }
 
     #[test]
+    fn reject_retired_whole_blob_write() {
+        match reject_broker_kind(&ActType::Write) {
+            Err(AppError::BadRequest(msg)) => assert!(msg.contains("Upgrade"), "{msg}"),
+            other => panic!("whole-blob Write must be refused, got {:?}", other.is_ok()),
+        }
+    }
+
+    #[test]
     fn accept_control_plane_kinds() {
         for kind in [
             ActType::Enroll,
-            ActType::Write,
             ActType::Export,
             ActType::Custom("vault-unlock".into()),
             ActType::Custom("vault-lock".into()),
