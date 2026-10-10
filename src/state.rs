@@ -21,7 +21,7 @@ use crate::storage::VaultDir;
 pub struct ApprovalEvent {
     pub vault_id: String,
     pub approval_id: String,
-    /// One of "pending" | "approved" | "rejected".
+    /// One of "pending" | "approved" | "rejected" | "cancelled".
     pub kind: String,
     /// Summary of the approved Operation (act.kind, target, scope) — present
     /// for pending. Frontend uses it to render the request card.

@@ -421,8 +421,18 @@ async fn run(
                 return Ok(());
             }
             403 => {
-                // Rejected by the user.
-                apply_reject(state.clone(), op_id, None).await;
+                // ONLY the backend's explicit user-rejection body is a human
+                // "no" — and a user rejection now resolves the whole intent
+                // chain (design/approvals-inbox.md D1). Any other 403 (tier
+                // gate, vault mismatch, key binding, …) is an auth/routing
+                // refusal of THIS poll: end it without rejecting anything; the
+                // op stays pending locally until its own expiry.
+                let body = resp.text().await.unwrap_or_default();
+                if is_user_rejection(&body) {
+                    apply_reject(state.clone(), op_id, None).await;
+                } else {
+                    tracing::warn!(op = %op_id, "relay poll refused (HTTP 403, not a user rejection): {}; poll ending, op left pending", body.chars().take(200).collect::<String>());
+                }
                 return Ok(());
             }
             202 => {
@@ -464,6 +474,20 @@ fn register_body(state: &AppState, base: &Value, op_id: &str, supersedes: &[Stri
     body["superseded_by"] = json!(superseded_by);
     body["retry_count"] = json!(retry_count.max(1));
     body
+}
+
+/// Is a relay poll's 403 body the backend's USER rejection
+/// (`{"error":"rejected"}`)? Anything else — other error codes, non-JSON, an
+/// empty body — is not.
+fn is_user_rejection(body: &str) -> bool {
+    serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|v| {
+            v.get("error")
+                .and_then(|e| e.as_str())
+                .map(|e| e == "rejected")
+        })
+        .unwrap_or(false)
 }
 
 /// True when the local op record exists and is no longer pending (approved,
@@ -665,6 +689,28 @@ mod tests {
         assert_eq!(old["supersedes"], json!([]));
         assert_eq!(old["superseded_by"], json!(b.id));
         assert_eq!(old["retry_count"], 1);
+    }
+
+    /// Only `{"error":"rejected"}` reads as a user rejection on a poll 403;
+    /// tier / vault / binding refusals (or a bare 403) must never reject the
+    /// op — that would now resolve its whole intent chain.
+    #[test]
+    fn only_explicit_rejection_body_is_user_rejection() {
+        assert!(is_user_rejection(r#"{"error":"rejected"}"#));
+        assert!(is_user_rejection(
+            r#"{"error":"rejected","grant_status":"rejected"}"#
+        ));
+        for other in [
+            r#"{"error":"forbidden_tier"}"#,
+            r#"{"error":"vault_mismatch"}"#,
+            r#"{"error":"op_relay_immutable"}"#,
+            r#"{"status":"rejected"}"#,
+            r#"{"error":{"code":"rejected"}}"#,
+            "rejected",
+            "",
+        ] {
+            assert!(!is_user_rejection(other), "{other}");
+        }
     }
 
     /// A late grant for an op the chain already resolved ends the relay poll

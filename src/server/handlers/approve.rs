@@ -766,6 +766,12 @@ pub async fn approve_op(
     // Captured here for the audit row finalize at the bottom (Use's upstream
     // status code; None for all other act kinds).
     let audit_upstream_status: Option<i64> = None;
+    // A Use apply's grant/cache write is DEFERRED until the op is actually
+    // marked approved (step 5): any status flip that bypasses the vault write
+    // lock (a user reject, a requester withdrawal, the reaper, an auto-reject)
+    // can land between dispatch and approve, and must never leave a live
+    // grant behind an op that reads rejected.
+    let mut deferred_grant: Option<DeferredGrant> = None;
     let (response, cached_value) = match &validated.op.act.kind {
         ActType::Enroll if validated.op.act.target == "passkeys" => {
             // Add-passkey-to-existing-vault path. PROTOCOL.md §3.4 maps
@@ -1124,17 +1130,17 @@ pub async fn approve_op(
                     pc.as_ref().map(|p| p.ttl_seconds).unwrap_or(300)
                 };
                 if !conn.is_empty() && !method.is_empty() && !host.is_empty() && !path.is_empty() {
-                    state.op_grant_insert(
-                        &vault_id,
-                        &grant_agent,
-                        &conn,
-                        method,
-                        &host,
-                        path,
-                        &scope_digest,
-                        s_o,
-                        now + window,
-                    );
+                    deferred_grant = Some(DeferredGrant::OpGrant {
+                        vault_id: vault_id.clone(),
+                        agent: grant_agent.clone(),
+                        conn: conn.clone(),
+                        method: method.to_string(),
+                        host: host.clone(),
+                        path: path.to_string(),
+                        scope_digest: scope_digest.clone(),
+                        value: s_o,
+                        expires_at: now + window,
+                    });
                 } else {
                     tracing::warn!(
                         vault = %vault_id, op = %op_id,
@@ -1145,13 +1151,13 @@ pub async fn approve_op(
                 // Unscoped ask (and legacy no-context ops): conn-keyed value with
                 // the grant-window TTL, read by the downgraded-to-Allow retry.
                 let ttl = pc.as_ref().map(|p| p.ttl_seconds).unwrap_or(300);
-                state.cache_insert(
-                    &vault_id,
-                    &conn,
-                    s_o,
-                    Some(now + ttl),
-                    Some(grant_agent.clone()),
-                );
+                deferred_grant = Some(DeferredGrant::ConnCache {
+                    vault_id: vault_id.clone(),
+                    conn: conn.clone(),
+                    value: s_o,
+                    expires_at: now + ttl,
+                    agent: grant_agent.clone(),
+                });
             }
             (
                 json!({ "ok": true, "act": "use", "authorized": true, "stream": true }),
@@ -2116,10 +2122,8 @@ pub async fn approve_op(
         rec_agent_prefix,
         satisfied_siblings,
     ) = {
-        let mut store = state.approvals.lock().unwrap();
-        let (rec, siblings) = store
-            .approve_chain(&op_id, cached_value.clone())
-            .ok_or_else(|| AppError::Conflict("op no longer pending after validation".into()))?;
+        let (rec, siblings) =
+            approve_and_commit(&state, &op_id, cached_value.clone(), deferred_grant)?;
         let preview = match &validated.op.act.kind {
             ActType::Use => cached_value
                 .as_deref()
@@ -2257,6 +2261,108 @@ pub async fn approve_op(
     Ok(Json(response))
 }
 
+/// A Use apply's grant write, captured during dispatch and executed only once
+/// the op is marked approved ([`approve_and_commit`]).
+pub(crate) enum DeferredGrant {
+    /// Request-bound grant (`op_grants`): ask-always, or a scoped ask.
+    OpGrant {
+        vault_id: String,
+        agent: String,
+        conn: String,
+        method: String,
+        host: String,
+        path: String,
+        scope_digest: String,
+        value: Vec<u8>,
+        expires_at: u64,
+    },
+    /// Connection-keyed window (`entries`): an unscoped ask / allow.
+    ConnCache {
+        vault_id: String,
+        conn: String,
+        value: Vec<u8>,
+        expires_at: u64,
+        agent: String,
+    },
+}
+
+impl DeferredGrant {
+    fn write(self, state: &AppState) {
+        match self {
+            DeferredGrant::OpGrant {
+                vault_id,
+                agent,
+                conn,
+                method,
+                host,
+                path,
+                scope_digest,
+                value,
+                expires_at,
+            } => state.op_grant_insert(
+                &vault_id,
+                &agent,
+                &conn,
+                &method,
+                &host,
+                &path,
+                &scope_digest,
+                value,
+                expires_at,
+            ),
+            DeferredGrant::ConnCache {
+                vault_id,
+                conn,
+                value,
+                expires_at,
+                agent,
+            } => state.cache_insert(&vault_id, &conn, value, Some(expires_at), Some(agent)),
+        }
+    }
+
+    /// Wipe the captured secret when the grant is never written.
+    fn discard(self) {
+        match self {
+            DeferredGrant::OpGrant { mut value, .. }
+            | DeferredGrant::ConnCache { mut value, .. } => value.zeroize(),
+        }
+    }
+}
+
+/// Step 5 core: mark `op_id` approved and resolve its intent chain in ONE
+/// `approvals` acquisition, THEN write the deferred Use grant. If the op is no
+/// longer pending (a reject / withdrawal / auto-reject landed after dispatch),
+/// nothing is written and the secret is wiped: an op that reads rejected never
+/// has a live grant. Once approved, its status can no longer flip, so writing
+/// after the mutex is released is race-free.
+fn approve_and_commit(
+    state: &AppState,
+    op_id: &str,
+    value: Option<String>,
+    deferred: Option<DeferredGrant>,
+) -> Result<(
+    crate::approval::ApprovalRecord,
+    Vec<crate::approval::ChainSibling>,
+)> {
+    let approved = state.approvals.lock().unwrap().approve_chain(op_id, value);
+    match approved {
+        Some(done) => {
+            if let Some(g) = deferred {
+                g.write(state);
+            }
+            Ok(done)
+        }
+        None => {
+            if let Some(g) = deferred {
+                g.discard();
+            }
+            Err(AppError::Conflict(
+                "op no longer pending after validation".into(),
+            ))
+        }
+    }
+}
+
 /// How an intent chain resolved its siblings.
 pub(crate) enum ChainOutcome<'a> {
     /// `by` applied; the siblings resolved approved with `satisfied_by = by`.
@@ -2270,7 +2376,8 @@ pub(crate) enum ChainOutcome<'a> {
 /// withdrawal with its reason. Called after the `approvals` mutex is
 /// released. The audit row is `cancelled` (a non-access outcome: the sibling
 /// itself touched no credential — the applied op is the one approval of
-/// record) with the pointer in its reason, matching the relay row's cancel.
+/// record) with the pointer in its reason, matching the relay row's cancel;
+/// the SSE event says the same (`cancelled` + reason).
 pub(crate) fn finish_chain_siblings(
     state: &Arc<AppState>,
     siblings: &[crate::approval::ChainSibling],
@@ -2284,15 +2391,13 @@ pub(crate) fn finish_chain_siblings(
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     for sib in siblings {
-        let (audit_reason, kind, relay_reason) = match outcome {
+        let (audit_reason, relay_reason) = match outcome {
             ChainOutcome::Satisfied { by } => (
                 format!("satisfied by {}", by),
-                "approved",
                 crate::relay::client::CancelReason::Satisfied { by: by.to_string() },
             ),
             ChainOutcome::Rejected { by } => (
                 format!("rejected with {}", by),
-                "rejected",
                 crate::relay::client::CancelReason::Rejected,
             ),
         };
@@ -2311,7 +2416,9 @@ pub(crate) fn finish_chain_siblings(
         state.emit_event(ApprovalEvent {
             vault_id: sib.vault_id.clone(),
             approval_id: sib.id.clone(),
-            kind: kind.into(),
+            // SSE agrees with the audit row: `cancelled`, the reason carries
+            // the pointer. Pollers still read `ok` / `rejected` from GET /op.
+            kind: "cancelled".into(),
             op_summary: None,
             response_preview: None,
             reason: Some(audit_reason),
@@ -3527,6 +3634,15 @@ mod tests {
         assert!(assert_signed_level(&json!({"level":"ask","window_s":"900"}), Some(&ask)).is_err());
         // A signed level with no policy context can't be honoured.
         assert!(assert_signed_level(&json!({"level":"ask"}), None).is_err());
+        // allow (a cache miss applies as the unscoped window) signs its window.
+        let allow = pc(AccessLevel::Allow, 600);
+        assert!(
+            assert_signed_level(&json!({"level":"allow","window_s":600}), Some(&allow)).is_ok()
+        );
+        assert!(
+            assert_signed_level(&json!({"level":"allow","window_s":900}), Some(&allow)).is_err()
+        );
+        assert!(assert_signed_level(&json!({"level":"allow","window_s":600}), Some(&ask)).is_err());
         // Pre-field scope: left to the existing pc-driven apply.
         assert!(assert_signed_level(&json!({"method":"GET"}), Some(&ask)).is_ok());
         assert!(assert_signed_level(&Value::Null, None).is_ok());
@@ -3744,6 +3860,126 @@ mod tests {
             op_poll_value(&state, &other.id, None).unwrap()["status"],
             "pending"
         );
+    }
+
+    fn deferred_pair(agent: &str) -> (DeferredGrant, DeferredGrant) {
+        (
+            DeferredGrant::ConnCache {
+                vault_id: "v1".into(),
+                conn: "github".into(),
+                value: b"tok-conn".to_vec(),
+                expires_at: u64::MAX / 2,
+                agent: agent.into(),
+            },
+            DeferredGrant::OpGrant {
+                vault_id: "v1".into(),
+                agent: agent.into(),
+                conn: "github".into(),
+                method: "GET".into(),
+                host: "api.github.com".into(),
+                path: "/user".into(),
+                scope_digest: String::new(),
+                value: b"tok-bound".to_vec(),
+                expires_at: u64::MAX / 2,
+            },
+        )
+    }
+
+    fn grants_present(state: &AppState, agent: &str) -> (bool, bool) {
+        (
+            state.cache_lookup_grant("v1", "github", agent).is_some(),
+            state
+                .op_grant_take(
+                    "v1",
+                    agent,
+                    "github",
+                    "GET",
+                    "api.github.com",
+                    "/user",
+                    "",
+                    false,
+                )
+                .is_some(),
+        )
+    }
+
+    /// The Use grant is written only once the op is marked approved. A status
+    /// flip that bypasses the vault write lock (user reject, requester
+    /// withdrawal / reaper, auto-reject) landing between dispatch and approve
+    /// leaves NO grant behind an op that reads rejected.
+    #[test]
+    fn deferred_use_grant_not_written_when_op_flipped_before_approve() {
+        let state = test_state();
+        state.unlock_vault(
+            "v1".into(),
+            crate::state::SecretsCache::default(),
+            zeroize::Zeroizing::new(Vec::new()),
+        );
+        for flip in [
+            "user rejected",
+            crate::server::handlers::op::WITHDRAWN_REASON,
+        ] {
+            for which in 0..2 {
+                let c = chained(&state, "/user", &b64r(1));
+                let (conn, bound) = deferred_pair("ag_x");
+                let g = if which == 0 { conn } else { bound };
+                // Dispatch done; the flip lands before step 5.
+                state.approvals.lock().unwrap().reject(&c.id, flip);
+                let err = approve_and_commit(&state, &c.id, None, Some(g)).unwrap_err();
+                assert!(matches!(err, AppError::Conflict(_)), "{err}");
+                assert_eq!(
+                    grants_present(&state, "ag_x"),
+                    (false, false),
+                    "flip={flip}"
+                );
+                assert!(matches!(
+                    state.approvals.lock().unwrap().get(&c.id).unwrap().status,
+                    ApprovalStatus::Rejected { .. }
+                ));
+            }
+        }
+        // Auto-reject (MAX_APPROVE_ATTEMPTS failures) is the same flip.
+        let c = chained(&state, "/user", &b64r(2));
+        for _ in 0..crate::approval::store::MAX_APPROVE_ATTEMPTS {
+            state.approvals.lock().unwrap().record_failure(&c.id);
+        }
+        let (conn, _) = deferred_pair("ag_x");
+        assert!(approve_and_commit(&state, &c.id, None, Some(conn)).is_err());
+        assert_eq!(grants_present(&state, "ag_x"), (false, false));
+
+        // Still pending at step 5: approved, then the grant is written.
+        let c = chained(&state, "/user", &b64r(3));
+        let (conn, bound) = deferred_pair("ag_x");
+        approve_and_commit(&state, &c.id, None, Some(conn)).unwrap();
+        let c2 = chained(&state, "/user", &b64r(4));
+        approve_and_commit(&state, &c2.id, None, Some(bound)).unwrap();
+        assert_eq!(grants_present(&state, "ag_x"), (true, true));
+    }
+
+    /// Satisfied / rejected chain siblings emit SSE `cancelled` with the
+    /// pointer in the reason, agreeing with their audit row.
+    #[tokio::test]
+    async fn chain_sibling_sse_agrees_with_audit() {
+        let state = Arc::new(test_state());
+        let mut rx = state.events.subscribe();
+        let a = chained(&state, "/user", &b64r(1));
+        let b = chained(&state, "/user", &b64r(2));
+        let (_, sibs) = state
+            .approvals
+            .lock()
+            .unwrap()
+            .approve_chain(&b.id, None)
+            .unwrap();
+        finish_chain_siblings(&state, &sibs, &ChainOutcome::Satisfied { by: &b.id });
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.approval_id, a.id);
+        assert_eq!(ev.kind, "cancelled");
+        assert_eq!(
+            ev.reason.as_deref(),
+            Some(format!("satisfied by {}", b.id).as_str())
+        );
+        // The poller still reads `ok`.
+        assert_eq!(op_poll_value(&state, &a.id, None).unwrap()["status"], "ok");
     }
 
     /// Enroll seeds a per-item store ONLY for a new vault: an existing store

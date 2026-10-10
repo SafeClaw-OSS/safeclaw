@@ -1208,15 +1208,19 @@ impl BrokerHandler {
 /// Stamp the policy level a Use op is minted under into its (signed) scope, so
 /// what the approver reads ("this one request" vs "N min") is what apply
 /// grants: `level` always, `window_s` (integer seconds — JCS rejects floats)
-/// only for `ask`, equal to the PolicyContext ttl. approve asserts both
-/// against the record's PolicyContext (design/approvals-inbox.md D1).
+/// for every level whose apply opens a window — `ask`, and `allow` (an
+/// allow-level cache miss applies as the unscoped connection-keyed window for
+/// the PolicyContext ttl) — equal to that ttl. Only `ask-always` (one request,
+/// no window) omits it. approve asserts both against the record's
+/// PolicyContext (design/approvals-inbox.md D1).
 fn stamp_signed_level(
     scope: &mut serde_json::Value,
     level: crate::core::policy::AccessLevel,
     grant_ttl: u64,
 ) {
+    use crate::core::policy::AccessLevel;
     scope["level"] = serde_json::Value::String(level.to_string());
-    if level == crate::core::policy::AccessLevel::Ask {
+    if matches!(level, AccessLevel::Ask | AccessLevel::Allow) {
         scope["window_s"] = serde_json::Value::from(grant_ttl);
     }
 }
@@ -1643,8 +1647,8 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
-    /// The signed Use scope carries the mint-time level; `window_s` only for
-    /// `ask` (ask-always is one request, no window), as an integer.
+    /// The signed Use scope carries the mint-time level; `window_s` for every
+    /// windowed level (ask, allow), never for ask-always, as an integer.
     #[test]
     fn signed_level_stamp() {
         use crate::core::policy::AccessLevel;
@@ -1658,6 +1662,13 @@ mod tests {
         stamp_signed_level(&mut always, AccessLevel::AskAlways, 900);
         assert_eq!(always["level"], "ask-always");
         assert!(always.get("window_s").is_none());
+
+        // An allow-level cache miss applies as the unscoped connection window
+        // for the pc ttl: that window must be signed and shown too.
+        let mut allow = json!({ "method": "GET" });
+        stamp_signed_level(&mut allow, AccessLevel::Allow, 600);
+        assert_eq!(allow["level"], "allow");
+        assert_eq!(allow["window_s"], 600);
     }
 
     #[test]
