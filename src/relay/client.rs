@@ -339,7 +339,7 @@ async fn run(
                     tracing::warn!(op = %op_id, "approved grant could not be applied ({}); rejecting so the CLI fails clearly instead of hanging", e);
                     // Carry the REAL cause: this is an apply failure after a
                     // genuine user approval, and must never read back as
-                    // "user denied" (it did, and misled approver and agent).
+                    // a human "no" (it did, and misled approver and agent).
                     apply_reject(
                         state.clone(),
                         op_id,
@@ -425,9 +425,9 @@ async fn apply_grant(state: Arc<AppState>, op_id: &str, grant: Value) -> Result<
     }
 }
 
-/// `reason: None` = a genuine user denial (the endpoint's default). `Some` =
+/// `reason: None` = a genuine user rejection (the endpoint's default). `Some` =
 /// the true cause of a non-user rejection (apply failure), recorded verbatim
-/// so `sc op wait` and the console never dress it up as "user denied".
+/// so `sc op wait` and the console never dress it up as "user rejected".
 async fn apply_reject(state: Arc<AppState>, op_id: &str, reason: Option<&str>) {
     let url = format!("http://127.0.0.1:{}/op/{}/reject", state.config.port, op_id);
     if let Ok(client) = reqwest::Client::builder()

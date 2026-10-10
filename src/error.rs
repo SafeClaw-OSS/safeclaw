@@ -207,7 +207,7 @@ impl ScCode {
                 "fix_request",
                 "request",
             ),
-            PolicyDenied => (403, "policy_denied", "Denied by policy", "none", "policy"),
+            PolicyDenied => (403, "policy_denied", "Blocked by policy", "none", "policy"),
             RefreshForbidden => (
                 403,
                 "refresh_forbidden",

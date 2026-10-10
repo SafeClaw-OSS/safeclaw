@@ -7,7 +7,7 @@ Every brokered request gets exactly one decision:
 | `allow` | proceeds, no ceremony |
 | `ask` | one passkey approval, then reused for that rule's window |
 | `ask-always` | a passkey approval every single time |
-| `deny` | refused unconditionally |
+| `deny` | blocked unconditionally |
 
 When multiple sources have an opinion, **the strictest wins**
 (`deny > ask-always > ask > allow`), the same fail-safe family as cloud IAM

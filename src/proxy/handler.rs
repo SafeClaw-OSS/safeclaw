@@ -529,7 +529,7 @@ impl BrokerHandler {
         // connection MUST flow into the op target — without it the approval
         // resolved a secret named after the CONNECTION, 400'd at apply, and the
         // relay then recorded the op rejected: the user's real approval read
-        // back as "user denied". Several roles in one request: the first is the
+        // back as a human "no". Several roles in one request: the first is the
         // stashed primary (the same order substitution scans).
         let op_role = def
             .as_ref()
@@ -616,7 +616,7 @@ impl BrokerHandler {
                 },
                 0,
             );
-            return err_response(ScCode::PolicyDenied, "this request is denied by policy").into();
+            return err_response(ScCode::PolicyDenied, "this request is blocked by policy").into();
         }
 
         // The credential bytes come from the session cache (the proxy has no

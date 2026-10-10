@@ -308,7 +308,7 @@ mod tests {
     fn reject_blocks_consume() {
         let mut s = ApprovalStore::new();
         let id = s.create("vault1".into(), fake_op(), "fake_r".into());
-        s.reject(&id, "user denied");
+        s.reject(&id, "user rejected");
         assert!(s.consume(&id).is_none());
     }
 

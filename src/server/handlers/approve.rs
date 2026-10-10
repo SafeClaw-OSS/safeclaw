@@ -2148,7 +2148,7 @@ pub async fn reject_op(
 ) -> Result<Json<Value>> {
     // Default = a human said no. A caller may carry the REAL cause instead
     // (the relay client's apply-failure path does): recording an apply
-    // failure as "user denied" misled every reader — the approver saw their
+    // failure as a human "no" misled every reader — the approver saw their
     // own approval come back as a denial, and the agent was told not to
     // retry a request the user in fact allowed.
     let reason: String = body
@@ -2157,7 +2157,7 @@ pub async fn reject_op(
         .and_then(|v| v.as_str())
         .map(|s| s.chars().take(300).collect::<String>())
         .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "user denied".to_string());
+        .unwrap_or_else(|| "user rejected".to_string());
     let (rec_id, rec_vault_id) = {
         let mut store = state.approvals.lock().unwrap();
         let rec = store.reject(&op_id, &reason).ok_or(AppError::NotFound)?;
@@ -3156,7 +3156,7 @@ mod tests {
         {
             let mut s = state.approvals.lock().unwrap();
             s.approve(&ids[1], None);
-            s.reject(&ids[2], "user denied");
+            s.reject(&ids[2], "user rejected");
         }
         let got_after = batch_expected_challenge(&state, &ids[0], "v1", &g).unwrap();
         assert_eq!(got_after, manual, "status-agnostic sibling rebuild");

@@ -135,7 +135,11 @@ pub async fn run_wait(args: OpWaitArgs) -> Result<(), String> {
                                     );
                                     std::process::exit(6);
                                 }
-                                if !reason.is_empty() && reason != "user denied" {
+                                // "user denied" = the same human no from an older daemon.
+                                if !reason.is_empty()
+                                    && reason != "user rejected"
+                                    && reason != "user denied"
+                                {
                                     // Not a human saying no (e.g. "approved,
                                     // but applying it failed: …") — retrying
                                     // after the cause is fixed is legitimate.

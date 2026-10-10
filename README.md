@@ -116,7 +116,7 @@ Maintenance   sc unlock · lock · sync · logs · doctor · upgrade · proxy ·
 
 **What about traffic I don't route through `sc run`?** Untouched. SafeClaw is not a machine-wide MITM; only commands you deliberately route are brokered, and a phantom sent unrouted is a worthless string.
 
-**What can a compromised agent do?** Spend credentials only through the proxy, only toward each connection's own hosts, under your policy, with sensitive actions blocked on your passkey. It cannot read the values, and outside the proxy its phantoms are inert.
+**What can a compromised agent do?** Spend credentials only through the proxy, only toward each connection's own hosts, under your policy, with sensitive actions waiting for your passkey. It cannot read the values, and outside the proxy its phantoms are inert.
 
 ## Docs
 

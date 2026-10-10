@@ -30,7 +30,7 @@ Enroll a backup passkey (your vault's Passkeys tab) the day you set up.
 
 Less than you'd fear. It holds phantoms, which are inert everywhere except
 SafeClaw's proxy. Through the proxy it can spend a credential only toward that
-connection's own hosts, under your policy, and sensitive actions block until
+connection's own hosts, under your policy, and sensitive actions wait until
 you approve them with a passkey. What it cannot do: read a value, send a
 credential to an attacker's host, or approve its own requests. Exfiltrating a
 key it never held is not on the table.

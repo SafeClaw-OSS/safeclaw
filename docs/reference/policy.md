@@ -28,10 +28,10 @@
 | `allow` | 直接放行,不审批 |
 | `ask` | 审批一次,之后在该 rule 的 `ttl` 内复用 |
 | `ask-always` | 每次都审批,永不缓存 |
-| `deny` | 无条件拒绝 |
+| `deny` | 无条件拦截 |
 
 **deny 从不做出厂默认**:SafeClaw 是 gate 非 block。recipe/用户显式把某条 rule 设成 `deny`
-才会拒。
+才会拦截。
 
 ## 3. Recipe `policy.toml` 格式
 
