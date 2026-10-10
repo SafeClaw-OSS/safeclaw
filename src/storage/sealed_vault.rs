@@ -1071,6 +1071,22 @@ fn membership_prefix_ok(uik: &KeysetUik, vault_id: &str) -> bool {
     crate::identity::membership_commitment(&prefix_sigs).as_slice() == proof.membership_hash.as_slice()
 }
 
+/// Which items absent from a view [`PerItemVault::reconcile_from_view`] may
+/// tombstone. Absence only means "deleted" relative to a known base.
+#[derive(Clone, Copy)]
+pub enum ViewDeletions<'a> {
+    /// Upsert-only: the view has no base (a whole-blob Enroll/Write), so an
+    /// absent item may be one this writer never saw.
+    Never,
+    /// Only items present in `base` (the view the change was made from).
+    RemovedSince(&'a crate::storage::plaintext::VaultPlaintextView),
+    /// Every item missing from the view: ONLY for a view the caller opened
+    /// from this store's own fold and then mutated. (A pull adopting a NEW row
+    /// between that open and this reconcile is not excluded: pull does not take
+    /// the vault write lock.)
+    MissingFromFold,
+}
+
 /// The daemon's per-item on-disk vault: keyset blob + N sealed item records.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PerItemVault {
@@ -1587,12 +1603,15 @@ impl PerItemVault {
     ///     connect MOVEs its `connecting` entry away → tombstone the old row).
     ///
     /// This is the daemon-side, single-writer equivalent of "PUT the changed
-    /// items" (contract §5 `writeVault` diff). Returns the ids that changed.
+    /// items" (contract §5 `writeVault` diff). Which missing items become
+    /// tombstones is the caller's [`ViewDeletions`]: only a view with a known
+    /// base can tell "deleted" from "never seen". Returns the ids that changed.
     pub fn reconcile_from_view<S: PrimitiveSuite>(
         &mut self,
         keys: VaultKeys,
         vault_id: &str,
         view: &crate::storage::plaintext::VaultPlaintextView,
+        deletions: ViewDeletions,
     ) -> Result<Vec<String>> {
         let mut changed: Vec<String> = Vec::new();
 
@@ -1648,11 +1667,30 @@ impl PerItemVault {
 
         // Tombstone secret/connection/connecting rows the view dropped. Our own
         // folded view gives the currently-live (ns, name) set; tombstone any not
-        // in `desired` (a completed connect MOVEs its `connecting` entry, so the
-        // old connecting row must become a tombstone).
+        // in `desired` that `deletions` says the caller removed (a completed
+        // connect MOVEs its `connecting` entry, so the old connecting row must
+        // become a tombstone).
+        if matches!(deletions, ViewDeletions::Never) {
+            return Ok(changed);
+        }
+        let removed = |ns: ItemNs, name: &String| -> bool {
+            if desired.contains_key(&(ns, name.clone())) {
+                return false;
+            }
+            match deletions {
+                ViewDeletions::Never => false,
+                ViewDeletions::MissingFromFold => true,
+                ViewDeletions::RemovedSince(base) => match ns {
+                    ItemNs::Secret => base.native_secrets.contains_key(name),
+                    ItemNs::Connection => base.aux.connections.contains_key(name),
+                    ItemNs::Connecting => base.aux.connecting.contains_key(name),
+                    _ => false,
+                },
+            }
+        };
         let mine = self.fold_view::<S>(keys, vault_id)?;
         for name in mine.native_secrets.keys() {
-            if !desired.contains_key(&(ItemNs::Secret, name.clone())) {
+            if removed(ItemNs::Secret, name) {
                 let (id, _v) = self.seal_and_bump::<S>(
                     keys,
                     vault_id,
@@ -1664,7 +1702,7 @@ impl PerItemVault {
             }
         }
         for id in mine.aux.connections.keys() {
-            if !desired.contains_key(&(ItemNs::Connection, id.clone())) {
+            if removed(ItemNs::Connection, id) {
                 let (iid, _v) = self.seal_and_bump::<S>(
                     keys,
                     vault_id,
@@ -1676,7 +1714,7 @@ impl PerItemVault {
             }
         }
         for id in mine.aux.connecting.keys() {
-            if !desired.contains_key(&(ItemNs::Connecting, id.clone())) {
+            if removed(ItemNs::Connecting, id) {
                 let (iid, _v) = self.seal_and_bump::<S>(
                     keys,
                     vault_id,
@@ -2369,7 +2407,8 @@ impl PerItemVault {
         }
         // Reconcile writes every config singleton at its NEW address (the
         // mapping lives in `singleton_bodies`, shared with seed).
-        let mut changed = self.reconcile_from_view::<S>(keys, vault_id, &view)?;
+        let mut changed =
+            self.reconcile_from_view::<S>(keys, vault_id, &view, ViewDeletions::MissingFromFold)?;
         // Tombstone every live legacy aux row (known + unknown names alike —
         // the namespace is retired wholesale).
         // Legacy `aux:agent/*` rows are skipped: the daemon never writes agent rows
@@ -2737,6 +2776,70 @@ mod tests {
     // The daemon NEVER writes authorized-agents rows (any spelling, live or
     // tombstone): it holds no UIK, so it cannot sign one. Seed + reconcile from a
     // view that carries agents emit only config; dropping an agent from the view
+    // `ViewDeletions`: only a view with a known base may turn "absent" into a
+    // tombstone. B was pulled into the store but is in neither the base nor the
+    // view (the writer never saw it): it survives everything but MissingFromFold.
+    #[test]
+    fn reconcile_deletions_respect_the_base() {
+        use crate::storage::plaintext::{VaultAux, VaultPlaintextView};
+        use sudp::primitives::StdPrimitives;
+        let k = [0x56u8; 32];
+        let vid = "vault-del";
+        let keys = VaultKeys::single(&k);
+        let view_of = |names: &[&str]| VaultPlaintextView {
+            aux: VaultAux::initial(),
+            native_secrets: names
+                .iter()
+                .map(|n| (n.to_string(), b"v".to_vec()))
+                .collect(),
+            legacy_addressing: false,
+        };
+        let store = || {
+            let mut pv = PerItemVault::build_initial(
+                b"c".to_vec(),
+                "x".into(),
+                "y".into(),
+                "Dev".into(),
+                vec![0u8; 32],
+                vec![0u8; 48],
+            )
+            .unwrap();
+            pv.seed_items_from_view::<StdPrimitives>(keys, vid, &view_of(&["A", "B", "C"]))
+                .unwrap();
+            pv
+        };
+        let live = |pv: &PerItemVault| -> Vec<String> {
+            pv.fold_view::<StdPrimitives>(keys, vid)
+                .unwrap()
+                .native_secrets
+                .keys()
+                .cloned()
+                .collect()
+        };
+        let base = view_of(&["A", "C"]);
+        let view = view_of(&["C"]); // the caller deleted A
+
+        let mut pv = store();
+        pv.reconcile_from_view::<StdPrimitives>(keys, vid, &view, ViewDeletions::Never)
+            .unwrap();
+        assert_eq!(live(&pv), ["A", "B", "C"], "upsert-only");
+
+        let mut pv = store();
+        pv.reconcile_from_view::<StdPrimitives>(
+            keys,
+            vid,
+            &view,
+            ViewDeletions::RemovedSince(&base),
+        )
+        .unwrap();
+        assert_eq!(live(&pv), ["B", "C"], "only what the base had is dropped");
+
+        let mut pv = store();
+        pv.reconcile_from_view::<StdPrimitives>(keys, vid, &view, ViewDeletions::MissingFromFold)
+            .unwrap();
+        assert_eq!(live(&pv), ["C"]);
+    }
+
     // writes no tombstone; and the seal primitive itself refuses agent rows.
     #[test]
     fn daemon_never_writes_agent_rows() {
@@ -2802,7 +2905,12 @@ mod tests {
         // Reconcile from a view that still carries agents (and then one that drops
         // one): no agent row is upserted, and no tombstone is written.
         let changed = pv
-            .reconcile_from_view::<StdPrimitives>(VaultKeys::single(&k), vid, &view)
+            .reconcile_from_view::<StdPrimitives>(
+                VaultKeys::single(&k),
+                vid,
+                &view,
+                ViewDeletions::MissingFromFold,
+            )
             .unwrap();
         assert!(
             changed.is_empty(),
@@ -2816,7 +2924,12 @@ mod tests {
         };
         view2.aux.agents.remove("ag_bob");
         let changed = pv
-            .reconcile_from_view::<StdPrimitives>(VaultKeys::single(&k), vid, &view2)
+            .reconcile_from_view::<StdPrimitives>(
+                VaultKeys::single(&k),
+                vid,
+                &view2,
+                ViewDeletions::MissingFromFold,
+            )
             .unwrap();
         assert!(changed.is_empty(), "dropping an agent writes no tombstone");
         assert_eq!(pv.items.len(), items_after_seed);

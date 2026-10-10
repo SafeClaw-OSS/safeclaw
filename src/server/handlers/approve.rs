@@ -2360,14 +2360,15 @@ fn seed_per_item_store(
 }
 
 /// The per-item store a whole-blob Enroll/Write lands as. An EXISTING store is
-/// reconciled INTO ([`PerItemVault::reconcile_from_view`], as connect does): only
-/// rows whose value changed are bumped, on top of their current versions, and
-/// unchanged rows keep their `synced_version`, so the next push CASes just the
-/// change on the cloud's version. Rebuilding every row at version 1 / unsynced
-/// instead made that push 409 and keep-both write the user's NEW value as the
-/// conflict copy while adopting the cloud's OLD one. Built from scratch only
-/// when no store exists, or its rows can't be reconciled under `k` (the cursors
-/// are carried either way).
+/// reconciled INTO ([`PerItemVault::reconcile_from_view`]), UPSERT-ONLY: rows
+/// whose value changed (or are new) are bumped on top of their current versions,
+/// unchanged rows keep their `synced_version`, and NOTHING is tombstoned: a
+/// whole-blob view has no base, so an item absent from it may be one the writer
+/// never saw (e.g. pulled from another device). Rebuilding every row at version
+/// 1 / unsynced instead made the next push 409 and keep-both write the user's
+/// NEW value as the conflict copy while adopting the cloud's OLD one. Built from
+/// scratch only when no store exists, or its rows can't be reconciled under `k`
+/// (the cursors are carried either way).
 fn per_item_from_view(
     existing: Option<crate::storage::sealed_vault::PerItemVault>,
     keyset: crate::storage::sealed_vault::Keyset,
@@ -2384,7 +2385,12 @@ fn per_item_from_view(
         .unwrap_or((0, 0));
     if let Some(mut pv) = existing {
         pv.keyset = keyset.clone();
-        match pv.reconcile_from_view::<S>(keys, vault_id, view) {
+        match pv.reconcile_from_view::<S>(
+            keys,
+            vault_id,
+            view,
+            crate::storage::sealed_vault::ViewDeletions::Never,
+        ) {
             Ok(changed) => {
                 tracing::debug!(vault = %vault_id, changed = changed.len(), "per-item store reconciled from view");
                 return Ok(pv);
@@ -3287,7 +3293,8 @@ mod tests {
 
     /// A whole-blob Write reconciles INTO an existing per-item store: only the
     /// changed row is bumped on top of its version (dirty, so the push CASes it
-    /// on the cloud's version) and unchanged rows stay clean. Rebuilding every
+    /// on the cloud's version), unchanged rows stay clean, and a row the blob
+    /// lacks (pulled from another device) is never tombstoned. Rebuilding every
     /// row at v1/unsynced made keep-both turn the user's NEW value into the
     /// conflict copy and adopt the cloud's OLD one.
     #[test]
@@ -3318,6 +3325,16 @@ mod tests {
             .items
             .values()
             .all(|s| s.version == 1 && s.synced_version == 0));
+        // C arrives from another device by pull: in the store, NOT in the blob.
+        pv.seal_and_upsert::<S>(
+            VaultKeys::single(&k),
+            vid,
+            ItemNs::Secret,
+            "C",
+            1,
+            &crate::storage::item::ItemPayload::secret_live("C", "pulled"),
+        )
+        .unwrap();
         // ...then pushed: every row confirmed on the cloud.
         for s in pv.items.values_mut() {
             s.synced_version = s.version;
@@ -3352,5 +3369,12 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(opened.body, serde_json::json!("three"));
+        // Upsert-only: C, absent from the base-less blob, is NOT tombstoned.
+        let c = pv
+            .open_item::<S>(VaultKeys::single(&k), vid, ItemNs::Secret, "C")
+            .unwrap()
+            .unwrap();
+        assert!(!c.is_tombstone());
+        assert_eq!(c.body, serde_json::json!("pulled"));
     }
 }

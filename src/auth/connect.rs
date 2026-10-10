@@ -42,6 +42,7 @@ use sudp::state::ProtectedState;
 use crate::auth::oauth2::{ExchangedTokens, OAuthStyle};
 use crate::state::AppState;
 use crate::storage::plaintext::{secret_key_for, suggested_secret_key, Connecting, Connection};
+use crate::storage::sealed_vault::ViewDeletions;
 
 /// The OAuth client/endpoint a pending connect resolves to before exchange, plus
 /// the service's secret role (so we know where to write the result).
@@ -610,6 +611,12 @@ pub(crate) async fn apply_pending_connects(
             }
         }
     };
+    // The base the connect machine mutates FROM. `M` may come from vault.dat,
+    // which lags the per-item store (a pull adopts rows into the store only), so
+    // "absent from the post-connect view" is NOT "deleted": only rows this base
+    // had and the connect dropped (the connecting→connection MOVE) are
+    // tombstoned. Unbuildable → upsert-only.
+    let base_view = crate::storage::plaintext::VaultPlaintextView::from_protected_state(&m).ok();
 
     // Register every loopback connect still AWAITING its redirect (carries a
     // `state`, no code yet) so the on-demand listener can match an incoming
@@ -748,9 +755,23 @@ pub(crate) async fn apply_pending_connects(
             tracing::warn!(vault = %vault_id, "oauth connect: write vault.dat failed: {}", e);
             return ConnectReport::default();
         }
-        reconcile_per_item_after_connect(state, vault_id, Some(&vault), &view, &k);
+        reconcile_per_item_after_connect(
+            state,
+            vault_id,
+            Some(&vault),
+            &view,
+            &k,
+            connect_deletions(base_view.as_ref()),
+        );
     } else {
-        reconcile_per_item_after_connect(state, vault_id, None, &view, &k);
+        reconcile_per_item_after_connect(
+            state,
+            vault_id,
+            None,
+            &view,
+            &k,
+            connect_deletions(base_view.as_ref()),
+        );
     }
     tracing::info!(
         vault = %vault_id,
@@ -856,15 +877,31 @@ pub(crate) async fn persist_rotated_refresh_locked(
             tracing::warn!(vault = %vault_id, "oauth rotate: write vault.dat failed: {}", e);
             return false;
         }
-        reconcile_per_item_after_connect(state, vault_id, Some(&vault), &view, &k);
+        // A rotation only writes a secret: never tombstone (its `M` may be the
+        // lagging vault.dat).
+        reconcile_per_item_after_connect(
+            state,
+            vault_id,
+            Some(&vault),
+            &view,
+            &k,
+            ViewDeletions::Never,
+        );
     } else {
-        reconcile_per_item_after_connect(state, vault_id, None, &view, &k);
+        reconcile_per_item_after_connect(state, vault_id, None, &view, &k, ViewDeletions::Never);
     }
 
     let cache = crate::server::handlers::approve::bootstrap_cache_from_view(&view, state);
     state.unlock_vault(vault_id.to_string(), cache, k);
     tracing::info!(vault = %vault_id, conn = %conn_id, "oauth refresh: rotated refresh_token persisted");
     true
+}
+
+/// Tombstones for a connect: only rows its base view had (see `base_view`).
+fn connect_deletions(
+    base: Option<&crate::storage::plaintext::VaultPlaintextView>,
+) -> ViewDeletions<'_> {
+    base.map_or(ViewDeletions::Never, ViewDeletions::RemovedSince)
 }
 
 /// Rebuild a [`ProtectedState`] `M` from a folded per-item view — the inverse of
@@ -914,9 +951,26 @@ pub(crate) fn persist_mutated_view(
             .map_err(|e| format!("reseal vault.dat: {}", e))?;
         crate::storage::sealed_vault::write_atomic(&vault_path, &vault)
             .map_err(|e| format!("write vault.dat: {}", e))?;
-        reconcile_per_item_after_connect(state, vault_id, Some(&vault), view, k);
+        // `view` was opened from the per-item store's own fold whenever one
+        // exists (`open_view_*` prefers it), so a missing item is one the caller
+        // removed. With no store, the bootstrap below is empty: nothing to drop.
+        reconcile_per_item_after_connect(
+            state,
+            vault_id,
+            Some(&vault),
+            view,
+            k,
+            ViewDeletions::MissingFromFold,
+        );
     } else {
-        reconcile_per_item_after_connect(state, vault_id, None, view, k);
+        reconcile_per_item_after_connect(
+            state,
+            vault_id,
+            None,
+            view,
+            k,
+            ViewDeletions::MissingFromFold,
+        );
     }
     let cache = crate::server::handlers::approve::bootstrap_cache_from_view(view, state);
     state.unlock_vault(
@@ -937,6 +991,7 @@ fn reconcile_per_item_after_connect(
     vault: Option<&crate::storage::SealedVault>,
     view: &crate::storage::plaintext::VaultPlaintextView,
     k: &[u8],
+    deletions: ViewDeletions,
 ) {
     use crate::storage::sealed_vault::{Keyset, PerItemVault};
     let Ok(path) = state.vaults.per_item_path(vault_id) else {
@@ -975,6 +1030,7 @@ fn reconcile_per_item_after_connect(
         crate::storage::item::VaultKeys::single(k),
         vault_id,
         view,
+        deletions,
     ) {
         Ok(changed) => {
             if changed.is_empty() {
