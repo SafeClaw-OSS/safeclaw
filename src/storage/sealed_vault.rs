@@ -4754,6 +4754,78 @@ pub(crate) mod tests {
         ));
     }
 
+    /// A re-keyed vault (generation 1): a v2 keyset pinned to its creator, the
+    /// creator's cred (`cid-creator`) holding a real K-seal of the key bundle
+    /// `id_seed ‖ c_new`, and the owner-signed proof of the re-key to `c_new`.
+    /// No items.
+    pub(crate) struct Rekeyed {
+        pub vault: &'static str,
+        pub id_seed: [u8; 32],
+        pub c_new: [u8; 32],
+        pub pv: PerItemVault,
+    }
+
+    impl Rekeyed {
+        /// The key material the creator's unlock retains: `id_seed ‖ c_new`.
+        pub fn material(&self) -> Vec<u8> {
+            crate::storage::item::vault_key_bundle(&self.id_seed, &self.c_new)
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn rekeyed_fixture() -> Rekeyed {
+        use crate::crypto::vault_key::UikRoot;
+        use crate::storage::plaintext::MemberRole;
+        let vault = "vault-rekeyed";
+        let creator = UikRoot::from_root([0x11u8; 32]);
+        let creator_id = creator.user_id();
+        let (id_seed, c_new) = ([0x5au8; 32], [0x7cu8; 32]);
+        let mut pv = PerItemVault::build_initial(
+            b"c".to_vec(),
+            "x".into(),
+            "y".into(),
+            "Dev".into(),
+            vec![0u8; 32],
+            vec![0u8; 48],
+        )
+        .unwrap();
+        let enc_pub = creator.encryption_public().unwrap();
+        let bundle = crate::storage::item::vault_key_bundle(&id_seed, &c_new);
+        let (k_encapped, k_ct) =
+            crate::crypto::vault_key::seal_k_to_uik(&enc_pub, vault, &bundle).unwrap();
+        pv.set_uik_cred(
+            "cid-creator".into(),
+            creator_id.clone(),
+            creator.signing().public_bytes().to_vec(),
+            enc_pub,
+            k_encapped,
+            k_ct,
+            MemberRole::Owner,
+            Vec::new(),
+        );
+        let commit = rekey_commitment(&c_new).to_vec();
+        let membership = crate::identity::membership_commitment(&[]).to_vec();
+        let input =
+            crate::identity::rekey_sig_input(vault, 1, &commit, &creator_id, 0, &membership);
+        let uik = pv.keyset.uik.as_mut().unwrap();
+        uik.creator_sig_pub = creator.signing().public_bytes().to_vec();
+        uik.generation = 1;
+        uik.rekey_proof = Some(RekeyProof {
+            generation: 1,
+            k_commitment: commit,
+            sig: creator.signing().sign(&input).to_vec(),
+            signer_id: creator_id,
+            membership_len: 0,
+            membership_hash: membership,
+        });
+        Rekeyed {
+            vault,
+            id_seed,
+            c_new,
+            pv,
+        }
+    }
+
     /// Shared setup for the role-on-keyset fixtures: a v2 keyset pinned to a
     /// creator, a creator cred (Owner, self-signed) and a member cred. Returns the
     /// vault, keyset holder, both roots, and their ids.

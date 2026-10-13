@@ -177,6 +177,10 @@ impl<'a> VaultKeys<'a> {
     }
 }
 
+/// Length of a single vault key `K` (a v1 vault: id-seed and content key in
+/// one), the only key a whole-blob `vault.dat` is sealed under.
+pub const SINGLE_KEY_LEN: usize = 32;
+
 /// Concatenate a DP-S1 key bundle: `id_seed(32) ‖ content_key(32)` = 64 bytes,
 /// the plaintext a v2 keyset seals to a member's UIK. Mirror on the browser side
 /// (lib/uik-crypto.ts). `VaultKeys::from_material` is the inverse.
