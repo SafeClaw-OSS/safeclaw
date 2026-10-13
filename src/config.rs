@@ -792,9 +792,11 @@ pub struct ServeArgs {
     /// WebAuthn relying party ID. Defaults to the host part of --origin
     /// (e.g. `custodian.example.com`), which is what 99% of deployments
     /// want. Override only for eTLD+1 sharing across subdomains. With
-    /// neither --origin nor --rp-id, a cloud-paired daemon accepts the
-    /// console's root, `app.` and `www.` origins under the root RP ID
-    /// (`passkey::webauthn::RelyingParty::console`).
+    /// neither --origin nor --rp-id, a daemon paired with the SafeClaw
+    /// console (safeclaw.pro, dev.safeclaw.pro) accepts its root, `app.` and
+    /// `www.` origins under the root RP ID
+    /// (`passkey::webauthn::RelyingParty::console`); any other console
+    /// origin is matched exactly.
     #[arg(long, env = "SAFECLAW_RP_ID")]
     pub rp_id: Option<String>,
 
@@ -1059,10 +1061,11 @@ pub fn default_state_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("./state"))
 }
 
-/// The WebAuthn relying party for `origin`: the console's (root RP ID, root /
-/// `app.` / `www.` origins) unless the origin or RP ID was given explicitly
-/// or the origin is not a bare https domain, in which case `origin` is
-/// matched exactly under `rp_id` (default: the origin's host).
+/// The WebAuthn relying party for `origin`: the SafeClaw console's (root RP
+/// ID, root / `app.` / `www.` origins) when `origin` is one of its hosts and
+/// neither the origin nor the RP ID was given explicitly. Every other origin
+/// (a self-hosted console, localhost) is matched exactly under `rp_id`
+/// (default: the origin's host).
 fn relying_party_for(
     origin: &str,
     explicit: bool,
@@ -1121,5 +1124,18 @@ mod relying_party_tests {
         let local = relying_party_for("http://localhost:23293", false, None);
         assert_eq!(local.rp_id, "localhost");
         assert_eq!(local.origins, vec!["http://localhost:23293".to_string()]);
+        // A self-hosted console: its own hostname is the RP ID and its origin
+        // the only one, whatever its labels.
+        for (stored, host) in [
+            ("https://vault.corp.example", "vault.corp.example"),
+            ("https://app.corp.example", "app.corp.example"),
+            ("https://www.corp.example", "www.corp.example"),
+        ] {
+            let rp = relying_party_for(stored, false, None);
+            assert_eq!(rp.rp_id, host, "{stored}");
+            assert_eq!(rp.origins, vec![stored.to_string()], "{stored}");
+            assert!(!rp.allows(&format!("https://app.{host}")));
+            assert!(!rp.allows(&format!("https://www.{host}")));
+        }
     }
 }
