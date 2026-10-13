@@ -6376,8 +6376,14 @@ mod peritem_tests {
             content: &fx.c_old,
             prev: &[],
         };
-        let new_bundle = vault_key_bundle(&fx.id_seed, &fx.c_new);
-        let current = VaultKeys::from_material(&new_bundle);
+        // The session's material after unlock: the bundle and the earlier
+        // key its own keyset row carries.
+        let sealed_prev = il::seal_prev_content_keys::<StdPrimitives>(&fx.c_new, vid, 1, &[(&fx.c_old, &[])]);
+        let mut material = vault_key_bundle(&fx.id_seed, &fx.c_new);
+        material.extend_from_slice(
+            &il::open_prev_content_keys::<StdPrimitives>(&fx.c_new, vid, 1, &sealed_prev).unwrap(),
+        );
+        let current = VaultKeys::from_material(&material);
         let old_bundle = vault_key_bundle(&fx.id_seed, &fx.c_old);
         let stale_session = VaultKeys::from_material(&old_bundle);
         // The keyset records what its own keys seal under.
