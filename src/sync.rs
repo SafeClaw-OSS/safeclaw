@@ -2625,17 +2625,16 @@ fn adopt_item_rows(
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
     type S = sudp::primitives::StdPrimitives;
-    // What is offered: the held rows, then the pulled ones; per id the newest.
+    // What is offered: the held rows, then the pulled ones; per id the one
+    // the server wrote last (its `seq`). The version a row states is not
+    // compared here: a held row that cannot be read may state any version.
     let mut offered: std::collections::BTreeMap<String, pv_store::HeldRow> =
         std::mem::take(&mut pv.held);
     for row in rows {
         let ct = URL_SAFE_NO_PAD
             .decode(row.ct.as_bytes())
             .map_err(|e| format!("item ct not base64url: {}", e))?;
-        if offered
-            .get(&row.item_id)
-            .is_some_and(|h| h.version >= row.version)
-        {
+        if offered.get(&row.item_id).is_some_and(|h| h.seq >= row.seq) {
             continue;
         }
         offered.insert(
@@ -5462,6 +5461,59 @@ mod peritem_tests {
         assert_eq!(n, 1);
         assert!(pv.held.is_empty());
         assert_eq!(pv.items_seq, 10);
+        assert_eq!(timeout(&pv), None);
+    }
+
+    /// A held row is replaced by a row the server wrote after it (a higher
+    /// `seq`), whatever version either states: a held row that cannot be
+    /// read, stating the highest version there is, never hides a later row.
+    #[test]
+    fn a_held_row_is_replaced_by_a_later_row_of_the_server() {
+        use crate::storage::item::ItemPayload;
+        use crate::storage::sealed_vault::tests::{in_body_signed, role_fixture_creator_cred};
+        use crate::storage::sealed_vault::{HeldRow, HELD_UNREADABLE};
+        let k = [0x5au8; 32];
+        let keys = VaultKeys::single(&k);
+        let (vault, creator, _, _, _, mut pv) = role_fixture_creator_cred();
+        let policy = serde_json::json!({ "timeout": 7 });
+        let legacy = ItemPayload::live(
+            ItemNs::Aux,
+            "policy",
+            in_body_signed(vault, &creator, "policy", 1, &policy),
+        );
+        let id = pv
+            .plant::<StdPrimitives>(keys, vault, ItemNs::Aux, "policy", 1, &legacy)
+            .unwrap();
+        pv.items.get_mut(&id).unwrap().synced_version = 1;
+        let timeout = |pv: &PerItemVault| {
+            pv.fold_view::<StdPrimitives>(keys, vault)
+                .unwrap()
+                .aux
+                .policy
+                .and_then(|p| p.timeout)
+        };
+        // Held: a row this device cannot read, stating the highest version.
+        let unreadable = HeldRow {
+            version: u64::MAX,
+            seq: 5,
+            ct: vec![1, 2, 3],
+            sig: None,
+            signer: None,
+            reason: HELD_UNREADABLE.to_string(),
+        };
+        pv.held.insert(id.clone(), unreadable.clone());
+        let tomb = ItemPayload::tombstone(ItemNs::Aux, "policy");
+        // A row the server wrote before it (seq 4) does not replace it.
+        let older = cloud_row(&k, vault, &tomb, 2, 4, Some((&creator, "policy")));
+        assert_eq!(adopt_item_rows(&mut pv, &[older], 6, Some((keys, vault))).unwrap(), 0);
+        assert_eq!(pv.held[&id], unreadable);
+        assert_eq!(timeout(&pv), Some(7));
+        // One it wrote after (seq 9) does, at a lower stated version, and is
+        // adopted (owner-signed).
+        let later = cloud_row(&k, vault, &tomb, 3, 9, Some((&creator, "policy")));
+        assert_eq!(adopt_item_rows(&mut pv, &[later], 9, Some((keys, vault))).unwrap(), 1);
+        assert!(pv.held.is_empty());
+        assert_eq!(pv.get_item(&id).unwrap().version, 3);
         assert_eq!(timeout(&pv), None);
     }
 
