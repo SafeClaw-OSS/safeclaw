@@ -20,7 +20,7 @@ use axum::{
 /// Canonical skill location. Points at `main` (the skill is additive and
 /// deployment-agnostic, so it doesn't need to be version-pinned to a tag).
 const SKILL_RAW_URL: &str =
-    "https://raw.githubusercontent.com/SafeClaw-OSS/safeclaw/main/static/safeclaw-skill.md";
+    "https://raw.githubusercontent.com/getsafeclaw/safeclaw/main/static/safeclaw-skill.md";
 
 pub async fn skill_md() -> impl IntoResponse {
     (StatusCode::FOUND, [(header::LOCATION, SKILL_RAW_URL)])

@@ -8,7 +8,7 @@ description = "SafeClaw daemon — multi-vault passkey-gated credential vault fo
 # (offering a substitute commercial product/service); converts to Apache-2.0
 # two years after each release. See LICENSE.
 license-file = "LICENSE"
-repository = "https://github.com/SafeClaw-OSS/safeclaw"
+repository = "https://github.com/getsafeclaw/safeclaw"
 
 # Two bin targets share the same main.rs:
 #   `safeclaw` — canonical name (discoverable via brew/cargo install)

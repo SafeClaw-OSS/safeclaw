@@ -2,7 +2,7 @@
 
 Straight answers to the questions that decide whether you trust a credential
 broker. The cryptographic detail behind each one is in
-[PROTOCOL.md](https://github.com/SafeClaw-OSS/safeclaw/blob/main/design/protocol.md).
+[PROTOCOL.md](https://github.com/getsafeclaw/safeclaw/blob/main/design/protocol.md).
 
 ## Where is the plaintext?
 

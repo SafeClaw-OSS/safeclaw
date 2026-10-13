@@ -19,7 +19,7 @@ install and run on. Passkey/browser support is a separate axis, covered in
 ## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/SafeClaw-OSS/safeclaw/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/getsafeclaw/safeclaw/main/install.sh | sh
 ```
 
 Puts the `sc` binary in `~/.local/bin` (override with `$SAFECLAW_BIN_DIR`). No
@@ -34,7 +34,7 @@ warns if it can't fetch it), plus a sigstore build-provenance attestation. To
 verify a binary yourself:
 
 ```bash
-gh attestation verify ~/.local/bin/sc --repo SafeClaw-OSS/safeclaw
+gh attestation verify ~/.local/bin/sc --repo getsafeclaw/safeclaw
 ```
 
 ## macOS

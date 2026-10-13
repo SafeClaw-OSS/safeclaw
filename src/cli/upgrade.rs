@@ -28,10 +28,10 @@ use std::time::Duration;
 use crate::cli::active::frontend_origin;
 use crate::config::UpgradeArgs;
 
-const REPO: &str = "SafeClaw-OSS/safeclaw";
+const REPO: &str = "getsafeclaw/safeclaw";
 /// Stable channel: GitHub's `latest` pointer, which by definition skips
 /// pre-releases and drafts — the asset base every ordinary `sc upgrade` uses.
-const LATEST_BASE: &str = "https://github.com/SafeClaw-OSS/safeclaw/releases/latest/download";
+const LATEST_BASE: &str = "https://github.com/getsafeclaw/safeclaw/releases/latest/download";
 
 /// Map the build target to the release asset name (matches install.sh + CI).
 fn asset_name() -> Result<&'static str, String> {

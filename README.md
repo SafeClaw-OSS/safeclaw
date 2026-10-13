@@ -7,7 +7,7 @@
 <p align="center"><b>Let your AI agent use your API keys. It never holds them.</b></p>
 
 <p align="center">
-  <a href="https://github.com/SafeClaw-OSS/safeclaw/releases"><img src="https://img.shields.io/github/v/release/SafeClaw-OSS/safeclaw?label=release&color=2ea44f" alt="release"></a>
+  <a href="https://github.com/getsafeclaw/safeclaw/releases"><img src="https://img.shields.io/github/v/release/getsafeclaw/safeclaw?label=release&color=2ea44f" alt="release"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-FSL--1.1--ALv2-blue" alt="license"></a>
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-555" alt="platforms">
 </p>
@@ -61,10 +61,10 @@ GitHub, OpenAI, Anthropic, Gemini, Gmail, Google Drive, GCP, Supabase, Railway, 
 **1. Install.** Downloads the prebuilt binary for your platform to `~/.local/bin` and verifies its `SHA256SUMS`; no sudo, no system changes. (Or `cargo build --release`.)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/SafeClaw-OSS/safeclaw/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/getsafeclaw/safeclaw/main/install.sh | sh
 ```
 
-Each release also carries a sigstore build-provenance attestation: `gh attestation verify ~/.local/bin/sc --repo SafeClaw-OSS/safeclaw`.
+Each release also carries a sigstore build-provenance attestation: `gh attestation verify ~/.local/bin/sc --repo getsafeclaw/safeclaw`.
 
 **2. Create your vault** at [safeclaw.pro](https://safeclaw.pro): sign in and register a passkey. No password to invent, nothing to remember.
 

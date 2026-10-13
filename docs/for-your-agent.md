@@ -1,7 +1,7 @@
 # For your agent
 
 Agents learn SafeClaw from one file:
-[`safeclaw-skill.md`](https://github.com/SafeClaw-OSS/safeclaw/blob/main/static/safeclaw-skill.md). It is the single
+[`safeclaw-skill.md`](https://github.com/getsafeclaw/safeclaw/blob/main/static/safeclaw-skill.md). It is the single
 source of truth for agent behavior: discovery, phantom placement, `sc run`,
 approvals. This page is only about handing it over.
 
@@ -18,7 +18,7 @@ Machine already paired, agent env already minted (`sc agent add` ran)? Send
 your agent this:
 
 ```text
-Fetch https://raw.githubusercontent.com/SafeClaw-OSS/safeclaw/main/static/safeclaw-skill.md
+Fetch https://raw.githubusercontent.com/getsafeclaw/safeclaw/main/static/safeclaw-skill.md
 and save it where you keep always-loaded skills. Follow it whenever a task
 needs an external credential: use the phantom placeholders it describes and
 route those commands through `sc run --`. Never ask me to paste a key and

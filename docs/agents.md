@@ -27,7 +27,7 @@ one identity file per agent, and don't re-mint when the env already exists.
 
 Discover connections through the registry, place phantoms, route commands
 through `sc run`, wait on approvals (`sc op wait`). The full behavioral
-contract fits in one file, [the skill](https://github.com/SafeClaw-OSS/safeclaw/blob/main/static/safeclaw-skill.md), and
+contract fits in one file, [the skill](https://github.com/getsafeclaw/safeclaw/blob/main/static/safeclaw-skill.md), and
 one habit: **phantoms, not values** ([`sc run` and phantoms](sc-run.md)).
 
 ## What an agent can't do

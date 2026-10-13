@@ -1,5 +1,5 @@
 #!/bin/sh
-# SafeClaw CLI installer — github.com/SafeClaw-OSS/safeclaw (open source)
+# SafeClaw CLI installer — github.com/getsafeclaw/safeclaw (open source)
 #
 # Transparent by design — read it before you run it:
 #   * Only downloads the prebuilt `sc` binary for your platform from the
@@ -7,7 +7,7 @@
 #     to ~/.local/bin. No sudo. No system changes. No telemetry.
 set -eu
 
-REPO="SafeClaw-OSS/safeclaw"
+REPO="getsafeclaw/safeclaw"
 BASE="https://github.com/${REPO}/releases/latest/download"
 
 OS="$(uname -s)"

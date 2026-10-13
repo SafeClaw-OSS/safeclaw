@@ -6,7 +6,7 @@ Takes about five minutes.
 ## 1. Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/SafeClaw-OSS/safeclaw/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/getsafeclaw/safeclaw/main/install.sh | sh
 ```
 
 Puts the `sc` binary in `~/.local/bin` after verifying its `SHA256SUMS`. No
