@@ -280,14 +280,29 @@ pub async fn resolve_auth_value(
     // miss. We hold the write lock; the persist helper must NOT re-acquire it.
     let cache_key = match rotated_refresh.as_deref() {
         Some(new_rt) if new_rt.as_bytes() != raw => {
-            crate::auth::connect::persist_rotated_refresh_locked(
+            match crate::auth::connect::persist_rotated_refresh_locked(
                 state,
                 vault_id,
                 conn_id,
                 &oauth.refresh_token,
                 new_rt,
             )
-            .await;
+            .await
+            {
+                // Landed: sent to the cloud once this lock drops.
+                Ok(()) => crate::auth::connect::spawn_push(state, vault_id),
+                // Not stored: the session still uses the new token, which is
+                // stored again on the next sync; the user is told.
+                Err(why) => crate::auth::connect::rotation_not_stored(
+                    state,
+                    vault_id,
+                    conn_id,
+                    &oauth.refresh_token,
+                    raw,
+                    new_rt,
+                    &why,
+                ),
+            }
             sha256_hex(new_rt.as_bytes())
         }
         // §5: no rotation → cache under the SAME key the lookup uses, so a

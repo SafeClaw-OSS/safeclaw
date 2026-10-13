@@ -350,6 +350,11 @@ impl SyncNote {
     }
 }
 
+/// The key a pending rotation's note is kept under in the sync notes.
+fn rotation_note_key(conn_id: &str) -> String {
+    format!("rotation {}", conn_id)
+}
+
 pub struct AppState {
     pub config: Config,
     pub vaults: VaultDir,
@@ -382,6 +387,12 @@ pub struct AppState {
     /// Vaults whose pull at unlock failed and is being retried in the
     /// background: vault → the last error. Shown by `sc status`.
     pub catch_up_failures: Mutex<HashMap<String, String>>,
+    /// Rotated OAuth refresh tokens not stored in the vault yet: vault →
+    /// `(connection id, role)` → the new token. The session already uses
+    /// each; the next sync stores it again. In-memory only.
+    pub pending_rotations: Mutex<
+        HashMap<String, std::collections::BTreeMap<(String, String), zeroize::Zeroizing<String>>>,
+    >,
     /// Team-edition extension hooks (team-edition §9 open/closed split). The
     /// open build leaves the [`crate::team_hooks::NoopHooks`] default (no team
     /// policy); the closed `safeclaw-ee` overlay injects real ones via
@@ -600,6 +611,7 @@ impl AppState {
             vault_upgrade_required: Mutex::new(std::collections::HashSet::new()),
             sync_conflicts: Mutex::new(HashMap::new()),
             catch_up_failures: Mutex::new(HashMap::new()),
+            pending_rotations: Mutex::new(HashMap::new()),
             team: std::sync::Arc::new(crate::team_hooks::NoopHooks),
             pending_format_mark: Mutex::new(std::collections::HashSet::new()),
             pending_config_ids: Mutex::new(HashMap::new()),
@@ -1555,6 +1567,67 @@ impl AppState {
             .lock()
             .unwrap()
             .insert(vault_id.to_string(), error.to_string());
+    }
+
+    /// A rotated refresh token of `conn_id` (`role`) was not stored (`why`):
+    /// kept to store again, and noted for `sc status` / `sc sync`.
+    pub fn note_rotation_pending(&self, vault_id: &str, conn_id: &str, role: &str, token: &str, why: &str) {
+        self.pending_rotations
+            .lock()
+            .unwrap()
+            .entry(vault_id.to_string())
+            .or_default()
+            .insert(
+                (conn_id.to_string(), role.to_string()),
+                zeroize::Zeroizing::new(token.to_string()),
+            );
+        self.note_sync(
+            vault_id,
+            &rotation_note_key(conn_id),
+            SyncNote::Refused(format!(
+                "connection {}: the provider's new refresh token could not be stored in the vault ({}); this device uses it, and the next sync stores it again",
+                conn_id, why
+            )),
+        );
+    }
+
+    /// The rotated refresh tokens of `vault_id` not stored yet, taken.
+    pub fn take_pending_rotations(
+        &self,
+        vault_id: &str,
+    ) -> Vec<((String, String), zeroize::Zeroizing<String>)> {
+        self.pending_rotations
+            .lock()
+            .unwrap()
+            .remove(vault_id)
+            .map(|m| m.into_iter().collect())
+            .unwrap_or_default()
+    }
+
+    /// A pending rotation of `conn_id` was stored: its note is settled.
+    pub fn clear_rotation_note(&self, vault_id: &str, conn_id: &str) {
+        self.clear_sync_conflict(vault_id, &rotation_note_key(conn_id));
+    }
+
+    /// Replace a connection's cached credential value `old` with `new`
+    /// wherever the unlocked session holds it (its entry, its named secrets).
+    /// A no-op when locked or not held.
+    pub fn cache_replace_value(&self, vault_id: &str, conn_id: &str, old: &[u8], new: &[u8]) {
+        let mut states = self.vault_states.lock().unwrap();
+        if let Some(VaultState::Unlocked { cache, .. }) = states.get_mut(vault_id) {
+            if let Some(e) = cache.entries.get_mut(conn_id) {
+                if e.value.as_slice() == old {
+                    e.value = new.to_vec();
+                }
+            }
+            if let Some(secrets) = cache.allow_secrets.get_mut(conn_id) {
+                for v in secrets.values_mut() {
+                    if v.as_slice() == old {
+                        *v = new.to_vec();
+                    }
+                }
+            }
+        }
     }
 
     /// The pull after unlock of `vault_id` landed (or the vault locked).
