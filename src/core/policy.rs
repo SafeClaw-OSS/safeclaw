@@ -54,7 +54,8 @@ pub(crate) mod match_spec {
 /// The access DECISION for a request.
 ///
 /// - `Allow`: pass through immediately, no approval
-/// - `Ask`: approve once, then cache for the rule's `ttl`
+/// - `Ask`: approve once; the approval holds for the rule's / floor's `ttl`
+///   (what it covers: `crate::approval::reuse`)
 /// - `AskAlways`: approve every request, never cache
 /// - `Deny`: block unconditionally
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -662,9 +663,9 @@ pub fn evaluate_with_match(
     // its own: the ttl of the most-specific floor (connection → tag → global),
     // the SAME precedence as the read/write floor decision below. Direction-
     // independent (Levels.ttl is a single value). Resolved up front because a
-    // rule decision returns early; consumed only by an `ask` rule (a
-    // floor-`ask` never caches), and a final constant fills in when nothing
-    // pins a window at all.
+    // rule decision returns early; consumed only by an `ask` rule (a floor
+    // decision returns its own floor's ttl), and a final constant fills in
+    // when nothing pins a window at all.
     let floor_ttl = connection_levels
         .and_then(|lv| lv.ttl)
         .or_else(|| {

@@ -66,24 +66,42 @@ the same request are byte-identical. PolicyContext level+ttl are included so
 ops minted under different policy (single-use op_grant vs 15-min window)
 never merge.
 
-**Policy level is signed and shown.** The Use op scope gains
-`level: "ask" | "ask-always"` and, for `ask`, `window_s` (integer seconds;
-JCS rejects floats). Being in `op.act.scope` they are in β. What the
-approval actually authorizes depends on the already-signed `scoped` flag,
-and the console renders exactly that:
-- `ask-always` → "allows this one request".
-- `ask` + `scoped` → "allows this request shape (same bound values) for N
-  min" (request-bound op_grant).
-- `ask` unscoped → "opens <connection> for <agent> for N min: every
-  ask-level request on it, including writes" (connection-keyed cache; this
-  is today's semantics, now stated instead of implied).
-At apply the daemon asserts the signed `scope.level` equals the record's
-PolicyContext level, and `window_s` equals `pc.ttl_seconds` WHEN present
-(ask-always omits `window_s` while its record still carries a ttl), and
-refuses on mismatch, so what was rendered is what is applied. (They are already in
-intent_key through `act`; the explicit pc fields stay for ops whose scope
-predates this.) Older daemons omit them; the console treats a missing level
-as ask-always for default-check purposes. Agent identity is per key, not per process: every session
+**Policy level and reuse are signed and shown.** The Use op scope carries
+`level: "ask" | "ask-always" | "allow"`, `reuse`, and `window_s` (integer
+seconds; JCS rejects floats) exactly when the reuse has a window. Being in
+`op.act.scope` they are in β. `reuse` states what approving lets the daemon
+serve again without a new approval; one classifier
+(`core src/approval/reuse.rs`) is used by the proxy to stamp it, by apply to
+pick the grant store, and by the approve-time assertion:
+
+| minted under | `reuse` | `window_s` | what apply holds |
+|---|---|---|---|
+| `ask-always` | `none` | absent | a single-use grant bound to this request (its replay only) |
+| `ask` whose request bound `[requests]` values | `exact` | ttl | a grant bound to this request and these values, reused within the window |
+| `ask` binding no values (rule or connection default, incl. a scoped path that bound none) | `connection` | ttl | the connection's credential for the approving agent |
+| `allow` (cache miss) | `connection` | ttl | same |
+
+`connection` means: within the window, the approving agent's ask-level
+requests through that connection that bind no request values are served
+without asking, whatever their method, path, host or rule (writes included),
+and requests the policy already allows on the connection are served from the
+same value. Its `ask-always` and value-bound requests keep their own
+approvals. The rule-approval record (agent, connection, rule, method, host)
+narrows the policy decision only and is not a separate reuse value.
+
+The console renders `reuse` verbatim (none: this one request; exact: this
+identical request for N min; connection: this agent's ask-once requests
+through the connection for N min, writes included).
+
+At apply the daemon asserts the signed `level` equals the record's
+PolicyContext level, the signed `reuse` equals the classifier's answer for
+that level and the scope's own bound values, and `window_s` is present
+exactly when that reuse has one and equals `pc.ttl_seconds`; a signed `level`
+without `reuse` is refused. Any mismatch refuses the approval, so what was
+rendered is what is applied. (They are already in intent_key through `act`;
+the explicit pc fields stay for ops whose scope predates this.) Older daemons
+omit them; the console treats a missing level as ask-always for
+default-check purposes and claims no window. Agent identity is per key, not per process: every session
 sharing one agent.env is one requester (harmless given the rules below).
 
 **Only `use` participates.** Export never supersedes (no requester

@@ -201,14 +201,17 @@ pub fn op_poll_value(state: &AppState, op_id: &str, waiter: Option<&str>) -> Res
     }))
 }
 
-/// Apply-time assertion (design/approvals-inbox.md D1): the SIGNED Use scope's
-/// `level` must equal the record's PolicyContext level and, when present,
-/// `window_s` must equal `pc.ttl_seconds` — so what the approver was shown is
-/// exactly what apply grants. `ask-always` omits `window_s` while its record
-/// still carries a ttl, hence the compare-only-when-present rule. A scope
-/// without `level` predates the field (older mint) and is left to the existing
-/// pc-driven apply. `Err` carries the human reason; the caller picks the arm's
-/// error variant.
+/// Apply-time assertion (design/approvals-inbox.md D1): what the approver was
+/// shown is exactly what apply grants. The SIGNED Use scope's `level` must
+/// equal the record's PolicyContext level; its `reuse` must equal the reuse
+/// apply will grant ([`crate::approval::Reuse::of`] over that level and the
+/// scope's own bound values, the same classifier the proxy stamped with and
+/// [`plan_use_grant`] writes from); and `window_s` must be present exactly when
+/// that reuse has a window, equal to `pc.ttl_seconds`. A signed `level` with no
+/// `reuse` is refused (every mint since `reuse` exists stamps both, and the
+/// approval store is in-memory, so no op predates it). A scope without `level`
+/// predates both fields and is left to the pc-driven apply. `Err` carries the
+/// human reason; the caller picks the arm's error variant.
 fn assert_signed_level(
     scope: &Value,
     pc: Option<&crate::approval::PolicyContext>,
@@ -224,13 +227,43 @@ fn assert_signed_level(
             signed, pc.level
         ));
     }
-    if let Some(w) = scope.get("window_s") {
-        let w = w.as_u64().ok_or("signed window_s is not an integer")?;
-        if w != pc.ttl_seconds {
+    let binds_values = !crate::approval::reuse::bound_values(scope).is_empty();
+    let expected = crate::approval::Reuse::of(pc.level, binds_values)
+        .ok_or("a deny-level op has nothing to approve")?;
+    let reuse = scope
+        .get("reuse")
+        .ok_or("signed level without signed reuse")?
+        .as_str()
+        .ok_or("signed reuse is not a string")?;
+    if reuse != expected.as_str() {
+        return Err(format!(
+            "signed reuse '{}' does not match what this approval grants ('{}')",
+            reuse,
+            expected.as_str()
+        ));
+    }
+    match (expected.window(pc.ttl_seconds), scope.get("window_s")) {
+        (None, None) => {}
+        (None, Some(_)) => {
             return Err(format!(
-                "signed window_s {} does not match the policy window ({}s)",
-                w, pc.ttl_seconds
-            ));
+                "signed window_s on a '{}' approval, which has no window",
+                expected.as_str()
+            ))
+        }
+        (Some(want), None) => {
+            return Err(format!(
+                "signed window_s missing (this approval holds for {}s)",
+                want
+            ))
+        }
+        (Some(want), Some(w)) => {
+            let w = w.as_u64().ok_or("signed window_s is not an integer")?;
+            if w != want {
+                return Err(format!(
+                    "signed window_s {} does not match the policy window ({}s)",
+                    w, want
+                ));
+            }
         }
     }
     Ok(())
@@ -1068,12 +1101,6 @@ pub async fn approve_op(
             )
             .await?;
             let scope = &validated.op.act.scope;
-            let conn = scope
-                .get("connection_id")
-                .or_else(|| scope.get("service"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
             let (pc, grant_agent) = {
                 let store = state.approvals.lock().unwrap();
                 let rec = store.get(&op_id);
@@ -1086,78 +1113,12 @@ pub async fn approve_op(
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
-            let level = pc.as_ref().map(|p| p.level);
-            // Phase 2: fold the bound `[requests]` scope-field values the proxy
-            // stamped into `scope.scope_vars` (and the passkey signed) into the
-            // grant identity. Rebuild the SAME sorted pairs the redeem path
-            // re-extracts from the live request, so an approval for `amount=80`
-            // can't be spent by `amount=180`. Empty (no requests shape) ⇒ `""`.
-            let bound: Vec<(String, String)> = scope
-                .get("scope_vars")
-                .and_then(|v| v.as_object())
-                .map(|m| {
-                    let mut pairs: Vec<(String, String)> = m
-                        .iter()
-                        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                        .collect();
-                    pairs.sort_by(|a, b| a.0.cmp(&b.0));
-                    pairs
-                })
-                .unwrap_or_default();
-            let scope_digest = crate::service::scope_digest(&bound);
-            let is_ask_always = level == Some(crate::core::policy::AccessLevel::AskAlways);
-            let scoped_ask =
-                level == Some(crate::core::policy::AccessLevel::Ask) && !scope_digest.is_empty();
-            if is_ask_always || scoped_ask {
-                // Request-BOUND grant (`op_grants`), keyed by the exact request
-                // the user saw — (connection, method, host, path, scope_digest)
-                // off the op scope. Never the conn-keyed `entries`: a conn-global
-                // value would let a DIFFERENT request on this connection silently
-                // ride the approval. ask-always is single-use; a scoped ask is
-                // reusable for the SAME bound action within its window. If the
-                // binding tuple is missing (malformed scope), store NOTHING — the
-                // replay re-prompts, the safe failure.
-                let method = scope.get("method").and_then(|v| v.as_str()).unwrap_or("");
-                let path = scope.get("path").and_then(|v| v.as_str()).unwrap_or("");
-                let host = pc
-                    .as_ref()
-                    .and_then(|p| p.host.clone())
-                    .or_else(|| scope.get("host").and_then(|v| v.as_str()).map(String::from))
-                    .unwrap_or_default();
-                let window = if is_ask_always {
-                    crate::state::ASK_ALWAYS_REPLAY_WINDOW_SECS
-                } else {
-                    pc.as_ref().map(|p| p.ttl_seconds).unwrap_or(300)
-                };
-                if !conn.is_empty() && !method.is_empty() && !host.is_empty() && !path.is_empty() {
-                    deferred_grant = Some(DeferredGrant::OpGrant {
-                        vault_id: vault_id.clone(),
-                        agent: grant_agent.clone(),
-                        conn: conn.clone(),
-                        method: method.to_string(),
-                        host: host.clone(),
-                        path: path.to_string(),
-                        scope_digest: scope_digest.clone(),
-                        value: s_o,
-                        expires_at: now + window,
-                    });
-                } else {
-                    tracing::warn!(
-                        vault = %vault_id, op = %op_id,
-                        "bound approve without a full request binding — grant not stored (replay will re-prompt)"
-                    );
-                }
-            } else if !conn.is_empty() {
-                // Unscoped ask (and legacy no-context ops): conn-keyed value with
-                // the grant-window TTL, read by the downgraded-to-Allow retry.
-                let ttl = pc.as_ref().map(|p| p.ttl_seconds).unwrap_or(300);
-                deferred_grant = Some(DeferredGrant::ConnCache {
-                    vault_id: vault_id.clone(),
-                    conn: conn.clone(),
-                    value: s_o,
-                    expires_at: now + ttl,
-                    agent: grant_agent.clone(),
-                });
+            deferred_grant = plan_use_grant(pc.as_ref(), scope, &vault_id, &grant_agent, s_o, now);
+            if deferred_grant.is_none() {
+                tracing::warn!(
+                    vault = %vault_id, op = %op_id,
+                    "use approve without a full binding — grant not stored (replay will re-prompt)"
+                );
             }
             (
                 json!({ "ok": true, "act": "use", "authorized": true, "stream": true }),
@@ -2148,80 +2109,16 @@ pub async fn approve_op(
         )
     };
 
-    // Cache write: an Ask-level approval scopes a TTL'd "next matching
-    // request fast-paths" effect. Service id pulled off the op's scope
-    // (which the broker resolve path populates verbatim). No-op when:
-    //   - The op wasn't a Use (policy_ctx_for_cache is None)
-    //   - The level was Allow / AskAlways / Deny (not stored)
-    //   - The vault relocked between approve and now (record_ask_approval
-    //     is a no-op then)
-    // A SCOPED ask does NOT use this conn-keyed downgrade window — it was bound
-    // into `op_grants` above (redeemed by peek), so writing a rule_approvals
-    // entry here would let `evaluate` downgrade it to Allow and fast-path a
-    // DIFFERENT bound value on the connection. Only a genuinely UNSCOPED ask
-    // (no `[requests]` shape on the path) takes the window. We key off the
-    // proxy-stamped `scoped` marker, NOT the presence of resolved values — an
-    // empty-body ask on a scoped path is still scoped and must not open a
-    // value-blind window (the "approve a blank purchase, then spend anything"
-    // bypass).
-    let is_scoped_path = validated
-        .op
-        .act
-        .scope
-        .get("scoped")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    // Rule-approval record (the policy downgrade for a rule-matched unscoped
+    // ask); see `record_rule_approval`.
     if let Some(pc) = policy_ctx_for_cache {
-        if pc.level == crate::core::policy::AccessLevel::Ask && !is_scoped_path {
-            // The grant is scoped to the **connection** (CONNECTION_SCHEMA.md §6):
-            // approving account A's request never fast-paths account B. Falls back
-            // to `service` for the default connection (conn == service).
-            let conn = validated
-                .op
-                .act
-                .scope
-                .get("connection_id")
-                .or_else(|| validated.op.act.scope.get("service"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            // Method scopes the grant (a read-approval can't fast-path a
-            // later write). Pulled off the op's scope, same as `connection_id`.
-            let req_method = validated
-                .op
-                .act
-                .scope
-                .get("method")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            // Host-scoped grant: read the resolved host the proxy stamped onto
-            // the policy context (falls back to the op scope for robustness).
-            let host = pc
-                .host
-                .clone()
-                .or_else(|| {
-                    validated
-                        .op
-                        .act
-                        .scope
-                        .get("host")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string())
-                })
-                .unwrap_or_default();
-            if !conn.is_empty() && !req_method.is_empty() {
-                state.record_ask_approval(
-                    &rec_vault_id,
-                    &rec_agent_prefix,
-                    &conn,
-                    pc.rule_id,
-                    &req_method,
-                    &host,
-                    pc.ttl_seconds,
-                );
-            }
-        }
+        record_rule_approval(
+            &state,
+            &pc,
+            &validated.op.act.scope,
+            &rec_vault_id,
+            &rec_agent_prefix,
+        );
     }
 
     // Audit: pending → approved. Best-effort; daemon UX must not depend on
@@ -2259,6 +2156,158 @@ pub async fn approve_op(
     );
 
     Ok(Json(response))
+}
+
+/// Post-approve rule-approval record for a Use op: an unscoped Ask-level
+/// approval writes `(agent, connection, rule, method, host)` into
+/// `rule_approvals` for the policy ttl, so `evaluate_request_policy`
+/// downgrades the same request shape to Allow. No-op when:
+///   - the level was Allow / AskAlways / Deny,
+///   - the path is scoped (the proxy-stamped `scoped` marker, NOT the presence
+///     of resolved values: a scoped path binds its approvals per value in
+///     `op_grants` and never takes a value-blind record, even when a request
+///     on it bound no values),
+///   - no rule matched (`record_ask_approval` ignores `rule_id == None`),
+///   - the vault relocked meanwhile (`record_ask_approval` no-ops).
+/// The reuse the approval grants is decided by [`plan_use_grant`]; this record
+/// only narrows the decision.
+pub(crate) fn record_rule_approval(
+    state: &AppState,
+    pc: &crate::approval::PolicyContext,
+    scope: &Value,
+    vault_id: &str,
+    agent: &str,
+) {
+    if pc.level != crate::core::policy::AccessLevel::Ask {
+        return;
+    }
+    if scope
+        .get("scoped")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return;
+    }
+    // Keyed by CONNECTION (CONNECTION_SCHEMA.md §6); falls back to `service`
+    // for the default connection (conn == service).
+    let conn = scope
+        .get("connection_id")
+        .or_else(|| scope.get("service"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let method = scope.get("method").and_then(|v| v.as_str()).unwrap_or("");
+    // Host: the resolved host the proxy stamped onto the policy context,
+    // falling back to the op scope.
+    let host = pc
+        .host
+        .clone()
+        .or_else(|| scope.get("host").and_then(|v| v.as_str()).map(String::from))
+        .unwrap_or_default();
+    if conn.is_empty() || method.is_empty() {
+        return;
+    }
+    state.record_ask_approval(
+        vault_id,
+        agent,
+        conn,
+        pc.rule_id.clone(),
+        method,
+        &host,
+        pc.ttl_seconds,
+    );
+}
+
+/// The grant a Use apply writes, chosen by [`crate::approval::Reuse`] — the
+/// same classifier the proxy stamped `scope.reuse` with and
+/// [`assert_signed_level`] checked, so the store written here is the reuse the
+/// approver was shown:
+///   - `none` (ask-always): a single-use `op_grants` entry bound to the
+///     approved request, redeemable for [`crate::state::ASK_ALWAYS_REPLAY_WINDOW_SECS`]
+///     (the replay deadline, not a reuse window).
+///   - `exact` (ask binding request values): an `op_grants` entry bound to the
+///     request + value digest, peeked (reused) for the policy window.
+///   - `connection` (ask binding no values, allow-level miss): the approving
+///     agent's held connection value for the policy window.
+/// A legacy op with no PolicyContext keeps the connection value for 300s.
+/// `None` when the scope lacks the binding the grant needs (no connection, or
+/// a request-bound grant missing method/host/path): nothing is stored and the
+/// replay asks again.
+pub(crate) fn plan_use_grant(
+    pc: Option<&crate::approval::PolicyContext>,
+    scope: &Value,
+    vault_id: &str,
+    agent: &str,
+    value: Vec<u8>,
+    now: u64,
+) -> Option<DeferredGrant> {
+    use crate::approval::Reuse;
+    // Every path that stores nothing wipes the resolved secret first.
+    let drop_value = |mut v: Vec<u8>| -> Option<DeferredGrant> {
+        v.zeroize();
+        None
+    };
+    let conn = scope
+        .get("connection_id")
+        .or_else(|| scope.get("service"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if conn.is_empty() {
+        return drop_value(value);
+    }
+    // Phase 2: the bound `[requests]` values the proxy stamped into
+    // `scope.scope_vars` (and the passkey signed) fold into the grant identity,
+    // rebuilt as the SAME sorted pairs the redeem path re-extracts from the
+    // live request. Empty (no requests shape, or none resolved) ⇒ `""`.
+    let bound = crate::approval::reuse::bound_values(scope);
+    let scope_digest = crate::service::scope_digest(&bound);
+    let reuse = match pc {
+        Some(p) => match Reuse::of(p.level, !scope_digest.is_empty()) {
+            Some(r) => r,
+            None => return drop_value(value),
+        },
+        None => Reuse::Connection,
+    };
+    let ttl = pc.map(|p| p.ttl_seconds).unwrap_or(300);
+    match reuse {
+        Reuse::None | Reuse::Exact => {
+            // Request-BOUND grant, keyed by the exact request the user saw.
+            // Never the connection value: that would let a different request
+            // on this connection use the approval.
+            let method = scope.get("method").and_then(|v| v.as_str()).unwrap_or("");
+            let path = scope.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            let host = pc
+                .and_then(|p| p.host.clone())
+                .or_else(|| scope.get("host").and_then(|v| v.as_str()).map(String::from))
+                .unwrap_or_default();
+            if method.is_empty() || host.is_empty() || path.is_empty() {
+                return drop_value(value);
+            }
+            let window = if reuse == Reuse::None {
+                crate::state::ASK_ALWAYS_REPLAY_WINDOW_SECS
+            } else {
+                ttl
+            };
+            Some(DeferredGrant::OpGrant {
+                vault_id: vault_id.to_string(),
+                agent: agent.to_string(),
+                conn,
+                method: method.to_string(),
+                host,
+                path: path.to_string(),
+                scope_digest,
+                value,
+                expires_at: now + window,
+            })
+        }
+        Reuse::Connection => Some(DeferredGrant::ConnCache {
+            vault_id: vault_id.to_string(),
+            conn,
+            value,
+            expires_at: now + ttl,
+            agent: agent.to_string(),
+        }),
+    }
 }
 
 /// A Use apply's grant write, captured during dispatch and executed only once
@@ -3620,37 +3669,96 @@ mod tests {
         use crate::core::policy::AccessLevel;
         let ask = pc(AccessLevel::Ask, 900);
         let always = pc(AccessLevel::AskAlways, 900);
-        // ask + matching window.
-        assert!(assert_signed_level(&json!({"level":"ask","window_s":900}), Some(&ask)).is_ok());
-        // ask-always omits window_s while its record still carries a ttl.
-        assert!(assert_signed_level(&json!({"level":"ask-always"}), Some(&always)).is_ok());
-        // Level mismatch either way.
-        assert!(
-            assert_signed_level(&json!({"level":"ask","window_s":900}), Some(&always)).is_err()
-        );
-        assert!(assert_signed_level(&json!({"level":"ask-always"}), Some(&ask)).is_err());
-        // Window mismatch / non-integer window.
-        assert!(assert_signed_level(&json!({"level":"ask","window_s":60}), Some(&ask)).is_err());
-        assert!(assert_signed_level(&json!({"level":"ask","window_s":"900"}), Some(&ask)).is_err());
-        // A signed level with no policy context can't be honoured.
-        assert!(assert_signed_level(&json!({"level":"ask"}), None).is_err());
-        // allow (a cache miss applies as the unscoped window) signs its window.
         let allow = pc(AccessLevel::Allow, 600);
-        assert!(
-            assert_signed_level(&json!({"level":"allow","window_s":600}), Some(&allow)).is_ok()
-        );
-        assert!(
-            assert_signed_level(&json!({"level":"allow","window_s":900}), Some(&allow)).is_err()
-        );
-        assert!(assert_signed_level(&json!({"level":"allow","window_s":600}), Some(&ask)).is_err());
+        let ok = |scope: Value, pc: &crate::approval::PolicyContext| {
+            assert_signed_level(&scope, Some(pc)).is_ok()
+        };
+        // Each level with its own reuse + window.
+        assert!(ok(
+            json!({"level":"ask","reuse":"connection","window_s":900}),
+            &ask
+        ));
+        assert!(ok(
+            json!({"level":"ask","reuse":"exact","window_s":900,"scope_vars":{"amount":"80"}}),
+            &ask
+        ));
+        // ask-always: reuse none and NO window, while its record still carries a ttl.
+        assert!(ok(json!({"level":"ask-always","reuse":"none"}), &always));
+        assert!(ok(
+            json!({"level":"ask-always","reuse":"none","scope_vars":{"amount":"80"}}),
+            &always
+        ));
+        assert!(ok(
+            json!({"level":"allow","reuse":"connection","window_s":600}),
+            &allow
+        ));
+
+        // Level mismatch either way.
+        assert!(!ok(
+            json!({"level":"ask","reuse":"connection","window_s":900}),
+            &always
+        ));
+        assert!(!ok(json!({"level":"ask-always","reuse":"none"}), &ask));
+        assert!(!ok(
+            json!({"level":"allow","reuse":"connection","window_s":600}),
+            &ask
+        ));
+        // Reuse must be exactly what apply grants: an unscoped ask is not
+        // `exact`, a value-bound ask is not `connection`, ask-always is `none`.
+        assert!(!ok(
+            json!({"level":"ask","reuse":"exact","window_s":900}),
+            &ask
+        ));
+        assert!(!ok(
+            json!({"level":"ask","reuse":"connection","window_s":900,"scope_vars":{"a":"1"}}),
+            &ask
+        ));
+        assert!(!ok(json!({"level":"ask","reuse":"none"}), &ask));
+        assert!(!ok(
+            json!({"level":"ask-always","reuse":"exact","window_s":900}),
+            &always
+        ));
+        assert!(!ok(
+            json!({"level":"ask","reuse":"method","window_s":900}),
+            &ask
+        ));
+        assert!(!ok(json!({"level":"ask","reuse":7,"window_s":900}), &ask));
+        // A signed level without a signed reuse is refused (fail closed).
+        assert!(!ok(json!({"level":"ask","window_s":900}), &ask));
+        assert!(!ok(json!({"level":"ask-always"}), &always));
+        // Window: present exactly when the reuse has one, equal to the ttl.
+        assert!(!ok(json!({"level":"ask","reuse":"connection"}), &ask));
+        assert!(!ok(
+            json!({"level":"ask","reuse":"connection","window_s":60}),
+            &ask
+        ));
+        assert!(!ok(
+            json!({"level":"ask","reuse":"connection","window_s":"900"}),
+            &ask
+        ));
+        assert!(!ok(
+            json!({"level":"ask-always","reuse":"none","window_s":900}),
+            &always
+        ));
+        assert!(!ok(
+            json!({"level":"allow","reuse":"connection","window_s":900}),
+            &allow
+        ));
+        // A signed level with no policy context can't be honoured.
+        assert!(assert_signed_level(&json!({"level":"ask","reuse":"connection"}), None).is_err());
         // Pre-field scope: left to the existing pc-driven apply.
-        assert!(assert_signed_level(&json!({"method":"GET"}), Some(&ask)).is_ok());
+        assert!(ok(json!({"method":"GET"}), &ask));
         assert!(assert_signed_level(&Value::Null, None).is_ok());
     }
 
     fn leveled_use_op(level: &str, window: Option<u64>) -> crate::protocol::operation::Operation {
         let mut op = use_op("v1", "/user");
         op.act.scope["level"] = json!(level);
+        op.act.scope["reuse"] = json!(if level == "ask-always" {
+            "none"
+        } else {
+            "connection"
+        });
         if let Some(w) = window {
             op.act.scope["window_s"] = json!(w);
         }
@@ -3737,6 +3845,7 @@ mod tests {
     fn chained(state: &AppState, path: &str, r: &str) -> crate::approval::ChainedCreate {
         let mut op = use_op("v1", path);
         op.act.scope["level"] = json!("ask");
+        op.act.scope["reuse"] = json!("connection");
         op.act.scope["window_s"] = json!(900);
         state.approvals.lock().unwrap().create_chained(
             "v1".into(),
@@ -3860,6 +3969,437 @@ mod tests {
             op_poll_value(&state, &other.id, None).unwrap()["status"],
             "pending"
         );
+    }
+
+    // ── signed reuse vs apply, end to end per path ─────────────────────────
+    //
+    // Each test mints the op scope exactly as the proxy does (stamp_signed_level
+    // + the scoped/scope_vars fields), asserts the stamped reuse/window_s, runs
+    // apply's two writes (plan_use_grant + record_rule_approval, after the
+    // approve-time assertion), then probes later requests through the SAME
+    // decision + lookup the proxy runs (evaluate_request_policy + grant_lookup).
+    // `Some` from the lookup = served without asking.
+
+    const RV: &str = "v-reuse";
+    const RC: &str = "gh";
+    const RH: &str = "api.gh.com";
+
+    fn reuse_policy() -> crate::core::policy::Policy {
+        use crate::core::policy::{AccessLevel, ConnectionPolicy, Levels, Policy, RuleConfig};
+        let rule = |pat: &str, level: AccessLevel, ttl: Option<u64>| RuleConfig {
+            match_pattern: Some(pat.to_string()),
+            level: Some(level),
+            ttl,
+            ..Default::default()
+        };
+        let mut rules = std::collections::HashMap::new();
+        rules.insert(
+            "read".to_string(),
+            rule("GET /x", AccessLevel::Ask, Some(60)),
+        );
+        rules.insert(
+            "write".to_string(),
+            rule("POST /x", AccessLevel::Ask, Some(60)),
+        );
+        rules.insert(
+            "del".to_string(),
+            rule("DELETE /x", AccessLevel::AskAlways, None),
+        );
+        rules.insert(
+            "buy".to_string(),
+            rule("POST /buy", AccessLevel::Ask, Some(120)),
+        );
+        rules.insert(
+            "open".to_string(),
+            rule("GET /open", AccessLevel::Allow, Some(900)),
+        );
+        let mut p = Policy::default();
+        p.connections.insert(
+            RC.to_string(),
+            ConnectionPolicy {
+                // Floor: ask both ways with its own window, so the connection
+                // is not resident and unmatched paths are floor asks.
+                default: Some(Levels {
+                    read: Some(AccessLevel::Ask),
+                    write: Some(AccessLevel::Ask),
+                    ttl: Some(300),
+                }),
+                rules,
+            },
+        );
+        p
+    }
+
+    fn reuse_state() -> AppState {
+        let state = test_state();
+        let mut cache = crate::state::SecretsCache::default();
+        cache.policy = reuse_policy();
+        state.unlock_vault(RV.into(), cache, zeroize::Zeroizing::new(Vec::new()));
+        state
+    }
+
+    fn now_s() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    /// The proxy's decision for a request: (level, rule, ttl).
+    fn decide(
+        state: &AppState,
+        agent: &str,
+        method: &str,
+        path: &str,
+        scoped: bool,
+    ) -> (crate::core::policy::AccessLevel, Option<String>, u64) {
+        let (l, r, t) = state
+            .evaluate_request_policy(
+                RV,
+                agent,
+                RC,
+                RC,
+                method,
+                path,
+                RH,
+                None,
+                &crate::core::policy::VarMap::new(),
+                scoped,
+            )
+            .expect("unlocked");
+        (l, r, t.unwrap_or(900))
+    }
+
+    /// Mint the op scope + PolicyContext for the request the way captive_portal
+    /// does (agent `agA`), and check the approve-time assertion accepts it.
+    fn mint(
+        state: &AppState,
+        method: &str,
+        path: &str,
+        scope_shape: bool,
+        bound: &[(&str, &str)],
+    ) -> (Value, crate::approval::PolicyContext) {
+        let (level, rule_id, ttl) = decide(state, "agA", method, path, scope_shape);
+        let mut scope = json!({
+            "connection_id": RC, "service": RC, "host": RH,
+            "method": method, "path": path, "authorize_only": true, "agent": "agA",
+        });
+        crate::proxy::handler::stamp_signed_level(&mut scope, level, ttl, !bound.is_empty());
+        if scope_shape {
+            scope["scoped"] = json!(true);
+            if !bound.is_empty() {
+                let m: serde_json::Map<String, Value> = bound
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), json!(v)))
+                    .collect();
+                scope["scope_vars"] = Value::Object(m);
+            }
+        }
+        let pc = crate::approval::PolicyContext {
+            level,
+            rule_id,
+            ttl_seconds: ttl,
+            host: Some(RH.into()),
+        };
+        assert_signed_level(&scope, Some(&pc)).expect("stamp passes the apply assertion");
+        (scope, pc)
+    }
+
+    /// Apply's grant writes, in approve_op's order.
+    fn apply(state: &AppState, scope: &Value, pc: &crate::approval::PolicyContext, now: u64) {
+        let g = plan_use_grant(Some(pc), scope, RV, "agA", b"tok".to_vec(), now)
+            .expect("a grant is planned");
+        g.write(state);
+        record_rule_approval(state, pc, scope, RV, "agA");
+    }
+
+    /// Would the proxy serve this request without asking?
+    fn served(
+        state: &AppState,
+        agent: &str,
+        method: &str,
+        path: &str,
+        bound: &[(&str, &str)],
+    ) -> bool {
+        let shape = path == "/buy";
+        let (level, _, _) = decide(state, agent, method, path, shape);
+        if level == crate::core::policy::AccessLevel::Deny {
+            return false;
+        }
+        let pairs: Vec<(String, String)> = bound
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let digest = crate::service::scope_digest(&pairs);
+        let (primary, _) = crate::proxy::handler::grant_lookup(
+            state, RV, agent, RC, level, method, RH, path, &digest,
+        );
+        primary.is_some()
+    }
+
+    fn held_expiry(state: &AppState) -> Option<u64> {
+        let states = state.vault_states.lock().unwrap();
+        match states.get(RV) {
+            Some(crate::state::VaultState::Unlocked { cache, .. }) => {
+                cache.entries.get(RC).and_then(|e| e.expires_at)
+            }
+            _ => None,
+        }
+    }
+
+    fn bound_expiry(
+        state: &AppState,
+        method: &str,
+        path: &str,
+        bound: &[(&str, &str)],
+    ) -> Option<u64> {
+        let pairs: Vec<(String, String)> = bound
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let digest = crate::service::scope_digest(&pairs);
+        let states = state.vault_states.lock().unwrap();
+        match states.get(RV) {
+            Some(crate::state::VaultState::Unlocked { cache, .. }) => cache
+                .op_grants
+                .get(&(
+                    "agA".to_string(),
+                    RC.to_string(),
+                    method.to_string(),
+                    RH.to_string(),
+                    path.to_string(),
+                    digest,
+                ))
+                .and_then(|e| e.expires_at),
+            _ => None,
+        }
+    }
+
+    /// ask-always → `none`, no window: the approved request replays once, the
+    /// next identical one asks, and nothing else rides it.
+    #[test]
+    fn reuse_ask_always_is_none() {
+        let state = reuse_state();
+        assert!(
+            !served(&state, "agA", "DELETE", "/x", &[]),
+            "asks before approval"
+        );
+        let (scope, pc) = mint(&state, "DELETE", "/x", false, &[]);
+        assert_eq!(scope["level"], "ask-always");
+        assert_eq!(scope["reuse"], "none");
+        assert!(scope.get("window_s").is_none());
+        let now = now_s();
+        apply(&state, &scope, &pc, now);
+        assert_eq!(
+            bound_expiry(&state, "DELETE", "/x", &[]),
+            Some(now + crate::state::ASK_ALWAYS_REPLAY_WINDOW_SECS),
+            "replay deadline only"
+        );
+        assert!(
+            served(&state, "agA", "DELETE", "/x", &[]),
+            "the approved replay"
+        );
+        assert!(
+            !served(&state, "agA", "DELETE", "/x", &[]),
+            "the next identical request asks"
+        );
+        assert!(
+            !served(&state, "agA", "GET", "/y", &[]),
+            "nothing held for other requests"
+        );
+        assert_eq!(held_expiry(&state), None);
+    }
+
+    /// A rule-matched unscoped ask with a ttl → `connection` for the rule's
+    /// window: the approving agent's other unscoped ask-level requests on the
+    /// connection (other rule, other method, floor asks) are served too; its
+    /// ask-always requests and every other agent still ask.
+    #[test]
+    fn reuse_rule_ask_is_connection() {
+        let state = reuse_state();
+        let (scope, pc) = mint(&state, "GET", "/x", false, &[]);
+        assert_eq!(pc.rule_id.as_deref(), Some("read"));
+        assert_eq!(scope["level"], "ask");
+        assert_eq!(scope["reuse"], "connection");
+        assert_eq!(scope["window_s"], 60);
+        let now = now_s();
+        apply(&state, &scope, &pc, now);
+        assert_eq!(
+            held_expiry(&state),
+            Some(now + 60),
+            "held for exactly window_s"
+        );
+        assert!(served(&state, "agA", "GET", "/x", &[]));
+        assert!(
+            served(&state, "agA", "GET", "/x", &[]),
+            "reused, not single-use"
+        );
+        assert!(
+            served(&state, "agA", "POST", "/x", &[]),
+            "other rule + method, same agent"
+        );
+        assert!(
+            served(&state, "agA", "GET", "/y", &[]),
+            "floor ask, same agent"
+        );
+        assert!(
+            !served(&state, "agA", "DELETE", "/x", &[]),
+            "ask-always keeps its own approval"
+        );
+        assert!(
+            !served(&state, "agA", "POST", "/buy", &[("amount", "80")]),
+            "value-bound asks keep their own approval"
+        );
+        assert!(!served(&state, "agB", "GET", "/x", &[]), "other agent");
+        assert!(!served(&state, "agB", "GET", "/y", &[]), "other agent");
+    }
+
+    /// A connection-default (floor) ask → `connection` for the floor window,
+    /// although it writes no rule-approval record.
+    #[test]
+    fn reuse_floor_ask_is_connection() {
+        let state = reuse_state();
+        let (scope, pc) = mint(&state, "GET", "/y", false, &[]);
+        assert_eq!(pc.rule_id, None);
+        assert_eq!(scope["reuse"], "connection");
+        assert_eq!(scope["window_s"], 300);
+        let now = now_s();
+        apply(&state, &scope, &pc, now);
+        {
+            let states = state.vault_states.lock().unwrap();
+            if let Some(crate::state::VaultState::Unlocked { cache, .. }) = states.get(RV) {
+                assert!(
+                    cache.rule_approvals.is_empty(),
+                    "no rule record for a floor ask"
+                );
+            }
+        }
+        assert_eq!(held_expiry(&state), Some(now + 300));
+        assert!(served(&state, "agA", "GET", "/y", &[]));
+        assert!(
+            served(&state, "agA", "DELETE", "/z", &[]),
+            "floor write, same agent"
+        );
+        assert!(
+            served(&state, "agA", "GET", "/x", &[]),
+            "rule ask, same agent"
+        );
+        assert!(!served(&state, "agA", "DELETE", "/x", &[]));
+        assert!(!served(&state, "agB", "GET", "/y", &[]));
+    }
+
+    /// A scoped ask that bound values → `exact`: only the identical request
+    /// (same values) is reused within window_s; nothing connection-wide.
+    #[test]
+    fn reuse_scoped_ask_with_values_is_exact() {
+        let state = reuse_state();
+        let v80 = [("amount", "80")];
+        let (scope, pc) = mint(&state, "POST", "/buy", true, &v80);
+        assert_eq!(scope["reuse"], "exact");
+        assert_eq!(scope["window_s"], 120);
+        let now = now_s();
+        apply(&state, &scope, &pc, now);
+        assert_eq!(bound_expiry(&state, "POST", "/buy", &v80), Some(now + 120));
+        assert_eq!(held_expiry(&state), None, "no connection value held");
+        assert!(served(&state, "agA", "POST", "/buy", &v80));
+        assert!(
+            served(&state, "agA", "POST", "/buy", &v80),
+            "identical request reused"
+        );
+        assert!(
+            !served(&state, "agA", "POST", "/buy", &[("amount", "180")]),
+            "other value"
+        );
+        assert!(
+            !served(&state, "agA", "GET", "/y", &[]),
+            "nothing else rides it"
+        );
+        assert!(!served(&state, "agB", "POST", "/buy", &v80), "other agent");
+    }
+
+    /// A scoped path whose request bound no values → `connection` (apply holds
+    /// the connection value; the path's value-bound requests still ask).
+    #[test]
+    fn reuse_scoped_path_without_values_is_connection() {
+        let state = reuse_state();
+        let (scope, pc) = mint(&state, "POST", "/buy", true, &[]);
+        assert_eq!(scope["scoped"], true);
+        assert!(scope.get("scope_vars").is_none());
+        assert_eq!(scope["reuse"], "connection");
+        assert_eq!(scope["window_s"], 120);
+        let now = now_s();
+        apply(&state, &scope, &pc, now);
+        assert_eq!(held_expiry(&state), Some(now + 120));
+        assert!(served(&state, "agA", "POST", "/buy", &[]));
+        assert!(served(&state, "agA", "GET", "/y", &[]));
+        assert!(!served(&state, "agA", "POST", "/buy", &[("amount", "80")]));
+        assert!(!served(&state, "agB", "POST", "/buy", &[]));
+    }
+
+    /// An allow-level cache miss → `connection`: allow-level requests from any
+    /// agent are served from the held value, and so are the approving agent's
+    /// unscoped ask-level requests.
+    #[test]
+    fn reuse_allow_miss_is_connection() {
+        let state = reuse_state();
+        assert!(
+            !served(&state, "agA", "GET", "/open", &[]),
+            "not resident: a miss asks"
+        );
+        let (scope, pc) = mint(&state, "GET", "/open", false, &[]);
+        assert_eq!(scope["level"], "allow");
+        assert_eq!(scope["reuse"], "connection");
+        assert_eq!(scope["window_s"], 900);
+        let now = now_s();
+        apply(&state, &scope, &pc, now);
+        assert_eq!(held_expiry(&state), Some(now + 900));
+        assert!(served(&state, "agA", "GET", "/open", &[]));
+        assert!(
+            served(&state, "agB", "GET", "/open", &[]),
+            "allowed requests, any agent"
+        );
+        assert!(
+            served(&state, "agA", "GET", "/y", &[]),
+            "approving agent's ask-level requests"
+        );
+        assert!(!served(&state, "agB", "GET", "/y", &[]));
+        assert!(!served(&state, "agA", "DELETE", "/x", &[]));
+    }
+
+    /// The whole approve_op path refuses a stored op whose signed reuse is not
+    /// the reuse apply would grant (before any crypto or vault access).
+    #[tokio::test]
+    async fn approve_refuses_signed_reuse_mismatch() {
+        use crate::core::policy::AccessLevel;
+        let state = Arc::new(test_state());
+        for (reuse, window) in [("exact", Some(900)), ("none", None), ("connection", None)] {
+            let mut op = use_op("v1", "/user");
+            op.act.scope["level"] = json!("ask");
+            op.act.scope["reuse"] = json!(reuse);
+            if let Some(w) = window {
+                op.act.scope["window_s"] = json!(w);
+            }
+            let id = {
+                let mut s = state.approvals.lock().unwrap();
+                s.create_with_policy(
+                    "v1".into(),
+                    op.clone(),
+                    b64r(9),
+                    Some(pc(AccessLevel::Ask, 900)),
+                )
+            };
+            let err = approve_op(
+                State(state.clone()),
+                Path(id),
+                Json(plain_grant(op, &b64r(9))),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(&err, AppError::BadRequest(m) if m.contains("reuse") || m.contains("window_s")),
+                "{reuse}: {err}"
+            );
+        }
     }
 
     fn deferred_pair(agent: &str) -> (DeferredGrant, DeferredGrant) {

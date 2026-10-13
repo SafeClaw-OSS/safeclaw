@@ -90,8 +90,8 @@ pub struct PolicyContext {
     /// point of the level.
     pub level: crate::core::policy::AccessLevel,
     /// Matched rule id from `evaluate_with_match`. `None` =
-    /// tag / global default fired — which is **not** cached (a grant
-    /// needs a rule's path scope to bound it; see `record_ask_approval`).
+    /// tag / global default fired, which writes no rule-approval record
+    /// (see `record_ask_approval`).
     pub rule_id: Option<String>,
     /// TTL in seconds the approval should remain cached. Threaded from
     /// the matched rule's `ttl`, the service / tag default's

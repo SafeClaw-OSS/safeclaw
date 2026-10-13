@@ -636,49 +636,17 @@ impl BrokerHandler {
         //     all, so it can't ride the allow residency OR a plain-ask/stale
         //     leftover: an approval is spendable only by the action the user
         //     saw, once.
-        let scoped = !scope_digest.is_empty();
-        let (primary, secrets_map) = match level {
-            // Single-use, request-bound.
-            AccessLevel::AskAlways => (
-                self.state.op_grant_take(
-                    &vault_id,
-                    &agent_prefix,
-                    &conn,
-                    &method,
-                    &dest_host,
-                    &path,
-                    &scope_digest,
-                    true,
-                ),
-                None,
-            ),
-            // A scoped `ask` is ALSO request-bound (peek/reuse within window),
-            // so its consent is never a false promise: a different field value
-            // misses and re-prompts. An UNSCOPED ask keeps the Phase-1 conn-keyed
-            // grant (the documented "usable but not fully bound" default).
-            AccessLevel::Ask if scoped => (
-                self.state.op_grant_take(
-                    &vault_id,
-                    &agent_prefix,
-                    &conn,
-                    &method,
-                    &dest_host,
-                    &path,
-                    &scope_digest,
-                    false,
-                ),
-                None,
-            ),
-            AccessLevel::Ask => (
-                self.state
-                    .cache_lookup_grant(&vault_id, &conn, &agent_prefix),
-                None,
-            ),
-            _ => (
-                self.state.cache_lookup(&vault_id, &conn),
-                self.state.cache_lookup_secrets(&vault_id, &conn),
-            ),
-        };
+        let (primary, secrets_map) = grant_lookup(
+            &self.state,
+            &vault_id,
+            &agent_prefix,
+            &conn,
+            level,
+            &method,
+            &dest_host,
+            &path,
+            &scope_digest,
+        );
 
         // First touch of an external-store-backed connection: an Allow-level
         // miss tries ONE lazy fill (fetch into the same `from_bootstrap`
@@ -1011,7 +979,10 @@ impl BrokerHandler {
         if let Some(prefix) = self.agent_attribution() {
             scope["agent"] = serde_json::Value::String(prefix);
         }
-        stamp_signed_level(&mut scope, level, grant_ttl);
+        // Same predicate the lookup and apply use: a non-empty bound value set
+        // is what makes the grant request-bound (`exact`).
+        let binds_values = req_scope.is_some_and(|rs| !rs.bound.is_empty());
+        stamp_signed_level(&mut scope, level, grant_ttl, binds_values);
         // Phase 2: fold the bound `[requests]` scope-field VALUES and the consent
         // template into the op scope. They are signed into β (the user's passkey
         // authorizes exactly the fields shown) and re-derived at approve to build
@@ -1205,23 +1176,85 @@ impl BrokerHandler {
     }
 }
 
-/// Stamp the policy level a Use op is minted under into its (signed) scope, so
-/// what the approver reads ("this one request" vs "N min") is what apply
-/// grants: `level` always, `window_s` (integer seconds — JCS rejects floats)
-/// for every level whose apply opens a window — `ask`, and `allow` (an
-/// allow-level cache miss applies as the unscoped connection-keyed window for
-/// the PolicyContext ttl) — equal to that ttl. Only `ask-always` (one request,
-/// no window) omits it. approve asserts both against the record's
-/// PolicyContext (design/approvals-inbox.md D1).
-fn stamp_signed_level(
+/// Stamp what approving a Use op grants into its (signed) scope, so what the
+/// approver reads is what apply does (design/approvals-inbox.md D1): `level`,
+/// `reuse` ([`crate::approval::Reuse`] — the SAME classifier apply and the
+/// approve-time assertion use), and `window_s` (integer seconds — JCS rejects
+/// floats) exactly when the reuse has a window, equal to the PolicyContext
+/// ttl. `binds_values` = the request bound at least one `[requests]` value.
+pub(crate) fn stamp_signed_level(
     scope: &mut serde_json::Value,
     level: crate::core::policy::AccessLevel,
     grant_ttl: u64,
+    binds_values: bool,
 ) {
-    use crate::core::policy::AccessLevel;
     scope["level"] = serde_json::Value::String(level.to_string());
-    if matches!(level, AccessLevel::Ask | AccessLevel::Allow) {
-        scope["window_s"] = serde_json::Value::from(grant_ttl);
+    if let Some(reuse) = crate::approval::Reuse::of(level, binds_values) {
+        scope["reuse"] = serde_json::Value::String(reuse.as_str().to_string());
+        if let Some(w) = reuse.window(grant_ttl) {
+            scope["window_s"] = serde_json::Value::from(w);
+        }
+    }
+}
+
+/// The proxy's credential lookup for one request, by policy level — the READ
+/// side of every grant an approval writes. Kept a free function so the apply
+/// tests drive the exact lookup the live pipeline uses.
+///
+/// - `ask-always`: redeem the single-use grant bound to exactly this request
+///   (consumed), never the connection cache.
+/// - `ask` with bound `[requests]` values: peek the request-bound grant (the
+///   same action reuses it within its window; a different value misses).
+/// - `ask` binding no values: the approving agent's held connection value,
+///   GRANT-ONLY (a bootstrap-resident value is ignored, so the first matching
+///   request still asks).
+/// - `allow` (including an ask the rule-approval window downgraded): the
+///   resident/held connection value plus the allow multi-secret map.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn grant_lookup(
+    state: &AppState,
+    vault_id: &str,
+    agent_prefix: &str,
+    conn: &str,
+    level: crate::core::policy::AccessLevel,
+    method: &str,
+    host: &str,
+    path: &str,
+    scope_digest: &str,
+) -> (Option<Vec<u8>>, Option<HashMap<String, Vec<u8>>>) {
+    use crate::core::policy::AccessLevel;
+    match level {
+        AccessLevel::AskAlways => (
+            state.op_grant_take(
+                vault_id,
+                agent_prefix,
+                conn,
+                method,
+                host,
+                path,
+                scope_digest,
+                true,
+            ),
+            None,
+        ),
+        AccessLevel::Ask if !scope_digest.is_empty() => (
+            state.op_grant_take(
+                vault_id,
+                agent_prefix,
+                conn,
+                method,
+                host,
+                path,
+                scope_digest,
+                false,
+            ),
+            None,
+        ),
+        AccessLevel::Ask => (state.cache_lookup_grant(vault_id, conn, agent_prefix), None),
+        _ => (
+            state.cache_lookup(vault_id, conn),
+            state.cache_lookup_secrets(vault_id, conn),
+        ),
     }
 }
 
@@ -1647,27 +1680,39 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
-    /// The signed Use scope carries the mint-time level; `window_s` for every
-    /// windowed level (ask, allow), never for ask-always, as an integer.
+    /// The signed Use scope carries the mint-time level, the reuse apply
+    /// grants, and `window_s` (an integer) exactly when that reuse has one.
     #[test]
     fn signed_level_stamp() {
         use crate::core::policy::AccessLevel;
-        let mut ask = json!({ "method": "GET" });
-        stamp_signed_level(&mut ask, AccessLevel::Ask, 900);
-        assert_eq!(ask["level"], "ask");
-        assert_eq!(ask["window_s"], 900);
-        assert!(ask["window_s"].is_u64());
+        let stamp = |level, ttl, binds| {
+            let mut s = json!({ "method": "GET" });
+            stamp_signed_level(&mut s, level, ttl, binds);
+            s
+        };
 
-        let mut always = json!({ "method": "GET" });
-        stamp_signed_level(&mut always, AccessLevel::AskAlways, 900);
+        let always = stamp(AccessLevel::AskAlways, 900, false);
         assert_eq!(always["level"], "ask-always");
+        assert_eq!(always["reuse"], "none");
         assert!(always.get("window_s").is_none());
+        // Bound values don't make ask-always reusable.
+        let always_bound = stamp(AccessLevel::AskAlways, 900, true);
+        assert_eq!(always_bound["reuse"], "none");
+        assert!(always_bound.get("window_s").is_none());
 
-        // An allow-level cache miss applies as the unscoped connection window
-        // for the pc ttl: that window must be signed and shown too.
-        let mut allow = json!({ "method": "GET" });
-        stamp_signed_level(&mut allow, AccessLevel::Allow, 600);
+        let exact = stamp(AccessLevel::Ask, 120, true);
+        assert_eq!(exact["level"], "ask");
+        assert_eq!(exact["reuse"], "exact");
+        assert_eq!(exact["window_s"], 120);
+        assert!(exact["window_s"].is_u64());
+
+        let conn = stamp(AccessLevel::Ask, 900, false);
+        assert_eq!(conn["reuse"], "connection");
+        assert_eq!(conn["window_s"], 900);
+
+        let allow = stamp(AccessLevel::Allow, 600, false);
         assert_eq!(allow["level"], "allow");
+        assert_eq!(allow["reuse"], "connection");
         assert_eq!(allow["window_s"], 600);
     }
 

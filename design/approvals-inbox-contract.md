@@ -29,10 +29,16 @@ for signing or default-check).
   cache miss); its apply opens the connection-keyed window exactly like an
   UNSCOPED `ask`, and the console renders it that way ("opens <connection>
   for <agent> for N min"). Never default-checked.
-- `window_s`: integer seconds (= pc.ttl_seconds), present for `"ask"` and
-  `"allow"`; absent for `"ask-always"`
-Apply asserts `scope.level == pc.level` and, when `window_s` present,
-`window_s == pc.ttl_seconds`; mismatch → refuse (BadRequest, plain arm;
+- `reuse`: `"none"` | `"exact"` | `"connection"`, what approving lets the
+  daemon serve again without a new approval (approvals-inbox.md D1 table):
+  `ask-always` → `none`; `ask` with bound `scope_vars` → `exact`; any other
+  `ask`, and `allow` → `connection`.
+- `window_s`: integer seconds (= pc.ttl_seconds), present exactly when
+  `reuse != "none"`.
+Apply asserts `scope.level == pc.level`, `scope.reuse` == the reuse apply
+grants for that level and the scope's bound values, and `window_s` present
+iff that reuse has one and equal to `pc.ttl_seconds`; a signed `level`
+without `reuse`, or any mismatch → refuse (BadRequest, plain arm;
 BatchVerify in batch arm).
 
 ### `POST /v/{vid}/op` (Export create) response

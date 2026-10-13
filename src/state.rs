@@ -124,13 +124,19 @@ pub struct SecretsCache {
     /// at unlock. `None` = keep forever. Used by `GET /v/{vid}/approvals` to
     /// opportunistically prune old rows before listing.
     pub audit_retention_days: Option<u32>,
-    /// Honors the `ask` (vs `ask-always`) semantic: after the user approves
-    /// an Ask-level op, the daemon caches the approval so subsequent
-    /// requests *of the same scope* within the TTL fast-path without
-    /// re-prompting. `ask-always` never lands here; `allow` doesn't need it.
+    /// The rule-approval record: after the user approves a rule-matched,
+    /// unscoped Ask-level op, `evaluate_request_policy` downgrades the same
+    /// (agent, connection, rule, method, host) to Allow within the TTL.
+    /// `ask-always` never lands here; `allow` doesn't need it.
+    ///
+    /// This record narrows the policy DECISION only. What an approval lets the
+    /// agent reuse is decided by the held connection value `approve_op` writes
+    /// alongside it (`cache_insert`, read by the proxy's ask lookup for the
+    /// same agent): that is connection-wide, and the op's signed `scope.reuse`
+    /// says so (`connection`, see `crate::approval::reuse`).
     ///
     /// Key shape: `(agent_prefix, connection_id, rule_id, method, host)`. The
-    /// grant is bound to:
+    /// record is bound to:
     ///   - the **agent** that triggered the approved op (op-agent binding,
     ///     team §C1) — agent A's approved ask never fast-paths agent B's
     ///     identical request inside the window;
@@ -142,9 +148,9 @@ pub struct SecretsCache {
     ///   - the resolved **destination host** — an approval for host A must not
     ///     authorize host B within the TTL (host is request data in the
     ///     phantom-only model: one connection may anchor several hosts).
-    /// A tag-/connection-default Ask (no rule matched) is deliberately
-    /// **not cached** — it has no author-defined path scope to bound a grant,
-    /// so it re-prompts every request. Value: Unix-epoch-second expiry.
+    /// A tag-/connection-default Ask (no rule matched) writes no record here
+    /// (there is no rule to key it by); its approval still holds the
+    /// connection value for the window. Value: Unix-epoch-second expiry.
     ///
     /// Lives in the same memory window as the rest of the cache: dropped on
     /// lock (which zero-outs the entire cache via Default drop). Daemon
@@ -1197,9 +1203,10 @@ impl AppState {
     ///     decision being its own `level`,
     ///   - else connection / tag / global default floor, else ask-always,
     ///   - **active `ask` approvals** — if the decision is `Ask`, a rule
-    ///     matched, AND the `(connection, rule_id, method)` triple is in the
-    ///     unexpired rule_approvals cache, downgrades to `Allow` so the
-    ///     request fast-paths. Connection-default Ask (no rule) never caches.
+    ///     matched, AND the `(agent, connection, rule_id, method, host)` key is
+    ///     in the unexpired rule_approvals record, downgrades to `Allow`. A
+    ///     connection-default Ask (no rule) has no record to match; whether
+    ///     it asks is then up to the proxy's lookup (`grant_lookup`).
     pub fn evaluate_request_policy(
         &self,
         vault_id: &str,
@@ -1270,15 +1277,13 @@ impl AppState {
             tags,
         );
 
-        // Cache hit honors the `ask`-with-TTL semantic, but the grant is
-        // scoped to the matched rule AND the HTTP method: a prior approval
-        // for the same (service, rule, method), not yet expired, downgrades
-        // this Ask to Allow so the request fast-paths without a passkey
-        // prompt. Two deliberate bounds keep a window from over-reaching:
-        //   - No rule matched (tag-/service-default Ask) → never a hit:
-        //     there is no author-defined path scope to bound the grant.
-        //   - Method is part of the key → approving a GET cannot fast-path a
-        //     later POST/DELETE inside the window.
+        // Rule-approval record: a prior approval for the same (agent,
+        // connection, rule, method, host), not yet expired, downgrades this
+        // Ask to Allow. Bounds of the record itself:
+        //   - No rule matched (tag-/service-default Ask) → no record to hit.
+        //   - Method and host are part of the key.
+        // The record narrows the decision only; the reuse an approval grants
+        // is the held connection value (see `rule_approvals`).
         // Passive cleanup: if expired, drop the entry instead of returning a
         // hit. `ask-always` and `deny` never consult or write the cache;
         // `allow` doesn't need to.
@@ -1315,17 +1320,17 @@ impl AppState {
         Some((level, matched_rule, ttl))
     }
 
-    /// Record an `ask`-level approval into the per-vault TTL cache. Called
-    /// from approve.rs when a Use op was approved AND the decision that
-    /// created it was Ask (not AskAlways). `ttl_seconds` is the level's
-    /// `ttl` falling back to `Policy.timeout` or a safe 300s default.
+    /// Record an `ask`-level approval into the per-vault rule-approval
+    /// record. Called from approve.rs when a Use op was approved AND the
+    /// decision that created it was an unscoped Ask (not AskAlways).
+    /// `ttl_seconds` is the PolicyContext ttl.
     ///
-    /// The grant is scoped to `(service, rule_id, method)`. Two bounds:
+    /// Keyed `(agent, connection, rule_id, method, host)`:
     ///   - `rule_id == None` (tag-/service-default Ask, no rule matched)
-    ///     is **not recorded** — without an author-defined path scope a grant
-    ///     would blanket the whole service, so such ops re-prompt every time.
-    ///   - `method` is part of the key, so approving one verb never lets a
-    ///     different verb fast-path inside the window.
+    ///     is not recorded (there is no rule to key it by).
+    ///   - `method` is part of the key, so the downgrade is per verb.
+    /// The reuse the approval grants is decided by the held connection value
+    /// written next to this (`scope.reuse = connection`), not by this key.
     ///
     /// No-op when the vault is locked at the moment of the call — that
     /// shouldn't happen in practice (the approve happens while the
@@ -2305,10 +2310,11 @@ mod tests {
         assert_eq!(state.cache_lookup("v1", "svc"), None);
     }
 
-    /// Security regression: an `ask` approval is scoped to (service, rule,
-    /// method). Approving a GET must NOT silently fast-path a later POST,
-    /// even within the TTL window — closes the standing-authority hole where
-    /// a single approval blanket-authorized every verb on a service.
+    /// The rule-approval RECORD is keyed by (agent, connection, rule, method,
+    /// host): a recorded GET approval downgrades only that key's decision.
+    /// This pins the policy layer only; what an approval lets the agent reuse
+    /// end to end (the held connection value) is pinned by the
+    /// `reuse_*` tests in server/handlers/approve.rs.
     #[test]
     fn ask_grant_is_scoped_to_method_and_rule() {
         use crate::core::policy::{AccessLevel, ConnectionPolicy, Policy, RuleConfig};
@@ -2430,8 +2436,8 @@ mod tests {
         );
         assert_eq!(rule.as_deref(), Some("write"));
 
-        // A tag-default Ask (no rule) is never recorded, so it can never
-        // produce a fast-path — record is a no-op for rule_id == None.
+        // A tag-default Ask (no rule) writes no record — record is a no-op
+        // for rule_id == None.
         state.record_ask_approval(vid, "agA", "gh", None, "GET", "api.gh.com", 60);
     }
 
