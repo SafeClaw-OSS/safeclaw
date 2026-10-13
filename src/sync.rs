@@ -144,7 +144,7 @@ pub async fn pull_on_start(state_dir: &Path) {
         // PER-ITEM: pull the KEYSET (the passkey-wrap layer, now on `/keys`)
         // BEFORE the content rows, so the folded view later sees a fresh K-wrap
         // layer. Best-effort; a 404 / non-per-item vault is a no-op.
-        match pull_keys(state_dir, cloud, vault, &dk).await {
+        match pull_keys(state_dir, cloud, vault, &dk, StoreLock::Boot).await {
             Ok(n) if n > 0 => {
                 tracing::info!(vault = %vault, adopted = n, "cloud sync: pulled keyset rows")
             }
@@ -154,7 +154,7 @@ pub async fn pull_on_start(state_dir: &Path) {
         // PER-ITEM: pull content rows too (pre-serve, no cache to refresh yet —
         // the first unlock folds them). Best-effort; a 404 / non-per-item vault
         // is a no-op.
-        match pull_items(state_dir, cloud, vault, &dk, None).await {
+        match pull_items(state_dir, cloud, vault, &dk, None, StoreLock::Boot).await {
             Ok(n) if n > 0 => {
                 tracing::info!(vault = %vault, adopted = n, "cloud sync: pulled item rows")
             }
@@ -227,7 +227,8 @@ pub async fn sync_vault_now(state: &Arc<AppState>, vault_id: &str) -> Result<Syn
     // the folded item view so the new rows are served without a re-unlock.
     if let Some(cloud2) = cfg.cloud_backend.as_deref().filter(|s| !s.is_empty()) {
         if let Some(dk2) = device_key() {
-            match pull_keys(&state.config.state_dir, cloud2, vault_id, &dk2).await {
+            let lock = StoreLock::Take(state);
+            match pull_keys(&state.config.state_dir, cloud2, vault_id, &dk2, lock).await {
                 Ok(n) if n > 0 => {
                     state.record_cloud_contact(vault_id);
                     tracing::info!(vault = %vault_id, adopted = n, "keyset pull: adopted rows")
@@ -242,6 +243,7 @@ pub async fn sync_vault_now(state: &Arc<AppState>, vault_id: &str) -> Result<Syn
                 vault_id,
                 &dk2,
                 key.as_deref().map(|m| &m[..]),
+                lock,
             )
             .await
             {
@@ -279,6 +281,7 @@ pub async fn sync_vault_now(state: &Arc<AppState>, vault_id: &str) -> Result<Syn
 /// missing the credential ("unknown credential") even though the cloud offers it.
 /// On a lookup miss we re-pull the WHOLE triple (since=0) here and retry once.
 /// Returns rows adopted. Best-effort caller: a local-only/unpaired daemon errs.
+/// The caller (an approve) holds the vault write lock.
 pub async fn resync_membership_now(state: &Arc<AppState>, vault_id: &str) -> Result<usize, String> {
     let cfg = active::load().map_err(|_| "not paired".to_string())?;
     let cloud = cfg
@@ -288,7 +291,15 @@ pub async fn resync_membership_now(state: &Arc<AppState>, vault_id: &str) -> Res
         .ok_or_else(|| "local-only daemon (no cloud) — cannot resync membership".to_string())?;
     let dk =
         device_key().ok_or_else(|| "daemon not paired — cannot resync membership".to_string())?;
-    let n = pull_membership(&state.config.state_dir, cloud, vault_id, &dk, true).await?;
+    let n = pull_membership(
+        &state.config.state_dir,
+        cloud,
+        vault_id,
+        &dk,
+        true,
+        StoreLock::Held,
+    )
+    .await?;
     if n > 0 {
         state.record_cloud_contact(vault_id);
         tracing::info!(vault = %vault_id, adopted = n, "membership resync (self-heal): backfilled keyset");
@@ -390,7 +401,8 @@ pub(crate) async fn pull_items_now(state: &Arc<AppState>, vault_id: &str) -> Res
     let dk = device_key().ok_or("this daemon is not paired")?;
     let key = state.cloned_state_key(vault_id);
     let key = key.as_deref().map(|m| &m[..]);
-    if pull_items(&state.config.state_dir, cloud, vault_id, &dk, key).await? > 0 {
+    let lock = StoreLock::Take(state);
+    if pull_items(&state.config.state_dir, cloud, vault_id, &dk, key, lock).await? > 0 {
         refresh_after_item_pull(state, vault_id);
     }
     Ok(())
@@ -2485,7 +2497,7 @@ async fn pull_and_process(
     channel: &str,
 ) -> bool {
     let mut ok = true;
-    match pull_keys(state_dir, cloud, vault, dk).await {
+    match pull_keys(state_dir, cloud, vault, dk, StoreLock::Take(state)).await {
         Ok(n) if n > 0 => {
             tracing::info!(vault = %vault, adopted = n, "cloud sync watch: pulled keyset rows")
         }
@@ -2496,7 +2508,16 @@ async fn pull_and_process(
         }
     }
     let key = state.cloned_state_key(vault);
-    match pull_items(state_dir, cloud, vault, dk, key.as_deref().map(|m| &m[..])).await {
+    let pulled = pull_items(
+        state_dir,
+        cloud,
+        vault,
+        dk,
+        key.as_deref().map(|m| &m[..]),
+        StoreLock::Take(state),
+    )
+    .await;
+    match pulled {
         Ok(n) if n > 0 => {
             // INFO parity with the keyset line above: item adoptions are the
             // content channel doing its job — their absence from the log was
@@ -2764,16 +2785,57 @@ fn parse_items_page(
     Ok((rows, next.or(more.then_some(seq))))
 }
 
+/// How a sync write-back of a vault's local store is serialized with the
+/// vault's other writers. Every write of the store happens under the vault
+/// write lock ([`AppState::vault_write_lock`]); a pull reads its cursor, makes
+/// its network call without the lock, then re-reads the store and merges into
+/// that copy under the lock, so a local write made meanwhile is kept.
+#[derive(Clone, Copy)]
+pub(crate) enum StoreLock<'a> {
+    /// Take the vault write lock for the re-read, merge and write.
+    Take(&'a AppState),
+    /// The caller holds it (an approve: the unlock catch-up, the membership
+    /// self-heal).
+    Held,
+    /// Before the daemon serves: no other writer exists yet.
+    Boot,
+}
+
+impl StoreLock<'_> {
+    async fn acquire(self, vault: &str) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        match self {
+            StoreLock::Take(state) => Some(state.vault_write_lock(vault).lock_owned().await),
+            StoreLock::Held | StoreLock::Boot => None,
+        }
+    }
+}
+
+/// The vault's local store for a keyset write-back: the stored one, or an
+/// empty one when there is none yet. A store that exists but cannot be read
+/// is an error, never replaced with an empty one.
+fn store_or_empty_keyset(state_dir: &Path, vault: &str) -> Result<PerItemVault, String> {
+    let path = state_dir
+        .join("vaults")
+        .join(vault)
+        .join("vault.per-item.json");
+    match pv_store::read_per_item(&path) {
+        Ok(Some(pv)) => Ok(pv),
+        Ok(None) => Ok(empty_keyset_store()),
+        Err(e) => Err(format!("the local store cannot be read: {}", e)),
+    }
+}
+
 /// Pull item rows changed since the local `.items_seq` cursor and adopt them
-/// ([`adopt_item_rows`]; `key`: the unlocked session's key material, if any).
-/// Best-effort: a 404 (endpoint not live yet) or a missing local store is a
-/// no-op. Returns the number of rows adopted.
-pub async fn pull_items(
+/// ([`adopt_pulled_item_rows`]; `key`: the unlocked session's key material,
+/// if any). Best-effort: a 404 (endpoint not live yet) or a missing local
+/// store is a no-op. Returns the number of rows adopted.
+pub(crate) async fn pull_items(
     state_dir: &Path,
     cloud: &str,
     vault: &str,
     device_key: &str,
     key: Option<&[u8]>,
+    lock: StoreLock<'_>,
 ) -> Result<usize, String> {
     // Personal build: a SHARED (team) vault's content is left to the official
     // build; never lands on disk here (team-edition §9). Covers every caller.
@@ -2786,13 +2848,27 @@ pub async fn pull_items(
     let Some((rows, max_seq)) = fetch_item_rows(cloud, vault, device_key, since).await? else {
         return Ok(0); // /items not live yet — no-op (stubbed[])
     };
-    // Re-read after the network call: a local write meanwhile is kept.
+    adopt_pulled_item_rows(state_dir, vault, lock, &rows, max_seq, key).await
+}
+
+/// The write-back of [`pull_items`]: under the vault write lock, re-read the
+/// store (a local write since the cursor was read is kept) and adopt the
+/// pulled rows into it ([`adopt_item_rows`]).
+async fn adopt_pulled_item_rows(
+    state_dir: &Path,
+    vault: &str,
+    lock: StoreLock<'_>,
+    rows: &[ItemRow],
+    max_seq: u64,
+    key: Option<&[u8]>,
+) -> Result<usize, String> {
+    let _guard = lock.acquire(vault).await;
     let Some(mut pv) = read_per_item_store(state_dir, vault) else {
         return Ok(0);
     };
     let before = (pv.held.clone(), pv.row_kinds.len(), pv.items_seq);
     let keys = key.map(|m| (item_layer::VaultKeys::from_material(m), vault));
-    let adopted = adopt_item_rows(&mut pv, &rows, max_seq, keys)?;
+    let adopted = adopt_item_rows(&mut pv, rows, max_seq, keys)?;
     if adopted > 0 || (pv.held.clone(), pv.row_kinds.len(), pv.items_seq) != before {
         write_per_item_store(state_dir, vault, &pv)?;
     }
@@ -2822,7 +2898,8 @@ const UNLOCK_PULL_TIMEOUT: Duration = Duration::from_secs(8);
 /// vault key, then pull (the held rows again, and anything newer). Returns
 /// whether rows were adopted (the caller folds again) and the pull's error,
 /// if it failed (the caller keeps retrying in the background,
-/// [`retry_pull_after_unlock`]). A daemon with no cloud pulls nothing.
+/// [`retry_pull_after_unlock`]). A daemon with no cloud pulls nothing. The
+/// caller (the unlock approve) holds the vault write lock.
 pub(crate) async fn catch_up_at_unlock(
     state: &Arc<AppState>,
     vault_id: &str,
@@ -2847,7 +2924,7 @@ pub(crate) async fn catch_up_at_unlock(
     };
     let pulled = tokio::time::timeout(
         UNLOCK_PULL_TIMEOUT,
-        pull_items(state_dir, cloud, vault_id, &dk, Some(key)),
+        pull_items(state_dir, cloud, vault_id, &dk, Some(key), StoreLock::Held),
     )
     .await;
     match pulled {
@@ -4011,6 +4088,8 @@ pub async fn push_items_best_effort(state: &Arc<AppState>, vault_id: &str) {
     // meanwhile stays dirty and goes out on the next sync.
     let mut content_changed = false;
     if !fixes.is_empty() {
+        let lock = state.vault_write_lock(vault_id);
+        let _guard = lock.lock().await;
         if let Some(mut pv) = read_per_item_store(state_dir, vault_id) {
             let applied = apply_local_fixes(&mut pv, fixes, keys.map(|k| (k, vault_id)));
             refused_rows.extend(applied.refused);
@@ -4177,26 +4256,26 @@ struct KeyRowData {
 ///
 /// Best-effort: a 404 (endpoint not live yet) is a no-op. Returns the number of
 /// rows adopted.
-pub async fn pull_keys(
+pub(crate) async fn pull_keys(
     state_dir: &Path,
     cloud: &str,
     vault: &str,
     device_key: &str,
+    lock: StoreLock<'_>,
 ) -> Result<usize, String> {
     // Personal build: a SHARED (team) vault's keyset is left to the official
     // build; never lands on disk here (team-edition §9). Covers every caller.
     if leave_shared_to_official(vault) {
         return Ok(0);
     }
-    // Create an empty per-item store on demand so a device that pulls keys
-    // before it has ever seeded items still ends up with a keyset on disk.
-    let mut pv = read_per_item_store(state_dir, vault).unwrap_or_else(empty_keyset_store);
+    // The cursor only: the store is read again for the write-back.
+    let since = read_per_item_store(state_dir, vault).map_or(0, |pv| pv.keyset_seq);
 
     let url = format!(
         "{}/v/{}/keys?since={}",
         cloud.trim_end_matches('/'),
         vault,
-        pv.keyset_seq
+        since
     );
     let client = crate::cli::egress_proxy::client(Duration::from_secs(15))
         .map_err(|e| format!("http client init: {}", e))?;
@@ -4213,7 +4292,7 @@ pub async fn pull_keys(
         // fmt>=2 vault: the backend serves the end-to-end verify(anchor, members, proof)
         // TRIPLE at /membership, not row-shaped /keys. Route there. Legacy fmt=1 personal
         // vaults keep the row path below (single request, unchanged).
-        409 => return pull_membership(state_dir, cloud, vault, device_key, false).await,
+        409 => return pull_membership(state_dir, cloud, vault, device_key, false, lock).await,
         401 | 403 => return Err(format!("cloud auth rejected (HTTP {})", resp.status())),
         other => return Err(format!("keys GET HTTP {}", other)),
     }
@@ -4228,13 +4307,26 @@ pub async fn pull_keys(
         .transpose()
         .map_err(|e| format!("parse keys array: {}", e))?
         .unwrap_or_default();
-    let max_seq = body
-        .get("seq")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(pv.keyset_seq);
-    let adopted = adopt_key_rows(&mut pv, vault, &rows)?;
-    if max_seq > pv.keyset_seq {
-        pv.keyset_seq = max_seq;
+    let seq = body.get("seq").and_then(|v| v.as_u64());
+    adopt_pulled_key_rows(state_dir, vault, lock, &rows, seq).await
+}
+
+/// The write-back of [`pull_keys`]: under the vault write lock, re-read the
+/// store (an empty one created on demand, so a device that pulls keys before
+/// it has ever seeded items still ends up with a keyset on disk) and adopt
+/// the pulled rows into it; the cursor advances to `seq`.
+async fn adopt_pulled_key_rows(
+    state_dir: &Path,
+    vault: &str,
+    lock: StoreLock<'_>,
+    rows: &[KeyRow],
+    seq: Option<u64>,
+) -> Result<usize, String> {
+    let _guard = lock.acquire(vault).await;
+    let mut pv = store_or_empty_keyset(state_dir, vault)?;
+    let adopted = adopt_key_rows(&mut pv, vault, rows)?;
+    if let Some(seq) = seq.filter(|s| *s > pv.keyset_seq) {
+        pv.keyset_seq = seq;
     }
     // Persist even a zero-adopt pull so the advanced cursor sticks.
     write_per_item_store(state_dir, vault, &pv)?;
@@ -4254,13 +4346,15 @@ async fn pull_membership(
     vault: &str,
     device_key: &str,
     force_full: bool,
+    lock: StoreLock<'_>,
 ) -> Result<usize, String> {
     // Personal build: a SHARED (team) vault's membership triple is left to the
     // official build; never lands on disk here (team-edition §9).
     if leave_shared_to_official(vault) {
         return Ok(0);
     }
-    let mut pv = read_per_item_store(state_dir, vault).unwrap_or_else(empty_keyset_store);
+    // The cursor only: the store is read again for the write-back.
+    let pv = read_per_item_store(state_dir, vault).unwrap_or_else(empty_keyset_store);
     // The `keyset_seq` cursor is per-FORMAT: the v1 `/keys` sequence and the v2
     // `/membership` `keyset_seq` are DIFFERENT counters. On a fmt1→fmt2 MIGRATION the
     // local cursor is still the v1 value (often far ahead of the fresh membership's
@@ -4300,6 +4394,21 @@ async fn pull_membership(
         .json()
         .await
         .map_err(|e| format!("parse membership response: {}", e))?;
+    adopt_pulled_membership(state_dir, vault, lock, &body).await
+}
+
+/// The write-back of [`pull_membership`]: under the vault write lock, re-read
+/// the store (an empty one created on demand) and adopt the pulled triple
+/// into it; the cursor advances to its `keyset_seq`.
+async fn adopt_pulled_membership(
+    state_dir: &Path,
+    vault: &str,
+    lock: StoreLock<'_>,
+    body: &serde_json::Value,
+) -> Result<usize, String> {
+    let _guard = lock.acquire(vault).await;
+    let mut pv = store_or_empty_keyset(state_dir, vault)?;
+    let first_v2 = pv.keyset.uik.is_none();
     let max_seq = body
         .get("keyset_seq")
         .and_then(|v| v.as_u64())
@@ -4307,7 +4416,7 @@ async fn pull_membership(
     // A since-delta "nothing new" reply carries only keyset_seq; a pre-bootstrap vault
     // carries a null anchor. Either way there is no triple to adopt — just advance the cursor.
     let adopted = match body.get("anchor").and_then(|v| v.as_str()) {
-        Some(anchor) if !anchor.is_empty() => adopt_membership_triple(&mut pv, vault, anchor, &body)?,
+        Some(anchor) if !anchor.is_empty() => adopt_membership_triple(&mut pv, vault, anchor, body)?,
         _ => 0,
     };
     if first_v2 {
@@ -5006,7 +5115,7 @@ pub async fn push_keys_best_effort(state: &Arc<AppState>, vault_id: &str) {
                     vault = %vault_id, cid = %cid_b64, current_version,
                     "keyset push: 409 conflict; adopting cloud keyset row (no clobber)"
                 );
-                let _ = pull_keys(state_dir, cloud, vault_id, &dk).await;
+                let _ = pull_keys(state_dir, cloud, vault_id, &dk, StoreLock::Take(state)).await;
                 return;
             }
             Ok(PushOutcome::Rejected { status, error }) => {
@@ -6226,6 +6335,124 @@ mod peritem_tests {
             .find(|c| c.credential_id == cred_id_raw)
             .unwrap();
         assert_eq!(back_cred.wrapped_key, wrapped_key_raw);
+    }
+
+    /// A pull reads its cursor, makes its network call without the vault
+    /// write lock, then re-reads the store and merges into it under the lock:
+    /// a local write made meanwhile (every daemon write holds the lock) is
+    /// kept, never written over with the copy read before the call. Keys,
+    /// membership and items alike.
+    #[test]
+    fn a_pull_keeps_a_local_write_made_during_its_network_call() {
+        use crate::storage::item::{self as il, ItemNs, ItemPayload};
+        use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+        use base64::Engine;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = crate::config::Config {
+            state_dir: dir.path().to_path_buf(),
+            port: 0,
+            proxy_port: 0,
+            listen: "127.0.0.1".into(),
+            origin: "http://localhost".into(),
+            relying_party: crate::passkey::webauthn::RelyingParty::exact(
+                "http://localhost",
+                "localhost",
+            ),
+            admin_key: None,
+            relay_url: None,
+            body_cap: crate::config::DEFAULT_BODY_CAP,
+        };
+        let mut st = AppState::new(cfg);
+        st.vaults = crate::storage::vault_dir::VaultDir::new(dir.path());
+        let state = Arc::new(st);
+        let state_dir = dir.path().to_path_buf();
+        let vid = "v-interleave";
+        let k = [0x42u8; 32];
+        let keys = VaultKeys::single(&k);
+        write_per_item_store(&state_dir, vid, &empty_pv()).unwrap();
+        let read = || read_per_item_store(&state_dir, vid).unwrap();
+        let local_write = |name: &str| {
+            let mut pv = read();
+            pv.seal_and_upsert::<StdPrimitives>(
+                keys,
+                vid,
+                ItemNs::Secret,
+                name,
+                1,
+                &ItemPayload::secret_live(name, "local"),
+            )
+            .unwrap();
+            write_per_item_store(&state_dir, vid, &pv).unwrap();
+        };
+        let has = |name: &str| {
+            read()
+                .open_item::<StdPrimitives>(keys, vid, ItemNs::Secret, name)
+                .unwrap()
+                .is_some()
+        };
+
+        // What each call brings back.
+        let enc = |b: &[u8]| STANDARD.encode(b);
+        let cid_raw = vec![7u8; 8];
+        let key_row: KeyRow = serde_json::from_value(serde_json::json!({
+            "cid": URL_SAFE_NO_PAD.encode(&cid_raw), "version": 1, "seq": 7,
+            "data": {
+                "x": enc(&[0xAA; 32]), "y": enc(&[0xBB; 32]),
+                "prf_salt": enc(&[1; 32]), "wrapped_key": enc(&[2; 48]),
+            },
+        }))
+        .unwrap();
+        let triple = serde_json::json!({
+            "anchor": enc(&[7; 32]),
+            "members": { "us_m": { "role": "member", "k_encapped": enc(&[5; 32]), "k_ct": enc(&[6; 80]) } },
+            "identities": { "us_m": { "sig_pub": enc(&[3; 32]), "enc_pub": enc(&[4; 32]) } },
+            "proof": { "generation": 0 },
+            "keyset_seq": 3,
+        });
+        let pulled = ItemPayload::secret_live("PULLED", "cloud");
+        let ctx = il::ItemCtx::for_item::<StdPrimitives>(&k, vid, ItemNs::Secret, "PULLED", 1).unwrap();
+        let item_row = ItemRow {
+            item_id: ctx.item_id_b64(),
+            version: 1,
+            seq: 9,
+            ct: URL_SAFE_NO_PAD.encode(il::seal_item::<StdPrimitives>(&k, &ctx, &pulled).unwrap()),
+            sig: None,
+            signer: None,
+        };
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            for which in 0..3usize {
+                // A daemon write holds the lock as the call returns.
+                let guard = state.vault_write_lock(vid).lock_owned().await;
+                let (st, sd) = (state.clone(), state_dir.clone());
+                let (key_row, triple, item_row) = (key_row.clone(), triple.clone(), item_row.clone());
+                let task = tokio::spawn(async move {
+                    let lock = StoreLock::Take(&st);
+                    match which {
+                        0 => adopt_pulled_key_rows(&sd, vid, lock, &[key_row], Some(7)).await,
+                        1 => adopt_pulled_membership(&sd, vid, lock, &triple).await,
+                        _ => adopt_pulled_item_rows(&sd, vid, lock, &[item_row], 9, None).await,
+                    }
+                });
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                assert!(!task.is_finished(), "the write-back waits for the lock");
+                let name = format!("LOCAL{}", which);
+                local_write(&name);
+                drop(guard);
+                task.await.unwrap().unwrap();
+                assert!(has(&name), "the local write is kept ({})", which);
+            }
+        });
+        let pv = read();
+        assert!((0..3).all(|w| has(&format!("LOCAL{}", w))));
+        assert!(pv.keyset.credentials.iter().any(|c| c.credential_id == cid_raw));
+        assert!(pv.uik_cred("us_m").is_some());
+        assert!(has("PULLED"));
+        assert_eq!(pv.items_seq, 9);
     }
 
     /// The previous content key a re-key puts on a kept member's keyset row
