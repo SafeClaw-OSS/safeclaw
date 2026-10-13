@@ -990,6 +990,12 @@ fn policy_from_file(file: RawPolicyFile, errs: &mut Vec<String>) -> ServicePolic
             errs.push(format!("{}: the label must not be empty", what));
         }
         check_match_list(&what, &r.match_pattern, errs);
+        if r.match_pattern.is_empty() && r.body.is_none() && r.when.is_none() {
+            errs.push(format!(
+                "{}: `match = []` with no body or when matches every request; list what it matches (a level for every request is [default])",
+                what
+            ));
+        }
         check_ttl(&what, r.ttl, errs);
         let level = match r.level.as_deref() {
             Some(l) => parse_level(&what, l, errs),

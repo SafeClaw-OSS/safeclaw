@@ -77,15 +77,21 @@ pub fn is_full_commit(s: &str) -> bool {
     s.len() == 40 && s.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f'))
 }
 
+/// A ref that names a commit (hex digits only, a full or short commit id)
+/// rather than a branch or tag.
+pub fn is_commit_ref(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
 /// Why a GitHub read failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FetchError {
-    /// GitHub was not reached or failed on its side: a transport error, a
-    /// timeout, a 5xx. Says nothing about the source.
+    /// No answer arrived: a transport error before the response, or none by
+    /// the deadline. Says nothing about the source.
     Unreachable(String),
-    /// GitHub answered: the repository, ref or commit is not there (404,
-    /// 422), the request was refused (401, 403, 429), or the download is too
-    /// large. A definitive answer.
+    /// An answer arrived and the read did not succeed: any non-success
+    /// status (not found, refused, a server or proxy error), or a download
+    /// that is too large, too slow or cut off after the answer.
     Answered(String),
 }
 
@@ -173,15 +179,19 @@ pub async fn fetch<A: GitHubApi>(
 }
 
 /// Check that `defs` (service id → service.toml, policy.toml), as a request
-/// carries them, are what `source` holds: a GitHub source is fetched again at
-/// its pinned commit and every definition's digest compared (a single service
+/// carries them, are what `source` holds. A GitHub source is pinned at the
+/// head of a branch or tag: its stated ref (absent: the default branch) is
+/// resolved and must point at the pinned commit (GitHub serves a commit that
+/// exists only in a fork through the parent repository's URLs, so a commit is
+/// the repository's only as the head of one of its refs); that commit is
+/// fetched again and every definition's digest compared (a single service
 /// folder stored under another id through `--id` is compared after the same
-/// rename). `Ok(Fetched)` when they match. `Err` when they do not, when the
-/// commit does not hold a source, or when GitHub gives a definitive answer
-/// ([`FetchError::Answered`]: not found, refused, too large). `Ok(NotReached)`
-/// only when GitHub was not reached ([`FetchError::Unreachable`]: a transport
-/// error, a timeout, a 5xx), and `Ok(LocalFolder)` for a local folder: neither
-/// can be checked here, and the card says so.
+/// rename). `Ok(Fetched)` when all of it holds. `Err` when it does not, when
+/// the commit does not hold a source, or when GitHub answers without the
+/// data ([`FetchError::Answered`]). `Ok(NotReached)` only when no answer
+/// arrived ([`FetchError::Unreachable`]), `Ok(CommitRef)` for a ref that is a
+/// commit id, and `Ok(LocalFolder)` for a local folder: none can be checked
+/// here, and the card says so.
 pub async fn verify<A: GitHubApi>(
     api: &A,
     source: &ServiceSource,
@@ -190,7 +200,11 @@ pub async fn verify<A: GitHubApi>(
     use super::card::SourceCheck;
     use super::definition_digest;
     let ServiceSource::Github {
-        repo, path, commit, ..
+        repo,
+        path,
+        git_ref,
+        commit,
+        ..
     } = source
     else {
         return Ok(SourceCheck::LocalFolder);
@@ -203,22 +217,50 @@ pub async fn verify<A: GitHubApi>(
     if !is_full_commit(commit) {
         return Err("source commit must be a full 40-hex commit".into());
     }
+    let shown = crate::util::terminal_safe(&source.display()).into_owned();
+    let refused = |e: &str| format!("{}: {}; nothing was stored", shown, e);
     let mismatch = || {
         format!(
             "the definitions in this request are not what {} holds; nothing was stored",
-            crate::util::terminal_safe(&source.display())
+            shown
         )
     };
+    // The ref's head at the time of the check.
+    let target = match git_ref {
+        Some(r) if is_commit_ref(r) => return Ok(SourceCheck::CommitRef),
+        Some(r) => {
+            check_ref(r)?;
+            r.clone()
+        }
+        None => match api.default_branch(owner, name).await {
+            Ok(b) => {
+                check_ref(&b)
+                    .map_err(|_| refused("GitHub returned an unusable default branch name"))?;
+                b
+            }
+            Err(FetchError::Unreachable(_)) => return Ok(SourceCheck::NotReached),
+            Err(FetchError::Answered(e)) => return Err(refused(&e)),
+        },
+    };
+    let head = match api.commit_of(owner, name, &target).await {
+        Ok(h) => h.trim().to_ascii_lowercase(),
+        Err(FetchError::Unreachable(_)) => return Ok(SourceCheck::NotReached),
+        Err(FetchError::Answered(e)) => return Err(refused(&e)),
+    };
+    if !is_full_commit(&head) {
+        return Err(refused("GitHub did not return a full commit id"));
+    }
+    if head != *commit {
+        return Err(refused(&format!(
+            "{} is at {}, not at the pinned commit",
+            source.ref_label(),
+            head
+        )));
+    }
     let gz = match api.tarball(owner, name, commit).await {
         Ok(gz) => gz,
         Err(FetchError::Unreachable(_)) => return Ok(SourceCheck::NotReached),
-        Err(FetchError::Answered(e)) => {
-            return Err(format!(
-                "{}: {}; nothing was stored",
-                crate::util::terminal_safe(&source.display()),
-                e
-            ))
-        }
+        Err(FetchError::Answered(e)) => return Err(refused(&e)),
     };
     let files = tar::read_tarball(&gz, path.as_deref()).map_err(|_| mismatch())?;
     let digest = |(s, p): &(String, Option<String>)| definition_digest(s, p.as_deref());
@@ -252,6 +294,10 @@ pub struct GitHubHttp {
     client: reqwest::Client,
     api: String,
     codeload: String,
+    /// When set, every read must be answered by then: no response by the
+    /// deadline is [`FetchError::Unreachable`]; a response whose body is not
+    /// read by then is [`FetchError::Answered`] (too large or too slow).
+    deadline: Option<tokio::time::Instant>,
 }
 
 /// Small JSON / text answers (repository metadata, a commit id).
@@ -265,7 +311,52 @@ impl GitHubHttp {
             client,
             api: "https://api.github.com".into(),
             codeload: "https://codeload.github.com".into(),
+            deadline: None,
         })
+    }
+
+    /// Every read must be answered by `deadline` (see [`Self::deadline`]).
+    pub fn answering_by(mut self, deadline: tokio::time::Instant) -> Self {
+        self.deadline = Some(deadline);
+        self
+    }
+
+    /// Send a request: no response (a transport error, or none by the
+    /// deadline) is [`FetchError::Unreachable`].
+    async fn send(
+        &self,
+        req: reqwest::RequestBuilder,
+        what: &str,
+    ) -> Result<reqwest::Response, FetchError> {
+        let sent = req.send();
+        let resp = match self.deadline {
+            Some(d) => tokio::time::timeout_at(d, sent).await.map_err(|_| {
+                FetchError::Unreachable(format!("GitHub did not answer in time for {}", what))
+            })?,
+            None => sent.await,
+        };
+        let resp = resp.map_err(unreachable)?;
+        if !resp.status().is_success() {
+            return Err(status_problem(resp.status().as_u16(), what));
+        }
+        Ok(resp)
+    }
+
+    /// Read an answered response's body, at most `cap` bytes, by the
+    /// deadline: anything else is [`FetchError::Answered`].
+    async fn read(
+        &self,
+        resp: reqwest::Response,
+        cap: usize,
+        what: &str,
+    ) -> Result<Vec<u8>, FetchError> {
+        let read = body_capped(resp, cap, what);
+        match self.deadline {
+            Some(d) => tokio::time::timeout_at(d, read)
+                .await
+                .map_err(|_| too_large_or_slow(what))?,
+            None => read.await,
+        }
     }
 
     fn get(&self, url: &str, accept: &str) -> reqwest::RequestBuilder {
@@ -287,46 +378,68 @@ pub(crate) fn tarball_url(codeload: &str, owner: &str, repo: &str, commit: &str)
     format!("{}/{}/{}/tar.gz/{}", codeload, owner, repo, commit)
 }
 
-/// What a non-success status says: a 5xx is GitHub failing on its side
-/// ([`FetchError::Unreachable`]); every other status is its answer
-/// ([`FetchError::Answered`]).
+/// What a non-success status says. Every status is an answer
+/// ([`FetchError::Answered`]); a proxy's (407) or a request timeout (408) is
+/// not GitHub's answer about the repository, and says so.
 pub(crate) fn status_problem(status: u16, what: &str) -> FetchError {
-    match status {
-        404 | 422 => FetchError::Answered(format!(
+    FetchError::Answered(match status {
+        404 | 422 => format!(
             "{} not found (only public repositories are supported)",
             what
-        )),
-        401 | 403 | 429 => FetchError::Answered(format!(
+        ),
+        401 | 403 | 429 => format!(
             "GitHub refused the request for {} (HTTP {}; often its rate limit), try again later",
             what, status
-        )),
-        s @ 500..=599 => {
-            FetchError::Unreachable(format!("GitHub failed with HTTP {} for {}", s, what))
-        }
-        s => FetchError::Answered(format!("GitHub answered HTTP {} for {}", s, what)),
-    }
+        ),
+        407 => format!(
+            "the proxy between this device and GitHub refused the request for {} (HTTP 407: proxy authentication required)",
+            what
+        ),
+        408 => format!(
+            "the request for {} timed out before GitHub read it (HTTP 408), try again later",
+            what
+        ),
+        s @ 500..=599 => format!(
+            "GitHub failed with HTTP {} for {}, try again later",
+            s, what
+        ),
+        s => format!("GitHub answered HTTP {} for {}", s, what),
+    })
 }
 
-/// A request that got no answer: a timeout or a transport error.
+/// A request that got no answer: a transport error before the response.
 fn unreachable(e: reqwest::Error) -> FetchError {
     FetchError::Unreachable(format!("cannot reach GitHub: {}", e))
 }
 
-/// Read a response body, refusing one over `cap` bytes (checked against the
-/// declared length first, then while reading).
-async fn body_capped(mut resp: reqwest::Response, cap: usize) -> Result<Vec<u8>, FetchError> {
-    let too_large = || FetchError::Answered(format!("the download is larger than {} bytes", cap));
+/// An answered download that cannot be read in full: too large or too slow.
+fn too_large_or_slow(what: &str) -> FetchError {
+    FetchError::Answered(format!(
+        "could not verify {}: the download is too large or too slow",
+        what
+    ))
+}
+
+/// Read an answered response's body, refusing one over `cap` bytes (by its
+/// declared length before reading, when it has one, then while reading) or
+/// cut off.
+async fn body_capped(
+    mut resp: reqwest::Response,
+    cap: usize,
+    what: &str,
+) -> Result<Vec<u8>, FetchError> {
     if resp.content_length().is_some_and(|n| n > cap as u64) {
-        return Err(too_large());
+        return Err(too_large_or_slow(what));
     }
     let mut out = Vec::new();
-    while let Some(chunk) = resp
-        .chunk()
-        .await
-        .map_err(|e| FetchError::Unreachable(format!("download failed: {}", e)))?
-    {
+    while let Some(chunk) = resp.chunk().await.map_err(|e| {
+        FetchError::Answered(format!(
+            "the download of {} broke off after GitHub answered: {}",
+            what, e
+        ))
+    })? {
         if out.len() + chunk.len() > cap {
-            return Err(too_large());
+            return Err(too_large_or_slow(what));
         }
         out.extend_from_slice(&chunk);
     }
@@ -336,18 +449,12 @@ async fn body_capped(mut resp: reqwest::Response, cap: usize) -> Result<Vec<u8>,
 impl GitHubApi for GitHubHttp {
     async fn default_branch(&self, owner: &str, repo: &str) -> Result<String, FetchError> {
         let what = format!("github:{}/{}", owner, repo);
-        let resp = self
-            .get(
-                &repo_url(&self.api, owner, repo),
-                "application/vnd.github+json",
-            )
-            .send()
-            .await
-            .map_err(unreachable)?;
-        if !resp.status().is_success() {
-            return Err(status_problem(resp.status().as_u16(), &what));
-        }
-        let body = body_capped(resp, MAX_META_RESPONSE).await?;
+        let req = self.get(
+            &repo_url(&self.api, owner, repo),
+            "application/vnd.github+json",
+        );
+        let resp = self.send(req, &what).await?;
+        let body = self.read(resp, MAX_META_RESPONSE, &what).await?;
         let answered = |m: &str| FetchError::Answered(m.to_string());
         let v: serde_json::Value = serde_json::from_slice(&body)
             .map_err(|_| answered("GitHub returned unreadable repository metadata"))?;
@@ -364,35 +471,142 @@ impl GitHubApi for GitHubHttp {
         git_ref: &str,
     ) -> Result<String, FetchError> {
         let what = format!("ref '{}' in github:{}/{}", git_ref, owner, repo);
-        let resp = self
-            .get(
-                &commit_url(&self.api, owner, repo, git_ref),
-                "application/vnd.github.sha",
-            )
-            .send()
-            .await
-            .map_err(unreachable)?;
-        if !resp.status().is_success() {
-            return Err(status_problem(resp.status().as_u16(), &what));
-        }
-        let body = body_capped(resp, 256).await?;
+        let req = self.get(
+            &commit_url(&self.api, owner, repo, git_ref),
+            "application/vnd.github.sha",
+        );
+        let resp = self.send(req, &what).await?;
+        let body = self.read(resp, 256, &what).await?;
         String::from_utf8(body)
             .map_err(|_| FetchError::Answered("GitHub returned an unreadable commit id".into()))
     }
 
     async fn tarball(&self, owner: &str, repo: &str, commit: &str) -> Result<Vec<u8>, FetchError> {
         let what = format!("github:{}/{} at {}", owner, repo, commit);
-        let resp = self
-            .get(
-                &tarball_url(&self.codeload, owner, repo, commit),
-                "application/x-gzip",
-            )
-            .send()
-            .await
-            .map_err(unreachable)?;
-        if !resp.status().is_success() {
-            return Err(status_problem(resp.status().as_u16(), &what));
+        let req = self.get(
+            &tarball_url(&self.codeload, owner, repo, commit),
+            "application/x-gzip",
+        );
+        let resp = self.send(req, &what).await?;
+        self.read(resp, MAX_TARBALL_BYTES, &what).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A stand-in for GitHub on 127.0.0.1: for every connection it reads the
+    /// request, writes `reply` (nothing: no answer), then holds the
+    /// connection open. Returns its base URL.
+    async fn stand_in(reply: Vec<u8>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let reply = reply.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = sock.read(&mut buf).await;
+                    let _ = sock.write_all(&reply).await;
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                });
+            }
+        });
+        base
+    }
+
+    /// A reader at `base` whose every read must be answered within `within`.
+    fn reader(base: &str, within: Duration) -> GitHubHttp {
+        GitHubHttp {
+            client: reqwest::Client::builder().no_proxy().build().unwrap(),
+            api: base.into(),
+            codeload: base.into(),
+            deadline: None,
         }
-        body_capped(resp, MAX_TARBALL_BYTES).await
+        .answering_by(tokio::time::Instant::now() + within)
+    }
+
+    /// Once GitHub has answered, a download not read in full by the deadline,
+    /// or declared larger than the cap, is an answer that refuses (too large
+    /// or too slow), never "not reached"; only no answer at all is.
+    #[test]
+    fn a_slow_or_oversize_answer_refuses_and_only_silence_is_unreachable() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let commit = "a".repeat(40);
+            let within = Duration::from_millis(400);
+            // Headers, then a body that never completes.
+            let slow =
+                stand_in(b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\npartial".to_vec()).await;
+            let e = reader(&slow, within)
+                .tarball("acme", "tools", &commit)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&e, FetchError::Answered(m) if m.contains("too large or too slow")),
+                "{e:?}"
+            );
+            // Declared larger than the cap: refused at once, before the deadline.
+            let big = stand_in(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                    MAX_TARBALL_BYTES + 1
+                )
+                .into_bytes(),
+            )
+            .await;
+            let started = tokio::time::Instant::now();
+            let e = reader(&big, Duration::from_secs(20))
+                .tarball("acme", "tools", &commit)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&e, FetchError::Answered(m) if m.contains("too large or too slow")),
+                "{e:?}"
+            );
+            assert!(started.elapsed() < Duration::from_secs(5));
+            // No answer at all: not reached.
+            let silent = stand_in(Vec::new()).await;
+            let e = reader(&silent, within)
+                .commit_of("acme", "tools", "main")
+                .await
+                .unwrap_err();
+            assert!(matches!(e, FetchError::Unreachable(_)), "{e:?}");
+            // A status is an answer.
+            let gone =
+                stand_in(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n".to_vec())
+                    .await;
+            let e = reader(&gone, within)
+                .default_branch("acme", "tools")
+                .await
+                .unwrap_err();
+            assert!(matches!(e, FetchError::Answered(_)), "{e:?}");
+        });
+    }
+
+    /// 407 and 408 are not GitHub's answer about the repository: their
+    /// messages say what they are.
+    #[test]
+    fn proxy_and_request_timeout_statuses_say_what_they_are() {
+        let m = |s| status_problem(s, "github:acme/tools").message().to_string();
+        assert!(
+            m(407).contains("proxy") && !m(407).contains("not found"),
+            "{}",
+            m(407)
+        );
+        assert!(
+            m(408).contains("timed out") && !m(408).contains("refused"),
+            "{}",
+            m(408)
+        );
+        assert!(m(404).contains("not found"));
+        for s in [407u16, 408, 404, 500] {
+            assert!(matches!(status_problem(s, "x"), FetchError::Answered(_)));
+        }
     }
 }

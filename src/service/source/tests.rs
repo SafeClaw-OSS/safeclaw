@@ -814,14 +814,18 @@ client_id = "public"
         "each label beside what the rule matches"
     );
     assert!(c.from.contains(&"a".repeat(40)));
-    assert!(c.from.contains("fetched again on your device"));
+    assert!(c.from.contains("checked on your device"));
     assert!(c.oauth.is_empty(), "PKCE is on by default");
     assert!(c.new_destinations.is_empty() && c.loosens.is_empty());
     // Not checked here: the source is what the requester stated, said as such.
-    for check in [SourceCheck::LocalFolder, SourceCheck::NotReached] {
+    for check in [
+        SourceCheck::LocalFolder,
+        SourceCheck::NotReached,
+        SourceCheck::CommitRef,
+    ] {
         let c = add_card(&snap, &src, check, false, &current, &reg).unwrap();
         assert!(c.from.contains("as stated by the requester"), "{}", c.from);
-        assert!(!c.from.contains("fetched again"));
+        assert!(!c.from.contains("checked on your device"));
         let mut scope = serde_json::json!({});
         c.stamp(&mut scope).unwrap();
         assert_eq!(scope["source_check"], check.as_str());
@@ -880,10 +884,10 @@ client_id = "public"
 }
 
 /// A first add's card shows what each rule matches beside its label, and
-/// every approval window that is not the default one (a rule's and the
-/// `[default]` one).
+/// every approval window the definition states, the default value's too (a
+/// rule's own window overrides a shorter one the owner set).
 #[test]
-fn first_add_card_shows_match_patterns_and_non_default_windows() {
+fn first_add_card_shows_match_patterns_and_stated_windows() {
     let reg = crate::service::ServiceRegistry::compiled_only();
     let default_ttl = crate::proxy::handler::DEFAULT_ASK_TTL;
     let policy = format!(
@@ -903,7 +907,7 @@ fn first_add_card_shows_match_patterns_and_non_default_windows() {
         c.tightens,
         [
             "acme: Pay [POST /v1/pay]: ask, approval lasts 86400s",
-            "acme: Refund [POST /v1/refund | POST /v1/refund/*]: ask",
+            format!("acme: Refund [POST /v1/refund | POST /v1/refund/*]: ask, approval lasts {default_ttl}s").as_str(),
             "acme: Delete [DELETE /v1/*]: deny",
             "acme: default write: ask",
             "acme: default approval lasts 3600s",
@@ -911,6 +915,20 @@ fn first_add_card_shows_match_patterns_and_non_default_windows() {
         "{:?}",
         c.tightens
     );
+    // A rule deciding on the body alone shows that as what it matches.
+    let body_only = "[[rule]]\nid = \"refunds\"\nlabel = \"Refunds\"\nmatch = []\nbody = \"refund\"\nlevel = \"deny\"\n";
+    let snap: BTreeMap<_, _> =
+        [("acme".to_string(), admitted("acme", ACME, Some(body_only)))].into();
+    let c = add_card(
+        &snap,
+        &gh("acme/tools", 'a'),
+        SourceCheck::Fetched,
+        false,
+        &BTreeMap::new(),
+        &reg,
+    )
+    .unwrap();
+    assert_eq!(c.tightens, ["acme: Refunds [body~refund]: deny"]);
 }
 
 #[test]
@@ -1291,8 +1309,13 @@ fn verify_fetches_the_pinned_commit_and_compares_every_definition() {
                 .collect()
         };
     let src = gh("acme/tools", 'c');
-    // A single service folder at the commit (the fake serves ACME).
-    let api = fake();
+    // A single service folder at the commit (the fake serves ACME), the
+    // default branch's head.
+    let at_c = |f: FakeGitHub| FakeGitHub {
+        refs: [("main", "c".repeat(40))].into(),
+        ..f
+    };
+    let api = at_c(fake());
     let ok = carried(&[("acme", ACME.to_string(), None)]);
     assert_eq!(
         block_on(github::verify(&api, &src, &ok)),
@@ -1326,7 +1349,7 @@ fn verify_fetches_the_pinned_commit_and_compares_every_definition() {
         assert!(e.contains("not what github:acme/tools"), "{e}");
     }
     // A collection: every folder must match, no more and no less.
-    let coll = FakeGitHub {
+    let coll = at_c(FakeGitHub {
         tarball: tar_gz(&[
             (
                 "o-r-x/services/a1/service.toml",
@@ -1345,7 +1368,7 @@ fn verify_fetches_the_pinned_commit_and_compares_every_definition() {
             ),
         ]),
         ..fake()
-    };
+    });
     let both = carried(&[
         ("a1", svc("a1", "a.dev"), None),
         ("b2", svc("b2", "b.dev"), Some(ACME_POLICY)),
@@ -1356,20 +1379,15 @@ fn verify_fetches_the_pinned_commit_and_compares_every_definition() {
     );
     let one = carried(&[("a1", svc("a1", "a.dev"), None)]);
     assert!(block_on(github::verify(&coll, &src, &one)).is_err());
-    // Not reached (a transport error, a timeout, a 5xx): said so on the card,
-    // not refused.
-    for offline in [
-        OfflineGitHub(None),
-        OfflineGitHub(Some(500)),
-        OfflineGitHub(Some(503)),
-    ] {
-        assert_eq!(
-            block_on(github::verify(&offline, &src, &ok)),
-            Ok(SourceCheck::NotReached)
-        );
-    }
-    // A definitive answer (not found, unprocessable, refused): refused.
-    for status in [404u16, 422, 401, 403, 429] {
+    // No answer at all (a transport error, none in time): said so on the
+    // card, not refused.
+    assert_eq!(
+        block_on(github::verify(&OfflineGitHub(None), &src, &ok)),
+        Ok(SourceCheck::NotReached)
+    );
+    // Any answer without the data (not found, refused, a server or proxy
+    // error): refused.
+    for status in [404u16, 422, 401, 403, 429, 407, 408, 500, 503] {
         let e = block_on(github::verify(&OfflineGitHub(Some(status)), &src, &ok)).unwrap_err();
         assert!(e.contains("nothing was stored"), "{status}: {e}");
     }
@@ -1380,6 +1398,101 @@ fn verify_fetches_the_pinned_commit_and_compares_every_definition() {
         block_on(github::verify(&OfflineGitHub(None), &local, &ok)),
         Ok(SourceCheck::LocalFolder)
     );
+}
+
+/// A GitHub source is checked at the head of its ref: the stated branch or
+/// tag (absent: the default branch) must point at the pinned commit. A
+/// commit that is not its head (one pushed only to a fork, which GitHub
+/// serves through the parent repository's URLs) is refused, naming the ref,
+/// before anything is fetched; a ref the repository does not have is
+/// refused; a ref that is a commit id cannot be checked and the card says so.
+/// The card shows the ref.
+#[test]
+fn verify_requires_the_ref_head_to_be_the_pinned_commit() {
+    let ok: BTreeMap<String, (String, Option<String>)> =
+        [("acme".to_string(), (ACME.to_string(), None))].into();
+    let pinned = |git_ref: Option<&str>, c: char| ServiceSource::Github {
+        repo: "acme/tools".into(),
+        path: None,
+        git_ref: git_ref.map(str::to_string),
+        commit: c.to_string().repeat(40),
+        checked: false,
+    };
+    let fetched = |api: &FakeGitHub| {
+        api.asked
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|a| a.starts_with("tarball"))
+    };
+    // `main` (the default branch) is at a, `v1.2.0` at b (the fake).
+    let api = fake();
+    let e = block_on(github::verify(&api, &pinned(None, 'c'), &ok)).unwrap_err();
+    assert!(
+        e.contains(&format!("the default branch is at {}", "a".repeat(40))),
+        "{e}"
+    );
+    let e = block_on(github::verify(&api, &pinned(Some("v1.2.0"), 'c'), &ok)).unwrap_err();
+    assert!(
+        e.contains(&format!("'v1.2.0' is at {}", "b".repeat(40))),
+        "{e}"
+    );
+    assert!(
+        !fetched(&api),
+        "nothing fetched at a commit no ref points at"
+    );
+    let e = block_on(github::verify(&api, &pinned(Some("from-a-fork"), 'c'), &ok)).unwrap_err();
+    assert!(e.contains("not found"), "{e}");
+    // The ref at the pin: checked.
+    assert_eq!(
+        block_on(github::verify(&api, &pinned(Some("v1.2.0"), 'b'), &ok)),
+        Ok(SourceCheck::Fetched)
+    );
+    assert_eq!(
+        block_on(github::verify(&api, &pinned(None, 'a'), &ok)),
+        Ok(SourceCheck::Fetched)
+    );
+    // A commit id as the ref: as stated, nothing asked of GitHub.
+    let api = fake();
+    for r in ["cccccccc", &"c".repeat(40)] {
+        assert_eq!(
+            block_on(github::verify(&api, &pinned(Some(r), 'c'), &ok)),
+            Ok(SourceCheck::CommitRef)
+        );
+    }
+    assert!(api.asked.lock().unwrap().is_empty());
+
+    // The card names the ref.
+    let reg = crate::service::ServiceRegistry::compiled_only();
+    let snap: BTreeMap<_, _> = [("acme".to_string(), admitted("acme", ACME, None))].into();
+    let card = |src: &ServiceSource, check| {
+        add_card(&snap, src, check, false, &BTreeMap::new(), &reg)
+            .unwrap()
+            .from
+    };
+    let from = card(&pinned(Some("v1.2.0"), 'b'), SourceCheck::Fetched);
+    assert!(from.contains("github:acme/tools (v1.2.0) @ "), "{from}");
+    assert!(from.contains("'v1.2.0' is at this commit"), "{from}");
+    let from = card(&pinned(None, 'a'), SourceCheck::Fetched);
+    assert!(
+        from.contains("(default branch)") && from.contains("the default branch is at this commit")
+    );
+    let from = card(&pinned(Some("cccccccc"), 'c'), SourceCheck::CommitRef);
+    assert!(
+        from.contains("as stated by the requester") && from.contains("(cccccccc)"),
+        "{from}"
+    );
+}
+
+/// The definition digest takes each part length-prefixed and the policy
+/// tagged present or absent, so different (service, policy) pairs differ.
+#[test]
+fn definition_digest_is_injective() {
+    let d = definition_digest;
+    assert_ne!(d("a\0b", None), d("a", Some("b")));
+    assert_ne!(d("a", Some("")), d("a", None));
+    assert_ne!(d("ab", Some("c")), d("a", Some("bc")));
+    assert_eq!(d("a", Some("b")), d("a", Some("b")));
 }
 
 // ── local folders: special files and the openat walk ───────────────────────

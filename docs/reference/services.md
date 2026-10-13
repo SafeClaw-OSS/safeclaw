@@ -42,7 +42,8 @@ names the service registry, which is not open yet.
 How it works:
 
 - **Pinned.** A GitHub source is resolved to a full commit (`--ref` takes a
-  branch, tag or commit; default: the default branch) and stored with it.
+  branch, tag or commit; default: the default branch) and stored with it and
+  the ref.
 - **Read, never run.** Only `service.toml` and `policy.toml` at those paths
   are read, as regular files: symlinks, links and devices are not followed
   (a local folder is opened one component at a time without following a
@@ -55,13 +56,15 @@ How it works:
   its credentials or OAuth data (declared hosts, the token endpoint, the
   authorization page, a redirect that leaves your device), `PKCE: off` when
   the flow has no PKCE, the rules it applies (each label with what it
-  matches, and any approval window other than the default), and the source
-  with its commit. A GitHub source is fetched again on your device at that
-  commit and must match; a definitive GitHub answer (not found, refused, too
-  large) refuses the request. A local folder, or GitHub out of reach (no
-  connection, a timeout, a GitHub server error), shows the source as stated by
-  the requester. `sc service ls` shows which: `checked at <commit>` or `as
-  stated by the requester`. Only the rules that tighten apply in a vault.
+  matches, and any approval window it sets), and the source with its ref and
+  commit. A GitHub source is checked on your device: its branch or tag (or
+  the default branch) must be at that commit, and the commit, fetched again,
+  must hold the same definitions. Any GitHub answer without the data (not
+  found, refused, a server error, a download too large or too slow) refuses
+  the request. A local folder, a commit given as `--ref`, or GitHub not
+  answering at all shows the source as stated by the requester. `sc service
+  ls` shows which: `checked at <commit>` or `as stated by the requester`.
+  Only the rules that tighten apply in a vault.
 - **Ids.** A definition is stored under its `[service] id`. It may not be a
   built-in id or one another source already holds; `--id` renames a
   single-service source.

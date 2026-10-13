@@ -532,6 +532,18 @@ fn policy_rules_are_recognized_whole_or_rejected() {
     ));
 }
 
+/// A rule that names nothing it matches (`match = []`, no body, no when)
+/// matches every request: refused. With a body or a when it decides on
+/// those.
+#[test]
+fn a_rule_matching_every_request_is_refused() {
+    let all = "[[rule]]\nid = \"all\"\nlabel = \"All\"\nmatch = []\nlevel = \"deny\"\n";
+    let e = rejected_with(GITHUB, all);
+    assert!(mentions(&e, "matches every request"), "{e:?}");
+    let body = all.replace("level", "body = \"delete\"\nlevel");
+    assert!(admit(None, GITHUB, Some(&body)).is_ok());
+}
+
 #[test]
 fn when_that_can_never_fire_is_rejected() {
     for (when, why) in [

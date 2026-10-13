@@ -74,7 +74,8 @@ pub async fn create(
     // services, every destination host, the rules, the source as checked; see
     // `service_ops`), on every vault: each service is a data record.
     if matches!(&op.act.kind, ActType::Custom(name) if name == "service-add") {
-        let api = crate::service::source::github::GitHubHttp::new().map_err(AppError::Internal)?;
+        let api =
+            crate::server::handlers::service_ops::source_check_api().map_err(AppError::Internal)?;
         crate::server::handlers::service_ops::mint_add(&state, &vault_id, &mut op, &api)
             .await
             .map_err(AppError::BadRequest)?;

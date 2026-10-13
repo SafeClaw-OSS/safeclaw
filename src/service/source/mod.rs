@@ -156,16 +156,38 @@ impl ServiceSource {
         }
     }
 
-    /// One line for humans: the source and, for GitHub, its pinned commit.
+    /// One line for humans: the source and, for GitHub, its ref and its
+    /// pinned commit (`github:owner/repo[:path] (<ref>) @ <commit>`).
     pub fn display(&self) -> String {
         match self {
             ServiceSource::Github {
-                repo, path, commit, ..
-            } => match path {
-                Some(p) => format!("github:{}:{} @ {}", repo, p, commit),
-                None => format!("github:{} @ {}", repo, commit),
-            },
+                repo,
+                path,
+                git_ref,
+                commit,
+                ..
+            } => {
+                let at = match git_ref {
+                    Some(r) => r.as_str(),
+                    None => "default branch",
+                };
+                match path {
+                    Some(p) => format!("github:{}:{} ({}) @ {}", repo, p, at, commit),
+                    None => format!("github:{} ({}) @ {}", repo, at, commit),
+                }
+            }
             ServiceSource::Local { name } => format!("local folder {}", name),
+        }
+    }
+
+    /// The ref a GitHub source is pinned at, as a sentence names it: `'<ref>'`,
+    /// or `the default branch`.
+    pub fn ref_label(&self) -> String {
+        match self {
+            ServiceSource::Github {
+                git_ref: Some(r), ..
+            } => format!("'{}'", r),
+            _ => "the default branch".to_string(),
         }
     }
 }
@@ -270,11 +292,18 @@ impl StoredService {
 /// changed one without the text leaving the daemon.
 pub fn definition_digest(service: &str, policy: Option<&str>) -> String {
     use sha2::{Digest, Sha256};
+    // Each part length-prefixed, the policy tagged present or absent: two
+    // different (service, policy) pairs never hash the same input.
     let mut h = Sha256::new();
+    h.update((service.len() as u64).to_be_bytes());
     h.update(service.as_bytes());
-    if let Some(p) = policy {
-        h.update([0u8]);
-        h.update(p.as_bytes());
+    match policy {
+        None => h.update([0u8]),
+        Some(p) => {
+            h.update([1u8]);
+            h.update((p.len() as u64).to_be_bytes());
+            h.update(p.as_bytes());
+        }
     }
     h.finalize().iter().map(|b| format!("{:02x}", b)).collect()
 }

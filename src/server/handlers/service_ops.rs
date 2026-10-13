@@ -272,10 +272,21 @@ pub(crate) async fn migrate_legacy_after_unlock(state: Arc<AppState>, vault_id: 
     }
 }
 
-/// How long op creation waits for GitHub to check a source before the card
-/// says it could not be checked (the requester's own request times out at
-/// 15 s).
+/// How long op creation waits for GitHub to check a source (the requester's
+/// own request times out at 15 s). Every GitHub read must be answered within
+/// it ([`source_check_api`]): no answer at all and the card says GitHub did
+/// not answer; an answer not read in full by then refuses the op.
 const SOURCE_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// What the whole check may take beyond [`SOURCE_CHECK_TIMEOUT`] (reading
+/// the tarball in memory) before the op is refused.
+const SOURCE_CHECK_GRACE: Duration = Duration::from_secs(2);
+
+/// The GitHub reader op creation checks a source with: every read answered
+/// within [`SOURCE_CHECK_TIMEOUT`] from now.
+pub(crate) fn source_check_api() -> std::result::Result<github::GitHubHttp, String> {
+    Ok(github::GitHubHttp::new()?.answering_by(tokio::time::Instant::now() + SOURCE_CHECK_TIMEOUT))
+}
 
 /// Op creation: admit the definitions, check where they come from (a GitHub
 /// source is fetched again through `api` at its pinned commit; definitions it
@@ -301,14 +312,22 @@ pub(crate) async fn mint_add<A: GitHubApi>(
         &entries,
         &state.services,
     )?;
+    // GitHub's reads carry their own deadline ([`source_check_api`]), so a
+    // check still running past it has had answers: whether it would have
+    // matched is unknown, and nothing unchecked is offered for approval.
     let check = match tokio::time::timeout(
-        SOURCE_CHECK_TIMEOUT,
+        SOURCE_CHECK_TIMEOUT + SOURCE_CHECK_GRACE,
         github::verify(api, &req.source, &req.defs),
     )
     .await
     {
         Ok(checked) => checked?,
-        Err(_) => SourceCheck::NotReached,
+        Err(_) => {
+            return Err(format!(
+                "could not verify {}: too large or too slow; nothing was stored",
+                crate::util::terminal_safe(&req.source.display())
+            ))
+        }
     };
     let (entries, _) = session(state, vault_id)?;
     let c = card::add_card(

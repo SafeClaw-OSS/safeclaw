@@ -6,7 +6,8 @@ use crate::storage::sealed_vault::PerItemVault;
 
 use crate::service::source::github::FetchError;
 
-/// GitHub as the tests see it: serves `tarball`, answers with an error, or is
+/// GitHub as the tests see it: serves `tarball` (or answers its read with an
+/// error) at the commit `main`, the default branch, is at (`a` × 40), or is
 /// out of reach.
 struct Gh(std::result::Result<Vec<u8>, FetchError>);
 
@@ -19,17 +20,30 @@ impl Gh {
     }
 }
 
+impl Gh {
+    fn reached(&self) -> std::result::Result<(), FetchError> {
+        match &self.0 {
+            Err(e @ FetchError::Unreachable(_)) => Err(e.clone()),
+            _ => Ok(()),
+        }
+    }
+}
+
 impl GitHubApi for Gh {
     async fn default_branch(&self, _o: &str, _r: &str) -> std::result::Result<String, FetchError> {
-        Err(FetchError::Unreachable("offline".into()))
+        self.reached().map(|_| "main".to_string())
     }
     async fn commit_of(
         &self,
         _o: &str,
         _r: &str,
-        _g: &str,
+        g: &str,
     ) -> std::result::Result<String, FetchError> {
-        Err(FetchError::Unreachable("offline".into()))
+        self.reached()?;
+        match g {
+            "main" => Ok("a".repeat(40)),
+            _ => Err(FetchError::Answered(format!("ref '{}' not found", g))),
+        }
     }
     async fn tarball(
         &self,
@@ -649,7 +663,22 @@ fn mint_checks_a_github_source_at_its_pinned_commit() {
     .unwrap();
     assert_eq!(signed["source_check"], json!("fetched"));
     let from = signed["from"].as_str().unwrap();
-    assert!(from.contains("fetched again on your device"), "{from}");
+    assert!(
+        from.contains("checked on your device: the default branch is at this commit"),
+        "{from}"
+    );
+    // A commit the default branch is not at (say, one pushed only to a fork,
+    // which GitHub serves through the parent repository's URLs): refused.
+    let e = mint_with(
+        &state,
+        scope(&[("a1", "a.dev")], &gh('b'), false),
+        &Gh::serving(at_commit.clone()),
+    )
+    .unwrap_err();
+    assert!(
+        e.contains(&format!("the default branch is at {}", "a".repeat(40))),
+        "{e}"
+    );
     // The requester's definitions differ from the commit's: refused.
     let e = mint_with(
         &state,
@@ -658,17 +687,17 @@ fn mint_checks_a_github_source_at_its_pinned_commit() {
     )
     .unwrap_err();
     assert!(e.contains("not what github:acme/tools"), "{e}");
-    // GitHub out of reach (a transport error, a timeout, a 5xx): stated, not
-    // checked.
+    // GitHub not answering (a transport error, no answer in time): stated,
+    // not checked.
     let signed = mint(&state, scope(&[("a1", "a.dev")], &gh('a'), false)).unwrap();
     assert_eq!(signed["source_check"], json!("not-reached"));
     assert!(signed["from"]
         .as_str()
         .unwrap()
         .contains("as stated by the requester"));
-    // A definitive answer from GitHub (not found, refused, too large) refuses
-    // the op.
-    for answer in [404u16, 422, 403] {
+    // An answer from GitHub without the data (not found, refused, a server
+    // error, too large or too slow) refuses the op.
+    for answer in [404u16, 422, 403, 502] {
         let gh_answer = Gh(Err(crate::service::source::github::status_problem(
             answer,
             "github:acme/tools",
@@ -690,10 +719,6 @@ fn mint_checks_a_github_source_at_its_pinned_commit() {
         &oversize
     )
     .is_err());
-    assert!(matches!(
-        crate::service::source::github::status_problem(502, "x"),
-        FetchError::Unreachable(_)
-    ));
     // A local folder cannot be checked here.
     let local = ServiceSource::Local {
         name: "mine".into(),

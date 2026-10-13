@@ -92,22 +92,26 @@ fn rule_summary(r: &PolicyRule) -> RuleSummary {
     }
 }
 
-/// An approval window that is not the default one, as a card shows it.
-fn non_default_window(ttl: Option<u64>) -> Option<String> {
-    ttl.filter(|t| *t != crate::proxy::handler::DEFAULT_ASK_TTL)
-        .map(|t| format!("approval lasts {}s", t))
+/// An approval window the definition states, as a card shows it: every
+/// stated value, the default one's too (a rule's own window overrides a
+/// shorter one the owner set, so it is never hidden as "the default").
+fn stated_window(ttl: Option<u64>) -> Option<String> {
+    ttl.map(|t| format!("approval lasts {}s", t))
 }
 
 /// A rule as the card shows it: the label (display text from the definition)
-/// with what the rule actually matches beside it, the level, and an approval
-/// window that is not the default one.
+/// with what the rule actually matches beside it (always shown), the level,
+/// and the approval window it states.
 fn card_rule_line(r: &RuleSummary) -> String {
-    let mut line = match &r.label {
-        Some(l) if !r.key.is_empty() => format!("{} [{}]: {}", l, r.key, r.level),
-        Some(l) => format!("{}: {}", l, r.level),
-        None => r.text.clone(),
+    let matched = match r.key.trim() {
+        "" => "every request",
+        k => k,
     };
-    if let Some(w) = non_default_window(r.ttl) {
+    let mut line = match &r.label {
+        Some(l) => format!("{} [{}]: {}", l, matched, r.level),
+        None => format!("{}: {}", matched, r.level),
+    };
+    if let Some(w) = stated_window(r.ttl) {
         line.push_str(", ");
         line.push_str(&w);
     }
@@ -355,13 +359,16 @@ fn loosened(id: &str, o: &DefSummary, n: &DefSummary, out: &mut Vec<String>) {
 /// stamped on the card (`source_check`) at op creation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceCheck {
-    /// The GitHub source was fetched again at its pinned commit on this
-    /// device and its definitions match the request's.
+    /// On this device: the GitHub source's ref is at its pinned commit, and
+    /// that commit, fetched again, holds the request's definitions.
     Fetched,
     /// A local folder: only the requester read it.
     LocalFolder,
-    /// GitHub could not be reached (or did not answer) to check it.
+    /// GitHub did not answer to check it (no response arrived).
     NotReached,
+    /// The ref is a commit id: a commit is the repository's only as the head
+    /// of one of its branches or tags, so it cannot be checked.
+    CommitRef,
 }
 
 impl SourceCheck {
@@ -370,6 +377,7 @@ impl SourceCheck {
             SourceCheck::Fetched => "fetched",
             SourceCheck::LocalFolder => "local",
             SourceCheck::NotReached => "not-reached",
+            SourceCheck::CommitRef => "commit-ref",
         }
     }
 
@@ -378,25 +386,32 @@ impl SourceCheck {
             SourceCheck::Fetched,
             SourceCheck::LocalFolder,
             SourceCheck::NotReached,
+            SourceCheck::CommitRef,
         ]
         .into_iter()
         .find(|c| c.as_str() == s)
     }
 
-    /// The card's source line: a fact only when this device checked it,
-    /// otherwise what the requester stated, said as such.
+    /// The card's source line (with its ref and commit): a fact only when
+    /// this device checked it, otherwise what the requester stated, said as
+    /// such.
     pub fn source_line(self, source: &ServiceSource) -> String {
         match self {
             SourceCheck::Fetched => format!(
-                "{} (fetched again on your device: the definitions match)",
-                source.display()
+                "{} (checked on your device: {} is at this commit and the definitions match)",
+                source.display(),
+                source.ref_label()
             ),
             SourceCheck::LocalFolder => format!(
                 "{}, as stated by the requester (a local folder cannot be checked)",
                 source.display()
             ),
             SourceCheck::NotReached => format!(
-                "{}, as stated by the requester (GitHub could not be reached to check it)",
+                "{}, as stated by the requester (GitHub did not answer to check it)",
+                source.display()
+            ),
+            SourceCheck::CommitRef => format!(
+                "{}, as stated by the requester (a commit is checked only as the head of a branch or tag; pin one to have it checked)",
                 source.display()
             ),
         }
@@ -412,8 +427,8 @@ impl SourceCheck {
 ///   artifacts.
 /// - `oauth`: OAuth flows without PKCE (`<id>: PKCE: off`).
 /// - `tightens`: the rules they apply (`<id>: <label> [<match>]: <level>`,
-///   with `, approval lasts <n>s` for a window that is not the default one),
-///   the `[default]` levels, and a `[default]` window that is not the default.
+///   with `, approval lasts <n>s` for a window the rule states), the
+///   `[default]` levels, and the `[default]` window when stated.
 /// - `replaces`: services already stored from this source, replaced.
 /// - `removes`: services stored from this source that it no longer has.
 /// - `new_destinations`: destinations none of the replaced services had
@@ -594,7 +609,7 @@ pub fn add_card(
                     .push(format!("{}: default {}: {}", id, dir, l));
             }
         }
-        if let Some(w) = non_default_window(s.ttl) {
+        if let Some(w) = stated_window(s.ttl) {
             card.tightens.push(format!("{}: default {}", id, w));
         }
     }
