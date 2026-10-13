@@ -64,11 +64,12 @@ pub fn render_operation(op: &Operation) -> String {
     }
 }
 
-/// A brokered Use op. Surface the request line (method + host + path) and, for
-/// a Phase-2 scope, the consent — so a HEADLESS / CLI approver (no console)
-/// sees what the console's rich card shows, not just the target slot. The
-/// `consent` template is interpolated over the bound `scope_vars`; with none,
-/// the bound fields are listed. (A `render` hint is a console-only concern.)
+/// A brokered Use op. Surface the request line (method + host + path), for a
+/// Phase-2 scope the consent, and what approving grants (the signed `level`,
+/// `reuse` and `window_s`), so a HEADLESS / CLI approver (no console) sees
+/// what the console's card shows, not just the target slot. The `consent`
+/// template is interpolated over the bound `scope_vars`; with none, the bound
+/// fields are listed. (A `render` hint is a console-only concern.)
 fn render_use(op: &Operation) -> String {
     let scope = &op.act.scope;
     let s = |k: &str| scope.get(k).and_then(|v| v.as_str()).unwrap_or("");
@@ -103,9 +104,60 @@ fn render_use(op: &Operation) -> String {
     } else {
         format!("the secret at \"{}\"", op.act.target)
     };
-    match consent_line {
+    let mut out = match consent_line {
         Some(c) => format!("Brokered call: {}\n{}", request, c),
         None => format!("Use {} for a brokered call.", request),
+    };
+    if let Some(g) = grant_line(scope) {
+        out.push('\n');
+        out.push_str(&g);
+    }
+    out
+}
+
+/// What approving a Use op grants, from its signed `level`, `reuse` (with the
+/// rule's label or id, or the floor's class) and `window_s`. `None` when the
+/// scope carries no signed level.
+fn grant_line(scope: &serde_json::Value) -> Option<String> {
+    let s = |k: &str| scope.get(k).and_then(|v| v.as_str());
+    let level = s("level")?;
+    let window = scope
+        .get("window_s")
+        .and_then(|v| v.as_u64())
+        .map(|w| format!(" for {}", human_window(w)))
+        .unwrap_or_default();
+    let class = crate::approval::reuse::Class::of(s("method").unwrap_or("")).as_str();
+    let reuse = match s("reuse") {
+        Some("none") if level == "allow" => "none".to_string(),
+        Some("none") => "none (this request only)".to_string(),
+        Some("exact") => format!("exact (this identical request){}", window),
+        Some("rule") => format!(
+            "rule \"{}\" ({} requests it decides){}",
+            truncate(s("reuse_label").or(s("reuse_rule")).unwrap_or(""), 80),
+            class,
+            window
+        ),
+        Some("floor") => format!(
+            "floor ({} requests no rule matches){}",
+            s("reuse_class").unwrap_or(""),
+            window
+        ),
+        Some(other) => format!("{}{}", truncate(other, 40), window),
+        None => "not stated".to_string(),
+    };
+    Some(format!(
+        "Policy: {}; reuse: {}.",
+        truncate(level, 20),
+        reuse
+    ))
+}
+
+/// `900` → "15 min", `90` → "90s".
+fn human_window(secs: u64) -> String {
+    if secs >= 60 && secs % 60 == 0 {
+        format!("{} min", secs / 60)
+    } else {
+        format!("{}s", secs)
     }
 }
 
@@ -143,5 +195,77 @@ fn truncate(s: &str, n: usize) -> String {
         s.to_string()
     } else {
         format!("{}…", s.chars().take(n).collect::<String>())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::operation::{Act, Bind, Valid};
+    use serde_json::json;
+
+    fn use_op(scope: serde_json::Value) -> Operation {
+        Operation {
+            act: Act {
+                kind: ActType::Use,
+                target: "GITHUB_TOKEN".into(),
+                scope,
+            },
+            bind: Bind {
+                redeemer: "v1".into(),
+                recipient: None,
+            },
+            valid: Valid::single_use(0, Some(300)),
+        }
+    }
+
+    /// A CLI / headless approver reads the level, the reuse (rule label or
+    /// floor class, with the request's class for a rule) and the window.
+    #[test]
+    fn use_line_states_level_reuse_and_window() {
+        let base = json!({ "method": "POST", "host": "api.github.com", "path": "/x" });
+        let with = |extra: serde_json::Value| {
+            let mut s = base.clone();
+            for (k, v) in extra.as_object().unwrap() {
+                s[k] = v.clone();
+            }
+            render_operation(&use_op(s))
+        };
+        let rule = with(json!({
+            "level": "ask", "reuse": "rule", "reuse_rule": "send",
+            "reuse_label": "Send email", "window_s": 900
+        }));
+        assert!(
+            rule.starts_with("Use POST api.github.com/x for a brokered call."),
+            "{rule}"
+        );
+        assert!(
+            rule.ends_with(
+                "Policy: ask; reuse: rule \"Send email\" (write requests it decides) for 15 min."
+            ),
+            "{rule}"
+        );
+        let floor = with(json!({
+            "method": "GET", "level": "ask", "reuse": "floor", "reuse_class": "read", "window_s": 90
+        }));
+        assert!(
+            floor.ends_with("Policy: ask; reuse: floor (read requests no rule matches) for 90s."),
+            "{floor}"
+        );
+        let always = with(json!({ "level": "ask-always", "reuse": "none" }));
+        assert!(
+            always.ends_with("Policy: ask-always; reuse: none (this request only)."),
+            "{always}"
+        );
+        let exact =
+            with(json!({ "level": "ask", "reuse": "exact", "window_s": 120, "scoped": true }));
+        assert!(
+            exact.ends_with("reuse: exact (this identical request) for 2 min."),
+            "{exact}"
+        );
+        // No signed level: no grant line is invented.
+        let bare = render_operation(&use_op(base.clone()));
+        assert_eq!(bare, "Use POST api.github.com/x for a brokered call.");
+        assert!(!bare.contains('\u{2014}') && !rule.contains('\u{2014}'));
     }
 }

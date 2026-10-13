@@ -430,12 +430,16 @@ pub(crate) fn apply_connection_rm_to_view(
     let plan = if keep_secrets {
         crate::storage::plaintext::ConnectionRemoval::default()
     } else {
+        let (custom, _) = crate::service::vault_custom_services(&view.aux.services, reg);
         crate::storage::plaintext::connection_removal(
             id,
             &rec,
             &view.aux.connections,
             &view.native_secrets,
-            reg,
+            &crate::service::ServiceDefs {
+                reg,
+                custom: &custom,
+            },
         )
     };
     let mut removed = Vec::new();
@@ -1901,14 +1905,20 @@ pub async fn approve_op(
                     view.native_secrets.keys().cloned().collect();
 
                 // What the owner approved must be what this write does.
+                let (custom_defs, _) =
+                    crate::service::vault_custom_services(&view.aux.services, &state.services);
                 let card = crate::server::handlers::connection_add::card(
                     &id,
+                    service.as_deref(),
                     def.as_ref(),
                     &hosts,
                     &slots,
                     &view.aux.connections,
                     &native,
-                    &state.services,
+                    &crate::service::ServiceDefs {
+                        reg: &state.services,
+                        custom: &custom_defs,
+                    },
                 );
                 crate::server::handlers::connection_add::assert_card(scope, &card)
                     .map_err(AppError::BadRequest)?;
@@ -2869,24 +2879,12 @@ pub(crate) fn bootstrap_cache_from_view(
     // Custom (per-vault `aux.services`) definitions: validate before they can
     // broker (defense in depth — never trust the stored blob), never shadow a
     // built-in id, load only if valid. Wiped on lock with the rest of the cache.
-    for (service_id, toml_src) in view.aux.services.iter() {
-        if state.services.get(service_id).is_some() {
-            tracing::warn!(service = %service_id, "custom service shadows a built-in id — skipped");
-            continue;
-        }
-        if let Err(e) = crate::service::validate::validate_service(toml_src) {
-            tracing::warn!(service = %service_id, "custom service failed validation: {:?} — skipped", e);
-            continue;
-        }
-        match toml::from_str::<crate::service::ServiceDef>(toml_src) {
-            Ok(def) => {
-                cache.custom_services.insert(service_id.clone(), def);
-            }
-            Err(e) => {
-                tracing::warn!(service = %service_id, "custom service parse failed: {} — skipped", e)
-            }
-        }
+    let (custom, skipped) =
+        crate::service::vault_custom_services(&view.aux.services, &state.services);
+    for (service_id, reason) in skipped {
+        tracing::warn!(service = %service_id, "custom service {} — skipped", reason);
     }
+    cache.custom_services = custom;
     cache
 }
 

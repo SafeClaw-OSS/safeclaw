@@ -16,7 +16,9 @@
 //! Grammar: `{{vars.target}}` and `{{vars.scope.<key>}}`, optional `|filter`
 //! accepted-and-ignored (display filters are a console concern). P3 rule:
 //! undefined/empty renders empty; `false` renders empty; `true` renders "yes";
-//! arrays join with ", ". A fact row whose value renders empty is omitted.
+//! arrays join with ", "; an object renders its distinct string values (in
+//! key order) joined with ", ". A fact row whose value renders empty is
+//! omitted.
 
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
@@ -177,6 +179,16 @@ fn render_value(v: Option<&serde_json::Value>) -> String {
             .filter_map(|x| x.as_str())
             .collect::<Vec<_>>()
             .join(", "),
+        // A slot → KEY map (the connection-add card): the KEYs, each once.
+        Some(serde_json::Value::Object(m)) => {
+            let mut out: Vec<&str> = Vec::new();
+            for v in m.values().filter_map(|x| x.as_str()) {
+                if !out.contains(&v) {
+                    out.push(v);
+                }
+            }
+            out.join(", ")
+        }
         _ => String::new(),
     }
 }
@@ -250,7 +262,12 @@ mod tests {
                 "hosts": ["api.xiaomimimo.com"],
                 "secrets": ["MIMO_API_TOKEN"],
                 "values_digest": "aa",
-                "destinations": ["api.xiaomimimo.com"]
+                "destinations": ["api.xiaomimimo.com"],
+                "written": { "MIMO_API_TOKEN": "MIMO_API_TOKEN" },
+                "referenced": {},
+                "overwrites": [],
+                "shared_with": {},
+                "replaces": false,
             }),
         );
         let c = consent_for(&o).expect("descriptor");
@@ -263,7 +280,49 @@ mod tests {
             .contains(&("Sends to".into(), "api.xiaomimimo.com".into())));
         assert!(c
             .facts
-            .contains(&("Secret in use".into(), "MIMO_API_TOKEN".into())));
+            .contains(&("Stores new value".into(), "MIMO_API_TOKEN".into())));
+        // Empty card fields (and `replaces: false`) omit their rows.
+        let labels: Vec<&str> = c.facts.iter().map(|(l, _)| l.as_str()).collect();
+        assert_eq!(labels, vec!["Sends to", "Stores new value"]);
+    }
+
+    /// The connection-add facts come from the daemon-stamped card, never
+    /// from the requester's `secrets` list.
+    #[test]
+    fn connection_add_facts_come_from_the_card() {
+        let o = op(
+            "connection-add",
+            "codex_x",
+            json!({
+                "service": "openai_codex",
+                "secrets": ["REQUESTER_SAYS_THIS"],
+                "destinations": ["chatgpt.com", "auth.openai.com"],
+                "written": { "A": "NEW_A" },
+                "referenced": { "R1": "OLD_KEY", "R2": "OLD_KEY" },
+                "overwrites": ["NEW_A"],
+                "shared_with": {},
+                "replaces": true,
+            }),
+        );
+        let c = consent_for(&o).unwrap();
+        let get = |l: &str| {
+            c.facts
+                .iter()
+                .find(|(k, _)| k == l)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(get("Uses existing secret"), Some("OLD_KEY"));
+        assert_eq!(get("Stores new value"), Some("NEW_A"));
+        assert_eq!(get("Overwrites"), Some("NEW_A"));
+        assert_eq!(get("Replaces existing connection"), Some("yes"));
+        assert!(c
+            .facts
+            .iter()
+            .all(|(_, v)| !v.contains("REQUESTER_SAYS_THIS")));
+        let line = crate::protocol::render::render_operation(&o);
+        assert!(line.contains("Uses existing secret: OLD_KEY"), "{line}");
+        assert!(line.contains("Overwrites: NEW_A"), "{line}");
+        assert!(!line.contains("REQUESTER_SAYS_THIS"), "{line}");
     }
 
     #[test]

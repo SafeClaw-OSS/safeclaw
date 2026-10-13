@@ -777,6 +777,68 @@ fn parse_access_level(s: Option<&String>) -> Option<crate::core::policy::AccessL
     }
 }
 
+// ── Vault-custom definitions ──────────────────────────────────────────────────
+
+/// A vault's own service definitions (`aux.services`, id → toml) as the daemon
+/// brokers them: every def that validates and whose id is not a compiled one
+/// (a custom def never shadows a built-in). The skipped ids come back with
+/// the reason. The unlock bootstrap loads exactly this set, so every other
+/// reader of `aux.services` agrees with what the proxy resolves.
+pub fn vault_custom_services(
+    aux_services: &std::collections::BTreeMap<String, String>,
+    reg: &ServiceRegistry,
+) -> (HashMap<String, ServiceDef>, Vec<(String, String)>) {
+    let mut defs = HashMap::new();
+    let mut skipped = Vec::new();
+    for (id, toml_src) in aux_services {
+        if reg.get(id).is_some() {
+            skipped.push((id.clone(), "shadows a built-in id".to_string()));
+            continue;
+        }
+        if let Err(e) = validate::validate_service(toml_src) {
+            skipped.push((id.clone(), format!("failed validation: {:?}", e)));
+            continue;
+        }
+        match toml::from_str::<ServiceDef>(toml_src) {
+            Ok(def) => {
+                defs.insert(id.clone(), def);
+            }
+            Err(e) => skipped.push((id.clone(), format!("parse failed: {}", e))),
+        }
+    }
+    (defs, skipped)
+}
+
+/// The definitions a vault's connections resolve against: the vault's own
+/// (custom) defs first, else the compiled registry, the same lookup the proxy
+/// uses for a connection's service.
+#[derive(Clone, Copy)]
+pub struct ServiceDefs<'a> {
+    pub reg: &'a ServiceRegistry,
+    pub custom: &'a HashMap<String, ServiceDef>,
+}
+
+impl<'a> ServiceDefs<'a> {
+    pub fn get(&self, id: &str) -> Option<&'a ServiceDef> {
+        self.custom.get(id).or_else(|| self.reg.get(id))
+    }
+
+    /// Every service id a connection could name (compiled ∪ custom), sorted
+    /// and deduplicated.
+    pub fn ids(&self) -> Vec<&'a str> {
+        let mut ids: Vec<&'a str> = self
+            .reg
+            .iter_sorted()
+            .into_iter()
+            .map(|(id, _)| id)
+            .chain(self.custom.keys().map(String::as_str))
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+}
+
 // ── ServiceRegistry ───────────────────────────────────────────────────────────
 
 pub struct ServiceRegistry {

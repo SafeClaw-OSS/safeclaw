@@ -21,7 +21,8 @@ never reach an approval surface (ERC-7730 / RFC 9396 shape).
 - `| filter` is display-only. Renderers MUST accept and MAY ignore any filter.
   Currently defined: `basic` (requests only, git credential preview). Adding a
   filter requires updating BOTH renderers (core `protocol::consent` +
-  console `interpOp` in `app/grant/[id]/page.tsx`) and the shared vectors below.
+  console `interpOp` in `components/approvals/approval-view.tsx`) and the
+  shared vectors below.
 
 ## Value rendering (P3 rules — both renderers MUST match)
 
@@ -29,6 +30,8 @@ never reach an approval surface (ERC-7730 / RFC 9396 shape).
 - string → verbatim; number → decimal
 - `true` → `yes`; `false` → empty
 - array → string elements joined with `", "`
+- object → its distinct string values, in key order, joined with `", "`
+  (the connection-add card's slot → KEY maps render as their KEYs)
 - a FACT row whose value renders empty is omitted entirely
 - values are truncated (core: 120 chars + `…`)
 
@@ -38,8 +41,11 @@ never reach an approval surface (ERC-7730 / RFC 9396 shape).
 label. `explain` (+`explain_zh`) — one sentence, ALWAYS rendered inline.
 `tone` — `neutral | info | danger`; advisory upward-only (clients keep a
 built-in danger floor per act kind; a catalog can raise tone, never lower).
-`facts` — `{label, label_zh?, value}` rows; labels `Service` / `Host` /
-`Connection` / `Secret in use` map onto the console's standard pretty rows.
+`facts` — `{label, label_zh?, value}` rows; the `Connection` label maps onto
+the console's "through" line. A fact renders only daemon-stamped or
+daemon-checked fields, never a requester-supplied list: connection-add's
+facts read the card (`written`, `referenced`, `overwrites`, `destinations`,
+`replaces`), not `secrets`.
 
 ## Drift gates
 

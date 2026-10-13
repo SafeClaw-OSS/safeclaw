@@ -114,7 +114,10 @@ tone = "neutral"
 facts = [
   { label = "Service", label_zh = "服务", value = "{{vars.scope.service}}" },
   { label = "Sends to", label_zh = "发往", value = "{{vars.scope.destinations}}" },
-  { label = "Secret in use", label_zh = "使用的密钥", value = "{{vars.scope.secrets}}" },
+  { label = "Uses existing secret", label_zh = "使用已有密钥", value = "{{vars.scope.referenced}}" },
+  { label = "Stores new value", label_zh = "存入新值", value = "{{vars.scope.written}}" },
+  { label = "Overwrites", label_zh = "覆盖", value = "{{vars.scope.overwrites}}" },
+  { label = "Replaces existing connection", label_zh = "替换同名连接", value = "{{vars.scope.replaces}}" },
 ]
 
 [acts.secret-set]

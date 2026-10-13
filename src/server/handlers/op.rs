@@ -32,6 +32,7 @@ pub async fn create(
 ) -> Result<Json<Value>> {
     validate_vault_id(&vault_id)?;
     reject_broker_kind(&op.act.kind)?;
+    check_scope_shape(&op.act.scope)?;
     // F-11: validate op.act.target length. A 256-char cap prevents
     // unbounded strings from reaching audit rows and downstream handlers.
     // Character set is not enforced globally (target syntax is act-kind
@@ -412,6 +413,18 @@ pub async fn reap_abandoned_exports_loop(state: Arc<AppState>) {
 /// Control-plane ops (Enroll, Write, Export, Custom("vault-unlock"/...))
 /// pass through; they're user-initiated state changes authorized by a
 /// passkey-signed grant.
+/// An op's scope is a JSON object, or null (no scope). Anything else is
+/// refused before any handler reads or stamps fields into it.
+fn check_scope_shape(scope: &Value) -> Result<()> {
+    if scope.is_object() || scope.is_null() {
+        Ok(())
+    } else {
+        Err(AppError::BadRequest(
+            "op.act.scope must be a JSON object".into(),
+        ))
+    }
+}
+
 fn reject_broker_kind(kind: &ActType) -> Result<()> {
     if matches!(kind, ActType::Use) {
         return Err(AppError::BadRequest(
@@ -451,6 +464,20 @@ mod tests {
     fn reject_use_kind() {
         let r = reject_broker_kind(&ActType::Use);
         assert!(matches!(r, Err(AppError::BadRequest(_))));
+    }
+
+    /// A scope that is neither an object nor null is a 400 at op create,
+    /// for every act kind.
+    #[test]
+    fn scope_must_be_an_object_or_null() {
+        assert!(check_scope_shape(&json!({ "service": "github" })).is_ok());
+        assert!(check_scope_shape(&Value::Null).is_ok());
+        for bad in [json!([1, 2]), json!("x"), json!(7), json!(true)] {
+            assert!(
+                matches!(check_scope_shape(&bad), Err(AppError::BadRequest(_))),
+                "{bad}"
+            );
+        }
     }
 
     #[test]

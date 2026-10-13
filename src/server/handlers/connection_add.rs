@@ -18,13 +18,16 @@
 //!   named.
 //! - `overwrites`: written KEYs that already hold a value in the vault.
 //! - `destinations`: every host the bound credentials, or tokens minted from
-//!   them, are sent to: the connection's hosts (raw anchors, service pins, or
-//!   the service's declared hosts) plus a minted mechanism's token endpoint.
-//! - `shared_with`: KEY → other existing connections already bound to it.
+//!   them, are sent to: the hosts the proxy anchors the stored record to
+//!   (`core::host::resolved_hosts`: a raw connection's anchors, or a
+//!   service's exact hosts plus any pins) plus a minted mechanism's token
+//!   endpoint.
+//! - `shared_with`: KEY → other connections that can already use it,
+//!   including a service's default connection that has no record of its own.
 //! - `replaces`: a connection with this id already exists and is replaced.
 //!
 //! A slot is a service's declared secret role, or for a raw connection the
-//! KEY itself.
+//! KEY itself. Every KEY the op names (`secrets`) must fill a slot.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -46,14 +49,22 @@ pub(crate) struct Card {
 
 impl Card {
     /// Write the card into an op scope (overwrites any requester-supplied
-    /// values of these fields).
-    pub fn stamp(&self, scope: &mut Value) {
-        scope["written"] = json!(self.written);
-        scope["referenced"] = json!(self.referenced);
-        scope["overwrites"] = json!(self.overwrites);
-        scope["destinations"] = json!(self.destinations);
-        scope["shared_with"] = json!(self.shared_with);
-        scope["replaces"] = json!(self.replaces);
+    /// values of these fields). A null scope becomes an object; any other
+    /// non-object scope is refused.
+    pub fn stamp(&self, scope: &mut Value) -> Result<(), String> {
+        if scope.is_null() {
+            *scope = json!({});
+        }
+        let Some(o) = scope.as_object_mut() else {
+            return Err("op.act.scope must be a JSON object".into());
+        };
+        o.insert("written".into(), json!(self.written));
+        o.insert("referenced".into(), json!(self.referenced));
+        o.insert("overwrites".into(), json!(self.overwrites));
+        o.insert("destinations".into(), json!(self.destinations));
+        o.insert("shared_with".into(), json!(self.shared_with));
+        o.insert("replaces".into(), json!(self.replaces));
+        Ok(())
     }
 
     /// Read the signed card back out of an op scope. Every field is required.
@@ -209,7 +220,8 @@ pub(crate) struct Requested {
 /// through the op's `keys` map (role matched case-insensitively) or, absent
 /// an entry, the role's own name (the identity binding `secret_key_for`
 /// applies); a role is NAMED when it has a `keys` entry or its KEY is in the
-/// op's `secrets`, and implicit otherwise.
+/// op's `secrets`, and implicit otherwise. A `secrets` entry that fills no
+/// slot is refused: the op names only keys the connection binds.
 pub(crate) fn requested_slots(
     scope: &Value,
     def: Option<&ServiceDef>,
@@ -260,7 +272,7 @@ pub(crate) fn requested_slots(
                     ));
                 }
             }
-            Ok(roles
+            let slots: Vec<Requested> = roles
                 .iter()
                 .map(
                     |role| match keys.iter().find(|(r, _)| r.eq_ignore_ascii_case(role)) {
@@ -276,7 +288,19 @@ pub(crate) fn requested_slots(
                         },
                     },
                 )
-                .collect())
+                .collect();
+            for n in &named {
+                if !slots.iter().any(|s| s.key.eq_ignore_ascii_case(n)) {
+                    return Err(format!(
+                        "'{}' is not bound to any secret of service '{}' (bind it with `--from-secret <ROLE>={}`; its secrets: {})",
+                        n,
+                        def.service.id,
+                        n,
+                        roles.join(", ")
+                    ));
+                }
+            }
+            Ok(slots)
         }
     }
 }
@@ -295,8 +319,12 @@ pub(crate) fn canonical_key(key: &str, native: &BTreeSet<String>) -> String {
         .unwrap_or_else(|| key.to_string())
 }
 
-/// Every host the bound credentials (or tokens minted from them) reach.
-pub(crate) fn destinations(def: Option<&ServiceDef>, hosts: &[String]) -> Vec<String> {
+/// Every host the bound credentials (or tokens minted from them) reach: the
+/// hosts the proxy anchors `rec` to ([`crate::core::host::resolved_hosts`],
+/// the same function the proxy enforces with) plus a minted mechanism's
+/// token endpoint. `rec` carries the record's `service` and `hosts` as
+/// [`record`] stores them.
+pub(crate) fn destinations(rec: &Connection, def: Option<&ServiceDef>) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut push = |h: &str| {
         let h = h.trim();
@@ -304,34 +332,22 @@ pub(crate) fn destinations(def: Option<&ServiceDef>, hosts: &[String]) -> Vec<St
             out.push(h.to_string());
         }
     };
-    match def {
-        None => hosts.iter().for_each(|h| push(h)),
-        Some(def) => {
-            if hosts.is_empty() {
-                def.service.hosts.iter().for_each(|h| push(h));
-            } else {
-                hosts.iter().for_each(|h| push(h));
-            }
-            let token_url = match def.auth.as_ref() {
-                Some(crate::service::AuthDef::Oauth2(o)) => o.token_url.clone(),
-                Some(crate::service::AuthDef::Snaplii(_)) => {
-                    Some(crate::auth::snaplii::TOKEN_URL.to_string())
-                }
-                None => None,
-            };
-            if let Some(host) = token_url
-                .as_deref()
-                .and_then(|u| url::Url::parse(u).ok())
-                .and_then(|u| u.host_str().map(str::to_string))
-            {
-                let covered = out
-                    .iter()
-                    .any(|o| crate::core::host::wildcard_matches(o, &host));
-                if !covered {
-                    out.push(host);
-                }
-            }
+    for h in crate::core::host::resolved_hosts(rec, def) {
+        push(&h);
+    }
+    let token_url = match def.and_then(|d| d.auth.as_ref()) {
+        Some(crate::service::AuthDef::Oauth2(o)) => o.token_url.clone(),
+        Some(crate::service::AuthDef::Snaplii(_)) => {
+            Some(crate::auth::snaplii::TOKEN_URL.to_string())
         }
+        None => None,
+    };
+    if let Some(host) = token_url
+        .as_deref()
+        .and_then(|u| url::Url::parse(u).ok())
+        .and_then(|u| u.host_str().map(str::to_string))
+    {
+        push(&host);
     }
     out
 }
@@ -399,19 +415,25 @@ pub(crate) async fn resolve_slots(
     Ok(slots)
 }
 
-/// The card for connection `id` binding `slots` = `(slot, canonical KEY,
-/// written?)`, against the vault's current `connections` and native key names.
+/// The card for connection `id` (`service`, `hosts` as requested) binding
+/// `slots` = `(slot, canonical KEY, written?)`, against the vault's current
+/// `connections`, native key names, and service definitions (`defs`,
+/// custom-first).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn card(
     id: &str,
+    service: Option<&str>,
     def: Option<&ServiceDef>,
     hosts: &[String],
     slots: &[(String, String, bool)],
     connections: &BTreeMap<String, Connection>,
     native: &BTreeSet<String>,
-    reg: &crate::service::ServiceRegistry,
+    defs: &crate::service::ServiceDefs,
 ) -> Card {
+    // The record as stored: its service and hosts are what the proxy anchors.
+    let anchors = record(service, hosts, None, &[], None);
     let mut c = Card {
-        destinations: destinations(def, hosts),
+        destinations: destinations(&anchors, def),
         replaces: connections.contains_key(id),
         ..Default::default()
     };
@@ -426,7 +448,7 @@ pub(crate) fn card(
         }
     }
     c.overwrites.sort();
-    let claims = crate::storage::plaintext::connection_claims_in(connections, reg, id);
+    let claims = crate::storage::plaintext::connection_claims_in(connections, defs, id);
     let bound: BTreeSet<&String> = c.written.values().chain(c.referenced.values()).collect();
     for key in bound {
         let mut by: Vec<String> = claims
@@ -468,6 +490,9 @@ pub(crate) fn stamp_at_mint(
     if !crate::cli::conn::valid_conn_id(&id) {
         return Err(format!("'{}' is not a valid connection id", id));
     }
+    if !(op.act.scope.is_object() || op.act.scope.is_null()) {
+        return Err("op.act.scope must be a JSON object".into());
+    }
     let scope = &op.act.scope;
     let service = scope
         .get("service")
@@ -490,7 +515,7 @@ pub(crate) fn stamp_at_mint(
             .collect(),
         None => BTreeSet::new(),
     };
-    let (connections, native, custom, has_external) = {
+    let (connections, native, custom_defs, has_external) = {
         let states = state.vault_states.lock().unwrap();
         match states.get(vault_id) {
             Some(crate::state::VaultState::Unlocked { cache, .. }) => (
@@ -500,20 +525,29 @@ pub(crate) fn stamp_at_mint(
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect::<BTreeMap<_, _>>(),
                 cache.native_keys.iter().cloned().collect::<BTreeSet<_>>(),
-                service
-                    .as_deref()
-                    .and_then(|s| cache.custom_services.get(s).cloned()),
+                cache.custom_services.clone(),
                 !cache.external_store_order.is_empty(),
             ),
             _ => return Err(crate::error::VAULT_LOCKED_MSG.to_string()),
         }
     };
+    let custom = service.as_deref().and_then(|s| custom_defs.get(s));
     let def = match &service {
-        Some(svc) => Some(resolve_def(svc, custom.as_ref(), &state.services)?),
+        Some(svc) => Some(resolve_def(svc, custom, &state.services)?),
         None => None,
     };
+    let requested = requested_slots(scope, def.as_ref())?;
+    // Same rule as apply (`resolve_slots`): every deposited KEY fills a slot.
+    for k in &deposited {
+        if !requested.iter().any(|r| r.key == *k) {
+            return Err(format!(
+                "deposited key '{}' is not bound to any slot of this connection",
+                k
+            ));
+        }
+    }
     let mut slots: Vec<(String, String, bool)> = Vec::new();
-    for r in requested_slots(scope, def.as_ref())? {
+    for r in requested {
         if deposited.contains(&r.key) {
             slots.push((r.slot, r.key, true));
             continue;
@@ -536,15 +570,18 @@ pub(crate) fn stamp_at_mint(
     }
     let c = card(
         &id,
+        service.as_deref(),
         def.as_ref(),
         &hosts,
         &slots,
         &connections,
         &native,
-        &state.services,
+        &crate::service::ServiceDefs {
+            reg: &state.services,
+            custom: &custom_defs,
+        },
     );
-    c.stamp(&mut op.act.scope);
-    Ok(())
+    c.stamp(&mut op.act.scope)
 }
 
 /// Apply-time: the signed card must equal the card recomputed from the opened
@@ -642,6 +679,25 @@ mod tests {
             "{e}"
         );
         assert!(e.contains("CLOUDFLARE_API_TOKEN"), "{e}");
+        // A `secrets` entry that fills no slot is refused: the op names only
+        // keys the connection binds.
+        let stray = json!({
+            "service": "cloudflare",
+            "secrets": ["CF_TOKEN_WORK", "SOMETHING_ELSE"],
+            "keys": { "CLOUDFLARE_API_TOKEN": "CF_TOKEN_WORK" },
+        });
+        let e = requested_slots(&stray, Some(cf)).unwrap_err();
+        assert!(
+            e.contains("'SOMETHING_ELSE' is not bound to any secret of service 'cloudflare'"),
+            "{e}"
+        );
+        // Bound through `keys` (any case) or the identity binding: fine.
+        let ok = json!({
+            "service": "cloudflare",
+            "secrets": ["cf_token_work", "CLOUDFLARE_ACCOUNT_ID"],
+            "keys": { "CLOUDFLARE_API_TOKEN": "CF_TOKEN_WORK" },
+        });
+        assert!(requested_slots(&ok, Some(cf)).is_ok());
     }
 
     fn req(slot: &str, key: &str, implicit: bool) -> Requested {
@@ -661,24 +717,76 @@ mod tests {
         );
     }
 
+    fn no_custom() -> std::collections::HashMap<String, ServiceDef> {
+        std::collections::HashMap::new()
+    }
+
+    /// The destinations are exactly the hosts the proxy anchors the stored
+    /// record to (`resolved_hosts`), plus a minted mechanism's token host.
     #[test]
-    fn destinations_include_the_token_endpoint() {
+    fn destinations_are_the_anchored_hosts_and_the_token_endpoint() {
         let r = reg();
+        let at = |service: Option<&str>, def: Option<&ServiceDef>, hosts: &[&str]| {
+            let hosts: Vec<String> = hosts.iter().map(|h| h.to_string()).collect();
+            let rec = record(service, &hosts, None, &[], None);
+            let d = destinations(&rec, def);
+            let lower = |v: Vec<String>| -> BTreeSet<String> {
+                v.into_iter().map(|h| h.to_ascii_lowercase()).collect()
+            };
+            assert_eq!(
+                lower(
+                    d.iter()
+                        .filter(|h| !h.eq_ignore_ascii_case("auth.openai.com"))
+                        .cloned()
+                        .collect()
+                ),
+                lower(crate::core::host::resolved_hosts(&rec, def)),
+                "the card lists what the proxy anchors"
+            );
+            d
+        };
         let codex = r.get("openai_codex").unwrap();
         assert_eq!(
-            destinations(Some(codex), &[]),
+            at(Some("openai_codex"), Some(codex), &[]),
             vec!["chatgpt.com", "api.openai.com", "auth.openai.com"]
         );
-        // Pins replace the API hosts; the token endpoint still applies.
+        // A pin adds to the service's exact hosts; it never replaces them,
+        // because the proxy anchors both.
         assert_eq!(
-            destinations(Some(codex), &["chatgpt.com".into()]),
-            vec!["chatgpt.com", "auth.openai.com"]
+            at(Some("openai_codex"), Some(codex), &["chatgpt.com"]),
+            vec!["chatgpt.com", "api.openai.com", "auth.openai.com"]
+        );
+        let mixed: ServiceDef = toml::from_str(
+            r#"
+[service]
+id = "mixed"
+name = "Mixed"
+hosts = ["api.x.example", "*.x.example"]
+secrets = ["MIXED_KEY"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            at(Some("mixed"), Some(&mixed), &["eu.x.example"]),
+            vec!["api.x.example", "eu.x.example"]
+        );
+        // A wildcard is never anchored, so it is never listed: with no pin,
+        // a wildcard-only service sends nowhere.
+        let alchemy = r.get("alchemy").unwrap();
+        assert!(at(Some("alchemy"), Some(alchemy), &[]).is_empty());
+        assert_eq!(
+            at(
+                Some("alchemy"),
+                Some(alchemy),
+                &["eth-mainnet.g.alchemy.com"]
+            ),
+            vec!["eth-mainnet.g.alchemy.com"]
         );
         // Static service: its hosts only. Raw: its anchors.
         let gh = r.get("github").unwrap();
-        assert_eq!(destinations(Some(gh), &[]), gh.service.hosts);
+        assert_eq!(at(Some("github"), Some(gh), &[]), gh.service.hosts);
         assert_eq!(
-            destinations(None, &["a.example.com".into(), "A.example.com".into()]),
+            at(None, None, &["a.example.com", "A.example.com"]),
             vec!["a.example.com"]
         );
     }
@@ -706,7 +814,21 @@ mod tests {
             "HEJIA_OAI_REFRESH_TOKEN_X".to_string(),
             false,
         )];
-        let c = card("codex_x", Some(codex), &[], &slots, &conns, &native, &r);
+        let custom = no_custom();
+        let defs = crate::service::ServiceDefs {
+            reg: &r,
+            custom: &custom,
+        };
+        let c = card(
+            "codex_x",
+            Some("openai_codex"),
+            Some(codex),
+            &[],
+            &slots,
+            &conns,
+            &native,
+            &defs,
+        );
         assert!(c.written.is_empty());
         assert_eq!(
             c.referenced
@@ -727,17 +849,38 @@ mod tests {
         let native: BTreeSet<String> = ["GITHUB_TOKEN".to_string()].into();
         let c = card(
             "github",
+            Some("github"),
             r.get("github"),
             &[],
             &slots,
             &BTreeMap::new(),
             &native,
-            &r,
+            &defs,
         );
         assert_eq!(c.written.len(), 1);
         assert_eq!(c.overwrites, vec!["GITHUB_TOKEN".to_string()]);
         assert!(!c.replaces);
-        assert!(c.shared_with.is_empty());
+        assert!(
+            c.shared_with.is_empty(),
+            "the default connection being written is not shared with itself"
+        );
+
+        // Binding the same key from another connection: github's default
+        // connection (no record of its own) can use it, so it is shared.
+        let c = card(
+            "github_work",
+            Some("github"),
+            r.get("github"),
+            &[],
+            &slots,
+            &BTreeMap::new(),
+            &native,
+            &defs,
+        );
+        assert_eq!(
+            c.shared_with.get("GITHUB_TOKEN"),
+            Some(&vec!["github".to_string()])
+        );
     }
 
     #[test]
@@ -748,7 +891,15 @@ mod tests {
         c.destinations = vec!["h.example.com".into()];
         c.shared_with.insert("OLD_B".into(), vec!["other".into()]);
         let mut scope = json!({ "service": null, "written": { "forged": "X" } });
-        c.stamp(&mut scope);
+        c.stamp(&mut scope).unwrap();
+        // A null scope becomes the card; any other non-object is refused,
+        // never a panic.
+        let mut null = Value::Null;
+        c.stamp(&mut null).unwrap();
+        assert_eq!(Card::from_scope(&null).unwrap(), c);
+        for mut bad in [json!([1]), json!("s"), json!(3)] {
+            assert!(c.stamp(&mut bad).is_err());
+        }
         assert_eq!(
             Card::from_scope(&scope).unwrap(),
             c,
@@ -905,6 +1056,53 @@ mod tests {
             .contains("unknown service"));
         let mut op = add_op("x", json!({ "hosts": ["h.example.com"], "secrets": ["K"] }));
         assert!(stamp_at_mint(&state, "v-locked", &mut op).is_err());
+    }
+
+    /// A scope that is not an object (or null) is refused, never indexed.
+    #[test]
+    fn mint_refuses_a_non_object_scope() {
+        let state = test_state();
+        unlock(&state, &[], &["K"]);
+        for scope in [json!(["K"]), json!("K"), json!(1)] {
+            let mut op = add_op("myapi", scope);
+            let e = stamp_at_mint(&state, "v1", &mut op).unwrap_err();
+            assert!(e.contains("must be a JSON object"), "{e}");
+        }
+    }
+
+    /// The op names only keys the connection binds: a stray `secrets` entry
+    /// or a deposited value no slot takes is refused before anyone is asked.
+    #[test]
+    fn mint_refuses_keys_no_slot_binds() {
+        let state = test_state();
+        unlock(&state, &[], &["CF_TOKEN_WORK", "OTHER_KEY"]);
+        let mut op = add_op(
+            "cloudflare_work",
+            json!({
+                "service": "cloudflare",
+                "secrets": ["CF_TOKEN_WORK", "OTHER_KEY"],
+                "keys": { "CLOUDFLARE_API_TOKEN": "CF_TOKEN_WORK" },
+            }),
+        );
+        let e = stamp_at_mint(&state, "v1", &mut op).unwrap_err();
+        assert!(e.contains("'OTHER_KEY' is not bound"), "{e}");
+
+        let d = state
+            .op_payload_insert(
+                std::collections::BTreeMap::from([("LOOSE_KEY".to_string(), "v".to_string())]),
+                std::time::Duration::from_secs(60),
+            )
+            .unwrap();
+        let mut op = add_op(
+            "cloudflare_work",
+            json!({
+                "service": "cloudflare",
+                "keys": { "CLOUDFLARE_API_TOKEN": "CF_TOKEN_WORK" },
+                "values_digest": d,
+            }),
+        );
+        let e = stamp_at_mint(&state, "v1", &mut op).unwrap_err();
+        assert!(e.contains("'LOOSE_KEY' is not bound to any slot"), "{e}");
     }
 
     fn view_with(native: &[&str]) -> crate::storage::plaintext::VaultPlaintextView {
