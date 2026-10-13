@@ -349,6 +349,91 @@ pub fn merge_rules(built_in: &[PolicyRule], user: &HashMap<String, RuleConfig>) 
     out
 }
 
+/// A connection's own rule edit that cannot be enforced as written on a
+/// scoped request (the service declares a `[requests]` shape for its path),
+/// with the reason; `None` when every edit covering the request is
+/// enforceable.
+///
+/// An approval on a scoped path binds only the matched shape's `scope`
+/// values, so a rule whose decision depends on anything else could be
+/// approved for one request and then decide a different request the approval
+/// still matches. The same invariant the compiled policies are held to
+/// (`service::validate::validate_service_policy`: a deciding field must be
+/// bound), applied per request to the user's edits:
+///   - a `when` on a var the matched shape declares but does not bind;
+///   - a `body` regex (the body is never bound).
+///
+/// Only the user's edits (`aux.policy.connections.<id>.rules`) are checked,
+/// and only those whose rule `match` covers this request. A `when` naming a
+/// var this shape does not declare never fires here (P3) and is not refused.
+/// `shape` / `declared` / `binds` describe the matched shape
+/// (`crate::service::RequestScope`).
+pub fn unenforceable_user_rule(
+    built_in: &[PolicyRule],
+    user: &HashMap<String, RuleConfig>,
+    method: &str,
+    path: &str,
+    shape: &str,
+    declared: &[String],
+    binds: &[String],
+) -> Option<String> {
+    let mut ids: Vec<&String> = user.keys().collect();
+    ids.sort();
+    for id in ids {
+        let edit = &user[id];
+        if edit.when.is_none() && edit.body.is_none() {
+            continue;
+        }
+        let base = built_in
+            .iter()
+            .find(|r| r.id.as_deref() == Some(id.as_str()));
+        let (patterns, level) = match base {
+            Some(r) => (r.match_patterns.clone(), edit.level.or(r.level)),
+            None => match &edit.match_pattern {
+                Some(m) => (vec![m.clone()], edit.level),
+                // An edit naming no built-in rule and no `match` adds nothing.
+                None => continue,
+            },
+        };
+        if level.is_none() {
+            continue; // never decides
+        }
+        let covers =
+            patterns.is_empty() || patterns.iter().any(|p| pattern_matches(p, method, path));
+        if !covers {
+            continue;
+        }
+        if edit.body.is_some() {
+            return Some(format!(
+                "this connection's policy rule '{}' decides on the request body, which an approval \
+                 on this path does not bind (it binds only the [requests.{}] scope fields); remove \
+                 the rule's body match, or gate it with `when` on a bound field",
+                id, shape
+            ));
+        }
+        let Some(cond) = edit.when.as_deref().and_then(Condition::parse) else {
+            continue; // an unparseable `when` never matches (P3)
+        };
+        let var = cond.var_name();
+        let (qualifier, bare) = match var.rsplit_once('.') {
+            Some((q, b)) => (Some(q), b),
+            None => (None, var),
+        };
+        if qualifier.is_some_and(|q| q != shape) || !declared.iter().any(|d| d == bare) {
+            continue; // never resolves on this path
+        }
+        if !binds.iter().any(|b| b == bare) {
+            return Some(format!(
+                "this connection's policy rule '{}' gates on `vars.{}`, which the [requests.{}] \
+                 shape does not bind, so an approval could not hold it fixed; gate the rule on a \
+                 bound field instead",
+                id, var, shape
+            ));
+        }
+    }
+    None
+}
+
 // ── Path Pattern Matching ─────────────────────────────────────────────────────
 
 /// Parse a match pattern into (optional_method, path_pattern).
@@ -550,12 +635,14 @@ impl Condition {
 /// Does a single `"METHOD /path"` (or `"/path"`) pattern match this request?
 /// The method/path half of rule matching, exposed so the service layer can
 /// resolve which `[requests]` shape a request hits with the SAME grammar the
-/// policy rules use (no second matcher to drift).
+/// policy rules use (no second matcher to drift). The method compares
+/// case-insensitively: the proxy normalizes it to uppercase at ingress, and a
+/// caller that did not still matches the rule it names.
 pub(crate) fn pattern_matches(pattern: &str, method: &str, path: &str) -> bool {
     let path_no_query = path.split('?').next().unwrap_or(path);
     let (rule_method, rule_path) = parse_match_pattern(pattern);
     if let Some(m) = rule_method {
-        if m != method {
+        if !m.eq_ignore_ascii_case(method) {
             return false;
         }
     }
@@ -608,8 +695,13 @@ fn matches_rule(
 
 // ── Policy Evaluation ──────────────────────────────────────────────────────────
 
+/// The read/write split the default floors and the reuse classes use. Fails
+/// closed: only `GET`, `HEAD` and `OPTIONS` (any case) are reads; every other
+/// method, including extension methods (`MOVE`, `PROPPATCH`, …), is a write.
 pub(crate) fn is_write_method(method: &str) -> bool {
-    matches!(method, "POST" | "PUT" | "PATCH" | "DELETE")
+    !["GET", "HEAD", "OPTIONS"]
+        .iter()
+        .any(|read| read.eq_ignore_ascii_case(method))
 }
 
 /// Determine the access level for a request. See [`evaluate_with_match`].
@@ -868,6 +960,136 @@ mod tests {
         );
         assert_eq!(AccessLevel::parse("nope"), None);
         assert!(AccessLevel::Deny.restrictiveness() > AccessLevel::Allow.restrictiveness());
+    }
+
+    // ── Connection rule edits on scoped paths ────────────────────────────────
+    #[test]
+    fn user_rule_on_a_scoped_path_must_decide_on_bound_fields() {
+        let built_in = vec![rule("pay", "POST /pay", AccessLevel::Ask)];
+        let declared = vec!["amount".to_string(), "memo".to_string()];
+        let binds = vec!["amount".to_string()];
+        let check = |user: &HashMap<String, RuleConfig>, m: &str, p: &str| {
+            unenforceable_user_rule(&built_in, user, m, p, "purchase", &declared, &binds)
+        };
+        let add = |pat: Option<&str>, when: Option<&str>, body: Option<&str>| RuleConfig {
+            match_pattern: pat.map(str::to_string),
+            when: when.map(str::to_string),
+            body: body.map(str::to_string),
+            level: Some(AccessLevel::AskAlways),
+            ..Default::default()
+        };
+        let mut user = HashMap::new();
+        // Gating on a bound field is enforceable.
+        user.insert(
+            "big".to_string(),
+            add(Some("POST /pay"), Some("vars.amount > 100"), None),
+        );
+        assert_eq!(check(&user, "POST", "/pay"), None);
+
+        // A declared but unbound field decides: refused, by rule and field.
+        user.insert(
+            "memo".to_string(),
+            add(Some("POST /pay"), Some("vars.memo == \"x\""), None),
+        );
+        let e = check(&user, "post", "/pay").expect("refused");
+        assert!(e.contains("'memo'") && e.contains("vars.memo"), "{e}");
+        assert!(!e.contains('\u{2014}'), "no em dash in copy");
+        // Only where the rule's match covers the request.
+        assert_eq!(check(&user, "POST", "/other"), None);
+        user.remove("memo");
+
+        // Qualified by this shape: the same field; by another shape: never
+        // resolves here, so not refused. An undeclared var never fires.
+        user.insert(
+            "q".to_string(),
+            add(Some("POST /pay"), Some("vars.purchase.memo == 1"), None),
+        );
+        assert!(check(&user, "POST", "/pay").is_some());
+        user.insert(
+            "q".to_string(),
+            add(Some("POST /pay"), Some("vars.refund.memo == 1"), None),
+        );
+        assert_eq!(check(&user, "POST", "/pay"), None);
+        user.insert(
+            "q".to_string(),
+            add(Some("POST /pay"), Some("vars.nope == 1"), None),
+        );
+        assert_eq!(check(&user, "POST", "/pay"), None);
+        user.remove("q");
+
+        // An override of a built-in rule by id is checked on the built-in's
+        // match, with the built-in's level.
+        user.insert(
+            "pay".to_string(),
+            RuleConfig {
+                when: Some("vars.memo == 1".into()),
+                ..Default::default()
+            },
+        );
+        assert!(check(&user, "POST", "/pay").unwrap().contains("'pay'"));
+        user.remove("pay");
+
+        // A body match on a covered scoped path: refused (the body is never bound).
+        user.insert("b".to_string(), add(Some("/pay"), None, Some("refund")));
+        let e = check(&user, "POST", "/pay").expect("refused");
+        assert!(e.contains("'b'") && e.contains("body"), "{e}");
+        assert_eq!(check(&user, "POST", "/elsewhere"), None);
+    }
+
+    // ── Method normalization (fail closed) ───────────────────────────────────
+    #[test]
+    fn only_get_head_options_are_reads() {
+        for m in ["GET", "HEAD", "OPTIONS", "get", "Head", "options"] {
+            assert!(!is_write_method(m), "{m} is a read");
+        }
+        for m in [
+            "POST",
+            "PUT",
+            "PATCH",
+            "DELETE",
+            "delete",
+            "MOVE",
+            "PROPPATCH",
+            "COPY",
+            "MKCOL",
+            "TRACE",
+            "",
+        ] {
+            assert!(is_write_method(m), "{m} is a write");
+        }
+    }
+
+    #[test]
+    fn rule_method_matches_case_insensitively() {
+        let rules = vec![rule("del", "DELETE /x", AccessLevel::Deny)];
+        let floor = Levels {
+            read: Some(AccessLevel::Allow),
+            write: Some(AccessLevel::Ask),
+            ttl: None,
+        };
+        let decide = |m: &str| {
+            evaluate_decision(
+                m,
+                "/x",
+                None,
+                &VarMap::new(),
+                Some(&rules),
+                Some(&floor),
+                &policy(),
+                &[],
+            )
+        };
+        // A lowercase `delete` hits the DELETE rule, never a floor.
+        let (level, by, _) = decide("delete");
+        assert_eq!(level, AccessLevel::Deny);
+        assert!(matches!(by, DecidedBy::Rule { id: Some(ref id), .. } if id == "del"));
+        // An extension method falls to the WRITE floor, not the read one.
+        for m in ["MOVE", "PROPPATCH", "propfind"] {
+            let (level, by, _) = decide(m);
+            assert_eq!(by, DecidedBy::Floor);
+            assert_eq!(level, AccessLevel::Ask, "{m} takes the write floor");
+        }
+        assert_eq!(decide("GET").0, AccessLevel::Allow);
     }
 
     // ── Path matching / specificity (unchanged engine) ───────────────────────

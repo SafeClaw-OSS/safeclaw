@@ -77,19 +77,31 @@ pick the grant store, and by the approve-time assertion:
 | minted under | `reuse` (+ fields) | `window_s` | what apply writes |
 |---|---|---|---|
 | `ask-always` | `none` | absent | a single-use grant bound to this request (its replay only) |
-| `ask` on a scoped path (`[requests]` shape; with or without bound values) | `exact` | ttl | a grant bound to this request and these values, reused within the window |
-| `ask` decided by a rule | `rule` + `reuse_rule` (id) + `reuse_label` (if the rule has one) | ttl | an ask-grant ledger entry for that rule |
+| `ask` decided by a rule with no id (scoped path or not) | `none` | absent | a single-use grant bound to this request |
+| `ask` on a scoped path (`[requests]` shape; with or without bound values) | `exact` | ttl | a grant bound to this request, these values and the deciding unit, reused within the window |
+| `ask` decided by a rule | `rule` + `reuse_rule` (id) + `reuse_label` (if the rule has one) | ttl | an ask-grant ledger entry for that rule and the request's class |
 | `ask` decided by a default floor | `floor` + `reuse_class` (`read` / `write`) | ttl | an ask-grant ledger entry for that floor class |
 | `allow` (cache miss) | `none` | absent | the value held for allow-level traffic; no ledger entry |
 
 Authorization is decoupled from value residency. Every ledger entry is keyed
-`(agent, connection, host, unit)`. A later ask-level request is served
-without asking only when the policy, re-run on it, is decided by the same
-unit (the same rule id, `when` included, or the same floor class) for the
-same agent, connection and host. Approving rule A never serves rule B, a read
-floor never serves a write, and an allow-level miss serves no ask. A value
+`(agent, connection, host, unit)`; a rule's unit is its id and the request's
+class (read: `GET`/`HEAD`/`OPTIONS`; anything else is a write), read from the
+signed `method`. A later ask-level request is served without asking only when
+the policy, re-run on it, is decided by the same unit (the same rule id,
+`when` included, and class, or the same floor class) for the same agent,
+connection and host. Approving rule A never serves rule B, a read (rule or
+floor) never serves a write, and an allow-level miss serves no ask. A value
 being resident in memory (bootstrap, or held after an approval) only serves
 requests the policy allows.
+
+A request-bound grant carries the tier that minted it (ask-always, `exact`
+under its unit, or a single-use ask from a rule with no id) and is redeemed
+only by a request whose own decision yields that tier, so no tier spends or
+reads another tier's grant for the same request line. On a scoped path the
+proxy refuses a request covered by a connection rule edit that decides on a
+field the approval cannot bind (a `when` on a var outside the shape's
+`scope`, or a `body` match); the policy is sealed and written by the console,
+so the check runs where the request is decided.
 
 The console renders the reuse (none: this one request; exact: this identical
 request for N min; rule: this agent's "<rule label or id>" requests for N
@@ -100,8 +112,8 @@ At apply the daemon asserts the signed `level` equals the record's
 PolicyContext level, the signed reuse fields equal the classifier's answer
 for that context (what decided the request, the scope's `scoped` marker and
 method), and `window_s` is present
-exactly when that reuse has one and equals `pc.ttl_seconds`; a signed `level`
-without `reuse` is refused. Any mismatch refuses the approval, so what was
+exactly when that reuse has one and equals `pc.ttl_seconds`; a Use op with no
+signed `level`, or a `level` without `reuse`, is refused. Any mismatch refuses the approval, so what was
 rendered is what is applied. (They are already in intent_key through `act`;
 the explicit pc fields stay for ops whose scope predates this.) Older daemons
 omit them; the console treats a missing level as ask-always for

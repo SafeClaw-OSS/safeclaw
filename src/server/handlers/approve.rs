@@ -207,18 +207,19 @@ pub fn op_poll_value(state: &AppState, op_id: &str, waiter: Option<&str>) -> Res
 /// `reuse_rule` / `reuse_label` / `reuse_class`) and `window_s` must be exactly
 /// what [`crate::approval::Reuse::of`] yields for that context (what decided
 /// the request, the scope's own `scoped` marker and `method`): the same
-/// classifier the proxy stamped with and [`plan_use_grant`] writes from. A
-/// signed `level` with no `reuse` is refused (every mint since `reuse` exists
-/// stamps both, and the approval store is in-memory, so no op predates it). A
-/// scope without `level` predates both fields and is left to the pc-driven
-/// apply. `Err` carries the human reason; the caller picks the arm's error
-/// variant.
+/// classifier the proxy stamped with and [`plan_use_grant`] writes from. A Use
+/// op must carry both: a scope with no signed `level`, or a `level` with no
+/// `reuse`, is refused (every mint stamps both, and the approval store is
+/// in-memory, so no live op predates them). `Err` carries the human reason;
+/// the caller picks the arm's error variant.
 fn assert_signed_level(
     scope: &Value,
     pc: Option<&crate::approval::PolicyContext>,
 ) -> std::result::Result<(), String> {
     let Some(signed) = scope.get("level") else {
-        return Ok(());
+        return Err(
+            "this use request carries no signed policy level, so what approving it grants is not stated; re-run the request".into(),
+        );
     };
     let pc = pc.ok_or("signed level on an op with no policy context")?;
     let signed = signed.as_str().ok_or("signed level is not a string")?;
@@ -2119,21 +2120,25 @@ pub async fn approve_op(
 /// [`assert_signed_level`] checked, so what is written is the reuse the
 /// approver was shown:
 ///   - `none` from `ask-always` (or an `ask` with no unit): a single-use
-///     `op_grants` entry bound to the approved request, redeemable for
-///     [`crate::state::ASK_ALWAYS_REPLAY_WINDOW_SECS`] (the replay deadline,
-///     not a reuse window).
+///     `op_grants` entry bound to the approved request and its tier,
+///     redeemable for [`crate::state::ASK_ALWAYS_REPLAY_WINDOW_SECS`] (the
+///     replay deadline, not a reuse window).
 ///   - `none` from an `allow`-level miss: the value is held for allow-level
 ///     traffic for the policy window. No ledger entry, so it never serves an
 ///     ask.
-///   - `exact` (scoped ask): an `op_grants` entry bound to the request + value
-///     digest, peeked (reused) for the policy window.
+///   - `exact` (scoped ask): an `op_grants` entry bound to the request, value
+///     digest and unit, peeked (reused) for the policy window.
 ///   - `rule` / `floor`: an ask-grant ledger entry for the approving agent,
 ///     connection, host and unit, plus the held value, for the policy window.
 ///
-/// A Use op with no PolicyContext (none is minted without one) gets a
-/// single-use grant. `None` when the scope lacks the binding the grant needs
-/// (no connection, or a request-bound grant missing method/host/path):
-/// nothing is stored and the replay asks again.
+/// Each request-bound entry carries the tier
+/// ([`crate::approval::reuse::BoundTier`]) the proxy's redeem derives from the
+/// same decision, so it is redeemable only by a request of that tier.
+///
+/// `None` (nothing stored, the replay asks again) when the op has no
+/// PolicyContext (none is minted without one, and approve refuses such an
+/// op) or the scope lacks the binding the grant needs (no connection, or a
+/// request-bound grant missing method/host/path).
 pub(crate) fn plan_use_grant(
     pc: Option<&crate::approval::PolicyContext>,
     scope: &Value,
@@ -2169,17 +2174,13 @@ pub(crate) fn plan_use_grant(
     // rebuilt as the SAME sorted pairs the redeem path re-extracts from the
     // live request. Empty (no requests shape, or none resolved) ⇒ `""`.
     let scope_digest = crate::service::scope_digest(&crate::approval::reuse::bound_values(scope));
-    let (reuse, level, ttl) = match pc {
-        Some(p) => match Reuse::of(
-            p.level,
-            &p.decided_by,
-            crate::approval::reuse::is_scoped(scope),
-            method,
-        ) {
-            Some(r) => (r, p.level, p.ttl_seconds),
-            None => return drop_value(value),
-        },
-        None => (Reuse::None, AccessLevel::AskAlways, 0),
+    let Some(p) = pc else {
+        return drop_value(value);
+    };
+    let scoped = crate::approval::reuse::is_scoped(scope);
+    let (reuse, level, ttl) = match Reuse::of(p.level, &p.decided_by, scoped, method) {
+        Some(r) => (r, p.level, p.ttl_seconds),
+        None => return drop_value(value),
     };
     if reuse == Reuse::None && level == AccessLevel::Allow {
         return Some(DeferredGrant::Value {
@@ -2211,7 +2212,11 @@ pub(crate) fn plan_use_grant(
     if method.is_empty() || host.is_empty() || path.is_empty() {
         return drop_value(value);
     }
-    let window = if reuse == Reuse::None {
+    let Some(tier) = crate::approval::reuse::BoundTier::of(level, &p.decided_by, scoped, method)
+    else {
+        return drop_value(value);
+    };
+    let window = if tier.single_use() {
         crate::state::ASK_ALWAYS_REPLAY_WINDOW_SECS
     } else {
         ttl
@@ -2224,6 +2229,7 @@ pub(crate) fn plan_use_grant(
         host,
         path: path.to_string(),
         scope_digest,
+        tier,
         value,
         expires_at: now + window,
     })
@@ -2232,7 +2238,8 @@ pub(crate) fn plan_use_grant(
 /// A Use apply's grant write, captured during dispatch and executed only once
 /// the op is marked approved ([`approve_and_commit`]).
 pub(crate) enum DeferredGrant {
-    /// Request-bound grant (`op_grants`): ask-always, or a scoped ask.
+    /// Request-bound grant (`op_grants`): ask-always, a scoped ask, or an ask
+    /// a rule with no id decided, keyed with the tier that minted it.
     OpGrant {
         vault_id: String,
         agent: String,
@@ -2241,6 +2248,7 @@ pub(crate) enum DeferredGrant {
         host: String,
         path: String,
         scope_digest: String,
+        tier: crate::approval::reuse::BoundTier,
         value: Vec<u8>,
         expires_at: u64,
     },
@@ -2277,6 +2285,7 @@ impl DeferredGrant {
                 host,
                 path,
                 scope_digest,
+                tier,
                 value,
                 expires_at,
             } => state.op_grant_insert(
@@ -2287,6 +2296,7 @@ impl DeferredGrant {
                 &host,
                 &path,
                 &scope_digest,
+                &tier,
                 value,
                 expires_at,
             ),
@@ -3734,9 +3744,15 @@ mod tests {
         ));
         // A signed level with no policy context can't be honoured.
         assert!(assert_signed_level(&json!({"level":"ask","reuse":"floor"}), None).is_err());
-        // Pre-field scope: left to the existing pc-driven apply.
-        assert!(ok(json!({"method":"GET"}), &floor));
-        assert!(assert_signed_level(&Value::Null, None).is_ok());
+        // A Use op with no signed level (or reuse) is refused: what approving
+        // it grants is not stated.
+        assert!(!ok(json!({"method":"GET"}), &floor));
+        assert!(!ok(
+            json!({"method":"GET","reuse":"floor","reuse_class":"read","window_s":900}),
+            &floor
+        ));
+        assert!(assert_signed_level(&json!({"method":"GET"}), None).is_err());
+        assert!(assert_signed_level(&Value::Null, None).is_err());
     }
 
     fn leveled_use_op(level: &str, window: Option<u64>) -> crate::protocol::operation::Operation {
@@ -4007,6 +4023,8 @@ mod tests {
             "open".to_string(),
             rule("GET /open", AccessLevel::Allow, Some(900)),
         );
+        // One rule over every method of a path.
+        rules.insert("rw".to_string(), rule("/rw", AccessLevel::Ask, Some(60)));
         let mut p = Policy::default();
         p.connections.insert(
             RC.to_string(),
@@ -4130,7 +4148,7 @@ mod tests {
         bound: &[(&str, &str)],
     ) -> bool {
         let shape = path == "/buy";
-        let (level, _, _) = decide_at(state, agent, method, path, host, shape);
+        let (level, by, _) = decide_at(state, agent, method, path, host, shape);
         if level == crate::core::policy::AccessLevel::Deny {
             return false;
         }
@@ -4140,7 +4158,7 @@ mod tests {
             .collect();
         let digest = crate::service::scope_digest(&pairs);
         let (primary, _) = crate::proxy::handler::grant_lookup(
-            state, RV, agent, RC, level, method, host, path, &digest, shape,
+            state, RV, agent, RC, level, &by, method, host, path, &digest, shape,
         );
         primary.is_some()
     }
@@ -4186,17 +4204,19 @@ mod tests {
         let digest = crate::service::scope_digest(&pairs);
         let states = state.vault_states.lock().unwrap();
         match states.get(RV) {
+            // Whatever tier minted it: the request line + digest identify it.
             Some(crate::state::VaultState::Unlocked { cache, .. }) => cache
                 .op_grants
-                .get(&(
-                    "agA".to_string(),
-                    RC.to_string(),
-                    method.to_string(),
-                    RH.to_string(),
-                    path.to_string(),
-                    digest,
-                ))
-                .and_then(|e| e.expires_at),
+                .iter()
+                .find(|(k, _)| {
+                    k.agent == "agA"
+                        && k.conn == RC
+                        && k.method == method
+                        && k.host == RH
+                        && k.path == path
+                        && k.scope_digest == digest
+                })
+                .and_then(|(_, e)| e.expires_at),
             _ => None,
         }
     }
@@ -4436,6 +4456,319 @@ mod tests {
         );
     }
 
+    /// Mint under an explicit decision, as when the policy (or a field the
+    /// grant key does not carry) decided the approved request differently
+    /// from the request that later replays it.
+    fn mint_as(
+        level: crate::core::policy::AccessLevel,
+        by: crate::core::policy::DecidedBy,
+        method: &str,
+        path: &str,
+        scoped: bool,
+        bound: &[(&str, &str)],
+    ) -> (Value, crate::approval::PolicyContext) {
+        let mut scope = json!({
+            "connection_id": RC, "service": RC, "host": RH,
+            "method": method, "path": path, "authorize_only": true, "agent": "agA",
+        });
+        crate::proxy::handler::stamp_signed_level(&mut scope, level, &by, scoped, method, 120);
+        if scoped {
+            scope["scoped"] = json!(true);
+            if !bound.is_empty() {
+                let m: serde_json::Map<String, Value> = bound
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), json!(v)))
+                    .collect();
+                scope["scope_vars"] = Value::Object(m);
+            }
+        }
+        let pc = crate::approval::PolicyContext {
+            level,
+            decided_by: by,
+            ttl_seconds: 120,
+            host: Some(RH.into()),
+        };
+        assert_signed_level(&scope, Some(&pc)).expect("stamp passes the apply assertion");
+        (scope, pc)
+    }
+
+    /// The proxy's lookup for a request the policy decides as `(level, by)`.
+    fn served_as(
+        state: &AppState,
+        level: crate::core::policy::AccessLevel,
+        by: &crate::core::policy::DecidedBy,
+        method: &str,
+        path: &str,
+        scoped: bool,
+        bound: &[(&str, &str)],
+    ) -> bool {
+        let pairs: Vec<(String, String)> = bound
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let digest = crate::service::scope_digest(&pairs);
+        crate::proxy::handler::grant_lookup(
+            state, RV, "agA", RC, level, by, method, RH, path, &digest, scoped,
+        )
+        .0
+        .is_some()
+    }
+
+    fn by_rule(id: Option<&str>) -> crate::core::policy::DecidedBy {
+        crate::core::policy::DecidedBy::Rule {
+            id: id.map(str::to_string),
+            label: None,
+        }
+    }
+
+    /// An ask-always grant is spent only by an ask-always request: a scoped
+    /// ask (which would only read it) and an id-less-rule ask on the same
+    /// request line miss, without spending it.
+    #[test]
+    fn ask_always_grant_redeems_only_as_ask_always() {
+        use crate::core::policy::AccessLevel::{Ask, AskAlways};
+        let state = reuse_state();
+        let v80 = [("amount", "80")];
+        let (scope, pc) = mint_as(AskAlways, by_rule(Some("buy")), "POST", "/buy", true, &v80);
+        assert_eq!(scope["reuse"], "none");
+        apply(&state, &scope, &pc, now_s());
+        assert!(
+            !served_as(
+                &state,
+                Ask,
+                &by_rule(Some("buy")),
+                "POST",
+                "/buy",
+                true,
+                &v80
+            ),
+            "a scoped ask does not read an ask-always grant"
+        );
+        assert!(!served_as(
+            &state,
+            Ask,
+            &by_rule(None),
+            "POST",
+            "/buy",
+            true,
+            &v80
+        ));
+        assert!(served_as(
+            &state,
+            AskAlways,
+            &by_rule(Some("buy")),
+            "POST",
+            "/buy",
+            true,
+            &v80
+        ));
+        assert!(
+            !served_as(
+                &state,
+                AskAlways,
+                &by_rule(Some("buy")),
+                "POST",
+                "/buy",
+                true,
+                &v80
+            ),
+            "single-use"
+        );
+    }
+
+    /// A scoped ask's `exact` grant is read only by a scoped ask of the same
+    /// unit: an ask-always request on the same line cannot spend it, and
+    /// another unit (a floor ask, an id-less rule) cannot read it.
+    #[test]
+    fn exact_grant_redeems_only_for_its_unit() {
+        use crate::core::policy::AccessLevel::{Ask, AskAlways};
+        use crate::core::policy::DecidedBy;
+        let state = reuse_state();
+        let v80 = [("amount", "80")];
+        let (scope, pc) = mint(&state, "POST", "/buy", true, &v80);
+        assert_eq!(scope["reuse"], "exact");
+        apply(&state, &scope, &pc, now_s());
+        assert!(
+            !served_as(
+                &state,
+                AskAlways,
+                &by_rule(Some("buy")),
+                "POST",
+                "/buy",
+                true,
+                &v80
+            ),
+            "ask-always never spends an exact grant"
+        );
+        assert!(!served_as(
+            &state,
+            Ask,
+            &DecidedBy::Floor,
+            "POST",
+            "/buy",
+            true,
+            &v80
+        ));
+        assert!(!served_as(
+            &state,
+            Ask,
+            &by_rule(Some("other")),
+            "POST",
+            "/buy",
+            true,
+            &v80
+        ));
+        assert!(!served_as(
+            &state,
+            Ask,
+            &by_rule(None),
+            "POST",
+            "/buy",
+            true,
+            &v80
+        ));
+        assert!(
+            served(&state, "agA", "POST", "/buy", &v80),
+            "still there for its own unit"
+        );
+    }
+
+    /// An ask a rule with no id decided is single-use on a scoped path too
+    /// (signed `none`), and only an id-less-rule ask redeems it.
+    #[test]
+    fn id_less_rule_ask_is_single_use_and_same_tier_only() {
+        use crate::core::policy::AccessLevel::{Ask, AskAlways};
+        use crate::core::policy::DecidedBy;
+        let state = reuse_state();
+        let (scope, pc) = mint_as(Ask, by_rule(None), "GET", "/y", false, &[]);
+        assert_eq!(scope["reuse"], "none");
+        assert!(scope.get("window_s").is_none());
+        apply(&state, &scope, &pc, now_s());
+        assert_eq!(ledger_len(&state), 0);
+        assert!(!served_as(
+            &state,
+            AskAlways,
+            &by_rule(None),
+            "GET",
+            "/y",
+            false,
+            &[]
+        ));
+        assert!(!served_as(
+            &state,
+            Ask,
+            &DecidedBy::Floor,
+            "GET",
+            "/y",
+            false,
+            &[]
+        ));
+        assert!(served_as(
+            &state,
+            Ask,
+            &by_rule(None),
+            "GET",
+            "/y",
+            false,
+            &[]
+        ));
+        assert!(!served_as(
+            &state,
+            Ask,
+            &by_rule(None),
+            "GET",
+            "/y",
+            false,
+            &[]
+        ));
+
+        let v80 = [("amount", "80")];
+        let (scope, pc) = mint_as(Ask, by_rule(None), "POST", "/buy", true, &v80);
+        assert_eq!(scope["reuse"], "none", "no unit: not exact");
+        apply(&state, &scope, &pc, now_s());
+        assert!(
+            !served(&state, "agA", "POST", "/buy", &v80),
+            "not an exact grant"
+        );
+        assert!(served_as(
+            &state,
+            Ask,
+            &by_rule(None),
+            "POST",
+            "/buy",
+            true,
+            &v80
+        ));
+        assert!(!served_as(
+            &state,
+            Ask,
+            &by_rule(None),
+            "POST",
+            "/buy",
+            true,
+            &v80
+        ));
+    }
+
+    /// A read approved under a rule never serves a write under the same rule
+    /// (the ledger unit is the rule and the request's class). The signed
+    /// fields stay the rule's id and label.
+    #[test]
+    fn rule_reuse_is_per_class() {
+        let state = reuse_state();
+        let (scope, pc) = mint(&state, "GET", "/rw", false, &[]);
+        assert_eq!(scope["reuse"], "rule");
+        assert_eq!(scope["reuse_rule"], "rw");
+        assert!(scope.get("reuse_class").is_none());
+        apply(&state, &scope, &pc, now_s());
+        assert!(served(&state, "agA", "GET", "/rw", &[]));
+        assert!(served(&state, "agA", "HEAD", "/rw", &[]), "another read");
+        assert!(!served(&state, "agA", "POST", "/rw", &[]), "a write asks");
+        assert!(!served(&state, "agA", "DELETE", "/rw", &[]), "a write asks");
+        assert!(
+            !served(&state, "agA", "MOVE", "/rw", &[]),
+            "an extension method is a write"
+        );
+
+        let (scope, pc) = mint(&state, "post", "/rw", false, &[]);
+        apply(&state, &scope, &pc, now_s());
+        assert!(
+            served(&state, "agA", "PUT", "/rw", &[]),
+            "the write class, any case"
+        );
+    }
+
+    /// A Use op that does not carry a signed level is refused at approve, and
+    /// apply plans no grant without a policy context.
+    #[tokio::test]
+    async fn approve_refuses_a_use_op_without_a_signed_level() {
+        use crate::core::policy::AccessLevel;
+        let state = Arc::new(test_state());
+        let op = use_op("v1", "/user");
+        assert!(op.act.scope.get("level").is_none());
+        let id = {
+            let mut s = state.approvals.lock().unwrap();
+            s.create_with_policy(
+                "v1".into(),
+                op.clone(),
+                b64r(9),
+                Some(pc(AccessLevel::Ask, 900)),
+            )
+        };
+        let err = approve_op(
+            State(state.clone()),
+            Path(id),
+            Json(plain_grant(op.clone(), &b64r(9))),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&err, AppError::BadRequest(m) if m.contains("no signed policy level")),
+            "{err}"
+        );
+        assert!(plan_use_grant(None, &op.act.scope, "v1", "agA", b"t".to_vec(), 0).is_none());
+    }
+
     /// The whole approve_op path refuses a stored op whose signed reuse is not
     /// the reuse apply would grant (before any crypto or vault access).
     #[tokio::test]
@@ -4487,14 +4820,20 @@ mod tests {
         }
     }
 
+    fn exact_read_tier() -> crate::approval::reuse::BoundTier {
+        use crate::approval::reuse::{BoundTier, Class, GrantUnit};
+        BoundTier::Exact(GrantUnit::Floor(Class::Read))
+    }
+
     fn deferred_pair(agent: &str) -> (DeferredGrant, DeferredGrant) {
+        use crate::approval::reuse::{Class, GrantUnit};
         (
             DeferredGrant::Ledger {
                 vault_id: "v1".into(),
                 agent: agent.into(),
                 conn: "github".into(),
                 host: "api.github.com".into(),
-                unit: crate::approval::reuse::GrantUnit::Rule("read".into()),
+                unit: GrantUnit::Rule("read".into(), Class::Read),
                 value: b"tok-conn".to_vec(),
                 ttl: 600,
                 expires_at: u64::MAX / 2,
@@ -4507,6 +4846,7 @@ mod tests {
                 host: "api.github.com".into(),
                 path: "/user".into(),
                 scope_digest: String::new(),
+                tier: exact_read_tier(),
                 value: b"tok-bound".to_vec(),
                 expires_at: u64::MAX / 2,
             },
@@ -4535,7 +4875,7 @@ mod tests {
                     "api.github.com",
                     "/user",
                     "",
-                    false,
+                    &exact_read_tier(),
                 )
                 .is_some(),
         )

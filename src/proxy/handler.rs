@@ -233,11 +233,15 @@ impl BrokerHandler {
         };
         let ip = ctx.client_addr.ip();
 
-        let (parts, body) = req.into_parts();
+        let (mut parts, body) = req.into_parts();
         // `orig_body` is the un-scanned streaming body; `body_bytes` is the
         // buffered copy when we scan. Exactly one is live past the scan below,
         // so both consumers `take()` from the Option.
         let mut orig_body = Some(body);
+        // The method is normalized ONCE, here: policy, the reuse classes, the
+        // grant keys and the upstream all see the same uppercase method, so a
+        // rule written for `DELETE` also decides a `delete`.
+        parts.method = normalize_method(&parts.method);
         let method = parts.method.as_str().to_string();
         let path = parts.uri.path().to_string();
         let pq = parts
@@ -576,6 +580,33 @@ impl BrokerHandler {
             .unwrap_or_default();
         let scope_digest = req_scope.as_ref().map(|r| r.digest()).unwrap_or_default();
 
+        // A connection rule edit that decides on a field an approval on this
+        // path does not bind (an unbound `when` var, or the body) is refused
+        // here, by name, rather than asked under.
+        if let Some(rs) = req_scope.as_ref() {
+            if let Some(problem) = self.state.connection_rule_problem(
+                &vault_id,
+                &conn,
+                &service_id,
+                &method,
+                &path,
+                rs,
+            ) {
+                write_forward_audit(
+                    &self.state,
+                    &AuditPending {
+                        vault_id: vault_id.clone(),
+                        service: service_id.clone(),
+                        method: method.clone(),
+                        path: path.clone(),
+                        agent_prefix: self.agent_attribution(),
+                    },
+                    0,
+                );
+                return err_response(ScCode::PolicyDenied, &problem).into();
+            }
+        }
+
         // ── policy ───────────────────────────────────────────────────────────
         // The same lossy view the phantom scan used (unified boundary).
         let body_for_policy = body_text.as_deref();
@@ -640,6 +671,7 @@ impl BrokerHandler {
             &agent_prefix,
             &conn,
             level,
+            &decided_by,
             &method,
             &dest_host,
             &path,
@@ -1208,15 +1240,19 @@ pub(crate) type GrantValues = (Option<Vec<u8>>, Option<HashMap<String, Vec<u8>>>
 /// side of every grant an approval writes. Kept a free function so the apply
 /// tests drive the exact lookup the live pipeline uses.
 ///
-/// - `ask-always`: redeem the single-use grant bound to exactly this request
-///   (consumed), never the connection cache.
+/// A request-bound grant is redeemed only from the tier this request's own
+/// decision yields ([`crate::approval::reuse::BoundTier::of`], the function
+/// apply minted it with), so no tier spends or reuses another tier's grant:
+/// - `ask-always`: the single-use grant an ask-always approval minted for
+///   exactly this request (consumed), never the connection cache.
 /// - a scoped `ask` (`scoped`: the path has a `[requests]` shape): peek the
-///   request-bound grant (the same action, same values, reuses it within its
-///   window; anything else misses).
-/// - any other `ask`: only a single-use grant for exactly this request (an
-///   ask from a rule with no id). Never the resident value: an ask is
-///   authorized by the ask-grant ledger, which downgrades it to `allow`
-///   before this lookup, or it asks.
+///   `exact` grant minted for the same request, values and unit (reused within
+///   its window; anything else misses).
+/// - an `ask` a rule with no id decided: the single-use grant such an ask
+///   minted for exactly this request (consumed).
+/// - any other `ask`: nothing. Never the resident value: it is authorized by
+///   the ask-grant ledger, which downgrades it to `allow` before this lookup,
+///   or it asks.
 /// - `allow` (including an ask the ledger downgraded): the resident/held
 ///   connection value plus the allow multi-secret map.
 #[allow(clippy::too_many_arguments)]
@@ -1226,6 +1262,7 @@ pub(crate) fn grant_lookup(
     agent_prefix: &str,
     conn: &str,
     level: crate::core::policy::AccessLevel,
+    decided_by: &crate::core::policy::DecidedBy,
     method: &str,
     host: &str,
     path: &str,
@@ -1234,29 +1271,20 @@ pub(crate) fn grant_lookup(
 ) -> GrantValues {
     use crate::core::policy::AccessLevel;
     match level {
-        AccessLevel::AskAlways => (
-            state.op_grant_take(
-                vault_id,
-                agent_prefix,
-                conn,
-                method,
-                host,
-                path,
-                scope_digest,
-                true,
-            ),
-            None,
-        ),
-        AccessLevel::Ask => (
-            state.op_grant_take(
-                vault_id,
-                agent_prefix,
-                conn,
-                method,
-                host,
-                path,
-                scope_digest,
-                !scoped,
+        AccessLevel::AskAlways | AccessLevel::Ask => (
+            crate::approval::reuse::BoundTier::of(level, decided_by, scoped, method).and_then(
+                |tier| {
+                    state.op_grant_take(
+                        vault_id,
+                        agent_prefix,
+                        conn,
+                        method,
+                        host,
+                        path,
+                        scope_digest,
+                        &tier,
+                    )
+                },
             ),
             None,
         ),
@@ -1299,6 +1327,18 @@ enum ResolveErr {
 }
 
 // ── free helpers ─────────────────────────────────────────────────────────────
+
+/// The request method in uppercase: the form every policy and grant surface
+/// compares, and the one forwarded upstream.
+pub(crate) fn normalize_method(m: &Method) -> Method {
+    let s = m.as_str();
+    if !s.bytes().any(|b| b.is_ascii_lowercase()) {
+        return m.clone();
+    }
+    // Uppercasing keeps a valid token valid, so this cannot fail; fall back to
+    // the original only to stay total.
+    Method::from_bytes(s.to_ascii_uppercase().as_bytes()).unwrap_or_else(|_| m.clone())
+}
 
 fn now_secs() -> u64 {
     SystemTime::now()
@@ -1736,6 +1776,32 @@ mod tests {
         assert_eq!(allow["level"], "allow");
         assert_eq!(allow["reuse"], "none");
         assert!(allow.get("window_s").is_none());
+    }
+
+    /// Ingress normalization: the method every surface compares (and the one
+    /// forwarded) is uppercase, so a lowercase `delete` is a DELETE: it hits
+    /// a DELETE rule and the write class, and its reuse class follows.
+    #[test]
+    fn method_is_normalized_at_ingress() {
+        use crate::approval::reuse::Class;
+        let lower = Method::from_bytes(b"delete").unwrap();
+        assert_ne!(
+            lower,
+            Method::DELETE,
+            "hyper keeps an extension-case method"
+        );
+        let n = normalize_method(&lower);
+        assert_eq!(n, Method::DELETE);
+        assert_eq!(n.as_str(), "DELETE");
+        assert_eq!(
+            normalize_method(&Method::from_bytes(b"propPatch").unwrap()).as_str(),
+            "PROPPATCH"
+        );
+        assert_eq!(normalize_method(&Method::GET), Method::GET);
+        assert_eq!(Class::of(n.as_str()), Class::Write);
+        assert_eq!(Class::of("move"), Class::Write);
+        assert_eq!(Class::of("PROPPATCH"), Class::Write);
+        assert_eq!(Class::of("head"), Class::Read);
     }
 
     #[test]

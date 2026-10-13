@@ -89,6 +89,43 @@ pub struct CacheEntry {
 /// request binding, not from this window.
 pub const ASK_ALWAYS_REPLAY_WINDOW_SECS: u64 = 1800;
 
+/// The identity of a request-bound grant (`SecretsCache::op_grants`): the
+/// approving agent, the request line, the bound-values digest, and the tier
+/// that minted it. Host is lowercased.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct OpGrantKey {
+    pub agent: String,
+    pub conn: String,
+    pub method: String,
+    pub host: String,
+    pub path: String,
+    pub scope_digest: String,
+    pub tier: crate::approval::reuse::BoundTier,
+}
+
+impl OpGrantKey {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        agent: &str,
+        conn: &str,
+        method: &str,
+        host: &str,
+        path: &str,
+        scope_digest: &str,
+        tier: &crate::approval::reuse::BoundTier,
+    ) -> OpGrantKey {
+        OpGrantKey {
+            agent: agent.to_string(),
+            conn: conn.to_string(),
+            method: method.to_string(),
+            host: host.to_ascii_lowercase(),
+            path: path.to_string(),
+            scope_digest: scope_digest.to_string(),
+            tier: tier.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SecretsCache {
     /// service_id → cached auth value with per-entry expiry. Filled by:
@@ -125,13 +162,13 @@ pub struct SecretsCache {
     /// decoupled from whether the credential value is resident. Key:
     /// `(agent_prefix, connection_id, host, unit)` where `unit` is the policy
     /// unit that produced the ask (`crate::approval::reuse::GrantUnit`): the
-    /// matched rule's id, or the default floor's class (read / write). Value:
-    /// Unix-epoch-second expiry.
+    /// matched rule's id and the request's class, or the default floor's class
+    /// (read / write). Value: Unix-epoch-second expiry.
     ///
     /// `evaluate_request_decision` downgrades a later `Ask` to `Allow` only
     /// when the policy, re-run on that request, lands on the same unit for the
     /// same agent, connection, and host. So approving rule A never serves rule
-    /// B, a read floor approval never serves a write, and an allow-level miss
+    /// B, a read approval (rule or floor) never serves a write, and an allow-level miss
     /// (which writes no entry) never serves an ask. Scoped paths and
     /// `ask-always` never consult it (they are request-bound, `op_grants`).
     ///
@@ -139,12 +176,15 @@ pub struct SecretsCache {
     /// every vault change (the cache is rebuilt), and a daemon restart starts
     /// empty (vaults boot Locked).
     pub ask_grants: HashMap<(String, String, String, crate::approval::reuse::GrantUnit), u64>,
-    /// `ask-always` one-shot grants, keyed by the REQUEST the user approved:
-    /// `(agent_prefix, connection_id, method, host, path, scope_digest)` —
-    /// agent-bound like `ask_grants` (a grant minted for agent A's request
-    /// cannot be spent by agent B). Written by
-    /// `approve_op` when the op's policy level was AskAlways; consumed (removed)
-    /// by the proxy's replay exactly once. This is what makes an `ask-always`
+    /// Request-bound grants, keyed by the REQUEST the user approved and the
+    /// tier that minted it ([`OpGrantKey`]): agent-bound like `ask_grants` (a
+    /// grant minted for agent A's request cannot be spent by agent B), and
+    /// tier-bound (`crate::approval::reuse::BoundTier`): an ask-always grant is
+    /// redeemed only by an ask-always request, a scoped ask's `exact` grant
+    /// only by a scoped ask of the same unit, a single-use ask grant only by an
+    /// ask a rule with no id decided. Written by `approve_op`; a single-use
+    /// tier is consumed (removed) by the proxy's replay exactly once, `exact`
+    /// is read within its window. This is what makes an `ask-always`
     /// approval mean "this action, once": a grant minted for `POST /v2/purchase`
     /// can never be spent by a different method/host/path on the same
     /// connection, and the ask-always path never falls back to the conn-keyed
@@ -162,7 +202,7 @@ pub struct SecretsCache {
     /// (e.g. a chat agent) may take minutes to re-run. Single-use + exact
     /// binding is what makes the long window safe — time is not the guard.
     /// Same memory window as the rest of the cache: dropped on lock/refresh.
-    pub op_grants: HashMap<(String, String, String, String, String, String), CacheEntry>,
+    pub op_grants: HashMap<OpGrantKey, CacheEntry>,
     /// Item names present in the decrypted `native-secrets` kv (names only,
     /// never values). Surface for `GET /v/{vid}/secret-keys` so the frontend
     /// can decide which services are "reachable" without paying for an
@@ -960,11 +1000,13 @@ impl AppState {
         }
     }
 
-    /// Store an `ask-always` one-shot grant, bound to the request tuple the
-    /// user's passkey approved. Overwrites a prior grant for the same tuple
-    /// (a fresh tap supersedes). No-op when the vault is locked.
+    /// Store a request-bound grant for the request tuple the user's passkey
+    /// approved, under the tier that minted it. Overwrites a prior grant for
+    /// the same tuple and tier (a fresh tap supersedes). No-op when the vault
+    /// is locked.
     ///
-    /// See [`ASK_ALWAYS_REPLAY_WINDOW_SECS`] for the expiry callers should use.
+    /// See [`ASK_ALWAYS_REPLAY_WINDOW_SECS`] for the single-use expiry.
+    #[allow(clippy::too_many_arguments)]
     pub fn op_grant_insert(
         &self,
         vault_id: &str,
@@ -974,19 +1016,21 @@ impl AppState {
         host: &str,
         path: &str,
         scope_digest: &str,
+        tier: &crate::approval::reuse::BoundTier,
         value: Vec<u8>,
         expires_at: u64,
     ) {
         let mut states = self.vault_states.lock().unwrap();
         if let Some(VaultState::Unlocked { cache, .. }) = states.get_mut(vault_id) {
             cache.op_grants.insert(
-                (
-                    agent_prefix.to_string(),
-                    conn_id.to_string(),
-                    method.to_string(),
-                    host.to_ascii_lowercase(),
-                    path.to_string(),
-                    scope_digest.to_string(),
+                OpGrantKey::new(
+                    agent_prefix,
+                    conn_id,
+                    method,
+                    host,
+                    path,
+                    scope_digest,
+                    tier,
                 ),
                 CacheEntry {
                     value,
@@ -998,20 +1042,24 @@ impl AppState {
         }
     }
 
-    /// Redeem the scope-bound grant for exactly this request tuple. A request
-    /// whose (method, host, path, scope_digest) differs from what the user
-    /// approved is a miss and re-prompts; there is NO fallback to the conn-keyed
-    /// `entries` (allow residency / plain-ask leftovers are not grants for a
-    /// bound action). `None` when locked / absent / expired.
+    /// Redeem the request-bound grant for exactly this request tuple, minted
+    /// under `tier` (the tier this request's own decision yields,
+    /// [`crate::approval::reuse::BoundTier::of`]). A request whose (method,
+    /// host, path, scope_digest) or tier differs from what the user approved
+    /// is a miss and re-prompts, without spending the stored grant; there is
+    /// NO fallback to the conn-keyed `entries` (allow residency / plain-ask
+    /// leftovers are not grants for a bound action). `None` when locked /
+    /// absent / expired.
     ///
-    /// `consume` distinguishes the two bound tiers:
-    ///   - `ask-always` → `true`: single-use, removed on redeem (each request
+    /// The tier decides whether the redeem spends the grant:
+    ///   - `ask-always` and a single-use ask: removed on redeem (each request
     ///     re-prompts).
-    ///   - a scoped `ask` → `false`: PEEK — the grant is reused for the SAME
+    ///   - `exact` (a scoped `ask`): PEEK. The grant is reused for the SAME
     ///     bound action within its window, but a DIFFERENT action (different
     ///     digest) still misses and re-prompts. (An irreversible/spending action
     ///     should be `ask-always`: a peeked window still lets the identical
     ///     spend repeat, which for money is drainage.)
+    #[allow(clippy::too_many_arguments)]
     pub fn op_grant_take(
         &self,
         vault_id: &str,
@@ -1021,7 +1069,7 @@ impl AppState {
         host: &str,
         path: &str,
         scope_digest: &str,
-        consume: bool,
+        tier: &crate::approval::reuse::BoundTier,
     ) -> Option<Vec<u8>> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1032,22 +1080,23 @@ impl AppState {
             Some(VaultState::Unlocked { cache, .. }) => cache,
             _ => return None,
         };
-        let key = (
-            agent_prefix.to_string(),
-            conn_id.to_string(),
-            method.to_string(),
-            host.to_ascii_lowercase(),
-            path.to_string(),
-            scope_digest.to_string(),
+        let key = OpGrantKey::new(
+            agent_prefix,
+            conn_id,
+            method,
+            host,
+            path,
+            scope_digest,
+            tier,
         );
-        // Peek first so an expired entry (of either tier) is dropped and a
-        // reusable ask grant survives a hit.
+        // Peek first so an expired entry (of any tier) is dropped and a
+        // reusable `exact` grant survives a hit.
         let entry = cache.op_grants.get(&key)?;
         if entry.expires_at.is_some_and(|exp| now >= exp) {
             cache.op_grants.remove(&key);
             return None;
         }
-        if consume {
+        if tier.single_use() {
             cache.op_grants.remove(&key).map(|e| e.value)
         } else {
             Some(entry.value.clone())
@@ -1201,7 +1250,8 @@ impl AppState {
     ///     decision being its own `level`,
     ///   - else connection / tag / global default floor, else ask-always,
     ///   - **the ask-grant ledger**: an unscoped `Ask` whose unit (the matched
-    ///     rule's id, or the floor's read/write class) has a live entry for
+    ///     rule's id and the request's read/write class, or the floor's class)
+    ///     has a live entry for
     ///     this `(agent, connection, host)` downgrades to `Allow`. Anything
     ///     else asks (`grant_lookup` never authorizes an ask from residency).
     #[allow(clippy::too_many_arguments)]
@@ -1272,8 +1322,8 @@ impl AppState {
             tags,
         );
 
-        // Ask-grant ledger: a prior approval of the SAME unit (rule id, or
-        // floor class) for this agent, connection, and host, not yet expired,
+        // Ask-grant ledger: a prior approval of the SAME unit (rule id and
+        // class, or floor class) for this agent, connection, and host, not yet expired,
         // downgrades this Ask to Allow. The policy above was re-run on this
         // request, so a rule unit matches only when the same rule (its `when`
         // included) decided again. Expired entries are dropped passively.
@@ -1295,6 +1345,43 @@ impl AppState {
         }
 
         Some((level, by, ttl))
+    }
+
+    /// For a scoped request (`rs`: its matched `[requests]` shape), the first
+    /// of this connection's own policy edits that cannot be enforced as
+    /// written there, with the reason
+    /// ([`crate::core::policy::unenforceable_user_rule`]). The proxy refuses
+    /// such a request rather than ask under a rule an approval cannot bind.
+    /// The policy is sealed and written by the console, so this is where the
+    /// daemon holds the line. `None` when locked or nothing is refused.
+    #[allow(clippy::too_many_arguments)]
+    pub fn connection_rule_problem(
+        &self,
+        vault_id: &str,
+        connection_id: &str,
+        service_id: &str,
+        method: &str,
+        path: &str,
+        rs: &crate::service::RequestScope,
+    ) -> Option<String> {
+        let states = self.vault_states.lock().unwrap();
+        let Some(VaultState::Unlocked { cache, .. }) = states.get(vault_id) else {
+            return None;
+        };
+        let conn_policy = cache.policy.connections.get(connection_id)?;
+        let built_in = self
+            .services
+            .default_policy_rules(service_id)
+            .unwrap_or_default();
+        crate::core::policy::unenforceable_user_rule(
+            &built_in,
+            &conn_policy.rules,
+            method,
+            path,
+            &rs.shape,
+            &rs.declared,
+            &rs.binds,
+        )
     }
 
     /// Record an approved `ask` in the ask-grant ledger: `(agent, connection,
@@ -1702,6 +1789,17 @@ mod tests {
     use crate::config::Config;
     use std::path::PathBuf;
 
+    /// The ask-always tier (single-use).
+    fn aa() -> crate::approval::reuse::BoundTier {
+        crate::approval::reuse::BoundTier::AskAlways
+    }
+
+    /// A scoped ask's `exact` tier (peeked), here under the write floor.
+    fn ex() -> crate::approval::reuse::BoundTier {
+        use crate::approval::reuse::{BoundTier, Class, GrantUnit};
+        BoundTier::Exact(GrantUnit::Floor(Class::Write))
+    }
+
     fn test_state() -> AppState {
         let cfg = Config {
             state_dir: PathBuf::from(format!("/tmp/safeclaw-test-{}", std::process::id())),
@@ -1800,6 +1898,7 @@ mod tests {
                 "agA",
                 "github",
                 level,
+                &crate::core::policy::DecidedBy::Floor,
                 "GET",
                 "api.github.com",
                 "/user",
@@ -1831,7 +1930,7 @@ mod tests {
                 "api.github.com",
                 "/repos/a/b",
                 "",
-                true
+                &aa()
             ),
             None
         );
@@ -1868,6 +1967,7 @@ mod tests {
             "api.x.com",
             "/v2/purchase",
             "",
+            &aa(),
             b"tok".to_vec(),
             far,
         );
@@ -1881,7 +1981,7 @@ mod tests {
                 "api.x.com",
                 "/v2/purchase",
                 "",
-                true
+                &aa()
             ),
             Some(b"tok".to_vec())
         );
@@ -1896,7 +1996,7 @@ mod tests {
                 "api.x.com",
                 "/v2/purchase",
                 "",
-                true
+                &aa()
             ),
             None
         );
@@ -1924,6 +2024,7 @@ mod tests {
             "api.x.com",
             "/v2/purchase",
             "",
+            &aa(),
             b"tok".to_vec(),
             far,
         );
@@ -1937,7 +2038,7 @@ mod tests {
                 "api.x.com",
                 "/v2/refund",
                 "",
-                true
+                &aa()
             ),
             None
         );
@@ -1950,7 +2051,7 @@ mod tests {
                 "api.x.com",
                 "/v2/purchase",
                 "",
-                true
+                &aa()
             ),
             None
         );
@@ -1963,7 +2064,7 @@ mod tests {
                 "api.y.com",
                 "/v2/purchase",
                 "",
-                true
+                &aa()
             ),
             None
         );
@@ -1976,7 +2077,7 @@ mod tests {
                 "api.x.com",
                 "/v2/purchase",
                 "",
-                true
+                &aa()
             ),
             None
         );
@@ -1990,7 +2091,7 @@ mod tests {
                 "API.X.COM",
                 "/v2/purchase",
                 "",
-                true
+                &aa()
             ),
             Some(b"tok".to_vec())
         );
@@ -2019,6 +2120,7 @@ mod tests {
             "api.x.com",
             "/v2/purchase",
             "",
+            &aa(),
             b"tok".to_vec(),
             far,
         );
@@ -2031,7 +2133,7 @@ mod tests {
                 "api.x.com",
                 "/v2/purchase",
                 "",
-                true
+                &aa()
             ),
             None,
             "agent B cannot redeem A's grant"
@@ -2045,14 +2147,17 @@ mod tests {
                 "api.x.com",
                 "/v2/purchase",
                 "",
-                true
+                &aa()
             ),
             Some(b"tok".to_vec()),
             "B's miss must not have consumed A's grant"
         );
 
         // (2) the ask-grant ledger: recorded for A, B still re-prompts.
-        let unit = crate::approval::reuse::GrantUnit::Rule("read".into());
+        let unit = crate::approval::reuse::GrantUnit::Rule(
+            "read".into(),
+            crate::approval::reuse::Class::Read,
+        );
         state.record_ask_grant("v1", "agA", "gh", "H.com", unit.clone(), 60);
         {
             let states = state.vault_states.lock().unwrap();
@@ -2085,12 +2190,13 @@ mod tests {
             "api.x.com",
             "/p",
             "",
+            &aa(),
             b"stale".to_vec(),
             0,
         );
         // Expired grant is not returned (and is consumed/dropped).
         assert_eq!(
-            state.op_grant_take("v1", "agA", "svc", "POST", "api.x.com", "/p", "", true),
+            state.op_grant_take("v1", "agA", "svc", "POST", "api.x.com", "/p", "", &aa()),
             None
         );
     }
@@ -2118,6 +2224,7 @@ mod tests {
             "api.x.com",
             "/v2/purchase",
             &d80,
+            &aa(),
             b"tok".to_vec(),
             far,
         );
@@ -2131,7 +2238,7 @@ mod tests {
                 "api.x.com",
                 "/v2/purchase",
                 &d180,
-                true
+                &aa()
             ),
             None
         );
@@ -2145,7 +2252,7 @@ mod tests {
                 "api.x.com",
                 "/v2/purchase",
                 &d80,
-                true
+                &aa()
             ),
             Some(b"tok".to_vec())
         );
@@ -2158,7 +2265,7 @@ mod tests {
                 "api.x.com",
                 "/v2/purchase",
                 &d80,
-                true
+                &aa()
             ),
             None
         );
@@ -2187,6 +2294,7 @@ mod tests {
             "api.x.com",
             "/search",
             &d_read,
+            &ex(),
             b"tok".to_vec(),
             far,
         );
@@ -2200,7 +2308,7 @@ mod tests {
                 "api.x.com",
                 "/search",
                 &d_read,
-                false
+                &ex()
             ),
             Some(b"tok".to_vec())
         );
@@ -2213,7 +2321,7 @@ mod tests {
                 "api.x.com",
                 "/search",
                 &d_read,
-                false
+                &ex()
             ),
             Some(b"tok".to_vec())
         );
@@ -2227,7 +2335,7 @@ mod tests {
                 "api.x.com",
                 "/search",
                 &d_other,
-                false
+                &ex()
             ),
             None
         );
@@ -2240,7 +2348,7 @@ mod tests {
                 "api.x.com",
                 "/search",
                 &d_read,
-                false
+                &ex()
             ),
             Some(b"tok".to_vec())
         );
@@ -2340,7 +2448,10 @@ mod tests {
             "agA",
             "gh",
             "api.gh.com",
-            crate::approval::reuse::GrantUnit::Rule("read".into()),
+            crate::approval::reuse::GrantUnit::Rule(
+                "read".into(),
+                crate::approval::reuse::Class::Read,
+            ),
             60,
         );
 
@@ -2477,7 +2588,7 @@ mod tests {
             "agA",
             "shop",
             "api.shop.com",
-            GrantUnit::Rule("pay".into()),
+            GrantUnit::Rule("pay".into(), Class::Write),
             60,
         );
         assert_eq!(decide("POST", "/pay", Some("50")), AccessLevel::Allow);
@@ -2504,6 +2615,80 @@ mod tests {
             decide("PUT", "/a", None),
             AccessLevel::Ask,
             "read never serves a write"
+        );
+    }
+
+    /// A connection's own rule edit that decides a scoped request on a field
+    /// its approval does not bind (a declared but unscoped var, or the body)
+    /// is reported for that connection only; a rule on a bound field is not.
+    #[test]
+    fn connection_rule_problem_flags_unbound_deciding_fields() {
+        use crate::core::policy::{AccessLevel, ConnectionPolicy, Policy, RuleConfig};
+        let def: crate::service::ServiceDef = toml::from_str(
+            r#"
+[service]
+id = "shop"
+name = "Shop"
+hosts = ["api.shop.com"]
+secrets = ["SHOP_KEY"]
+[requests.purchase]
+match = "POST /buy"
+vars.amount = "/amount"
+vars.force  = { in = "query", at = "force" }
+scope = ["amount"]
+"#,
+        )
+        .unwrap();
+        let rs = def
+            .extract_request_scope("POST", "/buy", Some("force=1"), Some(r#"{"amount":5}"#))
+            .expect("shape matches");
+        let rule = |when: Option<&str>, body: Option<&str>| RuleConfig {
+            match_pattern: Some("POST /buy".into()),
+            when: when.map(str::to_string),
+            body: body.map(str::to_string),
+            level: Some(AccessLevel::Allow),
+            ..Default::default()
+        };
+        let with_rules = |rules: Vec<(&str, RuleConfig)>| {
+            let mut p = Policy::default();
+            p.connections.insert(
+                "shop".to_string(),
+                ConnectionPolicy {
+                    default: None,
+                    rules: rules.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
+                },
+            );
+            let state = test_state();
+            let cache = SecretsCache {
+                policy: p,
+                ..Default::default()
+            };
+            state.unlock_vault("v1".into(), cache, zeroize::Zeroizing::new(Vec::new()));
+            state
+        };
+        let state = with_rules(vec![("small", rule(Some("vars.amount < 10"), None))]);
+        assert_eq!(
+            state.connection_rule_problem("v1", "shop", "shop", "POST", "/buy", &rs),
+            None
+        );
+        let state = with_rules(vec![("forced", rule(Some("vars.force == 1"), None))]);
+        let e = state
+            .connection_rule_problem("v1", "shop", "shop", "POST", "/buy", &rs)
+            .expect("unbound deciding field");
+        assert!(e.contains("'forced'") && e.contains("vars.force"), "{e}");
+        // Another connection of the vault has no such edit.
+        assert_eq!(
+            state.connection_rule_problem("v1", "shop_2", "shop", "POST", "/buy", &rs),
+            None
+        );
+        let state = with_rules(vec![("bodyish", rule(None, Some("gift")))]);
+        assert!(state
+            .connection_rule_problem("v1", "shop", "shop", "POST", "/buy", &rs)
+            .is_some());
+        // Locked: nothing to report (the request fails as locked anyway).
+        assert_eq!(
+            state.connection_rule_problem("v-none", "shop", "shop", "POST", "/buy", &rs),
+            None
         );
     }
 
@@ -2546,7 +2731,10 @@ mod tests {
             "agA",
             "shop",
             "api.shop.com",
-            crate::approval::reuse::GrantUnit::Rule("purchase".into()),
+            crate::approval::reuse::GrantUnit::Rule(
+                "purchase".into(),
+                crate::approval::reuse::Class::Write,
+            ),
             60,
         );
 

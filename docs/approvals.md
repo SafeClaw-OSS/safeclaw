@@ -28,7 +28,8 @@ some or set its floors.
 2. **Your overrides.** Per connection, you can re-level any rule or set
    read/write floors.
 3. **Floors.** Connection, category, and global read/write defaults, derived
-   from an objective fact (the HTTP method), not a vibe. They apply when no
+   from an objective fact (the HTTP method), not a vibe. `GET`, `HEAD` and
+   `OPTIONS` are reads; every other method is a write. They apply when no
    rule matches.
 
 There are no "risk scores". SafeClaw doesn't grade actions medium-spicy on
@@ -54,7 +55,9 @@ host, and only the unit that asked:
 - `ask` on a request a service scopes by its values (a `[requests]` shape,
   e.g. an amount): this identical request, same values, for the window.
 - `ask` from a rule (e.g. "Send email"): later requests that the same rule
-  decides, for the rule's window. Another rule still asks.
+  decides, for the rule's window, reads or writes like the approved one. A
+  read approved under a rule never lets a write through. Another rule still
+  asks.
 - `ask` from a read or write floor you set to `ask`: later reads (or writes)
   on that connection that no rule matches, for the floor's window. A read
   approval never lets a write through.
@@ -70,7 +73,9 @@ grant, so the card is never a guess.
 ## Boundaries refuse; they don't prompt
 
 A request outside a connection's hosts, or against a `deny` rule, is refused
-loudly and immediately. It does not become an approval popup. Prompts are
+loudly and immediately. So is a request on a value-scoped path covered by a
+connection rule you wrote that decides on something an approval there cannot
+pin: the body, or a field outside the path's `[requests]` scope. It does not become an approval popup. Prompts are
 reserved for actions you defined as sensitive; violations are not a
 negotiation. This is the anti-approval-fatigue stance: the fewer taps you
 see, the more each one means.

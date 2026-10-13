@@ -136,10 +136,15 @@ impl ServiceDef {
             .filter_map(|k| vars.get(k).map(|v| (k.clone(), cap_bound_value(v))))
             .collect();
         bound.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut declared: Vec<String> = shape.vars.keys().cloned().collect();
+        declared.sort();
         Some(RequestScope {
             vars,
             bound,
             consent: shape.consent.clone(),
+            shape: shape_name.clone(),
+            declared,
+            binds: shape.scope.clone(),
         })
     }
 
@@ -593,6 +598,13 @@ pub struct RequestScope {
     pub bound: Vec<(String, String)>,
     /// The shape's consent template (`{{ vars.x | filter }}` syntax).
     pub consent: Option<String>,
+    /// The matched shape's name (its `[requests.<name>]` key).
+    pub shape: String,
+    /// Every var the matched shape declares, resolved on this request or not.
+    pub declared: Vec<String>,
+    /// The matched shape's `scope`: the var names whose values bind an
+    /// approval of a request on this path.
+    pub binds: Vec<String>,
 }
 
 impl RequestScope {
@@ -2017,6 +2029,10 @@ consent = "Buy from {{ vars.merchant }} for {{ vars.amount }}"
             rs.consent.as_deref(),
             Some("Buy from {{ vars.merchant }} for {{ vars.amount }}")
         );
+        // The matched shape, for the connection-rule check.
+        assert_eq!(rs.shape, "purchase");
+        assert_eq!(rs.declared, vec!["amount", "force", "merchant"]);
+        assert_eq!(rs.binds, vec!["amount", "merchant"]);
     }
 
     #[test]
