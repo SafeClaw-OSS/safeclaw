@@ -3426,6 +3426,47 @@ enum Resolved {
         note: String,
         overwrite: Option<Overwrite>,
     },
+    /// The cloud refused ours for good ([`rejection_fixes`]): `fixes` (none:
+    /// ours stays dirty, unsent), and the user is told with `note`
+    /// ([`rejection_note`]); never reverted silently.
+    Rejected { fixes: Vec<LocalFix>, note: String },
+}
+
+/// What the user is told of a change of `ours` the cloud refused for good
+/// (`status`, `error`), and what became of it (`fixes`, as
+/// [`rejection_fixes`] made them): kept as its conflict copy, kept unsent,
+/// or not applied while the vault's version stays.
+fn rejection_note(ours: &item_layer::ItemPayload, status: u16, error: &str, fixes: &[LocalFix]) -> String {
+    let error: String = crate::util::terminal_safe(error).chars().take(80).collect();
+    let why = if error.is_empty() {
+        format!("HTTP {}", status)
+    } else {
+        format!("HTTP {}: {}", status, error)
+    };
+    let what = if fixes.iter().any(|f| matches!(f, LocalFix::KeepCopy { .. })) {
+        format!(
+            "the vault keeps its version; yours is kept on this device as \"{}\" and is sent once the cloud takes it",
+            item_layer::conflict_copy_name(&ours.name)
+        )
+    } else if fixes.is_empty() {
+        "it is kept on this device, unsent".to_string()
+    } else {
+        "the vault keeps its version; re-run it once the cloud takes it".to_string()
+    };
+    format!("{}: the cloud refused this change ({}); {}", conflict_record(ours), why, what)
+}
+
+/// [`rejection_fixes`] as a [`Resolved::Rejected`], said to the user.
+fn rejected(
+    ours_row: &DirtyRow,
+    ours: &item_layer::ItemPayload,
+    theirs: Option<TheirItem>,
+    status: u16,
+    error: &str,
+) -> Resolved {
+    let fixes = rejection_fixes(ours_row, ours, theirs).unwrap_or_default();
+    let note = rejection_note(ours, status, error, &fixes);
+    Resolved::Rejected { fixes, note }
 }
 
 /// Ours, to write over THEIR row that cannot be read ([`Resolved::NotReadable`]).
@@ -3715,6 +3756,7 @@ fn set_aside(
 
 /// Reconcile a TERMINAL rejection of OUR dirty row: see [`rejection_fixes`];
 /// a refusal over a signed row (`signed_row`) is a conflict ([`set_aside`]).
+#[allow(clippy::too_many_arguments)]
 async fn resolve_rejection(
     cloud: &str,
     vault_id: &str,
@@ -3722,20 +3764,18 @@ async fn resolve_rejection(
     keys: item_layer::VaultKeys<'_>,
     their_rows: &mut TheirRows,
     ours_row: &DirtyRow,
-    signed_row: bool,
+    status: u16,
+    error: &str,
 ) -> Resolved {
     let (ours, theirs) =
         match load_conflict_pair(cloud, vault_id, dk, keys, their_rows, ours_row, None).await {
             Ok(pair) => pair,
             Err(r) => return r,
         };
-    if signed_row {
+    if is_signed_row_refusal(status, error) {
         return set_aside(ours_row, &ours, theirs);
     }
-    match rejection_fixes(ours_row, &ours, theirs) {
-        Some(f) => Resolved::Fixed(f),
-        None => Resolved::LeaveDirty,
-    }
+    rejected(ours_row, &ours, theirs, status, error)
 }
 
 /// Warn ONCE per (vault, item, version, status) about a terminal rejection: a
@@ -3897,10 +3937,7 @@ async fn resolve_conflict(
                             // The copy itself is refused for good (a NEW item on a
                             // frozen plan): keep it locally, dirty, and take theirs.
                             warn_rejected_once(vault_id, &wire, version, status, &error);
-                            return match rejection_fixes(ours_row, &ours, Some((r, ct, p))) {
-                                Some(f) => Resolved::Fixed(f),
-                                None => Resolved::LeaveDirty,
-                            };
+                            return rejected(ours_row, &ours, Some((r, ct, p)), status, &error);
                         }
                         Err(e) => {
                             tracing::warn!(vault = %vault_id, item = %ours_row.id, "per-item 409: conflict copy write failed ({}); left dirty", e);
@@ -3982,10 +4019,7 @@ async fn resolve_conflict(
                 }
                 Ok(PushOutcome::Rejected { status, error }) => {
                     warn_rejected_once(vault_id, &ours_row.id, version, status, &error);
-                    match rejection_fixes(ours_row, &ours, theirs) {
-                        Some(f) => Resolved::Fixed(f),
-                        None => Resolved::LeaveDirty,
-                    }
+                    rejected(ours_row, &ours, theirs, status, &error)
                 }
                 Err(e) => {
                     tracing::warn!(vault = %vault_id, item = %ours_row.id, "per-item 409: re-apply failed ({}); left dirty", e);
@@ -4021,6 +4055,13 @@ impl PushTally {
                 self.refused_rows.push((row.id.clone(), why));
             }
             Resolved::NotReadable { fixes, note, .. } => {
+                self.fixes.extend(fixes);
+                self.refused_rows.push((row.id.clone(), note));
+            }
+            Resolved::Rejected { fixes, note } => {
+                if fixes.is_empty() {
+                    self.left_dirty += 1;
+                }
                 self.fixes.extend(fixes);
                 self.refused_rows.push((row.id.clone(), note));
             }
@@ -4512,7 +4553,8 @@ pub async fn push_items_best_effort(state: &Arc<AppState>, vault_id: &str) {
                     keys,
                     &mut their_rows,
                     row,
-                    signed_row,
+                    status,
+                    &error,
                 )
                 .await;
                 if !tally.take(row, r) {
@@ -6209,6 +6251,27 @@ mod peritem_tests {
         let tomb = ItemPayload::tombstone(ItemNs::Secret, "A");
         let fixes = rejection_fixes(&dirty, &tomb, theirs()).unwrap();
         assert_eq!(fixes.len(), 1, "adopt only");
+
+        // Each refusal is said to the user, with what became of ours; none
+        // is reverted silently.
+        let Resolved::Rejected { fixes, note } = rejected(&dirty, &ours, theirs(), 413, "too_large") else {
+            panic!("said to the user");
+        };
+        assert!(fixes.iter().any(|f| matches!(f, LocalFix::KeepCopy { .. })));
+        assert!(
+            note.starts_with("secret A: the cloud refused this change (HTTP 413: too_large); the vault keeps its version; yours is kept on this device as \"A (conflict copy)\""),
+            "{}",
+            note
+        );
+        let Resolved::Rejected { fixes, note } = rejected(&dirty, &ours, None, 402, "") else {
+            panic!("said to the user");
+        };
+        assert!(fixes.is_empty());
+        assert!(note.ends_with("(HTTP 402); it is kept on this device, unsent"), "{}", note);
+        let Resolved::Rejected { note, .. } = rejected(&dirty, &tomb, theirs(), 413, "too_large") else {
+            panic!("said to the user");
+        };
+        assert!(note.ends_with("the vault keeps its version; re-run it once the cloud takes it"), "{}", note);
     }
 
     /// THEIR row on a 409 (or a terminal refusal) that this device cannot
@@ -6269,7 +6332,8 @@ mod peritem_tests {
                     keys,
                     &mut fetched,
                     &dirty,
-                    false,
+                    413,
+                    "too_large",
                 ))
             } else {
                 rt.block_on(resolve_conflict(
@@ -6547,7 +6611,8 @@ mod peritem_tests {
                 keys,
                 &mut fetched(),
                 &dirty,
-                true,
+                403,
+                "record_write_forbidden",
             ));
             for resolved in [on_409, on_403] {
                 let Resolved::SetAside { fixes, record } = resolved else {
