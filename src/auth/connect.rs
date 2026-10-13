@@ -870,25 +870,28 @@ fn build_m_from_view(
 /// `open_view_for_grant_keep_key`), so the CLI never touches the PRF-derived
 /// user key — a `sc service` write works over SSH through the plain grant link.
 ///
-/// `Err` unless the whole change landed: a store that cannot be written, a
-/// reconcile that fails, or a part of the change refused or set aside (each
-/// said in the error; the parts that did land are kept and served).
+/// `Err` unless the whole change landed: a store that cannot be written or a
+/// reconcile that fails (`Internal`), or a part of the change refused or set
+/// aside (`Conflict`, saying each; the parts that did land are kept and
+/// served).
 pub(crate) fn persist_mutated_view(
     state: &Arc<AppState>,
     vault_id: &str,
     base: &ViewBase,
     view: &crate::storage::plaintext::VaultPlaintextView,
     k: &[u8],
-) -> Result<(), String> {
-    let m = build_m_from_view(view)?;
+) -> crate::error::Result<()> {
+    use crate::error::AppError;
+    let m = build_m_from_view(view).map_err(AppError::Internal)?;
     let vault_dat = crate::storage::sealed_vault::read(&vault_dat_path(state, vault_id))
         .ok()
         .flatten();
-    let not_applied = write_view(state, vault_id, vault_dat, &m, view, k, base)?;
+    let not_applied =
+        write_view(state, vault_id, vault_dat, &m, view, k, base).map_err(AppError::Internal)?;
     if not_applied.is_empty() {
         Ok(())
     } else {
-        Err(not_applied.join("; "))
+        Err(AppError::Conflict(not_applied.join("; ")))
     }
 }
 
@@ -1914,6 +1917,38 @@ refresh_token = "REFRESH_TOKEN"
         assert_eq!(folded.native_secrets["B"], b"b");
         assert!(!state.is_vault_locked(vid), "the session serves the store's fold");
 
+        // A row this key cannot open is never written over: the change to it
+        // is refused and said in the error (a conflict, not an internal
+        // failure); the rest of the change lands.
+        let other = VaultKeys {
+            id_seed: &fx.id_seed,
+            content: &[0x99u8; 32],
+            prev: &[],
+        };
+        let mut pv = read_per_item(&path).unwrap().unwrap();
+        let x = pv
+            .plant::<S>(other, vid, ItemNs::Secret, "X", 1, &ItemPayload::secret_live("X", "x"))
+            .unwrap();
+        pv.items.get_mut(&x).unwrap().synced_version = 1;
+        write_per_item_atomic(&path, &pv).unwrap();
+        let open = || {
+            crate::server::handlers::metadata::open_view_with_state_key(&state, vid, &material)
+                .unwrap()
+        };
+        let base2 = ViewBase::of(&open()).unwrap();
+        let mut mine = open();
+        mine.native_secrets.insert("X".into(), b"mine".to_vec());
+        mine.native_secrets.insert("D".into(), b"d".to_vec());
+        match persist_mutated_view(&state, vid, &base2, &mine, &material) {
+            Err(crate::error::AppError::Conflict(m)) => {
+                assert!(m.starts_with("secret X: the stored record cannot be read"), "{}", m)
+            }
+            other => panic!("a conflict, not {:?}", other.err()),
+        }
+        let pv = read_per_item(&path).unwrap().unwrap();
+        assert_eq!(pv.items[&x].version, 1, "not written over");
+        assert_eq!(pv.fold_view::<S>(keys, vid).unwrap().native_secrets["D"], b"d");
+
         // A store whose re-key proof no longer verifies: the write is refused,
         // the store is left byte for byte, and a locked session stays locked.
         state.lock_vault(vid);
@@ -1923,7 +1958,9 @@ refresh_token = "REFRESH_TOKEN"
         let before = std::fs::read(&path).unwrap();
         let mut again = changed;
         again.native_secrets.insert("C".into(), b"c".to_vec());
-        let err = persist_mutated_view(&state, vid, &base, &again, &material).unwrap_err();
+        let err = persist_mutated_view(&state, vid, &base, &again, &material)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("could not be applied"), "{}", err);
         assert_eq!(std::fs::read(&path).unwrap(), before);
         assert!(state.is_vault_locked(vid), "nothing served from memory");

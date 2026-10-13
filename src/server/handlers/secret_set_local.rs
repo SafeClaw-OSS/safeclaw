@@ -151,8 +151,7 @@ pub async fn create(
         } else {
             Vec::new()
         };
-        crate::auth::connect::persist_mutated_view(&state, &vault_id, &base, &view, &k)
-            .map_err(AppError::Internal)?;
+        crate::auth::connect::persist_mutated_view(&state, &vault_id, &base, &view, &k)?;
         (removed, anchors)
     };
 

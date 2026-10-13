@@ -375,7 +375,6 @@ pub(crate) fn persist(
     k: &[u8],
 ) -> Result<()> {
     crate::auth::connect::persist_mutated_view(state, vault_id, base, view, k)
-        .map_err(AppError::Internal)
 }
 
 /// Apply a `service-add`: the stored definitions of the source become exactly

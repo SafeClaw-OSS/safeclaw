@@ -1454,8 +1454,7 @@ pub async fn approve_op(
                         );
                     }
                 }
-                crate::auth::connect::persist_mutated_view(&state, &vault_id, &base, &view, &k)
-                    .map_err(AppError::Internal)?;
+                crate::auth::connect::persist_mutated_view(&state, &vault_id, &base, &view, &k)?;
                 {
                     let state = state.clone();
                     let vid = vault_id.clone();
@@ -1517,8 +1516,7 @@ pub async fn approve_op(
                     }
                 }
                 if removed {
-                    crate::auth::connect::persist_mutated_view(&state, &vault_id, &base, &view, &k)
-                        .map_err(AppError::Internal)?;
+                    crate::auth::connect::persist_mutated_view(&state, &vault_id, &base, &view, &k)?;
                     {
                         let state = state.clone();
                         let vid = vault_id.clone();
@@ -1675,8 +1673,7 @@ pub async fn approve_op(
                     .remove(&key)
                     .unwrap_or_default();
                 view.native_secrets.remove(&key);
-                crate::auth::connect::persist_mutated_view(&state, &vault_id, &base, &view, &k)
-                    .map_err(AppError::Internal)?;
+                crate::auth::connect::persist_mutated_view(&state, &vault_id, &base, &view, &k)?;
                 {
                     let state = state.clone();
                     let vid = vault_id.clone();
@@ -1733,8 +1730,7 @@ pub async fn approve_op(
                     &state.services,
                 )
                 .map_err(AppError::BadRequest)?;
-                crate::auth::connect::persist_mutated_view(&state, &vault_id, &base, &view, &k)
-                    .map_err(AppError::Internal)?;
+                crate::auth::connect::persist_mutated_view(&state, &vault_id, &base, &view, &k)?;
                 {
                     let state = state.clone();
                     let vid = vault_id.clone();
@@ -1977,8 +1973,7 @@ pub async fn approve_op(
                     }
                 }
                 view.aux.connections.insert(id.clone(), record);
-                crate::auth::connect::persist_mutated_view(&state, &vault_id, &base, &view, &k)
-                    .map_err(AppError::Internal)?;
+                crate::auth::connect::persist_mutated_view(&state, &vault_id, &base, &view, &k)?;
                 {
                     let state = state.clone();
                     let vid = vault_id.clone();
@@ -2068,8 +2063,7 @@ pub async fn approve_op(
                 } else {
                     hosts.clone()
                 };
-                crate::auth::connect::persist_mutated_view(&state, &vault_id, &base, &view, &k)
-                    .map_err(AppError::Internal)?;
+                crate::auth::connect::persist_mutated_view(&state, &vault_id, &base, &view, &k)?;
                 {
                     let state = state.clone();
                     let vid = vault_id.clone();
