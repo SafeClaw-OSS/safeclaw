@@ -51,6 +51,8 @@ level = "ask"
 # 可选: body = "<regex>",  ttl = <秒>
 ```
 
+定义里的 `ttl`(rule 或 `[default]`)上限 31536000 秒(一年),超出则整份定义拒收,不截断。console 里 owner 自己的设置不受此限。
+
 `match` = `"METHOD /path"` 或 `"/path"`(任意方法);`*` 匹配一个 path segment。
 **无 `level` 的 rule 被静默跳过**(它永远无法决策)。
 

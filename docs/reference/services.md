@@ -15,6 +15,71 @@ services/github/
 
 Format: TOML (authored by humans/agents; CI publishes `registry.json`).
 
+## Adding services to a vault: `sc service`
+
+Services outside the built-in catalog live in your vault, added from a
+**source**. A source is a folder in the catalog's layout:
+
+- a service folder: `service.toml` + optional `policy.toml`, or
+- a collection: `services/<id>/service.toml` + optional `policy.toml`.
+
+| Source | Example |
+|---|---|
+| Local folder | `./my-api`, `/abs/path/tools` |
+| GitHub repository, optional sub-folder | `github:owner/repo`, `github:owner/repo:services/acme` (`git:` works too) |
+
+GitHub only for now; another git host or a URL is refused. `owner/slug`
+names the service registry, which is not open yet.
+
+| Command | Does |
+|---|---|
+| `sc service add <source> [--id <id>] [--ref <ref>]` | Reads the source, checks every definition, stores them with one passkey approval. |
+| `sc service update <id\|source> [--all] [--check] [-y] [--ref <ref>]` | Re-reads a source and stores what changed, with one passkey approval. |
+| `sc service ls [id]` | Lists the vault's definitions by source, with the pinned commit and loaded / skipped (with the reason). |
+| `sc service rm <id\|source>` | Removes one service, or every service of a source. |
+| `sc service validate <source> [--ref <ref>]` | Runs the same checks as `add`, without a vault. For authors and CI. |
+
+How it works:
+
+- **Pinned.** A GitHub source is resolved to a full commit (`--ref` takes a
+  branch, tag or commit; default: the default branch) and stored with it.
+- **Read, never run.** Only `service.toml` and `policy.toml` at those paths
+  are read, as regular files: symlinks, links and devices are not followed
+  (a local folder is opened one component at a time without following a
+  link, macOS and Linux), a GitHub tarball is read in memory (never
+  extracted), `..` or an absolute path refuses it, and sizes and entry counts
+  are capped. A parse error gives its kind, line and column, never the text.
+- **All or nothing.** Every definition passes the same gate the daemon runs at
+  unlock; one invalid definition refuses the whole source.
+- **One approval.** The card lists each service, every host that receives
+  its credentials or OAuth data (declared hosts, the token endpoint, the
+  authorization page, a redirect that leaves your device), `PKCE: off` when
+  the flow has no PKCE, the rules it applies, and the source with its commit.
+  A GitHub source is fetched again on your device at that commit and must
+  match, or the request is refused; a local folder, or GitHub out of reach,
+  shows the source as stated by the requester. Only the rules that tighten
+  apply in a vault.
+- **Ids.** A definition is stored under its `[service] id`. It may not be a
+  built-in id or one another source already holds; `--id` renames a
+  single-service source.
+- **Updates.** `update` proposes the remote default branch head (or `--ref`),
+  shows what changes, and marks new hosts (`+ NEW HOST`) and what now lets
+  requests through more easily (`! LOOSENED`: a rule gone or less strict, a
+  longer approval window, a request variable an approval no longer binds,
+  PKCE turned off). `--check` only shows; `-y`
+  skips the terminal question, never the passkey. A local source is re-read
+  only from the path you pass: `sc service update ./my-api`. Services the
+  source no longer has are removed.
+- **Vaults with members.** Their service definitions must be signed by an
+  owner in the browser, so `add`, `update` and `rm` are refused there; add
+  services from the console for now.
+- **Sync.** If the definitions changed elsewhere before your change reached
+  the cloud and the cloud copy cannot be replaced, yours is set aside and not
+  applied; `sc service ls` and `sc sync` say so. Re-run the command.
+- **Removal.** Connections that use a removed service are kept and listed;
+  they stop working until a definition is added again.
+- `ls` reads the unlocked vault: no network, no passkey.
+
 ## service.toml
 
 ```toml

@@ -567,9 +567,16 @@ pub fn seal_wire_item<S: PrimitiveSuite>(
 /// (`lib/vault-grant.ts` `putConflictCopy`).
 pub const CONFLICT_COPY_VERSION: u64 = 1;
 
+const CONFLICT_COPY_SUFFIX: &str = " (conflict copy)";
+
 /// Display name of a conflict copy: `"<name> (conflict copy)"` (console parity).
 pub fn conflict_copy_name(name: &str) -> String {
-    format!("{} (conflict copy)", name)
+    format!("{}{}", name, CONFLICT_COPY_SUFFIX)
+}
+
+/// True for a name [`conflict_copy_name`] produced.
+pub fn is_conflict_copy_name(name: &str) -> bool {
+    name.ends_with(CONFLICT_COPY_SUFFIX)
 }
 
 /// Keep-both (§4): seal OURS as the conflict copy of `(ours.ns, ours.name)`

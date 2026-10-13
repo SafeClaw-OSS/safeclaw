@@ -30,7 +30,8 @@ secret shapes, OAuth wiring, and human-labeled policy rules. GitHub, OpenAI,
 Anthropic, Gemini, Gmail, Google Drive, GCP, Supabase, Railway, GitLab, npm,
 crates.io, Telegram and more are built in; agents discover what's connected
 with `sc connection ls`.
-Adding a service is a TOML file, not a plugin: [SERVICES.md](reference/services.md).
+Adding a service is a TOML file, not a plugin: `sc service add ./folder` or
+`sc service add github:owner/repo` ([services.md](reference/services.md)).
 
 ## Ways to connect
 

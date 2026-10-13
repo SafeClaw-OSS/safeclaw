@@ -284,6 +284,10 @@ pub struct SecretsCache {
     /// unlock. Wiped on lock (Default drop). A custom service folds into
     /// discovery like a compiled one and never shadows a built-in id.
     pub custom_services: HashMap<String, crate::service::ServiceDef>,
+    /// The vault's `aux.services` entries as stored (valid or not, with their
+    /// sources): what `sc service ls` lists and what a `service-add` /
+    /// `service-rm` card is computed against at op creation. Wiped on lock.
+    pub service_entries: std::collections::BTreeMap<String, crate::service::source::StoredService>,
 }
 
 #[derive(Debug)]
@@ -343,6 +347,13 @@ pub struct AppState {
     /// "run `sc upgrade`" instead of a silent parked-sync failure. In-memory only,
     /// (re)set by the sync path; cleared when a sync succeeds again.
     pub vault_upgrade_required: Mutex<std::collections::HashSet<String>>,
+    /// Local changes the sync set aside because the cloud row changed
+    /// elsewhere meanwhile and could not be replaced (a signed row):
+    /// vault → item id → the record it concerns (`services`, `policy`, ...).
+    /// Shown by `sc sync` and `sc service ls`; cleared when a later push of
+    /// that row lands. In-memory only (the set-aside copy itself is kept in
+    /// the store).
+    pub sync_conflicts: Mutex<HashMap<String, std::collections::BTreeMap<String, String>>>,
     /// Team-edition extension hooks (team-edition §9 open/closed split). The
     /// open build leaves the [`crate::team_hooks::NoopHooks`] default (no team
     /// policy); the closed `safeclaw-ee` overlay injects real ones via
@@ -559,6 +570,7 @@ impl AppState {
             cloud_contact: Mutex::new(HashMap::new()),
             vault_shared: Mutex::new(HashMap::new()),
             vault_upgrade_required: Mutex::new(std::collections::HashSet::new()),
+            sync_conflicts: Mutex::new(HashMap::new()),
             team: std::sync::Arc::new(crate::team_hooks::NoopHooks),
             pending_format_mark: Mutex::new(std::collections::HashSet::new()),
             pending_config_ids: Mutex::new(HashMap::new()),
@@ -1456,6 +1468,37 @@ impl AppState {
                 now + ttl_seconds,
             );
         }
+    }
+
+    /// Keep a change the sync set aside (see [`AppState::sync_conflicts`]).
+    pub fn note_sync_conflict(&self, vault_id: &str, item_id: &str, record: &str) {
+        self.sync_conflicts
+            .lock()
+            .unwrap()
+            .entry(vault_id.to_string())
+            .or_default()
+            .insert(item_id.to_string(), record.to_string());
+    }
+
+    /// A push of `item_id` landed: an earlier conflict on it is settled.
+    pub fn clear_sync_conflict(&self, vault_id: &str, item_id: &str) {
+        let mut all = self.sync_conflicts.lock().unwrap();
+        if let Some(m) = all.get_mut(vault_id) {
+            m.remove(item_id);
+            if m.is_empty() {
+                all.remove(vault_id);
+            }
+        }
+    }
+
+    /// The records of `vault_id` with a change set aside, sorted, each once.
+    pub fn sync_conflict_records(&self, vault_id: &str) -> Vec<String> {
+        let all = self.sync_conflicts.lock().unwrap();
+        let set: std::collections::BTreeSet<String> = all
+            .get(vault_id)
+            .map(|m| m.values().cloned().collect())
+            .unwrap_or_default();
+        set.into_iter().collect()
     }
 
     /// Record a successful cloud contact for this vault (sync pull/push, or
@@ -2689,7 +2732,7 @@ path_exact = "/v1/pay"
 level = "allow"
 "#;
         let mut aux = std::collections::BTreeMap::new();
-        aux.insert("acme".to_string(), src.to_string());
+        aux.insert("acme".to_string(), src.into());
         let state = test_state();
         let (custom, skipped) = crate::service::vault_custom_services(&aux, &state.services);
         assert!(skipped.is_empty(), "{skipped:?}");

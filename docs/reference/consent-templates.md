@@ -46,6 +46,11 @@ the console's "through" line. A fact renders only daemon-stamped or
 daemon-checked fields, never a requester-supplied list: connection-add's
 facts read the card (`written`, `referenced`, `overwrites`, `destinations`,
 `replaces`), not `secrets`.
+service-add's facts read its card (`ids`, `from`, `destinations`, `oauth`,
+`new_destinations`, `loosens`, `tightens`, `replaces`, `removes`) and
+service-rm's (`ids`, `from`, `connections`), not the definitions. `from`
+states the source as a fact only when the daemon fetched it again
+(`source_check = fetched`); otherwise it says the requester stated it.
 
 ## Drift gates
 

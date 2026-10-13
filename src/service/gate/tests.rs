@@ -79,7 +79,7 @@ fn key_must_equal_declared_id() {
     let mut aux = std::collections::BTreeMap::new();
     aux.insert(
         "mine".to_string(),
-        GITHUB.replace("\"github\"", "\"other\""),
+        GITHUB.replace("\"github\"", "\"other\"").into(),
     );
     let reg = crate::service::ServiceRegistry::compiled_only();
     let (defs, skipped) = crate::service::vault_custom_services(&aux, &reg);
@@ -180,11 +180,46 @@ fn rejects_tool_named_and_v3_sections() {
     assert!(mentions(&rejected(v3), "parse error"));
 }
 
+/// A parse error names its kind, line and column, never the text: neither the
+/// offending line nor a key or value from it is echoed.
+#[test]
+fn parse_errors_give_kind_and_position_never_the_text() {
+    let leaks = |e: &[String], text: &str| e.iter().any(|p| p.contains(text));
+    // Syntax, in service.toml and policy.toml.
+    let e = rejected("[service]\nid = \"x\"\nname = LEAK_ONE\n");
+    assert_eq!(
+        e,
+        ["service.toml: parse error: syntax error at line 3, column 8"]
+    );
+    let e = rejected_with(GITHUB, "[[rule]\nid = \"LEAK_TWO\"\n");
+    assert!(
+        mentions(&e, "policy.toml: parse error: syntax error at line 1"),
+        "{e:?}"
+    );
+    assert!(!leaks(&e, "LEAK_TWO"), "{e:?}");
+    let e = rejected("[service]\nid = \"x\"\nid = \"LEAK_THREE\"\n");
+    assert!(mentions(&e, "duplicate key at line 3"), "{e:?}");
+    assert!(!leaks(&e, "LEAK_THREE"), "{e:?}");
+    // Schema: a value of the wrong type, an unknown key.
+    let e = rejected(&GITHUB.replace(
+        "hosts = [\"api.github.com\", \"github.com\"]",
+        "hosts = \"leak-four.example\"",
+    ));
+    assert!(
+        mentions(&e, "a value has the wrong type at line 6"),
+        "{e:?}"
+    );
+    assert!(!leaks(&e, "leak-four"), "{e:?}");
+    let e = rejected(&format!("{GITHUB}leak_five = 1\n"));
+    assert!(mentions(&e, "unknown field at line 8"), "{e:?}");
+    assert!(!leaks(&e, "leak_five"), "{e:?}");
+}
+
 #[test]
 fn unknown_fields_are_rejected_everywhere() {
     // A typo in [service] (it used to be silently ignored there).
     let e = rejected(&GITHUB.replace("secrets =", "secret ="));
-    assert!(mentions(&e, "unknown field `secret`"), "{e:?}");
+    assert!(mentions(&e, "unknown field at line"), "{e:?}");
     // [requests] shape, and the table form of a var.
     let req =
         "[requests.buy]\nmatch = \"POST /buy\"\nvars.amount = \"/amount\"\nscope = [\"amount\"]\n";

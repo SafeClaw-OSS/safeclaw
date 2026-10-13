@@ -11,5 +11,6 @@ pub mod proxy;
 pub mod registry;
 pub mod secret_keys;
 pub mod secret_set_local;
+pub mod service_ops;
 pub mod skill;
 pub mod usage;

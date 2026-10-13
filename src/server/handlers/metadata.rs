@@ -219,6 +219,9 @@ pub async fn sync_now(
                         .map(|(conn, host)| json!({ "conn": conn, "host": host }))
                         .collect::<Vec<_>>(),
                 },
+                // Records whose local change the push set aside (the cloud
+                // row changed elsewhere meanwhile): the user re-runs them.
+                "conflicts": state.sync_conflict_records(&vault_id),
             }))
         }
         Err(e) => Json(json!({ "ok": false, "error": e })),

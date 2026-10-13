@@ -1,9 +1,9 @@
 //! Shared creation of connections for `sc set --host` (raw single-secret) and
-//! `sc connect` (raw multi-secret, or service-backed via `--service`), plus the
-//! `aux.services` write for `sc service add`. One place enforces the id + host +
-//! role rules so the verbs can't drift, and one place mutates the sealed `aux`
-//! value in a way that preserves every other key. Raw connections carry explicit
-//! `secrets` (§2); service-backed connections omit them (derived from the service).
+//! `sc connect` (raw multi-secret, or service-backed via `--service`). One place
+//! enforces the id + host + role rules so the verbs can't drift, and one place
+//! mutates the sealed `aux` value in a way that preserves every other key. Raw
+//! connections carry explicit `secrets` (§2); service-backed connections omit
+//! them (derived from the service).
 
 use serde_json::{json, Value};
 
@@ -202,20 +202,6 @@ pub fn insert_service_connection(
         .insert(conn_id.to_string(), Value::Object(rec));
 }
 
-/// Store a custom service definition (verbatim v4 toml source) under
-/// `aux.services[<id>]`, preserving every other aux key.
-pub fn insert_custom_service(aux: &mut Value, id: &str, toml_source: &str) {
-    ensure_object(aux);
-    let obj = aux.as_object_mut().unwrap();
-    let svcs = obj.entry("services").or_insert_with(|| json!({}));
-    if !svcs.is_object() {
-        *svcs = json!({});
-    }
-    svcs.as_object_mut()
-        .unwrap()
-        .insert(id.to_string(), Value::String(toml_source.to_string()));
-}
-
 /// Remove a connection from `aux.connections`, preserving every other aux key.
 /// Returns true if an entry was present. Used by `sc set --no-broker` and
 /// `sc rm` to un-broker / clean up the connection tied to a key.
@@ -365,13 +351,5 @@ mod tests {
             aux["connections"]["acme_t1"]["keys"]["ACME_TOKEN"],
             "ACME_TOKEN_T1"
         );
-    }
-
-    #[test]
-    fn insert_custom_service_preserves_aux() {
-        let mut aux = json!({ "version": 4, "connections": { "a": { "hosts": ["x.com"] } } });
-        insert_custom_service(&mut aux, "myapi", "[service]\nid=\"myapi\"\n");
-        assert_eq!(aux["services"]["myapi"], "[service]\nid=\"myapi\"\n");
-        assert!(aux["connections"]["a"].is_object());
     }
 }

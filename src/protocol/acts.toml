@@ -67,26 +67,35 @@ facts = [
   { label = "Host", label_zh = "主机", value = "{{vars.scope.host}}" },
 ]
 
-[acts.service-ls]
-action = "List custom services"
-action_zh = "列出自定义服务"
-explain = "Reads the names and validity of this vault's custom service definitions. Nothing changes and no secret is revealed."
-explain_zh = "读取此 vault 的自定义服务定义名称与有效性。不做任何更改，也不泄露任何密钥。"
-tone = "neutral"
-
 [acts.service-add]
-action = "Add a custom service definition"
-action_zh = "添加自定义服务定义"
-explain = "Stores a service definition (hosts, auth shape, request rules) in your vault. It only takes effect for connections you explicitly create with it."
-explain_zh = "将一个服务定义（主机、认证方式、请求规则）存入 vault。仅当你显式用它创建连接时才会生效。"
-tone = "neutral"
+action = "Add service definitions"
+action_zh = "添加服务定义"
+explain = "Stores these service definitions in your vault. Connections made with them send their credentials and sign-in data only to the hosts listed. The source line says whether it was checked on your device or only stated by the requester. Approve only a source you trust."
+explain_zh = "把这些服务定义存入你的 vault。用它们建立的连接只会把凭证和登录数据发往列出的主机。来源一行会说明它是在你的设备上核对过的，还是仅由请求方声称。只批准你信任的来源。"
+tone = "danger"
+facts = [
+  { label = "Source", label_zh = "来源", value = "{{vars.scope.from}}" },
+  { label = "Services", label_zh = "服务", value = "{{vars.scope.ids}}" },
+  { label = "Sends credentials to", label_zh = "凭证发往", value = "{{vars.scope.destinations}}" },
+  { label = "OAuth", label_zh = "OAuth", value = "{{vars.scope.oauth}}" },
+  { label = "New destinations", label_zh = "新增目标主机", value = "{{vars.scope.new_destinations}}" },
+  { label = "Loosened or removed rules", label_zh = "放宽或删除的规则", value = "{{vars.scope.loosens}}" },
+  { label = "Rules applied", label_zh = "生效的规则", value = "{{vars.scope.tightens}}" },
+  { label = "Replaces", label_zh = "替换", value = "{{vars.scope.replaces}}" },
+  { label = "Removes", label_zh = "移除", value = "{{vars.scope.removes}}" },
+]
 
 [acts.service-rm]
-action = "Remove custom service {{vars.target}}"
-action_zh = "移除自定义服务 {{vars.target}}"
-explain = "Deletes this custom service definition. Connections referencing it are kept but stop working until it is re-added."
-explain_zh = "删除该自定义服务定义。引用它的连接会保留，但在重新添加之前无法工作。"
+action = "Remove service definitions {{vars.target}}"
+action_zh = "移除服务定义 {{vars.target}}"
+explain = "Deletes these service definitions from your vault. Connections that use them are kept but stop working until a definition is added again."
+explain_zh = "从 vault 中删除这些服务定义。使用它们的连接会保留，但在重新添加定义之前无法工作。"
 tone = "danger"
+facts = [
+  { label = "Services", label_zh = "服务", value = "{{vars.scope.ids}}" },
+  { label = "Source", label_zh = "来源", value = "{{vars.scope.from}}" },
+  { label = "Connections that stop working", label_zh = "将停止工作的连接", value = "{{vars.scope.connections}}" },
+]
 
 [acts.secret-rm]
 action = "Remove secret {{vars.target}}"

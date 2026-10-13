@@ -198,11 +198,12 @@ fn admit_inner(
 
     // The schema: an unknown field anywhere is a parse error here.
     let raw: RawService = toml::from_str(service_toml)
-        .map_err(|e| vec![format!("service.toml: parse error: {}", e)])?;
+        .map_err(|e| vec![toml_problem("service.toml", service_toml, &e, SCHEMA_ERROR)])?;
     let raw_policy: Option<RawPolicyFile> = match policy_toml {
-        Some(p) => {
-            Some(toml::from_str(p).map_err(|e| vec![format!("policy.toml: parse error: {}", e)])?)
-        }
+        Some(p) => Some(
+            toml::from_str(p)
+                .map_err(|e| vec![toml_problem("policy.toml", p, &e, SCHEMA_ERROR)])?,
+        ),
         None => None,
     };
 
@@ -253,7 +254,53 @@ fn check_file_size(name: &str, text: &str, errs: &mut Vec<String>) {
 }
 
 fn parse_table(name: &str, text: &str) -> Result<toml::Table, Vec<String>> {
-    toml::from_str::<toml::Table>(text).map_err(|e| vec![format!("{}: parse error: {}", name, e)])
+    toml::from_str::<toml::Table>(text)
+        .map_err(|e| vec![toml_problem(name, text, &e, SYNTAX_ERROR)])
+}
+
+const SYNTAX_ERROR: &str = "syntax error";
+const SCHEMA_ERROR: &str = "does not match the definition format";
+
+/// A TOML error as its kind and position only. The parser's own text quotes
+/// the offending line and a schema error can quote a key or value; definition
+/// text is never echoed, so only a fixed kind and the line and column are
+/// reported. `default` is the kind when the error is none of the known ones.
+fn toml_problem(name: &str, text: &str, e: &toml::de::Error, default: &str) -> String {
+    let kind = toml_error_kind(e.message()).unwrap_or(default);
+    match e.span().and_then(|span| line_col(text, span.start)) {
+        Some((line, col)) => format!(
+            "{}: parse error: {} at line {}, column {}",
+            name, kind, line, col
+        ),
+        None => format!("{}: parse error: {}", name, kind),
+    }
+}
+
+/// The fixed kind of a TOML error message, from its leading words only.
+fn toml_error_kind(message: &str) -> Option<&'static str> {
+    const KINDS: [(&str, &str); 8] = [
+        ("unknown field", "unknown field"),
+        ("missing field", "missing field"),
+        ("duplicate field", "duplicate key"),
+        ("duplicate key", "duplicate key"),
+        ("invalid type", "a value has the wrong type"),
+        ("invalid value", "invalid value"),
+        ("invalid length", "wrong number of items"),
+        ("unknown variant", "unknown value"),
+    ];
+    let m = message.trim_start();
+    KINDS
+        .iter()
+        .find(|(prefix, _)| m.starts_with(prefix))
+        .map(|(_, kind)| *kind)
+}
+
+/// 1-based line and column (in characters) of byte offset `at` in `text`.
+fn line_col(text: &str, at: usize) -> Option<(usize, usize)> {
+    let before = text.get(..at.min(text.len()))?;
+    let line = before.matches('\n').count() + 1;
+    let col = before.rsplit('\n').next().map_or(0, |l| l.chars().count()) + 1;
+    Some((line, col))
 }
 
 // ── Strings: control / bidi characters and lengths, in every value and key ──
@@ -876,7 +923,19 @@ fn parse_level(what: &str, s: &str, errs: &mut Vec<String>) -> Option<AccessLeve
     level
 }
 
+/// A `ttl` from a definition may not exceed [`MAX_TTL_SECONDS`]; over it the
+/// definition is refused, never clamped.
+fn check_ttl(what: &str, ttl: Option<u64>, errs: &mut Vec<String>) {
+    if let Some(t) = ttl.filter(|t| *t > MAX_TTL_SECONDS) {
+        errs.push(format!(
+            "{}: ttl = {} is over the limit of {} seconds (one year)",
+            what, t, MAX_TTL_SECONDS
+        ));
+    }
+}
+
 fn levels_from(what: &str, raw: &RawLevels, errs: &mut Vec<String>) -> Levels {
+    check_ttl(what, raw.ttl, errs);
     Levels {
         read: raw
             .read
@@ -931,6 +990,7 @@ fn policy_from_file(file: RawPolicyFile, errs: &mut Vec<String>) -> ServicePolic
             errs.push(format!("{}: the label must not be empty", what));
         }
         check_match_list(&what, &r.match_pattern, errs);
+        check_ttl(&what, r.ttl, errs);
         let level = match r.level.as_deref() {
             Some(l) => parse_level(&what, l, errs),
             None => {

@@ -195,9 +195,9 @@ pub enum Command {
     /// Health + reachability checks: daemon connectivity, active
     /// profile, API key presence. Read-only; no vault state mutation.
     Doctor(CommonArgs),
-    /// Work with service.toml definitions. Today: `service validate <path>`
-    /// runs the static safety checks the console upload editor enforces.
-    /// Offline, no daemon needed.
+    /// Service definitions in the active vault, added from sources: a local
+    /// folder or a GitHub repository pinned to a commit (add / update / ls /
+    /// rm), and `validate` to run the same checks offline.
     Service(ServiceArgs),
     /// git credential helper — **invoked by git, not users**. Registered
     /// per-process by `sc run` (`GIT_CONFIG_KEY_*=credential.helper`,
@@ -434,32 +434,72 @@ pub struct ServiceArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum ServiceSubcommand {
-    /// Validate a service.toml definition against the broker's safety rules.
-    /// Prints each problem and exits non-zero on failure.
-    Validate(ServiceValidateArgs),
-    /// Store a validated custom service definition in the active vault
-    /// (`aux.services`), so its connections show up in the catalog and can be
-    /// added like any built-in. Validates the v4 schema first; the daemon
-    /// re-validates (v4 schema, no tool-named sections) at unlock before it
-    /// can broker. Two passkey gestures (unlock + write).
+    /// Add service definitions from a source to the active vault, with one
+    /// passkey approval whose card lists each service, every host its
+    /// credentials may be sent to, the rules it applies, and the source.
+    /// SOURCE: `./path` or `/abs/path` (a service folder with service.toml
+    /// and an optional policy.toml, or a collection folder with
+    /// services/<id>/...), or `github:owner/repo[:sub/path]` (`git:` works
+    /// too), pinned to a full commit. GitHub only for now.
     Add(ServiceAddArgs),
-    /// List the vault's custom service definitions (`aux.services`) with each
-    /// one's validation status — an INVALID definition is silently skipped by
-    /// the daemon (its connections stay stuck), and the console only surfaces
-    /// definitions that have a connection, so this is where orphaned or broken
-    /// defs become visible. One passkey gesture (unlock, read-only).
+    /// Update definitions from their source. A GitHub source proposes the
+    /// repository's default branch head (or `--ref`); a local source is re-read
+    /// only when you pass its path again (`sc service update ./path`). Shows
+    /// what changes, highlighting new hosts and loosened or removed rules,
+    /// then asks for the passkey approval (always required).
+    Update(ServiceUpdateArgs),
+    /// List the vault's service definitions grouped by source, with the
+    /// pinned commit and whether each is loaded or skipped (and why). Reads
+    /// the unlocked vault; no network, no passkey.
     Ls(ServiceLsArgs),
-    /// Delete a custom service definition from the vault (`aux.services`).
-    /// Warns when connections still reference it (they keep working off stored
-    /// secrets but lose the service backing). Two passkey gestures
-    /// (unlock + write).
+    /// Remove one service, or every service of a source
+    /// (`github:owner/repo[:path]` or `./path`). Connections that use them are
+    /// kept but stop working; they are listed first. One passkey approval.
     Rm(ServiceRmArgs),
+    /// Run the checks `add` runs on a source (the definition gate, and that no
+    /// id is a built-in one), without a vault. Exits non-zero on any problem.
+    Validate(ServiceValidateArgs),
 }
 
 #[derive(Debug, Args)]
 pub struct ServiceAddArgs {
-    /// Path to the v4 service.toml to store in the vault.
-    pub path: std::path::PathBuf,
+    /// `./path`, `/abs/path`, or `github:owner/repo[:sub/path]`.
+    pub source: String,
+    /// Store a single-service source under this id instead of its own (when
+    /// it collides with a built-in service or another source's).
+    #[arg(long, value_name = "ID")]
+    pub id: Option<String>,
+    /// Branch, tag or commit of a GitHub source (default: its default
+    /// branch). Resolved to a full commit and pinned.
+    #[arg(long = "ref", value_name = "REF")]
+    pub git_ref: Option<String>,
+    #[arg(long)]
+    pub no_browser: bool,
+    /// Fixed port for the localhost callback server (for SSH port-forwarding).
+    #[arg(long, env = "SAFECLAW_CB_PORT")]
+    pub cb_port: Option<u16>,
+    #[arg(long, default_value = "120")]
+    pub timeout: u64,
+}
+
+#[derive(Debug, Args)]
+pub struct ServiceUpdateArgs {
+    /// A service id or a source (`github:owner/repo[:path]`, `./path`).
+    #[arg(required_unless_present = "all")]
+    pub target: Option<String>,
+    /// Update every GitHub source in the vault.
+    #[arg(long, conflicts_with_all = ["target", "git_ref"])]
+    pub all: bool,
+    /// Show what would change; change nothing.
+    #[arg(long)]
+    pub check: bool,
+    /// Skip the terminal confirmation (the passkey approval is still required).
+    #[arg(long, short = 'y')]
+    pub yes: bool,
+    /// Update a GitHub source to this branch, tag or commit instead of its
+    /// default branch head.
+    #[arg(long = "ref", value_name = "REF")]
+    pub git_ref: Option<String>,
     #[arg(long)]
     pub no_browser: bool,
     /// Fixed port for the localhost callback server (for SSH port-forwarding).
@@ -471,19 +511,15 @@ pub struct ServiceAddArgs {
 
 #[derive(Debug, Args)]
 pub struct ServiceLsArgs {
-    #[arg(long)]
-    pub no_browser: bool,
-    /// Fixed port for the localhost callback server (for SSH port-forwarding).
-    #[arg(long, env = "SAFECLAW_CB_PORT")]
-    pub cb_port: Option<u16>,
-    #[arg(long, default_value = "120")]
-    pub timeout: u64,
+    /// Show one service in detail.
+    pub id: Option<String>,
 }
 
 #[derive(Debug, Args)]
 pub struct ServiceRmArgs {
-    /// The service id to delete (as shown by `sc service ls`).
-    pub id: String,
+    /// A service id, or a source (`github:owner/repo[:path]`, `./path`) to
+    /// remove all of its services.
+    pub target: String,
     #[arg(long)]
     pub no_browser: bool,
     /// Fixed port for the localhost callback server (for SSH port-forwarding).
@@ -495,13 +531,11 @@ pub struct ServiceRmArgs {
 
 #[derive(Debug, Args)]
 pub struct ServiceValidateArgs {
-    /// Path to the service.toml to validate.
-    pub path: std::path::PathBuf,
-    /// Validate as a first-party (trusted) definition — allows exec /
-    /// non-upstream steps. Default: validate as an UPLOADED definition (exec
-    /// forbidden), i.e. the same strict checks the console upload editor applies.
-    #[arg(long)]
-    pub first_party: bool,
+    /// `./path`, `/abs/path`, or `github:owner/repo[:sub/path]`.
+    pub source: String,
+    /// Branch, tag or commit of a GitHub source.
+    #[arg(long = "ref", value_name = "REF")]
+    pub git_ref: Option<String>,
 }
 
 #[derive(Debug, Args)]

@@ -2929,6 +2929,12 @@ enum Resolved {
     LeaveDirty,
     /// `/items` is not live (404): stop the push.
     EndpointMissing,
+    /// THEIR row stays canonical and OURS is set aside ([`set_aside_fixes`]):
+    /// apply the fixes and tell the user `record` changed elsewhere meanwhile.
+    SetAside {
+        fixes: Vec<LocalFix>,
+        record: String,
+    },
 }
 
 /// Replace our dirty row with THEIR row (clean), guarded on our version.
@@ -3067,7 +3073,90 @@ fn rejection_fixes(
     Some(fixes)
 }
 
-/// Reconcile a TERMINAL rejection of OUR dirty row: see [`rejection_fixes`].
+/// The server's refusal of an unsigned version over a row it holds signed (an
+/// owner-config record keeps its type and owner signature). This process never
+/// signs, so the same row can never land: a conflict, not a retryable error.
+fn is_signed_row_refusal(status: u16, error: &str) -> bool {
+    status == 403 && error == "record_write_forbidden"
+}
+
+/// The record a set-aside change concerns, as the user knows it: the config
+/// name (`services`, `policy`, ...) or `<namespace> <name>`.
+fn conflict_record(p: &item_layer::ItemPayload) -> String {
+    use item_layer::ItemNs;
+    match p.ns {
+        ItemNs::Aux => p.name.clone(),
+        ns if ns.is_singleton() => ns.as_str().to_string(),
+        ns => format!("{} {}", ns.as_str(), p.name),
+    }
+}
+
+/// Local fixes for OUR dirty row when THEIR row carries a signature this
+/// process cannot produce for a new version (it signs nothing): ours must
+/// never replace it. THEIR row stays canonical and untouched on the cloud,
+/// and OURS, when it is a value that differs from theirs, is kept as a
+/// conflict copy: in a keep-both namespace a dirty one (pushed as a create,
+/// like the console's copy); elsewhere a LOCAL one that is never pushed and
+/// never folded (a copy of a singleton or a `connecting` row would otherwise
+/// read as the real one). A delete keeps no copy. `None` = no row of theirs
+/// to take (left dirty).
+fn set_aside_fixes(
+    keys: item_layer::VaultKeys<'_>,
+    vault_id: &str,
+    ours_row: &DirtyRow,
+    ours: &item_layer::ItemPayload,
+    theirs: Option<TheirItem>,
+) -> Option<Vec<LocalFix>> {
+    type S = sudp::primitives::StdPrimitives;
+    let (r, ct, p) = theirs?;
+    let mut fixes = Vec::new();
+    let same = !p.is_tombstone() && p.body == ours.body;
+    if !ours.is_tombstone() && !same {
+        match item_layer::seal_conflict_copy::<S>(keys, vault_id, ours, r.version) {
+            Ok((copy_id, copy_ct)) => fixes.push(LocalFix::InsertIfAbsent {
+                id: copy_id,
+                row: pv_store::StoredItem {
+                    version: item_layer::CONFLICT_COPY_VERSION,
+                    ct: copy_ct,
+                    synced_version: if ours.ns.keeps_both_on_conflict() {
+                        0
+                    } else {
+                        item_layer::CONFLICT_COPY_VERSION
+                    },
+                    tombstone: false,
+                    sig: None,
+                    signer: None,
+                },
+            }),
+            Err(e) => {
+                tracing::warn!(vault = %vault_id, item = %ours_row.id, "per-item set-aside: seal conflict copy failed ({}); left dirty", e);
+                return None;
+            }
+        }
+    }
+    fixes.push(adopt_fix(ours_row, &r, ct, p.is_tombstone()));
+    Some(fixes)
+}
+
+/// [`set_aside_fixes`] as a [`Resolved`].
+fn set_aside(
+    keys: item_layer::VaultKeys<'_>,
+    vault_id: &str,
+    ours_row: &DirtyRow,
+    ours: &item_layer::ItemPayload,
+    theirs: Option<TheirItem>,
+) -> Resolved {
+    match set_aside_fixes(keys, vault_id, ours_row, ours, theirs) {
+        Some(fixes) => Resolved::SetAside {
+            fixes,
+            record: conflict_record(ours),
+        },
+        None => Resolved::LeaveDirty,
+    }
+}
+
+/// Reconcile a TERMINAL rejection of OUR dirty row: see [`rejection_fixes`];
+/// a refusal over a signed row (`signed_row`) is a conflict ([`set_aside`]).
 async fn resolve_rejection(
     cloud: &str,
     vault_id: &str,
@@ -3075,12 +3164,16 @@ async fn resolve_rejection(
     keys: item_layer::VaultKeys<'_>,
     their_rows: &mut TheirRows,
     ours_row: &DirtyRow,
+    signed_row: bool,
 ) -> Resolved {
     let (ours, theirs) =
         match load_conflict_pair(cloud, vault_id, dk, keys, their_rows, ours_row, None).await {
             Ok(pair) => pair,
             Err(r) => return r,
         };
+    if signed_row {
+        return set_aside(keys, vault_id, ours_row, &ours, theirs);
+    }
     match rejection_fixes(keys, vault_id, ours_row, &ours, theirs) {
         Some(f) => Resolved::Fixed(f),
         None => Resolved::LeaveDirty,
@@ -3117,9 +3210,12 @@ fn warn_rejected_once(vault_id: &str, item: &str, version: u64, status: u16, err
 ///     `conflict_copy_id(id_seed, ns, name, their_version)`; a 409 on it means
 ///     an earlier attempt already wrote it), then take theirs locally;
 ///   - `Reapply`  → re-seal ours at `their_version + 1` and CAS on their version
-///     (their row gone → re-create ours as-is).
+///     (their row gone → re-create ours as-is). Their row signed → never: an
+///     unsigned re-seal could only clear the signature, so ours is set aside
+///     ([`set_aside_fixes`]) and the cloud row is left as it is.
 ///
-/// A terminal rejection of the extra write falls back to [`rejection_fixes`].
+/// A terminal rejection of the extra write falls back to [`rejection_fixes`]
+/// (a refusal over a signed row: [`set_aside_fixes`]).
 /// At most ONE extra write per item per push: a second 409 leaves the row dirty
 /// for the next push (bounded, no loop). Nothing local changes unless the cloud
 /// write it depends on landed (or was refused for good), so a retry re-derives
@@ -3245,6 +3341,10 @@ async fn resolve_conflict(
             Resolved::Fixed(fixes)
         }
         ConflictAction::Reapply => {
+            if theirs.as_ref().is_some_and(|(r, _, _)| r.sig.is_some()) {
+                tracing::info!(vault = %vault_id, item = %ours_row.id, "per-item 409: their row is signed; ours set aside");
+                return set_aside(keys, vault_id, ours_row, &ours, theirs);
+            }
             let (base, version, ct) = match &theirs {
                 // Their row is gone (GC'd): re-create ours as-is, at OUR version
                 // with its existing ct (sealed at that version, so the AAD
@@ -3293,6 +3393,11 @@ async fn resolve_conflict(
                 // Raced again: one retry per item per push; the next push reconciles.
                 Ok(PushOutcome::Conflict { .. }) => Resolved::LeaveDirty,
                 Ok(PushOutcome::EndpointMissing) => Resolved::EndpointMissing,
+                Ok(PushOutcome::Rejected { status, error })
+                    if is_signed_row_refusal(status, &error) =>
+                {
+                    set_aside(keys, vault_id, ours_row, &ours, theirs)
+                }
                 Ok(PushOutcome::Rejected { status, error }) => {
                     warn_rejected_once(vault_id, &ours_row.id, version, status, &error);
                     match rejection_fixes(keys, vault_id, ours_row, &ours, theirs) {
@@ -3327,6 +3432,12 @@ async fn resolve_conflict(
 /// A TERMINAL rejection (400/402/403/413/422) is reconciled by
 /// [`resolve_rejection`]: theirs is taken at the canonical id and ours, where it
 /// differs, is kept as a LOCAL dirty conflict copy (warned once).
+///
+/// A row of theirs that is signed is never replaced by an unsigned version of
+/// ours (a 409 on it, or the server's `record_write_forbidden`): ours is set
+/// aside ([`set_aside_fixes`]) and the conflict is kept for the user
+/// ([`AppState::note_sync_conflict`], shown by `sc sync` and `sc service ls`)
+/// until a later push of that row lands.
 ///
 /// Reconciling needs `K` (open ours/theirs, seal the copy), taken from the
 /// unlocked session ([`AppState::cloned_state_key`]). A LOCKED vault leaves the
@@ -3390,6 +3501,7 @@ pub async fn push_items_best_effort(state: &Arc<AppState>, vault_id: &str) {
     let mut endpoint_missing = false;
     let mut left_dirty = 0usize;
     let mut fixes: Vec<LocalFix> = Vec::new();
+    let mut set_aside_rows: Vec<(String, String)> = Vec::new();
     for row in &rows {
         let base_version = push_base_version(row.synced_version);
         let ct_b64 = URL_SAFE_NO_PAD.encode(&row.ct);
@@ -3433,6 +3545,10 @@ pub async fn push_items_best_effort(state: &Arc<AppState>, vault_id: &str) {
                 .await
                 {
                     Resolved::Fixed(f) => fixes.extend(f),
+                    Resolved::SetAside { fixes: f, record } => {
+                        fixes.extend(f);
+                        set_aside_rows.push((row.id.clone(), record));
+                    }
                     Resolved::LeaveDirty => left_dirty += 1,
                     Resolved::EndpointMissing => {
                         endpoint_missing = true;
@@ -3443,14 +3559,32 @@ pub async fn push_items_best_effort(state: &Arc<AppState>, vault_id: &str) {
             Ok(PushOutcome::Rejected { status, error }) => {
                 // Terminal (400/402/403/413/422): these bytes never land. Take
                 // theirs, keep ours as a local dirty conflict copy (see
-                // `rejection_fixes`); locked (no K) → left dirty.
-                warn_rejected_once(vault_id, &row.id, row.version, status, &error);
+                // `rejection_fixes`); over a signed row, set ours aside (see
+                // `set_aside_fixes`); locked (no K) → left dirty.
+                let signed_row = is_signed_row_refusal(status, &error);
+                if !signed_row {
+                    warn_rejected_once(vault_id, &row.id, row.version, status, &error);
+                }
                 let Some(keys) = keys else {
                     left_dirty += 1;
                     continue;
                 };
-                match resolve_rejection(cloud, vault_id, &dk, keys, &mut their_rows, row).await {
+                match resolve_rejection(
+                    cloud,
+                    vault_id,
+                    &dk,
+                    keys,
+                    &mut their_rows,
+                    row,
+                    signed_row,
+                )
+                .await
+                {
                     Resolved::Fixed(f) => fixes.extend(f),
+                    Resolved::SetAside { fixes: f, record } => {
+                        fixes.extend(f);
+                        set_aside_rows.push((row.id.clone(), record));
+                    }
                     Resolved::LeaveDirty => left_dirty += 1,
                     Resolved::EndpointMissing => {
                         endpoint_missing = true;
@@ -3463,6 +3597,17 @@ pub async fn push_items_best_effort(state: &Arc<AppState>, vault_id: &str) {
                 tracing::warn!(vault = %vault_id, item = %row.id, "per-item push failed: {}", e);
             }
         }
+    }
+    // A push of a row that landed settles an earlier conflict on it; a row set
+    // aside now is one for the user to re-run.
+    for f in &fixes {
+        if let LocalFix::Synced { id, .. } = f {
+            state.clear_sync_conflict(vault_id, id);
+        }
+    }
+    for (id, record) in set_aside_rows {
+        tracing::warn!(vault = %vault_id, item = %id, record = %record, "per-item push: changed elsewhere meanwhile; ours set aside, theirs kept");
+        state.note_sync_conflict(vault_id, &id, &record);
     }
     // Apply what landed — re-read the store (a writer may have raced us); every
     // change is guarded on the exact version we pushed, so a row bumped
@@ -4748,6 +4893,135 @@ mod peritem_tests {
         )
         .unwrap();
         assert_eq!(fixes.len(), 1, "adopt only");
+    }
+
+    /// A signed row of theirs is never replaced by an unsigned version of
+    /// ours (this process signs nothing): on a 409 over it, and on the
+    /// server's `record_write_forbidden`, ours is set aside. Theirs stays
+    /// canonical with its signature, nothing is pushed (the cloud URL here is
+    /// unreachable, so a push attempt would leave the row dirty instead), and
+    /// ours is kept as a LOCAL conflict copy that is never pushed or folded.
+    #[test]
+    fn signed_row_is_never_replaced_ours_is_set_aside() {
+        use crate::storage::item::{self as il, ItemPayload};
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        let k = [0x42u8; 32];
+        let vid = "v";
+        let keys = VaultKeys::single(&k);
+        let mut pv = empty_pv();
+        // Ours: a local edit of the services record at v3 (cloud last confirmed v2).
+        let ours = ItemPayload::live(
+            ItemNs::Services,
+            "",
+            serde_json::json!({ "acme": { "service": "ours" } }),
+        );
+        let id = pv
+            .seal_and_upsert::<StdPrimitives>(keys, vid, ItemNs::Services, "", 3, &ours)
+            .unwrap();
+        pv.items.get_mut(&id).unwrap().synced_version = 2;
+        let dirty = DirtyRow {
+            id: id.clone(),
+            version: 3,
+            synced_version: 2,
+            ct: pv.get_item(&id).unwrap().ct.clone(),
+            tombstone: false,
+        };
+        // Theirs: v5, signed by an owner.
+        let theirs = ItemPayload::live(
+            ItemNs::Services,
+            "",
+            serde_json::json!({ "acme": { "service": "theirs" } }),
+        );
+        let their_ct = il::seal_wire_item::<StdPrimitives>(keys, vid, &id, 5, &theirs).unwrap();
+        let their_row = ItemRow {
+            item_id: id.clone(),
+            version: 5,
+            seq: 9,
+            ct: URL_SAFE_NO_PAD.encode(&their_ct),
+            sig: Some("c2ln".into()),
+            signer: Some("us_owner".into()),
+        };
+        let fetched =
+            || TheirRows::Fetched([(id.clone(), their_row.clone())].into_iter().collect());
+
+        assert!(is_signed_row_refusal(403, "record_write_forbidden"));
+        assert!(!is_signed_row_refusal(403, "plan_frozen"));
+        assert!(!is_signed_row_refusal(409, "record_write_forbidden"));
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let cloud = "http://127.0.0.1:9";
+        let on_409 = rt.block_on(resolve_conflict(
+            cloud,
+            vid,
+            "dk",
+            keys,
+            &mut fetched(),
+            &dirty,
+            5,
+        ));
+        let on_403 = rt.block_on(resolve_rejection(
+            cloud,
+            vid,
+            "dk",
+            keys,
+            &mut fetched(),
+            &dirty,
+            true,
+        ));
+        for resolved in [on_409, on_403] {
+            let Resolved::SetAside { fixes, record } = resolved else {
+                panic!("ours must be set aside, with nothing pushed");
+            };
+            assert_eq!(record, "services");
+            let mut pv = pv.clone();
+            let (changed, content) = apply_local_fixes(&mut pv, fixes);
+            assert!(changed && content);
+            // Theirs is canonical, clean, its signature kept.
+            let canon = pv.get_item(&id).unwrap();
+            assert_eq!(
+                (canon.version, canon.synced_version, canon.sig.as_deref()),
+                (5, 5, Some("c2ln"))
+            );
+            assert_eq!(canon.ct, their_ct);
+            // Ours is kept as a local copy: clean (never pushed), never folded.
+            let (copy_id, _) =
+                il::seal_conflict_copy::<StdPrimitives>(keys, vid, &ours, 5).unwrap();
+            let copy = pv.get_item(&copy_id).expect("ours kept as a conflict copy");
+            assert_eq!(copy.version, copy.synced_version, "never pushed");
+            let opened =
+                il::open_wire_item::<StdPrimitives>(keys, vid, &copy_id, copy.version, &copy.ct)
+                    .unwrap();
+            assert_eq!(opened.body, ours.body);
+            let view = pv.fold_view::<StdPrimitives>(keys, vid).unwrap();
+            assert!(
+                !view.aux.services.contains_key("acme"),
+                "the copy is not read as the services record"
+            );
+        }
+
+        // A delete keeps no copy; in a keep-both namespace the copy is dirty
+        // (pushed as a create, like the console's copy row).
+        let their = || Some((their_row.clone(), their_ct.clone(), theirs.clone()));
+        let tomb = ItemPayload::tombstone(ItemNs::Services, "");
+        assert_eq!(
+            set_aside_fixes(keys, vid, &dirty, &tomb, their())
+                .unwrap()
+                .len(),
+            1,
+            "adopt only"
+        );
+        let secret = ItemPayload::secret_live("A", "ours");
+        let fixes = set_aside_fixes(keys, vid, &dirty, &secret, their()).unwrap();
+        assert!(matches!(
+            &fixes[0],
+            LocalFix::InsertIfAbsent { row, .. } if row.synced_version == 0
+        ));
+        assert_eq!(conflict_record(&secret), "secret A");
+        assert!(set_aside_fixes(keys, vid, &dirty, &ours, None).is_none());
     }
 
     /// The §4 decision table (console parity: KEEP_BOTH_NS = secret, connection).

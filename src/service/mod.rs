@@ -8,6 +8,7 @@
 /// the request already carries the real upstream URL.
 pub mod gate;
 pub mod limits;
+pub mod source;
 
 use crate::auth::oauth2::OAuthStyle;
 use std::collections::HashMap;
@@ -718,26 +719,27 @@ pub fn scope_digest(bound: &[(String, String)]) -> String {
 
 // ── Vault-custom definitions ──────────────────────────────────────────────────
 
-/// A vault's own service definitions (`aux.services`, id → toml) as the daemon
-/// brokers them: every def the gate admits under its storage key (so the key
-/// is the declared id) and whose id is not a compiled one (a custom def never
-/// shadows a built-in), with its policy reduced to the parts that tighten
+/// A vault's own service definitions (`aux.services`, id → stored entry) as
+/// the daemon brokers them: every entry the gate admits under its storage key
+/// (so the key is the declared id), with its stored policy.toml if any, and
+/// whose id is not a compiled one (a custom def never shadows a built-in),
+/// with its policy reduced to the parts that tighten
 /// ([`ServiceDef::for_vault`]). The skipped ids come back with the reason. The
 /// unlock bootstrap loads exactly this set, so every other reader of
 /// `aux.services` (the proxy, the console's registry view) agrees with what is
 /// enforced.
 pub fn vault_custom_services(
-    aux_services: &std::collections::BTreeMap<String, String>,
+    aux_services: &std::collections::BTreeMap<String, source::StoredService>,
     reg: &ServiceRegistry,
 ) -> (HashMap<String, ServiceDef>, Vec<(String, String)>) {
     let mut defs = HashMap::new();
     let mut skipped = Vec::new();
-    for (id, toml_src) in aux_services {
+    for (id, entry) in aux_services {
         if reg.get(id).is_some() {
             skipped.push((id.clone(), "shadows a built-in id".to_string()));
             continue;
         }
-        match gate::admit(Some(id), toml_src, None) {
+        match entry.admit(id) {
             Ok(def) => {
                 defs.insert(id.clone(), def.for_vault().0);
             }
@@ -1346,7 +1348,7 @@ level = "allow"
         );
         // The registry reader applies it, so the console shows what is enforced.
         let mut aux = std::collections::BTreeMap::new();
-        aux.insert("acme".to_string(), VAULT_DEF.to_string());
+        aux.insert("acme".to_string(), VAULT_DEF.into());
         let (defs, _) = vault_custom_services(&aux, &ServiceRegistry::compiled_only());
         assert_eq!(defs["acme"].policy.as_ref().unwrap().rules.len(), 1);
         // Nothing that tightens: no policy at all.
@@ -1607,8 +1609,9 @@ type = "sigv4-someday"
 "#;
         assert!(gate::admit_toml(bad).is_err());
 
-        // The retired section name is an unknown field at the top level — the
-        // serde error names the offending section, pointing authors at [auth].
+        // The retired section name is an unknown field at the top level. The
+        // error points at it by line and column; definition text is never
+        // echoed.
         let legacy = r#"
 [service]
 id = "x"
@@ -1620,8 +1623,8 @@ refresh_token = "K"
 "#;
         let err = gate::admit_toml(legacy).unwrap_err().join("; ");
         assert!(
-            err.contains("oauth2"),
-            "error should name the offending section: {}",
+            err.contains("unknown field at line 7") && !err.contains("oauth2"),
+            "error should point at the offending section: {}",
             err
         );
     }

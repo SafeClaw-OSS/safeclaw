@@ -41,6 +41,7 @@ pub async fn run(_args: SyncArgs) -> Result<(), String> {
             }
         );
         report_connects(body.get("connects"));
+        report_conflicts(body.get("conflicts"));
         Ok(())
     } else {
         // The daemon's sync error crosses a process boundary as a string; if it
@@ -114,6 +115,21 @@ fn report_connects(connects: Option<&serde_json::Value>) {
             "  {}: couldn't reach {host} (network/proxy?) — will retry. \
              Behind a proxy? `sc proxy set <url>`.",
             unreached.join(", ")
+        );
+    }
+}
+
+/// Records whose local change was set aside because the cloud row changed
+/// elsewhere meanwhile: theirs was kept, ours was not applied.
+fn report_conflicts(conflicts: Option<&serde_json::Value>) {
+    let records: Vec<&str> = conflicts
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+    for r in records {
+        eprintln!(
+            "  {}: changed elsewhere meanwhile; your change was set aside and not applied. Re-run it.",
+            crate::util::terminal_safe(r)
         );
     }
 }

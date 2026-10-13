@@ -86,6 +86,9 @@ tower-service = "0.3"
 # vendored libcurl) fail to verify passthrough (non-brokered) public hosts.
 rustls-native-certs = "0.8"
 toml = "0.8"
+# gzip for `sc service add github:…`: a source tarball is read in memory
+# (never extracted to disk). Already in the tree via hudsucker's decoder.
+flate2 = "1"
 dirs = "5"
 url = "2"
 urlencoding = "2"
@@ -108,6 +111,13 @@ jsonwebtoken = "9"
 # on the host. See src/audit.rs + PROTOCOL.md §5.3 layout.
 rusqlite = { version = "0.31", features = ["bundled"] }
 rs_merkle = "1.5.0"
+
+# `sc service add ./path`: a local source is read with an openat walk that
+# never follows a symbolic link (O_NOFOLLOW on every component), and its files
+# are opened non-blocking and checked with fstat before reading. Already in the
+# tree (via tempfile).
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["fs"] }
 
 [dev-dependencies]
 tempfile = "3"

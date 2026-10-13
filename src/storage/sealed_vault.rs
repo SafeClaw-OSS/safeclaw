@@ -1511,6 +1511,78 @@ impl PerItemVault {
         Ok(id)
     }
 
+    /// Write the vault's service definitions (`services`, an owner-config
+    /// record) unsigned at the next version, where the live row is (the
+    /// unified `services` address when the vault has one, else
+    /// `aux:services`). Written even when `body` is empty, so a removal of the
+    /// last definition replaces the row instead of leaving it. Returns the id
+    /// written, or `None` when the stored definitions already equal `body`.
+    ///
+    /// Only a NoUik (v1) keyset honors unsigned owner-config. A v2 keyset
+    /// honors it only when an owner signed it, where the owner approves (in
+    /// the browser, over the content they see); this process never signs
+    /// owner-config, so the write is refused there.
+    ///
+    /// `base` is the view the caller opened and then changed: the stored
+    /// definitions must still be the ones it held (the rule
+    /// [`Self::reconcile_from_view`] applies with [`ReconcileBase::Since`]),
+    /// so a pull that landed in between is never reverted. When they differ,
+    /// nothing is written and the caller re-runs.
+    pub fn seal_services<S: PrimitiveSuite>(
+        &mut self,
+        keys: VaultKeys,
+        vault_id: &str,
+        body: serde_json::Value,
+        base: &ViewBase,
+    ) -> Result<Option<String>> {
+        if self.keyset.uik.is_some() {
+            return Err(AppError::Forbidden(
+                "service definitions on this vault must be signed by an owner in the browser; nothing was written".into(),
+            ));
+        }
+        let held = base.digest(ItemNs::Aux, "services");
+        let stored = ViewBase::of(&self.fold_view::<S>(keys, vault_id)?)?;
+        if stored.digest(ItemNs::Aux, "services") != held {
+            return Err(AppError::Conflict(
+                "the vault's service definitions changed since this request was opened (a sync landed meanwhile); nothing was written, re-run the command".into(),
+            ));
+        }
+        let wanted = match &body {
+            serde_json::Value::Object(o) if o.is_empty() => None,
+            b => Some(body_digest(b)),
+        };
+        if wanted.as_ref() == held {
+            return Ok(None);
+        }
+        let unified_live = matches!(
+            self.open_item::<S>(keys, vault_id, ItemNs::Services, ""),
+            Ok(Some(p)) if !p.is_tombstone()
+        );
+        let (ns, name) = if unified_live {
+            (ItemNs::Services, "")
+        } else {
+            (ItemNs::Aux, "services")
+        };
+        let version = self.item_version::<S>(keys, ns, name)? + 1;
+        let ctx = ItemCtx::for_item::<S>(keys.id_seed, vault_id, ns, name, version)?;
+        let payload = ItemPayload::live(ns, name.to_string(), body);
+        let ct = seal_item::<S>(keys.content, &ctx, &payload)?;
+        let id = ctx.item_id_b64();
+        let synced_version = self.items.get(&id).map(|s| s.synced_version).unwrap_or(0);
+        self.items.insert(
+            id.clone(),
+            StoredItem {
+                version,
+                ct,
+                synced_version,
+                tombstone: false,
+                sig: None,
+                signer: None,
+            },
+        );
+        Ok(Some(id))
+    }
+
     /// Unseal one stored item addressed by `(ns, name)` under `K`. `Ok(None)` if
     /// no such item is stored. The stored `version` is fed into the `SealCtx`,
     /// so a tampered version would fail the AEAD (contract §6).
@@ -2173,6 +2245,15 @@ impl PerItemVault {
                 let ctx = ItemCtx::new(vault_id, raw, stored.version);
                 let payload = unseal_item::<S>(keys.content, &ctx, &stored.ct)?;
                 if payload.is_tombstone() {
+                    return Ok(());
+                }
+                // A conflict copy outside the keep-both namespaces is a local
+                // record of a change set aside by the sync (never pushed):
+                // never folded. A singleton ignores its row's name and a
+                // `connecting` copy would read as an in-flight connect.
+                if !payload.ns.keeps_both_on_conflict()
+                    && crate::storage::item::is_conflict_copy_name(&payload.name)
+                {
                     return Ok(());
                 }
                 let name = payload.name;
@@ -5144,5 +5225,140 @@ mod tests {
             matches!(pv.resolve_membership_trust(vault), MembershipTrust::Untrusted),
             "a rolled-back log (committed event omitted) is rejected → Untrusted",
         );
+    }
+
+    /// The `services` row `sc service` writes: unsigned, so on a NoUik (v1)
+    /// keyset only; a v2 keyset refuses it and nothing is written. The stored
+    /// definitions must still be the ones the caller opened: a pull that
+    /// changed them in between refuses the write and keeps the pulled row. An
+    /// emptied map replaces the row; unchanged definitions write nothing.
+    #[test]
+    fn services_row_is_unsigned_v1_only_and_checked_against_its_base() {
+        use sudp::primitives::StdPrimitives;
+        type S = StdPrimitives;
+        let k = [0x5au8; 32];
+        let keys = VaultKeys::single(&k);
+        let vault = "vault-v1";
+        let acme = serde_json::json!({ "acme": { "service": "[service]\nid = \"acme\"\n" } });
+        let mut v1 = PerItemVault::build_initial(
+            b"c".to_vec(),
+            "x".into(),
+            "y".into(),
+            "Dev".into(),
+            vec![0u8; 32],
+            vec![0u8; 48],
+        )
+        .unwrap();
+        let view = |pv: &PerItemVault| pv.fold_view::<S>(keys, vault).unwrap();
+        let base = |pv: &PerItemVault| ViewBase::of(&view(pv)).unwrap();
+
+        // Written unsigned and honored.
+        let b0 = base(&v1);
+        let id = v1
+            .seal_services::<S>(keys, vault, acme.clone(), &b0)
+            .unwrap()
+            .expect("written");
+        assert!(v1.items[&id].sig.is_none() && v1.items[&id].signer.is_none());
+        assert!(view(&v1).aux.services.contains_key("acme"));
+        // The same definitions again: nothing to write.
+        let b1 = base(&v1);
+        assert!(v1
+            .seal_services::<S>(keys, vault, acme.clone(), &b1)
+            .unwrap()
+            .is_none());
+
+        // A pull lands between open (b1) and persist: refused, the pulled row stays.
+        let pulled = serde_json::json!({
+            "acme": { "service": "[service]\nid = \"acme\"\n" },
+            "beta": { "service": "[service]\nid = \"beta\"\n" },
+        });
+        v1.seal_and_bump::<S>(
+            keys,
+            vault,
+            ItemNs::Aux,
+            "services",
+            &ItemPayload::live(ItemNs::Aux, "services".to_string(), pulled),
+        )
+        .unwrap();
+        let e = v1
+            .seal_services::<S>(keys, vault, serde_json::json!({}), &b1)
+            .unwrap_err();
+        assert!(matches!(e, AppError::Conflict(_)), "{e:?}");
+        assert!(view(&v1).aux.services.contains_key("beta"));
+
+        // Against the current base, removing the last one sticks.
+        let b2 = base(&v1);
+        v1.seal_services::<S>(keys, vault, serde_json::json!({}), &b2)
+            .unwrap()
+            .expect("written");
+        assert!(view(&v1).aux.services.is_empty(), "the removal sticks");
+
+        // A v2 keyset: refused, nothing written.
+        let (vault2, _, _, _, _, mut v2) = role_fixture_creator_cred();
+        let before = v2.items.clone();
+        let e = v2
+            .seal_services::<S>(keys, vault2, acme, &ViewBase::default())
+            .unwrap_err();
+        assert!(matches!(e, AppError::Forbidden(_)), "{e:?}");
+        assert_eq!(v2.items.len(), before.len());
+    }
+
+    /// A conflict copy outside the keep-both namespaces is never folded: a
+    /// singleton ignores its row's name, and a `connecting` copy would read as
+    /// an in-flight connect. A keep-both copy (secret) still folds, as before.
+    #[test]
+    fn fold_skips_conflict_copies_outside_keep_both() {
+        use crate::storage::item::{conflict_copy_name, seal_conflict_copy};
+        use sudp::primitives::StdPrimitives;
+        type S = StdPrimitives;
+        let k = [0x5au8; 32];
+        let keys = VaultKeys::single(&k);
+        let vault = "vault-v1";
+        let mut pv = PerItemVault::build_initial(
+            b"c".to_vec(),
+            "x".into(),
+            "y".into(),
+            "Dev".into(),
+            vec![0u8; 32],
+            vec![0u8; 48],
+        )
+        .unwrap();
+        let copies = [
+            ItemPayload::live(
+                ItemNs::Services,
+                String::new(),
+                serde_json::json!({ "x": { "service": "s" } }),
+            ),
+            ItemPayload::live(
+                ItemNs::Policy,
+                String::new(),
+                serde_json::json!({ "timeout": 1 }),
+            ),
+            ItemPayload::live(
+                ItemNs::Connecting,
+                "gmail".to_string(),
+                serde_json::json!({ "service": "gmail" }),
+            ),
+            ItemPayload::live(ItemNs::Secret, "A".to_string(), serde_json::json!("v")),
+        ];
+        for ours in &copies {
+            let (id, ct) = seal_conflict_copy::<S>(keys, vault, ours, 3).unwrap();
+            pv.items.insert(
+                id,
+                StoredItem {
+                    version: crate::storage::item::CONFLICT_COPY_VERSION,
+                    ct,
+                    synced_version: crate::storage::item::CONFLICT_COPY_VERSION,
+                    tombstone: false,
+                    sig: None,
+                    signer: None,
+                },
+            );
+        }
+        let view = pv.fold_view::<S>(keys, vault).unwrap();
+        assert!(view.aux.services.is_empty());
+        assert!(view.aux.policy.is_none());
+        assert!(view.aux.connecting.is_empty());
+        assert!(view.native_secrets.contains_key(&conflict_copy_name("A")));
     }
 }

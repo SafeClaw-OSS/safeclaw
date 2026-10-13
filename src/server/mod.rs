@@ -78,6 +78,9 @@ pub fn app_router(state: Arc<AppState>) -> Router {
             get(handlers::secret_keys::secret_keys),
         )
         .route("/v/{vid}/registry", get(handlers::registry::vault_registry))
+        // The vault's own service definitions with their sources and status
+        // (`sc service ls`): unlocked session only, no passkey, no network.
+        .route("/v/{vid}/services", get(handlers::service_ops::list))
         .route("/v/{vid}/usage", get(handlers::usage::usage))
         // Device egress-proxy hot-reload (after `sc proxy set/clear`) — no vault
         // context, no params: re-reads the local stored value into the live

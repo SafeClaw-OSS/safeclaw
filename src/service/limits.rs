@@ -55,6 +55,12 @@ pub const MAX_VARS: usize = 32;
 /// `scope` entries per request shape (2: snaplii).
 pub const MAX_SCOPE: usize = 32;
 
+/// Seconds a definition's `ttl` (a rule's or `[default]`'s approval reuse
+/// window) may be: one year, a product decision on how long one approval may
+/// stand (1800: cratesio). The owner's own console and
+/// per-connection settings are not definitions and are not bound by it.
+pub const MAX_TTL_SECONDS: u64 = 365 * 24 * 60 * 60;
+
 /// Problems reported for one rejected definition; the rest are counted, so a
 /// pathological file cannot produce an unbounded message.
 pub const MAX_REPORTED_PROBLEMS: usize = 50;

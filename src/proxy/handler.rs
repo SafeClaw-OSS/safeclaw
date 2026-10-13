@@ -29,7 +29,7 @@ use crate::state::AppState;
 /// The last-resort `ask`-once window when neither the matched rule nor any
 /// floor (`default.ttl`) pins one — the "Ask once" grant lasts this long after
 /// approval. Kept in sync with the console's shown default (15 min).
-const DEFAULT_ASK_TTL: u64 = 900;
+pub(crate) const DEFAULT_ASK_TTL: u64 = 900;
 
 /// What `handle_response` needs to write the terminal audit row after the
 /// upstream answers a forwarded (allow) request.

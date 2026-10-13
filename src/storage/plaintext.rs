@@ -536,14 +536,16 @@ pub struct VaultAux {
     /// sensible range during prune.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audit_retention_days: Option<u32>,
-    /// Per-vault custom service definitions: `service_id → verbatim v4
-    /// service.toml source`. Validated (v4 schema, inline-complete `[oauth2]`,
-    /// no tool-named sections) at unlock before it can broker,
-    /// and again at author time. Sparse — empty when the user authored none. A
-    /// custom service is folded into the catalog exactly like a compiled one;
-    /// it never shadows a built-in id.
+    /// Per-vault custom service definitions: `service_id → { service,
+    /// policy?, source? }` (verbatim service.toml, optional policy.toml, where
+    /// it came from); an entry written before sources is a plain service.toml
+    /// string and reads as one with no policy and no source
+    /// ([`crate::service::source::StoredService`]). Admitted through the gate
+    /// at unlock before it can broker, and again at author time. Sparse —
+    /// empty when the user authored none. A custom service is folded into the
+    /// catalog exactly like a compiled one; it never shadows a built-in id.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub services: BTreeMap<String, String>,
+    pub services: BTreeMap<String, crate::service::source::StoredService>,
     /// The vault's **authorized-agents table** (design §11.1), keyed by `ag_id`
     /// (`derive_id(Agent, pubkey)`). **Presence = authorized**; an `ag_id` with no
     /// entry is not authorized (there is no admission mode). Each [`AgentEntry`] is

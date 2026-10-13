@@ -285,8 +285,9 @@ pub async fn run_cli(hooks: Arc<dyn TeamHooks>) -> Result<(), Box<dyn std::error
         Command::Service(args) => {
             use crate::config::ServiceSubcommand;
             let r = match args.sub {
-                ServiceSubcommand::Validate(a) => cli::service_def::run_validate(a).await,
+                ServiceSubcommand::Validate(a) => cli::service_def::run_validate(a, json).await,
                 ServiceSubcommand::Add(a) => cli::service_def::run_add(a).await,
+                ServiceSubcommand::Update(a) => cli::service_def::run_update(a).await,
                 ServiceSubcommand::Ls(a) => cli::service_def::run_ls(a, json).await,
                 ServiceSubcommand::Rm(a) => cli::service_def::run_rm(a).await,
             };

@@ -70,6 +70,24 @@ pub async fn create(
         crate::server::handlers::connection_add::stamp_at_mint(&state, &vault_id, &mut op)
             .map_err(AppError::BadRequest)?;
     }
+    // service-add / service-rm: the same discipline for service sources (the
+    // services, every destination host, the rules, the source as checked; see
+    // `service_ops`). Refused outright on a vault whose owner-config must be
+    // owner-signed: this process never signs it.
+    if matches!(&op.act.kind, ActType::Custom(name) if name == "service-add" || name == "service-rm")
+    {
+        crate::server::handlers::service_ops::refuse_if_owner_signed(&state, &vault_id)?;
+    }
+    if matches!(&op.act.kind, ActType::Custom(name) if name == "service-add") {
+        let api = crate::service::source::github::GitHubHttp::new().map_err(AppError::Internal)?;
+        crate::server::handlers::service_ops::mint_add(&state, &vault_id, &mut op, &api)
+            .await
+            .map_err(AppError::BadRequest)?;
+    }
+    if matches!(&op.act.kind, ActType::Custom(name) if name == "service-rm") {
+        crate::server::handlers::service_ops::stamp_rm_at_mint(&state, &vault_id, &mut op)
+            .map_err(AppError::BadRequest)?;
+    }
     if op.valid.exp.is_none() {
         let now_unix = SystemTime::now()
             .duration_since(UNIX_EPOCH)

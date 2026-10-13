@@ -102,6 +102,7 @@ Agents learn SafeClaw from one file: [safeclaw-skill.md](static/safeclaw-skill.m
 Setup         sc login · logout · up · down · restart · status
 Secrets       sc set · get · ls · rm              (aliases of sc secret …)
 Connections   sc connection add|ls|rm · sc run -- <cmd> · sc registry · sc store
+Services      sc service add|update|ls|rm|validate   (from ./folder or github:owner/repo)
 Account       sc agent · sc device · sc passkey · sc vault
 Maintenance   sc unlock · lock · sync · logs · doctor · upgrade · proxy · op
 ```
