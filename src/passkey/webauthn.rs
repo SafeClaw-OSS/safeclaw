@@ -32,6 +32,29 @@ use crate::error::{AppError, Result};
 /// `www.` relying party ([`RelyingParty::console`]).
 pub const CONSOLE_ROOTS: [&str; 2] = ["safeclaw.pro", "dev.safeclaw.pro"];
 
+/// The [`CONSOLE_ROOTS`] entry a host belongs to: the root itself, or the
+/// root under a single leading `app.` or `www.` label. `None` for any other
+/// host (self-host, localhost).
+pub fn console_root_of_host(host: &str) -> Option<&'static str> {
+    CONSOLE_ROOTS.iter().copied().find(|root| {
+        host == *root
+            || ["app.", "www."]
+                .iter()
+                .any(|label| host.strip_prefix(label) == Some(*root))
+    })
+}
+
+/// Where console pages are linked: `https://app.<root>` for a SafeClaw
+/// console origin (stored as the root or its `app.` host), otherwise the
+/// origin as given.
+pub fn console_link_origin(origin: &str) -> String {
+    let origin = origin.trim_end_matches('/');
+    match RelyingParty::console(origin) {
+        Some(rp) => format!("https://app.{}", rp.rp_id),
+        None => origin.to_string(),
+    }
+}
+
 /// Whose assertions the daemon accepts: the RP ID the authenticator signed
 /// for (`authenticatorData.rpIdHash` must be its SHA-256) and the exact
 /// `clientDataJSON.origin` values allowed.
@@ -77,12 +100,7 @@ impl RelyingParty {
         if !bare {
             return None;
         }
-        let root = CONSOLE_ROOTS.iter().copied().find(|root| {
-            host == *root
-                || ["app.", "www."]
-                    .iter()
-                    .any(|label| host.strip_prefix(label) == Some(*root))
-        })?;
+        let root = console_root_of_host(host)?;
         Some(Self {
             rp_id: root.to_string(),
             origins: vec![
@@ -372,5 +390,22 @@ mod tests {
         let local = RelyingParty::exact("http://localhost:23293", "localhost");
         let a = assertion(&key, "localhost", "http://localhost:23293", &challenge);
         assert!(verify_assertion(&a, &x, &y, &local, &challenge).is_ok());
+    }
+
+    #[test]
+    fn console_links_go_to_the_app_host_of_a_first_party_root() {
+        for stored in [
+            "https://dev.safeclaw.pro",
+            "https://app.dev.safeclaw.pro/",
+            "https://www.dev.safeclaw.pro",
+        ] {
+            assert_eq!(console_link_origin(stored), "https://app.dev.safeclaw.pro");
+        }
+        assert_eq!(console_link_origin("https://safeclaw.pro"), "https://app.safeclaw.pro");
+        assert_eq!(console_link_origin("https://vault.example.com/"), "https://vault.example.com");
+        assert_eq!(console_link_origin("http://localhost:23293"), "http://localhost:23293");
+        assert_eq!(console_root_of_host("app.dev.safeclaw.pro"), Some("dev.safeclaw.pro"));
+        assert_eq!(console_root_of_host("app.app.safeclaw.pro"), None);
+        assert_eq!(console_root_of_host("evil-safeclaw.pro"), None);
     }
 }

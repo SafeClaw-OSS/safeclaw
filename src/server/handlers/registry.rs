@@ -443,7 +443,7 @@ fn build_connection(
 fn console_url(state: &AppState, vault_id: &str) -> String {
     // Deep-link to THIS vault so the agent can hand the user a link that lands
     // straight on their vault. Demo vaults (minted by /try) live on /try.
-    let origin = state.config.origin.trim_end_matches('/');
+    let origin = crate::passkey::webauthn::console_link_origin(&state.config.origin);
     if vault_id.starts_with("demo-") {
         format!("{}/try", origin)
     } else {

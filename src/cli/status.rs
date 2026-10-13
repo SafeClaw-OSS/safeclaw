@@ -1,11 +1,11 @@
 //! `safeclaw status` / `safeclaw vault status` — current vault status.
 
-use crate::cli::active::{frontend_origin, join_vault_url, load as load_config};
+use crate::cli::active::{console_origin, frontend_origin, join_vault_url, load as load_config};
 
 #[derive(Debug)]
 pub struct VaultStatus {
     pub url: String,
-    /// Web console page for this vault (`{frontend_origin}/vault/{id}`) — the
+    /// Web console page for this vault (`{console_origin}/vault/{id}`) — the
     /// one URL here that IS meant for a browser. `None` when the device was
     /// never paired (local-only / self-host: no console exists).
     pub console: Option<String>,
@@ -118,7 +118,7 @@ async fn control_port_tcp_alive(control_root: &str) -> bool {
 pub async fn fetch_status(custodian: &str, vault: &str) -> VaultStatus {
     let url = join_vault_url(custodian, vault);
     // Mirrors the console's route shape (`/vault/{id}`, see fe vault-nav).
-    let console = frontend_origin().map(|o| format!("{}/vault/{}", o, vault));
+    let console = console_origin().map(|o| format!("{}/vault/{}", o, vault));
     let status = |state| VaultStatus {
         url: url.clone(),
         console: console.clone(),
@@ -355,7 +355,7 @@ fn origin_host(origin: &str) -> &str {
 /// Short environment label for a paired cloud host: the first-party prod / dev
 /// domains, else `self-host`. Purely cosmetic — it never gates anything.
 fn env_label(host: &str) -> &'static str {
-    match host {
+    match crate::passkey::webauthn::console_root_of_host(host).unwrap_or(host) {
         "safeclaw.pro" => "prod",
         "dev.safeclaw.pro" => "dev",
         _ => "self-host",
@@ -453,5 +453,18 @@ pub fn print_status(s: &VaultStatus) {
     }
     for line in &s.held {
         println!("  note:     {}", crate::util::terminal_safe(line));
+    }
+}
+
+#[cfg(test)]
+mod env_label_tests {
+    use super::env_label;
+
+    #[test]
+    fn either_console_host_names_its_environment() {
+        assert_eq!(env_label("dev.safeclaw.pro"), "dev");
+        assert_eq!(env_label("app.dev.safeclaw.pro"), "dev");
+        assert_eq!(env_label("app.safeclaw.pro"), "prod");
+        assert_eq!(env_label("vault.example.com"), "self-host");
     }
 }

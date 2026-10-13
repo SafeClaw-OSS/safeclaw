@@ -472,6 +472,14 @@ pub fn frontend_origin() -> Option<String> {
     Some(derive_frontend_from_backend(backend))
 }
 
+/// Where console pages are linked for this pairing: the `app.` host of a
+/// SafeClaw console (whichever form was stored at `sc login`), otherwise the
+/// stored origin. [`frontend_origin`] stays the stored value (it selects the
+/// passkey relying party).
+pub fn console_origin() -> Option<String> {
+    frontend_origin().map(|o| crate::passkey::webauthn::console_link_origin(&o))
+}
+
 /// Human web-approval link for an op. When the daemon is cloud-paired this is
 /// the absolute cloud page `{frontend_origin}/grant/{op_id}` — the only
 /// approval surface a remote user can actually reach (the daemon is
@@ -480,7 +488,7 @@ pub fn frontend_origin() -> Option<String> {
 /// exists yet, which is why callers gate absolute-vs-relative). Single source
 /// of truth for both the broker's `approve_url` and the CLI's remote-approve arm.
 pub fn grant_url(op_id: &str) -> String {
-    match frontend_origin() {
+    match console_origin() {
         Some(origin) => format!("{}/grant/{}", origin, op_id),
         None => format!("/op/{}", op_id),
     }

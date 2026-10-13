@@ -53,6 +53,14 @@ fn asset_name() -> Result<&'static str, String> {
 /// registry channel uses, so the two never disagree about what "dev" means.
 /// Returns `(want_prerelease, reason)`; `reason` is surfaced so the user can see
 /// which channel ran and why it was chosen.
+/// A pairing to a `dev.` cloud (its console root, so `app.dev.…` counts too).
+fn paired_to_dev(origin: &str) -> bool {
+    let host = origin_host(origin);
+    crate::passkey::webauthn::console_root_of_host(host)
+        .unwrap_or(host)
+        .starts_with("dev.")
+}
+
 fn resolve_channel(args: &UpgradeArgs) -> (bool, String) {
     if args.stable {
         return (false, "stable (--stable)".to_string());
@@ -61,7 +69,7 @@ fn resolve_channel(args: &UpgradeArgs) -> (bool, String) {
         return (true, "pre-release (--prerelease)".to_string());
     }
     match frontend_origin() {
-        Some(origin) if origin_host(&origin).starts_with("dev.") => (
+        Some(origin) if paired_to_dev(&origin) => (
             true,
             format!("pre-release (paired to {})", origin_host(&origin)),
         ),
@@ -149,6 +157,14 @@ mod tests {
             prerelease: pre,
             stable,
         }
+    }
+
+    #[test]
+    fn a_dev_pairing_is_dev_on_either_console_host() {
+        assert!(paired_to_dev("https://dev.safeclaw.pro"));
+        assert!(paired_to_dev("https://app.dev.safeclaw.pro"));
+        assert!(!paired_to_dev("https://app.safeclaw.pro"));
+        assert!(!paired_to_dev("https://safeclaw.pro"));
     }
 
     #[test]

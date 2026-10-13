@@ -400,7 +400,7 @@ impl BrokerHandler {
                 let hint = format!(
                     "this agent isn't authorized on this vault yet — authorize it in the \
                      SafeClaw console (Agents tab), then retry: {}/vault/{}/agents",
-                    self.state.config.origin,
+                    crate::passkey::webauthn::console_link_origin(&self.state.config.origin),
                     self.vid.as_deref().unwrap_or_default(),
                 );
                 return err_response(ScCode::AgentNotAuthorized, &hint).into();
