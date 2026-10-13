@@ -411,13 +411,19 @@ pub(crate) fn apply_secret_set_to_view(
 
 /// Apply a `connection-rm` to an open vault view: drop the record and, unless
 /// `keep_secrets`, delete the native keys `connection_removal` plans (written
-/// by this connection, bound by no other). Returns the deleted keys and the
-/// plan (its kept lists carry the reasons). The SSOT for the mutation, so tests
-/// drive the code the approve path runs.
+/// by this connection, bound by no other). Its rule (`policy:connection:<id>`)
+/// goes too where this process may write owner-config
+/// ([`crate::storage::item::device_may_write`]: a vault without a keyset,
+/// `has_keyset` false), so a later connection of the same id does not take it
+/// over. On a vault with a keyset the rule is owner-signed config and stays:
+/// the owner's console removes it. Returns the deleted keys and the plan (its
+/// kept lists carry the reasons). The SSOT for the mutation, so tests drive
+/// the code the approve path runs.
 pub(crate) fn apply_connection_rm_to_view(
     view: &mut crate::storage::plaintext::VaultPlaintextView,
     id: &str,
     keep_secrets: bool,
+    has_keyset: bool,
     reg: &crate::service::ServiceRegistry,
 ) -> std::result::Result<(Vec<String>, crate::storage::plaintext::ConnectionRemoval), String> {
     let rec = view
@@ -448,7 +454,34 @@ pub(crate) fn apply_connection_rm_to_view(
         }
     }
     view.aux.connections.remove(id);
+    let rule = format!("{}{}", crate::storage::item::POLICY_CONNECTION, id);
+    if crate::storage::item::device_may_write(
+        crate::storage::item::ItemNs::Policy,
+        &rule,
+        has_keyset,
+        true,
+    ) {
+        if let Some(policy) = view.aux.policy.as_mut() {
+            policy.connections.remove(id);
+        }
+    }
     Ok((removed, plan))
+}
+
+/// Whether `vault_id` has a keyset with members, as its per-item store says
+/// (`keyset.uik`): the rule table's `has_keyset` for what this process may
+/// write. A vault with no store (a whole-blob vault) has none; a store that
+/// cannot be read counts as having one, so owner-config is never written on
+/// a guess.
+fn vault_has_keyset(state: &AppState, vault_id: &str) -> bool {
+    let Ok(path) = state.vaults.per_item_path(vault_id) else {
+        return true;
+    };
+    match crate::storage::sealed_vault::read_per_item(&path) {
+        Ok(Some(pv)) => pv.keyset.uik.is_some(),
+        Ok(None) => false,
+        Err(_) => true,
+    }
 }
 
 /// `POST /op/{op_id}/approve` — U submits the signed grant. T validates and
@@ -1691,9 +1724,15 @@ pub async fn approve_op(
                         existing_vault.as_ref(),
                     )?;
                 let base = crate::storage::sealed_vault::ViewBase::of(&view)?;
-                let (removed_secrets, plan) =
-                    apply_connection_rm_to_view(&mut view, &id, keep_secrets, &state.services)
-                        .map_err(AppError::BadRequest)?;
+                let has_keyset = vault_has_keyset(&state, &vault_id);
+                let (removed_secrets, plan) = apply_connection_rm_to_view(
+                    &mut view,
+                    &id,
+                    keep_secrets,
+                    has_keyset,
+                    &state.services,
+                )
+                .map_err(AppError::BadRequest)?;
                 crate::auth::connect::persist_mutated_view(&state, &vault_id, &base, &view, &k)
                     .map_err(AppError::Internal)?;
                 {
@@ -3097,6 +3136,79 @@ mod tests {
         let mut m = sudp::state::ProtectedState::new();
         m.aux = serde_json::to_value(VaultAux::initial()).unwrap();
         crate::storage::plaintext::VaultPlaintextView::from_protected_state(&m).unwrap()
+    }
+
+    /// Removing a connection from a vault without a keyset removes its rule
+    /// (`policy:connection:<id>`) too, as a native tombstone: a later
+    /// connection of the same id does not take the rule over. On a vault with
+    /// a keyset the rule is owner-signed config and stays (the owner's console
+    /// removes it).
+    #[test]
+    fn connection_rm_takes_its_rule_along_only_without_a_keyset() {
+        use crate::storage::item::{wire_id_for, ItemNs, VaultKeys, POLICY_CONNECTION};
+        use crate::storage::sealed_vault::{PerItemVault, ReconcileBase, ViewBase};
+        type S = sudp::primitives::StdPrimitives;
+        let reg = crate::service::ServiceRegistry::load();
+        let k = [0x42u8; 32];
+        let keys = VaultKeys::single(&k);
+        let vid = "v-conn-rm";
+        let conn = || crate::storage::plaintext::Connection {
+            name: None,
+            service: None,
+            hosts: Some(vec!["api.example.com".into()]),
+            secrets: None,
+            keys: None,
+            written: Some(Vec::new()),
+        };
+        let mut view = empty_view();
+        view.aux.connections.insert("gh".into(), conn());
+        view.aux.policy = Some(
+            serde_json::from_value(serde_json::json!({
+                "connections": { "gh": { "default": { "read": "deny", "write": "deny" } } }
+            }))
+            .unwrap(),
+        );
+        let mut pv = PerItemVault::build_initial(
+            b"c".to_vec(),
+            "x".into(),
+            "y".into(),
+            "Dev".into(),
+            vec![0u8; 32],
+            vec![0u8; 48],
+        )
+        .unwrap();
+        pv.seed_items_from_view::<S>(keys, vid, &view).unwrap();
+        let rule = wire_id_for::<S>(&k, ItemNs::Policy, &format!("{}gh", POLICY_CONNECTION)).unwrap();
+        assert!(pv.items.contains_key(&rule), "the rule is its own record");
+
+        // A keyset: the rule stays in the view (and the device writes no
+        // owner-config there).
+        let mut kept = pv.fold_view::<S>(keys, vid).unwrap();
+        apply_connection_rm_to_view(&mut kept, "gh", true, true, &reg).unwrap();
+        assert!(!kept.aux.connections.contains_key("gh"));
+        assert!(kept.aux.policy.as_ref().unwrap().connections.contains_key("gh"));
+
+        // No keyset: the rule goes with the connection, as a tombstone.
+        let mut gone = pv.fold_view::<S>(keys, vid).unwrap();
+        let base = ViewBase::of(&gone).unwrap();
+        apply_connection_rm_to_view(&mut gone, "gh", true, false, &reg).unwrap();
+        let r = pv
+            .reconcile_from_view::<S>(keys, vid, &gone, ReconcileBase::Since(&base))
+            .unwrap();
+        assert!(r.changed.contains(&rule), "{:?}", r.changed);
+        assert!(pv.items[&rule].tombstone);
+        let after = pv.fold_view::<S>(keys, vid).unwrap();
+        assert!(!after.aux.policy.as_ref().is_some_and(|p| p.connections.contains_key("gh")));
+
+        // A later connection of the same id starts without it.
+        let base = ViewBase::of(&after).unwrap();
+        let mut again = pv.fold_view::<S>(keys, vid).unwrap();
+        again.aux.connections.insert("gh".into(), conn());
+        pv.reconcile_from_view::<S>(keys, vid, &again, ReconcileBase::Since(&base))
+            .unwrap();
+        let now = pv.fold_view::<S>(keys, vid).unwrap();
+        assert!(now.aux.connections.contains_key("gh"));
+        assert!(!now.aux.policy.as_ref().is_some_and(|p| p.connections.contains_key("gh")));
     }
 
     // The shared secret-set mutation is the SSOT for BOTH write paths (grant

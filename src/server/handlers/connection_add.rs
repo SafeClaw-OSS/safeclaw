@@ -1323,7 +1323,12 @@ secrets = ["MIXED_KEY"]
             .connections
             .insert("legacy".into(), conn_raw(&["LEGACY_KEY"]));
 
-        let rm = crate::server::handlers::approve::apply_connection_rm_to_view;
+        let rm = |view: &mut crate::storage::plaintext::VaultPlaintextView,
+                  id: &str,
+                  keep: bool,
+                  r: &crate::service::ServiceRegistry| {
+            crate::server::handlers::approve::apply_connection_rm_to_view(view, id, keep, false, r)
+        };
         let (removed, plan) = rm(&mut view, "codex_x", false, &r).unwrap();
         assert!(removed.is_empty());
         assert_eq!(
