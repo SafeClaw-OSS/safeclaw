@@ -344,6 +344,14 @@ pub struct StoredItem {
     /// sealed before this was recorded. Local bookkeeping only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generation: Option<u64>,
+    /// Confirmed, after a keyset refresh with keys of the keyset's current
+    /// generation, to open under no key this member holds (the current one,
+    /// or a retired one that lists it): no current member reads it, so a
+    /// writer that may write the record may write over it, at its next
+    /// version ([`PerItemVault::confirm_unreadable`]). Never set before such
+    /// a refresh; gone whenever the row is replaced. Local bookkeeping only.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unreadable_confirmed: bool,
 }
 
 /// A pulled replacement this device did not adopt (see `crate::sync`): kept
@@ -1637,6 +1645,7 @@ impl PerItemVault {
                 base: None,
                 upgrade: false,
                 generation: None,
+                unreadable_confirmed: false,
             },
         );
     }
@@ -1999,6 +2008,7 @@ impl PerItemVault {
                 base,
                 upgrade: false,
                 generation,
+                unreadable_confirmed: false,
             },
         );
         Ok(id)
@@ -2181,8 +2191,42 @@ impl PerItemVault {
         let wire = wire_id_for::<S>(keys.id_seed, ns, name)?;
         Ok(match self.items.get(&wire) {
             None => true,
-            Some(s) => open_wire_item::<S>(keys, vault_id, &wire, s.version, &s.ct).is_ok(),
+            Some(s) => {
+                s.unreadable_confirmed
+                    || open_wire_item::<S>(keys, vault_id, &wire, s.version, &s.ct).is_ok()
+            }
         })
+    }
+
+    /// After a keyset refresh, with `keys` of the keyset's current
+    /// generation: mark each clean row that opens under none of them
+    /// ([`StoredItem::unreadable_confirmed`]) and unmark one that opens.
+    /// Keys of another generation (a session from before the key changed)
+    /// mark nothing. Returns whether a mark changed.
+    pub fn confirm_unreadable<S: PrimitiveSuite>(&mut self, keys: VaultKeys, vault_id: &str) -> bool {
+        let current = self.keyset_generation().unwrap_or(0);
+        if self.seal_generation(keys) != Some(current) {
+            return false;
+        }
+        let marks: Vec<(String, bool)> = self
+            .items
+            .iter()
+            .filter(|(_, s)| s.version <= s.synced_version)
+            .map(|(id, s)| {
+                let unreadable = open_wire_item::<S>(keys, vault_id, id, s.version, &s.ct).is_err();
+                (id.clone(), unreadable)
+            })
+            .collect();
+        let mut changed = false;
+        for (id, unreadable) in marks {
+            if let Some(s) = self.items.get_mut(&id) {
+                if s.unreadable_confirmed != unreadable {
+                    s.unreadable_confirmed = unreadable;
+                    changed = true;
+                }
+            }
+        }
+        changed
     }
 
     /// A view's reconcilable items as `(ns, name) → body`: every native secret,
@@ -2307,6 +2351,9 @@ impl PerItemVault {
             let wire = wire_id_for::<S>(keys.id_seed, *ns, name)?;
             let existing = match self.open_item::<S>(keys, vault_id, *ns, name) {
                 Ok(p) => p,
+                // Confirmed after a keyset refresh to open under no key a
+                // current member holds: this change may go over it.
+                Err(_) if self.items.get(&wire).is_some_and(|s| s.unreadable_confirmed) => None,
                 Err(_) => {
                     let label =
                         crate::storage::item::record_label(&ItemPayload::live(*ns, name.clone(), body.clone()));
@@ -6749,6 +6796,38 @@ pub(crate) mod tests {
         // The rest applied.
         assert_eq!(r.changed.len(), 1);
         assert_eq!(pv.fold_view::<S>(keys, vid).unwrap().native_secrets["C"], b"c");
+
+        // After a keyset refresh, with keys of the current generation, both
+        // still open under no key this member holds: confirmed, and the same
+        // change now goes over them at their next versions.
+        assert!(pv.confirm_unreadable::<S>(keys, vid));
+        assert!(pv.get_item(&svc_wire).unwrap().unreadable_confirmed);
+        assert!(!pv.confirm_unreadable::<S>(keys, vid), "nothing new");
+        let view = pv.fold_view::<S>(keys, vid).unwrap();
+        let base = ViewBase::of(&view).unwrap();
+        let mut changed = pv.fold_view::<S>(keys, vid).unwrap();
+        changed.aux.services.remove("acme");
+        changed.native_secrets.insert("B".into(), b"new".to_vec());
+        let r = pv
+            .reconcile_from_view::<S>(keys, vid, &changed, ReconcileBase::Since(&base))
+            .unwrap();
+        assert!(r.refused.is_empty(), "{:?}", r.refused);
+        assert_eq!(pv.get_item(&svc_wire).unwrap().version, 4);
+        assert!(pv.get_item(&svc_wire).unwrap().tombstone);
+        assert_eq!(pv.get_item(&b_wire).unwrap().version, 3);
+        assert!(!pv.get_item(&b_wire).unwrap().unreadable_confirmed);
+        let after = pv.fold_view::<S>(keys, vid).unwrap();
+        assert_eq!(after.native_secrets["B"], b"new");
+        assert!(!after.aux.services.contains_key("acme"));
+
+        // Keys of an earlier generation (a session from before the key
+        // changed) confirm nothing.
+        let fx = rekeyed_fixture();
+        let mut stale = fx.pv.clone();
+        stale.put_raw(svc_wire.clone(), 3, garbage.clone());
+        let old_bundle = crate::storage::item::vault_key_bundle(&fx.id_seed, &fx.c_old);
+        assert!(!stale.confirm_unreadable::<S>(VaultKeys::from_material(&old_bundle), fx.vault));
+        assert!(!stale.get_item(&svc_wire).unwrap().unreadable_confirmed);
     }
 
     /// Owner-config is written at its native records, one per edit unit
@@ -7914,6 +7993,7 @@ pub(crate) mod tests {
             base: None,
             upgrade: false,
             generation: None,
+            unreadable_confirmed: false,
         };
         assert!(!v1.keeps_honored_owner_config::<S>(keys, vid, &w, &t));
     }

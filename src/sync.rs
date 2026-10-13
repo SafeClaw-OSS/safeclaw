@@ -228,14 +228,19 @@ pub async fn sync_vault_now(state: &Arc<AppState>, vault_id: &str) -> Result<Syn
     if let Some(cloud2) = cfg.cloud_backend.as_deref().filter(|s| !s.is_empty()) {
         if let Some(dk2) = device_key() {
             let lock = StoreLock::Take(state);
-            match pull_keys(&state.config.state_dir, cloud2, vault_id, &dk2, lock).await {
-                Ok(n) if n > 0 => {
+            let keys_pulled = match pull_keys(&state.config.state_dir, cloud2, vault_id, &dk2, lock).await {
+                Ok(n) => {
                     state.record_cloud_contact(vault_id);
-                    tracing::info!(vault = %vault_id, adopted = n, "keyset pull: adopted rows")
+                    if n > 0 {
+                        tracing::info!(vault = %vault_id, adopted = n, "keyset pull: adopted rows");
+                    }
+                    true
                 }
-                Ok(_) => state.record_cloud_contact(vault_id),
-                Err(e) => tracing::debug!(vault = %vault_id, "keyset pull failed: {}", e),
-            }
+                Err(e) => {
+                    tracing::debug!(vault = %vault_id, "keyset pull failed: {}", e);
+                    false
+                }
+            };
             let key = state.cloned_state_key(vault_id);
             match pull_items(
                 &state.config.state_dir,
@@ -254,6 +259,9 @@ pub async fn sync_vault_now(state: &Arc<AppState>, vault_id: &str) -> Result<Syn
                 }
                 Ok(_) => state.record_cloud_contact(vault_id),
                 Err(e) => tracing::debug!(vault = %vault_id, "per-item pull failed: {}", e),
+            }
+            if keys_pulled {
+                confirm_unreadable_after_refresh(state, vault_id).await;
             }
         }
     }
@@ -2497,11 +2505,14 @@ async fn pull_and_process(
     channel: &str,
 ) -> bool {
     let mut ok = true;
+    let mut keys_pulled = false;
     match pull_keys(state_dir, cloud, vault, dk, StoreLock::Take(state)).await {
-        Ok(n) if n > 0 => {
-            tracing::info!(vault = %vault, adopted = n, "cloud sync watch: pulled keyset rows")
+        Ok(n) => {
+            keys_pulled = true;
+            if n > 0 {
+                tracing::info!(vault = %vault, adopted = n, "cloud sync watch: pulled keyset rows")
+            }
         }
-        Ok(_) => {}
         Err(e) => {
             tracing::debug!(vault = %vault, "cloud sync watch: keyset pull failed: {}", e);
             ok = false;
@@ -2531,9 +2542,33 @@ async fn pull_and_process(
             ok = false;
         }
     }
+    if keys_pulled {
+        confirm_unreadable_after_refresh(state, vault).await;
+    }
     crate::auth::connect::process_vault_connects(state, vault, None).await;
     tracing::debug!(vault = %vault, channel = channel, "cloud sync watch: wake processed");
     ok
+}
+
+/// After a keyset refresh: record which rows this session's keys (of the
+/// keyset's current generation) cannot open, so a change may then go over
+/// them ([`PerItemVault::confirm_unreadable`]). Locked: nothing.
+async fn confirm_unreadable_after_refresh(state: &Arc<AppState>, vault_id: &str) {
+    let Some(k) = state.cloned_state_key(vault_id) else {
+        return;
+    };
+    let keys = item_layer::VaultKeys::from_material(&k);
+    let lock = state.vault_write_lock(vault_id);
+    let _guard = lock.lock().await;
+    let state_dir = &state.config.state_dir;
+    let Some(mut pv) = read_per_item_store(state_dir, vault_id) else {
+        return;
+    };
+    if pv.confirm_unreadable::<sudp::primitives::StdPrimitives>(keys, vault_id) {
+        if let Err(e) = write_per_item_store(state_dir, vault_id, &pv) {
+            tracing::warn!(vault = %vault_id, "unreadable rows not recorded: {}", e);
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -2678,6 +2713,7 @@ fn adopt_item_rows(
                         base: None,
                         upgrade: false,
                         generation: None,
+                        unreadable_confirmed: false,
                     };
                     pv.unhonored_replacement::<S>(keys, vault_id, &id, &incoming)
                 }
@@ -3260,6 +3296,7 @@ fn clean_row(
         base: None,
         upgrade: false,
         generation: None,
+        unreadable_confirmed: false,
     }
 }
 
@@ -3377,10 +3414,25 @@ enum Resolved {
     /// the user is told why.
     Refused(String),
     /// THEIR row cannot be opened with this device's keys: it was changed
-    /// under a vault key this device does not have. It is never written over:
-    /// it is taken locally as it is (the fixes), so ours is no longer sent, and
-    /// ours is set aside; the user is told with `note`.
-    NotReadable { fixes: Vec<LocalFix>, note: String },
+    /// under a vault key this device does not have. It is not written over
+    /// before a keyset refresh: it is taken locally as it is (the fixes), so
+    /// ours is no longer sent, and ours is set aside; the user is told with
+    /// `note`. `overwrite`: ours, to go over theirs if, after a keyset refresh,
+    /// theirs still opens under no key a current member holds
+    /// ([`overwrite_unreadable`]); `None` when ours is the row that cannot be
+    /// read.
+    NotReadable {
+        fixes: Vec<LocalFix>,
+        note: String,
+        overwrite: Option<Overwrite>,
+    },
+}
+
+/// Ours, to write over THEIR row that cannot be read ([`Resolved::NotReadable`]).
+struct Overwrite {
+    /// The version their row is at (ours goes at the next one).
+    their_version: u64,
+    ours: item_layer::ItemPayload,
 }
 
 /// What the user is told when a row of `record` cannot be opened here
@@ -3508,6 +3560,10 @@ fn open_conflict_pair(
                     return Err(Resolved::NotReadable {
                         fixes: vec![adopt_fix(ours_row, &r, ct, false)],
                         note: not_readable_note(&conflict_record(&ours)),
+                        overwrite: Some(Overwrite {
+                            their_version: r.version,
+                            ours: ours.clone(),
+                        }),
                     });
                 }
             }
@@ -3556,6 +3612,7 @@ fn unreadable_ours(
     Resolved::NotReadable {
         fixes: vec![fix],
         note: not_readable_note(&record),
+        overwrite: None,
     }
 }
 
@@ -3963,7 +4020,7 @@ impl PushTally {
                 self.left_dirty += 1;
                 self.refused_rows.push((row.id.clone(), why));
             }
-            Resolved::NotReadable { fixes, note } => {
+            Resolved::NotReadable { fixes, note, .. } => {
                 self.fixes.extend(fixes);
                 self.refused_rows.push((row.id.clone(), note));
             }
@@ -4065,6 +4122,7 @@ fn check_generation(
             base: row.base.clone(),
             upgrade: row.upgrade,
             generation: Some(current),
+            unreadable_confirmed: false,
         },
     };
     Gen::Redone(redone, fix)
@@ -4095,6 +4153,47 @@ fn keyset_changed_note(record: &str) -> String {
         "{}: the vault key changed since this change was made on this device; run `sc unlock`, and it is sent under the new key",
         record
     )
+}
+
+/// Write ours over THEIR row that cannot be read ([`Overwrite`]), at their
+/// next version under the current key, CAS on their version. The fix that
+/// keeps it locally when it landed; `None` otherwise (theirs stands).
+async fn overwrite_unreadable(
+    cloud: &str,
+    vault_id: &str,
+    dk: &str,
+    keys: item_layer::VaultKeys<'_>,
+    row: &DirtyRow,
+    o: &Overwrite,
+    generation: Option<u64>,
+) -> Option<LocalFix> {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    type S = sudp::primitives::StdPrimitives;
+    let version = o.their_version + 1;
+    let ct = item_layer::seal_wire_item::<S>(keys, vault_id, &row.id, version, &o.ours).ok()?;
+    let pushed = push_item(
+        cloud,
+        vault_id,
+        dk,
+        &row.id,
+        Some(o.their_version),
+        version,
+        &URL_SAFE_NO_PAD.encode(&ct),
+        generation,
+    )
+    .await;
+    match pushed {
+        Ok(PushOutcome::Ok { .. }) => {
+            tracing::info!(vault = %vault_id, item = %row.id, version, "per-item push: a row no current member can read was written over");
+            Some(LocalFix::Replace {
+                id: row.id.clone(),
+                expect: row.version,
+                row: clean_row(version, ct, o.ours.is_tombstone(), None, None),
+            })
+        }
+        _ => None,
+    }
 }
 
 /// A dirty row this device cannot read ([`Gen::Unreadable`]): never sent;
@@ -4348,6 +4447,47 @@ pub async fn push_items_best_effort(state: &Arc<AppState>, vault_id: &str) {
                     gens.session,
                 )
                 .await;
+                // Their row cannot be read: refresh the keyset first; if this
+                // session then holds the current generation's key, their row
+                // opens under no key a current member holds, and ours may go
+                // over it (a record this process may write). Never before.
+                let r = match r {
+                    Resolved::NotReadable {
+                        fixes: f,
+                        note,
+                        overwrite: Some(o),
+                    } => {
+                        if !keyset_pulled {
+                            keyset_pulled = true;
+                            if let Err(e) = pull_keys(state_dir, cloud, vault_id, &dk, StoreLock::Take(state)).await {
+                                tracing::warn!(vault = %vault_id, "per-item push: keyset pull failed: {}", e);
+                            }
+                            gens = push_gens(state_dir, vault_id, Some(keys));
+                        }
+                        let current = gens.keyset.unwrap_or(0);
+                        let may = gens.session == Some(current)
+                            && crate::storage::item::device_may_write(
+                                o.ours.ns,
+                                &o.ours.name,
+                                gens.keyset.is_some(),
+                                o.ours.is_tombstone(),
+                            );
+                        let landed = if may {
+                            overwrite_unreadable(cloud, vault_id, &dk, keys, row, &o, Some(current)).await
+                        } else {
+                            None
+                        };
+                        match landed {
+                            Some(fix) => Resolved::Fixed(vec![fix]),
+                            None => Resolved::NotReadable {
+                                fixes: f,
+                                note,
+                                overwrite: None,
+                            },
+                        }
+                    }
+                    r => r,
+                };
                 if !tally.take(row, r) {
                     break;
                 }
@@ -6143,7 +6283,7 @@ mod peritem_tests {
                     Some(0),
                 ))
             };
-            let Resolved::NotReadable { fixes, note } = resolved else {
+            let Resolved::NotReadable { fixes, note, .. } = resolved else {
                 panic!("set aside, not left dirty");
             };
             assert!(note.starts_with("secret API: this item was changed with a vault key this device does not have"), "{}", note);
@@ -6301,7 +6441,7 @@ mod peritem_tests {
                 &dirty,
                 None,
             ));
-            let Err(Resolved::NotReadable { fixes, note }) = resolved else {
+            let Err(Resolved::NotReadable { fixes, note, .. }) = resolved else {
                 panic!("set aside, not left dirty");
             };
             assert!(note.contains("this item was changed with a vault key this device does not have"), "{}", note);
