@@ -3271,6 +3271,20 @@ enum Resolved {
     /// be read, or the last copy level is taken): the row stays dirty and
     /// the user is told why.
     Refused(String),
+    /// THEIR row cannot be opened with this device's keys: it was changed
+    /// under a vault key this device does not have. It is never written over:
+    /// it is taken locally as it is (the fixes), so ours is no longer sent, and
+    /// ours is set aside; the user is told with `note`.
+    NotReadable { fixes: Vec<LocalFix>, note: String },
+}
+
+/// What the user is told when THEIR row of `record` cannot be opened here
+/// ([`Resolved::NotReadable`]).
+fn not_readable_note(record: &str) -> String {
+    format!(
+        "{}: this item was changed with a vault key this device does not have; your change to it was not applied: run `sc sync` after the vault owner's console finishes, then re-run it",
+        record
+    )
 }
 
 /// Replace our dirty row with THEIR row (clean), guarded on our version.
@@ -3378,8 +3392,17 @@ fn open_conflict_pair(
             match opened {
                 Ok((ct, p)) => Some((r, ct, p)),
                 Err(e) => {
-                    tracing::warn!(vault = %vault_id, item = %ours_row.id, "per-item reconcile: can't open their row ({}); left dirty", e);
-                    return Err(Resolved::LeaveDirty);
+                    // Changed under a key this device lacks: never written
+                    // over. Theirs is taken as it is, ours set aside.
+                    let Ok(ct) = URL_SAFE_NO_PAD.decode(r.ct.as_bytes()) else {
+                        tracing::warn!(vault = %vault_id, item = %ours_row.id, "per-item reconcile: their row is not base64url ({}); left dirty", e);
+                        return Err(Resolved::LeaveDirty);
+                    };
+                    tracing::warn!(vault = %vault_id, item = %ours_row.id, "per-item reconcile: can't open their row ({}); theirs kept, ours set aside", e);
+                    return Err(Resolved::NotReadable {
+                        fixes: vec![adopt_fix(ours_row, &r, ct, false)],
+                        note: not_readable_note(&conflict_record(&ours)),
+                    });
                 }
             }
         }
@@ -3789,6 +3812,10 @@ async fn resolve_conflict(
 /// ([`AppState::note_sync`], shown by `sc sync` and `sc status`)
 /// until a later push of that row lands.
 ///
+/// A row of theirs this device cannot open (changed under a vault key it
+/// does not have) is never written over: it is taken as it is, ours is set
+/// aside and the user is told to sync and re-run ([`Resolved::NotReadable`]).
+///
 /// Reconciling needs `K` (open ours/theirs, seal the copy), taken from the
 /// unlocked session ([`AppState::cloned_state_key`]). A LOCKED vault leaves the
 /// row dirty (nothing dropped, nothing copied); the pull side never adopts over
@@ -3906,6 +3933,10 @@ pub async fn push_items_best_effort(state: &Arc<AppState>, vault_id: &str) {
                         left_dirty += 1;
                         refused_rows.push((row.id.clone(), why));
                     }
+                    Resolved::NotReadable { fixes: f, note } => {
+                        fixes.extend(f);
+                        refused_rows.push((row.id.clone(), note));
+                    }
                     Resolved::LeaveDirty => left_dirty += 1,
                     Resolved::EndpointMissing => {
                         endpoint_missing = true;
@@ -3945,6 +3976,10 @@ pub async fn push_items_best_effort(state: &Arc<AppState>, vault_id: &str) {
                     Resolved::Refused(why) => {
                         left_dirty += 1;
                         refused_rows.push((row.id.clone(), why));
+                    }
+                    Resolved::NotReadable { fixes: f, note } => {
+                        fixes.extend(f);
+                        refused_rows.push((row.id.clone(), note));
                     }
                     Resolved::LeaveDirty => left_dirty += 1,
                     Resolved::EndpointMissing => {
@@ -5547,6 +5582,89 @@ mod peritem_tests {
         let tomb = ItemPayload::tombstone(ItemNs::Secret, "A");
         let fixes = rejection_fixes(&dirty, &tomb, theirs()).unwrap();
         assert_eq!(fixes.len(), 1, "adopt only");
+    }
+
+    /// THEIR row on a 409 (or a terminal refusal) that this device cannot
+    /// open, changed under a vault key it does not have: never written over.
+    /// It is taken locally as it is, so ours is no longer sent, and ours is
+    /// set aside with a note saying why and what to do.
+    #[test]
+    fn a_row_of_theirs_this_device_cannot_open_sets_ours_aside() {
+        use crate::storage::item::{self as il, ItemPayload};
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        let (k, other) = ([0x42u8; 32], [0x43u8; 32]);
+        let vid = "v";
+        let keys = VaultKeys::single(&k);
+        let theirs_keys = VaultKeys {
+            id_seed: &k,
+            content: &other,
+            prev: None,
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        for terminal in [false, true] {
+            let mut pv = empty_pv();
+            let ours = ItemPayload::secret_live("API", "mine");
+            let id = pv
+                .seal_and_upsert::<StdPrimitives>(keys, vid, ItemNs::Secret, "API", 3, &ours)
+                .unwrap();
+            pv.items.get_mut(&id).unwrap().synced_version = 2;
+            let dirty = DirtyRow {
+                id: id.clone(),
+                version: 3,
+                synced_version: 2,
+                ct: pv.get_item(&id).unwrap().ct.clone(),
+                tombstone: false,
+                base: None,
+                upgrade: false,
+            };
+            let theirs = ItemPayload::secret_live("API", "theirs");
+            let their_ct =
+                il::seal_wire_item::<StdPrimitives>(theirs_keys, vid, &id, 5, &theirs).unwrap();
+            let their_row = ItemRow {
+                item_id: id.clone(),
+                version: 5,
+                seq: 9,
+                ct: URL_SAFE_NO_PAD.encode(&their_ct),
+                sig: None,
+                signer: None,
+            };
+            let mut fetched = TheirRows::Fetched([(id.clone(), their_row)].into_iter().collect());
+            let resolved = if terminal {
+                rt.block_on(resolve_rejection(
+                    "http://127.0.0.1:9",
+                    vid,
+                    "dk",
+                    keys,
+                    &mut fetched,
+                    &dirty,
+                    false,
+                ))
+            } else {
+                rt.block_on(resolve_conflict(
+                    "http://127.0.0.1:9",
+                    vid,
+                    "dk",
+                    keys,
+                    &mut fetched,
+                    &dirty,
+                    5,
+                ))
+            };
+            let Resolved::NotReadable { fixes, note } = resolved else {
+                panic!("set aside, not left dirty");
+            };
+            assert!(note.starts_with("secret API: this item was changed with a vault key this device does not have"), "{}", note);
+            assert!(note.contains("run `sc sync` after the vault owner's console finishes, then re-run"), "{}", note);
+            apply_local_fixes(&mut pv, fixes, Some((keys, vid)));
+            let row = pv.get_item(&id).unwrap();
+            assert_eq!((row.version, row.synced_version), (5, 5), "clean: no longer sent");
+            assert_eq!(row.ct, their_ct, "theirs as it is");
+            assert_eq!(pv.items.len(), 1, "ours is not kept");
+        }
     }
 
     /// Ours is set aside, never written over theirs: an owner-config record
