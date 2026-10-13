@@ -68,8 +68,9 @@ How it works:
   refusing the connection, refuses the request. A local folder, a ref that
   is no branch or tag of the repository (a commit id, any other ref), or
   GitHub not answering at all shows the source as stated by the requester.
-  `sc service ls` shows which: `checked at <commit>` or `as stated by the
-  requester`.
+  `sc service ls` shows which: `checked at <commit> (on this device)` when
+  this device checked that definition at that commit itself (its own record,
+  not the vault's), else `as stated by the requester`.
   Only the rules that tighten apply in a vault.
 - **Ids.** A definition is stored under its `[service] id`. It may not be a
   built-in id or one another source already holds; `--id` renames a

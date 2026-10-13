@@ -35,6 +35,7 @@ use serde_json::{json, Value};
 use crate::error::{AppError, Result};
 use crate::service::source::card::SourceCheck;
 use crate::service::source::github::{self, GitHubApi};
+use crate::service::source::checks::{self, DeviceCheck, DeviceChecks};
 use crate::service::source::{
     card, ServiceSource, StoredService, MAX_SOURCE_DEFINITION_BYTES, MAX_SOURCE_SERVICES,
 };
@@ -94,7 +95,9 @@ pub(crate) fn parse_add(scope: &Value) -> std::result::Result<AddRequest, String
             total, MAX_SOURCE_DEFINITION_BYTES
         ));
     }
-    let mut source: ServiceSource = serde_json::from_value(
+    // A `checked` claim in it is ignored: whether the source was checked is
+    // this daemon's own finding (the card's `source_check`).
+    let source: ServiceSource = serde_json::from_value(
         scope
             .get("source")
             .cloned()
@@ -102,9 +105,6 @@ pub(crate) fn parse_add(scope: &Value) -> std::result::Result<AddRequest, String
     )
     .map_err(|_| "service-add scope.source is not a source record".to_string())?;
     source.check()?;
-    // Whether the source was checked is the daemon's finding (the card's
-    // `source_check`), never the requester's claim.
-    source.set_checked(false);
     let update = match scope.get("update") {
         None | Some(Value::Null) => false,
         Some(Value::Bool(b)) => *b,
@@ -339,11 +339,9 @@ pub(crate) async fn mint_add<A: GitHubApi>(
         &state.services,
     )?;
     c.stamp(&mut op.act.scope)?;
-    // The source as stored (with whether this device checked it), so every
-    // reader of the signed scope reads one spelling.
-    let mut source = req.source;
-    source.set_checked(check == SourceCheck::Fetched);
-    op.act.scope["source"] = serde_json::to_value(&source).map_err(|e| e.to_string())?;
+    // The source as stored, so every reader of the signed scope reads one
+    // spelling.
+    op.act.scope["source"] = serde_json::to_value(&req.source).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -412,15 +410,59 @@ pub(crate) fn apply_add(
     for id in &c.removes {
         view.aux.services.remove(id);
     }
-    // Stored with the check the approved card states.
-    let mut source = req.source;
-    source.set_checked(check == SourceCheck::Fetched);
     for (id, (svc, pol)) in req.defs {
         view.aux
             .services
-            .insert(id, StoredService::new(svc, pol, Some(source.clone())));
+            .insert(id, StoredService::new(svc, pol, Some(req.source.clone())));
     }
     Ok(c)
+}
+
+/// The facts a `service-add` lets this device record
+/// ([`crate::service::source::checks`]): every definition of the request,
+/// when the card this daemon stamped at op creation says it fetched the
+/// GitHub source again at its commit and found these definitions
+/// ([`SourceCheck::Fetched`]). Anything else: none.
+pub(crate) fn device_checks(req: &AddRequest, signed_scope: &Value) -> Vec<(String, DeviceCheck)> {
+    let fetched = signed_scope
+        .get("source_check")
+        .and_then(|v| v.as_str())
+        .and_then(SourceCheck::parse)
+        == Some(SourceCheck::Fetched);
+    if !fetched {
+        return Vec::new();
+    }
+    req.defs
+        .iter()
+        .filter_map(|(id, (svc, pol))| {
+            DeviceCheck::of(svc, pol.as_deref(), &req.source).map(|c| (id.clone(), c))
+        })
+        .collect()
+}
+
+/// Record `facts` for `vault_id` (after the definitions they name landed).
+/// A failure is logged: the sources then read as stated by the requester.
+pub(crate) fn record_device_checks(state: &AppState, vault_id: &str, facts: Vec<(String, DeviceCheck)>) {
+    if facts.is_empty() {
+        return;
+    }
+    let recorded = state
+        .vaults
+        .dir_for(vault_id)
+        .map_err(|e| e.to_string())
+        .and_then(|d| checks::record(&checks::path(&d), facts).map_err(|e| e.to_string()));
+    if let Err(e) = recorded {
+        tracing::warn!(vault = %vault_id, "the source check was not recorded: {}", e);
+    }
+}
+
+/// The facts this device recorded for `vault_id` (none when it has none).
+fn device_checks_of(state: &AppState, vault_id: &str) -> DeviceChecks {
+    state
+        .vaults
+        .dir_for(vault_id)
+        .map(|d| checks::load(&checks::path(&d)))
+        .unwrap_or_default()
 }
 
 /// Apply a `service-rm` of `target`; same card discipline as [`apply_add`].
@@ -450,12 +492,16 @@ fn changed_since(field: &str) -> String {
 }
 
 /// One `aux.services` entry as `sc service ls` shows it: its source, whether
-/// the daemon loads it (and if not, why), the connections that name it, and
-/// what it applies (destinations, rules) when it loads.
+/// the daemon loads it (and if not, why), the connections that name it, what
+/// it applies (destinations, rules) when it loads, and the commit this device
+/// checked it at (`checked_on_this_device`: its recorded fact names this
+/// definition text and this source at this commit; else null, the source is
+/// as the requester stated it).
 pub(crate) fn listing(
     entries: &BTreeMap<String, StoredService>,
     conns: &HashMap<String, Connection>,
     reg: &ServiceRegistry,
+    facts: &DeviceChecks,
 ) -> Vec<Value> {
     entries
         .iter()
@@ -465,6 +511,7 @@ pub(crate) fn listing(
                 crate::service::source::definition_digest(&p.service, p.policy.as_deref())
             });
             let source = parts.and_then(|p| p.source);
+            let checked = checks::checked_commit(facts, id, source.as_ref(), digest.as_deref());
             let (summary, problems) = if crate::storage::item::is_conflict_copy_name(id) {
                 (None, vec![crate::service::CONFLICT_COPY_REASON.to_string()])
             } else if reg.get(id).is_some() {
@@ -483,6 +530,7 @@ pub(crate) fn listing(
                 "connections": connections_using(conns.iter(), id),
                 "summary": summary,
                 "digest": digest,
+                "checked_on_this_device": checked,
             })
         })
         .collect()
@@ -497,8 +545,9 @@ pub async fn list(
 ) -> Result<Json<Value>> {
     crate::server::handlers::op::validate_vault_id(&vault_id)?;
     let (entries, conns) = session(&state, &vault_id).map_err(|_| AppError::VaultLocked)?;
+    let facts = device_checks_of(&state, &vault_id);
     Ok(Json(json!({
-        "services": listing(&entries, &conns, &state.services),
+        "services": listing(&entries, &conns, &state.services, &facts),
     })))
 }
 

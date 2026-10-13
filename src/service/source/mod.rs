@@ -13,6 +13,7 @@
 //! gate for definition text. Nothing in this module trusts what it reads.
 
 pub mod card;
+pub mod checks;
 pub mod github;
 pub mod tar;
 
@@ -43,12 +44,22 @@ pub const MAX_TARBALL_ENTRIES: usize = 10_000;
 
 // ── The stored form ──────────────────────────────────────────────────────────
 
-/// Where a vault definition came from. Recorded with the definition so `sc
-/// service ls` can group by it and `sc service update` can re-fetch it. A
-/// local path is meaningless on another machine, so a local source keeps only
-/// the folder name.
+/// Where a vault definition came from, as the requester stated it. Recorded
+/// with the definition so `sc service ls` can group by it and `sc service
+/// update` can re-fetch it. A local path is meaningless on another machine, so
+/// a local source keeps only the folder name.
+///
+/// The stored record is data any member may write, so it carries no claim
+/// that the source was checked: that is a fact this device records for
+/// itself ([`checks`]). A `checked` field an older record carries is read and
+/// ignored.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "lowercase", deny_unknown_fields)]
+#[serde(
+    tag = "kind",
+    rename_all = "lowercase",
+    deny_unknown_fields,
+    from = "SourceRecord"
+)]
 pub enum ServiceSource {
     Github {
         /// `owner/repo`.
@@ -62,16 +73,51 @@ pub enum ServiceSource {
         git_ref: Option<String>,
         /// The full 40-hex commit the definitions were read at.
         commit: String,
-        /// The daemon fetched the commit again itself and the definitions
-        /// matched ([`card::SourceCheck::Fetched`]); else the source is as the
-        /// requester stated it. Set only by the daemon from the approved card.
-        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-        checked: bool,
     },
     Local {
         /// The folder's name (not its path).
         name: String,
     },
+}
+
+/// A source record as read: [`ServiceSource`]'s fields, and the `checked`
+/// claim older records carry, which is ignored.
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase", deny_unknown_fields)]
+enum SourceRecord {
+    Github {
+        repo: String,
+        #[serde(default)]
+        path: Option<String>,
+        #[serde(rename = "ref", default)]
+        git_ref: Option<String>,
+        commit: String,
+        #[serde(default, rename = "checked")]
+        _checked: Option<serde::de::IgnoredAny>,
+    },
+    Local {
+        name: String,
+    },
+}
+
+impl From<SourceRecord> for ServiceSource {
+    fn from(r: SourceRecord) -> Self {
+        match r {
+            SourceRecord::Github {
+                repo,
+                path,
+                git_ref,
+                commit,
+                ..
+            } => ServiceSource::Github {
+                repo,
+                path,
+                git_ref,
+                commit,
+            },
+            SourceRecord::Local { name } => ServiceSource::Local { name },
+        }
+    }
 }
 
 impl ServiceSource {
@@ -126,33 +172,6 @@ impl ServiceSource {
                 None => format!("github:{}", repo.to_ascii_lowercase()),
             },
             ServiceSource::Local { name } => format!("local:{}", name),
-        }
-    }
-
-    /// Whether the daemon checked the definitions against the source itself
-    /// (a GitHub commit fetched again); a local folder never is.
-    pub fn checked(&self) -> bool {
-        matches!(self, ServiceSource::Github { checked: true, .. })
-    }
-
-    /// Record whether the daemon checked it (a no-op for a local folder).
-    pub fn set_checked(&mut self, value: bool) {
-        if let ServiceSource::Github { checked, .. } = self {
-            *checked = value;
-        }
-    }
-
-    /// How the source is known, for `sc service ls`: `checked at <commit>`
-    /// when the daemon fetched the commit again and the definitions matched,
-    /// else `as stated by the requester`.
-    pub fn check_line(&self) -> String {
-        match self {
-            ServiceSource::Github {
-                commit,
-                checked: true,
-                ..
-            } => format!("checked at {}", commit),
-            _ => "as stated by the requester".to_string(),
         }
     }
 
@@ -339,7 +358,6 @@ impl GitHubSpec {
             path: self.path.clone(),
             git_ref: None,
             commit: String::new(),
-            checked: false,
         }
         .identity()
     }

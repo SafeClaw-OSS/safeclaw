@@ -40,7 +40,6 @@ fn gh(repo: &str, commit: char) -> ServiceSource {
         path: None,
         git_ref: None,
         commit: commit.to_string().repeat(40),
-        checked: false,
     }
 }
 
@@ -204,7 +203,6 @@ fn source_identity_and_display() {
         path: Some("svc".into()),
         git_ref: Some("main".into()),
         commit: "b".repeat(40),
-        checked: false,
     };
     assert_eq!(a.identity(), "github:acme/tools:svc");
     assert!(a.display().contains(&"b".repeat(40)));
@@ -1483,7 +1481,6 @@ fn verify_requires_the_ref_head_to_be_the_pinned_commit() {
         path: None,
         git_ref: git_ref.map(str::to_string),
         commit: c.to_string().repeat(40),
-        checked: false,
     };
     let fetched = |api: &FakeGitHub| {
         api.asked

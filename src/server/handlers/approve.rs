@@ -1565,6 +1565,13 @@ pub async fn approve_op(
                         existing_vault.as_ref(),
                     )?;
                 let base = crate::storage::sealed_vault::ViewBase::of(&view)?;
+                // What this device found checking the source (stamped by this
+                // daemon at op creation), kept as its own fact once the
+                // definitions land, never in the vault.
+                let facts = crate::server::handlers::service_ops::device_checks(
+                    &req,
+                    &validated.op.act.scope,
+                );
                 let card = crate::server::handlers::service_ops::apply_add(
                     &mut view,
                     req,
@@ -1574,6 +1581,7 @@ pub async fn approve_op(
                 )
                 .map_err(AppError::BadRequest)?;
                 crate::server::handlers::service_ops::persist(&state, &vault_id, &base, &view, &k)?;
+                crate::server::handlers::service_ops::record_device_checks(&state, &vault_id, facts);
                 {
                     let state = state.clone();
                     let vid = vault_id.clone();

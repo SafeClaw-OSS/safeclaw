@@ -93,7 +93,6 @@ fn gh(commit: char) -> ServiceSource {
         path: None,
         git_ref: None,
         commit: commit.to_string().repeat(40),
-        checked: false,
     }
 }
 
@@ -365,7 +364,7 @@ fn listing_shows_source_status_and_reason() {
             ..Connection::default()
         },
     );
-    let rows = listing(&entries, &conns, &state.services);
+    let rows = listing(&entries, &conns, &state.services, &DeviceChecks::new());
     let row = |id: &str| rows.iter().find(|r| r["id"] == id).unwrap().clone();
     assert_eq!(row("a1")["valid"], json!(true));
     assert_eq!(row("a1")["source"]["kind"], json!("github"));
@@ -748,19 +747,25 @@ fn mint_checks_a_github_source_at_its_pinned_commit() {
         .starts_with("local folder mine, as stated by the requester"));
 }
 
-/// The check is stored with the source: `checked` only when this device
-/// fetched the pinned commit again and the definitions matched, never on the
-/// requester's word; `sc service ls` shows `checked at <commit>` or `as stated
-/// by the requester` from it.
+/// Whether a source was checked is this device's own fact, never the
+/// vault's: it is recorded beside the store only when this daemon fetched
+/// the pinned commit again and the definitions matched, and a listing says
+/// `checked_on_this_device` only while the stored definition is the one it
+/// names. The stored record carries no claim; one an older or another client
+/// wrote (`checked: true`) is read and ignored.
 #[test]
-fn the_source_check_is_stored_with_the_source() {
-    let state = test_state();
+fn the_source_check_is_this_devices_own_fact() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut st = test_state();
+    st.config.state_dir = dir.path().to_path_buf();
+    st.vaults = crate::storage::vault_dir::VaultDir::new(dir.path());
+    let state = st;
     let at_commit = tar_gz(&[(
         "acme-tools-x/services/a1/service.toml",
         b'0',
         svc("a1", "a.dev").as_bytes(),
     )]);
-    let stored_source = |gh_api: &Gh, claimed: bool| {
+    let applied = |gh_api: &Gh, claimed: bool| {
         let mut view = empty_view();
         unlock_with(&state, &view);
         let mut sc = scope(&[("a1", "a.dev")], &gh('a'), false);
@@ -769,28 +774,65 @@ fn the_source_check_is_stored_with_the_source() {
         }
         let signed = mint_with(&state, sc, gh_api).unwrap();
         let req = parse_add(&signed).unwrap();
+        let facts = device_checks(&req, &signed);
         let snap = admit_add(&req).unwrap();
         apply_add(&mut view, req, &snap, &signed, &state.services).unwrap();
-        (signed, view.aux.services["a1"].source().unwrap())
+        (signed, view, facts)
     };
-    let (signed, s) = stored_source(&Gh::serving(at_commit), false);
-    assert_eq!(signed["source"]["checked"], json!(true));
-    assert!(s.checked());
-    assert_eq!(s.check_line(), format!("checked at {}", "a".repeat(40)));
-    // Not reached, even with the requester claiming otherwise: as stated.
-    let (signed, s) = stored_source(&Gh::offline(), true);
+    let a = "a".repeat(40);
+    let listed = |view: &VaultPlaintextView| {
+        listing(
+            &view.aux.services,
+            &HashMap::new(),
+            &state.services,
+            &device_checks_of(&state, "v1"),
+        )
+    };
+
+    // Not reached, the requester claiming otherwise: no fact, as stated.
+    let (signed, view, facts) = applied(&Gh::offline(), true);
     assert!(signed["source"].get("checked").is_none());
-    assert!(!s.checked());
-    assert_eq!(s.check_line(), "as stated by the requester");
-    // The card's source_check decides at apply, not the scope's source field.
-    let mut view = empty_view();
-    unlock_with(&state, &view);
-    let mut signed = mint(&state, scope(&[("a1", "a.dev")], &gh('a'), false)).unwrap();
-    signed["source"]["checked"] = json!(true);
-    let req = parse_add(&signed).unwrap();
-    let snap = admit_add(&req).unwrap();
-    apply_add(&mut view, req, &snap, &signed, &state.services).unwrap();
-    assert!(!view.aux.services["a1"].source().unwrap().checked());
+    assert!(facts.is_empty());
+    record_device_checks(&state, "v1", facts);
+    assert_eq!(listed(&view)[0]["checked_on_this_device"], Value::Null);
+
+    // Fetched and matched: the stored record carries no claim; the fact is
+    // this device's, and the listing says the commit.
+    let (signed, view, facts) = applied(&Gh::serving(at_commit), false);
+    assert!(signed["source"].get("checked").is_none());
+    let stored = serde_json::to_value(&view.aux.services["a1"]).unwrap();
+    assert!(stored["source"].get("checked").is_none(), "{stored}");
+    assert_eq!(facts.len(), 1);
+    record_device_checks(&state, "v1", facts);
+    assert!(state.vaults.dir_for("v1").unwrap().join(crate::service::source::checks::FILE).exists());
+    assert_eq!(listed(&view)[0]["checked_on_this_device"], json!(a));
+
+    // The stored definition changed since (a member's write): as stated.
+    let mut changed = copy(&view);
+    changed.aux.services.insert(
+        "a1".into(),
+        StoredService::new(svc("a1", "evil.dev"), None, Some(gh('a'))),
+    );
+    assert_eq!(listed(&changed)[0]["checked_on_this_device"], Value::Null);
+    // A record claiming it was checked, with no fact here: as stated.
+    let mut claimed = copy(&view);
+    claimed.aux.services.insert(
+        "b2".into(),
+        serde_json::from_value(json!({
+            "service": svc("b2", "b.dev"),
+            "source": { "kind": "github", "repo": "acme/tools", "commit": a.clone(), "checked": true },
+        }))
+        .unwrap(),
+    );
+    let rows = listed(&claimed);
+    let b2 = rows.iter().find(|r| r["id"] == "b2").unwrap();
+    assert_eq!(b2["checked_on_this_device"], Value::Null);
+    assert!(b2["source"].get("checked").is_none());
+    assert_eq!(
+        claimed.aux.services["b2"].source(),
+        Some(gh('a')),
+        "an older record with the claim still reads"
+    );
 }
 
 /// A conflict copy (`"<id> (conflict copy)"`, kept by the sync beside the
@@ -810,7 +852,7 @@ fn a_conflict_copy_is_listed_skipped_and_never_used() {
         copy.clone(),
         StoredService::new(svc("a1", "evil.dev"), None, Some(gh('a'))),
     );
-    let rows = listing(&entries, &HashMap::new(), &state.services);
+    let rows = listing(&entries, &HashMap::new(), &state.services, &DeviceChecks::new());
     let row = rows.iter().find(|r| r["id"] == copy.as_str()).unwrap();
     assert_eq!(row["valid"], json!(false));
     assert_eq!(

@@ -190,6 +190,11 @@ struct Listed {
     summary: Option<DefSummary>,
     #[serde(default)]
     digest: Option<String>,
+    /// The commit this device checked the definition at, when its recorded
+    /// fact still names this definition and source; else the source is as
+    /// the requester stated it.
+    #[serde(default)]
+    checked_on_this_device: Option<String>,
 }
 
 /// The vault's definitions.
@@ -219,8 +224,10 @@ async fn listing(custodian: &str, vault: &str) -> Result<Vec<Listed>, String> {
 }
 
 /// The heading a stored source groups under: the source, then how it is
-/// known (`checked at <commit>` when the daemon fetched the commit again and
-/// the definitions matched, else `as stated by the requester`).
+/// known: `checked at <commit> (on this device)` when this device fetched
+/// that commit again and found this definition (its own record, never the
+/// vault's), else `as stated by the requester`. Definitions of one source
+/// known differently head separate groups.
 fn group_of(l: &Listed) -> (String, String) {
     match &l.source {
         Some(s) => {
@@ -230,7 +237,6 @@ fn group_of(l: &Listed) -> (String, String) {
                     path,
                     git_ref,
                     commit,
-                    checked,
                 } => {
                     let mut h = format!("github:{}", repo);
                     if let Some(p) = path {
@@ -240,18 +246,19 @@ fn group_of(l: &Listed) -> (String, String) {
                     if let Some(r) = git_ref {
                         h.push_str(&format!(" (ref {})", r));
                     }
-                    if *checked {
-                        h.push_str(&format!(": checked at {}", commit));
-                    } else {
-                        h.push_str(&format!(" @ {}: as stated by the requester", commit));
+                    match &l.checked_on_this_device {
+                        Some(c) if c == commit => {
+                            h.push_str(&format!(": checked at {} (on this device)", commit))
+                        }
+                        _ => h.push_str(&format!(" @ {}: as stated by the requester", commit)),
                     }
                     h
                 }
                 ServiceSource::Local { name } => {
-                    format!("local folder {}: {}", name, s.check_line())
+                    format!("local folder {}: as stated by the requester", name)
                 }
             };
-            (s.identity(), head)
+            (format!("{}\n{}", s.identity(), head), head)
         }
         None => (String::new(), "added before sources".into()),
     }
@@ -793,21 +800,22 @@ mod tests {
             connections: vec![],
             summary: None,
             digest: None,
+            checked_on_this_device: None,
         }
     }
 
     /// `sc service ls` heads each source with how it is known: checked at its
-    /// commit by the daemon, or as the requester stated it.
+    /// commit on this device, or as the requester stated it. A stored record
+    /// saying it was checked is not read.
     #[test]
     fn ls_heading_says_how_the_source_is_known() {
-        let mut gh = ServiceSource::Github {
-            repo: "acme/tools".into(),
-            path: Some("svc".into()),
-            git_ref: Some("main".into()),
-            commit: "a".repeat(40),
-            checked: false,
-        };
-        let (_, head) = group_of(&listed("a1", Some(gh.clone())));
+        let gh: ServiceSource = serde_json::from_value(serde_json::json!({
+            "kind": "github", "repo": "acme/tools", "path": "svc", "ref": "main",
+            "commit": "a".repeat(40), "checked": true,
+        }))
+        .unwrap();
+        let stated = listed("a1", Some(gh.clone()));
+        let (stated_key, head) = group_of(&stated);
         assert_eq!(
             head,
             format!(
@@ -815,15 +823,21 @@ mod tests {
                 "a".repeat(40)
             )
         );
-        gh.set_checked(true);
-        let (_, head) = group_of(&listed("a1", Some(gh)));
+        let mut checked = listed("a2", Some(gh.clone()));
+        checked.checked_on_this_device = Some("a".repeat(40));
+        let (checked_key, head) = group_of(&checked);
         assert_eq!(
             head,
             format!(
-                "github:acme/tools:svc (ref main): checked at {}",
+                "github:acme/tools:svc (ref main): checked at {} (on this device)",
                 "a".repeat(40)
             )
         );
+        assert_ne!(stated_key, checked_key, "known differently: separate groups");
+        // A check at another commit than the stored one says nothing.
+        let mut other = listed("a3", Some(gh));
+        other.checked_on_this_device = Some("b".repeat(40));
+        assert!(group_of(&other).1.ends_with("as stated by the requester"));
         let local = ServiceSource::Local {
             name: "mine".into(),
         };
@@ -858,7 +872,6 @@ mod tests {
             path: None,
             git_ref: None,
             commit: "a".repeat(40),
-            checked: false,
         };
         let local = ServiceSource::Local {
             name: "mine".into(),

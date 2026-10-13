@@ -276,7 +276,6 @@ pub async fn fetch<A: GitHubApi>(
             path: spec.path.clone(),
             git_ref: git_ref.map(str::to_string),
             commit,
-            checked: false,
         },
     ))
 }
