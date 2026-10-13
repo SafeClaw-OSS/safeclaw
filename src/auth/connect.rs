@@ -718,14 +718,21 @@ pub(crate) async fn apply_pending_connects(
     // refresh_token without a manual lock/unlock. A connect the store did not
     // take is reported failed, never served from memory.
     let mut report = report;
-    if let Err(e) = write_view(state, vault_id, vault_dat, &m, &view, &k, &base) {
-        tracing::warn!(vault = %vault_id, "oauth connect: not stored: {}", e);
-        let why = format!("the connection could not be stored: {}", e);
-        let completed = std::mem::take(&mut report.completed);
-        report
-            .failed
-            .extend(completed.into_iter().map(|c| (c, why.clone())));
-        return report;
+    let not_applied = match write_view(state, vault_id, vault_dat, &m, &view, &k, &base) {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!(vault = %vault_id, "oauth connect: not stored: {}", e);
+            let why = format!("the connection could not be stored: {}", e);
+            let completed = std::mem::take(&mut report.completed);
+            report
+                .failed
+                .extend(completed.into_iter().map(|c| (c, why.clone())));
+            return report;
+        }
+    };
+    if !not_applied.is_empty() {
+        let keys = crate::storage::item::VaultKeys::from_material(&k);
+        fail_refused_connects(&mut report, &not_applied, keys.id_seed);
     }
     tracing::info!(
         vault = %vault_id,
@@ -734,6 +741,27 @@ pub(crate) async fn apply_pending_connects(
         "oauth connect: processed"
     );
     report
+}
+
+/// A completed connect whose `connection:<id>` row the store refused or set
+/// aside (`not_applied`: `(item id, why)`) did not complete: moved to
+/// `failed`, with why. `id_seed` derives the row ids.
+fn fail_refused_connects(report: &mut ConnectReport, not_applied: &[(String, String)], id_seed: &[u8]) {
+    let completed = std::mem::take(&mut report.completed);
+    for conn in completed {
+        let wire = crate::storage::item::wire_id_for::<sudp::primitives::StdPrimitives>(
+            id_seed,
+            crate::storage::item::ItemNs::Connection,
+            &conn,
+        );
+        match not_applied
+            .iter()
+            .find(|(id, _)| wire.as_ref().is_ok_and(|w| w == id))
+        {
+            Some((_, why)) => report.failed.push((conn, why.clone())),
+            None => report.completed.push(conn),
+        }
+    }
 }
 
 /// Persist a ROTATED refresh_token back into the sealed vault at its bound BARE
@@ -782,7 +810,7 @@ pub(crate) async fn persist_rotated_refresh_locked(
         .map_err(|e| format!("view rebuild failed: {}", e))?;
     let not_applied = write_view(state, vault_id, vault_dat, &m, &view, &k, &base)?;
     if !not_applied.is_empty() {
-        return Err(not_applied.join("; "));
+        return Err(sentences(&not_applied));
     }
     tracing::info!(vault = %vault_id, conn = %conn_id, "oauth refresh: rotated refresh_token persisted");
     Ok(())
@@ -924,8 +952,17 @@ pub(crate) fn persist_mutated_view(
     if not_applied.is_empty() {
         Ok(())
     } else {
-        Err(AppError::Conflict(not_applied.join("; ")))
+        Err(AppError::Conflict(sentences(&not_applied)))
     }
+}
+
+/// The sentences of parts of a change not applied, joined.
+fn sentences(not_applied: &[(String, String)]) -> String {
+    not_applied
+        .iter()
+        .map(|(_, why)| why.as_str())
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// `vaults/<vault_id>/vault.dat`.
@@ -949,9 +986,9 @@ fn vault_dat_path(state: &AppState, vault_id: &str) -> std::path::PathBuf {
 ///   3. the cache, from the store's fold (or, for a vault with no store,
 ///      from `view`, which `vault.dat` now holds).
 ///
-/// Returns the parts of the change the store refused or set aside, each as a
-/// sentence (also noted for `sc sync` / `sc status`). `Err` when neither
-/// store took the change: the cache is left as it was.
+/// Returns the parts of the change the store refused or set aside, each
+/// `(item id, sentence)` (also noted for `sc sync` / `sc status`). `Err`
+/// when neither store took the change: the cache is left as it was.
 fn write_view(
     state: &Arc<AppState>,
     vault_id: &str,
@@ -960,7 +997,7 @@ fn write_view(
     view: &crate::storage::plaintext::VaultPlaintextView,
     k: &[u8],
     base: &ViewBase,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<(String, String)>, String> {
     let written = reconcile_per_item_after_connect(
         state,
         vault_id,
@@ -1016,8 +1053,9 @@ struct StoreWrite {
     /// from the caller's view (a keep-both conflict leaves THEIRS at the
     /// canonical name and ours in a copy row).
     served: crate::storage::plaintext::VaultPlaintextView,
-    /// The caller's changes the store refused or set aside, as sentences.
-    not_applied: Vec<String>,
+    /// The caller's changes the store refused or set aside, each `(item id,
+    /// sentence)`.
+    not_applied: Vec<(String, String)>,
 }
 
 /// Apply the caller's change (`view`, relative to `base`) to the local
@@ -1098,9 +1136,12 @@ fn reconcile_per_item_after_connect(
     // set aside, never written over; `sc sync` tells the user to re-run.
     for (item, record) in &reconciled.set_aside {
         tracing::warn!(vault = %vault_id, item = %item, record = %record, "changed elsewhere meanwhile; ours set aside, theirs kept");
-        not_applied.push(format!(
-            "{} changed elsewhere meanwhile; your change to it was not applied: re-run it",
-            record
+        not_applied.push((
+            item.clone(),
+            format!(
+                "{} changed elsewhere meanwhile; your change to it was not applied: re-run it",
+                record
+            ),
         ));
         state.note_sync(
             vault_id,
@@ -1112,7 +1153,7 @@ fn reconcile_per_item_after_connect(
     // no conflict copy may be written): reported, never applied.
     for (item, why) in &reconciled.refused {
         tracing::warn!(vault = %vault_id, item = %item, "change refused: {}", why);
-        not_applied.push(why.clone());
+        not_applied.push((item.clone(), why.clone()));
         state.note_sync(vault_id, item, crate::state::SyncNote::Refused(why.clone()));
     }
     Ok(Some(StoreWrite {
@@ -2036,5 +2077,26 @@ refresh_token = "REFRESH_TOKEN"
         assert_eq!(pending[0].1.as_str(), "new-rt");
         state.clear_rotation_note(vid, "codex");
         assert!(state.sync_note_lines(vid).is_empty());
+    }
+
+    /// A completed connect whose connection row the store refused is
+    /// reported failed with why; one whose row landed stays completed.
+    #[test]
+    fn a_connect_whose_connection_row_was_refused_is_reported_failed() {
+        type S = sudp::primitives::StdPrimitives;
+        let k = [0x42u8; 32];
+        let refused = crate::storage::item::wire_id_for::<S>(&k, crate::storage::item::ItemNs::Connection, "gmail")
+            .unwrap();
+        let mut report = ConnectReport {
+            completed: vec!["gmail".into(), "github".into()],
+            failed: Vec::new(),
+            unreached: Vec::new(),
+        };
+        fail_refused_connects(&mut report, &[(refused, "connection gmail: not applied".into())], &k);
+        assert_eq!(report.completed, vec!["github".to_string()]);
+        assert_eq!(
+            report.failed,
+            vec![("gmail".to_string(), "connection gmail: not applied".to_string())]
+        );
     }
 }
