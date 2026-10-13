@@ -240,11 +240,11 @@ pub struct ConnectArgs {
     /// be prompted (with the rest of the wizard); required off a terminal.
     #[arg(value_name = "ID")]
     pub name: Option<String>,
-    /// Back this connection with a catalog SERVICE — its id from `sc registry`
-    /// (e.g. `github`), which supplies the hosts + declared secret keys. `--host`
+    /// Back this connection with a catalog SERVICE: its id from `sc registry`
+    /// (e.g. `github`), which supplies the hosts + declared secret slots. `--host`
     /// then only PINS an exact FQDN inside one of the service's `*.suffix`
-    /// wildcards. Omit for a raw connection (you anchor your own `--host` +
-    /// `--secret`).
+    /// wildcards. Omit for a raw connection (you anchor your own `--host` and
+    /// fill its keys with `--from-literal` / `--from-secret`).
     #[arg(long)]
     pub service: Option<String>,
     /// Anchored egress host (exact domain, repeatable). Required for a raw
@@ -252,16 +252,23 @@ pub struct ConnectArgs {
     /// `--service` connection: optional, and each must be ⊆ the service's hosts.
     #[arg(long)]
     pub host: Vec<String>,
-    /// A secret to store on this connection: `KEY=VALUE` (non-interactive) or a
-    /// bare `KEY` (prompts for a hidden value on a TTY). Repeatable.
-    #[arg(long)]
-    pub secret: Vec<String>,
-    /// Back this connection with an EXISTING vault secret named KEY (no new
-    /// value). KEY is matched as typed: native keys fold to their stored
-    /// UPPERCASE form; an external store's key (e.g. a lowercase GCP secret
-    /// id) is matched exactly. Repeatable.
-    #[arg(long)]
-    pub use_existing: Vec<String>,
+    /// Fill a slot with a NEW secret value, written to the vault when the
+    /// connection is approved: `SLOT=VALUE`. With `--service`, SLOT is one of
+    /// the service's declared secret roles (case-insensitive); for a raw
+    /// connection SLOT is the vault KEY itself (stored UPPERCASE). A bare `SLOT`
+    /// prompts for the value with hidden input on a terminal. Repeatable.
+    #[arg(long = "from-literal", value_name = "SLOT=VALUE")]
+    pub from_literal: Vec<String>,
+    /// Fill a slot with a secret ALREADY in the vault, by its KEY; no value is
+    /// written or shown: `SLOT=KEY`. With `--service`, SLOT is one of the
+    /// service's declared secret roles and the `SLOT=KEY` form is required; for
+    /// a raw connection SLOT is the KEY itself, so `--from-secret KEY` is the
+    /// short form. KEY is matched as typed: native keys fold to their stored
+    /// UPPERCASE form; an external store's key (e.g. a lowercase GCP secret id)
+    /// is matched exactly. Repeatable. A service slot named by neither flag is
+    /// prompted for (hidden) on a terminal and is an error off one.
+    #[arg(long = "from-secret", value_name = "SLOT=KEY")]
+    pub from_secret: Vec<String>,
     #[arg(long)]
     pub no_browser: bool,
     /// Fixed port for the localhost callback server (for SSH port-forwarding).
@@ -279,10 +286,14 @@ pub struct ConnectionArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum ConnectionSubcommand {
-    /// Create a connection (secret(s) + host anchor) in one unlock+write cycle.
-    /// On a terminal, `sc connection add` with no args runs a short wizard
-    /// (id → optional service → host(s) → secret(s)); off a terminal, pass the
-    /// `<id>` and `--host`/`--secret` (or `--service`) as flags.
+    /// Create a connection (secret(s) + host anchor) in one approval. Each secret
+    /// slot is filled from a new value (`--from-literal SLOT=VALUE`) or from a
+    /// secret already in the vault (`--from-secret SLOT=KEY`). An agent may run
+    /// this to propose a connection; it takes effect only after the vault
+    /// owner approves it with a passkey, on a card that lists every bound key
+    /// and every destination host. On a terminal, `sc connection add` with no
+    /// args runs a short wizard (id → optional service → host(s) → secret(s));
+    /// off a terminal, pass the `<id>` and the flags.
     Add(ConnectArgs),
     /// List the connections the agent can use (id, hosts, phantoms). Requires an
     /// unlocked vault. `--json` for scripts.

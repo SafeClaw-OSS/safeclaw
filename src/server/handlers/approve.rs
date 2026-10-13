@@ -1769,8 +1769,18 @@ pub async fn approve_op(
                             .filter_map(|(r, k)| k.as_str().map(|k| (r.clone(), k.to_string())))
                             .collect()
                     });
+                // A service slot may bind an existing key by name: same
+                // reference charset as `secrets`.
+                for k in keys.iter().flat_map(|m| m.values()) {
+                    if !crate::cli::conn::valid_secret_ref(k) {
+                        return Err(AppError::BadRequest(format!(
+                            "'{}' is not a valid secret key reference",
+                            k
+                        )));
+                    }
+                }
                 // The committed value deposit (absent = no new values, e.g. a
-                // pure `--use-existing` connection). Single-use; expiry or a
+                // pure `--from-secret` connection). Single-use; expiry or a
                 // daemon restart between create and approve fails closed.
                 let values = match scope.get("values_digest").and_then(|v| v.as_str()) {
                     Some(d) => Some(state.op_payload_take(d).ok_or_else(|| {
@@ -1810,121 +1820,134 @@ pub async fn approve_op(
                     )?;
                 let base = crate::storage::sealed_vault::ViewBase::of(&view)?;
 
-                let record = match &service {
+                // The service def, custom-first (a per-vault def wins).
+                let def: Option<crate::service::ServiceDef> = match &service {
+                    None => None,
+                    Some(svc) => Some(match view.aux.services.get(svc) {
+                        Some(toml_src) => toml::from_str::<crate::service::ServiceDef>(toml_src)
+                            .map_err(|e| {
+                                AppError::BadRequest(format!("custom service '{}': {}", svc, e))
+                            })?,
+                        None => state.services.get(svc).cloned().ok_or_else(|| {
+                            AppError::BadRequest(format!("unknown service '{}'", svc))
+                        })?,
+                    }),
+                };
+                let hosts: Vec<String> = hosts.unwrap_or_default();
+                if def.is_none() {
                     // RAW: anchors its own exact FQDNs; explicit `secrets` list.
-                    None => {
-                        let hosts = hosts.filter(|h| !h.is_empty()).ok_or_else(|| {
-                            AppError::BadRequest("a raw connection needs at least one host".into())
-                        })?;
-                        for h in &hosts {
-                            crate::cli::conn::validate_raw_host(h).map_err(AppError::BadRequest)?;
-                        }
-                        if referenced.is_empty() {
-                            return Err(AppError::BadRequest(
-                                "a raw connection needs at least one secret key".into(),
-                            ));
-                        }
-                        // `--use-existing` keys (referenced but not deposited)
-                        // must already be in the vault. The vault is ONE flat
-                        // namespace across every store — a key hosted in an
-                        // external store (GCP etc.) binds exactly like a
-                        // native one, so walk the full store_order, not just
-                        // native-secrets. Canonicalisation: native keys are
-                        // canonically UPPERCASE (a lowercase-typed reference
-                        // rewrites to the stored casing); external keys are
-                        // accepted exactly as named (external naming is not
-                        // ours to fold). The external probe is a network
-                        // call, but this is a ceremony (approve) path; a
-                        // store outage surfaces as the approve failing
-                        // loudly, never as a silent "no such secret".
-                        let mut canonical: Vec<String> = Vec::with_capacity(referenced.len());
-                        for key in &referenced {
-                            let deposited = values
-                                .as_ref()
-                                .map(|v| v.contains_key(key))
-                                .unwrap_or(false);
-                            if deposited || view.native_secrets.contains_key(key) {
-                                canonical.push(key.clone());
-                                continue;
-                            }
-                            if let Some((native, _)) = view
-                                .native_secrets
-                                .iter()
-                                .find(|(k, _)| k.eq_ignore_ascii_case(key))
-                            {
-                                canonical.push(native.clone());
-                                continue;
-                            }
-                            if view.resolve_value_async(key).await?.is_some() {
-                                canonical.push(key.clone());
-                                continue;
-                            }
+                    if hosts.is_empty() {
+                        return Err(AppError::BadRequest(
+                            "a raw connection needs at least one host".into(),
+                        ));
+                    }
+                    if referenced.is_empty() {
+                        return Err(AppError::BadRequest(
+                            "a raw connection needs at least one secret key".into(),
+                        ));
+                    }
+                }
+                for h in &hosts {
+                    crate::cli::conn::validate_raw_host(h).map_err(AppError::BadRequest)?;
+                }
+                if let Some(def) = &def {
+                    // SERVICE-backed: `hosts` here only PINS exact FQDNs inside
+                    // the service's `*.suffix` wildcards.
+                    for h in &hosts {
+                        let ok = def
+                            .service
+                            .hosts
+                            .iter()
+                            .any(|e| crate::core::host::wildcard_matches(e, h));
+                        if !ok {
                             return Err(AppError::BadRequest(format!(
-                                "no such secret '{}' in the vault (checked native + external stores)",
-                                key
+                                "pinned host '{}' is not within service '{}' hosts",
+                                h, def.service.id
                             )));
                         }
+                    }
+                }
+
+                // Every slot's KEY is either WRITTEN here (deposited) or must
+                // already be in the vault — raw and service alike. The vault
+                // is ONE flat namespace across every store: a key hosted in an
+                // external store (GCP etc.) binds exactly like a native one, so
+                // walk the full store_order, not just native-secrets.
+                // Canonicalisation: native keys are canonically UPPERCASE (a
+                // lowercase-typed reference rewrites to the stored casing);
+                // external keys are accepted exactly as named. The external
+                // probe is a network call, but this is a ceremony (approve)
+                // path; a store outage surfaces as the approve failing loudly,
+                // never as a silent "no such secret".
+                let requested =
+                    crate::server::handlers::connection_add::requested_slots(scope, def.as_ref())
+                        .map_err(AppError::BadRequest)?;
+                let deposited: std::collections::BTreeSet<String> = values
+                    .as_ref()
+                    .map(|v| v.keys().cloned().collect())
+                    .unwrap_or_default();
+                let slots = crate::server::handlers::connection_add::resolve_slots(
+                    &view, requested, &deposited,
+                )
+                .await?;
+                let native: std::collections::BTreeSet<String> =
+                    view.native_secrets.keys().cloned().collect();
+
+                // What the owner approved must be what this write does.
+                let card = crate::server::handlers::connection_add::card(
+                    &id,
+                    def.as_ref(),
+                    &hosts,
+                    &slots,
+                    &view.aux.connections,
+                    &native,
+                    &state.services,
+                );
+                crate::server::handlers::connection_add::assert_card(scope, &card)
+                    .map_err(AppError::BadRequest)?;
+
+                let record = match &def {
+                    None => {
                         // Exact dedup only: native case-folding already
                         // collapsed duplicates; two external keys differing
                         // by case are DISTINCT secrets (GCP is case-
                         // sensitive) and must both survive.
                         let mut seen = std::collections::HashSet::new();
-                        canonical.retain(|k| seen.insert(k.clone()));
+                        let canonical: Vec<String> = slots
+                            .iter()
+                            .map(|(_, k, _)| k.clone())
+                            .filter(|k| seen.insert(k.clone()))
+                            .collect();
                         crate::storage::plaintext::Connection {
                             name: None,
                             service: None,
-                            hosts: Some(hosts),
+                            hosts: Some(hosts.clone()),
                             secrets: Some(canonical),
                             keys: None,
                         }
                     }
-                    // SERVICE-backed: hosts derive from the service; `hosts`
-                    // here only PINS exact FQDNs inside its `*.suffix`
-                    // wildcards. Custom-first resolution (per-vault def wins).
-                    Some(svc) => {
-                        let service_hosts: Vec<String> = match view.aux.services.get(svc) {
-                            Some(toml_src) => {
-                                toml::from_str::<crate::service::ServiceDef>(toml_src)
-                                    .map(|d| d.service.hosts)
-                                    .map_err(|e| {
-                                        AppError::BadRequest(format!(
-                                            "custom service '{}': {}",
-                                            svc, e
-                                        ))
-                                    })?
-                            }
-                            None => state
-                                .services
-                                .get(svc)
-                                .ok_or_else(|| {
-                                    AppError::BadRequest(format!("unknown service '{}'", svc))
-                                })?
-                                .service
-                                .hosts
-                                .clone(),
-                        };
-                        let pins = hosts.filter(|h| !h.is_empty());
-                        if let Some(pins) = &pins {
-                            for h in pins {
-                                crate::cli::conn::validate_raw_host(h)
-                                    .map_err(AppError::BadRequest)?;
-                                let ok = service_hosts
-                                    .iter()
-                                    .any(|e| crate::core::host::wildcard_matches(e, h));
-                                if !ok {
-                                    return Err(AppError::BadRequest(format!(
-                                        "pinned host '{}' is not within service '{}' hosts",
-                                        h, svc
-                                    )));
-                                }
-                            }
-                        }
+                    Some(_) => {
+                        // The requested `keys` map with each referenced KEY in
+                        // its canonical form; roles the request left on the
+                        // identity binding stay off the map.
+                        let keys = keys.clone().map(|m| {
+                            m.into_iter()
+                                .map(|(role, key)| {
+                                    let canon = slots
+                                        .iter()
+                                        .find(|(slot, _, _)| slot.eq_ignore_ascii_case(&role))
+                                        .map(|(_, k, _)| k.clone())
+                                        .unwrap_or(key);
+                                    (role, canon)
+                                })
+                                .collect::<std::collections::BTreeMap<_, _>>()
+                        });
                         crate::storage::plaintext::Connection {
                             name: None,
-                            service: Some(svc.clone()),
-                            hosts: pins,
+                            service: service.clone(),
+                            hosts: Some(hosts.clone()).filter(|h| !h.is_empty()),
                             secrets: None,
-                            keys: keys.clone().filter(|m| !m.is_empty()),
+                            keys: keys.filter(|m| !m.is_empty()),
                         }
                     }
                 };
@@ -2169,6 +2192,7 @@ pub async fn approve_op(
 ///     on it bound no values),
 ///   - no rule matched (`record_ask_approval` ignores `rule_id == None`),
 ///   - the vault relocked meanwhile (`record_ask_approval` no-ops).
+///
 /// The reuse the approval grants is decided by [`plan_use_grant`]; this record
 /// only narrows the decision.
 pub(crate) fn record_rule_approval(
@@ -2228,6 +2252,7 @@ pub(crate) fn record_rule_approval(
 ///     request + value digest, peeked (reused) for the policy window.
 ///   - `connection` (ask binding no values, allow-level miss): the approving
 ///     agent's held connection value for the policy window.
+///
 /// A legacy op with no PolicyContext keeps the connection value for 300s.
 /// `None` when the scope lacks the binding the grant needs (no connection, or
 /// a request-bound grant missing method/host/path): nothing is stored and the
@@ -4032,8 +4057,10 @@ mod tests {
 
     fn reuse_state() -> AppState {
         let state = test_state();
-        let mut cache = crate::state::SecretsCache::default();
-        cache.policy = reuse_policy();
+        let cache = crate::state::SecretsCache {
+            policy: reuse_policy(),
+            ..Default::default()
+        };
         state.unlock_vault(RV.into(), cache, zeroize::Zeroizing::new(Vec::new()));
         state
     }

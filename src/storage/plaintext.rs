@@ -251,37 +251,47 @@ impl VaultAux {
         reg: &crate::service::ServiceRegistry,
         exclude: &str,
     ) -> BTreeMap<String, Vec<String>> {
-        let mut claims: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        for (id, rec) in &self.connections {
-            if id == exclude {
-                continue;
+        connection_claims_in(&self.connections, reg, exclude)
+    }
+}
+
+/// [`VaultAux::connection_claims`] over any connection map (the daemon's
+/// session snapshot as well as an opened vault's `aux.connections`).
+pub fn connection_claims_in<'a>(
+    connections: impl IntoIterator<Item = (&'a String, &'a Connection)>,
+    reg: &crate::service::ServiceRegistry,
+    exclude: &str,
+) -> BTreeMap<String, Vec<String>> {
+    let mut claims: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (id, rec) in connections {
+        if id == exclude {
+            continue;
+        }
+        let mut add = |key: String| {
+            let by = claims.entry(key).or_default();
+            if !by.contains(id) {
+                by.push(id.clone());
             }
-            let mut add = |key: String| {
-                let by = claims.entry(key).or_default();
-                if !by.contains(id) {
-                    by.push(id.clone());
+        };
+        match rec.service.as_deref() {
+            None => {
+                for k in rec.secrets.clone().unwrap_or_default() {
+                    add(k.to_ascii_uppercase());
                 }
-            };
-            match rec.service.as_deref() {
-                None => {
-                    for k in rec.secrets.clone().unwrap_or_default() {
-                        add(k.to_ascii_uppercase());
+            }
+            Some(service) => {
+                if let Some(def) = reg.get(service) {
+                    for role in &def.service.secrets {
+                        add(secret_key_for(Some(rec), &role.to_ascii_uppercase()));
                     }
                 }
-                Some(service) => {
-                    if let Some(def) = reg.get(service) {
-                        for role in &def.service.secrets {
-                            add(secret_key_for(Some(rec), &role.to_ascii_uppercase()));
-                        }
-                    }
-                    for k in rec.keys.clone().unwrap_or_default().into_values() {
-                        add(k);
-                    }
+                for k in rec.keys.clone().unwrap_or_default().into_values() {
+                    add(k);
                 }
             }
         }
-        claims
     }
+    claims
 }
 
 /// Creation-time DEFAULT `keys` binding for a **named** connection's role:

@@ -55,6 +55,15 @@ pub async fn create(
     // and the op's own expiry can never disagree. A locked vault (the unlock
     // ceremony) can't read its policy and takes the 30-min default.
     let mut op = op;
+    // connection-add: the approval card (bound keys per slot, written vs
+    // referenced, destinations, sharing) is computed HERE from the unlocked
+    // session state and stamped into the signed scope, overwriting anything
+    // the requester sent in those fields; apply re-derives and compares
+    // (`connection_add::assert_card`).
+    if matches!(&op.act.kind, ActType::Custom(name) if name == "connection-add") {
+        crate::server::handlers::connection_add::stamp_at_mint(&state, &vault_id, &mut op)
+            .map_err(AppError::BadRequest)?;
+    }
     if op.valid.exp.is_none() {
         let now_unix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -159,10 +168,14 @@ pub async fn create(
         reason: None,
     });
 
+    // `op` = the op exactly as stored (and as relayed for approval), which may
+    // differ from the request body (a defaulted `valid.exp`, a stamped
+    // connection-add card). A local signer must sign THIS.
     let mut resp = json!({
         "op_id": op_id,
         "r": r,
         "expires_at": expires_at,
+        "op": serde_json::to_value(&op).unwrap_or(Value::Null),
     });
     if let Some(secret) = waiter_secret {
         resp["waiter_secret"] = json!(secret);

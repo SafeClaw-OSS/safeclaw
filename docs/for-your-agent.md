@@ -29,6 +29,15 @@ link as the skill instructs.
 Agents with filesystem access can equally copy the file from a checkout of
 this repo into their skills directory.
 
+## What your agent can propose
+
+Changes to the vault come from you, but an agent may ask for one: a new
+host on a connection (`sc connection add-host`), or a new connection that
+uses a secret already in your vault
+(`sc connection add <id> --service <svc> --from-secret ROLE=KEY`). Each is an
+approval request; nothing changes until you approve it with your passkey,
+and the card lists every key and host involved.
+
 ## What the agent's env means
 
 `sc agent add <name>` mints one env block per agent:

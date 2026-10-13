@@ -626,6 +626,17 @@ impl AppState {
         Some(digest)
     }
 
+    /// The KEY names a live (unexpired) stash holds, without consuming it or
+    /// exposing a value: the mint-time card reads which keys an op writes.
+    pub fn op_payload_keys(&self, digest: &str) -> Option<Vec<String>> {
+        let m = self.op_payloads.lock().unwrap();
+        let entry = m.get(digest)?;
+        if entry.inserted_at.elapsed() >= entry.ttl {
+            return None;
+        }
+        Some(entry.values.keys().cloned().collect())
+    }
+
     /// Consume the stash for an approved op. Single-use (removed on take);
     /// expired entries and digest mismatches (defense-in-depth recompute)
     /// yield `None` — the caller fails the act closed.

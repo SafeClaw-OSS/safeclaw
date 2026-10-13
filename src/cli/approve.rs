@@ -195,11 +195,13 @@ pub async fn approve_op(
     if crate::cli::active::frontend_origin().is_some() {
         remote_approve(custodian, &created.op_id, label, waiter).await
     } else {
+        // Sign the op as the daemon stored it (see CreatedOp::op).
+        let stored = created.op.as_ref().unwrap_or(op);
         let ceremony = local_ceremony(
             custodian,
             &created.op_id,
             &created.r,
-            op,
+            stored,
             &meta,
             label,
             opts,

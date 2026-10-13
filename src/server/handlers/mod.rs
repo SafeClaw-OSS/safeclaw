@@ -1,4 +1,5 @@
 pub mod approve;
+pub mod connection_add;
 pub mod events;
 pub mod health;
 pub mod metadata;

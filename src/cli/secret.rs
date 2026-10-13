@@ -61,7 +61,7 @@ pub async fn run_set(args: SetArgs) -> Result<(), String> {
     if let BrokerIntent::Host(hosts) = &intent {
         if !valid_conn_id(&conn) {
             return Err(format!(
-                "can't derive a connection id from '{}' — use `sc connect <name> --host {} --secret {}=<value>` instead",
+                "can't derive a connection id from '{}'; use `sc connection add <name> --host {} --from-literal {}=<value>` instead",
                 key,
                 hosts.first().map(String::as_str).unwrap_or("<domain>"),
                 key

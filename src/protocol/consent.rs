@@ -249,7 +249,8 @@ mod tests {
             json!({
                 "hosts": ["api.xiaomimimo.com"],
                 "secrets": ["MIMO_API_TOKEN"],
-                "values_digest": "aa"
+                "values_digest": "aa",
+                "destinations": ["api.xiaomimimo.com"]
             }),
         );
         let c = consent_for(&o).expect("descriptor");
@@ -259,7 +260,7 @@ mod tests {
         assert!(c.facts.iter().all(|(l, _)| l != "Service"));
         assert!(c
             .facts
-            .contains(&("Host".into(), "api.xiaomimimo.com".into())));
+            .contains(&("Sends to".into(), "api.xiaomimimo.com".into())));
         assert!(c
             .facts
             .contains(&("Secret in use".into(), "MIMO_API_TOKEN".into())));

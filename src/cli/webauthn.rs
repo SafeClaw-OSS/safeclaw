@@ -169,6 +169,10 @@ pub struct CreatedOp {
     pub op_id: String,
     pub r: String,
     pub waiter_secret: Option<String>,
+    /// The op as the daemon STORED it (a defaulted `valid.exp`, a stamped
+    /// connection-add card). A local gesture signs this, never the request
+    /// body. `None` from an older daemon.
+    pub op: Option<Value>,
 }
 
 /// [`create_op`] keeping the Export `waiter_secret`.
@@ -200,10 +204,12 @@ pub async fn create_op_full(custodian: &str, vault: &str, op: &Value) -> Result<
     let op_id = body["op_id"].as_str().ok_or("no op_id")?.to_string();
     let r = body["r"].as_str().ok_or("no r")?.to_string();
     let waiter_secret = body["waiter_secret"].as_str().map(str::to_string);
+    let op = body.get("op").filter(|v| v.is_object()).cloned();
     Ok(CreatedOp {
         op_id,
         r,
         waiter_secret,
+        op,
     })
 }
 

@@ -108,12 +108,12 @@ facts = [
 [acts.connection-add]
 action = "Add connection {{vars.target}}"
 action_zh = "添加连接 {{vars.target}}"
-explain = "Stores the listed secret key(s) in your vault and anchors them to the destination above. The values never left your device; this page only checks their fingerprint."
-explain_zh = "将列出的密钥存入你的 vault，并锚定到上方的目标。密钥值从未离开你的设备，本页面只核对它的指纹。"
+explain = "Binds the listed secret key(s) to this connection, which sends them only to the hosts listed. New values are stored in your vault; they never left your device, and this page only checks their fingerprint."
+explain_zh = "把列出的密钥绑定到这条连接，它只会把密钥发往列出的主机。新的密钥值存入你的 vault；密钥值从未离开你的设备，本页面只核对它的指纹。"
 tone = "neutral"
 facts = [
   { label = "Service", label_zh = "服务", value = "{{vars.scope.service}}" },
-  { label = "Host", label_zh = "主机", value = "{{vars.scope.hosts}}" },
+  { label = "Sends to", label_zh = "发往", value = "{{vars.scope.destinations}}" },
   { label = "Secret in use", label_zh = "使用的密钥", value = "{{vars.scope.secrets}}" },
 ]
 

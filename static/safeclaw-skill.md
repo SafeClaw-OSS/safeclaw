@@ -71,11 +71,24 @@ When the user is at the daemon's own terminal, they can add one there
 
 ```
 sc set STRIPE_KEY --host api.stripe.com
-sc connect myapi --host api.example.com --secret API_TOKEN=<value>
+sc connection add myapi --host api.example.com --from-literal API_TOKEN=<value>
 ```
 
 Leave credential entry to the user, and keep any value you happen to see out of
 your replies.
+
+When the secret is already in the vault (`sc secret ls` shows its KEY), you may
+propose a connection that uses it, without any value passing through you:
+
+```
+sc connection add codex_work --service openai_codex --from-secret OPENAI_CODEX_REFRESH_TOKEN=WORK_REFRESH_TOKEN
+sc connection add myapi --host api.example.com --from-secret API_TOKEN
+```
+
+With `--service`, name the slot (`ROLE=KEY`); a raw connection's slot is the
+KEY itself. Nothing changes until the user approves with a passkey; the approval
+lists every key and every host the connection will send it to. Surface the link
+as for any approval.
 
 ### Which vault
 

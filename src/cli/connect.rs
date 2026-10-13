@@ -1,22 +1,37 @@
-//! `sc connect <name>` — create a connection in one unlock+write cycle. The CLI
-//! superset of `sc set --host` (which is the raw single-secret shorthand).
+//! `sc connection add <id>` (hidden alias `sc connect`) — create a connection in
+//! ONE approval. The CLI superset of `sc set --host` (the raw single-secret
+//! shorthand).
+//!
+//! Every secret SLOT is filled from one of two sources, two flags of the same
+//! shape (the flag names the source):
+//!   - `--from-literal SLOT=VALUE` — a NEW value, written to the vault on
+//!     approval (the value rides the local deposit, never the op);
+//!   - `--from-secret SLOT=KEY` — a secret ALREADY in the vault, bound by KEY
+//!     (no plaintext anywhere).
 //!
 //! Two shapes (§9):
-//!   - RAW (default): `--host <domain>` (repeatable) + `--secret KEY[=VALUE]`
-//!     (repeatable) and/or `--use-existing KEY`. Anchors its own hosts and stores
-//!     each secret at its BARE uppercase KEY (the vault is a flat env namespace).
-//!     Reachable via `__sc__<name>__` (sole) or `__sc__<name>__<role>__` (several).
+//!   - RAW (default): `--host <domain>` (repeatable). A raw connection's SLOT is
+//!     the vault KEY itself, so `--from-secret KEY` is its short form. Anchors
+//!     its own hosts; stores new values at their BARE uppercase KEY (the vault
+//!     is a flat env namespace). Reachable via `__sc__<name>__` (sole) or
+//!     `__sc__<name>__<role>__` (several).
 //!   - SERVICE-backed: `--service <id>` binds a catalog service — its hosts and
-//!     declared secrets. `--host` is then optional and only PINS an exact FQDN
-//!     inside the service's `*.suffix` wildcards (each pin ⊆ the service hosts).
-//!     Secret values are provided with `--secret KEY=VALUE`; keys must be a
-//!     subset of the service's declared secrets. Every value is stored at a
+//!     declared secret roles. SLOT is a role (case-insensitive), and
+//!     `--from-secret` needs the `ROLE=KEY` form. Every role must be filled: a
+//!     role named by neither flag is prompted for (hidden) on a terminal and is
+//!     an error off one. `--host` is optional and only PINS an exact FQDN
+//!     inside the service's `*.suffix` wildcards. A new value is stored at a
 //!     BARE uppercase key (§3): the role's own name for the default connection,
-//!     the suggested `<ROLE>_<QUALIFIER>` for a named one — recorded in the
-//!     connection's `keys` map (the binding is stored data, never recomputed).
+//!     the suggested `<ROLE>_<QUALIFIER>` for a named one; the role → KEY
+//!     binding is recorded in the connection's `keys` map.
 //!
-//! Secret KEYs are canonical UPPERCASE (§1); a lowercase `--secret key=…` is
-//! auto-converted. Connection ids are lowercase.
+//! An agent may run this to PROPOSE a connection; nothing is written until the
+//! vault owner approves with a passkey. The daemon stamps the approval card
+//! (every bound key, new vs existing, every destination host, other
+//! connections sharing a key) into the signed op and checks it again at apply.
+//!
+//! Secret KEYs written here are canonical UPPERCASE (§1); a lowercase literal
+//! slot is auto-converted. Connection ids are lowercase.
 
 use std::io::IsTerminal;
 use std::io::Write as _;
@@ -65,7 +80,7 @@ fn resolve_conn_id(args: &mut ConnectArgs) -> Result<String, String> {
 
     if !std::io::stdin().is_terminal() {
         return Err(
-            "provide a connection id: `sc connection add <id> --host <domain> --secret KEY=VALUE` (or `--service <id>`)".into(),
+            "provide a connection id: `sc connection add <id> --host <domain> --from-literal KEY=VALUE` (or `--service <id>`)".into(),
         );
     }
 
@@ -127,7 +142,7 @@ pub async fn run_ls(json: bool) -> Result<(), String> {
 
     if conns.is_empty() {
         println!(
-            "no connections — add one with `sc connection add <id> --host <domain> --secret KEY=VALUE`"
+            "no connections; add one with `sc connection add <id> --host <domain> --from-literal KEY=VALUE`"
         );
         return Ok(());
     }
@@ -365,26 +380,44 @@ async fn run_raw(
         validate_raw_host(h)?;
     }
 
-    // Secrets: gather + uppercase the KEYs (§1).
-    let gathered = gather_secrets(name, &args.secret, &args.use_existing)?;
+    // Slots: a raw connection's SLOT is its vault KEY. New values are stored at
+    // their BARE uppercase KEY (§2 — the vault is a flat env namespace; two
+    // connections referencing the same KEY share it).
+    let gathered = gather_raw_slots(
+        name,
+        &args.from_literal,
+        &args.from_secret,
+        std::io::stdin().is_terminal(),
+    )?;
     if gathered.new_values.is_empty() && gathered.existing.is_empty() {
         return Err(
-            "a connection needs at least one secret — `--secret KEY=VALUE` or `--use-existing KEY`"
+            "a raw connection needs at least one secret: `--from-literal KEY=VALUE` (a new value) or `--from-secret KEY` (a secret already in the vault)"
                 .into(),
         );
     }
 
-    // Raw secrets are stored at their BARE uppercase KEY (§2 — the vault is a
-    // flat env namespace; two connections referencing the same KEY share it).
-    // `secret_keys` = every KEY the connection references (new + existing);
-    // the daemon verifies each `--use-existing` KEY actually exists.
+    // `secret_keys` = every KEY the connection binds (new + existing); the
+    // daemon verifies each `--from-secret` KEY actually exists.
     let mut secret_keys: Vec<String> = gathered
         .new_values
         .iter()
-        .map(|(role, _)| role.clone())
+        .map(|(key, _)| key.clone())
         .collect();
     secret_keys.extend(gathered.existing.iter().cloned());
-    dedup_upper(&mut secret_keys);
+    dedup_exact(&mut secret_keys);
+    print_proposal(
+        name,
+        gathered
+            .new_values
+            .iter()
+            .map(|(k, _)| (k.clone(), k.clone(), true))
+            .chain(
+                gathered
+                    .existing
+                    .iter()
+                    .map(|k| (k.clone(), k.clone(), false)),
+            ),
+    );
 
     // New VALUES go to the local daemon deposit; the op carries only the
     // salted digest (the op JSON travels to the cloud grant page — §values).
@@ -465,60 +498,52 @@ async fn run_service_backed(
         Some(args.host.clone())
     };
 
-    // Secret values: keys must be a subset of the service's declared secrets.
-    let gathered = gather_secrets(name, &args.secret, &[])?;
-    if !args.use_existing.is_empty() {
-        return Err("--use-existing is not supported with --service (provide values with `--secret KEY=VALUE`)".into());
-    }
-    for (role, _) in &gathered.new_values {
-        let declared = service_secrets.iter().any(|s| s.eq_ignore_ascii_case(role));
-        if !declared {
-            return Err(format!(
-                "secret '{}' is not declared by service '{}' (its secrets: {})",
-                role,
-                service,
-                if service_secrets.is_empty() {
-                    "none".into()
-                } else {
-                    service_secrets.join(", ")
-                }
-            ));
+    // Every declared role is a slot; each must be filled from a new value or
+    // a secret already in the vault.
+    let filled = fill_service_slots(
+        service,
+        &service_secrets,
+        &args.from_literal,
+        &args.from_secret,
+        std::io::stdin().is_terminal(),
+    )?;
+
+    // A NEW value is stored at a BARE uppercase KEY (§3): the role's own
+    // mainstream name for the default connection (`name == service`), or the
+    // suggested `<ROLE>_<QUALIFIER>` for a named one. An existing secret is
+    // bound by its KEY as typed (the daemon folds a native key's case).
+    let mut bindings: Vec<(String, String, bool)> = Vec::new(); // (role, KEY, new?)
+    let mut values = std::collections::BTreeMap::new();
+    for (role, source) in filled {
+        match source {
+            Filled::Value(v) => {
+                let key = suggested_secret_key(name, service, &role);
+                values.insert(key.clone(), v);
+                bindings.push((role, key, true));
+            }
+            Filled::Secret(key) => bindings.push((role, key, false)),
         }
     }
-
-    // Every secret is stored at a BARE uppercase KEY (§3): the role's own
-    // mainstream name for the default connection (`name == service`), or the
-    // suggested `<ROLE>_<QUALIFIER>` for a named one — recorded in the
-    // connection's `keys` map so readers resolve the same slot.
-    let keys: Option<Vec<(String, String)>> = if name == service {
-        None
-    } else {
-        Some(
-            gathered
-                .new_values
-                .iter()
-                .map(|(role, _)| (role.clone(), suggested_secret_key(name, service, role)))
-                .collect(),
-        )
-    };
-    let mut values = std::collections::BTreeMap::new();
-    for (role, val) in &gathered.new_values {
-        let key = keys
-            .as_ref()
-            .and_then(|m| m.iter().find(|(r, _)| r == role).map(|(_, k)| k.clone()))
-            .unwrap_or_else(|| role.clone());
-        values.insert(key, val.clone());
-    }
+    // The connection's `keys` map: a named connection records every role's
+    // KEY; the default connection keeps the identity binding for its new
+    // values and records only roles bound to a differently named secret.
+    let keys: Vec<(String, String)> = bindings
+        .iter()
+        .filter(|(role, key, new)| name != service || (!*new && key != role))
+        .map(|(role, key, _)| (role.clone(), key.clone()))
+        .collect();
+    let mut bound_keys: Vec<String> = bindings.iter().map(|(_, k, _)| k.clone()).collect();
+    dedup_exact(&mut bound_keys);
+    print_proposal(name, bindings.iter().cloned());
 
     // New VALUES go to the local daemon deposit; the op carries only the
     // salted digest plus the public shape (service, pins, key bindings).
-    let written_keys: Vec<String> = values.keys().cloned().collect();
-    let mut scope = json!({ "service": service, "secrets": written_keys });
+    let mut scope = json!({ "service": service, "secrets": bound_keys });
     if let Some(p) = &pins {
         scope["hosts"] = json!(p);
     }
-    if let Some(k) = keys.as_ref().filter(|k| !k.is_empty()) {
-        let map: serde_json::Map<String, Value> = k
+    if !keys.is_empty() {
+        let map: serde_json::Map<String, Value> = keys
             .iter()
             .map(|(role, key)| (role.clone(), Value::String(key.clone())))
             .collect();
@@ -562,117 +587,353 @@ async fn run_service_backed(
         eprintln!("  phantom: {}", ph);
     }
     if phantoms.is_empty() {
-        eprintln!("  (no injectable phantom yet — provide the service's secret with `--secret KEY=VALUE`)");
+        eprintln!("  (no injectable phantom yet: fill the service's secret with `--from-literal ROLE=VALUE` or `--from-secret ROLE=KEY`)");
     }
     Ok(())
 }
 
-// ── shared secret gathering ──────────────────────────────────────────────────
+// ── slot filling ─────────────────────────────────────────────────────────────
 
-struct Gathered {
-    /// New secrets to write: `(UPPERCASE_ROLE, value)`.
+/// One `--from-literal` / `--from-secret` argument, split.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SlotArg {
+    /// `--from-literal SLOT=VALUE`.
+    Literal { slot: String, value: String },
+    /// `--from-literal SLOT`: prompt for the value (hidden) on a terminal.
+    Prompt { slot: String },
+    /// `--from-secret SLOT=KEY`.
+    Secret { slot: String, key: String },
+    /// `--from-secret KEY` (raw connections only: the slot IS the key).
+    SecretShort { key: String },
+}
+
+/// Split the two flags into slot arguments, checking only their shape.
+fn parse_slot_args(
+    from_literal: &[String],
+    from_secret: &[String],
+) -> Result<Vec<SlotArg>, String> {
+    let mut out = Vec::new();
+    for a in from_literal {
+        match a.split_once('=') {
+            Some((slot, value)) => {
+                let slot = slot.trim();
+                if slot.is_empty() {
+                    return Err(format!(
+                        "--from-literal '{}': SLOT is empty (expected SLOT=VALUE)",
+                        a
+                    ));
+                }
+                if value.is_empty() {
+                    return Err(format!(
+                        "--from-literal {}: the value is empty; pass `--from-literal {}=<value>`, or `--from-literal {}` on a terminal to type it hidden",
+                        slot, slot, slot
+                    ));
+                }
+                out.push(SlotArg::Literal {
+                    slot: slot.to_string(),
+                    value: value.to_string(),
+                });
+            }
+            None => {
+                let slot = a.trim();
+                if slot.is_empty() {
+                    return Err("--from-literal needs SLOT=VALUE".into());
+                }
+                out.push(SlotArg::Prompt {
+                    slot: slot.to_string(),
+                });
+            }
+        }
+    }
+    for a in from_secret {
+        let (slot, key) = match a.split_once('=') {
+            Some((slot, key)) => (Some(slot.trim()), key.trim()),
+            None => (None, a.trim()),
+        };
+        if !crate::cli::conn::valid_secret_ref(key) {
+            return Err(format!(
+                "--from-secret '{}': '{}' is not a valid secret key (ASCII letters/digits/_/-, no '__')",
+                a, key
+            ));
+        }
+        match slot {
+            Some("") => {
+                return Err(format!(
+                    "--from-secret '{}': SLOT is empty (expected SLOT=KEY)",
+                    a
+                ))
+            }
+            Some(slot) => out.push(SlotArg::Secret {
+                slot: slot.to_string(),
+                key: key.to_string(),
+            }),
+            None => out.push(SlotArg::SecretShort {
+                key: key.to_string(),
+            }),
+        }
+    }
+    Ok(out)
+}
+
+/// Where a filled slot's value comes from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Filled {
+    /// A new value to write.
+    Value(String),
+    /// An existing vault secret, by KEY as typed.
+    Secret(String),
+}
+
+/// What a slot argument resolves to before prompting: a value, a prompt, or a
+/// reference.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Pending {
+    Value(String),
+    Prompt,
+    Secret(String),
+}
+
+/// Record `slot → pending`, refusing a slot named twice (case-insensitively),
+/// with the reason naming both flags when the sources differ.
+fn claim_slot(
+    seen: &mut Vec<(String, Pending)>,
+    slot: String,
+    pending: Pending,
+) -> Result<(), String> {
+    if let Some((_, prev)) = seen.iter().find(|(s, _)| s.eq_ignore_ascii_case(&slot)) {
+        let both = matches!(prev, Pending::Secret(_)) != matches!(pending, Pending::Secret(_));
+        return Err(if both {
+            format!(
+                "slot '{}' is filled by both --from-literal and --from-secret; use one",
+                slot
+            )
+        } else {
+            format!("slot '{}' is given twice", slot)
+        });
+    }
+    seen.push((slot, pending));
+    Ok(())
+}
+
+/// Hidden prompt for one slot's value (re-asks on an empty answer).
+fn prompt_value(slot: &str) -> Result<String, String> {
+    loop {
+        let val = rpassword::prompt_password(format!("Value for {} (hidden): ", slot))
+            .map_err(|e| format!("read value: {}", e))?;
+        if !val.is_empty() {
+            return Ok(val);
+        }
+        eprintln!("  value cannot be empty; try again");
+    }
+}
+
+/// RAW slots: SLOT is the vault KEY. Returns new `(UPPERCASE KEY, value)`
+/// pairs and existing KEYs as typed. No flags at all on a terminal runs the
+/// interactive KEY + hidden-value loop.
+#[derive(Debug)]
+struct RawSlots {
     new_values: Vec<(String, String)>,
-    /// Existing BARE secret KEYs to reference (uppercased).
     existing: Vec<String>,
 }
 
-/// Parse `--secret KEY[=VALUE]` (and `--use-existing KEY`), uppercasing every KEY
-/// to the canonical form (§1). A bare `--secret KEY` prompts for a hidden value
-/// on a TTY. Fully-interactive (no flags) loops prompting KEY + value.
-fn gather_secrets(
+fn gather_raw_slots(
     name: &str,
-    secret_flags: &[String],
-    use_existing: &[String],
-) -> Result<Gathered, String> {
-    let mut new_values: Vec<(String, String)> = Vec::new();
-    // `--use-existing` keys pass through AS TYPED: an external store's key
-    // (GCP allows lowercase/hyphens) must reach the daemon exactly as named.
-    // The daemon canonicalises — a native key typed in the wrong case is
-    // folded to its stored (uppercase) form at approve.
-    let existing: Vec<String> = use_existing.iter().map(|k| k.trim().to_string()).collect();
-    for k in &existing {
-        if !crate::cli::conn::valid_secret_ref(k) {
-            return Err(format!(
-                "--use-existing '{}': not a valid secret key (ASCII letters/digits/_/-, no '__')",
-                k
-            ));
+    from_literal: &[String],
+    from_secret: &[String],
+    tty: bool,
+) -> Result<RawSlots, String> {
+    let args = parse_slot_args(from_literal, from_secret)?;
+    let mut seen: Vec<(String, Pending)> = Vec::new();
+    for a in args {
+        match a {
+            SlotArg::Literal { slot, value } => {
+                claim_slot(&mut seen, upper_key(&slot)?, Pending::Value(value))?
+            }
+            SlotArg::Prompt { slot } => claim_slot(&mut seen, upper_key(&slot)?, Pending::Prompt)?,
+            SlotArg::SecretShort { key } => {
+                claim_slot(&mut seen, key.clone(), Pending::Secret(key))?
+            }
+            SlotArg::Secret { slot, key } => {
+                if !slot.eq_ignore_ascii_case(&key) {
+                    return Err(format!(
+                        "--from-secret {}={}: a raw connection's slot is the key itself; use `--from-secret {}`",
+                        slot, key, key
+                    ));
+                }
+                claim_slot(&mut seen, key.clone(), Pending::Secret(key))?
+            }
         }
     }
 
-    if !secret_flags.is_empty() {
-        for s in secret_flags {
-            if let Some((k, v)) = s.split_once('=') {
-                let role = k.trim().to_ascii_uppercase();
-                if !valid_role(&role) {
-                    return Err(format!(
-                        "secret KEY '{}' isn't a valid env key ([A-Z0-9_])",
-                        k.trim()
-                    ));
-                }
-                new_values.push((role, v.to_string()));
-            } else if std::io::stdin().is_terminal() {
-                let role = s.trim().to_ascii_uppercase();
-                if !valid_role(&role) {
-                    return Err(format!(
-                        "secret KEY '{}' isn't a valid env key ([A-Z0-9_])",
-                        s.trim()
-                    ));
-                }
-                let val = rpassword::prompt_password(format!("Value for {} (hidden): ", role))
-                    .map_err(|e| format!("read value: {}", e))?;
-                if val.is_empty() {
-                    return Err(format!("value for '{}' cannot be empty", role));
-                }
-                new_values.push((role, val));
-            } else {
-                return Err(format!(
-                    "--secret {}: provide a value as `--secret {}=<value>` (non-interactive)",
-                    s, s
-                ));
-            }
-        }
-    } else if existing.is_empty() {
+    let mut out = RawSlots {
+        new_values: Vec::new(),
+        existing: Vec::new(),
+    };
+    if seen.is_empty() && tty {
         // Fully interactive: loop prompting KEY names + hidden values.
-        if !std::io::stdin().is_terminal() {
-            return Err(
-                "no secrets given — `--secret KEY=VALUE` (repeatable) or `--use-existing KEY`"
-                    .into(),
-            );
-        }
         loop {
-            let role = prompt_line(&format!("secret KEY for '{}' (blank to finish): ", name))?;
-            let role = role.trim().to_ascii_uppercase();
-            if role.is_empty() {
+            let key = prompt_line(&format!("secret KEY for '{}' (blank to finish): ", name))?;
+            let key = key.trim().to_ascii_uppercase();
+            if key.is_empty() {
                 break;
             }
-            if !valid_role(&role) {
-                eprintln!("  '{}' isn't a valid env key ([A-Z0-9_]); try again", role);
+            if !valid_role(&key) {
+                eprintln!("  '{}' isn't a valid env key ([A-Z0-9_]); try again", key);
                 continue;
             }
-            let val = rpassword::prompt_password(format!("Value for {} (hidden): ", role))
-                .map_err(|e| format!("read value: {}", e))?;
-            if val.is_empty() {
-                eprintln!("  value cannot be empty; try again");
+            if out.new_values.iter().any(|(k, _)| *k == key) {
+                eprintln!("  '{}' already given; try again", key);
                 continue;
             }
-            new_values.push((role, val));
+            let val = prompt_value(&key)?;
+            out.new_values.push((key, val));
+        }
+        return Ok(out);
+    }
+    for (slot, pending) in seen {
+        match pending {
+            Pending::Value(v) => out.new_values.push((slot, v)),
+            Pending::Secret(k) => out.existing.push(k),
+            Pending::Prompt if tty => {
+                let v = prompt_value(&slot)?;
+                out.new_values.push((slot, v));
+            }
+            Pending::Prompt => {
+                return Err(format!(
+                    "--from-literal {}: provide the value as `--from-literal {}=<value>` (no terminal to prompt on)",
+                    slot, slot
+                ))
+            }
         }
     }
-
-    // Duplicate KEY guard (already uppercase — case-insensitive by construction).
-    let mut seen = std::collections::HashSet::new();
-    for (role, _) in &new_values {
-        if !seen.insert(role.clone()) {
-            return Err(format!("duplicate secret KEY '{}'", role));
-        }
-    }
-    Ok(Gathered {
-        new_values,
-        existing,
-    })
+    Ok(out)
 }
 
-fn dedup_upper(keys: &mut Vec<String>) {
+/// A raw literal slot names the KEY to write: canonical UPPERCASE (§1).
+fn upper_key(slot: &str) -> Result<String, String> {
+    let key = slot.trim().to_ascii_uppercase();
+    if !valid_role(&key) {
+        return Err(format!(
+            "secret KEY '{}' isn't a valid env key ([A-Z0-9_])",
+            slot.trim()
+        ));
+    }
+    Ok(key)
+}
+
+/// SERVICE slots: every declared role, in declaration order, filled from a
+/// flag or (on a terminal) a hidden prompt. Off a terminal, unfilled roles are
+/// an error that names them and both ways to fill them.
+fn fill_service_slots(
+    service: &str,
+    roles: &[String],
+    from_literal: &[String],
+    from_secret: &[String],
+    tty: bool,
+) -> Result<Vec<(String, Filled)>, String> {
+    let declared = |slot: &str| -> Result<String, String> {
+        roles
+            .iter()
+            .find(|r| r.eq_ignore_ascii_case(slot))
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "secret '{}' is not declared by service '{}' (its secrets: {})",
+                    slot,
+                    service,
+                    if roles.is_empty() {
+                        "none".into()
+                    } else {
+                        roles.join(", ")
+                    }
+                )
+            })
+    };
+    let mut seen: Vec<(String, Pending)> = Vec::new();
+    for a in parse_slot_args(from_literal, from_secret)? {
+        match a {
+            SlotArg::Literal { slot, value } => {
+                claim_slot(&mut seen, declared(&slot)?, Pending::Value(value))?
+            }
+            SlotArg::Prompt { slot } => claim_slot(&mut seen, declared(&slot)?, Pending::Prompt)?,
+            SlotArg::Secret { slot, key } => {
+                claim_slot(&mut seen, declared(&slot)?, Pending::Secret(key))?
+            }
+            SlotArg::SecretShort { key } => {
+                return Err(format!(
+                    "--from-secret {}: with --service, name the slot it fills: `--from-secret ROLE={}` (roles of '{}': {}). A key name alone does not say which of the service's secrets it is.",
+                    key,
+                    key,
+                    service,
+                    if roles.is_empty() {
+                        "none".into()
+                    } else {
+                        roles.join(", ")
+                    }
+                ))
+            }
+        }
+    }
+
+    let missing: Vec<&String> = roles
+        .iter()
+        .filter(|r| !seen.iter().any(|(s, _)| s == *r))
+        .collect();
+    if !missing.is_empty() && !tty {
+        let first = missing[0];
+        return Err(format!(
+            "service '{}' needs a value for: {}. Fill each slot with a new value (`--from-literal {}=<value>`) or with a secret already in the vault (`--from-secret {}=<KEY>`).",
+            service,
+            missing
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+            first,
+            first
+        ));
+    }
+
+    let mut out = Vec::with_capacity(roles.len());
+    for role in roles {
+        let filled = match seen.iter().find(|(s, _)| s == role).map(|(_, p)| p.clone()) {
+            Some(Pending::Value(v)) => Filled::Value(v),
+            Some(Pending::Secret(k)) => Filled::Secret(k),
+            // A bare `--from-literal ROLE`, or a role no flag named: hidden
+            // prompt (only reached on a terminal).
+            Some(Pending::Prompt) | None => {
+                if !tty {
+                    return Err(format!(
+                        "--from-literal {}: provide the value as `--from-literal {}=<value>` (no terminal to prompt on)",
+                        role, role
+                    ));
+                }
+                Filled::Value(prompt_value(role)?)
+            }
+        };
+        out.push((role.clone(), filled));
+    }
+    Ok(out)
+}
+
+/// Print what the request proposes, before the approval: every slot, its KEY,
+/// and whether the value is new or an existing secret.
+fn print_proposal(name: &str, bindings: impl Iterator<Item = (String, String, bool)>) {
+    eprintln!(
+        "Proposing connection '{}' (nothing changes until it is approved):",
+        name
+    );
+    for (slot, key, new) in bindings {
+        let src = if new { "new value" } else { "existing secret" };
+        if slot == key {
+            eprintln!("  {}  ({})", key, src);
+        } else {
+            eprintln!("  {} ← {}  ({})", slot, key, src);
+        }
+    }
+}
+
+fn dedup_exact(keys: &mut Vec<String>) {
     let mut seen = std::collections::HashSet::new();
     keys.retain(|k| seen.insert(k.clone()));
 }
@@ -720,5 +981,180 @@ fn report_phantoms(name: &str, hosts: &[String], secret_keys: &[String]) {
     let phantoms = crate::core::host::phantoms_for_raw(name, secret_keys);
     for ph in phantoms.values() {
         eprintln!("  phantom: {}", ph);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn v(xs: &[&str]) -> Vec<String> {
+        xs.iter().map(|x| x.to_string()).collect()
+    }
+
+    fn roles() -> Vec<String> {
+        v(&["CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID"])
+    }
+
+    #[test]
+    fn parse_shapes() {
+        let a = parse_slot_args(&v(&["K=a=b", "P"]), &v(&["R=OLD_KEY", "xh-gcp-test"])).unwrap();
+        assert_eq!(
+            a,
+            vec![
+                SlotArg::Literal {
+                    slot: "K".into(),
+                    value: "a=b".into()
+                },
+                SlotArg::Prompt { slot: "P".into() },
+                SlotArg::Secret {
+                    slot: "R".into(),
+                    key: "OLD_KEY".into()
+                },
+                SlotArg::SecretShort {
+                    key: "xh-gcp-test".into()
+                },
+            ]
+        );
+        assert!(parse_slot_args(&v(&["K="]), &[])
+            .unwrap_err()
+            .contains("value is empty"));
+        assert!(parse_slot_args(&v(&["=x"]), &[])
+            .unwrap_err()
+            .contains("SLOT is empty"));
+        assert!(parse_slot_args(&[], &v(&["R=a__b"]))
+            .unwrap_err()
+            .contains("not a valid secret key"));
+        assert!(parse_slot_args(&[], &v(&["=K"]))
+            .unwrap_err()
+            .contains("SLOT is empty"));
+    }
+
+    #[test]
+    fn service_slots_mix_sources_case_insensitively() {
+        let f = fill_service_slots(
+            "cloudflare",
+            &roles(),
+            &v(&["cloudflare_account_id=acc123"]),
+            &v(&["Cloudflare_Api_Token=CF_TOKEN_WORK"]),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            f,
+            vec![
+                (
+                    "CLOUDFLARE_API_TOKEN".into(),
+                    Filled::Secret("CF_TOKEN_WORK".into())
+                ),
+                (
+                    "CLOUDFLARE_ACCOUNT_ID".into(),
+                    Filled::Value("acc123".into())
+                ),
+            ]
+        );
+        // A pure-reference service connection is fine (no "no secrets" refusal).
+        let f = fill_service_slots(
+            "cloudflare",
+            &roles(),
+            &[],
+            &v(&["CLOUDFLARE_API_TOKEN=A", "CLOUDFLARE_ACCOUNT_ID=B"]),
+            false,
+        )
+        .unwrap();
+        assert!(f.iter().all(|(_, s)| matches!(s, Filled::Secret(_))));
+    }
+
+    #[test]
+    fn service_slot_errors() {
+        // Undeclared role: same message shape as before, listing the roles.
+        let e =
+            fill_service_slots("cloudflare", &roles(), &v(&["NOPE=x"]), &[], false).unwrap_err();
+        assert_eq!(
+            e,
+            "secret 'NOPE' is not declared by service 'cloudflare' (its secrets: CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID)"
+        );
+        // Shorthand needs a slot with --service, and says why.
+        let e =
+            fill_service_slots("cloudflare", &roles(), &[], &v(&["CF_TOKEN"]), false).unwrap_err();
+        assert!(e.contains("with --service, name the slot"), "{e}");
+        assert!(e.contains("--from-secret ROLE=CF_TOKEN"), "{e}");
+        // Both flags on one slot.
+        let e = fill_service_slots(
+            "cloudflare",
+            &roles(),
+            &v(&["CLOUDFLARE_API_TOKEN=x"]),
+            &v(&["cloudflare_api_token=K"]),
+            false,
+        )
+        .unwrap_err();
+        assert!(e.contains("both --from-literal and --from-secret"), "{e}");
+        // Same flag twice.
+        let e = fill_service_slots(
+            "cloudflare",
+            &roles(),
+            &v(&["CLOUDFLARE_API_TOKEN=x", "cloudflare_api_token=y"]),
+            &[],
+            false,
+        )
+        .unwrap_err();
+        assert!(e.contains("given twice"), "{e}");
+        // Unfilled roles off a terminal: listed, with both ways to fill them.
+        let e = fill_service_slots(
+            "cloudflare",
+            &roles(),
+            &v(&["CLOUDFLARE_API_TOKEN=x"]),
+            &[],
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            e.contains("needs a value for: CLOUDFLARE_ACCOUNT_ID"),
+            "{e}"
+        );
+        assert!(
+            e.contains("--from-literal CLOUDFLARE_ACCOUNT_ID=<value>"),
+            "{e}"
+        );
+        assert!(
+            e.contains("--from-secret CLOUDFLARE_ACCOUNT_ID=<KEY>"),
+            "{e}"
+        );
+        // A bare --from-literal off a terminal can't prompt.
+        let e = fill_service_slots(
+            "cloudflare",
+            &roles(),
+            &v(&["CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID=x"]),
+            &[],
+            false,
+        )
+        .unwrap_err();
+        assert!(e.contains("no terminal to prompt on"), "{e}");
+    }
+
+    #[test]
+    fn raw_slots_are_keys() {
+        let r = gather_raw_slots(
+            "myapi",
+            &v(&["api_token=v1"]),
+            &v(&["xh-gcp-test", "OLD_KEY=old_key"]),
+            false,
+        )
+        .unwrap();
+        assert_eq!(r.new_values, vec![("API_TOKEN".into(), "v1".into())]);
+        assert_eq!(r.existing, v(&["xh-gcp-test", "old_key"]));
+        // SLOT=KEY with a different slot is refused for raw: the slot IS the key.
+        let e = gather_raw_slots("myapi", &[], &v(&["TOKEN=OTHER_KEY"]), false).unwrap_err();
+        assert!(e.contains("use `--from-secret OTHER_KEY`"), "{e}");
+        // Same KEY from both flags.
+        let e =
+            gather_raw_slots("myapi", &v(&["API_TOKEN=x"]), &v(&["api_token"]), false).unwrap_err();
+        assert!(e.contains("both --from-literal and --from-secret"), "{e}");
+        // Literal KEYs must be env keys.
+        let e = gather_raw_slots("myapi", &v(&["bad-key=x"]), &[], false).unwrap_err();
+        assert!(e.contains("isn't a valid env key"), "{e}");
+        // No flags off a terminal: empty (the caller refuses with both flags named).
+        let r = gather_raw_slots("myapi", &[], &[], false).unwrap();
+        assert!(r.new_values.is_empty() && r.existing.is_empty());
     }
 }
