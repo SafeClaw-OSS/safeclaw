@@ -2646,7 +2646,7 @@ scope = ["amount"]
             match_pattern: Some("POST /buy".into()),
             when: when.map(str::to_string),
             body: body.map(str::to_string),
-            level: Some(AccessLevel::Allow),
+            level: Some(AccessLevel::Ask),
             ..Default::default()
         };
         let with_rules = |rules: Vec<(&str, RuleConfig)>| {
@@ -2685,6 +2685,18 @@ scope = ["amount"]
         assert!(state
             .connection_rule_problem("v1", "shop", "shop", "POST", "/buy", &rs)
             .is_some());
+        // A protective deny on the body mints no approval: not refused.
+        let state = with_rules(vec![(
+            "no_gifts",
+            RuleConfig {
+                level: Some(AccessLevel::Deny),
+                ..rule(None, Some("gift"))
+            },
+        )]);
+        assert_eq!(
+            state.connection_rule_problem("v1", "shop", "shop", "POST", "/buy", &rs),
+            None
+        );
         // Locked: nothing to report (the request fails as locked anyway).
         assert_eq!(
             state.connection_rule_problem("v-none", "shop", "shop", "POST", "/buy", &rs),

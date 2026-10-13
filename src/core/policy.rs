@@ -364,8 +364,10 @@ pub fn merge_rules(built_in: &[PolicyRule], user: &HashMap<String, RuleConfig>) 
 ///   - a `body` regex (the body is never bound).
 ///
 /// Only the user's edits (`aux.policy.connections.<id>.rules`) are checked,
-/// and only those whose rule `match` covers this request. A `when` naming a
-/// var this shape does not declare never fires here (P3) and is not refused.
+/// only those that decide `ask` or `ask-always` (an `allow` or `deny` mints
+/// no approval and is re-decided on every request), and only those whose rule
+/// `match` covers this request. A `when` naming a var this shape does not
+/// declare never fires here (P3) and is not refused.
 /// `shape` / `declared` / `binds` describe the matched shape
 /// (`crate::service::RequestScope`).
 pub fn unenforceable_user_rule(
@@ -395,8 +397,10 @@ pub fn unenforceable_user_rule(
                 None => continue,
             },
         };
-        if level.is_none() {
-            continue; // never decides
+        // Only an ask decision mints an approval this could ride: `allow` and
+        // `deny` (or no level) are re-decided on every request.
+        if !matches!(level, Some(AccessLevel::Ask | AccessLevel::AskAlways)) {
+            continue;
         }
         let covers =
             patterns.is_empty() || patterns.iter().any(|p| pattern_matches(p, method, path));
@@ -415,14 +419,16 @@ pub fn unenforceable_user_rule(
             continue; // an unparseable `when` never matches (P3)
         };
         let var = cond.var_name();
-        let (qualifier, bare) = match var.rsplit_once('.') {
-            Some((q, b)) => (Some(q), b),
-            None => (None, var),
-        };
-        if qualifier.is_some_and(|q| q != shape) || !declared.iter().any(|d| d == bare) {
-            continue; // never resolves on this path
-        }
-        if !binds.iter().any(|b| b == bare) {
+        // The declared fields the `when` can resolve to, by the same lookup
+        // evaluation uses (`extract_request_scope` inserts each var as `name`
+        // and as `<shape>.name`). None: it never resolves on this path.
+        let qualified = format!("{}.", shape);
+        let fields: Vec<&str> = [Some(var), var.strip_prefix(qualified.as_str())]
+            .into_iter()
+            .flatten()
+            .filter(|f| declared.iter().any(|d| d == f))
+            .collect();
+        if fields.iter().any(|f| !binds.iter().any(|b| b == f)) {
             return Some(format!(
                 "this connection's policy rule '{}' gates on `vars.{}`, which the [requests.{}] \
                  shape does not bind, so an approval could not hold it fixed; gate the rule on a \
@@ -1034,6 +1040,33 @@ mod tests {
         let e = check(&user, "POST", "/pay").expect("refused");
         assert!(e.contains("'b'") && e.contains("body"), "{e}");
         assert_eq!(check(&user, "POST", "/elsewhere"), None);
+        user.remove("b");
+
+        // `allow` / `deny` edits mint no approval: never refused.
+        for level in [AccessLevel::Allow, AccessLevel::Deny] {
+            let mut only = HashMap::new();
+            only.insert(
+                "protect".to_string(),
+                RuleConfig {
+                    level: Some(level),
+                    ..add(Some("POST /pay"), Some("vars.memo == 1"), Some("bitcoin"))
+                },
+            );
+            assert_eq!(check(&only, "POST", "/pay"), None, "{level:?}");
+        }
+
+        // A declared var whose own name has a dot resolves verbatim, as at
+        // evaluation.
+        let dotted = vec!["a.b".to_string(), "amount".to_string()];
+        let mut only = HashMap::new();
+        only.insert(
+            "d".to_string(),
+            add(Some("POST /pay"), Some("vars.a.b == 1"), None),
+        );
+        assert!(unenforceable_user_rule(
+            &built_in, &only, "POST", "/pay", "purchase", &dotted, &binds
+        )
+        .is_some());
     }
 
     // ── Method normalization (fail closed) ───────────────────────────────────

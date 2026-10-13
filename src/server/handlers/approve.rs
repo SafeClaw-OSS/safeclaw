@@ -1829,18 +1829,22 @@ pub async fn approve_op(
                     )?;
                 let base = crate::storage::sealed_vault::ViewBase::of(&view)?;
 
-                // The service def, custom-first (a per-vault def wins).
+                // The service def, resolved as mint and the proxy resolve it:
+                // the vault's valid custom defs (never shadowing a built-in
+                // id), else the compiled registry.
+                let (custom_defs, _) =
+                    crate::service::vault_custom_services(&view.aux.services, &state.services);
                 let def: Option<crate::service::ServiceDef> = match &service {
                     None => None,
-                    Some(svc) => Some(match view.aux.services.get(svc) {
-                        Some(toml_src) => toml::from_str::<crate::service::ServiceDef>(toml_src)
-                            .map_err(|e| {
-                                AppError::BadRequest(format!("custom service '{}': {}", svc, e))
+                    Some(svc) => Some(
+                        custom_defs
+                            .get(svc)
+                            .or_else(|| state.services.get(svc))
+                            .cloned()
+                            .ok_or_else(|| {
+                                AppError::BadRequest(format!("unknown service '{}'", svc))
                             })?,
-                        None => state.services.get(svc).cloned().ok_or_else(|| {
-                            AppError::BadRequest(format!("unknown service '{}'", svc))
-                        })?,
-                    }),
+                    ),
                 };
                 let hosts: Vec<String> = hosts.unwrap_or_default();
                 if def.is_none() {
@@ -1905,8 +1909,6 @@ pub async fn approve_op(
                     view.native_secrets.keys().cloned().collect();
 
                 // What the owner approved must be what this write does.
-                let (custom_defs, _) =
-                    crate::service::vault_custom_services(&view.aux.services, &state.services);
                 let card = crate::server::handlers::connection_add::card(
                     &id,
                     service.as_deref(),
