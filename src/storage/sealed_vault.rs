@@ -29,8 +29,8 @@ use crate::passkey::PasskeyEntry;
 use crate::protocol::operation::decode_credential_id;
 use crate::storage::item::{
     aad_id_from_wire, body_digest as item_body_digest, item_id, item_id_bytes, normalized_body,
-    open_wire_item, parse_secret_body, seal_item, secret_body, unseal_item, wire_id_for, Conflict,
-    ItemCtx, ItemNs, ItemPayload, Read, VaultKeys,
+    open_wire_item, parse_secret_body, seal_item, secret_body, unseal_item_keys,
+    wire_id_for, Conflict, ItemCtx, ItemNs, ItemPayload, Read, VaultKeys,
 };
 
 /// Per-vault count of items the LAST fold had to skip (unreadable at a format
@@ -424,6 +424,13 @@ pub struct UikCred {
     /// fails verification).
     #[serde(default)]
     pub role_sig: Vec<u8>,
+    /// The content key before the last re-key, sealed under the current one
+    /// (the row's `uik_prev_content_ct`; an owner's re-key sets it on every
+    /// kept member's row): opens rows the re-key has not moved yet
+    /// ([`crate::storage::item::material_with_prev`]). Empty when there is
+    /// none. Every write of this entry keeps it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prev_content_ct: Vec<u8>,
 }
 
 /// The v2 (UIK) layer of a keyset — the `custody → UIK → K` layering
@@ -1715,6 +1722,8 @@ impl PerItemVault {
     /// Upsert a credential's v2 UIK material, promoting the keyset to v2 if it
     /// was v1 (owner-driven join / re-key sealed `K` to `enc_pub` via
     /// [`crate::crypto::vault_key::seal_k_to_uik`]). Idempotent by `cid_b64`.
+    /// The entry's previous content key ([`UikCred::prev_content_ct`]) is
+    /// kept; [`Self::set_uik_prev_content_ct`] replaces it.
     #[allow(clippy::too_many_arguments)]
     pub fn set_uik_cred(
         &mut self,
@@ -1727,28 +1736,45 @@ impl PerItemVault {
         role: crate::storage::plaintext::MemberRole,
         role_sig: Vec<u8>,
     ) {
-        self.keyset
+        let creds = &mut self.keyset.uik.get_or_insert_with(KeysetUik::default).creds;
+        let prev_content_ct = creds
+            .get(&cid_b64)
+            .map(|c| c.prev_content_ct.clone())
+            .unwrap_or_default();
+        creds.insert(
+            cid_b64,
+            UikCred {
+                user_id,
+                sig_pub,
+                enc_pub,
+                k_encapped,
+                k_ct,
+                role,
+                role_sig,
+                prev_content_ct,
+            },
+        );
+    }
+
+    /// Set the previous content key an entry carries (an adopted row's
+    /// `uik_prev_content_ct`). A no-op for an entry that is not stored.
+    pub fn set_uik_prev_content_ct(&mut self, cid_b64: &str, sealed: Vec<u8>) {
+        if let Some(c) = self
+            .keyset
             .uik
-            .get_or_insert_with(KeysetUik::default)
-            .creds
-            .insert(
-                cid_b64,
-                UikCred {
-                    user_id,
-                    sig_pub,
-                    enc_pub,
-                    k_encapped,
-                    k_ct,
-                    role,
-                    role_sig,
-                },
-            );
+            .as_mut()
+            .and_then(|u| u.creds.get_mut(cid_b64))
+        {
+            c.prev_content_ct = sealed;
+        }
     }
 
     /// Adopt a pulled `/keys` row's v2 UIK fields (base64, lenient-decoded like
     /// the other keyset data fields). Mirrors [`Self::upsert_key_row`]'s b64-in
     /// contract so the sync layer never handles raw key bytes. Promotes the
-    /// keyset to v2.
+    /// keyset to v2. `prev_content_ct_b64`: the row's previous content key; a
+    /// row without one keeps the one the entry holds (a re-key replaces it; the
+    /// seal binds the generation, so a stale one never opens).
     #[allow(clippy::too_many_arguments)]
     pub fn set_uik_cred_b64(
         &mut self,
@@ -1760,7 +1786,12 @@ impl PerItemVault {
         k_ct_b64: &str,
         role: crate::storage::plaintext::MemberRole,
         role_sig_b64: &str,
+        prev_content_ct_b64: Option<&str>,
     ) -> Result<()> {
+        let prev_content_ct = prev_content_ct_b64
+            .filter(|s| !s.is_empty())
+            .map(decode_keys_data_field)
+            .transpose()?;
         let sig_pub = decode_keys_data_field(sig_pub_b64)?;
         let enc_pub = decode_keys_data_field(enc_pub_b64)?;
         let k_encapped = decode_keys_data_field(k_encapped_b64)?;
@@ -1782,6 +1813,9 @@ impl PerItemVault {
             role,
             role_sig,
         );
+        if let Some(sealed) = prev_content_ct {
+            self.set_uik_prev_content_ct(cid_b64, sealed);
+        }
         Ok(())
     }
 
@@ -1975,7 +2009,7 @@ impl PerItemVault {
         };
         let raw = item_id_bytes::<S>(keys.id_seed, ns.as_str(), name)?;
         let ctx = ItemCtx::new(vault_id, raw, stored.version);
-        Ok(Some(unseal_item::<S>(keys.content, &ctx, &stored.ct)?))
+        Ok(Some(unseal_item_keys::<S>(keys, &ctx, &stored.ct)?.0))
     }
 
     /// Seed / re-seed this vault's item rows from a decrypted
@@ -2702,7 +2736,7 @@ impl PerItemVault {
                 // recomputes its HMAC (design/agent-authz-cleartext-cutover.md).
                 let raw = aad_id_from_wire::<S>(keys.id_seed, id_b64)?;
                 let ctx = ItemCtx::new(vault_id, raw, stored.version);
-                let payload = unseal_item::<S>(keys.content, &ctx, &stored.ct)?;
+                let (payload, _) = unseal_item_keys::<S>(keys, &ctx, &stored.ct)?;
                 // A record without a rule is not read: the retired `stores:` /
                 // `services:` / `members`, a legacy `aux:agent/<id>` (only
                 // native, UIK-signed agent rows authorize), an unknown `aux` or
@@ -2923,8 +2957,8 @@ impl PerItemVault {
                     return Ok(None);
                 };
                 let raw = item_id_bytes::<S>(keys.id_seed, ItemNs::Aux.as_str(), field)?;
-                let payload = unseal_item::<S>(
-                    keys.content,
+                let (payload, _) = unseal_item_keys::<S>(
+                    keys,
                     &ItemCtx::new(vault_id, raw, stored.version),
                     &stored.ct,
                 )?;
@@ -2990,8 +3024,8 @@ impl PerItemVault {
         let Ok(raw) = item_id_bytes::<S>(keys.id_seed, ns.as_str(), name) else {
             return NativeKey::Unreadable;
         };
-        let Ok(payload) = unseal_item::<S>(
-            keys.content,
+        let Ok((payload, _)) = unseal_item_keys::<S>(
+            keys,
             &ItemCtx::new(vault_id, raw, stored.version),
             &stored.ct,
         ) else {
@@ -3157,8 +3191,8 @@ impl PerItemVault {
         let trust = self.resolve_membership_trust(vault_id);
         let read = |stored: &StoredItem| -> Option<bool> {
             let raw = aad_id_from_wire::<S>(keys.id_seed, wire).ok()?;
-            let payload = unseal_item::<S>(
-                keys.content,
+            let (payload, _) = unseal_item_keys::<S>(
+                keys,
                 &ItemCtx::new(vault_id, raw, stored.version),
                 &stored.ct,
             )
@@ -3280,7 +3314,7 @@ impl PerItemVault {
                 // Cleartext agent wire ids recompute their HMAC AAD; blinded decode.
                 let raw = aad_id_from_wire::<S>(keys.id_seed, id_b64)?;
                 let ctx = ItemCtx::new(vault_id, raw, stored.version);
-                let payload = unseal_item::<S>(keys.content, &ctx, &stored.ct)?;
+                let (payload, _) = unseal_item_keys::<S>(keys, &ctx, &stored.ct)?;
                 if payload.ns == want && !payload.is_tombstone() {
                     out.push(payload.name);
                 }
@@ -4555,6 +4589,107 @@ pub(crate) mod tests {
         );
     }
 
+    /// A re-key the owner's console has not finished: rows still under the
+    /// previous content key read through the previous key the member's own
+    /// keyset row carries (opened at unlock with the current key). A row read
+    /// that way is never written back under it: a reconcile leaves it as it is,
+    /// and a change to it is sealed under the current key.
+    #[test]
+    fn rows_a_rekey_has_not_moved_read_through_the_previous_key() {
+        use crate::storage::item::{seal_prev_content_key, vault_key_bundle};
+        type S = sudp::primitives::StdPrimitives;
+        let fx = rekeyed_fixture();
+        let vid = fx.vault;
+        let mut pv = fx.pv.clone();
+        pv.set_uik_prev_content_ct(
+            "cid-creator",
+            seal_prev_content_key::<S>(&fx.c_new, vid, 1, &fx.c_old),
+        );
+        let old = VaultKeys {
+            id_seed: &fx.id_seed,
+            content: &fx.c_old,
+            prev: None,
+        };
+        let bundle = vault_key_bundle(&fx.id_seed, &fx.c_new);
+        let current = VaultKeys::from_material(&bundle);
+        let old_id = pv
+            .plant::<S>(old, vid, ItemNs::Secret, "OLD", 3, &ItemPayload::secret_live("OLD", "o"))
+            .unwrap();
+        let new_id = pv
+            .plant::<S>(current, vid, ItemNs::Secret, "NEW", 1, &ItemPayload::secret_live("NEW", "n"))
+            .unwrap();
+        for s in pv.items.values_mut() {
+            s.synced_version = s.version;
+        }
+
+        // Unlock: the grant's root opens the bundle and, from the member's own
+        // row, the previous key.
+        let material = crate::server::handlers::metadata::acquire_k_from_keyset(
+            &pv.keyset,
+            &fx.root,
+            b"another-cred",
+            vid,
+        )
+        .unwrap();
+        assert_eq!(material.len(), 96);
+        let keys = VaultKeys::from_material(&material);
+        let view = pv.fold_view::<S>(keys, vid).unwrap();
+        assert_eq!(view.native_secrets["OLD"], b"o");
+        assert_eq!(view.native_secrets["NEW"], b"n");
+        // Without it, only the current key reads.
+        let view = pv.fold_view::<S>(current, vid).unwrap();
+        assert!(!view.native_secrets.contains_key("OLD"));
+        // A seal for another generation does not open: the bundle alone.
+        let mut stale = pv.clone();
+        stale.set_uik_prev_content_ct(
+            "cid-creator",
+            seal_prev_content_key::<S>(&fx.c_new, vid, 2, &fx.c_old),
+        );
+        let m = crate::server::handlers::metadata::acquire_k_from_keyset(
+            &stale.keyset,
+            &fx.root,
+            b"another-cred",
+            vid,
+        )
+        .unwrap();
+        assert_eq!(m.len(), 64);
+
+        // Nothing changed: nothing is written, the old row stays as it is.
+        let before = pv.items[&old_id].clone();
+        let view = pv.fold_view::<S>(keys, vid).unwrap();
+        let base = ViewBase::of(&view).unwrap();
+        let r = pv
+            .reconcile_from_view::<S>(keys, vid, &view, ReconcileBase::Since(&base))
+            .unwrap();
+        assert!(r.changed.is_empty() && r.refused.is_empty());
+        let r = pv
+            .reconcile_from_view::<S>(keys, vid, &view, ReconcileBase::OwnFold)
+            .unwrap();
+        assert!(r.changed.is_empty() && r.refused.is_empty());
+        // Another row changed: the old one is still not touched.
+        let mut changed = pv.fold_view::<S>(keys, vid).unwrap();
+        changed.native_secrets.insert("NEW".into(), b"n2".to_vec());
+        let r = pv
+            .reconcile_from_view::<S>(keys, vid, &changed, ReconcileBase::Since(&base))
+            .unwrap();
+        assert_eq!(r.changed, vec![new_id.clone()]);
+        assert_eq!(pv.items[&old_id].ct, before.ct);
+        assert_eq!(pv.items[&old_id].version, before.version);
+        // The old row changed: written at its next version under the current key.
+        let base = ViewBase::of(&changed).unwrap();
+        changed.native_secrets.insert("OLD".into(), b"o2".to_vec());
+        let r = pv
+            .reconcile_from_view::<S>(keys, vid, &changed, ReconcileBase::Since(&base))
+            .unwrap();
+        assert_eq!(r.changed, vec![old_id.clone()]);
+        assert_eq!(pv.items[&old_id].version, 4);
+        let got = pv
+            .open_item::<S>(current, vid, ItemNs::Secret, "OLD")
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.body, serde_json::json!("o2"));
+    }
+
     #[test]
     fn dps1_content_rotation_preserves_ids_and_forward_secrecy() {
         // DP-S1 (team-shared-vault-security-model.md §3.2): a re-key rotates the
@@ -4585,6 +4720,7 @@ pub(crate) mod tests {
         let vk_new = VaultKeys {
             id_seed: &seed,
             content: &c_new,
+            prev: None,
         };
         pv.seal_and_upsert::<StdPrimitives>(
             vk_new,
@@ -4618,6 +4754,7 @@ pub(crate) mod tests {
         let vk_old = VaultKeys {
             id_seed: &seed,
             content: &c_old,
+            prev: None,
         };
         assert!(
             pv.open_item::<StdPrimitives>(vk_old, vid, ItemNs::Secret, "TOKEN")
@@ -4756,11 +4893,14 @@ pub(crate) mod tests {
 
     /// A re-keyed vault (generation 1): a v2 keyset pinned to its creator, the
     /// creator's cred (`cid-creator`) holding a real K-seal of the key bundle
-    /// `id_seed ‖ c_new`, and the owner-signed proof of the re-key to `c_new`.
-    /// No items.
+    /// `id_seed ‖ c_new`, and the owner-signed proof of the re-key to `c_new`
+    /// from `c_old`. No items, no previous content key on the cred.
     pub(crate) struct Rekeyed {
         pub vault: &'static str,
+        /// The creator's UIK root (the secret a grant delivers).
+        pub root: [u8; 32],
         pub id_seed: [u8; 32],
+        pub c_old: [u8; 32],
         pub c_new: [u8; 32],
         pub pv: PerItemVault,
     }
@@ -4777,9 +4917,10 @@ pub(crate) mod tests {
         use crate::crypto::vault_key::UikRoot;
         use crate::storage::plaintext::MemberRole;
         let vault = "vault-rekeyed";
-        let creator = UikRoot::from_root([0x11u8; 32]);
+        let root = [0x11u8; 32];
+        let creator = UikRoot::from_root(root);
         let creator_id = creator.user_id();
-        let (id_seed, c_new) = ([0x5au8; 32], [0x7cu8; 32]);
+        let (id_seed, c_old, c_new) = ([0x5au8; 32], [0x6bu8; 32], [0x7cu8; 32]);
         let mut pv = PerItemVault::build_initial(
             b"c".to_vec(),
             "x".into(),
@@ -4820,7 +4961,9 @@ pub(crate) mod tests {
         });
         Rekeyed {
             vault,
+            root,
             id_seed,
+            c_old,
             c_new,
             pv,
         }

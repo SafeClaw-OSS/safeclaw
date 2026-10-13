@@ -4090,6 +4090,11 @@ struct KeyRowData {
     /// (F3-b generation-binding). Absent on a legacy row ⇒ the cred is not an owner.
     #[serde(default)]
     uik_role_sig: Option<String>,
+    /// The content key before the last re-key, sealed under the current one
+    /// (std base64; set by an owner's re-key on each kept member's row). Kept
+    /// on the cred entry and written back with the row.
+    #[serde(default)]
+    uik_prev_content_ct: Option<String>,
     /// The vault's ROOT owner (creator) UIK signing pubkey (base64, raw 32 bytes).
     /// Keyset-LEVEL but carried REDUNDANTLY on every row (like `uik_generation`).
     /// TOFU-pinned SET-ONCE by the daemon on adopt — first-seen wins, a non-empty
@@ -4363,14 +4368,27 @@ fn adopt_membership_triple(
             .and_then(|v| serde_json::from_value(v).ok())
             .unwrap_or_default();
         let role_sig = m.get("role_sig").and_then(|v| v.as_str()).unwrap_or("");
+        // The member entry's previous content key (the row form's
+        // `uik_prev_content_ct`), kept on every cred entry of the member.
+        let prev_content_ct = m.get("prev_content_ct").and_then(|v| v.as_str());
         // Key the OWN member under its credential cid(s); OTHER members under their us_id.
         let keys: Vec<String> = match cids_by_member.get(id) {
             Some(cids) if !cids.is_empty() => cids.clone(),
             _ => vec![id.clone()],
         };
         for key in keys {
-            pv.set_uik_cred_b64(&key, id, sig_pub, enc_pub, k_encapped, k_ct, role, role_sig)
-                .map_err(|e| format!("adopt uik seal {}: {}", id, e))?;
+            pv.set_uik_cred_b64(
+                &key,
+                id,
+                sig_pub,
+                enc_pub,
+                k_encapped,
+                k_ct,
+                role,
+                role_sig,
+                prev_content_ct,
+            )
+            .map_err(|e| format!("adopt uik seal {}: {}", id, e))?;
         }
         adopted += 1;
     }
@@ -4466,8 +4484,18 @@ fn adopt_key_rows(pv: &mut PerItemVault, vault_id: &str, rows: &[KeyRow]) -> Res
             // non-owner (fails `resolve_membership_trust`'s verify).
             let role = row.data.uik_role.unwrap_or_default();
             let role_sig = row.data.uik_role_sig.as_deref().unwrap_or("");
-            pv.set_uik_cred_b64(&row.cid, uid, sig, enc, encapped, ct, role, role_sig)
-                .map_err(|e| format!("adopt uik seal {}: {}", row.cid, e))?;
+            pv.set_uik_cred_b64(
+                &row.cid,
+                uid,
+                sig,
+                enc,
+                encapped,
+                ct,
+                role,
+                role_sig,
+                row.data.uik_prev_content_ct.as_deref(),
+            )
+            .map_err(|e| format!("adopt uik seal {}: {}", row.cid, e))?;
         }
         // The vault's ROOT owner (creator) anchor — keyset-LEVEL, carried per row.
         // TOFU-pinned SET-ONCE (first-seen wins; never overwrite a non-empty pin).
@@ -4842,6 +4870,12 @@ fn key_row_data_for(
         data["uik_role"] = serde_json::to_value(entry.role).unwrap_or(serde_json::Value::Null);
         if !entry.role_sig.is_empty() {
             data["uik_role_sig"] = serde_json::Value::String(STANDARD.encode(&entry.role_sig));
+        }
+        // The previous content key rides with the row it was adopted from: a
+        // write of the row never drops it.
+        if !entry.prev_content_ct.is_empty() {
+            data["uik_prev_content_ct"] =
+                serde_json::Value::String(STANDARD.encode(&entry.prev_content_ct));
         }
     }
     // Keyset-LEVEL role anchor + DP-S1 re-key metadata (both emitted REDUNDANTLY on
@@ -6074,6 +6108,79 @@ mod peritem_tests {
             .find(|c| c.credential_id == cred_id_raw)
             .unwrap();
         assert_eq!(back_cred.wrapped_key, wrapped_key_raw);
+    }
+
+    /// The previous content key a re-key puts on a kept member's keyset row
+    /// (`uik_prev_content_ct`; `prev_content_ct` on a membership triple's
+    /// member entry) is kept on the cred entry, written back with the row, and
+    /// kept when a later row of the same cred omits it.
+    #[test]
+    fn prev_content_key_rides_the_keyset_row() {
+        use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+        use base64::Engine;
+        let cid_raw = vec![0xDEu8, 0xAD, 0xBE, 0xEF, 1, 2, 3, 4];
+        let cid = URL_SAFE_NO_PAD.encode(&cid_raw);
+        let sealed = vec![0xABu8; 73];
+        let enc = |b: &[u8]| STANDARD.encode(b);
+        let row = |version: u64, prev: Option<&[u8]>| -> KeyRow {
+            let mut data = serde_json::json!({
+                "x": enc(&[0xAA; 32]), "y": enc(&[0xBB; 32]),
+                "prf_salt": enc(&[1; 32]), "wrapped_key": enc(&[2; 48]),
+                "uik_user_id": "us_member", "uik_sig_pub": enc(&[3; 32]),
+                "uik_enc_pub": enc(&[4; 32]), "uik_k_encapped": enc(&[5; 32]),
+                "uik_k_ct": enc(&[6; 80]),
+            });
+            if let Some(p) = prev {
+                data["uik_prev_content_ct"] = serde_json::json!(enc(p));
+            }
+            serde_json::from_value(serde_json::json!({
+                "cid": cid, "version": version, "seq": version, "data": data,
+            }))
+            .unwrap()
+        };
+        let mut pv = empty_keyset_store();
+        adopt_key_rows(&mut pv, "v", &[row(1, Some(&sealed))]).unwrap();
+        assert_eq!(pv.uik_cred(&cid).unwrap().prev_content_ct, sealed);
+        // Written back with the row.
+        let cred = pv
+            .keyset
+            .credentials
+            .iter()
+            .find(|c| c.credential_id == cid_raw)
+            .unwrap()
+            .clone();
+        let data = key_row_data_for(&pv, &cred).unwrap();
+        assert_eq!(data["uik_prev_content_ct"], serde_json::json!(enc(&sealed)));
+        // A later row without it: kept.
+        adopt_key_rows(&mut pv, "v", &[row(2, None)]).unwrap();
+        assert_eq!(pv.uik_cred(&cid).unwrap().prev_content_ct, sealed);
+        let data = key_row_data_for(&pv, &cred).unwrap();
+        assert_eq!(data["uik_prev_content_ct"], serde_json::json!(enc(&sealed)));
+        // A row with another one: replaced.
+        adopt_key_rows(&mut pv, "v", &[row(3, Some(&[0xCD; 73]))]).unwrap();
+        assert_eq!(pv.uik_cred(&cid).unwrap().prev_content_ct, vec![0xCDu8; 73]);
+        // On disk.
+        let back: PerItemVault = serde_json::from_slice(&serde_json::to_vec(&pv).unwrap()).unwrap();
+        assert_eq!(back.uik_cred(&cid).unwrap().prev_content_ct, vec![0xCDu8; 73]);
+
+        // A membership triple's member entry, on every cred of the member.
+        let body = serde_json::json!({
+            "anchor": enc(&[7; 32]),
+            "members": { "us_member": {
+                "role": "member", "k_encapped": enc(&[5; 32]), "k_ct": enc(&[6; 80]),
+                "prev_content_ct": enc(&sealed),
+            } },
+            "proof": { "generation": 1 },
+            "identities": { "us_member": { "sig_pub": enc(&[3; 32]), "enc_pub": enc(&[4; 32]) } },
+            "credentials": [
+                { "cid": "cid-a", "identity_id": "us_member" },
+                { "cid": "cid-b", "identity_id": "us_member" },
+            ],
+        });
+        let mut pv = empty_keyset_store();
+        adopt_membership_triple(&mut pv, "v", &enc(&[7; 32]), &body).unwrap();
+        assert_eq!(pv.uik_cred("cid-a").unwrap().prev_content_ct, sealed);
+        assert_eq!(pv.uik_cred("cid-b").unwrap().prev_content_ct, sealed);
     }
 
     /// DP-S1 wire plumbing (Part 1): a re-keyed vault's keyset-LEVEL `generation`

@@ -426,6 +426,9 @@ pub fn unwrap_k_from_keyset(
 ///   it from the passkey PRF), and `K` is HPKE-sealed to the member's UIK enc key
 ///   in this credential's per-row seal ([`crate::crypto::vault_key::UikRoot::open_k`]).
 ///
+/// On a re-keyed v2 vault the material also carries the previous content key
+/// from this member's own keyset row ([`crate::storage::item::material_with_prev`]).
+///
 /// One seam so no read path can diverge on how a grant resolves `K` across the
 /// two keyset formats. The grant wire is identical in both cases (a 32-byte
 /// secret HPKE-sealed to the daemon's `sc_pk`); only its meaning differs, and
@@ -466,7 +469,15 @@ pub fn acquire_k_from_keyset(
         .get(&cid_b64)
         .or_else(|| uik.creds.values().find(|c| c.user_id == us_id))
         .ok_or_else(|| AppError::Unauthorized("no UIK seal for this member".into()))?;
-    uik_root.open_k(vault_id, &entry.k_encapped, &entry.k_ct)
+    let bundle = uik_root.open_k(vault_id, &entry.k_encapped, &entry.k_ct)?;
+    // A re-keyed vault: this member's own row may carry the previous content
+    // key, kept with the bundle so rows the re-key has not moved yet still read.
+    Ok(crate::storage::item::material_with_prev::<StdPrimitives>(
+        bundle,
+        vault_id,
+        uik.generation,
+        &entry.prev_content_ct,
+    ))
 }
 
 /// Per-item analogue of [`decrypt_vault_view`]: unwrap `K` from the keyset via

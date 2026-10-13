@@ -154,25 +154,45 @@ pub struct VaultKeys<'a> {
     /// not delete-all + add-all).
     pub id_seed: &'a [u8],
     /// The current generation's content-encryption key (rotates on re-key).
+    /// Every write seals under it.
     pub content: &'a [u8],
+    /// The content key before the last re-key, when this member's keyset row
+    /// carries it ([`open_prev_content_key`]). Reads only: it opens a row the
+    /// re-key has not moved to the current key yet ([`unseal_item_keys`]);
+    /// nothing is ever sealed under it. The owner's console moves such rows.
+    pub prev: Option<&'a [u8]>,
 }
 
 impl<'a> VaultKeys<'a> {
     /// A gen-0 (never-re-keyed) vault: id-seed and content are the same key `K`.
     pub fn single(k: &'a [u8]) -> Self {
-        Self { id_seed: k, content: k }
+        Self {
+            id_seed: k,
+            content: k,
+            prev: None,
+        }
     }
 
     /// Interpret acquired key material into the split view:
     ///   - **64 bytes** = a v2 DP-S1 bundle `id_seed(32) ‖ content_key(32)` →
     ///     the two halves (id_seed stable, content rotates on re-key);
+    ///   - **96 bytes** = that bundle and the previous content key
+    ///     ([`material_with_prev`]);
     ///   - **any other length** (32 = v1 single `K`) → `single` (id == content).
     /// The daemon retains the acquired material and rebuilds this on each fold.
     pub fn from_material(material: &'a [u8]) -> Self {
-        if material.len() == 64 {
-            Self { id_seed: &material[..32], content: &material[32..] }
-        } else {
-            Self::single(material)
+        match material.len() {
+            64 => Self {
+                id_seed: &material[..32],
+                content: &material[32..],
+                prev: None,
+            },
+            96 => Self {
+                id_seed: &material[..32],
+                content: &material[32..64],
+                prev: Some(&material[64..]),
+            },
+            _ => Self::single(material),
         }
     }
 }
@@ -180,6 +200,97 @@ impl<'a> VaultKeys<'a> {
 /// Length of a single vault key `K` (a v1 vault: id-seed and content key in
 /// one), the only key a whole-blob `vault.dat` is sealed under.
 pub const SINGLE_KEY_LEN: usize = 32;
+
+/// `SealCtx.domain` of a re-key's previous content key, sealed under the new
+/// content key on each kept member's keyset row.
+pub const PREV_CONTENT_KEY_DOMAIN: &str = "prev_content_key";
+
+/// The seal context of a previous content key: the domain
+/// [`PREV_CONTENT_KEY_DOMAIN`], the vault id, an empty id, and the generation
+/// the re-key created (`u64` big-endian). Byte-identical to the console's
+/// `prevContentKeyCtx` (lib/vault-items.ts).
+fn prev_content_key_ctx<'a>(vault: &'a [u8], version: &'a [u8; 8]) -> SealCtx<'a> {
+    SealCtx {
+        domain: PREV_CONTENT_KEY_DOMAIN,
+        vault,
+        id: &[],
+        version,
+    }
+}
+
+/// Open a re-key's previous content key (`uik_prev_content_ct`, decoded):
+/// sealed with the item AEAD under the current content key `content` for this
+/// vault and `generation` (the console's `sealPrevContentKey`). `Err` unless it
+/// opens to a 32-byte key.
+pub fn open_prev_content_key<S: PrimitiveSuite>(
+    content: &[u8],
+    vault_id: &str,
+    generation: u64,
+    sealed: &[u8],
+) -> Result<zeroize::Zeroizing<Vec<u8>>> {
+    let version = generation.to_be_bytes();
+    let prev = zeroize::Zeroizing::new(
+        unseal_record::<S>(
+            content,
+            &prev_content_key_ctx(vault_id.as_bytes(), &version),
+            sealed,
+        )
+        .map_err(|e| AppError::Unauthorized(format!("previous content key: {}", e)))?,
+    );
+    if prev.len() != SINGLE_KEY_LEN {
+        return Err(AppError::Unauthorized(
+            "previous content key is not 32 bytes".into(),
+        ));
+    }
+    Ok(prev)
+}
+
+/// Seal a previous content key the way an owner's re-key does. This process
+/// never seals one (the owner's console does); tests only.
+#[cfg(test)]
+pub fn seal_prev_content_key<S: PrimitiveSuite>(
+    content: &[u8],
+    vault_id: &str,
+    generation: u64,
+    prev: &[u8],
+) -> Vec<u8> {
+    let version = generation.to_be_bytes();
+    seal_record::<S>(
+        content,
+        &prev_content_key_ctx(vault_id.as_bytes(), &version),
+        prev,
+    )
+    .expect("seal previous content key")
+}
+
+/// The key material a member keeps: the key `bundle` (`id_seed ‖ content`),
+/// followed by the previous content key when `sealed_prev` (this member's own
+/// keyset row's `uik_prev_content_ct`) opens under the bundle's content key
+/// for this vault at `generation` ([`VaultKeys::from_material`] splits it
+/// back). Anything else (no previous key, a gen-0 vault, a single key, a seal
+/// that does not open) is the bundle alone: only the current key reads.
+pub fn material_with_prev<S: PrimitiveSuite>(
+    bundle: zeroize::Zeroizing<Vec<u8>>,
+    vault_id: &str,
+    generation: u64,
+    sealed_prev: &[u8],
+) -> zeroize::Zeroizing<Vec<u8>> {
+    if sealed_prev.is_empty() || generation == 0 || bundle.len() != 2 * SINGLE_KEY_LEN {
+        return bundle;
+    }
+    match open_prev_content_key::<S>(&bundle[SINGLE_KEY_LEN..], vault_id, generation, sealed_prev) {
+        Ok(prev) => {
+            let mut out = zeroize::Zeroizing::new(Vec::with_capacity(3 * SINGLE_KEY_LEN));
+            out.extend_from_slice(&bundle);
+            out.extend_from_slice(&prev);
+            out
+        }
+        Err(e) => {
+            tracing::warn!(vault = %vault_id, generation, "this member's previous content key does not open ({}); reading with the current key only", e);
+            bundle
+        }
+    }
+}
 
 /// Concatenate a DP-S1 key bundle: `id_seed(32) ‖ content_key(32)` = 64 bytes,
 /// the plaintext a v2 keyset seals to a member's UIK. Mirror on the browser side
@@ -941,9 +1052,30 @@ pub fn unseal_item<S: PrimitiveSuite>(
     ItemPayload::from_json_bytes(&pt)
 }
 
+/// Unseal a stored row under `keys`: with the current content key, else (a
+/// row a re-key has not moved yet) with the previous one, when this member
+/// holds it. The flag: it opened only under the previous key. Every read of a
+/// row goes through here; every write seals under `keys.content`, so a row
+/// read through the previous key is never written back under it.
+pub fn unseal_item_keys<S: PrimitiveSuite>(
+    keys: VaultKeys,
+    ctx: &ItemCtx,
+    sealed: &[u8],
+) -> Result<(ItemPayload, bool)> {
+    match unseal_item::<S>(keys.content, ctx, sealed) {
+        Ok(p) => Ok((p, false)),
+        Err(e) => match keys.prev {
+            Some(prev) => unseal_item::<S>(prev, ctx, sealed)
+                .map(|p| (p, true))
+                .map_err(|_| e),
+            None => Err(e),
+        },
+    }
+}
+
 /// Open a stored/pulled row addressed by its WIRE id (row PK) at `version`:
 /// recover the 32-byte AAD id ([`aad_id_from_wire`], stable id-seed) and unseal
-/// with the current content key. The one read used by the push-side 409
+/// it ([`unseal_item_keys`]). The one read used by the push-side 409
 /// reconcile for both OUR local row and THEIR fresh cloud row.
 pub fn open_wire_item<S: PrimitiveSuite>(
     keys: VaultKeys,
@@ -953,7 +1085,7 @@ pub fn open_wire_item<S: PrimitiveSuite>(
     sealed: &[u8],
 ) -> Result<ItemPayload> {
     let raw = aad_id_from_wire::<S>(keys.id_seed, wire_id)?;
-    unseal_item::<S>(keys.content, &ItemCtx::new(vault_id, raw, version), sealed)
+    unseal_item_keys::<S>(keys, &ItemCtx::new(vault_id, raw, version), sealed).map(|(p, _)| p)
 }
 
 /// Seal `payload` for the row at WIRE id `wire_id` at `version` (the inverse of
@@ -1629,5 +1761,63 @@ mod tests {
             let json = serde_json::to_value(ns).unwrap();
             assert_eq!(json, serde_json::Value::String(ns.as_str().to_string()));
         }
+    }
+
+    /// The previous content key a re-keyed keyset row carries, as the
+    /// console seals it (`sealPrevContentKey`, lib/vault-items.ts; vector made
+    /// by running the console's own function): the item AEAD under the new
+    /// content key, AAD {domain "prev_content_key", vault, id empty, version
+    /// u64be(generation)}, std base64 on the row. Opens here to the old key;
+    /// another generation, vault or content key does not open it. If this
+    /// fails, the two sides diverged: do not edit the vector.
+    #[test]
+    fn prev_content_key_parity_vector() {
+        use base64::engine::general_purpose::STANDARD;
+        const CONSOLE_SEALED: &str = "AWJ5abJHYr0x4o08CrBCNJGCCmyz6Q4reXBmJrE46b9WyJOy2HhezDUOJF/vUekzza7NubtASIXhBE5TBidHkPlPsy0eI0t31Q==";
+        let content = [0x7cu8; 32];
+        let vault = "vlt_prev_vector";
+        let sealed = STANDARD.decode(CONSOLE_SEALED).unwrap();
+        let prev = open_prev_content_key::<StdPrimitives>(&content, vault, 3, &sealed).unwrap();
+        assert_eq!(prev.as_slice(), &[0x6bu8; 32]);
+        assert!(open_prev_content_key::<StdPrimitives>(&content, vault, 4, &sealed).is_err());
+        assert!(open_prev_content_key::<StdPrimitives>(&content, "vlt_other", 3, &sealed).is_err());
+        assert!(open_prev_content_key::<StdPrimitives>(&[0x6bu8; 32], vault, 3, &sealed).is_err());
+        // A seal made here opens the same way (the console opens it too).
+        let ours = seal_prev_content_key::<StdPrimitives>(&content, vault, 3, &[0x6bu8; 32]);
+        println!("daemon-sealed uik_prev_content_ct: {}", STANDARD.encode(&ours));
+        let back = open_prev_content_key::<StdPrimitives>(&content, vault, 3, &ours).unwrap();
+        assert_eq!(back.as_slice(), &[0x6bu8; 32]);
+    }
+
+    /// Key material with a previous content key splits into three keys; a
+    /// read falls back to the previous key, a write never seals under it.
+    #[test]
+    fn material_with_prev_reads_through_the_previous_key() {
+        let (seed, old, new) = ([1u8; 32], [2u8; 32], [3u8; 32]);
+        let vault = "vlt_m";
+        let bundle = zeroize::Zeroizing::new(vault_key_bundle(&seed, &new));
+        let sealed = seal_prev_content_key::<StdPrimitives>(&new, vault, 2, &old);
+        // Gen 0, no seal, a seal for another generation: the bundle alone.
+        for (gen, s) in [(0u64, sealed.as_slice()), (2, &[][..]), (3, sealed.as_slice())] {
+            let m = material_with_prev::<StdPrimitives>(bundle.clone(), vault, gen, s);
+            assert_eq!(m.len(), 64);
+            assert!(VaultKeys::from_material(&m).prev.is_none());
+        }
+        let m = material_with_prev::<StdPrimitives>(bundle.clone(), vault, 2, &sealed);
+        let keys = VaultKeys::from_material(&m);
+        assert_eq!((keys.id_seed, keys.content, keys.prev), (&seed[..], &new[..], Some(&old[..])));
+
+        let ctx = ItemCtx::for_item::<StdPrimitives>(&seed, vault, ItemNs::Secret, "A", 1).unwrap();
+        let p = ItemPayload::secret_live("A", "a");
+        let under_old = seal_item::<StdPrimitives>(&old, &ctx, &p).unwrap();
+        let under_new = seal_item::<StdPrimitives>(&new, &ctx, &p).unwrap();
+        assert!(!unseal_item_keys::<StdPrimitives>(keys, &ctx, &under_new).unwrap().1);
+        assert!(unseal_item_keys::<StdPrimitives>(keys, &ctx, &under_old).unwrap().1);
+        let current_only = VaultKeys { prev: None, ..keys };
+        assert!(unseal_item_keys::<StdPrimitives>(current_only, &ctx, &under_old).is_err());
+        // A write under these keys seals under the current key.
+        let wire = ctx.item_id_b64();
+        let written = seal_wire_item::<StdPrimitives>(keys, vault, &wire, 2, &p).unwrap();
+        assert!(open_wire_item::<StdPrimitives>(current_only, vault, &wire, 2, &written).is_ok());
     }
 }
