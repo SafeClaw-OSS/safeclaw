@@ -221,20 +221,17 @@ pub(crate) fn held_lines(state: &AppState, vault_id: &str) -> Vec<String> {
     if let Some(pv) = pv {
         let key = state.cloned_state_key(vault_id);
         for (id, h) in &pv.held {
-            let what = key
-                .as_ref()
-                .and_then(|k| {
-                    crate::storage::item::open_wire_item::<StdPrimitives>(
-                        VaultKeys::from_material(k),
-                        vault_id,
-                        id,
-                        h.version,
-                        &h.ct,
-                    )
-                    .ok()
-                })
-                .map(|p| format!("config change to {}", crate::storage::item::record_label(&p)))
-                .unwrap_or_else(|| "config change".to_string());
+            let opened = key.as_ref().and_then(|k| {
+                crate::storage::item::open_wire_item::<StdPrimitives>(
+                    VaultKeys::from_material(k),
+                    vault_id,
+                    id,
+                    h.version,
+                    &h.ct,
+                )
+                .ok()
+            });
+            let what = held_what(opened.as_ref(), pv.row_kinds.get(id).copied());
             out.push(held_line(&what, h.signer.as_deref(), &h.reason));
         }
     }
@@ -246,6 +243,30 @@ pub(crate) fn held_lines(state: &AppState, vault_id: &str) -> Vec<String> {
     }
     out.extend(state.sync_note_lines(vault_id));
     out
+}
+
+/// What a held row is, as [`held_line`] says it: a change to a data record
+/// (a secret, a connection, an in-flight connect, a service) or a config
+/// change (owner-config, an agent grant, a row not at its own address). Named
+/// when it reads under the session's key (`opened`); else known by what this
+/// device read the row as before (`kind`); a row never read is a change.
+fn held_what(
+    opened: Option<&crate::storage::item::ItemPayload>,
+    kind: Option<crate::storage::sealed_vault::RowKind>,
+) -> String {
+    use crate::storage::item::{record_label, rule, Conflict, ItemNs};
+    use crate::storage::sealed_vault::RowKind;
+    match opened {
+        Some(p) => {
+            let data = p.ns != ItemNs::Agent
+                && rule(p.ns, &p.name).is_some_and(|r| r.conflict != Conflict::OwnerConfig)
+                && kind != Some(RowKind::Guarded);
+            let what = if data { "change" } else { "config change" };
+            format!("{} to {}", what, record_label(p))
+        }
+        None if kind == Some(RowKind::Guarded) => "config change".to_string(),
+        None => "change".to_string(),
+    }
 }
 
 /// One held change as a sentence: what it is, where it came from (who
@@ -696,6 +717,27 @@ mod tests {
         // A signer id is shown bounded.
         let long = "x".repeat(500);
         assert!(held_line("config change", Some(&long), "r").len() < 200);
+    }
+
+    /// A held row is said as what it is: a data record's change or a config
+    /// change, named when the session's key reads it, else by what the row
+    /// was read as before.
+    #[test]
+    fn a_held_row_is_said_as_data_or_config() {
+        use crate::storage::item::{ItemNs, ItemPayload};
+        use crate::storage::sealed_vault::RowKind;
+        let secret = ItemPayload::secret_live("API", "v");
+        let policy = ItemPayload::live(ItemNs::Policy, "", serde_json::json!({}));
+        let svc = ItemPayload::live(ItemNs::Service, "a1", serde_json::json!({ "service": "x" }));
+        assert_eq!(held_what(Some(&secret), Some(RowKind::Data)), "change to secret API");
+        assert_eq!(held_what(Some(&svc), None), "change to service a1");
+        assert_eq!(held_what(Some(&policy), None), "config change to policy");
+        // A data record's payload at a row read before as guarded (not at its
+        // own address): config.
+        assert_eq!(held_what(Some(&secret), Some(RowKind::Guarded)), "config change to secret API");
+        assert_eq!(held_what(None, Some(RowKind::Guarded)), "config change");
+        assert_eq!(held_what(None, Some(RowKind::Data)), "change");
+        assert_eq!(held_what(None, None), "change");
     }
 
     /// The retained-K refresh path: a vault's body is K-sealed with AAD

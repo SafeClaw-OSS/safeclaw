@@ -197,6 +197,9 @@ struct Listed {
     checked_on_this_device: Option<String>,
 }
 
+/// What `sc service ls` says of a locked vault.
+const LOCKED: &str = "the vault is locked; run `sc unlock` first";
+
 /// The vault's definitions.
 async fn listing(custodian: &str, vault: &str) -> Result<Vec<Listed>, String> {
     let client = reqwest::Client::builder()
@@ -215,7 +218,7 @@ async fn listing(custodian: &str, vault: &str) -> Result<Vec<Listed>, String> {
         .map_err(|e| format!("cannot reach the daemon: {}", e))?;
     match resp.status().as_u16() {
         200 => {}
-        423 => return Err("the vault is locked; run `sc unlock` first".into()),
+        423 => return Err(LOCKED.into()),
         s => return Err(format!("the daemon answered HTTP {}", s)),
     }
     let body: Value = resp.json().await.map_err(|e| format!("parse: {}", e))?;
@@ -590,7 +593,16 @@ fn print_diff(
 
 pub async fn run_ls(args: ServiceLsArgs, json: bool) -> Result<(), String> {
     let (custodian, vault) = resolve_active(None)?;
-    let mut rows = listing(&custodian, &vault).await?;
+    let mut rows = match listing(&custodian, &vault).await {
+        Ok(rows) => rows,
+        // Locked: what the daemon has not applied is still known (`sc status`
+        // shows the same), so it is said before the refusal.
+        Err(e) if e == LOCKED && !json => {
+            print_held(&held_notes(&custodian, &vault).await);
+            return Err(e);
+        }
+        Err(e) => return Err(e),
+    };
     if let Some(id) = &args.id {
         rows.retain(|l| &l.id == id);
         if rows.is_empty() {
