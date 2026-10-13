@@ -6,18 +6,21 @@
 /// plus the auth mechanism (`[auth]`, absent = static) and cosmetic helpers. No
 /// routing/transport is declared: the phantom is the sole intent carrier and
 /// the request already carries the real upstream URL.
-pub mod validate;
+pub mod gate;
+pub mod limits;
 
 use crate::auth::oauth2::OAuthStyle;
 use std::collections::HashMap;
 
 // ── ServiceDef: parsed from service.toml (v4) ───────────────────────────────
 
-/// A service TYPE. `deny_unknown_fields` rejects stale v3 sections and any
-/// tool-named section (`[git]`, `[docker]`) at parse — auth is a MECHANISM,
-/// never a tool, and the only auth section is `[auth]` (type-discriminated).
-#[derive(Debug, Clone, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
+/// A service TYPE, as the gate admitted it ([`gate::admit`], the only
+/// constructor: the private field keeps every other module from building one,
+/// and there is no `Deserialize`). The schema it was parsed from rejects stale
+/// v3 sections and any tool-named section (`[git]`, `[docker]`): auth is a
+/// MECHANISM, never a tool, and the only auth section is `[auth]`
+/// (type-discriminated).
+#[derive(Debug, Clone)]
 pub struct ServiceDef {
     pub service: ServiceMeta,
     /// The auth MECHANISM — how the wire credential is produced from the
@@ -27,25 +30,33 @@ pub struct ServiceDef {
     /// When present, the default phantom resolves to a MINTED short-lived
     /// token and the mechanism's input role (`mint_input_role`) is internal
     /// by construction and never injectable.
-    #[serde(default)]
     pub auth: Option<AuthDef>,
     /// Optional agent-facing `setup` prose: service-specific guidance on where a
     /// phantom goes for this service's tools (a header, an env var, a URL) when
     /// run under `sc run --`. Plain text — no template tokens.
-    #[serde(default)]
     pub setup: Option<String>,
-    /// Optional inline policy fallback (`[policy.levels]` / `[[policy.rules]]`).
-    /// Standalone `policy.toml` is preferred; kept for back-compat with tests
-    /// and any service that inlines its floor.
-    #[serde(default)]
-    pub policy: Option<PolicyDef>,
+    /// The definition's policy, compiled at the gate: its policy.toml, or the
+    /// inline `[policy]` section (`[policy.levels]` / `[[policy.rules]]`) of a
+    /// service.toml without one. `None` when it declares neither.
+    pub policy: Option<ServicePolicy>,
     /// Request shapes (`[requests.<name>]`): the body/query fields this
     /// service's endpoints expose, which of them identify an action for
     /// binding (`scope`), and how to phrase them (`consent`). Opt-in — absent
     /// ⇒ the body is not part of any grant identity (Phase-1 behavior). See
     /// design/request-scope.md and [`RequestShape`].
-    #[serde(default)]
     pub requests: HashMap<String, RequestShape>,
+    /// Set only by the gate.
+    _gate: (),
+}
+
+/// A definition's policy, compiled at the gate: the read/write floor when no
+/// rule matches, and the rules in file order, each with a parsed level and a
+/// compiled `body`.
+#[derive(Debug, Clone, Default)]
+pub struct ServicePolicy {
+    /// `[default]` in policy.toml, `[policy.levels]` inline.
+    pub defaults: Option<crate::core::policy::Levels>,
+    pub rules: Vec<crate::core::policy::PolicyRule>,
 }
 
 impl ServiceDef {
@@ -281,6 +292,7 @@ pub struct OAuth2Def {
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServiceMeta {
     pub id: String,
     pub name: String,
@@ -410,30 +422,6 @@ pub struct ConnectDescriptor {
     pub authorize_params: HashMap<String, String>,
 }
 
-/// Inline policy in service.toml (legacy, still supported as fallback).
-/// Prefer standalone policy.toml for new services.
-#[derive(Debug, Clone, serde::Deserialize)]
-pub struct PolicyDef {
-    pub levels: Option<HashMap<String, String>>,
-    #[serde(default)]
-    pub rules: Vec<TomlPolicyRule>,
-}
-
-impl PolicyDef {
-    pub fn to_levels(&self) -> Option<crate::core::policy::Levels> {
-        let levels = self.levels.as_ref()?;
-        Some(crate::core::policy::Levels {
-            write: parse_access_level(levels.get("write")),
-            read: parse_access_level(levels.get("read")),
-            ttl: None,
-        })
-    }
-
-    pub fn to_policy_rules(&self) -> Vec<crate::core::policy::PolicyRule> {
-        self.rules.iter().filter_map(|r| r.to_core_rule()).collect()
-    }
-}
-
 // ── Request shapes: `[requests.<name>]` (design/request-scope.md) ──────────────
 
 /// One request shape: a method+path matcher plus the body/query fields it
@@ -532,11 +520,17 @@ pub enum VarDef {
     /// Bare string = a JSON Pointer (RFC 6901) into the request BODY.
     BodyPointer(String),
     /// `{ in = "body"|"query", at = "<pointer-or-param>" }`.
-    Located {
-        #[serde(rename = "in")]
-        location: VarLoc,
-        at: String,
-    },
+    Located(VarAt),
+}
+
+/// The table form of a var address. `deny_unknown_fields` so a typo is a
+/// parse error, not a silently-ignored field.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VarAt {
+    #[serde(rename = "in")]
+    pub location: VarLoc,
+    pub at: String,
 }
 
 impl VarDef {
@@ -545,14 +539,14 @@ impl VarDef {
     fn resolve(&self, body: Option<&serde_json::Value>, query: Option<&str>) -> Option<String> {
         match self {
             VarDef::BodyPointer(ptr) => from_body(body, ptr),
-            VarDef::Located {
+            VarDef::Located(VarAt {
                 location: VarLoc::Body,
                 at,
-            } => from_body(body, at),
-            VarDef::Located {
+            }) => from_body(body, at),
+            VarDef::Located(VarAt {
                 location: VarLoc::Query,
                 at,
-            } => from_query(query, at),
+            }) => from_query(query, at),
         }
     }
 }
@@ -653,137 +647,14 @@ pub fn scope_digest(bound: &[(String, String)]) -> String {
     format!("{:x}", h.finalize())
 }
 
-/// Policy rule as it appears in legacy service.toml `[[policy.rules]]`.
-#[derive(Debug, Clone, serde::Deserialize)]
-pub struct TomlPolicyRule {
-    #[serde(default)]
-    pub method: Option<String>,
-    #[serde(default)]
-    pub path_exact: Option<String>,
-    #[serde(default)]
-    pub path_suffix: Option<String>,
-    pub level: String,
-}
-
-impl TomlPolicyRule {
-    /// Convert legacy method+path_exact+path_suffix to a core rule. The legacy
-    /// `level` is the access decision directly.
-    fn to_core_rule(&self) -> Option<crate::core::policy::PolicyRule> {
-        let level = crate::core::policy::AccessLevel::parse(&self.level)?;
-
-        let path_part = if let Some(ref exact) = self.path_exact {
-            exact.trim_end_matches('/').to_string()
-        } else {
-            // path_suffix rules can't cleanly map to path patterns; skip them
-            return None;
-        };
-        let match_pattern = if let Some(ref m) = self.method {
-            format!("{} {}", m, path_part)
-        } else {
-            path_part
-        };
-
-        Some(crate::core::policy::PolicyRule {
-            id: None,
-            label: None,
-            match_patterns: vec![match_pattern],
-            body: None,
-            when: None,
-            level: Some(level),
-            ttl: None,
-        })
-    }
-}
-
-/// Standalone policy.toml file: `[default]` + `[[rule]]`.
-#[derive(Debug, Clone, serde::Deserialize)]
-pub struct PolicyFileDef {
-    pub default: Option<HashMap<String, String>>,
-    #[serde(default)]
-    pub rule: Vec<PolicyFileRule>,
-}
-
-/// A rule in policy.toml.
-#[derive(Debug, Clone, serde::Deserialize)]
-pub struct PolicyFileRule {
-    pub id: String,
-    pub label: String,
-    /// Path pattern(s): "METHOD /path" or "/path" (any method). `*` = one
-    /// segment. A single string, or a list = OR (fires if any matches) for one
-    /// operation exposed at several endpoints. See core `PolicyRule::match_patterns`.
-    #[serde(
-        rename = "match",
-        deserialize_with = "crate::core::policy::match_spec::deserialize"
-    )]
-    pub match_pattern: Vec<String>,
-    /// Regex matched against request body (optional).
-    #[serde(default)]
-    pub body: Option<String>,
-    /// Structured field condition (`"vars.amount > 80"`), AND-combined with
-    /// `match`/`body`. Vars come from the service's `[requests]`. See core
-    /// [`crate::core::policy::Condition`] and design/request-scope.md.
-    #[serde(default)]
-    pub when: Option<String>,
-    /// Access decision (`allow` | `ask` | `ask-always` | `deny`) when this rule
-    /// matches. A rule with no parseable `level` is skipped.
-    #[serde(default)]
-    pub level: Option<String>,
-    /// `ask`-cache TTL in seconds (PROTOCOL.md §6.1 `policy.rules[].ttl`).
-    #[serde(default)]
-    pub ttl: Option<u64>,
-}
-
-impl PolicyFileDef {
-    pub fn to_levels(&self) -> Option<crate::core::policy::Levels> {
-        let levels = self.default.as_ref()?;
-        Some(crate::core::policy::Levels {
-            write: parse_access_level(levels.get("write")),
-            read: parse_access_level(levels.get("read")),
-            ttl: levels.get("ttl").and_then(|v| v.parse().ok()),
-        })
-    }
-
-    pub fn to_policy_rules(&self) -> Vec<crate::core::policy::PolicyRule> {
-        self.rule
-            .iter()
-            .filter_map(|r| {
-                // A rule decides via its `level`; one with no parseable level is
-                // skipped (it could never decide).
-                let level = r
-                    .level
-                    .as_deref()
-                    .and_then(crate::core::policy::AccessLevel::parse)?;
-                Some(crate::core::policy::PolicyRule {
-                    id: Some(r.id.clone()),
-                    label: Some(r.label.clone()),
-                    match_patterns: r.match_pattern.clone(),
-                    body: r.body.clone(),
-                    when: r.when.clone(),
-                    level: Some(level),
-                    ttl: r.ttl,
-                })
-            })
-            .collect()
-    }
-}
-
-fn parse_access_level(s: Option<&String>) -> Option<crate::core::policy::AccessLevel> {
-    match s?.as_str() {
-        "allow" => Some(crate::core::policy::AccessLevel::Allow),
-        "ask" => Some(crate::core::policy::AccessLevel::Ask),
-        "ask-always" => Some(crate::core::policy::AccessLevel::AskAlways),
-        "deny" => Some(crate::core::policy::AccessLevel::Deny),
-        _ => None,
-    }
-}
-
 // ── Vault-custom definitions ──────────────────────────────────────────────────
 
 /// A vault's own service definitions (`aux.services`, id → toml) as the daemon
-/// brokers them: every def that validates and whose id is not a compiled one
-/// (a custom def never shadows a built-in). The skipped ids come back with
-/// the reason. The unlock bootstrap loads exactly this set, so every other
-/// reader of `aux.services` agrees with what the proxy resolves.
+/// brokers them: every def the gate admits under its storage key (so the key
+/// is the declared id) and whose id is not a compiled one (a custom def never
+/// shadows a built-in). The skipped ids come back with the reason. The unlock
+/// bootstrap loads exactly this set, so every other reader of `aux.services`
+/// agrees with what the proxy resolves.
 pub fn vault_custom_services(
     aux_services: &std::collections::BTreeMap<String, String>,
     reg: &ServiceRegistry,
@@ -795,15 +666,13 @@ pub fn vault_custom_services(
             skipped.push((id.clone(), "shadows a built-in id".to_string()));
             continue;
         }
-        if let Err(e) = validate::validate_service(toml_src) {
-            skipped.push((id.clone(), format!("failed validation: {:?}", e)));
-            continue;
-        }
-        match toml::from_str::<ServiceDef>(toml_src) {
+        match gate::admit(Some(id), toml_src, None) {
             Ok(def) => {
                 defs.insert(id.clone(), def);
             }
-            Err(e) => skipped.push((id.clone(), format!("parse failed: {}", e))),
+            Err(problems) => {
+                skipped.push((id.clone(), format!("rejected: {}", problems.join("; "))))
+            }
         }
     }
     (defs, skipped)
@@ -842,57 +711,60 @@ impl<'a> ServiceDefs<'a> {
 // ── ServiceRegistry ───────────────────────────────────────────────────────────
 
 pub struct ServiceRegistry {
+    /// Every definition the gate admitted, with its policy (policy.toml or
+    /// inline) compiled inside it.
     services: HashMap<String, ServiceDef>,
-    /// Parsed policy.toml files (service_id → PolicyFileDef).
-    policies: HashMap<String, PolicyFileDef>,
 }
 
+/// Read a definition file, refusing one over the size limit without reading
+/// it whole (the gate re-checks the bytes it is given).
+fn read_capped(path: &std::path::Path) -> Result<String, String> {
+    use std::io::Read;
+    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let mut buf = Vec::new();
+    file.take(limits::MAX_FILE_BYTES as u64 + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| e.to_string())?;
+    if buf.len() > limits::MAX_FILE_BYTES {
+        return Err(format!(
+            "larger than the {}-byte limit",
+            limits::MAX_FILE_BYTES
+        ));
+    }
+    String::from_utf8(buf).map_err(|_| "not UTF-8".to_string())
+}
+
+/// One service directory's files: (id = directory name, service.toml,
+/// optional policy.toml).
+type ServiceDirFiles = (
+    String,
+    Result<String, String>,
+    Option<Result<String, String>>,
+);
+
 impl ServiceRegistry {
-    /// Load all service definitions in priority layers:
+    /// Load all service definitions in priority layers, each through the gate
+    /// (a definition and its policy.toml are admitted or skipped together,
+    /// never mixed across layers):
     /// 1. Compiled-in defaults (always loaded as base)
     /// 2. $SAFECLAW_DATA/services/ (runtime override for dev/deployment)
     /// 3. ~/.safeclaw/services/ (user-installed services, highest priority)
     pub fn load() -> Self {
         let mut services = HashMap::new();
-        let mut policies = HashMap::new();
 
         // Layer 1: compiled-in defaults (always loaded as base)
-        Self::load_compiled_defaults(&mut services, &mut policies);
+        Self::load_compiled_defaults(&mut services);
 
         // Layer 2: $SAFECLAW_DATA/services/ override
-        let dirs = Self::discover_service_dirs();
-        if !dirs.is_empty() {
-            for (id, service_toml, policy_toml) in dirs {
-                match toml::from_str::<ServiceDef>(&service_toml) {
-                    Ok(def) => {
-                        services.insert(id.clone(), def);
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed to parse service.toml for {}: {}", id, e);
-                    }
-                }
-                if let Some(policy_str) = policy_toml {
-                    match toml::from_str::<PolicyFileDef>(&policy_str) {
-                        Ok(def) => {
-                            policies.insert(id, def);
-                        }
-                        Err(e) => {
-                            tracing::warn!("Failed to parse policy.toml for {}: {}", id, e);
-                        }
-                    }
-                }
-            }
+        for files in Self::discover_service_dirs() {
+            Self::admit_dir(files, &mut services);
         }
 
         // Layer 3: ~/.safeclaw/services/ (user-installed, overrides everything)
-        Self::load_user_services(&mut services, &mut policies);
+        Self::load_user_services(&mut services);
 
-        tracing::info!(
-            "Loaded {} service definitions, {} policy files",
-            services.len(),
-            policies.len()
-        );
-        Self { services, policies }
+        tracing::info!("Loaded {} service definitions", services.len());
+        Self { services }
     }
 
     /// Build a registry from ONLY the compiled-in (in-tree) services — no
@@ -902,13 +774,51 @@ impl ServiceRegistry {
     /// deployment state.
     pub fn compiled_only() -> Self {
         let mut services = HashMap::new();
-        let mut policies = HashMap::new();
-        Self::load_compiled_defaults(&mut services, &mut policies);
-        Self { services, policies }
+        Self::load_compiled_defaults(&mut services);
+        Self { services }
     }
 
-    /// Returns (service_id, service_toml_content, optional_policy_toml_content).
-    fn discover_service_dirs() -> Vec<(String, String, Option<String>)> {
+    /// Admit one service directory's files through the gate, keyed by the
+    /// directory name; a definition that fails is logged and skipped.
+    /// True when it was admitted.
+    fn admit_dir(
+        (id, service, policy): ServiceDirFiles,
+        services: &mut HashMap<String, ServiceDef>,
+    ) -> bool {
+        let loaded = service.and_then(|svc| match policy {
+            Some(Err(e)) => Err(format!("policy.toml: {}", e)),
+            Some(Ok(p)) => Ok((svc, Some(p))),
+            None => Ok((svc, None)),
+        });
+        let admitted = loaded
+            .map_err(|e| vec![e])
+            .and_then(|(svc, pol)| gate::admit(Some(&id), &svc, pol.as_deref()));
+        match admitted {
+            Ok(def) => {
+                services.insert(id, def);
+                true
+            }
+            Err(problems) => {
+                tracing::warn!(
+                    "service {} skipped: {}",
+                    crate::util::terminal_safe(&id),
+                    problems.join("; ")
+                );
+                false
+            }
+        }
+    }
+
+    /// One directory's files, read under the size limit.
+    fn read_dir_files(id: String, dir: &std::path::Path) -> ServiceDirFiles {
+        let service =
+            read_capped(&dir.join("service.toml")).map_err(|e| format!("service.toml: {}", e));
+        let policy_path = dir.join("policy.toml");
+        let policy = policy_path.exists().then(|| read_capped(&policy_path));
+        (id, service, policy)
+    }
+
+    fn discover_service_dirs() -> Vec<ServiceDirFiles> {
         let mut results = vec![];
 
         // Check $SAFECLAW_DATA/services/ first (runtime override)
@@ -939,9 +849,15 @@ impl ServiceRegistry {
     }
 
     /// Scan for service.toml and policy.toml files. Supports both flat and nested layouts.
-    fn scan_dir(base: &std::path::Path, results: &mut Vec<(String, String, Option<String>)>) {
+    fn scan_dir(base: &std::path::Path, results: &mut Vec<ServiceDirFiles>) {
         let Ok(entries) = std::fs::read_dir(base) else {
             return;
+        };
+        let dir_id = |p: &std::path::Path| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
         };
         for entry in entries.flatten() {
             let path = entry.path();
@@ -950,18 +866,9 @@ impl ServiceRegistry {
             }
 
             // Check if this directory itself has service.toml (flat layout)
-            let toml_path = path.join("service.toml");
-            if toml_path.exists() {
-                if let Ok(content) = std::fs::read_to_string(&toml_path) {
-                    let id = path
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("")
-                        .to_string();
-                    if !id.is_empty() {
-                        let policy = std::fs::read_to_string(path.join("policy.toml")).ok();
-                        results.push((id, content, policy));
-                    }
+            if path.join("service.toml").exists() {
+                if let Some(id) = dir_id(&path) {
+                    results.push(Self::read_dir_files(id, &path));
                 }
                 continue;
             }
@@ -974,21 +881,9 @@ impl ServiceRegistry {
             };
             for sub_entry in sub_entries.flatten() {
                 let sub_path = sub_entry.path();
-                if !sub_path.is_dir() {
-                    continue;
-                }
-                let sub_toml = sub_path.join("service.toml");
-                if sub_toml.exists() {
-                    if let Ok(content) = std::fs::read_to_string(&sub_toml) {
-                        let id = sub_path
-                            .file_name()
-                            .and_then(|n| n.to_str())
-                            .unwrap_or("")
-                            .to_string();
-                        if !id.is_empty() {
-                            let policy = std::fs::read_to_string(sub_path.join("policy.toml")).ok();
-                            results.push((id, content, policy));
-                        }
+                if sub_path.is_dir() && sub_path.join("service.toml").exists() {
+                    if let Some(id) = dir_id(&sub_path) {
+                        results.push(Self::read_dir_files(id, &sub_path));
                     }
                 }
             }
@@ -997,10 +892,7 @@ impl ServiceRegistry {
 
     /// Load user-installed services from ~/.safeclaw/services/.
     /// Skips directories with a `.disabled` marker file.
-    fn load_user_services(
-        services: &mut HashMap<String, ServiceDef>,
-        policies: &mut HashMap<String, PolicyFileDef>,
-    ) {
+    fn load_user_services(services: &mut HashMap<String, ServiceDef>) {
         let user_dir = match user_services_dir() {
             Some(d) if d.is_dir() => d,
             _ => return,
@@ -1025,26 +917,11 @@ impl ServiceRegistry {
                 Some(s) if !s.is_empty() => s.to_string(),
                 _ => continue,
             };
-
-            let toml_path = path.join("service.toml");
-            let Ok(content) = std::fs::read_to_string(&toml_path) else {
+            if !path.join("service.toml").exists() {
                 continue;
-            };
-            match toml::from_str::<ServiceDef>(&content) {
-                Ok(def) => {
-                    services.insert(id.clone(), def);
-                    count += 1;
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to parse user service {}: {}", id, e);
-                    continue;
-                }
             }
-
-            if let Ok(policy_str) = std::fs::read_to_string(path.join("policy.toml")) {
-                if let Ok(def) = toml::from_str::<PolicyFileDef>(&policy_str) {
-                    policies.insert(id, def);
-                }
+            if Self::admit_dir(Self::read_dir_files(id, &path), services) {
+                count += 1;
             }
         }
         if count > 0 {
@@ -1056,22 +933,21 @@ impl ServiceRegistry {
         }
     }
 
-    /// Compiled-in service definitions for when filesystem discovery fails.
-    /// Uses the auto-generated registry from build.rs.
-    fn load_compiled_defaults(
-        services: &mut HashMap<String, ServiceDef>,
-        policies: &mut HashMap<String, PolicyFileDef>,
-    ) {
-        let defaults = crate::generated_services::compiled_service_tomls();
-        for (id, toml_str) in defaults {
-            if let Ok(def) = toml::from_str::<ServiceDef>(toml_str) {
-                services.insert(id.to_string(), def);
-            }
-        }
-        let policy_defaults = crate::generated_services::compiled_policy_tomls();
-        for (id, toml_str) in policy_defaults {
-            if let Ok(def) = toml::from_str::<PolicyFileDef>(toml_str) {
-                policies.insert(id.to_string(), def);
+    /// Compiled-in service definitions, admitted through the same gate as
+    /// every other source (the compiled-defs tests hold each one to it).
+    fn load_compiled_defaults(services: &mut HashMap<String, ServiceDef>) {
+        let policies: HashMap<&str, &str> = crate::generated_services::compiled_policy_tomls()
+            .iter()
+            .copied()
+            .collect();
+        for (id, toml_str) in crate::generated_services::compiled_service_tomls() {
+            match gate::admit(Some(id), toml_str, policies.get(id).copied()) {
+                Ok(def) => {
+                    services.insert(id.to_string(), def);
+                }
+                Err(problems) => {
+                    tracing::error!("compiled service {} rejected: {}", id, problems.join("; "))
+                }
             }
         }
     }
@@ -1097,35 +973,6 @@ impl ServiceRegistry {
             .get(service_name)
             .map(|d| d.service.tags.as_slice())
             .unwrap_or(&[])
-    }
-
-    /// Default-read AccessLevel for a service (H3 unlock bootstrap predicate).
-    /// Priority: standalone policy.toml `[default] read` > service.toml inline
-    /// `policy.levels.read` > safe default (AskAlways). Per-rule overrides
-    /// (e.g. github's `delete-branch ask-always`) are NOT consulted here —
-    /// they're evaluated per request at /use time. This helper answers only
-    /// "is this service's bulk default `allow`?", i.e. "should its auth value
-    /// be bootstrapped into secrets_cache at unlock?".
-    pub fn default_read_level(&self, service_id: &str) -> crate::core::policy::AccessLevel {
-        if let Some(policy) = self.policies.get(service_id) {
-            if let Some(default) = policy.default.as_ref() {
-                if let Some(read) = default.get("read") {
-                    if let Some(level) = parse_access_level(Some(read)) {
-                        return level;
-                    }
-                }
-            }
-        }
-        if let Some(svc) = self.services.get(service_id) {
-            if let Some(policy) = svc.policy.as_ref() {
-                if let Some(levels) = policy.to_levels() {
-                    if let Some(read) = levels.read {
-                        return read;
-                    }
-                }
-            }
-        }
-        crate::core::policy::AccessLevel::AskAlways
     }
 
     /// The stored secret role that backs a **registry** service's credential.
@@ -1222,45 +1069,25 @@ impl ServiceRegistry {
         })
     }
 
-    /// Get default policy levels: policy.toml > service.toml [policy.levels].
+    /// A service's default read/write floor: its policy's `[default]`
+    /// (policy.toml) or `[policy.levels]` (inline).
     pub fn default_policy_levels(&self, service_name: &str) -> Option<crate::core::policy::Levels> {
-        // Prefer policy.toml [default]
-        if let Some(policy) = self.policies.get(service_name) {
-            if let Some(levels) = policy.to_levels() {
-                return Some(levels);
-            }
-        }
-        // Fall back to service.toml [policy.levels]
-        let def = self.services.get(service_name)?;
-        def.policy.as_ref()?.to_levels()
+        self.services
+            .get(service_name)?
+            .policy
+            .as_ref()?
+            .defaults
+            .clone()
     }
 
-    /// Get default policy rules: policy.toml [[rule]] > service.toml [[policy.rules]].
+    /// A service's rules (policy.toml `[[rule]]` or inline `[[policy.rules]]`),
+    /// compiled at the gate. `None` when it declares none.
     pub fn default_policy_rules(
         &self,
         service_name: &str,
-    ) -> Option<Vec<crate::core::policy::PolicyRule>> {
-        // Prefer policy.toml [[rule]]
-        if let Some(policy) = self.policies.get(service_name) {
-            let rules = policy.to_policy_rules();
-            if !rules.is_empty() {
-                return Some(rules);
-            }
-        }
-        // Fall back to service.toml [[policy.rules]] (legacy, converted to regex)
-        let def = self.services.get(service_name)?;
-        let policy = def.policy.as_ref()?;
-        let rules = policy.to_policy_rules();
-        if rules.is_empty() {
-            None
-        } else {
-            Some(rules)
-        }
-    }
-
-    /// Get policy file definition (for console UI to show action labels).
-    pub fn policy_file(&self, service_name: &str) -> Option<&PolicyFileDef> {
-        self.policies.get(service_name)
+    ) -> Option<&[crate::core::policy::PolicyRule]> {
+        let rules = &self.services.get(service_name)?.policy.as_ref()?.rules;
+        (!rules.is_empty()).then_some(rules.as_slice())
     }
 
     /// Return all service definitions (for catalog/UI use).
@@ -1282,63 +1109,78 @@ mod tests {
     use crate::core::policy::AccessLevel;
 
     fn reg(services: HashMap<String, ServiceDef>) -> ServiceRegistry {
-        ServiceRegistry {
-            services,
-            policies: HashMap::new(),
-        }
+        ServiceRegistry { services }
     }
 
-    // ── PolicyDef::to_levels (inline policy fallback kept) ───────────────────
-
-    #[test]
-    fn policy_def_converts_allow_levels() {
-        let mut levels = HashMap::new();
-        levels.insert("read".into(), "allow".into());
-        levels.insert("write".into(), "allow".into());
-        let def = PolicyDef {
-            levels: Some(levels),
-            rules: vec![],
-        };
-        let sl = def.to_levels().unwrap();
-        assert_eq!(sl.read, Some(AccessLevel::Allow));
-        assert_eq!(sl.write, Some(AccessLevel::Allow));
+    fn def(toml: &str) -> ServiceDef {
+        gate::admit_toml(toml).unwrap_or_else(|e| panic!("fixture rejected: {:?}", e))
     }
 
+    // ── inline [policy] (the policy.toml alternative) ────────────────────────
+
+    const INLINE: &str = r#"
+[service]
+id = "acme"
+name = "Acme"
+hosts = ["api.acme.dev"]
+secrets = ["ACME_KEY"]
+[policy.levels]
+read = "deny"
+write = "ask-always"
+[[policy.rules]]
+method = "delete"
+path_exact = "/v1/things/"
+level = "ask"
+"#;
+
     #[test]
-    fn policy_def_handles_deny_and_ask_always() {
-        let mut levels = HashMap::new();
-        levels.insert("read".into(), "deny".into());
-        levels.insert("write".into(), "ask-always".into());
-        let def = PolicyDef {
-            levels: Some(levels),
-            rules: vec![],
-        };
-        let sl = def.to_levels().unwrap();
+    fn inline_policy_compiles_levels_and_rules() {
+        let d = def(INLINE);
+        let p = d.policy.as_ref().expect("inline policy");
+        let sl = p.defaults.as_ref().unwrap();
         assert_eq!(sl.read, Some(AccessLevel::Deny));
         assert_eq!(sl.write, Some(AccessLevel::AskAlways));
+        assert_eq!(p.rules.len(), 1);
+        assert_eq!(
+            p.rules[0].match_patterns,
+            vec!["delete /v1/things".to_string()]
+        );
+        assert_eq!(p.rules[0].level, Some(AccessLevel::Ask));
+        // A lowercase method word is a method at this rule source too.
+        let mut services = HashMap::new();
+        services.insert("acme".to_string(), d);
+        let r = reg(services);
+        let rules = r.default_policy_rules("acme").unwrap().to_vec();
+        let access = crate::core::policy::evaluate(
+            "DELETE",
+            "/v1/things",
+            None,
+            &crate::core::policy::VarMap::new(),
+            Some(&rules),
+            r.default_policy_levels("acme").as_ref(),
+            &crate::core::policy::Policy::default(),
+            &[],
+        );
+        assert_eq!(access, AccessLevel::Ask);
     }
 
     #[test]
-    fn toml_policy_used_when_vault_has_none() {
-        let mut levels = HashMap::new();
-        levels.insert("read".into(), "allow".into());
-        levels.insert("write".into(), "allow".into());
-        let def = PolicyDef {
-            levels: Some(levels),
-            rules: vec![],
-        };
-        let toml_levels = def.to_levels();
-        let access = crate::core::policy::evaluate(
-            "POST",
-            "/v1/chat",
-            None,
-            &crate::core::policy::VarMap::new(),
-            None,
-            toml_levels.as_ref(),
-            &crate::core::policy::Policy::default(),
-            &["app".into()],
-        );
-        assert_eq!(access, AccessLevel::Allow);
+    fn inline_policy_never_drops_a_rule() {
+        // path_suffix was skipped by the old converter; now the whole
+        // definition is rejected, as is an unknown level or field.
+        for bad in [
+            INLINE.replace("path_exact = \"/v1/things/\"", "path_suffix = \"/things\""),
+            INLINE.replace("level = \"ask\"", "level = \"sometimes\""),
+            INLINE.replace("read = \"deny\"", "read = \"nope\""),
+            INLINE.replace("level = \"ask\"", "level = \"ask\"\nlabel = \"x\""),
+            INLINE.replace("method = \"delete\"", "method = \"DEL ETE\""),
+        ] {
+            assert!(gate::admit_toml(&bad).is_err(), "{bad}");
+        }
+        // Declared twice (inline and policy.toml): rejected, never mixed.
+        let file = "[default]\nread = \"allow\"\n";
+        let e = gate::admit(None, INLINE, Some(file)).unwrap_err();
+        assert!(e.iter().any(|m| m.contains("declared twice")), "{e:?}");
     }
 
     // ── v4 service.toml parsing ──────────────────────────────────────────────
@@ -1353,7 +1195,7 @@ name = "GitHub"
 hosts = ["api.github.com", "github.com"]
 secrets = ["GITHUB_TOKEN"]
 "#;
-        let def: ServiceDef = toml::from_str(toml_str).unwrap();
+        let def = def(toml_str);
         assert_eq!(def.service.id, "github");
         assert_eq!(def.service.hosts, vec!["api.github.com", "github.com"]);
         assert_eq!(def.service.secrets, vec!["GITHUB_TOKEN"]);
@@ -1368,14 +1210,18 @@ id = "gmail"
 name = "Gmail"
 
 hosts = ["gmail.googleapis.com"]
+secrets = ["GMAIL_REFRESH_TOKEN"]
 
 [auth]
 type = "oauth2"
 provider = "google"
 scopes = ["https://www.googleapis.com/auth/gmail.send"]
 refresh_token = "GMAIL_REFRESH_TOKEN"
+authorization_url = "https://auth.example.com/authorize"
+token_url = "https://auth.example.com/token"
+client_id = "public-client"
 "#;
-        let def: ServiceDef = toml::from_str(toml_str).unwrap();
+        let def = def(toml_str);
         let o = def.oauth2().unwrap();
         assert_eq!(o.provider.as_deref(), Some("google"));
         assert_eq!(o.refresh_token, "GMAIL_REFRESH_TOKEN");
@@ -1387,18 +1233,22 @@ refresh_token = "GMAIL_REFRESH_TOKEN"
     fn parse_oauth2_exposes() {
         let toml_str = r#"
 [service]
-id = "openai-codex"
+id = "openai_codex"
 name = "OpenAI Codex"
 
 hosts = ["api.openai.com"]
+secrets = ["OPENAI_CODEX_REFRESH_TOKEN"]
 
 [auth]
 type = "oauth2"
 provider = "openai"
 refresh_token = "OPENAI_CODEX_REFRESH_TOKEN"
 exposes = ["account_id"]
+authorization_url = "https://auth.example.com/authorize"
+token_url = "https://auth.example.com/token"
+client_id = "public-client"
 "#;
-        let def: ServiceDef = toml::from_str(toml_str).unwrap();
+        let def = def(toml_str);
         assert_eq!(def.oauth2().unwrap().exposes, vec!["account_id"]);
     }
 
@@ -1414,7 +1264,7 @@ secrets = ["SNAPLII_API_KEY"]
 [auth]
 type = "snaplii"
 "#;
-        let def: ServiceDef = toml::from_str(toml_str).unwrap();
+        let def = def(toml_str);
         assert!(matches!(def.auth, Some(AuthDef::Snaplii(_))));
         assert!(def.oauth2().is_none());
         // The mint input (and thus env_role / never-injectable role) is the
@@ -1435,7 +1285,7 @@ hosts = ["x.example.com"]
 [auth]
 type = "sigv4-someday"
 "#;
-        assert!(toml::from_str::<ServiceDef>(bad).is_err());
+        assert!(gate::admit_toml(bad).is_err());
 
         // The retired section name is an unknown field at the top level — the
         // serde error names the offending section, pointing authors at [auth].
@@ -1448,9 +1298,7 @@ hosts = ["x.example.com"]
 [oauth2]
 refresh_token = "K"
 "#;
-        let err = toml::from_str::<ServiceDef>(legacy)
-            .unwrap_err()
-            .to_string();
+        let err = gate::admit_toml(legacy).unwrap_err().join("; ");
         assert!(
             err.contains("oauth2"),
             "error should name the offending section: {}",
@@ -1469,10 +1317,7 @@ hosts = ["x.com"]
 [git]
 helper = "sc"
 "#;
-        assert!(
-            toml::from_str::<ServiceDef>(git).is_err(),
-            "[git] must be rejected"
-        );
+        assert!(gate::admit_toml(git).is_err(), "[git] must be rejected");
         // A stale v3 `[[upstream]]` is rejected too.
         let v3 = r#"
 [service]
@@ -1483,7 +1328,7 @@ id = "default"
 url = "https://x.com"
 "#;
         assert!(
-            toml::from_str::<ServiceDef>(v3).is_err(),
+            gate::admit_toml(v3).is_err(),
             "[[upstream]] must be rejected"
         );
     }
@@ -1495,12 +1340,16 @@ url = "https://x.com"
 id = "gmail"
 name = "Gmail"
 hosts = ["gmail.googleapis.com"]
+secrets = ["GMAIL_REFRESH_TOKEN"]
 [auth]
 type = "oauth2"
 provider = "google"
 refresh_token = "GMAIL_REFRESH_TOKEN"
+authorization_url = "https://auth.example.com/authorize"
+token_url = "https://auth.example.com/token"
+client_id = "public-client"
 "#;
-        let def: ServiceDef = toml::from_str(toml_str).unwrap();
+        let def = def(toml_str);
         let mut services = HashMap::new();
         services.insert("gmail".into(), def);
         let r = reg(services);
@@ -1519,7 +1368,7 @@ name = "GitHub"
 hosts = ["api.github.com"]
 secrets = ["GITHUB_TOKEN"]
 "#;
-        let def: ServiceDef = toml::from_str(toml_str).unwrap();
+        let def = def(toml_str);
         let mut services = HashMap::new();
         services.insert("github".into(), def);
         let r = reg(services);
@@ -1539,12 +1388,16 @@ secrets = ["GITHUB_TOKEN"]
 id = "gcp"
 name = "Google Cloud"
 hosts = ["compute.googleapis.com"]
+secrets = ["GCP_REFRESH_TOKEN"]
 [auth]
 type = "oauth2"
 provider = "google"
 refresh_token = "GCP_REFRESH_TOKEN"
+authorization_url = "https://auth.example.com/authorize"
+token_url = "https://auth.example.com/token"
+client_id = "public-client"
 "#;
-        let def: ServiceDef = toml::from_str(toml_str).unwrap();
+        let def = def(toml_str);
         // The pure projection resolves regardless of where the def came from —
         // the single source of truth both the forward and approve paths share.
         assert_eq!(def.env_role().as_deref(), Some("GCP_REFRESH_TOKEN"));
@@ -1569,7 +1422,7 @@ name = "GitHub"
 hosts = ["github.com"]
 secrets = ["GITHUB_TOKEN"]
 "#;
-        let def: ServiceDef = toml::from_str(toml_str).unwrap();
+        let def = def(toml_str);
         let setup = def.setup.as_deref().unwrap();
         assert!(setup.contains("sc run --"));
     }
@@ -1611,8 +1464,8 @@ secrets = ["GITHUB_TOKEN"]
     #[test]
     fn compiled_services_parse_and_validate() {
         for (id, toml_str) in crate::generated_services::compiled_service_tomls() {
-            let def: ServiceDef = toml::from_str(toml_str)
-                .unwrap_or_else(|e| panic!("service '{}' failed to parse: {}", id, e));
+            let def = gate::admit(Some(id), toml_str, None)
+                .unwrap_or_else(|e| panic!("service '{}' rejected: {:?}", id, e));
             // Non-hidden services must anchor at least one host.
             if !def.service.hidden {
                 assert!(
@@ -1652,7 +1505,7 @@ secrets = ["GITHUB_TOKEN"]
     fn compiled_codex_resolves_fully_inline() {
         let mut services = HashMap::new();
         for (id, toml_str) in crate::generated_services::compiled_service_tomls() {
-            if let Ok(def) = toml::from_str::<ServiceDef>(toml_str) {
+            if let Ok(def) = gate::admit_toml(toml_str) {
                 services.insert(id.to_string(), def);
             }
         }
@@ -1720,7 +1573,7 @@ secrets = ["GITHUB_TOKEN"]
     fn compiled_google_trio_is_inline_complete_and_shares_one_client() {
         let mut services = HashMap::new();
         for (id, toml_str) in crate::generated_services::compiled_service_tomls() {
-            if let Ok(def) = toml::from_str::<ServiceDef>(toml_str) {
+            if let Ok(def) = gate::admit_toml(toml_str) {
                 services.insert(id.to_string(), def);
             }
         }
@@ -1794,7 +1647,8 @@ secrets = ["GITHUB_TOKEN"]
         let r = ServiceRegistry::load();
         let rules = r
             .default_policy_rules("gmail")
-            .expect("gmail policy.toml must parse and yield rules");
+            .expect("gmail policy.toml must parse and yield rules")
+            .to_vec();
         let policy = Policy::default();
         let eval = |m: &str, p: &str| {
             evaluate(
@@ -1832,7 +1686,8 @@ secrets = ["GITHUB_TOKEN"]
         let r = ServiceRegistry::load();
         let rules = r
             .default_policy_rules("cratesio")
-            .expect("cratesio policy.toml must parse and yield rules");
+            .expect("cratesio policy.toml must parse and yield rules")
+            .to_vec();
         let policy = Policy::default();
         let eval = |m: &str, p: &str| {
             evaluate(
@@ -1898,7 +1753,8 @@ secrets = ["GITHUB_TOKEN"]
         let r = ServiceRegistry::load();
         let rules = r
             .default_policy_rules("railway")
-            .expect("railway policy.toml must parse and yield rules");
+            .expect("railway policy.toml must parse and yield rules")
+            .to_vec();
         let policy = Policy::default();
         let eval = |body: &str| {
             // The whole API is one POST endpoint; the mutation name lives in the body.
@@ -1978,7 +1834,8 @@ secrets = ["GITHUB_TOKEN"]
         let r = ServiceRegistry::load();
         let rules = r
             .default_policy_rules("supabase")
-            .expect("supabase policy.toml must parse and yield rules");
+            .expect("supabase policy.toml must parse and yield rules")
+            .to_vec();
         let policy = Policy::default();
         let eval = |m: &str, p: &str| {
             evaluate(
@@ -2042,7 +1899,7 @@ secrets = ["GITHUB_TOKEN"]
     // ── [requests] extraction + scope digest (Phase 2) ───────────────────────
 
     fn snaplii_def() -> ServiceDef {
-        toml::from_str(
+        gate::admit_toml(
             r#"
 [service]
 id = "snaplii"

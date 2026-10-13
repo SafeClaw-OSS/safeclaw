@@ -1647,7 +1647,7 @@ client_id = "acme-public"
 refresh_token = "REFRESH_TOKEN"
 "#;
         let def: crate::service::ServiceDef =
-            toml::from_str(toml_src).expect("valid custom oauth2 def");
+            crate::service::gate::admit_toml(toml_src).expect("valid custom oauth2 def");
         let mut custom = std::collections::HashMap::new();
         custom.insert("acme".to_string(), def);
 
@@ -1690,7 +1690,7 @@ client_id = "shadow-client"
 refresh_token = "REFRESH_TOKEN"
 "#;
         let def: crate::service::ServiceDef =
-            toml::from_str(toml_src).expect("valid custom oauth2 def");
+            crate::service::gate::admit_toml(toml_src).expect("valid custom oauth2 def");
         let mut custom = std::collections::HashMap::new();
         custom.insert("gmail".to_string(), def);
 

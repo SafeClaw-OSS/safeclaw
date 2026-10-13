@@ -7,7 +7,7 @@
 
 use serde_json::{json, Value};
 
-use crate::service::validate::host_egress_allowed;
+use crate::core::egress::check_host_entry;
 
 /// A connection id / phantom `<conn>` segment: `[a-z0-9_]`, starts
 /// alphanumeric, no `__` (the phantom delimiter). Same rule the resolver and
@@ -135,13 +135,13 @@ pub fn validate_raw_host(h: &str) -> Result<(), String> {
             h
         ));
     }
-    if !host_egress_allowed(bare) {
-        return Err(format!(
-            "host '{}' is loopback / private / metadata — not a valid egress target",
-            h
-        ));
-    }
-    Ok(())
+    check_host_entry(bare).map_err(|e| {
+        if bare == h {
+            e
+        } else {
+            format!("host '{}': {}", h, e)
+        }
+    })
 }
 
 /// Insert (or replace) a RAW connection into the vault `aux` value, preserving

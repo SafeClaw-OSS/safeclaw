@@ -1295,9 +1295,9 @@ impl AppState {
         let built_in = self
             .services
             .default_policy_rules(service_id)
-            .unwrap_or_default();
+            .unwrap_or(&[]);
         let rules = crate::core::policy::merge_rules(
-            &built_in,
+            built_in,
             conn_policy.map(|c| &c.rules).unwrap_or(&empty_rules),
         );
         // Connection default floor (when no rule matches): user's per-connection
@@ -1372,9 +1372,9 @@ impl AppState {
         let built_in = self
             .services
             .default_policy_rules(service_id)
-            .unwrap_or_default();
+            .unwrap_or(&[]);
         crate::core::policy::unenforceable_user_rule(
-            &built_in,
+            built_in,
             &conn_policy.rules,
             method,
             path,
@@ -2624,7 +2624,7 @@ mod tests {
     #[test]
     fn connection_rule_problem_flags_unbound_deciding_fields() {
         use crate::core::policy::{AccessLevel, ConnectionPolicy, Policy, RuleConfig};
-        let def: crate::service::ServiceDef = toml::from_str(
+        let def: crate::service::ServiceDef = crate::service::gate::admit_toml(
             r#"
 [service]
 id = "shop"
@@ -2645,7 +2645,7 @@ scope = ["amount"]
         let rule = |when: Option<&str>, body: Option<&str>| RuleConfig {
             match_pattern: Some("POST /buy".into()),
             when: when.map(str::to_string),
-            body: body.map(str::to_string),
+            body: body.map(crate::core::policy::BodyPattern::lenient),
             level: Some(AccessLevel::Ask),
             ..Default::default()
         };

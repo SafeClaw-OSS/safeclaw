@@ -756,7 +756,7 @@ mod tests {
             at(Some("openai_codex"), Some(codex), &["chatgpt.com"]),
             vec!["chatgpt.com", "api.openai.com", "auth.openai.com"]
         );
-        let mixed: ServiceDef = toml::from_str(
+        let mixed: ServiceDef = crate::service::gate::admit_toml(
             r#"
 [service]
 id = "mixed"

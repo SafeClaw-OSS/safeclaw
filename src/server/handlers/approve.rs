@@ -1374,8 +1374,13 @@ pub async fn approve_op(
                     // declared hosts). Materialise a record that keeps the
                     // service binding and pins the just-approved host.
                     None => {
-                        let bound_service = (view.aux.services.contains_key(&conn)
-                            || state.services.get(&conn).is_some())
+                        let bound_service = (state.services.get(&conn).is_some()
+                            || crate::service::vault_custom_services(
+                                &view.aux.services,
+                                &state.services,
+                            )
+                            .0
+                            .contains_key(&conn))
                         .then(|| conn.clone());
                         view.aux.connections.insert(
                             conn.clone(),
@@ -1489,7 +1494,7 @@ pub async fn approve_op(
                 )?;
                 let mut services = Vec::new();
                 for (id, toml_src) in &view.aux.services {
-                    let problems = crate::service::validate::validate_service(toml_src)
+                    let problems = crate::service::gate::admit(Some(id), toml_src, None)
                         .err()
                         .unwrap_or_default();
                     services.push(json!({
@@ -1550,8 +1555,9 @@ pub async fn approve_op(
                 (resp, cached)
             }
             // Store a validated custom service definition (`aux.services`). The
-            // toml rides `scope.toml`; the daemon re-validates (same gate as the
-            // unlock-time check) and refuses to shadow a built-in id. Daemon-side
+            // toml rides `scope.toml`; the daemon re-admits it through the gate
+            // (the same one the unlock-time load uses), stores it under its
+            // declared id, and refuses to shadow a built-in id. Daemon-side
             // reseal + reconcile + push, like service-rm.
             "service-add" => {
                 let toml_src = validated
@@ -1562,14 +1568,13 @@ pub async fn approve_op(
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| AppError::BadRequest("service-add scope.toml required".into()))?
                     .to_string();
-                if let Err(problems) = crate::service::validate::validate_service(&toml_src) {
-                    return Err(AppError::BadRequest(format!(
-                        "invalid service definition: {}",
-                        problems.join("; ")
-                    )));
-                }
-                let def: crate::service::ServiceDef = toml::from_str(&toml_src)
-                    .map_err(|e| AppError::BadRequest(format!("parse: {}", e)))?;
+                let def =
+                    crate::service::gate::admit(None, &toml_src, None).map_err(|problems| {
+                        AppError::BadRequest(format!(
+                            "invalid service definition: {}",
+                            problems.join("; ")
+                        ))
+                    })?;
                 let id = def.service.id.clone();
                 if state.services.get(&id).is_some() {
                     return Err(AppError::BadRequest(format!(

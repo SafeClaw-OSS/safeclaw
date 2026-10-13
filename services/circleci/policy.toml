@@ -5,8 +5,10 @@
 # writing a project env var plants a value the build will read. Each rule is a
 # per-connection console toggle; loosen or tighten to taste.
 #
-# Paths are relative to host circleci.com; the project slug is one URL-encoded
-# segment (e.g. gh%2Forg%2Frepo), so `**` covers both encoded and literal forms.
+# Paths are relative to host circleci.com. The project slug is written either
+# as one URL-encoded segment (gh%2Forg%2Frepo) or as three literal ones
+# (gh/org/repo), so each rule lists both forms (`*` is one segment; `**` is
+# only allowed as the final segment).
 
 [default]
 read = "allow"
@@ -16,12 +18,12 @@ write = "allow"
 [[rule]]
 id = "trigger-pipeline"
 label = "Trigger a pipeline (runs arbitrary CI code)"
-match = "POST /api/v2/project/**/pipeline"
+match = ["POST /api/v2/project/*/pipeline", "POST /api/v2/project/*/*/*/pipeline"]
 level = "ask"
 
 # ── Plant a secret the build will read ───────────────────────────────────────
 [[rule]]
 id = "create-env-var"
 label = "Create or overwrite a project environment variable"
-match = "POST /api/v2/project/**/envvar"
+match = ["POST /api/v2/project/*/envvar", "POST /api/v2/project/*/*/*/envvar"]
 level = "ask"

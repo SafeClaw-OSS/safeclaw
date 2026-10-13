@@ -549,18 +549,21 @@ impl BrokerHandler {
         // derives the service's declared hosts.
         let resolved_hosts = crate::core::host::resolved_hosts(&conn_rec, def.as_ref());
 
-        // ── host anchor (exact FQDN, with the private/metadata floor beneath) ─
+        // ── host anchor (exact FQDN), with the private-address floor beneath ─
+        // The floor runs first, on every brokered request: the destination as
+        // the client's URL parser reads it must be a canonical, public host
+        // (`core::egress`), anchored or not.
+        if !crate::core::egress::host_egress_allowed(&dest_host) {
+            return err_response(
+                ScCode::HostForbidden,
+                &format!(
+                    "destination '{}' is not a permitted egress target",
+                    dest_host
+                ),
+            )
+            .into();
+        }
         if !crate::core::host::host_allowed(&dest_host, &resolved_hosts) {
-            if !crate::service::validate::host_egress_allowed(&dest_host) {
-                return err_response(
-                    ScCode::HostForbidden,
-                    &format!(
-                        "destination '{}' is not a permitted egress target",
-                        dest_host
-                    ),
-                )
-                .into();
-            }
             return self.widen_deny(&vault_id, &conn, &dest_host, ip).await;
         }
 

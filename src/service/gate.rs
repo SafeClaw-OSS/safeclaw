@@ -1,0 +1,1055 @@
+//! The one gate for service definitions.
+//!
+//! Definition text is untrusted input: it comes from community repositories,
+//! local folders, or a team member writing the vault. [`admit`] is the only
+//! way to turn it into a [`ServiceDef`] (the type carries a private field, so
+//! nothing else can build one, and it has no `Deserialize`): every reader of
+//! `aux.services`, of an on-disk service directory and of the compiled-in
+//! catalog goes through here, and every consumer holds only what came out
+//! ("parse, don't validate"; LangSec full recognition before processing).
+//!
+//! The gate recognizes the whole definition or rejects the whole definition
+//! (CWE-636, no failing open): an unknown field anywhere, an unknown level, a
+//! `body` regex that does not compile, a `when` that does not parse, a
+//! consent filter the console does not implement, a duplicate rule id, an
+//! empty label, a string carrying a control or bidi character, or anything
+//! over a limit ([`crate::service::limits`]) rejects it with a precise
+//! message. No rule is ever dropped on the way through.
+//!
+//! Pure and synchronous: no DNS, no network. Hosts and URLs are read with the
+//! HTTP client's own URL parser and judged by the address floor in
+//! [`crate::core::egress`].
+
+use std::collections::{HashMap, HashSet};
+
+use serde::Deserialize;
+
+use crate::core::egress::{check_host_entry, check_url};
+use crate::core::policy::{
+    match_pattern_problem, patterns_overlap, AccessLevel, BodyPattern, Condition, Levels,
+    PolicyRule,
+};
+use crate::service::limits::*;
+use crate::service::{AuthDef, RequestShape, ServiceDef, ServiceMeta, ServicePolicy, VarDef};
+
+/// The filters the console implements for a consent template
+/// (`{{ vars.<name> | <filter> }}`): `email` renders the bound value as a
+/// decoded message card (the approval view in the console). A filter outside
+/// this set would show the approver nothing, so a definition naming one is
+/// rejected.
+pub const CONSENT_FILTERS: &[&str] = &["email"];
+
+/// Consent-URL query params the OAuth flow itself controls; an
+/// `authorize_params` map may never set these (the frontend applies the map
+/// first and the protocol params after, so an entry here would silently lose;
+/// it is rejected instead).
+const RESERVED_AUTHORIZE_PARAMS: &[&str] = &[
+    "client_id",
+    "redirect_uri",
+    "response_type",
+    "scope",
+    "state",
+    "code_challenge",
+    "code_challenge_method",
+];
+
+// ── Raw (untrusted) shapes: serde targets that only the gate reads ──────────
+
+/// service.toml as written. `deny_unknown_fields` rejects stale v3 sections
+/// and any tool-named section (`[git]`, `[docker]`) at parse.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawService {
+    service: ServiceMeta,
+    #[serde(default)]
+    auth: Option<AuthDef>,
+    #[serde(default)]
+    setup: Option<String>,
+    #[serde(default)]
+    policy: Option<RawInlinePolicy>,
+    #[serde(default)]
+    requests: HashMap<String, RequestShape>,
+}
+
+/// The inline `[policy]` of a service.toml (`[policy.levels]` +
+/// `[[policy.rules]]`), the older alternative to a policy.toml.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawInlinePolicy {
+    #[serde(default)]
+    levels: Option<RawLevels>,
+    #[serde(default)]
+    rules: Vec<RawInlineRule>,
+}
+
+/// A read/write floor: `[default]` in policy.toml, `[policy.levels]` inline.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawLevels {
+    #[serde(default)]
+    read: Option<String>,
+    #[serde(default)]
+    write: Option<String>,
+    #[serde(default)]
+    ttl: Option<u64>,
+}
+
+/// An inline `[[policy.rules]]` entry.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawInlineRule {
+    #[serde(default)]
+    method: Option<String>,
+    #[serde(default)]
+    path_exact: Option<String>,
+    /// Never supported by the matcher; named here so it is rejected with a
+    /// precise message instead of a generic unknown-field one.
+    #[serde(default)]
+    path_suffix: Option<String>,
+    level: String,
+}
+
+/// policy.toml as written: `[default]` + `[[rule]]`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPolicyFile {
+    #[serde(default)]
+    default: Option<RawLevels>,
+    #[serde(default)]
+    rule: Vec<RawRule>,
+}
+
+/// A `[[rule]]` in policy.toml.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRule {
+    id: String,
+    label: String,
+    #[serde(
+        rename = "match",
+        deserialize_with = "crate::core::policy::match_spec::deserialize"
+    )]
+    match_pattern: Vec<String>,
+    #[serde(default)]
+    body: Option<String>,
+    #[serde(default)]
+    when: Option<String>,
+    #[serde(default)]
+    level: Option<String>,
+    #[serde(default)]
+    ttl: Option<u64>,
+}
+
+// ── The gate ─────────────────────────────────────────────────────────────────
+
+/// Turn untrusted definition text into a validated [`ServiceDef`], or reject
+/// it whole with every problem found.
+///
+/// `key` is the name the definition is stored or found under (its
+/// `aux.services` key, its service directory name); when given, the declared
+/// `[service] id` must equal it. `policy_toml` is the paired policy.toml, if
+/// any. The messages carry no control or bidi characters (they quote the
+/// definition, and are printed and logged).
+pub fn admit(
+    key: Option<&str>,
+    service_toml: &str,
+    policy_toml: Option<&str>,
+) -> Result<ServiceDef, Vec<String>> {
+    admit_inner(key, service_toml, policy_toml).map_err(|mut errs| {
+        if errs.len() > MAX_REPORTED_PROBLEMS {
+            let more = errs.len() - MAX_REPORTED_PROBLEMS;
+            errs.truncate(MAX_REPORTED_PROBLEMS);
+            errs.push(format!("... and {} more problems", more));
+        }
+        errs.into_iter()
+            .map(|e| crate::util::terminal_safe(&e).into_owned())
+            .collect()
+    })
+}
+
+fn admit_inner(
+    key: Option<&str>,
+    service_toml: &str,
+    policy_toml: Option<&str>,
+) -> Result<ServiceDef, Vec<String>> {
+    // Bytes first: nothing larger than the limit reaches the parser.
+    let mut errs = Vec::new();
+    check_file_size("service.toml", service_toml, &mut errs);
+    if let Some(p) = policy_toml {
+        check_file_size("policy.toml", p, &mut errs);
+    }
+    if !errs.is_empty() {
+        return Err(errs);
+    }
+
+    // Syntax, then every string and key, before any message quotes a value.
+    let service_table = parse_table("service.toml", service_toml)?;
+    let policy_table = match policy_toml {
+        Some(p) => Some(parse_table("policy.toml", p)?),
+        None => None,
+    };
+    check_strings_in_table(&service_table, "", true, &mut errs);
+    if let Some(t) = &policy_table {
+        check_strings_in_table(t, "", false, &mut errs);
+    }
+    if !errs.is_empty() {
+        return Err(errs);
+    }
+
+    // The schema: an unknown field anywhere is a parse error here.
+    let raw: RawService = toml::from_str(service_toml)
+        .map_err(|e| vec![format!("service.toml: parse error: {}", e)])?;
+    let raw_policy: Option<RawPolicyFile> = match policy_toml {
+        Some(p) => {
+            Some(toml::from_str(p).map_err(|e| vec![format!("policy.toml: parse error: {}", e)])?)
+        }
+        None => None,
+    };
+
+    check_service(key, &raw, &mut errs);
+    check_requests(&raw.requests, &mut errs);
+    let policy = match (raw_policy, raw.policy.as_ref()) {
+        (Some(_), Some(_)) => {
+            errs.push(
+                "the policy is declared twice (policy.toml and an inline [policy]); keep one"
+                    .into(),
+            );
+            None
+        }
+        (Some(file), None) => Some(policy_from_file(file, &mut errs)),
+        (None, Some(inline)) => Some(policy_from_inline(inline, &mut errs)),
+        (None, None) => None,
+    };
+    if let Some(p) = &policy {
+        check_rules_against_requests(&p.rules, &raw.requests, &mut errs);
+    }
+
+    if !errs.is_empty() {
+        return Err(errs);
+    }
+    Ok(ServiceDef {
+        service: raw.service,
+        auth: raw.auth,
+        setup: raw.setup,
+        policy,
+        requests: raw.requests,
+        _gate: (),
+    })
+}
+
+fn check_file_size(name: &str, text: &str, errs: &mut Vec<String>) {
+    if text.len() > MAX_FILE_BYTES {
+        errs.push(format!(
+            "{} is {} bytes; the limit is {}",
+            name,
+            text.len(),
+            MAX_FILE_BYTES
+        ));
+    }
+}
+
+fn parse_table(name: &str, text: &str) -> Result<toml::Table, Vec<String>> {
+    toml::from_str::<toml::Table>(text).map_err(|e| vec![format!("{}: parse error: {}", name, e)])
+}
+
+// ── Strings: control / bidi characters and lengths, in every value and key ──
+
+/// Walk every string value and key of a parsed file. Only the top-level
+/// `setup` of a service.toml is prose: it may carry `\n` and `\t` and the
+/// longer prose limit; everything else is a single line.
+fn check_strings_in_table(
+    table: &toml::Table,
+    path: &str,
+    service_file: bool,
+    errs: &mut Vec<String>,
+) {
+    for (key, value) in table {
+        check_string(&format!("a key in {}", or_root(path)), key, false, errs);
+        // A message names the key, shortened: a long key is already an error.
+        let mut shown = key.as_str();
+        if shown.len() > 64 {
+            let mut cut = 64;
+            while !shown.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            shown = &shown[..cut];
+        }
+        let child = if path.is_empty() {
+            shown.to_string()
+        } else {
+            format!("{}.{}", path, shown)
+        };
+        let prose = service_file && path.is_empty() && key == "setup";
+        check_value(value, &child, prose, errs);
+    }
+}
+
+fn or_root(path: &str) -> &str {
+    if path.is_empty() {
+        "the file"
+    } else {
+        path
+    }
+}
+
+fn check_value(value: &toml::Value, path: &str, prose: bool, errs: &mut Vec<String>) {
+    match value {
+        toml::Value::String(s) => check_string(path, s, prose, errs),
+        toml::Value::Array(items) => {
+            for (i, item) in items.iter().enumerate() {
+                check_value(item, &format!("{}[{}]", path, i), false, errs);
+            }
+        }
+        toml::Value::Table(t) => check_strings_in_table(t, path, false, errs),
+        toml::Value::Integer(_)
+        | toml::Value::Float(_)
+        | toml::Value::Boolean(_)
+        | toml::Value::Datetime(_) => {}
+    }
+}
+
+fn check_string(path: &str, s: &str, prose: bool, errs: &mut Vec<String>) {
+    let limit = if prose {
+        MAX_PROSE_BYTES
+    } else {
+        MAX_STRING_BYTES
+    };
+    if s.len() > limit {
+        errs.push(format!(
+            "{} is {} bytes; the limit is {}",
+            path,
+            s.len(),
+            limit
+        ));
+        return;
+    }
+    if let Some(c) = s
+        .chars()
+        .find(|&c| !(prose && (c == '\n' || c == '\t')) && crate::util::is_unsafe_display_char(c))
+    {
+        errs.push(format!(
+            "{} contains the control or bidi character U+{:04X}{}",
+            path,
+            c as u32,
+            if prose {
+                " (only \\n and \\t are allowed)"
+            } else {
+                ""
+            }
+        ));
+    }
+}
+
+// ── [service] and [auth] ─────────────────────────────────────────────────────
+
+/// A service / connection id usable as a phantom `<conn>` segment: `[a-z0-9_]`,
+/// no `__` (the phantom delimiter), starting alphanumeric.
+fn is_valid_service_id(s: &str) -> bool {
+    if s.is_empty() || s.len() > 64 || s.contains("__") {
+        return false;
+    }
+    s.starts_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && s.chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+}
+
+/// A secret role key: env-style `[A-Z0-9_]`, starts with a letter, and,
+/// because its lowercase becomes a phantom role segment (`__sc__<conn>__<role>__`),
+/// it carries no `__` (the delimiter) and no trailing `_` (which would fuse
+/// into the delimiter as `___` and make the advertised phantom unparseable).
+fn is_valid_role(s: &str) -> bool {
+    if s.is_empty() || s.contains("__") || s.ends_with('_') {
+        return false;
+    }
+    s.starts_with(|c: char| c.is_ascii_uppercase())
+        && s.chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+}
+
+/// A name the console's consent grammar and `when` can address: `[A-Za-z0-9_]+`.
+fn is_ident(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Within the limit? Over it, the error is recorded and the caller skips the
+/// per-entry checks, so the work done never exceeds the limits.
+fn check_count(what: &str, n: usize, limit: usize, errs: &mut Vec<String>) -> bool {
+    if n > limit {
+        errs.push(format!(
+            "{} has {} entries; the limit is {}",
+            what, n, limit
+        ));
+        return false;
+    }
+    true
+}
+
+/// A single host anchor entry: an exact host or a `*.suffix` wildcard
+/// (leftmost, single label, over a domain of at least two labels).
+/// Authorities only: no scheme, no path, no port, no template.
+fn check_host(entry: &str, errs: &mut Vec<String>) {
+    if entry.contains("://") || entry.contains('/') || entry.contains("{{") {
+        errs.push(format!(
+            "host '{}' must be a bare host (no scheme, path or template)",
+            entry
+        ));
+        return;
+    }
+    if entry.contains(':') {
+        errs.push(format!("host '{}' must not carry a port", entry));
+        return;
+    }
+    if entry == "*" {
+        errs.push("a bare '*' host is forbidden; anchor to an exact host or a '*.suffix'".into());
+        return;
+    }
+    let base = match entry.strip_prefix("*.") {
+        Some(suffix) => {
+            if suffix.contains('*') {
+                errs.push(format!(
+                    "host '{}': '*' is only allowed as the leftmost single label",
+                    entry
+                ));
+                return;
+            }
+            // A wildcard pins within a domain: never a whole TLD, never an IP.
+            let domain = matches!(url::Host::parse(suffix), Ok(url::Host::Domain(_)));
+            if !domain || !suffix.trim_end_matches('.').contains('.') {
+                errs.push(format!(
+                    "host '{}' is too broad; a wildcard needs a domain like *.example.com",
+                    entry
+                ));
+                return;
+            }
+            suffix
+        }
+        None => {
+            if entry.contains('*') {
+                errs.push(format!(
+                    "host '{}': '*' is only allowed as the leftmost single label",
+                    entry
+                ));
+                return;
+            }
+            entry
+        }
+    };
+    if let Err(e) = check_host_entry(base) {
+        errs.push(if base == entry {
+            e
+        } else {
+            format!("host '{}': {}", entry, e)
+        });
+    }
+}
+
+fn check_service(key: Option<&str>, raw: &RawService, errs: &mut Vec<String>) {
+    let s = &raw.service;
+    if !is_valid_service_id(&s.id) {
+        errs.push(format!(
+            "service id '{}' is not valid (^[a-z0-9][a-z0-9_]* , no '__', at most 64)",
+            s.id
+        ));
+    }
+    if let Some(k) = key {
+        if k != s.id {
+            errs.push(format!(
+                "the definition is stored as '{}' but declares id '{}'; they must be the same",
+                k, s.id
+            ));
+        }
+    }
+    if s.name.trim().is_empty() {
+        errs.push("[service] name must not be empty".into());
+    }
+
+    // Hosts: non-hidden services must anchor at least one.
+    if s.hosts.is_empty() && !s.hidden {
+        errs.push("service declares no hosts (an anchor is required)".into());
+    }
+    if check_count("[service] hosts", s.hosts.len(), MAX_HOSTS, errs) {
+        for h in &s.hosts {
+            check_host(h, errs);
+        }
+    }
+
+    // Secrets: env-style role keys, no duplicates.
+    let mut seen_secret = HashSet::new();
+    let secrets_ok = check_count("[service] secrets", s.secrets.len(), MAX_SECRETS, errs);
+    for r in s.secrets.iter().filter(|_| secrets_ok) {
+        if !is_valid_role(r) {
+            errs.push(format!(
+                "secret role '{}' is not a valid env key ([A-Z0-9_])",
+                r
+            ));
+        }
+        if !seen_secret.insert(r.to_ascii_uppercase()) {
+            errs.push(format!("duplicate secret role '{}'", r));
+        }
+    }
+
+    // Tags: lowercase-kebab slugs, no duplicates. Free vocabulary; only the
+    // shape is enforced so the console can render any tag as a chip.
+    let mut seen_tag = HashSet::new();
+    let tags_ok = check_count("[service] tags", s.tags.len(), MAX_TAGS, errs);
+    for t in s.tags.iter().filter(|_| tags_ok) {
+        let kebab = !t.is_empty()
+            && t.split('-').all(|seg| {
+                !seg.is_empty()
+                    && seg
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+            });
+        if !kebab {
+            errs.push(format!(
+                "tag '{}' is not lowercase-kebab ([a-z0-9] segments joined by '-')",
+                t
+            ));
+        }
+        if !seen_tag.insert(t.as_str()) {
+            errs.push(format!("duplicate tag '{}'", t));
+        }
+    }
+
+    if let Some(g) = &s.group {
+        if !is_valid_service_id(g) {
+            errs.push(format!("[service] group '{}' is not a service id", g));
+        }
+    }
+    if let Some(a) = &s.activation {
+        if a != "auto" {
+            errs.push(format!(
+                "[service] activation '{}' is unknown (the only value is \"auto\"; omit it otherwise)",
+                a
+            ));
+        }
+    }
+    // secret_url is a display-only link, rendered as an <a href> by the
+    // console: a plain web URL only.
+    if let Some(u) = &s.secret_url {
+        if let Err(e) = check_url("[service] secret_url", u, &["https", "http"], false) {
+            errs.push(e);
+        }
+    }
+
+    match &raw.auth {
+        Some(AuthDef::Snaplii(_)) => {
+            // The snaplii exchange input is the first `secrets` role; a def
+            // without one can never mint.
+            if !s.secrets.iter().any(|r| !r.trim().is_empty()) {
+                errs.push(
+                    "[auth] type=\"snaplii\" requires a [service] secrets entry (the exchange api key)"
+                        .into(),
+                );
+            }
+        }
+        Some(AuthDef::Oauth2(o)) => check_oauth2(o, s, &seen_secret, errs),
+        None => {}
+    }
+}
+
+/// The oauth2 section is self-sufficient: the inline fields carry the
+/// endpoints and client (there is no template layer; `provider` is a display
+/// label only). Endpoints are https to a public host.
+fn check_oauth2(
+    o: &crate::service::OAuth2Def,
+    s: &ServiceMeta,
+    seen_secret: &HashSet<String>,
+    errs: &mut Vec<String>,
+) {
+    if !(o.authorization_url.is_some() && o.token_url.is_some() && o.client_id.is_some()) {
+        errs.push(
+            "[auth] oauth2 must declare authorization_url + token_url + client_id inline".into(),
+        );
+    }
+    if o.provider.as_deref().is_some_and(|p| p.trim().is_empty()) {
+        errs.push("[auth] provider (display label) must not be empty (omit it instead)".into());
+    }
+    if o.client_id.as_deref().is_some_and(|c| c.trim().is_empty()) {
+        errs.push("[auth] client_id must not be empty".into());
+    }
+    if let Some(u) = &o.authorization_url {
+        if let Err(e) = check_url("[auth] authorization_url", u, &["https"], true) {
+            errs.push(e);
+        }
+    }
+    if let Some(u) = &o.token_url {
+        if let Err(e) = check_url("[auth] token_url", u, &["https"], true) {
+            errs.push(e);
+        }
+    }
+    // The loopback redirect the consent lands on: a URL, but not an egress
+    // target (a local listener catches it).
+    if let Some(u) = &o.redirect_uri {
+        if let Err(e) = check_url("[auth] redirect_uri", u, &["http", "https"], false) {
+            errs.push(e);
+        }
+    }
+    if let Some(style) = &o.oauth_style {
+        if style != "form" && style != "json" {
+            errs.push(format!(
+                "[auth] oauth_style '{}' is unknown (\"form\" or \"json\")",
+                style
+            ));
+        }
+    }
+    check_count("[auth] scopes", o.scopes.len(), MAX_OAUTH_SCOPES, errs);
+    if o.scopes.iter().any(|sc| sc.trim().is_empty()) {
+        errs.push("[auth] scopes has an empty entry".into());
+    }
+    let exposes_ok = check_count("[auth] exposes", o.exposes.len(), MAX_EXPOSES, errs);
+    let claims_ok = check_count("[auth.claims]", o.claims.len(), MAX_CLAIMS, errs);
+    let mut claim_roles: Vec<&String> = o.claims.keys().filter(|_| claims_ok).collect();
+    claim_roles.sort();
+    for role in claim_roles {
+        let path = &o.claims[role];
+        if !o.exposes.iter().any(|e| e == role) {
+            errs.push(format!("[auth] claims key '{}' is not in exposes", role));
+        }
+        check_count(
+            &format!("[auth.claims] '{}'", role),
+            path.len(),
+            MAX_CLAIM_PATH,
+            errs,
+        );
+        if path.is_empty() || path.iter().any(|seg| seg.trim().is_empty()) {
+            errs.push(format!(
+                "[auth] claims path for '{}' has an empty segment",
+                role
+            ));
+        }
+    }
+    // authorize_params are ADDITIONS to the consent URL, never overrides of
+    // the protocol params the flow itself controls.
+    let params_ok = check_count(
+        "[auth.authorize_params]",
+        o.authorize_params.len(),
+        MAX_AUTHORIZE_PARAMS,
+        errs,
+    );
+    let mut params: Vec<&String> = o.authorize_params.keys().filter(|_| params_ok).collect();
+    params.sort();
+    for k in params {
+        if RESERVED_AUTHORIZE_PARAMS.contains(&k.as_str()) {
+            errs.push(format!(
+                "[auth] authorize_params may not set the reserved param '{}'",
+                k
+            ));
+        }
+    }
+    // Durable token slots use RFC 6749 field names; each is a valid env KEY
+    // that is ALSO declared in the top-level `secrets` (the uniform
+    // durable-credential contract, SERVICES.md §3).
+    let declared = |k: &str| s.secrets.iter().any(|r| r.eq_ignore_ascii_case(k));
+    if o.refresh_token.trim().is_empty() {
+        errs.push("[auth] oauth2 requires a refresh_token (the vault secret KEY the refresh token is stored under)".into());
+    } else if !is_valid_role(&o.refresh_token) {
+        errs.push(format!(
+            "[auth] refresh_token '{}' is not a valid env key ([A-Z0-9_])",
+            o.refresh_token
+        ));
+    } else if !declared(&o.refresh_token) {
+        errs.push(format!(
+            "[auth] refresh_token '{}' must be listed in the service's top-level secrets",
+            o.refresh_token
+        ));
+    }
+    if let Some(idt) = &o.id_token {
+        if !is_valid_role(idt) {
+            errs.push(format!(
+                "[auth] id_token '{}' is not a valid env key ([A-Z0-9_])",
+                idt
+            ));
+        } else if !declared(idt) {
+            errs.push(format!(
+                "[auth] id_token '{}' must be listed in the service's top-level secrets",
+                idt
+            ));
+        }
+    }
+    for e in o.exposes.iter().filter(|_| exposes_ok) {
+        if !is_valid_service_id(e) {
+            errs.push(format!(
+                "[auth] exposes entry '{}' is not a valid role ([a-z0-9_])",
+                e
+            ));
+        }
+        if seen_secret.contains(&e.to_ascii_uppercase()) {
+            errs.push(format!(
+                "[auth] exposes entry '{}' collides with a secret role",
+                e
+            ));
+        }
+    }
+}
+
+// ── [requests] ───────────────────────────────────────────────────────────────
+
+fn check_match_list(what: &str, patterns: &[String], errs: &mut Vec<String>) {
+    if !check_count(
+        &format!("{} match", what),
+        patterns.len(),
+        MAX_MATCH_PATTERNS,
+        errs,
+    ) {
+        return;
+    }
+    for p in patterns {
+        if let Some(problem) = match_pattern_problem(p) {
+            errs.push(format!("{}: {}", what, problem));
+        }
+    }
+}
+
+fn check_requests(requests: &HashMap<String, RequestShape>, errs: &mut Vec<String>) {
+    if !check_count("[requests]", requests.len(), MAX_REQUESTS, errs) {
+        return;
+    }
+    let mut names: Vec<&String> = requests.keys().collect();
+    names.sort();
+    for name in names {
+        let shape = &requests[name];
+        let what = format!("[requests.{}]", name);
+        if !is_ident(name) {
+            errs.push(format!(
+                "{} is not a valid request name ([A-Za-z0-9_])",
+                what
+            ));
+        }
+        if shape.match_pattern.is_empty() {
+            errs.push(format!("{} declares no `match`", what));
+        }
+        check_match_list(&what, &shape.match_pattern, errs);
+
+        let vars_ok = check_count(&format!("{} vars", what), shape.vars.len(), MAX_VARS, errs);
+        let mut vars: Vec<&String> = shape.vars.keys().filter(|_| vars_ok).collect();
+        vars.sort();
+        for var in vars {
+            if !is_ident(var) {
+                errs.push(format!(
+                    "{} var '{}' is not a valid name ([A-Za-z0-9_])",
+                    what, var
+                ));
+            }
+            // A body address is an RFC 6901 pointer (leading '/'); a query
+            // `at` is non-empty.
+            match &shape.vars[var] {
+                VarDef::BodyPointer(p) => check_pointer(&what, var, p, errs),
+                VarDef::Located(at) => match at.location {
+                    crate::service::VarLoc::Body => check_pointer(&what, var, &at.at, errs),
+                    crate::service::VarLoc::Query => {
+                        if at.at.is_empty() {
+                            errs.push(format!("{} var '{}' query `at` is empty", what, var));
+                        }
+                    }
+                },
+            }
+        }
+
+        // scope ⊆ vars: only a declared field can be bound. No duplicates: a
+        // repeated entry makes the approve digest (object, deduped) and the
+        // redeem digest (vec) disagree.
+        let scope_ok = check_count(
+            &format!("{} scope", what),
+            shape.scope.len(),
+            MAX_SCOPE,
+            errs,
+        );
+        let mut seen_scope = HashSet::new();
+        for k in shape.scope.iter().filter(|_| scope_ok) {
+            if !shape.vars.contains_key(k) {
+                errs.push(format!(
+                    "{} scope names '{}', which is not a declared var",
+                    what, k
+                ));
+            }
+            if !seen_scope.insert(k) {
+                errs.push(format!("{} scope lists '{}' more than once", what, k));
+            }
+        }
+
+        if let Some(consent) = &shape.consent {
+            check_consent(&what, consent, &shape.scope, errs);
+        }
+    }
+}
+
+fn check_pointer(what: &str, var: &str, p: &str, errs: &mut Vec<String>) {
+    if !p.starts_with('/') {
+        errs.push(format!(
+            "{} var '{}' body address '{}' must be a JSON Pointer (start with '/')",
+            what, var, p
+        ));
+    }
+}
+
+/// A consent template is literal text and `{{ vars.<name> }}` or
+/// `{{ vars.<name> | <filter> }}` tokens, nothing else. Every referenced var
+/// must be in `scope` (P4 show ⊆ bind) and every filter one the console
+/// implements ([`CONSENT_FILTERS`]).
+fn check_consent(what: &str, template: &str, scope: &[String], errs: &mut Vec<String>) {
+    let mut rest = template;
+    while let Some(start) = rest.find("{{") {
+        let after = &rest[start + 2..];
+        let Some(end) = after.find("}}") else {
+            errs.push(format!("{} consent has an unclosed '{{{{'", what));
+            return;
+        };
+        let inner = after[..end].trim();
+        let (expr, filter) = match inner.split_once('|') {
+            Some((e, f)) => (e.trim(), Some(f.trim())),
+            None => (inner, None),
+        };
+        match expr.strip_prefix("vars.") {
+            Some(var) if is_ident(var) => {
+                if !scope.iter().any(|k| k == var) {
+                    errs.push(format!(
+                        "{} consent references '{{{}}}', which is not in `scope` (show ⊆ bind)",
+                        what, var
+                    ));
+                }
+            }
+            _ => errs.push(format!(
+                "{} consent token '{{{{ {} }}}}' must be {{{{ vars.<name> }}}} or {{{{ vars.<name> | <filter> }}}}",
+                what, inner
+            )),
+        }
+        if let Some(f) = filter {
+            if !CONSENT_FILTERS.contains(&f) {
+                errs.push(format!(
+                    "{} consent filter '{}' is unknown (known: {})",
+                    what,
+                    f,
+                    CONSENT_FILTERS.join(", ")
+                ));
+            }
+        }
+        rest = &after[end + 2..];
+    }
+}
+
+// ── Policy ───────────────────────────────────────────────────────────────────
+
+fn parse_level(what: &str, s: &str, errs: &mut Vec<String>) -> Option<AccessLevel> {
+    let level = AccessLevel::parse(s);
+    if level.is_none() {
+        errs.push(format!(
+            "{}: level '{}' is unknown (allow, ask, ask-always or deny)",
+            what, s
+        ));
+    }
+    level
+}
+
+fn levels_from(what: &str, raw: &RawLevels, errs: &mut Vec<String>) -> Levels {
+    Levels {
+        read: raw
+            .read
+            .as_deref()
+            .and_then(|l| parse_level(&format!("{} read", what), l, errs)),
+        write: raw
+            .write
+            .as_deref()
+            .and_then(|l| parse_level(&format!("{} write", what), l, errs)),
+        ttl: raw.ttl,
+    }
+}
+
+/// A rule id: the key a user edit names it by. `[a-z0-9][a-z0-9_-]*`.
+fn is_valid_rule_id(s: &str) -> bool {
+    s.starts_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && s.chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+}
+
+fn policy_from_file(file: RawPolicyFile, errs: &mut Vec<String>) -> ServicePolicy {
+    let defaults = file
+        .default
+        .as_ref()
+        .map(|d| levels_from("policy.toml [default]", d, errs));
+    if !check_count("policy.toml rules", file.rule.len(), MAX_RULES, errs) {
+        return ServicePolicy {
+            defaults,
+            rules: Vec::new(),
+        };
+    }
+    let mut seen_ids = HashSet::new();
+    let mut rules = Vec::with_capacity(file.rule.len());
+    for r in file.rule {
+        let what = format!("rule '{}'", r.id);
+        if !is_valid_rule_id(&r.id) {
+            errs.push(format!("{}: the id must be [a-z0-9][a-z0-9_-]*", what));
+        }
+        if !seen_ids.insert(r.id.clone()) {
+            errs.push(format!("{}: the id is used by more than one rule", what));
+        }
+        if r.label.trim().is_empty() {
+            errs.push(format!("{}: the label must not be empty", what));
+        }
+        check_match_list(&what, &r.match_pattern, errs);
+        let level = match r.level.as_deref() {
+            Some(l) => parse_level(&what, l, errs),
+            None => {
+                errs.push(format!(
+                    "{}: declares no level (allow, ask, ask-always or deny)",
+                    what
+                ));
+                None
+            }
+        };
+        let body = r
+            .body
+            .as_deref()
+            .and_then(|b| match BodyPattern::compile(b) {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    errs.push(format!("{}: body regex {}", what, e));
+                    None
+                }
+            });
+        if let Some(w) = &r.when {
+            if Condition::parse(w).is_none() {
+                errs.push(format!(
+                    "{}: `when = \"{}\"` is not a valid condition (expected `vars.<name> <op> <literal>`)",
+                    what, w
+                ));
+            }
+        }
+        rules.push(PolicyRule {
+            id: Some(r.id),
+            label: Some(r.label),
+            match_patterns: r.match_pattern,
+            body,
+            when: r.when,
+            level,
+            ttl: r.ttl,
+        });
+    }
+    ServicePolicy { defaults, rules }
+}
+
+fn policy_from_inline(inline: &RawInlinePolicy, errs: &mut Vec<String>) -> ServicePolicy {
+    let defaults = inline
+        .levels
+        .as_ref()
+        .map(|l| levels_from("[policy.levels]", l, errs));
+    if !check_count("[[policy.rules]]", inline.rules.len(), MAX_RULES, errs) {
+        return ServicePolicy {
+            defaults,
+            rules: Vec::new(),
+        };
+    }
+    let mut rules = Vec::with_capacity(inline.rules.len());
+    for (i, r) in inline.rules.iter().enumerate() {
+        let what = format!("[[policy.rules]] #{}", i + 1);
+        if r.path_suffix.is_some() {
+            errs.push(format!(
+                "{}: path_suffix is not supported; write the path in path_exact",
+                what
+            ));
+        }
+        let Some(path) = &r.path_exact else {
+            errs.push(format!("{}: declares no path_exact", what));
+            continue;
+        };
+        let path = path.trim_end_matches('/');
+        let pattern = match &r.method {
+            Some(m) => format!("{} {}", m, path),
+            None => path.to_string(),
+        };
+        if r.method
+            .as_deref()
+            .is_some_and(|m| m.is_empty() || !m.bytes().all(|b| b.is_ascii_alphabetic()))
+        {
+            errs.push(format!("{}: method must be letters (e.g. DELETE)", what));
+        }
+        if let Some(problem) = match_pattern_problem(&pattern) {
+            errs.push(format!("{}: {}", what, problem));
+        }
+        let level = parse_level(&what, &r.level, errs);
+        rules.push(PolicyRule {
+            id: None,
+            label: None,
+            match_patterns: vec![pattern],
+            body: None,
+            when: None,
+            level,
+            ttl: None,
+        });
+    }
+    ServicePolicy { defaults, rules }
+}
+
+/// Cross-checks of the policy against the paired `[requests]` shapes, the
+/// invariant that a field deciding an approval must be bound by it:
+///   - every `when` var is declared by some shape and in some shape's
+///     `scope` (else an ask-always approved at one value could be redeemed
+///     at another);
+///   - no `ask` / `ask-always` rule decides on the `body` on a path a shape
+///     covers (an approval there binds only the shape's `scope` fields).
+fn check_rules_against_requests(
+    rules: &[PolicyRule],
+    requests: &HashMap<String, RequestShape>,
+    errs: &mut Vec<String>,
+) {
+    let declared: HashSet<&str> = requests
+        .values()
+        .flat_map(|s| s.vars.keys().map(String::as_str))
+        .collect();
+    let bound: HashSet<&str> = requests
+        .values()
+        .flat_map(|s| s.scope.iter().map(String::as_str))
+        .collect();
+    let mut shapes: Vec<(&String, &RequestShape)> = requests.iter().collect();
+    shapes.sort_by_key(|(n, _)| *n);
+    for (i, rule) in rules.iter().enumerate() {
+        let what = match &rule.id {
+            Some(id) => format!("rule '{}'", id),
+            None => format!("[[policy.rules]] #{}", i + 1),
+        };
+        if let Some(cond) = rule.when.as_deref().and_then(Condition::parse) {
+            // Strip a `shape.` qualifier for the membership check.
+            let var = cond.var_name();
+            let bare = var.rsplit('.').next().unwrap_or(var);
+            if !declared.contains(bare) {
+                errs.push(format!(
+                    "{}: `when` references var '{}', which no [requests] shape declares",
+                    what, var
+                ));
+            } else if !bound.contains(bare) {
+                errs.push(format!(
+                    "{}: `when` gates on var '{}', which is not in any shape's `scope`; a deciding field must be bound (add it to scope)",
+                    what, var
+                ));
+            }
+        }
+        if rule.body.is_some()
+            && matches!(rule.level, Some(AccessLevel::Ask | AccessLevel::AskAlways))
+        {
+            for (name, shape) in &shapes {
+                let covers = rule.match_patterns.is_empty()
+                    || rule.match_patterns.iter().any(|rp| {
+                        shape
+                            .match_pattern
+                            .iter()
+                            .any(|sp| patterns_overlap(rp, sp))
+                    });
+                if covers {
+                    errs.push(format!(
+                        "{}: decides an ask on the request body on a path [requests.{}] covers, where an approval binds only the shape's `scope` fields; gate it with `when` on a bound field instead",
+                        what, name
+                    ));
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests;
+
+/// Test fixtures: admit a service.toml with no storage key and no policy.
+#[cfg(test)]
+pub(crate) fn admit_toml(service_toml: &str) -> Result<ServiceDef, Vec<String>> {
+    admit(None, service_toml, None)
+}

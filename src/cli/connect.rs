@@ -146,13 +146,15 @@ pub async fn run_ls(json: bool) -> Result<(), String> {
         );
         return Ok(());
     }
+    // Names and hosts derive from service definitions (untrusted text).
+    use crate::util::terminal_safe;
     for c in &conns {
-        println!("{}", c.name);
+        println!("{}", terminal_safe(&c.name));
         if !c.hosts.is_empty() {
-            println!("  hosts:    {}", c.hosts.join(", "));
+            println!("  hosts:    {}", terminal_safe(&c.hosts.join(", ")));
         }
         for ph in &c.phantoms {
-            println!("  phantom:  {}", ph);
+            println!("  phantom:  {}", terminal_safe(ph));
         }
     }
     Ok(())
@@ -488,7 +490,7 @@ async fn run_service_backed(
     let service_secrets = def.service.secrets.clone();
     // Auxiliary pointer to where the token is minted (display-only).
     if let Some(url) = def.service.secret_url.as_deref() {
-        eprintln!("  Get a token: {}", url);
+        eprintln!("  Get a token: {}", crate::util::terminal_safe(url));
     }
 
     // `--host` on a service-backed connect only PINS a host inside the service's

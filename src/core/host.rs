@@ -269,7 +269,7 @@ mod tests {
             "[service]\nid = \"{}\"\nname = \"X\"\nhosts = [{}]\nsecrets = [{}]\n",
             id, hosts, secrets
         );
-        toml::from_str(&toml).unwrap()
+        crate::service::gate::admit_toml(&toml).unwrap()
     }
 
     #[test]
@@ -409,13 +409,17 @@ mod tests {
 id = "gmail"
 name = "Gmail"
 hosts = ["gmail.googleapis.com"]
+secrets = ["GMAIL_REFRESH_TOKEN"]
 [auth]
 type = "oauth2"
 provider = "google"
 refresh_token = "GMAIL_REFRESH_TOKEN"
 exposes = ["account_id"]
+authorization_url = "https://auth.example.com/authorize"
+token_url = "https://auth.example.com/token"
+client_id = "public-client"
 "#;
-        let def: ServiceDef = toml::from_str(toml).unwrap();
+        let def: ServiceDef = crate::service::gate::admit_toml(toml).unwrap();
         let m = phantoms_for("gmail", &def);
         assert_eq!(m.get("ACCESS").map(String::as_str), Some("__sc__gmail__"));
         assert_eq!(
