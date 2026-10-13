@@ -4599,9 +4599,9 @@ pub(crate) mod tests {
     /// Re-keys the owner's console has not finished: rows still under a
     /// previous content key read through the previous keys the member's own
     /// keyset row carries (opened at unlock with the current key, newest
-    /// first), each only for the rows that existed when it was retired. A row
-    /// under a retired key that it does not list (sealed after it retired) is
-    /// not honored and never written over. A row read through a previous key
+    /// first), each only for the rows that existed, exactly so, when it was
+    /// retired. A row under a retired key that it does not list (sealed after
+    /// it retired) is not honored and never written over. A row read through a previous key
     /// is never written back under it: a reconcile leaves it as it is, and a
     /// change to it is sealed under the current key.
     #[test]
@@ -4639,6 +4639,7 @@ pub(crate) mod tests {
         for s in pv.items.values_mut() {
             s.synced_version = s.version;
         }
+        let (old_ct, older_ct) = (pv.items[&old_id].ct.clone(), pv.items[&older_id].ct.clone());
         pv.set_uik_prev_content_ct(
             "cid-creator",
             seal_prev_content_keys::<S>(
@@ -4646,8 +4647,8 @@ pub(crate) mod tests {
                 vid,
                 1,
                 &[
-                    (&fx.c_old, &[(old_id.as_str(), 3)]),
-                    (&c_older, &[(older_id.as_str(), 2)]),
+                    (&fx.c_old, &[(old_id.as_str(), 3, old_ct.as_slice())]),
+                    (&c_older, &[(older_id.as_str(), 2, older_ct.as_slice())]),
                 ],
             ),
         );
@@ -4676,7 +4677,12 @@ pub(crate) mod tests {
         let mut stale = pv.clone();
         stale.set_uik_prev_content_ct(
             "cid-creator",
-            seal_prev_content_keys::<S>(&fx.c_new, vid, 2, &[(&fx.c_old, &[(old_id.as_str(), 3)])]),
+            seal_prev_content_keys::<S>(
+                &fx.c_new,
+                vid,
+                2,
+                &[(&fx.c_old, &[(old_id.as_str(), 3, old_ct.as_slice())])],
+            ),
         );
         let m = crate::server::handlers::metadata::acquire_k_from_keyset(
             &stale.keyset,

@@ -1,0 +1,57 @@
+{
+  "description": "uik_prev_content_ct / prev_content_ct: every earlier content key, newest first, each with the rows the vault held when it was retired ([wire id, version], sorted by wire id then version), sealed under the CURRENT content key with the item AEAD (sudp sealRecord, suite 1). Std base64. An earlier key opens only the rows listed under it. Open with unsealRecord(current_content_key, ctx, sealed) and parse the plaintext.",
+  "vault_id": "vlt_prev_keys_vector",
+  "generation": 3,
+  "seal_ctx": {
+    "domain": "prev_content_keys",
+    "vault": "utf8(vault_id)",
+    "id": "(empty)",
+    "version": "u64_be(generation)"
+  },
+  "aad_hex": "010000000c737564702f76312f6974656d00000011707265765f636f6e74656e745f6b65797300000014766c745f707265765f6b6579735f766563746f7200000000000000080000000000000003",
+  "current_content_key_b64": "REREREREREREREREREREREREREREREREREREREREREQ=",
+  "prev_keys_newest_first": [
+    {
+      "k": "Q0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0M=",
+      "items_as_given": [
+        [
+          "hBVW1yFYQ9aIxjcB-PeisTpr_EYtjQFXysiLCq7bN6k",
+          1
+        ],
+        [
+          "25fAyYNRxgkF3WqLCKweefkv-JCd5UECrQP7LCgApiQ",
+          4
+        ],
+        [
+          "ag_abcdefghijklmnopqrstuvwxyz234567",
+          2
+        ]
+      ]
+    },
+    {
+      "k": "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI=",
+      "items_as_given": [
+        [
+          "25fAyYNRxgkF3WqLCKweefkv-JCd5UECrQP7LCgApiQ",
+          3
+        ],
+        [
+          "hBVW1yFYQ9aIxjcB-PeisTpr_EYtjQFXysiLCq7bN6k",
+          1
+        ]
+      ]
+    },
+    {
+      "k": "QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE=",
+      "items_as_given": [
+        [
+          "25fAyYNRxgkF3WqLCKweefkv-JCd5UECrQP7LCgApiQ",
+          2
+        ]
+      ]
+    }
+  ],
+  "plaintext": "{\"v\":1,\"keys\":[{\"k\":\"Q0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0M=\",\"items\":[[\"25fAyYNRxgkF3WqLCKweefkv-JCd5UECrQP7LCgApiQ\",4],[\"ag_abcdefghijklmnopqrstuvwxyz234567\",2],[\"hBVW1yFYQ9aIxjcB-PeisTpr_EYtjQFXysiLCq7bN6k\",1]]},{\"k\":\"QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI=\",\"items\":[[\"25fAyYNRxgkF3WqLCKweefkv-JCd5UECrQP7LCgApiQ\",3],[\"hBVW1yFYQ9aIxjcB-PeisTpr_EYtjQFXysiLCq7bN6k\",1]]},{\"k\":\"QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE=\",\"items\":[[\"25fAyYNRxgkF3WqLCKweefkv-JCd5UECrQP7LCgApiQ\",2]]}]}",
+  "sealed_b64": "AUIjkUX7CNcWqVWeAkudyFsHk49QTlYAKakc+HN5QCVE8Qf17gFdmvDCRRVXCspGG99F54MHEudP+5RvoglwBPfuNQnxhWhSRTK5Cd3vqRTPL9W6MpYYGL+N2y34vDYSd3/uWwwPNIW1fy0fwMcfYWLe6dOy9hZlVkyW8iX/CLfKxHYHw66VcXUqtp8x+dlMBj9PoIxB0r4/KsFxKyPNQ8rqXWrowSmBuhes7W9m2kXPB8nMkJd6O79lKraN+2NgouEepuBWE519f1MFAZyJfpWnvM8D1m5d9SESHtegTaNm52hsSR0TWUUtpmnXQL530AbEWaY9mlVBTDODUFc576gqqPPJu/JbdsGkLK/zJ34lc5i7Z45vjO6fLEkN9tIBGxRgZLRmL3QIhAON8KUi3dnhIqQwar+tbP+mNe3/dZ2f3aE2Kmzb8VfFVYFsl4/MJ46Mowh61GHE3NJgc71vMOWt1I0HUWetqYozdhXwzfKw/hznA3K0OQt5jQ4jcpXpnJrKx02Qc837HHQeWstBdgON7Mhe8vpYsHrEoV1xbZdIeWZm1UwKfToEIhynRJ3W1CGLcg6Hvj09rvpDhu8G1rFJdIM2cHTdH0pTtyhA6HrTvjxuKaamjDwUh33LGrvnbH54b9X3dVE9gFDF2icegZWbHfFyKjBGhZhUAZAW/fUtSPcWbuE2Jg2L9vJkks2EfimeB0cZzKeCAA==",
+  "sealed_layout": "suite(1) || nonce(24) || ciphertext || tag(16)"
+}

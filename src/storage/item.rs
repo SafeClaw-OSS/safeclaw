@@ -208,7 +208,8 @@ impl<'a> VaultKeys<'a> {
 }
 
 /// One previous content key and the rows that existed when it was retired.
-/// Encoded `key(32) ‖ u32be(n) ‖ n × (u16be(len) ‖ wire id ‖ u64be(version))`.
+/// Encoded `key(32) ‖ u32be(n) ‖ n × (u16be(len) ‖ wire id ‖ u64be(version)
+/// ‖ sha256(ct)(32))`.
 #[derive(Clone, Copy)]
 pub struct PrevKey<'a> {
     pub key: &'a [u8],
@@ -218,14 +219,15 @@ pub struct PrevKey<'a> {
 
 impl PrevKey<'_> {
     /// Whether the row at `wire` (its id as `/items` carries it) at `version`
-    /// existed when this key was retired: the only rows it opens.
-    pub fn lists(&self, wire: &str, version: u64) -> bool {
+    /// with ciphertext digest `ct_sha256` (SHA-256 of the row's decoded ct
+    /// bytes) existed when this key was retired: the only rows it opens.
+    pub fn lists(&self, wire: &str, version: u64, ct_sha256: &[u8; 32]) -> bool {
         let mut rest = self.rows;
         for _ in 0..self.n {
-            let Some((w, v, r)) = split_listed_row(rest) else {
+            let Some((w, v, h, r)) = split_listed_row(rest) else {
                 return false;
             };
-            if v == version && w == wire.as_bytes() {
+            if v == version && h == ct_sha256 && w == wire.as_bytes() {
                 return true;
             }
             rest = r;
@@ -234,11 +236,15 @@ impl PrevKey<'_> {
     }
 }
 
-fn split_listed_row(b: &[u8]) -> Option<(&[u8], u64, &[u8])> {
+/// Length of one listed row's ciphertext digest.
+const ROW_DIGEST_LEN: usize = 32;
+
+fn split_listed_row(b: &[u8]) -> Option<(&[u8], u64, &[u8], &[u8])> {
     let len = u16::from_be_bytes(b.get(..2)?.try_into().ok()?) as usize;
     let wire = b.get(2..2 + len)?;
     let version = u64::from_be_bytes(b.get(2 + len..10 + len)?.try_into().ok()?);
-    Some((wire, version, &b[10 + len..]))
+    let digest = b.get(10 + len..10 + len + ROW_DIGEST_LEN)?;
+    Some((wire, version, digest, &b[10 + len + ROW_DIGEST_LEN..]))
 }
 
 fn split_prev_key(b: &[u8]) -> Option<(PrevKey<'_>, &[u8])> {
@@ -247,7 +253,7 @@ fn split_prev_key(b: &[u8]) -> Option<(PrevKey<'_>, &[u8])> {
     let start = &b[SINGLE_KEY_LEN + 4..];
     let mut rest = start;
     for _ in 0..n {
-        rest = split_listed_row(rest)?.2;
+        rest = split_listed_row(rest)?.3;
     }
     let rows = &start[..start.len() - rest.len()];
     Some((PrevKey { key, n, rows }, rest))
@@ -261,6 +267,13 @@ fn prev_section_ok(mut b: &[u8]) -> bool {
         }
     }
     true
+}
+
+/// SHA-256 of a row's decoded ciphertext bytes, as a retired key's list
+/// names the row.
+pub fn ct_sha256(ct: &[u8]) -> [u8; 32] {
+    use sha2::Digest;
+    Sha256::digest(ct).into()
 }
 
 /// Length of a single vault key `K` (a v1 vault: id-seed and content key in
@@ -285,8 +298,9 @@ fn prev_content_keys_ctx<'a>(vault: &'a [u8], version: &'a [u8; 8]) -> SealCtx<'
 
 /// The plaintext of the previous content keys, newest first: compact JSON
 /// `{"v":1,"keys":[{"k":"<std base64 of the 32-byte key>","items":[["<wire
-/// id>",<version>],…]},…]}`, `items` = every row of the vault (tombstones
-/// included) when the re-key retired that key, sorted by wire id then version.
+/// id>",<version>,"<std base64 SHA-256 of the row's decoded ct bytes>"],…]},…]}`,
+/// `items` = every row of the vault (tombstones included) when the re-key
+/// retired that key, sorted by wire id then version.
 #[derive(Serialize, Deserialize)]
 struct PrevContentKeys {
     v: u64,
@@ -296,7 +310,7 @@ struct PrevContentKeys {
 #[derive(Serialize, Deserialize)]
 struct PrevKeyEntry {
     k: String,
-    items: Vec<(String, u64)>,
+    items: Vec<(String, u64, String)>,
 }
 
 impl Drop for PrevKeyEntry {
@@ -308,8 +322,10 @@ impl Drop for PrevKeyEntry {
 /// Open a vault's previous content keys (`uik_prev_content_ct`, decoded):
 /// sealed with the item AEAD under the current content key `content` for this
 /// vault and the current `generation`. Returns them encoded as
-/// [`PrevKey`]s, newest first. `Err` unless it opens to version 1 with every
-/// key 32 bytes.
+/// [`PrevKey`]s, newest first, in a zeroized buffer of exactly their size.
+/// `Err` unless it opens to version 1 with every key 32 bytes and every row
+/// digest 32 bytes. What fails to parse is said only as a malformed list:
+/// the plaintext holds key material.
 pub fn open_prev_content_keys<S: PrimitiveSuite>(
     content: &[u8],
     vault_id: &str,
@@ -317,7 +333,7 @@ pub fn open_prev_content_keys<S: PrimitiveSuite>(
     sealed: &[u8],
 ) -> Result<zeroize::Zeroizing<Vec<u8>>> {
     use base64::engine::general_purpose::STANDARD;
-    let bad = |why: String| AppError::Unauthorized(format!("previous content keys: {}", why));
+    let bad = |why: &str| AppError::Unauthorized(format!("previous content keys: {}", why));
     let version = generation.to_be_bytes();
     let pt = zeroize::Zeroizing::new(
         unseal_record::<S>(
@@ -325,40 +341,59 @@ pub fn open_prev_content_keys<S: PrimitiveSuite>(
             &prev_content_keys_ctx(vault_id.as_bytes(), &version),
             sealed,
         )
-        .map_err(|e| bad(e.to_string()))?,
+        .map_err(|_| bad("they do not open"))?,
     );
-    let parsed: PrevContentKeys = serde_json::from_slice(&pt).map_err(|e| bad(e.to_string()))?;
+    let parsed: PrevContentKeys = serde_json::from_slice(&pt).map_err(|_| bad("malformed list"))?;
     if parsed.v != 1 {
-        return Err(bad("not version 1".into()));
+        return Err(bad("malformed list"));
     }
-    let mut out = zeroize::Zeroizing::new(Vec::new());
+    // The exact size, so the buffer never grows (no copy of a key is left
+    // behind in a freed allocation).
+    let mut size = 0usize;
     for entry in &parsed.keys {
-        let key = zeroize::Zeroizing::new(STANDARD.decode(&entry.k).map_err(|e| bad(e.to_string()))?);
-        if key.len() != SINGLE_KEY_LEN {
-            return Err(bad("a key is not 32 bytes".into()));
+        u32::try_from(entry.items.len()).map_err(|_| bad("malformed list"))?;
+        size += SINGLE_KEY_LEN + 4;
+        for (wire, _, _) in &entry.items {
+            u16::try_from(wire.len()).map_err(|_| bad("malformed list"))?;
+            size += 2 + wire.len() + 8 + ROW_DIGEST_LEN;
         }
-        let n = u32::try_from(entry.items.len()).map_err(|_| bad("too many rows".into()))?;
+    }
+    let mut out = zeroize::Zeroizing::new(Vec::with_capacity(size));
+    for entry in &parsed.keys {
+        let key = zeroize::Zeroizing::new(
+            STANDARD
+                .decode(&entry.k)
+                .map_err(|_| bad("malformed list"))?,
+        );
+        if key.len() != SINGLE_KEY_LEN {
+            return Err(bad("malformed list"));
+        }
         out.extend_from_slice(&key);
-        out.extend_from_slice(&n.to_be_bytes());
-        for (wire, version) in &entry.items {
-            let len = u16::try_from(wire.len()).map_err(|_| bad("a row id is too long".into()))?;
-            out.extend_from_slice(&len.to_be_bytes());
+        out.extend_from_slice(&(entry.items.len() as u32).to_be_bytes());
+        for (wire, version, digest) in &entry.items {
+            let digest = STANDARD.decode(digest).map_err(|_| bad("malformed list"))?;
+            if digest.len() != ROW_DIGEST_LEN {
+                return Err(bad("malformed list"));
+            }
+            out.extend_from_slice(&(wire.len() as u16).to_be_bytes());
             out.extend_from_slice(wire.as_bytes());
             out.extend_from_slice(&version.to_be_bytes());
+            out.extend_from_slice(&digest);
         }
     }
+    debug_assert_eq!(out.len(), size);
     Ok(out)
 }
 
 /// Seal a vault's previous content keys (newest first, each with the rows it
-/// retired with) the way an owner does. This process never seals them (the
-/// owner's console does); tests only.
+/// retired with: wire id, version, decoded ct) the way an owner does. This
+/// process never seals them (the owner's console does); tests only.
 #[cfg(test)]
 pub fn seal_prev_content_keys<S: PrimitiveSuite>(
     content: &[u8],
     vault_id: &str,
     generation: u64,
-    keys: &[(&[u8], &[(&str, u64)])],
+    keys: &[(&[u8], &[(&str, u64, &[u8])])],
 ) -> Vec<u8> {
     use base64::engine::general_purpose::STANDARD;
     let version = generation.to_be_bytes();
@@ -368,7 +403,10 @@ pub fn seal_prev_content_keys<S: PrimitiveSuite>(
             .iter()
             .map(|(k, rows)| PrevKeyEntry {
                 k: STANDARD.encode(k),
-                items: rows.iter().map(|(w, v)| (w.to_string(), *v)).collect(),
+                items: rows
+                    .iter()
+                    .map(|(w, v, ct)| (w.to_string(), *v, STANDARD.encode(ct_sha256(ct))))
+                    .collect(),
             })
             .collect(),
     })
@@ -1179,11 +1217,12 @@ pub fn unseal_item<S: PrimitiveSuite>(
 /// Unseal the stored row at `wire` (its id as `/items` carries it) under
 /// `keys`: with the current content key, else (a row a re-key has not moved
 /// yet) with a previous key this member holds that lists this row at this
-/// version (it existed when that key was retired), newest first. A row that
-/// opens only under a previous key that does not list it is unreadable. The
-/// flag: it opened only under a previous key. Every read of a row goes
-/// through here; every write seals under `keys.content`, so a row read
-/// through a previous key is never written back under it.
+/// version with this ciphertext (it existed, exactly so, when that key was
+/// retired), newest first. A row that opens only under a previous key that
+/// does not list it is unreadable. The flag: it opened only under a previous
+/// key. Every read of a row goes through here; every write seals under
+/// `keys.content`, so a row read through a previous key is never written
+/// back under it.
 pub fn unseal_item_keys<S: PrimitiveSuite>(
     keys: VaultKeys,
     wire: &str,
@@ -1192,11 +1231,37 @@ pub fn unseal_item_keys<S: PrimitiveSuite>(
 ) -> Result<(ItemPayload, bool)> {
     match unseal_item::<S>(keys.content, ctx, sealed) {
         Ok(p) => Ok((p, false)),
+        Err(e) if keys.prev.is_empty() => Err(e),
+        Err(e) => {
+            let digest = ct_sha256(sealed);
+            keys.prev_keys()
+                .filter(|prev| prev.lists(wire, ctx.version(), &digest))
+                .find_map(|prev| unseal_item::<S>(prev.key, ctx, sealed).ok())
+                .map(|p| (p, true))
+                .ok_or(e)
+        }
+    }
+}
+
+/// Open a dirty row of this device's own (a change it sealed and has not
+/// sent yet) at `wire`: with the current content key, else with any
+/// previous key this member holds. A retired key's list names the rows the
+/// vault held, which a change made here after that never is; this device
+/// knows its own change.
+pub fn open_own_wire_item<S: PrimitiveSuite>(
+    keys: VaultKeys,
+    vault_id: &str,
+    wire: &str,
+    version: u64,
+    sealed: &[u8],
+) -> Result<ItemPayload> {
+    let raw = aad_id_from_wire::<S>(keys.id_seed, wire)?;
+    let ctx = ItemCtx::new(vault_id, raw, version);
+    match unseal_item::<S>(keys.content, &ctx, sealed) {
+        Ok(p) => Ok(p),
         Err(e) => keys
             .prev_keys()
-            .filter(|prev| prev.lists(wire, ctx.version()))
-            .find_map(|prev| unseal_item::<S>(prev.key, ctx, sealed).ok())
-            .map(|p| (p, true))
+            .find_map(|prev| unseal_item::<S>(prev.key, &ctx, sealed).ok())
             .ok_or(e),
     }
 }
@@ -1895,18 +1960,24 @@ mod tests {
     /// The previous content keys a keyset row carries: the item AEAD under
     /// the current content key, AAD {domain "prev_content_keys", vault, id
     /// empty, version u64be(current generation)}, over the compact JSON
-    /// `{"v":1,"keys":[{"k":<std base64 key>,"items":[[<wire id>,<version>],…]},…]}`,
-    /// newest first. They open here in that order with their rows; another
-    /// generation, vault, content key or domain does not open them, and
-    /// anything but version 1 with 32-byte keys is refused.
+    /// `{"v":1,"keys":[{"k":<std base64 key>,"items":[[<wire id>,<version>,<std
+    /// base64 SHA-256 of the row's ct>],…]},…]}`, newest first. They open here
+    /// in that order with their rows; another generation, vault, content key
+    /// or domain does not open them, and anything but version 1 with 32-byte
+    /// keys and 32-byte row digests is refused as a malformed list.
     #[test]
     fn prev_content_keys_format() {
         use base64::engine::general_purpose::STANDARD;
         let content = [0x7cu8; 32];
         let (n1, n2) = ([0x6bu8; 32], [0x5cu8; 32]);
         let vault = "vlt_prev_vector";
-        let r1: &[(&str, u64)] = &[("ag_abcdefghijklmnopqrstuvwxyz234567", 2), ("aaaa", 1), ("aaaa", 3)];
-        let r2: &[(&str, u64)] = &[];
+        let (ct_a, ct_b, ct_c) = (b"ct-a".as_slice(), b"ct-b".as_slice(), b"ct-c".as_slice());
+        let r1: &[(&str, u64, &[u8])] = &[
+            ("ag_abcdefghijklmnopqrstuvwxyz234567", 2, ct_a),
+            ("aaaa", 1, ct_b),
+            ("aaaa", 3, ct_c),
+        ];
+        let r2: &[(&str, u64, &[u8])] = &[];
         let sealed = seal_prev_content_keys::<StdPrimitives>(&content, vault, 3, &[(&n1, r1), (&n2, r2)]);
         // The plaintext, byte for byte.
         let version = 3u64.to_be_bytes();
@@ -1916,11 +1987,15 @@ mod tests {
             &sealed,
         )
         .unwrap();
+        let h = |ct: &[u8]| STANDARD.encode(ct_sha256(ct));
         assert_eq!(
             String::from_utf8(pt).unwrap(),
             format!(
-                r#"{{"v":1,"keys":[{{"k":"{}","items":[["ag_abcdefghijklmnopqrstuvwxyz234567",2],["aaaa",1],["aaaa",3]]}},{{"k":"{}","items":[]}}]}}"#,
+                r#"{{"v":1,"keys":[{{"k":"{}","items":[["ag_abcdefghijklmnopqrstuvwxyz234567",2,"{}"],["aaaa",1,"{}"],["aaaa",3,"{}"]]}},{{"k":"{}","items":[]}}]}}"#,
                 STANDARD.encode(n1),
+                h(ct_a),
+                h(ct_b),
+                h(ct_c),
                 STANDARD.encode(n2)
             )
         );
@@ -1931,10 +2006,14 @@ mod tests {
         let prev: Vec<PrevKey> = keys.prev_keys().collect();
         assert_eq!(prev.len(), 2);
         assert_eq!((prev[0].key, prev[1].key), (&n1[..], &n2[..]));
-        assert!(prev[0].lists("ag_abcdefghijklmnopqrstuvwxyz234567", 2));
-        assert!(prev[0].lists("aaaa", 1) && prev[0].lists("aaaa", 3));
-        assert!(!prev[0].lists("aaaa", 2) && !prev[0].lists("aaab", 1));
-        assert!(!prev[1].lists("aaaa", 1));
+        assert!(prev[0].lists("ag_abcdefghijklmnopqrstuvwxyz234567", 2, &ct_sha256(ct_a)));
+        assert!(prev[0].lists("aaaa", 1, &ct_sha256(ct_b)));
+        assert!(prev[0].lists("aaaa", 3, &ct_sha256(ct_c)));
+        // All three must match.
+        assert!(!prev[0].lists("aaaa", 1, &ct_sha256(ct_c)), "another ciphertext");
+        assert!(!prev[0].lists("aaaa", 2, &ct_sha256(ct_b)), "another version");
+        assert!(!prev[0].lists("aaab", 1, &ct_sha256(ct_b)), "another row");
+        assert!(!prev[1].lists("aaaa", 1, &ct_sha256(ct_b)), "another key");
         assert!(open_prev_content_keys::<StdPrimitives>(&content, vault, 4, &sealed).is_err());
         assert!(open_prev_content_keys::<StdPrimitives>(&content, "vlt_other", 3, &sealed).is_err());
         assert!(open_prev_content_keys::<StdPrimitives>(&n1, vault, 3, &sealed).is_err());
@@ -1952,25 +2031,83 @@ mod tests {
             .unwrap()
         };
         let open = |sealed: &[u8]| open_prev_content_keys::<StdPrimitives>(&content, vault, 3, sealed);
-        // Another domain does not open; the plain key list (never released)
-        // is not this format.
+        let malformed = |sealed: &[u8]| {
+            open(sealed).err().map(|e| e.to_string()).is_some_and(|e| e.ends_with("previous content keys: malformed list"))
+        };
+        // Another domain does not open.
         let other_domain = seal_json("prev_content_key", r#"{"v":1,"keys":[]}"#);
         assert!(open(&other_domain).is_err());
-        let plain_list = seal_json(PREV_CONTENT_KEYS_DOMAIN, &format!(r#"{{"v":1,"keys":["{}"]}}"#, STANDARD.encode(n1)));
-        assert!(open(&plain_list).is_err());
-        // Another version, a key of another length: refused. None: none.
-        let v2 = seal_json(PREV_CONTENT_KEYS_DOMAIN, &format!(r#"{{"v":2,"keys":[{{"k":"{}","items":[]}}]}}"#, STANDARD.encode(n1)));
-        assert!(open(&v2).is_err());
-        let short = seal_json(PREV_CONTENT_KEYS_DOMAIN, &format!(r#"{{"v":1,"keys":[{{"k":"{}","items":[]}}]}}"#, STANDARD.encode([1u8; 16])));
-        assert!(open(&short).is_err());
+        // Earlier shapes (never released), another version, a key or a row
+        // digest of another length: a malformed list, said as only that.
+        let k1 = STANDARD.encode(n1);
+        for json in [
+            format!(r#"{{"v":1,"keys":["{}"]}}"#, k1),
+            format!(r#"{{"v":1,"keys":[{{"k":"{}","items":[["aaaa",1]]}}]}}"#, k1),
+            format!(r#"{{"v":2,"keys":[{{"k":"{}","items":[]}}]}}"#, k1),
+            format!(r#"{{"v":1,"keys":[{{"k":"{}","items":[]}}]}}"#, STANDARD.encode([1u8; 16])),
+            format!(r#"{{"v":1,"keys":[{{"k":"{}","items":[["aaaa",1,"{}"]]}}]}}"#, k1, STANDARD.encode([1u8; 16])),
+            format!(r#"{{"v":1,"keys":[{{"k":"not base64!","items":[]}}]}}"#),
+        ] {
+            assert!(malformed(&seal_json(PREV_CONTENT_KEYS_DOMAIN, &json)), "{}", json);
+        }
         let none = seal_json(PREV_CONTENT_KEYS_DOMAIN, r#"{"v":1,"keys":[]}"#);
         assert!(open(&none).unwrap().is_empty());
+        // The buffer is exactly the encoded size.
+        assert_eq!(section.len(), section.capacity());
+    }
+
+    /// The console's vector (`testdata/prev-keys-vector.json`, made by
+    /// running the console's own code): its sealed list opens here to its
+    /// plaintext, and every row it lists is listed under its key. If this
+    /// fails, the two sides diverged: do not edit the vector.
+    #[test]
+    #[ignore = "until testdata/prev-keys-vector.json is the console's vector with [wire id, version, digest] rows"]
+    fn prev_content_keys_console_vector() {
+        use base64::engine::general_purpose::STANDARD;
+        let v: serde_json::Value =
+            serde_json::from_str(include_str!("testdata/prev-keys-vector.json")).unwrap();
+        let vault = v["vault_id"].as_str().unwrap();
+        let generation = v["generation"].as_u64().unwrap();
+        let content = STANDARD
+            .decode(v["current_content_key_b64"].as_str().unwrap())
+            .unwrap();
+        let sealed = STANDARD.decode(v["sealed_b64"].as_str().unwrap()).unwrap();
+        let version = generation.to_be_bytes();
+        let pt = unseal_record::<StdPrimitives>(
+            &content,
+            &prev_content_keys_ctx(vault.as_bytes(), &version),
+            &sealed,
+        )
+        .unwrap();
+        assert_eq!(std::str::from_utf8(&pt).unwrap(), v["plaintext"].as_str().unwrap());
+        let section =
+            open_prev_content_keys::<StdPrimitives>(&content, vault, generation, &sealed).unwrap();
+        let mut material = vault_key_bundle(&[0u8; 32], &content);
+        material.extend_from_slice(&section);
+        let keys = VaultKeys::from_material(&material);
+        let prev: Vec<PrevKey> = keys.prev_keys().collect();
+        let plain: serde_json::Value = serde_json::from_slice(&pt).unwrap();
+        let entries = plain["keys"].as_array().unwrap();
+        assert_eq!(prev.len(), entries.len());
+        for (p, e) in prev.iter().zip(entries) {
+            assert_eq!(STANDARD.encode(p.key), e["k"].as_str().unwrap());
+            for item in e["items"].as_array().unwrap() {
+                let digest: [u8; 32] = STANDARD
+                    .decode(item[2].as_str().unwrap())
+                    .unwrap()
+                    .try_into()
+                    .unwrap();
+                assert!(p.lists(item[0].as_str().unwrap(), item[1].as_u64().unwrap(), &digest));
+            }
+        }
     }
 
     /// Key material with the previous content keys splits back into the
     /// bundle and the keys, newest first; a read tries the current key, then
-    /// each previous key that lists the row at its version; a row a key does
-    /// not list is unreadable under it; a write never seals under one.
+    /// each previous key that lists the row at its version with its
+    /// ciphertext; a row a key does not list so is unreadable under it; a
+    /// write never seals under one. This device's own change opens under
+    /// any key it holds.
     #[test]
     fn material_with_prev_reads_only_the_rows_a_key_retired_with() {
         let (seed, older, old, new) = ([1u8; 32], [4u8; 32], [2u8; 32], [3u8; 32]);
@@ -1979,12 +2116,16 @@ mod tests {
             ItemCtx::for_item::<StdPrimitives>(&seed, vault, ItemNs::Secret, name, v).unwrap()
         };
         let (a, b) = (ctx("A", 1).item_id_b64(), ctx("B", 1).item_id_b64());
+        let p = |name: &str| ItemPayload::secret_live(name, "x");
+        let under = |k: &[u8], name: &str, v: u64| seal_item::<StdPrimitives>(k, &ctx(name, v), &p(name)).unwrap();
+        // The rows as the vault held them when each key retired.
+        let (a_old, b_older) = (under(&old, "A", 1), under(&older, "B", 1));
         let bundle = zeroize::Zeroizing::new(vault_key_bundle(&seed, &new));
         let sealed = seal_prev_content_keys::<StdPrimitives>(
             &new,
             vault,
             2,
-            &[(&old, &[(a.as_str(), 1)]), (&older, &[(b.as_str(), 1)])],
+            &[(&old, &[(a.as_str(), 1, a_old.as_slice())]), (&older, &[(b.as_str(), 1, b_older.as_slice())])],
         );
         // No seal, a seal for another generation: the bundle alone.
         for (gen, s) in [(2u64, &[][..]), (3, sealed.as_slice())] {
@@ -2003,22 +2144,27 @@ mod tests {
         assert!(VaultKeys::from_material(&torn).prev.is_empty());
         assert_eq!(VaultKeys::from_material(&m[..40]).content.len(), 40);
 
-        let p = |name: &str| ItemPayload::secret_live(name, "x");
-        let under = |k: &[u8], name: &str, v: u64| seal_item::<StdPrimitives>(k, &ctx(name, v), &p(name)).unwrap();
         let read = |name: &str, wire: &str, v: u64, ct: &[u8]| {
             unseal_item_keys::<StdPrimitives>(keys, wire, &ctx(name, v), ct).map(|(_, prev)| prev)
         };
         assert!(!read("A", &a, 1, &under(&new, "A", 1)).unwrap());
-        // Listed under the key that sealed it: read through it.
-        assert!(read("A", &a, 1, &under(&old, "A", 1)).unwrap());
-        assert!(read("B", &b, 1, &under(&older, "B", 1)).unwrap());
-        // Another version, another row, or listed under another key: unreadable.
+        // Listed under the key that sealed it, this very ciphertext: read.
+        assert!(read("A", &a, 1, &a_old).unwrap());
+        assert!(read("B", &b, 1, &b_older).unwrap());
+        // Another ciphertext of the same row and version (sealed again under
+        // the retired key), another version, another row, or listed under
+        // another key: unreadable.
+        assert!(read("A", &a, 1, &under(&old, "A", 1)).is_err());
         assert!(read("A", &a, 2, &under(&old, "A", 2)).is_err());
         assert!(read("B", &b, 1, &under(&old, "B", 1)).is_err());
         assert!(read("A", &a, 1, &under(&older, "A", 1)).is_err());
         assert!(read("A", &a, 1, &under(&[9u8; 32], "A", 1)).is_err());
         let current_only = VaultKeys { prev: &[], ..keys };
-        assert!(unseal_item_keys::<StdPrimitives>(current_only, &a, &ctx("A", 1), &under(&old, "A", 1)).is_err());
+        assert!(unseal_item_keys::<StdPrimitives>(current_only, &a, &ctx("A", 1), &a_old).is_err());
+        // This device's own change, sealed under a key it held: it opens it.
+        let own = under(&old, "A", 2);
+        assert!(open_own_wire_item::<StdPrimitives>(keys, vault, &a, 2, &own).is_ok());
+        assert!(open_own_wire_item::<StdPrimitives>(keys, vault, &a, 2, &under(&[9u8; 32], "A", 2)).is_err());
         // A write under these keys seals under the current key.
         let written = seal_wire_item::<StdPrimitives>(keys, vault, &a, 2, &p("A")).unwrap();
         assert!(open_wire_item::<StdPrimitives>(current_only, vault, &a, 2, &written).is_ok());
