@@ -1571,6 +1571,10 @@ struct AuditEventWire {
     target: Option<String>, // ceremony subject (key name / connection id)
     #[serde(skip_serializing_if = "Option::is_none")]
     agent_id: Option<String>, // agent api-key PREFIX (= cloud api_keys.prefix)
+    /// Why a denied request was refused: its ScCode wire name only, never
+    /// the local free-text reason.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code: Option<String>,
 }
 
 fn event_from_row(row: &crate::audit::ApprovalRow) -> AuditEventWire {
@@ -1590,6 +1594,7 @@ fn event_from_row(row: &crate::audit::ApprovalRow) -> AuditEventWire {
         action,
         target: row.target.clone(),
         agent_id: row.agent_prefix.clone(),
+        code: row.code.clone(),
     }
 }
 
@@ -8156,6 +8161,35 @@ mod tests {
 
     /// The format gate reads every format up to and including the one this
     /// build knows, and only a NEWER one trips the loud upgrade path.
+    /// A refused request ships with why, as its code only: the destination
+    /// host as its target, never the local free-text reason.
+    #[test]
+    fn an_audit_event_carries_the_refusal_code_and_no_reason() {
+        let row = crate::audit::ApprovalRow {
+            id: "op-1".into(),
+            created_at: 1,
+            decided_at: Some(2),
+            expires_at: 3,
+            status: crate::audit::STATUS_DENIED.into(),
+            act_kind: "use".into(),
+            service: Some("github".into()),
+            method: Some("GET".into()),
+            path: Some("/repos".into()),
+            target: Some("evil.example".into()),
+            reason: Some("free text".into()),
+            credential_id: None,
+            upstream_status: None,
+            agent_prefix: None,
+            code: Some("host_not_anchored".into()),
+        };
+        let v = serde_json::to_value(event_from_row(&row)).unwrap();
+        assert_eq!(v["decision"], "denied");
+        assert_eq!(v["code"], "host_not_anchored");
+        assert_eq!(v["target"], "evil.example");
+        assert_eq!(v["action"], "GET /repos");
+        assert!(v.get("reason").is_none());
+    }
+
     #[test]
     fn vault_format_gate_trips_only_above_supported() {
         for f in 0..=SUPPORTED_VAULT_FORMAT {

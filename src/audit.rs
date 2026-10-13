@@ -68,6 +68,9 @@ CREATE TABLE IF NOT EXISTS approvals (
     -- Use row (= api_keys.prefix in the cloud). NULL for ceremonies and
     -- CLI-initiated ops. Never the full key.
     agent_prefix    TEXT,
+    -- Why a request was refused, as its ScCode wire name (`host_forbidden`,
+    -- `host_not_anchored`, `policy_denied`). NULL otherwise. Never free text.
+    code            TEXT,
     -- De-daemon (DE_DAEMON.md §4): cloud audit-shipper outbox flag.
     -- 0 = not yet shipped to the cloud `audit_events` table; 1 = shipped.
     synced          INTEGER NOT NULL DEFAULT 0
@@ -103,6 +106,11 @@ pub struct ApprovalRow {
     pub upstream_status: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_prefix: Option<String>,
+    /// Why a `denied` request was refused: the ScCode wire name
+    /// (`host_forbidden`, `host_not_anchored`, `policy_denied`). Only the
+    /// code, never free text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
 }
 
 /// First 16 chars of an agent api-key — the non-secret identity handle the
@@ -124,6 +132,20 @@ pub fn row_from_op(
     let act_kind = crate::protocol::operation::discriminator(&op.act);
     let scope = &op.act.scope;
     let pick = |k: &str| scope.get(k).and_then(|v| v.as_str()).map(|s| s.to_string());
+    // A host change (widen-host / narrow-host) names its connection and host
+    // in its scope: shown as the row's service and target.
+    let host_op = matches!(
+        &op.act.kind,
+        crate::protocol::operation::ActType::Custom(n) if n == "widen-host" || n == "narrow-host"
+    );
+    let (service, target) = if host_op {
+        (pick("connection_id"), pick("host"))
+    } else {
+        (
+            pick("service"),
+            (!op.act.target.is_empty()).then(|| op.act.target.clone()),
+        )
+    };
     ApprovalRow {
         id: id.to_string(),
         created_at,
@@ -131,20 +153,17 @@ pub fn row_from_op(
         expires_at,
         status: STATUS_PENDING.into(),
         act_kind,
-        service: pick("service"),
+        service,
         method: pick("method"),
         path: pick("path"),
-        target: if op.act.target.is_empty() {
-            None
-        } else {
-            Some(op.act.target.clone())
-        },
+        target,
         reason: None,
         credential_id: None,
         upstream_status: None,
         // Stamped by the caller when the op came through the broker with an
         // authenticated agent key; ceremonies / CLI-initiated ops stay None.
         agent_prefix: None,
+        code: None,
     }
 }
 
@@ -177,6 +196,8 @@ impl AuditStore {
         );
         // Additive `agent_prefix` (0.9.48-rc.6) — same idempotent-ALTER idiom.
         let _ = conn.execute("ALTER TABLE approvals ADD COLUMN agent_prefix TEXT", []);
+        // Additive `code` (1.1.0): why a request was refused — same idiom.
+        let _ = conn.execute("ALTER TABLE approvals ADD COLUMN code TEXT", []);
         // Outbox scan index — created here (not in SCHEMA) so it always runs
         // AFTER `synced` is guaranteed to exist on both fresh and migrated DBs.
         // Partial: indexes only the unshipped rows the shipper actually scans.
@@ -198,8 +219,8 @@ impl AuditStore {
             "INSERT INTO approvals
              (id, created_at, decided_at, expires_at, status, act_kind,
               service, method, path, target, reason, credential_id,
-              upstream_status, agent_prefix)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+              upstream_status, agent_prefix, code)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 row.id,
                 row.created_at,
@@ -215,6 +236,7 @@ impl AuditStore {
                 row.credential_id,
                 row.upstream_status,
                 row.agent_prefix,
+                row.code,
             ],
         )
         .map_err(|e| AppError::Internal(format!("audit insert: {}", e)))?;
@@ -273,7 +295,7 @@ impl AuditStore {
             .prepare(&format!(
                 "SELECT id, created_at, decided_at, expires_at, status, act_kind,
                         service, method, path, target, reason, credential_id,
-                        upstream_status, agent_prefix
+                        upstream_status, agent_prefix, code
                  FROM approvals
                  WHERE synced = 0 {}AND status != 'pending'
                  ORDER BY created_at ASC
@@ -298,6 +320,7 @@ impl AuditStore {
                     credential_id: row.get(11)?,
                     upstream_status: row.get(12)?,
                     agent_prefix: row.get(13)?,
+                    code: row.get(14)?,
                 })
             })
             .map_err(|e| AppError::Internal(format!("audit unsynced query: {}", e)))?;
@@ -400,7 +423,7 @@ impl AuditStore {
         let sql = format!(
             "SELECT id, created_at, decided_at, expires_at, status, act_kind,
                     service, method, path, target, reason, credential_id,
-                    upstream_status, agent_prefix
+                    upstream_status, agent_prefix, code
              FROM approvals{}
              ORDER BY created_at DESC
              LIMIT ?{}",
@@ -430,6 +453,7 @@ impl AuditStore {
                     credential_id: row.get(11)?,
                     upstream_status: row.get(12)?,
                     agent_prefix: row.get(13)?,
+                    code: row.get(14)?,
                 })
             })
             .map_err(|e| AppError::Internal(format!("audit query: {}", e)))?;
@@ -598,6 +622,7 @@ mod tests {
             credential_id: None,
             upstream_status: None,
             agent_prefix: None,
+            code: None,
         }
     }
 
@@ -631,6 +656,65 @@ mod tests {
         s.mark_synced(&["op-use".into(), "op-write".into()])
             .unwrap();
         assert!(s.list_unsynced(10, true).unwrap().is_empty());
+    }
+
+    /// Why a request was refused rides its row as the ScCode wire name, kept
+    /// and read back (the list and the outbox); an audit.db from before the
+    /// column gains it on open, its rows reading none.
+    #[test]
+    fn a_refusal_code_is_kept_and_an_older_db_gains_the_column() {
+        let (_tmp, s) = fresh_store();
+        let mut blocked = row("op-blocked", STATUS_DENIED, 100);
+        blocked.target = Some("evil.example".into());
+        blocked.code = Some("host_not_anchored".into());
+        s.insert(&blocked).unwrap();
+        let listed = s.list(None, None, None, 10).unwrap();
+        assert_eq!(listed[0].code.as_deref(), Some("host_not_anchored"));
+        assert_eq!(listed[0].target.as_deref(), Some("evil.example"));
+        assert_eq!(
+            s.list_unsynced(10, false).unwrap()[0].code.as_deref(),
+            Some("host_not_anchored")
+        );
+
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().join("audit.db");
+        {
+            let old = Connection::open(&p).unwrap();
+            old.execute_batch(
+                "CREATE TABLE approvals (
+                    id TEXT PRIMARY KEY, created_at INTEGER NOT NULL, decided_at INTEGER,
+                    expires_at INTEGER NOT NULL, status TEXT NOT NULL, act_kind TEXT NOT NULL,
+                    service TEXT, method TEXT, path TEXT, target TEXT, reason TEXT,
+                    credential_id TEXT, upstream_status INTEGER);
+                 INSERT INTO approvals (id, created_at, expires_at, status, act_kind)
+                    VALUES ('old', 1, 2, 'denied', 'use');",
+            )
+            .unwrap();
+        }
+        let s = AuditStore::open(&p).unwrap();
+        let listed = s.list(None, None, None, 10).unwrap();
+        assert_eq!(listed[0].id, "old");
+        assert!(listed[0].code.is_none());
+        s.insert(&blocked).unwrap();
+        assert_eq!(s.list(None, None, None, 10).unwrap().len(), 2);
+    }
+
+    /// A host change's pending row names its connection as the service and
+    /// its host as the target.
+    #[test]
+    fn a_host_change_row_names_its_connection_and_host() {
+        let op: crate::protocol::operation::Operation = serde_json::from_value(serde_json::json!({
+            "act": { "type": { "custom": "widen-host" }, "target": "",
+                     "scope": { "connection_id": "github", "host": "api.example.com", "etld1": "example.com" } },
+            "bind": { "redeemer": "v1" },
+            "valid": { "iat": 0, "multiplicity": 1 }
+        }))
+        .unwrap();
+        let r = row_from_op("op-w", &op, 1, 2);
+        assert_eq!(r.act_kind, "custom:widen-host");
+        assert_eq!(r.service.as_deref(), Some("github"));
+        assert_eq!(r.target.as_deref(), Some("api.example.com"));
+        assert!(r.code.is_none());
     }
 
     #[test]

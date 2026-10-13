@@ -170,7 +170,7 @@ impl HttpHandler for BrokerHandler {
 
     async fn handle_response(&mut self, _ctx: &HttpContext, res: Response<Body>) -> Response<Body> {
         if let Some(p) = self.pending.take() {
-            write_forward_audit(&self.state, &p, res.status().as_u16());
+            write_forward_audit(&self.state, &p, res.status().as_u16(), None, None);
         }
         res
     }
@@ -548,12 +548,22 @@ impl BrokerHandler {
         // anchor (→ spurious widen-deny). For the synthesized default this
         // derives the service's declared hosts.
         let resolved_hosts = crate::core::host::resolved_hosts(&conn_rec, def.as_ref());
+        // The `denied` audit row every refusal below writes: the request as
+        // it came, with why (`code`).
+        let refused = AuditPending {
+            vault_id: vault_id.clone(),
+            service: service_id.clone(),
+            method: method.clone(),
+            path: path.clone(),
+            agent_prefix: self.agent_attribution(),
+        };
 
         // ── host anchor (exact FQDN), with the private-address floor beneath ─
         // The floor runs first, on every brokered request: the destination as
         // the client's URL parser reads it must be a canonical, public host
         // (`core::egress`), anchored or not.
         if !crate::core::egress::host_egress_allowed(&dest_host) {
+            write_forward_audit(&self.state, &refused, 0, Some(&dest_host), Some(ScCode::HostForbidden));
             return err_response(
                 ScCode::HostForbidden,
                 &format!(
@@ -564,6 +574,8 @@ impl BrokerHandler {
             .into();
         }
         if !crate::core::host::host_allowed(&dest_host, &resolved_hosts) {
+            // Refused whether or not the widen request below registers.
+            write_forward_audit(&self.state, &refused, 0, Some(&dest_host), Some(ScCode::HostNotAnchored));
             return self.widen_deny(&vault_id, &conn, &dest_host, ip).await;
         }
 
@@ -595,17 +607,7 @@ impl BrokerHandler {
                 &path,
                 rs,
             ) {
-                write_forward_audit(
-                    &self.state,
-                    &AuditPending {
-                        vault_id: vault_id.clone(),
-                        service: service_id.clone(),
-                        method: method.clone(),
-                        path: path.clone(),
-                        agent_prefix: self.agent_attribution(),
-                    },
-                    0,
-                );
+                write_forward_audit(&self.state, &refused, 0, None, Some(ScCode::PolicyDenied));
                 return err_response(ScCode::PolicyDenied, &problem).into();
             }
         }
@@ -640,17 +642,7 @@ impl BrokerHandler {
 
         use crate::core::policy::AccessLevel;
         if level == AccessLevel::Deny {
-            write_forward_audit(
-                &self.state,
-                &AuditPending {
-                    vault_id: vault_id.clone(),
-                    service: service_id.clone(),
-                    method: method.clone(),
-                    path: path.clone(),
-                    agent_prefix: self.agent_attribution(),
-                },
-                0,
-            );
+            write_forward_audit(&self.state, &refused, 0, None, Some(ScCode::PolicyDenied));
             return err_response(ScCode::PolicyDenied, "this request is blocked by policy").into();
         }
 
@@ -1672,8 +1664,15 @@ fn proxy_auth_challenge() -> Response<Body> {
 }
 
 /// Best-effort terminal audit row for a forwarded (or denied) request. Denies
-/// pass `upstream_status = 0`.
-fn write_forward_audit(state: &AppState, p: &AuditPending, upstream_status: u16) {
+/// pass `upstream_status = 0`, `target` (the destination host, for a host
+/// refusal) and `code` (why: its ScCode wire name, never free text).
+fn write_forward_audit(
+    state: &AppState,
+    p: &AuditPending,
+    upstream_status: u16,
+    target: Option<&str>,
+    code: Option<ScCode>,
+) {
     let Ok(store) = state.audits.for_vault(&p.vault_id) else {
         return;
     };
@@ -1693,7 +1692,7 @@ fn write_forward_audit(state: &AppState, p: &AuditPending, upstream_status: u16)
         service: Some(p.service.clone()),
         method: Some(p.method.clone()),
         path: Some(p.path.clone()),
-        target: None,
+        target: target.map(str::to_string),
         reason: None,
         credential_id: None,
         upstream_status: if upstream_status == 0 {
@@ -1702,6 +1701,7 @@ fn write_forward_audit(state: &AppState, p: &AuditPending, upstream_status: u16)
             Some(upstream_status as i64)
         },
         agent_prefix: p.agent_prefix.clone(),
+        code: code.map(|c| c.as_str().to_string()),
     };
     if let Err(e) = store.insert(&row) {
         tracing::warn!(vault = %p.vault_id, "proxy audit insert failed: {}", e);
