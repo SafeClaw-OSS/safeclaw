@@ -175,6 +175,18 @@ pub struct CreatedOp {
     pub op: Option<Value>,
 }
 
+/// When this CLI runs as an agent (`SAFECLAW_AGENT_IDENTITY` names its
+/// identity file), a proof of possession over exactly `op` for `vault`, so the
+/// approval names the agent instead of a bare terminal. The daemon verifies it
+/// and drops any unproven claim; this is display and consent information, not
+/// access control. `None` (no attribution) when there is no agent identity or
+/// the op does not parse.
+fn agent_op_token(vault: &str, op: &Value) -> Option<String> {
+    let signer = crate::agent_pop::signer_from_env()?;
+    let op: crate::protocol::operation::Operation = serde_json::from_value(op.clone()).ok()?;
+    signer.op_token(vault, &op, crate::util::now_unix())
+}
+
 /// [`create_op`] keeping the Export `waiter_secret`.
 pub async fn create_op_full(custodian: &str, vault: &str, op: &Value) -> Result<CreatedOp, String> {
     let client = http_client()?;
@@ -183,12 +195,11 @@ pub async fn create_op_full(custodian: &str, vault: &str, op: &Value) -> Result<
         custodian.trim_end_matches('/'),
         urlencoding::encode(vault)
     );
-    let resp = client
-        .post(&url)
-        .json(op)
-        .send()
-        .await
-        .map_err(|e| format!("create op: {}", e))?;
+    let mut req = client.post(&url).json(op);
+    if let Some(token) = agent_op_token(vault, op) {
+        req = req.header(crate::agent_pop::OP_POP_HEADER, token);
+    }
+    let resp = req.send().await.map_err(|e| format!("create op: {}", e))?;
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();

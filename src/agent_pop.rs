@@ -54,6 +54,58 @@ pub fn apiface_target(path_and_query: &str) -> String {
     format!("apiface:{}", path_and_query)
 }
 
+/// Request header carrying an agent's PoP token on the daemon's LOCAL op API
+/// (`POST /v/{vid}/op`, which the CLI ceremonies use: `sc unlock`, `sc secret
+/// get`, `sc connection add`, ...). Same token format as the proxy channel.
+pub const OP_POP_HEADER: &str = "x-sc-agent-pop";
+
+/// Build the PoP `target` that binds a token to ONE operation an agent asks
+/// the local op API to create: `op:` + base64url(SHA-256(canonical op bytes)),
+/// the canonical encoding the approval binding itself hashes
+/// (`Operation::canonical_bytes`). The vault id rides the signing input as
+/// usual, so a token for one op or vault never verifies for another, and the
+/// `op:` namespace keeps it apart from CONNECT (`host:port`) and `apiface:`
+/// targets. `None` when the op has no canonical form (a float in its scope),
+/// which simply means no attribution.
+///
+/// Attribution on this loopback API is DISPLAY and consent information (it
+/// names the agent on the approval), not a security boundary: any local
+/// process can omit the token, and the op then reads as coming from a
+/// terminal. Nothing is authorized by it.
+pub fn op_target(op: &crate::protocol::operation::Operation) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let bytes = op.canonical_bytes().ok()?;
+    Some(format!(
+        "op:{}",
+        BASE64URL_NOPAD.encode(&Sha256::digest(&bytes))
+    ))
+}
+
+/// Daemon side of [`op_target`]: the `ag_…` id that proved possession over
+/// exactly `op` for `vault_id`, or `None` (absent, malformed, stale, or signed
+/// over anything else).
+pub fn verify_op_pop(
+    token: &str,
+    vault_id: &str,
+    op: &crate::protocol::operation::Operation,
+    now: u64,
+) -> Option<String> {
+    let target = op_target(op)?;
+    verify_agent_proxy_pop(token.trim(), vault_id, &target, now, DEFAULT_MAX_SKEW_SECS)
+}
+
+/// The agent's AIK signer from `SAFECLAW_AGENT_IDENTITY` (a PATH to the agent
+/// identity file, per the locked naming, NOT a secret). `None` when unset,
+/// unreadable, or not an agent identity.
+pub fn signer_from_env() -> Option<AgentProxyPopSigner> {
+    let path = std::env::var_os("SAFECLAW_AGENT_IDENTITY").filter(|p| !p.is_empty())?;
+    let loaded = crate::identity_file::load(std::path::Path::new(&path)).ok()?;
+    if loaded.kind != IdKind::Agent {
+        return None;
+    }
+    Some(AgentProxyPopSigner::new(loaded.identity, loaded.id))
+}
+
 /// Signs one proxy-connect PoP token per CONNECT. Holds the agent's AIK and its
 /// `ag_…` self-id. Lives in the `sc` transport, never in the agent's env.
 pub struct AgentProxyPopSigner {
@@ -85,6 +137,18 @@ impl AgentProxyPopSigner {
             timestamp,
             BASE64URL_NOPAD.encode(&sig),
         )
+    }
+
+    /// The local-op-API token ([`OP_POP_HEADER`]) proving this agent asks for
+    /// exactly `op` on `vault_id` ([`op_target`]). `None` when the op has no
+    /// canonical form.
+    pub fn op_token(
+        &self,
+        vault_id: &str,
+        op: &crate::protocol::operation::Operation,
+        timestamp: u64,
+    ) -> Option<String> {
+        Some(self.token(vault_id, &op_target(op)?, timestamp))
     }
 }
 
@@ -186,6 +250,42 @@ mod tests {
         // …and never as a CONNECT tunnel to some host:port (cross-channel replay).
         assert!(verify_agent_proxy_pop(&tok, "vault-x", "api.openai.com:443", 1_700_000_000, 300).is_none());
         assert!(verify_agent_proxy_pop(&tok, "", "/v/abc/registry", 1_700_000_000, 300).is_none());
+    }
+
+    fn op(target: &str, scope: serde_json::Value) -> crate::protocol::operation::Operation {
+        serde_json::from_value(serde_json::json!({
+            "act": { "type": { "custom": "secret-rm" }, "target": target, "scope": scope },
+            "bind": { "redeemer": "vault-x" },
+            "valid": { "iat": 1_700_000_000u64, "multiplicity": 1 }
+        }))
+        .unwrap()
+    }
+
+    /// An op token binds the exact op (canonical bytes) and vault: any change
+    /// to the op, another vault, or another channel fails.
+    #[test]
+    fn op_token_binds_the_exact_op_and_vault() {
+        let s = signer();
+        let o = op("GITHUB_TOKEN", serde_json::Value::Null);
+        let tok = s.op_token("vault-x", &o, 1_700_000_000).unwrap();
+        assert_eq!(
+            verify_op_pop(&tok, "vault-x", &o, 1_700_000_000).as_deref(),
+            Some(s.agent_id())
+        );
+        assert!(verify_op_pop(&tok, "vault-y", &o, 1_700_000_000).is_none());
+        let other = op("STRIPE_KEY", serde_json::Value::Null);
+        assert!(verify_op_pop(&tok, "vault-x", &other, 1_700_000_000).is_none());
+        let scoped = op("GITHUB_TOKEN", serde_json::json!({ "agent": "ag_other" }));
+        assert!(verify_op_pop(&tok, "vault-x", &scoped, 1_700_000_000).is_none());
+        assert!(verify_op_pop(&tok, "vault-x", &o, 1_700_000_301).is_none(), "stale");
+        // Not usable as a CONNECT or api-face proof.
+        let target = op_target(&o).unwrap();
+        assert!(target.starts_with("op:"));
+        assert!(verify_agent_proxy_pop(&tok, "vault-x", "api.openai.com:443", 1_700_000_000, 300).is_none());
+        assert!(verify_agent_proxy_pop(&tok, "", &apiface_target("/op/x"), 1_700_000_000, 300).is_none());
+        // A CONNECT token is not an op proof.
+        let connect = s.token("vault-x", "api.openai.com:443", 1_700_000_000);
+        assert!(verify_op_pop(&connect, "vault-x", &o, 1_700_000_000).is_none());
     }
 
     #[test]

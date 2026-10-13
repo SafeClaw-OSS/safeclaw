@@ -265,8 +265,11 @@ pub struct ConnectArgs {
     /// a raw connection SLOT is the KEY itself, so `--from-secret KEY` is the
     /// short form. KEY is matched as typed: native keys fold to their stored
     /// UPPERCASE form; an external store's key (e.g. a lowercase GCP secret id)
-    /// is matched exactly. Repeatable. A service slot named by neither flag is
-    /// prompted for (hidden) on a terminal and is an error off one.
+    /// is matched exactly. Repeatable. The service's primary credential slot
+    /// (its token, or the refresh token it mints from) is required: named by
+    /// neither flag, it is prompted for (hidden) on a terminal and is an error
+    /// off one. Its other slots are optional: offered on a terminal (blank
+    /// skips), left unfilled otherwise.
     #[arg(long = "from-secret", value_name = "SLOT=KEY")]
     pub from_secret: Vec<String>,
     #[arg(long)]
@@ -351,8 +354,10 @@ pub struct ConnectionRmArgs {
     #[arg(long, short = 'y')]
     pub yes: bool,
     /// Remove only the connection record and keep every secret value in the
-    /// vault (unreference). Default deletes the keys ONLY this connection
-    /// references; keys other connections still reference are always kept.
+    /// vault (unreference). Default deletes the keys this connection WROTE
+    /// that no other connection references; a key it only bound
+    /// (`--from-secret`), a key another connection references, and every key
+    /// of a connection added before write tracking are always kept.
     #[arg(long)]
     pub keep_secrets: bool,
     #[arg(long)]

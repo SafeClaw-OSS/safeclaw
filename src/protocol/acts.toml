@@ -98,8 +98,8 @@ tone = "danger"
 [acts.connection-rm]
 action = "Remove connection {{vars.target}}"
 action_zh = "移除连接 {{vars.target}}"
-explain = "Removes this connection and any secret only it references. Your agent loses access immediately."
-explain_zh = "移除此连接，及仅被它引用的密钥。你的 agent 将立即失去访问。"
+explain = "Removes this connection and the secrets it wrote that no other connection uses. Secrets that were already in the vault stay. Your agent loses access immediately."
+explain_zh = "移除此连接，及它写入且没有其他连接在用的密钥。原本就在 vault 里的密钥会保留。你的 agent 将立即失去访问。"
 tone = "danger"
 facts = [
   { label = "Secrets kept", label_zh = "保留密钥", value = "{{vars.scope.keep_secrets}}" },

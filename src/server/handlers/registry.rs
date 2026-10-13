@@ -819,6 +819,7 @@ secrets = ["GITHUB_TOKEN"]
             hosts: Some(vec!["api.stripe.com".to_string()]),
             secrets: Some(vec!["STRIPE_KEY".to_string()]),
             keys: None,
+            written: None,
         };
         let present: HashSet<String> = ["STRIPE_KEY".to_string()].into_iter().collect();
         let empty: HashSet<String> = HashSet::new();

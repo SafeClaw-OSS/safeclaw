@@ -8,7 +8,8 @@
 > the flags are `--from-literal` / `--from-secret` (§1, breaking, no
 > aliases); an agent MAY propose a binding, which takes effect only on the
 > owner's passkey approval of a card listing every bound key and host
-> (§4, Non-goals).
+> (§4, Non-goals); only a service's primary credential role is required
+> (§1); disconnect deletes only keys the connection wrote (Decisions).
 
 ## The gap
 
@@ -82,21 +83,35 @@ SLOT semantics:
 - KEY passes through as typed. Native keys fold to their stored uppercase
   form at approve, external-store keys are matched exactly.
 - A slot named by both flags is an error.
-- Every role of a service must be filled. A role named by neither flag is
-  prompted for (hidden) on a TTY; off a TTY the command errors, listing the
-  missing roles and both ways to fill them. A pure-reference service
-  connection therefore never hits a "no secrets given" refusal.
+- A service's primary credential role is required: its mint input for a
+  minted service, else its first declared secret (`ServiceDef::env_role`, the
+  same projection that names "the" secret everywhere else). Named by neither
+  flag, it is prompted for (hidden) on a TTY; off a TTY the command errors,
+  listing the missing required roles and both ways to fill them. Every other
+  declared role (e.g. Cloudflare's `CLOUDFLARE_ACCOUNT_ID`) is optional: it
+  may be filled by either flag, is offered on a TTY with blank skipping it,
+  and otherwise stays unfilled. The schema has no per-role optional marker;
+  before this change the CLI accepted any subset of roles, and a partly
+  filled connection is a first-class state (the console's "Partly
+  configured"; `required_keys` in the registry still defines "connected" as
+  every declared role present). A pure-reference service connection never
+  hits a "no secrets given" refusal.
 - Before asking for approval the CLI prints the proposal: each slot, its
   KEY, new value or existing secret.
 
 ### 2. Daemon
 
-The SERVICE branch now verifies every slot's KEY exactly like the RAW branch:
-written here (deposited) or present across the full `store_order`, so a
-mistyped KEY fails loudly at approve instead of surfacing later as a
-connection whose phantom never resolves. Every declared role is a slot (its
-`keys` entry, else the identity binding), so the record never binds a key the
-approval did not show. Referenced keys are recorded in canonical form.
+The SERVICE branch now verifies every NAMED slot's KEY exactly like the RAW
+branch: written here (deposited) or present across the full `store_order`, so
+a mistyped KEY fails loudly at approve instead of surfacing later as a
+connection whose phantom never resolves. A role is named when the op gives it
+a `keys` entry or lists its KEY in `secrets`. A role the op leaves unnamed
+falls back to the identity binding: it binds that KEY when the vault holds it
+natively (so the card shows it, at mint and at apply alike), and otherwise
+stays unfilled. Apply refuses an unnamed role whose identity KEY exists only
+in an external store, since it would bind without the card showing it. So the
+record never binds a key the approval did not show. Referenced keys are
+recorded in canonical form.
 
 ### 3. Console, follow-up
 
@@ -129,14 +144,22 @@ fields only.
 
 ## Decisions this forces
 
-**Disconnect must not delete a bound key.** (OPEN: not built yet; today
-`sc connection rm` keeps only keys another connection still references.) The
-drawer sweeps a connection's
-secret addresses on disconnect. A key that was BOUND rather than WRITTEN may
-back other connections or predate the connection entirely, so sweeping it is
-destructive. Record the distinction (the raw path's `secretKeys` superset,
-`connections-tab.tsx:129`, already models half of it) and delete only what this
-connection wrote.
+**Disconnect must not delete a bound key.** (RESOLVED.) A key that was BOUND
+rather than WRITTEN may back other connections or predate the connection
+entirely, so sweeping it is destructive. The connection record carries
+`written`: the KEYs whose value it wrote (created or overwrote) when it was
+added. Every writer records it: `connection-add` apply (the deposited keys,
+plus keys a replaced same-id record had written and the new one still binds),
+`sc set --host` (its key), the OAuth exchange (the keys it stores), a
+widen-host materialized default record (none), and the console's create/edit
+(the values it writes). Removal (`connection_removal`, used by `sc connection
+rm`; the console's drawer applies the same rule) deletes a bound native key
+only when it is in `written` and no other connection binds it. Every other
+bound key is kept, and the CLI says why: still used by other connections,
+already in the vault when the connection was added, or (no `written` at all,
+a record that predates the field) unknown provenance, which keeps every key
+because it may predate the connection. The console offers a legacy record's
+keys behind an unticked checkbox instead.
 
 **Rotation writes back to the bound key, and that is the point.** It is why
 binding beats copying: one key stays live no matter how many connections read

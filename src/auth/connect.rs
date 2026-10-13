@@ -198,15 +198,24 @@ pub fn apply_exchange_result(
         }
         Some(map)
     });
-    let rec = Connection {
+    let mut rec = Connection {
         name: None, // set below from the connecting entry
         service: Some(service.to_string()),
         hosts,
         secrets: None,
         keys,
+        written: None, // set below: every KEY this exchange stores
+    };
+    let mut written: Vec<String> = Vec::new();
+    let mut put = |m: &mut ProtectedState, key: String, value: Vec<u8>| {
+        if !written.contains(&key) {
+            written.push(key.clone());
+        }
+        m.put_secret(key, value);
     };
     if let Some(rt) = &tokens.refresh_token {
-        m.put_secret(
+        put(
+            m,
             secret_key_for(Some(&rec), &cfg.secret_role),
             rt.as_bytes().to_vec(),
         );
@@ -214,7 +223,8 @@ pub fn apply_exchange_result(
     if let Some(idt) = &tokens.id_token {
         // Store the raw id_token only when the service names a slot for it.
         if let Some(idt_role) = &cfg.id_token_role {
-            m.put_secret(
+            put(
+                m,
                 secret_key_for(Some(&rec), idt_role),
                 idt.as_bytes().to_vec(),
             );
@@ -227,7 +237,7 @@ pub fn apply_exchange_result(
             match crate::auth::oauth2::id_token_claim(idt, path) {
                 Some(v) => {
                     let key = role.to_ascii_uppercase();
-                    m.put_secret(secret_key_for(Some(&rec), &key), v.into_bytes());
+                    put(m, secret_key_for(Some(&rec), &key), v.into_bytes());
                 }
                 None => tracing::warn!(
                     conn = %conn,
@@ -242,6 +252,8 @@ pub fn apply_exchange_result(
             "oauth connect: service exposes derived roles but the exchange returned no id_token"
         );
     }
+    written.sort();
+    rec.written = Some(written);
     // MOVE: drop from `connecting`, add to `connections` (name carried over).
     let mut connecting = aux_map::<Connecting>(m, "connecting");
     let name = connecting.remove(conn).and_then(|c| c.name);
@@ -1216,6 +1228,11 @@ mod tests {
         assert!(
             conns.get("gmail").and_then(|c| c.keys.as_ref()).is_none(),
             "default conn stores no keys map"
+        );
+        assert_eq!(
+            conns.get("gmail").and_then(|c| c.written.clone()),
+            Some(vec!["GMAIL_REFRESH_TOKEN".to_string()]),
+            "the exchange records the key it wrote, so removal may delete it"
         );
     }
 

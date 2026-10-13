@@ -490,6 +490,7 @@ impl BrokerHandler {
                         hosts: None,
                         secrets: None,
                         keys: None,
+                        written: None,
                     }
                 } else {
                     return err_response(

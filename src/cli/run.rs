@@ -16,7 +16,6 @@ use crate::cli::proxy_env::{
     build_bundle, control_plane_up, proxy_url_for_vault, resident_ca_bundle_path, resident_ca_path,
 };
 use crate::config::RunArgs;
-use crate::identity::IdKind;
 
 pub async fn run(args: RunArgs) -> Result<(), String> {
     // clap already makes --export-env and a command mutually exclusive; require
@@ -128,16 +127,10 @@ fn warn_git_url_specific_proxy(cmd: &[String]) {
     );
 }
 
-/// Load the agent's AIK signer from `SAFECLAW_AGENT_IDENTITY` (a PATH to the
-/// agent identity file, per the locked naming — NOT a secret). `None` when unset
+/// Load the agent's AIK signer from `SAFECLAW_AGENT_IDENTITY`. `None` when unset
 /// or not an agent identity, so `sc run` falls back to the direct path.
 fn load_agent_signer() -> Option<AgentProxyPopSigner> {
-    let path = std::env::var_os("SAFECLAW_AGENT_IDENTITY").filter(|p| !p.is_empty())?;
-    let loaded = crate::identity_file::load(Path::new(&path)).ok()?;
-    if loaded.kind != IdKind::Agent {
-        return None;
-    }
-    Some(AgentProxyPopSigner::new(loaded.identity, loaded.id))
+    crate::agent_pop::signer_from_env()
 }
 
 /// The `host:port` authority of a URL (scheme + path stripped) — where the shim

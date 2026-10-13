@@ -13,6 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{
     extract::{ConnectInfo, Path, State},
+    http::HeaderMap,
     Json,
 };
 use serde_json::{json, Value};
@@ -26,6 +27,7 @@ pub async fn create(
     State(state): State<Arc<AppState>>,
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Path(vault_id): Path<String>,
+    headers: HeaderMap,
     Json(op): Json<Operation>,
 ) -> Result<Json<Value>> {
     validate_vault_id(&vault_id)?;
@@ -55,6 +57,9 @@ pub async fn create(
     // and the op's own expiry can never disagree. A locked vault (the unlock
     // ceremony) can't read its policy and takes the 30-min default.
     let mut op = op;
+    // Requester attribution: verified from the agent's proof over this exact
+    // op, else none (see `attribute_agent`).
+    let agent = attribute_agent(&headers, &vault_id, &mut op, crate::util::now_unix());
     // connection-add: the approval card (bound keys per slot, written vs
     // referenced, destinations, sharing) is computed HERE from the unlocked
     // session state and stamped into the signed scope, overwriting anything
@@ -92,7 +97,7 @@ pub async fn create(
     };
     let (op_id, expires_at) = {
         let mut store = state.approvals.lock().unwrap();
-        let id = store.create(vault_id.clone(), op.clone(), r.clone());
+        let id = store.create_bound(vault_id.clone(), op.clone(), r.clone(), None, agent.clone());
         if let Some(secret) = &waiter_secret {
             store.set_waiter(&id, secret);
         }
@@ -120,7 +125,8 @@ pub async fn create(
             }
             _ => {}
         }
-        let row = audit::row_from_op(&op_id, &op, now, expires_at as i64);
+        let mut row = audit::row_from_op(&op_id, &op, now, expires_at as i64);
+        row.agent_prefix = agent.clone();
         if let Err(e) = store.insert(&row) {
             tracing::warn!(vault = %vault_id, op = %op_id, "audit insert pending failed: {}", e);
         }
@@ -136,8 +142,8 @@ pub async fn create(
         serde_json::to_value(&op).unwrap_or(Value::Null),
         r.clone(),
         expires_at,
-        None,   // user-initiated lifecycle ceremony — no triggering agent
-        vec![], // only `use` ops join intent chains
+        agent.clone(), // the verified requesting agent, if any
+        vec![],        // only `use` ops join intent chains
     );
 
     // Requester-side supersede: a lifecycle ceremony (unlock/lock) is a
@@ -181,6 +187,45 @@ pub async fn create(
         resp["waiter_secret"] = json!(secret);
     }
     Ok(Json(resp))
+}
+
+/// Requester attribution for an op created on this LOCAL API (the CLI
+/// ceremonies). A requester-supplied `scope.agent` is always dropped; the
+/// agent is stamped only from a valid proof of possession over exactly this
+/// op as received (header [`crate::agent_pop::OP_POP_HEADER`], verified by
+/// [`crate::agent_pop::verify_op_pop`]): the same `scope.agent` `ag_…` id a
+/// proxy-originated Use op carries, so the approval names the agent. A
+/// missing, malformed, stale, or mismatched proof yields no attribution.
+///
+/// This is display and consent information, not a security boundary: any
+/// local process can omit the proof (the op then reads as from a terminal),
+/// and nothing is authorized by it. It is therefore not checked against the
+/// vault's agents table (a locked vault, the unlock ceremony, cannot read
+/// it): the claim is only "the holder of this agent key asked", which the
+/// proof establishes either way.
+fn attribute_agent(
+    headers: &HeaderMap,
+    vault_id: &str,
+    op: &mut Operation,
+    now: u64,
+) -> Option<String> {
+    // Verify BEFORE any mutation: the proof covers the op as sent.
+    let verified = headers
+        .get(crate::agent_pop::OP_POP_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|t| crate::agent_pop::verify_op_pop(t, vault_id, op, now));
+    if let Some(o) = op.act.scope.as_object_mut() {
+        o.remove("agent");
+    }
+    let ag = verified?;
+    if op.act.scope.is_null() {
+        op.act.scope = json!({});
+    }
+    op.act
+        .scope
+        .as_object_mut()?
+        .insert("agent".into(), Value::String(ag.clone()));
+    Some(ag)
 }
 
 /// Withdraw a ceremony op that a newer one just superseded. Local: flip the
@@ -495,6 +540,7 @@ mod tests {
             State(state.clone()),
             ConnectInfo(addr),
             Path("v1".into()),
+            HeaderMap::new(),
             Json(op),
         )
         .await
@@ -556,11 +602,122 @@ mod tests {
             State(state.clone()),
             ConnectInfo(addr),
             Path("v1".into()),
+            HeaderMap::new(),
             Json(op),
         )
         .await
         .unwrap()
         .0
+    }
+
+    async fn create_with(state: &Arc<AppState>, op: Operation, headers: HeaderMap) -> Value {
+        if state.is_vault_locked("v1") {
+            state.unlock_vault(
+                "v1".into(),
+                crate::state::SecretsCache::default(),
+                zeroize::Zeroizing::new(Vec::new()),
+            );
+        }
+        let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+        create(
+            State(state.clone()),
+            ConnectInfo(addr),
+            Path("v1".into()),
+            headers,
+            Json(op),
+        )
+        .await
+        .unwrap()
+        .0
+    }
+
+    fn agent_signer() -> crate::agent_pop::AgentProxyPopSigner {
+        let id = crate::identity::SigningIdentity::from_seed(&[7u8; 32]);
+        let ag = crate::identity::derive_id(crate::identity::IdKind::Agent, &id.public_bytes());
+        crate::agent_pop::AgentProxyPopSigner::new(id, ag)
+    }
+
+    fn pop_headers(token: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(crate::agent_pop::OP_POP_HEADER, token.parse().unwrap());
+        h
+    }
+
+    fn rm_op(scope: Value) -> Operation {
+        serde_json::from_value(json!({
+            "act": { "type": { "custom": "secret-rm" }, "target": "GITHUB_TOKEN", "scope": scope },
+            "bind": { "redeemer": "v1" },
+            "valid": { "iat": 0, "multiplicity": 1 }
+        }))
+        .unwrap()
+    }
+
+    /// The stored op's `scope.agent`, the record's agent, and the audit row's.
+    fn attribution(state: &AppState, body: &Value) -> (Option<String>, Option<String>) {
+        let id = body["op_id"].as_str().unwrap();
+        let rec = state.approvals.lock().unwrap().get(id).unwrap().clone();
+        let scope_agent = rec
+            .op
+            .act
+            .scope
+            .get("agent")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        assert_eq!(
+            body["op"]["act"]["scope"]
+                .get("agent")
+                .and_then(|v| v.as_str()),
+            scope_agent.as_deref(),
+            "the response op (what a local signer signs) matches the stored op"
+        );
+        (scope_agent, rec.agent_prefix)
+    }
+
+    /// A CLI ceremony run by an agent carries a proof over the exact op; the
+    /// daemon stamps the agent into the signed scope (as a proxy Use op
+    /// carries it) and onto the record.
+    #[tokio::test]
+    async fn valid_op_pop_stamps_the_agent() {
+        let state = Arc::new(test_state());
+        let s = agent_signer();
+        let op = rm_op(Value::Null);
+        let tok = s.op_token("v1", &op, crate::util::now_unix()).unwrap();
+        let body = create_with(&state, op, pop_headers(&tok)).await;
+        let (scope_agent, rec_agent) = attribution(&state, &body);
+        assert_eq!(scope_agent.as_deref(), Some(s.agent_id()));
+        assert_eq!(rec_agent.as_deref(), Some(s.agent_id()));
+    }
+
+    /// No proof, a proof over a different op, a proof for another vault, or a
+    /// garbage header: nothing is stamped, and a requester-supplied
+    /// `scope.agent` never survives.
+    #[tokio::test]
+    async fn absent_or_tampered_op_pop_stamps_nothing() {
+        let state = Arc::new(test_state());
+        let s = agent_signer();
+        let now = crate::util::now_unix();
+        let claimed = json!({ "agent": s.agent_id() });
+
+        // Absent proof, forged claim in the scope.
+        let body = create_with(&state, rm_op(claimed.clone()), HeaderMap::new()).await;
+        assert_eq!(attribution(&state, &body), (None, None));
+
+        // Proof signed over the op WITHOUT the claim, sent with it (tampered).
+        let tok = s.op_token("v1", &rm_op(Value::Null), now).unwrap();
+        let body = create_with(&state, rm_op(claimed.clone()), pop_headers(&tok)).await;
+        assert_eq!(attribution(&state, &body), (None, None));
+
+        // Proof for another vault.
+        let tok = s.op_token("v2", &rm_op(Value::Null), now).unwrap();
+        let body = create_with(&state, rm_op(Value::Null), pop_headers(&tok)).await;
+        assert_eq!(attribution(&state, &body), (None, None));
+
+        // A stale proof and a malformed one.
+        let tok = s.op_token("v1", &rm_op(Value::Null), now - 3600).unwrap();
+        let body = create_with(&state, rm_op(Value::Null), pop_headers(&tok)).await;
+        assert_eq!(attribution(&state, &body), (None, None));
+        let body = create_with(&state, rm_op(Value::Null), pop_headers("scpop1.x.y.z")).await;
+        assert_eq!(attribution(&state, &body), (None, None));
     }
 
     fn status_of(state: &AppState, id: &str) -> crate::approval::ApprovalStatus {

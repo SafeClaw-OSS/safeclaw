@@ -284,7 +284,7 @@ pub async fn run_rm(args: ConnectionRmArgs) -> Result<(), String> {
             if args.keep_secrets {
                 " (keeping its secrets)"
             } else {
-                " and the secret(s) only it references"
+                " and the secret(s) it wrote that nothing else uses"
             },
         ))?;
         if !matches!(ans.trim(), "y" | "Y" | "yes" | "YES") {
@@ -313,15 +313,18 @@ pub async fn run_rm(args: ConnectionRmArgs) -> Result<(), String> {
     .await?;
 
     let result = act_result(&body);
-    let removed_secrets: Vec<String> = result
-        .get("removed_secrets")
-        .and_then(|v| v.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|x| x.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default();
+    let strs = |field: &str| -> Vec<String> {
+        result
+            .get(field)
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let removed_secrets = strs("removed_secrets");
     if removed_secrets.is_empty() {
         println!("connection '{}' removed", id);
     } else {
@@ -354,6 +357,18 @@ pub async fn run_rm(args: ConnectionRmArgs) -> Result<(), String> {
                 .unwrap_or_default();
             eprintln!("  kept: {} (still referenced by {})", key, by);
         }
+    }
+    for key in strs("kept_referenced") {
+        eprintln!(
+            "  kept: {} (it was already in the vault when this connection was added; this connection did not write it)",
+            key
+        );
+    }
+    for key in strs("kept_untracked") {
+        eprintln!(
+            "  kept: {} (this connection was added before SafeClaw recorded which secrets a connection writes, so the key may predate it; `sc secret rm {}` deletes it)",
+            key, key
+        );
     }
     Ok(())
 }
@@ -417,6 +432,7 @@ async fn run_raw(
                     .iter()
                     .map(|k| (k.clone(), k.clone(), false)),
             ),
+        &[],
     );
 
     // New VALUES go to the local daemon deposit; the op carries only the
@@ -498,11 +514,24 @@ async fn run_service_backed(
         Some(args.host.clone())
     };
 
-    // Every declared role is a slot; each must be filled from a new value or
-    // a secret already in the vault.
+    // Every declared role is a slot, filled from a new value or a secret
+    // already in the vault. Only the service's primary credential role (its
+    // mint input, else its first declared secret) is required; the rest are
+    // optional and may stay unfilled.
+    let required: Vec<String> = def
+        .env_role()
+        .and_then(|r| {
+            service_secrets
+                .iter()
+                .find(|s| s.eq_ignore_ascii_case(&r))
+                .cloned()
+        })
+        .into_iter()
+        .collect();
     let filled = fill_service_slots(
         service,
         &service_secrets,
+        &required,
         &args.from_literal,
         &args.from_secret,
         std::io::stdin().is_terminal(),
@@ -513,15 +542,17 @@ async fn run_service_backed(
     // suggested `<ROLE>_<QUALIFIER>` for a named one. An existing secret is
     // bound by its KEY as typed (the daemon folds a native key's case).
     let mut bindings: Vec<(String, String, bool)> = Vec::new(); // (role, KEY, new?)
+    let mut unfilled: Vec<String> = Vec::new();
     let mut values = std::collections::BTreeMap::new();
     for (role, source) in filled {
         match source {
-            Filled::Value(v) => {
+            Some(Filled::Value(v)) => {
                 let key = suggested_secret_key(name, service, &role);
                 values.insert(key.clone(), v);
                 bindings.push((role, key, true));
             }
-            Filled::Secret(key) => bindings.push((role, key, false)),
+            Some(Filled::Secret(key)) => bindings.push((role, key, false)),
+            None => unfilled.push(role),
         }
     }
     // The connection's `keys` map: a named connection records every role's
@@ -534,7 +565,7 @@ async fn run_service_backed(
         .collect();
     let mut bound_keys: Vec<String> = bindings.iter().map(|(_, k, _)| k.clone()).collect();
     dedup_exact(&mut bound_keys);
-    print_proposal(name, bindings.iter().cloned());
+    print_proposal(name, bindings.iter().cloned(), &unfilled);
 
     // New VALUES go to the local daemon deposit; the op carries only the
     // salted digest plus the public shape (service, pins, key bindings).
@@ -821,16 +852,20 @@ fn upper_key(slot: &str) -> Result<String, String> {
     Ok(key)
 }
 
-/// SERVICE slots: every declared role, in declaration order, filled from a
-/// flag or (on a terminal) a hidden prompt. Off a terminal, unfilled roles are
-/// an error that names them and both ways to fill them.
+/// SERVICE slots: every declared role, in declaration order. A role named by
+/// a flag is filled from it. A `required` role no flag names is prompted for
+/// (hidden) on a terminal; off a terminal that is an error naming the missing
+/// required roles and both ways to fill them. Any other role is optional: on
+/// a terminal it is offered with a blank answer skipping it, and otherwise it
+/// stays unfilled (`None`).
 fn fill_service_slots(
     service: &str,
     roles: &[String],
+    required: &[String],
     from_literal: &[String],
     from_secret: &[String],
     tty: bool,
-) -> Result<Vec<(String, Filled)>, String> {
+) -> Result<Vec<(String, Option<Filled>)>, String> {
     let declared = |slot: &str| -> Result<String, String> {
         roles
             .iter()
@@ -875,9 +910,10 @@ fn fill_service_slots(
         }
     }
 
+    let is_required = |r: &str| required.iter().any(|q| q.eq_ignore_ascii_case(r));
     let missing: Vec<&String> = roles
         .iter()
-        .filter(|r| !seen.iter().any(|(s, _)| s == *r))
+        .filter(|r| is_required(r) && !seen.iter().any(|(s, _)| s == *r))
         .collect();
     if !missing.is_empty() && !tty {
         let first = missing[0];
@@ -897,28 +933,50 @@ fn fill_service_slots(
     let mut out = Vec::with_capacity(roles.len());
     for role in roles {
         let filled = match seen.iter().find(|(s, _)| s == role).map(|(_, p)| p.clone()) {
-            Some(Pending::Value(v)) => Filled::Value(v),
-            Some(Pending::Secret(k)) => Filled::Secret(k),
-            // A bare `--from-literal ROLE`, or a role no flag named: hidden
-            // prompt (only reached on a terminal).
-            Some(Pending::Prompt) | None => {
-                if !tty {
-                    return Err(format!(
-                        "--from-literal {}: provide the value as `--from-literal {}=<value>` (no terminal to prompt on)",
-                        role, role
-                    ));
-                }
-                Filled::Value(prompt_value(role)?)
-            }
+            Some(Pending::Value(v)) => Some(Filled::Value(v)),
+            Some(Pending::Secret(k)) => Some(Filled::Secret(k)),
+            // A bare `--from-literal ROLE`, or a required role no flag named:
+            // hidden prompt (only reached on a terminal).
+            Some(Pending::Prompt) => Some(Filled::Value(prompt_or_fail(role, tty)?)),
+            None if is_required(role) => Some(Filled::Value(prompt_or_fail(role, tty)?)),
+            // An optional role no flag named.
+            None if tty => prompt_optional_value(role)?.map(Filled::Value),
+            None => None,
         };
         out.push((role.clone(), filled));
     }
     Ok(out)
 }
 
+/// The hidden prompt for a slot that needs a value, or the error saying how to
+/// pass it when there is no terminal to prompt on.
+fn prompt_or_fail(role: &str, tty: bool) -> Result<String, String> {
+    if !tty {
+        return Err(format!(
+            "--from-literal {}: provide the value as `--from-literal {}=<value>` (no terminal to prompt on)",
+            role, role
+        ));
+    }
+    prompt_value(role)
+}
+
+/// Hidden prompt for an optional slot; a blank answer leaves it unfilled.
+fn prompt_optional_value(slot: &str) -> Result<Option<String>, String> {
+    let val = rpassword::prompt_password(format!(
+        "Value for {} (hidden, optional; blank to skip): ",
+        slot
+    ))
+    .map_err(|e| format!("read value: {}", e))?;
+    Ok(Some(val).filter(|v| !v.is_empty()))
+}
+
 /// Print what the request proposes, before the approval: every slot, its KEY,
 /// and whether the value is new or an existing secret.
-fn print_proposal(name: &str, bindings: impl Iterator<Item = (String, String, bool)>) {
+fn print_proposal(
+    name: &str,
+    bindings: impl Iterator<Item = (String, String, bool)>,
+    unfilled: &[String],
+) {
     eprintln!(
         "Proposing connection '{}' (nothing changes until it is approved):",
         name
@@ -930,6 +988,9 @@ fn print_proposal(name: &str, bindings: impl Iterator<Item = (String, String, bo
         } else {
             eprintln!("  {} ← {}  ({})", slot, key, src);
         }
+    }
+    for slot in unfilled {
+        eprintln!("  {}  (optional, not set by this command)", slot);
     }
 }
 
@@ -1030,11 +1091,16 @@ mod tests {
             .contains("SLOT is empty"));
     }
 
+    fn required() -> Vec<String> {
+        v(&["CLOUDFLARE_API_TOKEN"])
+    }
+
     #[test]
     fn service_slots_mix_sources_case_insensitively() {
         let f = fill_service_slots(
             "cloudflare",
             &roles(),
+            &required(),
             &v(&["cloudflare_account_id=acc123"]),
             &v(&["Cloudflare_Api_Token=CF_TOKEN_WORK"]),
             false,
@@ -1045,11 +1111,11 @@ mod tests {
             vec![
                 (
                     "CLOUDFLARE_API_TOKEN".into(),
-                    Filled::Secret("CF_TOKEN_WORK".into())
+                    Some(Filled::Secret("CF_TOKEN_WORK".into()))
                 ),
                 (
                     "CLOUDFLARE_ACCOUNT_ID".into(),
-                    Filled::Value("acc123".into())
+                    Some(Filled::Value("acc123".into()))
                 ),
             ]
         );
@@ -1057,32 +1123,88 @@ mod tests {
         let f = fill_service_slots(
             "cloudflare",
             &roles(),
+            &required(),
             &[],
             &v(&["CLOUDFLARE_API_TOKEN=A", "CLOUDFLARE_ACCOUNT_ID=B"]),
             false,
         )
         .unwrap();
-        assert!(f.iter().all(|(_, s)| matches!(s, Filled::Secret(_))));
+        assert!(f.iter().all(|(_, s)| matches!(s, Some(Filled::Secret(_)))));
+    }
+
+    /// Only the primary credential role is required: the account id may stay
+    /// unfilled off a terminal, from either flag's side.
+    #[test]
+    fn optional_service_roles_may_stay_unfilled() {
+        for (lit, sec) in [
+            (v(&["CLOUDFLARE_API_TOKEN=x"]), vec![]),
+            (vec![], v(&["CLOUDFLARE_API_TOKEN=CF_TOKEN"])),
+        ] {
+            let f =
+                fill_service_slots("cloudflare", &roles(), &required(), &lit, &sec, false).unwrap();
+            assert!(f[0].1.is_some(), "{f:?}");
+            assert_eq!(f[1], ("CLOUDFLARE_ACCOUNT_ID".to_string(), None));
+        }
+        // The optional role alone does not satisfy the required one.
+        let e = fill_service_slots(
+            "cloudflare",
+            &roles(),
+            &required(),
+            &v(&["CLOUDFLARE_ACCOUNT_ID=acc"]),
+            &[],
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            e.contains("needs a value for: CLOUDFLARE_API_TOKEN."),
+            "{e}"
+        );
+        // The required role is the service's primary credential (env_role):
+        // the mint input for a minted service, else the first secret.
+        let reg = ServiceRegistry::load();
+        assert_eq!(
+            reg.get("cloudflare").unwrap().env_role().as_deref(),
+            Some("CLOUDFLARE_API_TOKEN")
+        );
+        assert_eq!(
+            reg.get("openai_codex").unwrap().env_role().as_deref(),
+            Some("OPENAI_CODEX_REFRESH_TOKEN")
+        );
     }
 
     #[test]
     fn service_slot_errors() {
         // Undeclared role: same message shape as before, listing the roles.
-        let e =
-            fill_service_slots("cloudflare", &roles(), &v(&["NOPE=x"]), &[], false).unwrap_err();
+        let e = fill_service_slots(
+            "cloudflare",
+            &roles(),
+            &required(),
+            &v(&["NOPE=x"]),
+            &[],
+            false,
+        )
+        .unwrap_err();
         assert_eq!(
             e,
             "secret 'NOPE' is not declared by service 'cloudflare' (its secrets: CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID)"
         );
         // Shorthand needs a slot with --service, and says why.
-        let e =
-            fill_service_slots("cloudflare", &roles(), &[], &v(&["CF_TOKEN"]), false).unwrap_err();
+        let e = fill_service_slots(
+            "cloudflare",
+            &roles(),
+            &required(),
+            &[],
+            &v(&["CF_TOKEN"]),
+            false,
+        )
+        .unwrap_err();
         assert!(e.contains("with --service, name the slot"), "{e}");
         assert!(e.contains("--from-secret ROLE=CF_TOKEN"), "{e}");
         // Both flags on one slot.
         let e = fill_service_slots(
             "cloudflare",
             &roles(),
+            &required(),
             &v(&["CLOUDFLARE_API_TOKEN=x"]),
             &v(&["cloudflare_api_token=K"]),
             false,
@@ -1093,37 +1215,35 @@ mod tests {
         let e = fill_service_slots(
             "cloudflare",
             &roles(),
+            &required(),
             &v(&["CLOUDFLARE_API_TOKEN=x", "cloudflare_api_token=y"]),
             &[],
             false,
         )
         .unwrap_err();
         assert!(e.contains("given twice"), "{e}");
-        // Unfilled roles off a terminal: listed, with both ways to fill them.
-        let e = fill_service_slots(
-            "cloudflare",
-            &roles(),
-            &v(&["CLOUDFLARE_API_TOKEN=x"]),
-            &[],
-            false,
-        )
-        .unwrap_err();
+        // Unfilled REQUIRED roles off a terminal: listed, with both ways to
+        // fill them.
+        let e =
+            fill_service_slots("cloudflare", &roles(), &required(), &[], &[], false).unwrap_err();
+        assert!(e.contains("needs a value for: CLOUDFLARE_API_TOKEN"), "{e}");
         assert!(
-            e.contains("needs a value for: CLOUDFLARE_ACCOUNT_ID"),
+            e.contains("--from-literal CLOUDFLARE_API_TOKEN=<value>"),
             "{e}"
         );
         assert!(
-            e.contains("--from-literal CLOUDFLARE_ACCOUNT_ID=<value>"),
+            e.contains("--from-secret CLOUDFLARE_API_TOKEN=<KEY>"),
             "{e}"
         );
         assert!(
-            e.contains("--from-secret CLOUDFLARE_ACCOUNT_ID=<KEY>"),
-            "{e}"
+            !e.contains("CLOUDFLARE_ACCOUNT_ID"),
+            "optional roles are not listed: {e}"
         );
         // A bare --from-literal off a terminal can't prompt.
         let e = fill_service_slots(
             "cloudflare",
             &roles(),
+            &required(),
             &v(&["CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID=x"]),
             &[],
             false,

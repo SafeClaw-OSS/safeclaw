@@ -357,6 +357,7 @@ mod tests {
             hosts: Some(vec!["tenant1.acme.dev".to_string()]),
             secrets: None,
             keys: None,
+            written: None,
         };
         let hosts = resolved_hosts(&conn, Some(&def));
         assert!(hosts.contains(&"api.acme.com".to_string()));
@@ -372,6 +373,7 @@ mod tests {
             hosts: Some(vec!["api.stripe.com".to_string()]),
             secrets: Some(vec!["STRIPE_KEY".to_string()]),
             keys: None,
+            written: None,
         };
         assert_eq!(
             resolved_hosts(&conn, None),

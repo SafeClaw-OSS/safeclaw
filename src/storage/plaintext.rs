@@ -114,6 +114,15 @@ pub struct Connection {
     /// this — their `secrets` list IS the binding (role == KEY).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keys: Option<BTreeMap<String, String>>,
+    /// The vault KEYs whose value this connection WROTE (created or
+    /// overwrote) when it was added, as opposed to keys it binds that already
+    /// held a value (`sc connection add --from-secret`, a console reuse). Only
+    /// these may be deleted with the connection (`connection_removal`), and
+    /// never one another connection still binds. `Some(empty)` = it wrote
+    /// nothing. `None` = unknown: a record from before this field existed, or
+    /// from a writer that does not record it; removal then deletes nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub written: Option<Vec<String>>,
 }
 
 /// An **in-flight** connect handshake — everything the daemon needs to redeem
@@ -292,6 +301,57 @@ pub fn connection_claims_in<'a>(
         }
     }
     claims
+}
+
+/// What removing a connection does to the native keys it binds. Only a key the
+/// connection WROTE (`Connection::written`) and no other connection binds is
+/// deleted; every other bound native key is kept, with the reason.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ConnectionRemoval {
+    /// Written by this connection, bound by no other: deleted.
+    pub delete: Vec<String>,
+    /// Kept: other connections still bind it (`key`, their ids).
+    pub shared: Vec<(String, Vec<String>)>,
+    /// Kept: bound, but its value was already in the vault when the
+    /// connection was added (this connection did not write it).
+    pub referenced: Vec<String>,
+    /// Kept: the record does not say what it wrote (it predates
+    /// `Connection::written`), so the key may predate the connection.
+    pub untracked: Vec<String>,
+}
+
+/// Plan the removal of connection `id` (record `rec`) against the vault's
+/// connections and native keys. External-store keys are never listed: SafeClaw
+/// only reads them, so removal never deletes one.
+pub fn connection_removal(
+    id: &str,
+    rec: &Connection,
+    connections: &BTreeMap<String, Connection>,
+    native: &BTreeMap<String, Vec<u8>>,
+    reg: &crate::service::ServiceRegistry,
+) -> ConnectionRemoval {
+    let claims = connection_claims_in(connections, reg, id);
+    let mut out = ConnectionRemoval::default();
+    let mut seen: Vec<String> = Vec::new();
+    for addr in rec.secret_addresses(reg) {
+        if seen.iter().any(|s| s.eq_ignore_ascii_case(&addr)) {
+            continue;
+        }
+        seen.push(addr.clone());
+        if !native.contains_key(&addr) {
+            continue;
+        }
+        if let Some(by) = claims.get(&addr) {
+            out.shared.push((addr, by.clone()));
+            continue;
+        }
+        match &rec.written {
+            None => out.untracked.push(addr),
+            Some(w) if w.iter().any(|k| k.eq_ignore_ascii_case(&addr)) => out.delete.push(addr),
+            Some(_) => out.referenced.push(addr),
+        }
+    }
+    out
 }
 
 /// Creation-time DEFAULT `keys` binding for a **named** connection's role:
@@ -593,6 +653,56 @@ impl VaultPlaintextView {
 mod tests {
     use super::*;
 
+    /// Removal deletes only what the connection wrote and nothing else binds;
+    /// every other bound native key is kept with its reason, a pre-tracking
+    /// record keeps all, and an external-store key is never listed.
+    #[test]
+    fn connection_removal_deletes_only_written_unshared_keys() {
+        let reg = crate::service::ServiceRegistry::load();
+        let raw = |keys: &[&str], written: Option<&[&str]>| Connection {
+            hosts: Some(vec!["api.example.com".into()]),
+            secrets: Some(keys.iter().map(|k| k.to_string()).collect()),
+            written: written.map(|w| w.iter().map(|k| k.to_string()).collect()),
+            ..Connection::default()
+        };
+        let mut conns = BTreeMap::new();
+        conns.insert(
+            "a".to_string(),
+            raw(
+                &["MINE", "SHARED", "BOUND", "EXTERNAL_ONLY"],
+                Some(&["mine", "SHARED"]),
+            ),
+        );
+        conns.insert("b".to_string(), raw(&["SHARED"], Some(&[])));
+        conns.insert("legacy".to_string(), raw(&["OLD"], None));
+        let native: BTreeMap<String, Vec<u8>> = ["MINE", "SHARED", "BOUND", "OLD"]
+            .iter()
+            .map(|k| (k.to_string(), b"v".to_vec()))
+            .collect();
+
+        let plan = connection_removal("a", &conns["a"], &conns, &native, &reg);
+        assert_eq!(plan.delete, vec!["MINE".to_string()]);
+        assert_eq!(
+            plan.shared,
+            vec![("SHARED".to_string(), vec!["b".to_string()])]
+        );
+        assert_eq!(plan.referenced, vec!["BOUND".to_string()]);
+        assert!(plan.untracked.is_empty());
+
+        let plan = connection_removal("legacy", &conns["legacy"], &conns, &native, &reg);
+        assert!(plan.delete.is_empty());
+        assert_eq!(plan.untracked, vec!["OLD".to_string()]);
+
+        // `written` round-trips, and a legacy record without it reads as None.
+        let json = serde_json::to_value(&conns["b"]).unwrap();
+        assert_eq!(json["written"], serde_json::json!([]));
+        let legacy: Connection = serde_json::from_value(
+            serde_json::json!({ "hosts": ["h.example.com"], "secrets": ["OLD"] }),
+        )
+        .unwrap();
+        assert_eq!(legacy.written, None);
+    }
+
     #[test]
     fn connection_claims_cover_raw_keysmap_and_identity_bindings() {
         // Registry is loaded so gmail's declared GMAIL_REFRESH_TOKEN role
@@ -609,6 +719,7 @@ mod tests {
                 hosts: None,
                 secrets: Some(vec!["SHARED_KEY".into()]),
                 keys: None,
+                written: None,
             },
         );
         aux.connections.insert(
@@ -619,6 +730,7 @@ mod tests {
                 hosts: None,
                 secrets: None,
                 keys: None,
+                written: None,
             },
         );
         let mut work_keys = BTreeMap::new();
@@ -634,6 +746,7 @@ mod tests {
                 hosts: None,
                 secrets: None,
                 keys: Some(work_keys),
+                written: None,
             },
         );
 

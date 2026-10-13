@@ -429,12 +429,52 @@ pub(crate) fn apply_secret_set_to_view(
                 hosts: Some(hosts.to_vec()),
                 secrets: Some(vec![key.to_string()]),
                 keys: None,
+                // This op wrote the key's value above.
+                written: Some(vec![key.to_string()]),
             },
         );
         false
     } else {
         false
     }
+}
+
+/// Apply a `connection-rm` to an open vault view: drop the record and, unless
+/// `keep_secrets`, delete the native keys `connection_removal` plans (written
+/// by this connection, bound by no other). Returns the deleted keys and the
+/// plan (its kept lists carry the reasons). The SSOT for the mutation, so tests
+/// drive the code the approve path runs.
+pub(crate) fn apply_connection_rm_to_view(
+    view: &mut crate::storage::plaintext::VaultPlaintextView,
+    id: &str,
+    keep_secrets: bool,
+    reg: &crate::service::ServiceRegistry,
+) -> std::result::Result<(Vec<String>, crate::storage::plaintext::ConnectionRemoval), String> {
+    let rec = view
+        .aux
+        .connections
+        .get(id)
+        .cloned()
+        .ok_or_else(|| format!("no connection '{}' in this vault", id))?;
+    let plan = if keep_secrets {
+        crate::storage::plaintext::ConnectionRemoval::default()
+    } else {
+        crate::storage::plaintext::connection_removal(
+            id,
+            &rec,
+            &view.aux.connections,
+            &view.native_secrets,
+            reg,
+        )
+    };
+    let mut removed = Vec::new();
+    for key in &plan.delete {
+        if view.native_secrets.remove(key).is_some() {
+            removed.push(key.clone());
+        }
+    }
+    view.aux.connections.remove(id);
+    Ok((removed, plan))
 }
 
 /// `POST /op/{op_id}/approve` — U submits the signed grant. T validates and
@@ -1370,6 +1410,9 @@ pub async fn approve_op(
                                 hosts: Some(vec![host.clone()]),
                                 secrets: None,
                                 keys: None,
+                                // Materialising the record writes no secret:
+                                // the keys it binds were stored by others.
+                                written: Some(Vec::new()),
                             },
                         );
                     }
@@ -1648,9 +1691,12 @@ pub async fn approve_op(
                 (resp, cached)
             }
             // Delete a connection record. Unless `scope.keep_secrets`, also
-            // deletes the secret(s) ONLY this connection references (shared-pool
-            // guard: a key another connection still claims is kept). Returns the
-            // removed + kept secret lists so the CLI can report them.
+            // deletes the secret(s) this connection WROTE that no other
+            // connection binds (`connection_removal`): a key it only bound
+            // (`--from-secret`), a key another connection still claims, and
+            // every key of a record that predates write tracking are kept.
+            // Returns the removed list and each kept key with its reason so
+            // the CLI can report them.
             "connection-rm" => {
                 let id = validated.op.act.target.trim().to_string();
                 if id.is_empty() {
@@ -1675,26 +1721,9 @@ pub async fn approve_op(
                         existing_vault.as_ref(),
                     )?;
                 let base = crate::storage::sealed_vault::ViewBase::of(&view)?;
-                let rec = view.aux.connections.get(&id).cloned().ok_or_else(|| {
-                    AppError::BadRequest(format!("no connection '{}' in this vault", id))
-                })?;
-                let mut removed_secrets: Vec<String> = Vec::new();
-                let mut kept_secrets: Vec<(String, Vec<String>)> = Vec::new();
-                if !keep_secrets {
-                    let claims = view.aux.connection_claims(&state.services, &id);
-                    for addr in rec.secret_addresses(&state.services) {
-                        if let Some(by) = claims.get(&addr) {
-                            if view.native_secrets.contains_key(&addr) {
-                                kept_secrets.push((addr, by.clone()));
-                            }
-                            continue;
-                        }
-                        if view.native_secrets.remove(&addr).is_some() {
-                            removed_secrets.push(addr);
-                        }
-                    }
-                }
-                view.aux.connections.remove(&id);
+                let (removed_secrets, plan) =
+                    apply_connection_rm_to_view(&mut view, &id, keep_secrets, &state.services)
+                        .map_err(AppError::BadRequest)?;
                 crate::auth::connect::persist_mutated_view(&state, &vault_id, &base, &view, &k)
                     .map_err(AppError::Internal)?;
                 {
@@ -1706,11 +1735,16 @@ pub async fn approve_op(
                     });
                 }
                 tracing::info!(vault = %vault_id, connection = %id, "connection removed");
+                // `kept_secrets` keeps its original shape ([key, [conn, …]]:
+                // still bound elsewhere) for older CLIs; the two newer reasons
+                // ride their own fields.
                 let resp = json!({
                     "ok": true, "act": "connection-rm",
                     "removed": id,
                     "removed_secrets": removed_secrets,
-                    "kept_secrets": kept_secrets,
+                    "kept_secrets": plan.shared,
+                    "kept_referenced": plan.referenced,
+                    "kept_untracked": plan.untracked,
                 });
                 let cached = Some(resp.to_string());
                 (resp, cached)
@@ -1868,8 +1902,10 @@ pub async fn approve_op(
                     }
                 }
 
-                // Every slot's KEY is either WRITTEN here (deposited) or must
-                // already be in the vault — raw and service alike. The vault
+                // Every NAMED slot's KEY is either WRITTEN here (deposited) or
+                // must already be in the vault, raw and service alike; an
+                // optional service role the request left unnamed binds its
+                // identity KEY only if the vault holds it natively. The vault
                 // is ONE flat namespace across every store: a key hosted in an
                 // external store (GCP etc.) binds exactly like a native one, so
                 // walk the full store_order, not just native-secrets.
@@ -1906,51 +1942,13 @@ pub async fn approve_op(
                 crate::server::handlers::connection_add::assert_card(scope, &card)
                     .map_err(AppError::BadRequest)?;
 
-                let record = match &def {
-                    None => {
-                        // Exact dedup only: native case-folding already
-                        // collapsed duplicates; two external keys differing
-                        // by case are DISTINCT secrets (GCP is case-
-                        // sensitive) and must both survive.
-                        let mut seen = std::collections::HashSet::new();
-                        let canonical: Vec<String> = slots
-                            .iter()
-                            .map(|(_, k, _)| k.clone())
-                            .filter(|k| seen.insert(k.clone()))
-                            .collect();
-                        crate::storage::plaintext::Connection {
-                            name: None,
-                            service: None,
-                            hosts: Some(hosts.clone()),
-                            secrets: Some(canonical),
-                            keys: None,
-                        }
-                    }
-                    Some(_) => {
-                        // The requested `keys` map with each referenced KEY in
-                        // its canonical form; roles the request left on the
-                        // identity binding stay off the map.
-                        let keys = keys.clone().map(|m| {
-                            m.into_iter()
-                                .map(|(role, key)| {
-                                    let canon = slots
-                                        .iter()
-                                        .find(|(slot, _, _)| slot.eq_ignore_ascii_case(&role))
-                                        .map(|(_, k, _)| k.clone())
-                                        .unwrap_or(key);
-                                    (role, canon)
-                                })
-                                .collect::<std::collections::BTreeMap<_, _>>()
-                        });
-                        crate::storage::plaintext::Connection {
-                            name: None,
-                            service: service.clone(),
-                            hosts: Some(hosts.clone()).filter(|h| !h.is_empty()),
-                            secrets: None,
-                            keys: keys.filter(|m| !m.is_empty()),
-                        }
-                    }
-                };
+                let record = crate::server::handlers::connection_add::record(
+                    service.as_deref(),
+                    &hosts,
+                    keys.as_ref(),
+                    &slots,
+                    view.aux.connections.get(&id),
+                );
 
                 let written: Vec<String> = values
                     .as_ref()

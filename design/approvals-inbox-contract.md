@@ -16,10 +16,17 @@ names are exact. All new fields are optional on read (old peers omit them).
 Every approval row/card shows THREE roles: **user** (the human account that
 owns the requesting agent key or device key; in a personal vault this is the
 viewer, rendered "you"/"你"), **agent** (label of the agent key whose prefix
-the daemon signed into `scope.agent`; absent for CLI ceremonies such as
-`sc get` → render "SafeClaw CLI"), **device** (device key label the relay row
-was registered with). All three are DISPLAY ONLY (backend-resolved, never used
-for signing or default-check).
+the daemon signed into `scope.agent`). A CLI ceremony (`sc get`, `sc unlock`,
+`sc connection add`, ...) run by an agent carries the same `scope.agent`: the
+CLI sends a proof of possession over the exact op (`x-sc-agent-pop`, target
+`op:<b64url SHA-256 of the op's canonical bytes>`, `agent_pop::op_target`),
+the daemon verifies it on `POST /v/{vid}/op`, drops any unproven
+`scope.agent`, and stamps the verified `ag_…` id (also onto the record, audit
+row, and relay registration). Without a valid proof there is no agent → render
+"Terminal" / 「终端」. On this loopback API the attribution is consent
+information, not a boundary: a local process can omit it. **device** (device
+key label the relay row was registered with). All three are DISPLAY ONLY
+(backend-resolved, never used for signing or default-check).
 
 ## 1. Daemon ↔ CLI (local loopback)
 

@@ -44,8 +44,9 @@ Adding a service is a TOML file, not a plugin: [SERVICES.md](reference/services.
   (`--from-literal SLOT=VALUE`) or from a secret already in the vault
   (`--from-secret SLOT=KEY`, no value shown anywhere). With `--service`, a
   slot is one of the service's secret roles; for a custom connection it is
-  the KEY itself (`--from-secret KEY`). A service role left unfilled is
-  prompted for on a terminal.
+  the KEY itself (`--from-secret KEY`). A service's primary credential role
+  is required (prompted for on a terminal); its other roles, like
+  Cloudflare's account ID, are optional.
 
   ```
   sc connection add codex_work --service openai_codex \
@@ -57,6 +58,12 @@ Adding a service is a TOML file, not a plugin: [SERVICES.md](reference/services.
   approve with your passkey, and the approval lists every key the connection
   binds (new or existing), every host it sends them to, and any other
   connection already using the same key.
+
+  `sc connection rm <id>` deletes the secrets that connection wrote, unless
+  another connection uses them. A secret it was bound to with
+  `--from-secret` stays in the vault, and so does every secret of a
+  connection added before SafeClaw recorded which secrets a connection
+  writes; the command lists each kept key and why.
 - **Any other HTTPS API**: a custom connection with your own host anchor.
   The catalog is a convenience, not a boundary.
 - **External stores**: keep values in your own secret manager (e.g. GCP

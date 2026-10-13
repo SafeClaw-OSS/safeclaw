@@ -103,15 +103,117 @@ impl Card {
     }
 }
 
+/// The record's `written` list (`Connection::written`): every KEY this
+/// approval writes (deposited), plus any KEY the same-id record it replaces had
+/// written and the new one still binds, so re-adding a connection over its own
+/// secret keeps that secret's provenance. A KEY the new record only references
+/// and the old one did not write (or a legacy record with no `written`) stays
+/// off the list: removal then keeps it.
+pub(crate) fn written_keys(
+    slots: &[(String, String, bool)],
+    replaced: Option<&Connection>,
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |k: &str| {
+        if !out.iter().any(|o| o.eq_ignore_ascii_case(k)) {
+            out.push(k.to_string());
+        }
+    };
+    for (_, key, written) in slots {
+        if *written {
+            push(key);
+        }
+    }
+    let prev = replaced.and_then(|c| c.written.as_ref());
+    for k in prev.into_iter().flatten() {
+        if slots.iter().any(|(_, key, _)| key.eq_ignore_ascii_case(k)) {
+            push(k);
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Apply-time: the record a `connection-add` stores for resolved `slots` =
+/// `(slot, canonical KEY, written?)`. RAW (`service: None`): the slot KEYs as
+/// its `secrets` list (exact dedup only: native case-folding already collapsed
+/// duplicates, and two external keys differing by case are distinct secrets).
+/// SERVICE: the requested `keys` map with each KEY in its canonical form;
+/// roles the request left on the identity binding stay off the map. Either
+/// way `written` comes from [`written_keys`] against the record replaced.
+pub(crate) fn record(
+    service: Option<&str>,
+    hosts: &[String],
+    keys: Option<&BTreeMap<String, String>>,
+    slots: &[(String, String, bool)],
+    replaced: Option<&Connection>,
+) -> Connection {
+    let written = Some(written_keys(slots, replaced));
+    match service {
+        None => {
+            let mut seen = std::collections::HashSet::new();
+            let canonical: Vec<String> = slots
+                .iter()
+                .map(|(_, k, _)| k.clone())
+                .filter(|k| seen.insert(k.clone()))
+                .collect();
+            Connection {
+                name: None,
+                service: None,
+                hosts: Some(hosts.to_vec()),
+                secrets: Some(canonical),
+                keys: None,
+                written,
+            }
+        }
+        Some(service) => {
+            let keys: Option<BTreeMap<String, String>> = keys.map(|m| {
+                m.iter()
+                    .map(|(role, key)| {
+                        let canon = slots
+                            .iter()
+                            .find(|(slot, _, _)| slot.eq_ignore_ascii_case(role))
+                            .map(|(_, k, _)| k.clone())
+                            .unwrap_or_else(|| key.clone());
+                        (role.clone(), canon)
+                    })
+                    .collect()
+            });
+            Connection {
+                name: None,
+                service: Some(service.to_string()),
+                hosts: Some(hosts.to_vec()).filter(|h| !h.is_empty()),
+                secrets: None,
+                keys: keys.filter(|m| !m.is_empty()),
+                written,
+            }
+        }
+    }
+}
+
+/// One slot as the op REQUESTS it (before native case-folding).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Requested {
+    pub slot: String,
+    pub key: String,
+    /// A service role the op does not name (no `keys` entry, its KEY not in
+    /// `secrets`): it falls back to the identity binding. Optional: it binds
+    /// that KEY only when the vault already holds it natively (and the card
+    /// then shows it), else it stays unfilled. Never set for a raw slot.
+    pub implicit: bool,
+}
+
 /// The connection's slots and the KEY each binds, as the op REQUESTS them
 /// (before native case-folding). A raw connection's slots are its `secrets`
-/// list (slot = KEY); a service connection binds EVERY declared role, through
-/// the op's `keys` map (role matched case-insensitively) or, absent an entry,
-/// the role's own name (the identity binding `secret_key_for` applies).
+/// list (slot = KEY). A service connection has a slot per declared role,
+/// through the op's `keys` map (role matched case-insensitively) or, absent
+/// an entry, the role's own name (the identity binding `secret_key_for`
+/// applies); a role is NAMED when it has a `keys` entry or its KEY is in the
+/// op's `secrets`, and implicit otherwise.
 pub(crate) fn requested_slots(
     scope: &Value,
     def: Option<&ServiceDef>,
-) -> Result<Vec<(String, String)>, String> {
+) -> Result<Vec<Requested>, String> {
     let str_list = |k: &str| -> Vec<String> {
         scope
             .get(k)
@@ -129,7 +231,11 @@ pub(crate) fn requested_slots(
             Ok(str_list("secrets")
                 .into_iter()
                 .filter(|k| seen.insert(k.clone()))
-                .map(|k| (k.clone(), k))
+                .map(|k| Requested {
+                    slot: k.clone(),
+                    key: k,
+                    implicit: false,
+                })
                 .collect())
         }
         Some(def) => {
@@ -142,6 +248,7 @@ pub(crate) fn requested_slots(
                         .collect()
                 })
                 .unwrap_or_default();
+            let named = str_list("secrets");
             let roles = &def.service.secrets;
             for r in keys.keys() {
                 if !roles.iter().any(|d| d.eq_ignore_ascii_case(r)) {
@@ -155,14 +262,20 @@ pub(crate) fn requested_slots(
             }
             Ok(roles
                 .iter()
-                .map(|role| {
-                    let key = keys
-                        .iter()
-                        .find(|(r, _)| r.eq_ignore_ascii_case(role))
-                        .map(|(_, k)| k.clone())
-                        .unwrap_or_else(|| role.clone());
-                    (role.clone(), key)
-                })
+                .map(
+                    |role| match keys.iter().find(|(r, _)| r.eq_ignore_ascii_case(role)) {
+                        Some((_, k)) => Requested {
+                            slot: role.clone(),
+                            key: k.clone(),
+                            implicit: false,
+                        },
+                        None => Requested {
+                            slot: role.clone(),
+                            key: role.clone(),
+                            implicit: !named.iter().any(|n| n.eq_ignore_ascii_case(role)),
+                        },
+                    },
+                )
                 .collect())
         }
     }
@@ -223,20 +336,25 @@ pub(crate) fn destinations(def: Option<&ServiceDef>, hosts: &[String]) -> Vec<St
     out
 }
 
-/// Apply-time: resolve each requested `(slot, KEY)` against the opened vault
-/// into `(slot, canonical KEY, written?)`. A KEY is WRITTEN when the op's
-/// deposit holds it; otherwise it must already exist, native (case-folded to
-/// its stored casing) or in an external store, walking the full store_order
-/// (a network probe on this ceremony path; an outage fails the approve
-/// loudly). Every deposited KEY must be bound to some slot.
+/// Apply-time: resolve each requested slot against the opened vault into
+/// `(slot, canonical KEY, written?)`. A KEY is WRITTEN when the op's deposit
+/// holds it; otherwise a NAMED slot's KEY must already exist, native
+/// (case-folded to its stored casing) or in an external store, walking the
+/// full store_order (a network probe on this ceremony path; an outage fails
+/// the approve loudly). An IMPLICIT slot (an optional service role the op
+/// left on its identity binding) binds its KEY only when it exists natively
+/// and is otherwise left out; one that exists only in an external store is
+/// refused, since it would bind without the card (computed at mint from
+/// native names only) showing it. Every deposited KEY must be bound to some
+/// slot.
 pub(crate) async fn resolve_slots(
     view: &crate::storage::plaintext::VaultPlaintextView,
-    requested: Vec<(String, String)>,
+    requested: Vec<Requested>,
     deposited: &BTreeSet<String>,
 ) -> crate::error::Result<Vec<(String, String, bool)>> {
     use crate::error::AppError;
     for k in deposited {
-        if !requested.iter().any(|(_, key)| key == k) {
+        if !requested.iter().any(|r| r.key == *k) {
             return Err(AppError::BadRequest(format!(
                 "deposited key '{}' is not bound to any slot of this connection",
                 k
@@ -245,19 +363,38 @@ pub(crate) async fn resolve_slots(
     }
     let native: BTreeSet<String> = view.native_secrets.keys().cloned().collect();
     let mut slots = Vec::with_capacity(requested.len());
-    for (slot, key) in requested {
+    for Requested {
+        slot,
+        key,
+        implicit,
+    } in requested
+    {
         if deposited.contains(&key) {
             slots.push((slot, key, true));
             continue;
         }
         let canon = canonical_key(&key, &native);
-        if !native.contains(&canon) && view.resolve_value_async(&canon).await?.is_none() {
-            return Err(AppError::BadRequest(format!(
-                "no such secret '{}' in the vault (checked native + external stores)",
-                key
-            )));
+        if native.contains(&canon) {
+            slots.push((slot, canon, false));
+            continue;
         }
-        slots.push((slot, canon, false));
+        let external = view.resolve_value_async(&canon).await?.is_some();
+        match (implicit, external) {
+            (false, true) => slots.push((slot, canon, false)),
+            (false, false) => {
+                return Err(AppError::BadRequest(format!(
+                    "no such secret '{}' in the vault (checked native + external stores)",
+                    key
+                )))
+            }
+            (true, true) => {
+                return Err(AppError::BadRequest(format!(
+                    "slot '{}' was left unfilled, but an external store holds '{}', which this connection would then use; name it explicitly (`--from-secret {}={}`) so the approval shows it",
+                    slot, canon, slot, canon
+                )))
+            }
+            (true, false) => {} // optional role, unfilled
+        }
     }
     Ok(slots)
 }
@@ -375,25 +512,26 @@ pub(crate) fn stamp_at_mint(
         Some(svc) => Some(resolve_def(svc, custom.as_ref(), &state.services)?),
         None => None,
     };
-    let slots: Vec<(String, String, bool)> = requested_slots(scope, def.as_ref())?
-        .into_iter()
-        .map(|(slot, key)| {
-            if deposited.contains(&key) {
-                (slot, key, true)
-            } else {
-                (slot, canonical_key(&key, &native), false)
-            }
-        })
-        .collect();
-    // Refuse before anyone is asked to approve when a referenced key can't
-    // exist: no native match and no external store that could hold it. With
-    // an external store configured, apply checks it (network) instead.
-    if !has_external {
-        if let Some((_, key, _)) = slots
-            .iter()
-            .find(|(_, k, written)| !written && !native.contains(k))
-        {
-            return Err(format!("no such secret '{}' in the vault", key));
+    let mut slots: Vec<(String, String, bool)> = Vec::new();
+    for r in requested_slots(scope, def.as_ref())? {
+        if deposited.contains(&r.key) {
+            slots.push((r.slot, r.key, true));
+            continue;
+        }
+        let canon = canonical_key(&r.key, &native);
+        if native.contains(&canon) {
+            slots.push((r.slot, canon, false));
+        } else if r.implicit {
+            // An optional role left unfilled (apply refuses if an external
+            // store turns out to hold its identity KEY).
+        } else if !has_external {
+            // Refuse before anyone is asked to approve when a named key can't
+            // exist: no native match and no external store that could hold
+            // it. With an external store configured, apply checks it
+            // (network) instead.
+            return Err(format!("no such secret '{}' in the vault", r.key));
+        } else {
+            slots.push((r.slot, canon, false));
         }
     }
     let c = card(
@@ -449,6 +587,7 @@ mod tests {
             hosts: Some(vec!["api.example.com".into()]),
             secrets: Some(keys.iter().map(|k| k.to_string()).collect()),
             keys: None,
+            written: None,
         }
     }
 
@@ -467,6 +606,7 @@ mod tests {
                         .collect(),
                 )
             },
+            written: None,
         }
     }
 
@@ -482,13 +622,18 @@ mod tests {
         assert_eq!(
             slots,
             vec![
-                ("CLOUDFLARE_API_TOKEN".into(), "CF_TOKEN_WORK".into()),
-                (
-                    "CLOUDFLARE_ACCOUNT_ID".into(),
-                    "CLOUDFLARE_ACCOUNT_ID".into()
-                ),
+                req("CLOUDFLARE_API_TOKEN", "CF_TOKEN_WORK", false),
+                // Not named by the op: optional, on its identity binding.
+                req("CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_ACCOUNT_ID", true),
             ]
         );
+        // A role whose identity KEY the op lists in `secrets` is named.
+        let scope = json!({
+            "service": "cloudflare",
+            "secrets": ["cloudflare_account_id"],
+        });
+        let slots = requested_slots(&scope, Some(cf)).unwrap();
+        assert!(slots[0].implicit && !slots[1].implicit, "{slots:?}");
         // An undeclared role in `keys` is refused with the service's roles.
         let bad = json!({ "service": "cloudflare", "keys": { "NOPE": "X" } });
         let e = requested_slots(&bad, Some(cf)).unwrap_err();
@@ -499,15 +644,20 @@ mod tests {
         assert!(e.contains("CLOUDFLARE_API_TOKEN"), "{e}");
     }
 
+    fn req(slot: &str, key: &str, implicit: bool) -> Requested {
+        Requested {
+            slot: slot.into(),
+            key: key.into(),
+            implicit,
+        }
+    }
+
     #[test]
     fn raw_slots_are_the_keys() {
         let scope = json!({ "secrets": ["A_KEY", "B_KEY", "A_KEY"] });
         assert_eq!(
             requested_slots(&scope, None).unwrap(),
-            vec![
-                ("A_KEY".into(), "A_KEY".into()),
-                ("B_KEY".into(), "B_KEY".into())
-            ]
+            vec![req("A_KEY", "A_KEY", false), req("B_KEY", "B_KEY", false)]
         );
     }
 
@@ -778,9 +928,9 @@ mod tests {
         let slots = resolve_slots(
             &view,
             vec![
-                ("R1".into(), "old_refresh".into()),
-                ("R2".into(), "NEW_KEY".into()),
-                ("R3".into(), "GITHUB_TOKEN".into()),
+                req("R1", "old_refresh", false),
+                req("R2", "NEW_KEY", false),
+                req("R3", "GITHUB_TOKEN", false),
             ],
             &deposited,
         )
@@ -794,18 +944,204 @@ mod tests {
                 ("R3".to_string(), "GITHUB_TOKEN".to_string(), false),
             ]
         );
-        let e = resolve_slots(
-            &view,
-            vec![("R".into(), "TYPO_KEY".into())],
-            &BTreeSet::new(),
-        )
-        .await
-        .unwrap_err();
+        let e = resolve_slots(&view, vec![req("R", "TYPO_KEY", false)], &BTreeSet::new())
+            .await
+            .unwrap_err();
         assert!(e.to_string().contains("no such secret 'TYPO_KEY'"), "{e}");
-        let e = resolve_slots(&view, vec![("R".into(), "GITHUB_TOKEN".into())], &deposited)
+        let e = resolve_slots(&view, vec![req("R", "GITHUB_TOKEN", false)], &deposited)
             .await
             .unwrap_err();
         assert!(e.to_string().contains("not bound to any slot"), "{e}");
+    }
+
+    /// An optional role the op left unnamed binds its identity KEY only when
+    /// the vault holds it natively; otherwise it is simply left out.
+    #[tokio::test]
+    async fn apply_leaves_an_absent_optional_role_unfilled() {
+        let view = view_with(&["CF_TOKEN"]);
+        let slots = resolve_slots(
+            &view,
+            vec![
+                req("CLOUDFLARE_API_TOKEN", "CF_TOKEN", false),
+                req("CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_ACCOUNT_ID", true),
+            ],
+            &BTreeSet::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            slots,
+            vec![(
+                "CLOUDFLARE_API_TOKEN".to_string(),
+                "CF_TOKEN".to_string(),
+                false
+            )]
+        );
+        let view = view_with(&["CF_TOKEN", "CLOUDFLARE_ACCOUNT_ID"]);
+        let slots = resolve_slots(
+            &view,
+            vec![req("CLOUDFLARE_ACCOUNT_ID", "cloudflare_account_id", true)],
+            &BTreeSet::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            slots,
+            vec![(
+                "CLOUDFLARE_ACCOUNT_ID".to_string(),
+                "CLOUDFLARE_ACCOUNT_ID".to_string(),
+                false
+            )],
+            "present natively: bound, and so on the card"
+        );
+    }
+
+    /// Mint: a service connection that fills only its primary role is
+    /// accepted (no "no such secret" for the optional role), and the card
+    /// shows only what binds.
+    #[test]
+    fn mint_accepts_an_unfilled_optional_role() {
+        let state = test_state();
+        unlock(&state, &[], &["CF_TOKEN_WORK"]);
+        let mut op = add_op(
+            "cloudflare_work",
+            json!({
+                "service": "cloudflare",
+                "secrets": ["CF_TOKEN_WORK"],
+                "keys": { "CLOUDFLARE_API_TOKEN": "CF_TOKEN_WORK" },
+            }),
+        );
+        stamp_at_mint(&state, "v1", &mut op).unwrap();
+        let c = Card::from_scope(&op.act.scope).unwrap();
+        assert_eq!(
+            c.referenced,
+            BTreeMap::from([(
+                "CLOUDFLARE_API_TOKEN".to_string(),
+                "CF_TOKEN_WORK".to_string()
+            )])
+        );
+        assert!(c.written.is_empty());
+        // A NAMED key that cannot exist is still refused.
+        let mut op = add_op(
+            "cloudflare_work",
+            json!({
+                "service": "cloudflare",
+                "secrets": ["CF_TOKEN_WORK", "CF_ACCT_TYPO"],
+                "keys": {
+                    "CLOUDFLARE_API_TOKEN": "CF_TOKEN_WORK",
+                    "CLOUDFLARE_ACCOUNT_ID": "CF_ACCT_TYPO",
+                },
+            }),
+        );
+        let e = stamp_at_mint(&state, "v1", &mut op).unwrap_err();
+        assert!(e.contains("no such secret 'CF_ACCT_TYPO'"), "{e}");
+    }
+
+    /// Provenance: a deposited KEY is written, a referenced one is not, and a
+    /// same-id record being replaced hands over only keys it wrote that the
+    /// new record still binds.
+    #[test]
+    fn written_keys_track_what_this_connection_wrote() {
+        let slots = vec![
+            ("A".to_string(), "NEW_A".to_string(), true),
+            ("B".to_string(), "OLD_B".to_string(), false),
+            ("C".to_string(), "OWN_C".to_string(), false),
+        ];
+        assert_eq!(written_keys(&slots, None), vec!["NEW_A".to_string()]);
+        let prev = Connection {
+            written: Some(vec!["OWN_C".into(), "GONE".into()]),
+            ..Connection::default()
+        };
+        assert_eq!(
+            written_keys(&slots, Some(&prev)),
+            vec!["NEW_A".to_string(), "OWN_C".to_string()]
+        );
+        let legacy = Connection::default();
+        assert_eq!(
+            written_keys(&slots, Some(&legacy)),
+            vec!["NEW_A".to_string()]
+        );
+    }
+
+    /// The design's acceptance (4) end to end over the apply code: a service
+    /// connection BOUND to an existing refresh token, then removed, leaves
+    /// that token in the vault; a connection that WROTE its key takes it with
+    /// it; a pre-tracking record keeps everything.
+    #[tokio::test]
+    async fn rm_keeps_a_bound_key_and_deletes_a_written_one() {
+        let r = reg();
+        let mut view = view_with(&["HEJIA_OAI_REFRESH_TOKEN_X"]);
+        // Add codex_x bound to the existing token (no deposit).
+        let codex = r.get("openai_codex").unwrap();
+        let scope = json!({
+            "service": "openai_codex",
+            "secrets": ["HEJIA_OAI_REFRESH_TOKEN_X"],
+            "keys": { "OPENAI_CODEX_REFRESH_TOKEN": "HEJIA_OAI_REFRESH_TOKEN_X" },
+        });
+        let slots = resolve_slots(
+            &view,
+            requested_slots(&scope, Some(codex)).unwrap(),
+            &BTreeSet::new(),
+        )
+        .await
+        .unwrap();
+        let keys: BTreeMap<String, String> = BTreeMap::from([(
+            "OPENAI_CODEX_REFRESH_TOKEN".to_string(),
+            "HEJIA_OAI_REFRESH_TOKEN_X".to_string(),
+        )]);
+        let rec = record(Some("openai_codex"), &[], Some(&keys), &slots, None);
+        assert_eq!(rec.written, Some(vec![]));
+        view.aux.connections.insert("codex_x".into(), rec);
+
+        // Add github_work writing a new value.
+        let gh = r.get("github").unwrap();
+        let scope = json!({
+            "service": "github",
+            "secrets": ["GITHUB_TOKEN_WORK"],
+            "keys": { "GITHUB_TOKEN": "GITHUB_TOKEN_WORK" },
+        });
+        let deposited: BTreeSet<String> = ["GITHUB_TOKEN_WORK".to_string()].into();
+        let slots = resolve_slots(
+            &view,
+            requested_slots(&scope, Some(gh)).unwrap(),
+            &deposited,
+        )
+        .await
+        .unwrap();
+        let keys = BTreeMap::from([("GITHUB_TOKEN".to_string(), "GITHUB_TOKEN_WORK".to_string())]);
+        let rec = record(Some("github"), &[], Some(&keys), &slots, None);
+        assert_eq!(rec.written, Some(vec!["GITHUB_TOKEN_WORK".to_string()]));
+        view.native_secrets
+            .insert("GITHUB_TOKEN_WORK".into(), b"ghp".to_vec());
+        view.aux.connections.insert("github_work".into(), rec);
+
+        // A record from before write tracking, bound to its own key.
+        view.native_secrets
+            .insert("LEGACY_KEY".into(), b"l".to_vec());
+        view.aux
+            .connections
+            .insert("legacy".into(), conn_raw(&["LEGACY_KEY"]));
+
+        let rm = crate::server::handlers::approve::apply_connection_rm_to_view;
+        let (removed, plan) = rm(&mut view, "codex_x", false, &r).unwrap();
+        assert!(removed.is_empty());
+        assert_eq!(
+            plan.referenced,
+            vec!["HEJIA_OAI_REFRESH_TOKEN_X".to_string()]
+        );
+        assert!(view
+            .native_secrets
+            .contains_key("HEJIA_OAI_REFRESH_TOKEN_X"));
+        assert!(!view.aux.connections.contains_key("codex_x"));
+
+        let (removed, _) = rm(&mut view, "github_work", false, &r).unwrap();
+        assert_eq!(removed, vec!["GITHUB_TOKEN_WORK".to_string()]);
+        assert!(!view.native_secrets.contains_key("GITHUB_TOKEN_WORK"));
+
+        let (removed, plan) = rm(&mut view, "legacy", false, &r).unwrap();
+        assert!(removed.is_empty());
+        assert_eq!(plan.untracked, vec!["LEGACY_KEY".to_string()]);
+        assert!(view.native_secrets.contains_key("LEGACY_KEY"));
     }
 
     #[test]
