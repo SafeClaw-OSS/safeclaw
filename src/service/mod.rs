@@ -1439,15 +1439,39 @@ level = "allow"
                 ("POST", "pipeline/run"),
                 ("POST", "envvar"),
                 ("POST", "schedule"),
+                ("POST", "checkout-key"),
+                ("PATCH", "settings"),
             ] {
                 let path = format!("/api/v2/project/{}/{}", slug, tail);
+                assert_eq!(eval(m, &path), AccessLevel::Ask, "{m} {path}");
+            }
+            // API v1.1 on the same host.
+            for (m, tail) in [
+                ("POST", ""),
+                ("POST", "/build"),
+                ("POST", "/tree/main"),
+                ("POST", "/tree/feature%2Fx"),
+                ("POST", "/tree/feature/x"),
+                ("POST", "/42/retry"),
+                ("POST", "/42/ssh"),
+                ("POST", "/42/ssh-users"),
+                ("POST", "/envvar"),
+                ("POST", "/ssh-key"),
+                ("POST", "/checkout-key"),
+            ] {
+                let path = format!("/api/v1.1/project/{}{}", slug, tail);
                 assert_eq!(eval(m, &path), AccessLevel::Ask, "{m} {path}");
             }
             // Reads and removals ride the floor.
             let pipelines = format!("/api/v2/project/{}/pipeline", slug);
             assert_eq!(eval("GET", &pipelines), AccessLevel::Allow);
+            let settings = format!("/api/v2/project/{}/settings", slug);
+            assert_eq!(eval("GET", &settings), AccessLevel::Allow);
             let envvar = format!("/api/v2/project/{}/envvar/NAME", slug);
             assert_eq!(eval("DELETE", &envvar), AccessLevel::Allow);
+            let v1_envvar = format!("/api/v1.1/project/{}/envvar/NAME", slug);
+            assert_eq!(eval("DELETE", &v1_envvar), AccessLevel::Allow);
+            assert_eq!(eval("GET", &v1_envvar), AccessLevel::Allow);
         }
         for (m, p) in [
             ("PUT", "/api/v2/context/c-1/environment-variable/TOKEN"),
@@ -1459,10 +1483,24 @@ level = "allow"
                 "/api/v2/projects/p-1/pipeline-definitions/d-1/triggers",
             ),
             ("PATCH", "/api/v2/projects/p-1/triggers/t-1"),
+            ("POST", "/api/v2/workflow/w-1/approve/a-1"),
+            ("POST", "/api/v2/projects/p-1/rollback"),
+            ("POST", "/api/v2/projects/p-1/pipeline-definitions"),
+            ("PATCH", "/api/v2/projects/p-1/pipeline-definitions/d-1"),
+            ("PATCH", "/api/v2/org/o-1/oidc-custom-claims"),
+            ("PATCH", "/api/v2/org/o-1/project/p-1/oidc-custom-claims"),
+            ("DELETE", "/api/v2/context/c-1/restrictions/r-1"),
         ] {
             assert_eq!(eval(m, p), AccessLevel::Ask, "{m} {p}");
         }
-        assert_eq!(eval("GET", "/api/v2/me"), AccessLevel::Allow);
+        for (m, p) in [
+            ("GET", "/api/v2/me"),
+            ("GET", "/api/v2/projects/p-1/pipeline-definitions"),
+            ("GET", "/api/v2/org/o-1/oidc-custom-claims"),
+            ("POST", "/api/v2/context/c-1/restrictions"),
+        ] {
+            assert_eq!(eval(m, p), AccessLevel::Allow, "{m} {p}");
+        }
     }
 
     // ── v4 service.toml parsing ──────────────────────────────────────────────

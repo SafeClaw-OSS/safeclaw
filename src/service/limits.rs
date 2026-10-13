@@ -46,7 +46,7 @@ pub const MAX_RULES: usize = 128;
 /// Rules with a `body` regex, each compiled at load and matched against the
 /// bodies its paths see (3: railway).
 pub const MAX_BODY_RULES: usize = 16;
-/// `match` patterns per rule or request shape (8: circleci).
+/// `match` patterns per rule or request shape (20: circleci).
 pub const MAX_MATCH_PATTERNS: usize = 32;
 /// `[requests.<name>]` shapes (1: gmail, snaplii).
 pub const MAX_REQUESTS: usize = 32;

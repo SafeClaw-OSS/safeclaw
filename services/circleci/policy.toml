@@ -1,14 +1,21 @@
 # CircleCI policy. The token never enters the agent and egress is host-anchored,
 # so routine reads (pipelines, jobs, workflows, insights, env-var listing) ride
-# the floor. The gate is spent where CI code runs or reads planted values:
-# triggering, continuing or rerunning a pipeline, scheduling one, and writing a
-# project or context env var the build will read. Each rule is a per-connection
-# console toggle; loosen or tighten to taste.
+# the floor. The gate is spent where CI code runs or reads planted values, and
+# where a deploy or a project's trust settings change: triggering, continuing
+# or rerunning a pipeline, scheduling one, changing which config it runs,
+# approving a held job, rolling back, writing an env var or key the build will
+# read, changing project settings or OIDC token claims, and lifting a context
+# restriction. Each rule is a per-connection console toggle; loosen or tighten
+# to taste.
 #
 # Endpoints are CircleCI API v2 (https://circleci.com/api/v2/openapi.json). A
 # project slug is `vcs-slug/org-name/repo-name` and either `/` may be
 # URL-escaped, so a slug spans one, two or three path segments and each rule
-# lists all three forms (`*` is one segment; `**` is only allowed last).
+# lists all three forms (`*` is one segment; `**` is only allowed last). The
+# project endpoints CircleCI still documents under API v1.1 on the same host
+# (https://circleci.com/docs/api/v1/) are covered alongside their v2
+# counterparts; their `:vcs-type/:username/:project` is matched in the same
+# three forms.
 
 [default]
 read = "allow"
@@ -17,7 +24,7 @@ write = "allow"
 # ── Supply chain / code execution ────────────────────────────────────────────
 [[rule]]
 id = "trigger-pipeline"
-label = "Trigger, continue or rerun a pipeline (runs CI code)"
+label = "Trigger, continue or rerun a pipeline or job (runs CI code)"
 match = [
   "POST /api/v2/project/*/pipeline",
   "POST /api/v2/project/*/*/pipeline",
@@ -27,6 +34,32 @@ match = [
   "POST /api/v2/project/*/*/*/pipeline/run",
   "POST /api/v2/pipeline/continue",
   "POST /api/v2/workflow/*/rerun",
+  # v1.1: trigger a job, a job on a branch, a pipeline; retry a job.
+  "POST /api/v1.1/project/*",
+  "POST /api/v1.1/project/*/*",
+  "POST /api/v1.1/project/*/*/*",
+  "POST /api/v1.1/project/*/tree/**",
+  "POST /api/v1.1/project/*/*/tree/**",
+  "POST /api/v1.1/project/*/*/*/tree/**",
+  "POST /api/v1.1/project/*/build",
+  "POST /api/v1.1/project/*/*/build",
+  "POST /api/v1.1/project/*/*/*/build",
+  "POST /api/v1.1/project/*/*/retry",
+  "POST /api/v1.1/project/*/*/*/retry",
+  "POST /api/v1.1/project/*/*/*/*/retry",
+]
+level = "ask"
+
+[[rule]]
+id = "job-ssh"
+label = "Rerun a job with SSH access, or give a user SSH access to a job"
+match = [
+  "POST /api/v1.1/project/*/*/ssh",
+  "POST /api/v1.1/project/*/*/*/ssh",
+  "POST /api/v1.1/project/*/*/*/*/ssh",
+  "POST /api/v1.1/project/*/*/ssh-users",
+  "POST /api/v1.1/project/*/*/*/ssh-users",
+  "POST /api/v1.1/project/*/*/*/*/ssh-users",
 ]
 level = "ask"
 
@@ -43,7 +76,29 @@ match = [
 ]
 level = "ask"
 
-# ── Plant a secret the build will read ───────────────────────────────────────
+[[rule]]
+id = "pipeline-definition"
+label = "Create or change a pipeline definition (which config a project runs)"
+match = [
+  "POST /api/v2/projects/*/pipeline-definitions",
+  "PATCH /api/v2/projects/*/pipeline-definitions/*",
+]
+level = "ask"
+
+# ── Deploys ──────────────────────────────────────────────────────────────────
+[[rule]]
+id = "approve-job"
+label = "Approve a job that is waiting for approval (can release a held deploy)"
+match = ["POST /api/v2/workflow/*/approve/*"]
+level = "ask"
+
+[[rule]]
+id = "rollback-project"
+label = "Roll back a project (runs its rollback pipeline)"
+match = ["POST /api/v2/projects/*/rollback"]
+level = "ask"
+
+# ── Plant a secret or key the build will read ────────────────────────────────
 [[rule]]
 id = "create-env-var"
 label = "Create or overwrite a project or context environment variable"
@@ -52,5 +107,52 @@ match = [
   "POST /api/v2/project/*/*/envvar",
   "POST /api/v2/project/*/*/*/envvar",
   "PUT /api/v2/context/*/environment-variable/*",
+  "POST /api/v1.1/project/*/envvar",
+  "POST /api/v1.1/project/*/*/envvar",
+  "POST /api/v1.1/project/*/*/*/envvar",
 ]
+level = "ask"
+
+[[rule]]
+id = "add-project-key"
+label = "Add a checkout key or SSH key to a project"
+match = [
+  "POST /api/v2/project/*/checkout-key",
+  "POST /api/v2/project/*/*/checkout-key",
+  "POST /api/v2/project/*/*/*/checkout-key",
+  "POST /api/v1.1/project/*/checkout-key",
+  "POST /api/v1.1/project/*/*/checkout-key",
+  "POST /api/v1.1/project/*/*/*/checkout-key",
+  "POST /api/v1.1/project/*/ssh-key",
+  "POST /api/v1.1/project/*/*/ssh-key",
+  "POST /api/v1.1/project/*/*/*/ssh-key",
+]
+level = "ask"
+
+# ── Project and organization trust settings ──────────────────────────────────
+[[rule]]
+id = "project-settings"
+label = "Change a project's advanced settings"
+match = [
+  "PATCH /api/v2/project/*/settings",
+  "PATCH /api/v2/project/*/*/settings",
+  "PATCH /api/v2/project/*/*/*/settings",
+]
+level = "ask"
+
+[[rule]]
+id = "oidc-claims"
+label = "Change the custom claims in CircleCI's OIDC tokens for an organization or project"
+match = [
+  "PATCH /api/v2/org/*/oidc-custom-claims",
+  "PATCH /api/v2/org/*/project/*/oidc-custom-claims",
+]
+level = "ask"
+
+# Removing a restriction widens who can use the context's secrets, so unlike
+# other removals it does not ride the floor.
+[[rule]]
+id = "remove-context-restriction"
+label = "Remove a restriction on who can use a context"
+match = ["DELETE /api/v2/context/*/restrictions/*"]
 level = "ask"
