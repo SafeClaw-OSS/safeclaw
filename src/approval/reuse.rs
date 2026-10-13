@@ -24,8 +24,12 @@
 //!   included). Requests the policy already allows on this connection (from
 //!   any agent) are served from the same held value instead of asking for it.
 //!   `ask-always` requests and value-bound (`exact`) requests keep their own
-//!   approvals. A later approval on the same connection replaces the held
-//!   value, and locking the vault drops it.
+//!   approvals.
+//!
+//! Every window is an upper bound: a later approval on the same connection
+//! replaces the held value, and any vault change (a write, a sync) or a lock
+//! rebuilds the session cache and drops held approvals. A window can end
+//! early; it never extends.
 //!
 //! A per-(rule, method) window is NOT a value here: the rule-approval record
 //! (`state::record_ask_approval`) narrows the policy decision, but the held

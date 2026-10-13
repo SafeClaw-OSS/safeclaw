@@ -5,7 +5,7 @@ Every brokered request gets exactly one decision:
 | Level | Behavior |
 |---|---|
 | `allow` | proceeds, no ceremony |
-| `ask` | one passkey approval, then reused for that rule's window |
+| `ask` | one passkey approval, then reused for the rule's window |
 | `ask-always` | a passkey approval every single time |
 | `deny` | blocked unconditionally |
 
@@ -40,8 +40,18 @@ signature covers that operation, scope-bound, and nothing else. There is no
 session-wide approval token to steal, and an approval can't be replayed into
 a different request.
 
-`ask` approvals cache per (connection, rule, method) for the rule's window,
-so routine work doesn't nag. `ask-always` never caches.
+What an approval lets through afterwards is stated on its card, from one
+signed field:
+
+- `ask-always`: this one request; the next identical one asks again.
+- `ask` on a request that binds specific values (a service's `[requests]`
+  scope, e.g. an amount): this identical request, for the window.
+- any other `ask`: the requesting agent's `ask` requests through that
+  connection, writes included, for the window. Its `ask-always` and
+  value-bound requests still ask.
+
+The daemon refuses an approval whose signed card differs from what it would
+grant, so the card is never a guess.
 
 ## Boundaries refuse; they don't prompt
 

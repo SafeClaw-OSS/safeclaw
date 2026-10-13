@@ -1197,6 +1197,10 @@ pub(crate) fn stamp_signed_level(
     }
 }
 
+/// What [`grant_lookup`] yields: the primary credential bytes and the
+/// multi-secret role map (allow paths only).
+pub(crate) type GrantValues = (Option<Vec<u8>>, Option<HashMap<String, Vec<u8>>>);
+
 /// The proxy's credential lookup for one request, by policy level — the READ
 /// side of every grant an approval writes. Kept a free function so the apply
 /// tests drive the exact lookup the live pipeline uses.
@@ -1221,7 +1225,7 @@ pub(crate) fn grant_lookup(
     host: &str,
     path: &str,
     scope_digest: &str,
-) -> (Option<Vec<u8>>, Option<HashMap<String, Vec<u8>>>) {
+) -> GrantValues {
     use crate::core::policy::AccessLevel;
     match level {
         AccessLevel::AskAlways => (
