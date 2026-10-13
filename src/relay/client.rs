@@ -663,7 +663,7 @@ mod tests {
         };
         let pc = crate::approval::PolicyContext {
             level: AccessLevel::Ask,
-            rule_id: None,
+            decided_by: crate::core::policy::DecidedBy::Floor,
             ttl_seconds: 60,
             host: Some("h".into()),
         };

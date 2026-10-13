@@ -33,20 +33,21 @@ key label the relay row was registered with). All three are DISPLAY ONLY
 ### Use op scope (signed, in β) — new keys
 - `level`: `"ask"` | `"ask-always"` | `"allow"` (from PolicyContext.level at
   mint). `"allow"` = an allow-level request whose secret was not resident (a
-  cache miss); its apply opens the connection-keyed window exactly like an
-  UNSCOPED `ask`, and the console renders it that way ("opens <connection>
-  for <agent> for N min"). Never default-checked.
-- `reuse`: `"none"` | `"exact"` | `"connection"`, what approving lets the
-  daemon serve again without a new approval (approvals-inbox.md D1 table):
-  `ask-always` → `none`; `ask` with bound `scope_vars` → `exact`; any other
-  `ask`, and `allow` → `connection`.
+  cache miss); approving it holds the value for allow-level traffic only and
+  serves no ask. Never default-checked.
+- `reuse`: `"none"` | `"exact"` | `"rule"` | `"floor"`, what approving lets
+  the daemon serve again without a new approval (approvals-inbox.md D1
+  table): `ask-always` and `allow` → `none`; an `ask` on a scoped path →
+  `exact`; an `ask` decided by a rule → `rule`, with `reuse_rule` (the rule
+  id) and `reuse_label` (its label, when it has one); an `ask` decided by a
+  default floor → `floor`, with `reuse_class` (`"read"` | `"write"`, by
+  method).
 - `window_s`: integer seconds (= pc.ttl_seconds), present exactly when
   `reuse != "none"`.
-Apply asserts `scope.level == pc.level`, `scope.reuse` == the reuse apply
-grants for that level and the scope's bound values, and `window_s` present
-iff that reuse has one and equal to `pc.ttl_seconds`; a signed `level`
-without `reuse`, or any mismatch → refuse (BadRequest, plain arm;
-BatchVerify in batch arm).
+Apply asserts `scope.level == pc.level`, the reuse fields == what apply
+grants for that context, and `window_s` present iff that reuse has one and
+equal to `pc.ttl_seconds`; a signed `level` without `reuse`, or any mismatch
+→ refuse (BadRequest, plain arm; BatchVerify in batch arm).
 
 ### `POST /v/{vid}/op` (Export create) response
 `{ op_id, r, expires_at, waiter_secret }` — `waiter_secret` = 32 random bytes,

@@ -72,16 +72,13 @@ pub struct CacheEntry {
     pub expires_at: Option<u64>,
     /// `true` = this value was pre-loaded at unlock by `bootstrap_cache_from_view`
     /// (the connection's read floor is `allow`), NOT produced by a passkey grant.
-    /// The allow fast-path (`cache_lookup`) uses it, but the `ask` path
-    /// (`cache_lookup_grant`) must IGNORE it — a per-path ask rule has to
-    /// force a fresh approval, never ride the allow-level residency. (The
-    /// ask-always path never reads `entries` at all — see `op_grants`.) A real
-    /// grant (from `approve_op`) overwrites it with `from_bootstrap = false`.
+    /// Residency only: a value in `entries` (bootstrapped or held after an
+    /// approval) serves requests the policy allows, and an ask-level request
+    /// only once the ask-grant ledger (`ask_grants`) authorized it. The
+    /// ask-always path never reads `entries` at all (see `op_grants`).
     pub from_bootstrap: bool,
-    /// Op-agent binding (team §C1): for a GRANT entry, the prefix of the agent
-    /// key the approval was minted for — `cache_lookup_grant` misses for any
-    /// other agent. `None` on bootstrap/residency entries (allow-level values
-    /// are not approvals; any policy-allowed agent may use them).
+    /// The agent whose approval put this value here (`None` for bootstrap /
+    /// residency entries). Informational: residency never authorizes an ask.
     pub agent_prefix: Option<String>,
 }
 
@@ -124,41 +121,27 @@ pub struct SecretsCache {
     /// at unlock. `None` = keep forever. Used by `GET /v/{vid}/approvals` to
     /// opportunistically prune old rows before listing.
     pub audit_retention_days: Option<u32>,
-    /// The rule-approval record: after the user approves a rule-matched,
-    /// unscoped Ask-level op, `evaluate_request_policy` downgrades the same
-    /// (agent, connection, rule, method, host) to Allow within the TTL.
-    /// `ask-always` never lands here; `allow` doesn't need it.
+    /// The ask-grant ledger: what an approved, unscoped `ask` authorizes,
+    /// decoupled from whether the credential value is resident. Key:
+    /// `(agent_prefix, connection_id, host, unit)` where `unit` is the policy
+    /// unit that produced the ask (`crate::approval::reuse::GrantUnit`): the
+    /// matched rule's id, or the default floor's class (read / write). Value:
+    /// Unix-epoch-second expiry.
     ///
-    /// This record narrows the policy DECISION only. What an approval lets the
-    /// agent reuse is decided by the held connection value `approve_op` writes
-    /// alongside it (`cache_insert`, read by the proxy's ask lookup for the
-    /// same agent): that is connection-wide, and the op's signed `scope.reuse`
-    /// says so (`connection`, see `crate::approval::reuse`).
+    /// `evaluate_request_decision` downgrades a later `Ask` to `Allow` only
+    /// when the policy, re-run on that request, lands on the same unit for the
+    /// same agent, connection, and host. So approving rule A never serves rule
+    /// B, a read floor approval never serves a write, and an allow-level miss
+    /// (which writes no entry) never serves an ask. Scoped paths and
+    /// `ask-always` never consult it (they are request-bound, `op_grants`).
     ///
-    /// Key shape: `(agent_prefix, connection_id, rule_id, method, host)`. The
-    /// record is bound to:
-    ///   - the **agent** that triggered the approved op (op-agent binding,
-    ///     team §C1) — agent A's approved ask never fast-paths agent B's
-    ///     identical request inside the window;
-    ///   - the **connection** — approving account A's send never fast-paths B;
-    ///   - the matched **policy rule** — which carries the path scope, so a
-    ///     grant can never reach beyond the rule the user's approval matched;
-    ///   - the **HTTP method** — so approving a read (GET) never silently
-    ///     authorizes a later write (POST/DELETE) inside the window;
-    ///   - the resolved **destination host** — an approval for host A must not
-    ///     authorize host B within the TTL (host is request data in the
-    ///     phantom-only model: one connection may anchor several hosts).
-    /// A tag-/connection-default Ask (no rule matched) writes no record here
-    /// (there is no rule to key it by); its approval still holds the
-    /// connection value for the window. Value: Unix-epoch-second expiry.
-    ///
-    /// Lives in the same memory window as the rest of the cache: dropped on
-    /// lock (which zero-outs the entire cache via Default drop). Daemon
-    /// restart also blows it away (vaults boot Locked, cache starts empty).
-    pub rule_approvals: HashMap<(String, String, String, String, String), u64>,
+    /// Same memory window as the rest of the cache: dropped on lock and on
+    /// every vault change (the cache is rebuilt), and a daemon restart starts
+    /// empty (vaults boot Locked).
+    pub ask_grants: HashMap<(String, String, String, crate::approval::reuse::GrantUnit), u64>,
     /// `ask-always` one-shot grants, keyed by the REQUEST the user approved:
     /// `(agent_prefix, connection_id, method, host, path, scope_digest)` —
-    /// agent-bound like `rule_approvals` (a grant minted for agent A's request
+    /// agent-bound like `ask_grants` (a grant minted for agent A's request
     /// cannot be spent by agent B). Written by
     /// `approve_op` when the op's policy level was AskAlways; consumed (removed)
     /// by the proxy's replay exactly once. This is what makes an `ask-always`
@@ -243,7 +226,7 @@ pub struct SecretsCache {
     /// connection). Wiped on lock.
     ///
     /// NOTE on the maps above (`entries`, `allow_secrets`, `oauth_access`,
-    /// `rule_approvals`): the daemon keys them by **connection_id**, so two
+    /// `ask_grants`): the daemon keys them by **connection_id**, so two
     /// connections of one service never share a cache slot. Policy is likewise
     /// per-connection (`policy.connections.<id>`), while the built-in rules it
     /// merges come from the shared service definition.
@@ -943,12 +926,14 @@ impl AppState {
         }
     }
 
-    /// Insert (or overwrite) a cached auth value with optional TTL.
+    /// Hold a connection's credential value (residency, not authorization).
     /// `expires_at = None` means "live until lock" (allow-level
-    /// semantics). `Some(t)` is unix-second expiry for ask-level
-    /// TTL caching. No-op when the vault is locked at the time of
-    /// the call (shouldn't happen on the approve-time write path,
-    /// but defensive — `approve_op` runs concurrently with locks).
+    /// semantics). `Some(t)` is unix-second expiry. An existing entry's
+    /// window is never shortened: the value is the same credential, and
+    /// another approval's ledger entry may still need it (`None` wins, else
+    /// the later expiry). No-op when the vault is locked at the time of the
+    /// call (shouldn't happen on the approve-time write path, but defensive:
+    /// `approve_op` runs concurrently with locks).
     pub fn cache_insert(
         &self,
         vault_id: &str,
@@ -959,10 +944,12 @@ impl AppState {
     ) {
         let mut states = self.vault_states.lock().unwrap();
         if let Some(VaultState::Unlocked { cache, .. }) = states.get_mut(vault_id) {
+            let expires_at = match (cache.entries.get(conn_id), expires_at) {
+                (Some(prev), Some(t)) => prev.expires_at.map(|p| p.max(t)),
+                (_, e) => e,
+            };
             cache.entries.insert(
                 conn_id.to_string(),
-                // A real approval grant — consumable by the ask retry path,
-                // bound to the agent the approval was minted for.
                 CacheEntry {
                     value,
                     expires_at,
@@ -1067,44 +1054,6 @@ impl AppState {
         }
     }
 
-    /// Like [`Self::cache_lookup`] but **grant-only**: a bootstrap-resident value
-    /// (`from_bootstrap`) is treated as a miss. Used by the `ask` path so the
-    /// first matching request forces a passkey approval instead of riding the
-    /// connection's allow-level residency; after approval the downgraded (Allow)
-    /// retry reads the real grant via `cache_lookup`. Non-destructive; honors TTL.
-    pub fn cache_lookup_grant(
-        &self,
-        vault_id: &str,
-        conn_id: &str,
-        agent_prefix: &str,
-    ) -> Option<Vec<u8>> {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let mut states = self.vault_states.lock().unwrap();
-        let cache = match states.get_mut(vault_id) {
-            Some(VaultState::Unlocked { cache, .. }) => cache,
-            _ => return None,
-        };
-        let entry = cache.entries.get(conn_id)?;
-        if entry.from_bootstrap {
-            return None;
-        }
-        // Op-agent binding: a grant minted for one agent is not a grant for
-        // another — miss (and re-prompt) instead of riding it.
-        if entry.agent_prefix.as_deref() != Some(agent_prefix) {
-            return None;
-        }
-        if let Some(exp) = entry.expires_at {
-            if now >= exp {
-                cache.entries.remove(conn_id);
-                return None;
-            }
-        }
-        Some(entry.value.clone())
-    }
-
     /// Look up a cached OAuth `access_token` by `sha256(refresh_token)` hex (§5).
     /// Returns `None` if locked, never minted, or past its expiry. Lazily evicts
     /// expired entries (same shape as `cache_lookup`).
@@ -1201,11 +1150,49 @@ impl AppState {
             .retain(|(v, _)| v != vault_id);
     }
 
+    /// [`Self::evaluate_request_decision`] as `(level, matched_rule_id, ttl)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn evaluate_request_policy(
+        &self,
+        vault_id: &str,
+        agent_prefix: &str,
+        connection_id: &str,
+        service_id: &str,
+        method: &str,
+        path: &str,
+        host: &str,
+        body: Option<&str>,
+        vars: &crate::core::policy::VarMap,
+        has_scope_shape: bool,
+    ) -> Option<(
+        crate::core::policy::AccessLevel,
+        Option<String>,
+        Option<u64>,
+    )> {
+        let (level, by, ttl) = self.evaluate_request_decision(
+            vault_id,
+            agent_prefix,
+            connection_id,
+            service_id,
+            method,
+            path,
+            host,
+            body,
+            vars,
+            has_scope_shape,
+        )?;
+        let id = match by {
+            crate::core::policy::DecidedBy::Rule { id, .. } => id,
+            crate::core::policy::DecidedBy::Floor => None,
+        };
+        Some((level, id, ttl))
+    }
+
     /// Evaluate the per-request policy decision for `(vault, connection,
     /// service, method, path, body)`. Returns `None` when the vault is Locked
     /// or never unlocked (caller should treat that as "vault locked").
     ///
-    /// Returned tuple: `(effective_level, matched_rule_id, ttl_seconds)`.
+    /// Returned tuple: `(effective_level, what decided it, ttl_seconds)`.
     ///
     /// Resolution (PROTOCOL.md §6.4):
     ///   - merge the service's built-in rules with this connection's
@@ -1213,12 +1200,12 @@ impl AppState {
     ///   - most-restrictive matching rule wins (deny-override), each rule's
     ///     decision being its own `level`,
     ///   - else connection / tag / global default floor, else ask-always,
-    ///   - **active `ask` approvals** — if the decision is `Ask`, a rule
-    ///     matched, AND the `(agent, connection, rule_id, method, host)` key is
-    ///     in the unexpired rule_approvals record, downgrades to `Allow`. A
-    ///     connection-default Ask (no rule) has no record to match; whether
-    ///     it asks is then up to the proxy's lookup (`grant_lookup`).
-    pub fn evaluate_request_policy(
+    ///   - **the ask-grant ledger**: an unscoped `Ask` whose unit (the matched
+    ///     rule's id, or the floor's read/write class) has a live entry for
+    ///     this `(agent, connection, host)` downgrades to `Allow`. Anything
+    ///     else asks (`grant_lookup` never authorizes an ask from residency).
+    #[allow(clippy::too_many_arguments)]
+    pub fn evaluate_request_decision(
         &self,
         vault_id: &str,
         agent_prefix: &str,
@@ -1232,15 +1219,12 @@ impl AppState {
         // True when the service declares a `[requests]` scope SHAPE for this
         // path (i.e. the proxy resolved a `RequestScope`), regardless of whether
         // this particular request populated any values. A scoped path binds its
-        // approval per-value through `op_grants`, so it must NEVER ride the
-        // coarse connection-window downgrade below — otherwise a value-less
-        // (empty-body) ask, approved once, would write a scope-blind window key
-        // that a later, differently-valued request could ride without a fresh
-        // passkey (approving a blank purchase then spending any amount).
+        // approval to the exact request through `op_grants`, so it never
+        // consults the value-blind ledger below.
         has_scope_shape: bool,
     ) -> Option<(
         crate::core::policy::AccessLevel,
-        Option<String>,
+        crate::core::policy::DecidedBy,
         Option<u64>,
     )> {
         let now = SystemTime::now()
@@ -1277,7 +1261,7 @@ impl AppState {
         // `aux.policy` overlaid on compiled defaults at refresh). Read live
         // here → a policy edit is realtime on the next request.
         let tags = self.services.service_tags(service_id);
-        let (level, matched_rule, ttl) = crate::core::policy::evaluate_with_match(
+        let (level, by, ttl) = crate::core::policy::evaluate_decision(
             method,
             path,
             body,
@@ -1288,89 +1272,57 @@ impl AppState {
             tags,
         );
 
-        // Rule-approval record: a prior approval for the same (agent,
-        // connection, rule, method, host), not yet expired, downgrades this
-        // Ask to Allow. Bounds of the record itself:
-        //   - No rule matched (tag-/service-default Ask) → no record to hit.
-        //   - Method and host are part of the key.
-        // The record narrows the decision only; the reuse an approval grants
-        // is the held connection value (see `rule_approvals`).
-        // Passive cleanup: if expired, drop the entry instead of returning a
-        // hit. `ask-always` and `deny` never consult or write the cache;
-        // `allow` doesn't need to.
-        //
-        // Scoped paths are excluded: a `[requests]`-shaped path binds its
-        // approval to the exact field VALUES via `op_grants` (a $40-to-Acme
-        // grant never redeems a $75-to-EvilCorp request), so it must not also
-        // have a coarse, value-blind connection window that a differently-valued
-        // request could ride. Only a genuinely scope-less rule uses this window.
+        // Ask-grant ledger: a prior approval of the SAME unit (rule id, or
+        // floor class) for this agent, connection, and host, not yet expired,
+        // downgrades this Ask to Allow. The policy above was re-run on this
+        // request, so a rule unit matches only when the same rule (its `when`
+        // included) decided again. Expired entries are dropped passively.
         if level == crate::core::policy::AccessLevel::Ask && !has_scope_shape {
-            if let Some(rule_id) = matched_rule.clone() {
-                // The grant is scoped to the **agent** (op-agent binding),
-                // the **connection** (not the service), the matched rule, the
-                // method, AND the resolved host: an approval for host A must
-                // not fast-path host B in the window, and agent A's approval
-                // never fast-paths agent B.
+            if let Some(unit) = crate::approval::reuse::GrantUnit::of(&by, method) {
                 let key = (
                     agent_prefix.to_string(),
                     connection_id.to_string(),
-                    rule_id,
-                    method.to_string(),
                     host.to_ascii_lowercase(),
+                    unit,
                 );
-                if let Some(&exp) = cache.rule_approvals.get(&key) {
+                if let Some(&exp) = cache.ask_grants.get(&key) {
                     if exp > now {
-                        return Some((crate::core::policy::AccessLevel::Allow, matched_rule, ttl));
-                    } else {
-                        cache.rule_approvals.remove(&key);
+                        return Some((crate::core::policy::AccessLevel::Allow, by, ttl));
                     }
+                    cache.ask_grants.remove(&key);
                 }
             }
         }
 
-        Some((level, matched_rule, ttl))
+        Some((level, by, ttl))
     }
 
-    /// Record an `ask`-level approval into the per-vault rule-approval
-    /// record. Called from approve.rs when a Use op was approved AND the
-    /// decision that created it was an unscoped Ask (not AskAlways).
-    /// `ttl_seconds` is the PolicyContext ttl.
-    ///
-    /// Keyed `(agent, connection, rule_id, method, host)`:
-    ///   - `rule_id == None` (tag-/service-default Ask, no rule matched)
-    ///     is not recorded (there is no rule to key it by).
-    ///   - `method` is part of the key, so the downgrade is per verb.
-    /// The reuse the approval grants is decided by the held connection value
-    /// written next to this (`scope.reuse = connection`), not by this key.
-    ///
-    /// No-op when the vault is locked at the moment of the call — that
-    /// shouldn't happen in practice (the approve happens while the
-    /// vault is unlocked) but we don't want to panic if it does.
-    pub fn record_ask_approval(
+    /// Record an approved `ask` in the ask-grant ledger: `(agent, connection,
+    /// host, unit)` until now + `ttl_seconds`. Called once the Use op is
+    /// approved (`approve.rs` `DeferredGrant::Ledger`). A fresh approval of
+    /// the same key replaces the expiry. No-op when the vault is locked at the
+    /// moment of the call.
+    pub fn record_ask_grant(
         &self,
         vault_id: &str,
         agent_prefix: &str,
         connection_id: &str,
-        rule_id: Option<String>,
-        method: &str,
         host: &str,
+        unit: crate::approval::reuse::GrantUnit,
         ttl_seconds: u64,
     ) {
-        // No rule scope → not cacheable (see doc above).
-        let Some(rule_id) = rule_id else { return };
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
         let mut states = self.vault_states.lock().unwrap();
         if let Some(VaultState::Unlocked { cache, .. }) = states.get_mut(vault_id) {
-            cache.rule_approvals.insert(
+            cache.ask_grants.insert(
                 (
                     agent_prefix.to_string(),
                     connection_id.to_string(),
-                    rule_id,
-                    method.to_string(),
                     host.to_ascii_lowercase(),
+                    unit,
                 ),
                 now + ttl_seconds,
             );
@@ -1840,10 +1792,27 @@ mod tests {
         let state = test_state();
         unlock_with_empty_cache(&state, "v1");
         insert_bootstrap(&state, "v1", "github", b"tok");
+        use crate::core::policy::AccessLevel;
+        let lookup = |level| {
+            crate::proxy::handler::grant_lookup(
+                &state,
+                "v1",
+                "agA",
+                "github",
+                level,
+                "GET",
+                "api.github.com",
+                "/user",
+                "",
+                false,
+            )
+            .0
+        };
         // allow fast-path uses the residency…
         assert_eq!(state.cache_lookup("v1", "github"), Some(b"tok".to_vec()));
-        // …but ask must NOT: a bootstrap value is not a grant.
-        assert_eq!(state.cache_lookup_grant("v1", "github", "agA"), None);
+        assert_eq!(lookup(AccessLevel::Allow), Some(b"tok".to_vec()));
+        // …but ask must NOT: a resident value is not a grant.
+        assert_eq!(lookup(AccessLevel::Ask), None);
         // ask-always never reads `entries` at all — the residency (and even a
         // real conn-keyed ask grant) is invisible to op_grant_take.
         state.cache_insert(
@@ -1866,11 +1835,9 @@ mod tests {
             ),
             None
         );
-        // The ask path sees its grant as usual.
-        assert_eq!(
-            state.cache_lookup_grant("v1", "github", "agA"),
-            Some(b"granted".to_vec())
-        );
+        // Nor does an approval-held value authorize an ask: only the
+        // ask-grant ledger does (it downgrades the decision before lookup).
+        assert_eq!(lookup(AccessLevel::Ask), None);
     }
 
     #[test]
@@ -2084,30 +2051,22 @@ mod tests {
             "B's miss must not have consumed A's grant"
         );
 
-        // (2) unscoped-ask conn-keyed grant.
-        state.cache_insert("v1", "svc", b"granted".to_vec(), None, Some("agA".into()));
-        assert_eq!(state.cache_lookup_grant("v1", "svc", "agB"), None);
-        assert_eq!(
-            state.cache_lookup_grant("v1", "svc", "agA"),
-            Some(b"granted".to_vec())
-        );
-
-        // (3) rule-approvals window: recorded for A, B still re-prompts.
-        state.record_ask_approval("v1", "agA", "gh", Some("read".into()), "GET", "h.com", 60);
+        // (2) the ask-grant ledger: recorded for A, B still re-prompts.
+        let unit = crate::approval::reuse::GrantUnit::Rule("read".into());
+        state.record_ask_grant("v1", "agA", "gh", "H.com", unit.clone(), 60);
         {
             let states = state.vault_states.lock().unwrap();
             if let Some(VaultState::Unlocked { cache, .. }) = states.get("v1") {
                 let key_a = (
                     "agA".to_string(),
                     "gh".to_string(),
-                    "read".to_string(),
-                    "GET".to_string(),
                     "h.com".to_string(),
+                    unit.clone(),
                 );
                 let mut key_b = key_a.clone();
                 key_b.0 = "agB".to_string();
-                assert!(cache.rule_approvals.contains_key(&key_a));
-                assert!(!cache.rule_approvals.contains_key(&key_b));
+                assert!(cache.ask_grants.contains_key(&key_a));
+                assert!(!cache.ask_grants.contains_key(&key_b));
             } else {
                 panic!("vault not unlocked");
             }
@@ -2375,14 +2334,13 @@ mod tests {
         assert_eq!(lvl, AccessLevel::Ask);
         assert_eq!(rule.as_deref(), Some("read"));
 
-        // User approves that GET toward host A.
-        state.record_ask_approval(
+        // User approves that GET toward host A (rule "read").
+        state.record_ask_grant(
             vid,
             "agA",
             "gh",
-            Some("read".to_string()),
-            "GET",
             "api.gh.com",
+            crate::approval::reuse::GrantUnit::Rule("read".into()),
             60,
         );
 
@@ -2446,10 +2404,107 @@ mod tests {
             "approving a GET must never fast-path a POST"
         );
         assert_eq!(rule.as_deref(), Some("write"));
+    }
 
-        // A tag-default Ask (no rule) writes no record — record is a no-op
-        // for rule_id == None.
-        state.record_ask_approval(vid, "agA", "gh", None, "GET", "api.gh.com", 60);
+    /// A rule unit matches only when the policy, re-run on the later request,
+    /// lands on the SAME rule (`when` included); a floor unit only for its
+    /// own class. Both are bound to the agent, connection and host.
+    #[test]
+    fn ask_grant_ledger_matches_the_rerun_decision() {
+        use crate::approval::reuse::{Class, GrantUnit};
+        use crate::core::policy::{AccessLevel, ConnectionPolicy, Levels, Policy, RuleConfig};
+        let mut rules = std::collections::HashMap::new();
+        rules.insert(
+            "big".to_string(),
+            RuleConfig {
+                match_pattern: Some("POST /pay".into()),
+                when: Some("vars.amount > 100".into()),
+                level: Some(AccessLevel::AskAlways),
+                ..Default::default()
+            },
+        );
+        rules.insert(
+            "pay".to_string(),
+            RuleConfig {
+                match_pattern: Some("POST /pay".into()),
+                level: Some(AccessLevel::Ask),
+                ttl: Some(60),
+                ..Default::default()
+            },
+        );
+        let mut policy = Policy::default();
+        policy.connections.insert(
+            "shop".to_string(),
+            ConnectionPolicy {
+                default: Some(Levels {
+                    read: Some(AccessLevel::Ask),
+                    write: Some(AccessLevel::Ask),
+                    ttl: Some(300),
+                }),
+                rules,
+            },
+        );
+        let state = test_state();
+        let vid = "v-ledger";
+        let cache = SecretsCache {
+            policy,
+            ..Default::default()
+        };
+        state.unlock_vault(vid.to_string(), cache, zeroize::Zeroizing::new(Vec::new()));
+        let decide = |method: &str, path: &str, amount: Option<&str>| {
+            let mut vars = crate::core::policy::VarMap::new();
+            if let Some(a) = amount {
+                vars.insert("amount".into(), a.into());
+            }
+            state
+                .evaluate_request_decision(
+                    vid,
+                    "agA",
+                    "shop",
+                    "shop",
+                    method,
+                    path,
+                    "api.shop.com",
+                    None,
+                    &vars,
+                    false,
+                )
+                .unwrap()
+                .0
+        };
+        state.record_ask_grant(
+            vid,
+            "agA",
+            "shop",
+            "api.shop.com",
+            GrantUnit::Rule("pay".into()),
+            60,
+        );
+        assert_eq!(decide("POST", "/pay", Some("50")), AccessLevel::Allow);
+        // Same path, but `when` now picks the stricter rule: it asks.
+        assert_eq!(decide("POST", "/pay", Some("150")), AccessLevel::AskAlways);
+        // The floor is a different unit.
+        assert_eq!(decide("POST", "/other", None), AccessLevel::Ask);
+
+        state.record_ask_grant(
+            vid,
+            "agA",
+            "shop",
+            "api.shop.com",
+            GrantUnit::Floor(Class::Read),
+            300,
+        );
+        assert_eq!(decide("GET", "/a", None), AccessLevel::Allow);
+        assert_eq!(
+            decide("DELETE", "/a", None),
+            AccessLevel::Ask,
+            "read never serves a write"
+        );
+        assert_eq!(
+            decide("PUT", "/a", None),
+            AccessLevel::Ask,
+            "read never serves a write"
+        );
     }
 
     // A path that declares a `[requests]` scope shape must bind its approval
@@ -2484,15 +2539,14 @@ mod tests {
         cache.policy = policy;
         state.unlock_vault(vid.to_string(), cache, zeroize::Zeroizing::new(Vec::new()));
 
-        // A value-less ask on this rule/conn/method/host got approved, seeding
-        // the coarse connection-window key (exactly the empty-body path).
-        state.record_ask_approval(
+        // A ledger entry for the rule exists (as an unscoped caller's
+        // approval would write).
+        state.record_ask_grant(
             vid,
             "agA",
             "shop",
-            Some("purchase".to_string()),
-            "POST",
             "api.shop.com",
+            crate::approval::reuse::GrantUnit::Rule("purchase".into()),
             60,
         );
 

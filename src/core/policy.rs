@@ -608,7 +608,7 @@ fn matches_rule(
 
 // ── Policy Evaluation ──────────────────────────────────────────────────────────
 
-fn is_write_method(method: &str) -> bool {
+pub(crate) fn is_write_method(method: &str) -> bool {
     matches!(method, "POST" | "PUT" | "PATCH" | "DELETE")
 }
 
@@ -636,19 +636,24 @@ pub fn evaluate(
     .0
 }
 
+/// What decided a request: a matched rule, or a default floor (connection,
+/// tag, global, or the safe floor). The unit an `ask` approval is reused by
+/// (`crate::approval::Reuse`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DecidedBy {
+    /// A rule matched; its `id` and `label` as declared.
+    Rule {
+        id: Option<String>,
+        label: Option<String>,
+    },
+    /// No rule matched.
+    Floor,
+}
+
 /// Resolve the access decision for a request, returning `(level,
-/// matched_rule_id, ttl)`.
-///
-/// Resolution (PROTOCOL.md §6.4):
-///   1. Among ALL matching rules, the **most restrictive** effective level wins
-///      (deny-override / fail-safe). Ties broken by specificity for a
-///      deterministic ask-cache scope (`(connection, rule_id, method)`).
-///   2. else connection default (read/write floor),
-///   3. else tag default (the service's tags matched against the
-///      `Policy.categories` floor map; several hits → most restrictive wins),
-///   4. else global default,
-///   5. else `ask-always` (safe floor).
-/// `matched_rule_id` / `ttl` are `Some` only when a rule decided (step 1).
+/// matched_rule_id, ttl)`. See [`evaluate_decision`], which also says what
+/// decided it.
+#[allow(clippy::too_many_arguments)]
 pub fn evaluate_with_match(
     method: &str,
     path: &str,
@@ -659,6 +664,49 @@ pub fn evaluate_with_match(
     policy: &Policy,
     tags: &[String],
 ) -> (AccessLevel, Option<String>, Option<u64>) {
+    let (level, by, ttl) = evaluate_decision(
+        method,
+        path,
+        body,
+        vars,
+        rules,
+        connection_levels,
+        policy,
+        tags,
+    );
+    let id = match by {
+        DecidedBy::Rule { id, .. } => id,
+        DecidedBy::Floor => None,
+    };
+    (level, id, ttl)
+}
+
+/// Resolve the access decision for a request, returning `(level, what decided
+/// it, ttl)`.
+///
+/// Resolution (PROTOCOL.md §6.4):
+///   1. Among ALL matching rules, the **most restrictive** effective level wins
+///      (deny-override / fail-safe). Ties broken by specificity for a
+///      deterministic ask-cache scope (`(connection, rule_id, method)`).
+///   2. else connection default (read/write floor),
+///   3. else tag default (the service's tags matched against the
+///      `Policy.categories` floor map; several hits → most restrictive wins),
+///   4. else global default,
+///   5. else `ask-always` (safe floor).
+///
+/// [`DecidedBy::Rule`] when a rule decided (step 1), else
+/// [`DecidedBy::Floor`].
+#[allow(clippy::too_many_arguments)]
+pub fn evaluate_decision(
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+    vars: &VarMap,
+    rules: Option<&Vec<PolicyRule>>,
+    connection_levels: Option<&Levels>,
+    policy: &Policy,
+    tags: &[String],
+) -> (AccessLevel, DecidedBy, Option<u64>) {
     // The `ask`-cache window a matched rule inherits when it pins no `ttl` of
     // its own: the ttl of the most-specific floor (connection → tag → global),
     // the SAME precedence as the read/write floor decision below. Direction-
@@ -692,7 +740,11 @@ pub fn evaluate_with_match(
         }
         if let Some((_, _, rule, level)) = best {
             // The rule's own ttl wins; else it inherits the default-floor window.
-            return (level, rule.id.clone(), rule.ttl.or(floor_ttl));
+            let by = DecidedBy::Rule {
+                id: rule.id.clone(),
+                label: rule.label.clone(),
+            };
+            return (level, by, rule.ttl.or(floor_ttl));
         }
     }
 
@@ -707,7 +759,7 @@ pub fn evaluate_with_match(
     };
     if let Some(lv) = connection_levels {
         if let Some((l, ttl)) = pick(lv) {
-            return (l, None, ttl);
+            return (l, DecidedBy::Floor, ttl);
         }
     }
     // A service may carry several tags; if more than one hits a floor that
@@ -719,16 +771,16 @@ pub fn evaluate_with_match(
         .filter_map(|lv| pick(lv))
         .max_by_key(|(l, _)| l.restrictiveness());
     if let Some((l, ttl)) = tag_hit {
-        return (l, None, ttl);
+        return (l, DecidedBy::Floor, ttl);
     }
     if let Some(lv) = policy.default.as_ref() {
         if let Some((l, ttl)) = pick(lv) {
-            return (l, None, ttl);
+            return (l, DecidedBy::Floor, ttl);
         }
     }
 
     // 5. Safe floor.
-    (AccessLevel::AskAlways, None, None)
+    (AccessLevel::AskAlways, DecidedBy::Floor, None)
 }
 
 // ── Unit Tests ─────────────────────────────────────────────────────────────────

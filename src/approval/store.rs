@@ -89,18 +89,18 @@ pub struct PolicyContext {
     /// debug. `AskAlways` is explicitly excluded — that's the whole
     /// point of the level.
     pub level: crate::core::policy::AccessLevel,
-    /// Matched rule id from `evaluate_with_match`. `None` =
-    /// tag / global default fired, which writes no rule-approval record
-    /// (see `record_ask_approval`).
-    pub rule_id: Option<String>,
+    /// What decided the request (`evaluate_decision`): the matched rule
+    /// (id + label) or a default floor. Picks the ledger unit an `ask`
+    /// approval reuses by (`crate::approval::Reuse`).
+    pub decided_by: crate::core::policy::DecidedBy,
     /// TTL in seconds the approval should remain cached. Threaded from
     /// the matched rule's `ttl`, the service / tag default's
     /// `ask_ttl`, or `Policy.timeout` as last resort.
     pub ttl_seconds: u64,
     /// Resolved destination host of the request that created this op. The
-    /// approval-cache key is host-scoped (an approval for host A must not
+    /// ask-grant ledger is host-scoped (an approval for host A must not
     /// authorize host B in the TTL), so the approve handler reads this when it
-    /// writes `record_ask_approval`. Stamped by the proxy at op-create.
+    /// writes `record_ask_grant`. Stamped by the proxy at op-create.
     pub host: Option<String>,
 }
 
@@ -581,7 +581,10 @@ mod tests {
     fn pc(level: crate::core::policy::AccessLevel, ttl: u64) -> PolicyContext {
         PolicyContext {
             level,
-            rule_id: Some("r1".into()),
+            decided_by: crate::core::policy::DecidedBy::Rule {
+                id: Some("r1".into()),
+                label: None,
+            },
             ttl_seconds: ttl,
             host: Some("api.github.com".into()),
         }

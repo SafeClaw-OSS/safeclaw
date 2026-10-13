@@ -582,7 +582,7 @@ impl BrokerHandler {
         // Op-agent binding: every approval/grant surface below keys on the
         // requesting agent (the pipeline validated self.key before secrets).
         let agent_prefix = self.agent_attribution().unwrap_or_default();
-        let decision = self.state.evaluate_request_policy(
+        let decision = self.state.evaluate_request_decision(
             &vault_id,
             &agent_prefix,
             &conn,
@@ -597,7 +597,7 @@ impl BrokerHandler {
             // connection-window downgrade.
             req_scope.is_some(),
         );
-        let (level, rule_id, ttl) = match decision {
+        let (level, decided_by, ttl) = match decision {
             Some(d) => d,
             None => {
                 return err_response(ScCode::VaultLocked, crate::error::VAULT_LOCKED_MSG).into()
@@ -623,14 +623,11 @@ impl BrokerHandler {
         // The credential bytes come from the session cache (the proxy has no
         // grant to open the vault). A miss falls through to the captive portal.
         //   - Allow: read the resident value (incl. the unlock bootstrap) + the
-        //     allow multi-secret map — the frictionless fast-path.
-        //   - Ask: GRANT-ONLY. Ignores the allow-level bootstrap
-        //     (`cache_lookup_grant` skips `from_bootstrap` entries, and we pass
-        //     no `allow_secrets` map) so a per-path ask rule ALWAYS forces a
-        //     fresh passkey the first time, even on a connection whose read
-        //     floor is `allow` and is therefore resident. A downgraded
-        //     (approved-and-cached) Ask arrives here as Allow and reads its
-        //     grant via the fast-path above.
+        //     allow multi-secret map, the frictionless fast-path. An Ask the
+        //     ask-grant ledger authorized (same rule / floor class) arrives here
+        //     already downgraded to Allow.
+        //   - Ask: request-bound grants only (`op_grants`), never residency, so
+        //     an ask the ledger did not authorize always reaches the portal.
         //   - AskAlways: ONE-SHOT, REQUEST-BOUND. Redeems only the grant the
         //     approve ceremony minted for exactly this (connection, method,
         //     host, path) — consumed single-use. It never reads `entries` at
@@ -647,6 +644,7 @@ impl BrokerHandler {
             &dest_host,
             &path,
             &scope_digest,
+            req_scope.is_some(),
         );
 
         // First touch of an external-store-backed connection: an Allow-level
@@ -717,7 +715,7 @@ impl BrokerHandler {
                             &method,
                             &path,
                             level,
-                            rule_id,
+                            decided_by.clone(),
                             ttl,
                             req_scope.as_ref(),
                             ip,
@@ -925,7 +923,7 @@ impl BrokerHandler {
         method: &str,
         path: &str,
         level: crate::core::policy::AccessLevel,
-        rule_id: Option<String>,
+        decided_by: crate::core::policy::DecidedBy,
         ttl: Option<u64>,
         req_scope: Option<&crate::service::RequestScope>,
         ip: IpAddr,
@@ -980,10 +978,16 @@ impl BrokerHandler {
         if let Some(prefix) = self.agent_attribution() {
             scope["agent"] = serde_json::Value::String(prefix);
         }
-        // Same predicate the lookup and apply use: a non-empty bound value set
-        // is what makes the grant request-bound (`exact`).
-        let binds_values = req_scope.is_some_and(|rs| !rs.bound.is_empty());
-        stamp_signed_level(&mut scope, level, grant_ttl, binds_values);
+        // Same inputs the lookup and apply use: what decided the request, and
+        // whether the path is scoped (a `[requests]` shape matched).
+        stamp_signed_level(
+            &mut scope,
+            level,
+            &decided_by,
+            req_scope.is_some(),
+            method,
+            grant_ttl,
+        );
         // Phase 2: fold the bound `[requests]` scope-field VALUES and the consent
         // template into the op scope. They are signed into β (the user's passkey
         // authorizes exactly the fields shown) and re-derived at approve to build
@@ -1024,7 +1028,7 @@ impl BrokerHandler {
         };
         let pc = crate::approval::PolicyContext {
             level,
-            rule_id,
+            decided_by,
             ttl_seconds: grant_ttl,
             host: Some(host.to_string()),
         };
@@ -1179,22 +1183,20 @@ impl BrokerHandler {
 
 /// Stamp what approving a Use op grants into its (signed) scope, so what the
 /// approver reads is what apply does (design/approvals-inbox.md D1): `level`,
-/// `reuse` ([`crate::approval::Reuse`] — the SAME classifier apply and the
-/// approve-time assertion use), and `window_s` (integer seconds — JCS rejects
-/// floats) exactly when the reuse has a window, equal to the PolicyContext
-/// ttl. `binds_values` = the request bound at least one `[requests]` value.
+/// then the reuse fields and `window_s` from [`crate::approval::Reuse`] (the
+/// SAME classifier apply and the approve-time assertion use). `scoped` = the
+/// path has a `[requests]` shape.
 pub(crate) fn stamp_signed_level(
     scope: &mut serde_json::Value,
     level: crate::core::policy::AccessLevel,
+    decided_by: &crate::core::policy::DecidedBy,
+    scoped: bool,
+    method: &str,
     grant_ttl: u64,
-    binds_values: bool,
 ) {
     scope["level"] = serde_json::Value::String(level.to_string());
-    if let Some(reuse) = crate::approval::Reuse::of(level, binds_values) {
-        scope["reuse"] = serde_json::Value::String(reuse.as_str().to_string());
-        if let Some(w) = reuse.window(grant_ttl) {
-            scope["window_s"] = serde_json::Value::from(w);
-        }
+    if let Some(reuse) = crate::approval::Reuse::of(level, decided_by, scoped, method) {
+        reuse.stamp(scope, grant_ttl);
     }
 }
 
@@ -1208,13 +1210,15 @@ pub(crate) type GrantValues = (Option<Vec<u8>>, Option<HashMap<String, Vec<u8>>>
 ///
 /// - `ask-always`: redeem the single-use grant bound to exactly this request
 ///   (consumed), never the connection cache.
-/// - `ask` with bound `[requests]` values: peek the request-bound grant (the
-///   same action reuses it within its window; a different value misses).
-/// - `ask` binding no values: the approving agent's held connection value,
-///   GRANT-ONLY (a bootstrap-resident value is ignored, so the first matching
-///   request still asks).
-/// - `allow` (including an ask the rule-approval window downgraded): the
-///   resident/held connection value plus the allow multi-secret map.
+/// - a scoped `ask` (`scoped`: the path has a `[requests]` shape): peek the
+///   request-bound grant (the same action, same values, reuses it within its
+///   window; anything else misses).
+/// - any other `ask`: only a single-use grant for exactly this request (an
+///   ask from a rule with no id). Never the resident value: an ask is
+///   authorized by the ask-grant ledger, which downgrades it to `allow`
+///   before this lookup, or it asks.
+/// - `allow` (including an ask the ledger downgraded): the resident/held
+///   connection value plus the allow multi-secret map.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn grant_lookup(
     state: &AppState,
@@ -1226,6 +1230,7 @@ pub(crate) fn grant_lookup(
     host: &str,
     path: &str,
     scope_digest: &str,
+    scoped: bool,
 ) -> GrantValues {
     use crate::core::policy::AccessLevel;
     match level {
@@ -1242,7 +1247,7 @@ pub(crate) fn grant_lookup(
             ),
             None,
         ),
-        AccessLevel::Ask if !scope_digest.is_empty() => (
+        AccessLevel::Ask => (
             state.op_grant_take(
                 vault_id,
                 agent_prefix,
@@ -1251,11 +1256,10 @@ pub(crate) fn grant_lookup(
                 host,
                 path,
                 scope_digest,
-                false,
+                !scoped,
             ),
             None,
         ),
-        AccessLevel::Ask => (state.cache_lookup_grant(vault_id, conn, agent_prefix), None),
         _ => (
             state.cache_lookup(vault_id, conn),
             state.cache_lookup_secrets(vault_id, conn),
@@ -1686,39 +1690,52 @@ mod tests {
     }
 
     /// The signed Use scope carries the mint-time level, the reuse apply
-    /// grants, and `window_s` (an integer) exactly when that reuse has one.
+    /// grants (with its rule id + label or floor class), and `window_s` (an
+    /// integer) exactly when that reuse has one.
     #[test]
     fn signed_level_stamp() {
-        use crate::core::policy::AccessLevel;
-        let stamp = |level, ttl, binds| {
-            let mut s = json!({ "method": "GET" });
-            stamp_signed_level(&mut s, level, ttl, binds);
+        use crate::core::policy::{AccessLevel, DecidedBy};
+        let send = DecidedBy::Rule {
+            id: Some("send".into()),
+            label: Some("Send email".into()),
+        };
+        let stamp = |level, by: &DecidedBy, scoped, method: &str, ttl| {
+            let mut s = json!({ "method": method });
+            stamp_signed_level(&mut s, level, by, scoped, method, ttl);
             s
         };
 
-        let always = stamp(AccessLevel::AskAlways, 900, false);
+        let always = stamp(AccessLevel::AskAlways, &send, false, "POST", 900);
         assert_eq!(always["level"], "ask-always");
         assert_eq!(always["reuse"], "none");
         assert!(always.get("window_s").is_none());
-        // Bound values don't make ask-always reusable.
-        let always_bound = stamp(AccessLevel::AskAlways, 900, true);
-        assert_eq!(always_bound["reuse"], "none");
-        assert!(always_bound.get("window_s").is_none());
+        // A scoped path doesn't make ask-always reusable.
+        let always_scoped = stamp(AccessLevel::AskAlways, &send, true, "POST", 900);
+        assert_eq!(always_scoped["reuse"], "none");
+        assert!(always_scoped.get("window_s").is_none());
 
-        let exact = stamp(AccessLevel::Ask, 120, true);
+        let exact = stamp(AccessLevel::Ask, &send, true, "POST", 120);
         assert_eq!(exact["level"], "ask");
         assert_eq!(exact["reuse"], "exact");
         assert_eq!(exact["window_s"], 120);
         assert!(exact["window_s"].is_u64());
+        assert!(exact.get("reuse_rule").is_none());
 
-        let conn = stamp(AccessLevel::Ask, 900, false);
-        assert_eq!(conn["reuse"], "connection");
-        assert_eq!(conn["window_s"], 900);
+        let rule = stamp(AccessLevel::Ask, &send, false, "POST", 900);
+        assert_eq!(rule["reuse"], "rule");
+        assert_eq!(rule["reuse_rule"], "send");
+        assert_eq!(rule["reuse_label"], "Send email");
+        assert_eq!(rule["window_s"], 900);
 
-        let allow = stamp(AccessLevel::Allow, 600, false);
+        let floor = stamp(AccessLevel::Ask, &DecidedBy::Floor, false, "PATCH", 300);
+        assert_eq!(floor["reuse"], "floor");
+        assert_eq!(floor["reuse_class"], "write");
+        assert_eq!(floor["window_s"], 300);
+
+        let allow = stamp(AccessLevel::Allow, &DecidedBy::Floor, false, "GET", 600);
         assert_eq!(allow["level"], "allow");
-        assert_eq!(allow["reuse"], "connection");
-        assert_eq!(allow["window_s"], 600);
+        assert_eq!(allow["reuse"], "none");
+        assert!(allow.get("window_s").is_none());
     }
 
     #[test]
