@@ -1511,78 +1511,6 @@ impl PerItemVault {
         Ok(id)
     }
 
-    /// Write the vault's service definitions (`services`, an owner-config
-    /// record) unsigned at the next version, where the live row is (the
-    /// unified `services` address when the vault has one, else
-    /// `aux:services`). Written even when `body` is empty, so a removal of the
-    /// last definition replaces the row instead of leaving it. Returns the id
-    /// written, or `None` when the stored definitions already equal `body`.
-    ///
-    /// Only a NoUik (v1) keyset honors unsigned owner-config. A v2 keyset
-    /// honors it only when an owner signed it, where the owner approves (in
-    /// the browser, over the content they see); this process never signs
-    /// owner-config, so the write is refused there.
-    ///
-    /// `base` is the view the caller opened and then changed: the stored
-    /// definitions must still be the ones it held (the rule
-    /// [`Self::reconcile_from_view`] applies with [`ReconcileBase::Since`]),
-    /// so a pull that landed in between is never reverted. When they differ,
-    /// nothing is written and the caller re-runs.
-    pub fn seal_services<S: PrimitiveSuite>(
-        &mut self,
-        keys: VaultKeys,
-        vault_id: &str,
-        body: serde_json::Value,
-        base: &ViewBase,
-    ) -> Result<Option<String>> {
-        if self.keyset.uik.is_some() {
-            return Err(AppError::Forbidden(
-                "service definitions on this vault must be signed by an owner in the browser; nothing was written".into(),
-            ));
-        }
-        let held = base.digest(ItemNs::Aux, "services");
-        let stored = ViewBase::of(&self.fold_view::<S>(keys, vault_id)?)?;
-        if stored.digest(ItemNs::Aux, "services") != held {
-            return Err(AppError::Conflict(
-                "the vault's service definitions changed since this request was opened (a sync landed meanwhile); nothing was written, re-run the command".into(),
-            ));
-        }
-        let wanted = match &body {
-            serde_json::Value::Object(o) if o.is_empty() => None,
-            b => Some(body_digest(b)),
-        };
-        if wanted.as_ref() == held {
-            return Ok(None);
-        }
-        let unified_live = matches!(
-            self.open_item::<S>(keys, vault_id, ItemNs::Services, ""),
-            Ok(Some(p)) if !p.is_tombstone()
-        );
-        let (ns, name) = if unified_live {
-            (ItemNs::Services, "")
-        } else {
-            (ItemNs::Aux, "services")
-        };
-        let version = self.item_version::<S>(keys, ns, name)? + 1;
-        let ctx = ItemCtx::for_item::<S>(keys.id_seed, vault_id, ns, name, version)?;
-        let payload = ItemPayload::live(ns, name.to_string(), body);
-        let ct = seal_item::<S>(keys.content, &ctx, &payload)?;
-        let id = ctx.item_id_b64();
-        let synced_version = self.items.get(&id).map(|s| s.synced_version).unwrap_or(0);
-        self.items.insert(
-            id.clone(),
-            StoredItem {
-                version,
-                ct,
-                synced_version,
-                tombstone: false,
-                sig: None,
-                signer: None,
-            },
-        );
-        Ok(Some(id))
-    }
-
     /// Unseal one stored item addressed by `(ns, name)` under `K`. `Ok(None)` if
     /// no such item is stored. The stored `version` is fed into the `SealCtx`,
     /// so a tampered version would fail the AEAD (contract §6).
@@ -1657,6 +1585,16 @@ impl PerItemVault {
                 &ItemPayload::live(ItemNs::Aux, name.clone(), body),
             )?;
         }
+        for (id, body) in Self::service_bodies(&view.aux)? {
+            self.seal_and_upsert::<S>(
+                keys,
+                vault_id,
+                ItemNs::Service,
+                &id,
+                1,
+                &ItemPayload::live(ItemNs::Service, id.clone(), body),
+            )?;
+        }
         Ok(())
     }
 
@@ -1687,13 +1625,20 @@ impl PerItemVault {
         if let Some(days) = aux.audit_retention_days {
             out.push(("audit_retention_days".into(), serde_json::json!(days)));
         }
-        if !aux.services.is_empty() {
-            out.push((
-                "services".into(),
-                serde_json::to_value(&aux.services).map_err(AppError::from)?,
-            ));
-        }
+        // Service definitions are not an aux blob any more: one native
+        // `service` item per id ([`Self::service_bodies`]).
         Ok(out)
+    }
+
+    /// The native `service` items a view wants, `id → body`: every entry of
+    /// `aux.services` (legacy entries included), each its own item.
+    fn service_bodies(
+        aux: &crate::storage::plaintext::VaultAux,
+    ) -> Result<Vec<(String, serde_json::Value)>> {
+        aux.services
+            .iter()
+            .map(|(id, e)| Ok((id.clone(), serde_json::to_value(e).map_err(AppError::from)?)))
+            .collect()
     }
 
     /// Keep-both (§4), locally: store `ours` as the conflict copy beside THEIR row
@@ -1755,6 +1700,9 @@ impl PerItemVault {
                 serde_json::to_value(c).map_err(AppError::from)?,
             );
         }
+        for (id, body) in Self::service_bodies(&view.aux)? {
+            out.insert((ItemNs::Service, id), body);
+        }
         if with_aux {
             for (name, body) in Self::aux_blob_bodies(&view.aux)? {
                 out.insert((ItemNs::Aux, name.to_string()), body);
@@ -1792,6 +1740,7 @@ impl PerItemVault {
         // and the daemon holds no UIK: an unsigned copy would be dropped by every
         // fold, and re-writing it could clobber an owner-signed row (or replace a
         // dropped one with the safe default). Agents are never emitted at all.
+        // Native `service` items are data records: written on every keyset.
         let desired = Self::view_items(view, self.keyset.uik.is_none())?;
 
         // Upsert every desired item the caller changed (vs its base) whose sealed
@@ -1890,8 +1839,75 @@ impl PerItemVault {
                 changed.push(iid);
             }
         }
+        // A service the caller dropped (a native item, or a legacy-only entry of
+        // the `services` record) gets a native tombstone, which hides the legacy
+        // entry of its id.
+        for id in mine.aux.services.keys() {
+            if removed(ItemNs::Service, id) {
+                let (iid, _v) = self.seal_and_bump::<S>(
+                    keys,
+                    vault_id,
+                    ItemNs::Service,
+                    id,
+                    &ItemPayload::tombstone(ItemNs::Service, id.clone()),
+                )?;
+                changed.push(iid);
+            }
+        }
         // Agent rows are never written here (no live upsert, no tombstone): a
         // revoke is the console deleting the UIK-signed row.
+        Ok(changed)
+    }
+
+    /// LEGACY(services row): write every service the fold reads from the
+    /// legacy `services` record (honored as owner-config: owner-signed on a v2
+    /// keyset) and that has no native `service` row yet (live or tombstone: a
+    /// native row wins) as a native item, an unsigned data record. On a NoUik
+    /// (v1) keyset the legacy record is then written empty; on a v2 keyset it
+    /// is left as it is (it is owner-signed; an owner's console empties it).
+    /// Returns the item ids written (empty = nothing to migrate). Remove with
+    /// the legacy record.
+    pub fn migrate_legacy_services<S: PrimitiveSuite>(
+        &mut self,
+        keys: VaultKeys,
+        vault_id: &str,
+    ) -> Result<Vec<String>> {
+        let folded = self.fold_view::<S>(keys, vault_id)?;
+        let mut changed = Vec::new();
+        for (id, entry) in &folded.aux.services {
+            let native = wire_id_for::<S>(keys.id_seed, ItemNs::Service, id)?;
+            if self.items.contains_key(&native) {
+                continue; // a native item or tombstone wins
+            }
+            let body = serde_json::to_value(entry).map_err(AppError::from)?;
+            let (iid, _v) = self.seal_and_bump::<S>(
+                keys,
+                vault_id,
+                ItemNs::Service,
+                id,
+                &ItemPayload::live(ItemNs::Service, id.clone(), body),
+            )?;
+            changed.push(iid);
+        }
+        if self.keyset.uik.is_none() {
+            for (ns, name) in [(ItemNs::Services, ""), (ItemNs::Aux, "services")] {
+                let holds_entries = matches!(
+                    self.open_item::<S>(keys, vault_id, ns, name),
+                    Ok(Some(p)) if !p.is_tombstone()
+                        && p.body.as_object().is_some_and(|o| !o.is_empty())
+                );
+                if holds_entries {
+                    let (iid, _v) = self.seal_and_bump::<S>(
+                        keys,
+                        vault_id,
+                        ns,
+                        name,
+                        &ItemPayload::live(ns, name.to_string(), serde_json::json!({})),
+                    )?;
+                    changed.push(iid);
+                }
+            }
+        }
         Ok(changed)
     }
 
@@ -2215,6 +2231,13 @@ impl PerItemVault {
         let mut legacy_retention: Option<serde_json::Value> = None;
         let mut legacy_services: Option<serde_json::Value> = None;
         let mut legacy_addressing = false;
+        // Native `service` items (one per service id): live entries, and the
+        // ids a tombstone removes. Overlaid on the legacy `services` record
+        // after the loop: a native item wins for its id.
+        let mut native_services: BTreeMap<String, crate::service::source::StoredService> =
+            BTreeMap::new();
+        let mut native_removed: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
 
         // D: the verified OWNER-SET authorizes owner-config (owner-only). It is
         // now derived from the KEYSET (creator-rooted role grants), NOT from an
@@ -2244,6 +2267,27 @@ impl PerItemVault {
                 let raw = aad_id_from_wire::<S>(keys.id_seed, id_b64)?;
                 let ctx = ItemCtx::new(vault_id, raw, stored.version);
                 let payload = unseal_item::<S>(keys.content, &ctx, &stored.ct)?;
+                if payload.ns == ItemNs::Service {
+                    // A data record like a connection (no signature), live or
+                    // tombstone, read only at its own address: one item per
+                    // service id. A conflict copy is a change the sync set
+                    // aside, never a service.
+                    if crate::storage::item::is_conflict_copy_name(&payload.name)
+                        || wire_id_for::<S>(keys.id_seed, ItemNs::Service, &payload.name)?
+                            != *id_b64
+                    {
+                        return Ok(());
+                    }
+                    if payload.is_tombstone() {
+                        native_removed.insert(payload.name);
+                    } else {
+                        let entry = serde_json::from_value(payload.body).map_err(|e| {
+                            AppError::Internal(format!("service '{}' parse: {}", payload.name, e))
+                        })?;
+                        native_services.insert(payload.name, entry);
+                    }
+                    return Ok(());
+                }
                 if payload.is_tombstone() {
                     return Ok(());
                 }
@@ -2411,6 +2455,8 @@ impl PerItemVault {
                             .map_err(|e| AppError::Internal(format!("services parse: {}", e)))?;
                         seen_new.services = true;
                     }
+                    // Folded above, before the tombstone check.
+                    ItemNs::Service => {}
                     ItemNs::Members => {
                         // The in-vault membership is RETIRED (finding #1):
                         // role now rides the keyset cred (owner-authority anchor,
@@ -2564,6 +2610,15 @@ impl PerItemVault {
                     .map_err(|e| AppError::Internal(format!("aux.services parse: {}", e)))?;
             }
         }
+        // LEGACY(services row): the services are the union of the legacy
+        // `services` record (owner-config, read only; moved to native items by
+        // `migrate_legacy_services`) and the native `service` items; a native
+        // tombstone hides the legacy entry of its id, a native live item
+        // replaces it. Drop the legacy half with the legacy record.
+        for id in native_removed {
+            aux.services.remove(&id);
+        }
+        aux.services.extend(native_services);
         // No `members` legacy blob to merge: the in-vault membership is retired
         // (finding #1); role lives on the keyset cred (owner-authority anchor).
 
@@ -5227,20 +5282,13 @@ mod tests {
         );
     }
 
-    /// The `services` row `sc service` writes: unsigned, so on a NoUik (v1)
-    /// keyset only; a v2 keyset refuses it and nothing is written. The stored
-    /// definitions must still be the ones the caller opened: a pull that
-    /// changed them in between refuses the write and keeps the pulled row. An
-    /// emptied map replaces the row; unchanged definitions write nothing.
-    #[test]
-    fn services_row_is_unsigned_v1_only_and_checked_against_its_base() {
-        use sudp::primitives::StdPrimitives;
-        type S = StdPrimitives;
-        let k = [0x5au8; 32];
-        let keys = VaultKeys::single(&k);
-        let vault = "vault-v1";
-        let acme = serde_json::json!({ "acme": { "service": "[service]\nid = \"acme\"\n" } });
-        let mut v1 = PerItemVault::build_initial(
+    /// A v1 store holding a legacy `services` record with `entries`.
+    fn v1_with_legacy_services(
+        keys: VaultKeys,
+        vault: &str,
+        entries: serde_json::Value,
+    ) -> PerItemVault {
+        let mut pv = PerItemVault::build_initial(
             b"c".to_vec(),
             "x".into(),
             "y".into(),
@@ -5249,58 +5297,245 @@ mod tests {
             vec![0u8; 48],
         )
         .unwrap();
-        let view = |pv: &PerItemVault| pv.fold_view::<S>(keys, vault).unwrap();
-        let base = |pv: &PerItemVault| ViewBase::of(&view(pv)).unwrap();
-
-        // Written unsigned and honored.
-        let b0 = base(&v1);
-        let id = v1
-            .seal_services::<S>(keys, vault, acme.clone(), &b0)
-            .unwrap()
-            .expect("written");
-        assert!(v1.items[&id].sig.is_none() && v1.items[&id].signer.is_none());
-        assert!(view(&v1).aux.services.contains_key("acme"));
-        // The same definitions again: nothing to write.
-        let b1 = base(&v1);
-        assert!(v1
-            .seal_services::<S>(keys, vault, acme.clone(), &b1)
-            .unwrap()
-            .is_none());
-
-        // A pull lands between open (b1) and persist: refused, the pulled row stays.
-        let pulled = serde_json::json!({
-            "acme": { "service": "[service]\nid = \"acme\"\n" },
-            "beta": { "service": "[service]\nid = \"beta\"\n" },
-        });
-        v1.seal_and_bump::<S>(
+        pv.seal_and_bump::<sudp::primitives::StdPrimitives>(
             keys,
             vault,
             ItemNs::Aux,
             "services",
-            &ItemPayload::live(ItemNs::Aux, "services".to_string(), pulled),
+            &ItemPayload::live(ItemNs::Aux, "services".to_string(), entries),
         )
         .unwrap();
-        let e = v1
-            .seal_services::<S>(keys, vault, serde_json::json!({}), &b1)
-            .unwrap_err();
-        assert!(matches!(e, AppError::Conflict(_)), "{e:?}");
-        assert!(view(&v1).aux.services.contains_key("beta"));
+        pv
+    }
 
-        // Against the current base, removing the last one sticks.
-        let b2 = base(&v1);
-        v1.seal_services::<S>(keys, vault, serde_json::json!({}), &b2)
+    fn svc_entry(id: &str, host: &str) -> serde_json::Value {
+        serde_json::json!({ "service": format!("[service]\nid = \"{id}\"\nhosts = [\"{host}\"]\n") })
+    }
+
+    /// Services are the union of the legacy record and the native `service`
+    /// items: a native item replaces the legacy entry of its id, a native
+    /// tombstone hides it, a native-only item is added. A native item read at
+    /// another address, or a conflict copy, is not a service.
+    #[test]
+    fn services_fold_unions_legacy_and_native_items() {
+        use sudp::primitives::StdPrimitives;
+        type S = StdPrimitives;
+        let k = [0x5au8; 32];
+        let keys = VaultKeys::single(&k);
+        let vault = "vault-v1";
+        let mut pv = v1_with_legacy_services(
+            keys,
+            vault,
+            serde_json::json!({ "a": svc_entry("a", "a.old"), "b": svc_entry("b", "b.dev") }),
+        );
+        let put = |pv: &mut PerItemVault, p: ItemPayload| {
+            let name = p.name.clone();
+            pv.seal_and_bump::<S>(keys, vault, ItemNs::Service, &name, &p)
+                .unwrap();
+        };
+        put(
+            &mut pv,
+            ItemPayload::live(ItemNs::Service, "a", svc_entry("a", "a.new")),
+        );
+        put(&mut pv, ItemPayload::tombstone(ItemNs::Service, "b"));
+        put(
+            &mut pv,
+            ItemPayload::live(ItemNs::Service, "c", svc_entry("c", "c.dev")),
+        );
+        // A `service` payload sealed at another id is not read as that service.
+        let elsewhere =
+            ItemCtx::for_item::<S>(keys.id_seed, vault, ItemNs::Service, "zz", 1).unwrap();
+        let ct = seal_item::<S>(
+            keys.content,
+            &elsewhere,
+            &ItemPayload::live(ItemNs::Service, "d", svc_entry("d", "d.dev")),
+        )
+        .unwrap();
+        pv.put_raw(elsewhere.item_id_b64(), 1, ct);
+
+        let services = pv.fold_view::<S>(keys, vault).unwrap().aux.services;
+        assert_eq!(services.keys().collect::<Vec<_>>(), ["a", "c"]);
+        assert_eq!(
+            serde_json::to_value(&services["a"]).unwrap(),
+            svc_entry("a", "a.new")
+        );
+    }
+
+    /// Native service items are data records: written unsigned by the daemon's
+    /// reconcile on every keyset (a v2 keyset too, where they are honored
+    /// unsigned), never as the legacy record; a dropped service, legacy-only
+    /// included, becomes a native tombstone.
+    #[test]
+    fn reconcile_writes_services_as_native_items_on_every_keyset() {
+        use sudp::primitives::StdPrimitives;
+        type S = StdPrimitives;
+        let k = [0x5au8; 32];
+        let keys = VaultKeys::single(&k);
+        let (v2_vault, _, _, _, _, v2) = role_fixture_creator_cred();
+        let v1_vault = "vault-v1";
+        let v1 = v1_with_legacy_services(
+            keys,
+            v1_vault,
+            serde_json::json!({ "old": svc_entry("old", "o.dev") }),
+        );
+        for (vault, mut pv) in [(v1_vault, v1), (v2_vault, v2)] {
+            let legacy_id = wire_id_for::<S>(keys.id_seed, ItemNs::Aux, "services").unwrap();
+            let legacy_before = pv.items.get(&legacy_id).map(|r| (r.version, r.ct.clone()));
+            let mut view = pv.fold_view::<S>(keys, vault).unwrap();
+            let base = ViewBase::of(&view).unwrap();
+            view.aux.services.insert(
+                "acme".into(),
+                serde_json::from_value(svc_entry("acme", "a.dev")).unwrap(),
+            );
+            view.aux.services.remove("old");
+            pv.reconcile_from_view::<S>(keys, vault, &view, ReconcileBase::Since(&base))
+                .unwrap();
+
+            let acme = wire_id_for::<S>(keys.id_seed, ItemNs::Service, "acme").unwrap();
+            let row = &pv.items[&acme];
+            assert!(
+                row.sig.is_none() && row.signer.is_none(),
+                "{vault}: unsigned"
+            );
+            assert!(
+                row.version > row.synced_version,
+                "{vault}: dirty, pushed by the sync"
+            );
+            assert_eq!(
+                pv.items.get(&legacy_id).map(|r| (r.version, r.ct.clone())),
+                legacy_before,
+                "{vault}: the legacy record is never rewritten"
+            );
+            let services = pv.fold_view::<S>(keys, vault).unwrap().aux.services;
+            assert_eq!(services.keys().collect::<Vec<_>>(), ["acme"], "{vault}");
+        }
+    }
+
+    /// LEGACY(services row) migration: every service the fold reads from the
+    /// legacy record without a native row becomes a native item (a native
+    /// item wins); on v1 the legacy record is then empty, on v2 it is left as
+    /// it is. Only what the fold honors moves: an unsigned legacy record on a
+    /// v2 keyset is not read, so nothing of it is migrated. Idempotent.
+    #[test]
+    fn legacy_services_migrate_to_native_items() {
+        use base64::engine::general_purpose::STANDARD;
+        use sudp::primitives::StdPrimitives;
+        type S = StdPrimitives;
+        let k = [0x5au8; 32];
+        let keys = VaultKeys::single(&k);
+        let fold =
+            |pv: &PerItemVault, vault: &str| pv.fold_view::<S>(keys, vault).unwrap().aux.services;
+
+        // v1: `a` already native (wins), `b` legacy-only (moves).
+        let vault = "vault-v1";
+        let mut v1 = v1_with_legacy_services(
+            keys,
+            vault,
+            serde_json::json!({ "a": svc_entry("a", "a.old"), "b": svc_entry("b", "b.dev") }),
+        );
+        v1.seal_and_bump::<S>(
+            keys,
+            vault,
+            ItemNs::Service,
+            "a",
+            &ItemPayload::live(ItemNs::Service, "a", svc_entry("a", "a.new")),
+        )
+        .unwrap();
+        let before = fold(&v1, vault);
+        let a_id = wire_id_for::<S>(keys.id_seed, ItemNs::Service, "a").unwrap();
+        let a_version = v1.items[&a_id].version;
+        let changed = v1.migrate_legacy_services::<S>(keys, vault).unwrap();
+        assert_eq!(changed.len(), 2, "b moved, legacy record emptied");
+        assert_eq!(v1.items[&a_id].version, a_version, "the native item wins");
+        let legacy = v1
+            .open_item::<S>(keys, vault, ItemNs::Aux, "services")
             .unwrap()
-            .expect("written");
-        assert!(view(&v1).aux.services.is_empty(), "the removal sticks");
+            .unwrap();
+        assert_eq!(legacy.body, serde_json::json!({}));
+        assert_eq!(fold(&v1, vault), before, "the same services are read");
+        assert!(
+            v1.migrate_legacy_services::<S>(keys, vault)
+                .unwrap()
+                .is_empty(),
+            "idempotent"
+        );
 
-        // A v2 keyset: refused, nothing written.
-        let (vault2, _, _, _, _, mut v2) = role_fixture_creator_cred();
-        let before = v2.items.clone();
-        let e = v2
-            .seal_services::<S>(keys, vault2, acme, &ViewBase::default())
-            .unwrap_err();
-        assert!(matches!(e, AppError::Forbidden(_)), "{e:?}");
-        assert_eq!(v2.items.len(), before.len());
+        // v2: an owner-signed legacy record moves, and is left as it is.
+        let (vault, creator, _, creator_id, _, mut v2) = role_fixture_creator_cred();
+        let (legacy_id, _) = {
+            let ctx =
+                ItemCtx::for_item::<S>(keys.id_seed, vault, ItemNs::Aux, "services", 1).unwrap();
+            let ct = seal_item::<S>(
+                keys.content,
+                &ctx,
+                &ItemPayload::live(
+                    ItemNs::Aux,
+                    "services",
+                    serde_json::json!({ "x": svc_entry("x", "x.dev") }),
+                ),
+            )
+            .unwrap();
+            let input = crate::identity::record_signature_input(
+                "services",
+                ctx.id_bytes(),
+                1,
+                vault,
+                &ct,
+                true,
+                &creator_id,
+            );
+            let sig = STANDARD.encode(creator.signing().sign(&input));
+            v2.put_raw_signed(
+                ctx.item_id_b64(),
+                1,
+                ct,
+                Some(sig),
+                Some(creator_id.clone()),
+            );
+            (ctx.item_id_b64(), ())
+        };
+        let legacy_row = v2.items[&legacy_id].clone();
+        assert!(fold(&v2, vault).contains_key("x"));
+        let changed = v2.migrate_legacy_services::<S>(keys, vault).unwrap();
+        assert_eq!(changed.len(), 1, "x moved, the legacy record untouched");
+        let row = &v2.items[&legacy_id];
+        assert!(
+            row.version == legacy_row.version
+                && row.ct == legacy_row.ct
+                && row.sig == legacy_row.sig
+        );
+        let x = &v2.items[&wire_id_for::<S>(keys.id_seed, ItemNs::Service, "x").unwrap()];
+        assert!(
+            x.sig.is_none(),
+            "a native service item is an unsigned data record"
+        );
+        assert!(fold(&v2, vault).contains_key("x"));
+        assert!(
+            v2.migrate_legacy_services::<S>(keys, vault)
+                .unwrap()
+                .is_empty(),
+            "idempotent"
+        );
+
+        // v2 with an UNSIGNED legacy record: the fold drops it, nothing moves.
+        let (vault, _, _, _, _, mut v2u) = role_fixture_creator_cred();
+        v2u.seal_and_bump::<S>(
+            keys,
+            vault,
+            ItemNs::Aux,
+            "services",
+            &ItemPayload::live(
+                ItemNs::Aux,
+                "services",
+                serde_json::json!({ "y": svc_entry("y", "y.dev") }),
+            ),
+        )
+        .unwrap();
+        assert!(fold(&v2u, vault).is_empty());
+        assert!(v2u
+            .migrate_legacy_services::<S>(keys, vault)
+            .unwrap()
+            .is_empty());
     }
 
     /// A conflict copy outside the keep-both namespaces is never folded: a

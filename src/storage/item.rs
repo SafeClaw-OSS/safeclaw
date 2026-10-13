@@ -296,6 +296,12 @@ pub enum ItemNs {
     Aux,
     /// `body` = [`AgentEntry`] (reach mask); `name` = agent id. Team §8.1.
     Agent,
+    /// One vault service definition (`name` = the service id): `body` =
+    /// `{ service, policy?, source? }`, the object form of an `aux.services`
+    /// entry. A data record like a connection: member-writable, unsigned. The
+    /// fold unions these with the legacy `services` record, a native item (or
+    /// tombstone) winning for its id.
+    Service,
     /// Singleton (`name = ""`): `body` = the [`Policy`] tree.
     Policy,
     /// Singleton: `body` = the stores map.
@@ -348,6 +354,7 @@ impl ItemNs {
             ItemNs::Connecting => "connecting",
             ItemNs::Aux => "aux",
             ItemNs::Agent => "agent",
+            ItemNs::Service => "service",
             ItemNs::Policy => "policy",
             ItemNs::Stores => "stores",
             ItemNs::StoreOrder => "store_order",
@@ -368,7 +375,7 @@ impl ItemNs {
         use ItemNs::*;
         match self {
             // Data records: any member principal, incl. the device's automatic writes.
-            Secret | Connection | Connecting => true,
+            Secret | Connection | Connecting | Service => true,
             // Owner-config singletons: a human OWNER only.
             Policy | Stores | StoreOrder | AuditRetentionDays | Services => {
                 role == WriterRole::Owner
@@ -654,7 +661,7 @@ mod tests {
         use ItemNs::*;
         use WriterRole::*;
         // Data records: every writer principal (owner / member / device auto-write).
-        for ns in [Secret, Connection, Connecting] {
+        for ns in [Secret, Connection, Connecting, Service] {
             for role in [Owner, Member, Device] {
                 assert!(ns.write_allowed(role, false), "{ns:?} writable by {role:?}");
             }

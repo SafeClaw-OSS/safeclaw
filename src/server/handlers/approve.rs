@@ -1179,6 +1179,20 @@ pub async fn approve_op(
                     "vault unlocked"
                 );
                 state.unlock_vault(vault_id.clone(), cache, unlock_key);
+                // LEGACY(services row): move entries of the legacy `services`
+                // record that have no native item into native `service` items
+                // now that K is held. The fold reads the same services before
+                // and after, so the cache stands.
+                if crate::server::handlers::service_ops::migrate_legacy_services_after_unlock(
+                    &state, &vault_id,
+                ) > 0
+                {
+                    let state = state.clone();
+                    let vid = vault_id.clone();
+                    tokio::spawn(async move {
+                        crate::sync::push_items_best_effort(&state, &vid).await;
+                    });
+                }
                 // Backfill the acting credential's key-check value if the stored
                 // keyset predates it (best-effort; we hold the write guard). This
                 // lets a later cross-device approval fail FAST in the browser
@@ -1477,18 +1491,11 @@ pub async fn approve_op(
             // Remove one vault service definition, or every definition of one
             // source (`target` = a service id, or a source identity such as
             // `github:owner/repo`). Connections naming them are kept (their
-            // secrets stay) and listed on the signed card. Refused on a vault
-            // whose owner-config must be owner-signed (never signed here); the
-            // card is recomputed and compared at apply.
+            // secrets stay) and listed on the signed card; the card is
+            // recomputed and compared at apply. Each removed service becomes a
+            // native `service` tombstone (a data record, like a connection).
             "service-rm" => {
                 let target = validated.op.act.target.trim().to_string();
-                if crate::server::handlers::service_ops::needs_owner_signature(
-                    existing_per_item.as_ref(),
-                ) {
-                    return Err(AppError::Forbidden(
-                        crate::server::handlers::service_ops::OWNER_SIGNATURE_NEEDED.into(),
-                    ));
-                }
                 let (mut view, k) =
                     crate::server::handlers::metadata::open_view_for_grant_keep_key(
                         &state,
@@ -1527,17 +1534,10 @@ pub async fn approve_op(
             // through the gate (the one the unlock load uses), refuses a built-in
             // id or one another source holds, recomputes the signed card against
             // the opened vault (refused on any difference), and on an update
-            // drops the source's services it no longer has. Refused on a vault
-            // whose owner-config must be owner-signed (never signed here).
-            // Daemon-side reseal + reconcile + push.
+            // drops the source's services it no longer has. Each service is
+            // its own native `service` item (a data record, like a
+            // connection): daemon-side reseal + reconcile + push.
             "service-add" => {
-                if crate::server::handlers::service_ops::needs_owner_signature(
-                    existing_per_item.as_ref(),
-                ) {
-                    return Err(AppError::Forbidden(
-                        crate::server::handlers::service_ops::OWNER_SIGNATURE_NEEDED.into(),
-                    ));
-                }
                 let req = crate::server::handlers::service_ops::parse_add(&validated.op.act.scope)
                     .map_err(AppError::BadRequest)?;
                 let snapshot = crate::server::handlers::service_ops::admit_add(&req)

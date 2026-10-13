@@ -13,13 +13,14 @@
 //! `service-rm` removes one service or a whole source the same way
 //! ([`card::RmCard`]).
 //!
-//! The definitions are an owner-config record. A vault whose keyset carries
-//! member keys (v2) honors owner-config only when an owner signed it, and
-//! that signature is made where the owner approves, in the browser, over the
-//! content they see. This process never signs owner-config, so on such a
-//! vault both acts are refused before an op is created
-//! ([`refuse_if_owner_signed`]); a v1 keyset (one person) honors the record
-//! unsigned.
+//! Each definition is its own native `service` item (`ns = "service"`,
+//! `name` = the id, body `{ service, policy?, source? }`): a data record like
+//! a connection, sealed under `K`, unsigned, written by this process after the
+//! approved card on every vault ([`persist`]). The old single `services`
+//! record is owner-config, read only here; the fold takes
+//! the union, a native item or tombstone winning for its id, and an unlock
+//! moves its entries to native items
+//! ([`migrate_legacy_services_after_unlock`]).
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -169,28 +170,48 @@ fn session(
     }
 }
 
-/// Why `sc service add|update|rm` is refused on a vault whose owner-config
-/// must be owner-signed.
-pub(crate) const OWNER_SIGNATURE_NEEDED: &str = "service changes on this vault need the owner's signature in the browser; add services from the console for now";
-
-/// True when `pv`'s folds drop unsigned owner-config (a v2 keyset).
-pub(crate) fn needs_owner_signature(
-    pv: Option<&crate::storage::sealed_vault::PerItemVault>,
-) -> bool {
-    pv.is_some_and(|pv| pv.keyset.uik.is_some())
+/// Op creation: drop the change-list fields a requester may send; the
+/// change approved is the card, computed here and recomputed at apply.
+fn drop_requester_fields(scope: &mut Value) {
+    if let Some(o) = scope.as_object_mut() {
+        for k in ["service_changes", "services_next", "services_row"] {
+            o.remove(k);
+        }
+    }
 }
 
-/// Op creation, before anything else: refuse `service-add` / `service-rm` on a
-/// vault whose owner-config must be owner-signed (see the module docs).
-pub(crate) fn refuse_if_owner_signed(state: &AppState, vault_id: &str) -> Result<()> {
-    let pv = match state.vaults.per_item_path(vault_id) {
-        Ok(path) => crate::storage::sealed_vault::read_per_item(&path)?,
-        Err(_) => None,
+/// LEGACY(services row): after an unlock, write the services the legacy
+/// `services` record still holds without a native item as native `service`
+/// items, and on a v1 keyset empty the legacy record
+/// ([`crate::storage::sealed_vault::PerItemVault::migrate_legacy_services`]).
+/// Best-effort: a failure is logged and the next unlock tries again. Returns
+/// the number of items written (the caller pushes them).
+pub(crate) fn migrate_legacy_services_after_unlock(state: &Arc<AppState>, vault_id: &str) -> usize {
+    use crate::storage::sealed_vault::{read_per_item, write_per_item_atomic};
+    let run = || -> Result<usize> {
+        let Some(k) = state.cloned_state_key(vault_id) else {
+            return Ok(0);
+        };
+        let path = state.vaults.per_item_path(vault_id)?;
+        let Some(mut pv) = read_per_item(&path)? else {
+            return Ok(0);
+        };
+        let changed = pv.migrate_legacy_services::<sudp::primitives::StdPrimitives>(
+            crate::storage::item::VaultKeys::from_material(&k),
+            vault_id,
+        )?;
+        if !changed.is_empty() {
+            write_per_item_atomic(&path, &pv)?;
+        }
+        Ok(changed.len())
     };
-    if needs_owner_signature(pv.as_ref()) {
-        return Err(AppError::Forbidden(OWNER_SIGNATURE_NEEDED.into()));
+    match run() {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!(vault = %vault_id, "legacy services migration deferred: {}", e);
+            0
+        }
     }
-    Ok(())
 }
 
 /// How long op creation waits for GitHub to check a source before the card
@@ -240,7 +261,12 @@ pub(crate) async fn mint_add<A: GitHubApi>(
         &entries,
         &state.services,
     )?;
-    c.stamp(&mut op.act.scope)
+    c.stamp(&mut op.act.scope)?;
+    // The source as stored, so every reader of the signed scope reads one
+    // spelling.
+    op.act.scope["source"] = serde_json::to_value(&req.source).map_err(|e| e.to_string())?;
+    drop_requester_fields(&mut op.act.scope);
+    Ok(())
 }
 
 /// Op creation: compute the `service-rm` card (`op.act.target` = a service
@@ -256,15 +282,16 @@ pub(crate) fn stamp_rm_at_mint(
     }
     let (entries, conns) = session(state, vault_id)?;
     let c = card::rm_card(&target, &entries, |id| connections_using(conns.iter(), id))?;
-    c.stamp(&mut op.act.scope)
+    c.stamp(&mut op.act.scope)?;
+    drop_requester_fields(&mut op.act.scope);
+    Ok(())
 }
 
-/// Write the changed definitions and refresh the session: the `services` row
-/// first (unsigned, checked against `base`, the view as opened: see
-/// [`crate::storage::sealed_vault::PerItemVault::seal_services`]), then the
-/// usual reseal + reconcile + cache refresh
-/// ([`crate::auth::connect::persist_mutated_view`]). A vault whose
-/// owner-config must be owner-signed is refused and nothing is written.
+/// Write the changed definitions and refresh the session: the usual reseal +
+/// reconcile + cache refresh ([`crate::auth::connect::persist_mutated_view`]),
+/// which writes each changed service as its own native `service` item and a
+/// removed one as a native tombstone, on every vault (data records, like
+/// connections). The legacy `services` record is never rewritten here.
 pub(crate) fn persist(
     state: &Arc<AppState>,
     vault_id: &str,
@@ -272,25 +299,6 @@ pub(crate) fn persist(
     view: &crate::storage::plaintext::VaultPlaintextView,
     k: &[u8],
 ) -> Result<()> {
-    use crate::storage::sealed_vault::{read_per_item, write_per_item_atomic};
-    if let Ok(path) = state.vaults.per_item_path(vault_id) {
-        // No store yet: the reconcile below bootstraps one from the view.
-        if let Some(mut pv) = read_per_item(&path)? {
-            if needs_owner_signature(Some(&pv)) {
-                return Err(AppError::Forbidden(OWNER_SIGNATURE_NEEDED.into()));
-            }
-            let body = serde_json::to_value(&view.aux.services)?;
-            let written = pv.seal_services::<sudp::primitives::StdPrimitives>(
-                crate::storage::item::VaultKeys::from_material(k),
-                vault_id,
-                body,
-                base,
-            )?;
-            if written.is_some() {
-                write_per_item_atomic(&path, &pv)?;
-            }
-        }
-    }
     crate::auth::connect::persist_mutated_view(state, vault_id, base, view, k)
         .map_err(AppError::Internal)
 }
@@ -412,7 +420,7 @@ pub async fn list(
     let set_aside = state
         .sync_conflict_records(&vault_id)
         .iter()
-        .any(|r| r == "services");
+        .any(|r| r == "services" || r.starts_with("service "));
     Ok(Json(json!({
         "services": listing(&entries, &conns, &state.services),
         "set_aside": set_aside,

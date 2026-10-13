@@ -72,12 +72,7 @@ pub async fn create(
     }
     // service-add / service-rm: the same discipline for service sources (the
     // services, every destination host, the rules, the source as checked; see
-    // `service_ops`). Refused outright on a vault whose owner-config must be
-    // owner-signed: this process never signs it.
-    if matches!(&op.act.kind, ActType::Custom(name) if name == "service-add" || name == "service-rm")
-    {
-        crate::server::handlers::service_ops::refuse_if_owner_signed(&state, &vault_id)?;
-    }
+    // `service_ops`), on every vault: each service is a data record.
     if matches!(&op.act.kind, ActType::Custom(name) if name == "service-add") {
         let api = crate::service::source::github::GitHubHttp::new().map_err(AppError::Internal)?;
         crate::server::handlers::service_ops::mint_add(&state, &vault_id, &mut op, &api)

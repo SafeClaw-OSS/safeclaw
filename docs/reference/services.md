@@ -70,9 +70,10 @@ How it works:
   skips the terminal question, never the passkey. A local source is re-read
   only from the path you pass: `sc service update ./my-api`. Services the
   source no longer has are removed.
-- **Vaults with members.** Their service definitions must be signed by an
-  owner in the browser, so `add`, `update` and `rm` are refused there; add
-  services from the console for now.
+- **Storage.** Each definition is its own record in the vault, like a
+  connection: any member can add, update or remove one, after approving the
+  card with a passkey. Definitions stored by earlier versions in one shared
+  record are moved to their own records the next time the vault is unlocked.
 - **Sync.** If the definitions changed elsewhere before your change reached
   the cloud and the cloud copy cannot be replaced, yours is set aside and not
   applied; `sc service ls` and `sc sync` say so. Re-run the command.

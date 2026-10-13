@@ -370,42 +370,140 @@ fn v2_vault(vault: &str) -> PerItemVault {
     pv
 }
 
-/// Owner-config on a vault with members must be owner-signed, and this
-/// process never signs it: `sc service add|update|rm` are refused at op
-/// creation, and a write reaching apply anyway is refused with nothing
-/// written. A vault with no members (v1 keyset, or no store yet) is not.
-#[test]
-fn a_vault_needing_owner_signatures_refuses_service_changes() {
+/// A tempdir-backed state holding `pv` for `vault`, unlocked under `k`
+/// (session entries = the store's fold, as an unlock leaves them).
+fn state_with_store(
+    vault: &str,
+    pv: &PerItemVault,
+    k: &[u8; 32],
+) -> (tempfile::TempDir, Arc<AppState>) {
     let dir = tempfile::tempdir().unwrap();
     let mut state = test_state();
     state.config.state_dir = dir.path().to_path_buf();
     state.vaults = crate::storage::vault_dir::VaultDir::new(dir.path());
     let state = Arc::new(state);
-    let team = "vault-team";
-    let path = state.vaults.per_item_path(team).unwrap();
-    crate::storage::sealed_vault::write_per_item_atomic(&path, &v2_vault(team)).unwrap();
-    let before = std::fs::read(&path).unwrap();
+    let path = state.vaults.per_item_path(vault).unwrap();
+    crate::storage::sealed_vault::write_per_item_atomic(&path, pv).unwrap();
+    let view = crate::server::handlers::metadata::decrypt_vault_view_peritem_with_key(k, pv, vault)
+        .unwrap();
+    let cache = crate::state::SecretsCache {
+        service_entries: view.aux.services.clone(),
+        ..Default::default()
+    };
+    state.unlock_vault(vault.into(), cache, zeroize::Zeroizing::new(k.to_vec()));
+    (dir, state)
+}
 
-    let e = refuse_if_owner_signed(&state, team).unwrap_err();
-    assert!(
-        matches!(&e, AppError::Forbidden(m) if m == OWNER_SIGNATURE_NEEDED),
-        "{e:?}"
-    );
-    assert!(OWNER_SIGNATURE_NEEDED.contains("console"));
-    let e = persist(
-        &state,
-        team,
-        &crate::storage::sealed_vault::ViewBase::default(),
-        &empty_view(),
-        &[0u8; 32],
+fn stored(state: &AppState, vault: &str) -> PerItemVault {
+    crate::storage::sealed_vault::read_per_item(&state.vaults.per_item_path(vault).unwrap())
+        .unwrap()
+        .unwrap()
+}
+
+/// The approved flow end to end on a vault with members (v2), whose
+/// owner-config needs owner signatures: service definitions are data records,
+/// so `service-add` and `service-rm` are minted, applied and written by this
+/// process (unsigned native `service` items, as any member's daemon writes a
+/// connection), and the fold honors them. Fields a requester may send are
+/// dropped at mint and the source is stamped in its stored form.
+#[test]
+fn services_are_data_records_on_a_vault_with_members() {
+    type S = sudp::primitives::StdPrimitives;
+    let vault = "vault-team";
+    let k = [0x5au8; 32];
+    let keys = crate::storage::item::VaultKeys::single(&k);
+    let (_dir, state) = state_with_store(vault, &v2_vault(vault), &k);
+
+    // Mint: the requester's change lists are dropped, `path: null` is not kept.
+    let mut sc = scope(&[("a1", "a.dev")], &gh('a'), false);
+    sc["source"]["path"] = Value::Null;
+    sc["service_changes"] = json!([{ "id": "a1", "next": { "service": "evil" } }]);
+    sc["services_next"] = json!({ "a1": "evil" });
+    sc["services_row"] = json!({ "item_id": "x", "base_version": 0 });
+    let mut op: crate::protocol::operation::Operation = serde_json::from_value(json!({
+        "act": { "type": { "custom": "service-add" }, "target": "github:acme/tools", "scope": sc },
+        "bind": { "redeemer": vault },
+        "valid": { "iat": 0, "multiplicity": 1 }
+    }))
+    .unwrap();
+    block_on(mint_add(&state, vault, &mut op, &Gh(None))).unwrap();
+    let signed = op.act.scope.clone();
+    for k in ["service_changes", "services_next", "services_row"] {
+        assert!(signed.get(k).is_none(), "{k} dropped");
+    }
+    assert_eq!(signed["source"], serde_json::to_value(gh('a')).unwrap());
+    assert!(signed["source"].get("path").is_none());
+
+    // Apply the approved card: the daemon writes a native item, unsigned.
+    let open = |state: &AppState| {
+        crate::server::handlers::metadata::decrypt_vault_view_peritem_with_key(
+            &k,
+            &stored(state, vault),
+            vault,
+        )
+        .unwrap()
+    };
+    let mut view = open(&state);
+    let base = crate::storage::sealed_vault::ViewBase::of(&view).unwrap();
+    let req = parse_add(&signed).unwrap();
+    let snap = admit_add(&req).unwrap();
+    apply_add(&mut view, req, &snap, &signed, &state.services).unwrap();
+    persist(&state, vault, &base, &view, &k).unwrap();
+    let pv = stored(&state, vault);
+    let a1 = crate::storage::item::wire_id_for::<S>(
+        keys.id_seed,
+        crate::storage::item::ItemNs::Service,
+        "a1",
     )
-    .unwrap_err();
-    assert!(matches!(e, AppError::Forbidden(_)), "{e:?}");
-    assert_eq!(std::fs::read(&path).unwrap(), before, "nothing written");
+    .unwrap();
+    assert!(pv.items[&a1].sig.is_none(), "no signature");
+    assert!(
+        open(&state).aux.services.contains_key("a1"),
+        "honored on a v2 keyset"
+    );
+    assert!(
+        session(&state, vault).unwrap().0.contains_key("a1"),
+        "the session sees it"
+    );
 
-    // One person, no members: not refused.
-    let personal = "vault-personal";
-    let v1 = PerItemVault::build_initial(
+    // Remove it the same way: a native tombstone.
+    let mut rm: crate::protocol::operation::Operation = serde_json::from_value(json!({
+        "act": { "type": { "custom": "service-rm" }, "target": "a1", "scope": { "services_next": {} } },
+        "bind": { "redeemer": vault },
+        "valid": { "iat": 0, "multiplicity": 1 }
+    }))
+    .unwrap();
+    stamp_rm_at_mint(&state, vault, &mut rm).unwrap();
+    assert!(rm.act.scope.get("services_next").is_none());
+    let mut view = open(&state);
+    let base = crate::storage::sealed_vault::ViewBase::of(&view).unwrap();
+    apply_rm(&mut view, "a1", &rm.act.scope).unwrap();
+    persist(&state, vault, &base, &view, &k).unwrap();
+    assert!(stored(&state, vault).items[&a1].tombstone);
+    assert!(open(&state).aux.services.is_empty());
+}
+
+/// LEGACY(services row): an unlock moves legacy entries to native items on
+/// every vault; the legacy record is emptied on v1 and left as it is on v2
+/// (owner-config there). With nothing to move, nothing is written.
+#[test]
+fn unlock_migrates_legacy_services() {
+    use crate::storage::item::ItemPayload;
+    use crate::storage::item::{ItemNs, VaultKeys};
+    type S = sudp::primitives::StdPrimitives;
+    let k = [0x5au8; 32];
+    let keys = VaultKeys::single(&k);
+    let legacy = || {
+        ItemPayload::live(
+            ItemNs::Aux,
+            "services",
+            json!({ "old": { "service": svc("old", "o.dev") } }),
+        )
+    };
+
+    // v1: moved, the legacy record emptied.
+    let vault = "vault-personal";
+    let mut v1 = PerItemVault::build_initial(
         b"c".to_vec(),
         "x".into(),
         "y".into(),
@@ -414,13 +512,41 @@ fn a_vault_needing_owner_signatures_refuses_service_changes() {
         vec![0u8; 48],
     )
     .unwrap();
-    crate::storage::sealed_vault::write_per_item_atomic(
-        &state.vaults.per_item_path(personal).unwrap(),
-        &v1,
-    )
-    .unwrap();
-    assert!(refuse_if_owner_signed(&state, personal).is_ok());
-    assert!(refuse_if_owner_signed(&state, "vault-none").is_ok());
+    v1.seal_and_bump::<S>(keys, vault, ItemNs::Aux, "services", &legacy())
+        .unwrap();
+    let (_d1, state) = state_with_store(vault, &v1, &k);
+    assert_eq!(migrate_legacy_services_after_unlock(&state, vault), 2);
+    let pv = stored(&state, vault);
+    assert_eq!(
+        pv.open_item::<S>(keys, vault, ItemNs::Aux, "services")
+            .unwrap()
+            .unwrap()
+            .body,
+        json!({})
+    );
+    assert!(pv
+        .open_item::<S>(keys, vault, ItemNs::Service, "old")
+        .unwrap()
+        .is_some());
+    assert_eq!(migrate_legacy_services_after_unlock(&state, vault), 0);
+
+    // v2 with an unsigned legacy record: not honored, so not moved; the store
+    // is not rewritten.
+    let vault = "vault-team";
+    let mut v2 = v2_vault(vault);
+    v2.seal_and_bump::<S>(keys, vault, ItemNs::Aux, "services", &legacy())
+        .unwrap();
+    let (_d2, state) = state_with_store(vault, &v2, &k);
+    let before = std::fs::read(state.vaults.per_item_path(vault).unwrap()).unwrap();
+    assert_eq!(migrate_legacy_services_after_unlock(&state, vault), 0);
+    assert_eq!(
+        std::fs::read(state.vaults.per_item_path(vault).unwrap()).unwrap(),
+        before
+    );
+
+    // A locked vault: nothing.
+    state.lock_vault(vault);
+    assert_eq!(migrate_legacy_services_after_unlock(&state, vault), 0);
 }
 
 /// The card's source is a fact only when this device fetched the pinned
