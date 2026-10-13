@@ -1050,17 +1050,23 @@ fn reconcile_per_item_after_connect(
         view,
         base,
     ) {
-        Ok(changed) => {
-            if !changed.is_empty() {
+        Ok(reconciled) => {
+            if !reconciled.changed.is_empty() {
                 if let Err(e) = crate::storage::sealed_vault::write_per_item_atomic(&path, &pv) {
                     tracing::warn!(vault = %vault_id, "per-item connect reconcile write failed: {}", e);
                     return None;
                 }
                 tracing::info!(
                     vault = %vault_id,
-                    changed = changed.len(),
+                    changed = reconciled.changed.len(),
                     "per-item store updated after connect (refresh-token + connection MOVE)"
                 );
+            }
+            // Owner-config the caller changed while it also changed elsewhere:
+            // set aside, never written over; `sc sync` tells the user to re-run.
+            for (item, record) in &reconciled.set_aside {
+                tracing::warn!(vault = %vault_id, item = %item, record = %record, "changed elsewhere meanwhile; ours set aside, theirs kept");
+                state.note_sync_conflict(vault_id, item, record);
             }
             // Fold even when nothing changed: an existing conflict copy (an
             // idempotent no-op) still means the store differs from `view`.

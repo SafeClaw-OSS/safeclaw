@@ -76,7 +76,8 @@ How it works:
 - **Storage.** Each definition is its own record in the vault, like a
   connection: any member can add, update or remove one, after approving the
   card with a passkey. Definitions stored by earlier versions in one shared
-  record are copied to their own records the next time the vault is unlocked.
+  record are moved to their own records: by the daemon after an unlock (a
+  personal vault), or by the owner in the console (a vault with members).
 - **Sync.** If a definition was changed in two places at once, both versions
   are kept, like a connection: the second is `<id> (conflict copy)`, which
   `sc service ls` lists as skipped and which is never used; keep the one you

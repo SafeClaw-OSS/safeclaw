@@ -110,13 +110,13 @@ pub fn is_agent_wire_id(wire_id: &str) -> bool {
     wire_id.len() == AGENT_WIRE_ID_LEN && wire_id.starts_with("ag_")
 }
 
-/// The WIRE id (row PK / URL) for `(ns, name)`. `agent` ns ⇒ the cleartext ag_id
-/// (`== name`); every other ns ⇒ the blinded base64url HMAC.
+/// The WIRE id (row PK / URL) for `(ns, name)`, per the namespace's
+/// [`Address`] in [`ITEM_RULES`]: the cleartext name (`agent` ⇒ the ag_id) or
+/// the blinded base64url HMAC.
 pub fn wire_id_for<S: PrimitiveSuite>(k: &[u8], ns: ItemNs, name: &str) -> Result<String> {
-    if ns == ItemNs::Agent {
-        Ok(name.to_string())
-    } else {
-        item_id::<S>(k, ns.as_str(), name)
+    match ns.address() {
+        Address::CleartextWireHmacAad => Ok(name.to_string()),
+        Address::Blinded => item_id::<S>(k, ns.as_str(), name),
     }
 }
 
@@ -287,36 +287,48 @@ pub enum ItemNs {
     Connection,
     /// `body` = `{ service, config, code, verifier }`.
     Connecting,
-    /// LEGACY (pre-unification): `ns = "aux"`, `name ∈ {policy, stores, …}`.
-    /// Read-compat only — the fold still parses it, nothing writes it. Team
-    /// §8.2: one rule now addresses everything (`ns` = the `VaultAux` field,
-    /// `name` = the map key, singletons use the empty name), so each former
-    /// aux subtree has its own ns below. Removable once the version census
-    /// says the fleet is migrated.
+    /// LEGACY(aux addressing) owner-config address: `ns = "aux"`, `name` =
+    /// the `VaultAux` field. Written only as the tombstone the migration
+    /// leaves after copying it to its native records ([`ITEM_RULES`]); the
+    /// fold reads `aux:<field>` only while its kind has no honored native
+    /// record, and `aux:services` unioned under the native `service` items.
+    /// Remove once every vault is migrated.
     Aux,
     /// `body` = [`AgentEntry`] (reach mask); `name` = agent id. Team §8.1.
     Agent,
     /// One vault service definition (`name` = the service id): `body` =
     /// `{ service, policy?, source? }`, the object form of an `aux.services`
-    /// entry. A data record like a connection: member-writable, unsigned, and
-    /// a same-item conflict keeps both (`"<id> (conflict copy)"`). The fold
-    /// unions these with the legacy `services` record, a native item (or
-    /// tombstone) winning for its id.
+    /// entry. A data record like a connection ([`ITEM_RULES`]): member-
+    /// writable, unsigned, read only at its own derived id, and a same-item
+    /// conflict keeps both (`"<id> (conflict copy)"`). The fold unions these
+    /// with the legacy `services` record, a native item (or tombstone) winning
+    /// for its id.
     Service,
-    /// Singleton (`name = ""`): `body` = the [`Policy`] tree.
+    /// Owner-config, one record per edit unit, reassembled into the
+    /// [`Policy`] tree by the fold: `policy:` (empty name) = `{timeout,
+    /// default}`, `policy:category:<tag>` = that tag's `Levels`,
+    /// `policy:connection:<connection_id>` = that connection's
+    /// `ConnectionPolicy`. Any other name is ignored.
     Policy,
-    /// Singleton: `body` = the stores map.
-    Stores,
-    /// Singleton: `body` = the store-order list.
+    /// Owner-config: one store (`name` = the store id, `body` = the `Store`).
+    Store,
+    /// Owner-config singleton: `body` = the store-order list.
     #[serde(rename = "store_order")]
     StoreOrder,
-    /// Singleton: `body` = retention days (integer).
+    /// Owner-config singleton: `body` = retention days (integer).
     #[serde(rename = "audit_retention_days")]
     AuditRetentionDays,
-    /// Singleton: `body` = custom-service source map.
+    /// The console's secret order (singleton); this process ignores it.
+    #[serde(rename = "secret_order")]
+    SecretOrder,
+    /// RETIRED `stores:` singleton (stores are `store:<id>`): parsed, never
+    /// read or written.
+    Stores,
+    /// RETIRED `services:` singleton (services are `service:<id>`): parsed,
+    /// never read or written.
     Services,
-    /// Singleton: `body` = `{ user_id → role }` (team membership record —
-    /// the signed owner-list anchor once UIK config signatures land).
+    /// RETIRED in-vault membership (roles ride the keyset): parsed, never
+    /// read or written.
     Members,
 }
 
@@ -338,13 +350,15 @@ pub enum WriterRole {
 }
 
 impl ItemNs {
-    /// Same-item conflicts in this namespace KEEP BOTH (§4): user-visible items
-    /// a person can compare and resolve. Everything else (singletons,
-    /// `connecting`, legacy aux …) takes the writer's value, where a
-    /// "(conflict copy)" row would be invisible to the fold and undeletable.
-    /// Console parity: `KEEP_BOTH_NS` in `lib/vault-grant.ts`.
-    pub fn keeps_both_on_conflict(self) -> bool {
-        matches!(self, ItemNs::Secret | ItemNs::Connection | ItemNs::Service)
+    /// How this namespace is addressed: the [`Address`] of its rules in
+    /// [`ITEM_RULES`] (every rule of one namespace shares it); a namespace with
+    /// no rule is blinded.
+    pub fn address(self) -> Address {
+        ITEM_RULES
+            .iter()
+            .find(|r| r.ns == self)
+            .map(|r| r.address)
+            .unwrap_or(Address::Blinded)
     }
 
     /// The lowercase wire string (matches the serde rename and the TS side).
@@ -357,48 +371,455 @@ impl ItemNs {
             ItemNs::Agent => "agent",
             ItemNs::Service => "service",
             ItemNs::Policy => "policy",
+            ItemNs::Store => "store",
             ItemNs::Stores => "stores",
             ItemNs::StoreOrder => "store_order",
             ItemNs::AuditRetentionDays => "audit_retention_days",
+            ItemNs::SecretOrder => "secret_order",
             ItemNs::Services => "services",
             ItemNs::Members => "members",
         }
     }
 
     /// §A1.4/A2 role×type write authorization: may a principal with `role` write
-    /// (or tombstone) this record type? `is_own_agent` applies ONLY to `Agent` —
-    /// it means the signer is the authorized agent's declared owner (self-service).
-    /// The server uses this on the plaintext type as a clean-state write-gate, and
-    /// every reader re-applies it after verifying the record signature (A1.5, the
-    /// trust wall). Fail-CLOSED: retired (`Members`), legacy (`Aux`), and any type
-    /// not enumerated deny (A1.4 "未知 type → 默认拒").
-    pub fn write_allowed(self, role: WriterRole, is_own_agent: bool) -> bool {
-        use ItemNs::*;
+    /// the record `(self, name)`? It follows the record's rule in
+    /// [`ITEM_RULES`] ([`ItemRule::write_allowed`]): `is_own_agent` applies
+    /// only to `agent` (the signer is the agent's declared owner) and
+    /// `has_keyset` only to owner-config (the device writes it on a vault
+    /// without a keyset). A tombstone is a write too; the legacy `aux` rows
+    /// take only the migration's tombstone ([`ItemRule::migration_tombstone_allowed`]).
+    /// Fail-CLOSED: a record without a rule (the retired `stores:` /
+    /// `services:` / `members`, an unknown or `agent/` `aux` name, an unknown
+    /// `policy` name) is written by nobody (A1.4 "未知 type → 默认拒").
+    pub fn write_allowed(
+        self,
+        name: &str,
+        role: WriterRole,
+        is_own_agent: bool,
+        has_keyset: bool,
+    ) -> bool {
+        rule(self, name).is_some_and(|r| r.write_allowed(role, is_own_agent, has_keyset))
+    }
+}
+
+// ── The item-namespace rule table ────────────────────────────────────────────
+// ONE table decides, per record type, how it is addressed, who may write it,
+// what signs it, how a same-item conflict resolves and what a reader accepts.
+// The console holds the same table; both sides assert the canonical text of it
+// ([`canonical_rule_table`]), so a change must land on both sides at once.
+
+/// How a record type is addressed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Address {
+    /// Wire id = AAD id = `HMAC(K_id, lp(ns) ‖ lp(name))` (base64url).
+    Blinded,
+    /// Wire id = the cleartext name; the seal/sig AAD stays the blinded HMAC.
+    CleartextWireHmacAad,
+}
+
+/// A principal that may write (or tombstone) a record type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Writer {
+    /// A vault owner.
+    Owner,
+    /// The member an agent belongs to, for that agent only.
+    OwnMember,
+    /// Any member, owners included.
+    Member,
+    /// The device: the daemon's automatic writes and the writes it makes after
+    /// a person approves.
+    Device,
+    /// The device, on a vault without a keyset only.
+    DeviceWithoutKeyset,
+    /// Only the tombstone the migration writes after copying a legacy row to
+    /// its native records: an owner on a vault with a keyset, anyone (the
+    /// device included) without one.
+    MigrationTombstoneOnly,
+}
+
+/// What signs a record type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Signed {
+    /// Never signed.
+    None,
+    /// The writer's sidecar signature, record type `agent`.
+    WriterAgent,
+    /// On a vault with a keyset: an owner's sidecar signature, record type =
+    /// the namespace (`policy`, `store`, `store_order`,
+    /// `audit_retention_days`; a legacy `aux` row: its field name). Without a
+    /// keyset: unsigned.
+    OwnerWithKeyset,
+}
+
+/// How a same-item conflict resolves (the console applies the same rules).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Conflict {
+    /// Theirs stays canonical; ours becomes `"<name> (conflict copy)"`. Our
+    /// edit against their delete: the delete stands, ours becomes the copy.
+    /// Their body equal to our base (normalized) is no conflict: ours applies.
+    KeepBoth,
+    /// Ours is written over theirs.
+    TakeWriter,
+    /// Never overwritten, never re-sealed: ours is set aside and the user is
+    /// told it changed elsewhere meanwhile.
+    OwnerConfig,
+}
+
+/// What a reader accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Read {
+    /// Every record.
+    All,
+    /// Only a record whose signer may write it and whose wire id is its name.
+    SignerAuthorizedAndWireIdMatches,
+    /// A native owner-config record: with a keyset only owner-signed, else
+    /// any. Its kind is read from the native records alone once any of them
+    /// is honored.
+    OwnerSignedWithKeysetNativeWins,
+    /// A legacy `aux:<field>` row (same signature rule), read only while its
+    /// kind has no honored native record; never mixed with native ones.
+    LegacyWhenNoHonoredNative,
+    /// The console's; this process ignores it.
+    ConsoleOnly,
+    /// The legacy services record: read, unioned under the native items (a
+    /// native item or tombstone wins for its id).
+    LegacyUnionNativeWins,
+    /// Only a record at its own derived id (a conflict copy excepted), unioned
+    /// with the legacy services record, native first.
+    DerivedIdOnlyUnionLegacy,
+}
+
+/// Which names of its namespace a rule covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Name {
+    /// Every name; the key shows the placeholder.
+    Any(&'static str),
+    /// Exactly this name (`""` for a singleton, an `aux` field).
+    Exact(&'static str),
+    /// `<prefix><non-empty rest>`; the key shows the prefix and the placeholder.
+    Prefixed(&'static str, &'static str),
+}
+
+impl Name {
+    pub fn matches(self, name: &str) -> bool {
         match self {
-            // Data records: any member principal, incl. the device's automatic writes.
-            Secret | Connection | Connecting | Service => true,
-            // Owner-config singletons: a human OWNER only.
-            Policy | Stores | StoreOrder | AuditRetentionDays | Services => {
-                role == WriterRole::Owner
-            }
-            // Authorized-agents table (§11.1): any owner, or the agent's own member.
-            Agent => role == WriterRole::Owner || (role == WriterRole::Member && is_own_agent),
-            // Retired in-vault membership + legacy aux ns + anything else: fail-closed.
-            Members | Aux => false,
+            Name::Any(_) => true,
+            Name::Exact(n) => n == name,
+            Name::Prefixed(p, _) => name.strip_prefix(p).is_some_and(|rest| !rest.is_empty()),
         }
     }
 
-    /// Singleton namespaces address exactly one item and use the empty name.
-    pub fn is_singleton(self) -> bool {
-        matches!(
-            self,
-            ItemNs::Policy
-                | ItemNs::Stores
-                | ItemNs::StoreOrder
-                | ItemNs::AuditRetentionDays
-                | ItemNs::Services
-                | ItemNs::Members
+    fn key_part(self) -> String {
+        match self {
+            Name::Any(placeholder) => placeholder.to_string(),
+            Name::Exact(n) => n.to_string(),
+            Name::Prefixed(p, placeholder) => format!("{}{}", p, placeholder),
+        }
+    }
+}
+
+/// One row of [`ITEM_RULES`].
+#[derive(Debug, Clone, Copy)]
+pub struct ItemRule {
+    pub ns: ItemNs,
+    pub name: Name,
+    pub address: Address,
+    pub writers: &'static [Writer],
+    pub signed: Signed,
+    pub conflict: Conflict,
+    pub read: Read,
+}
+
+const fn data_record(ns: ItemNs, placeholder: &'static str, conflict: Conflict) -> ItemRule {
+    ItemRule {
+        ns,
+        name: Name::Any(placeholder),
+        address: Address::Blinded,
+        writers: &[Writer::Member, Writer::Device],
+        signed: Signed::None,
+        conflict,
+        read: Read::All,
+    }
+}
+
+/// A native owner-config record.
+const fn owner_config(ns: ItemNs, name: Name) -> ItemRule {
+    ItemRule {
+        ns,
+        name,
+        address: Address::Blinded,
+        writers: &[Writer::Owner, Writer::DeviceWithoutKeyset],
+        signed: Signed::OwnerWithKeyset,
+        conflict: Conflict::OwnerConfig,
+        read: Read::OwnerSignedWithKeysetNativeWins,
+    }
+}
+
+/// LEGACY(aux addressing): an `aux:<field>` row, written only as the
+/// migration's tombstone, read only while its kind has no honored native
+/// record.
+const fn legacy_aux(field: &'static str) -> ItemRule {
+    ItemRule {
+        ns: ItemNs::Aux,
+        name: Name::Exact(field),
+        address: Address::Blinded,
+        writers: &[Writer::MigrationTombstoneOnly],
+        signed: Signed::OwnerWithKeyset,
+        conflict: Conflict::OwnerConfig,
+        read: Read::LegacyWhenNoHonoredNative,
+    }
+}
+
+/// THE rule table (design: item-namespace table). Every per-record decision
+/// in this crate reads it: [`wire_id_for`], [`ItemNs::write_allowed`], what
+/// this process writes, the sync's conflict decision and the fold's read
+/// rules.
+pub const ITEM_RULES: [ItemRule; 18] = [
+    data_record(ItemNs::Secret, "<KEY>", Conflict::KeepBoth),
+    data_record(ItemNs::Connection, "<id>", Conflict::KeepBoth),
+    data_record(ItemNs::Connecting, "<id>", Conflict::TakeWriter),
+    ItemRule {
+        read: Read::DerivedIdOnlyUnionLegacy,
+        ..data_record(ItemNs::Service, "<id>", Conflict::KeepBoth)
+    },
+    ItemRule {
+        ns: ItemNs::Agent,
+        name: Name::Any("<ag_id>"),
+        address: Address::CleartextWireHmacAad,
+        writers: &[Writer::Owner, Writer::OwnMember],
+        signed: Signed::WriterAgent,
+        conflict: Conflict::TakeWriter,
+        read: Read::SignerAuthorizedAndWireIdMatches,
+    },
+    owner_config(ItemNs::Policy, Name::Exact("")),
+    owner_config(ItemNs::Policy, Name::Prefixed(POLICY_CATEGORY, "<tag>")),
+    owner_config(
+        ItemNs::Policy,
+        Name::Prefixed(POLICY_CONNECTION, "<connection_id>"),
+    ),
+    owner_config(ItemNs::Store, Name::Any("<id>")),
+    owner_config(ItemNs::StoreOrder, Name::Exact("")),
+    owner_config(ItemNs::AuditRetentionDays, Name::Exact("")),
+    ItemRule {
+        ns: ItemNs::SecretOrder,
+        name: Name::Exact(""),
+        address: Address::Blinded,
+        writers: &[Writer::Member],
+        signed: Signed::None,
+        conflict: Conflict::TakeWriter,
+        read: Read::ConsoleOnly,
+    },
+    ItemRule {
+        read: Read::LegacyUnionNativeWins,
+        ..legacy_aux("services")
+    },
+    legacy_aux("policy"),
+    legacy_aux("stores"),
+    legacy_aux("store_order"),
+    legacy_aux("audit_retention_days"),
+    ItemRule {
+        signed: Signed::None,
+        conflict: Conflict::TakeWriter,
+        ..legacy_aux("secret_order")
+    },
+];
+
+/// `policy:category:<tag>`: a tag's default levels.
+pub const POLICY_CATEGORY: &str = "category:";
+/// `policy:connection:<connection_id>`: a connection's policy.
+pub const POLICY_CONNECTION: &str = "connection:";
+
+/// The rule for the record `(ns, name)`, if the table has one.
+pub fn rule(ns: ItemNs, name: &str) -> Option<&'static ItemRule> {
+    ITEM_RULES
+        .iter()
+        .find(|r| r.ns == ns && r.name.matches(name))
+}
+
+/// The conflict policy of `(ns, name)`. A record without a rule is written
+/// by nobody; were one ever dirty, it is never overwritten.
+pub fn conflict_policy(ns: ItemNs, name: &str) -> Conflict {
+    rule(ns, name).map_or(Conflict::OwnerConfig, |r| r.conflict)
+}
+
+/// True when the device (this process) may write `(ns, name)` (`tombstone`:
+/// the write is a tombstone) on a vault with (`has_keyset`) or without a
+/// keyset. A record without a rule: never.
+pub fn device_may_write(ns: ItemNs, name: &str, has_keyset: bool, tombstone: bool) -> bool {
+    rule(ns, name).is_some_and(|r| {
+        r.write_allowed(WriterRole::Device, false, has_keyset)
+            || (tombstone && r.migration_tombstone_allowed(WriterRole::Device, has_keyset))
+    })
+}
+
+impl ItemRule {
+    /// `ns:name` (`ns:<placeholder>` for a rule covering many names).
+    pub fn key(&self) -> String {
+        format!("{}:{}", self.ns.as_str(), self.name.key_part())
+    }
+
+    /// May a principal with `role` write this record (live, or a tombstone)?
+    /// See [`Writer`]; the migration's tombstone of a legacy row is
+    /// [`Self::migration_tombstone_allowed`].
+    pub fn write_allowed(&self, role: WriterRole, is_own_agent: bool, has_keyset: bool) -> bool {
+        self.writers.iter().any(|w| match w {
+            Writer::Owner => role == WriterRole::Owner,
+            Writer::OwnMember => role == WriterRole::Member && is_own_agent,
+            Writer::Member => matches!(role, WriterRole::Owner | WriterRole::Member),
+            Writer::Device => role == WriterRole::Device,
+            Writer::DeviceWithoutKeyset => role == WriterRole::Device && !has_keyset,
+            Writer::MigrationTombstoneOnly => false,
+        })
+    }
+
+    /// May a principal with `role` write the migration's tombstone of this
+    /// (legacy) record: an owner with a keyset, anyone without.
+    pub fn migration_tombstone_allowed(&self, role: WriterRole, has_keyset: bool) -> bool {
+        self.writers.contains(&Writer::MigrationTombstoneOnly)
+            && (!has_keyset || role == WriterRole::Owner)
+    }
+
+    /// The sidecar record type a signature of the record named `name` is made
+    /// over, when the record is signed: `agent`, or for owner-config the
+    /// namespace (a legacy `aux` row: its field name).
+    pub fn signature_type<'a>(&self, name: &'a str) -> Option<&'a str> {
+        match self.signed {
+            Signed::None => None,
+            Signed::WriterAgent => Some("agent"),
+            Signed::OwnerWithKeyset if self.ns == ItemNs::Aux => Some(name),
+            Signed::OwnerWithKeyset => Some(self.ns.as_str()),
+        }
+    }
+
+    fn canonical_json(&self) -> String {
+        let s = |v: &str| serde_json::Value::String(v.to_string()).to_string();
+        let writers: Vec<String> = self.writers.iter().map(|w| s(w.as_str())).collect();
+        format!(
+            "{{\"key\":{},\"address\":{},\"writers\":[{}],\"signed\":{},\"conflict\":{},\"read\":{}}}",
+            s(&self.key()),
+            s(self.address.as_str()),
+            writers.join(","),
+            s(self.signed.as_str()),
+            s(self.conflict.as_str()),
+            s(self.read.as_str()),
         )
+    }
+}
+
+impl Address {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Address::Blinded => "blinded",
+            Address::CleartextWireHmacAad => "cleartext_wire_hmac_aad",
+        }
+    }
+}
+
+impl Writer {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Writer::Owner => "owner",
+            Writer::OwnMember => "own_member",
+            Writer::Member => "member",
+            Writer::Device => "device",
+            Writer::DeviceWithoutKeyset => "device_without_keyset",
+            Writer::MigrationTombstoneOnly => "migration_tombstone_only",
+        }
+    }
+}
+
+impl Signed {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Signed::None => "none",
+            Signed::WriterAgent => "writer:agent",
+            Signed::OwnerWithKeyset => "owner_with_keyset",
+        }
+    }
+}
+
+impl Conflict {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Conflict::KeepBoth => "keep_both",
+            Conflict::TakeWriter => "take_writer",
+            Conflict::OwnerConfig => "owner_config",
+        }
+    }
+}
+
+impl Read {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Read::All => "all",
+            Read::SignerAuthorizedAndWireIdMatches => "signer_authorized_and_wire_id_matches",
+            Read::OwnerSignedWithKeysetNativeWins => "owner_signed_with_keyset_native_wins",
+            Read::LegacyWhenNoHonoredNative => "legacy_when_no_honored_native",
+            Read::ConsoleOnly => "console_only",
+            Read::LegacyUnionNativeWins => "legacy_union_native_wins",
+            Read::DerivedIdOnlyUnionLegacy => "derived_id_only_union_legacy",
+        }
+    }
+}
+
+/// The canonical text of [`ITEM_RULES`]: a compact JSON array (no spaces),
+/// sorted by `key`, each object's fields in the order key, address, writers,
+/// signed, conflict, read. The console asserts the same text.
+pub fn canonical_rule_table() -> String {
+    let mut rows: Vec<(String, String)> = ITEM_RULES
+        .iter()
+        .map(|r| (r.key(), r.canonical_json()))
+        .collect();
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    let rows: Vec<String> = rows.into_iter().map(|(_, j)| j).collect();
+    format!("[{}]", rows.join(","))
+}
+
+/// A body as compared and written: a `service` entry in its object form
+/// `{service, policy?, source?}` (the plain-string form written before
+/// sources is `{service: <text>}`; a null `policy` / `source` is absent).
+/// Every other body is itself.
+pub fn normalized_body(ns: ItemNs, body: &serde_json::Value) -> serde_json::Value {
+    if ns != ItemNs::Service {
+        return body.clone();
+    }
+    match body {
+        serde_json::Value::String(s) => serde_json::json!({ "service": s }),
+        serde_json::Value::Object(o) => serde_json::Value::Object(
+            o.iter()
+                .filter(|(k, v)| !(v.is_null() && matches!(k.as_str(), "policy" | "source")))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+/// SHA-256 of the JCS form (sorted keys) of the [`normalized_body`].
+pub fn body_digest(ns: ItemNs, body: &serde_json::Value) -> [u8; 32] {
+    use sha2::Digest;
+    Sha256::digest(crate::crypto::canonical::canonicalize(&normalized_body(
+        ns, body,
+    )))
+    .into()
+}
+
+/// Hex of a [`body_digest`] (as a dirty row records its base).
+pub fn body_digest_hex(ns: ItemNs, body: &serde_json::Value) -> String {
+    body_digest(ns, body)
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect()
+}
+
+/// The record a set-aside change concerns, as the user knows it: an `aux`
+/// field by its name, a singleton by its namespace, anything else as
+/// `<namespace> <name>`.
+pub fn record_label(p: &ItemPayload) -> String {
+    match p.ns {
+        ItemNs::Aux => p.name.clone(),
+        ns if p.name.is_empty() => ns.as_str().to_string(),
+        ns => format!("{} {}", ns.as_str(), p.name),
     }
 }
 
@@ -462,7 +883,7 @@ pub struct ItemPayload {
     pub ns: ItemNs,
     pub name: String,
     pub status: ItemStatus,
-    /// The value (`secret` string / `connection` object / aux subtree) or
+    /// The value (`secret` string / `connection` object / owner-config part) or
     /// `null` for a tombstone. Always serialized (including `null`).
     #[serde(default)]
     pub body: serde_json::Value,
@@ -661,26 +1082,211 @@ mod tests {
     fn write_allowed_role_x_type() {
         use ItemNs::*;
         use WriterRole::*;
-        // Data records: every writer principal (owner / member / device auto-write).
+        // Data records: every writer principal (owner / member / device), any keyset.
         for ns in [Secret, Connection, Connecting, Service] {
             for role in [Owner, Member, Device] {
-                assert!(ns.write_allowed(role, false), "{ns:?} writable by {role:?}");
+                for ks in [false, true] {
+                    assert!(ns.write_allowed("x", role, false, ks), "{ns:?} by {role:?}");
+                }
             }
         }
-        // Owner-config: OWNER only; member + device denied.
-        for ns in [Policy, Stores, StoreOrder, AuditRetentionDays, Services] {
-            assert!(ns.write_allowed(Owner, false), "{ns:?} owner ok");
-            assert!(!ns.write_allowed(Member, false), "{ns:?} member denied");
-            assert!(!ns.write_allowed(Device, false), "{ns:?} device denied");
+        // Owner-config: an owner; the device only on a vault without a
+        // keyset; never a plain member.
+        for (ns, name) in [
+            (Policy, ""),
+            (Policy, "category:ai"),
+            (Policy, "connection:gmail"),
+            (Store, "native-secrets"),
+            (StoreOrder, ""),
+            (AuditRetentionDays, ""),
+        ] {
+            for ks in [false, true] {
+                assert!(
+                    ns.write_allowed(name, Owner, false, ks),
+                    "{ns:?}:{name} owner"
+                );
+                assert!(
+                    !ns.write_allowed(name, Member, false, ks),
+                    "{ns:?}:{name} member"
+                );
+            }
+            assert!(
+                ns.write_allowed(name, Device, false, false),
+                "{ns:?}:{name} v1"
+            );
+            assert!(
+                !ns.write_allowed(name, Device, false, true),
+                "{ns:?}:{name} keyset"
+            );
         }
+        // Unknown policy names and named singletons: nobody.
+        for (ns, name) in [
+            (Policy, "other:x"),
+            (Policy, "category:"),
+            (StoreOrder, "x"),
+            (AuditRetentionDays, "x"),
+        ] {
+            assert!(
+                !ns.write_allowed(name, Owner, false, false),
+                "{ns:?}:{name}"
+            );
+        }
+        // The console's secret order: members only.
+        assert!(SecretOrder.write_allowed("", Member, false, true));
+        assert!(!SecretOrder.write_allowed("", Device, false, false));
+        // Legacy `aux` rows: no live write by anyone; only the migration's
+        // tombstone (an owner with a keyset, anyone without).
+        for field in [
+            "policy",
+            "stores",
+            "store_order",
+            "audit_retention_days",
+            "secret_order",
+            "services",
+        ] {
+            let r = rule(Aux, field).unwrap();
+            for role in [Owner, Member, Device] {
+                for ks in [false, true] {
+                    assert!(!Aux.write_allowed(field, role, false, ks), "aux:{field}");
+                }
+                assert!(r.migration_tombstone_allowed(role, false), "aux:{field} v1");
+            }
+            assert!(r.migration_tombstone_allowed(Owner, true));
+            assert!(!r.migration_tombstone_allowed(Device, true));
+            assert!(!r.migration_tombstone_allowed(Member, true));
+            assert!(device_may_write(Aux, field, false, true), "v1 tombstone");
+            assert!(!device_may_write(Aux, field, false, false), "never live");
+            assert!(
+                !device_may_write(Aux, field, true, true),
+                "keyset: the owner's"
+            );
+        }
+        assert!(!rule(Secret, "x")
+            .unwrap()
+            .migration_tombstone_allowed(Device, false));
         // Authorized-agents table: any owner; the agent's OWN member; not others.
-        assert!(Agent.write_allowed(Owner, false), "any owner may authorize any agent");
-        assert!(Agent.write_allowed(Member, true), "member authorizes their OWN agent");
-        assert!(!Agent.write_allowed(Member, false), "member cannot authorize someone else's agent");
-        assert!(!Agent.write_allowed(Device, true), "device never authorizes agents");
-        // Retired / legacy / (implicitly) unknown: fail-closed.
-        assert!(!Members.write_allowed(Owner, false), "in-vault membership retired");
-        assert!(!Aux.write_allowed(Owner, false), "legacy aux ns not writable");
+        assert!(Agent.write_allowed("ag", Owner, false, true), "any owner");
+        assert!(
+            Agent.write_allowed("ag", Member, true, true),
+            "their OWN agent"
+        );
+        assert!(
+            !Agent.write_allowed("ag", Member, false, true),
+            "someone else's agent"
+        );
+        assert!(
+            !Agent.write_allowed("ag", Device, true, false),
+            "device never"
+        );
+        assert!(!device_may_write(Agent, "ag", false, true));
+        // Retired / unknown: fail-closed.
+        for ns in [Stores, Services, Members] {
+            assert!(!ns.write_allowed("", Owner, false, true), "{ns:?} retired");
+        }
+        assert!(
+            !Aux.write_allowed("agent/ag_x", Owner, false, false),
+            "no rule"
+        );
+        assert!(!device_may_write(Aux, "agent/ag_x", false, true), "no rule");
+        assert!(!Aux.write_allowed("other", Device, false, false), "no rule");
+    }
+
+    /// THE canonical text of the item-namespace rule table, copied verbatim
+    /// from the design (DESIGN-item-namespace-table.md). The console asserts
+    /// the same text: a change to the table must change both sides.
+    #[test]
+    fn rule_table_matches_the_canonical_text() {
+        const CANONICAL: &str = r#"[{"key":"agent:<ag_id>","address":"cleartext_wire_hmac_aad","writers":["owner","own_member"],"signed":"writer:agent","conflict":"take_writer","read":"signer_authorized_and_wire_id_matches"},{"key":"audit_retention_days:","address":"blinded","writers":["owner","device_without_keyset"],"signed":"owner_with_keyset","conflict":"owner_config","read":"owner_signed_with_keyset_native_wins"},{"key":"aux:audit_retention_days","address":"blinded","writers":["migration_tombstone_only"],"signed":"owner_with_keyset","conflict":"owner_config","read":"legacy_when_no_honored_native"},{"key":"aux:policy","address":"blinded","writers":["migration_tombstone_only"],"signed":"owner_with_keyset","conflict":"owner_config","read":"legacy_when_no_honored_native"},{"key":"aux:secret_order","address":"blinded","writers":["migration_tombstone_only"],"signed":"none","conflict":"take_writer","read":"legacy_when_no_honored_native"},{"key":"aux:services","address":"blinded","writers":["migration_tombstone_only"],"signed":"owner_with_keyset","conflict":"owner_config","read":"legacy_union_native_wins"},{"key":"aux:store_order","address":"blinded","writers":["migration_tombstone_only"],"signed":"owner_with_keyset","conflict":"owner_config","read":"legacy_when_no_honored_native"},{"key":"aux:stores","address":"blinded","writers":["migration_tombstone_only"],"signed":"owner_with_keyset","conflict":"owner_config","read":"legacy_when_no_honored_native"},{"key":"connecting:<id>","address":"blinded","writers":["member","device"],"signed":"none","conflict":"take_writer","read":"all"},{"key":"connection:<id>","address":"blinded","writers":["member","device"],"signed":"none","conflict":"keep_both","read":"all"},{"key":"policy:","address":"blinded","writers":["owner","device_without_keyset"],"signed":"owner_with_keyset","conflict":"owner_config","read":"owner_signed_with_keyset_native_wins"},{"key":"policy:category:<tag>","address":"blinded","writers":["owner","device_without_keyset"],"signed":"owner_with_keyset","conflict":"owner_config","read":"owner_signed_with_keyset_native_wins"},{"key":"policy:connection:<connection_id>","address":"blinded","writers":["owner","device_without_keyset"],"signed":"owner_with_keyset","conflict":"owner_config","read":"owner_signed_with_keyset_native_wins"},{"key":"secret:<KEY>","address":"blinded","writers":["member","device"],"signed":"none","conflict":"keep_both","read":"all"},{"key":"secret_order:","address":"blinded","writers":["member"],"signed":"none","conflict":"take_writer","read":"console_only"},{"key":"service:<id>","address":"blinded","writers":["member","device"],"signed":"none","conflict":"keep_both","read":"derived_id_only_union_legacy"},{"key":"store:<id>","address":"blinded","writers":["owner","device_without_keyset"],"signed":"owner_with_keyset","conflict":"owner_config","read":"owner_signed_with_keyset_native_wins"},{"key":"store_order:","address":"blinded","writers":["owner","device_without_keyset"],"signed":"owner_with_keyset","conflict":"owner_config","read":"owner_signed_with_keyset_native_wins"}]"#;
+        assert_eq!(canonical_rule_table(), CANONICAL);
+    }
+
+    /// The table's lookups: one rule per key; a pattern rule covers every
+    /// name (a conflict copy's too), a prefixed rule its prefix with a
+    /// non-empty rest, an exact rule its name; the device writes only records
+    /// that need no signature where it writes them.
+    #[test]
+    fn rule_lookup_and_device_writes() {
+        let keys: std::collections::BTreeSet<String> = ITEM_RULES.iter().map(|r| r.key()).collect();
+        assert_eq!(keys.len(), ITEM_RULES.len(), "one rule per key");
+        assert_eq!(
+            rule(ItemNs::Secret, "A (conflict copy)").unwrap().key(),
+            "secret:<KEY>"
+        );
+        assert_eq!(rule(ItemNs::Policy, "").unwrap().key(), "policy:");
+        assert_eq!(
+            rule(ItemNs::Policy, "category:ai").unwrap().key(),
+            "policy:category:<tag>"
+        );
+        assert_eq!(
+            rule(ItemNs::Policy, "connection:gmail-work").unwrap().key(),
+            "policy:connection:<connection_id>"
+        );
+        assert!(rule(ItemNs::Policy, "category:").is_none());
+        assert!(rule(ItemNs::Policy, "rules:x").is_none(), "unknown prefix");
+        assert!(rule(ItemNs::Policy, " (conflict copy)").is_none());
+        assert_eq!(rule(ItemNs::Store, "x").unwrap().key(), "store:<id>");
+        assert_eq!(rule(ItemNs::Aux, "policy").unwrap().key(), "aux:policy");
+        for ns in [ItemNs::Stores, ItemNs::Services, ItemNs::Members] {
+            assert!(rule(ns, "").is_none(), "{ns:?} retired");
+        }
+        assert_eq!(conflict_policy(ItemNs::Service, "x"), Conflict::KeepBoth);
+        assert_eq!(conflict_policy(ItemNs::Store, "x"), Conflict::OwnerConfig);
+        assert_eq!(
+            conflict_policy(ItemNs::Policy, "category:ai"),
+            Conflict::OwnerConfig
+        );
+        assert_eq!(
+            conflict_policy(ItemNs::Aux, "stores"),
+            Conflict::OwnerConfig
+        );
+        assert_eq!(
+            conflict_policy(ItemNs::Connecting, "x"),
+            Conflict::TakeWriter
+        );
+        assert_eq!(ItemNs::Agent.address(), Address::CleartextWireHmacAad);
+        assert_eq!(ItemNs::Aux.address(), Address::Blinded);
+        for (ns, name, ty) in [
+            (ItemNs::Policy, "", "policy"),
+            (ItemNs::Policy, "connection:gmail", "policy"),
+            (ItemNs::Store, "native-secrets", "store"),
+            (ItemNs::StoreOrder, "", "store_order"),
+            (ItemNs::AuditRetentionDays, "", "audit_retention_days"),
+            (ItemNs::Aux, "store_order", "store_order"),
+            (ItemNs::Agent, "ag_x", "agent"),
+        ] {
+            assert_eq!(rule(ns, name).unwrap().signature_type(name), Some(ty));
+        }
+        assert_eq!(rule(ItemNs::Secret, "x").unwrap().signature_type("x"), None);
+        for r in &ITEM_RULES {
+            for ks in [false, true] {
+                if r.write_allowed(WriterRole::Device, false, ks) {
+                    let unsigned =
+                        r.signed == Signed::None || (r.signed == Signed::OwnerWithKeyset && !ks);
+                    assert!(unsigned, "{} written by the device unsigned", r.key());
+                }
+            }
+        }
+    }
+
+    /// A service body compares in its object form: the plain-string entry is
+    /// `{service: <text>}`, a null policy / source is absent. Other bodies are
+    /// compared as they are.
+    #[test]
+    fn service_bodies_compare_normalized() {
+        let plain = serde_json::json!("[service]\nid = \"a\"\n");
+        let object = serde_json::json!({ "service": "[service]\nid = \"a\"\n" });
+        let nulls = serde_json::json!({ "service": "[service]\nid = \"a\"\n", "policy": null, "source": null });
+        assert_eq!(normalized_body(ItemNs::Service, &plain), object);
+        assert_eq!(normalized_body(ItemNs::Service, &nulls), object);
+        assert_eq!(
+            body_digest(ItemNs::Service, &plain),
+            body_digest(ItemNs::Service, &object)
+        );
+        assert_eq!(body_digest_hex(ItemNs::Service, &nulls).len(), 64);
+        assert_ne!(
+            body_digest(ItemNs::Secret, &plain),
+            body_digest(ItemNs::Secret, &object)
+        );
     }
 
     /// THE pinned cross-language parity vector (build contract §1).
@@ -874,6 +1480,16 @@ mod tests {
             ItemNs::Connection,
             ItemNs::Connecting,
             ItemNs::Aux,
+            ItemNs::Agent,
+            ItemNs::Service,
+            ItemNs::Policy,
+            ItemNs::Store,
+            ItemNs::StoreOrder,
+            ItemNs::AuditRetentionDays,
+            ItemNs::SecretOrder,
+            ItemNs::Stores,
+            ItemNs::Services,
+            ItemNs::Members,
         ] {
             let json = serde_json::to_value(ns).unwrap();
             assert_eq!(json, serde_json::Value::String(ns.as_str().to_string()));

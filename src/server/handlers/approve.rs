@@ -1179,20 +1179,17 @@ pub async fn approve_op(
                     "vault unlocked"
                 );
                 state.unlock_vault(vault_id.clone(), cache, unlock_key);
-                // LEGACY(services row): move entries of the legacy `services`
-                // record that have no native item into native `service` items
-                // now that K is held. The fold reads the same services before
-                // and after, so the cache stands.
-                if crate::server::handlers::service_ops::migrate_legacy_services_after_unlock(
-                    &state, &vault_id,
-                ) > 0
-                {
-                    let state = state.clone();
-                    let vid = vault_id.clone();
-                    tokio::spawn(async move {
-                        crate::sync::push_items_best_effort(&state, &vid).await;
-                    });
-                }
+                // LEGACY(aux addressing, services row): now that K is held,
+                // pull, then move the legacy rows to their native records (a
+                // vault without a keyset), then push. Detached: it takes the
+                // vault write lock after this handler releases it. The fold
+                // reads the same configuration before and after.
+                tokio::spawn(
+                    crate::server::handlers::service_ops::migrate_legacy_after_unlock(
+                        state.clone(),
+                        vault_id.clone(),
+                    ),
+                );
                 // Backfill the acting credential's key-check value if the stored
                 // keyset predates it (best-effort; we hold the write guard). This
                 // lets a later cross-device approval fail FAST in the browser
@@ -3178,7 +3175,6 @@ mod tests {
             aux,
             native_secrets,
             native_secret_notes: BTreeMap::new(),
-            legacy_addressing: false,
         };
 
         let cache = bootstrap_cache_from_view(&view, &state);

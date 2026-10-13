@@ -18,9 +18,9 @@
 //! a connection, sealed under `K`, unsigned, written by this process after the
 //! approved card on every vault ([`persist`]). The old single `services`
 //! record is owner-config, read only here; the fold takes
-//! the union, a native item or tombstone winning for its id, and an unlock
-//! moves its entries to native items
-//! ([`migrate_legacy_services_after_unlock`]).
+//! the union, a native item or tombstone winning for its id, and after an
+//! unlock and a pull the daemon moves it to native items on a vault without a
+//! keyset ([`migrate_legacy_after_unlock`]).
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -173,14 +173,18 @@ fn session(
     }
 }
 
-/// LEGACY(services row): after an unlock, write the services the legacy
-/// `services` record still holds without a native item as native `service`
-/// items, and on a v1 keyset empty the legacy record
-/// ([`crate::storage::sealed_vault::PerItemVault::migrate_legacy_services`]).
-/// Best-effort: a failure is logged and the next unlock tries again. Returns
-/// the number of items written (the caller pushes them).
-pub(crate) fn migrate_legacy_services_after_unlock(state: &Arc<AppState>, vault_id: &str) -> usize {
+/// LEGACY(aux addressing, services row): move the legacy rows to their
+/// native records now, on a vault without a keyset: owner-config
+/// ([`crate::storage::sealed_vault::PerItemVault::migrate_addressing`]) and
+/// the services record
+/// ([`crate::storage::sealed_vault::PerItemVault::migrate_legacy_services`]),
+/// each copied then tombstoned. Needs the vault unlocked; the caller holds the
+/// vault write lock and has just pulled. Best-effort: a failure is logged and
+/// the next unlock tries again. Returns the number of items written (the
+/// caller pushes them).
+pub(crate) fn migrate_legacy_now(state: &Arc<AppState>, vault_id: &str) -> usize {
     use crate::storage::sealed_vault::{read_per_item, write_per_item_atomic};
+    type S = sudp::primitives::StdPrimitives;
     let run = || -> Result<usize> {
         let Some(k) = state.cloned_state_key(vault_id) else {
             return Ok(0);
@@ -189,10 +193,9 @@ pub(crate) fn migrate_legacy_services_after_unlock(state: &Arc<AppState>, vault_
         let Some(mut pv) = read_per_item(&path)? else {
             return Ok(0);
         };
-        let changed = pv.migrate_legacy_services::<sudp::primitives::StdPrimitives>(
-            crate::storage::item::VaultKeys::from_material(&k),
-            vault_id,
-        )?;
+        let keys = crate::storage::item::VaultKeys::from_material(&k);
+        let mut changed = pv.migrate_addressing::<S>(keys, vault_id)?;
+        changed.extend(pv.migrate_legacy_services::<S>(keys, vault_id)?);
         if !changed.is_empty() {
             write_per_item_atomic(&path, &pv)?;
         }
@@ -201,9 +204,43 @@ pub(crate) fn migrate_legacy_services_after_unlock(state: &Arc<AppState>, vault_
     match run() {
         Ok(n) => n,
         Err(e) => {
-            tracing::warn!(vault = %vault_id, "legacy services migration deferred: {}", e);
+            tracing::warn!(vault = %vault_id, "legacy rows migration deferred: {}", e);
             0
         }
+    }
+}
+
+/// LEGACY(aux addressing, services row): after `pull` (the device's pull of
+/// the vault's items), migrate the legacy rows under the vault write lock
+/// ([`migrate_legacy_now`]). A failed pull migrates nothing: a device that is
+/// behind must not write copies of rows that changed elsewhere. Returns the
+/// number of items written.
+pub(crate) async fn migrate_legacy_after<F>(state: &Arc<AppState>, vault_id: &str, pull: F) -> usize
+where
+    F: std::future::Future<Output = std::result::Result<(), String>>,
+{
+    if let Err(e) = pull.await {
+        tracing::info!(vault = %vault_id, "legacy rows migration waits for a pull: {}", e);
+        return 0;
+    }
+    let lock = state.vault_write_lock(vault_id);
+    let _guard = lock.lock().await;
+    migrate_legacy_now(state, vault_id)
+}
+
+/// LEGACY(aux addressing, services row): at unlock (run detached, after the
+/// unlock handler released the vault write lock): pull this vault's items,
+/// then migrate, then push what the migration wrote.
+pub(crate) async fn migrate_legacy_after_unlock(state: Arc<AppState>, vault_id: String) {
+    let n = migrate_legacy_after(
+        &state,
+        &vault_id,
+        crate::sync::pull_items_now(&state, &vault_id),
+    )
+    .await;
+    if n > 0 {
+        crate::sync::refresh_after_item_pull(&state, &vault_id);
+        crate::sync::push_items_best_effort(&state, &vault_id).await;
     }
 }
 

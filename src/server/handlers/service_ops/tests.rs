@@ -499,25 +499,30 @@ fn services_are_data_records_on_a_vault_with_members() {
     assert!(open(&state).aux.services.is_empty());
 }
 
-/// LEGACY(services row): an unlock moves legacy entries to native items on
-/// every vault and leaves the legacy record as it is (a device on an earlier
-/// version still reads it). With nothing to move, nothing is written.
+/// LEGACY(services row): after an unlock, and only after a pull, a vault
+/// without a keyset moves the legacy record to native items (object form)
+/// and tombstones it, in one pass. A failed pull moves nothing. A vault with
+/// a keyset is left to the owner's console: nothing is written.
 #[test]
-fn unlock_migrates_legacy_services() {
+fn legacy_services_move_only_after_a_pull() {
     use crate::storage::item::ItemPayload;
     use crate::storage::item::{ItemNs, VaultKeys};
     type S = sudp::primitives::StdPrimitives;
     let k = [0x5au8; 32];
     let keys = VaultKeys::single(&k);
+    // One entry written before sources (plain text), one in the object form.
     let legacy = || {
         ItemPayload::live(
             ItemNs::Aux,
             "services",
-            json!({ "old": { "service": svc("old", "o.dev") } }),
+            json!({ "old": svc("old", "o.dev"), "new": { "service": svc("new", "n.dev") } }),
         )
     };
+    let pulled = || async { std::result::Result::<(), String>::Ok(()) };
+    let offline = || async { std::result::Result::<(), String>::Err("offline".into()) };
 
-    // v1: moved, the legacy record kept.
+    // v1: a failed pull moves nothing; after a pull both move, the legacy
+    // record is tombstoned.
     let vault = "vault-personal";
     let mut v1 = PerItemVault::build_initial(
         b"c".to_vec(),
@@ -528,33 +533,44 @@ fn unlock_migrates_legacy_services() {
         vec![0u8; 48],
     )
     .unwrap();
-    v1.seal_and_bump::<S>(keys, vault, ItemNs::Aux, "services", &legacy())
+    v1.plant::<S>(keys, vault, ItemNs::Aux, "services", 1, &legacy())
         .unwrap();
     let (_d1, state) = state_with_store(vault, &v1, &k);
-    assert_eq!(migrate_legacy_services_after_unlock(&state, vault), 1);
+    let path = state.vaults.per_item_path(vault).unwrap();
+    let before = std::fs::read(&path).unwrap();
+    assert_eq!(block_on(migrate_legacy_after(&state, vault, offline())), 0);
+    assert_eq!(std::fs::read(&path).unwrap(), before, "nothing written");
+    assert_eq!(block_on(migrate_legacy_after(&state, vault, pulled())), 3);
     let pv = stored(&state, vault);
+    assert!(pv
+        .open_item::<S>(keys, vault, ItemNs::Aux, "services")
+        .unwrap()
+        .unwrap()
+        .is_tombstone());
     assert_eq!(
-        pv.open_item::<S>(keys, vault, ItemNs::Aux, "services")
+        pv.open_item::<S>(keys, vault, ItemNs::Service, "old")
             .unwrap()
             .unwrap()
             .body,
-        legacy().body
+        json!({ "service": svc("old", "o.dev") }),
+        "written in the object form"
     );
-    assert!(pv
-        .open_item::<S>(keys, vault, ItemNs::Service, "old")
-        .unwrap()
-        .is_some());
-    assert_eq!(migrate_legacy_services_after_unlock(&state, vault), 0);
+    let services =
+        crate::server::handlers::metadata::decrypt_vault_view_peritem_with_key(&k, &pv, vault)
+            .unwrap()
+            .aux
+            .services;
+    assert_eq!(services.keys().collect::<Vec<_>>(), ["new", "old"]);
+    assert_eq!(block_on(migrate_legacy_after(&state, vault, pulled())), 0);
 
-    // v2 with an unsigned legacy record: not honored, so not moved; the store
-    // is not rewritten.
+    // v2: the console's job; nothing is written, signed or not.
     let vault = "vault-team";
     let mut v2 = v2_vault(vault);
-    v2.seal_and_bump::<S>(keys, vault, ItemNs::Aux, "services", &legacy())
+    v2.plant::<S>(keys, vault, ItemNs::Aux, "services", 1, &legacy())
         .unwrap();
     let (_d2, state) = state_with_store(vault, &v2, &k);
     let before = std::fs::read(state.vaults.per_item_path(vault).unwrap()).unwrap();
-    assert_eq!(migrate_legacy_services_after_unlock(&state, vault), 0);
+    assert_eq!(block_on(migrate_legacy_after(&state, vault, pulled())), 0);
     assert_eq!(
         std::fs::read(state.vaults.per_item_path(vault).unwrap()).unwrap(),
         before
@@ -562,7 +578,7 @@ fn unlock_migrates_legacy_services() {
 
     // A locked vault: nothing.
     state.lock_vault(vault);
-    assert_eq!(migrate_legacy_services_after_unlock(&state, vault), 0);
+    assert_eq!(block_on(migrate_legacy_after(&state, vault, pulled())), 0);
 }
 
 /// The card's source is a fact only when this device fetched the pinned

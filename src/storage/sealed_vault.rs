@@ -28,8 +28,9 @@ use crate::error::{AppError, Result};
 use crate::passkey::PasskeyEntry;
 use crate::protocol::operation::decode_credential_id;
 use crate::storage::item::{
-    aad_id_from_wire, item_id, item_id_bytes, parse_secret_body, seal_item, secret_body,
-    unseal_item, wire_id_for, ItemCtx, ItemNs, ItemPayload, VaultKeys,
+    aad_id_from_wire, body_digest as item_body_digest, item_id, item_id_bytes, normalized_body,
+    parse_secret_body, seal_item, secret_body, unseal_item, wire_id_for, Conflict, ItemCtx, ItemNs,
+    ItemPayload, Read, VaultKeys,
 };
 
 /// Per-vault count of items the LAST fold had to skip (unreadable at a format
@@ -325,6 +326,13 @@ pub struct StoredItem {
     /// devices) to verify + to a role for the role×type gate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signer: Option<String>,
+    /// For a DIRTY row in a keep-both namespace: the hex
+    /// [`crate::storage::item::body_digest`] of the body our change was made
+    /// from (the base), when known. A same-item conflict whose body equals it
+    /// is no conflict: ours applies. Local bookkeeping only (never sent);
+    /// `None` = unknown (the keep-both rule applies as is).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
 }
 
 /// The v2 (UIK) material carried alongside one credential (device) row — the
@@ -1082,7 +1090,8 @@ pub enum ReconcileBase<'a> {
     OwnFold,
 }
 
-/// A view's items as `(ns, name) → SHA-256(body)`, captured as a
+/// A view's items as `(ns, name) → digest(normalized body)`
+/// ([`crate::storage::item::body_digest`]), captured as a
 /// [`ReconcileBase::Since`] base. Digests only: no secret values are copied.
 #[derive(Debug, Clone, Default)]
 pub struct ViewBase {
@@ -1091,9 +1100,9 @@ pub struct ViewBase {
 
 impl ViewBase {
     pub fn of(view: &crate::storage::plaintext::VaultPlaintextView) -> Result<Self> {
-        let items = PerItemVault::view_items(view, true)?
+        let items = PerItemVault::view_items(view)?
             .into_iter()
-            .map(|(k, body)| (k, body_digest(&body)))
+            .map(|((ns, name), body)| ((ns, name), item_body_digest(ns, &body)))
             .collect();
         Ok(Self { items })
     }
@@ -1107,15 +1116,280 @@ impl ViewBase {
     }
 
     fn unchanged(&self, ns: ItemNs, name: &str, body: &serde_json::Value) -> bool {
-        self.digest(ns, name) == Some(&body_digest(body))
+        self.digest(ns, name) == Some(&item_body_digest(ns, body))
     }
 }
 
-/// SHA-256 of the body's JCS canonical form (sorted keys), so the digest never
-/// depends on map ordering (e.g. a `preserve_order` serde_json feature).
-fn body_digest(body: &serde_json::Value) -> [u8; 32] {
-    use sha2::{Digest, Sha256};
-    Sha256::digest(crate::crypto::canonical::canonicalize(body)).into()
+/// Hex form of a body digest (as [`StoredItem::base`] holds it).
+fn digest_hex(d: &[u8; 32]) -> String {
+    d.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+/// What [`PerItemVault::reconcile_from_view`] did: the item ids it wrote, and
+/// the owner-config changes it set aside instead (the stored row changed since
+/// the caller's base), each `(canonical item id, record)` for the caller to
+/// report ("changed elsewhere meanwhile; re-run").
+#[derive(Debug, Default)]
+pub struct Reconciled {
+    pub changed: Vec<String>,
+    pub set_aside: Vec<(String, String)>,
+}
+
+// ── Owner-config records ─────────────────────────────────────────────────────
+// Storage unit = edit unit: `policy:` = `{timeout, default}`,
+// `policy:category:<tag>` = that tag's Levels, `policy:connection:<id>` =
+// that connection's ConnectionPolicy, `store:<id>` = one Store,
+// `store_order:` and `audit_retention_days:` one record each. The fold
+// reassembles the `VaultAux` fields, so policy evaluation is unchanged.
+
+/// The `policy:` record: the policy's own fields.
+#[derive(Serialize, Deserialize)]
+struct PolicyRoot {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    timeout: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    default: Option<crate::core::policy::Levels>,
+}
+
+/// A view's owner-config as its native records, `(ns, name) → body`. A
+/// present policy always has its `policy:` record (so "set, but empty" stays
+/// distinct from "not set"); a category or connection under an empty key has
+/// no address and is left out.
+fn owner_config_items(
+    aux: &crate::storage::plaintext::VaultAux,
+) -> Result<Vec<((ItemNs, String), serde_json::Value)>> {
+    use crate::storage::item::{POLICY_CATEGORY, POLICY_CONNECTION};
+    fn v<T: Serialize>(x: &T) -> Result<serde_json::Value> {
+        serde_json::to_value(x).map_err(AppError::from)
+    }
+    let mut out = Vec::new();
+    if let Some(p) = &aux.policy {
+        let root = PolicyRoot {
+            timeout: p.timeout,
+            default: p.default.clone(),
+        };
+        out.push(((ItemNs::Policy, String::new()), v(&root)?));
+        for (tag, levels) in p.categories.iter().filter(|(k, _)| !k.is_empty()) {
+            out.push((
+                (ItemNs::Policy, format!("{}{}", POLICY_CATEGORY, tag)),
+                v(levels)?,
+            ));
+        }
+        for (id, cp) in p.connections.iter().filter(|(k, _)| !k.is_empty()) {
+            out.push((
+                (ItemNs::Policy, format!("{}{}", POLICY_CONNECTION, id)),
+                v(cp)?,
+            ));
+        }
+    }
+    for (id, store) in &aux.stores {
+        out.push(((ItemNs::Store, id.clone()), v(store)?));
+    }
+    out.push(((ItemNs::StoreOrder, String::new()), v(&aux.store_order)?));
+    if let Some(days) = aux.audit_retention_days {
+        out.push((
+            (ItemNs::AuditRetentionDays, String::new()),
+            serde_json::json!(days),
+        ));
+    }
+    Ok(out)
+}
+
+/// The native owner-config namespaces this process reads.
+fn is_owner_config_ns(ns: ItemNs) -> bool {
+    matches!(
+        ns,
+        ItemNs::Policy | ItemNs::Store | ItemNs::StoreOrder | ItemNs::AuditRetentionDays
+    )
+}
+
+/// Parse an owner-config value, naming it in the error.
+fn parse_config<T: serde::de::DeserializeOwned>(what: &str, v: serde_json::Value) -> Result<T> {
+    serde_json::from_value(v).map_err(|e| AppError::Internal(format!("{} parse: {}", what, e)))
+}
+
+/// The owner-config the fold collects: the honored native records per key
+/// (`Some(value)` live, `None` a tombstone), and (LEGACY) the honored live
+/// legacy `aux:<field>` values. [`Self::apply`] resolves every key the same
+/// way: an honored native record (live or tombstone) wins; otherwise the
+/// legacy row's entry for that key applies; with neither the field keeps its
+/// default (none once the kind has any native record: no implicit
+/// defaults). Keys: the policy's own fields (`policy:`), each category tag,
+/// each connection id; each store id; the whole store order; the whole
+/// retention. (The services union in the fold is the same rule per id.)
+#[derive(Default)]
+struct OwnerConfigFold {
+    policy_root: Option<Option<serde_json::Value>>,
+    policy_categories: BTreeMap<String, Option<serde_json::Value>>,
+    policy_connections: BTreeMap<String, Option<serde_json::Value>>,
+    stores: BTreeMap<String, Option<serde_json::Value>>,
+    store_order: Option<Option<serde_json::Value>>,
+    retention: Option<Option<serde_json::Value>>,
+    legacy: BTreeMap<String, serde_json::Value>,
+}
+
+impl OwnerConfigFold {
+    /// An honored native record: `Some(body)` live, `None` a tombstone.
+    fn native(&mut self, ns: ItemNs, name: String, data: Option<serde_json::Value>) {
+        use crate::storage::item::{POLICY_CATEGORY, POLICY_CONNECTION};
+        match ns {
+            ItemNs::Policy => {
+                if name.is_empty() {
+                    self.policy_root = Some(data);
+                } else if let Some(tag) = name.strip_prefix(POLICY_CATEGORY) {
+                    self.policy_categories.insert(tag.to_string(), data);
+                } else if let Some(id) = name.strip_prefix(POLICY_CONNECTION) {
+                    self.policy_connections.insert(id.to_string(), data);
+                }
+            }
+            ItemNs::Store => {
+                self.stores.insert(name, data);
+            }
+            ItemNs::StoreOrder => self.store_order = Some(data),
+            ItemNs::AuditRetentionDays => self.retention = Some(data),
+            _ => {}
+        }
+    }
+
+    /// LEGACY(aux addressing): an honored, live `aux:<field>` value.
+    fn legacy(&mut self, field: &str, data: serde_json::Value) {
+        self.legacy.insert(field.to_string(), data);
+    }
+
+    fn apply(mut self, aux: &mut crate::storage::plaintext::VaultAux) -> Result<()> {
+        // Policy: per key over the legacy policy (or none).
+        let legacy_policy: Option<crate::core::policy::Policy> = self
+            .legacy
+            .remove("policy")
+            .map(|v| parse_config("aux.policy", v))
+            .transpose()?;
+        let native_live = matches!(self.policy_root, Some(Some(_)))
+            || self.policy_categories.values().any(Option::is_some)
+            || self.policy_connections.values().any(Option::is_some);
+        if legacy_policy.is_some() || native_live {
+            let mut p = legacy_policy.unwrap_or_else(|| crate::core::policy::Policy {
+                timeout: None,
+                default: None,
+                categories: Default::default(),
+                connections: Default::default(),
+            });
+            match self.policy_root {
+                Some(Some(v)) => {
+                    let root: PolicyRoot = parse_config("policy", v)?;
+                    p.timeout = root.timeout;
+                    p.default = root.default;
+                }
+                Some(None) => {
+                    p.timeout = None;
+                    p.default = None;
+                }
+                None => {}
+            }
+            for (tag, v) in self.policy_categories {
+                match v {
+                    Some(v) => {
+                        p.categories
+                            .insert(tag, parse_config("policy category", v)?);
+                    }
+                    None => {
+                        p.categories.remove(&tag);
+                    }
+                }
+            }
+            for (id, v) in self.policy_connections {
+                match v {
+                    Some(v) => {
+                        p.connections
+                            .insert(id, parse_config("policy connection", v)?);
+                    }
+                    None => {
+                        p.connections.remove(&id);
+                    }
+                }
+            }
+            aux.policy = Some(p);
+        }
+        // Stores: per id over the legacy map; with no legacy row, over nothing
+        // once any native store record exists (no implicit defaults), else
+        // the fresh-vault default.
+        if let Some(v) = self.legacy.remove("stores") {
+            aux.stores = parse_config("aux.stores", v)?;
+        } else if !self.stores.is_empty() {
+            aux.stores = BTreeMap::new();
+        }
+        for (id, v) in self.stores {
+            match v {
+                Some(v) => {
+                    aux.stores.insert(id, parse_config("store", v)?);
+                }
+                None => {
+                    aux.stores.remove(&id);
+                }
+            }
+        }
+        // Single values: the native record (a tombstone: none, no implicit
+        // default), else the legacy one, else the default.
+        match self.store_order {
+            Some(Some(v)) => aux.store_order = parse_config("store_order", v)?,
+            Some(None) => aux.store_order = Vec::new(),
+            None => {
+                if let Some(v) = self.legacy.remove("store_order") {
+                    aux.store_order = parse_config("aux.store_order", v)?;
+                }
+            }
+        }
+        match self.retention {
+            Some(Some(v)) => aux.audit_retention_days = parse_config("audit_retention_days", v)?,
+            Some(None) => aux.audit_retention_days = None,
+            None => {
+                if let Some(v) = self.legacy.remove("audit_retention_days") {
+                    aux.audit_retention_days = parse_config("aux.audit_retention_days", v)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Whether an owner-config TOMBSTONE counts as honored, by the same trust
+/// rules as a live record ([`fold_owner_config_record`]): without a keyset an
+/// unsigned one; with one, only an owner's sidecar signature over the
+/// tombstone (`status_live = false`).
+#[allow(clippy::too_many_arguments)]
+fn owner_config_tombstone_honored(
+    stored_sig: Option<&str>,
+    stored_signer: Option<&str>,
+    ct: &[u8],
+    keyset: &Keyset,
+    vault_id: &str,
+    item_id_raw: &[u8],
+    record_type: &str,
+    version: u64,
+    trust: &MembershipTrust,
+) -> bool {
+    match trust {
+        MembershipTrust::Untrusted => false,
+        MembershipTrust::NoUik => stored_sig.is_none(),
+        MembershipTrust::Verified(membership) => {
+            let (Some(sig), Some(signer)) = (stored_sig, stored_signer) else {
+                return false;
+            };
+            verify_record_sidecar_sig(
+                ct,
+                keyset,
+                vault_id,
+                item_id_raw,
+                record_type,
+                version,
+                false,
+                sig,
+                signer,
+            )
+            .is_some_and(|sid| {
+                membership.get(&sid) == Some(&crate::storage::plaintext::MemberRole::Owner)
+            })
+        }
+    }
 }
 
 /// The daemon's per-item on-disk vault: keyset blob + N sealed item records.
@@ -1213,6 +1487,7 @@ impl PerItemVault {
                 tombstone: false,
                 sig,
                 signer,
+                base: None,
             },
         );
     }
@@ -1476,22 +1751,60 @@ impl PerItemVault {
         version: u64,
         payload: &ItemPayload,
     ) -> Result<String> {
-        // The daemon NEVER writes an authorized-agents row, in ANY spelling (native
-        // `agent:<ag_id>` or legacy `aux:agent/<ag_id>`), live or tombstone: it holds
-        // no UIK so it can't sign one (a v2 fold drops unsigned rows). Agent
-        // authorization is written only by the console, UIK-signed (§11.1).
-        if ns == ItemNs::Agent || (ns == ItemNs::Aux && name.starts_with("agent/")) {
+        // This process writes as the device: only what the rule table lets
+        // the device write. Never an authorized-agents row in any spelling
+        // (native `agent:<ag_id>` or legacy `aux:agent/<ag_id>`, live or
+        // tombstone: it holds no UIK, agent authorization is console-written
+        // and UIK-signed, §11.1), never a legacy `aux` row except the
+        // migration's tombstone, owner-config only on a vault without a keyset.
+        let has_keyset = self.keyset.uik.is_some();
+        if !crate::storage::item::device_may_write(ns, name, has_keyset, payload.is_tombstone()) {
             return Err(AppError::Internal(format!(
-                "refusing to write agent row '{}': agent rows are console-written and UIK-signed only",
+                "refusing to write {} '{}': this process may not write that record",
+                ns.as_str(),
                 name
             )));
         }
+        self.seal_and_insert::<S>(keys, vault_id, ns, name, version, payload)
+    }
+
+    /// Plant a row as another writer would (an owner's console, an earlier
+    /// version): sealed like [`Self::seal_and_upsert`], without its rule-table
+    /// check. Test fixtures only.
+    #[cfg(test)]
+    pub(crate) fn plant<S: PrimitiveSuite>(
+        &mut self,
+        keys: VaultKeys,
+        vault_id: &str,
+        ns: ItemNs,
+        name: &str,
+        version: u64,
+        payload: &ItemPayload,
+    ) -> Result<String> {
+        self.seal_and_insert::<S>(keys, vault_id, ns, name, version, payload)
+    }
+
+    fn seal_and_insert<S: PrimitiveSuite>(
+        &mut self,
+        keys: VaultKeys,
+        vault_id: &str,
+        ns: ItemNs,
+        name: &str,
+        version: u64,
+        payload: &ItemPayload,
+    ) -> Result<String> {
         let ctx = ItemCtx::for_item::<S>(keys.id_seed, vault_id, ns, name, version)?;
         let ct = seal_item::<S>(keys.content, &ctx, payload)?;
         let id = ctx.item_id_b64();
         // A local write leaves `synced_version` where it was (the new version
         // is by definition not on the cloud yet) — the row is dirty until pushed.
-        let synced_version = self.items.get(&id).map(|s| s.synced_version).unwrap_or(0);
+        // A row that was already dirty keeps the base its first change was made
+        // from (the cloud still holds that one or a later one).
+        let (synced_version, base) = match self.items.get(&id) {
+            Some(s) if s.version > s.synced_version => (s.synced_version, s.base.clone()),
+            Some(s) => (s.synced_version, None),
+            None => (0, None),
+        };
         let tombstone = payload.is_tombstone();
         // B2a: seal-level writers land UNSIGNED (sig/signer None) — signing is done
         // by the write ORCHESTRATION (B2b), which knows the principal (the DIK for
@@ -1506,6 +1819,7 @@ impl PerItemVault {
                 tombstone,
                 sig: None,
                 signer: None,
+                base,
             },
         );
         Ok(id)
@@ -1541,11 +1855,10 @@ impl PerItemVault {
     ///
     /// Each item's CAS `version` starts at `bump_from + 1` for a freshly-sealed
     /// row, so re-seeding after a write monotonically advances the version an
-    /// offline peer will CAS against (the enroll case passes `0`). Aux subtrees
-    /// with their default/empty value are NOT sealed (they'd only add tombstone-
-    /// like noise); only `stores`, `store_order`, `policy`,
-    /// `audit_retention_days`, plus every connection/connecting entry and every
-    /// native secret, become their own item.
+    /// offline peer will CAS against (the enroll case passes `0`). Every
+    /// native secret, connection, in-flight connect and service becomes its own
+    /// item, and (a vault without a keyset) the owner-config its native records
+    /// ([`owner_config_items`]); an unset policy or retention writes nothing.
     pub fn seed_items_from_view<S: PrimitiveSuite>(
         &mut self,
         keys: VaultKeys,
@@ -1573,16 +1886,22 @@ impl PerItemVault {
             let payload = ItemPayload::live(ItemNs::Connecting, conn_id.clone(), body);
             self.seal_and_upsert::<S>(keys, vault_id, ItemNs::Connecting, conn_id, 1, &payload)?;
         }
-        // aux config subtrees → one `aux:<name>` item each. Agents are NEVER
-        // written by the daemon (console-written, UIK-signed only; §11.1).
-        for (name, body) in Self::aux_blob_bodies(&view.aux)? {
+        // Owner-config → its native records (`policy:*`, `store:<id>`,
+        // `store_order:`, `audit_retention_days:`), where the device may write
+        // them (a vault without a keyset). Agents are NEVER written by the
+        // daemon (console-written, UIK-signed only; §11.1).
+        let has_keyset = self.keyset.uik.is_some();
+        for ((ns, name), body) in owner_config_items(&view.aux)? {
+            if !crate::storage::item::device_may_write(ns, &name, has_keyset, false) {
+                continue;
+            }
             self.seal_and_upsert::<S>(
                 keys,
                 vault_id,
-                ItemNs::Aux,
+                ns,
                 &name,
                 1,
-                &ItemPayload::live(ItemNs::Aux, name.clone(), body),
+                &ItemPayload::live(ns, name.clone(), body),
             )?;
         }
         for (id, body) in Self::service_bodies(&view.aux)? {
@@ -1598,90 +1917,66 @@ impl PerItemVault {
         Ok(())
     }
 
-    /// The aux items a view wants materialised, as `(aux_name, body)` pairs
-    /// under `aux:<name>` addressing. Shared by seed + reconcile so the two
-    /// write paths can never disagree. Config singletons only: the authorized-
-    /// agents table is NEVER emitted (the daemon can't sign an agent row; agent
-    /// authorization is console-written, UIK-signed). Default/empty subtrees are
-    /// skipped (no tombstone-like noise).
-    fn aux_blob_bodies(
-        aux: &crate::storage::plaintext::VaultAux,
-    ) -> Result<Vec<(String, serde_json::Value)>> {
-        let mut out: Vec<(String, serde_json::Value)> = Vec::new();
-        out.push((
-            "stores".into(),
-            serde_json::to_value(&aux.stores).map_err(AppError::from)?,
-        ));
-        out.push((
-            "store_order".into(),
-            serde_json::to_value(&aux.store_order).map_err(AppError::from)?,
-        ));
-        if let Some(policy) = &aux.policy {
-            out.push((
-                "policy".into(),
-                serde_json::to_value(policy).map_err(AppError::from)?,
-            ));
-        }
-        if let Some(days) = aux.audit_retention_days {
-            out.push(("audit_retention_days".into(), serde_json::json!(days)));
-        }
-        // Service definitions are not an aux blob any more: one native
-        // `service` item per id ([`Self::service_bodies`]).
-        Ok(out)
-    }
-
     /// The native `service` items a view wants, `id → body`: every entry of
-    /// `aux.services` (legacy entries included), each its own item. A conflict
-    /// copy is left where the sync put it: it is never written from a view
-    /// (its row is not at the address of its name).
+    /// `aux.services` (legacy entries included), each its own item, always in
+    /// the object form `{service, policy?, source?}`
+    /// ([`crate::storage::item::normalized_body`]: a plain-string entry is
+    /// `{service: <text>}`). A conflict copy is left where the sync put it: it
+    /// is never written from a view (its row is not at the address of its name).
     fn service_bodies(
         aux: &crate::storage::plaintext::VaultAux,
     ) -> Result<Vec<(String, serde_json::Value)>> {
         aux.services
             .iter()
             .filter(|(id, _)| !crate::storage::item::is_conflict_copy_name(id))
-            .map(|(id, e)| Ok((id.clone(), serde_json::to_value(e).map_err(AppError::from)?)))
+            .map(|(id, e)| {
+                let body = serde_json::to_value(e).map_err(AppError::from)?;
+                Ok((id.clone(), normalized_body(ItemNs::Service, &body)))
+            })
             .collect()
     }
 
-    /// Keep-both (§4), locally: store `ours` as the conflict copy beside THEIR row
-    /// at `their_version` (the console's `putConflictCopy` id/name, version 1),
-    /// DIRTY (`synced_version` 0) so the next push sends it as a create. Inserted
-    /// only if absent (idempotent). Returns the copy id when it was inserted.
+    /// Keep `ours` as the conflict copy beside THEIR row at `their_version`
+    /// (the console's `putConflictCopy` id/name, version 1), inserted only if
+    /// absent (idempotent). `dirty`: a keep-both copy (`synced_version` 0, the
+    /// next push sends it as a create); else a change set aside, kept locally
+    /// and never pushed or folded. Returns the copy id when it was inserted.
     fn put_local_conflict_copy<S: PrimitiveSuite>(
         &mut self,
         keys: VaultKeys,
         vault_id: &str,
         ours: &ItemPayload,
         their_version: u64,
+        dirty: bool,
     ) -> Result<Option<String>> {
         let (copy_id, ct) =
             crate::storage::item::seal_conflict_copy::<S>(keys, vault_id, ours, their_version)?;
         if self.items.contains_key(&copy_id) {
             return Ok(None);
         }
+        let version = crate::storage::item::CONFLICT_COPY_VERSION;
         self.items.insert(
             copy_id.clone(),
             StoredItem {
-                version: crate::storage::item::CONFLICT_COPY_VERSION,
+                version,
                 ct,
-                synced_version: 0,
+                synced_version: if dirty { 0 } else { version },
                 tombstone: false,
                 sig: None,
                 signer: None,
+                base: None,
             },
         );
         Ok(Some(copy_id))
     }
 
     /// A view's reconcilable items as `(ns, name) → body`: every native secret,
-    /// connection and in-flight connect, plus (`with_aux`) the aux config
-    /// subtrees at legacy `aux:<name>`. Shared by [`Self::reconcile_from_view`]
+    /// connection, in-flight connect and service (normalized), and the
+    /// owner-config records ([`owner_config_items`]). Shared by [`Self::reconcile_from_view`]
     /// and [`ViewBase::of`] so a base and a view are always compared on the
     /// same representation.
     fn view_items(
         view: &crate::storage::plaintext::VaultPlaintextView,
-        with_aux: bool,
     ) -> Result<BTreeMap<(ItemNs, String), serde_json::Value>> {
         let mut out: BTreeMap<(ItemNs, String), serde_json::Value> = BTreeMap::new();
         for (name, bytes) in &view.native_secrets {
@@ -1706,10 +2001,8 @@ impl PerItemVault {
         for (id, body) in Self::service_bodies(&view.aux)? {
             out.insert((ItemNs::Service, id), body);
         }
-        if with_aux {
-            for (name, body) in Self::aux_blob_bodies(&view.aux)? {
-                out.insert((ItemNs::Aux, name.to_string()), body);
-            }
+        for (key, body) in owner_config_items(&view.aux)? {
+            out.insert(key, body);
         }
         Ok(out)
     }
@@ -1719,79 +2012,145 @@ impl PerItemVault {
     /// monotonic version bump so the sync layer's per-item CAS sees a strictly
     /// higher version (contract §4/§6). Unlike [`seed_items_from_view`] (which
     /// resets every version to 1), this:
-    ///   - upserts a `secret`/`connection`/`connecting`/`aux` item whose sealed
-    ///     value changed, at `current + 1`;
-    ///   - writes a `tombstone` (also bumped) for a `secret`/`connection`/
-    ///     `connecting` item that the view no longer has (e.g. a completed
-    ///     connect MOVEs its `connecting` entry away → tombstone the old row).
+    ///   - upserts an item whose sealed value changed, at `current + 1`: a
+    ///     secret, connection, in-flight connect or service, and (a vault
+    ///     without a keyset) an owner-config record;
+    ///   - writes a `tombstone` (also bumped) for one the view no longer has
+    ///     (e.g. a completed connect MOVEs its `connecting` entry away →
+    ///     tombstone the old row; a key only the legacy row held gets a native
+    ///     tombstone, so the legacy entry does not come back).
     ///
     /// This is the daemon-side, single-writer equivalent of "PUT the changed
     /// items" (contract §5 `writeVault` diff). What counts as changed is
     /// relative to the caller's [`ReconcileBase`]: only a view with a known base
     /// can tell "the caller changed/deleted it" from "someone else changed it
-    /// since". Returns the ids that changed.
+    /// since". A same-item conflict resolves per the record's
+    /// [`Conflict`] policy ([`crate::storage::item::ITEM_RULES`]). Returns the
+    /// ids written and the owner-config changes set aside ([`Reconciled`]).
     pub fn reconcile_from_view<S: PrimitiveSuite>(
         &mut self,
         keys: VaultKeys,
         vault_id: &str,
         view: &crate::storage::plaintext::VaultPlaintextView,
         base: ReconcileBase<'_>,
-    ) -> Result<Vec<String>> {
-        let mut changed: Vec<String> = Vec::new();
-        // aux config subtrees at legacy `aux:<name>` — ONLY on a NoUik (fmt1)
-        // keyset. On a v2 keyset owner-config is honored only when owner-signed,
-        // and the daemon holds no UIK: an unsigned copy would be dropped by every
-        // fold, and re-writing it could clobber an owner-signed row (or replace a
-        // dropped one with the safe default). Agents are never emitted at all.
-        // Native `service` items are data records: written on every keyset.
-        let desired = Self::view_items(view, self.keyset.uik.is_none())?;
+    ) -> Result<Reconciled> {
+        let mut out = Reconciled::default();
+        // Only what the device may write (the rule table): data records on
+        // every keyset; owner-config only on a vault without a keyset. On a
+        // keyset owner-config is honored only owner-signed, and this process
+        // holds no UIK: an unsigned copy would be dropped by every fold, and
+        // re-writing it could clobber an owner-signed row (or replace a dropped
+        // one with the safe default). Agents are never emitted at all.
+        let has_keyset = self.keyset.uik.is_some();
+        let desired: BTreeMap<(ItemNs, String), serde_json::Value> = Self::view_items(view)?
+            .into_iter()
+            .filter(|((ns, name), _)| {
+                crate::storage::item::device_may_write(*ns, name, has_keyset, false)
+            })
+            .collect();
+        // The base each write is made from, recorded on a keep-both row that
+        // goes dirty (see [`StoredItem::base`]). `OwnFold`: our own fold now.
+        let own_base = match base {
+            ReconcileBase::OwnFold => Some(ViewBase::of(&self.fold_view::<S>(keys, vault_id)?)?),
+            ReconcileBase::Since(_) => None,
+        };
+        let base_digests: &ViewBase = match (base, own_base.as_ref()) {
+            (ReconcileBase::Since(b), _) => b,
+            (ReconcileBase::OwnFold, Some(b)) => b,
+            (ReconcileBase::OwnFold, None) => unreachable!("own base computed above"),
+        };
+
+        // An owner-config kind with no native record yet is written WHOLE on
+        // its first write (its other keys came from the legacy row or the
+        // defaults, which no longer apply to it once a native record exists).
+        let native_kinds = self.native_owner_config_kinds::<S>(keys, vault_id);
+        let whole_kinds: std::collections::BTreeSet<ItemNs> = match base {
+            ReconcileBase::Since(b) => desired
+                .iter()
+                .filter(|((ns, name), body)| {
+                    is_owner_config_ns(*ns)
+                        && !native_kinds.contains(ns)
+                        && !b.unchanged(*ns, name, body)
+                })
+                .map(|((ns, _), _)| *ns)
+                .collect(),
+            ReconcileBase::OwnFold => Default::default(),
+        };
 
         // Upsert every desired item the caller changed (vs its base) whose sealed
-        // body differs from what we hold.
+        // body differs from what we hold (compared normalized).
         for ((ns, name), body) in &desired {
             if let ReconcileBase::Since(b) = base {
-                if b.unchanged(*ns, name, body) {
+                if b.unchanged(*ns, name, body) && !whole_kinds.contains(ns) {
                     continue;
                 }
             }
             // `open_item` is unconverted (single-key); id_seed == content here so
             // the read is byte-identical either way.
             let existing = self.open_item::<S>(keys, vault_id, *ns, name)?;
-            let same = existing
-                .as_ref()
-                .map(|p| !p.is_tombstone() && &p.body == body)
-                .unwrap_or(false);
-            if same {
+            let existing_live = existing.as_ref().filter(|p| !p.is_tombstone());
+            let wanted = item_body_digest(*ns, body);
+            if existing_live.is_some_and(|p| item_body_digest(*ns, &p.body) == wanted) {
                 continue;
             }
             let payload = ItemPayload::live(*ns, name.clone(), body.clone());
+            let policy = crate::storage::item::conflict_policy(*ns, name);
+            let wire = wire_id_for::<S>(keys.id_seed, *ns, name)?;
+            let row = self
+                .items
+                .get(&wire)
+                .map(|s| (s.version, s.version > s.synced_version));
             // §4 same-item conflict: the caller changed it AND the stored row no
             // longer matches the base (a pull changed or deleted it meanwhile,
-            // e.g. during a connect's token exchange). Keep-both namespaces keep
-            // THEIRS at the canonical id and OURS as a local dirty conflict copy;
-            // the rest take the caller's write (console parity).
-            if let ReconcileBase::Since(b) = base {
-                let wire = wire_id_for::<S>(keys.id_seed, *ns, name)?;
-                if let Some(their_version) = self.items.get(&wire).map(|s| s.version) {
-                    let theirs = existing
-                        .as_ref()
-                        .filter(|p| !p.is_tombstone())
-                        .map(|p| body_digest(&p.body));
-                    if ns.keeps_both_on_conflict() && theirs.as_ref() != b.digest(*ns, name) {
-                        if let Some(copy) = self.put_local_conflict_copy::<S>(
-                            keys,
-                            vault_id,
-                            &payload,
-                            their_version,
-                        )? {
-                            changed.push(copy);
+            // e.g. during a connect's token exchange). Their body equal to the
+            // base (normalized) is no conflict: ours applies.
+            if let (ReconcileBase::Since(b), Some((their_version, _))) = (base, row) {
+                let theirs = existing_live.map(|p| item_body_digest(*ns, &p.body));
+                if theirs.as_ref() != b.digest(*ns, name) {
+                    match policy {
+                        // THEIRS stays at the canonical id; OURS becomes a local
+                        // dirty conflict copy (console parity); their delete
+                        // stands.
+                        Conflict::KeepBoth => {
+                            if let Some(copy) = self.put_local_conflict_copy::<S>(
+                                keys,
+                                vault_id,
+                                &payload,
+                                their_version,
+                                true,
+                            )? {
+                                out.changed.push(copy);
+                            }
+                            continue;
                         }
-                        continue;
+                        // Never overwritten: ours is set aside locally (never
+                        // pushed or folded) and reported for a re-run.
+                        Conflict::OwnerConfig => {
+                            if let Some(copy) = self.put_local_conflict_copy::<S>(
+                                keys,
+                                vault_id,
+                                &payload,
+                                their_version,
+                                false,
+                            )? {
+                                out.changed.push(copy);
+                            }
+                            out.set_aside
+                                .push((wire.clone(), crate::storage::item::record_label(&payload)));
+                            continue;
+                        }
+                        Conflict::TakeWriter => {}
                     }
                 }
             }
+            let was_clean = row.is_none_or(|(_, dirty)| !dirty);
             let (id, _v) = self.seal_and_bump::<S>(keys, vault_id, *ns, name, &payload)?;
-            changed.push(id);
+            if was_clean && policy == Conflict::KeepBoth {
+                if let Some(s) = self.items.get_mut(&id) {
+                    s.base = base_digests.digest(*ns, name).map(digest_hex);
+                }
+            }
+            out.changed.push(id);
         }
 
         // Tombstone secret/connection/connecting rows the caller dropped. Our own
@@ -1815,7 +2174,7 @@ impl PerItemVault {
                     name,
                     &ItemPayload::tombstone(ItemNs::Secret, name.clone()),
                 )?;
-                changed.push(id);
+                out.changed.push(id);
             }
         }
         for id in mine.aux.connections.keys() {
@@ -1827,7 +2186,7 @@ impl PerItemVault {
                     id,
                     &ItemPayload::tombstone(ItemNs::Connection, id.clone()),
                 )?;
-                changed.push(iid);
+                out.changed.push(iid);
             }
         }
         for id in mine.aux.connecting.keys() {
@@ -1839,7 +2198,7 @@ impl PerItemVault {
                     id,
                     &ItemPayload::tombstone(ItemNs::Connecting, id.clone()),
                 )?;
-                changed.push(iid);
+                out.changed.push(iid);
             }
         }
         // A service the caller dropped (a native item, or a legacy-only entry of
@@ -1854,38 +2213,115 @@ impl PerItemVault {
                     id,
                     &ItemPayload::tombstone(ItemNs::Service, id.clone()),
                 )?;
-                changed.push(iid);
+                out.changed.push(iid);
+            }
+        }
+        // Owner-config records the caller dropped (a policy category or
+        // connection entry, a store, the retention), where the device may
+        // write them.
+        for ((ns, name), _) in owner_config_items(&mine.aux)? {
+            if removed(ns, &name)
+                && crate::storage::item::device_may_write(ns, &name, has_keyset, true)
+            {
+                let (iid, _v) = self.seal_and_bump::<S>(
+                    keys,
+                    vault_id,
+                    ns,
+                    &name,
+                    &ItemPayload::tombstone(ns, name.clone()),
+                )?;
+                out.changed.push(iid);
             }
         }
         // Agent rows are never written here (no live upsert, no tombstone): a
         // revoke is the console deleting the UIK-signed row.
-        Ok(changed)
+        Ok(out)
     }
 
-    /// LEGACY(services row): write every service the fold reads from the
-    /// legacy `services` record (honored as owner-config: owner-signed on a v2
-    /// keyset) and that has no native `service` row yet (live or tombstone: a
-    /// native row wins) as a native item, an unsigned data record. The legacy
-    /// record itself is left as it is on every keyset: a device still running
-    /// an earlier version reads only that record, and once every entry has a
-    /// native item the union reads the native ones. Returns the item ids
-    /// written (empty = nothing to migrate). Remove with the legacy record.
+    /// The owner-config namespaces with any native record (live or
+    /// tombstone). Unreadable rows are skipped.
+    fn native_owner_config_kinds<S: PrimitiveSuite>(
+        &self,
+        keys: VaultKeys,
+        vault_id: &str,
+    ) -> std::collections::BTreeSet<ItemNs> {
+        let mut out = std::collections::BTreeSet::new();
+        for (id_b64, stored) in &self.items {
+            let Ok(raw) = aad_id_from_wire::<S>(keys.id_seed, id_b64) else {
+                continue;
+            };
+            if let Ok(p) = unseal_item::<S>(
+                keys.content,
+                &ItemCtx::new(vault_id, raw, stored.version),
+                &stored.ct,
+            ) {
+                if is_owner_config_ns(p.ns) {
+                    out.insert(p.ns);
+                }
+            }
+        }
+        out
+    }
+
+    /// LEGACY(services row): on a vault without a keyset, move the legacy
+    /// `services` record to native `service` items in one pass: every entry
+    /// of it the fold reads and that has no native row yet (live or
+    /// tombstone: a native row wins) is written as a native item (object form,
+    /// unsigned), then the legacy record is tombstoned. A record the fold does
+    /// not read (unreadable, dropped) is left as it is. On a vault with a
+    /// keyset this process writes neither: the owner's console moves and
+    /// tombstones it, signed. Run only after a pull (a device that is behind
+    /// must not write stale copies). Returns the item ids written (empty =
+    /// nothing to migrate). Remove with the legacy record.
     pub fn migrate_legacy_services<S: PrimitiveSuite>(
         &mut self,
         keys: VaultKeys,
         vault_id: &str,
     ) -> Result<Vec<String>> {
-        let folded = self.fold_view::<S>(keys, vault_id)?;
+        if self.keyset.uik.is_some() {
+            return Ok(Vec::new());
+        }
+        let legacy_id = wire_id_for::<S>(keys.id_seed, ItemNs::Aux, "services")?;
+        let Some(stored) = self.items.get(&legacy_id).cloned() else {
+            return Ok(Vec::new());
+        };
+        let raw = item_id_bytes::<S>(keys.id_seed, ItemNs::Aux.as_str(), "services")?;
+        let payload = unseal_item::<S>(
+            keys.content,
+            &ItemCtx::new(vault_id, raw, stored.version),
+            &stored.ct,
+        )?;
+        if payload.is_tombstone() {
+            return Ok(Vec::new());
+        }
+        let trust = self.resolve_membership_trust(vault_id);
+        let Some(data) = fold_owner_config_record(
+            stored.sig.as_deref(),
+            stored.signer.as_deref(),
+            &stored.ct,
+            &self.keyset,
+            vault_id,
+            &raw,
+            "services",
+            stored.version,
+            payload.body,
+            &trust,
+        ) else {
+            return Ok(Vec::new());
+        };
+        let entries: BTreeMap<String, crate::service::source::StoredService> =
+            serde_json::from_value(data)
+                .map_err(|e| AppError::Internal(format!("aux.services parse: {}", e)))?;
         let mut changed = Vec::new();
-        for (id, entry) in &folded.aux.services {
-            if crate::storage::item::is_conflict_copy_name(id) {
-                continue; // a native conflict copy, not a legacy entry
-            }
+        for (id, entry) in &entries {
             let native = wire_id_for::<S>(keys.id_seed, ItemNs::Service, id)?;
             if self.items.contains_key(&native) {
                 continue; // a native item or tombstone wins
             }
-            let body = serde_json::to_value(entry).map_err(AppError::from)?;
+            let body = normalized_body(
+                ItemNs::Service,
+                &serde_json::to_value(entry).map_err(AppError::from)?,
+            );
             let (iid, _v) = self.seal_and_bump::<S>(
                 keys,
                 vault_id,
@@ -1895,6 +2331,14 @@ impl PerItemVault {
             )?;
             changed.push(iid);
         }
+        let (iid, _v) = self.seal_and_bump::<S>(
+            keys,
+            vault_id,
+            ItemNs::Aux,
+            "services",
+            &ItemPayload::tombstone(ItemNs::Aux, "services"),
+        )?;
+        changed.push(iid);
         Ok(changed)
     }
 
@@ -2188,36 +2632,18 @@ impl PerItemVault {
         keys: VaultKeys,
         vault_id: &str,
     ) -> Result<crate::storage::plaintext::VaultPlaintextView> {
+        use crate::storage::item::{is_conflict_copy_name, rule};
         use crate::storage::plaintext::{VaultAux, VaultPlaintextView};
 
-        // Start from the fresh-vault defaults; config items OVERRIDE their
-        // subtree, secret/connection/connecting/agent items fill their maps.
-        //
-        // Unified addressing (team §8.2): config singletons live at their own
-        // ns with the empty name. Legacy `aux:<name>` items are still parsed
-        // (read-compat for not-yet-migrated vaults) but NEW addresses win when
-        // both spellings exist mid-migration — precedence is tracked with
-        // `seen_new`, not item order (the id map iterates in hash order).
+        // Start from the fresh-vault defaults. Every record is read per its
+        // rule in the table (`ITEM_RULES`, its `read`): data records fill
+        // their maps; owner-config is collected per kind and applied after the
+        // loop (the id map iterates in hash order), native before legacy.
         let mut aux = VaultAux::initial();
         let mut native_secrets: BTreeMap<String, Vec<u8>> = BTreeMap::new();
         let mut native_secret_notes: BTreeMap<String, String> = BTreeMap::new();
-        #[derive(Default)]
-        struct SeenNew {
-            stores: bool,
-            store_order: bool,
-            policy: bool,
-            retention: bool,
-            services: bool,
-        }
-        let mut seen_new = SeenNew::default();
-        // Legacy values parked until the loop ends (applied only where no new-
-        // address item set the field).
-        let mut legacy_stores: Option<serde_json::Value> = None;
-        let mut legacy_store_order: Option<serde_json::Value> = None;
-        let mut legacy_policy: Option<serde_json::Value> = None;
-        let mut legacy_retention: Option<serde_json::Value> = None;
+        let mut config = OwnerConfigFold::default();
         let mut legacy_services: Option<serde_json::Value> = None;
-        let mut legacy_addressing = false;
         // Native `service` items (one per service id): live entries, and the
         // ids a tombstone removes. Overlaid on the legacy `services` record
         // after the loop: a native item wins for its id.
@@ -2254,63 +2680,120 @@ impl PerItemVault {
                 let raw = aad_id_from_wire::<S>(keys.id_seed, id_b64)?;
                 let ctx = ItemCtx::new(vault_id, raw, stored.version);
                 let payload = unseal_item::<S>(keys.content, &ctx, &stored.ct)?;
-                if payload.ns == ItemNs::Service {
-                    // A data record like a connection (no signature), live or
-                    // tombstone. A conflict copy (`"<id> (conflict copy)"`, kept
-                    // beside theirs) folds under its own name, like a
-                    // connection's; no service is loaded from it (its name is
-                    // not a service id: `vault_custom_services`).
-                    if payload.is_tombstone() {
-                        native_removed.insert(payload.name);
-                    } else {
-                        let entry = serde_json::from_value(payload.body).map_err(|e| {
-                            AppError::Internal(format!("service '{}' parse: {}", payload.name, e))
-                        })?;
-                        native_services.insert(payload.name, entry);
-                    }
+                // A record without a rule is not read: the retired `stores:` /
+                // `services:` / `members`, a legacy `aux:agent/<id>` (only
+                // native, UIK-signed agent rows authorize), an unknown `aux` or
+                // `policy` name (fail closed).
+                let Some(r) = rule(payload.ns, &payload.name) else {
                     return Ok(());
-                }
-                if payload.is_tombstone() {
-                    return Ok(());
-                }
-                // A conflict copy outside the keep-both namespaces is a local
+                };
+                // A conflict copy outside the keep-both records is a local
                 // record of a change set aside by the sync (never pushed):
-                // never folded. A singleton ignores its row's name and a
-                // `connecting` copy would read as an in-flight connect.
-                if !payload.ns.keeps_both_on_conflict()
-                    && crate::storage::item::is_conflict_copy_name(&payload.name)
-                {
+                // never folded (a `connecting` copy would read as an in-flight
+                // connect).
+                let copy = is_conflict_copy_name(&payload.name);
+                if copy && r.conflict != Conflict::KeepBoth {
                     return Ok(());
                 }
+                let own_id = wire_id_for::<S>(keys.id_seed, payload.ns, &payload.name)? == *id_b64;
+                let sig_type = r.signature_type(&payload.name).map(str::to_string);
+                let owner_config = |body: serde_json::Value| {
+                    fold_owner_config_record(
+                        stored.sig.as_deref(),
+                        stored.signer.as_deref(),
+                        &stored.ct,
+                        &self.keyset,
+                        vault_id,
+                        &raw,
+                        sig_type.as_deref().unwrap_or(""),
+                        stored.version,
+                        body,
+                        &trust,
+                    )
+                };
                 let name = payload.name;
-                match payload.ns {
-                    ItemNs::Secret => {
-                        let (value, notes) = parse_secret_body(&payload.body).map_err(|e| {
-                            AppError::Internal(format!("secret item '{}': {}", name, e))
-                        })?;
-                        if let Some(n) = notes {
-                            native_secret_notes.insert(name.clone(), n);
+                match r.read {
+                    // A data record like a connection (no signature), live or
+                    // tombstone, read only at its own derived id: one item per
+                    // service id. The exception is a conflict copy (`"<id>
+                    // (conflict copy)"`, kept beside theirs at the copy id),
+                    // which folds under its own name like a connection's; no
+                    // service is loaded from it (`vault_custom_services`).
+                    Read::DerivedIdOnlyUnionLegacy => {
+                        if !copy && !own_id {
+                            tracing::warn!(vault = %vault_id, service = %name, wire = %id_b64, "fold: dropping a service record that is not at its own id");
+                        } else if payload.status == crate::storage::item::ItemStatus::Tombstone {
+                            native_removed.insert(name);
+                        } else {
+                            let entry = serde_json::from_value(payload.body).map_err(|e| {
+                                AppError::Internal(format!("service '{}' parse: {}", name, e))
+                            })?;
+                            native_services.insert(name, entry);
                         }
-                        native_secrets.insert(name, value.into_bytes());
                     }
-                    ItemNs::Connection => {
-                        let conn = serde_json::from_value(payload.body).map_err(|e| {
-                            AppError::Internal(format!("connection '{}' parse: {}", name, e))
-                        })?;
-                        aux.connections.insert(name, conn);
+                    // Native owner-config, at its own id; with a keyset only
+                    // owner-signed (sidecar type = the namespace). A tombstone
+                    // counts too: it wins its key over the legacy row.
+                    Read::OwnerSignedWithKeysetNativeWins => {
+                        if !own_id {
+                            tracing::warn!(vault = %vault_id, ns = %payload.ns.as_str(), wire = %id_b64, "fold: dropping an owner-config record that is not at its own id");
+                            return Ok(());
+                        }
+                        let ty = sig_type.as_deref().unwrap_or("");
+                        if payload.status == crate::storage::item::ItemStatus::Tombstone {
+                            if owner_config_tombstone_honored(
+                                stored.sig.as_deref(),
+                                stored.signer.as_deref(),
+                                &stored.ct,
+                                &self.keyset,
+                                vault_id,
+                                &raw,
+                                ty,
+                                stored.version,
+                                &trust,
+                            ) {
+                                config.native(payload.ns, name, None);
+                            }
+                            return Ok(());
+                        }
+                        match owner_config(payload.body) {
+                            Some(data) => config.native(payload.ns, name, Some(data)),
+                            None => {
+                                tracing::warn!(vault = %vault_id, ns = %payload.ns.as_str(), "fold: dropping owner-config — unauthorized/invalid owner signature")
+                            }
+                        }
                     }
-                    ItemNs::Connecting => {
-                        let c = serde_json::from_value(payload.body).map_err(|e| {
-                            AppError::Internal(format!("connecting '{}' parse: {}", name, e))
-                        })?;
-                        aux.connecting.insert(name, c);
-                    }
-                    ItemNs::Agent => {
-                        // T2 (design/agent-authz-cleartext-cutover.md): a native agent
-                        // item MUST live at its own cleartext id (wire id == ag_id ==
-                        // name). Drop a body smuggled at any other id, so the backend
-                        // ownership gate on the ag_id cannot be dodged.
-                        if id_b64.as_str() != name.as_str() {
+                    _ if payload.status == crate::storage::item::ItemStatus::Tombstone => {}
+                    Read::All => match payload.ns {
+                        ItemNs::Secret => {
+                            let (value, notes) = parse_secret_body(&payload.body).map_err(|e| {
+                                AppError::Internal(format!("secret item '{}': {}", name, e))
+                            })?;
+                            if let Some(n) = notes {
+                                native_secret_notes.insert(name.clone(), n);
+                            }
+                            native_secrets.insert(name, value.into_bytes());
+                        }
+                        ItemNs::Connection => {
+                            let conn = serde_json::from_value(payload.body).map_err(|e| {
+                                AppError::Internal(format!("connection '{}' parse: {}", name, e))
+                            })?;
+                            aux.connections.insert(name, conn);
+                        }
+                        ItemNs::Connecting => {
+                            let c = serde_json::from_value(payload.body).map_err(|e| {
+                                AppError::Internal(format!("connecting '{}' parse: {}", name, e))
+                            })?;
+                            aux.connecting.insert(name, c);
+                        }
+                        _ => {}
+                    },
+                    // T2 (design/agent-authz-cleartext-cutover.md): a native agent
+                    // item MUST live at its own cleartext id (wire id == ag_id ==
+                    // name). Drop a body smuggled at any other id, so the backend
+                    // ownership gate on the ag_id cannot be dodged.
+                    Read::SignerAuthorizedAndWireIdMatches => {
+                        if !own_id {
                             tracing::warn!(vault = %vault_id, agent = %name, wire = %id_b64, "fold: dropping agent grant — wire id != ag_id");
                             return Ok(());
                         }
@@ -2334,212 +2817,20 @@ impl PerItemVault {
                             })?;
                         aux.agents.insert(name, entry);
                     }
-                    ItemNs::Policy => {
-                        let Some(data) = fold_owner_config_record(
-                            stored.sig.as_deref(),
-                            stored.signer.as_deref(),
-                            &stored.ct,
-                            &self.keyset,
-                            vault_id,
-                            &raw,
-                            "policy",
-                            stored.version,
-                            payload.body,
-                            &trust,
-                        ) else {
-                            tracing::warn!(vault = %vault_id, "fold: dropping policy — unauthorized/invalid owner signature");
-                            return Ok(());
-                        };
-                        aux.policy = Some(
-                            serde_json::from_value(data)
-                                .map_err(|e| AppError::Internal(format!("policy parse: {}", e)))?,
-                        );
-                        seen_new.policy = true;
-                    }
-                    ItemNs::Stores => {
-                        let Some(data) = fold_owner_config_record(
-                            stored.sig.as_deref(),
-                            stored.signer.as_deref(),
-                            &stored.ct,
-                            &self.keyset,
-                            vault_id,
-                            &raw,
-                            "stores",
-                            stored.version,
-                            payload.body,
-                            &trust,
-                        ) else {
-                            tracing::warn!(vault = %vault_id, "fold: dropping stores — unauthorized/invalid owner signature");
-                            return Ok(());
-                        };
-                        aux.stores = serde_json::from_value(data)
-                            .map_err(|e| AppError::Internal(format!("stores parse: {}", e)))?;
-                        seen_new.stores = true;
-                    }
-                    ItemNs::StoreOrder => {
-                        let Some(data) = fold_owner_config_record(
-                            stored.sig.as_deref(),
-                            stored.signer.as_deref(),
-                            &stored.ct,
-                            &self.keyset,
-                            vault_id,
-                            &raw,
-                            "store_order",
-                            stored.version,
-                            payload.body,
-                            &trust,
-                        ) else {
-                            tracing::warn!(vault = %vault_id, "fold: dropping store_order — unauthorized/invalid owner signature");
-                            return Ok(());
-                        };
-                        aux.store_order = serde_json::from_value(data)
-                            .map_err(|e| AppError::Internal(format!("store_order parse: {}", e)))?;
-                        seen_new.store_order = true;
-                    }
-                    ItemNs::AuditRetentionDays => {
-                        let Some(data) = fold_owner_config_record(
-                            stored.sig.as_deref(),
-                            stored.signer.as_deref(),
-                            &stored.ct,
-                            &self.keyset,
-                            vault_id,
-                            &raw,
-                            "audit_retention_days",
-                            stored.version,
-                            payload.body,
-                            &trust,
-                        ) else {
-                            tracing::warn!(vault = %vault_id, "fold: dropping audit_retention_days — unauthorized/invalid owner signature");
-                            return Ok(());
-                        };
-                        aux.audit_retention_days = serde_json::from_value(data).map_err(|e| {
-                            AppError::Internal(format!("audit_retention_days parse: {}", e))
-                        })?;
-                        seen_new.retention = true;
-                    }
-                    ItemNs::Services => {
-                        let Some(data) = fold_owner_config_record(
-                            stored.sig.as_deref(),
-                            stored.signer.as_deref(),
-                            &stored.ct,
-                            &self.keyset,
-                            vault_id,
-                            &raw,
-                            "services",
-                            stored.version,
-                            payload.body,
-                            &trust,
-                        ) else {
-                            tracing::warn!(vault = %vault_id, "fold: dropping services — unauthorized/invalid owner signature");
-                            return Ok(());
-                        };
-                        aux.services = serde_json::from_value(data)
-                            .map_err(|e| AppError::Internal(format!("services parse: {}", e)))?;
-                        seen_new.services = true;
-                    }
-                    // Folded above, before the tombstone check.
-                    ItemNs::Service => {}
-                    ItemNs::Members => {
-                        // The in-vault membership is RETIRED (finding #1):
-                        // role now rides the keyset cred (owner-authority anchor,
-                        // §4.3), derived by `resolve_membership_trust`. Any
-                        // legacy `members:` item is ignored — never trusted for
-                        // roles, never folded back into the view.
-                    }
-                    ItemNs::Aux => {
-                        // Config singletons ride `aux:<name>` blobs (parked +
-                        // applied after the loop if no unified-ns item set the
-                        // field — the cosmetic `aux:` drop is deferred). Legacy
-                        // `aux:agent/<id>` rows are ignored (native ns only).
-                        legacy_addressing = true;
-                        // C.3: owner-config carries a UIK signature (or is legacy
-                        // raw, honored only on NoUik). Verify+unwrap here; a bad /
-                        // missing signature parks `None` (→ safe default).
-                        // `config_name` is addressing-independent.
-                        // A legacy `aux:members` blob is ignored (membership retired).
-                        match name.as_str() {
-                            "stores" => {
-                                legacy_stores = fold_owner_config_record(
-                                    stored.sig.as_deref(),
-                                    stored.signer.as_deref(),
-                                    &stored.ct,
-                                    &self.keyset,
-                                    vault_id,
-                                    &raw,
-                                    "stores",
-                                    stored.version,
-                                    payload.body,
-                                    &trust,
-                                )
-                            }
-                            "store_order" => {
-                                legacy_store_order = fold_owner_config_record(
-                                    stored.sig.as_deref(),
-                                    stored.signer.as_deref(),
-                                    &stored.ct,
-                                    &self.keyset,
-                                    vault_id,
-                                    &raw,
-                                    "store_order",
-                                    stored.version,
-                                    payload.body,
-                                    &trust,
-                                )
-                            }
-                            "policy" => {
-                                legacy_policy = fold_owner_config_record(
-                                    stored.sig.as_deref(),
-                                    stored.signer.as_deref(),
-                                    &stored.ct,
-                                    &self.keyset,
-                                    vault_id,
-                                    &raw,
-                                    "policy",
-                                    stored.version,
-                                    payload.body,
-                                    &trust,
-                                )
-                            }
-                            "audit_retention_days" => {
-                                legacy_retention = fold_owner_config_record(
-                                    stored.sig.as_deref(),
-                                    stored.signer.as_deref(),
-                                    &stored.ct,
-                                    &self.keyset,
-                                    vault_id,
-                                    &raw,
-                                    "audit_retention_days",
-                                    stored.version,
-                                    payload.body,
-                                    &trust,
-                                )
-                            }
-                            "services" => {
-                                legacy_services = fold_owner_config_record(
-                                    stored.sig.as_deref(),
-                                    stored.signer.as_deref(),
-                                    &stored.ct,
-                                    &self.keyset,
-                                    vault_id,
-                                    &raw,
-                                    "services",
-                                    stored.version,
-                                    payload.body,
-                                    &trust,
-                                )
-                            }
-                            n => {
-                                if let Some(agent_id) = n.strip_prefix("agent/") {
-                                    // Legacy `aux:agent/<ag_id>` rows are NEVER folded
-                                    // (any trust state): the id is blinded, so the
-                                    // backend's ownership gate on the ag_id can't see
-                                    // the write. Only native `agent:<ag_id>` rows count.
-                                    tracing::debug!(vault = %vault_id, agent = %agent_id, "fold: ignoring legacy aux:agent row (only native, UIK-signed agent rows authorize)");
-                                }
-                                // other unknown aux names: ignored (forward-compat).
-                            }
+                    // LEGACY(aux addressing): `aux:<field>`, whose entries
+                    // apply to the keys without an honored native record
+                    // ([`OwnerConfigFold::apply`]). C.3: a bad / missing
+                    // signature drops it (→ safe default).
+                    Read::LegacyWhenNoHonoredNative => {
+                        if let Some(data) = owner_config(payload.body) {
+                            config.legacy(&name, data);
                         }
                     }
+                    // LEGACY(services row): unioned under the native items.
+                    Read::LegacyUnionNativeWins => {
+                        legacy_services = owner_config(payload.body);
+                    }
+                    Read::ConsoleOnly => {}
                 }
                 Ok(())
             })();
@@ -2558,105 +2849,203 @@ impl PerItemVault {
             }
         }
 
-        // Apply parked legacy values where no new-address item set the field.
-        if !seen_new.stores {
-            if let Some(v) = legacy_stores {
-                aux.stores = serde_json::from_value(v)
-                    .map_err(|e| AppError::Internal(format!("aux.stores parse: {}", e)))?;
-            }
-        }
-        if !seen_new.store_order {
-            if let Some(v) = legacy_store_order {
-                aux.store_order = serde_json::from_value(v)
-                    .map_err(|e| AppError::Internal(format!("aux.store_order parse: {}", e)))?;
-            }
-        }
-        if !seen_new.policy {
-            if let Some(v) = legacy_policy {
-                aux.policy = Some(
-                    serde_json::from_value(v)
-                        .map_err(|e| AppError::Internal(format!("aux.policy parse: {}", e)))?,
-                );
-            }
-        }
-        if !seen_new.retention {
-            if let Some(v) = legacy_retention {
-                aux.audit_retention_days = serde_json::from_value(v).map_err(|e| {
-                    AppError::Internal(format!("aux.audit_retention_days parse: {}", e))
-                })?;
-            }
-        }
-        if !seen_new.services {
-            if let Some(v) = legacy_services {
-                aux.services = serde_json::from_value(v)
-                    .map_err(|e| AppError::Internal(format!("aux.services parse: {}", e)))?;
-            }
-        }
+        // Owner-config per key: an honored native record, else (LEGACY) the
+        // legacy row's entry.
+        config.apply(&mut aux)?;
         // LEGACY(services row): the services are the union of the legacy
         // `services` record (owner-config, read only; moved to native items by
         // `migrate_legacy_services`) and the native `service` items; a native
         // tombstone hides the legacy entry of its id, a native live item
         // replaces it. Drop the legacy half with the legacy record.
+        if let Some(v) = legacy_services {
+            aux.services = serde_json::from_value(v)
+                .map_err(|e| AppError::Internal(format!("aux.services parse: {}", e)))?;
+        }
         for id in native_removed {
             aux.services.remove(&id);
         }
         aux.services.extend(native_services);
-        // No `members` legacy blob to merge: the in-vault membership is retired
-        // (finding #1); role lives on the keyset cred (owner-authority anchor).
 
         Ok(VaultPlaintextView {
             aux,
             native_secrets,
             native_secret_notes,
-            legacy_addressing,
         })
     }
 
-    /// One-shot migration to the unified addressing (team §8.3 "升级即切换").
-    /// If the vault still holds live legacy `aux:*` items: fold, re-write every
-    /// config singleton at its new address, and tombstone the legacy rows —
-    /// all version-bumped so sync pushes them as normal item changes. Idempotent
-    /// (second call folds to `legacy_addressing == false` and does nothing).
-    /// Returns the changed item ids (empty = already migrated). The caller is
-    /// responsible for (a) writing a plaintext snapshot BEFORE calling this and
-    /// (b) marking the vault `format=2` server-side AFTER the push succeeds.
+    /// LEGACY(aux addressing): on a vault without a keyset, move every legacy
+    /// owner-config row the fold reads to its native records in one pass,
+    /// unsigned: `aux:policy` → `policy:` + `policy:category:<tag>` +
+    /// `policy:connection:<id>`, `aux:stores` → `store:<id>`,
+    /// `aux:store_order` → `store_order:`, `aux:audit_retention_days` →
+    /// `audit_retention_days:`; then tombstone each legacy row moved. Per key
+    /// (as the fold reads it): an entry whose key already has an honored native
+    /// record (live or tombstone) is not copied, that record already wins. A
+    /// legacy row the fold does not read (unreadable, dropped, unparseable) is
+    /// left as it is; `aux:secret_order` is the console's and is never touched.
+    /// On a vault with a keyset this process writes nothing (the owner's
+    /// console moves and tombstones, signed). Run only after a pull. The fold
+    /// reads the same configuration before and after. Returns the item ids
+    /// written (empty = nothing to migrate). The services record moves with
+    /// [`Self::migrate_legacy_services`].
     pub fn migrate_addressing<S: PrimitiveSuite>(
         &mut self,
         keys: VaultKeys,
         vault_id: &str,
     ) -> Result<Vec<String>> {
-        let view = self.fold_view::<S>(keys, vault_id)?;
-        if !view.legacy_addressing {
+        use crate::storage::plaintext::VaultAux;
+        if self.keyset.uik.is_some() {
             return Ok(Vec::new());
         }
-        // Reconcile writes every config singleton at its NEW address (the
-        // mapping lives in `singleton_bodies`, shared with seed).
-        let mut changed =
-            self.reconcile_from_view::<S>(keys, vault_id, &view, ReconcileBase::OwnFold)?;
-        // Tombstone every live legacy aux row (known + unknown names alike —
-        // the namespace is retired wholesale).
-        // Legacy `aux:agent/*` rows are skipped: the daemon never writes agent rows
-        // (not even tombstones), and the fold already ignores them.
-        let legacy: Vec<String> = self
-            .live_names_in_ns::<S>(keys, vault_id, ItemNs::Aux)?
-            .into_iter()
-            .filter(|n| !n.starts_with("agent/"))
-            .collect();
-        for name in legacy {
-            let (id, _v) = self.seal_and_bump::<S>(
+        let trust = self.resolve_membership_trust(vault_id);
+        let honored = self.honored_native_owner_config::<S>(keys, vault_id, &trust)?;
+        let mut changed = Vec::new();
+        for field in ["policy", "stores", "store_order", "audit_retention_days"] {
+            let legacy_id = wire_id_for::<S>(keys.id_seed, ItemNs::Aux, field)?;
+            let Some(stored) = self.items.get(&legacy_id).cloned() else {
+                continue;
+            };
+            let raw = item_id_bytes::<S>(keys.id_seed, ItemNs::Aux.as_str(), field)?;
+            let Ok(payload) = unseal_item::<S>(
+                keys.content,
+                &ItemCtx::new(vault_id, raw, stored.version),
+                &stored.ct,
+            ) else {
+                continue; // unreadable: left as it is
+            };
+            if payload.is_tombstone() {
+                continue;
+            }
+            let Some(data) = fold_owner_config_record(
+                stored.sig.as_deref(),
+                stored.signer.as_deref(),
+                &stored.ct,
+                &self.keyset,
+                vault_id,
+                &raw,
+                field,
+                stored.version,
+                payload.body,
+                &trust,
+            ) else {
+                continue; // not read by the fold: left as it is
+            };
+            // The legacy value as the field it is, split into native records.
+            let mut only = VaultAux::initial();
+            let (parsed, kind) = match field {
+                "policy" => (
+                    parse_config("aux.policy", data).map(|p| only.policy = Some(p)),
+                    ItemNs::Policy,
+                ),
+                "stores" => (
+                    parse_config("aux.stores", data).map(|v| only.stores = v),
+                    ItemNs::Store,
+                ),
+                "store_order" => (
+                    parse_config("aux.store_order", data).map(|v| only.store_order = v),
+                    ItemNs::StoreOrder,
+                ),
+                _ => (
+                    parse_config("aux.audit_retention_days", data)
+                        .map(|v| only.audit_retention_days = v),
+                    ItemNs::AuditRetentionDays,
+                ),
+            };
+            if parsed.is_err() {
+                continue; // unparseable: left as it is
+            }
+            for ((ns, name), body) in owner_config_items(&only)? {
+                if ns != kind || honored.contains(&(ns, name.clone())) {
+                    continue;
+                }
+                let (iid, _v) = self.seal_and_bump::<S>(
+                    keys,
+                    vault_id,
+                    ns,
+                    &name,
+                    &ItemPayload::live(ns, name.clone(), body),
+                )?;
+                changed.push(iid);
+            }
+            let (iid, _v) = self.seal_and_bump::<S>(
                 keys,
                 vault_id,
                 ItemNs::Aux,
-                &name,
-                &ItemPayload::tombstone(ItemNs::Aux, name.clone()),
+                field,
+                &ItemPayload::tombstone(ItemNs::Aux, field),
             )?;
-            changed.push(id);
+            changed.push(iid);
         }
         Ok(changed)
     }
 
+    /// The keys `(ns, name)` of the native owner-config records the fold
+    /// honors (live or tombstone; at their own id, with a rule, signed as the
+    /// trust state requires).
+    fn honored_native_owner_config<S: PrimitiveSuite>(
+        &self,
+        keys: VaultKeys,
+        vault_id: &str,
+        trust: &MembershipTrust,
+    ) -> Result<std::collections::BTreeSet<(ItemNs, String)>> {
+        let mut out = std::collections::BTreeSet::new();
+        for (id_b64, stored) in &self.items {
+            let Ok(raw) = aad_id_from_wire::<S>(keys.id_seed, id_b64) else {
+                continue;
+            };
+            let Ok(payload) = unseal_item::<S>(
+                keys.content,
+                &ItemCtx::new(vault_id, raw, stored.version),
+                &stored.ct,
+            ) else {
+                continue;
+            };
+            let Some(r) = crate::storage::item::rule(payload.ns, &payload.name) else {
+                continue;
+            };
+            if r.read != Read::OwnerSignedWithKeysetNativeWins
+                || wire_id_for::<S>(keys.id_seed, payload.ns, &payload.name)? != *id_b64
+            {
+                continue;
+            }
+            let ty = r.signature_type(&payload.name).unwrap_or("");
+            let honored = if payload.is_tombstone() {
+                owner_config_tombstone_honored(
+                    stored.sig.as_deref(),
+                    stored.signer.as_deref(),
+                    &stored.ct,
+                    &self.keyset,
+                    vault_id,
+                    &raw,
+                    ty,
+                    stored.version,
+                    trust,
+                )
+            } else {
+                fold_owner_config_record(
+                    stored.sig.as_deref(),
+                    stored.signer.as_deref(),
+                    &stored.ct,
+                    &self.keyset,
+                    vault_id,
+                    &raw,
+                    ty,
+                    stored.version,
+                    payload.body.clone(),
+                    trust,
+                )
+                .is_some()
+            };
+            if honored {
+                out.insert((payload.ns, payload.name));
+            }
+        }
+        Ok(out)
+    }
+
     /// Names of live (non-tombstone) items in one namespace. Unreadable items
     /// are skipped with a warning (same fault isolation as the fold).
+    #[cfg(test)]
     fn live_names_in_ns<S: PrimitiveSuite>(
         &self,
         keys: VaultKeys,
@@ -3015,7 +3404,6 @@ mod tests {
                 .map(|(n, v)| (n.to_string(), v.as_bytes().to_vec()))
                 .collect(),
             native_secret_notes: Default::default(),
-            legacy_addressing: false,
         };
         // The store: A, B (pulled), C at its NEWER pulled value, D.
         let store = || {
@@ -3089,7 +3477,6 @@ mod tests {
                 aux,
                 native_secrets: [("K".to_string(), k_val.as_bytes().to_vec())].into(),
                 native_secret_notes: Default::default(),
-                legacy_addressing: false,
             }
         };
         let mut pv = PerItemVault::build_initial(
@@ -3113,7 +3500,8 @@ mod tests {
         // The caller read the base (K "base", 7) and changed both.
         let base = ViewBase::of(&view_of("base", 7)).unwrap();
         let view = view_of("ours", 30);
-        pv.reconcile_from_view::<StdPrimitives>(keys, vid, &view, ReconcileBase::Since(&base))
+        let reconciled = pv
+            .reconcile_from_view::<StdPrimitives>(keys, vid, &view, ReconcileBase::Since(&base))
             .unwrap();
 
         // K: theirs untouched (still clean); ours is a dirty local conflict copy.
@@ -3137,14 +3525,134 @@ mod tests {
         let folded = pv.fold_view::<StdPrimitives>(keys, vid).unwrap();
         assert_eq!(folded.native_secrets["K"], b"theirs");
         assert_eq!(folded.native_secrets[&il::conflict_copy_name("K")], b"ours");
-        // Not a keep-both ns: the caller's write wins.
-        assert_eq!(folded.aux.audit_retention_days, Some(30));
+        // Owner-config: never written over theirs, also without a keyset. Ours
+        // is set aside as a local copy (clean: never pushed; never folded) and
+        // reported for a re-run.
+        assert_eq!(folded.aux.audit_retention_days, Some(14));
+        let r_id = il::wire_id_for::<StdPrimitives>(&k, ItemNs::AuditRetentionDays, "").unwrap();
+        assert_eq!(
+            reconciled.set_aside,
+            [(r_id.clone(), "audit_retention_days".to_string())]
+        );
+        let theirs_r = pv.get_item(&r_id).unwrap();
+        assert_eq!(
+            theirs_r.version, theirs_r.synced_version,
+            "theirs untouched"
+        );
+        let (r_copy, _) = il::seal_conflict_copy::<StdPrimitives>(
+            keys,
+            vid,
+            &ItemPayload::live(ItemNs::AuditRetentionDays, "", serde_json::json!(30)),
+            theirs_r.version,
+        )
+        .unwrap();
+        let r_copy = pv.get_item(&r_copy).expect("ours set aside locally");
+        assert_eq!(r_copy.version, r_copy.synced_version, "never pushed");
+        assert!(reconciled.changed.contains(&copy_id));
 
         // Idempotent: a second reconcile adds no second copy.
         let n = pv.items.len();
-        pv.reconcile_from_view::<StdPrimitives>(keys, vid, &view, ReconcileBase::Since(&base))
+        let again = pv
+            .reconcile_from_view::<StdPrimitives>(keys, vid, &view, ReconcileBase::Since(&base))
             .unwrap();
         assert_eq!(pv.items.len(), n);
+        assert_eq!(again.set_aside.len(), 1, "still reported");
+    }
+
+    // keep_both, the base rule: the stored row changed since the caller's base
+    // but its body equals the base (normalized: e.g. another device only
+    // copied a legacy plain-text service entry to a native item in the object
+    // form) is no conflict: ours applies, and the dirty row records the base
+    // it was made from (the push applies the same rule to a 409).
+    #[test]
+    fn reconcile_applies_ours_when_theirs_equals_the_base() {
+        use crate::service::source::StoredService;
+        use crate::storage::item::{self as il};
+        use crate::storage::plaintext::{VaultAux, VaultPlaintextView};
+        use sudp::primitives::StdPrimitives;
+        type S = StdPrimitives;
+        let k = [0x58u8; 32];
+        let vid = "vault-base";
+        let keys = VaultKeys::single(&k);
+        let text = |host: &str| format!("[service]\nid = \"acme\"\nhosts = [\"{host}\"]\n");
+        let view_with = |entry: StoredService| {
+            let mut aux = VaultAux::initial();
+            aux.services.insert("acme".into(), entry);
+            VaultPlaintextView {
+                aux,
+                native_secrets: Default::default(),
+                native_secret_notes: Default::default(),
+            }
+        };
+        let mut pv = PerItemVault::build_initial(
+            b"c".to_vec(),
+            "x".into(),
+            "y".into(),
+            "Dev".into(),
+            vec![0u8; 32],
+            vec![0u8; 48],
+        )
+        .unwrap();
+        // Another device copied the entry (plain text in our base) as a native
+        // item in the object form; we pulled it.
+        pv.seal_and_bump::<S>(
+            keys,
+            vid,
+            ItemNs::Service,
+            "acme",
+            &ItemPayload::live(
+                ItemNs::Service,
+                "acme",
+                serde_json::json!({ "service": text("a.old") }),
+            ),
+        )
+        .unwrap();
+        for s in pv.items.values_mut() {
+            s.synced_version = s.version;
+        }
+        let base = ViewBase::of(&view_with(StoredService::from(text("a.old")))).unwrap();
+        let ours = view_with(StoredService::new(text("a.new"), None, None));
+        let r = pv
+            .reconcile_from_view::<S>(keys, vid, &ours, ReconcileBase::Since(&base))
+            .unwrap();
+        assert!(r.set_aside.is_empty());
+        let id = il::wire_id_for::<S>(&k, ItemNs::Service, "acme").unwrap();
+        assert_eq!(r.changed, [id.clone()], "ours applied, no conflict copy");
+        let row = pv.get_item(&id).unwrap();
+        assert!(row.version > row.synced_version, "dirty");
+        assert_eq!(
+            row.base.as_deref(),
+            Some(il::body_digest_hex(ItemNs::Service, &serde_json::json!(text("a.old"))).as_str()),
+            "the base it was made from"
+        );
+        assert_eq!(
+            pv.open_item::<S>(keys, vid, ItemNs::Service, "acme")
+                .unwrap()
+                .unwrap()
+                .body,
+            serde_json::json!({ "service": text("a.new") })
+        );
+        // A second change before the push keeps the first base.
+        let ours2 = view_with(StoredService::new(text("a.newer"), None, None));
+        let base2 = ViewBase::of(&ours).unwrap();
+        pv.reconcile_from_view::<S>(keys, vid, &ours2, ReconcileBase::Since(&base2))
+            .unwrap();
+        assert_eq!(
+            pv.get_item(&id).unwrap().base.as_deref(),
+            Some(il::body_digest_hex(ItemNs::Service, &serde_json::json!(text("a.old"))).as_str())
+        );
+        // A plain-text entry in a view is written in the object form.
+        let plain = view_with(StoredService::from(text("a.plain")));
+        let base3 = ViewBase::of(&pv.fold_view::<S>(keys, vid).unwrap()).unwrap();
+        pv.reconcile_from_view::<S>(keys, vid, &plain, ReconcileBase::Since(&base3))
+            .unwrap();
+        assert_eq!(
+            pv.open_item::<S>(keys, vid, ItemNs::Service, "acme")
+                .unwrap()
+                .unwrap()
+                .body,
+            serde_json::json!({ "service": text("a.plain") })
+        );
     }
 
     // The daemon NEVER writes authorized-agents rows (any spelling, live or
@@ -3184,7 +3692,6 @@ mod tests {
             aux,
             native_secrets: std::collections::BTreeMap::new(),
             native_secret_notes: std::collections::BTreeMap::new(),
-            legacy_addressing: false,
         };
         pv.seed_items_from_view::<StdPrimitives>(VaultKeys::single(&k), vid, &view)
             .unwrap();
@@ -3222,7 +3729,8 @@ mod tests {
                 &view,
                 ReconcileBase::OwnFold,
             )
-            .unwrap();
+            .unwrap()
+            .changed;
         assert!(
             changed.is_empty(),
             "agents in the view write nothing: {:?}",
@@ -3232,7 +3740,6 @@ mod tests {
             aux: view.aux.clone(),
             native_secrets: view.native_secrets.clone(),
             native_secret_notes: view.native_secret_notes.clone(),
-            legacy_addressing: false,
         };
         view2.aux.agents.remove("ag_bob");
         let changed = pv
@@ -3242,7 +3749,8 @@ mod tests {
                 &view2,
                 ReconcileBase::OwnFold,
             )
-            .unwrap();
+            .unwrap()
+            .changed;
         assert!(changed.is_empty(), "dropping an agent writes no tombstone");
         assert_eq!(pv.items.len(), items_after_seed);
 
@@ -3467,7 +3975,8 @@ mod tests {
             ),
         )
         .unwrap();
-        pv.seal_and_upsert::<StdPrimitives>(
+        // LEGACY(aux addressing): a row an earlier version wrote.
+        pv.plant::<StdPrimitives>(
             VaultKeys::single(&k),
             vid,
             ItemNs::Aux,
@@ -5279,11 +5788,12 @@ mod tests {
             vec![0u8; 48],
         )
         .unwrap();
-        pv.seal_and_bump::<sudp::primitives::StdPrimitives>(
+        pv.plant::<sudp::primitives::StdPrimitives>(
             keys,
             vault,
             ItemNs::Aux,
             "services",
+            1,
             &ItemPayload::live(ItemNs::Aux, "services".to_string(), entries),
         )
         .unwrap();
@@ -5297,7 +5807,7 @@ mod tests {
     /// Services are the union of the legacy record and the native `service`
     /// items: a native item replaces the legacy entry of its id, a native
     /// tombstone hides it, a native-only item is added. A native item read at
-    /// another address, or a conflict copy, is not a service.
+    /// another address than its own derived id is not a service.
     #[test]
     fn services_fold_unions_legacy_and_native_items() {
         use sudp::primitives::StdPrimitives;
@@ -5324,6 +5834,26 @@ mod tests {
             &mut pv,
             ItemPayload::live(ItemNs::Service, "c", svc_entry("c", "c.dev")),
         );
+        // A `service` payload sealed at another id is not read as that service.
+        let elsewhere =
+            ItemCtx::for_item::<S>(keys.id_seed, vault, ItemNs::Service, "zz", 1).unwrap();
+        let ct = seal_item::<S>(
+            keys.content,
+            &elsewhere,
+            &ItemPayload::live(ItemNs::Service, "d", svc_entry("d", "d.dev")),
+        )
+        .unwrap();
+        pv.put_raw(elsewhere.item_id_b64(), 1, ct);
+        // Nor one that names another id (`a`) at `zz2`'s address.
+        let elsewhere =
+            ItemCtx::for_item::<S>(keys.id_seed, vault, ItemNs::Service, "zz2", 1).unwrap();
+        let ct = seal_item::<S>(
+            keys.content,
+            &elsewhere,
+            &ItemPayload::live(ItemNs::Service, "a", svc_entry("a", "evil.dev")),
+        )
+        .unwrap();
+        pv.put_raw(elsewhere.item_id_b64(), 1, ct);
         let services = pv.fold_view::<S>(keys, vault).unwrap().aux.services;
         assert_eq!(services.keys().collect::<Vec<_>>(), ["a", "c"]);
         assert_eq!(
@@ -5455,14 +5985,42 @@ mod tests {
         }
     }
 
-    /// LEGACY(services row) migration: every service the fold reads from the
-    /// legacy record without a native row becomes a native item (a native
-    /// item wins); the legacy record is left as it is on v1 and v2. Only what
-    /// the fold honors moves: an unsigned legacy record on a v2 keyset is not
-    /// read, so nothing of it is migrated. Idempotent.
+    /// Seal `payload` at `(ns, name)` version 1 and sign it as `signer`
+    /// (sidecar, record type `ty`): a row an owner's console wrote.
+    fn plant_signed(
+        pv: &mut PerItemVault,
+        keys: VaultKeys,
+        vault: &str,
+        signer: &crate::crypto::vault_key::UikRoot,
+        ty: &str,
+        payload: &ItemPayload,
+    ) -> String {
+        use base64::engine::general_purpose::STANDARD;
+        type S = sudp::primitives::StdPrimitives;
+        let ctx =
+            ItemCtx::for_item::<S>(keys.id_seed, vault, payload.ns, &payload.name, 1).unwrap();
+        let ct = seal_item::<S>(keys.content, &ctx, payload).unwrap();
+        let input = crate::identity::record_signature_input(
+            ty,
+            ctx.id_bytes(),
+            1,
+            vault,
+            &ct,
+            !payload.is_tombstone(),
+            &signer.user_id(),
+        );
+        let sig = STANDARD.encode(signer.signing().sign(&input));
+        pv.put_raw_signed(ctx.item_id_b64(), 1, ct, Some(sig), Some(signer.user_id()));
+        ctx.item_id_b64()
+    }
+
+    /// LEGACY(services row) migration, on a vault without a keyset: every
+    /// entry the fold reads from the legacy record without a native row is
+    /// copied to a native item (object form), then the legacy record is
+    /// tombstoned, in one pass; the same services are read. Idempotent. A
+    /// vault with a keyset is the owner's console's: nothing is written.
     #[test]
     fn legacy_services_migrate_to_native_items() {
-        use base64::engine::general_purpose::STANDARD;
         use sudp::primitives::StdPrimitives;
         type S = StdPrimitives;
         let k = [0x5au8; 32];
@@ -5470,12 +6028,12 @@ mod tests {
         let fold =
             |pv: &PerItemVault, vault: &str| pv.fold_view::<S>(keys, vault).unwrap().aux.services;
 
-        // v1: `a` already native (wins), `b` legacy-only (moves).
+        // v1: `a` already native (wins), `b` legacy-only and plain text (moves).
         let vault = "vault-v1";
         let mut v1 = v1_with_legacy_services(
             keys,
             vault,
-            serde_json::json!({ "a": svc_entry("a", "a.old"), "b": svc_entry("b", "b.dev") }),
+            serde_json::json!({ "a": svc_entry("a", "a.old"), "b": "[service]\nid = \"b\"\n" }),
         );
         v1.seal_and_bump::<S>(
             keys,
@@ -5485,91 +6043,64 @@ mod tests {
             &ItemPayload::live(ItemNs::Service, "a", svc_entry("a", "a.new")),
         )
         .unwrap();
-        let before = fold(&v1, vault);
+        let before: Vec<String> = fold(&v1, vault).keys().cloned().collect();
         let a_id = wire_id_for::<S>(keys.id_seed, ItemNs::Service, "a").unwrap();
         let a_version = v1.items[&a_id].version;
-        let legacy_id = wire_id_for::<S>(keys.id_seed, ItemNs::Aux, "services").unwrap();
-        let legacy_row = v1.items[&legacy_id].clone();
         let changed = v1.migrate_legacy_services::<S>(keys, vault).unwrap();
-        assert_eq!(changed.len(), 1, "b moved");
+        assert_eq!(changed.len(), 2, "b moved, the legacy record tombstoned");
         assert_eq!(v1.items[&a_id].version, a_version, "the native item wins");
-        let row = &v1.items[&legacy_id];
-        assert!(
-            row.version == legacy_row.version && row.ct == legacy_row.ct,
-            "the legacy record is left as it is"
-        );
-        assert_eq!(fold(&v1, vault), before, "the same services are read");
-        assert!(
-            v1.migrate_legacy_services::<S>(keys, vault)
+        assert!(v1
+            .open_item::<S>(keys, vault, ItemNs::Aux, "services")
+            .unwrap()
+            .unwrap()
+            .is_tombstone());
+        assert_eq!(
+            v1.open_item::<S>(keys, vault, ItemNs::Service, "b")
                 .unwrap()
-                .is_empty(),
-            "idempotent"
+                .unwrap()
+                .body,
+            serde_json::json!({ "service": "[service]\nid = \"b\"\n" })
         );
+        let after = fold(&v1, vault);
+        assert_eq!(after.keys().cloned().collect::<Vec<_>>(), before);
+        assert_eq!(
+            serde_json::to_value(&after["a"]).unwrap(),
+            svc_entry("a", "a.new")
+        );
+        assert!(v1
+            .migrate_legacy_services::<S>(keys, vault)
+            .unwrap()
+            .is_empty());
 
-        // v2: an owner-signed legacy record moves, and is left as it is.
-        let (vault, creator, _, creator_id, _, mut v2) = role_fixture_creator_cred();
-        let (legacy_id, _) = {
-            let ctx =
-                ItemCtx::for_item::<S>(keys.id_seed, vault, ItemNs::Aux, "services", 1).unwrap();
-            let ct = seal_item::<S>(
-                keys.content,
-                &ctx,
-                &ItemPayload::live(
-                    ItemNs::Aux,
-                    "services",
-                    serde_json::json!({ "x": svc_entry("x", "x.dev") }),
-                ),
-            )
-            .unwrap();
-            let input = crate::identity::record_signature_input(
+        // v2 with an owner-signed legacy record: read, but left to the console.
+        let (vault, creator, _, _, _, mut v2) = role_fixture_creator_cred();
+        plant_signed(
+            &mut v2,
+            keys,
+            vault,
+            &creator,
+            "services",
+            &ItemPayload::live(
+                ItemNs::Aux,
                 "services",
-                ctx.id_bytes(),
-                1,
-                vault,
-                &ct,
-                true,
-                &creator_id,
-            );
-            let sig = STANDARD.encode(creator.signing().sign(&input));
-            v2.put_raw_signed(
-                ctx.item_id_b64(),
-                1,
-                ct,
-                Some(sig),
-                Some(creator_id.clone()),
-            );
-            (ctx.item_id_b64(), ())
-        };
-        let legacy_row = v2.items[&legacy_id].clone();
-        assert!(fold(&v2, vault).contains_key("x"));
-        let changed = v2.migrate_legacy_services::<S>(keys, vault).unwrap();
-        assert_eq!(changed.len(), 1, "x moved, the legacy record untouched");
-        let row = &v2.items[&legacy_id];
-        assert!(
-            row.version == legacy_row.version
-                && row.ct == legacy_row.ct
-                && row.sig == legacy_row.sig
-        );
-        let x = &v2.items[&wire_id_for::<S>(keys.id_seed, ItemNs::Service, "x").unwrap()];
-        assert!(
-            x.sig.is_none(),
-            "a native service item is an unsigned data record"
+                serde_json::json!({ "x": svc_entry("x", "x.dev") }),
+            ),
         );
         assert!(fold(&v2, vault).contains_key("x"));
-        assert!(
-            v2.migrate_legacy_services::<S>(keys, vault)
-                .unwrap()
-                .is_empty(),
-            "idempotent"
-        );
-
-        // v2 with an UNSIGNED legacy record: the fold drops it, nothing moves.
+        let n = v2.items.len();
+        assert!(v2
+            .migrate_legacy_services::<S>(keys, vault)
+            .unwrap()
+            .is_empty());
+        assert_eq!(v2.items.len(), n, "nothing written with a keyset");
+        // An unsigned legacy record on a v2 keyset is not read at all.
         let (vault, _, _, _, _, mut v2u) = role_fixture_creator_cred();
-        v2u.seal_and_bump::<S>(
+        v2u.plant::<S>(
             keys,
             vault,
             ItemNs::Aux,
             "services",
+            1,
             &ItemPayload::live(
                 ItemNs::Aux,
                 "services",
@@ -5578,10 +6109,585 @@ mod tests {
         )
         .unwrap();
         assert!(fold(&v2u, vault).is_empty());
-        assert!(v2u
-            .migrate_legacy_services::<S>(keys, vault)
+    }
+
+    /// A policy with every part, stores, store order and retention, for the
+    /// owner-config tests.
+    fn full_aux() -> crate::storage::plaintext::VaultAux {
+        let mut aux = crate::storage::plaintext::VaultAux::initial();
+        aux.policy = Some(
+            serde_json::from_value(serde_json::json!({
+                "timeout": 120,
+                "default": { "read": "allow", "write": "ask", "ttl": 60 },
+                "categories": {
+                    "ai": { "read": "allow", "write": "allow" },
+                    "payments": { "write": "deny" }
+                },
+                "connections": {
+                    "gmail": { "default": { "write": "ask" } },
+                    "stripe-work": { "rules": { "pay": { "level": "deny" } } }
+                }
+            }))
+            .unwrap(),
+        );
+        aux.stores.insert(
+            "gcp-1".into(),
+            serde_json::from_value(serde_json::json!({
+                "kind": "gcp-sm", "category": "value", "project_id": "p1"
+            }))
+            .unwrap(),
+        );
+        aux.store_order = vec!["native-secrets".into(), "gcp-1".into()];
+        aux.audit_retention_days = Some(30);
+        aux
+    }
+
+    /// The owner-config fields as JSON, to compare two views.
+    fn config_json(aux: &crate::storage::plaintext::VaultAux) -> serde_json::Value {
+        serde_json::json!({
+            "policy": aux.policy,
+            "stores": aux.stores,
+            "store_order": aux.store_order,
+            "audit_retention_days": aux.audit_retention_days,
+        })
+    }
+
+    /// A store on a vault without a keyset.
+    fn v1_store() -> PerItemVault {
+        PerItemVault::build_initial(
+            b"c".to_vec(),
+            "x".into(),
+            "y".into(),
+            "Dev".into(),
+            vec![0u8; 32],
+            vec![0u8; 48],
+        )
+        .unwrap()
+    }
+
+    /// Owner-config is written at its native records, one per edit unit
+    /// (`policy:`, `policy:category:<tag>`, `policy:connection:<id>`,
+    /// `store:<id>`, `store_order:`, `audit_retention_days:`), and the fold
+    /// reassembles exactly the same fields. Nothing at `aux:*`. On a keyset
+    /// vault this process writes no owner-config.
+    #[test]
+    fn owner_config_round_trips_through_its_native_records() {
+        use crate::storage::plaintext::VaultPlaintextView;
+        use sudp::primitives::StdPrimitives;
+        type S = StdPrimitives;
+        let k = [0x61u8; 32];
+        let keys = VaultKeys::single(&k);
+        let vid = "vault-cfg";
+        let view = VaultPlaintextView {
+            aux: full_aux(),
+            native_secrets: Default::default(),
+            native_secret_notes: Default::default(),
+        };
+        // Seed (enroll) and reconcile both write the native records.
+        let mut seeded = v1_store();
+        seeded.seed_items_from_view::<S>(keys, vid, &view).unwrap();
+        let mut reconciled = v1_store();
+        reconciled
+            .reconcile_from_view::<S>(keys, vid, &view, ReconcileBase::OwnFold)
+            .unwrap();
+        for pv in [&seeded, &reconciled] {
+            let folded = pv.fold_view::<S>(keys, vid).unwrap();
+            assert_eq!(config_json(&folded.aux), config_json(&view.aux));
+            for (ns, name) in [
+                (ItemNs::Policy, ""),
+                (ItemNs::Policy, "category:ai"),
+                (ItemNs::Policy, "category:payments"),
+                (ItemNs::Policy, "connection:gmail"),
+                (ItemNs::Policy, "connection:stripe-work"),
+                (ItemNs::Store, "native-secrets"),
+                (ItemNs::Store, "gcp-1"),
+                (ItemNs::StoreOrder, ""),
+                (ItemNs::AuditRetentionDays, ""),
+            ] {
+                assert!(
+                    pv.open_item::<S>(keys, vid, ns, name).unwrap().is_some(),
+                    "{ns:?}:{name}"
+                );
+            }
+            for field in ["policy", "stores", "store_order", "audit_retention_days"] {
+                assert!(pv
+                    .open_item::<S>(keys, vid, ItemNs::Aux, field)
+                    .unwrap()
+                    .is_none());
+            }
+            assert_eq!(
+                pv.open_item::<S>(keys, vid, ItemNs::Policy, "")
+                    .unwrap()
+                    .unwrap()
+                    .body,
+                serde_json::json!({ "timeout": 120, "default": { "read": "allow", "write": "ask", "ttl": 60 } }),
+                "the policy's own fields only"
+            );
+        }
+        // An edit is one record: dropping a category tombstones only it.
+        let mut pv = reconciled;
+        let base = ViewBase::of(&pv.fold_view::<S>(keys, vid).unwrap()).unwrap();
+        let mut edited = pv.fold_view::<S>(keys, vid).unwrap();
+        edited
+            .aux
+            .policy
+            .as_mut()
             .unwrap()
-            .is_empty());
+            .categories
+            .remove("payments");
+        let r = pv
+            .reconcile_from_view::<S>(keys, vid, &edited, ReconcileBase::Since(&base))
+            .unwrap();
+        assert_eq!(
+            r.changed,
+            [wire_id_for::<S>(&k, ItemNs::Policy, "category:payments").unwrap()]
+        );
+        assert_eq!(
+            config_json(&pv.fold_view::<S>(keys, vid).unwrap().aux),
+            config_json(&edited.aux)
+        );
+
+        // A keyset vault: no owner-config is written by this process.
+        let (vault, _, _, _, _, mut v2) = role_fixture_creator_cred();
+        let r = v2
+            .reconcile_from_view::<S>(keys, vault, &view, ReconcileBase::OwnFold)
+            .unwrap();
+        assert!(r.changed.is_empty(), "{:?}", r.changed);
+        assert!(v2
+            .seal_and_bump::<S>(
+                keys,
+                vault,
+                ItemNs::Policy,
+                "",
+                &ItemPayload::live(ItemNs::Policy, "", serde_json::json!({})),
+            )
+            .is_err());
+    }
+
+    /// The fold reads owner-config per key: an honored native record (live or
+    /// tombstone) wins its key; every other key comes from the legacy row.
+    /// A half-finished migration (some native policy records written, the
+    /// legacy row still live) reads the full, correct policy. An unknown
+    /// `policy` name is ignored. On a keyset vault an unsigned native record
+    /// is not honored (its key falls back to the legacy row); an owner-signed
+    /// one wins.
+    #[test]
+    fn owner_config_reads_native_first_per_key() {
+        use crate::storage::plaintext::VaultAux;
+        use sudp::primitives::StdPrimitives;
+        type S = StdPrimitives;
+        let k = [0x62u8; 32];
+        let keys = VaultKeys::single(&k);
+        let vid = "vault-half";
+        let legacy = full_aux();
+        let legacy_policy = serde_json::to_value(&legacy.policy).unwrap();
+        let mut pv = v1_store();
+        pv.plant::<S>(
+            keys,
+            vid,
+            ItemNs::Aux,
+            "policy",
+            1,
+            &ItemPayload::live(ItemNs::Aux, "policy", legacy_policy.clone()),
+        )
+        .unwrap();
+        pv.plant::<S>(
+            keys,
+            vid,
+            ItemNs::Aux,
+            "stores",
+            1,
+            &ItemPayload::live(
+                ItemNs::Aux,
+                "stores",
+                serde_json::to_value(&legacy.stores).unwrap(),
+            ),
+        )
+        .unwrap();
+        pv.plant::<S>(
+            keys,
+            vid,
+            ItemNs::Aux,
+            "audit_retention_days",
+            1,
+            &ItemPayload::live(ItemNs::Aux, "audit_retention_days", serde_json::json!(30)),
+        )
+        .unwrap();
+        // The legacy rows alone read as before.
+        let only_legacy = pv.fold_view::<S>(keys, vid).unwrap().aux;
+        assert_eq!(
+            serde_json::to_value(&only_legacy.policy).unwrap(),
+            legacy_policy
+        );
+        assert_eq!(only_legacy.stores.len(), 2);
+
+        // Half-finished: the global part and one category written natively
+        // (with new values), one connection deleted natively; the rest only
+        // in the legacy row.
+        let put = |pv: &mut PerItemVault, ns: ItemNs, name: &str, p: ItemPayload| {
+            pv.seal_and_bump::<S>(keys, vid, ns, name, &p).unwrap();
+        };
+        put(
+            &mut pv,
+            ItemNs::Policy,
+            "",
+            ItemPayload::live(ItemNs::Policy, "", serde_json::json!({ "timeout": 300 })),
+        );
+        put(
+            &mut pv,
+            ItemNs::Policy,
+            "category:ai",
+            ItemPayload::live(
+                ItemNs::Policy,
+                "category:ai",
+                serde_json::json!({ "write": "ask" }),
+            ),
+        );
+        put(
+            &mut pv,
+            ItemNs::Policy,
+            "connection:gmail",
+            ItemPayload::tombstone(ItemNs::Policy, "connection:gmail"),
+        );
+        put(
+            &mut pv,
+            ItemNs::Store,
+            "gcp-1",
+            ItemPayload::tombstone(ItemNs::Store, "gcp-1"),
+        );
+        // An unknown policy name is ignored, whatever it holds.
+        pv.plant::<S>(
+            keys,
+            vid,
+            ItemNs::Policy,
+            "rules:pay",
+            1,
+            &ItemPayload::live(
+                ItemNs::Policy,
+                "rules:pay",
+                serde_json::json!({ "level": "allow" }),
+            ),
+        )
+        .unwrap();
+        let aux: VaultAux = pv.fold_view::<S>(keys, vid).unwrap().aux;
+        let mut want =
+            serde_json::from_value::<crate::core::policy::Policy>(legacy_policy.clone()).unwrap();
+        want.timeout = Some(300);
+        want.default = None; // the native global part has none: it wins
+        want.categories.insert(
+            "ai".into(),
+            serde_json::from_value(serde_json::json!({ "write": "ask" })).unwrap(),
+        );
+        want.connections.remove("gmail");
+        assert_eq!(
+            serde_json::to_value(&aux.policy).unwrap(),
+            serde_json::to_value(Some(&want)).unwrap(),
+            "native keys win, every other key from the legacy row"
+        );
+        assert!(aux
+            .policy
+            .as_ref()
+            .unwrap()
+            .categories
+            .contains_key("payments"));
+        assert!(aux
+            .policy
+            .as_ref()
+            .unwrap()
+            .connections
+            .contains_key("stripe-work"));
+        assert_eq!(
+            aux.stores.keys().collect::<Vec<_>>(),
+            ["native-secrets"],
+            "a native tombstone hides the legacy store"
+        );
+        assert_eq!(
+            aux.audit_retention_days,
+            Some(30),
+            "legacy, no native record"
+        );
+
+        // A keyset vault: an unsigned native record is not honored; an
+        // owner-signed one wins its key.
+        let (vault, creator, _, _, _, mut v2) = role_fixture_creator_cred();
+        plant_signed(
+            &mut v2,
+            keys,
+            vault,
+            &creator,
+            "policy",
+            &ItemPayload::live(ItemNs::Aux, "policy", legacy_policy.clone()),
+        );
+        v2.plant::<S>(
+            keys,
+            vault,
+            ItemNs::Policy,
+            "",
+            1,
+            &ItemPayload::live(ItemNs::Policy, "", serde_json::json!({ "timeout": 1 })),
+        )
+        .unwrap();
+        let read = v2.fold_view::<S>(keys, vault).unwrap().aux.policy.unwrap();
+        assert_eq!(read.timeout, Some(120), "unsigned native: not honored");
+        plant_signed(
+            &mut v2,
+            keys,
+            vault,
+            &creator,
+            "policy",
+            &ItemPayload::live(
+                ItemNs::Policy,
+                "category:ai",
+                serde_json::json!({ "write": "deny" }),
+            ),
+        );
+        plant_signed(
+            &mut v2,
+            keys,
+            vault,
+            &creator,
+            "policy",
+            &ItemPayload::tombstone(ItemNs::Policy, "connection:gmail"),
+        );
+        let read = v2.fold_view::<S>(keys, vault).unwrap().aux.policy.unwrap();
+        assert_eq!(
+            serde_json::to_value(&read.categories["ai"]).unwrap(),
+            serde_json::json!({ "write": "deny" }),
+            "owner-signed native wins its key"
+        );
+        assert!(
+            !read.connections.contains_key("gmail"),
+            "a signed tombstone wins"
+        );
+        assert!(read.categories.contains_key("payments"));
+    }
+
+    /// Defaults and first writes: a kind with no native record and no legacy
+    /// row reads its default (the native-secrets store); its first write
+    /// writes the whole kind, so adding a store keeps the default one; once a
+    /// native record of the kind exists there is no implicit default.
+    /// Removing a key that only the legacy row holds writes a native
+    /// tombstone, so the legacy entry does not come back.
+    #[test]
+    fn owner_config_first_write_and_legacy_only_removal() {
+        use crate::storage::plaintext::NATIVE_SECRETS_ID;
+        use sudp::primitives::StdPrimitives;
+        type S = StdPrimitives;
+        let k = [0x64u8; 32];
+        let keys = VaultKeys::single(&k);
+        let vid = "vault-first";
+        let gcp: crate::storage::plaintext::Store =
+            serde_json::from_value(serde_json::json!({ "kind": "gcp-sm", "category": "value" }))
+                .unwrap();
+
+        // No owner-config record at all: the defaults.
+        let mut pv = v1_store();
+        let view = pv.fold_view::<S>(keys, vid).unwrap();
+        assert_eq!(
+            view.aux.stores.keys().collect::<Vec<_>>(),
+            [NATIVE_SECRETS_ID]
+        );
+        // Add a store: the whole kind is written, the default store stays.
+        let base = ViewBase::of(&view).unwrap();
+        let mut added = pv.fold_view::<S>(keys, vid).unwrap();
+        added.aux.stores.insert("gcp-1".into(), gcp.clone());
+        pv.reconcile_from_view::<S>(keys, vid, &added, ReconcileBase::Since(&base))
+            .unwrap();
+        assert!(pv
+            .open_item::<S>(keys, vid, ItemNs::Store, NATIVE_SECRETS_ID)
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            pv.fold_view::<S>(keys, vid)
+                .unwrap()
+                .aux
+                .stores
+                .keys()
+                .collect::<Vec<_>>(),
+            ["gcp-1", NATIVE_SECRETS_ID]
+        );
+
+        // A native store record alone: no implicit default.
+        let mut only = v1_store();
+        only.seal_and_bump::<S>(
+            keys,
+            vid,
+            ItemNs::Store,
+            "gcp-1",
+            &ItemPayload::live(ItemNs::Store, "gcp-1", serde_json::to_value(&gcp).unwrap()),
+        )
+        .unwrap();
+        assert_eq!(
+            only.fold_view::<S>(keys, vid)
+                .unwrap()
+                .aux
+                .stores
+                .keys()
+                .collect::<Vec<_>>(),
+            ["gcp-1"]
+        );
+
+        // Remove a store only the legacy row holds: a native tombstone.
+        let mut legacy = v1_store();
+        let mut stores = crate::storage::plaintext::VaultAux::initial().stores;
+        stores.insert("gcp-1".into(), gcp);
+        legacy
+            .plant::<S>(
+                keys,
+                vid,
+                ItemNs::Aux,
+                "stores",
+                1,
+                &ItemPayload::live(
+                    ItemNs::Aux,
+                    "stores",
+                    serde_json::to_value(&stores).unwrap(),
+                ),
+            )
+            .unwrap();
+        let view = legacy.fold_view::<S>(keys, vid).unwrap();
+        let base = ViewBase::of(&view).unwrap();
+        let mut removed = legacy.fold_view::<S>(keys, vid).unwrap();
+        removed.aux.stores.remove("gcp-1");
+        legacy
+            .reconcile_from_view::<S>(keys, vid, &removed, ReconcileBase::Since(&base))
+            .unwrap();
+        assert!(legacy
+            .open_item::<S>(keys, vid, ItemNs::Store, "gcp-1")
+            .unwrap()
+            .unwrap()
+            .is_tombstone());
+        assert_eq!(
+            legacy
+                .fold_view::<S>(keys, vid)
+                .unwrap()
+                .aux
+                .stores
+                .keys()
+                .collect::<Vec<_>>(),
+            [NATIVE_SECRETS_ID],
+            "the legacy entry does not come back; the other one still reads"
+        );
+    }
+
+    /// LEGACY(aux addressing) migration on a vault without a keyset: every
+    /// legacy owner-config row the fold reads is split into its native records
+    /// (a key that already has a native record keeps it) and tombstoned, in
+    /// one pass; the fold reads the same before and after; `aux:secret_order`
+    /// (the console's) and an unreadable row are left as they are.
+    /// Idempotent. A keyset vault: nothing is written.
+    #[test]
+    fn migrate_addressing_splits_then_tombstones_on_v1_only() {
+        use sudp::primitives::StdPrimitives;
+        type S = StdPrimitives;
+        let k = [0x63u8; 32];
+        let keys = VaultKeys::single(&k);
+        let vid = "vault-mig";
+        let legacy = full_aux();
+        let mut pv = v1_store();
+        for (field, body) in [
+            ("policy", serde_json::to_value(&legacy.policy).unwrap()),
+            ("stores", serde_json::to_value(&legacy.stores).unwrap()),
+            (
+                "store_order",
+                serde_json::to_value(&legacy.store_order).unwrap(),
+            ),
+            ("audit_retention_days", serde_json::json!(30)),
+            ("secret_order", serde_json::json!(["A", "B"])),
+        ] {
+            pv.plant::<S>(
+                keys,
+                vid,
+                ItemNs::Aux,
+                field,
+                1,
+                &ItemPayload::live(ItemNs::Aux, field, body),
+            )
+            .unwrap();
+        }
+        // Half-finished already: one native category with another value.
+        pv.seal_and_bump::<S>(
+            keys,
+            vid,
+            ItemNs::Policy,
+            "category:ai",
+            &ItemPayload::live(
+                ItemNs::Policy,
+                "category:ai",
+                serde_json::json!({ "write": "deny" }),
+            ),
+        )
+        .unwrap();
+        let ai_id = wire_id_for::<S>(&k, ItemNs::Policy, "category:ai").unwrap();
+        let ai_version = pv.items[&ai_id].version;
+        let before = config_json(&pv.fold_view::<S>(keys, vid).unwrap().aux);
+        let secret_order_id = wire_id_for::<S>(&k, ItemNs::Aux, "secret_order").unwrap();
+        let secret_order_row = pv.items[&secret_order_id].clone();
+
+        let changed = pv.migrate_addressing::<S>(keys, vid).unwrap();
+        // policy: root + payments + 2 connections (ai kept); stores: 2;
+        // store_order; retention; + 4 legacy tombstones.
+        assert_eq!(changed.len(), 4 + 2 + 1 + 1 + 4, "{changed:?}");
+        assert_eq!(
+            pv.items[&ai_id].version, ai_version,
+            "a native key keeps its record"
+        );
+        for field in ["policy", "stores", "store_order", "audit_retention_days"] {
+            assert!(
+                pv.open_item::<S>(keys, vid, ItemNs::Aux, field)
+                    .unwrap()
+                    .unwrap()
+                    .is_tombstone(),
+                "aux:{field} tombstoned"
+            );
+        }
+        let row = &pv.items[&secret_order_id];
+        assert!(row.version == secret_order_row.version && row.ct == secret_order_row.ct);
+        assert_eq!(
+            config_json(&pv.fold_view::<S>(keys, vid).unwrap().aux),
+            before,
+            "the same configuration is read"
+        );
+        assert!(
+            pv.migrate_addressing::<S>(keys, vid).unwrap().is_empty(),
+            "idempotent"
+        );
+
+        // An unparseable legacy row is left as it is.
+        let mut bad = v1_store();
+        bad.plant::<S>(
+            keys,
+            vid,
+            ItemNs::Aux,
+            "store_order",
+            1,
+            &ItemPayload::live(
+                ItemNs::Aux,
+                "store_order",
+                serde_json::json!({ "not": "a list" }),
+            ),
+        )
+        .unwrap();
+        assert!(bad.migrate_addressing::<S>(keys, vid).unwrap().is_empty());
+
+        // A keyset vault: the owner's console migrates; nothing is written here.
+        let (vault, creator, _, _, _, mut v2) = role_fixture_creator_cred();
+        plant_signed(
+            &mut v2,
+            keys,
+            vault,
+            &creator,
+            "policy",
+            &ItemPayload::live(
+                ItemNs::Aux,
+                "policy",
+                serde_json::to_value(&legacy.policy).unwrap(),
+            ),
+        );
+        let n = v2.items.len();
+        assert!(v2.migrate_addressing::<S>(keys, vault).unwrap().is_empty());
+        assert_eq!(v2.items.len(), n);
+        assert!(v2.fold_view::<S>(keys, vault).unwrap().aux.policy.is_some());
     }
 
     /// A conflict copy outside the keep-both namespaces is never folded: a
@@ -5616,6 +6722,11 @@ mod tests {
                 serde_json::json!({ "timeout": 1 }),
             ),
             ItemPayload::live(
+                ItemNs::Store,
+                "gcp-1".to_string(),
+                serde_json::json!({ "kind": "gcp-sm", "category": "value" }),
+            ),
+            ItemPayload::live(
                 ItemNs::Connecting,
                 "gmail".to_string(),
                 serde_json::json!({ "service": "gmail" }),
@@ -5633,12 +6744,14 @@ mod tests {
                     tombstone: false,
                     sig: None,
                     signer: None,
+                    base: None,
                 },
             );
         }
         let view = pv.fold_view::<S>(keys, vault).unwrap();
         assert!(view.aux.services.is_empty());
         assert!(view.aux.policy.is_none());
+        assert!(!view.aux.stores.contains_key("gcp-1 (conflict copy)"));
         assert!(view.aux.connecting.is_empty());
         assert!(view.native_secrets.contains_key(&conflict_copy_name("A")));
     }

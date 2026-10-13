@@ -600,10 +600,6 @@ pub struct VaultPlaintextView {
     /// re-seal its value, so a daemon-side rewrite (an OAuth token refresh,
     /// `sc set`) never drops them.
     pub native_secret_notes: BTreeMap<String, String>,
-    /// True when the fold saw any live legacy `aux:*` item — the trigger for
-    /// the one-shot addressing migration (team §8.3). Always false for views
-    /// opened from a whole-blob `ProtectedState` (no addressing there).
-    pub legacy_addressing: bool,
 }
 
 impl VaultPlaintextView {
@@ -625,7 +621,6 @@ impl VaultPlaintextView {
             aux,
             native_secrets,
             native_secret_notes: BTreeMap::new(),
-            legacy_addressing: false,
         })
     }
 

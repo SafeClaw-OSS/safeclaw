@@ -359,11 +359,28 @@ async fn deliver_team_marks(state: &Arc<AppState>, vault_id: &str) {
     }
 }
 
+/// Pull `vault_id`'s item rows now, serving what was adopted. A daemon with
+/// no cloud configured has nothing to pull (local-only): `Ok`. A paired one
+/// that cannot pull: `Err`.
+pub(crate) async fn pull_items_now(state: &Arc<AppState>, vault_id: &str) -> Result<(), String> {
+    let Ok(cfg) = active::load() else {
+        return Ok(());
+    };
+    let Some(cloud) = cfg.cloud_backend.as_deref().filter(|s| !s.is_empty()) else {
+        return Ok(());
+    };
+    let dk = device_key().ok_or("this daemon is not paired")?;
+    if pull_items(&state.config.state_dir, cloud, vault_id, &dk).await? > 0 {
+        refresh_after_item_pull(state, vault_id);
+    }
+    Ok(())
+}
+
 /// After a per-item pull adopted new rows, refresh the in-memory cache for an
 /// UNLOCKED vault by folding the per-item store with the retained `K` — no
 /// passkey. Locked vault (no K) → no-op (the next unlock folds the new rows). A
 /// rotated `K` that can't unseal → log + leave the cache (graceful).
-fn refresh_after_item_pull(state: &Arc<AppState>, vault: &str) {
+pub(crate) fn refresh_after_item_pull(state: &Arc<AppState>, vault: &str) {
     let Some(k) = state.cloned_state_key(vault) else {
         return;
     };
@@ -2477,9 +2494,9 @@ async fn pull_and_process(
 //
 // PULL adopts server truth (§5): a newer version replaces the local row, a
 // tombstone is stored (fold_view drops it), the cursor advances to max(seq).
-// PUSH is per-item CAS (§4); 409 → reconcile under K (never last-writer-wins):
-// secret/connection keep both (ours → conflict copy), other ns re-apply ours on
-// the fresh version, a delete wins over an edit. See `push_items_best_effort`.
+// PUSH is per-item CAS (§4); 409 → reconcile under K (never last-writer-wins),
+// per the record's conflict policy in the rule table (`item::ITEM_RULES`):
+// keep_both, take_writer, owner_config. See `push_items_best_effort`.
 //
 // Backing HTTP is only exercised once the backend `/items` endpoints are live;
 // until then these are wired but a 404 leaves the local per-item store as the
@@ -2769,6 +2786,9 @@ struct DirtyRow {
     synced_version: u64,
     ct: Vec<u8>,
     tombstone: bool,
+    /// The digest of the body our change was made from, when known
+    /// ([`pv_store::StoredItem::base`]).
+    base: Option<String>,
 }
 
 /// `base_version` to push a dirty row with: the last version KNOWN to be on the
@@ -2794,47 +2814,58 @@ enum ConflictAction {
     /// Re-apply ours on top of theirs (CAS on their version), or re-create it
     /// when their row is gone.
     Reapply,
+    /// Owner-config: never overwritten, never re-sealed. Theirs stays, ours
+    /// is set aside locally ([`set_aside_fixes`]) and the user is told it
+    /// changed elsewhere meanwhile.
+    SetAside,
 }
 
-/// Namespaces whose same-item conflicts keep both: user-visible items a person
-/// can compare and resolve. Everything else (singletons, `connecting`, legacy
-/// aux …) re-applies ours, where a "(conflict copy)" row would be invisible to
-/// the fold and undeletable. Console parity: `KEEP_BOTH_NS` in
-/// `lib/vault-grant.ts`.
-fn is_keep_both_ns(ns: item_layer::ItemNs) -> bool {
-    ns.keeps_both_on_conflict()
-}
-
-/// The §4 decision for OUR dirty row vs THEIR current row (`None` = gone).
-/// Delete wins over a concurrent edit (our tombstone is re-applied); an equal
-/// live body is a no-op adopt; otherwise keep-both for [`is_keep_both_ns`] and
-/// re-apply for the rest (incl. their tombstone vs our edit in a keep-both ns:
-/// the copy keeps our value, their delete stands, as in the console).
+/// The §4 decision for OUR dirty row vs THEIR current row (`None` = gone),
+/// per the record's conflict policy in the rule table
+/// ([`item_layer::conflict_policy`]; the console applies the same):
+///   - an equal live body (normalized) is a no-op adopt, both deleted too;
+///   - `keep_both`: theirs stays, ours becomes the conflict copy (their
+///     delete vs our edit: the delete stands, ours is the copy); their body
+///     equal to our `base` (normalized; e.g. they only copied it during a
+///     migration) is no conflict: ours is re-applied. Our delete vs their
+///     edit: the delete is re-applied;
+///   - `take_writer`: ours is re-applied (a delete too);
+///   - `owner_config`: ours is set aside, never written over theirs.
+///
+/// Their row gone → ours is re-created.
 fn decide_conflict(
     ours: &item_layer::ItemPayload,
     theirs: Option<&item_layer::ItemPayload>,
+    base: Option<&str>,
 ) -> ConflictAction {
+    use item_layer::Conflict;
     let Some(theirs) = theirs else {
         return ConflictAction::Reapply;
     };
+    let policy = item_layer::conflict_policy(ours.ns, &ours.name);
     if ours.is_tombstone() {
         return if theirs.is_tombstone() {
             ConflictAction::Adopt
+        } else if policy == Conflict::OwnerConfig {
+            ConflictAction::SetAside
         } else {
             ConflictAction::Reapply
         };
     }
-    if !theirs.is_tombstone()
-        && theirs.ns == ours.ns
-        && theirs.name == ours.name
-        && theirs.body == ours.body
+    let their_digest = (!theirs.is_tombstone() && theirs.ns == ours.ns && theirs.name == ours.name)
+        .then(|| item_layer::body_digest_hex(theirs.ns, &theirs.body));
+    if their_digest.is_some()
+        && their_digest == Some(item_layer::body_digest_hex(ours.ns, &ours.body))
     {
         return ConflictAction::Adopt;
     }
-    if is_keep_both_ns(ours.ns) {
-        ConflictAction::KeepBoth
-    } else {
-        ConflictAction::Reapply
+    match policy {
+        Conflict::KeepBoth if their_digest.is_some() && their_digest.as_deref() == base => {
+            ConflictAction::Reapply
+        }
+        Conflict::KeepBoth => ConflictAction::KeepBoth,
+        Conflict::TakeWriter => ConflictAction::Reapply,
+        Conflict::OwnerConfig => ConflictAction::SetAside,
     }
 }
 
@@ -2872,6 +2903,7 @@ fn clean_row(
         tombstone,
         sig,
         signer,
+        base: None,
     }
 }
 
@@ -3049,7 +3081,7 @@ fn rejection_fixes(
     type S = sudp::primitives::StdPrimitives;
     let (r, ct, p) = theirs?;
     let mut fixes = Vec::new();
-    if decide_conflict(ours, Some(&p)) == ConflictAction::KeepBoth {
+    if decide_conflict(ours, Some(&p), ours_row.base.as_deref()) == ConflictAction::KeepBoth {
         match item_layer::seal_conflict_copy::<S>(keys, vault_id, ours, r.version) {
             Ok((copy_id, copy_ct)) => fixes.push(LocalFix::InsertIfAbsent {
                 id: copy_id,
@@ -3061,6 +3093,7 @@ fn rejection_fixes(
                     tombstone: false,
                     sig: None,
                     signer: None,
+                    base: None,
                 },
             }),
             Err(e) => {
@@ -3080,15 +3113,10 @@ fn is_signed_row_refusal(status: u16, error: &str) -> bool {
     status == 403 && error == "record_write_forbidden"
 }
 
-/// The record a set-aside change concerns, as the user knows it: the config
-/// name (`services`, `policy`, ...) or `<namespace> <name>`.
+/// The record a set-aside change concerns, as the user knows it
+/// ([`item_layer::record_label`]).
 fn conflict_record(p: &item_layer::ItemPayload) -> String {
-    use item_layer::ItemNs;
-    match p.ns {
-        ItemNs::Aux => p.name.clone(),
-        ns if ns.is_singleton() => ns.as_str().to_string(),
-        ns => format!("{} {}", ns.as_str(), p.name),
-    }
+    item_layer::record_label(p)
 }
 
 /// Local fixes for OUR dirty row when THEIR row carries a signature this
@@ -3110,7 +3138,8 @@ fn set_aside_fixes(
     type S = sudp::primitives::StdPrimitives;
     let (r, ct, p) = theirs?;
     let mut fixes = Vec::new();
-    let same = !p.is_tombstone() && p.body == ours.body;
+    let same = !p.is_tombstone()
+        && item_layer::body_digest(p.ns, &p.body) == item_layer::body_digest(ours.ns, &ours.body);
     if !ours.is_tombstone() && !same {
         match item_layer::seal_conflict_copy::<S>(keys, vault_id, ours, r.version) {
             Ok((copy_id, copy_ct)) => fixes.push(LocalFix::InsertIfAbsent {
@@ -3118,7 +3147,9 @@ fn set_aside_fixes(
                 row: pv_store::StoredItem {
                     version: item_layer::CONFLICT_COPY_VERSION,
                     ct: copy_ct,
-                    synced_version: if ours.ns.keeps_both_on_conflict() {
+                    synced_version: if item_layer::conflict_policy(ours.ns, &ours.name)
+                        == item_layer::Conflict::KeepBoth
+                    {
                         0
                     } else {
                         item_layer::CONFLICT_COPY_VERSION
@@ -3126,6 +3157,7 @@ fn set_aside_fixes(
                     tombstone: false,
                     sig: None,
                     signer: None,
+                    base: None,
                 },
             }),
             Err(e) => {
@@ -3206,6 +3238,8 @@ fn warn_rejected_once(vault_id: &str, item: &str, version: u64, status: u16, err
 /// Reconcile one 409 on OUR dirty row (§4) under `K` (`keys`): open ours, read
 /// THEIR current row from the full snapshot, then per [`decide_conflict`]:
 ///   - `Adopt`    → take theirs locally;
+///   - `SetAside` → owner-config: theirs stays, ours is set aside
+///     ([`set_aside_fixes`]) and reported; nothing is written;
 ///   - `KeepBoth` → write ours as the conflict copy (CREATE at version 1 under
 ///     `conflict_copy_id(id_seed, ns, name, their_version)`; a 409 on it means
 ///     an earlier attempt already wrote it), then take theirs locally;
@@ -3248,7 +3282,11 @@ async fn resolve_conflict(
         Err(r) => return r,
     };
 
-    match decide_conflict(&ours, theirs.as_ref().map(|(_, _, p)| p)) {
+    match decide_conflict(
+        &ours,
+        theirs.as_ref().map(|(_, _, p)| p),
+        ours_row.base.as_deref(),
+    ) {
         ConflictAction::Adopt => {
             let Some((r, ct, p)) = theirs else {
                 return Resolved::LeaveDirty;
@@ -3340,6 +3378,10 @@ async fn resolve_conflict(
             fixes.push(adopt_fix(ours_row, &r, ct, p.is_tombstone()));
             Resolved::Fixed(fixes)
         }
+        ConflictAction::SetAside => {
+            tracing::info!(vault = %vault_id, item = %ours_row.id, "per-item 409: owner-config changed elsewhere; ours set aside");
+            set_aside(keys, vault_id, ours_row, &ours, theirs)
+        }
         ConflictAction::Reapply => {
             if theirs.as_ref().is_some_and(|(r, _, _)| r.sig.is_some()) {
                 tracing::info!(vault = %vault_id, item = %ours_row.id, "per-item 409: their row is signed; ours set aside");
@@ -3419,15 +3461,19 @@ async fn resolve_conflict(
 /// known to be on the cloud ([`push_base_version`]). Writes go before deletes.
 ///
 /// A 409 (someone else wrote the same item) is reconciled inline by
-/// [`resolve_conflict`], never last-writer-wins:
-///   - `secret` / `connection`: if theirs equals ours, adopt it; otherwise KEEP
-///     BOTH: theirs stays at the canonical id, ours is written as a conflict
-///     copy (`"<name> (conflict copy)"`, version 1, id
-///     `conflict_copy_id(id_seed, ns, name, their_version)`, byte-identical to
-///     the console's `putConflictCopy`), and the local store converges to
-///     theirs + the copy;
-///   - every other namespace: re-apply ours on their fresh version;
-///   - our tombstone vs their edit: delete wins (our tombstone is re-applied).
+/// [`resolve_conflict`], never last-writer-wins, per the record's conflict
+/// policy in the rule table ([`decide_conflict`]):
+///   - an equal body (normalized): adopt theirs;
+///   - keep_both (`secret`, `connection`, `service`): theirs stays at the
+///     canonical id, ours is written as a conflict copy (`"<name> (conflict
+///     copy)"`, version 1, id `conflict_copy_id(id_seed, ns, name,
+///     their_version)`, byte-identical to the console's `putConflictCopy`),
+///     and the local store converges to theirs + the copy; their body equal
+///     to the base ours was made from is no conflict (ours is re-applied);
+///   - take_writer (`connecting`): re-apply ours on their fresh version;
+///   - owner_config: ours is set aside, never written over theirs;
+///   - our tombstone vs their edit: delete wins (our tombstone is re-applied),
+///     except over owner-config.
 ///
 /// A TERMINAL rejection (400/402/403/413/422) is reconciled by
 /// [`resolve_rejection`]: theirs is taken at the canonical id and ours, where it
@@ -3472,6 +3518,7 @@ pub async fn push_items_best_effort(state: &Arc<AppState>, vault_id: &str) {
             synced_version: s.synced_version,
             ct: s.ct.clone(),
             tombstone: s.tombstone,
+            base: s.base.clone(),
         })
         .collect();
     drop(pv);
@@ -4835,6 +4882,7 @@ mod peritem_tests {
             synced_version: s.synced_version,
             ct: s.ct.clone(),
             tombstone: false,
+            base: None,
         };
         let ours = il::open_wire_item::<StdPrimitives>(keys, vid, &id, 3, &s.ct).unwrap();
         // Theirs: v5 on the cloud with a different value.
@@ -4895,140 +4943,205 @@ mod peritem_tests {
         assert_eq!(fixes.len(), 1, "adopt only");
     }
 
-    /// A signed row of theirs is never replaced by an unsigned version of
-    /// ours (this process signs nothing): on a 409 over it, and on the
-    /// server's `record_write_forbidden`, ours is set aside. Theirs stays
-    /// canonical with its signature, nothing is pushed (the cloud URL here is
-    /// unreachable, so a push attempt would leave the row dirty instead), and
-    /// ours is kept as a LOCAL conflict copy that is never pushed or folded.
+    /// Ours is set aside, never written over theirs: an owner-config record
+    /// on any conflict (also unsigned, on a vault without a keyset), and any
+    /// record whose row of theirs is signed (this process signs nothing), on
+    /// a 409 over it and on the server's `record_write_forbidden`. Theirs
+    /// stays canonical with its signature, nothing is pushed (the cloud URL
+    /// here is unreachable, so a push attempt would leave the row dirty
+    /// instead), and ours is kept as a LOCAL conflict copy that is never
+    /// pushed or folded; the record is reported.
     #[test]
-    fn signed_row_is_never_replaced_ours_is_set_aside() {
+    fn owner_config_and_signed_rows_are_never_replaced_ours_is_set_aside() {
         use crate::storage::item::{self as il, ItemPayload};
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         use base64::Engine;
         let k = [0x42u8; 32];
         let vid = "v";
         let keys = VaultKeys::single(&k);
-        let mut pv = empty_pv();
-        // Ours: a local edit of the services record at v3 (cloud last confirmed v2).
-        let ours = ItemPayload::live(
-            ItemNs::Services,
-            "",
-            serde_json::json!({ "acme": { "service": "ours" } }),
-        );
-        let id = pv
-            .seal_and_upsert::<StdPrimitives>(keys, vid, ItemNs::Services, "", 3, &ours)
+        let connecting = |code: &str| serde_json::json!({ "service": "gmail", "oauth2": { "code": code, "code_verifier": "v" } });
+        let cases = [
+            // Owner-config, unsigned (no keyset): set aside by its policy.
+            (
+                ItemNs::Policy,
+                "",
+                serde_json::json!({ "timeout": 1 }),
+                serde_json::json!({ "timeout": 2 }),
+                false,
+                "policy",
+            ),
+            // A take-writer record whose row of theirs is signed.
+            (
+                ItemNs::Connecting,
+                "gmail",
+                connecting("ours"),
+                connecting("theirs"),
+                true,
+                "connecting gmail",
+            ),
+        ];
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
             .unwrap();
-        pv.items.get_mut(&id).unwrap().synced_version = 2;
+        let cloud = "http://127.0.0.1:9";
+        for (ns, name, ours_body, theirs_body, signed, want_record) in cases {
+            let mut pv = empty_pv();
+            // Ours: a local edit at v3 (cloud last confirmed v2).
+            let ours = ItemPayload::live(ns, name, ours_body);
+            let id = pv
+                .seal_and_upsert::<StdPrimitives>(keys, vid, ns, name, 3, &ours)
+                .unwrap();
+            pv.items.get_mut(&id).unwrap().synced_version = 2;
+            let dirty = DirtyRow {
+                id: id.clone(),
+                version: 3,
+                synced_version: 2,
+                ct: pv.get_item(&id).unwrap().ct.clone(),
+                tombstone: false,
+                base: None,
+            };
+            // Theirs: v5.
+            let theirs = ItemPayload::live(ns, name, theirs_body.clone());
+            let their_ct = il::seal_wire_item::<StdPrimitives>(keys, vid, &id, 5, &theirs).unwrap();
+            let their_row = ItemRow {
+                item_id: id.clone(),
+                version: 5,
+                seq: 9,
+                ct: URL_SAFE_NO_PAD.encode(&their_ct),
+                sig: signed.then(|| "c2ln".into()),
+                signer: signed.then(|| "us_owner".into()),
+            };
+            let fetched =
+                || TheirRows::Fetched([(id.clone(), their_row.clone())].into_iter().collect());
+            let on_409 = rt.block_on(resolve_conflict(
+                cloud,
+                vid,
+                "dk",
+                keys,
+                &mut fetched(),
+                &dirty,
+                5,
+            ));
+            let on_403 = rt.block_on(resolve_rejection(
+                cloud,
+                vid,
+                "dk",
+                keys,
+                &mut fetched(),
+                &dirty,
+                true,
+            ));
+            for resolved in [on_409, on_403] {
+                let Resolved::SetAside { fixes, record } = resolved else {
+                    panic!("{want_record}: ours must be set aside, with nothing pushed");
+                };
+                assert_eq!(record, want_record);
+                let mut pv = pv.clone();
+                let (changed, content) = apply_local_fixes(&mut pv, fixes);
+                assert!(changed && content);
+                // Theirs is canonical, clean, its signature kept.
+                let canon = pv.get_item(&id).unwrap();
+                assert_eq!(
+                    (canon.version, canon.synced_version, canon.sig.clone()),
+                    (5, 5, signed.then(|| "c2ln".to_string()))
+                );
+                assert_eq!(canon.ct, their_ct);
+                // Ours is kept as a local copy: clean (never pushed), never folded.
+                let (copy_id, _) =
+                    il::seal_conflict_copy::<StdPrimitives>(keys, vid, &ours, 5).unwrap();
+                let copy = pv.get_item(&copy_id).expect("ours kept as a conflict copy");
+                assert_eq!(copy.version, copy.synced_version, "never pushed");
+                let opened = il::open_wire_item::<StdPrimitives>(
+                    keys,
+                    vid,
+                    &copy_id,
+                    copy.version,
+                    &copy.ct,
+                )
+                .unwrap();
+                assert_eq!(opened.body, ours.body);
+                let view = pv.fold_view::<StdPrimitives>(keys, vid).unwrap();
+                match ns {
+                    ItemNs::Policy => assert_eq!(view.aux.policy.unwrap().timeout, Some(2)),
+                    _ => assert_eq!(
+                        serde_json::to_value(&view.aux.connecting[name]).unwrap()["oauth2"]["code"],
+                        "theirs"
+                    ),
+                }
+                assert_eq!(
+                    view.aux.connecting.len(),
+                    usize::from(ns == ItemNs::Connecting)
+                );
+            }
+            // A delete keeps no copy.
+            let their = || Some((their_row.clone(), their_ct.clone(), theirs.clone()));
+            let tomb = ItemPayload::tombstone(ns, name);
+            assert_eq!(
+                set_aside_fixes(keys, vid, &dirty, &tomb, their())
+                    .unwrap()
+                    .len(),
+                1,
+                "adopt only"
+            );
+            assert!(set_aside_fixes(keys, vid, &dirty, &ours, None).is_none());
+        }
+
+        // In a keep-both namespace the set-aside copy is dirty (pushed as a
+        // create, like the console's copy row).
+        let mut pv = empty_pv();
+        let secret = ItemPayload::secret_live("A", "ours");
+        let id = pv
+            .seal_and_upsert::<StdPrimitives>(keys, vid, ItemNs::Secret, "A", 3, &secret)
+            .unwrap();
         let dirty = DirtyRow {
             id: id.clone(),
             version: 3,
             synced_version: 2,
             ct: pv.get_item(&id).unwrap().ct.clone(),
             tombstone: false,
+            base: None,
         };
-        // Theirs: v5, signed by an owner.
-        let theirs = ItemPayload::live(
-            ItemNs::Services,
-            "",
-            serde_json::json!({ "acme": { "service": "theirs" } }),
-        );
+        let theirs = ItemPayload::secret_live("A", "theirs");
         let their_ct = il::seal_wire_item::<StdPrimitives>(keys, vid, &id, 5, &theirs).unwrap();
         let their_row = ItemRow {
             item_id: id.clone(),
             version: 5,
             seq: 9,
             ct: URL_SAFE_NO_PAD.encode(&their_ct),
-            sig: Some("c2ln".into()),
-            signer: Some("us_owner".into()),
+            sig: None,
+            signer: None,
         };
-        let fetched =
-            || TheirRows::Fetched([(id.clone(), their_row.clone())].into_iter().collect());
-
-        assert!(is_signed_row_refusal(403, "record_write_forbidden"));
-        assert!(!is_signed_row_refusal(403, "plan_frozen"));
-        assert!(!is_signed_row_refusal(409, "record_write_forbidden"));
-
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let cloud = "http://127.0.0.1:9";
-        let on_409 = rt.block_on(resolve_conflict(
-            cloud,
-            vid,
-            "dk",
+        let fixes = set_aside_fixes(
             keys,
-            &mut fetched(),
-            &dirty,
-            5,
-        ));
-        let on_403 = rt.block_on(resolve_rejection(
-            cloud,
             vid,
-            "dk",
-            keys,
-            &mut fetched(),
             &dirty,
-            true,
-        ));
-        for resolved in [on_409, on_403] {
-            let Resolved::SetAside { fixes, record } = resolved else {
-                panic!("ours must be set aside, with nothing pushed");
-            };
-            assert_eq!(record, "services");
-            let mut pv = pv.clone();
-            let (changed, content) = apply_local_fixes(&mut pv, fixes);
-            assert!(changed && content);
-            // Theirs is canonical, clean, its signature kept.
-            let canon = pv.get_item(&id).unwrap();
-            assert_eq!(
-                (canon.version, canon.synced_version, canon.sig.as_deref()),
-                (5, 5, Some("c2ln"))
-            );
-            assert_eq!(canon.ct, their_ct);
-            // Ours is kept as a local copy: clean (never pushed), never folded.
-            let (copy_id, _) =
-                il::seal_conflict_copy::<StdPrimitives>(keys, vid, &ours, 5).unwrap();
-            let copy = pv.get_item(&copy_id).expect("ours kept as a conflict copy");
-            assert_eq!(copy.version, copy.synced_version, "never pushed");
-            let opened =
-                il::open_wire_item::<StdPrimitives>(keys, vid, &copy_id, copy.version, &copy.ct)
-                    .unwrap();
-            assert_eq!(opened.body, ours.body);
-            let view = pv.fold_view::<StdPrimitives>(keys, vid).unwrap();
-            assert!(
-                !view.aux.services.contains_key("acme"),
-                "the copy is not read as the services record"
-            );
-        }
-
-        // A delete keeps no copy; in a keep-both namespace the copy is dirty
-        // (pushed as a create, like the console's copy row).
-        let their = || Some((their_row.clone(), their_ct.clone(), theirs.clone()));
-        let tomb = ItemPayload::tombstone(ItemNs::Services, "");
-        assert_eq!(
-            set_aside_fixes(keys, vid, &dirty, &tomb, their())
-                .unwrap()
-                .len(),
-            1,
-            "adopt only"
-        );
-        let secret = ItemPayload::secret_live("A", "ours");
-        let fixes = set_aside_fixes(keys, vid, &dirty, &secret, their()).unwrap();
+            &secret,
+            Some((their_row, their_ct, theirs)),
+        )
+        .unwrap();
         assert!(matches!(
             &fixes[0],
             LocalFix::InsertIfAbsent { row, .. } if row.synced_version == 0
         ));
         assert_eq!(conflict_record(&secret), "secret A");
-        assert!(set_aside_fixes(keys, vid, &dirty, &ours, None).is_none());
+        assert_eq!(
+            conflict_record(&ItemPayload::live(
+                ItemNs::Policy,
+                "",
+                serde_json::json!({})
+            )),
+            "policy"
+        );
     }
 
-    /// The §4 decision table (console parity: KEEP_BOTH_NS = secret,
-    /// connection, service).
+    /// The §4 decision table, per the rule table's conflict policy (the
+    /// console applies the same): keep_both = secret, connection, service;
+    /// take_writer = connecting; owner_config = policy, stores, store order,
+    /// retention (native or legacy `aux`).
     #[test]
     fn decide_conflict_table() {
-        use crate::storage::item::ItemPayload;
+        use crate::storage::item::{body_digest_hex, ItemPayload};
         let live = |ns, name: &str, v: serde_json::Value| ItemPayload::live(ns, name, v);
         let tomb = |ns, name: &str| ItemPayload::tombstone(ns, name);
         let s_ours = live(ItemNs::Secret, "T", serde_json::json!("ours"));
@@ -5037,63 +5150,120 @@ mod peritem_tests {
 
         // Equal live body → adopt, no copy.
         assert_eq!(
-            decide_conflict(&s_ours, Some(&s_same)),
+            decide_conflict(&s_ours, Some(&s_same), None),
             ConflictAction::Adopt
         );
-        // Genuine same-item conflict in a keep-both ns → keep both.
+        // Genuine same-item conflict in a keep-both record → keep both.
         assert_eq!(
-            decide_conflict(&s_ours, Some(&s_theirs)),
+            decide_conflict(&s_ours, Some(&s_theirs), None),
             ConflictAction::KeepBoth
         );
         let c_ours = live(ItemNs::Connection, "gmail", serde_json::json!({"a": 1}));
         let c_theirs = live(ItemNs::Connection, "gmail", serde_json::json!({"a": 2}));
         assert_eq!(
-            decide_conflict(&c_ours, Some(&c_theirs)),
+            decide_conflict(&c_ours, Some(&c_theirs), None),
             ConflictAction::KeepBoth
         );
         let v_ours = live(ItemNs::Service, "acme", serde_json::json!({"service": "a"}));
         let v_theirs = live(ItemNs::Service, "acme", serde_json::json!({"service": "b"}));
         assert_eq!(
-            decide_conflict(&v_ours, Some(&v_theirs)),
+            decide_conflict(&v_ours, Some(&v_theirs), None),
             ConflictAction::KeepBoth
         );
-        // Their delete vs our edit (keep-both ns) → copy keeps ours, delete stands.
+        // Their body equal to our base (they only copied it): not a conflict,
+        // ours applies. Compared normalized: a plain-string service entry is
+        // `{service: <text>}`.
+        let v_copied = live(ItemNs::Service, "acme", serde_json::json!("b"));
+        let base = body_digest_hex(ItemNs::Service, &serde_json::json!({"service": "b"}));
         assert_eq!(
-            decide_conflict(&s_ours, Some(&tomb(ItemNs::Secret, "T"))),
+            decide_conflict(&v_ours, Some(&v_copied), Some(&base)),
+            ConflictAction::Reapply
+        );
+        assert_eq!(
+            decide_conflict(&v_ours, Some(&v_theirs), Some(&base)),
+            ConflictAction::Reapply
+        );
+        let other_base = body_digest_hex(ItemNs::Service, &serde_json::json!({"service": "x"}));
+        assert_eq!(
+            decide_conflict(&v_ours, Some(&v_theirs), Some(&other_base)),
             ConflictAction::KeepBoth
         );
-        // Other namespaces re-apply ours on the fresh version.
-        for ns in [
-            ItemNs::Policy,
-            ItemNs::Stores,
-            ItemNs::StoreOrder,
-            ItemNs::Connecting,
+        let s_base = body_digest_hex(ItemNs::Secret, &serde_json::json!("theirs"));
+        assert_eq!(
+            decide_conflict(&s_ours, Some(&s_theirs), Some(&s_base)),
+            ConflictAction::Reapply
+        );
+        // A plain-string entry equal to ours in object form: adopt.
+        let v_plain_same = live(ItemNs::Service, "acme", serde_json::json!("a"));
+        assert_eq!(
+            decide_conflict(&v_ours, Some(&v_plain_same), None),
+            ConflictAction::Adopt
+        );
+        // Their delete vs our edit (keep-both) → copy keeps ours, delete stands,
+        // whatever our base.
+        assert_eq!(
+            decide_conflict(&s_ours, Some(&tomb(ItemNs::Secret, "T")), Some(&s_base)),
+            ConflictAction::KeepBoth
+        );
+        // Take-writer: ours is re-applied on the fresh version.
+        let ours = live(ItemNs::Connecting, "g", serde_json::json!({"x": 1}));
+        let theirs = live(ItemNs::Connecting, "g", serde_json::json!({"x": 2}));
+        assert_eq!(
+            decide_conflict(&ours, Some(&theirs), None),
+            ConflictAction::Reapply
+        );
+        assert_eq!(
+            decide_conflict(&ours, Some(&ours.clone()), None),
+            ConflictAction::Adopt
+        );
+        // Owner-config (native or legacy address): never overwritten, also
+        // without a keyset; an equal body adopts.
+        for (ns, name) in [
+            (ItemNs::Policy, ""),
+            (ItemNs::Stores, ""),
+            (ItemNs::StoreOrder, ""),
+            (ItemNs::AuditRetentionDays, ""),
+            (ItemNs::Aux, "policy"),
+            (ItemNs::Aux, "stores"),
+            (ItemNs::Aux, "store_order"),
+            (ItemNs::Aux, "audit_retention_days"),
         ] {
-            let ours = live(ns, "", serde_json::json!({"x": 1}));
-            let theirs = live(ns, "", serde_json::json!({"x": 2}));
+            let ours = live(ns, name, serde_json::json!({"x": 1}));
+            let theirs = live(ns, name, serde_json::json!({"x": 2}));
             assert_eq!(
-                decide_conflict(&ours, Some(&theirs)),
-                ConflictAction::Reapply,
-                "{ns:?}"
+                decide_conflict(&ours, Some(&theirs), None),
+                ConflictAction::SetAside,
+                "{ns:?} {name}"
             );
             assert_eq!(
-                decide_conflict(&ours, Some(&ours.clone())),
-                ConflictAction::Adopt,
-                "{ns:?}"
+                decide_conflict(&tomb(ns, name), Some(&theirs), None),
+                ConflictAction::SetAside,
+                "{ns:?} {name}: a delete is never written over theirs either"
+            );
+            assert_eq!(
+                decide_conflict(&ours, Some(&ours.clone()), None),
+                ConflictAction::Adopt
             );
         }
         // Our delete vs their edit → delete wins (re-apply the tombstone).
         assert_eq!(
-            decide_conflict(&tomb(ItemNs::Secret, "T"), Some(&s_theirs)),
+            decide_conflict(&tomb(ItemNs::Secret, "T"), Some(&s_theirs), None),
             ConflictAction::Reapply
         );
         // Both deleted → adopt.
         assert_eq!(
-            decide_conflict(&tomb(ItemNs::Secret, "T"), Some(&tomb(ItemNs::Secret, "T"))),
+            decide_conflict(
+                &tomb(ItemNs::Secret, "T"),
+                Some(&tomb(ItemNs::Secret, "T")),
+                None
+            ),
             ConflictAction::Adopt
         );
         // Their row is gone → re-create ours.
-        assert_eq!(decide_conflict(&s_ours, None), ConflictAction::Reapply);
+        assert_eq!(
+            decide_conflict(&s_ours, None, None),
+            ConflictAction::Reapply
+        );
     }
 
     /// Post-push local fixes are version-guarded: a row a writer bumped during
