@@ -94,7 +94,7 @@ pub(crate) fn parse_add(scope: &Value) -> std::result::Result<AddRequest, String
             total, MAX_SOURCE_DEFINITION_BYTES
         ));
     }
-    let source: ServiceSource = serde_json::from_value(
+    let mut source: ServiceSource = serde_json::from_value(
         scope
             .get("source")
             .cloned()
@@ -102,6 +102,9 @@ pub(crate) fn parse_add(scope: &Value) -> std::result::Result<AddRequest, String
     )
     .map_err(|_| "service-add scope.source is not a source record".to_string())?;
     source.check()?;
+    // Whether the source was checked is the daemon's finding (the card's
+    // `source_check`), never the requester's claim.
+    source.set_checked(false);
     let update = match scope.get("update") {
         None | Some(Value::Null) => false,
         Some(Value::Bool(b)) => *b,
@@ -167,16 +170,6 @@ fn session(
             Ok((cache.service_entries.clone(), cache.connections.clone()))
         }
         _ => Err(crate::error::VAULT_LOCKED_MSG.to_string()),
-    }
-}
-
-/// Op creation: drop the change-list fields a requester may send; the
-/// change approved is the card, computed here and recomputed at apply.
-fn drop_requester_fields(scope: &mut Value) {
-    if let Some(o) = scope.as_object_mut() {
-        for k in ["service_changes", "services_next", "services_row"] {
-            o.remove(k);
-        }
     }
 }
 
@@ -262,10 +255,11 @@ pub(crate) async fn mint_add<A: GitHubApi>(
         &state.services,
     )?;
     c.stamp(&mut op.act.scope)?;
-    // The source as stored, so every reader of the signed scope reads one
-    // spelling.
-    op.act.scope["source"] = serde_json::to_value(&req.source).map_err(|e| e.to_string())?;
-    drop_requester_fields(&mut op.act.scope);
+    // The source as stored (with whether this device checked it), so every
+    // reader of the signed scope reads one spelling.
+    let mut source = req.source;
+    source.set_checked(check == SourceCheck::Fetched);
+    op.act.scope["source"] = serde_json::to_value(&source).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -283,7 +277,6 @@ pub(crate) fn stamp_rm_at_mint(
     let (entries, conns) = session(state, vault_id)?;
     let c = card::rm_card(&target, &entries, |id| connections_using(conns.iter(), id))?;
     c.stamp(&mut op.act.scope)?;
-    drop_requester_fields(&mut op.act.scope);
     Ok(())
 }
 
@@ -335,10 +328,13 @@ pub(crate) fn apply_add(
     for id in &c.removes {
         view.aux.services.remove(id);
     }
+    // Stored with the check the approved card states.
+    let mut source = req.source;
+    source.set_checked(check == SourceCheck::Fetched);
     for (id, (svc, pol)) in req.defs {
         view.aux
             .services
-            .insert(id, StoredService::new(svc, pol, Some(req.source.clone())));
+            .insert(id, StoredService::new(svc, pol, Some(source.clone())));
     }
     Ok(c)
 }
@@ -417,15 +413,8 @@ pub async fn list(
 ) -> Result<Json<Value>> {
     crate::server::handlers::op::validate_vault_id(&vault_id)?;
     let (entries, conns) = session(&state, &vault_id).map_err(|_| AppError::VaultLocked)?;
-    // A change to the definitions the sync set aside (changed elsewhere
-    // meanwhile): `sc service ls` tells the user to re-run it.
-    let set_aside = state
-        .sync_conflict_records(&vault_id)
-        .iter()
-        .any(|r| r == "services" || r.starts_with("service "));
     Ok(Json(json!({
         "services": listing(&entries, &conns, &state.services),
-        "set_aside": set_aside,
     })))
 }
 

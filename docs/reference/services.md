@@ -54,11 +54,14 @@ How it works:
 - **One approval.** The card lists each service, every host that receives
   its credentials or OAuth data (declared hosts, the token endpoint, the
   authorization page, a redirect that leaves your device), `PKCE: off` when
-  the flow has no PKCE, the rules it applies, and the source with its commit.
-  A GitHub source is fetched again on your device at that commit and must
-  match, or the request is refused; a local folder, or GitHub out of reach,
-  shows the source as stated by the requester. Only the rules that tighten
-  apply in a vault.
+  the flow has no PKCE, the rules it applies (each label with what it
+  matches, and any approval window other than the default), and the source
+  with its commit. A GitHub source is fetched again on your device at that
+  commit and must match; a definitive GitHub answer (not found, refused, too
+  large) refuses the request. A local folder, or GitHub out of reach (no
+  connection, a timeout, a GitHub server error), shows the source as stated by
+  the requester. `sc service ls` shows which: `checked at <commit>` or `as
+  stated by the requester`. Only the rules that tighten apply in a vault.
 - **Ids.** A definition is stored under its `[service] id`. It may not be a
   built-in id or one another source already holds; `--id` renames a
   single-service source.

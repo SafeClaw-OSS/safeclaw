@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use super::card::{add_card, diff, rm_card, summarize, SourceCheck};
-use super::github::{self, GitHubApi};
+use super::github::{self, FetchError, GitHubApi};
 use super::tar::{read_tarball, read_tarball_with};
 use super::*;
 
@@ -40,6 +40,7 @@ fn gh(repo: &str, commit: char) -> ServiceSource {
         path: None,
         git_ref: None,
         commit: commit.to_string().repeat(40),
+        checked: false,
     }
 }
 
@@ -203,6 +204,7 @@ fn source_identity_and_display() {
         path: Some("svc".into()),
         git_ref: Some("main".into()),
         commit: "b".repeat(40),
+        checked: false,
     };
     assert_eq!(a.identity(), "github:acme/tools:svc");
     assert!(a.display().contains(&"b".repeat(40)));
@@ -643,17 +645,17 @@ struct FakeGitHub {
 }
 
 impl GitHubApi for FakeGitHub {
-    async fn default_branch(&self, _o: &str, _r: &str) -> Result<String, String> {
+    async fn default_branch(&self, _o: &str, _r: &str) -> Result<String, FetchError> {
         Ok(self.default.into())
     }
-    async fn commit_of(&self, _o: &str, _r: &str, git_ref: &str) -> Result<String, String> {
+    async fn commit_of(&self, _o: &str, _r: &str, git_ref: &str) -> Result<String, FetchError> {
         self.asked.lock().unwrap().push(git_ref.to_string());
         self.refs
             .get(git_ref)
             .cloned()
-            .ok_or_else(|| format!("ref '{}' not found", git_ref))
+            .ok_or_else(|| FetchError::Answered(format!("ref '{}' not found", git_ref)))
     }
-    async fn tarball(&self, _o: &str, _r: &str, commit: &str) -> Result<Vec<u8>, String> {
+    async fn tarball(&self, _o: &str, _r: &str, commit: &str) -> Result<Vec<u8>, FetchError> {
         self.asked
             .lock()
             .unwrap()
@@ -803,7 +805,14 @@ client_id = "public"
         ],
         "every declared host, the token endpoint's and the authorization page's"
     );
-    assert_eq!(c.tightens, ["acme: Delete a thing: deny", "acme: Pay: ask"]);
+    assert_eq!(
+        c.tightens,
+        [
+            "acme: Delete a thing [DELETE /v1/things/*]: deny",
+            "acme: Pay [POST /v1/pay]: ask"
+        ],
+        "each label beside what the rule matches"
+    );
     assert!(c.from.contains(&"a".repeat(40)));
     assert!(c.from.contains("fetched again on your device"));
     assert!(c.oauth.is_empty(), "PKCE is on by default");
@@ -868,6 +877,40 @@ client_id = "public"
     )
     .unwrap_err()
     .contains("not added"));
+}
+
+/// A first add's card shows what each rule matches beside its label, and
+/// every approval window that is not the default one (a rule's and the
+/// `[default]` one).
+#[test]
+fn first_add_card_shows_match_patterns_and_non_default_windows() {
+    let reg = crate::service::ServiceRegistry::compiled_only();
+    let default_ttl = crate::proxy::handler::DEFAULT_ASK_TTL;
+    let policy = format!(
+        "[default]\nwrite = \"ask\"\nttl = 3600\n\n[[rule]]\nid = \"pay\"\nlabel = \"Pay\"\nmatch = \"POST /v1/pay\"\nlevel = \"ask\"\nttl = 86400\n\n[[rule]]\nid = \"refund\"\nlabel = \"Refund\"\nmatch = [\"POST /v1/refund\", \"POST /v1/refund/*\"]\nlevel = \"ask\"\nttl = {default_ttl}\n\n[[rule]]\nid = \"no-delete\"\nlabel = \"Delete\"\nmatch = \"DELETE /v1/*\"\nlevel = \"deny\"\n"
+    );
+    let snap: BTreeMap<_, _> = [("acme".to_string(), admitted("acme", ACME, Some(&policy)))].into();
+    let c = add_card(
+        &snap,
+        &gh("acme/tools", 'a'),
+        SourceCheck::Fetched,
+        false,
+        &BTreeMap::new(),
+        &reg,
+    )
+    .unwrap();
+    assert_eq!(
+        c.tightens,
+        [
+            "acme: Pay [POST /v1/pay]: ask, approval lasts 86400s",
+            "acme: Refund [POST /v1/refund | POST /v1/refund/*]: ask",
+            "acme: Delete [DELETE /v1/*]: deny",
+            "acme: default write: ask",
+            "acme: default approval lasts 3600s",
+        ],
+        "{:?}",
+        c.tightens
+    );
 }
 
 #[test]
@@ -1215,18 +1258,27 @@ fn update_flags_longer_approval_windows_unbound_scope_vars_and_pkce_off() {
 
 // ── the daemon's own check of a GitHub source ───────────────────────────────
 
-/// GitHub out of reach.
-struct OfflineGitHub;
+/// GitHub out of reach (`None`), or answering every read with `Some(status)`.
+struct OfflineGitHub(Option<u16>);
+
+impl OfflineGitHub {
+    fn fail(&self) -> FetchError {
+        match self.0 {
+            None => FetchError::Unreachable("offline".into()),
+            Some(status) => github::status_problem(status, "github:acme/tools"),
+        }
+    }
+}
 
 impl GitHubApi for OfflineGitHub {
-    async fn default_branch(&self, _o: &str, _r: &str) -> Result<String, String> {
-        Err("offline".into())
+    async fn default_branch(&self, _o: &str, _r: &str) -> Result<String, FetchError> {
+        Err(self.fail())
     }
-    async fn commit_of(&self, _o: &str, _r: &str, _g: &str) -> Result<String, String> {
-        Err("offline".into())
+    async fn commit_of(&self, _o: &str, _r: &str, _g: &str) -> Result<String, FetchError> {
+        Err(self.fail())
     }
-    async fn tarball(&self, _o: &str, _r: &str, _c: &str) -> Result<Vec<u8>, String> {
-        Err("offline".into())
+    async fn tarball(&self, _o: &str, _r: &str, _c: &str) -> Result<Vec<u8>, FetchError> {
+        Err(self.fail())
     }
 }
 
@@ -1304,16 +1356,28 @@ fn verify_fetches_the_pinned_commit_and_compares_every_definition() {
     );
     let one = carried(&[("a1", svc("a1", "a.dev"), None)]);
     assert!(block_on(github::verify(&coll, &src, &one)).is_err());
-    // Not checkable here: said so on the card, not refused.
-    assert_eq!(
-        block_on(github::verify(&OfflineGitHub, &src, &ok)),
-        Ok(SourceCheck::NotReached)
-    );
+    // Not reached (a transport error, a timeout, a 5xx): said so on the card,
+    // not refused.
+    for offline in [
+        OfflineGitHub(None),
+        OfflineGitHub(Some(500)),
+        OfflineGitHub(Some(503)),
+    ] {
+        assert_eq!(
+            block_on(github::verify(&offline, &src, &ok)),
+            Ok(SourceCheck::NotReached)
+        );
+    }
+    // A definitive answer (not found, unprocessable, refused): refused.
+    for status in [404u16, 422, 401, 403, 429] {
+        let e = block_on(github::verify(&OfflineGitHub(Some(status)), &src, &ok)).unwrap_err();
+        assert!(e.contains("nothing was stored"), "{status}: {e}");
+    }
     let local = ServiceSource::Local {
         name: "mine".into(),
     };
     assert_eq!(
-        block_on(github::verify(&OfflineGitHub, &local, &ok)),
+        block_on(github::verify(&OfflineGitHub(None), &local, &ok)),
         Ok(SourceCheck::LocalFolder)
     );
 }

@@ -57,6 +57,10 @@ pub struct RuleSummary {
     /// How long an approval lasts (seconds), when the rule sets it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ttl: Option<u64>,
+    /// The rule's label (or id), when it has one: display text from the
+    /// definition, shown beside what the rule matches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }
 
 fn rule_summary(r: &PolicyRule) -> RuleSummary {
@@ -71,7 +75,8 @@ fn rule_summary(r: &PolicyRule) -> RuleSummary {
         key.push_str(" when ");
         key.push_str(w);
     }
-    let name = r.label.clone().or_else(|| r.id.clone()).unwrap_or_else(|| {
+    let label = r.label.clone().or_else(|| r.id.clone());
+    let name = label.clone().unwrap_or_else(|| {
         if matched.is_empty() {
             key.clone()
         } else {
@@ -83,7 +88,30 @@ fn rule_summary(r: &PolicyRule) -> RuleSummary {
         key,
         level,
         ttl: r.ttl,
+        label,
     }
+}
+
+/// An approval window that is not the default one, as a card shows it.
+fn non_default_window(ttl: Option<u64>) -> Option<String> {
+    ttl.filter(|t| *t != crate::proxy::handler::DEFAULT_ASK_TTL)
+        .map(|t| format!("approval lasts {}s", t))
+}
+
+/// A rule as the card shows it: the label (display text from the definition)
+/// with what the rule actually matches beside it, the level, and an approval
+/// window that is not the default one.
+fn card_rule_line(r: &RuleSummary) -> String {
+    let mut line = match &r.label {
+        Some(l) if !r.key.is_empty() => format!("{} [{}]: {}", l, r.key, r.level),
+        Some(l) => format!("{}: {}", l, r.level),
+        None => r.text.clone(),
+    };
+    if let Some(w) = non_default_window(r.ttl) {
+        line.push_str(", ");
+        line.push_str(&w);
+    }
+    line
 }
 
 /// The out-of-band redirect: the provider shows the code on its own page.
@@ -383,7 +411,9 @@ impl SourceCheck {
 /// - `destinations`: every host that receives their credentials or OAuth
 ///   artifacts.
 /// - `oauth`: OAuth flows without PKCE (`<id>: PKCE: off`).
-/// - `tightens`: the rules they apply (`<id>: <rule>: <level>`).
+/// - `tightens`: the rules they apply (`<id>: <label> [<match>]: <level>`,
+///   with `, approval lasts <n>s` for a window that is not the default one),
+///   the `[default]` levels, and a `[default]` window that is not the default.
 /// - `replaces`: services already stored from this source, replaced.
 /// - `removes`: services stored from this source that it no longer has.
 /// - `new_destinations`: destinations none of the replaced services had
@@ -553,13 +583,19 @@ pub fn add_card(
         if s.pkce_off {
             card.oauth.push(format!("{}: PKCE: off", id));
         }
-        card.tightens
-            .extend(s.rules.iter().map(|r| format!("{}: {}", id, r.text)));
+        card.tightens.extend(
+            s.rules
+                .iter()
+                .map(|r| format!("{}: {}", id, card_rule_line(r))),
+        );
         for (dir, l) in [("read", &s.read), ("write", &s.write)] {
             if let Some(l) = l {
                 card.tightens
                     .push(format!("{}: default {}: {}", id, dir, l));
             }
+        }
+        if let Some(w) = non_default_window(s.ttl) {
+            card.tightens.push(format!("{}: default {}", id, w));
         }
     }
     card.replaces = mine

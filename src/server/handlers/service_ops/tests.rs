@@ -4,18 +4,40 @@ use crate::service::source::tests::tar_gz;
 use crate::storage::plaintext::{MemberRole, VaultAux, VaultPlaintextView};
 use crate::storage::sealed_vault::PerItemVault;
 
-/// GitHub as the tests see it: serves `tarball`, or is out of reach.
-struct Gh(Option<Vec<u8>>);
+use crate::service::source::github::FetchError;
+
+/// GitHub as the tests see it: serves `tarball`, answers with an error, or is
+/// out of reach.
+struct Gh(std::result::Result<Vec<u8>, FetchError>);
+
+impl Gh {
+    fn serving(tarball: Vec<u8>) -> Self {
+        Gh(Ok(tarball))
+    }
+    fn offline() -> Self {
+        Gh(Err(FetchError::Unreachable("offline".into())))
+    }
+}
 
 impl GitHubApi for Gh {
-    async fn default_branch(&self, _o: &str, _r: &str) -> std::result::Result<String, String> {
-        Err("offline".into())
+    async fn default_branch(&self, _o: &str, _r: &str) -> std::result::Result<String, FetchError> {
+        Err(FetchError::Unreachable("offline".into()))
     }
-    async fn commit_of(&self, _o: &str, _r: &str, _g: &str) -> std::result::Result<String, String> {
-        Err("offline".into())
+    async fn commit_of(
+        &self,
+        _o: &str,
+        _r: &str,
+        _g: &str,
+    ) -> std::result::Result<String, FetchError> {
+        Err(FetchError::Unreachable("offline".into()))
     }
-    async fn tarball(&self, _o: &str, _r: &str, _c: &str) -> std::result::Result<Vec<u8>, String> {
-        self.0.clone().ok_or_else(|| "offline".to_string())
+    async fn tarball(
+        &self,
+        _o: &str,
+        _r: &str,
+        _c: &str,
+    ) -> std::result::Result<Vec<u8>, FetchError> {
+        self.0.clone()
     }
 }
 
@@ -40,6 +62,7 @@ fn gh(commit: char) -> ServiceSource {
         path: None,
         git_ref: None,
         commit: commit.to_string().repeat(40),
+        checked: false,
     }
 }
 
@@ -98,7 +121,7 @@ fn mint_with(state: &AppState, scope: Value, gh: &Gh) -> std::result::Result<Val
 }
 
 fn mint(state: &AppState, scope: Value) -> std::result::Result<Value, String> {
-    mint_with(state, scope, &Gh(None))
+    mint_with(state, scope, &Gh::offline())
 }
 
 fn unlock_with(state: &AppState, view: &VaultPlaintextView) {
@@ -404,8 +427,8 @@ fn stored(state: &AppState, vault: &str) -> PerItemVault {
 /// owner-config needs owner signatures: service definitions are data records,
 /// so `service-add` and `service-rm` are minted, applied and written by this
 /// process (unsigned native `service` items, as any member's daemon writes a
-/// connection), and the fold honors them. Fields a requester may send are
-/// dropped at mint and the source is stamped in its stored form.
+/// connection), and the fold honors them. The source is stamped in its stored
+/// form.
 #[test]
 fn services_are_data_records_on_a_vault_with_members() {
     type S = sudp::primitives::StdPrimitives;
@@ -414,23 +437,17 @@ fn services_are_data_records_on_a_vault_with_members() {
     let keys = crate::storage::item::VaultKeys::single(&k);
     let (_dir, state) = state_with_store(vault, &v2_vault(vault), &k);
 
-    // Mint: the requester's change lists are dropped, `path: null` is not kept.
+    // Mint: `path: null` is not kept.
     let mut sc = scope(&[("a1", "a.dev")], &gh('a'), false);
     sc["source"]["path"] = Value::Null;
-    sc["service_changes"] = json!([{ "id": "a1", "next": { "service": "evil" } }]);
-    sc["services_next"] = json!({ "a1": "evil" });
-    sc["services_row"] = json!({ "item_id": "x", "base_version": 0 });
     let mut op: crate::protocol::operation::Operation = serde_json::from_value(json!({
         "act": { "type": { "custom": "service-add" }, "target": "github:acme/tools", "scope": sc },
         "bind": { "redeemer": vault },
         "valid": { "iat": 0, "multiplicity": 1 }
     }))
     .unwrap();
-    block_on(mint_add(&state, vault, &mut op, &Gh(None))).unwrap();
+    block_on(mint_add(&state, vault, &mut op, &Gh::offline())).unwrap();
     let signed = op.act.scope.clone();
-    for k in ["service_changes", "services_next", "services_row"] {
-        assert!(signed.get(k).is_none(), "{k} dropped");
-    }
     assert_eq!(signed["source"], serde_json::to_value(gh('a')).unwrap());
     assert!(signed["source"].get("path").is_none());
 
@@ -468,13 +485,12 @@ fn services_are_data_records_on_a_vault_with_members() {
 
     // Remove it the same way: a native tombstone.
     let mut rm: crate::protocol::operation::Operation = serde_json::from_value(json!({
-        "act": { "type": { "custom": "service-rm" }, "target": "a1", "scope": { "services_next": {} } },
+        "act": { "type": { "custom": "service-rm" }, "target": "a1", "scope": {} },
         "bind": { "redeemer": vault },
         "valid": { "iat": 0, "multiplicity": 1 }
     }))
     .unwrap();
     stamp_rm_at_mint(&state, vault, &mut rm).unwrap();
-    assert!(rm.act.scope.get("services_next").is_none());
     let mut view = open(&state);
     let base = crate::storage::sealed_vault::ViewBase::of(&view).unwrap();
     apply_rm(&mut view, "a1", &rm.act.scope).unwrap();
@@ -564,7 +580,7 @@ fn mint_checks_a_github_source_at_its_pinned_commit() {
     let signed = mint_with(
         &state,
         scope(&[("a1", "a.dev")], &gh('a'), false),
-        &Gh(Some(at_commit.clone())),
+        &Gh::serving(at_commit.clone()),
     )
     .unwrap();
     assert_eq!(signed["source_check"], json!("fetched"));
@@ -574,17 +590,46 @@ fn mint_checks_a_github_source_at_its_pinned_commit() {
     let e = mint_with(
         &state,
         scope(&[("a1", "evil.example")], &gh('a'), false),
-        &Gh(Some(at_commit)),
+        &Gh::serving(at_commit.clone()),
     )
     .unwrap_err();
     assert!(e.contains("not what github:acme/tools"), "{e}");
-    // GitHub out of reach: stated, not checked.
+    // GitHub out of reach (a transport error, a timeout, a 5xx): stated, not
+    // checked.
     let signed = mint(&state, scope(&[("a1", "a.dev")], &gh('a'), false)).unwrap();
     assert_eq!(signed["source_check"], json!("not-reached"));
     assert!(signed["from"]
         .as_str()
         .unwrap()
         .contains("as stated by the requester"));
+    // A definitive answer from GitHub (not found, refused, too large) refuses
+    // the op.
+    for answer in [404u16, 422, 403] {
+        let gh_answer = Gh(Err(crate::service::source::github::status_problem(
+            answer,
+            "github:acme/tools",
+        )));
+        let e = mint_with(
+            &state,
+            scope(&[("a1", "a.dev")], &gh('a'), false),
+            &gh_answer,
+        )
+        .unwrap_err();
+        assert!(e.contains("nothing was stored"), "{answer}: {e}");
+    }
+    let oversize = Gh(Err(FetchError::Answered(
+        "the download is larger than 16 bytes".into(),
+    )));
+    assert!(mint_with(
+        &state,
+        scope(&[("a1", "a.dev")], &gh('a'), false),
+        &oversize
+    )
+    .is_err());
+    assert!(matches!(
+        crate::service::source::github::status_problem(502, "x"),
+        FetchError::Unreachable(_)
+    ));
     // A local folder cannot be checked here.
     let local = ServiceSource::Local {
         name: "mine".into(),
@@ -595,6 +640,51 @@ fn mint_checks_a_github_source_at_its_pinned_commit() {
         .as_str()
         .unwrap()
         .starts_with("local folder mine, as stated by the requester"));
+}
+
+/// The check is stored with the source: `checked` only when this device
+/// fetched the pinned commit again and the definitions matched, never on the
+/// requester's word; `sc service ls` shows `checked at <commit>` or `as stated
+/// by the requester` from it.
+#[test]
+fn the_source_check_is_stored_with_the_source() {
+    let state = test_state();
+    let at_commit = tar_gz(&[(
+        "acme-tools-x/services/a1/service.toml",
+        b'0',
+        svc("a1", "a.dev").as_bytes(),
+    )]);
+    let stored_source = |gh_api: &Gh, claimed: bool| {
+        let mut view = empty_view();
+        unlock_with(&state, &view);
+        let mut sc = scope(&[("a1", "a.dev")], &gh('a'), false);
+        if claimed {
+            sc["source"]["checked"] = json!(true);
+        }
+        let signed = mint_with(&state, sc, gh_api).unwrap();
+        let req = parse_add(&signed).unwrap();
+        let snap = admit_add(&req).unwrap();
+        apply_add(&mut view, req, &snap, &signed, &state.services).unwrap();
+        (signed, view.aux.services["a1"].source().unwrap())
+    };
+    let (signed, s) = stored_source(&Gh::serving(at_commit), false);
+    assert_eq!(signed["source"]["checked"], json!(true));
+    assert!(s.checked());
+    assert_eq!(s.check_line(), format!("checked at {}", "a".repeat(40)));
+    // Not reached, even with the requester claiming otherwise: as stated.
+    let (signed, s) = stored_source(&Gh::offline(), true);
+    assert!(signed["source"].get("checked").is_none());
+    assert!(!s.checked());
+    assert_eq!(s.check_line(), "as stated by the requester");
+    // The card's source_check decides at apply, not the scope's source field.
+    let mut view = empty_view();
+    unlock_with(&state, &view);
+    let mut signed = mint(&state, scope(&[("a1", "a.dev")], &gh('a'), false)).unwrap();
+    signed["source"]["checked"] = json!(true);
+    let req = parse_add(&signed).unwrap();
+    let snap = admit_add(&req).unwrap();
+    apply_add(&mut view, req, &snap, &signed, &state.services).unwrap();
+    assert!(!view.aux.services["a1"].source().unwrap().checked());
 }
 
 /// A conflict copy (`"<id> (conflict copy)"`, kept by the sync beside the

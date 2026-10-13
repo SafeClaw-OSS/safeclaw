@@ -192,9 +192,8 @@ struct Listed {
     digest: Option<String>,
 }
 
-/// The vault's definitions, and whether a change to them was set aside by the
-/// sync (changed elsewhere meanwhile).
-async fn listing(custodian: &str, vault: &str) -> Result<(Vec<Listed>, bool), String> {
+/// The vault's definitions.
+async fn listing(custodian: &str, vault: &str) -> Result<Vec<Listed>, String> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
@@ -215,13 +214,13 @@ async fn listing(custodian: &str, vault: &str) -> Result<(Vec<Listed>, bool), St
         s => return Err(format!("the daemon answered HTTP {}", s)),
     }
     let body: Value = resp.json().await.map_err(|e| format!("parse: {}", e))?;
-    let rows = serde_json::from_value(body.get("services").cloned().unwrap_or(json!([])))
-        .map_err(|e| format!("parse: {}", e))?;
-    let set_aside = body.get("set_aside").and_then(|v| v.as_bool()) == Some(true);
-    Ok((rows, set_aside))
+    serde_json::from_value(body.get("services").cloned().unwrap_or(json!([])))
+        .map_err(|e| format!("parse: {}", e))
 }
 
-/// The heading a stored source groups under.
+/// The heading a stored source groups under: the source, then how it is
+/// known (`checked at <commit>` when the daemon fetched the commit again and
+/// the definitions matched, else `as stated by the requester`).
 fn group_of(l: &Listed) -> (String, String) {
     match &l.source {
         Some(s) => {
@@ -231,19 +230,26 @@ fn group_of(l: &Listed) -> (String, String) {
                     path,
                     git_ref,
                     commit,
+                    checked,
                 } => {
                     let mut h = format!("github:{}", repo);
                     if let Some(p) = path {
                         h.push(':');
                         h.push_str(p);
                     }
-                    h.push_str(&format!(" @ {}", &commit[..12.min(commit.len())]));
                     if let Some(r) = git_ref {
                         h.push_str(&format!(" (ref {})", r));
                     }
+                    if *checked {
+                        h.push_str(&format!(": checked at {}", commit));
+                    } else {
+                        h.push_str(&format!(" @ {}: as stated by the requester", commit));
+                    }
                     h
                 }
-                ServiceSource::Local { name } => format!("local folder {}", name),
+                ServiceSource::Local { name } => {
+                    format!("local folder {}: {}", name, s.check_line())
+                }
             };
             (s.identity(), head)
         }
@@ -449,7 +455,7 @@ fn update_targets(
 
 pub async fn run_update(args: ServiceUpdateArgs) -> Result<(), String> {
     let (custodian, vault) = resolve_active(None)?;
-    let (stored, _) = listing(&custodian, &vault).await?;
+    let stored = listing(&custodian, &vault).await?;
     let targets = update_targets(&args, &stored)?;
     let reg = ServiceRegistry::load();
     let approve = opts(args.no_browser, args.cb_port, args.timeout);
@@ -577,12 +583,7 @@ fn print_diff(
 
 pub async fn run_ls(args: ServiceLsArgs, json: bool) -> Result<(), String> {
     let (custodian, vault) = resolve_active(None)?;
-    let (mut rows, set_aside) = listing(&custodian, &vault).await?;
-    if set_aside {
-        eprintln!(
-            "warning: a change to these definitions was set aside: they changed elsewhere meanwhile. Re-run it."
-        );
-    }
+    let mut rows = listing(&custodian, &vault).await?;
     if let Some(id) = &args.id {
         rows.retain(|l| &l.id == id);
         if rows.is_empty() {
@@ -663,7 +664,7 @@ fn rm_target(arg: &str) -> Result<String, String> {
 pub async fn run_rm(args: ServiceRmArgs) -> Result<(), String> {
     let target = rm_target(&args.target)?;
     let (custodian, vault) = resolve_active(None)?;
-    let (stored, _) = listing(&custodian, &vault).await?;
+    let stored = listing(&custodian, &vault).await?;
     let hit: Vec<&Listed> = stored
         .iter()
         .filter(|l| l.id == target || l.source.as_ref().is_some_and(|s| s.identity() == target))
@@ -775,6 +776,41 @@ mod tests {
         }
     }
 
+    /// `sc service ls` heads each source with how it is known: checked at its
+    /// commit by the daemon, or as the requester stated it.
+    #[test]
+    fn ls_heading_says_how_the_source_is_known() {
+        let mut gh = ServiceSource::Github {
+            repo: "acme/tools".into(),
+            path: Some("svc".into()),
+            git_ref: Some("main".into()),
+            commit: "a".repeat(40),
+            checked: false,
+        };
+        let (_, head) = group_of(&listed("a1", Some(gh.clone())));
+        assert_eq!(
+            head,
+            format!(
+                "github:acme/tools:svc (ref main) @ {}: as stated by the requester",
+                "a".repeat(40)
+            )
+        );
+        gh.set_checked(true);
+        let (_, head) = group_of(&listed("a1", Some(gh)));
+        assert_eq!(
+            head,
+            format!(
+                "github:acme/tools:svc (ref main): checked at {}",
+                "a".repeat(40)
+            )
+        );
+        let local = ServiceSource::Local {
+            name: "mine".into(),
+        };
+        let (_, head) = group_of(&listed("m1", Some(local)));
+        assert_eq!(head, "local folder mine: as stated by the requester");
+    }
+
     fn update_args(target: Option<&str>, all: bool) -> ServiceUpdateArgs {
         ServiceUpdateArgs {
             target: target.map(str::to_string),
@@ -802,6 +838,7 @@ mod tests {
             path: None,
             git_ref: None,
             commit: "a".repeat(40),
+            checked: false,
         };
         let local = ServiceSource::Local {
             name: "mine".into(),
