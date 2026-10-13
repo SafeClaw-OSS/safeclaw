@@ -7,9 +7,11 @@
 //! command (the approval is cached; the retry consumes it). Polling `/op/{id}`
 //! never consumes anything, so waiting and retrying can't race each other.
 //!
-//! Exit codes are the contract: 0 approved, 5 rejected, 3 expired/unknown,
-//! 4 timed out waiting, 1 local failure. 2 is clap's usage-error code — a
-//! malformed invocation must stay distinguishable from a human rejection.
+//! Exit codes are the contract: 0 approved, 5 not approved (a person said no,
+//! or a stated cause), 6 ended without a decision (withdrawn by the requester
+//! or superseded by a newer request), 3 expired/unknown, 4 timed out waiting,
+//! 1 local failure. 2 is clap's usage-error code — a malformed invocation must
+//! stay distinguishable from a human rejection.
 //! Stdout gets the final poll body (JSON); progress prose goes to stderr.
 
 use std::time::{Duration, Instant};
@@ -31,6 +33,28 @@ enum Verdict {
     Approved,
     Rejected,
     Pending,
+}
+
+/// How an op that ended as `rejected` ended, from its `reason`: a person's
+/// no, a withdrawal by the requester, a newer request replacing it, or
+/// another stated cause (e.g. approved, but applying it failed).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum NotApproved<'a> {
+    Rejected,
+    Withdrawn,
+    Superseded,
+    Other(&'a str),
+}
+
+pub(crate) fn not_approved(reason: &str) -> NotApproved<'_> {
+    use crate::server::handlers::op::{ABANDONED_REASON, WITHDRAWN_REASON};
+    match reason {
+        // "user denied" = the same human no from an older daemon.
+        "" | "user rejected" | "user denied" => NotApproved::Rejected,
+        r if r == WITHDRAWN_REASON || r == ABANDONED_REASON => NotApproved::Withdrawn,
+        r if r.contains("superseded") => NotApproved::Superseded,
+        r => NotApproved::Other(r),
+    }
 }
 
 /// Wire-status → outcome. `consumed` counts as approved: the gesture landed
@@ -128,27 +152,30 @@ pub async fn run_wait(args: OpWaitArgs) -> Result<(), String> {
                                 println!("{}", body);
                                 let reason =
                                     body.get("reason").and_then(|s| s.as_str()).unwrap_or("");
-                                if reason.contains("superseded") {
-                                    eprintln!(
-                                        "superseded by a newer approval request — \
-                                         re-run the original command"
-                                    );
-                                    std::process::exit(6);
-                                }
-                                // "user denied" = the same human no from an older daemon.
-                                if !reason.is_empty()
-                                    && reason != "user rejected"
-                                    && reason != "user denied"
-                                {
-                                    // Not a human saying no (e.g. "approved,
-                                    // but applying it failed: …") — retrying
-                                    // after the cause is fixed is legitimate.
-                                    eprintln!(
-                                        "rejected ✗ ({}); fix the cause, then re-run",
-                                        reason
-                                    );
-                                } else {
-                                    eprintln!("rejected ✗ — do not retry");
+                                match not_approved(reason) {
+                                    NotApproved::Superseded => {
+                                        eprintln!(
+                                            "superseded by a newer approval request — \
+                                             re-run the original command"
+                                        );
+                                        std::process::exit(6);
+                                    }
+                                    NotApproved::Withdrawn => {
+                                        eprintln!(
+                                            "withdrawn by the requester, not rejected — \
+                                             re-run the original command to ask again"
+                                        );
+                                        std::process::exit(6);
+                                    }
+                                    // Not a person saying no (e.g. "approved, but
+                                    // applying it failed: …"): retrying after the
+                                    // cause is fixed is legitimate.
+                                    NotApproved::Other(r) => {
+                                        eprintln!("not approved ✗ ({}); fix the cause, then re-run", r);
+                                    }
+                                    NotApproved::Rejected => {
+                                        eprintln!("rejected ✗ by the approver — do not retry");
+                                    }
                                 }
                                 std::process::exit(5);
                             }
@@ -181,6 +208,21 @@ pub async fn run_wait(args: OpWaitArgs) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_withdrawal_or_a_newer_request_is_not_a_rejection() {
+        use crate::server::handlers::op::{ABANDONED_REASON, WITHDRAWN_REASON};
+        assert_eq!(not_approved(""), NotApproved::Rejected);
+        assert_eq!(not_approved("user rejected"), NotApproved::Rejected);
+        assert_eq!(not_approved("user denied"), NotApproved::Rejected);
+        assert_eq!(not_approved(WITHDRAWN_REASON), NotApproved::Withdrawn);
+        assert_eq!(not_approved(ABANDONED_REASON), NotApproved::Withdrawn);
+        assert_eq!(not_approved("superseded by a newer request"), NotApproved::Superseded);
+        assert_eq!(
+            not_approved("approved, but applying it failed: x"),
+            NotApproved::Other("approved, but applying it failed: x")
+        );
+    }
 
     #[test]
     fn verdict_maps_wire_statuses() {

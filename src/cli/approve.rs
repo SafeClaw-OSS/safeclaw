@@ -427,21 +427,18 @@ async fn remote_wait(
                 return Ok(body);
             }
             "rejected" => {
+                use crate::cli::op::{not_approved, NotApproved};
                 let reason = body.get("reason").and_then(|v| v.as_str()).unwrap_or("");
-                if reason.contains("superseded") {
-                    return Err(RemoteWaitErr::Failed(
-                        "approval superseded by a newer request (not a user rejection) — \
-                         re-run the command"
-                            .into(),
-                    ));
-                }
-                if !reason.is_empty() {
-                    return Err(RemoteWaitErr::Failed(format!(
-                        "approval was rejected: {}",
-                        reason
-                    )));
-                }
-                return Err(RemoteWaitErr::Failed("approval was rejected".into()));
+                return Err(RemoteWaitErr::Failed(match not_approved(reason) {
+                    NotApproved::Superseded => "approval superseded by a newer request \
+                         (not a user rejection) — re-run the command"
+                        .into(),
+                    NotApproved::Withdrawn => "the approval request was withdrawn \
+                         (not a user rejection) — re-run the command"
+                        .into(),
+                    NotApproved::Other(r) => format!("not approved: {}", r),
+                    NotApproved::Rejected => "approval was rejected".into(),
+                }));
             }
             _ => {} // pending — keep polling
         }
