@@ -120,8 +120,7 @@ pub async fn create(
         &body.assertion,
         &body.x,
         &body.y,
-        &state.config.origin,
-        &state.config.rp_id,
+        &state.config.relying_party,
         &payload_hash,
     )?;
 

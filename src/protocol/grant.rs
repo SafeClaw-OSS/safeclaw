@@ -6,7 +6,7 @@ use zeroize::Zeroize;
 
 use crate::crypto::binding::{binding_for_op, DOMAIN_SETUP, DOMAIN_STANDARD};
 use crate::error::{AppError, Result};
-use crate::passkey::webauthn::{verify_assertion, AssertionData};
+use crate::passkey::webauthn::{verify_assertion, AssertionData, RelyingParty};
 use crate::passkey::PasskeyEntry;
 use crate::protocol::operation::{
     as_enroll_credential, check_now, decode_credential_id, ActType, Operation,
@@ -116,8 +116,7 @@ impl Drop for ValidatedGrant {
 pub fn validate_grant(
     grant: &Grant,
     challenge_store: &mut crate::passkey::challenge::ChallengeStore,
-    origin: &str,
-    rp_id: &str,
+    rp: &RelyingParty,
     credential_lookup: impl FnOnce(&str) -> Option<PasskeyEntry>,
 ) -> Result<ValidatedGrant> {
     if grant.batch.is_some() {
@@ -181,15 +180,7 @@ pub fn validate_grant(
     let op_value = serde_json::to_value(&grant.o)?;
     let beta = binding_for_op(domain, &r_bytes, &op_value)?;
 
-    validate_grant_core(
-        grant,
-        assertion,
-        &entry,
-        &beta,
-        challenge_store,
-        origin,
-        rp_id,
-    )
+    validate_grant_core(grant, assertion, &entry, &beta, challenge_store, rp)
 }
 
 /// Validate a BATCH grant (design/batch-approve.md). The caller (the approve
@@ -202,8 +193,7 @@ pub fn validate_batch_grant(
     grant: &Grant,
     expected_challenge: &[u8; 32],
     challenge_store: &mut crate::passkey::challenge::ChallengeStore,
-    origin: &str,
-    rp_id: &str,
+    rp: &RelyingParty,
     credential_lookup: impl FnOnce(&str) -> Option<PasskeyEntry>,
 ) -> Result<ValidatedGrant> {
     let batch = grant
@@ -234,8 +224,7 @@ pub fn validate_batch_grant(
         &entry,
         expected_challenge,
         challenge_store,
-        origin,
-        rp_id,
+        rp,
     )
     .map_err(|e| match e {
         AppError::Unauthorized(msg) | AppError::BadRequest(msg) => AppError::BatchVerify(msg),
@@ -252,8 +241,7 @@ fn validate_grant_core(
     entry: &PasskeyEntry,
     expected_challenge: &[u8; 32],
     challenge_store: &mut crate::passkey::challenge::ChallengeStore,
-    origin: &str,
-    rp_id: &str,
+    rp: &RelyingParty,
 ) -> Result<ValidatedGrant> {
     // 1. Gate on r (must be issued by us and unexpired) but do NOT consume it
     //    yet — a cheap peek. Consuming here (before the signature is verified)
@@ -280,14 +268,7 @@ fn validate_grant_core(
             ));
         }
     }
-    verify_assertion(
-        assertion,
-        &entry.x,
-        &entry.y,
-        origin,
-        rp_id,
-        expected_challenge,
-    )?;
+    verify_assertion(assertion, &entry.x, &entry.y, rp, expected_challenge)?;
 
     // 7. Decode wrapping_key + credential_id raw bytes.
     //
@@ -394,8 +375,7 @@ mod tests {
             &grant,
             &[0x42u8; 32],
             &mut chs,
-            "http://localhost",
-            "localhost",
+            &RelyingParty::exact("http://localhost", "localhost"),
             |_| Some(dummy_entry()),
         );
         let err = match err {
@@ -425,9 +405,12 @@ mod tests {
         let mut chs = ChallengeStore::new();
         let r = chs.issue("127.0.0.1".parse().unwrap()).unwrap();
         let grant = batch_grant(&r);
-        let err = validate_grant(&grant, &mut chs, "http://localhost", "localhost", |_| {
-            Some(dummy_entry())
-        });
+        let err = validate_grant(
+            &grant,
+            &mut chs,
+            &RelyingParty::exact("http://localhost", "localhost"),
+            |_| Some(dummy_entry()),
+        );
         let err = match err {
             Err(e) => e,
             Ok(_) => panic!("expected error"),
@@ -447,8 +430,7 @@ mod tests {
             &grant,
             &[0x42u8; 32],
             &mut chs,
-            "http://localhost",
-            "localhost",
+            &RelyingParty::exact("http://localhost", "localhost"),
             |_| Some(dummy_entry()),
         );
         let err = match err {

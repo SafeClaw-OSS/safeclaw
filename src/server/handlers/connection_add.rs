@@ -926,7 +926,10 @@ secrets = ["MIXED_KEY"]
             proxy_port: 0,
             listen: "127.0.0.1".into(),
             origin: "http://localhost".into(),
-            rp_id: "localhost".into(),
+            relying_party: crate::passkey::webauthn::RelyingParty::exact(
+                "http://localhost",
+                "localhost",
+            ),
             admin_key: None,
             relay_url: None,
             body_cap: crate::config::DEFAULT_BODY_CAP,

@@ -791,7 +791,10 @@ pub struct ServeArgs {
 
     /// WebAuthn relying party ID. Defaults to the host part of --origin
     /// (e.g. `custodian.example.com`), which is what 99% of deployments
-    /// want. Override only for eTLD+1 sharing across subdomains.
+    /// want. Override only for eTLD+1 sharing across subdomains. With
+    /// neither --origin nor --rp-id, a cloud-paired daemon accepts the
+    /// console's root, `app.` and `www.` origins under the root RP ID
+    /// (`passkey::webauthn::RelyingParty::console`).
     #[arg(long, env = "SAFECLAW_RP_ID")]
     pub rp_id: Option<String>,
 
@@ -992,8 +995,10 @@ pub struct Config {
     /// Credential-proxy plane bind port (the hudsucker MITM). S2 binds it.
     pub proxy_port: u16,
     pub listen: String,
+    /// The console origin links point at (`{origin}/vault/<id>`).
     pub origin: String,
-    pub rp_id: String,
+    /// Whose WebAuthn assertions verify: the RP ID and the accepted origins.
+    pub relying_party: crate::passkey::webauthn::RelyingParty,
     pub admin_key: Option<String>,
     pub relay_url: Option<String>,
     /// See `ServeArgs::body_cap` / [`DEFAULT_BODY_CAP`].
@@ -1011,17 +1016,18 @@ impl Config {
         // thing that'd want a localhost rpId — isn't used when paired: all
         // approvals route to the cloud /grant page.) An explicit --origin /
         // SAFECLAW_ORIGIN always wins.
+        let explicit = args.origin.is_some() || args.rp_id.is_some();
         let origin = args.origin.unwrap_or_else(|| {
             crate::cli::active::frontend_origin()
                 .unwrap_or_else(|| format!("http://localhost:{}", args.port))
         });
-        // rp_id defaults to origin's host: cheaper than depending on a URL
-        // crate, and we already require origin to be well-formed for WebAuthn
-        // to work. Strips scheme, path, and :port. Falls back to "localhost"
-        // if origin is somehow unparseable.
-        let rp_id = args
-            .rp_id
-            .unwrap_or_else(|| host_from_origin(&origin).unwrap_or_else(|| "localhost".into()));
+        // A paired daemon's console origin (stored at `sc login`, either the
+        // root or its `app.` host) gives the console relying party: the root
+        // RP ID and its root / `app.` / `www.` origins. Explicit --origin /
+        // --rp-id, and a localhost or self-host origin, match exactly; the
+        // rp_id then defaults to the origin's host (scheme, path and :port
+        // stripped; "localhost" if it does not parse).
+        let relying_party = relying_party_for(&origin, explicit, args.rp_id);
         // state_dir default = ~/.safeclaw/state (see `default_state_dir`).
         let state_dir = args.state_dir.unwrap_or_else(default_state_dir);
         Self {
@@ -1030,7 +1036,7 @@ impl Config {
             proxy_port: args.proxy_port,
             listen: args.listen,
             origin,
-            rp_id,
+            relying_party,
             admin_key: args.admin_key,
             relay_url: args.relay_url,
             body_cap: args.body_cap,
@@ -1053,6 +1059,26 @@ pub fn default_state_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("./state"))
 }
 
+/// The WebAuthn relying party for `origin`: the console's (root RP ID, root /
+/// `app.` / `www.` origins) unless the origin or RP ID was given explicitly
+/// or the origin is not a bare https domain, in which case `origin` is
+/// matched exactly under `rp_id` (default: the origin's host).
+fn relying_party_for(
+    origin: &str,
+    explicit: bool,
+    rp_id: Option<String>,
+) -> crate::passkey::webauthn::RelyingParty {
+    use crate::passkey::webauthn::RelyingParty;
+    match RelyingParty::console(origin).filter(|_| !explicit) {
+        Some(rp) => rp,
+        None => {
+            let rp_id = rp_id
+                .unwrap_or_else(|| host_from_origin(origin).unwrap_or_else(|| "localhost".into()));
+            RelyingParty::exact(origin, &rp_id)
+        }
+    }
+}
+
 fn host_from_origin(origin: &str) -> Option<String> {
     let after_scheme = origin
         .strip_prefix("https://")
@@ -1063,5 +1089,37 @@ fn host_from_origin(origin: &str) -> Option<String> {
         None
     } else {
         Some(host.to_string())
+    }
+}
+
+#[cfg(test)]
+mod relying_party_tests {
+    use super::*;
+
+    #[test]
+    fn stored_console_origin_gives_the_root_party_explicit_flags_stay_exact() {
+        for stored in ["https://safeclaw.pro", "https://app.safeclaw.pro"] {
+            let rp = relying_party_for(stored, false, None);
+            assert_eq!(rp.rp_id, "safeclaw.pro");
+            assert!(rp.allows("https://safeclaw.pro"));
+            assert!(rp.allows("https://app.safeclaw.pro"));
+            assert!(rp.allows("https://www.safeclaw.pro"));
+            assert!(!rp.allows("https://evil.safeclaw.pro"));
+        }
+        let dev = relying_party_for("https://app.dev.safeclaw.pro", false, None);
+        assert_eq!(dev.rp_id, "dev.safeclaw.pro");
+        // --origin / --rp-id: exactly as given.
+        let explicit = relying_party_for("https://app.safeclaw.pro", true, None);
+        assert_eq!(explicit.rp_id, "app.safeclaw.pro");
+        assert_eq!(
+            explicit.origins,
+            vec!["https://app.safeclaw.pro".to_string()]
+        );
+        let rp_only = relying_party_for("https://safeclaw.pro", true, Some("safeclaw.pro".into()));
+        assert_eq!(rp_only.origins, vec!["https://safeclaw.pro".to_string()]);
+        // Unpaired localhost.
+        let local = relying_party_for("http://localhost:23293", false, None);
+        assert_eq!(local.rp_id, "localhost");
+        assert_eq!(local.origins, vec!["http://localhost:23293".to_string()]);
     }
 }
