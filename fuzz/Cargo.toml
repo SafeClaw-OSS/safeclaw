@@ -1,0 +1,28 @@
+# cargo-fuzz harness for the service-definition gate. Outside the main build:
+# its own workspace, built only by `cargo fuzz` (nightly + cargo-fuzz), e.g.
+#   cargo +nightly fuzz run gate -- -max_total_time=600 -max_len=65536
+# Seed it with the in-tree definitions:
+#   mkdir -p corpus/gate && for d in ../services/*/; do cp "$d"service.toml "corpus/gate/$(basename "$d")"; done
+[package]
+name = "safeclaw-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+safeclaw = { path = ".." }
+
+[[bin]]
+name = "gate"
+path = "fuzz_targets/gate.rs"
+test = false
+doc = false
+bench = false
+
+# Keep this crate out of any parent workspace.
+[workspace]
+members = ["."]
