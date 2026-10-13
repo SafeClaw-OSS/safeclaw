@@ -154,7 +154,7 @@ pub async fn pull_on_start(state_dir: &Path) {
         // PER-ITEM: pull content rows too (pre-serve, no cache to refresh yet —
         // the first unlock folds them). Best-effort; a 404 / non-per-item vault
         // is a no-op.
-        match pull_items(state_dir, cloud, vault, &dk).await {
+        match pull_items(state_dir, cloud, vault, &dk, None).await {
             Ok(n) if n > 0 => {
                 tracing::info!(vault = %vault, adopted = n, "cloud sync: pulled item rows")
             }
@@ -235,7 +235,16 @@ pub async fn sync_vault_now(state: &Arc<AppState>, vault_id: &str) -> Result<Syn
                 Ok(_) => state.record_cloud_contact(vault_id),
                 Err(e) => tracing::debug!(vault = %vault_id, "keyset pull failed: {}", e),
             }
-            match pull_items(&state.config.state_dir, cloud2, vault_id, &dk2).await {
+            let key = state.cloned_state_key(vault_id);
+            match pull_items(
+                &state.config.state_dir,
+                cloud2,
+                vault_id,
+                &dk2,
+                key.as_deref().map(|m| &m[..]),
+            )
+            .await
+            {
                 Ok(n) if n > 0 => {
                     state.record_cloud_contact(vault_id);
                     tracing::info!(vault = %vault_id, adopted = n, "per-item pull: adopted rows");
@@ -359,6 +368,15 @@ async fn deliver_team_marks(state: &Arc<AppState>, vault_id: &str) {
     }
 }
 
+/// True when this daemon syncs its vaults with a cloud (a backend is
+/// configured); false for a local-only daemon.
+pub(crate) fn cloud_configured() -> bool {
+    active::load()
+        .ok()
+        .and_then(|c| c.cloud_backend)
+        .is_some_and(|s| !s.is_empty())
+}
+
 /// Pull `vault_id`'s item rows now, serving what was adopted. A daemon with
 /// no cloud configured has nothing to pull (local-only): `Ok`. A paired one
 /// that cannot pull: `Err`.
@@ -370,7 +388,9 @@ pub(crate) async fn pull_items_now(state: &Arc<AppState>, vault_id: &str) -> Res
         return Ok(());
     };
     let dk = device_key().ok_or("this daemon is not paired")?;
-    if pull_items(&state.config.state_dir, cloud, vault_id, &dk).await? > 0 {
+    let key = state.cloned_state_key(vault_id);
+    let key = key.as_deref().map(|m| &m[..]);
+    if pull_items(&state.config.state_dir, cloud, vault_id, &dk, key).await? > 0 {
         refresh_after_item_pull(state, vault_id);
     }
     Ok(())
@@ -2458,7 +2478,8 @@ async fn pull_and_process(
             ok = false;
         }
     }
-    match pull_items(state_dir, cloud, vault, dk).await {
+    let key = state.cloned_state_key(vault);
+    match pull_items(state_dir, cloud, vault, dk, key.as_deref().map(|m| &m[..])).await {
         Ok(n) if n > 0 => {
             // INFO parity with the keyset line above: item adoptions are the
             // content channel doing its job — their absence from the log was
@@ -2511,7 +2532,6 @@ use crate::storage::sealed_vault::{self as pv_store, PerItemVault};
 struct ItemRow {
     item_id: String,
     version: u64,
-    #[allow(dead_code)]
     seq: u64,
     /// base64url-nopad of `suite‖nonce‖ct‖tag`.
     ct: String,
@@ -2546,10 +2566,26 @@ fn write_per_item_store(state_dir: &Path, vault: &str, pv: &PerItemVault) -> Res
 /// to the max `seq` seen. Tombstones are stored like any other row — `fold_view`
 /// drops them at read time, and a later GC hard-deletes them. Returns the number
 /// of rows adopted.
-fn adopt_item_rows(pv: &mut PerItemVault, rows: &[ItemRow], max_seq: u64) -> Result<usize, String> {
+///
+/// On a vault with a keyset, the owner-config the fold honors is kept: a row
+/// that would replace an honored owner-config record with one the fold does
+/// not honor (an unsigned tombstone over an owner-signed legacy row, say) or
+/// cannot read is not adopted ([`PerItemVault::keeps_honored_owner_config`],
+/// under `keys` = the unlocked session's). Without `keys` (locked) a
+/// replacement of an existing row cannot be checked and waits. A row not
+/// adopted for either reason holds the cursor before it, so the next pull
+/// offers it again.
+fn adopt_item_rows(
+    pv: &mut PerItemVault,
+    rows: &[ItemRow],
+    max_seq: u64,
+    keys: Option<(item_layer::VaultKeys<'_>, &str)>,
+) -> Result<usize, String> {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
+    type S = sudp::primitives::StdPrimitives;
     let mut adopted = 0usize;
+    let mut held: Option<u64> = None;
     for row in rows {
         // Only adopt a strictly-newer version (server is authoritative, but a
         // stale replay must not clobber a fresher local row we already pushed).
@@ -2558,6 +2594,7 @@ fn adopt_item_rows(pv: &mut PerItemVault, rows: &[ItemRow], max_seq: u64) -> Res
         // the push side, whose 409 reconcile (`push_items_best_effort`) compares
         // ours with theirs and keeps both / re-applies; while the vault is locked
         // it stays dirty and is reconciled on the first push after unlock.
+        let replaces = pv.get_item(&row.item_id).is_some();
         let keep = pv
             .get_item(&row.item_id)
             .map(|s| row.version > s.version && s.version <= s.synced_version)
@@ -2568,11 +2605,41 @@ fn adopt_item_rows(pv: &mut PerItemVault, rows: &[ItemRow], max_seq: u64) -> Res
         let ct = URL_SAFE_NO_PAD
             .decode(row.ct.as_bytes())
             .map_err(|e| format!("item ct not base64url: {}", e))?;
+        if replaces && pv.keyset.uik.is_some() && !item_layer::is_agent_wire_id(&row.item_id) {
+            let hold = match keys {
+                None => true,
+                Some((keys, vault_id)) => {
+                    let incoming = pv_store::StoredItem {
+                        version: row.version,
+                        ct: ct.clone(),
+                        synced_version: row.version,
+                        tombstone: false,
+                        sig: row.sig.clone(),
+                        signer: row.signer.clone(),
+                        base: None,
+                    };
+                    let keep_ours =
+                        pv.keeps_honored_owner_config::<S>(keys, vault_id, &row.item_id, &incoming);
+                    if keep_ours {
+                        tracing::warn!(item = %row.item_id, version = row.version, "per-item pull: an owner-config row the fold would not honor is not adopted; the honored one is kept");
+                    }
+                    keep_ours
+                }
+            };
+            if hold {
+                held = Some(held.map_or(row.seq, |h| h.min(row.seq)));
+                continue;
+            }
+        }
         pv.put_raw_signed(row.item_id.clone(), row.version, ct, row.sig.clone(), row.signer.clone());
         adopted += 1;
     }
-    if max_seq > pv.items_seq {
-        pv.items_seq = max_seq;
+    let cursor = match held {
+        Some(seq) => max_seq.min(seq.saturating_sub(1)),
+        None => max_seq,
+    };
+    if cursor > pv.items_seq {
+        pv.items_seq = cursor;
     }
     Ok(adopted)
 }
@@ -2624,7 +2691,8 @@ async fn fetch_item_rows(
     Ok(Some((rows, max_seq)))
 }
 
-/// Pull item rows changed since the local `.items_seq` cursor and adopt them.
+/// Pull item rows changed since the local `.items_seq` cursor and adopt them
+/// ([`adopt_item_rows`]; `key`: the unlocked session's key material, if any).
 /// Best-effort: a 404 (endpoint not live yet) or a missing local store is a
 /// no-op. Returns the number of rows adopted.
 pub async fn pull_items(
@@ -2632,6 +2700,7 @@ pub async fn pull_items(
     cloud: &str,
     vault: &str,
     device_key: &str,
+    key: Option<&[u8]>,
 ) -> Result<usize, String> {
     // Personal build: a SHARED (team) vault's content is left to the official
     // build; never lands on disk here (team-edition §9). Covers every caller.
@@ -2645,7 +2714,8 @@ pub async fn pull_items(
     else {
         return Ok(0); // /items not live yet — no-op (stubbed[])
     };
-    let adopted = adopt_item_rows(&mut pv, &rows, max_seq)?;
+    let keys = key.map(|m| (item_layer::VaultKeys::from_material(m), vault));
+    let adopted = adopt_item_rows(&mut pv, &rows, max_seq, keys)?;
     if adopted > 0 || max_seq > 0 {
         write_per_item_store(state_dir, vault, &pv)?;
     }
@@ -2853,9 +2923,9 @@ fn decide_conflict(
         };
     }
     let their_digest = (!theirs.is_tombstone() && theirs.ns == ours.ns && theirs.name == ours.name)
-        .then(|| item_layer::body_digest_hex(theirs.ns, &theirs.body));
+        .then(|| item_layer::body_digest_hex(theirs.ns, &theirs.name, &theirs.body));
     if their_digest.is_some()
-        && their_digest == Some(item_layer::body_digest_hex(ours.ns, &ours.body))
+        && their_digest == Some(item_layer::body_digest_hex(ours.ns, &ours.name, &ours.body))
     {
         return ConflictAction::Adopt;
     }
@@ -2926,7 +2996,10 @@ fn apply_local_fixes(pv: &mut PerItemVault, fixes: Vec<LocalFix>) -> (bool, bool
                 }
             }
             LocalFix::Replace { id, expect, row } => {
-                if pv.items.get(&id).map(|s| s.version) == Some(expect) {
+                let current = pv.items.get(&id).map(|s| (s.version, s.synced_version));
+                if current
+                    .is_some_and(|(v, synced)| v == expect && !is_rollback(row.version, synced))
+                {
                     pv.items.insert(id, row);
                     changed = true;
                     content_changed = true;
@@ -3000,22 +3073,6 @@ async fn load_conflict_pair(
     ours_row: &DirtyRow,
     current_version: Option<u64>,
 ) -> Result<(item_layer::ItemPayload, Option<TheirItem>), Resolved> {
-    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    use base64::Engine;
-    type S = sudp::primitives::StdPrimitives;
-
-    let ours = item_layer::open_wire_item::<S>(
-        keys,
-        vault_id,
-        &ours_row.id,
-        ours_row.version,
-        &ours_row.ct,
-    )
-    .map_err(|e| {
-        tracing::warn!(vault = %vault_id, item = %ours_row.id, "per-item reconcile: can't open our row ({}); left dirty", e);
-        Resolved::LeaveDirty
-    })?;
-
     let theirs_row: Option<ItemRow> = if current_version == Some(0) {
         None
     } else {
@@ -3036,8 +3093,48 @@ async fn load_conflict_pair(
             _ => return Err(Resolved::LeaveDirty),
         }
     };
+    open_conflict_pair(keys, vault_id, ours_row, theirs_row)
+}
+
+/// A fetched row older than the version this device last saw synced for the
+/// same item is a rollback: never adopted (the one anti-rollback rule of the
+/// sync; nothing else is stored for it).
+fn is_rollback(fetched_version: u64, synced_version: u64) -> bool {
+    fetched_version < synced_version
+}
+
+/// Open OUR dirty row and THEIR row (`None` = gone) for the reconcile. THEIR
+/// row below the version we last saw synced ([`is_rollback`]) is not taken:
+/// warned, ours left dirty. An unreadable row: left dirty.
+fn open_conflict_pair(
+    keys: item_layer::VaultKeys<'_>,
+    vault_id: &str,
+    ours_row: &DirtyRow,
+    theirs_row: Option<ItemRow>,
+) -> Result<(item_layer::ItemPayload, Option<TheirItem>), Resolved> {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    type S = sudp::primitives::StdPrimitives;
+    let ours = item_layer::open_wire_item::<S>(
+        keys,
+        vault_id,
+        &ours_row.id,
+        ours_row.version,
+        &ours_row.ct,
+    )
+    .map_err(|e| {
+        tracing::warn!(vault = %vault_id, item = %ours_row.id, "per-item reconcile: can't open our row ({}); left dirty", e);
+        Resolved::LeaveDirty
+    })?;
     let theirs = match theirs_row {
         None => None,
+        Some(r) if is_rollback(r.version, ours_row.synced_version) => {
+            tracing::warn!(
+                vault = %vault_id, item = %ours_row.id, their_version = r.version, synced_version = ours_row.synced_version,
+                "per-item reconcile: the cloud returned an older version than this device synced; not adopted, left dirty"
+            );
+            return Err(Resolved::LeaveDirty);
+        }
         Some(r) => {
             let opened = URL_SAFE_NO_PAD
                 .decode(r.ct.as_bytes())
@@ -3139,7 +3236,8 @@ fn set_aside_fixes(
     let (r, ct, p) = theirs?;
     let mut fixes = Vec::new();
     let same = !p.is_tombstone()
-        && item_layer::body_digest(p.ns, &p.body) == item_layer::body_digest(ours.ns, &ours.body);
+        && item_layer::body_digest(p.ns, &p.name, &p.body)
+            == item_layer::body_digest(ours.ns, &ours.name, &ours.body);
     if !ours.is_tombstone() && !same {
         match item_layer::seal_conflict_copy::<S>(keys, vault_id, ours, r.version) {
             Ok((copy_id, copy_ct)) => fixes.push(LocalFix::InsertIfAbsent {
@@ -4769,7 +4867,7 @@ mod peritem_tests {
             sig: None,
             signer: None,
         };
-        let n = adopt_item_rows(&mut pv, std::slice::from_ref(&stale), 5).unwrap();
+        let n = adopt_item_rows(&mut pv, std::slice::from_ref(&stale), 5, None).unwrap();
         assert_eq!(n, 0, "stale version ignored");
         assert_eq!(pv.get_item(&id).unwrap().version, 2);
         assert_eq!(pv.items_seq, 5, "cursor still advances to max seq");
@@ -4786,7 +4884,7 @@ mod peritem_tests {
             sig: None,
             signer: None,
         };
-        let n = adopt_item_rows(&mut pv, std::slice::from_ref(&newer), 9).unwrap();
+        let n = adopt_item_rows(&mut pv, std::slice::from_ref(&newer), 9, None).unwrap();
         assert_eq!(n, 1);
         assert_eq!(pv.get_item(&id).unwrap().version, 3);
         assert_eq!(pv.get_item(&id).unwrap().ct, vec![1u8, 2, 3, 4]);
@@ -4822,11 +4920,176 @@ mod peritem_tests {
             sig: None,
             signer: None,
         };
-        let n = adopt_item_rows(&mut pv, std::slice::from_ref(&theirs), 9).unwrap();
+        let n = adopt_item_rows(&mut pv, std::slice::from_ref(&theirs), 9, None).unwrap();
         assert_eq!(n, 0, "dirty row is left to the push reconcile");
         assert_eq!(pv.get_item(&id).unwrap().version, 2);
         assert_eq!(pv.get_item(&id).unwrap().ct, ours_ct);
         assert_eq!(pv.items_seq, 9, "cursor still advances");
+    }
+
+    /// A pulled row as the cloud serves it: `payload` sealed at `version`
+    /// under `k` at its own address (sidecar-signed by `by`, as type `ty`).
+    fn cloud_row(
+        k: &[u8; 32],
+        vault: &str,
+        payload: &crate::storage::item::ItemPayload,
+        version: u64,
+        seq: u64,
+        by: Option<(&crate::crypto::vault_key::UikRoot, &str)>,
+    ) -> ItemRow {
+        use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+        use base64::Engine;
+        let ctx = crate::storage::item::ItemCtx::for_item::<StdPrimitives>(
+            k,
+            vault,
+            payload.ns,
+            &payload.name,
+            version,
+        )
+        .unwrap();
+        let ct = crate::storage::item::seal_item::<StdPrimitives>(k, &ctx, payload).unwrap();
+        let (sig, signer) = match by {
+            Some((s, ty)) => {
+                let input = crate::identity::record_signature_input(
+                    ty,
+                    ctx.id_bytes(),
+                    version,
+                    vault,
+                    &ct,
+                    !payload.is_tombstone(),
+                    &s.user_id(),
+                );
+                (
+                    Some(STANDARD.encode(s.signing().sign(&input))),
+                    Some(s.user_id()),
+                )
+            }
+            None => (None, None),
+        };
+        ItemRow {
+            item_id: ctx.item_id_b64(),
+            version,
+            seq,
+            ct: URL_SAFE_NO_PAD.encode(&ct),
+            sig,
+            signer,
+        }
+    }
+
+    /// On a vault with a keyset a pull keeps the honored owner-config: an
+    /// unsigned tombstone over an owner-signed legacy `aux:policy` is not
+    /// adopted, and the cursor stays before it (offered again next pull); an
+    /// owner-signed tombstone is adopted. Locked (no key), a replacement of
+    /// an existing row waits the same way; a new row is adopted.
+    #[test]
+    fn pull_keeps_honored_owner_config_over_an_unsigned_tombstone() {
+        use crate::storage::item::ItemPayload;
+        use crate::storage::sealed_vault::tests::{in_body_signed, role_fixture_creator_cred};
+        let k = [0x5au8; 32];
+        let keys = VaultKeys::single(&k);
+        let (vault, creator, _, _, _, mut pv) = role_fixture_creator_cred();
+        let policy = serde_json::json!({ "timeout": 7 });
+        let legacy = ItemPayload::live(
+            ItemNs::Aux,
+            "policy",
+            in_body_signed(vault, &creator, "policy", 1, &policy),
+        );
+        let id = pv
+            .plant::<StdPrimitives>(keys, vault, ItemNs::Aux, "policy", 1, &legacy)
+            .unwrap();
+        pv.items.get_mut(&id).unwrap().synced_version = 1;
+        pv.items_seq = 3;
+        let timeout = |pv: &PerItemVault| {
+            pv.fold_view::<StdPrimitives>(keys, vault)
+                .unwrap()
+                .aux
+                .policy
+                .and_then(|p| p.timeout)
+        };
+        assert_eq!(timeout(&pv), Some(7));
+
+        let tomb = ItemPayload::tombstone(ItemNs::Aux, "policy");
+        let unsigned = cloud_row(&k, vault, &tomb, 2, 5, None);
+        let n = adopt_item_rows(&mut pv, &[unsigned.clone()], 6, Some((keys, vault))).unwrap();
+        assert_eq!(n, 0, "not adopted");
+        assert_eq!(timeout(&pv), Some(7), "the honored value stays");
+        assert_eq!(pv.items_seq, 4, "the cursor stays before it");
+
+        // Locked: a replacement waits; a new row lands.
+        let new_secret = cloud_row(&k, vault, &ItemPayload::secret_live("NEW", "v"), 1, 5, None);
+        let n = adopt_item_rows(&mut pv, &[unsigned, new_secret], 6, None).unwrap();
+        assert_eq!(n, 1, "only the new row");
+        assert_eq!(pv.items_seq, 4);
+        assert_eq!(timeout(&pv), Some(7));
+
+        // The owner's signed tombstone (its migration) is adopted.
+        let signed = cloud_row(&k, vault, &tomb, 2, 5, Some((&creator, "policy")));
+        let n = adopt_item_rows(&mut pv, &[signed], 6, Some((keys, vault))).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(pv.items_seq, 6);
+        assert_eq!(timeout(&pv), None);
+    }
+
+    /// Anti-rollback, one rule: a fetched row whose version is below the
+    /// version this device last saw synced for the item is never adopted. A
+    /// 409 whose snapshot serves an older row leaves ours dirty; a local fix
+    /// that would put an older row back is not applied.
+    #[test]
+    fn an_older_row_than_the_synced_one_is_never_adopted() {
+        use crate::storage::item::ItemPayload;
+        let k = [0x42u8; 32];
+        let keys = VaultKeys::single(&k);
+        let vid = "v";
+        let mut pv = empty_pv();
+        let id = pv
+            .seal_and_upsert::<StdPrimitives>(
+                keys,
+                vid,
+                ItemNs::Secret,
+                "A",
+                6,
+                &ItemPayload::secret_live("A", "ours"),
+            )
+            .unwrap();
+        pv.items.get_mut(&id).unwrap().synced_version = 5;
+        let s = pv.get_item(&id).unwrap();
+        let ours = DirtyRow {
+            id: id.clone(),
+            version: s.version,
+            synced_version: s.synced_version,
+            ct: s.ct.clone(),
+            tombstone: false,
+            base: None,
+        };
+        // A faked 409 whose snapshot holds version 3 of the row.
+        let older = cloud_row(&k, vid, &ItemPayload::secret_live("A", "old"), 3, 9, None);
+        assert!(matches!(
+            open_conflict_pair(keys, vid, &ours, Some(older.clone())),
+            Err(Resolved::LeaveDirty)
+        ));
+        // The synced version itself, or newer, is read.
+        let same = cloud_row(
+            &k,
+            vid,
+            &ItemPayload::secret_live("A", "theirs"),
+            5,
+            9,
+            None,
+        );
+        assert!(open_conflict_pair(keys, vid, &ours, Some(same)).is_ok());
+
+        // A fix that would put version 3 back over a row synced at 5.
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        let fix = adopt_fix(
+            &ours,
+            &older,
+            URL_SAFE_NO_PAD.decode(older.ct.as_bytes()).unwrap(),
+            false,
+        );
+        let (changed, _) = apply_local_fixes(&mut pv, vec![fix]);
+        assert!(!changed);
+        assert_eq!(pv.get_item(&id).unwrap().version, 6);
     }
 
     /// base_version = the last version known on the cloud, so N local bumps
@@ -5174,7 +5437,11 @@ mod peritem_tests {
         // ours applies. Compared normalized: a plain-string service entry is
         // `{service: <text>}`.
         let v_copied = live(ItemNs::Service, "acme", serde_json::json!("b"));
-        let base = body_digest_hex(ItemNs::Service, &serde_json::json!({"service": "b"}));
+        let base = body_digest_hex(
+            ItemNs::Service,
+            "acme",
+            &serde_json::json!({"service": "b"}),
+        );
         assert_eq!(
             decide_conflict(&v_ours, Some(&v_copied), Some(&base)),
             ConflictAction::Reapply
@@ -5183,12 +5450,16 @@ mod peritem_tests {
             decide_conflict(&v_ours, Some(&v_theirs), Some(&base)),
             ConflictAction::Reapply
         );
-        let other_base = body_digest_hex(ItemNs::Service, &serde_json::json!({"service": "x"}));
+        let other_base = body_digest_hex(
+            ItemNs::Service,
+            "acme",
+            &serde_json::json!({"service": "x"}),
+        );
         assert_eq!(
             decide_conflict(&v_ours, Some(&v_theirs), Some(&other_base)),
             ConflictAction::KeepBoth
         );
-        let s_base = body_digest_hex(ItemNs::Secret, &serde_json::json!("theirs"));
+        let s_base = body_digest_hex(ItemNs::Secret, "T", &serde_json::json!("theirs"));
         assert_eq!(
             decide_conflict(&s_ours, Some(&s_theirs), Some(&s_base)),
             ConflictAction::Reapply
@@ -5218,18 +5489,34 @@ mod peritem_tests {
         );
         // Owner-config (native or legacy address): never overwritten, also
         // without a keyset; an equal body adopts.
-        for (ns, name) in [
-            (ItemNs::Policy, ""),
-            (ItemNs::Stores, ""),
-            (ItemNs::StoreOrder, ""),
-            (ItemNs::AuditRetentionDays, ""),
-            (ItemNs::Aux, "policy"),
-            (ItemNs::Aux, "stores"),
-            (ItemNs::Aux, "store_order"),
-            (ItemNs::Aux, "audit_retention_days"),
+        let x = |n: u64| serde_json::json!({ "x": n });
+        for (ns, name, a, b) in [
+            (
+                ItemNs::Policy,
+                "",
+                serde_json::json!({"timeout": 1}),
+                serde_json::json!({"timeout": 2}),
+            ),
+            (ItemNs::Stores, "", x(1), x(2)),
+            (
+                ItemNs::StoreOrder,
+                "",
+                serde_json::json!(["a"]),
+                serde_json::json!(["b"]),
+            ),
+            (
+                ItemNs::AuditRetentionDays,
+                "",
+                serde_json::json!(1),
+                serde_json::json!(2),
+            ),
+            (ItemNs::Aux, "policy", x(1), x(2)),
+            (ItemNs::Aux, "stores", x(1), x(2)),
+            (ItemNs::Aux, "store_order", x(1), x(2)),
+            (ItemNs::Aux, "audit_retention_days", x(1), x(2)),
         ] {
-            let ours = live(ns, name, serde_json::json!({"x": 1}));
-            let theirs = live(ns, name, serde_json::json!({"x": 2}));
+            let ours = live(ns, name, a);
+            let theirs = live(ns, name, b);
             assert_eq!(
                 decide_conflict(&ours, Some(&theirs), None),
                 ConflictAction::SetAside,
@@ -5243,6 +5530,45 @@ mod peritem_tests {
             assert_eq!(
                 decide_conflict(&ours, Some(&ours.clone()), None),
                 ConflictAction::Adopt
+            );
+        }
+        // The console and this process copying the same legacy row at once:
+        // the same content written two ways is equal (adopt theirs, nothing
+        // set aside or copied).
+        for (ns, name, console, daemon) in [
+            (
+                ItemNs::Policy,
+                "category:ai",
+                serde_json::json!({ "write": "ask", "ttl": null }),
+                serde_json::json!({ "write": "ask" }),
+            ),
+            (
+                ItemNs::Policy,
+                "",
+                serde_json::json!({ "default": { "read": "allow", "write": null }, "timeout": 60 }),
+                serde_json::json!({ "timeout": 60, "default": { "read": "allow" } }),
+            ),
+            (
+                ItemNs::Service,
+                "acme",
+                serde_json::json!({ "service": "a", "policy": null }),
+                serde_json::json!({ "service": "a" }),
+            ),
+            (
+                ItemNs::Service,
+                "acme",
+                serde_json::json!("a"),
+                serde_json::json!({ "service": "a" }),
+            ),
+        ] {
+            assert_eq!(
+                decide_conflict(
+                    &live(ns, name, daemon),
+                    Some(&live(ns, name, console)),
+                    None
+                ),
+                ConflictAction::Adopt,
+                "{ns:?}:{name}"
             );
         }
         // Our delete vs their edit → delete wins (re-apply the tombstone).

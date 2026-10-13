@@ -775,38 +775,45 @@ pub fn canonical_rule_table() -> String {
     format!("[{}]", rows.join(","))
 }
 
-/// A body as compared and written: a `service` entry in its object form
-/// `{service, policy?, source?}` (the plain-string form written before
-/// sources is `{service: <text>}`; a null `policy` / `source` is absent).
-/// Every other body is itself.
-pub fn normalized_body(ns: ItemNs, body: &serde_json::Value) -> serde_json::Value {
-    if ns != ItemNs::Service {
-        return body.clone();
-    }
-    match body {
-        serde_json::Value::String(s) => serde_json::json!({ "service": s }),
-        serde_json::Value::Object(o) => serde_json::Value::Object(
-            o.iter()
-                .filter(|(k, v)| !(v.is_null() && matches!(k.as_str(), "policy" | "source")))
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect(),
-        ),
-        other => other.clone(),
+/// A body as compared and written, so the same content written by any client
+/// compares equal: a `service` entry in its object form `{service, policy?,
+/// source?}` (the plain-string form written before sources is `{service:
+/// <text>}`; a null `policy` / `source` is absent); an owner-config record
+/// (`name` picks its type) as its typed value (an absent or null field and
+/// an unknown one are the same); a body that does not parse, and every other
+/// body, is itself.
+pub fn normalized_body(ns: ItemNs, name: &str, body: &serde_json::Value) -> serde_json::Value {
+    match ns {
+        ItemNs::Service => match body {
+            serde_json::Value::String(s) => serde_json::json!({ "service": s }),
+            serde_json::Value::Object(o) => serde_json::Value::Object(
+                o.iter()
+                    .filter(|(k, v)| !(v.is_null() && matches!(k.as_str(), "policy" | "source")))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+            ),
+            other => other.clone(),
+        },
+        ItemNs::Policy | ItemNs::Store | ItemNs::StoreOrder | ItemNs::AuditRetentionDays => {
+            crate::storage::sealed_vault::owner_config_typed(ns, name, body)
+                .unwrap_or_else(|| body.clone())
+        }
+        _ => body.clone(),
     }
 }
 
 /// SHA-256 of the JCS form (sorted keys) of the [`normalized_body`].
-pub fn body_digest(ns: ItemNs, body: &serde_json::Value) -> [u8; 32] {
+pub fn body_digest(ns: ItemNs, name: &str, body: &serde_json::Value) -> [u8; 32] {
     use sha2::Digest;
     Sha256::digest(crate::crypto::canonical::canonicalize(&normalized_body(
-        ns, body,
+        ns, name, body,
     )))
     .into()
 }
 
 /// Hex of a [`body_digest`] (as a dirty row records its base).
-pub fn body_digest_hex(ns: ItemNs, body: &serde_json::Value) -> String {
-    body_digest(ns, body)
+pub fn body_digest_hex(ns: ItemNs, name: &str, body: &serde_json::Value) -> String {
+    body_digest(ns, name, body)
         .iter()
         .map(|b| format!("{:02x}", b))
         .collect()
@@ -1191,9 +1198,9 @@ mod tests {
         assert!(!Aux.write_allowed("other", Device, false, false), "no rule");
     }
 
-    /// THE canonical text of the item-namespace rule table, copied verbatim
-    /// from the design (DESIGN-item-namespace-table.md). The console asserts
-    /// the same text: a change to the table must change both sides.
+    /// THE canonical text of the item-namespace rule table. The console
+    /// asserts the same text, verbatim: a change to the table must change
+    /// both sides.
     #[test]
     fn rule_table_matches_the_canonical_text() {
         const CANONICAL: &str = r#"[{"key":"agent:<ag_id>","address":"cleartext_wire_hmac_aad","writers":["owner","own_member"],"signed":"writer:agent","conflict":"take_writer","read":"signer_authorized_and_wire_id_matches"},{"key":"audit_retention_days:","address":"blinded","writers":["owner","device_without_keyset"],"signed":"owner_with_keyset","conflict":"owner_config","read":"owner_signed_with_keyset_native_wins"},{"key":"aux:audit_retention_days","address":"blinded","writers":["migration_tombstone_only"],"signed":"owner_with_keyset","conflict":"owner_config","read":"legacy_when_no_honored_native"},{"key":"aux:policy","address":"blinded","writers":["migration_tombstone_only"],"signed":"owner_with_keyset","conflict":"owner_config","read":"legacy_when_no_honored_native"},{"key":"aux:secret_order","address":"blinded","writers":["migration_tombstone_only"],"signed":"none","conflict":"take_writer","read":"legacy_when_no_honored_native"},{"key":"aux:services","address":"blinded","writers":["migration_tombstone_only"],"signed":"owner_with_keyset","conflict":"owner_config","read":"legacy_union_native_wins"},{"key":"aux:store_order","address":"blinded","writers":["migration_tombstone_only"],"signed":"owner_with_keyset","conflict":"owner_config","read":"legacy_when_no_honored_native"},{"key":"aux:stores","address":"blinded","writers":["migration_tombstone_only"],"signed":"owner_with_keyset","conflict":"owner_config","read":"legacy_when_no_honored_native"},{"key":"connecting:<id>","address":"blinded","writers":["member","device"],"signed":"none","conflict":"take_writer","read":"all"},{"key":"connection:<id>","address":"blinded","writers":["member","device"],"signed":"none","conflict":"keep_both","read":"all"},{"key":"policy:","address":"blinded","writers":["owner","device_without_keyset"],"signed":"owner_with_keyset","conflict":"owner_config","read":"owner_signed_with_keyset_native_wins"},{"key":"policy:category:<tag>","address":"blinded","writers":["owner","device_without_keyset"],"signed":"owner_with_keyset","conflict":"owner_config","read":"owner_signed_with_keyset_native_wins"},{"key":"policy:connection:<connection_id>","address":"blinded","writers":["owner","device_without_keyset"],"signed":"owner_with_keyset","conflict":"owner_config","read":"owner_signed_with_keyset_native_wins"},{"key":"secret:<KEY>","address":"blinded","writers":["member","device"],"signed":"none","conflict":"keep_both","read":"all"},{"key":"secret_order:","address":"blinded","writers":["member"],"signed":"none","conflict":"take_writer","read":"console_only"},{"key":"service:<id>","address":"blinded","writers":["member","device"],"signed":"none","conflict":"keep_both","read":"derived_id_only_union_legacy"},{"key":"store:<id>","address":"blinded","writers":["owner","device_without_keyset"],"signed":"owner_with_keyset","conflict":"owner_config","read":"owner_signed_with_keyset_native_wins"},{"key":"store_order:","address":"blinded","writers":["owner","device_without_keyset"],"signed":"owner_with_keyset","conflict":"owner_config","read":"owner_signed_with_keyset_native_wins"}]"#;
@@ -1269,24 +1276,74 @@ mod tests {
     }
 
     /// A service body compares in its object form: the plain-string entry is
-    /// `{service: <text>}`, a null policy / source is absent. Other bodies are
-    /// compared as they are.
+    /// `{service: <text>}`, a null policy / source is absent. An owner-config
+    /// body compares as its typed value (a null or unknown field is absent),
+    /// so the same content from the console and from this process is equal.
+    /// Other bodies are compared as they are.
     #[test]
-    fn service_bodies_compare_normalized() {
+    fn bodies_compare_normalized() {
         let plain = serde_json::json!("[service]\nid = \"a\"\n");
         let object = serde_json::json!({ "service": "[service]\nid = \"a\"\n" });
         let nulls = serde_json::json!({ "service": "[service]\nid = \"a\"\n", "policy": null, "source": null });
-        assert_eq!(normalized_body(ItemNs::Service, &plain), object);
-        assert_eq!(normalized_body(ItemNs::Service, &nulls), object);
+        assert_eq!(normalized_body(ItemNs::Service, "a", &plain), object);
+        assert_eq!(normalized_body(ItemNs::Service, "a", &nulls), object);
         assert_eq!(
-            body_digest(ItemNs::Service, &plain),
-            body_digest(ItemNs::Service, &object)
+            body_digest(ItemNs::Service, "a", &plain),
+            body_digest(ItemNs::Service, "a", &object)
         );
-        assert_eq!(body_digest_hex(ItemNs::Service, &nulls).len(), 64);
+        assert_eq!(body_digest_hex(ItemNs::Service, "a", &nulls).len(), 64);
         assert_ne!(
-            body_digest(ItemNs::Secret, &plain),
-            body_digest(ItemNs::Secret, &object)
+            body_digest(ItemNs::Secret, "a", &plain),
+            body_digest(ItemNs::Secret, "a", &object)
         );
+        // Owner-config: same content, written two ways.
+        for (ns, name, a, b) in [
+            (
+                ItemNs::Policy,
+                "",
+                serde_json::json!({ "timeout": 30, "default": { "read": "allow", "ttl": null } }),
+                serde_json::json!({ "default": { "read": "allow" }, "timeout": 30 }),
+            ),
+            (
+                ItemNs::Policy,
+                "category:ai",
+                serde_json::json!({ "write": "ask", "read": null }),
+                serde_json::json!({ "write": "ask" }),
+            ),
+            (
+                ItemNs::Policy,
+                "connection:gmail",
+                serde_json::json!({ "default": { "write": "ask" }, "rules": {} }),
+                serde_json::json!({ "default": { "write": "ask" } }),
+            ),
+            (
+                ItemNs::Store,
+                "gcp-1",
+                serde_json::json!({ "kind": "gcp-sm", "category": "value", "items": {} }),
+                serde_json::json!({ "category": "value", "kind": "gcp-sm" }),
+            ),
+        ] {
+            assert_eq!(
+                body_digest(ns, name, &a),
+                body_digest(ns, name, &b),
+                "{ns:?}:{name}"
+            );
+        }
+        assert_ne!(
+            body_digest(
+                ItemNs::Policy,
+                "category:ai",
+                &serde_json::json!({ "write": "ask" })
+            ),
+            body_digest(
+                ItemNs::Policy,
+                "category:ai",
+                &serde_json::json!({ "write": "deny" })
+            )
+        );
+        // A body that does not parse compares as it is.
+        let odd = serde_json::json!({ "write": 7 });
+        assert_eq!(normalized_body(ItemNs::Policy, "category:ai", &odd), odd);
     }
 
     /// THE pinned cross-language parity vector (build contract §1).

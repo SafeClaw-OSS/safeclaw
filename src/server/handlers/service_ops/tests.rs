@@ -500,9 +500,10 @@ fn services_are_data_records_on_a_vault_with_members() {
 }
 
 /// LEGACY(services row): after an unlock, and only after a pull, a vault
-/// without a keyset moves the legacy record to native items (object form)
-/// and tombstones it, in one pass. A failed pull moves nothing. A vault with
-/// a keyset is left to the owner's console: nothing is written.
+/// without a keyset copies the legacy record to native items (object form);
+/// the retirement tombstones it once the copies are held (locally here: no
+/// cloud). A failed pull moves nothing. A vault with a keyset is left to the
+/// owner's console: nothing is written.
 #[test]
 fn legacy_services_move_only_after_a_pull() {
     use crate::storage::item::ItemPayload;
@@ -538,9 +539,39 @@ fn legacy_services_move_only_after_a_pull() {
     let (_d1, state) = state_with_store(vault, &v1, &k);
     let path = state.vaults.per_item_path(vault).unwrap();
     let before = std::fs::read(&path).unwrap();
-    assert_eq!(block_on(migrate_legacy_after(&state, vault, offline())), 0);
+    let copies = LegacyStep::Copies;
+    let retire = LegacyStep::Retire { on_cloud: false };
+    assert_eq!(
+        block_on(migrate_legacy_after(&state, vault, offline(), copies)),
+        None
+    );
+    assert_eq!(
+        block_on(migrate_legacy_after(&state, vault, offline(), retire)),
+        None
+    );
     assert_eq!(std::fs::read(&path).unwrap(), before, "nothing written");
-    assert_eq!(block_on(migrate_legacy_after(&state, vault, pulled())), 3);
+    assert_eq!(
+        block_on(migrate_legacy_after(&state, vault, pulled(), copies)),
+        Some(2)
+    );
+    assert!(
+        !stored(&state, vault)
+            .open_item::<S>(keys, vault, ItemNs::Aux, "services")
+            .unwrap()
+            .unwrap()
+            .is_tombstone(),
+        "the copies first; the legacy record stays"
+    );
+    // Held on the cloud: not yet (the copies are not pushed), nothing retired.
+    let on_cloud = LegacyStep::Retire { on_cloud: true };
+    assert_eq!(
+        block_on(migrate_legacy_after(&state, vault, pulled(), on_cloud)),
+        Some(0)
+    );
+    assert_eq!(
+        block_on(migrate_legacy_after(&state, vault, pulled(), retire)),
+        Some(1)
+    );
     let pv = stored(&state, vault);
     assert!(pv
         .open_item::<S>(keys, vault, ItemNs::Aux, "services")
@@ -561,7 +592,14 @@ fn legacy_services_move_only_after_a_pull() {
             .aux
             .services;
     assert_eq!(services.keys().collect::<Vec<_>>(), ["new", "old"]);
-    assert_eq!(block_on(migrate_legacy_after(&state, vault, pulled())), 0);
+    assert_eq!(
+        block_on(migrate_legacy_after(&state, vault, pulled(), copies)),
+        Some(0)
+    );
+    assert_eq!(
+        block_on(migrate_legacy_after(&state, vault, pulled(), retire)),
+        Some(0)
+    );
 
     // v2: the console's job; nothing is written, signed or not.
     let vault = "vault-team";
@@ -570,7 +608,14 @@ fn legacy_services_move_only_after_a_pull() {
         .unwrap();
     let (_d2, state) = state_with_store(vault, &v2, &k);
     let before = std::fs::read(state.vaults.per_item_path(vault).unwrap()).unwrap();
-    assert_eq!(block_on(migrate_legacy_after(&state, vault, pulled())), 0);
+    assert_eq!(
+        block_on(migrate_legacy_after(&state, vault, pulled(), copies)),
+        Some(0)
+    );
+    assert_eq!(
+        block_on(migrate_legacy_after(&state, vault, pulled(), retire)),
+        Some(0)
+    );
     assert_eq!(
         std::fs::read(state.vaults.per_item_path(vault).unwrap()).unwrap(),
         before
@@ -578,7 +623,10 @@ fn legacy_services_move_only_after_a_pull() {
 
     // A locked vault: nothing.
     state.lock_vault(vault);
-    assert_eq!(block_on(migrate_legacy_after(&state, vault, pulled())), 0);
+    assert_eq!(
+        block_on(migrate_legacy_after(&state, vault, pulled(), copies)),
+        Some(0)
+    );
 }
 
 /// The card's source is a fact only when this device fetched the pinned

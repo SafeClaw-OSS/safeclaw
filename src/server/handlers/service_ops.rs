@@ -173,16 +173,16 @@ fn session(
     }
 }
 
-/// LEGACY(aux addressing, services row): move the legacy rows to their
-/// native records now, on a vault without a keyset: owner-config
-/// ([`crate::storage::sealed_vault::PerItemVault::migrate_addressing`]) and
-/// the services record
-/// ([`crate::storage::sealed_vault::PerItemVault::migrate_legacy_services`]),
-/// each copied then tombstoned. Needs the vault unlocked; the caller holds the
-/// vault write lock and has just pulled. Best-effort: a failure is logged and
-/// the next unlock tries again. Returns the number of items written (the
-/// caller pushes them).
-pub(crate) fn migrate_legacy_now(state: &Arc<AppState>, vault_id: &str) -> usize {
+/// LEGACY(aux addressing, services row): one step of the migration on a
+/// vault without a keyset, under the vault write lock the caller holds:
+/// `Copies` writes the native copies of the legacy rows
+/// ([`crate::storage::sealed_vault::PerItemVault::migrate_legacy_copies`]);
+/// `Retire { on_cloud }` tombstones each legacy row whose copies are all
+/// confirmed ([`crate::storage::sealed_vault::PerItemVault::retire_legacy_rows`]).
+/// Needs the vault unlocked. Best-effort: a failure is logged and the next
+/// unlock tries again. Returns the number of items written (the caller
+/// pushes them).
+pub(crate) fn migrate_legacy_now(state: &Arc<AppState>, vault_id: &str, step: LegacyStep) -> usize {
     use crate::storage::sealed_vault::{read_per_item, write_per_item_atomic};
     type S = sudp::primitives::StdPrimitives;
     let run = || -> Result<usize> {
@@ -194,8 +194,10 @@ pub(crate) fn migrate_legacy_now(state: &Arc<AppState>, vault_id: &str) -> usize
             return Ok(0);
         };
         let keys = crate::storage::item::VaultKeys::from_material(&k);
-        let mut changed = pv.migrate_addressing::<S>(keys, vault_id)?;
-        changed.extend(pv.migrate_legacy_services::<S>(keys, vault_id)?);
+        let changed = match step {
+            LegacyStep::Copies => pv.migrate_legacy_copies::<S>(keys, vault_id),
+            LegacyStep::Retire { on_cloud } => pv.retire_legacy_rows::<S>(keys, vault_id, on_cloud),
+        };
         if !changed.is_empty() {
             write_per_item_atomic(&path, &pv)?;
         }
@@ -210,37 +212,63 @@ pub(crate) fn migrate_legacy_now(state: &Arc<AppState>, vault_id: &str) -> usize
     }
 }
 
+/// LEGACY: a step of the migration ([`migrate_legacy_now`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LegacyStep {
+    /// Write the native copies.
+    Copies,
+    /// Retire the legacy rows whose copies are held: on the cloud
+    /// (`on_cloud`), or locally on a device without a cloud.
+    Retire { on_cloud: bool },
+}
+
 /// LEGACY(aux addressing, services row): after `pull` (the device's pull of
-/// the vault's items), migrate the legacy rows under the vault write lock
+/// the vault's items), run `step` under the vault write lock
 /// ([`migrate_legacy_now`]). A failed pull migrates nothing: a device that is
-/// behind must not write copies of rows that changed elsewhere. Returns the
-/// number of items written.
-pub(crate) async fn migrate_legacy_after<F>(state: &Arc<AppState>, vault_id: &str, pull: F) -> usize
+/// behind must not write copies of rows that changed elsewhere. `None`: the
+/// pull failed; else the number of items written.
+pub(crate) async fn migrate_legacy_after<F>(
+    state: &Arc<AppState>,
+    vault_id: &str,
+    pull: F,
+    step: LegacyStep,
+) -> Option<usize>
 where
     F: std::future::Future<Output = std::result::Result<(), String>>,
 {
     if let Err(e) = pull.await {
         tracing::info!(vault = %vault_id, "legacy rows migration waits for a pull: {}", e);
-        return 0;
+        return None;
     }
     let lock = state.vault_write_lock(vault_id);
     let _guard = lock.lock().await;
-    migrate_legacy_now(state, vault_id)
+    Some(migrate_legacy_now(state, vault_id, step))
 }
 
 /// LEGACY(aux addressing, services row): at unlock (run detached, after the
 /// unlock handler released the vault write lock): pull this vault's items,
-/// then migrate, then push what the migration wrote.
+/// write the native copies and push them; then, after another pull, retire
+/// the legacy rows whose copies the cloud now holds and push those
+/// tombstones. A copy that did not land (an error, a refusal, a conflict
+/// left for later) keeps its legacy row live for a later unlock, so no
+/// reader ever sees a setting gone. A retirement that conflicts (the legacy
+/// row changed meanwhile) keeps theirs and is reported by the push.
 pub(crate) async fn migrate_legacy_after_unlock(state: Arc<AppState>, vault_id: String) {
-    let n = migrate_legacy_after(
-        &state,
-        &vault_id,
-        crate::sync::pull_items_now(&state, &vault_id),
-    )
-    .await;
+    let pull = || crate::sync::pull_items_now(&state, &vault_id);
+    let Some(n) = migrate_legacy_after(&state, &vault_id, pull(), LegacyStep::Copies).await else {
+        return;
+    };
     if n > 0 {
         crate::sync::refresh_after_item_pull(&state, &vault_id);
         crate::sync::push_items_best_effort(&state, &vault_id).await;
+    }
+    let on_cloud = crate::sync::cloud_configured();
+    let step = LegacyStep::Retire { on_cloud };
+    if let Some(m) = migrate_legacy_after(&state, &vault_id, pull(), step).await {
+        if m > 0 {
+            crate::sync::refresh_after_item_pull(&state, &vault_id);
+            crate::sync::push_items_best_effort(&state, &vault_id).await;
+        }
     }
 }
 
