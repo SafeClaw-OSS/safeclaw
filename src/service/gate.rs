@@ -583,16 +583,12 @@ fn check_oauth2(
         }
     }
     // Where the consent lands: not an egress target (a local listener or the
-    // provider's own page catches it), and the forms in use are many (http
-    // loopback, `urn:ietf:wg:oauth:2.0:oob`, an app scheme like
-    // `com.example:/cb`). Any absolute URI; the string checks above already
-    // bound its length and characters.
+    // provider's own page catches it), so any host is allowed, but only the
+    // forms a native or web OAuth client uses. The string checks above
+    // already bound its length and characters.
     if let Some(u) = &o.redirect_uri {
-        if url::Url::parse(u).is_err() {
-            errs.push(format!(
-                "[auth] redirect_uri '{}' is not an absolute URI",
-                u
-            ));
+        if let Some(problem) = redirect_uri_problem(u) {
+            errs.push(format!("[auth] redirect_uri '{}' {}", u, problem));
         }
     }
     if let Some(style) = &o.oauth_style {
@@ -690,6 +686,35 @@ fn check_oauth2(
                 e
             ));
         }
+    }
+}
+
+/// The out-of-band redirect: the provider shows the code on its own page.
+const OOB_REDIRECT: &str = "urn:ietf:wg:oauth:2.0:oob";
+
+/// Why `uri` is not a redirect an OAuth client uses, or `None`: an `http` or
+/// `https` URL (loopback included, RFC 8252 §7.3), [`OOB_REDIRECT`], or a
+/// private-use scheme in reverse-domain form (RFC 8252 §7.1: at least two
+/// dot-separated labels of letters, digits and `-`, as in
+/// `com.example.app:/cb`). Every other scheme is refused.
+fn redirect_uri_problem(uri: &str) -> Option<&'static str> {
+    let Ok(url) = url::Url::parse(uri) else {
+        return Some("is not an absolute URI");
+    };
+    let scheme = url.scheme();
+    let reverse_domain = scheme.contains('.')
+        && scheme.split('.').all(|label| {
+            !label.is_empty()
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        });
+    if matches!(scheme, "http" | "https") || uri == OOB_REDIRECT || reverse_domain {
+        None
+    } else {
+        Some(
+            "must be an http(s) URL, urn:ietf:wg:oauth:2.0:oob, or a reverse-domain app scheme (com.example.app:/cb)",
+        )
     }
 }
 
@@ -1009,25 +1034,24 @@ fn policy_from_inline(inline: &RawInlinePolicy, errs: &mut Vec<String>) -> Servi
 }
 
 /// Cross-checks of the policy against the paired `[requests]` shapes, the
-/// invariant that a field deciding an approval must be bound by it:
-///   - every `when` var is declared by some shape and in some shape's
-///     `scope` (else an ask-always approved at one value could be redeemed
-///     at another);
-///   - no `ask` / `ask-always` rule decides on the `body` on a path a shape
+/// invariant that a field deciding an approval must be bound by it. A shape
+/// covers a rule when their `match` patterns overlap (a rule with no `match`
+/// overlaps every shape); a request the rule matches resolves its vars from
+/// one of the covering shapes.
+///   - A `when` on `vars.<name>`: at least one shape covers the rule, and
+///     every covering shape declares `<name>` and lists it in `scope`, so the
+///     var resolves, and is held fixed by the approval, whichever covering
+///     shape a request resolves to (else an ask-always approved at one value
+///     could be redeemed at another).
+///   - A `when` on `vars.<shape>.<name>`: that shape covers the rule,
+///     declares `<name>` and lists it in `scope`.
+///   - No `ask` / `ask-always` rule decides on the `body` on a path a shape
 ///     covers (an approval there binds only the shape's `scope` fields).
 fn check_rules_against_requests(
     rules: &[PolicyRule],
     requests: &HashMap<String, RequestShape>,
     errs: &mut Vec<String>,
 ) {
-    let declared: HashSet<&str> = requests
-        .values()
-        .flat_map(|s| s.vars.keys().map(String::as_str))
-        .collect();
-    let bound: HashSet<&str> = requests
-        .values()
-        .flat_map(|s| s.scope.iter().map(String::as_str))
-        .collect();
     let mut shapes: Vec<(&String, &RequestShape)> = requests.iter().collect();
     shapes.sort_by_key(|(n, _)| *n);
     for (i, rule) in rules.iter().enumerate() {
@@ -1035,55 +1059,93 @@ fn check_rules_against_requests(
             Some(id) => format!("rule '{}'", id),
             None => format!("[[policy.rules]] #{}", i + 1),
         };
+        let covering: Vec<(&String, &RequestShape)> = shapes
+            .iter()
+            .copied()
+            .filter(|(_, shape)| shape_covers_rule(shape, rule))
+            .collect();
         if let Some(cond) = rule.when.as_deref().and_then(Condition::parse) {
-            let var = cond.var_name();
-            match var.split_once('.') {
-                // `vars.<shape>.<name>`: that shape must declare and bind it.
-                Some((shape, name)) => match requests.get(shape) {
-                    _ if !is_ident(shape) || !is_ident(name) => errs.push(format!(
-                        "{}: `when` var '{}' must be `vars.<name>` or `vars.<shape>.<name>`",
-                        what, var
-                    )),
-                    None => errs.push(format!(
-                        "{}: `when` names shape '{}', which is not a [requests] shape",
-                        what, shape
-                    )),
-                    Some(s) if !s.vars.contains_key(name) => errs.push(format!(
-                        "{}: `when` references var '{}', which [requests.{}] does not declare",
-                        what, name, shape
-                    )),
-                    Some(s) if !s.scope.iter().any(|k| k == name) => errs.push(format!(
-                        "{}: `when` gates on var '{}', which [requests.{}] does not bind; a deciding field must be bound (add it to scope)",
-                        what, name, shape
-                    )),
-                    Some(_) => {}
-                },
-                None if !declared.contains(var) => errs.push(format!(
-                    "{}: `when` references var '{}', which no [requests] shape declares",
-                    what, var
-                )),
-                None if !bound.contains(var) => errs.push(format!(
-                    "{}: `when` gates on var '{}', which is not in any shape's `scope`; a deciding field must be bound (add it to scope)",
-                    what, var
-                )),
-                None => {}
-            }
+            check_when_var(&what, cond.var_name(), requests, &covering, errs);
         }
         if rule.body.is_some()
             && matches!(rule.level, Some(AccessLevel::Ask | AccessLevel::AskAlways))
         {
-            for (name, shape) in &shapes {
-                let covers = rule.match_patterns.is_empty()
-                    || rule.match_patterns.iter().any(|rp| {
-                        shape
-                            .match_pattern
-                            .iter()
-                            .any(|sp| patterns_overlap(rp, sp))
-                    });
-                if covers {
+            for (name, _) in &covering {
+                errs.push(format!(
+                    "{}: decides an ask on the request body on a path [requests.{}] covers, where an approval binds only the shape's `scope` fields; gate it with `when` on a bound field instead",
+                    what, name
+                ));
+            }
+        }
+    }
+}
+
+/// Could a request match both `rule` and `shape`? A rule with no `match`
+/// applies to every path.
+fn shape_covers_rule(shape: &RequestShape, rule: &PolicyRule) -> bool {
+    rule.match_patterns.is_empty()
+        || rule.match_patterns.iter().any(|rp| {
+            shape
+                .match_pattern
+                .iter()
+                .any(|sp| patterns_overlap(rp, sp))
+        })
+}
+
+/// The `when` var rules of [`check_rules_against_requests`]. `covering` is
+/// the shapes that cover the rule, sorted by name.
+fn check_when_var(
+    what: &str,
+    var: &str,
+    requests: &HashMap<String, RequestShape>,
+    covering: &[(&String, &RequestShape)],
+    errs: &mut Vec<String>,
+) {
+    let binds = |s: &RequestShape, name: &str| s.scope.iter().any(|k| k == name);
+    match var.split_once('.') {
+        // `vars.<shape>.<name>`: that shape covers the rule, declares and
+        // binds the var.
+        Some((shape, name)) => match requests.get(shape) {
+            _ if !is_ident(shape) || !is_ident(name) => errs.push(format!(
+                "{}: `when` var '{}' must be `vars.<name>` or `vars.<shape>.<name>`",
+                what, var
+            )),
+            None => errs.push(format!(
+                "{}: `when` names shape '{}', which is not a [requests] shape",
+                what, shape
+            )),
+            Some(s) if !s.vars.contains_key(name) => errs.push(format!(
+                "{}: `when` references var '{}', which [requests.{}] does not declare",
+                what, name, shape
+            )),
+            Some(s) if !binds(s, name) => errs.push(format!(
+                "{}: `when` gates on var '{}', which [requests.{}] does not bind; a deciding field must be bound (add it to scope)",
+                what, name, shape
+            )),
+            Some(_) if !covering.iter().any(|(n, _)| n.as_str() == shape) => {
+                errs.push(format!(
+                    "{}: `when` gates on `vars.{}`, but [requests.{}] does not cover the rule's `match`, so the var never resolves there",
+                    what, var, shape
+                ))
+            }
+            Some(_) => {}
+        },
+        // `vars.<name>`: every covering shape declares and binds it.
+        None if covering.is_empty() => errs.push(format!(
+            "{}: `when` gates on var '{}', but no [requests] shape covers the rule's `match`, so no request it matches carries vars; declare a shape for these paths or drop the `when`",
+            what, var
+        )),
+        None => {
+            for (n, s) in covering {
+                if !s.vars.contains_key(var) {
                     errs.push(format!(
-                        "{}: decides an ask on the request body on a path [requests.{}] covers, where an approval binds only the shape's `scope` fields; gate it with `when` on a bound field instead",
-                        what, name
+                        "{}: `when` references var '{}', which [requests.{}] does not declare; every shape covering the rule's `match` must declare and bind it",
+                        what, var, n
+                    ));
+                } else if !binds(s, var) {
+                    errs.push(format!(
+                        "{}: `when` gates on var '{}', which [requests.{}] does not bind; every shape covering the rule's `match` must bind a deciding field (add it to scope)",
+                        what, var, n
                     ));
                 }
             }

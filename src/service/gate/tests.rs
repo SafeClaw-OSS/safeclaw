@@ -279,12 +279,15 @@ fn urls_are_parsed_by_the_client_parser_and_refuse_userinfo() {
         )
     };
     // redirect_uri is where the consent lands, not an egress target: any
-    // absolute URI the console and the providers use.
+    // host, in the forms OAuth clients use (http(s), out-of-band, a
+    // reverse-domain app scheme).
     for u in [
         "http://127.0.0.1:8765/safeclaw/oauth/callback",
         "http://localhost:1455/auth/callback",
         "urn:ietf:wg:oauth:2.0:oob",
         "com.example.app:/oauth2redirect",
+        "com.googleusercontent.apps.123-abc:/oauth2redirect",
+        "Com.Example.App:/cb",
         "https://app.example.com/cb",
     ] {
         ok(&redirect(u));
@@ -292,6 +295,20 @@ fn urls_are_parsed_by_the_client_parser_and_refuse_userinfo() {
     for u in ["/relative/cb", "not a uri", "cb"] {
         let e = rejected(&redirect(u));
         assert!(mentions(&e, "not an absolute URI"), "{u}: {e:?}");
+    }
+    for u in [
+        "javascript:alert(1)",
+        "data:text/html,hi",
+        "file:///etc/passwd",
+        "ftp://example.com/cb",
+        "myapp:/cb",
+        "urn:ietf:wg:oauth:2.0:other",
+        "com..example:/cb",
+        "com.example.:/cb",
+        "com.ex+ample:/cb",
+    ] {
+        let e = rejected(&redirect(u));
+        assert!(mentions(&e, "must be an http(s) URL"), "{u}: {e:?}");
     }
     let e = rejected(&redirect("com.example.app:/cb\\u202e"));
     assert!(mentions(&e, "control or bidi"), "{e:?}");
@@ -532,7 +549,75 @@ fn when_var_must_be_bound() {
     );
     let policy = RULE.replace("vars.amount > 80", "vars.risk == \\\"high\\\"");
     let e = rejected_with(&svc, &policy);
-    assert!(mentions(&e, "not in any shape's `scope`"), "{e:?}");
+    assert!(mentions(&e, "[requests.purchase] does not bind"), "{e:?}");
+}
+
+/// A `when` var is judged per shape covering the rule's `match`, never
+/// against the union of all shapes.
+#[test]
+fn when_var_is_declared_and_bound_by_every_shape_covering_the_rule() {
+    let svc = |pay: &str| {
+        format!(
+            "[service]\nid = \"pay\"\nname = \"Pay\"\nhosts = [\"api.pay.com\"]\n\
+             [requests.transfer]\nmatch = \"POST /transfer\"\nvars.amount = \"/amount\"\nscope = [\"amount\"]\n{pay}"
+        )
+    };
+    let rule = |m: &str, when: &str| {
+        format!(
+            "[[rule]]\nid = \"big\"\nlabel = \"Big payment\"\nmatch = \"{m}\"\nwhen = \"{when}\"\nlevel = \"ask-always\"\n"
+        )
+    };
+    // No shape covers POST /pay: the var never resolves there.
+    let e = rejected_with(&svc(""), &rule("POST /pay", "vars.amount > 100"));
+    assert!(mentions(&e, "no [requests] shape covers"), "{e:?}");
+    // The covering shape declares the var but does not bind it, while
+    // another shape binds it.
+    let unbound = "[requests.pay]\nmatch = \"POST /pay\"\nvars.amount = \"/amount\"\n";
+    let e = rejected_with(&svc(unbound), &rule("POST /pay", "vars.amount > 100"));
+    assert!(mentions(&e, "[requests.pay] does not bind"), "{e:?}");
+    // The covering shape does not declare it.
+    let other =
+        "[requests.pay]\nmatch = \"POST /pay\"\nvars.total = \"/total\"\nscope = [\"total\"]\n";
+    let e = rejected_with(&svc(other), &rule("POST /pay", "vars.amount > 100"));
+    assert!(
+        mentions(&e, "'amount', which [requests.pay] does not declare"),
+        "{e:?}"
+    );
+    // A rule spanning both shapes needs the var from each.
+    let e = rejected_with(&svc(other), &rule("POST /*", "vars.amount > 100"));
+    assert!(mentions(&e, "[requests.pay] does not declare"), "{e:?}");
+    let e = rejected_with(&svc(unbound), &rule("/**", "vars.amount > 100"));
+    assert!(mentions(&e, "[requests.pay] does not bind"), "{e:?}");
+    let bound =
+        "[requests.pay]\nmatch = \"POST /pay\"\nvars.amount = \"/amount\"\nscope = [\"amount\"]\n";
+    for m in ["POST /pay", "POST /*", "/**"] {
+        assert!(
+            admit(None, &svc(bound), Some(&rule(m, "vars.amount > 100"))).is_ok(),
+            "{m}"
+        );
+    }
+    // A rule with an empty `match` covers every shape.
+    let no_match = "[[rule]]\nid = \"big\"\nlabel = \"Big\"\nmatch = []\nwhen = \"vars.amount > 100\"\nlevel = \"ask-always\"\n";
+    assert!(admit(None, &svc(bound), Some(no_match)).is_ok());
+    let e = rejected_with(&svc(unbound), no_match);
+    assert!(mentions(&e, "[requests.pay] does not bind"), "{e:?}");
+    // Qualified: the named shape must cover the rule's paths.
+    let e = rejected_with(
+        &svc(bound),
+        &rule("POST /pay", "vars.transfer.amount > 100"),
+    );
+    assert!(
+        mentions(&e, "[requests.transfer] does not cover the rule's `match`"),
+        "{e:?}"
+    );
+    assert!(admit(
+        None,
+        &svc(unbound),
+        Some(&rule("POST /*", "vars.transfer.amount > 100"))
+    )
+    .is_ok());
+    let e = rejected_with(&svc(unbound), &rule("POST /*", "vars.pay.amount > 100"));
+    assert!(mentions(&e, "[requests.pay] does not bind"), "{e:?}");
 }
 
 #[test]
