@@ -9,7 +9,8 @@
 //!   versions, merges, or GCs.
 //! - **SafeClaw (this module)** owns everything else: the opaque **item id**
 //!   (HMAC of `ns ‖ name` under a K-derived subkey), the [`SealCtx`] build, the
-//!   JSON payload shape `{ns,name,status,body}`, and the conflict-copy id. The
+//!   JSON payload shape `{ns,name,status,body}`, and where a conflict copy
+//!   lands (an ordinary record, [`conflict_copy_slot`]). The
 //!   version comparison / merge / tombstone / GC policy lives in `sync.rs`.
 //!
 //! ## Cross-language parity (the recurring bug)
@@ -33,10 +34,6 @@ use crate::error::{AppError, Result};
 
 /// HKDF `info` label for the item-id subkey. Byte-identical to the TS side.
 const ITEM_ID_INFO: &[u8] = b"safeclaw/item-id/v1";
-
-/// Discriminator folded into a conflict-copy id so it never collides with the
-/// canonical item's id (contract §4/§5).
-const CONFLICT_LABEL: &[u8] = b"conflict";
 
 /// `SealCtx.domain` for a **content** item — distinct from the future
 /// `"keyset"` domain (cross-domain confusion is caught by sudp's AAD binding).
@@ -134,35 +131,6 @@ pub fn aad_id_from_wire<S: PrimitiveSuite>(k: &[u8], wire_id: &str) -> Result<[u
         <[u8; 32]>::try_from(raw.as_slice())
             .map_err(|_| AppError::Internal("item id is not 32 bytes".into()))
     }
-}
-
-/// Deterministic **conflict-copy** id (contract §4/§5): the same HMAC
-/// construction as [`item_id_bytes`] with an extra `"conflict"` label and the
-/// loser's version folded in, so a retry of the same conflict is idempotent
-/// (can't spawn a second copy) yet never collides with the canonical id.
-pub fn conflict_copy_id_bytes<S: PrimitiveSuite>(
-    k: &[u8],
-    ns: &str,
-    name: &str,
-    loser_version: u64,
-) -> Result<[u8; 32]> {
-    let k_id = derive_item_id_key::<S>(k)?;
-    let mut msg = Vec::new();
-    push_lp(&mut msg, ns.as_bytes());
-    push_lp(&mut msg, name.as_bytes());
-    push_lp(&mut msg, CONFLICT_LABEL);
-    push_lp(&mut msg, &loser_version.to_be_bytes());
-    Ok(hmac32(&k_id, &msg))
-}
-
-/// `base64url_nopad` of a [`conflict_copy_id_bytes`].
-pub fn conflict_copy_id<S: PrimitiveSuite>(
-    k: &[u8],
-    ns: &str,
-    name: &str,
-    loser_version: u64,
-) -> Result<String> {
-    Ok(URL_SAFE_NO_PAD.encode(conflict_copy_id_bytes::<S>(k, ns, name, loser_version)?))
 }
 
 /// `HMAC-SHA256(key, msg)` → 32 bytes.
@@ -484,8 +452,8 @@ pub enum Read {
     /// The legacy services record: read, unioned under the native items (a
     /// native item or tombstone wins for its id).
     LegacyUnionNativeWins,
-    /// Only a record at its own derived id (a conflict copy excepted), unioned
-    /// with the legacy services record, native first.
+    /// Only a record at its own derived id (a conflict copy is a record of
+    /// its own name), unioned with the legacy services record, native first.
     DerivedIdOnlyUnionLegacy,
 }
 
@@ -997,13 +965,11 @@ pub fn seal_wire_item<S: PrimitiveSuite>(
     seal_item::<S>(keys.content, &ItemCtx::new(vault_id, raw, version), payload)
 }
 
-/// CAS version a conflict copy is written at: always a CREATE at version 1 (no
-/// `base_version`), so a retry of the same conflict 409s on the existing copy
-/// instead of spawning a second one. Byte-parity with the console
-/// (`lib/vault-grant.ts` `putConflictCopy`).
-pub const CONFLICT_COPY_VERSION: u64 = 1;
-
 const CONFLICT_COPY_SUFFIX: &str = " (conflict copy)";
+
+/// Copy levels a record may reach (`"<name> (conflict copy)"` nested at most
+/// this many times); a conflict past them is refused, never written over.
+pub const MAX_COPY_LEVELS: usize = 3;
 
 /// Display name of a conflict copy: `"<name> (conflict copy)"` (console parity).
 pub fn conflict_copy_name(name: &str) -> String {
@@ -1015,24 +981,116 @@ pub fn is_conflict_copy_name(name: &str) -> bool {
     name.ends_with(CONFLICT_COPY_SUFFIX)
 }
 
-/// Keep-both (§4): seal OURS as the conflict copy of `(ours.ns, ours.name)`
-/// beside THEIR row at `theirs_version`. Returns `(copy_wire_id, ct)`. Exactly
-/// the console's `putConflictCopy`: id = [`conflict_copy_id`] under the id-seed
-/// with `loser_version = theirs_version`, payload `{ns, "<name> (conflict
-/// copy)", live, ours.body}`, sealed under the content key at
-/// [`CONFLICT_COPY_VERSION`] with the copy id as AAD.
-pub fn seal_conflict_copy<S: PrimitiveSuite>(
+/// How many copy levels `name` carries.
+fn copy_level(name: &str) -> usize {
+    let mut n = 0;
+    let mut rest = name;
+    while let Some(r) = rest.strip_suffix(CONFLICT_COPY_SUFFIX) {
+        n += 1;
+        rest = r;
+    }
+    n
+}
+
+/// The row at a candidate copy's address, as [`conflict_copy_slot`] sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RowAt {
+    /// No row.
+    Absent,
+    /// A tombstone at `version`.
+    Removed { version: u64 },
+    /// A live row whose normalized body digests to `digest`.
+    Live { digest: [u8; 32] },
+    /// A row this key cannot open.
+    Unreadable,
+}
+
+/// Where a keep-both conflict copy goes ([`conflict_copy_slot`]).
+#[derive(Debug, Clone)]
+pub enum CopySlot {
+    /// Write `payload` at `wire`, a create (`base_version` `None`) or over the
+    /// tombstone at `base_version`.
+    Write {
+        payload: ItemPayload,
+        wire: String,
+        base_version: Option<u64>,
+    },
+    /// The copy is already there (same content): nothing to write.
+    Same { wire: String },
+}
+
+/// Keep-both (§4): OURS is kept as the record `"<name> (conflict copy)"`, an
+/// ordinary record at that name's own derived id. A live row there with the
+/// same content is the same copy; with other content the copy goes one level
+/// down (`"<name> (conflict copy) (conflict copy)"`), at most
+/// [`MAX_COPY_LEVELS`] in all; a tombstone there is written over at its next
+/// version. A row that cannot be read is never written over, and a conflict
+/// past the last level is refused: both `Err`. `at(wire)` reads the row at
+/// an address.
+pub fn conflict_copy_slot<S: PrimitiveSuite>(
+    id_seed: &[u8],
+    ours: &ItemPayload,
+    mut at: impl FnMut(&str) -> RowAt,
+) -> Result<CopySlot> {
+    let mut name = ours.name.clone();
+    while copy_level(&name) < MAX_COPY_LEVELS {
+        name = conflict_copy_name(&name);
+        let wire = wire_id_for::<S>(id_seed, ours.ns, &name)?;
+        let payload = ItemPayload::live(ours.ns, name.clone(), ours.body.clone());
+        match at(&wire) {
+            RowAt::Absent => {
+                return Ok(CopySlot::Write {
+                    payload,
+                    wire,
+                    base_version: None,
+                })
+            }
+            RowAt::Removed { version } => {
+                return Ok(CopySlot::Write {
+                    payload,
+                    wire,
+                    base_version: Some(version),
+                })
+            }
+            RowAt::Live { digest } if digest == body_digest(ours.ns, &name, &ours.body) => {
+                return Ok(CopySlot::Same { wire })
+            }
+            RowAt::Live { .. } => {}
+            RowAt::Unreadable => {
+                return Err(AppError::Conflict(format!(
+                    "{} '{}': the record at '{}' cannot be read with this vault's key, so no copy is written over it",
+                    ours.ns.as_str(),
+                    ours.name,
+                    name
+                )))
+            }
+        }
+    }
+    Err(AppError::Conflict(format!(
+        "{} '{}': {} conflict copies of it already differ; resolve them in the console",
+        ours.ns.as_str(),
+        ours.name,
+        MAX_COPY_LEVELS
+    )))
+}
+
+/// [`RowAt`] of a stored row opened under `keys` (`None`: no row).
+pub fn row_at<S: PrimitiveSuite>(
     keys: VaultKeys,
     vault_id: &str,
-    ours: &ItemPayload,
-    theirs_version: u64,
-) -> Result<(String, Vec<u8>)> {
-    let id_bytes =
-        conflict_copy_id_bytes::<S>(keys.id_seed, ours.ns.as_str(), &ours.name, theirs_version)?;
-    let copy = ItemPayload::live(ours.ns, conflict_copy_name(&ours.name), ours.body.clone());
-    let ctx = ItemCtx::new(vault_id, id_bytes, CONFLICT_COPY_VERSION);
-    let ct = seal_item::<S>(keys.content, &ctx, &copy)?;
-    Ok((URL_SAFE_NO_PAD.encode(id_bytes), ct))
+    wire: &str,
+    row: Option<(u64, &[u8])>,
+) -> RowAt {
+    let Some((version, ct)) = row else {
+        return RowAt::Absent;
+    };
+    match open_wire_item::<S>(keys, vault_id, wire, version, ct) {
+        Ok(p) if p.is_tombstone() => RowAt::Removed { version },
+        Ok(p) => RowAt::Live {
+            digest: body_digest(p.ns, &p.name, &p.body),
+        },
+        Err(_) => RowAt::Unreadable,
+    }
 }
 
 #[cfg(test)]
@@ -1454,63 +1512,79 @@ mod tests {
         assert!(unseal_item::<StdPrimitives>(&k, &ItemCtx::new("v", id, 2), &sealed).is_err());
     }
 
-    /// THE pinned cross-language conflict-copy-id vector (build contract §7 /
-    /// §1 CANONICAL). `K = 0x42*32 ; ns = "secret" ; name = "GMAIL_REFRESH_TOKEN"
-    /// ; loser_version = 2`. Layout:
-    /// `base64url_nopad(HMAC-SHA256(K_id, lp(ns)‖lp(name)‖lp("conflict")‖lp(u64_be(2))))`.
-    /// The frontend TS conflict-copy id MUST produce this exact string; if it
-    /// ever drifts, do NOT edit the expected value — find why Rust ↔ TS diverged.
+    /// A keep-both conflict copy is an ordinary record `"<name> (conflict
+    /// copy)"` at that name's own derived id: written there when absent or
+    /// removed (over the tombstone's version), the same copy when the content
+    /// is already there, one level down when other content is there, refused
+    /// past [`MAX_COPY_LEVELS`] or over a row that cannot be read.
     #[test]
-    fn pinned_conflict_copy_id_parity_vector() {
+    fn a_conflict_copy_is_a_record_of_its_own_name() {
         let k = [0x42u8; 32];
-        let id = conflict_copy_id::<StdPrimitives>(&k, "secret", "GMAIL_REFRESH_TOKEN", 2).unwrap();
-        assert_eq!(id, "hBVW1yFYQ9aIxjcB-PeisTpr_EYtjQFXysiLCq7bN6k");
-    }
-
-    /// A conflict-copy id is deterministic (idempotent retry) and distinct from
-    /// both the canonical id and any other loser version.
-    #[test]
-    fn conflict_copy_id_is_deterministic_and_distinct() {
-        let k = [0x42u8; 32];
-        let canonical = item_id::<StdPrimitives>(&k, "secret", "T").unwrap();
-        let c1 = conflict_copy_id::<StdPrimitives>(&k, "secret", "T", 3).unwrap();
-        let c1_again = conflict_copy_id::<StdPrimitives>(&k, "secret", "T", 3).unwrap();
-        let c2 = conflict_copy_id::<StdPrimitives>(&k, "secret", "T", 4).unwrap();
-        assert_eq!(c1, c1_again, "same inputs → same id (idempotent)");
-        assert_ne!(c1, canonical, "conflict copy never collides with canonical");
-        assert_ne!(c1, c2, "different loser version → different id");
-    }
-
-    /// The daemon's conflict copy is the console's `putConflictCopy`: id =
-    /// `conflict_copy_id(id_seed, ns, name, theirs_version)`, sealed at version 1
-    /// under the content key with the copy id as AAD, payload name
-    /// `"<name> (conflict copy)"`, same ns + body. Deterministic id → a retry
-    /// lands on the same row.
-    #[test]
-    fn seal_conflict_copy_matches_console_shape() {
-        let id_seed = [0x42u8; 32];
-        let content = [0x24u8; 32];
-        let keys = VaultKeys {
-            id_seed: &id_seed,
-            content: &content,
+        let ours = ItemPayload::secret_live("T", "mine");
+        let id = |name: &str| item_id::<StdPrimitives>(&k, "secret", name).unwrap();
+        let mine = body_digest(ItemNs::Secret, "T (conflict copy)", &serde_json::json!("mine"));
+        let other = body_digest(ItemNs::Secret, "x", &serde_json::json!("other"));
+        let slot = |rows: &dyn Fn(&str) -> RowAt| {
+            conflict_copy_slot::<StdPrimitives>(&k, &ours, |w| rows(w))
         };
-        let ours = ItemPayload::secret_live("GMAIL_REFRESH_TOKEN", "mine");
-        let (id, ct) = seal_conflict_copy::<StdPrimitives>(keys, "v", &ours, 2).unwrap();
-        assert_eq!(
-            id, "hBVW1yFYQ9aIxjcB-PeisTpr_EYtjQFXysiLCq7bN6k",
-            "pinned copy-id vector"
-        );
-        let (id_again, _) = seal_conflict_copy::<StdPrimitives>(keys, "v", &ours, 2).unwrap();
-        assert_eq!(id, id_again, "idempotent retry targets the same row");
-
-        let opened =
-            open_wire_item::<StdPrimitives>(keys, "v", &id, CONFLICT_COPY_VERSION, &ct).unwrap();
-        assert_eq!(opened.ns, ItemNs::Secret);
-        assert_eq!(opened.name, "GMAIL_REFRESH_TOKEN (conflict copy)");
-        assert!(!opened.is_tombstone());
-        assert_eq!(opened.body, serde_json::json!("mine"));
-        // Bound to version 1 (a create), not to their version.
-        assert!(open_wire_item::<StdPrimitives>(keys, "v", &id, 2, &ct).is_err());
+        // Absent: a create at "T (conflict copy)".
+        match slot(&|_| RowAt::Absent).unwrap() {
+            CopySlot::Write {
+                payload,
+                wire,
+                base_version,
+            } => {
+                assert_eq!(payload.name, "T (conflict copy)");
+                assert_eq!(wire, id("T (conflict copy)"));
+                assert_eq!(base_version, None);
+                assert_eq!(payload.body, serde_json::json!("mine"));
+            }
+            s => panic!("{s:?}"),
+        }
+        // Removed: written over the tombstone at its next version.
+        assert!(matches!(
+            slot(&|_| RowAt::Removed { version: 4 }).unwrap(),
+            CopySlot::Write { base_version: Some(4), .. }
+        ));
+        // The same content there: nothing to write.
+        assert!(matches!(
+            slot(&|_| RowAt::Live { digest: mine }).unwrap(),
+            CopySlot::Same { .. }
+        ));
+        // Other content there: one level down.
+        let first = id("T (conflict copy)");
+        match slot(&|w| {
+            if w == first {
+                RowAt::Live { digest: other }
+            } else {
+                RowAt::Absent
+            }
+        })
+        .unwrap()
+        {
+            CopySlot::Write { payload, wire, .. } => {
+                assert_eq!(payload.name, "T (conflict copy) (conflict copy)");
+                assert_eq!(wire, id("T (conflict copy) (conflict copy)"));
+            }
+            s => panic!("{s:?}"),
+        }
+        // Every level taken by other content: refused, nothing written over.
+        let e = slot(&|_| RowAt::Live { digest: other }).unwrap_err();
+        assert!(e.to_string().contains("3 conflict copies"), "{e}");
+        // A copy of a copy counts its levels: two more at most.
+        let deep = ItemPayload::secret_live("T (conflict copy) (conflict copy)", "mine");
+        let e = conflict_copy_slot::<StdPrimitives>(&k, &deep, |w| {
+            if w == id("T (conflict copy) (conflict copy) (conflict copy)") {
+                RowAt::Live { digest: other }
+            } else {
+                RowAt::Absent
+            }
+        })
+        .unwrap_err();
+        assert!(e.to_string().contains("conflict copies"), "{e}");
+        // A row that cannot be read is never written over.
+        let e = slot(&|_| RowAt::Unreadable).unwrap_err();
+        assert!(e.to_string().contains("cannot be read"), "{e}");
     }
 
     /// `seal_wire_item` / `open_wire_item` round-trip a re-seal at a fresh version

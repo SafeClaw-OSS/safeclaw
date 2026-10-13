@@ -72,15 +72,81 @@ pub fn check_ref(s: &str) -> Result<(), String> {
     }
 }
 
-/// A full commit id: 40 lowercase hex digits.
+/// A full git object id (a commit, a tag object): 40 lowercase hex digits.
 pub fn is_full_commit(s: &str) -> bool {
     s.len() == 40 && s.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f'))
 }
 
-/// A ref that names a commit (hex digits only, a full or short commit id)
-/// rather than a branch or tag.
-pub fn is_commit_ref(s: &str) -> bool {
-    !s.is_empty() && s.chars().all(|c| c.is_ascii_hexdigit())
+/// The refs a stated ref may be among the repository's own branches and
+/// tags, as `heads/<name>` / `tags/<name>`: `refs/heads/<x>` or
+/// `refs/tags/<x>` is exactly that ref; any other `refs/...` is neither; a
+/// bare name (hex digits included) may be either.
+fn head_paths(git_ref: &str) -> Vec<String> {
+    match git_ref.strip_prefix("refs/") {
+        Some(rest) if rest.starts_with("heads/") || rest.starts_with("tags/") => {
+            vec![rest.to_string()]
+        }
+        Some(_) => Vec::new(),
+        None => vec![format!("heads/{}", git_ref), format!("tags/{}", git_ref)],
+    }
+}
+
+/// Annotated tags peeled in a row before a ref is refused.
+const MAX_TAG_DEPTH: usize = 4;
+
+/// The commit `obj` (a ref's target) names, peeling annotated tags.
+async fn peel<A: GitHubApi>(
+    api: &A,
+    owner: &str,
+    repo: &str,
+    mut obj: GitObject,
+    shown: &str,
+) -> Result<String, FetchError> {
+    for _ in 0..=MAX_TAG_DEPTH {
+        match obj {
+            GitObject::Commit(c) => return Ok(c),
+            GitObject::Tag(t) => obj = api.tag_target(owner, repo, &t).await?,
+            GitObject::Other => break,
+        }
+    }
+    Err(FetchError::Answered(format!(
+        "'{}' in github:{}/{} does not name a commit",
+        crate::util::terminal_safe(shown),
+        owner,
+        repo
+    )))
+}
+
+/// The commit at the head of the repository's own branch or tag `git_ref`
+/// names (see [`head_paths`]; an annotated tag peeled to its commit), or
+/// `None` when it names no branch or tag of the repository. A bare name that
+/// is a branch and a tag at different commits is refused: the requester
+/// states `refs/heads/<name>` or `refs/tags/<name>`.
+pub async fn ref_head<A: GitHubApi>(
+    api: &A,
+    owner: &str,
+    repo: &str,
+    git_ref: &str,
+) -> Result<Option<String>, FetchError> {
+    let mut heads: Vec<String> = Vec::new();
+    for path in head_paths(git_ref) {
+        if let Some(obj) = api.git_ref(owner, repo, &path).await? {
+            let c = peel(api, owner, repo, obj, git_ref).await?;
+            heads.push(c.trim().to_ascii_lowercase());
+        }
+    }
+    heads.dedup();
+    match heads.len() {
+        0 => Ok(None),
+        1 => Ok(heads.pop()),
+        _ => {
+            let r = crate::util::terminal_safe(git_ref);
+            Err(FetchError::Answered(format!(
+                "'{}' is both a branch and a tag of github:{}/{} at different commits; state refs/heads/{} or refs/tags/{}",
+                r, owner, repo, r, r
+            )))
+        }
+    }
 }
 
 /// Why a GitHub read failed.
@@ -111,12 +177,37 @@ impl From<FetchError> for String {
     }
 }
 
-/// The three GitHub reads a source needs. [`GitHubHttp`] is the real one.
+/// A git object a ref or an annotated tag points at, as GitHub reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GitObject {
+    /// A commit (its full id).
+    Commit(String),
+    /// An annotated tag object (its full id), peeled through
+    /// [`GitHubApi::tag_target`].
+    Tag(String),
+    /// Anything else (a tree, a blob).
+    Other,
+}
+
+/// The GitHub reads a source needs. [`GitHubHttp`] is the real one.
 #[allow(async_fn_in_trait)]
 pub trait GitHubApi {
     /// The repository's default branch.
     async fn default_branch(&self, owner: &str, repo: &str) -> Result<String, FetchError>;
-    /// The full commit a branch, tag or (short or full) commit resolves to.
+    /// The object the repository's own ref `path` (`heads/<branch>` or
+    /// `tags/<tag>`, matched exactly) points at; `None` when it has no such
+    /// ref.
+    async fn git_ref(
+        &self,
+        owner: &str,
+        repo: &str,
+        path: &str,
+    ) -> Result<Option<GitObject>, FetchError>;
+    /// The object the annotated tag object `sha` points at.
+    async fn tag_target(&self, owner: &str, repo: &str, sha: &str)
+        -> Result<GitObject, FetchError>;
+    /// The full commit GitHub resolves any ref or commit id to (a fetch of a
+    /// ref that is no branch or tag of the repository).
     async fn commit_of(&self, owner: &str, repo: &str, git_ref: &str)
         -> Result<String, FetchError>;
     /// The `tar.gz` of the repository at `commit`, at most
@@ -126,7 +217,10 @@ pub trait GitHubApi {
 
 /// Fetch a GitHub source: resolve `git_ref` (absent: the default branch) to a
 /// full commit, fetch that commit's tarball and read the source out of it.
-/// Returns the files and the source record pinning the commit.
+/// A ref is resolved among the repository's own branches and tags first
+/// ([`ref_head`]); one that is neither (a commit id, another ref) is resolved
+/// as GitHub resolves it, and the daemon then shows that source as stated by
+/// the requester. Returns the files and the source record pinning the commit.
 pub async fn fetch<A: GitHubApi>(
     api: &A,
     spec: &GitHubSpec,
@@ -137,27 +231,36 @@ pub async fn fetch<A: GitHubApi>(
     if let Some(p) = &spec.path {
         super::check_sub_path(p).map_err(|e| vec![e])?;
     }
-    let target = match git_ref {
+    let (owner, repo) = (spec.owner.as_str(), spec.repo.as_str());
+    let commit = match git_ref {
         Some(r) => {
             check_ref(r).map_err(|e| vec![e])?;
-            r.to_string()
+            match ref_head(api, owner, repo, r)
+                .await
+                .map_err(|e| vec![e.into()])?
+            {
+                Some(c) => c,
+                None => api
+                    .commit_of(owner, repo, r)
+                    .await
+                    .map_err(|e| vec![e.into()])?,
+            }
         }
         None => {
             let b = api
-                .default_branch(&spec.owner, &spec.repo)
+                .default_branch(owner, repo)
                 .await
                 .map_err(|e| vec![e.into()])?;
             check_ref(&b)
                 .map_err(|_| vec!["GitHub returned an unusable default branch name".to_string()])?;
-            b
+            ref_head(api, owner, repo, &format!("refs/heads/{}", b))
+                .await
+                .map_err(|e| vec![e.into()])?
+                .ok_or_else(|| vec!["GitHub has no commit for the default branch".to_string()])?
         }
-    };
-    let commit = api
-        .commit_of(&spec.owner, &spec.repo, &target)
-        .await
-        .map_err(|e| vec![e.into()])?
-        .trim()
-        .to_ascii_lowercase();
+    }
+    .trim()
+    .to_ascii_lowercase();
     if !is_full_commit(&commit) {
         return Err(vec!["GitHub did not return a full commit id".into()]);
     }
@@ -179,19 +282,20 @@ pub async fn fetch<A: GitHubApi>(
 }
 
 /// Check that `defs` (service id → service.toml, policy.toml), as a request
-/// carries them, are what `source` holds. A GitHub source is pinned at the
-/// head of a branch or tag: its stated ref (absent: the default branch) is
-/// resolved and must point at the pinned commit (GitHub serves a commit that
-/// exists only in a fork through the parent repository's URLs, so a commit is
-/// the repository's only as the head of one of its refs); that commit is
-/// fetched again and every definition's digest compared (a single service
-/// folder stored under another id through `--id` is compared after the same
-/// rename). `Ok(Fetched)` when all of it holds. `Err` when it does not, when
-/// the commit does not hold a source, or when GitHub answers without the
-/// data ([`FetchError::Answered`]). `Ok(NotReached)` only when no answer
-/// arrived ([`FetchError::Unreachable`]), `Ok(CommitRef)` for a ref that is a
-/// commit id, and `Ok(LocalFolder)` for a local folder: none can be checked
-/// here, and the card says so.
+/// carries them, are what `source` holds. A GitHub source is checked only at
+/// the head of one of the repository's own branches or tags: its stated ref
+/// (absent: the default branch) is resolved under `refs/heads/` or
+/// `refs/tags/` ([`ref_head`], an annotated tag peeled to its commit) and
+/// must point at the pinned commit; that commit is fetched again and every
+/// definition's digest compared (a single service folder stored under
+/// another id through `--id` is compared after the same rename).
+/// `Ok(Fetched)` when all of it holds. `Err` when it does not, when the
+/// commit does not hold a source, or when GitHub answers without the data
+/// ([`FetchError::Answered`]). `Ok(NotReached)` only when no answer arrived
+/// ([`FetchError::Unreachable`]), `Ok(NotBranchOrTag)` for a ref that is no
+/// branch or tag of the repository (a commit id, any other ref), and
+/// `Ok(LocalFolder)` for a local folder: none is checked, and the card shows
+/// the source as the requester stated it.
 pub async fn verify<A: GitHubApi>(
     api: &A,
     source: &ServiceSource,
@@ -225,9 +329,9 @@ pub async fn verify<A: GitHubApi>(
             shown
         )
     };
-    // The ref's head at the time of the check.
+    // The head of the ref, among the repository's own branches and tags, at
+    // the time of the check.
     let target = match git_ref {
-        Some(r) if is_commit_ref(r) => return Ok(SourceCheck::CommitRef),
         Some(r) => {
             check_ref(r)?;
             r.clone()
@@ -236,14 +340,16 @@ pub async fn verify<A: GitHubApi>(
             Ok(b) => {
                 check_ref(&b)
                     .map_err(|_| refused("GitHub returned an unusable default branch name"))?;
-                b
+                format!("refs/heads/{}", b)
             }
             Err(FetchError::Unreachable(_)) => return Ok(SourceCheck::NotReached),
             Err(FetchError::Answered(e)) => return Err(refused(&e)),
         },
     };
-    let head = match api.commit_of(owner, name, &target).await {
-        Ok(h) => h.trim().to_ascii_lowercase(),
+    let head = match ref_head(api, owner, name, &target).await {
+        Ok(Some(h)) => h,
+        Ok(None) if git_ref.is_some() => return Ok(SourceCheck::NotBranchOrTag),
+        Ok(None) => return Err(refused("GitHub has no commit for the default branch")),
         Err(FetchError::Unreachable(_)) => return Ok(SourceCheck::NotReached),
         Err(FetchError::Answered(e)) => return Err(refused(&e)),
     };
@@ -321,9 +427,10 @@ impl GitHubHttp {
         self
     }
 
-    /// Send a request: no response (a transport error, or none by the
-    /// deadline) is [`FetchError::Unreachable`].
-    async fn send(
+    /// Send a request and take any status: no response (a transport error,
+    /// or none by the deadline) is [`FetchError::Unreachable`]; a proxy's
+    /// refusal to open the connection is its answer ([`no_response`]).
+    async fn send_any(
         &self,
         req: reqwest::RequestBuilder,
         what: &str,
@@ -335,7 +442,16 @@ impl GitHubHttp {
             })?,
             None => sent.await,
         };
-        let resp = resp.map_err(unreachable)?;
+        resp.map_err(|e| no_response(&e, what))
+    }
+
+    /// [`Self::send_any`], a non-success status refused ([`status_problem`]).
+    async fn send(
+        &self,
+        req: reqwest::RequestBuilder,
+        what: &str,
+    ) -> Result<reqwest::Response, FetchError> {
+        let resp = self.send_any(req, what).await?;
         if !resp.status().is_success() {
             return Err(status_problem(resp.status().as_u16(), what));
         }
@@ -374,13 +490,20 @@ pub(crate) fn repo_url(api: &str, owner: &str, repo: &str) -> String {
 pub(crate) fn commit_url(api: &str, owner: &str, repo: &str, git_ref: &str) -> String {
     format!("{}/repos/{}/{}/commits/{}", api, owner, repo, git_ref)
 }
+pub(crate) fn git_ref_url(api: &str, owner: &str, repo: &str, path: &str) -> String {
+    format!("{}/repos/{}/{}/git/ref/{}", api, owner, repo, path)
+}
+pub(crate) fn git_tag_url(api: &str, owner: &str, repo: &str, sha: &str) -> String {
+    format!("{}/repos/{}/{}/git/tags/{}", api, owner, repo, sha)
+}
 pub(crate) fn tarball_url(codeload: &str, owner: &str, repo: &str, commit: &str) -> String {
     format!("{}/{}/{}/tar.gz/{}", codeload, owner, repo, commit)
 }
 
 /// What a non-success status says. Every status is an answer
-/// ([`FetchError::Answered`]); a proxy's (407) or a request timeout (408) is
-/// not GitHub's answer about the repository, and says so.
+/// ([`FetchError::Answered`]); a request timeout (408) is not GitHub's answer
+/// about the repository, and says so. (Every source URL is HTTPS: a proxy
+/// answers inside its tunnel setup, see [`no_response`].)
 pub(crate) fn status_problem(status: u16, what: &str) -> FetchError {
     FetchError::Answered(match status {
         404 | 422 => format!(
@@ -390,10 +513,6 @@ pub(crate) fn status_problem(status: u16, what: &str) -> FetchError {
         401 | 403 | 429 => format!(
             "GitHub refused the request for {} (HTTP {}; often its rate limit), try again later",
             what, status
-        ),
-        407 => format!(
-            "the proxy between this device and GitHub refused the request for {} (HTTP 407: proxy authentication required)",
-            what
         ),
         408 => format!(
             "the request for {} timed out before GitHub read it (HTTP 408), try again later",
@@ -407,9 +526,55 @@ pub(crate) fn status_problem(status: u16, what: &str) -> FetchError {
     })
 }
 
-/// A request that got no answer: a transport error before the response.
-fn unreachable(e: reqwest::Error) -> FetchError {
-    FetchError::Unreachable(format!("cannot reach GitHub: {}", e))
+/// A request that got no response. A proxy that refused to open the
+/// connection to GitHub answered, with its own refusal
+/// ([`FetchError::Answered`], said as the proxy's); anything else (no route,
+/// a reset, TLS) is no answer ([`FetchError::Unreachable`]).
+fn no_response(e: &reqwest::Error, what: &str) -> FetchError {
+    match proxy_refusal(e) {
+        Some(why) => FetchError::Answered(format!(
+            "the proxy between this device and GitHub refused the connection for {} ({}); check the proxy (`sc proxy`)",
+            what, why
+        )),
+        None => FetchError::Unreachable(format!("cannot reach GitHub: {}", e)),
+    }
+}
+
+/// Why a proxy refused to open a tunnel, read from the HTTP client's tunnel
+/// error (its type is not exported; its text is stable and tested below).
+fn proxy_refusal(e: &(dyn std::error::Error + 'static)) -> Option<&'static str> {
+    let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    while let Some(err) = cur {
+        match err.to_string().as_str() {
+            "tunnel error: proxy authorization required" => {
+                return Some("it requires proxy authentication")
+            }
+            "tunnel error: unsuccessful" => return Some("it answered the tunnel request with a refusal"),
+            "tunnel error: proxy response headers too long" => {
+                return Some("its answer to the tunnel request was unreadable")
+            }
+            _ => {}
+        }
+        cur = err.source();
+    }
+    None
+}
+
+/// A ref's or a tag's target object as GitHub's git database reports it
+/// (`{sha, type}`): its id must be a full object id.
+fn git_object(v: Option<&serde_json::Value>) -> Result<GitObject, FetchError> {
+    let o = v.ok_or_else(|| FetchError::Answered("GitHub returned a ref without its object".into()))?;
+    let sha = o
+        .get("sha")
+        .and_then(|s| s.as_str())
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| is_full_commit(s))
+        .ok_or_else(|| FetchError::Answered("GitHub returned an unreadable object id".into()))?;
+    Ok(match o.get("type").and_then(|t| t.as_str()) {
+        Some("commit") => GitObject::Commit(sha),
+        Some("tag") => GitObject::Tag(sha),
+        _ => GitObject::Other,
+    })
 }
 
 /// An answered download that cannot be read in full: too large or too slow.
@@ -462,6 +627,56 @@ impl GitHubApi for GitHubHttp {
             .and_then(|b| b.as_str())
             .map(str::to_string)
             .ok_or_else(|| answered("GitHub returned no default branch"))
+    }
+
+    async fn git_ref(
+        &self,
+        owner: &str,
+        repo: &str,
+        path: &str,
+    ) -> Result<Option<GitObject>, FetchError> {
+        let what = format!("ref '{}' in github:{}/{}", path, owner, repo);
+        let req = self.get(
+            &git_ref_url(&self.api, owner, repo, path),
+            "application/vnd.github+json",
+        );
+        let resp = self.send_any(req, &what).await?;
+        match resp.status().as_u16() {
+            404 => return Ok(None),
+            s if !(200..300).contains(&s) => return Err(status_problem(s, &what)),
+            _ => {}
+        }
+        let body = self.read(resp, MAX_META_RESPONSE, &what).await?;
+        let v: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|_| FetchError::Answered("GitHub returned an unreadable ref".into()))?;
+        // Only the exact ref counts (never a list of refs it prefixes).
+        if v.get("ref").and_then(|r| r.as_str()) != Some(format!("refs/{}", path).as_str()) {
+            return Ok(None);
+        }
+        git_object(v.get("object")).map(Some)
+    }
+
+    async fn tag_target(
+        &self,
+        owner: &str,
+        repo: &str,
+        sha: &str,
+    ) -> Result<GitObject, FetchError> {
+        if !is_full_commit(sha) {
+            return Err(FetchError::Answered(
+                "GitHub returned an unreadable object id".into(),
+            ));
+        }
+        let what = format!("tag object {} in github:{}/{}", sha, owner, repo);
+        let req = self.get(
+            &git_tag_url(&self.api, owner, repo, sha),
+            "application/vnd.github+json",
+        );
+        let resp = self.send(req, &what).await?;
+        let body = self.read(resp, MAX_META_RESPONSE, &what).await?;
+        let v: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|_| FetchError::Answered("GitHub returned an unreadable tag".into()))?;
+        git_object(v.get("object"))
     }
 
     async fn commit_of(
@@ -589,16 +804,11 @@ mod tests {
         });
     }
 
-    /// 407 and 408 are not GitHub's answer about the repository: their
-    /// messages say what they are.
+    /// A request timeout (408) is not GitHub's answer about the repository:
+    /// its message says what it is. Every status is an answer.
     #[test]
-    fn proxy_and_request_timeout_statuses_say_what_they_are() {
+    fn request_timeout_status_says_what_it_is() {
         let m = |s| status_problem(s, "github:acme/tools").message().to_string();
-        assert!(
-            m(407).contains("proxy") && !m(407).contains("not found"),
-            "{}",
-            m(407)
-        );
         assert!(
             m(408).contains("timed out") && !m(408).contains("refused"),
             "{}",
@@ -608,5 +818,121 @@ mod tests {
         for s in [407u16, 408, 404, 500] {
             assert!(matches!(status_problem(s, "x"), FetchError::Answered(_)));
         }
+    }
+
+    /// A reader of `https://api.github.com` through the proxy at `proxy`.
+    fn via_proxy(proxy: &str) -> GitHubHttp {
+        GitHubHttp {
+            client: reqwest::Client::builder()
+                .proxy(reqwest::Proxy::all(proxy).unwrap())
+                .build()
+                .unwrap(),
+            api: "https://api.github.com".into(),
+            codeload: "https://codeload.github.com".into(),
+            deadline: None,
+        }
+        .answering_by(tokio::time::Instant::now() + Duration::from_secs(5))
+    }
+
+    /// A proxy that refuses to open the HTTPS tunnel answered: its refusal
+    /// is said as the proxy's (never as GitHub not answering) and refuses.
+    /// A proxy that closes without an answer is no answer.
+    #[test]
+    fn a_proxy_refusing_the_tunnel_is_its_own_answer() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            for (reply, why) in [
+                (
+                    &b"HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 0\r\n\r\n"[..],
+                    "requires proxy authentication",
+                ),
+                (
+                    &b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n"[..],
+                    "refusal",
+                ),
+            ] {
+                let proxy = stand_in(reply.to_vec()).await;
+                let e = via_proxy(&proxy)
+                    .default_branch("acme", "tools")
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(&e, FetchError::Answered(m) if m.contains("the proxy between this device and GitHub refused") && m.contains(why) && !m.contains("did not answer")),
+                    "{e:?}"
+                );
+            }
+            // Closed without an answer: not reached.
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let proxy = format!("http://{}", listener.local_addr().unwrap());
+            tokio::spawn(async move {
+                while let Ok((mut sock, _)) = listener.accept().await {
+                    let mut buf = [0u8; 4096];
+                    let _ = sock.read(&mut buf).await;
+                    drop(sock);
+                }
+            });
+            let e = via_proxy(&proxy)
+                .default_branch("acme", "tools")
+                .await
+                .unwrap_err();
+            assert!(matches!(e, FetchError::Unreachable(_)), "{e:?}");
+        });
+    }
+
+    /// A ref read from GitHub's git database: only the exact ref counts, its
+    /// object id must be a full id, and a missing ref is `None`.
+    #[test]
+    fn a_ref_is_read_exactly() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let sha = "b".repeat(40);
+            let reply = |body: String| {
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .into_bytes()
+            };
+            let exact = stand_in(reply(format!(
+                r#"{{"ref":"refs/tags/v1","object":{{"sha":"{}","type":"tag"}}}}"#,
+                sha
+            )))
+            .await;
+            let within = Duration::from_secs(5);
+            assert_eq!(
+                reader(&exact, within).git_ref("acme", "tools", "tags/v1").await,
+                Ok(Some(GitObject::Tag(sha.clone())))
+            );
+            // Another ref than the one asked for: none.
+            assert_eq!(
+                reader(&exact, within).git_ref("acme", "tools", "heads/v1").await,
+                Ok(None)
+            );
+            let gone = stand_in(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_vec()).await;
+            assert_eq!(
+                reader(&gone, within).git_ref("acme", "tools", "heads/main").await,
+                Ok(None)
+            );
+            let short = stand_in(reply(
+                r#"{"ref":"refs/heads/main","object":{"sha":"abc","type":"commit"}}"#.into(),
+            ))
+            .await;
+            assert!(matches!(
+                reader(&short, within).git_ref("acme", "tools", "heads/main").await,
+                Err(FetchError::Answered(_))
+            ));
+            // A tag object's id is checked before it goes into a URL.
+            assert!(matches!(
+                reader(&exact, within).tag_target("acme", "tools", "../x").await,
+                Err(FetchError::Answered(_))
+            ));
+        });
     }
 }

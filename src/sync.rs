@@ -396,6 +396,23 @@ pub(crate) async fn pull_items_now(state: &Arc<AppState>, vault_id: &str) -> Res
     Ok(())
 }
 
+/// The per-item store of `vault` folded under `key` (`None`: no store, or
+/// it does not fold; logged).
+pub(crate) fn fold_with_key(
+    state: &AppState,
+    vault: &str,
+    key: &[u8],
+) -> Option<crate::storage::plaintext::VaultPlaintextView> {
+    let pv = read_per_item_store(&state.config.state_dir, vault)?;
+    match crate::server::handlers::metadata::decrypt_vault_view_peritem_with_key(key, &pv, vault) {
+        Ok(view) => Some(view),
+        Err(e) => {
+            tracing::warn!(vault = %vault, "fold after the unlock pull failed (serving the view opened at unlock): {}", e);
+            None
+        }
+    }
+}
+
 /// After a per-item pull adopted new rows, refresh the in-memory cache for an
 /// UNLOCKED vault by folding the per-item store with the retained `K` — no
 /// passkey. Locked vault (no K) → no-op (the next unlock folds the new rows). A
@@ -2562,19 +2579,22 @@ fn write_per_item_store(state_dir: &Path, vault: &str, pv: &PerItemVault) -> Res
 
 /// Adopt a batch of pulled item rows into the local store (server-authoritative,
 /// §5): a strictly-newer `version` replaces a CLEAN local row (a dirty one is
-/// left for the push-side 409 reconcile); the cursor advances
-/// to the max `seq` seen. Tombstones are stored like any other row — `fold_view`
-/// drops them at read time, and a later GC hard-deletes them. Returns the number
-/// of rows adopted.
+/// left for the push-side 409 reconcile); the cursor advances to the max
+/// `seq` seen. Tombstones are stored like any other row — `fold_view` drops
+/// them at read time, and a later GC hard-deletes them. Returns the number of
+/// rows adopted.
 ///
-/// On a vault with a keyset, the owner-config the fold honors is kept: a row
-/// that would replace an honored owner-config record with one the fold does
-/// not honor (an unsigned tombstone over an owner-signed legacy row, say) or
-/// cannot read is not adopted ([`PerItemVault::keeps_honored_owner_config`],
-/// under `keys` = the unlocked session's). Without `keys` (locked) a
-/// replacement of an existing row cannot be checked and waits. A row not
-/// adopted for either reason holds the cursor before it, so the next pull
-/// offers it again.
+/// On a vault with a keyset, the owner-config the fold honors is kept: a
+/// replacement the fold would not honor (an unsigned tombstone over an
+/// owner-signed legacy row, say) or cannot read is held
+/// ([`PerItemVault::unhonored_replacement`], under `keys` = the unlocked
+/// session's). Without `keys` (locked) only a replacement of a row this
+/// device has read as a data record ([`pv_store::RowKind::Data`]) is
+/// adopted; any other replacement needs the key and is held. A held row
+/// never pins the cursor: it is kept in the store's `held` list with why,
+/// offered again here on every pull (and at unlock, [`catch_up_at_unlock`])
+/// until it is adopted, superseded by a newer row, or stale, and shown to the
+/// user meanwhile. With `keys`, rows not yet classified are classified.
 fn adopt_item_rows(
     pv: &mut PerItemVault,
     rows: &[ItemRow],
@@ -2584,9 +2604,33 @@ fn adopt_item_rows(
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
     type S = sudp::primitives::StdPrimitives;
-    let mut adopted = 0usize;
-    let mut held: Option<u64> = None;
+    // What is offered: the held rows, then the pulled ones; per id the newest.
+    let mut offered: std::collections::BTreeMap<String, pv_store::HeldRow> =
+        std::mem::take(&mut pv.held);
     for row in rows {
+        let ct = URL_SAFE_NO_PAD
+            .decode(row.ct.as_bytes())
+            .map_err(|e| format!("item ct not base64url: {}", e))?;
+        if offered
+            .get(&row.item_id)
+            .is_some_and(|h| h.version >= row.version)
+        {
+            continue;
+        }
+        offered.insert(
+            row.item_id.clone(),
+            pv_store::HeldRow {
+                version: row.version,
+                seq: row.seq,
+                ct,
+                sig: row.sig.clone(),
+                signer: row.signer.clone(),
+                reason: String::new(),
+            },
+        );
+    }
+    let mut adopted = 0usize;
+    for (id, mut row) in offered {
         // Only adopt a strictly-newer version (server is authoritative, but a
         // stale replay must not clobber a fresher local row we already pushed).
         // NEVER adopt over a DIRTY local row (a local write not yet confirmed on
@@ -2594,92 +2638,115 @@ fn adopt_item_rows(
         // the push side, whose 409 reconcile (`push_items_best_effort`) compares
         // ours with theirs and keeps both / re-applies; while the vault is locked
         // it stays dirty and is reconciled on the first push after unlock.
-        let replaces = pv.get_item(&row.item_id).is_some();
-        let keep = pv
-            .get_item(&row.item_id)
-            .map(|s| row.version > s.version && s.version <= s.synced_version)
-            .unwrap_or(true);
-        if !keep {
+        let local = pv.get_item(&id);
+        let replaces = local.is_some();
+        if local.is_some_and(|s| row.version <= s.version || s.version > s.synced_version) {
             continue;
         }
-        let ct = URL_SAFE_NO_PAD
-            .decode(row.ct.as_bytes())
-            .map_err(|e| format!("item ct not base64url: {}", e))?;
-        if replaces && pv.keyset.uik.is_some() && !item_layer::is_agent_wire_id(&row.item_id) {
-            let hold = match keys {
-                None => true,
+        if replaces && pv.keyset.uik.is_some() && !item_layer::is_agent_wire_id(&id) {
+            let reason = match keys {
+                None => (pv.row_kinds.get(&id) != Some(&pv_store::RowKind::Data))
+                    .then_some(pv_store::HELD_LOCKED),
                 Some((keys, vault_id)) => {
                     let incoming = pv_store::StoredItem {
                         version: row.version,
-                        ct: ct.clone(),
+                        ct: row.ct.clone(),
                         synced_version: row.version,
                         tombstone: false,
                         sig: row.sig.clone(),
                         signer: row.signer.clone(),
                         base: None,
+                        upgrade: false,
                     };
-                    let keep_ours =
-                        pv.keeps_honored_owner_config::<S>(keys, vault_id, &row.item_id, &incoming);
-                    if keep_ours {
-                        tracing::warn!(item = %row.item_id, version = row.version, "per-item pull: an owner-config row the fold would not honor is not adopted; the honored one is kept");
-                    }
-                    keep_ours
+                    pv.unhonored_replacement::<S>(keys, vault_id, &id, &incoming)
                 }
             };
-            if hold {
-                held = Some(held.map_or(row.seq, |h| h.min(row.seq)));
+            if let Some(reason) = reason {
+                if keys.is_some() && row.reason != reason {
+                    tracing::warn!(item = %id, version = row.version, "per-item pull: a replacement the fold would not honor is held; the honored owner-config is kept: {}", reason);
+                }
+                row.reason = reason.to_string();
+                pv.held.insert(id, row);
                 continue;
             }
         }
-        pv.put_raw_signed(row.item_id.clone(), row.version, ct, row.sig.clone(), row.signer.clone());
+        pv.put_raw_signed(id, row.version, row.ct, row.sig, row.signer);
         adopted += 1;
     }
-    let cursor = match held {
-        Some(seq) => max_seq.min(seq.saturating_sub(1)),
-        None => max_seq,
-    };
-    if cursor > pv.items_seq {
-        pv.items_seq = cursor;
+    if let Some((keys, vault_id)) = keys {
+        pv.classify_rows::<S>(keys, vault_id);
+    }
+    if max_seq > pv.items_seq {
+        pv.items_seq = max_seq;
     }
     Ok(adopted)
 }
+
+/// Pages a single pull follows before it stops (a backend that pages its
+/// answer says `more`).
+const MAX_ITEM_PAGES: usize = 10_000;
 
 /// GET `/v/{vault}/items?since=<since>` → `Ok(Some((rows, max_seq)))`, or
 /// `Ok(None)` when the `/items` endpoint isn't live (404). `max_seq` is the
 /// cursor the caller should hold next (`since` unchanged when nothing is newer).
 /// `since = 0` is a full snapshot (the 409 reconcile reads THEIR current row
-/// from it, independent of the local cursor).
+/// from it, independent of the local cursor). An answer that says there is
+/// more (`more: true`, or a `next` cursor) is followed from its cursor until
+/// the last page.
 async fn fetch_item_rows(
     cloud: &str,
     vault: &str,
     device_key: &str,
     since: u64,
 ) -> Result<Option<(Vec<ItemRow>, u64)>, String> {
-    let url = format!(
-        "{}/v/{}/items?since={}",
-        cloud.trim_end_matches('/'),
-        vault,
-        since
-    );
     let client = crate::cli::egress_proxy::client(Duration::from_secs(15))
         .map_err(|e| format!("http client init: {}", e))?;
-    let resp = client
-        .get(&url)
-        .bearer_auth(device_key)
-        .dik_pop("GET", &url, &[])
-        .send()
-        .await
-        .map_err(|e| format!("reach {}: {}", cloud, e))?;
-    match resp.status().as_u16() {
-        200 => {}
-        404 => return Ok(None), // /items not live yet — no-op (stubbed[])
-        401 | 403 => return Err(format!("cloud auth rejected (HTTP {})", resp.status())),
-        other => return Err(format!("items GET HTTP {}", other)),
+    let mut rows: Vec<ItemRow> = Vec::new();
+    let mut cursor = since;
+    for _ in 0..MAX_ITEM_PAGES {
+        let url = format!(
+            "{}/v/{}/items?since={}",
+            cloud.trim_end_matches('/'),
+            vault,
+            cursor
+        );
+        let resp = client
+            .get(&url)
+            .bearer_auth(device_key)
+            .dik_pop("GET", &url, &[])
+            .send()
+            .await
+            .map_err(|e| format!("reach {}: {}", cloud, e))?;
+        match resp.status().as_u16() {
+            200 => {}
+            404 => return Ok(None), // /items not live yet — no-op (stubbed[])
+            401 | 403 => return Err(format!("cloud auth rejected (HTTP {})", resp.status())),
+            other => return Err(format!("items GET HTTP {}", other)),
+        }
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("parse items response: {}", e))?;
+        let (page, next) = parse_items_page(&body, cursor)?;
+        rows.extend(page);
+        match next {
+            Some(n) if n > cursor => cursor = n,
+            Some(_) => return Err("items GET: the next page does not advance".into()),
+            None => {
+                let max_seq = body.get("seq").and_then(|v| v.as_u64()).unwrap_or(cursor);
+                return Ok(Some((rows, max_seq.max(cursor))));
+            }
+        }
     }
-    let body: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("parse items response: {}", e))?;
+    Err(format!("items GET: more than {} pages", MAX_ITEM_PAGES))
+}
+
+/// One `/items` answer: its rows, and the cursor of the next page when it
+/// says there is more (`more: true` → its `seq`; a numeric `next`).
+fn parse_items_page(
+    body: &serde_json::Value,
+    since: u64,
+) -> Result<(Vec<ItemRow>, Option<u64>), String> {
     let rows: Vec<ItemRow> = body
         .get("items")
         .cloned()
@@ -2687,8 +2754,14 @@ async fn fetch_item_rows(
         .transpose()
         .map_err(|e| format!("parse items array: {}", e))?
         .unwrap_or_default();
-    let max_seq = body.get("seq").and_then(|v| v.as_u64()).unwrap_or(since);
-    Ok(Some((rows, max_seq)))
+    let seq = body.get("seq").and_then(|v| v.as_u64()).unwrap_or(since);
+    let next = match body.get("next") {
+        Some(serde_json::Value::Number(n)) => n.as_u64(),
+        Some(serde_json::Value::Null) | None => None,
+        Some(_) => Some(seq),
+    };
+    let more = body.get("more").and_then(|v| v.as_bool()).unwrap_or(false);
+    Ok((rows, next.or(more.then_some(seq))))
 }
 
 /// Pull item rows changed since the local `.items_seq` cursor and adopt them
@@ -2707,19 +2780,121 @@ pub async fn pull_items(
     if leave_shared_to_official(vault) {
         return Ok(0);
     }
-    let Some(mut pv) = read_per_item_store(state_dir, vault) else {
+    let Some(since) = read_per_item_store(state_dir, vault).map(|pv| pv.items_seq) else {
         return Ok(0); // no per-item store yet (vault not enrolled per-item)
     };
-    let Some((rows, max_seq)) = fetch_item_rows(cloud, vault, device_key, pv.items_seq).await?
-    else {
+    let Some((rows, max_seq)) = fetch_item_rows(cloud, vault, device_key, since).await? else {
         return Ok(0); // /items not live yet — no-op (stubbed[])
     };
+    // Re-read after the network call: a local write meanwhile is kept.
+    let Some(mut pv) = read_per_item_store(state_dir, vault) else {
+        return Ok(0);
+    };
+    let before = (pv.held.clone(), pv.row_kinds.len(), pv.items_seq);
     let keys = key.map(|m| (item_layer::VaultKeys::from_material(m), vault));
     let adopted = adopt_item_rows(&mut pv, &rows, max_seq, keys)?;
-    if adopted > 0 || max_seq > 0 {
+    if adopted > 0 || (pv.held.clone(), pv.row_kinds.len(), pv.items_seq) != before {
         write_per_item_store(state_dir, vault, &pv)?;
     }
     Ok(adopted)
+}
+
+/// Offer the held rows of `vault` again under `key`, locally (no network).
+/// Returns the number adopted.
+fn reoffer_held(state_dir: &Path, vault: &str, key: &[u8]) -> Result<usize, String> {
+    let Some(mut pv) = read_per_item_store(state_dir, vault) else {
+        return Ok(0);
+    };
+    let before = (pv.held.clone(), pv.row_kinds.len());
+    let seq = pv.items_seq;
+    let keys = Some((item_layer::VaultKeys::from_material(key), vault));
+    let adopted = adopt_item_rows(&mut pv, &[], seq, keys)?;
+    if adopted > 0 || (pv.held.clone(), pv.row_kinds.len()) != before {
+        write_per_item_store(state_dir, vault, &pv)?;
+    }
+    Ok(adopted)
+}
+
+/// How long unlock waits for its pull before it serves.
+const UNLOCK_PULL_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// At unlock, before the vault serves: offer every held row again under the
+/// vault key, then pull (the held rows again, and anything newer). Returns
+/// whether rows were adopted (the caller folds again) and the pull's error,
+/// if it failed (the caller keeps retrying in the background,
+/// [`retry_pull_after_unlock`]). A daemon with no cloud pulls nothing.
+pub(crate) async fn catch_up_at_unlock(
+    state: &Arc<AppState>,
+    vault_id: &str,
+    key: &[u8],
+) -> (bool, Option<String>) {
+    let state_dir = &state.config.state_dir;
+    let mut adopted = match reoffer_held(state_dir, vault_id, key) {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!(vault = %vault_id, "unlock: held rows not offered again: {}", e);
+            0
+        }
+    };
+    let Ok(cfg) = active::load() else {
+        return (adopted > 0, None);
+    };
+    let Some(cloud) = cfg.cloud_backend.as_deref().filter(|s| !s.is_empty()) else {
+        return (adopted > 0, None);
+    };
+    let Some(dk) = device_key() else {
+        return (adopted > 0, Some("this daemon is not paired".into()));
+    };
+    let pulled = tokio::time::timeout(
+        UNLOCK_PULL_TIMEOUT,
+        pull_items(state_dir, cloud, vault_id, &dk, Some(key)),
+    )
+    .await;
+    match pulled {
+        Ok(Ok(n)) => {
+            adopted += n;
+            state.record_cloud_contact(vault_id);
+            (adopted > 0, None)
+        }
+        Ok(Err(e)) => (adopted > 0, Some(e)),
+        Err(_) => (
+            adopted > 0,
+            Some(format!(
+                "the cloud did not answer within {}s",
+                UNLOCK_PULL_TIMEOUT.as_secs()
+            )),
+        ),
+    }
+}
+
+/// After an unlock whose pull failed: keep pulling in the background (2 s,
+/// doubling to 60 s) until one succeeds or the vault locks again, and report
+/// it meanwhile ([`AppState::note_catch_up`], shown by `sc status`).
+pub(crate) fn retry_pull_after_unlock(state: Arc<AppState>, vault_id: String, error: String) {
+    tracing::warn!(vault = %vault_id, "unlock: the pull of changes from the cloud failed ({}); retrying in the background", error);
+    state.note_catch_up(&vault_id, &error);
+    tokio::spawn(async move {
+        let mut delay = Duration::from_secs(2);
+        loop {
+            tokio::time::sleep(delay).await;
+            if state.cloned_state_key(&vault_id).is_none() {
+                // Locked again: the next unlock pulls before it serves.
+                state.clear_catch_up(&vault_id);
+                return;
+            }
+            match pull_items_now(&state, &vault_id).await {
+                Ok(()) => {
+                    state.clear_catch_up(&vault_id);
+                    tracing::info!(vault = %vault_id, "unlock: changes from the cloud pulled");
+                    return;
+                }
+                Err(e) => {
+                    state.note_catch_up(&vault_id, &e);
+                    delay = (delay * 2).min(Duration::from_secs(60));
+                }
+            }
+        }
+    });
 }
 
 /// Push a single item to the cloud with per-item CAS (§4). `base_version` is the
@@ -2859,6 +3034,8 @@ struct DirtyRow {
     /// The digest of the body our change was made from, when known
     /// ([`pv_store::StoredItem::base`]).
     base: Option<String>,
+    /// Written by SafeClaw's automatic upgrade ([`pv_store::StoredItem::upgrade`]).
+    upgrade: bool,
 }
 
 /// `base_version` to push a dirty row with: the last version KNOWN to be on the
@@ -2951,10 +3128,19 @@ enum LocalFix {
         expect: u64,
         row: pv_store::StoredItem,
     },
-    /// A row known to be on the cloud (a conflict copy) → insert iff absent.
-    InsertIfAbsent {
+    /// A row known to be on the cloud (a conflict copy) → stored iff the
+    /// local row is absent, or clean and older (as a pull adopts it).
+    Mirror {
         id: String,
         row: pv_store::StoredItem,
+    },
+    /// Keep `ours` as its conflict copy, a dirty record of its own name
+    /// placed against the local store ([`PerItemVault::keep_conflict_copy`]).
+    /// When no copy may be written, the fixes for the row `of` are not
+    /// applied: ours stays dirty and the refusal is reported.
+    KeepCopy {
+        of: String,
+        ours: item_layer::ItemPayload,
     },
 }
 
@@ -2974,47 +3160,88 @@ fn clean_row(
         sig,
         signer,
         base: None,
+        upgrade: false,
     }
+}
+
+/// What [`apply_local_fixes`] did: whether the store changed, whether a row's
+/// sealed content was replaced or added (the unlocked cache needs a refresh),
+/// and the conflict copies refused, each `(row id, why)`.
+#[derive(Debug, Default)]
+struct Applied {
+    changed: bool,
+    content_changed: bool,
+    refused: Vec<(String, String)>,
 }
 
 /// Apply the push loop's [`LocalFix`]es. Every change is version-guarded so a
 /// writer that raced the push (bumped a row meanwhile) is never clobbered: its
-/// newer row stays dirty and goes out on the next push. Returns `(changed,
-/// content_changed)`; `content_changed` = a row's sealed content was replaced or
-/// added (the unlocked cache needs a refresh).
-fn apply_local_fixes(pv: &mut PerItemVault, fixes: Vec<LocalFix>) -> (bool, bool) {
-    let mut changed = false;
-    let mut content_changed = false;
+/// newer row stays dirty and goes out on the next push. A conflict copy needs
+/// `keys`; one that cannot be written keeps ours dirty (the other fixes for
+/// that row are skipped).
+fn apply_local_fixes(
+    pv: &mut PerItemVault,
+    fixes: Vec<LocalFix>,
+    keys: Option<(item_layer::VaultKeys<'_>, &str)>,
+) -> Applied {
+    type S = sudp::primitives::StdPrimitives;
+    let mut out = Applied::default();
+    let mut blocked: std::collections::BTreeSet<String> = Default::default();
     for fix in fixes {
         match fix {
             LocalFix::Synced { id, version } => {
                 if let Some(s) = pv.items.get_mut(&id) {
                     if s.version == version && s.synced_version < version {
                         s.synced_version = version;
-                        changed = true;
+                        out.changed = true;
                     }
                 }
             }
             LocalFix::Replace { id, expect, row } => {
+                if blocked.contains(&id) {
+                    continue;
+                }
                 let current = pv.items.get(&id).map(|s| (s.version, s.synced_version));
                 if current
                     .is_some_and(|(v, synced)| v == expect && !is_rollback(row.version, synced))
                 {
                     pv.items.insert(id, row);
-                    changed = true;
-                    content_changed = true;
+                    out.changed = true;
+                    out.content_changed = true;
                 }
             }
-            LocalFix::InsertIfAbsent { id, row } => {
-                if !pv.items.contains_key(&id) {
+            LocalFix::Mirror { id, row } => {
+                let take = pv.items.get(&id).is_none_or(|s| {
+                    s.version < row.version && s.version <= s.synced_version
+                });
+                if take {
                     pv.items.insert(id, row);
-                    changed = true;
-                    content_changed = true;
+                    out.changed = true;
+                    out.content_changed = true;
+                }
+            }
+            LocalFix::KeepCopy { of, ours } => {
+                let kept = match keys {
+                    Some((keys, vault_id)) => pv.keep_conflict_copy::<S>(keys, vault_id, &ours),
+                    None => Err(crate::error::AppError::Internal(
+                        "a conflict copy needs the vault key".into(),
+                    )),
+                };
+                match kept {
+                    Ok(Some(_)) => {
+                        out.changed = true;
+                        out.content_changed = true;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        out.refused.push((of.clone(), e.to_string()));
+                        blocked.insert(of);
+                    }
                 }
             }
         }
     }
-    (changed, content_changed)
+    out
 }
 
 /// THEIR rows for the 409 reconcile: one full `/items` snapshot, fetched lazily
@@ -3040,6 +3267,10 @@ enum Resolved {
         fixes: Vec<LocalFix>,
         record: String,
     },
+    /// Ours cannot be kept as a conflict copy (a row it would go over cannot
+    /// be read, or the last copy level is taken): the row stays dirty and
+    /// the user is told why.
+    Refused(String),
 }
 
 /// Replace our dirty row with THEIR row (clean), guarded on our version.
@@ -3162,42 +3393,23 @@ fn open_conflict_pair(
 /// dirty row), so just leaving ours dirty would pin the canonical id to a value
 /// only this device holds and re-offer it forever. Instead THEIR row becomes
 /// the canonical one locally and, for a differing live value in a keep-both
-/// namespace, OURS moves to a LOCAL conflict-copy row (the id the console would
-/// use) that stays DIRTY: it is re-offered on every push and lands once the
-/// entitlement returns (e.g. the plan is unfrozen). A refused delete, an equal
-/// value, or another namespace (owner-only config, where a copy row would be
-/// invisible to the fold) just takes theirs. `None` = nothing to take (no row
-/// of theirs: a refused create), so ours stays dirty where it is.
+/// namespace, OURS is kept as its conflict copy, a dirty record of its own
+/// name ([`LocalFix::KeepCopy`]): it is offered on every push and lands once
+/// the entitlement returns (e.g. the plan is unfrozen). A refused delete, an
+/// equal value, or another namespace just takes theirs. `None` = nothing to
+/// take (no row of theirs: a refused create), so ours stays dirty where it is.
 fn rejection_fixes(
-    keys: item_layer::VaultKeys<'_>,
-    vault_id: &str,
     ours_row: &DirtyRow,
     ours: &item_layer::ItemPayload,
     theirs: Option<TheirItem>,
 ) -> Option<Vec<LocalFix>> {
-    type S = sudp::primitives::StdPrimitives;
     let (r, ct, p) = theirs?;
     let mut fixes = Vec::new();
     if decide_conflict(ours, Some(&p), ours_row.base.as_deref()) == ConflictAction::KeepBoth {
-        match item_layer::seal_conflict_copy::<S>(keys, vault_id, ours, r.version) {
-            Ok((copy_id, copy_ct)) => fixes.push(LocalFix::InsertIfAbsent {
-                id: copy_id,
-                // Dirty (`synced_version` 0): pushed as a create next time.
-                row: pv_store::StoredItem {
-                    version: item_layer::CONFLICT_COPY_VERSION,
-                    ct: copy_ct,
-                    synced_version: 0,
-                    tombstone: false,
-                    sig: None,
-                    signer: None,
-                    base: None,
-                },
-            }),
-            Err(e) => {
-                tracing::warn!(vault = %vault_id, item = %ours_row.id, "per-item rejection: seal local conflict copy failed ({}); left dirty", e);
-                return None;
-            }
-        }
+        fixes.push(LocalFix::KeepCopy {
+            of: ours_row.id.clone(),
+            ours: ours.clone(),
+        });
     }
     fixes.push(adopt_fix(ours_row, &r, ct, p.is_tombstone()));
     Some(fixes)
@@ -3217,66 +3429,53 @@ fn conflict_record(p: &item_layer::ItemPayload) -> String {
 }
 
 /// Local fixes for OUR dirty row when THEIR row carries a signature this
-/// process cannot produce for a new version (it signs nothing): ours must
-/// never replace it. THEIR row stays canonical and untouched on the cloud,
-/// and OURS, when it is a value that differs from theirs, is kept as a
-/// conflict copy: in a keep-both namespace a dirty one (pushed as a create,
-/// like the console's copy); elsewhere a LOCAL one that is never pushed and
-/// never folded (a copy of a singleton or a `connecting` row would otherwise
-/// read as the real one). A delete keeps no copy. `None` = no row of theirs
-/// to take (left dirty).
+/// process cannot produce for a new version (it signs nothing), or is
+/// owner-config: ours must never replace it. THEIR row stays canonical and
+/// untouched on the cloud. OURS, when it is a live value that differs from
+/// theirs in a keep-both namespace, is kept as its conflict copy
+/// ([`LocalFix::KeepCopy`]); otherwise it is not kept, and the caller reports
+/// it for a re-run. `None` = no row of theirs to take (left dirty).
 fn set_aside_fixes(
-    keys: item_layer::VaultKeys<'_>,
-    vault_id: &str,
     ours_row: &DirtyRow,
     ours: &item_layer::ItemPayload,
     theirs: Option<TheirItem>,
 ) -> Option<Vec<LocalFix>> {
-    type S = sudp::primitives::StdPrimitives;
     let (r, ct, p) = theirs?;
     let mut fixes = Vec::new();
     let same = !p.is_tombstone()
         && item_layer::body_digest(p.ns, &p.name, &p.body)
             == item_layer::body_digest(ours.ns, &ours.name, &ours.body);
-    if !ours.is_tombstone() && !same {
-        match item_layer::seal_conflict_copy::<S>(keys, vault_id, ours, r.version) {
-            Ok((copy_id, copy_ct)) => fixes.push(LocalFix::InsertIfAbsent {
-                id: copy_id,
-                row: pv_store::StoredItem {
-                    version: item_layer::CONFLICT_COPY_VERSION,
-                    ct: copy_ct,
-                    synced_version: if item_layer::conflict_policy(ours.ns, &ours.name)
-                        == item_layer::Conflict::KeepBoth
-                    {
-                        0
-                    } else {
-                        item_layer::CONFLICT_COPY_VERSION
-                    },
-                    tombstone: false,
-                    sig: None,
-                    signer: None,
-                    base: None,
-                },
-            }),
-            Err(e) => {
-                tracing::warn!(vault = %vault_id, item = %ours_row.id, "per-item set-aside: seal conflict copy failed ({}); left dirty", e);
-                return None;
-            }
-        }
+    if !ours.is_tombstone()
+        && !same
+        && item_layer::conflict_policy(ours.ns, &ours.name) == item_layer::Conflict::KeepBoth
+    {
+        fixes.push(LocalFix::KeepCopy {
+            of: ours_row.id.clone(),
+            ours: ours.clone(),
+        });
     }
     fixes.push(adopt_fix(ours_row, &r, ct, p.is_tombstone()));
     Some(fixes)
 }
 
+/// How a set-aside change of `record` is reported: one SafeClaw's automatic
+/// upgrade wrote (`upgrade`) as the upgrade pausing and retrying, any other
+/// as the person's change set aside.
+fn set_aside_note(record: String, upgrade: bool) -> crate::state::SyncNote {
+    if upgrade {
+        crate::state::SyncNote::UpgradePaused(record)
+    } else {
+        crate::state::SyncNote::ChangedElsewhere(record)
+    }
+}
+
 /// [`set_aside_fixes`] as a [`Resolved`].
 fn set_aside(
-    keys: item_layer::VaultKeys<'_>,
-    vault_id: &str,
     ours_row: &DirtyRow,
     ours: &item_layer::ItemPayload,
     theirs: Option<TheirItem>,
 ) -> Resolved {
-    match set_aside_fixes(keys, vault_id, ours_row, ours, theirs) {
+    match set_aside_fixes(ours_row, ours, theirs) {
         Some(fixes) => Resolved::SetAside {
             fixes,
             record: conflict_record(ours),
@@ -3302,9 +3501,9 @@ async fn resolve_rejection(
             Err(r) => return r,
         };
     if signed_row {
-        return set_aside(keys, vault_id, ours_row, &ours, theirs);
+        return set_aside(ours_row, &ours, theirs);
     }
-    match rejection_fixes(keys, vault_id, ours_row, &ours, theirs) {
+    match rejection_fixes(ours_row, &ours, theirs) {
         Some(f) => Resolved::Fixed(f),
         None => Resolved::LeaveDirty,
     }
@@ -3395,95 +3594,102 @@ async fn resolve_conflict(
             let Some((r, ct, p)) = theirs else {
                 return Resolved::LeaveDirty;
             };
-            let (copy_id, copy_ct) = match item_layer::seal_conflict_copy::<S>(
-                keys, vault_id, &ours, r.version,
-            ) {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::warn!(vault = %vault_id, item = %ours_row.id, "per-item 409: seal conflict copy failed ({}); left dirty", e);
-                    return Resolved::LeaveDirty;
-                }
+            // OURS is kept as its conflict copy, an ordinary record of its own
+            // name, placed against the cloud's rows (the snapshot).
+            let TheirRows::Fetched(snapshot) = &*their_rows else {
+                return Resolved::LeaveDirty;
             };
+            let slot = item_layer::conflict_copy_slot::<S>(keys.id_seed, &ours, |wire| {
+                match snapshot.get(wire) {
+                    None => item_layer::RowAt::Absent,
+                    Some(c) => match URL_SAFE_NO_PAD.decode(c.ct.as_bytes()) {
+                        Ok(cct) => item_layer::row_at::<S>(
+                            keys,
+                            vault_id,
+                            wire,
+                            Some((c.version, cct.as_slice())),
+                        ),
+                        Err(_) => item_layer::RowAt::Unreadable,
+                    },
+                }
+            });
             let mut fixes = Vec::new();
-            match push_item(
-                cloud,
-                vault_id,
-                dk,
-                &copy_id,
-                None,
-                item_layer::CONFLICT_COPY_VERSION,
-                &URL_SAFE_NO_PAD.encode(&copy_ct),
-            )
-            .await
-            {
-                Ok(PushOutcome::Ok { .. }) => fixes.push(LocalFix::InsertIfAbsent {
-                    id: copy_id.clone(),
-                    row: clean_row(
-                        item_layer::CONFLICT_COPY_VERSION,
-                        copy_ct,
-                        false,
-                        None,
-                        None,
-                    ),
-                }),
-                Ok(PushOutcome::Conflict { .. }) => {
-                    // The copy already exists (an earlier attempt wrote it):
-                    // idempotent. Mirror it locally if the snapshot has it.
-                    if let TheirRows::Fetched(map) = &*their_rows {
-                        if let Some(c) = map.get(&copy_id) {
-                            if let Ok(cct) = URL_SAFE_NO_PAD.decode(c.ct.as_bytes()) {
-                                fixes.push(LocalFix::InsertIfAbsent {
-                                    id: copy_id.clone(),
-                                    row: clean_row(
-                                        c.version,
-                                        cct,
-                                        false,
-                                        c.sig.clone(),
-                                        c.signer.clone(),
-                                    ),
-                                });
-                            }
+            match slot {
+                Err(e) => return Resolved::Refused(e.to_string()),
+                Ok(item_layer::CopySlot::Same { wire }) => {
+                    // Already on the cloud: mirror it.
+                    if let Some(c) = snapshot.get(&wire) {
+                        if let Ok(cct) = URL_SAFE_NO_PAD.decode(c.ct.as_bytes()) {
+                            fixes.push(LocalFix::Mirror {
+                                id: wire.clone(),
+                                row: clean_row(c.version, cct, false, c.sig.clone(), c.signer.clone()),
+                            });
                         }
                     }
                 }
-                Ok(PushOutcome::EndpointMissing) => return Resolved::EndpointMissing,
-                Ok(PushOutcome::Rejected { status, error }) => {
-                    // The copy itself is refused for good (a NEW item on a frozen
-                    // plan): keep it as a LOCAL dirty copy and take theirs.
-                    warn_rejected_once(
+                Ok(item_layer::CopySlot::Write {
+                    payload,
+                    wire,
+                    base_version,
+                }) => {
+                    let version = base_version.map_or(1, |v| v + 1);
+                    let copy_ct =
+                        match item_layer::seal_wire_item::<S>(keys, vault_id, &wire, version, &payload) {
+                            Ok(c) => c,
+                            Err(e) => {
+                                tracing::warn!(vault = %vault_id, item = %ours_row.id, "per-item 409: seal conflict copy failed ({}); left dirty", e);
+                                return Resolved::LeaveDirty;
+                            }
+                        };
+                    match push_item(
+                        cloud,
                         vault_id,
-                        &copy_id,
-                        item_layer::CONFLICT_COPY_VERSION,
-                        status,
-                        &error,
-                    );
-                    return match rejection_fixes(keys, vault_id, ours_row, &ours, Some((r, ct, p)))
+                        dk,
+                        &wire,
+                        base_version,
+                        version,
+                        &URL_SAFE_NO_PAD.encode(&copy_ct),
+                    )
+                    .await
                     {
-                        Some(f) => Resolved::Fixed(f),
-                        None => Resolved::LeaveDirty,
-                    };
-                }
-                Err(e) => {
-                    // Ours stays dirty; the retry re-targets the same copy id.
-                    tracing::warn!(vault = %vault_id, item = %ours_row.id, "per-item 409: conflict copy write failed ({}); left dirty", e);
-                    return Resolved::LeaveDirty;
+                        Ok(PushOutcome::Ok { .. }) => fixes.push(LocalFix::Mirror {
+                            id: wire.clone(),
+                            row: clean_row(version, copy_ct, false, None, None),
+                        }),
+                        // Raced: the next push places it again.
+                        Ok(PushOutcome::Conflict { .. }) => return Resolved::LeaveDirty,
+                        Ok(PushOutcome::EndpointMissing) => return Resolved::EndpointMissing,
+                        Ok(PushOutcome::Rejected { status, error }) => {
+                            // The copy itself is refused for good (a NEW item on a
+                            // frozen plan): keep it locally, dirty, and take theirs.
+                            warn_rejected_once(vault_id, &wire, version, status, &error);
+                            return match rejection_fixes(ours_row, &ours, Some((r, ct, p))) {
+                                Some(f) => Resolved::Fixed(f),
+                                None => Resolved::LeaveDirty,
+                            };
+                        }
+                        Err(e) => {
+                            tracing::warn!(vault = %vault_id, item = %ours_row.id, "per-item 409: conflict copy write failed ({}); left dirty", e);
+                            return Resolved::LeaveDirty;
+                        }
+                    }
+                    tracing::info!(
+                        vault = %vault_id, item = %ours_row.id, copy = %wire, their_version = r.version,
+                        "per-item 409: kept both (theirs canonical, ours as its conflict copy)"
+                    );
                 }
             }
-            tracing::info!(
-                vault = %vault_id, item = %ours_row.id, copy = %copy_id, their_version = r.version,
-                "per-item 409: kept both (theirs canonical, ours as conflict copy)"
-            );
             fixes.push(adopt_fix(ours_row, &r, ct, p.is_tombstone()));
             Resolved::Fixed(fixes)
         }
         ConflictAction::SetAside => {
             tracing::info!(vault = %vault_id, item = %ours_row.id, "per-item 409: owner-config changed elsewhere; ours set aside");
-            set_aside(keys, vault_id, ours_row, &ours, theirs)
+            set_aside(ours_row, &ours, theirs)
         }
         ConflictAction::Reapply => {
             if theirs.as_ref().is_some_and(|(r, _, _)| r.sig.is_some()) {
                 tracing::info!(vault = %vault_id, item = %ours_row.id, "per-item 409: their row is signed; ours set aside");
-                return set_aside(keys, vault_id, ours_row, &ours, theirs);
+                return set_aside(ours_row, &ours, theirs);
             }
             let (base, version, ct) = match &theirs {
                 // Their row is gone (GC'd): re-create ours as-is, at OUR version
@@ -3536,11 +3742,11 @@ async fn resolve_conflict(
                 Ok(PushOutcome::Rejected { status, error })
                     if is_signed_row_refusal(status, &error) =>
                 {
-                    set_aside(keys, vault_id, ours_row, &ours, theirs)
+                    set_aside(ours_row, &ours, theirs)
                 }
                 Ok(PushOutcome::Rejected { status, error }) => {
                     warn_rejected_once(vault_id, &ours_row.id, version, status, &error);
-                    match rejection_fixes(keys, vault_id, ours_row, &ours, theirs) {
+                    match rejection_fixes(ours_row, &ours, theirs) {
                         Some(f) => Resolved::Fixed(f),
                         None => Resolved::LeaveDirty,
                     }
@@ -3580,7 +3786,7 @@ async fn resolve_conflict(
 /// A row of theirs that is signed is never replaced by an unsigned version of
 /// ours (a 409 on it, or the server's `record_write_forbidden`): ours is set
 /// aside ([`set_aside_fixes`]) and the conflict is kept for the user
-/// ([`AppState::note_sync_conflict`], shown by `sc sync` and `sc service ls`)
+/// ([`AppState::note_sync`], shown by `sc sync` and `sc status`)
 /// until a later push of that row lands.
 ///
 /// Reconciling needs `K` (open ours/theirs, seal the copy), taken from the
@@ -3617,6 +3823,7 @@ pub async fn push_items_best_effort(state: &Arc<AppState>, vault_id: &str) {
             ct: s.ct.clone(),
             tombstone: s.tombstone,
             base: s.base.clone(),
+            upgrade: s.upgrade,
         })
         .collect();
     drop(pv);
@@ -3646,7 +3853,8 @@ pub async fn push_items_best_effort(state: &Arc<AppState>, vault_id: &str) {
     let mut endpoint_missing = false;
     let mut left_dirty = 0usize;
     let mut fixes: Vec<LocalFix> = Vec::new();
-    let mut set_aside_rows: Vec<(String, String)> = Vec::new();
+    let mut set_aside_rows: Vec<(String, String, bool)> = Vec::new();
+    let mut refused_rows: Vec<(String, String)> = Vec::new();
     for row in &rows {
         let base_version = push_base_version(row.synced_version);
         let ct_b64 = URL_SAFE_NO_PAD.encode(&row.ct);
@@ -3692,7 +3900,11 @@ pub async fn push_items_best_effort(state: &Arc<AppState>, vault_id: &str) {
                     Resolved::Fixed(f) => fixes.extend(f),
                     Resolved::SetAside { fixes: f, record } => {
                         fixes.extend(f);
-                        set_aside_rows.push((row.id.clone(), record));
+                        set_aside_rows.push((row.id.clone(), record, row.upgrade));
+                    }
+                    Resolved::Refused(why) => {
+                        left_dirty += 1;
+                        refused_rows.push((row.id.clone(), why));
                     }
                     Resolved::LeaveDirty => left_dirty += 1,
                     Resolved::EndpointMissing => {
@@ -3728,7 +3940,11 @@ pub async fn push_items_best_effort(state: &Arc<AppState>, vault_id: &str) {
                     Resolved::Fixed(f) => fixes.extend(f),
                     Resolved::SetAside { fixes: f, record } => {
                         fixes.extend(f);
-                        set_aside_rows.push((row.id.clone(), record));
+                        set_aside_rows.push((row.id.clone(), record, row.upgrade));
+                    }
+                    Resolved::Refused(why) => {
+                        left_dirty += 1;
+                        refused_rows.push((row.id.clone(), why));
                     }
                     Resolved::LeaveDirty => left_dirty += 1,
                     Resolved::EndpointMissing => {
@@ -3744,15 +3960,16 @@ pub async fn push_items_best_effort(state: &Arc<AppState>, vault_id: &str) {
         }
     }
     // A push of a row that landed settles an earlier conflict on it; a row set
-    // aside now is one for the user to re-run.
+    // aside now is one for the user to re-run, or (written by SafeClaw's
+    // automatic upgrade) one the upgrade retries.
     for f in &fixes {
         if let LocalFix::Synced { id, .. } = f {
             state.clear_sync_conflict(vault_id, id);
         }
     }
-    for (id, record) in set_aside_rows {
-        tracing::warn!(vault = %vault_id, item = %id, record = %record, "per-item push: changed elsewhere meanwhile; ours set aside, theirs kept");
-        state.note_sync_conflict(vault_id, &id, &record);
+    for (id, record, upgrade) in set_aside_rows {
+        tracing::warn!(vault = %vault_id, item = %id, record = %record, upgrade, "per-item push: changed elsewhere meanwhile; ours set aside, theirs kept");
+        state.note_sync(vault_id, &id, set_aside_note(record, upgrade));
     }
     // Apply what landed — re-read the store (a writer may have raced us); every
     // change is guarded on the exact version we pushed, so a row bumped
@@ -3760,16 +3977,22 @@ pub async fn push_items_best_effort(state: &Arc<AppState>, vault_id: &str) {
     let mut content_changed = false;
     if !fixes.is_empty() {
         if let Some(mut pv) = read_per_item_store(state_dir, vault_id) {
-            let (changed, content) = apply_local_fixes(&mut pv, fixes);
-            if changed {
+            let applied = apply_local_fixes(&mut pv, fixes, keys.map(|k| (k, vault_id)));
+            refused_rows.extend(applied.refused);
+            if applied.changed {
                 match write_per_item_store(state_dir, vault_id, &pv) {
-                    Ok(()) => content_changed = content,
+                    Ok(()) => content_changed = applied.content_changed,
                     Err(e) => {
                         tracing::warn!(vault = %vault_id, "per-item push: local write-back failed: {}", e)
                     }
                 }
             }
         }
+    }
+    // Ours could not be kept as a conflict copy: it stays dirty, said so.
+    for (id, why) in refused_rows {
+        tracing::warn!(vault = %vault_id, item = %id, "per-item push: {}; ours left unsent", why);
+        state.note_sync(vault_id, &id, crate::state::SyncNote::Refused(why));
     }
     // Adopted theirs / added a conflict copy → serve it without a re-unlock.
     if content_changed {
@@ -4184,6 +4407,8 @@ fn empty_keyset_store() -> PerItemVault {
         items: std::collections::BTreeMap::new(),
         items_seq: 0,
         keyset_seq: 0,
+        held: Default::default(),
+        row_kinds: Default::default(),
     }
 }
 
@@ -4977,14 +5202,17 @@ mod peritem_tests {
     }
 
     /// On a vault with a keyset a pull keeps the honored owner-config: an
-    /// unsigned tombstone over an owner-signed legacy `aux:policy` is not
-    /// adopted, and the cursor stays before it (offered again next pull); an
-    /// owner-signed tombstone is adopted. Locked (no key), a replacement of
-    /// an existing row waits the same way; a new row is adopted.
+    /// unsigned tombstone over an owner-signed legacy `aux:policy` is held,
+    /// with why, in the store's persisted held list, and the cursor moves
+    /// past it. Every later pull offers it again; a newer owner-signed row
+    /// supersedes it. Locked: a replacement of a row read as a data record is
+    /// adopted; owner-config, and a row not yet read with the key, is held
+    /// until the key is there (unlock), where it is offered again.
     #[test]
-    fn pull_keeps_honored_owner_config_over_an_unsigned_tombstone() {
+    fn held_rows_never_pin_the_cursor_and_are_offered_again() {
         use crate::storage::item::ItemPayload;
         use crate::storage::sealed_vault::tests::{in_body_signed, role_fixture_creator_cred};
+        use crate::storage::sealed_vault::{RowKind, HELD_LOCKED, HELD_NOT_OWNER_SIGNED};
         let k = [0x5au8; 32];
         let keys = VaultKeys::single(&k);
         let (vault, creator, _, _, _, mut pv) = role_fixture_creator_cred();
@@ -4998,36 +5226,110 @@ mod peritem_tests {
             .plant::<StdPrimitives>(keys, vault, ItemNs::Aux, "policy", 1, &legacy)
             .unwrap();
         pv.items.get_mut(&id).unwrap().synced_version = 1;
+        let s_id = pv
+            .plant::<StdPrimitives>(keys, vault, ItemNs::Secret, "S", 1, &ItemPayload::secret_live("S", "one"))
+            .unwrap();
+        pv.items.get_mut(&s_id).unwrap().synced_version = 1;
         pv.items_seq = 3;
-        let timeout = |pv: &PerItemVault| {
-            pv.fold_view::<StdPrimitives>(keys, vault)
-                .unwrap()
-                .aux
-                .policy
-                .and_then(|p| p.timeout)
-        };
+        let view = |pv: &PerItemVault| pv.fold_view::<StdPrimitives>(keys, vault).unwrap();
+        let timeout = |pv: &PerItemVault| view(pv).aux.policy.and_then(|p| p.timeout);
         assert_eq!(timeout(&pv), Some(7));
 
+        // Unlocked: held, the cursor moves past it.
         let tomb = ItemPayload::tombstone(ItemNs::Aux, "policy");
         let unsigned = cloud_row(&k, vault, &tomb, 2, 5, None);
-        let n = adopt_item_rows(&mut pv, &[unsigned.clone()], 6, Some((keys, vault))).unwrap();
+        let n = adopt_item_rows(&mut pv, &[unsigned], 6, Some((keys, vault))).unwrap();
         assert_eq!(n, 0, "not adopted");
         assert_eq!(timeout(&pv), Some(7), "the honored value stays");
-        assert_eq!(pv.items_seq, 4, "the cursor stays before it");
+        assert_eq!(pv.items_seq, 6, "the cursor is not pinned");
+        assert_eq!(pv.held[&id].version, 2);
+        assert_eq!(pv.held[&id].reason, HELD_NOT_OWNER_SIGNED);
+        // What each row addresses is recorded with the key.
+        assert_eq!(pv.row_kinds[&s_id], RowKind::Data);
+        assert_eq!(pv.row_kinds[&id], RowKind::Guarded);
+        // Persisted with the store.
+        let back: PerItemVault = serde_json::from_str(&serde_json::to_string(&pv).unwrap()).unwrap();
+        assert_eq!(back.held, pv.held);
+        assert_eq!(back.row_kinds, pv.row_kinds);
+        // The next pull (nothing new) offers it again: still held.
+        assert_eq!(adopt_item_rows(&mut pv, &[], 6, Some((keys, vault))).unwrap(), 0);
+        assert!(pv.held.contains_key(&id));
 
-        // Locked: a replacement waits; a new row lands.
-        let new_secret = cloud_row(&k, vault, &ItemPayload::secret_live("NEW", "v"), 1, 5, None);
-        let n = adopt_item_rows(&mut pv, &[unsigned, new_secret], 6, None).unwrap();
-        assert_eq!(n, 1, "only the new row");
-        assert_eq!(pv.items_seq, 4);
-        assert_eq!(timeout(&pv), Some(7));
+        // Locked: a data record's replacement lands, a new row lands, the
+        // owner-config replacement waits for the key.
+        let s2 = cloud_row(&k, vault, &ItemPayload::secret_live("S", "two"), 2, 7, None);
+        let new_secret = cloud_row(&k, vault, &ItemPayload::secret_live("NEW", "v1"), 1, 8, None);
+        let n = adopt_item_rows(&mut pv, &[s2, new_secret], 8, None).unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(pv.items_seq, 8);
+        assert_eq!(pv.held[&id].reason, HELD_LOCKED);
+        assert_eq!(view(&pv).native_secrets["S"], b"two");
+        // A row not yet read with the key, replaced while locked: held.
+        let new2 = cloud_row(&k, vault, &ItemPayload::secret_live("NEW", "v2"), 2, 9, None);
+        let new_id = new2.item_id.clone();
+        assert_eq!(adopt_item_rows(&mut pv, &[new2], 9, None).unwrap(), 0);
+        assert_eq!(pv.held[&new_id].reason, HELD_LOCKED);
+        assert_eq!(pv.items_seq, 9);
 
-        // The owner's signed tombstone (its migration) is adopted.
-        let signed = cloud_row(&k, vault, &tomb, 2, 5, Some((&creator, "policy")));
-        let n = adopt_item_rows(&mut pv, &[signed], 6, Some((keys, vault))).unwrap();
+        // Unlock: offered again under the key. The data row lands; the
+        // unsigned tombstone is held again, as not owner-signed.
+        assert_eq!(adopt_item_rows(&mut pv, &[], 9, Some((keys, vault))).unwrap(), 1);
+        assert_eq!(view(&pv).native_secrets["NEW"], b"v2");
+        assert_eq!(pv.held.len(), 1);
+        assert_eq!(pv.held[&id].reason, HELD_NOT_OWNER_SIGNED);
+
+        // A newer owner-signed tombstone (its migration) supersedes it.
+        let signed = cloud_row(&k, vault, &tomb, 3, 10, Some((&creator, "policy")));
+        let n = adopt_item_rows(&mut pv, &[signed], 10, Some((keys, vault))).unwrap();
         assert_eq!(n, 1);
-        assert_eq!(pv.items_seq, 6);
+        assert!(pv.held.is_empty());
+        assert_eq!(pv.items_seq, 10);
         assert_eq!(timeout(&pv), None);
+    }
+
+    /// A change SafeClaw's automatic upgrade wrote that is set aside after a
+    /// 409 is said as the upgrade pausing and retrying, never as the
+    /// person's change set aside; a person's change is said as theirs.
+    #[test]
+    fn a_set_aside_upgrade_write_is_said_as_the_upgrade_pausing() {
+        let upgrade = set_aside_note("policy".into(), true).sentence().unwrap();
+        assert!(
+            upgrade.contains("SafeClaw's automatic upgrade of this vault paused")
+                && upgrade.contains("retries")
+                && upgrade.contains("policy")
+                && !upgrade.contains("your change"),
+            "{upgrade}"
+        );
+        assert_eq!(
+            set_aside_note("policy".into(), false),
+            crate::state::SyncNote::ChangedElsewhere("policy".into())
+        );
+        // `sc sync` words the person's case itself.
+        assert!(set_aside_note("policy".into(), false).sentence().is_none());
+    }
+
+    /// A paged `/items` answer is followed from its cursor: `more: true`
+    /// continues from its `seq`, a numeric `next` from that; neither is the
+    /// last page.
+    #[test]
+    fn a_paged_items_answer_is_followed() {
+        let row = serde_json::json!({ "item_id": "a", "version": 1, "seq": 4, "ct": "AA" });
+        let (rows, next) =
+            parse_items_page(&serde_json::json!({ "items": [row], "seq": 4, "more": true }), 0)
+                .unwrap();
+        assert_eq!((rows.len(), next), (1, Some(4)));
+        let (_, next) =
+            parse_items_page(&serde_json::json!({ "items": [], "seq": 4, "next": 9 }), 0).unwrap();
+        assert_eq!(next, Some(9));
+        let (_, next) =
+            parse_items_page(&serde_json::json!({ "items": [row], "seq": 4 }), 0).unwrap();
+        assert_eq!(next, None);
+        let (_, next) = parse_items_page(
+            &serde_json::json!({ "items": [], "seq": 4, "more": false, "next": null }),
+            0,
+        )
+        .unwrap();
+        assert_eq!(next, None);
     }
 
     /// Anti-rollback, one rule: a fetched row whose version is below the
@@ -5060,6 +5362,7 @@ mod peritem_tests {
             ct: s.ct.clone(),
             tombstone: false,
             base: None,
+            upgrade: false,
         };
         // A faked 409 whose snapshot holds version 3 of the row.
         let older = cloud_row(&k, vid, &ItemPayload::secret_live("A", "old"), 3, 9, None);
@@ -5087,8 +5390,7 @@ mod peritem_tests {
             URL_SAFE_NO_PAD.decode(older.ct.as_bytes()).unwrap(),
             false,
         );
-        let (changed, _) = apply_local_fixes(&mut pv, vec![fix]);
-        assert!(!changed);
+        assert!(!apply_local_fixes(&mut pv, vec![fix], None).changed);
         assert_eq!(pv.get_item(&id).unwrap().version, 6);
     }
 
@@ -5115,8 +5417,11 @@ mod peritem_tests {
     }
 
     /// A terminal rejection takes THEIRS at the canonical id and keeps OURS as
-    /// a LOCAL, DIRTY conflict copy (re-offered on every push); a refused
-    /// create with no row of theirs stays dirty; a refused delete just adopts.
+    /// its conflict copy, a DIRTY record of its own name (re-offered on every
+    /// push); a refused create with no row of theirs stays dirty; a refused
+    /// delete just adopts. When no copy may be written (the copy's address
+    /// holds a row this key cannot open), nothing of ours is dropped: it
+    /// stays dirty and the refusal is returned.
     #[test]
     fn rejection_keeps_ours_as_local_dirty_copy() {
         use crate::storage::item::{self as il, ItemPayload};
@@ -5146,6 +5451,7 @@ mod peritem_tests {
             ct: s.ct.clone(),
             tombstone: false,
             base: None,
+            upgrade: false,
         };
         let ours = il::open_wire_item::<StdPrimitives>(keys, vid, &id, 3, &s.ct).unwrap();
         // Theirs: v5 on the cloud with a different value.
@@ -5162,29 +5468,39 @@ mod peritem_tests {
         };
 
         // Refused create (no row of theirs): nothing to take, ours stays dirty.
-        assert!(rejection_fixes(keys, vid, &dirty, &ours, None).is_none());
+        assert!(rejection_fixes(&dirty, &ours, None).is_none());
 
-        let fixes = rejection_fixes(
-            keys,
-            vid,
-            &dirty,
-            &ours,
-            Some((their_row.clone(), their_ct.clone(), their_payload.clone())),
-        )
-        .unwrap();
-        let (changed, content) = apply_local_fixes(&mut pv, fixes);
-        assert!(changed && content);
+        let theirs = || Some((their_row.clone(), their_ct.clone(), their_payload.clone()));
+        // The copy's address holds a row this key cannot open: refused, ours
+        // stays dirty where it is.
+        let copy_id =
+            il::wire_id_for::<StdPrimitives>(&k, ItemNs::Secret, &il::conflict_copy_name("A"))
+                .unwrap();
+        let mut blocked = pv.clone();
+        blocked.put_raw(copy_id.clone(), 2, vec![0u8; 40]);
+        let applied = apply_local_fixes(
+            &mut blocked,
+            rejection_fixes(&dirty, &ours, theirs()).unwrap(),
+            Some((keys, vid)),
+        );
+        assert_eq!(applied.refused.len(), 1);
+        assert!(applied.refused[0].1.contains("cannot be read"), "{:?}", applied.refused);
+        assert_eq!(blocked.get_item(&id).unwrap().version, 3, "ours still dirty");
+        assert_eq!(blocked.get_item(&copy_id).unwrap().ct, vec![0u8; 40], "not written over");
+
+        let applied = apply_local_fixes(
+            &mut pv,
+            rejection_fixes(&dirty, &ours, theirs()).unwrap(),
+            Some((keys, vid)),
+        );
+        assert!(applied.changed && applied.content_changed && applied.refused.is_empty());
         // Canonical id = theirs, clean.
         let canon = pv.get_item(&id).unwrap();
         assert_eq!((canon.version, canon.synced_version), (5, 5));
         assert_eq!(canon.ct, their_ct);
-        // Ours lives on as a DIRTY local conflict copy at the console's id.
-        let (copy_id, _) = il::seal_conflict_copy::<StdPrimitives>(keys, vid, &ours, 5).unwrap();
+        // Ours lives on as a DIRTY record of the copy's name, at its own id.
         let copy = pv.get_item(&copy_id).expect("local conflict copy");
-        assert_eq!(
-            (copy.version, copy.synced_version),
-            (il::CONFLICT_COPY_VERSION, 0)
-        );
+        assert_eq!((copy.version, copy.synced_version), (1, 0));
         let opened =
             il::open_wire_item::<StdPrimitives>(keys, vid, &copy_id, copy.version, &copy.ct)
                 .unwrap();
@@ -5195,14 +5511,7 @@ mod peritem_tests {
 
         // A refused DELETE just adopts theirs (no copy of a tombstone).
         let tomb = ItemPayload::tombstone(ItemNs::Secret, "A");
-        let fixes = rejection_fixes(
-            keys,
-            vid,
-            &dirty,
-            &tomb,
-            Some((their_row, their_ct, their_payload)),
-        )
-        .unwrap();
+        let fixes = rejection_fixes(&dirty, &tomb, theirs()).unwrap();
         assert_eq!(fixes.len(), 1, "adopt only");
     }
 
@@ -5212,8 +5521,8 @@ mod peritem_tests {
     /// a 409 over it and on the server's `record_write_forbidden`. Theirs
     /// stays canonical with its signature, nothing is pushed (the cloud URL
     /// here is unreachable, so a push attempt would leave the row dirty
-    /// instead), and ours is kept as a LOCAL conflict copy that is never
-    /// pushed or folded; the record is reported.
+    /// instead), ours is not kept (outside the keep-both namespaces) and the
+    /// record is reported.
     #[test]
     fn owner_config_and_signed_rows_are_never_replaced_ours_is_set_aside() {
         use crate::storage::item::{self as il, ItemPayload};
@@ -5263,6 +5572,7 @@ mod peritem_tests {
                 ct: pv.get_item(&id).unwrap().ct.clone(),
                 tombstone: false,
                 base: None,
+                upgrade: false,
             };
             // Theirs: v5.
             let theirs = ItemPayload::live(ns, name, theirs_body.clone());
@@ -5301,8 +5611,10 @@ mod peritem_tests {
                 };
                 assert_eq!(record, want_record);
                 let mut pv = pv.clone();
-                let (changed, content) = apply_local_fixes(&mut pv, fixes);
-                assert!(changed && content);
+                let n = pv.items.len();
+                let applied = apply_local_fixes(&mut pv, fixes, Some((keys, vid)));
+                assert!(applied.changed && applied.content_changed);
+                assert_eq!(pv.items.len(), n, "no copy of a set-aside change");
                 // Theirs is canonical, clean, its signature kept.
                 let canon = pv.get_item(&id).unwrap();
                 assert_eq!(
@@ -5310,20 +5622,6 @@ mod peritem_tests {
                     (5, 5, signed.then(|| "c2ln".to_string()))
                 );
                 assert_eq!(canon.ct, their_ct);
-                // Ours is kept as a local copy: clean (never pushed), never folded.
-                let (copy_id, _) =
-                    il::seal_conflict_copy::<StdPrimitives>(keys, vid, &ours, 5).unwrap();
-                let copy = pv.get_item(&copy_id).expect("ours kept as a conflict copy");
-                assert_eq!(copy.version, copy.synced_version, "never pushed");
-                let opened = il::open_wire_item::<StdPrimitives>(
-                    keys,
-                    vid,
-                    &copy_id,
-                    copy.version,
-                    &copy.ct,
-                )
-                .unwrap();
-                assert_eq!(opened.body, ours.body);
                 let view = pv.fold_view::<StdPrimitives>(keys, vid).unwrap();
                 match ns {
                     ItemNs::Policy => assert_eq!(view.aux.policy.unwrap().timeout, Some(2)),
@@ -5341,17 +5639,15 @@ mod peritem_tests {
             let their = || Some((their_row.clone(), their_ct.clone(), theirs.clone()));
             let tomb = ItemPayload::tombstone(ns, name);
             assert_eq!(
-                set_aside_fixes(keys, vid, &dirty, &tomb, their())
-                    .unwrap()
-                    .len(),
+                set_aside_fixes(&dirty, &tomb, their()).unwrap().len(),
                 1,
                 "adopt only"
             );
-            assert!(set_aside_fixes(keys, vid, &dirty, &ours, None).is_none());
+            assert!(set_aside_fixes(&dirty, &ours, None).is_none());
         }
 
-        // In a keep-both namespace the set-aside copy is dirty (pushed as a
-        // create, like the console's copy row).
+        // In a keep-both namespace ours is kept as its conflict copy, a dirty
+        // record of its own name (pushed as a create).
         let mut pv = empty_pv();
         let secret = ItemPayload::secret_live("A", "ours");
         let id = pv
@@ -5364,6 +5660,7 @@ mod peritem_tests {
             ct: pv.get_item(&id).unwrap().ct.clone(),
             tombstone: false,
             base: None,
+            upgrade: false,
         };
         let theirs = ItemPayload::secret_live("A", "theirs");
         let their_ct = il::seal_wire_item::<StdPrimitives>(keys, vid, &id, 5, &theirs).unwrap();
@@ -5375,18 +5672,14 @@ mod peritem_tests {
             sig: None,
             signer: None,
         };
-        let fixes = set_aside_fixes(
-            keys,
-            vid,
-            &dirty,
-            &secret,
-            Some((their_row, their_ct, theirs)),
-        )
-        .unwrap();
-        assert!(matches!(
-            &fixes[0],
-            LocalFix::InsertIfAbsent { row, .. } if row.synced_version == 0
-        ));
+        let fixes = set_aside_fixes(&dirty, &secret, Some((their_row, their_ct, theirs))).unwrap();
+        assert!(matches!(&fixes[0], LocalFix::KeepCopy { of, .. } if of == &id));
+        let applied = apply_local_fixes(&mut pv, fixes, Some((keys, vid)));
+        assert!(applied.refused.is_empty());
+        let copy_id =
+            il::wire_id_for::<StdPrimitives>(&k, ItemNs::Secret, &il::conflict_copy_name("A"))
+                .unwrap();
+        assert_eq!(pv.get_item(&copy_id).unwrap().synced_version, 0);
         assert_eq!(conflict_record(&secret), "secret A");
         assert_eq!(
             conflict_record(&ItemPayload::live(
@@ -5594,7 +5887,8 @@ mod peritem_tests {
 
     /// Post-push local fixes are version-guarded: a row a writer bumped during
     /// the push is never clobbered (it stays dirty for the next push), and a
-    /// conflict copy is inserted only if absent (idempotent on retry).
+    /// copy known on the cloud is stored only over nothing or an older clean
+    /// row (idempotent on retry).
     #[test]
     fn apply_local_fixes_is_guarded_and_idempotent() {
         let k = [0x42u8; 32];
@@ -5632,14 +5926,14 @@ mod peritem_tests {
                 id: c.clone(),
                 version: 3,
             },
-            // A conflict copy, inserted once.
-            LocalFix::InsertIfAbsent {
+            // A conflict copy on the cloud, mirrored once.
+            LocalFix::Mirror {
                 id: "copy".into(),
                 row: clean_row(1, vec![1u8; 4], false, None, None),
             },
         ];
-        let (changed, content) = apply_local_fixes(&mut pv, fixes);
-        assert!(changed && content);
+        let applied = apply_local_fixes(&mut pv, fixes, None);
+        assert!(applied.changed && applied.content_changed);
         let ra = pv.get_item(&a).unwrap();
         assert_eq!(
             (ra.version, ra.synced_version, ra.ct.clone()),
@@ -5653,15 +5947,27 @@ mod peritem_tests {
         assert_eq!(pv.get_item("copy").unwrap().version, 1);
 
         // Retry: the copy is already there → no-op; nothing else changes.
-        let (changed2, content2) = apply_local_fixes(
+        let again = apply_local_fixes(
             &mut pv,
-            vec![LocalFix::InsertIfAbsent {
+            vec![LocalFix::Mirror {
                 id: "copy".into(),
                 row: clean_row(1, vec![2u8; 4], false, None, None),
             }],
+            None,
         );
-        assert!(!changed2 && !content2);
+        assert!(!again.changed && !again.content_changed);
         assert_eq!(pv.get_item("copy").unwrap().ct, vec![1u8; 4]);
+        // A newer version of it replaces the clean row.
+        let newer = apply_local_fixes(
+            &mut pv,
+            vec![LocalFix::Mirror {
+                id: "copy".into(),
+                row: clean_row(2, vec![3u8; 4], false, None, None),
+            }],
+            None,
+        );
+        assert!(newer.changed);
+        assert_eq!(pv.get_item("copy").unwrap().version, 2);
     }
 
     /// A `/keys` row `data` JSON shaped EXACTLY as the frontend writes it

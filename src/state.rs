@@ -322,6 +322,34 @@ pub struct PendingLoopback {
     inserted_at: std::time::Instant,
 }
 
+/// Why the sync did not apply a local change ([`AppState::note_sync`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SyncNote {
+    /// A person's change to the record: it changed elsewhere meanwhile and
+    /// was set aside (`sc sync` asks to re-run it).
+    ChangedElsewhere(String),
+    /// SafeClaw's automatic upgrade of this vault paused on the record: it
+    /// changed elsewhere meanwhile; the upgrade retries.
+    UpgradePaused(String),
+    /// Refused, with why (a full sentence).
+    Refused(String),
+}
+
+impl SyncNote {
+    /// The note as a sentence; `None` for a set-aside change (`sc sync`
+    /// words that one itself).
+    pub fn sentence(&self) -> Option<String> {
+        match self {
+            SyncNote::ChangedElsewhere(_) => None,
+            SyncNote::UpgradePaused(r) => Some(format!(
+                "SafeClaw's automatic upgrade of this vault paused: {} changed elsewhere meanwhile; it retries at the next unlock",
+                r
+            )),
+            SyncNote::Refused(why) => Some(why.clone()),
+        }
+    }
+}
+
 pub struct AppState {
     pub config: Config,
     pub vaults: VaultDir,
@@ -347,13 +375,13 @@ pub struct AppState {
     /// "run `sc upgrade`" instead of a silent parked-sync failure. In-memory only,
     /// (re)set by the sync path; cleared when a sync succeeds again.
     pub vault_upgrade_required: Mutex<std::collections::HashSet<String>>,
-    /// Local changes the sync set aside because the cloud row changed
-    /// elsewhere meanwhile and could not be replaced (a signed row):
-    /// vault → item id → the record it concerns (`services`, `policy`, ...).
-    /// Shown by `sc sync` and `sc service ls`; cleared when a later push of
-    /// that row lands. In-memory only (the set-aside copy itself is kept in
-    /// the store).
-    pub sync_conflicts: Mutex<HashMap<String, std::collections::BTreeMap<String, String>>>,
+    /// Local changes the sync did not apply, vault → item id → why
+    /// ([`SyncNote`]). Shown by `sc sync` and `sc status`; cleared when a
+    /// later write or push of that row lands. In-memory only.
+    pub sync_conflicts: Mutex<HashMap<String, std::collections::BTreeMap<String, SyncNote>>>,
+    /// Vaults whose pull at unlock failed and is being retried in the
+    /// background: vault → the last error. Shown by `sc status`.
+    pub catch_up_failures: Mutex<HashMap<String, String>>,
     /// Team-edition extension hooks (team-edition §9 open/closed split). The
     /// open build leaves the [`crate::team_hooks::NoopHooks`] default (no team
     /// policy); the closed `safeclaw-ee` overlay injects real ones via
@@ -571,6 +599,7 @@ impl AppState {
             vault_shared: Mutex::new(HashMap::new()),
             vault_upgrade_required: Mutex::new(std::collections::HashSet::new()),
             sync_conflicts: Mutex::new(HashMap::new()),
+            catch_up_failures: Mutex::new(HashMap::new()),
             team: std::sync::Arc::new(crate::team_hooks::NoopHooks),
             pending_format_mark: Mutex::new(std::collections::HashSet::new()),
             pending_config_ids: Mutex::new(HashMap::new()),
@@ -1470,17 +1499,18 @@ impl AppState {
         }
     }
 
-    /// Keep a change the sync set aside (see [`AppState::sync_conflicts`]).
-    pub fn note_sync_conflict(&self, vault_id: &str, item_id: &str, record: &str) {
+    /// Keep why a change of `item_id` was not applied (see
+    /// [`AppState::sync_conflicts`]).
+    pub fn note_sync(&self, vault_id: &str, item_id: &str, note: SyncNote) {
         self.sync_conflicts
             .lock()
             .unwrap()
             .entry(vault_id.to_string())
             .or_default()
-            .insert(item_id.to_string(), record.to_string());
+            .insert(item_id.to_string(), note);
     }
 
-    /// A push of `item_id` landed: an earlier conflict on it is settled.
+    /// A write or push of `item_id` landed: an earlier note on it is settled.
     pub fn clear_sync_conflict(&self, vault_id: &str, item_id: &str) {
         let mut all = self.sync_conflicts.lock().unwrap();
         if let Some(m) = all.get_mut(vault_id) {
@@ -1491,14 +1521,50 @@ impl AppState {
         }
     }
 
-    /// The records of `vault_id` with a change set aside, sorted, each once.
+    /// The records of `vault_id` whose change was set aside because they
+    /// changed elsewhere meanwhile, sorted, each once.
     pub fn sync_conflict_records(&self, vault_id: &str) -> Vec<String> {
         let all = self.sync_conflicts.lock().unwrap();
         let set: std::collections::BTreeSet<String> = all
             .get(vault_id)
-            .map(|m| m.values().cloned().collect())
+            .map(|m| {
+                m.values()
+                    .filter_map(|n| match n {
+                        SyncNote::ChangedElsewhere(r) => Some(r.clone()),
+                        _ => None,
+                    })
+                    .collect()
+            })
             .unwrap_or_default();
         set.into_iter().collect()
+    }
+
+    /// Every other note of `vault_id` as a sentence, sorted, each once.
+    pub fn sync_note_lines(&self, vault_id: &str) -> Vec<String> {
+        let all = self.sync_conflicts.lock().unwrap();
+        let set: std::collections::BTreeSet<String> = all
+            .get(vault_id)
+            .map(|m| m.values().filter_map(SyncNote::sentence).collect())
+            .unwrap_or_default();
+        set.into_iter().collect()
+    }
+
+    /// The pull at unlock of `vault_id` failed with `error`; it is retried.
+    pub fn note_catch_up(&self, vault_id: &str, error: &str) {
+        self.catch_up_failures
+            .lock()
+            .unwrap()
+            .insert(vault_id.to_string(), error.to_string());
+    }
+
+    /// The pull after unlock of `vault_id` landed (or the vault locked).
+    pub fn clear_catch_up(&self, vault_id: &str) {
+        self.catch_up_failures.lock().unwrap().remove(vault_id);
+    }
+
+    /// Why the changes from the cloud since unlock are not pulled yet.
+    pub fn catch_up_failure(&self, vault_id: &str) -> Option<String> {
+        self.catch_up_failures.lock().unwrap().get(vault_id).cloned()
     }
 
     /// Record a successful cloud contact for this vault (sync pull/push, or

@@ -10,6 +10,9 @@ pub struct VaultStatus {
     /// never paired (local-only / self-host: no console exists).
     pub console: Option<String>,
     pub state: VaultState,
+    /// What the daemon has not applied, one sentence each (`GET
+    /// /v/{vid}/held`).
+    pub held: Vec<String>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -120,6 +123,7 @@ pub async fn fetch_status(custodian: &str, vault: &str) -> VaultStatus {
         url: url.clone(),
         console: console.clone(),
         state,
+        held: Vec::new(),
     };
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
@@ -155,6 +159,11 @@ pub async fn fetch_status(custodian: &str, vault: &str) -> VaultStatus {
         .map(|a| a.len())
         .unwrap_or(0);
 
+    let held = fetch_held(&client, custodian, vault).await;
+    let status = |state| VaultStatus {
+        held: held.clone(),
+        ..status(state)
+    };
     let kk_url = format!(
         "{}/v/{}/secret-keys",
         custodian.trim_end_matches('/'),
@@ -180,6 +189,28 @@ pub async fn fetch_status(custodian: &str, vault: &str) -> VaultStatus {
         Ok(r) if r.status().as_u16() == 409 => status(VaultState::Locked { passkeys }),
         _ => status(VaultState::Locked { passkeys }),
     }
+}
+
+/// What the daemon has not applied for `vault` (`GET /v/{vid}/held`), one
+/// sentence each; empty when it cannot say.
+pub async fn fetch_held(client: &reqwest::Client, custodian: &str, vault: &str) -> Vec<String> {
+    let url = format!(
+        "{}/v/{}/held",
+        custodian.trim_end_matches('/'),
+        urlencoding::encode(vault)
+    );
+    let Ok(r) = client.get(&url).send().await else {
+        return Vec::new();
+    };
+    if !r.status().is_success() {
+        return Vec::new();
+    }
+    r.json::<serde_json::Value>()
+        .await
+        .ok()
+        .and_then(|b| b.get("held").cloned())
+        .and_then(|v| serde_json::from_value(v).ok())
+        .unwrap_or_default()
 }
 
 pub async fn run(json: bool) -> Result<(), String> {
@@ -354,6 +385,7 @@ fn print_json(
             "state": state,
             "passkeys": passkeys,
             "secrets": secrets,
+            "not_applied": s.held,
         })
     });
     let login_json = match frontend_origin() {
@@ -418,5 +450,8 @@ pub fn print_status(s: &VaultStatus) {
             println!("  passkeys: {}", passkeys);
             println!("  secrets:  {}", secrets);
         }
+    }
+    for line in &s.held {
+        println!("  note:     {}", crate::util::terminal_safe(line));
     }
 }

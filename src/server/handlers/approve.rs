@@ -1146,7 +1146,7 @@ pub async fn approve_op(
             "vault-unlock" => {
                 // Read seam: per-item store first (a web-enrolled vault has only
                 // vault.per-item.json, no vault.dat), whole-blob as Option fallback.
-                let (view, unlock_key) =
+                let (mut view, unlock_key) =
                     crate::server::handlers::metadata::open_view_for_grant_keep_key(
                         &state,
                         &vault_id,
@@ -1155,6 +1155,16 @@ pub async fn approve_op(
                         &validated.credential_id_bytes,
                         existing_vault.as_ref(),
                     )?;
+                // Before the vault serves: every held row is offered again under
+                // the key, then the cloud is pulled. A failed pull keeps
+                // retrying in the background and is reported (`sc status`).
+                let (adopted, pull_error) =
+                    crate::sync::catch_up_at_unlock(&state, &vault_id, &unlock_key).await;
+                if adopted {
+                    if let Some(v) = crate::sync::fold_with_key(&state, &vault_id, &unlock_key) {
+                        view = v;
+                    }
+                }
                 // vault-unlock is a pure STATE TRANSITION: it uses the grant's
                 // W_c to open the vault, bootstrap the daemon's in-memory
                 // secrets cache, and flip the vault unlocked. It deliberately
@@ -1179,6 +1189,12 @@ pub async fn approve_op(
                     "vault unlocked"
                 );
                 state.unlock_vault(vault_id.clone(), cache, unlock_key);
+                match pull_error {
+                    Some(e) => {
+                        crate::sync::retry_pull_after_unlock(state.clone(), vault_id.clone(), e)
+                    }
+                    None => state.clear_catch_up(&vault_id),
+                }
                 // LEGACY(aux addressing, services row): now that K is held,
                 // pull, then move the legacy rows to their native records (a
                 // vault without a keyset), then push. Detached: it takes the
@@ -2538,6 +2554,8 @@ fn seed_per_item_store(
         items: std::collections::BTreeMap::new(),
         items_seq: 0,
         keyset_seq: 0,
+        held: Default::default(),
+        row_kinds: Default::default(),
     };
     if let Err(e) = pv.seed_items_from_view::<sudp::primitives::StdPrimitives>(
         crate::storage::item::VaultKeys::single(k),

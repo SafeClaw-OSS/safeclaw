@@ -366,9 +366,9 @@ pub enum SourceCheck {
     LocalFolder,
     /// GitHub did not answer to check it (no response arrived).
     NotReached,
-    /// The ref is a commit id: a commit is the repository's only as the head
-    /// of one of its branches or tags, so it cannot be checked.
-    CommitRef,
+    /// The ref is no branch or tag of the repository (a commit id, any other
+    /// ref): only the head of one of its own branches or tags is checked.
+    NotBranchOrTag,
 }
 
 impl SourceCheck {
@@ -377,7 +377,7 @@ impl SourceCheck {
             SourceCheck::Fetched => "fetched",
             SourceCheck::LocalFolder => "local",
             SourceCheck::NotReached => "not-reached",
-            SourceCheck::CommitRef => "commit-ref",
+            SourceCheck::NotBranchOrTag => "not-branch-or-tag",
         }
     }
 
@@ -386,7 +386,7 @@ impl SourceCheck {
             SourceCheck::Fetched,
             SourceCheck::LocalFolder,
             SourceCheck::NotReached,
-            SourceCheck::CommitRef,
+            SourceCheck::NotBranchOrTag,
         ]
         .into_iter()
         .find(|c| c.as_str() == s)
@@ -410,9 +410,10 @@ impl SourceCheck {
                 "{}, as stated by the requester (GitHub did not answer to check it)",
                 source.display()
             ),
-            SourceCheck::CommitRef => format!(
-                "{}, as stated by the requester (a commit is checked only as the head of a branch or tag; pin one to have it checked)",
-                source.display()
+            SourceCheck::NotBranchOrTag => format!(
+                "{}, as stated by the requester (only the head of one of the repository's branches or tags is checked, and {} is neither; pin a branch or tag to have it checked)",
+                source.display(),
+                source.ref_label()
             ),
         }
     }

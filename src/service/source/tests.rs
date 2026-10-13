@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use super::card::{add_card, diff, rm_card, summarize, SourceCheck};
-use super::github::{self, FetchError, GitHubApi};
+use super::github::{self, FetchError, GitHubApi, GitObject};
 use super::tar::{read_tarball, read_tarball_with};
 use super::*;
 
@@ -639,7 +639,12 @@ fn tarball_random_bytes_never_panic() {
 
 struct FakeGitHub {
     default: &'static str,
-    refs: BTreeMap<&'static str, String>,
+    /// The repository's own refs (`heads/<b>`, `tags/<t>`) → their object.
+    refs: BTreeMap<&'static str, GitObject>,
+    /// Annotated tag objects → their target.
+    tags: BTreeMap<String, GitObject>,
+    /// What GitHub resolves any other ref or commit id to.
+    commits: BTreeMap<&'static str, String>,
     tarball: Vec<u8>,
     asked: std::sync::Mutex<Vec<String>>,
 }
@@ -648,9 +653,24 @@ impl GitHubApi for FakeGitHub {
     async fn default_branch(&self, _o: &str, _r: &str) -> Result<String, FetchError> {
         Ok(self.default.into())
     }
+    async fn git_ref(
+        &self,
+        _o: &str,
+        _r: &str,
+        path: &str,
+    ) -> Result<Option<GitObject>, FetchError> {
+        self.asked.lock().unwrap().push(format!("ref {}", path));
+        Ok(self.refs.get(path).cloned())
+    }
+    async fn tag_target(&self, _o: &str, _r: &str, sha: &str) -> Result<GitObject, FetchError> {
+        self.tags
+            .get(sha)
+            .cloned()
+            .ok_or_else(|| FetchError::Answered(format!("tag {} not found", sha)))
+    }
     async fn commit_of(&self, _o: &str, _r: &str, git_ref: &str) -> Result<String, FetchError> {
-        self.asked.lock().unwrap().push(git_ref.to_string());
-        self.refs
+        self.asked.lock().unwrap().push(format!("commits {}", git_ref));
+        self.commits
             .get(git_ref)
             .cloned()
             .ok_or_else(|| FetchError::Answered(format!("ref '{}' not found", git_ref)))
@@ -664,19 +684,34 @@ impl GitHubApi for FakeGitHub {
     }
 }
 
+fn commit(c: char) -> GitObject {
+    GitObject::Commit(c.to_string().repeat(40))
+}
+
+/// `main` (the default branch) at a; the annotated tag `v1.2.0` at b; a
+/// branch `cafe` (hex digits only) at e; a branch named like a full commit
+/// id at e; `dup` a branch at a and a tag at b. GitHub's commits endpoint
+/// resolves commit ids and a pull ref.
 fn fake() -> FakeGitHub {
-    let commit = "c".repeat(40);
+    let c40 = "c".repeat(40);
     FakeGitHub {
         default: "main",
         refs: [
-            ("main", "a".repeat(40)),
-            ("v1.2.0", "b".repeat(40)),
-            ("cccccccc", commit.clone()),
-            (
-                "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
-                commit.to_ascii_uppercase(),
-            ),
+            ("heads/main", commit('a')),
+            ("tags/v1.2.0", GitObject::Tag("7".repeat(40))),
+            ("heads/cafe", commit('e')),
+            ("heads/1111111111111111111111111111111111111111", commit('e')),
+            ("heads/dup", commit('a')),
+            ("tags/dup", commit('b')),
+        ]
+        .into(),
+        tags: [("7".repeat(40), commit('b'))].into(),
+        commits: [
+            ("cafe", "f".repeat(40)),
+            ("cccccccc", c40.clone()),
+            ("CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC", c40.to_ascii_uppercase()),
             ("short", "abc".into()),
+            ("pull/1/head", "d".repeat(40)),
         ]
         .into(),
         tarball: tar_gz(&[("o-r-x/service.toml", b'0', ACME.as_bytes())]),
@@ -702,9 +737,18 @@ fn github_ref_branch_tag_and_commit_are_pinned() {
     // No --ref: the default branch's head.
     let (_, s) = block_on(github::fetch(&api, &spec, None)).unwrap();
     assert_eq!(s, gh("acme/tools", 'a'));
-    // A branch, a tag, a (short) commit: each resolved to a full commit and pinned,
-    // the ref recorded as asked.
-    for (r, want) in [("main", 'a'), ("v1.2.0", 'b'), ("cccccccc", 'c')] {
+    // A branch, an annotated tag (peeled), a full ref name, a hex-only branch
+    // name (a branch before a commit id), a commit id, another ref: each
+    // resolved to a full commit and pinned, the ref recorded as asked.
+    for (r, want) in [
+        ("main", 'a'),
+        ("v1.2.0", 'b'),
+        ("refs/heads/main", 'a'),
+        ("refs/tags/v1.2.0", 'b'),
+        ("cafe", 'e'),
+        ("cccccccc", 'c'),
+        ("pull/1/head", 'd'),
+    ] {
         let (files, s) = block_on(github::fetch(&api, &spec, Some(r))).unwrap();
         assert!(files.single);
         let ServiceSource::Github {
@@ -733,6 +777,9 @@ fn github_ref_branch_tag_and_commit_are_pinned() {
     .unwrap();
     assert!(matches!(s, ServiceSource::Github { commit, .. } if commit == "c".repeat(40)));
     assert!(block_on(github::fetch(&api, &spec, Some("short"))).is_err());
+    // A name that is a branch and a tag at different commits is refused.
+    let e = block_on(github::fetch(&api, &spec, Some("dup"))).unwrap_err();
+    assert!(e[0].contains("both a branch and a tag"), "{e:?}");
     // A ref outside the charset never reaches the API.
     let before = api.asked.lock().unwrap().len();
     assert!(block_on(github::fetch(&api, &spec, Some("../x"))).is_err());
@@ -760,6 +807,14 @@ fn github_urls_are_built_from_checked_names() {
     assert_eq!(
         github::repo_url("https://api.github.com", "acme", "tools"),
         "https://api.github.com/repos/acme/tools"
+    );
+    assert_eq!(
+        github::git_ref_url("https://api.github.com", "acme", "tools", "tags/v1"),
+        "https://api.github.com/repos/acme/tools/git/ref/tags/v1"
+    );
+    assert_eq!(
+        github::git_tag_url("https://api.github.com", "acme", "tools", &"7".repeat(40)),
+        format!("https://api.github.com/repos/acme/tools/git/tags/{}", "7".repeat(40))
     );
 }
 
@@ -821,7 +876,7 @@ client_id = "public"
     for check in [
         SourceCheck::LocalFolder,
         SourceCheck::NotReached,
-        SourceCheck::CommitRef,
+        SourceCheck::NotBranchOrTag,
     ] {
         let c = add_card(&snap, &src, check, false, &current, &reg).unwrap();
         assert!(c.from.contains("as stated by the requester"), "{}", c.from);
@@ -1292,6 +1347,17 @@ impl GitHubApi for OfflineGitHub {
     async fn default_branch(&self, _o: &str, _r: &str) -> Result<String, FetchError> {
         Err(self.fail())
     }
+    async fn git_ref(
+        &self,
+        _o: &str,
+        _r: &str,
+        _p: &str,
+    ) -> Result<Option<GitObject>, FetchError> {
+        Err(self.fail())
+    }
+    async fn tag_target(&self, _o: &str, _r: &str, _s: &str) -> Result<GitObject, FetchError> {
+        Err(self.fail())
+    }
     async fn commit_of(&self, _o: &str, _r: &str, _g: &str) -> Result<String, FetchError> {
         Err(self.fail())
     }
@@ -1312,7 +1378,7 @@ fn verify_fetches_the_pinned_commit_and_compares_every_definition() {
     // A single service folder at the commit (the fake serves ACME), the
     // default branch's head.
     let at_c = |f: FakeGitHub| FakeGitHub {
-        refs: [("main", "c".repeat(40))].into(),
+        refs: [("heads/main", commit('c'))].into(),
         ..f
     };
     let api = at_c(fake());
@@ -1400,12 +1466,13 @@ fn verify_fetches_the_pinned_commit_and_compares_every_definition() {
     );
 }
 
-/// A GitHub source is checked at the head of its ref: the stated branch or
-/// tag (absent: the default branch) must point at the pinned commit. A
-/// commit that is not its head (one pushed only to a fork, which GitHub
-/// serves through the parent repository's URLs) is refused, naming the ref,
-/// before anything is fetched; a ref the repository does not have is
-/// refused; a ref that is a commit id cannot be checked and the card says so.
+/// A GitHub source is checked only at the head of one of the repository's
+/// own branches or tags: the stated branch or tag (absent: the default
+/// branch; an annotated tag peeled) must point at the pinned commit, else it
+/// is refused, naming the ref, before anything is fetched. A ref that is no
+/// branch or tag of the repository (a commit id, a pull ref, an unknown name)
+/// is not checked, and the card says the source is as the requester stated
+/// it. A hex-only or commit-shaped name that is a branch is checked as one.
 /// The card shows the ref.
 #[test]
 fn verify_requires_the_ref_head_to_be_the_pinned_commit() {
@@ -1425,7 +1492,6 @@ fn verify_requires_the_ref_head_to_be_the_pinned_commit() {
             .iter()
             .any(|a| a.starts_with("tarball"))
     };
-    // `main` (the default branch) is at a, `v1.2.0` at b (the fake).
     let api = fake();
     let e = block_on(github::verify(&api, &pinned(None, 'c'), &ok)).unwrap_err();
     assert!(
@@ -1437,30 +1503,50 @@ fn verify_requires_the_ref_head_to_be_the_pinned_commit() {
         e.contains(&format!("'v1.2.0' is at {}", "b".repeat(40))),
         "{e}"
     );
+    let e = block_on(github::verify(&api, &pinned(Some("dup"), 'a'), &ok)).unwrap_err();
+    assert!(e.contains("both a branch and a tag"), "{e}");
     assert!(
         !fetched(&api),
-        "nothing fetched at a commit no ref points at"
+        "nothing fetched at a commit no branch or tag points at"
     );
-    let e = block_on(github::verify(&api, &pinned(Some("from-a-fork"), 'c'), &ok)).unwrap_err();
-    assert!(e.contains("not found"), "{e}");
-    // The ref at the pin: checked.
-    assert_eq!(
-        block_on(github::verify(&api, &pinned(Some("v1.2.0"), 'b'), &ok)),
-        Ok(SourceCheck::Fetched)
-    );
-    assert_eq!(
-        block_on(github::verify(&api, &pinned(None, 'a'), &ok)),
-        Ok(SourceCheck::Fetched)
-    );
-    // A commit id as the ref: as stated, nothing asked of GitHub.
-    let api = fake();
-    for r in ["cccccccc", &"c".repeat(40)] {
+    // The ref's head at the pin: checked.
+    for (r, c) in [
+        (Some("v1.2.0"), 'b'),
+        (Some("refs/tags/v1.2.0"), 'b'),
+        (None, 'a'),
+        (Some("refs/heads/main"), 'a'),
+        (Some("cafe"), 'e'),
+        (Some("1111111111111111111111111111111111111111"), 'e'),
+    ] {
         assert_eq!(
-            block_on(github::verify(&api, &pinned(Some(r), 'c'), &ok)),
-            Ok(SourceCheck::CommitRef)
+            block_on(github::verify(&api, &pinned(r, c), &ok)),
+            Ok(SourceCheck::Fetched),
+            "{r:?}"
         );
     }
-    assert!(api.asked.lock().unwrap().is_empty());
+    // No branch or tag of the repository: as stated, nothing fetched.
+    let api = fake();
+    for (r, c) in [
+        ("cccccccc", 'c'),
+        (&*"c".repeat(40), 'c'),
+        ("pull/1/head", 'd'),
+        ("refs/pull/1/head", 'd'),
+        ("no-such-ref", 'c'),
+    ] {
+        assert_eq!(
+            block_on(github::verify(&api, &pinned(Some(r), c), &ok)),
+            Ok(SourceCheck::NotBranchOrTag),
+            "{r}"
+        );
+    }
+    assert!(!fetched(&api));
+    // A `refs/` name outside heads and tags asks GitHub nothing.
+    let before = api.asked.lock().unwrap().len();
+    assert_eq!(
+        block_on(github::verify(&api, &pinned(Some("refs/pull/7/head"), 'd'), &ok)),
+        Ok(SourceCheck::NotBranchOrTag)
+    );
+    assert_eq!(api.asked.lock().unwrap().len(), before);
 
     // The card names the ref.
     let reg = crate::service::ServiceRegistry::compiled_only();
@@ -1477,9 +1563,11 @@ fn verify_requires_the_ref_head_to_be_the_pinned_commit() {
     assert!(
         from.contains("(default branch)") && from.contains("the default branch is at this commit")
     );
-    let from = card(&pinned(Some("cccccccc"), 'c'), SourceCheck::CommitRef);
+    let from = card(&pinned(Some("pull/1/head"), 'd'), SourceCheck::NotBranchOrTag);
     assert!(
-        from.contains("as stated by the requester") && from.contains("(cccccccc)"),
+        from.contains("as stated by the requester")
+            && from.contains("(pull/1/head)")
+            && from.contains("'pull/1/head' is neither"),
         "{from}"
     );
 }

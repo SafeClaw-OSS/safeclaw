@@ -42,6 +42,7 @@ pub async fn run(_args: SyncArgs) -> Result<(), String> {
         );
         report_connects(body.get("connects"));
         report_conflicts(body.get("conflicts"));
+        report_notes(body.get("notes"));
         Ok(())
     } else {
         // The daemon's sync error crosses a process boundary as a string; if it
@@ -116,6 +117,17 @@ fn report_connects(connects: Option<&serde_json::Value>) {
              Behind a proxy? `sc proxy set <url>`.",
             unreached.join(", ")
         );
+    }
+}
+
+/// Every other change the sync did not apply, as the daemon words it.
+fn report_notes(notes: Option<&serde_json::Value>) {
+    for n in notes
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
+        .unwrap_or_default()
+    {
+        eprintln!("  {}", crate::util::terminal_safe(n));
     }
 }
 

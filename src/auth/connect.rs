@@ -1041,6 +1041,8 @@ fn reconcile_per_item_after_connect(
                 items: std::collections::BTreeMap::new(),
                 items_seq: 0,
                 keyset_seq: 0,
+                held: Default::default(),
+                row_kinds: Default::default(),
             }
         }
     };
@@ -1062,11 +1064,25 @@ fn reconcile_per_item_after_connect(
                     "per-item store updated after connect (refresh-token + connection MOVE)"
                 );
             }
+            // A row written settles an earlier note on it.
+            for item in &reconciled.changed {
+                state.clear_sync_conflict(vault_id, item);
+            }
             // Owner-config the caller changed while it also changed elsewhere:
             // set aside, never written over; `sc sync` tells the user to re-run.
             for (item, record) in &reconciled.set_aside {
                 tracing::warn!(vault = %vault_id, item = %item, record = %record, "changed elsewhere meanwhile; ours set aside, theirs kept");
-                state.note_sync_conflict(vault_id, item, record);
+                state.note_sync(
+                    vault_id,
+                    item,
+                    crate::state::SyncNote::ChangedElsewhere(record.clone()),
+                );
+            }
+            // A change refused (a row it would write over cannot be read, or
+            // no conflict copy may be written): reported, never applied.
+            for (item, why) in &reconciled.refused {
+                tracing::warn!(vault = %vault_id, item = %item, "change refused: {}", why);
+                state.note_sync(vault_id, item, crate::state::SyncNote::Refused(why.clone()));
             }
             // Fold even when nothing changed: an existing conflict copy (an
             // idempotent no-op) still means the store differs from `view`.

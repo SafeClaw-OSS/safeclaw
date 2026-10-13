@@ -197,6 +197,68 @@ pub async fn pubkey(State(state): State<Arc<AppState>>) -> Json<Value> {
 /// pull is device-key-authed; the connect re-seal uses the retained K and
 /// no-ops if the vault is locked). The vault id is validated; the rest is
 /// handled inside `sync::sync_vault_now`.
+/// `GET /v/{vid}/held`: what this device has not applied, one sentence each
+/// (`sc status`, `sc service ls`): the pulled changes it holds, and why; a
+/// pull at unlock that failed and is being retried; local changes the sync
+/// did not apply. Local, no passkey.
+pub async fn held(
+    State(state): State<Arc<AppState>>,
+    Path(vault_id): Path<String>,
+) -> Result<Json<serde_json::Value>> {
+    validate_vault_id(&vault_id)?;
+    Ok(Json(json!({ "held": held_lines(&state, &vault_id) })))
+}
+
+/// The sentences of [`held`]. A held change names its record when the vault
+/// is unlocked, and who signed it (or that nobody did), as the row says.
+pub(crate) fn held_lines(state: &AppState, vault_id: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let pv = state
+        .vaults
+        .per_item_path(vault_id)
+        .ok()
+        .and_then(|p| crate::storage::sealed_vault::read_per_item(&p).ok().flatten());
+    if let Some(pv) = pv {
+        let key = state.cloned_state_key(vault_id);
+        for (id, h) in &pv.held {
+            let what = key
+                .as_ref()
+                .and_then(|k| {
+                    crate::storage::item::open_wire_item::<StdPrimitives>(
+                        VaultKeys::from_material(k),
+                        vault_id,
+                        id,
+                        h.version,
+                        &h.ct,
+                    )
+                    .ok()
+                })
+                .map(|p| format!("config change to {}", crate::storage::item::record_label(&p)))
+                .unwrap_or_else(|| "config change".to_string());
+            out.push(held_line(&what, h.signer.as_deref(), &h.reason));
+        }
+    }
+    if let Some(e) = state.catch_up_failure(vault_id) {
+        out.push(format!(
+            "changes from the cloud since unlock are not pulled yet ({}); retrying",
+            e
+        ));
+    }
+    out.extend(state.sync_note_lines(vault_id));
+    out
+}
+
+/// One held change as a sentence: what it is, where it came from (who
+/// signed it, as the row says, or that nobody did), and why it is not
+/// applied.
+fn held_line(what: &str, signer: Option<&str>, reason: &str) -> String {
+    let who = match signer {
+        Some(s) => format!("signed by {}", s.chars().take(64).collect::<String>()),
+        None => "unsigned".to_string(),
+    };
+    format!("{} from the cloud ({}) not applied: {}", what, who, reason)
+}
+
 pub async fn sync_now(
     State(state): State<Arc<AppState>>,
     Path(vault_id): Path<String>,
@@ -222,6 +284,8 @@ pub async fn sync_now(
                 // Records whose local change the push set aside (the cloud
                 // row changed elsewhere meanwhile): the user re-runs them.
                 "conflicts": state.sync_conflict_records(&vault_id),
+                // Every other change not applied, as sentences.
+                "notes": state.sync_note_lines(&vault_id),
             }))
         }
         Err(e) => Json(json!({ "ok": false, "error": e })),
@@ -600,6 +664,28 @@ mod tests {
     use sudp::primitives::domain::DS_SEAL;
     use sudp::primitives::{Aead, ChaCha20Poly1305};
     use sudp::state::{ProtectedState, CURRENT_VERSION};
+
+    /// A held change says what it is, who signed it (or that nobody did)
+    /// and why it is not applied.
+    #[test]
+    fn a_held_change_says_where_it_came_from_and_why() {
+        use crate::storage::sealed_vault::{HELD_LOCKED, HELD_NOT_OWNER_SIGNED};
+        assert_eq!(
+            held_line("config change to policy", Some("us_member"), HELD_NOT_OWNER_SIGNED),
+            format!(
+                "config change to policy from the cloud (signed by us_member) not applied: {}",
+                HELD_NOT_OWNER_SIGNED
+            )
+        );
+        let locked = held_line("config change", None, HELD_LOCKED);
+        assert!(
+            locked.starts_with("config change from the cloud (unsigned) not applied: the vault is locked"),
+            "{locked}"
+        );
+        // A signer id is shown bounded.
+        let long = "x".repeat(500);
+        assert!(held_line("config change", Some(&long), "r").len() < 200);
+    }
 
     /// The retained-K refresh path: a vault's body is K-sealed with AAD
     /// `DS_SEAL ‖ ver`, independent of any credential, so a held `K` opens it

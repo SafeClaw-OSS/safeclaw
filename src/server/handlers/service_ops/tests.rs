@@ -4,7 +4,7 @@ use crate::service::source::tests::tar_gz;
 use crate::storage::plaintext::{MemberRole, VaultAux, VaultPlaintextView};
 use crate::storage::sealed_vault::PerItemVault;
 
-use crate::service::source::github::FetchError;
+use crate::service::source::github::{FetchError, GitObject};
 
 /// GitHub as the tests see it: serves `tarball` (or answers its read with an
 /// error) at the commit `main`, the default branch, is at (`a` × 40), or is
@@ -32,6 +32,23 @@ impl Gh {
 impl GitHubApi for Gh {
     async fn default_branch(&self, _o: &str, _r: &str) -> std::result::Result<String, FetchError> {
         self.reached().map(|_| "main".to_string())
+    }
+    async fn git_ref(
+        &self,
+        _o: &str,
+        _r: &str,
+        path: &str,
+    ) -> std::result::Result<Option<GitObject>, FetchError> {
+        self.reached()?;
+        Ok((path == "heads/main").then(|| GitObject::Commit("a".repeat(40))))
+    }
+    async fn tag_target(
+        &self,
+        _o: &str,
+        _r: &str,
+        sha: &str,
+    ) -> std::result::Result<GitObject, FetchError> {
+        Err(FetchError::Answered(format!("tag {} not found", sha)))
     }
     async fn commit_of(
         &self,

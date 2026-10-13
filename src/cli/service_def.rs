@@ -597,8 +597,10 @@ pub async fn run_ls(args: ServiceLsArgs, json: bool) -> Result<(), String> {
         );
         return Ok(());
     }
+    let held = held_notes(&custodian, &vault).await;
     if rows.is_empty() {
         println!("no service definitions in this vault; add one with `sc service add <source>`");
+        print_held(&held);
         return Ok(());
     }
     let mut groups: BTreeMap<String, (String, Vec<&Listed>)> = BTreeMap::new();
@@ -638,7 +640,25 @@ pub async fn run_ls(args: ServiceLsArgs, json: bool) -> Result<(), String> {
             }
         }
     }
+    print_held(&held);
     Ok(())
+}
+
+/// What the daemon has not applied for this vault (`GET /v/{vid}/held`).
+async fn held_notes(custodian: &str, vault: &str) -> Vec<String> {
+    match reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+    {
+        Ok(c) => crate::cli::status::fetch_held(&c, custodian, vault).await,
+        Err(_) => Vec::new(),
+    }
+}
+
+fn print_held(held: &[String]) {
+    for line in held {
+        println!("note: {}", safe(line));
+    }
 }
 
 // ── rm ───────────────────────────────────────────────────────────────────────

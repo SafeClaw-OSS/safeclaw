@@ -29,8 +29,8 @@ use crate::passkey::PasskeyEntry;
 use crate::protocol::operation::decode_credential_id;
 use crate::storage::item::{
     aad_id_from_wire, body_digest as item_body_digest, item_id, item_id_bytes, normalized_body,
-    parse_secret_body, seal_item, secret_body, unseal_item, wire_id_for, Conflict, ItemCtx, ItemNs,
-    ItemPayload, Read, VaultKeys,
+    open_wire_item, parse_secret_body, seal_item, secret_body, unseal_item, wire_id_for, Conflict,
+    ItemCtx, ItemNs, ItemPayload, Read, VaultKeys,
 };
 
 /// Per-vault count of items the LAST fold had to skip (unreadable at a format
@@ -333,6 +333,41 @@ pub struct StoredItem {
     /// `None` = unknown (the keep-both rule applies as is).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base: Option<String>,
+    /// Written by SafeClaw's automatic upgrade of this vault (the legacy-row
+    /// migration), not by a person: a conflict on it pauses the upgrade,
+    /// which retries. Local bookkeeping only (never sent).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub upgrade: bool,
+}
+
+/// A pulled replacement this device did not adopt (see `crate::sync`): kept
+/// with why, offered again on every pull and at unlock, and shown to the user
+/// until it is adopted or superseded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeldRow {
+    pub version: u64,
+    pub seq: u64,
+    #[serde(with = "b64url_bytes")]
+    pub ct: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sig: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signer: Option<String>,
+    /// Why it is not applied.
+    pub reason: String,
+}
+
+/// What an item id addresses, as read with the vault key ([`PerItemVault::classify_rows`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RowKind {
+    /// A data record (a secret, a connection, an in-flight connect, a
+    /// service, `secret_order`), copies included: a pulled replacement needs
+    /// no key to adopt.
+    Data,
+    /// Owner-config, an agent grant, or a row not at its own address: a
+    /// pulled replacement on a vault with a keyset waits for the key.
+    Guarded,
 }
 
 /// The v2 (UIK) material carried alongside one credential (device) row — the
@@ -1136,14 +1171,25 @@ fn digest_hex(d: &[u8; 32]) -> String {
     d.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
-/// What [`PerItemVault::reconcile_from_view`] did: the item ids it wrote, and
-/// the owner-config changes it set aside instead (the stored row changed since
+/// What [`PerItemVault::reconcile_from_view`] did: the item ids it wrote; the
+/// owner-config changes it set aside instead (the stored row changed since
 /// the caller's base), each `(canonical item id, record)` for the caller to
-/// report ("changed elsewhere meanwhile; re-run").
+/// report ("changed elsewhere meanwhile; re-run"); and the changes it refused
+/// because a row they would write over cannot be read with this vault's key
+/// (or no conflict copy may be written), each `(item id, why)`.
 #[derive(Debug, Default)]
 pub struct Reconciled {
     pub changed: Vec<String>,
     pub set_aside: Vec<(String, String)>,
+    pub refused: Vec<(String, String)>,
+}
+
+/// Why a change to `record` was not written over a row that cannot be read.
+pub fn unreadable_refusal(record: &str) -> String {
+    format!(
+        "{}: the stored record cannot be read with this vault's key, so it was not written over and your change was not applied; run `sc sync`, then re-run it",
+        record
+    )
 }
 
 // ── Owner-config records ─────────────────────────────────────────────────────
@@ -1487,6 +1533,12 @@ pub struct PerItemVault {
     /// existing on-disk `vault.per-item.json` loads without migration.
     #[serde(default)]
     pub keyset_seq: u64,
+    /// Pulled replacements not adopted, by item id (the newest each).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub held: BTreeMap<String, HeldRow>,
+    /// What each item id addresses, once read with the vault key.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub row_kinds: BTreeMap<String, RowKind>,
 }
 
 impl PerItemVault {
@@ -1526,6 +1578,8 @@ impl PerItemVault {
             items: BTreeMap::new(),
             items_seq: 0,
             keyset_seq: 0,
+            held: BTreeMap::new(),
+            row_kinds: BTreeMap::new(),
         })
     }
 
@@ -1564,6 +1618,7 @@ impl PerItemVault {
                 sig,
                 signer,
                 base: None,
+                upgrade: false,
             },
         );
     }
@@ -1896,6 +1951,7 @@ impl PerItemVault {
                 sig: None,
                 signer: None,
                 base,
+                upgrade: false,
             },
         );
         Ok(id)
@@ -1997,14 +2053,12 @@ impl PerItemVault {
     /// `aux.services` (legacy entries included), each its own item, always in
     /// the object form `{service, policy?, source?}`
     /// ([`crate::storage::item::normalized_body`]: a plain-string entry is
-    /// `{service: <text>}`). A conflict copy is left where the sync put it: it
-    /// is never written from a view (its row is not at the address of its name).
+    /// `{service: <text>}`). A conflict copy is a record of its own name.
     fn service_bodies(
         aux: &crate::storage::plaintext::VaultAux,
     ) -> Result<Vec<(String, serde_json::Value)>> {
         aux.services
             .iter()
-            .filter(|(id, _)| !crate::storage::item::is_conflict_copy_name(id))
             .map(|(id, e)| {
                 let body = serde_json::to_value(e).map_err(AppError::from)?;
                 Ok((id.clone(), normalized_body(ItemNs::Service, id, &body)))
@@ -2012,38 +2066,50 @@ impl PerItemVault {
             .collect()
     }
 
-    /// Keep `ours` as the conflict copy beside THEIR row at `their_version`
-    /// (the console's `putConflictCopy` id/name, version 1), inserted only if
-    /// absent (idempotent). `dirty`: a keep-both copy (`synced_version` 0, the
-    /// next push sends it as a create); else a change set aside, kept locally
-    /// and never pushed or folded. Returns the copy id when it was inserted.
-    fn put_local_conflict_copy<S: PrimitiveSuite>(
+    /// Keep `ours` as its keep-both conflict copy, an ordinary record
+    /// ([`crate::storage::item::conflict_copy_slot`] against this store):
+    /// written dirty (the next push sends it), or already here. Returns the
+    /// id written, if any; `Err` when no copy may be written (a row that
+    /// cannot be read, or the last copy level taken).
+    pub(crate) fn keep_conflict_copy<S: PrimitiveSuite>(
         &mut self,
         keys: VaultKeys,
         vault_id: &str,
         ours: &ItemPayload,
-        their_version: u64,
-        dirty: bool,
     ) -> Result<Option<String>> {
-        let (copy_id, ct) =
-            crate::storage::item::seal_conflict_copy::<S>(keys, vault_id, ours, their_version)?;
-        if self.items.contains_key(&copy_id) {
-            return Ok(None);
+        use crate::storage::item::{conflict_copy_slot, row_at, CopySlot};
+        let slot = conflict_copy_slot::<S>(keys.id_seed, ours, |wire| {
+            row_at::<S>(
+                keys,
+                vault_id,
+                wire,
+                self.items.get(wire).map(|s| (s.version, s.ct.as_slice())),
+            )
+        })?;
+        match slot {
+            CopySlot::Same { .. } => Ok(None),
+            CopySlot::Write { payload, .. } => {
+                let (id, _) =
+                    self.seal_and_bump::<S>(keys, vault_id, payload.ns, &payload.name, &payload)?;
+                Ok(Some(id))
+            }
         }
-        let version = crate::storage::item::CONFLICT_COPY_VERSION;
-        self.items.insert(
-            copy_id.clone(),
-            StoredItem {
-                version,
-                ct,
-                synced_version: if dirty { 0 } else { version },
-                tombstone: false,
-                sig: None,
-                signer: None,
-                base: None,
-            },
-        );
-        Ok(Some(copy_id))
+    }
+
+    /// Whether the row at `(ns, name)` may be written over: absent, or one
+    /// this key opens. A row that cannot be read is never written over.
+    fn writable<S: PrimitiveSuite>(
+        &self,
+        keys: VaultKeys,
+        vault_id: &str,
+        ns: ItemNs,
+        name: &str,
+    ) -> Result<bool> {
+        let wire = wire_id_for::<S>(keys.id_seed, ns, name)?;
+        Ok(match self.items.get(&wire) {
+            None => true,
+            Some(s) => open_wire_item::<S>(keys, vault_id, &wire, s.version, &s.ct).is_ok(),
+        })
     }
 
     /// A view's reconcilable items as `(ns, name) → body`: every native secret,
@@ -2163,8 +2229,18 @@ impl PerItemVault {
                 }
             }
             // `open_item` is unconverted (single-key); id_seed == content here so
-            // the read is byte-identical either way.
-            let existing = self.open_item::<S>(keys, vault_id, *ns, name)?;
+            // the read is byte-identical either way. A row this key cannot
+            // open is never written over: the change is refused and reported.
+            let wire = wire_id_for::<S>(keys.id_seed, *ns, name)?;
+            let existing = match self.open_item::<S>(keys, vault_id, *ns, name) {
+                Ok(p) => p,
+                Err(_) => {
+                    let label =
+                        crate::storage::item::record_label(&ItemPayload::live(*ns, name.clone(), body.clone()));
+                    out.refused.push((wire, unreadable_refusal(&label)));
+                    continue;
+                }
+            };
             let existing_live = existing.as_ref().filter(|p| !p.is_tombstone());
             let wanted = item_body_digest(*ns, name, body);
             if existing_live.is_some_and(|p| item_body_digest(*ns, name, &p.body) == wanted) {
@@ -2172,7 +2248,6 @@ impl PerItemVault {
             }
             let payload = ItemPayload::live(*ns, name.clone(), body.clone());
             let policy = crate::storage::item::conflict_policy(*ns, name);
-            let wire = wire_id_for::<S>(keys.id_seed, *ns, name)?;
             let row = self
                 .items
                 .get(&wire)
@@ -2181,37 +2256,24 @@ impl PerItemVault {
             // longer matches the base (a pull changed or deleted it meanwhile,
             // e.g. during a connect's token exchange). Their body equal to the
             // base (normalized) is no conflict: ours applies.
-            if let (ReconcileBase::Since(b), Some((their_version, _))) = (base, row) {
+            if let (ReconcileBase::Since(b), Some(_)) = (base, row) {
                 let theirs = existing_live.map(|p| item_body_digest(*ns, name, &p.body));
                 if theirs.as_ref() != b.digest(*ns, name) {
                     match policy {
-                        // THEIRS stays at the canonical id; OURS becomes a local
-                        // dirty conflict copy (console parity); their delete
-                        // stands.
+                        // THEIRS stays at the canonical id; OURS becomes its
+                        // conflict copy, a dirty record of its own name
+                        // (console parity); their delete stands.
                         Conflict::KeepBoth => {
-                            if let Some(copy) = self.put_local_conflict_copy::<S>(
-                                keys,
-                                vault_id,
-                                &payload,
-                                their_version,
-                                true,
-                            )? {
-                                out.changed.push(copy);
+                            match self.keep_conflict_copy::<S>(keys, vault_id, &payload) {
+                                Ok(Some(copy)) => out.changed.push(copy),
+                                Ok(None) => {}
+                                Err(e) => out.refused.push((wire.clone(), e.to_string())),
                             }
                             continue;
                         }
-                        // Never overwritten: ours is set aside locally (never
-                        // pushed or folded) and reported for a re-run.
+                        // Never overwritten: ours is not written and is
+                        // reported for a re-run.
                         Conflict::OwnerConfig => {
-                            if let Some(copy) = self.put_local_conflict_copy::<S>(
-                                keys,
-                                vault_id,
-                                &payload,
-                                their_version,
-                                false,
-                            )? {
-                                out.changed.push(copy);
-                            }
                             out.set_aside
                                 .push((wire.clone(), crate::storage::item::record_label(&payload)));
                             continue;
@@ -2242,73 +2304,48 @@ impl PerItemVault {
                 }
         };
         let mine = self.fold_view::<S>(keys, vault_id)?;
-        for name in mine.native_secrets.keys() {
-            if removed(ItemNs::Secret, name) {
-                let (id, _v) = self.seal_and_bump::<S>(
-                    keys,
-                    vault_id,
-                    ItemNs::Secret,
-                    name,
-                    &ItemPayload::tombstone(ItemNs::Secret, name.clone()),
-                )?;
-                out.changed.push(id);
-            }
-        }
-        for id in mine.aux.connections.keys() {
-            if removed(ItemNs::Connection, id) {
-                let (iid, _v) = self.seal_and_bump::<S>(
-                    keys,
-                    vault_id,
-                    ItemNs::Connection,
-                    id,
-                    &ItemPayload::tombstone(ItemNs::Connection, id.clone()),
-                )?;
-                out.changed.push(iid);
-            }
-        }
-        for id in mine.aux.connecting.keys() {
-            if removed(ItemNs::Connecting, id) {
-                let (iid, _v) = self.seal_and_bump::<S>(
-                    keys,
-                    vault_id,
-                    ItemNs::Connecting,
-                    id,
-                    &ItemPayload::tombstone(ItemNs::Connecting, id.clone()),
-                )?;
-                out.changed.push(iid);
-            }
-        }
-        // A service the caller dropped (a native item, or a legacy-only entry of
-        // the `services` record) gets a native tombstone, which hides the legacy
-        // entry of its id.
-        for id in mine.aux.services.keys() {
-            if !crate::storage::item::is_conflict_copy_name(id) && removed(ItemNs::Service, id) {
-                let (iid, _v) = self.seal_and_bump::<S>(
-                    keys,
-                    vault_id,
-                    ItemNs::Service,
-                    id,
-                    &ItemPayload::tombstone(ItemNs::Service, id.clone()),
-                )?;
-                out.changed.push(iid);
-            }
-        }
+        let mut drop_keys: Vec<(ItemNs, String)> = Vec::new();
+        drop_keys.extend(mine.native_secrets.keys().map(|n| (ItemNs::Secret, n.clone())));
+        drop_keys.extend(mine.aux.connections.keys().map(|n| (ItemNs::Connection, n.clone())));
+        drop_keys.extend(mine.aux.connecting.keys().map(|n| (ItemNs::Connecting, n.clone())));
+        // A service the caller dropped (a native item, or a legacy-only entry
+        // of the `services` record) gets a native tombstone, which hides the
+        // legacy entry of its id.
+        drop_keys.extend(mine.aux.services.keys().map(|n| (ItemNs::Service, n.clone())));
         // Owner-config records the caller dropped (a policy category or
         // connection entry, a store, the retention), where the device may
         // write them.
-        for ((ns, name), _) in owner_config_items(&mine.aux)? {
-            if removed(ns, &name)
-                && crate::storage::item::device_may_write(ns, &name, has_keyset, true)
-            {
-                let (iid, _v) = self.seal_and_bump::<S>(
-                    keys,
-                    vault_id,
-                    ns,
-                    &name,
-                    &ItemPayload::tombstone(ns, name.clone()),
-                )?;
-                out.changed.push(iid);
+        drop_keys.extend(
+            owner_config_items(&mine.aux)?
+                .into_iter()
+                .map(|(k, _)| k)
+                .filter(|(ns, name)| {
+                    crate::storage::item::device_may_write(*ns, name, has_keyset, true)
+                }),
+        );
+        for (ns, name) in drop_keys {
+            if !removed(ns, &name) {
+                continue;
             }
+            // A key read from a legacy row may have a native row this key
+            // cannot open: never written over.
+            if !self.writable::<S>(keys, vault_id, ns, &name)? {
+                let label =
+                    crate::storage::item::record_label(&ItemPayload::tombstone(ns, name.clone()));
+                out.refused.push((
+                    wire_id_for::<S>(keys.id_seed, ns, &name)?,
+                    unreadable_refusal(&label),
+                ));
+                continue;
+            }
+            let (iid, _v) = self.seal_and_bump::<S>(
+                keys,
+                vault_id,
+                ns,
+                &name,
+                &ItemPayload::tombstone(ns, name.clone()),
+            )?;
+            out.changed.push(iid);
         }
         // Agent rows are never written here (no live upsert, no tombstone): a
         // revoke is the console deleting the UIK-signed row.
@@ -2618,7 +2655,7 @@ impl PerItemVault {
         crate::storage::plaintext::VaultPlaintextView,
         std::collections::BTreeSet<ItemNs>,
     )> {
-        use crate::storage::item::{is_conflict_copy_name, rule};
+        use crate::storage::item::rule;
         use crate::storage::plaintext::{VaultAux, VaultPlaintextView};
 
         // Start from the fresh-vault defaults. Every record is read per its
@@ -2637,9 +2674,6 @@ impl PerItemVault {
             BTreeMap::new();
         let mut native_removed: std::collections::BTreeSet<String> =
             std::collections::BTreeSet::new();
-        // Conflict copies (keep-both records only), folded after the loop
-        // under their own names, never over a record at its own id.
-        let mut copies: Vec<ItemPayload> = Vec::new();
 
         // D: the verified OWNER-SET authorizes owner-config (owner-only). It is
         // now derived from the KEYSET (creator-rooted role grants), NOT from an
@@ -2677,20 +2711,11 @@ impl PerItemVault {
                     return Ok(());
                 };
                 // One address per record: a row counts only at the derived id
-                // of its own (ns, name) (an agent's: its ag_id). A row anywhere
-                // else is a conflict copy, read only for a record that keeps
-                // both and only under a copy's name, so it never stands in for
-                // the record itself. A copy of any other record is a change the
-                // sync set aside locally: never read (a `connecting` copy would
-                // read as an in-flight connect).
+                // of its own (ns, name) (an agent's: its ag_id). A conflict
+                // copy is a record of its own name (`"<name> (conflict
+                // copy)"`) at that name's id, read like any other.
                 if wire_id_for::<S>(keys.id_seed, payload.ns, &payload.name)? != *id_b64 {
-                    if r.conflict == Conflict::KeepBoth && is_conflict_copy_name(&payload.name) {
-                        if payload.status == crate::storage::item::ItemStatus::Live {
-                            copies.push(payload);
-                        }
-                    } else if !is_conflict_copy_name(&payload.name) {
-                        tracing::warn!(vault = %vault_id, ns = %payload.ns.as_str(), wire = %id_b64, "fold: dropping a record that is not at its own id");
-                    }
+                    tracing::warn!(vault = %vault_id, ns = %payload.ns.as_str(), wire = %id_b64, "fold: dropping a record that is not at its own id");
                     return Ok(());
                 }
                 let sig_type = r.signature_type(&payload.name).map(str::to_string);
@@ -2824,44 +2849,6 @@ impl PerItemVault {
                 // this, via the signed envelope): this record is unreadable as is.
                 unreadable += 1;
                 tracing::warn!(vault = %vault_id, item = %id_b64, "fold: skipping unreadable item: {}", e);
-            }
-        }
-
-        // Keep-both conflict copies, under their own names; a record at its
-        // own id of the same name wins. No service is loaded from a service
-        // copy (`vault_custom_services`).
-        for copy in copies {
-            let name = copy.name;
-            let read: Result<()> = match copy.ns {
-                ItemNs::Secret if !native_secrets.contains_key(&name) => {
-                    parse_secret_body(&copy.body).map(|(value, notes)| {
-                        if let Some(n) = notes {
-                            native_secret_notes.insert(name.clone(), n);
-                        }
-                        native_secrets.insert(name.clone(), value.into_bytes());
-                    })
-                }
-                ItemNs::Connection if !aux.connections.contains_key(&name) => {
-                    serde_json::from_value(copy.body)
-                        .map(|c| {
-                            aux.connections.insert(name.clone(), c);
-                        })
-                        .map_err(AppError::from)
-                }
-                ItemNs::Service
-                    if !native_services.contains_key(&name) && !native_removed.contains(&name) =>
-                {
-                    serde_json::from_value(copy.body)
-                        .map(|e| {
-                            native_services.insert(name.clone(), e);
-                        })
-                        .map_err(AppError::from)
-                }
-                _ => Ok(()),
-            };
-            if let Err(e) = read {
-                unreadable += 1;
-                tracing::warn!(vault = %vault_id, copy = %name, "fold: skipping unreadable conflict copy: {}", e);
             }
         }
 
@@ -3085,7 +3072,10 @@ impl PerItemVault {
                 }
                 let payload = ItemPayload::live(ns, name.clone(), body);
                 match self.seal_and_bump::<S>(keys, vault_id, ns, &name, &payload) {
-                    Ok((iid, _)) => changed.push(iid),
+                    Ok((iid, _)) => {
+                        self.mark_upgrade(&iid);
+                        changed.push(iid)
+                    }
                     Err(e) => {
                         tracing::warn!(vault = %vault_id, field, "legacy copy not written: {}", e)
                     }
@@ -3130,31 +3120,40 @@ impl PerItemVault {
                 field,
                 &ItemPayload::tombstone(ItemNs::Aux, field),
             ) {
-                Ok((iid, _)) => changed.push(iid),
+                Ok((iid, _)) => {
+                    self.mark_upgrade(&iid);
+                    changed.push(iid)
+                }
                 Err(e) => tracing::warn!(vault = %vault_id, field, "legacy row not retired: {}", e),
             }
         }
         changed
     }
 
-    /// Whether adopting `incoming` over the local row at `wire` would replace
-    /// an owner-config record the fold honors (native or legacy, live or
-    /// tombstone) with one it does not honor or cannot read: then the local
-    /// row is kept, the last honored value. Only a vault with a keyset has
-    /// owner-config the fold drops; without one this is always `false`.
-    pub(crate) fn keeps_honored_owner_config<S: PrimitiveSuite>(
+    /// Mark the row at `iid` as written by SafeClaw's automatic upgrade.
+    fn mark_upgrade(&mut self, iid: &str) {
+        if let Some(s) = self.items.get_mut(iid) {
+            s.upgrade = true;
+        }
+    }
+
+    /// Why adopting `incoming` over the local row at `wire` is held back, or
+    /// `None` to adopt: it would replace an owner-config record the fold
+    /// honors (native or legacy, live or tombstone) with one it does not
+    /// honor or cannot read; then the local row is kept, the last honored
+    /// value. Only a vault with a keyset has owner-config the fold drops;
+    /// without one this is always `None`.
+    pub(crate) fn unhonored_replacement<S: PrimitiveSuite>(
         &self,
         keys: VaultKeys,
         vault_id: &str,
         wire: &str,
         incoming: &StoredItem,
-    ) -> bool {
+    ) -> Option<&'static str> {
         if self.keyset.uik.is_none() {
-            return false;
+            return None;
         }
-        let Some(local) = self.items.get(wire) else {
-            return false;
-        };
+        let local = self.items.get(wire)?;
         let trust = self.resolve_membership_trust(vault_id);
         let read = |stored: &StoredItem| -> Option<bool> {
             let raw = aad_id_from_wire::<S>(keys.id_seed, wire).ok()?;
@@ -3200,7 +3199,70 @@ impl PerItemVault {
                 .is_some()
             })
         };
-        read(local) == Some(true) && read(incoming) != Some(true)
+        if read(local) != Some(true) {
+            return None;
+        }
+        match read(incoming) {
+            Some(true) => None,
+            Some(false) => Some(HELD_NOT_OWNER_SIGNED),
+            None => Some(HELD_UNREADABLE),
+        }
+    }
+
+    /// Whether [`Self::unhonored_replacement`] holds `incoming` back.
+    #[cfg(test)]
+    pub(crate) fn keeps_honored_owner_config<S: PrimitiveSuite>(
+        &self,
+        keys: VaultKeys,
+        vault_id: &str,
+        wire: &str,
+        incoming: &StoredItem,
+    ) -> bool {
+        self.unhonored_replacement::<S>(keys, vault_id, wire, incoming)
+            .is_some()
+    }
+
+    /// Record what each row not yet classified addresses ([`RowKind`]),
+    /// reading it with the vault key: a data record at its own derived id is
+    /// [`RowKind::Data`]; owner-config, an agent grant, or a row not at its
+    /// own address is [`RowKind::Guarded`]. An id is the HMAC of its record's
+    /// name, so what it addresses never changes. A row this key cannot open
+    /// stays unclassified (read again next time). Ids no longer stored are
+    /// forgotten.
+    pub fn classify_rows<S: PrimitiveSuite>(&mut self, keys: VaultKeys, vault_id: &str) {
+        let items = &self.items;
+        self.row_kinds.retain(|id, _| items.contains_key(id));
+        let todo: Vec<String> = self
+            .items
+            .keys()
+            .filter(|id| !self.row_kinds.contains_key(*id))
+            .cloned()
+            .collect();
+        for id in todo {
+            if crate::storage::item::is_agent_wire_id(&id) {
+                self.row_kinds.insert(id, RowKind::Guarded);
+                continue;
+            }
+            let stored = &self.items[&id];
+            let Ok(payload) = open_wire_item::<S>(keys, vault_id, &id, stored.version, &stored.ct)
+            else {
+                continue;
+            };
+            let data = crate::storage::item::rule(payload.ns, &payload.name).is_some_and(|r| {
+                r.conflict != Conflict::OwnerConfig
+                    && payload.ns != ItemNs::Agent
+                    && wire_id_for::<S>(keys.id_seed, payload.ns, &payload.name)
+                        .is_ok_and(|w| w == id)
+            });
+            self.row_kinds.insert(
+                id,
+                if data {
+                    RowKind::Data
+                } else {
+                    RowKind::Guarded
+                },
+            );
+        }
     }
 
     /// Names of live (non-tombstone) items in one namespace. Unreadable items
@@ -3231,6 +3293,16 @@ impl PerItemVault {
         Ok(out)
     }
 }
+
+/// A held replacement's reason: not signed by an owner of the vault.
+pub const HELD_NOT_OWNER_SIGNED: &str =
+    "it is not signed by an owner of this vault; the owner-signed setting stays in force";
+/// A held replacement's reason: it cannot be read with the vault key.
+pub const HELD_UNREADABLE: &str =
+    "it cannot be read with this vault's key; the owner-signed setting stays in force";
+/// A held replacement's reason: the vault is locked.
+pub const HELD_LOCKED: &str =
+    "the vault is locked; it is checked with the vault key at unlock";
 
 /// Read the per-item vault file. `None` if it doesn't exist. (New per-item
 /// format; NOT interchangeable with [`read`]'s whole-blob `SealedState`.)
@@ -3620,11 +3692,12 @@ pub(crate) mod tests {
 
     // §4 under `Since`: the caller changed K while a pull changed K too (the
     // stored row no longer matches the base). A keep-both ns keeps THEIRS at the
-    // canonical id and OURS as a local DIRTY conflict copy (console id/name,
-    // version 1); other namespaces take the caller's write. Idempotent.
+    // canonical id and OURS as its DIRTY conflict copy, the record "K
+    // (conflict copy)"; owner-config is never written over (reported).
+    // Idempotent.
     #[test]
     fn reconcile_keeps_both_on_a_concurrent_same_item_change() {
-        use crate::storage::item::{self as il, ItemPayload};
+        use crate::storage::item::{self as il};
         use crate::storage::plaintext::{VaultAux, VaultPlaintextView};
         use sudp::primitives::StdPrimitives;
         let k = [0x57u8; 32];
@@ -3670,24 +3743,18 @@ pub(crate) mod tests {
             (k_now.version, k_now.synced_version, k_now.ct.clone()),
             (their_k.version, their_k.version, their_k.ct.clone())
         );
-        let (copy_id, _) = il::seal_conflict_copy::<StdPrimitives>(
-            keys,
-            vid,
-            &ItemPayload::secret_live("K", "ours"),
-            their_k.version,
-        )
-        .unwrap();
+        // The copy is a record of its own name at that name's id: dirty, a
+        // create on the next push.
+        let copy_id =
+            il::wire_id_for::<StdPrimitives>(&k, ItemNs::Secret, &il::conflict_copy_name("K"))
+                .unwrap();
         let copy = pv.get_item(&copy_id).expect("local conflict copy").clone();
-        assert_eq!(
-            (copy.version, copy.synced_version),
-            (il::CONFLICT_COPY_VERSION, 0)
-        );
+        assert_eq!((copy.version, copy.synced_version), (1, 0));
         let folded = pv.fold_view::<StdPrimitives>(keys, vid).unwrap();
         assert_eq!(folded.native_secrets["K"], b"theirs");
         assert_eq!(folded.native_secrets[&il::conflict_copy_name("K")], b"ours");
         // Owner-config: never written over theirs, also without a keyset. Ours
-        // is set aside as a local copy (clean: never pushed; never folded) and
-        // reported for a re-run.
+        // is not written and is reported for a re-run.
         assert_eq!(folded.aux.audit_retention_days, Some(14));
         let r_id = il::wire_id_for::<StdPrimitives>(&k, ItemNs::AuditRetentionDays, "").unwrap();
         assert_eq!(
@@ -3699,18 +3766,11 @@ pub(crate) mod tests {
             theirs_r.version, theirs_r.synced_version,
             "theirs untouched"
         );
-        let (r_copy, _) = il::seal_conflict_copy::<StdPrimitives>(
-            keys,
-            vid,
-            &ItemPayload::live(ItemNs::AuditRetentionDays, "", serde_json::json!(30)),
-            theirs_r.version,
-        )
-        .unwrap();
-        let r_copy = pv.get_item(&r_copy).expect("ours set aside locally");
-        assert_eq!(r_copy.version, r_copy.synced_version, "never pushed");
         assert!(reconciled.changed.contains(&copy_id));
+        assert!(!reconciled.changed.contains(&r_id));
 
-        // Idempotent: a second reconcile adds no second copy.
+        // Idempotent: a second reconcile adds no second copy (the same
+        // content is already there).
         let n = pv.items.len();
         let again = pv
             .reconcile_from_view::<StdPrimitives>(keys, vid, &view, ReconcileBase::Since(&base))
@@ -6030,13 +6090,13 @@ pub(crate) mod tests {
 
     /// A same-item conflict on a service keeps both, like a connection: the
     /// daemon's write over a row that changed since its base leaves theirs at
-    /// the canonical id and puts ours beside it as `"<id> (conflict copy)"`
-    /// (the console's copy id and name), dirty, so the push sends it as a
-    /// create. The copy folds under its own name and no service is loaded
+    /// the canonical id and puts ours beside it as the record `"<id>
+    /// (conflict copy)"` at that name's own id, dirty, so the push sends it as
+    /// a create. The copy folds under its own name and no service is loaded
     /// from it.
     #[test]
     fn service_conflict_keeps_both_and_the_copy_is_not_used() {
-        use crate::storage::item::{conflict_copy_name, seal_conflict_copy};
+        use crate::storage::item::conflict_copy_name;
         use sudp::primitives::StdPrimitives;
         type S = StdPrimitives;
         let k = [0x5au8; 32];
@@ -6064,8 +6124,8 @@ pub(crate) mod tests {
         pv.reconcile_from_view::<S>(keys, vault, &ours_view, ReconcileBase::Since(&base))
             .unwrap();
 
-        let ours = ItemPayload::live(ItemNs::Service, "acme", svc_entry("acme", "a.ours"));
-        let (copy_id, _) = seal_conflict_copy::<S>(keys, vault, &ours, their_version).unwrap();
+        let copy_id =
+            wire_id_for::<S>(keys.id_seed, ItemNs::Service, &conflict_copy_name("acme")).unwrap();
         let copy = pv.get_item(&copy_id).expect("ours kept as a conflict copy");
         assert_eq!(copy.synced_version, 0, "dirty: pushed as a create");
         assert_eq!(
@@ -6328,6 +6388,63 @@ pub(crate) mod tests {
             vec![0u8; 48],
         )
         .unwrap()
+    }
+
+    /// A row this key cannot open is never written over: a change that
+    /// would (an upsert of its record, the native tombstone that removes a
+    /// legacy-only service) is refused and reported, the row is left as it
+    /// is, and every other change still applies.
+    #[test]
+    fn a_row_that_cannot_be_read_is_never_written_over() {
+        use sudp::primitives::StdPrimitives;
+        type S = StdPrimitives;
+        let k = [0x66u8; 32];
+        let keys = VaultKeys::single(&k);
+        let vid = "vault-unreadable";
+        let mut pv = v1_store();
+        pv.plant::<S>(
+            keys,
+            vid,
+            ItemNs::Aux,
+            "services",
+            1,
+            &ItemPayload::live(
+                ItemNs::Aux,
+                "services",
+                serde_json::json!({ "acme": svc_entry("acme", "a.dev") }),
+            ),
+        )
+        .unwrap();
+        // Rows sealed under another key at `service:acme` and `secret:B`.
+        let garbage = vec![7u8; 60];
+        let svc_wire = wire_id_for::<S>(&k, ItemNs::Service, "acme").unwrap();
+        let b_wire = wire_id_for::<S>(&k, ItemNs::Secret, "B").unwrap();
+        pv.put_raw(svc_wire.clone(), 3, garbage.clone());
+        pv.put_raw(b_wire.clone(), 2, garbage.clone());
+        let view = pv.fold_view::<S>(keys, vid).unwrap();
+        assert!(view.aux.services.contains_key("acme"), "the legacy entry reads");
+        let base = ViewBase::of(&view).unwrap();
+        let mut changed = pv.fold_view::<S>(keys, vid).unwrap();
+        changed.aux.services.remove("acme");
+        changed.native_secrets.insert("B".into(), b"new".to_vec());
+        changed.native_secrets.insert("C".into(), b"c".to_vec());
+        let r = pv
+            .reconcile_from_view::<S>(keys, vid, &changed, ReconcileBase::Since(&base))
+            .unwrap();
+        let refused: Vec<&String> = r.refused.iter().map(|(id, _)| id).collect();
+        assert_eq!(refused.len(), 2, "{:?}", r.refused);
+        assert!(refused.contains(&&svc_wire) && refused.contains(&&b_wire));
+        assert!(r
+            .refused
+            .iter()
+            .all(|(_, why)| why.contains("cannot be read with this vault's key")));
+        for (wire, v) in [(&svc_wire, 3), (&b_wire, 2)] {
+            let row = pv.get_item(wire).unwrap();
+            assert_eq!((row.version, &row.ct), (v, &garbage), "left as it is");
+        }
+        // The rest applied.
+        assert_eq!(r.changed.len(), 1);
+        assert_eq!(pv.fold_view::<S>(keys, vid).unwrap().native_secrets["C"], b"c");
     }
 
     /// Owner-config is written at its native records, one per edit unit
@@ -6826,6 +6943,9 @@ pub(crate) mod tests {
             pv.items[&ai_id].version, ai_version,
             "a native key keeps its record"
         );
+        // Each copy is marked as written by SafeClaw's automatic upgrade.
+        assert!(copies.iter().all(|id| pv.items[id].upgrade));
+        assert!(!pv.items[&ai_id].upgrade);
         for field in [
             "policy",
             "stores",
@@ -6848,6 +6968,7 @@ pub(crate) mod tests {
         mark_pushed(&mut pv, &[order_id.as_str()]);
         let retired = pv.retire_legacy_rows::<S>(keys, vid, true);
         assert_eq!(retired.len(), 4, "{retired:?}");
+        assert!(retired.iter().all(|id| pv.items[id].upgrade));
         assert!(legacy_live(&pv, "store_order"));
         for field in ["policy", "stores", "audit_retention_days", "services"] {
             assert!(!legacy_live(&pv, field), "aux:{field} retired");
@@ -6869,6 +6990,17 @@ pub(crate) mod tests {
             pv.retire_legacy_rows::<S>(keys, vid, true).is_empty(),
             "idempotent"
         );
+        // A person's later write of a record is theirs, not the upgrade's.
+        let (iid, _) = pv
+            .seal_and_bump::<S>(
+                keys,
+                vid,
+                ItemNs::AuditRetentionDays,
+                "",
+                &ItemPayload::live(ItemNs::AuditRetentionDays, "", serde_json::json!(60)),
+            )
+            .unwrap();
+        assert!(!pv.items[&iid].upgrade);
 
         // Each row on its own: an unparseable `aux:services` or
         // `aux:store_order` is left as it is and blocks nothing else.
@@ -6922,12 +7054,13 @@ pub(crate) mod tests {
         assert!(v2.fold_view::<S>(keys, vault).unwrap().aux.policy.is_some());
     }
 
-    /// A conflict copy outside the keep-both namespaces is never folded: a
-    /// singleton ignores its row's name, and a `connecting` copy would read as
-    /// an in-flight connect. A keep-both copy (secret) still folds, as before.
+    /// A row counts only at the derived id of its own (ns, name), whatever
+    /// its name: one anywhere else is never read, a "copy"-named one
+    /// included. A conflict copy is the record of its own name at that name's
+    /// id: it folds like any record, and a tombstone there removes it.
     #[test]
-    fn fold_skips_conflict_copies_outside_keep_both() {
-        use crate::storage::item::{conflict_copy_name, seal_conflict_copy};
+    fn rows_count_only_at_their_own_address_copies_included() {
+        use crate::storage::item::{conflict_copy_name, seal_wire_item};
         use sudp::primitives::StdPrimitives;
         type S = StdPrimitives;
         let k = [0x5au8; 32];
@@ -6942,12 +7075,8 @@ pub(crate) mod tests {
             vec![0u8; 48],
         )
         .unwrap();
-        let copies = [
-            ItemPayload::live(
-                ItemNs::Services,
-                String::new(),
-                serde_json::json!({ "x": { "service": "s" } }),
-            ),
+        // Rows away from their own address (planted at another name's id).
+        let elsewhere = [
             ItemPayload::live(
                 ItemNs::Policy,
                 String::new(),
@@ -6955,7 +7084,7 @@ pub(crate) mod tests {
             ),
             ItemPayload::live(
                 ItemNs::Store,
-                "gcp-1".to_string(),
+                "gcp-1 (conflict copy)".to_string(),
                 serde_json::json!({ "kind": "gcp-sm", "category": "value" }),
             ),
             ItemPayload::live(
@@ -6963,29 +7092,70 @@ pub(crate) mod tests {
                 "gmail".to_string(),
                 serde_json::json!({ "service": "gmail" }),
             ),
-            ItemPayload::live(ItemNs::Secret, "A".to_string(), serde_json::json!("v")),
+            ItemPayload::live(ItemNs::Secret, conflict_copy_name("A"), serde_json::json!("v")),
         ];
-        for ours in &copies {
-            let (id, ct) = seal_conflict_copy::<S>(keys, vault, ours, 3).unwrap();
-            pv.items.insert(
-                id,
-                StoredItem {
-                    version: crate::storage::item::CONFLICT_COPY_VERSION,
-                    ct,
-                    synced_version: crate::storage::item::CONFLICT_COPY_VERSION,
-                    tombstone: false,
-                    sig: None,
-                    signer: None,
-                    base: None,
-                },
-            );
+        for (i, ours) in elsewhere.iter().enumerate() {
+            let wire = wire_id_for::<S>(&k, ItemNs::Secret, &format!("other-{}", i)).unwrap();
+            let ct = seal_wire_item::<S>(keys, vault, &wire, 1, ours).unwrap();
+            pv.put_raw(wire, 1, ct);
         }
         let view = pv.fold_view::<S>(keys, vault).unwrap();
-        assert!(view.aux.services.is_empty());
         assert!(view.aux.policy.is_none());
         assert!(!view.aux.stores.contains_key("gcp-1 (conflict copy)"));
         assert!(view.aux.connecting.is_empty());
-        assert!(view.native_secrets.contains_key(&conflict_copy_name("A")));
+        assert!(view.native_secrets.is_empty());
+
+        // A copy at its own name's id folds; its removal sticks.
+        let copy = conflict_copy_name("A");
+        pv.seal_and_bump::<S>(
+            keys,
+            vault,
+            ItemNs::Secret,
+            &copy,
+            &ItemPayload::secret_live(copy.clone(), "ours"),
+        )
+        .unwrap();
+        let view = pv.fold_view::<S>(keys, vault).unwrap();
+        assert_eq!(view.native_secrets[&copy], b"ours");
+        let base = ViewBase::of(&view).unwrap();
+        let mut removed = pv.fold_view::<S>(keys, vault).unwrap();
+        removed.native_secrets.remove(&copy);
+        let r = pv
+            .reconcile_from_view::<S>(keys, vault, &removed, ReconcileBase::Since(&base))
+            .unwrap();
+        assert_eq!(r.changed.len(), 1);
+        for _ in 0..2 {
+            let view = pv.fold_view::<S>(keys, vault).unwrap();
+            assert!(!view.native_secrets.contains_key(&copy), "removal sticks");
+            let base = ViewBase::of(&view).unwrap();
+            let again = pv
+                .reconcile_from_view::<S>(keys, vault, &view, ReconcileBase::Since(&base))
+                .unwrap();
+            assert!(again.changed.is_empty());
+        }
+        // The same for a connection copy.
+        let conn = conflict_copy_name("gmail");
+        pv.seal_and_bump::<S>(
+            keys,
+            vault,
+            ItemNs::Connection,
+            &conn,
+            &ItemPayload::live(
+                ItemNs::Connection,
+                conn.clone(),
+                serde_json::json!({ "service": "gmail" }),
+            ),
+        )
+        .unwrap();
+        let view = pv.fold_view::<S>(keys, vault).unwrap();
+        assert!(view.aux.connections.contains_key(&conn));
+        let base = ViewBase::of(&view).unwrap();
+        let mut removed = pv.fold_view::<S>(keys, vault).unwrap();
+        removed.aux.connections.remove(&conn);
+        pv.reconcile_from_view::<S>(keys, vault, &removed, ReconcileBase::Since(&base))
+            .unwrap();
+        let view = pv.fold_view::<S>(keys, vault).unwrap();
+        assert!(!view.aux.connections.contains_key(&conn), "removal sticks");
     }
 
     /// The old in-body owner wrapper `{data, uik_sig, uik_sign_pub}` over
@@ -7104,16 +7274,15 @@ pub(crate) mod tests {
         assert!(p.categories.is_empty());
     }
 
-    /// A conflict copy is identified by its address, never by its name: a
-    /// row at the derived id of its own (ns, name) is that record whatever
-    /// its name, so a connection really named "gmail (conflict copy)" keeps
-    /// its policy, migrated or not. A row anywhere else is a copy: read only
-    /// for a keep-both record under a copy's name, and never over the record
-    /// at its own id; a record of any kind at another record's address
-    /// (secret, legacy row) is not read.
+    /// A record is identified by its address: a row at the derived id of its
+    /// own (ns, name) is that record whatever its name, so a connection
+    /// really named "gmail (conflict copy)" keeps its policy, migrated or
+    /// not, and a secret named like a copy is read under that name. A record
+    /// of any kind at another record's address (secret, legacy row) is not
+    /// read.
     #[test]
-    fn copies_are_identified_by_address_not_by_name() {
-        use crate::storage::item::{conflict_copy_name, seal_conflict_copy};
+    fn records_are_identified_by_address_not_by_name() {
+        use crate::storage::item::conflict_copy_name;
         use sudp::primitives::StdPrimitives;
         type S = StdPrimitives;
         let k = [0x72u8; 32];
@@ -7157,24 +7326,7 @@ pub(crate) mod tests {
         assert_eq!(pv.retire_legacy_rows::<S>(keys, vid, false).len(), 1);
         assert_eq!(level(&pv), want, "migrated");
 
-        // A secret really named like a copy, at its own id, wins over the
-        // copy of `A` (same name, at the copy address).
-        pv.seal_and_bump::<S>(
-            keys,
-            vid,
-            ItemNs::Secret,
-            "A",
-            &ItemPayload::secret_live("A", "a"),
-        )
-        .unwrap();
-        let (copy_id, ct) =
-            seal_conflict_copy::<S>(keys, vid, &ItemPayload::secret_live("A", "copy"), 3).unwrap();
-        pv.put_raw(
-            copy_id.clone(),
-            crate::storage::item::CONFLICT_COPY_VERSION,
-            ct,
-        );
-        assert_eq!(read(&pv).native_secrets[&conflict_copy_name("A")], b"copy");
+        // A secret named like a copy, at its own id, is read under its name.
         pv.seal_and_bump::<S>(
             keys,
             vid,
@@ -7390,6 +7542,15 @@ pub(crate) mod tests {
         let mut unreadable = incoming(&tomb, Some(&creator));
         unreadable.ct[5] ^= 1;
         assert!(pv.keeps_honored_owner_config::<S>(keys, vault, &wire, &unreadable));
+        // Each says why.
+        assert_eq!(
+            pv.unhonored_replacement::<S>(keys, vault, &wire, &unreadable),
+            Some(HELD_UNREADABLE)
+        );
+        assert_eq!(
+            pv.unhonored_replacement::<S>(keys, vault, &wire, &incoming(&tomb, Some(&member))),
+            Some(HELD_NOT_OWNER_SIGNED)
+        );
 
         // A native record signed by an owner, replaced unsigned.
         let cat = ItemPayload::live(
@@ -7447,6 +7608,7 @@ pub(crate) mod tests {
             sig: None,
             signer: None,
             base: None,
+            upgrade: false,
         };
         assert!(!v1.keeps_honored_owner_config::<S>(keys, vid, &w, &t));
     }

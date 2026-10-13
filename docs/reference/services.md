@@ -57,13 +57,19 @@ How it works:
   authorization page, a redirect that leaves your device), `PKCE: off` when
   the flow has no PKCE, the rules it applies (each label with what it
   matches, and any approval window it sets), and the source with its ref and
-  commit. A GitHub source is checked on your device: its branch or tag (or
-  the default branch) must be at that commit, and the commit, fetched again,
-  must hold the same definitions. Any GitHub answer without the data (not
-  found, refused, a server error, a download too large or too slow) refuses
-  the request. A local folder, a commit given as `--ref`, or GitHub not
-  answering at all shows the source as stated by the requester. `sc service
-  ls` shows which: `checked at <commit>` or `as stated by the requester`.
+  commit. A GitHub source is checked on your device only at the head of one
+  of the repository's own branches or tags: the ref (or the default branch)
+  is resolved under `refs/heads/` or `refs/tags/` (an annotated tag to its
+  commit) and must be at that commit, and the commit, fetched again, must
+  hold the same definitions. A name that is both a branch and a tag at
+  different commits is refused (state `refs/heads/<name>` or
+  `refs/tags/<name>`). Any GitHub answer without the data (not found,
+  refused, a server error, a download too large or too slow), or a proxy
+  refusing the connection, refuses the request. A local folder, a ref that
+  is no branch or tag of the repository (a commit id, any other ref), or
+  GitHub not answering at all shows the source as stated by the requester.
+  `sc service ls` shows which: `checked at <commit>` or `as stated by the
+  requester`.
   Only the rules that tighten apply in a vault.
 - **Ids.** A definition is stored under its `[service] id`. It may not be a
   built-in id or one another source already holds; `--id` renames a
@@ -83,9 +89,11 @@ How it works:
   without a keyset after an unlock; a vault with a keyset is migrated in the
   console by an owner.
 - **Sync.** If a definition was changed in two places at once, both versions
-  are kept, like a connection: the second is `<id> (conflict copy)`, which
-  `sc service ls` lists as skipped and which is never used; keep the one you
-  want in the console.
+  are kept, like a connection: the second is the record `<id> (conflict
+  copy)`, which `sc service ls` lists as skipped and which is never used;
+  keep the one you want in the console. A pulled change this device does not
+  apply (a setting not signed by an owner, or one that waits for unlock) is
+  listed by `sc status` and `sc service ls` with why.
 - **Removal.** Connections that use a removed service are kept and listed;
   they stop working until a definition is added again.
 - `ls` reads the unlocked vault: no network, no passkey.
