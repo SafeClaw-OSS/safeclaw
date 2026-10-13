@@ -338,6 +338,12 @@ pub struct StoredItem {
     /// which retries. Local bookkeeping only (never sent).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub upgrade: bool,
+    /// The keyset generation this device sealed the row under (its own
+    /// change), sent with its push: a vault with a keyset takes a row only
+    /// at its current generation. `None` for a row adopted from the cloud, or
+    /// sealed before this was recorded. Local bookkeeping only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<u64>,
 }
 
 /// A pulled replacement this device did not adopt (see `crate::sync`): kept
@@ -1630,6 +1636,7 @@ impl PerItemVault {
                 signer,
                 base: None,
                 upgrade: false,
+                generation: None,
             },
         );
     }
@@ -1975,6 +1982,7 @@ impl PerItemVault {
             None => (0, None),
         };
         let tombstone = payload.is_tombstone();
+        let generation = self.seal_generation(keys);
         // B2a: seal-level writers land UNSIGNED (sig/signer None) — signing is done
         // by the write ORCHESTRATION (B2b), which knows the principal (the DIK for
         // the daemon's automatic writes). An unsigned owner-config / agent row is
@@ -1990,9 +1998,36 @@ impl PerItemVault {
                 signer: None,
                 base,
                 upgrade: false,
+                generation,
             },
         );
         Ok(id)
+    }
+
+    /// The keyset generation `keys` seal under: this keyset's current one
+    /// when `keys.content` is the key its owner-signed re-key proof commits
+    /// to (generation 0, the original key, has no proof; a vault without a
+    /// keyset is generation 0). `None`: `keys` are not the current
+    /// generation's (an earlier key this session still holds).
+    pub fn seal_generation(&self, keys: VaultKeys) -> Option<u64> {
+        match self.keyset.uik.as_ref() {
+            None => Some(0),
+            Some(u) if u.generation == 0 => Some(0),
+            Some(u) => u
+                .rekey_proof
+                .as_ref()
+                .filter(|p| {
+                    p.generation == u.generation
+                        && p.k_commitment.as_slice() == rekey_commitment(keys.content).as_slice()
+                })
+                .map(|_| u.generation),
+        }
+    }
+
+    /// The keyset generation a row sealed now must carry (`None` without a
+    /// keyset: unchecked).
+    pub fn keyset_generation(&self) -> Option<u64> {
+        self.keyset.uik.as_ref().map(|u| u.generation)
     }
 
     /// Unseal one stored item addressed by `(ns, name)` under `K`. `Ok(None)` if
@@ -7878,6 +7913,7 @@ pub(crate) mod tests {
             signer: None,
             base: None,
             upgrade: false,
+            generation: None,
         };
         assert!(!v1.keeps_honored_owner_config::<S>(keys, vid, &w, &t));
     }

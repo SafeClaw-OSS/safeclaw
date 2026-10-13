@@ -2677,6 +2677,7 @@ fn adopt_item_rows(
                         signer: row.signer.clone(),
                         base: None,
                         upgrade: false,
+                        generation: None,
                     };
                     pv.unhonored_replacement::<S>(keys, vault_id, &id, &incoming)
                 }
@@ -2982,11 +2983,14 @@ pub(crate) fn retry_pull_after_unlock(state: Arc<AppState>, vault_id: String, er
 /// live yet — the caller treats it as a no-op (stubbed[]).
 /// `PushOutcome::Rejected` is a TERMINAL refusal ([`is_terminal_put_status`]):
 /// the same bytes can never land, so retrying them is pointless.
+/// `PushOutcome::KeysetChanged` (a 409 `SC_KEYSET_CHANGED`): the row was
+/// sealed under another keyset generation than the vault's current one.
 pub enum PushOutcome {
     Ok { version: u64, seq: u64 },
     Conflict { current_version: u64 },
     EndpointMissing,
     Rejected { status: u16, error: String },
+    KeysetChanged,
 }
 
 /// A non-2xx item PUT status the server returns for the write ITSELF (bad
@@ -2997,6 +3001,7 @@ fn is_terminal_put_status(status: u16) -> bool {
     matches!(status, 400 | 402 | 403 | 413 | 422)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn push_item(
     cloud: &str,
     vault: &str,
@@ -3005,6 +3010,7 @@ pub async fn push_item(
     base_version: Option<u64>,
     version: u64,
     ct_b64: &str,
+    generation: Option<u64>,
 ) -> Result<PushOutcome, String> {
     let url = format!(
         "{}/v/{}/items/{}",
@@ -3017,6 +3023,11 @@ pub async fn push_item(
     let mut body = serde_json::json!({ "version": version, "ct": ct_b64 });
     if let Some(bv) = base_version {
         body["base_version"] = serde_json::json!(bv);
+    }
+    // The keyset generation the row was sealed under: a vault with a keyset
+    // takes a row only at its current one.
+    if let Some(g) = generation {
+        body["generation"] = serde_json::json!(g);
     }
     let client = crate::cli::egress_proxy::client(Duration::from_secs(15))
         .map_err(|e| format!("http client init: {}", e))?;
@@ -3041,6 +3052,11 @@ pub async fn push_item(
             // Backend: `{conflict, currentVersion}` (0 = the row is gone). Read
             // `currentVersion ?? version` like the console.
             let b: serde_json::Value = resp.json().await.unwrap_or_default();
+            if b.get("code").and_then(|v| v.as_str()) == Some("SC_KEYSET_CHANGED")
+                || b.get("error").and_then(|v| v.as_str()) == Some("keyset_changed")
+            {
+                return Ok(PushOutcome::KeysetChanged);
+            }
             let current = b
                 .get("currentVersion")
                 .and_then(|v| v.as_u64())
@@ -3101,6 +3117,7 @@ pub async fn gc_item(
 
 /// One DIRTY local row (`version > synced_version`) snapshotted for a push, so
 /// the store isn't held across awaits.
+#[derive(Clone)]
 struct DirtyRow {
     id: String,
     version: u64,
@@ -3112,6 +3129,8 @@ struct DirtyRow {
     base: Option<String>,
     /// Written by SafeClaw's automatic upgrade ([`pv_store::StoredItem::upgrade`]).
     upgrade: bool,
+    /// The keyset generation it was sealed under ([`pv_store::StoredItem::generation`]).
+    generation: Option<u64>,
 }
 
 /// `base_version` to push a dirty row with: the last version KNOWN to be on the
@@ -3240,6 +3259,7 @@ fn clean_row(
         signer,
         base: None,
         upgrade: false,
+        generation: None,
     }
 }
 
@@ -3443,7 +3463,8 @@ fn open_conflict_pair(
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
     type S = sudp::primitives::StdPrimitives;
-    let ours = match item_layer::open_wire_item::<S>(
+    // Ours is this device's own change: it opens under any key it holds.
+    let ours = match item_layer::open_own_wire_item::<S>(
         keys,
         vault_id,
         &ours_row.id,
@@ -3702,6 +3723,7 @@ fn warn_rejected_once(vault_id: &str, item: &str, version: u64, status: u16, err
 /// for the next push (bounded, no loop). Nothing local changes unless the cloud
 /// write it depends on landed (or was refused for good), so a retry re-derives
 /// the same decision and the same copy id (idempotent).
+#[allow(clippy::too_many_arguments)]
 async fn resolve_conflict(
     cloud: &str,
     vault_id: &str,
@@ -3710,6 +3732,7 @@ async fn resolve_conflict(
     their_rows: &mut TheirRows,
     ours_row: &DirtyRow,
     current_version: u64,
+    session_generation: Option<u64>,
 ) -> Resolved {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
@@ -3800,6 +3823,7 @@ async fn resolve_conflict(
                         base_version,
                         version,
                         &URL_SAFE_NO_PAD.encode(&copy_ct),
+                        session_generation,
                     )
                     .await
                     {
@@ -3807,8 +3831,10 @@ async fn resolve_conflict(
                             id: wire.clone(),
                             row: clean_row(version, copy_ct, false, None, None),
                         }),
-                        // Raced: the next push places it again.
-                        Ok(PushOutcome::Conflict { .. }) => return Resolved::LeaveDirty,
+                        // Raced, or the vault key changed: the next push places it again.
+                        Ok(PushOutcome::Conflict { .. } | PushOutcome::KeysetChanged) => {
+                            return Resolved::LeaveDirty
+                        }
                         Ok(PushOutcome::EndpointMissing) => return Resolved::EndpointMissing,
                         Ok(PushOutcome::Rejected { status, error }) => {
                             // The copy itself is refused for good (a NEW item on a
@@ -3842,18 +3868,18 @@ async fn resolve_conflict(
                 tracing::info!(vault = %vault_id, item = %ours_row.id, "per-item 409: their row is signed; ours set aside");
                 return set_aside(ours_row, &ours, theirs);
             }
-            let (base, version, ct) = match &theirs {
+            let (base, version, ct, generation) = match &theirs {
                 // Their row is gone (GC'd): re-create ours as-is, at OUR version
                 // with its existing ct (sealed at that version, so the AAD
                 // matches). The backend takes a create at any version
                 // (`coalesce(p_version, 1)`); re-creating at 1 like the console
                 // would be ignored by a device still holding the GC'd row at a
                 // higher version (a pull adopts strictly-newer only).
-                None => (None, ours_row.version, ours_row.ct.clone()),
+                None => (None, ours_row.version, ours_row.ct.clone(), ours_row.generation),
                 Some((r, _, _)) => {
                     let v = r.version + 1;
                     match item_layer::seal_wire_item::<S>(keys, vault_id, &ours_row.id, v, &ours) {
-                        Ok(ct) => (Some(r.version), v, ct),
+                        Ok(ct) => (Some(r.version), v, ct, session_generation),
                         Err(e) => {
                             tracing::warn!(vault = %vault_id, item = %ours_row.id, "per-item 409: re-seal failed ({}); left dirty", e);
                             return Resolved::LeaveDirty;
@@ -3869,6 +3895,7 @@ async fn resolve_conflict(
                 base,
                 version,
                 &URL_SAFE_NO_PAD.encode(&ct),
+                generation,
             )
             .await
             {
@@ -3887,8 +3914,9 @@ async fn resolve_conflict(
                     };
                     Resolved::Fixed(vec![fix])
                 }
-                // Raced again: one retry per item per push; the next push reconciles.
-                Ok(PushOutcome::Conflict { .. }) => Resolved::LeaveDirty,
+                // Raced again, or the vault key changed: one retry per item per
+                // push; the next push reconciles.
+                Ok(PushOutcome::Conflict { .. } | PushOutcome::KeysetChanged) => Resolved::LeaveDirty,
                 Ok(PushOutcome::EndpointMissing) => Resolved::EndpointMissing,
                 Ok(PushOutcome::Rejected { status, error })
                     if is_signed_row_refusal(status, &error) =>
@@ -3908,6 +3936,183 @@ async fn resolve_conflict(
                 }
             }
         }
+    }
+}
+
+/// What a push's rows resolved to, gathered for the store write-back and the
+/// notes ([`push_items_best_effort`]).
+#[derive(Default)]
+struct PushTally {
+    fixes: Vec<LocalFix>,
+    set_aside_rows: Vec<(String, String, bool)>,
+    refused_rows: Vec<(String, String)>,
+    left_dirty: usize,
+    endpoint_missing: bool,
+}
+
+impl PushTally {
+    /// Take what `row` resolved to. `false`: stop the push (`/items` is gone).
+    fn take(&mut self, row: &DirtyRow, r: Resolved) -> bool {
+        match r {
+            Resolved::Fixed(f) => self.fixes.extend(f),
+            Resolved::SetAside { fixes, record } => {
+                self.fixes.extend(fixes);
+                self.set_aside_rows.push((row.id.clone(), record, row.upgrade));
+            }
+            Resolved::Refused(why) => {
+                self.left_dirty += 1;
+                self.refused_rows.push((row.id.clone(), why));
+            }
+            Resolved::NotReadable { fixes, note } => {
+                self.fixes.extend(fixes);
+                self.refused_rows.push((row.id.clone(), note));
+            }
+            Resolved::LeaveDirty => self.left_dirty += 1,
+            Resolved::EndpointMissing => {
+                self.endpoint_missing = true;
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// The keyset state a push checks its rows against, read from the store.
+struct PushGens {
+    /// The generation the vault's keyset is at (`None`: no keyset, unchecked).
+    keyset: Option<u64>,
+    /// The generation this session's keys seal under (`None`: locked, or
+    /// keys of an earlier generation).
+    session: Option<u64>,
+}
+
+fn push_gens(state_dir: &Path, vault_id: &str, keys: Option<item_layer::VaultKeys<'_>>) -> PushGens {
+    let pv = read_per_item_store(state_dir, vault_id);
+    PushGens {
+        keyset: pv.as_ref().and_then(|pv| pv.keyset_generation()),
+        session: match (pv.as_ref(), keys) {
+            (Some(pv), Some(k)) => pv.seal_generation(k),
+            _ => None,
+        },
+    }
+}
+
+/// How a dirty row stands against the keyset before it is sent.
+enum Gen {
+    /// Sealed at the keyset's generation (or the vault has no keyset): sent
+    /// as is.
+    Send,
+    /// Sealed under another generation (or one not recorded), and this
+    /// session holds the current key: the change re-sealed under it at the
+    /// same version, and the local fix that keeps it so.
+    Redone(DirtyRow, LocalFix),
+    /// Sealed under another generation, and this session does not hold the
+    /// current key (locked, or unlocked before the key changed): kept,
+    /// unsent, until `sc unlock`.
+    NeedsUnlock,
+    /// This device cannot read it under any key it holds.
+    Unreadable,
+}
+
+/// Check `row` against the keyset state `gens` before it is sent
+/// ([`Gen`]). A row of this device's own opens under any key it holds
+/// ([`item_layer::open_own_wire_item`]).
+fn check_generation(
+    gens: &PushGens,
+    keys: Option<item_layer::VaultKeys<'_>>,
+    vault_id: &str,
+    row: &DirtyRow,
+) -> Gen {
+    type S = sudp::primitives::StdPrimitives;
+    let readable = |k: item_layer::VaultKeys| {
+        item_layer::open_own_wire_item::<S>(k, vault_id, &row.id, row.version, &row.ct).ok()
+    };
+    let current = match gens.keyset {
+        Some(g) if row.generation != Some(g) => g,
+        // At the current generation, or no keyset: as is, if it reads.
+        _ => {
+            return match keys {
+                Some(k) if readable(k).is_none() => Gen::Unreadable,
+                _ => Gen::Send,
+            }
+        }
+    };
+    let Some(keys) = keys.filter(|_| gens.session == Some(current)) else {
+        return Gen::NeedsUnlock;
+    };
+    let Some(payload) = readable(keys) else {
+        return Gen::Unreadable;
+    };
+    let Ok(ct) = item_layer::seal_wire_item::<S>(keys, vault_id, &row.id, row.version, &payload)
+    else {
+        return Gen::NeedsUnlock;
+    };
+    let redone = DirtyRow {
+        ct: ct.clone(),
+        generation: Some(current),
+        ..row.clone()
+    };
+    let fix = LocalFix::Replace {
+        id: row.id.clone(),
+        expect: row.version,
+        row: pv_store::StoredItem {
+            version: row.version,
+            ct,
+            synced_version: row.synced_version,
+            tombstone: row.tombstone,
+            sig: None,
+            signer: None,
+            base: row.base.clone(),
+            upgrade: row.upgrade,
+            generation: Some(current),
+        },
+    };
+    Gen::Redone(redone, fix)
+}
+
+/// The record a dirty row of this device's own changes, as the user knows
+/// it; `item <id>` when it cannot be read here.
+fn own_record(keys: Option<item_layer::VaultKeys<'_>>, vault_id: &str, row: &DirtyRow) -> String {
+    keys.and_then(|k| {
+        item_layer::open_own_wire_item::<sudp::primitives::StdPrimitives>(
+            k,
+            vault_id,
+            &row.id,
+            row.version,
+            &row.ct,
+        )
+        .ok()
+    })
+    .map(|p| conflict_record(&p))
+    .unwrap_or_else(|| format!("item {}", row.id))
+}
+
+/// What the user is told about a change of `record` this device made under
+/// a vault key that has since changed, when this session does not hold the
+/// new key ([`Gen::NeedsUnlock`]): kept, sent after `sc unlock`.
+fn keyset_changed_note(record: &str) -> String {
+    format!(
+        "{}: the vault key changed since this change was made on this device; run `sc unlock`, and it is sent under the new key",
+        record
+    )
+}
+
+/// A dirty row this device cannot read ([`Gen::Unreadable`]): never sent;
+/// theirs taken if there is one ([`unreadable_ours`]). Locked: left dirty.
+async fn set_aside_unreadable(
+    cloud: &str,
+    vault_id: &str,
+    dk: &str,
+    keys: Option<item_layer::VaultKeys<'_>>,
+    their_rows: &mut TheirRows,
+    row: &DirtyRow,
+) -> Resolved {
+    let Some(keys) = keys else {
+        return Resolved::LeaveDirty;
+    };
+    match load_conflict_pair(cloud, vault_id, dk, keys, their_rows, row, None).await {
+        Err(r) => r,
+        Ok(_) => Resolved::LeaveDirty,
     }
 }
 
@@ -3944,6 +4149,13 @@ async fn resolve_conflict(
 /// does not have) is never written over: it is taken as it is, ours is set
 /// aside and the user is told to sync and re-run ([`Resolved::NotReadable`]).
 ///
+/// Every row is sent with the keyset generation it was sealed under, checked
+/// first against the keyset this device holds ([`check_generation`]): one
+/// sealed under another generation is re-sealed under the current key when
+/// this session holds it, else kept unsent with a note to run `sc unlock`.
+/// A `SC_KEYSET_CHANGED` refusal pulls the keyset (keys and membership) and
+/// does the same once; nothing is dropped.
+///
 /// Reconciling needs `K` (open ours/theirs, seal the copy), taken from the
 /// unlocked session ([`AppState::cloned_state_key`]). A LOCKED vault leaves the
 /// row dirty (nothing dropped, nothing copied); the pull side never adopts over
@@ -3979,6 +4191,7 @@ pub async fn push_items_best_effort(state: &Arc<AppState>, vault_id: &str) {
             tombstone: s.tombstone,
             base: s.base.clone(),
             upgrade: s.upgrade,
+            generation: s.generation,
         })
         .collect();
     drop(pv);
@@ -4000,45 +4213,42 @@ pub async fn push_items_best_effort(state: &Arc<AppState>, vault_id: &str) {
     let keys = k
         .as_ref()
         .map(|m| item_layer::VaultKeys::from_material(m.as_slice()));
+    // The keyset as this device holds it now: the generation every row is
+    // sent at, and whether this session holds that generation's key.
+    let mut gens = push_gens(state_dir, vault_id, keys);
+    let mut keyset_pulled = false;
 
     // A conflict/error on ONE item says nothing about the others (each item_id
     // is independent), so we NEVER stop the loop early — doing so would strand
     // every item ordered after the first conflict.
     let mut their_rows = TheirRows::Unfetched;
-    let mut endpoint_missing = false;
-    let mut left_dirty = 0usize;
-    let mut fixes: Vec<LocalFix> = Vec::new();
-    let mut set_aside_rows: Vec<(String, String, bool)> = Vec::new();
-    let mut refused_rows: Vec<(String, String)> = Vec::new();
+    let mut tally = PushTally::default();
     for row in &rows {
-        // A row this device cannot read is never sent (it would land where no
-        // member reads it): set aside instead, theirs taken if there is one.
-        if let Some(keys) = keys {
-            let opens = item_layer::open_wire_item::<sudp::primitives::StdPrimitives>(
-                keys,
-                vault_id,
-                &row.id,
-                row.version,
-                &row.ct,
-            )
-            .is_ok();
-            if !opens {
-                match load_conflict_pair(cloud, vault_id, &dk, keys, &mut their_rows, row, None)
-                    .await
-                {
-                    Err(Resolved::NotReadable { fixes: f, note }) => {
-                        fixes.extend(f);
-                        refused_rows.push((row.id.clone(), note));
-                    }
-                    Err(Resolved::EndpointMissing) => {
-                        endpoint_missing = true;
-                        break;
-                    }
-                    _ => left_dirty += 1,
+        // Checked against the latest keyset state before it is sent: a row
+        // sealed under another generation is redone under the current key, or
+        // waits for `sc unlock`; one this device cannot read is never sent.
+        let row = match check_generation(&gens, keys, vault_id, row) {
+            Gen::Send => row.clone(),
+            Gen::Redone(redone, fix) => {
+                tally.fixes.push(fix);
+                redone
+            }
+            Gen::NeedsUnlock => {
+                tally.left_dirty += 1;
+                tally
+                    .refused_rows
+                    .push((row.id.clone(), keyset_changed_note(&own_record(keys, vault_id, row))));
+                continue;
+            }
+            Gen::Unreadable => {
+                let r = set_aside_unreadable(cloud, vault_id, &dk, keys, &mut their_rows, row).await;
+                if !tally.take(row, r) {
+                    break;
                 }
                 continue;
             }
-        }
+        };
+        let row = &row;
         let base_version = push_base_version(row.synced_version);
         let ct_b64 = URL_SAFE_NO_PAD.encode(&row.ct);
         match push_item(
@@ -4049,16 +4259,74 @@ pub async fn push_items_best_effort(state: &Arc<AppState>, vault_id: &str) {
             base_version,
             row.version,
             &ct_b64,
+            row.generation,
         )
         .await
         {
-            Ok(PushOutcome::Ok { .. }) => fixes.push(LocalFix::Synced {
+            Ok(PushOutcome::Ok { .. }) => tally.fixes.push(LocalFix::Synced {
                 id: row.id.clone(),
                 version: row.version,
             }),
             Ok(PushOutcome::EndpointMissing) => {
-                endpoint_missing = true;
+                tally.endpoint_missing = true;
                 break; // the whole /items endpoint is down — nothing more to try
+            }
+            Ok(PushOutcome::KeysetChanged) => {
+                // The vault's keyset moved past this device's: take it (keys
+                // and membership), then redo the change once under the new
+                // key if this session holds it; else it waits for `sc unlock`.
+                // Never dropped.
+                if !keyset_pulled {
+                    keyset_pulled = true;
+                    if let Err(e) = pull_keys(state_dir, cloud, vault_id, &dk, StoreLock::Take(state)).await {
+                        tracing::warn!(vault = %vault_id, "per-item push: keyset pull failed: {}", e);
+                    }
+                    gens = push_gens(state_dir, vault_id, keys);
+                }
+                match check_generation(&gens, keys, vault_id, row) {
+                    Gen::Redone(redone, fix) => {
+                        tally.fixes.push(fix);
+                        let pushed = push_item(
+                            cloud,
+                            vault_id,
+                            &dk,
+                            &redone.id,
+                            push_base_version(redone.synced_version),
+                            redone.version,
+                            &URL_SAFE_NO_PAD.encode(&redone.ct),
+                            redone.generation,
+                        )
+                        .await;
+                        match pushed {
+                            Ok(PushOutcome::Ok { .. }) => tally.fixes.push(LocalFix::Synced {
+                                id: redone.id.clone(),
+                                version: redone.version,
+                            }),
+                            Ok(PushOutcome::EndpointMissing) => {
+                                tally.endpoint_missing = true;
+                                break;
+                            }
+                            // Kept, re-sealed: the next push reconciles it.
+                            _ => tally.left_dirty += 1,
+                        }
+                    }
+                    Gen::NeedsUnlock => {
+                        tally.left_dirty += 1;
+                        tally.refused_rows.push((
+                            row.id.clone(),
+                            keyset_changed_note(&own_record(keys, vault_id, row)),
+                        ));
+                    }
+                    Gen::Unreadable => {
+                        let r = set_aside_unreadable(cloud, vault_id, &dk, keys, &mut their_rows, row).await;
+                        if !tally.take(row, r) {
+                            break;
+                        }
+                    }
+                    // The keyset as pulled says the row's generation is the
+                    // current one: the pull did not land; the next push retries.
+                    Gen::Send => tally.left_dirty += 1,
+                }
             }
             Ok(PushOutcome::Conflict { current_version }) => {
                 let Some(keys) = keys else {
@@ -4066,10 +4334,10 @@ pub async fn push_items_best_effort(state: &Arc<AppState>, vault_id: &str) {
                         vault = %vault_id, item = %row.id, current_version,
                         "per-item push: 409 on a locked vault; left dirty until unlock"
                     );
-                    left_dirty += 1;
+                    tally.left_dirty += 1;
                     continue;
                 };
-                match resolve_conflict(
+                let r = resolve_conflict(
                     cloud,
                     vault_id,
                     &dk,
@@ -4077,27 +4345,11 @@ pub async fn push_items_best_effort(state: &Arc<AppState>, vault_id: &str) {
                     &mut their_rows,
                     row,
                     current_version,
+                    gens.session,
                 )
-                .await
-                {
-                    Resolved::Fixed(f) => fixes.extend(f),
-                    Resolved::SetAside { fixes: f, record } => {
-                        fixes.extend(f);
-                        set_aside_rows.push((row.id.clone(), record, row.upgrade));
-                    }
-                    Resolved::Refused(why) => {
-                        left_dirty += 1;
-                        refused_rows.push((row.id.clone(), why));
-                    }
-                    Resolved::NotReadable { fixes: f, note } => {
-                        fixes.extend(f);
-                        refused_rows.push((row.id.clone(), note));
-                    }
-                    Resolved::LeaveDirty => left_dirty += 1,
-                    Resolved::EndpointMissing => {
-                        endpoint_missing = true;
-                        break;
-                    }
+                .await;
+                if !tally.take(row, r) {
+                    break;
                 }
             }
             Ok(PushOutcome::Rejected { status, error }) => {
@@ -4110,10 +4362,10 @@ pub async fn push_items_best_effort(state: &Arc<AppState>, vault_id: &str) {
                     warn_rejected_once(vault_id, &row.id, row.version, status, &error);
                 }
                 let Some(keys) = keys else {
-                    left_dirty += 1;
+                    tally.left_dirty += 1;
                     continue;
                 };
-                match resolve_rejection(
+                let r = resolve_rejection(
                     cloud,
                     vault_id,
                     &dk,
@@ -4122,26 +4374,9 @@ pub async fn push_items_best_effort(state: &Arc<AppState>, vault_id: &str) {
                     row,
                     signed_row,
                 )
-                .await
-                {
-                    Resolved::Fixed(f) => fixes.extend(f),
-                    Resolved::SetAside { fixes: f, record } => {
-                        fixes.extend(f);
-                        set_aside_rows.push((row.id.clone(), record, row.upgrade));
-                    }
-                    Resolved::Refused(why) => {
-                        left_dirty += 1;
-                        refused_rows.push((row.id.clone(), why));
-                    }
-                    Resolved::NotReadable { fixes: f, note } => {
-                        fixes.extend(f);
-                        refused_rows.push((row.id.clone(), note));
-                    }
-                    Resolved::LeaveDirty => left_dirty += 1,
-                    Resolved::EndpointMissing => {
-                        endpoint_missing = true;
-                        break;
-                    }
+                .await;
+                if !tally.take(row, r) {
+                    break;
                 }
             }
             Err(e) => {
@@ -4150,6 +4385,13 @@ pub async fn push_items_best_effort(state: &Arc<AppState>, vault_id: &str) {
             }
         }
     }
+    let PushTally {
+        fixes,
+        set_aside_rows,
+        mut refused_rows,
+        left_dirty,
+        endpoint_missing,
+    } = tally;
     // A push of a row that landed settles an earlier conflict on it; a row set
     // aside now is one for the user to re-run, or (written by SafeClaw's
     // automatic upgrade) one the upgrade retries.
@@ -4182,7 +4424,7 @@ pub async fn push_items_best_effort(state: &Arc<AppState>, vault_id: &str) {
             }
         }
     }
-    // Ours could not be kept as a conflict copy: it stays dirty, said so.
+    // Ours not sent, not applied or set aside: said so (kept where it can be).
     for (id, why) in refused_rows {
         tracing::warn!(vault = %vault_id, item = %id, "per-item push: {}; ours left unsent", why);
         state.note_sync(vault_id, &id, crate::state::SyncNote::Refused(why));
@@ -5202,6 +5444,7 @@ pub async fn push_keys_best_effort(state: &Arc<AppState>, vault_id: &str) {
                 tracing::warn!(vault = %vault_id, cid = %cid_b64, "keyset push rejected: HTTP {} {}", status, error);
                 return;
             }
+            Ok(PushOutcome::KeysetChanged) => return,
             Err(e) => {
                 tracing::warn!(vault = %vault_id, cid = %cid_b64, "keyset push failed: {}", e);
                 return;
@@ -5674,6 +5917,7 @@ mod peritem_tests {
             tombstone: false,
             base: None,
             upgrade: false,
+            generation: None,
         };
         // A faked 409 whose snapshot holds version 3 of the row.
         let older = cloud_row(&k, vid, &ItemPayload::secret_live("A", "old"), 3, 9, None);
@@ -5763,6 +6007,7 @@ mod peritem_tests {
             tombstone: false,
             base: None,
             upgrade: false,
+            generation: None,
         };
         let ours = il::open_wire_item::<StdPrimitives>(keys, vid, &id, 3, &s.ct).unwrap();
         // Theirs: v5 on the cloud with a different value.
@@ -5862,6 +6107,7 @@ mod peritem_tests {
                 tombstone: false,
                 base: None,
                 upgrade: false,
+                generation: None,
             };
             let theirs = ItemPayload::secret_live("API", "theirs");
             let their_ct =
@@ -5894,6 +6140,7 @@ mod peritem_tests {
                     &mut fetched,
                     &dirty,
                     5,
+                    Some(0),
                 ))
             };
             let Resolved::NotReadable { fixes, note } = resolved else {
@@ -5907,6 +6154,86 @@ mod peritem_tests {
             assert_eq!(row.ct, their_ct, "theirs as it is");
             assert_eq!(pv.items.len(), 1, "ours is not kept");
         }
+    }
+
+    /// Every row is sent with the keyset generation it was sealed under,
+    /// checked first against the keyset this device holds: at the current
+    /// generation it goes as is; under another (or one not recorded) it is
+    /// re-sealed under the current key at the same version when this session
+    /// holds it, else it waits for `sc unlock`; one this device cannot read
+    /// is never sent. A vault without a keyset is not checked.
+    #[test]
+    fn a_row_is_sent_at_the_keyset_generation_it_was_sealed_under() {
+        use crate::storage::item::{self as il, vault_key_bundle, ItemPayload};
+        let fx = crate::storage::sealed_vault::tests::rekeyed_fixture();
+        let vid = fx.vault;
+        let old = VaultKeys {
+            id_seed: &fx.id_seed,
+            content: &fx.c_old,
+            prev: &[],
+        };
+        let new_bundle = vault_key_bundle(&fx.id_seed, &fx.c_new);
+        let current = VaultKeys::from_material(&new_bundle);
+        let old_bundle = vault_key_bundle(&fx.id_seed, &fx.c_old);
+        let stale_session = VaultKeys::from_material(&old_bundle);
+        // The keyset records what its own keys seal under.
+        let mut pv = fx.pv.clone();
+        assert_eq!(pv.keyset_generation(), Some(1));
+        assert_eq!(pv.seal_generation(current), Some(1));
+        assert_eq!(pv.seal_generation(stale_session), None);
+        let id = pv
+            .seal_and_upsert::<StdPrimitives>(current, vid, ItemNs::Secret, "S", 1, &ItemPayload::secret_live("S", "s"))
+            .unwrap();
+        assert_eq!(pv.items[&id].generation, Some(1));
+
+        let row = |keys: VaultKeys, generation: Option<u64>| {
+            let ctx = il::ItemCtx::for_item::<StdPrimitives>(&fx.id_seed, vid, ItemNs::Secret, "A", 2).unwrap();
+            DirtyRow {
+                id: ctx.item_id_b64(),
+                version: 2,
+                synced_version: 1,
+                ct: il::seal_item::<StdPrimitives>(keys.content, &ctx, &ItemPayload::secret_live("A", "a")).unwrap(),
+                tombstone: false,
+                base: None,
+                upgrade: false,
+                generation,
+            }
+        };
+        let gens = |keyset: Option<u64>, session: Option<u64>| PushGens { keyset, session };
+        // At the current generation: as is.
+        let at_current = row(current, Some(1));
+        assert!(matches!(check_generation(&gens(Some(1), Some(1)), Some(current), vid, &at_current), Gen::Send));
+        assert!(matches!(check_generation(&gens(Some(1), None), None, vid, &at_current), Gen::Send));
+        // Sealed under the earlier key, this session holding the current one:
+        // re-sealed under it, same version, kept by the fix.
+        let stale = row(old, Some(0));
+        let Gen::Redone(redone, fix) = check_generation(&gens(Some(1), Some(1)), Some(current), vid, &stale) else {
+            panic!("redone under the current key");
+        };
+        assert_eq!((redone.version, redone.synced_version, redone.generation), (2, 1, Some(1)));
+        let opened = il::open_wire_item::<StdPrimitives>(current, vid, &redone.id, 2, &redone.ct).unwrap();
+        assert_eq!(opened.body, serde_json::json!("a"));
+        assert!(matches!(fix, LocalFix::Replace { expect: 2, .. }));
+        // A generation not recorded is treated the same.
+        assert!(matches!(
+            check_generation(&gens(Some(1), Some(1)), Some(current), vid, &row(old, None)),
+            Gen::Redone(..)
+        ));
+        // Locked, or a session from before the key changed: waits for `sc unlock`.
+        assert!(matches!(check_generation(&gens(Some(1), None), None, vid, &stale), Gen::NeedsUnlock));
+        assert!(matches!(
+            check_generation(&gens(Some(1), None), Some(stale_session), vid, &stale),
+            Gen::NeedsUnlock
+        ));
+        assert!(keyset_changed_note("secret A").contains("run `sc unlock`"));
+        // Under no key this device holds: never sent.
+        let other = VaultKeys { content: &[0x99u8; 32], ..old };
+        assert!(matches!(
+            check_generation(&gens(Some(1), Some(1)), Some(current), vid, &row(other, Some(1))),
+            Gen::Unreadable
+        ));
+        // No keyset: not checked.
+        assert!(matches!(check_generation(&gens(None, Some(0)), None, vid, &stale), Gen::Send));
     }
 
     /// OUR dirty row that this device cannot read (sealed under a key it no
@@ -5945,6 +6272,7 @@ mod peritem_tests {
                 tombstone: false,
                 base: None,
                 upgrade: false,
+                generation: None,
             };
             let theirs = ItemPayload::secret_live("API", "theirs");
             let their_ct = il::seal_wire_item::<StdPrimitives>(keys, vid, &id, 5, &theirs).unwrap();
@@ -6047,6 +6375,7 @@ mod peritem_tests {
                 tombstone: false,
                 base: None,
                 upgrade: false,
+                generation: None,
             };
             // Theirs: v5.
             let theirs = ItemPayload::live(ns, name, theirs_body.clone());
@@ -6069,6 +6398,7 @@ mod peritem_tests {
                 &mut fetched(),
                 &dirty,
                 5,
+                Some(0),
             ));
             let on_403 = rt.block_on(resolve_rejection(
                 cloud,
@@ -6135,6 +6465,7 @@ mod peritem_tests {
             tombstone: false,
             base: None,
             upgrade: false,
+            generation: None,
         };
         let theirs = ItemPayload::secret_live("A", "theirs");
         let their_ct = il::seal_wire_item::<StdPrimitives>(keys, vid, &id, 5, &theirs).unwrap();
