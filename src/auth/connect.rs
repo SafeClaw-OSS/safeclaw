@@ -933,8 +933,8 @@ fn build_m_from_view(
 ///
 /// `Err` unless the whole change landed: a store that cannot be written or a
 /// reconcile that fails (`Internal`), or a part of the change refused or set
-/// aside (`Conflict`, saying each; the parts that did land are kept and
-/// served).
+/// aside (`Conflict`, saying each; the parts that did land are kept, served
+/// and pushed).
 pub(crate) fn persist_mutated_view(
     state: &Arc<AppState>,
     vault_id: &str,
@@ -952,6 +952,9 @@ pub(crate) fn persist_mutated_view(
     if not_applied.is_empty() {
         Ok(())
     } else {
+        // The caller returns this error before its own push: the parts that
+        // did land go out now.
+        spawn_push(state, vault_id);
         Err(AppError::Conflict(sentences(&not_applied)))
     }
 }
