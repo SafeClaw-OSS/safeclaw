@@ -4203,9 +4203,10 @@ struct KeyRowData {
     /// (F3-b generation-binding). Absent on a legacy row ⇒ the cred is not an owner.
     #[serde(default)]
     uik_role_sig: Option<String>,
-    /// The content key before the last re-key, sealed under the current one
-    /// (std base64; set by an owner's re-key on each kept member's row). Kept
-    /// on the cred entry and written back with the row.
+    /// The vault's previous content keys, sealed under the current one (std
+    /// base64; set by an owner on each member's row at a re-key and on an
+    /// invite). Kept on the cred entry as sealed and written back with the
+    /// row; never made here.
     #[serde(default)]
     uik_prev_content_ct: Option<String>,
     /// The vault's ROOT owner (creator) UIK signing pubkey (base64, raw 32 bytes).
@@ -4511,7 +4512,7 @@ fn adopt_membership_triple(
             .and_then(|v| serde_json::from_value(v).ok())
             .unwrap_or_default();
         let role_sig = m.get("role_sig").and_then(|v| v.as_str()).unwrap_or("");
-        // The member entry's previous content key (the row form's
+        // The member entry's sealed previous content keys (the row form's
         // `uik_prev_content_ct`), kept on every cred entry of the member.
         let prev_content_ct = m.get("prev_content_ct").and_then(|v| v.as_str());
         // Key the OWN member under its credential cid(s); OTHER members under their us_id.
@@ -5014,7 +5015,7 @@ fn key_row_data_for(
         if !entry.role_sig.is_empty() {
             data["uik_role_sig"] = serde_json::Value::String(STANDARD.encode(&entry.role_sig));
         }
-        // The previous content key rides with the row it was adopted from: a
+        // The previous content keys ride with the row they were adopted from: a
         // write of the row never drops it.
         if !entry.prev_content_ct.is_empty() {
             data["uik_prev_content_ct"] =
@@ -5760,7 +5761,7 @@ mod peritem_tests {
         let theirs_keys = VaultKeys {
             id_seed: &k,
             content: &other,
-            prev: None,
+            prev: &[],
         };
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -6507,12 +6508,12 @@ mod peritem_tests {
         assert_eq!(pv.items_seq, 9);
     }
 
-    /// The previous content key a re-key puts on a kept member's keyset row
+    /// The sealed previous content keys an owner puts on a member's keyset row
     /// (`uik_prev_content_ct`; `prev_content_ct` on a membership triple's
-    /// member entry) is kept on the cred entry, written back with the row, and
-    /// kept when a later row of the same cred omits it.
+    /// member entry) are kept on the cred entry as sealed, written back with
+    /// the row, and kept when a later row of the same cred omits them.
     #[test]
-    fn prev_content_key_rides_the_keyset_row() {
+    fn prev_content_keys_ride_the_keyset_row() {
         use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
         use base64::Engine;
         let cid_raw = vec![0xDEu8, 0xAD, 0xBE, 0xEF, 1, 2, 3, 4];
