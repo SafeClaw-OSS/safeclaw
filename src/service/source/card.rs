@@ -459,13 +459,16 @@ impl AddCard {
     }
 }
 
-/// The services already stored from `source`'s identity.
+/// The services already stored from `source`'s identity. A conflict copy is
+/// not one of them: it is resolved in the console, never updated or removed
+/// with its source.
 pub fn stored_from<'a>(
     current: &'a BTreeMap<String, StoredService>,
     identity: &str,
 ) -> BTreeMap<&'a String, &'a StoredService> {
     current
         .iter()
+        .filter(|(id, _)| !crate::storage::item::is_conflict_copy_name(id))
         .filter(|(_, e)| e.source().is_some_and(|s| s.identity() == identity))
         .collect()
 }
@@ -625,6 +628,13 @@ pub fn rm_card(
     current: &BTreeMap<String, StoredService>,
     uses: impl Fn(&str) -> Vec<String>,
 ) -> Result<RmCard, String> {
+    if crate::storage::item::is_conflict_copy_name(target) {
+        return Err(format!(
+            "'{}' is {}",
+            crate::util::terminal_safe(target),
+            crate::service::CONFLICT_COPY_REASON
+        ));
+    }
     let (ids, from): (Vec<String>, String) = if let Some(e) = current.get(target) {
         (
             vec![target.to_string()],

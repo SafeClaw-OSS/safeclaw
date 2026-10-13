@@ -298,8 +298,9 @@ pub enum ItemNs {
     Agent,
     /// One vault service definition (`name` = the service id): `body` =
     /// `{ service, policy?, source? }`, the object form of an `aux.services`
-    /// entry. A data record like a connection: member-writable, unsigned. The
-    /// fold unions these with the legacy `services` record, a native item (or
+    /// entry. A data record like a connection: member-writable, unsigned, and
+    /// a same-item conflict keeps both (`"<id> (conflict copy)"`). The fold
+    /// unions these with the legacy `services` record, a native item (or
     /// tombstone) winning for its id.
     Service,
     /// Singleton (`name = ""`): `body` = the [`Policy`] tree.
@@ -343,7 +344,7 @@ impl ItemNs {
     /// "(conflict copy)" row would be invisible to the fold and undeletable.
     /// Console parity: `KEEP_BOTH_NS` in `lib/vault-grant.ts`.
     pub fn keeps_both_on_conflict(self) -> bool {
-        matches!(self, ItemNs::Secret | ItemNs::Connection)
+        matches!(self, ItemNs::Secret | ItemNs::Connection | ItemNs::Service)
     }
 
     /// The lowercase wire string (matches the serde rename and the TS side).

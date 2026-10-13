@@ -484,8 +484,8 @@ fn services_are_data_records_on_a_vault_with_members() {
 }
 
 /// LEGACY(services row): an unlock moves legacy entries to native items on
-/// every vault; the legacy record is emptied on v1 and left as it is on v2
-/// (owner-config there). With nothing to move, nothing is written.
+/// every vault and leaves the legacy record as it is (a device on an earlier
+/// version still reads it). With nothing to move, nothing is written.
 #[test]
 fn unlock_migrates_legacy_services() {
     use crate::storage::item::ItemPayload;
@@ -501,7 +501,7 @@ fn unlock_migrates_legacy_services() {
         )
     };
 
-    // v1: moved, the legacy record emptied.
+    // v1: moved, the legacy record kept.
     let vault = "vault-personal";
     let mut v1 = PerItemVault::build_initial(
         b"c".to_vec(),
@@ -515,14 +515,14 @@ fn unlock_migrates_legacy_services() {
     v1.seal_and_bump::<S>(keys, vault, ItemNs::Aux, "services", &legacy())
         .unwrap();
     let (_d1, state) = state_with_store(vault, &v1, &k);
-    assert_eq!(migrate_legacy_services_after_unlock(&state, vault), 2);
+    assert_eq!(migrate_legacy_services_after_unlock(&state, vault), 1);
     let pv = stored(&state, vault);
     assert_eq!(
         pv.open_item::<S>(keys, vault, ItemNs::Aux, "services")
             .unwrap()
             .unwrap()
             .body,
-        json!({})
+        legacy().body
     );
     assert!(pv
         .open_item::<S>(keys, vault, ItemNs::Service, "old")
@@ -595,4 +595,40 @@ fn mint_checks_a_github_source_at_its_pinned_commit() {
         .as_str()
         .unwrap()
         .starts_with("local folder mine, as stated by the requester"));
+}
+
+/// A conflict copy (`"<id> (conflict copy)"`, kept by the sync beside the
+/// service) is listed as skipped with the reason, is never part of its
+/// source (an update or a source-wide removal leaves it), and `sc service rm`
+/// refuses it: it is resolved in the console.
+#[test]
+fn a_conflict_copy_is_listed_skipped_and_never_used() {
+    let state = test_state();
+    let copy = "a1 (conflict copy)".to_string();
+    let mut entries = BTreeMap::new();
+    entries.insert(
+        "a1".to_string(),
+        StoredService::new(svc("a1", "a.dev"), None, Some(gh('a'))),
+    );
+    entries.insert(
+        copy.clone(),
+        StoredService::new(svc("a1", "evil.dev"), None, Some(gh('a'))),
+    );
+    let rows = listing(&entries, &HashMap::new(), &state.services);
+    let row = rows.iter().find(|r| r["id"] == copy.as_str()).unwrap();
+    assert_eq!(row["valid"], json!(false));
+    assert_eq!(
+        row["problems"],
+        json!([crate::service::CONFLICT_COPY_REASON])
+    );
+    assert!(crate::service::CONFLICT_COPY_REASON.contains("console"));
+    let (defs, skipped) = crate::service::vault_custom_services(&entries, &state.services);
+    assert!(defs.contains_key("a1") && !defs.contains_key(&copy));
+    assert!(skipped.iter().any(|(id, _)| id == &copy));
+    // Not part of its source.
+    let c = card::rm_card("github:acme/tools", &entries, |_| vec![]).unwrap();
+    assert_eq!(c.ids, ["a1"]);
+    assert!(card::rm_card(&copy, &entries, |_| vec![])
+        .unwrap_err()
+        .contains("conflict copy"));
 }

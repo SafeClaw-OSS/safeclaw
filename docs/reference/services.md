@@ -73,10 +73,11 @@ How it works:
 - **Storage.** Each definition is its own record in the vault, like a
   connection: any member can add, update or remove one, after approving the
   card with a passkey. Definitions stored by earlier versions in one shared
-  record are moved to their own records the next time the vault is unlocked.
-- **Sync.** If the definitions changed elsewhere before your change reached
-  the cloud and the cloud copy cannot be replaced, yours is set aside and not
-  applied; `sc service ls` and `sc sync` say so. Re-run the command.
+  record are copied to their own records the next time the vault is unlocked.
+- **Sync.** If a definition was changed in two places at once, both versions
+  are kept, like a connection: the second is `<id> (conflict copy)`, which
+  `sc service ls` lists as skipped and which is never used; keep the one you
+  want in the console.
 - **Removal.** Connections that use a removed service are kept and listed;
   they stop working until a definition is added again.
 - `ls` reads the unlocked vault: no network, no passkey.

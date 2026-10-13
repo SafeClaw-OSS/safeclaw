@@ -5024,7 +5024,8 @@ mod peritem_tests {
         assert!(set_aside_fixes(keys, vid, &dirty, &ours, None).is_none());
     }
 
-    /// The §4 decision table (console parity: KEEP_BOTH_NS = secret, connection).
+    /// The §4 decision table (console parity: KEEP_BOTH_NS = secret,
+    /// connection, service).
     #[test]
     fn decide_conflict_table() {
         use crate::storage::item::ItemPayload;
@@ -5048,6 +5049,12 @@ mod peritem_tests {
         let c_theirs = live(ItemNs::Connection, "gmail", serde_json::json!({"a": 2}));
         assert_eq!(
             decide_conflict(&c_ours, Some(&c_theirs)),
+            ConflictAction::KeepBoth
+        );
+        let v_ours = live(ItemNs::Service, "acme", serde_json::json!({"service": "a"}));
+        let v_theirs = live(ItemNs::Service, "acme", serde_json::json!({"service": "b"}));
+        assert_eq!(
+            decide_conflict(&v_ours, Some(&v_theirs)),
             ConflictAction::KeepBoth
         );
         // Their delete vs our edit (keep-both ns) → copy keeps ours, delete stands.

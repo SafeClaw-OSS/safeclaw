@@ -1631,12 +1631,15 @@ impl PerItemVault {
     }
 
     /// The native `service` items a view wants, `id → body`: every entry of
-    /// `aux.services` (legacy entries included), each its own item.
+    /// `aux.services` (legacy entries included), each its own item. A conflict
+    /// copy is left where the sync put it: it is never written from a view
+    /// (its row is not at the address of its name).
     fn service_bodies(
         aux: &crate::storage::plaintext::VaultAux,
     ) -> Result<Vec<(String, serde_json::Value)>> {
         aux.services
             .iter()
+            .filter(|(id, _)| !crate::storage::item::is_conflict_copy_name(id))
             .map(|(id, e)| Ok((id.clone(), serde_json::to_value(e).map_err(AppError::from)?)))
             .collect()
     }
@@ -1843,7 +1846,7 @@ impl PerItemVault {
         // the `services` record) gets a native tombstone, which hides the legacy
         // entry of its id.
         for id in mine.aux.services.keys() {
-            if removed(ItemNs::Service, id) {
+            if !crate::storage::item::is_conflict_copy_name(id) && removed(ItemNs::Service, id) {
                 let (iid, _v) = self.seal_and_bump::<S>(
                     keys,
                     vault_id,
@@ -1862,11 +1865,11 @@ impl PerItemVault {
     /// LEGACY(services row): write every service the fold reads from the
     /// legacy `services` record (honored as owner-config: owner-signed on a v2
     /// keyset) and that has no native `service` row yet (live or tombstone: a
-    /// native row wins) as a native item, an unsigned data record. On a NoUik
-    /// (v1) keyset the legacy record is then written empty; on a v2 keyset it
-    /// is left as it is (it is owner-signed; an owner's console empties it).
-    /// Returns the item ids written (empty = nothing to migrate). Remove with
-    /// the legacy record.
+    /// native row wins) as a native item, an unsigned data record. The legacy
+    /// record itself is left as it is on every keyset: a device still running
+    /// an earlier version reads only that record, and once every entry has a
+    /// native item the union reads the native ones. Returns the item ids
+    /// written (empty = nothing to migrate). Remove with the legacy record.
     pub fn migrate_legacy_services<S: PrimitiveSuite>(
         &mut self,
         keys: VaultKeys,
@@ -1875,6 +1878,9 @@ impl PerItemVault {
         let folded = self.fold_view::<S>(keys, vault_id)?;
         let mut changed = Vec::new();
         for (id, entry) in &folded.aux.services {
+            if crate::storage::item::is_conflict_copy_name(id) {
+                continue; // a native conflict copy, not a legacy entry
+            }
             let native = wire_id_for::<S>(keys.id_seed, ItemNs::Service, id)?;
             if self.items.contains_key(&native) {
                 continue; // a native item or tombstone wins
@@ -1888,25 +1894,6 @@ impl PerItemVault {
                 &ItemPayload::live(ItemNs::Service, id.clone(), body),
             )?;
             changed.push(iid);
-        }
-        if self.keyset.uik.is_none() {
-            for (ns, name) in [(ItemNs::Services, ""), (ItemNs::Aux, "services")] {
-                let holds_entries = matches!(
-                    self.open_item::<S>(keys, vault_id, ns, name),
-                    Ok(Some(p)) if !p.is_tombstone()
-                        && p.body.as_object().is_some_and(|o| !o.is_empty())
-                );
-                if holds_entries {
-                    let (iid, _v) = self.seal_and_bump::<S>(
-                        keys,
-                        vault_id,
-                        ns,
-                        name,
-                        &ItemPayload::live(ns, name.to_string(), serde_json::json!({})),
-                    )?;
-                    changed.push(iid);
-                }
-            }
         }
         Ok(changed)
     }
@@ -2269,15 +2256,10 @@ impl PerItemVault {
                 let payload = unseal_item::<S>(keys.content, &ctx, &stored.ct)?;
                 if payload.ns == ItemNs::Service {
                     // A data record like a connection (no signature), live or
-                    // tombstone, read only at its own address: one item per
-                    // service id. A conflict copy is a change the sync set
-                    // aside, never a service.
-                    if crate::storage::item::is_conflict_copy_name(&payload.name)
-                        || wire_id_for::<S>(keys.id_seed, ItemNs::Service, &payload.name)?
-                            != *id_b64
-                    {
-                        return Ok(());
-                    }
+                    // tombstone. A conflict copy (`"<id> (conflict copy)"`, kept
+                    // beside theirs) folds under its own name, like a
+                    // connection's; no service is loaded from it (its name is
+                    // not a service id: `vault_custom_services`).
                     if payload.is_tombstone() {
                         native_removed.insert(payload.name);
                     } else {
@@ -5342,23 +5324,85 @@ mod tests {
             &mut pv,
             ItemPayload::live(ItemNs::Service, "c", svc_entry("c", "c.dev")),
         );
-        // A `service` payload sealed at another id is not read as that service.
-        let elsewhere =
-            ItemCtx::for_item::<S>(keys.id_seed, vault, ItemNs::Service, "zz", 1).unwrap();
-        let ct = seal_item::<S>(
-            keys.content,
-            &elsewhere,
-            &ItemPayload::live(ItemNs::Service, "d", svc_entry("d", "d.dev")),
-        )
-        .unwrap();
-        pv.put_raw(elsewhere.item_id_b64(), 1, ct);
-
         let services = pv.fold_view::<S>(keys, vault).unwrap().aux.services;
         assert_eq!(services.keys().collect::<Vec<_>>(), ["a", "c"]);
         assert_eq!(
             serde_json::to_value(&services["a"]).unwrap(),
             svc_entry("a", "a.new")
         );
+    }
+
+    /// A same-item conflict on a service keeps both, like a connection: the
+    /// daemon's write over a row that changed since its base leaves theirs at
+    /// the canonical id and puts ours beside it as `"<id> (conflict copy)"`
+    /// (the console's copy id and name), dirty, so the push sends it as a
+    /// create. The copy folds under its own name and no service is loaded
+    /// from it.
+    #[test]
+    fn service_conflict_keeps_both_and_the_copy_is_not_used() {
+        use crate::storage::item::{conflict_copy_name, seal_conflict_copy};
+        use sudp::primitives::StdPrimitives;
+        type S = StdPrimitives;
+        let k = [0x5au8; 32];
+        let keys = VaultKeys::single(&k);
+        let (vault, _, _, _, _, mut pv) = role_fixture_creator_cred();
+        let mut view = pv.fold_view::<S>(keys, vault).unwrap();
+        let entry = |host: &str| -> crate::service::source::StoredService {
+            serde_json::from_value(svc_entry("acme", host)).unwrap()
+        };
+        view.aux.services.insert("acme".into(), entry("a.base"));
+        pv.reconcile_from_view::<S>(keys, vault, &view, ReconcileBase::OwnFold)
+            .unwrap();
+        let base = ViewBase::of(&pv.fold_view::<S>(keys, vault).unwrap()).unwrap();
+        // Theirs lands (a pull) after our base was taken.
+        let theirs = ItemPayload::live(ItemNs::Service, "acme", svc_entry("acme", "a.theirs"));
+        let (canon, their_version) = pv
+            .seal_and_bump::<S>(keys, vault, ItemNs::Service, "acme", &theirs)
+            .unwrap();
+        // Ours, from the base.
+        let mut ours_view = pv.fold_view::<S>(keys, vault).unwrap();
+        ours_view
+            .aux
+            .services
+            .insert("acme".into(), entry("a.ours"));
+        pv.reconcile_from_view::<S>(keys, vault, &ours_view, ReconcileBase::Since(&base))
+            .unwrap();
+
+        let ours = ItemPayload::live(ItemNs::Service, "acme", svc_entry("acme", "a.ours"));
+        let (copy_id, _) = seal_conflict_copy::<S>(keys, vault, &ours, their_version).unwrap();
+        let copy = pv.get_item(&copy_id).expect("ours kept as a conflict copy");
+        assert_eq!(copy.synced_version, 0, "dirty: pushed as a create");
+        assert_eq!(
+            pv.get_item(&canon).unwrap().version,
+            their_version,
+            "theirs stays"
+        );
+        let services = pv.fold_view::<S>(keys, vault).unwrap().aux.services;
+        assert_eq!(
+            serde_json::to_value(&services["acme"]).unwrap(),
+            svc_entry("acme", "a.theirs")
+        );
+        let copy_name = conflict_copy_name("acme");
+        assert_eq!(copy_name, "acme (conflict copy)");
+        assert_eq!(
+            serde_json::to_value(&services[&copy_name]).unwrap(),
+            svc_entry("acme", "a.ours")
+        );
+        let (_, skipped) = crate::service::vault_custom_services(
+            &services,
+            &crate::service::ServiceRegistry::load(),
+        );
+        assert!(skipped
+            .iter()
+            .any(|(id, why)| id == &copy_name && why == crate::service::CONFLICT_COPY_REASON));
+        // A later write of the view never rewrites or deletes the copy.
+        let before = pv.items.len();
+        let mut again = pv.fold_view::<S>(keys, vault).unwrap();
+        let base = ViewBase::of(&again).unwrap();
+        again.aux.services.insert("other".into(), entry("o.dev"));
+        pv.reconcile_from_view::<S>(keys, vault, &again, ReconcileBase::Since(&base))
+            .unwrap();
+        assert_eq!(pv.items.len(), before + 1, "only `other` was written");
     }
 
     /// Native service items are data records: written unsigned by the daemon's
@@ -5413,9 +5457,9 @@ mod tests {
 
     /// LEGACY(services row) migration: every service the fold reads from the
     /// legacy record without a native row becomes a native item (a native
-    /// item wins); on v1 the legacy record is then empty, on v2 it is left as
-    /// it is. Only what the fold honors moves: an unsigned legacy record on a
-    /// v2 keyset is not read, so nothing of it is migrated. Idempotent.
+    /// item wins); the legacy record is left as it is on v1 and v2. Only what
+    /// the fold honors moves: an unsigned legacy record on a v2 keyset is not
+    /// read, so nothing of it is migrated. Idempotent.
     #[test]
     fn legacy_services_migrate_to_native_items() {
         use base64::engine::general_purpose::STANDARD;
@@ -5444,14 +5488,16 @@ mod tests {
         let before = fold(&v1, vault);
         let a_id = wire_id_for::<S>(keys.id_seed, ItemNs::Service, "a").unwrap();
         let a_version = v1.items[&a_id].version;
+        let legacy_id = wire_id_for::<S>(keys.id_seed, ItemNs::Aux, "services").unwrap();
+        let legacy_row = v1.items[&legacy_id].clone();
         let changed = v1.migrate_legacy_services::<S>(keys, vault).unwrap();
-        assert_eq!(changed.len(), 2, "b moved, legacy record emptied");
+        assert_eq!(changed.len(), 1, "b moved");
         assert_eq!(v1.items[&a_id].version, a_version, "the native item wins");
-        let legacy = v1
-            .open_item::<S>(keys, vault, ItemNs::Aux, "services")
-            .unwrap()
-            .unwrap();
-        assert_eq!(legacy.body, serde_json::json!({}));
+        let row = &v1.items[&legacy_id];
+        assert!(
+            row.version == legacy_row.version && row.ct == legacy_row.ct,
+            "the legacy record is left as it is"
+        );
         assert_eq!(fold(&v1, vault), before, "the same services are read");
         assert!(
             v1.migrate_legacy_services::<S>(keys, vault)

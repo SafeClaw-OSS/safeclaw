@@ -385,7 +385,9 @@ pub(crate) fn listing(
                 crate::service::source::definition_digest(&p.service, p.policy.as_deref())
             });
             let source = parts.and_then(|p| p.source);
-            let (summary, problems) = if reg.get(id).is_some() {
+            let (summary, problems) = if crate::storage::item::is_conflict_copy_name(id) {
+                (None, vec![crate::service::CONFLICT_COPY_REASON.to_string()])
+            } else if reg.get(id).is_some() {
                 (None, vec!["shadows a built-in id".to_string()])
             } else {
                 match e.admit(id) {

@@ -719,6 +719,10 @@ pub fn scope_digest(bound: &[(String, String)]) -> String {
 
 // ── Vault-custom definitions ──────────────────────────────────────────────────
 
+/// Why a vault service entry named `"<id> (conflict copy)"` is not loaded:
+/// the sync kept a second version of `<id>` beside the first.
+pub const CONFLICT_COPY_REASON: &str = "a conflict copy: the service was changed in two places at once and both versions were kept; keep the one you want in the console";
+
 /// A vault's own service definitions (`aux.services`, id → stored entry) as
 /// the daemon brokers them: every entry the gate admits under its storage key
 /// (so the key is the declared id), with its stored policy.toml if any, and
@@ -735,6 +739,10 @@ pub fn vault_custom_services(
     let mut defs = HashMap::new();
     let mut skipped = Vec::new();
     for (id, entry) in aux_services {
+        if crate::storage::item::is_conflict_copy_name(id) {
+            skipped.push((id.clone(), CONFLICT_COPY_REASON.to_string()));
+            continue;
+        }
         if reg.get(id).is_some() {
             skipped.push((id.clone(), "shadows a built-in id".to_string()));
             continue;
