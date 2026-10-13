@@ -59,6 +59,75 @@ pub struct ServicePolicy {
     pub rules: Vec<crate::core::policy::PolicyRule>,
 }
 
+impl ServicePolicy {
+    /// The parts of this policy that can only tighten a decision, and a note
+    /// for each part left out. A vault definition's policy is applied this
+    /// way (tightening applies directly; loosening needs the owner's consent,
+    /// which a definition any member can write does not carry): rules that
+    /// decide `deny`, `ask` or `ask-always`, and a `[default]` read or write
+    /// level other than `allow` (with its `ttl`). The decision then takes the
+    /// stricter of the outcome with and without it
+    /// ([`crate::core::policy::stricter`]).
+    pub fn tightening(&self) -> (ServicePolicy, Vec<String>) {
+        use crate::core::policy::{AccessLevel, Levels};
+        const WHY: &str = "a vault service definition can only tighten policy; loosening is the owner's setting in the console";
+        let mut notes = Vec::new();
+        let mut rules = Vec::new();
+        for (i, r) in self.rules.iter().enumerate() {
+            if matches!(r.level, Some(AccessLevel::Allow) | None) {
+                let name =
+                    r.id.as_deref()
+                        .map(|id| format!("rule '{}'", id))
+                        .unwrap_or_else(|| format!("[[policy.rules]] #{}", i + 1));
+                notes.push(format!("{} (allow) is not applied: {}", name, WHY));
+            } else {
+                rules.push(r.clone());
+            }
+        }
+        let defaults = self.defaults.as_ref().and_then(|d| {
+            let keep = |dir: &str, l: Option<AccessLevel>, notes: &mut Vec<String>| match l {
+                Some(AccessLevel::Allow) => {
+                    notes.push(format!("default {} = allow is not applied: {}", dir, WHY));
+                    None
+                }
+                other => other,
+            };
+            let read = keep("read", d.read, &mut notes);
+            let write = keep("write", d.write, &mut notes);
+            if read.is_none() && write.is_none() {
+                if d.ttl.is_some() {
+                    notes.push(format!(
+                        "default ttl is not applied: the default levels it goes with are not ({})",
+                        WHY
+                    ));
+                }
+                return None;
+            }
+            Some(Levels {
+                read,
+                write,
+                ttl: d.ttl,
+            })
+        });
+        (ServicePolicy { defaults, rules }, notes)
+    }
+}
+
+impl ServiceDef {
+    /// This definition as a vault (`aux.services`) definition applies it: its
+    /// policy reduced to [`ServicePolicy::tightening`], with a note for each
+    /// part left out (`sc service validate` / `add` print them).
+    pub fn for_vault(mut self) -> (ServiceDef, Vec<String>) {
+        let mut notes = Vec::new();
+        if let Some(p) = &self.policy {
+            let (kept, n) = p.tightening();
+            notes = n;
+            self.policy = (!kept.rules.is_empty() || kept.defaults.is_some()).then_some(kept);
+        }
+        (self, notes)
+    }
+}
+
 impl ServiceDef {
     /// The `[auth] type = "oauth2"` section, when that is this service's
     /// mechanism. Shorthand for the oauth-only call sites (consent flow,
@@ -652,9 +721,11 @@ pub fn scope_digest(bound: &[(String, String)]) -> String {
 /// A vault's own service definitions (`aux.services`, id → toml) as the daemon
 /// brokers them: every def the gate admits under its storage key (so the key
 /// is the declared id) and whose id is not a compiled one (a custom def never
-/// shadows a built-in). The skipped ids come back with the reason. The unlock
-/// bootstrap loads exactly this set, so every other reader of `aux.services`
-/// agrees with what the proxy resolves.
+/// shadows a built-in), with its policy reduced to the parts that tighten
+/// ([`ServiceDef::for_vault`]). The skipped ids come back with the reason. The
+/// unlock bootstrap loads exactly this set, so every other reader of
+/// `aux.services` (the proxy, the console's registry view) agrees with what is
+/// enforced.
 pub fn vault_custom_services(
     aux_services: &std::collections::BTreeMap<String, String>,
     reg: &ServiceRegistry,
@@ -668,7 +739,7 @@ pub fn vault_custom_services(
         }
         match gate::admit(Some(id), toml_src, None) {
             Ok(def) => {
-                defs.insert(id.clone(), def);
+                defs.insert(id.clone(), def.for_vault().0);
             }
             Err(problems) => {
                 skipped.push((id.clone(), format!("rejected: {}", problems.join("; "))))
@@ -751,17 +822,21 @@ impl ServiceRegistry {
     /// 3. ~/.safeclaw/services/ (user-installed services, highest priority)
     pub fn load() -> Self {
         let mut services = HashMap::new();
+        // id → the policy.toml text its admitted definition carries, so an
+        // override directory without a policy.toml keeps the policy of the
+        // definition it overrides.
+        let mut policy_texts = HashMap::new();
 
         // Layer 1: compiled-in defaults (always loaded as base)
-        Self::load_compiled_defaults(&mut services);
+        Self::load_compiled_defaults(&mut services, &mut policy_texts);
 
         // Layer 2: $SAFECLAW_DATA/services/ override
         for files in Self::discover_service_dirs() {
-            Self::admit_dir(files, &mut services);
+            Self::admit_dir(files, &mut services, &mut policy_texts);
         }
 
         // Layer 3: ~/.safeclaw/services/ (user-installed, overrides everything)
-        Self::load_user_services(&mut services);
+        Self::load_user_services(&mut services, &mut policy_texts);
 
         tracing::info!("Loaded {} service definitions", services.len());
         Self { services }
@@ -774,34 +849,73 @@ impl ServiceRegistry {
     /// deployment state.
     pub fn compiled_only() -> Self {
         let mut services = HashMap::new();
-        Self::load_compiled_defaults(&mut services);
+        Self::load_compiled_defaults(&mut services, &mut HashMap::new());
         Self { services }
     }
 
     /// Admit one service directory's files through the gate, keyed by the
-    /// directory name; a definition that fails is logged and skipped.
-    /// True when it was admitted.
+    /// directory name; a definition that fails is logged and skipped. A
+    /// directory with no policy.toml and no inline `[policy]` that overrides
+    /// a definition which had a policy.toml keeps that policy (admitted again,
+    /// paired with the new service.toml, so every cross-check reruns); if the
+    /// two no longer fit, the override is skipped and the earlier definition
+    /// stays. True when the directory's definition was admitted.
     fn admit_dir(
         (id, service, policy): ServiceDirFiles,
         services: &mut HashMap<String, ServiceDef>,
+        policy_texts: &mut HashMap<String, String>,
     ) -> bool {
-        let loaded = service.and_then(|svc| match policy {
-            Some(Err(e)) => Err(format!("policy.toml: {}", e)),
-            Some(Ok(p)) => Ok((svc, Some(p))),
-            None => Ok((svc, None)),
-        });
-        let admitted = loaded
-            .map_err(|e| vec![e])
-            .and_then(|(svc, pol)| gate::admit(Some(&id), &svc, pol.as_deref()));
-        match admitted {
+        let shown = crate::util::terminal_safe(&id).into_owned();
+        let skip = |problems: Vec<String>| {
+            tracing::warn!("service {} skipped: {}", shown, problems.join("; "));
+            false
+        };
+        let svc = match service {
+            Ok(s) => s,
+            Err(e) => return skip(vec![e]),
+        };
+        let own_policy = match policy {
+            Some(Ok(p)) => Some(p),
+            Some(Err(e)) => return skip(vec![format!("policy.toml: {}", e)]),
+            None => None,
+        };
+        if let Some(p) = own_policy {
+            return match gate::admit(Some(&id), &svc, Some(&p)) {
+                Ok(def) => {
+                    services.insert(id.clone(), def);
+                    policy_texts.insert(id, p);
+                    true
+                }
+                Err(problems) => skip(problems),
+            };
+        }
+        let def = match gate::admit(Some(&id), &svc, None) {
+            Ok(def) => def,
+            Err(problems) => return skip(problems),
+        };
+        let kept = policy_texts
+            .get(&id)
+            .filter(|_| def.policy.is_none())
+            .cloned();
+        let Some(kept) = kept else {
+            // Its own inline policy, or nothing to keep.
+            policy_texts.remove(&id);
+            services.insert(id, def);
+            return true;
+        };
+        match gate::admit(Some(&id), &svc, Some(&kept)) {
             Ok(def) => {
+                tracing::info!(
+                    "service {}: the override has no policy.toml; keeping the policy of the definition it overrides",
+                    shown
+                );
                 services.insert(id, def);
                 true
             }
             Err(problems) => {
                 tracing::warn!(
-                    "service {} skipped: {}",
-                    crate::util::terminal_safe(&id),
+                    "service {} override skipped: it has no policy.toml and does not fit the policy it would keep ({}); the earlier definition stays",
+                    shown,
                     problems.join("; ")
                 );
                 false
@@ -892,7 +1006,10 @@ impl ServiceRegistry {
 
     /// Load user-installed services from ~/.safeclaw/services/.
     /// Skips directories with a `.disabled` marker file.
-    fn load_user_services(services: &mut HashMap<String, ServiceDef>) {
+    fn load_user_services(
+        services: &mut HashMap<String, ServiceDef>,
+        policy_texts: &mut HashMap<String, String>,
+    ) {
         let user_dir = match user_services_dir() {
             Some(d) if d.is_dir() => d,
             _ => return,
@@ -920,7 +1037,7 @@ impl ServiceRegistry {
             if !path.join("service.toml").exists() {
                 continue;
             }
-            if Self::admit_dir(Self::read_dir_files(id, &path), services) {
+            if Self::admit_dir(Self::read_dir_files(id, &path), services, policy_texts) {
                 count += 1;
             }
         }
@@ -935,7 +1052,10 @@ impl ServiceRegistry {
 
     /// Compiled-in service definitions, admitted through the same gate as
     /// every other source (the compiled-defs tests hold each one to it).
-    fn load_compiled_defaults(services: &mut HashMap<String, ServiceDef>) {
+    fn load_compiled_defaults(
+        services: &mut HashMap<String, ServiceDef>,
+        policy_texts: &mut HashMap<String, String>,
+    ) {
         let policies: HashMap<&str, &str> = crate::generated_services::compiled_policy_tomls()
             .iter()
             .copied()
@@ -944,6 +1064,9 @@ impl ServiceRegistry {
             match gate::admit(Some(id), toml_str, policies.get(id).copied()) {
                 Ok(def) => {
                     services.insert(id.to_string(), def);
+                    if let Some(p) = policies.get(id) {
+                        policy_texts.insert(id.to_string(), p.to_string());
+                    }
                 }
                 Err(problems) => {
                     tracing::error!("compiled service {} rejected: {}", id, problems.join("; "))
@@ -1181,6 +1304,165 @@ level = "ask"
         let file = "[default]\nread = \"allow\"\n";
         let e = gate::admit(None, INLINE, Some(file)).unwrap_err();
         assert!(e.iter().any(|m| m.contains("declared twice")), "{e:?}");
+    }
+
+    // ── a vault definition's policy only tightens ───────────────────────────
+
+    const VAULT_DEF: &str = r#"
+[service]
+id = "acme"
+name = "Acme"
+hosts = ["api.acme.dev"]
+secrets = ["ACME_KEY"]
+[policy.levels]
+read = "allow"
+write = "ask"
+ttl = 60
+[[policy.rules]]
+method = "DELETE"
+path_exact = "/v1/things"
+level = "deny"
+[[policy.rules]]
+method = "POST"
+path_exact = "/v1/pay"
+level = "allow"
+"#;
+
+    #[test]
+    fn vault_definitions_keep_only_the_parts_that_tighten() {
+        let (d, notes) = def(VAULT_DEF).for_vault();
+        let p = d.policy.as_ref().unwrap();
+        assert_eq!(p.rules.len(), 1, "the allow rule is not applied");
+        assert_eq!(p.rules[0].level, Some(AccessLevel::Deny));
+        let lv = p.defaults.as_ref().unwrap();
+        assert_eq!(lv.read, None, "read = allow is not applied");
+        assert_eq!(lv.write, Some(AccessLevel::Ask));
+        assert_eq!(lv.ttl, Some(60));
+        assert_eq!(notes.len(), 2, "{notes:?}");
+        assert!(notes.iter().any(|n| n.contains("#2 (allow)")), "{notes:?}");
+        assert!(
+            notes.iter().any(|n| n.contains("default read = allow")),
+            "{notes:?}"
+        );
+        // The registry reader applies it, so the console shows what is enforced.
+        let mut aux = std::collections::BTreeMap::new();
+        aux.insert("acme".to_string(), VAULT_DEF.to_string());
+        let (defs, _) = vault_custom_services(&aux, &ServiceRegistry::compiled_only());
+        assert_eq!(defs["acme"].policy.as_ref().unwrap().rules.len(), 1);
+        // Nothing that tightens: no policy at all.
+        let loose = VAULT_DEF
+            .replace("level = \"deny\"", "level = \"allow\"")
+            .replace("write = \"ask\"", "write = \"allow\"");
+        let (d, notes) = def(&loose).for_vault();
+        assert!(d.policy.is_none());
+        assert_eq!(notes.len(), 5, "{notes:?}");
+    }
+
+    #[test]
+    fn override_without_policy_keeps_the_overridden_policy() {
+        let compiled = ServiceRegistry::compiled_only();
+        let mut services = compiled.services.clone();
+        let mut texts: HashMap<String, String> = crate::generated_services::compiled_policy_tomls()
+            .iter()
+            .map(|(id, t)| (id.to_string(), t.to_string()))
+            .collect();
+        let svc = crate::generated_services::compiled_service_tomls()
+            .iter()
+            .find(|(id, _)| *id == "github")
+            .unwrap()
+            .1
+            .replace("hosts = [", "hosts = [\"git.acme.example\", ");
+        assert!(ServiceRegistry::admit_dir(
+            ("github".into(), Ok(svc.clone()), None),
+            &mut services,
+            &mut texts
+        ));
+        let gh = &services["github"];
+        assert!(gh.service.hosts.iter().any(|h| h == "git.acme.example"));
+        let rules = &gh.policy.as_ref().expect("compiled policy kept").rules;
+        assert!(rules.iter().any(|r| r.id.as_deref() == Some("delete-repo")));
+        // An override whose own policy.toml is given uses it instead.
+        let own =
+            "[[rule]]\nid = \"only\"\nlabel = \"Only\"\nmatch = \"DELETE /x\"\nlevel = \"deny\"\n";
+        assert!(ServiceRegistry::admit_dir(
+            ("github".into(), Ok(svc.clone()), Some(Ok(own.to_string()))),
+            &mut services,
+            &mut texts
+        ));
+        assert_eq!(services["github"].policy.as_ref().unwrap().rules.len(), 1);
+        // An override that no longer fits the kept policy is skipped whole.
+        let mut services = compiled.services.clone();
+        let mut texts: HashMap<String, String> = [(
+            "github".to_string(),
+            "[[rule]]\nid = \"w\"\nlabel = \"W\"\nmatch = \"POST /x\"\nwhen = \"vars.amount > 1\"\nlevel = \"deny\"\n".to_string(),
+        )]
+        .into_iter()
+        .collect();
+        assert!(!ServiceRegistry::admit_dir(
+            ("github".into(), Ok(svc), None),
+            &mut services,
+            &mut texts
+        ));
+        assert!(!services["github"]
+            .service
+            .hosts
+            .iter()
+            .any(|h| h == "git.acme.example"));
+    }
+
+    #[test]
+    fn compiled_circleci_policy_covers_every_slug_form() {
+        use crate::core::policy::{evaluate, Policy};
+        let r = ServiceRegistry::compiled_only();
+        let rules = r.default_policy_rules("circleci").unwrap().to_vec();
+        let eval = |m: &str, p: &str| {
+            evaluate(
+                m,
+                p,
+                None,
+                &crate::core::policy::VarMap::new(),
+                Some(&rules),
+                r.default_policy_levels("circleci").as_ref(),
+                &Policy::default(),
+                &["dev".into()],
+            )
+        };
+        for slug in [
+            "gh%2Forg%2Frepo",
+            "gh/org%2Frepo",
+            "gh%2Forg/repo",
+            "gh/org/repo",
+            "circleci/o-id/p-id",
+        ] {
+            for (m, tail) in [
+                ("POST", "pipeline"),
+                ("POST", "pipeline/run"),
+                ("POST", "envvar"),
+                ("POST", "schedule"),
+            ] {
+                let path = format!("/api/v2/project/{}/{}", slug, tail);
+                assert_eq!(eval(m, &path), AccessLevel::Ask, "{m} {path}");
+            }
+            // Reads and removals ride the floor.
+            let pipelines = format!("/api/v2/project/{}/pipeline", slug);
+            assert_eq!(eval("GET", &pipelines), AccessLevel::Allow);
+            let envvar = format!("/api/v2/project/{}/envvar/NAME", slug);
+            assert_eq!(eval("DELETE", &envvar), AccessLevel::Allow);
+        }
+        for (m, p) in [
+            ("PUT", "/api/v2/context/c-1/environment-variable/TOKEN"),
+            ("POST", "/api/v2/pipeline/continue"),
+            ("POST", "/api/v2/workflow/w-1/rerun"),
+            ("PATCH", "/api/v2/schedule/s-1"),
+            (
+                "POST",
+                "/api/v2/projects/p-1/pipeline-definitions/d-1/triggers",
+            ),
+            ("PATCH", "/api/v2/projects/p-1/triggers/t-1"),
+        ] {
+            assert_eq!(eval(m, p), AccessLevel::Ask, "{m} {p}");
+        }
+        assert_eq!(eval("GET", "/api/v2/me"), AccessLevel::Allow);
     }
 
     // ── v4 service.toml parsing ──────────────────────────────────────────────

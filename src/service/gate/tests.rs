@@ -278,9 +278,23 @@ fn urls_are_parsed_by_the_client_parser_and_refuse_userinfo() {
             &format!("client_id = \"acme-public\"\nredirect_uri = \"{}\"", u),
         )
     };
-    ok(&redirect("http://127.0.0.1:8765/safeclaw/oauth/callback"));
-    rejected(&redirect("http://me@127.0.0.1:8765/cb"));
-    rejected(&redirect("javascript:alert(1)"));
+    // redirect_uri is where the consent lands, not an egress target: any
+    // absolute URI the console and the providers use.
+    for u in [
+        "http://127.0.0.1:8765/safeclaw/oauth/callback",
+        "http://localhost:1455/auth/callback",
+        "urn:ietf:wg:oauth:2.0:oob",
+        "com.example.app:/oauth2redirect",
+        "https://app.example.com/cb",
+    ] {
+        ok(&redirect(u));
+    }
+    for u in ["/relative/cb", "not a uri", "cb"] {
+        let e = rejected(&redirect(u));
+        assert!(mentions(&e, "not an absolute URI"), "{u}: {e:?}");
+    }
+    let e = rejected(&redirect("com.example.app:/cb\\u202e"));
+    assert!(mentions(&e, "control or bidi"), "{e:?}");
 }
 
 #[test]
@@ -467,6 +481,50 @@ fn policy_rules_are_recognized_whole_or_rejected() {
 }
 
 #[test]
+fn when_that_can_never_fire_is_rejected() {
+    for (when, why) in [
+        ("vars.amount > 80usd", "needs a numeric literal"),
+        ("vars.amount > \\\"80\\\"", "needs a numeric literal"),
+        ("vars.amount >= NaN", "not a finite number"),
+        ("vars.amount < 1e400", "not a finite number"),
+        ("vars.amount == inf", "not a finite number"),
+        ("vars.nope.amount > 1", "names shape 'nope'"),
+        (
+            "vars.purchase.total > 1",
+            "[requests.purchase] does not declare",
+        ),
+        ("vars.purchase.amount.x > 1", "must be `vars.<name>`"),
+    ] {
+        let e = rejected_with(REQ_SERVICE, &RULE.replace("vars.amount > 80", when));
+        assert!(mentions(&e, why), "{when}: {e:?}");
+    }
+    // A qualified var the shape declares and binds is fine; one it declares
+    // but does not bind is refused.
+    assert!(admit(
+        None,
+        REQ_SERVICE,
+        Some(&RULE.replace("vars.amount > 80", "vars.purchase.amount > 80"))
+    )
+    .is_ok());
+    let svc = REQ_SERVICE.replace(
+        "vars.amount = \"/amount\"",
+        "vars.amount = \"/amount\"\nvars.memo = \"/memo\"",
+    );
+    let e = rejected_with(
+        &svc,
+        &RULE.replace("vars.amount > 80", "vars.purchase.memo == \\\"x\\\""),
+    );
+    assert!(mentions(&e, "[requests.purchase] does not bind"), "{e:?}");
+    // Equality with a bare word stays a string comparison.
+    assert!(admit(
+        None,
+        REQ_SERVICE,
+        Some(&RULE.replace("vars.amount > 80", "vars.amount == unlimited"))
+    )
+    .is_ok());
+}
+
+#[test]
 fn when_var_must_be_bound() {
     let svc = REQ_SERVICE.replace(
         "vars.amount = \"/amount\"",
@@ -548,6 +606,45 @@ fn rule_method_word_is_case_insensitive() {
 }
 
 // ── limits ───────────────────────────────────────────────────────────────────
+
+#[test]
+fn body_rules_are_capped() {
+    let rules: String = (0..=MAX_BODY_RULES)
+        .map(|i| {
+            format!("[[rule]]\nid = \"b{i}\"\nlabel = \"B\"\nmatch = \"POST /b{i}\"\nbody = \"x\"\nlevel = \"deny\"\n")
+        })
+        .collect();
+    let e = rejected_with(GITHUB, &rules);
+    assert!(mentions(&e, "rules with a body has 17 entries"), "{e:?}");
+}
+
+#[test]
+fn over_limit_lists_never_reach_the_cross_checks() {
+    // A shape and a body rule with huge match lists: refused on the counts,
+    // before any pairwise rule/shape comparison (12k x 12k would be ~1.4e8).
+    let matches = vec!["\"/b\""; 12_000].join(",");
+    let svc = format!(
+        "[service]\nid = \"pay\"\nname = \"Pay\"\nhosts = [\"api.pay.com\"]\n[requests.purchase]\nmatch = [{}]\nvars.amount = \"/amount\"\nscope = [\"amount\"]\n",
+        matches
+    );
+    let rule = format!(
+        "[[rule]]\nid = \"g\"\nlabel = \"G\"\nmatch = [{}]\nbody = \"gift\"\nlevel = \"ask\"\n",
+        matches
+    );
+    assert!(svc.len() < MAX_FILE_BYTES && rule.len() < MAX_FILE_BYTES);
+    let started = std::time::Instant::now();
+    let e = rejected_with(&svc, &rule);
+    assert!(
+        mentions(&e, "[requests.purchase] match has 12000 entries"),
+        "{e:?}"
+    );
+    assert!(mentions(&e, "rule 'g' match has 12000 entries"), "{e:?}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "{:?}",
+        started.elapsed()
+    );
+}
 
 #[test]
 fn limits_reject_oversized_definitions() {

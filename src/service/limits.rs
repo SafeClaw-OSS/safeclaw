@@ -43,8 +43,11 @@ pub const MAX_CLAIMS: usize = 16;
 pub const MAX_CLAIM_PATH: usize = 16;
 /// Policy rules, policy.toml or inline (17: cratesio).
 pub const MAX_RULES: usize = 128;
-/// `match` patterns per rule or request shape (2: supabase).
-pub const MAX_MATCH_PATTERNS: usize = 16;
+/// Rules with a `body` regex, each compiled at load and matched against the
+/// bodies its paths see (3: railway).
+pub const MAX_BODY_RULES: usize = 16;
+/// `match` patterns per rule or request shape (8: circleci).
+pub const MAX_MATCH_PATTERNS: usize = 32;
 /// `[requests.<name>]` shapes (1: gmail, snaplii).
 pub const MAX_REQUESTS: usize = 32;
 /// `vars` per request shape (2: snaplii).

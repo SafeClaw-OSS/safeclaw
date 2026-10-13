@@ -1249,11 +1249,18 @@ impl AppState {
     ///   - most-restrictive matching rule wins (deny-override), each rule's
     ///     decision being its own `level`,
     ///   - else connection / tag / global default floor, else ask-always,
+    ///   - a vault (`aux.services`) definition's policy only tightens: its
+    ///     tightening parts ([`crate::service::ServicePolicy::tightening`])
+    ///     decide alongside, and the stricter of the decision with and
+    ///     without them stands ([`crate::core::policy::stricter`]),
     ///   - **the ask-grant ledger**: an unscoped `Ask` whose unit (the matched
     ///     rule's id and the request's read/write class, or the floor's class)
     ///     has a live entry for
     ///     this `(agent, connection, host)` downgrades to `Allow`. Anything
     ///     else asks (`grant_lookup` never authorizes an ask from residency).
+    ///
+    /// The vault state lock is held only to copy what the decision needs;
+    /// rule matching (a body regex included) runs outside it.
     #[allow(clippy::too_many_arguments)]
     pub fn evaluate_request_decision(
         &self,
@@ -1277,50 +1284,69 @@ impl AppState {
         crate::core::policy::DecidedBy,
         Option<u64>,
     )> {
+        use crate::core::policy::{evaluate_decision, merge_levels, merge_rules, stricter};
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let mut states = self.vault_states.lock().unwrap();
-        let cache = match states.get_mut(vault_id) {
-            Some(VaultState::Unlocked { cache, .. }) => cache,
-            _ => return None,
-        };
-        // Built-in rules come from the connection's *service* definition (static);
-        // the user's per-connection edits/additions (`aux.policy.connections.
-        // <id>.rules`) merge on top. The merge is per-connection so two
-        // connections of the same service can be policed independently.
-        let conn_policy = cache.policy.connections.get(connection_id);
-        let empty_rules = std::collections::HashMap::new();
-        let built_in = self
-            .services
-            .default_policy_rules(service_id)
-            .unwrap_or(&[]);
-        let rules = crate::core::policy::merge_rules(
-            built_in,
-            conn_policy.map(|c| &c.rules).unwrap_or(&empty_rules),
-        );
-        // Connection default floor (when no rule matches): user's per-connection
-        // override field-wise over the service's `[default]`.
-        let builtin_levels = self.services.default_policy_levels(service_id);
-        let connection_levels = crate::core::policy::merge_levels(
-            conn_policy.and_then(|c| c.default.as_ref()),
-            builtin_levels.as_ref(),
-        );
         // The tag/global floors live in `cache.policy` (the user's
-        // `aux.policy` overlaid on compiled defaults at refresh). Read live
-        // here → a policy edit is realtime on the next request.
+        // `aux.policy` overlaid on compiled defaults at refresh), read live
+        // here, so a policy edit is realtime on the next request.
+        let (conn_policy, floors, vault_policy) = {
+            let states = self.vault_states.lock().unwrap();
+            let Some(VaultState::Unlocked { cache, .. }) = states.get(vault_id) else {
+                return None;
+            };
+            (
+                cache.policy.connections.get(connection_id).cloned(),
+                crate::core::policy::Policy {
+                    timeout: cache.policy.timeout,
+                    default: cache.policy.default.clone(),
+                    categories: cache.policy.categories.clone(),
+                    connections: HashMap::new(),
+                },
+                cache
+                    .custom_services
+                    .get(service_id)
+                    .and_then(|d| d.policy.clone()),
+            )
+        };
+        // Built-in rules come from the connection's *service* definition; the
+        // user's per-connection edits/additions (`aux.policy.connections.
+        // <id>.rules`) merge on top, and the user's per-connection default
+        // overrides the service's field-wise. Per connection, so two
+        // connections of the same service can be policed independently.
+        let empty_rules = HashMap::new();
+        let user_rules = conn_policy
+            .as_ref()
+            .map(|c| &c.rules)
+            .unwrap_or(&empty_rules);
+        let user_default = conn_policy.as_ref().and_then(|c| c.default.as_ref());
         let tags = self.services.service_tags(service_id);
-        let (level, by, ttl) = crate::core::policy::evaluate_decision(
-            method,
-            path,
-            body,
-            vars,
-            Some(&rules),
-            connection_levels.as_ref(),
-            &cache.policy,
-            tags,
-        );
+        let decide = |built_in: &[crate::core::policy::PolicyRule],
+                      recipe: Option<&crate::core::policy::Levels>| {
+            let rules = merge_rules(built_in, user_rules);
+            let levels = merge_levels(user_default, recipe);
+            evaluate_decision(
+                method,
+                path,
+                body,
+                vars,
+                Some(&rules),
+                levels.as_ref(),
+                &floors,
+                tags,
+            )
+        };
+        let (level, by, ttl) = match &vault_policy {
+            Some(p) => stricter(decide(&[], None), decide(&p.rules, p.defaults.as_ref())),
+            None => decide(
+                self.services
+                    .default_policy_rules(service_id)
+                    .unwrap_or(&[]),
+                self.services.default_policy_levels(service_id).as_ref(),
+            ),
+        };
 
         // Ask-grant ledger: a prior approval of the SAME unit (rule id and
         // class, or floor class) for this agent, connection, and host, not yet expired,
@@ -1335,11 +1361,14 @@ impl AppState {
                     host.to_ascii_lowercase(),
                     unit,
                 );
-                if let Some(&exp) = cache.ask_grants.get(&key) {
-                    if exp > now {
-                        return Some((crate::core::policy::AccessLevel::Allow, by, ttl));
+                let mut states = self.vault_states.lock().unwrap();
+                if let Some(VaultState::Unlocked { cache, .. }) = states.get_mut(vault_id) {
+                    if let Some(&exp) = cache.ask_grants.get(&key) {
+                        if exp > now {
+                            return Some((crate::core::policy::AccessLevel::Allow, by, ttl));
+                        }
+                        cache.ask_grants.remove(&key);
                     }
-                    cache.ask_grants.remove(&key);
                 }
             }
         }
@@ -1364,18 +1393,31 @@ impl AppState {
         path: &str,
         rs: &crate::service::RequestScope,
     ) -> Option<String> {
-        let states = self.vault_states.lock().unwrap();
-        let Some(VaultState::Unlocked { cache, .. }) = states.get(vault_id) else {
-            return None;
+        let (user_rules, vault_policy) = {
+            let states = self.vault_states.lock().unwrap();
+            let Some(VaultState::Unlocked { cache, .. }) = states.get(vault_id) else {
+                return None;
+            };
+            (
+                cache.policy.connections.get(connection_id)?.rules.clone(),
+                cache
+                    .custom_services
+                    .get(service_id)
+                    .and_then(|d| d.policy.clone()),
+            )
         };
-        let conn_policy = cache.policy.connections.get(connection_id)?;
-        let built_in = self
-            .services
-            .default_policy_rules(service_id)
-            .unwrap_or(&[]);
+        // The rules the edits merge onto: the vault definition's (tightening)
+        // rules, else the registry definition's.
+        let built_in = match &vault_policy {
+            Some(p) => p.rules.as_slice(),
+            None => self
+                .services
+                .default_policy_rules(service_id)
+                .unwrap_or(&[]),
+        };
         crate::core::policy::unenforceable_user_rule(
             built_in,
-            &conn_policy.rules,
+            &user_rules,
             method,
             path,
             &rs.shape,
@@ -2616,6 +2658,96 @@ mod tests {
             AccessLevel::Ask,
             "read never serves a write"
         );
+    }
+
+    /// A vault (`aux.services`) definition's policy only tightens: its deny
+    /// and ask rules and stricter defaults decide alongside the vault's own
+    /// policy, the stricter of the two stands, and an `allow` it declares
+    /// changes nothing. The owner's per-connection setting still loosens.
+    #[test]
+    fn vault_definition_policy_only_tightens() {
+        use crate::core::policy::{AccessLevel, ConnectionPolicy, Levels, Policy};
+        let src = r#"
+[service]
+id = "acme"
+name = "Acme"
+hosts = ["api.acme.dev"]
+secrets = ["ACME_KEY"]
+[policy.levels]
+read = "allow"
+write = "ask"
+[[policy.rules]]
+method = "DELETE"
+path_exact = "/v1/things"
+level = "deny"
+[[policy.rules]]
+method = "POST"
+path_exact = "/v1/pay"
+level = "allow"
+"#;
+        let mut aux = std::collections::BTreeMap::new();
+        aux.insert("acme".to_string(), src.to_string());
+        let state = test_state();
+        let (custom, skipped) = crate::service::vault_custom_services(&aux, &state.services);
+        assert!(skipped.is_empty(), "{skipped:?}");
+        let unlock = |policy: Policy| {
+            let cache = SecretsCache {
+                policy,
+                custom_services: custom.clone(),
+                ..Default::default()
+            };
+            state.unlock_vault("v1".into(), cache, zeroize::Zeroizing::new(Vec::new()));
+        };
+        let decide = |m: &str, p: &str| {
+            state
+                .evaluate_request_policy(
+                    "v1",
+                    "ag",
+                    "acme",
+                    "acme",
+                    m,
+                    p,
+                    "api.acme.dev",
+                    None,
+                    &crate::core::policy::VarMap::new(),
+                    false,
+                )
+                .unwrap()
+                .0
+        };
+        // Global floor allow: the deny rule and the write default tighten;
+        // the definition's allow rule and read default change nothing.
+        unlock(Policy::default());
+        assert_eq!(decide("DELETE", "/v1/things"), AccessLevel::Deny);
+        assert_eq!(decide("POST", "/v1/pay"), AccessLevel::Ask);
+        assert_eq!(decide("GET", "/v1/things"), AccessLevel::Allow);
+        // The owner's stricter floor is never loosened by the definition.
+        let mut strict = Policy::default();
+        strict.default = Some(Levels {
+            read: Some(AccessLevel::AskAlways),
+            write: Some(AccessLevel::AskAlways),
+            ttl: None,
+        });
+        unlock(strict);
+        assert_eq!(decide("POST", "/v1/pay"), AccessLevel::AskAlways);
+        assert_eq!(decide("GET", "/v1/things"), AccessLevel::AskAlways);
+        assert_eq!(decide("DELETE", "/v1/things"), AccessLevel::Deny);
+        // The owner's own per-connection default is consent to loosen.
+        let mut owner = Policy::default();
+        owner.connections.insert(
+            "acme".to_string(),
+            ConnectionPolicy {
+                default: Some(Levels {
+                    read: None,
+                    write: Some(AccessLevel::Allow),
+                    ttl: None,
+                }),
+                rules: Default::default(),
+            },
+        );
+        unlock(owner);
+        assert_eq!(decide("POST", "/v1/pay"), AccessLevel::Allow);
+        assert_eq!(decide("DELETE", "/v1/things"), AccessLevel::Deny);
     }
 
     /// A connection's own rule edit that decides a scoped request on a field

@@ -766,6 +766,20 @@ impl Condition {
         &self.var
     }
 
+    /// Why this condition could never decide a request, or `None`: a numeric
+    /// literal must be finite (`NaN`, `inf`, `1e400` compare as nothing
+    /// useful), and an ordering comparison needs a number (an ordering
+    /// against `80usd` or a quoted string is never true, see [`Self::eval`]).
+    pub fn never_fires(&self) -> Option<&'static str> {
+        match self.lit_num {
+            Some(n) if !n.is_finite() => Some("its literal is not a finite number"),
+            None if matches!(self.op, CmpOp::Gt | CmpOp::Lt | CmpOp::Ge | CmpOp::Le) => {
+                Some("an ordering comparison needs a numeric literal")
+            }
+            _ => None,
+        }
+    }
+
     /// Evaluate against the request vars. An undefined var → `false` (P3: the
     /// rule simply doesn't match; the engine invents no decision). Ordering
     /// comparisons need both sides numeric; equality falls back to string.
@@ -948,6 +962,20 @@ pub fn evaluate_with_match(
         DecidedBy::Floor => None,
     };
     (level, id, ttl)
+}
+
+/// The stricter of two decisions for one request: `overlay` only where it is
+/// more restrictive than `base`, a tie keeps `base`. How a policy that may
+/// only tighten (a vault definition's) joins the decision made without it.
+pub fn stricter(
+    base: (AccessLevel, DecidedBy, Option<u64>),
+    overlay: (AccessLevel, DecidedBy, Option<u64>),
+) -> (AccessLevel, DecidedBy, Option<u64>) {
+    if overlay.0.restrictiveness() > base.0.restrictiveness() {
+        overlay
+    } else {
+        base
+    }
 }
 
 /// Resolve the access decision for a request, returning `(level, what decided

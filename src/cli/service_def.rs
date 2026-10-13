@@ -42,12 +42,25 @@ fn admit_file(path: &std::path::Path) -> Result<(String, ServiceDef), String> {
     }
 }
 
+/// Print the parts of `def`'s policy a vault does not apply (a vault
+/// definition's policy can only tighten), one note each.
+fn print_vault_notes(def: &ServiceDef) {
+    let (_, notes) = def.clone().for_vault();
+    if !notes.is_empty() {
+        eprintln!("note: in a vault, part of this policy is not applied:");
+        for n in &notes {
+            eprintln!("  • {}", terminal_safe(n));
+        }
+    }
+}
+
 pub async fn run_validate(args: ServiceValidateArgs) -> Result<(), String> {
-    admit_file(&args.path)?;
+    let (_, def) = admit_file(&args.path)?;
     println!(
         "✓ {}: valid",
         terminal_safe(&args.path.display().to_string())
     );
+    print_vault_notes(&def);
     Ok(())
 }
 
@@ -59,6 +72,7 @@ pub async fn run_add(args: ServiceAddArgs) -> Result<(), String> {
     let (custodian, vault) = resolve_active(None)?;
     // Offline fast-fail: the same gate the daemon re-runs on the grant.
     let (toml_str, def) = admit_file(&args.path)?;
+    print_vault_notes(&def);
     let id = def.service.id.clone();
 
     let op = json!({

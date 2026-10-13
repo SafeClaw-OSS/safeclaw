@@ -220,10 +220,14 @@ fn admit_inner(
         (None, Some(inline)) => Some(policy_from_inline(inline, &mut errs)),
         (None, None) => None,
     };
+    // Cross-checks only over parts that passed on their own: a list over its
+    // limit never reaches the pairwise work below.
+    if !errs.is_empty() {
+        return Err(errs);
+    }
     if let Some(p) = &policy {
         check_rules_against_requests(&p.rules, &raw.requests, &mut errs);
     }
-
     if !errs.is_empty() {
         return Err(errs);
     }
@@ -578,11 +582,17 @@ fn check_oauth2(
             errs.push(e);
         }
     }
-    // The loopback redirect the consent lands on: a URL, but not an egress
-    // target (a local listener catches it).
+    // Where the consent lands: not an egress target (a local listener or the
+    // provider's own page catches it), and the forms in use are many (http
+    // loopback, `urn:ietf:wg:oauth:2.0:oob`, an app scheme like
+    // `com.example:/cb`). Any absolute URI; the string checks above already
+    // bound its length and characters.
     if let Some(u) = &o.redirect_uri {
-        if let Err(e) = check_url("[auth] redirect_uri", u, &["http", "https"], false) {
-            errs.push(e);
+        if url::Url::parse(u).is_err() {
+            errs.push(format!(
+                "[auth] redirect_uri '{}' is not an absolute URI",
+                u
+            ));
         }
     }
     if let Some(style) = &o.oauth_style {
@@ -873,6 +883,15 @@ fn policy_from_file(file: RawPolicyFile, errs: &mut Vec<String>) -> ServicePolic
             rules: Vec::new(),
         };
     }
+    // Body rules are capped on their own: each is a regex compiled at load
+    // and matched against every request body the rule's paths see.
+    let body_rules = file.rule.iter().filter(|r| r.body.is_some()).count();
+    let bodies_ok = check_count(
+        "policy.toml rules with a body",
+        body_rules,
+        MAX_BODY_RULES,
+        errs,
+    );
     let mut seen_ids = HashSet::new();
     let mut rules = Vec::with_capacity(file.rule.len());
     for r in file.rule {
@@ -897,22 +916,31 @@ fn policy_from_file(file: RawPolicyFile, errs: &mut Vec<String>) -> ServicePolic
                 None
             }
         };
-        let body = r
-            .body
-            .as_deref()
-            .and_then(|b| match BodyPattern::compile(b) {
-                Ok(p) => Some(p),
-                Err(e) => {
-                    errs.push(format!("{}: body regex {}", what, e));
-                    None
-                }
-            });
+        let body =
+            r.body
+                .as_deref()
+                .filter(|_| bodies_ok)
+                .and_then(|b| match BodyPattern::compile(b) {
+                    Ok(p) => Some(p),
+                    Err(e) => {
+                        errs.push(format!("{}: body regex {}", what, e));
+                        None
+                    }
+                });
         if let Some(w) = &r.when {
-            if Condition::parse(w).is_none() {
-                errs.push(format!(
+            match Condition::parse(w) {
+                None => errs.push(format!(
                     "{}: `when = \"{}\"` is not a valid condition (expected `vars.<name> <op> <literal>`)",
                     what, w
-                ));
+                )),
+                Some(c) => {
+                    if let Some(why) = c.never_fires() {
+                        errs.push(format!(
+                            "{}: `when = \"{}\"` can never be true: {}",
+                            what, w, why
+                        ));
+                    }
+                }
             }
         }
         rules.push(PolicyRule {
@@ -1008,19 +1036,37 @@ fn check_rules_against_requests(
             None => format!("[[policy.rules]] #{}", i + 1),
         };
         if let Some(cond) = rule.when.as_deref().and_then(Condition::parse) {
-            // Strip a `shape.` qualifier for the membership check.
             let var = cond.var_name();
-            let bare = var.rsplit('.').next().unwrap_or(var);
-            if !declared.contains(bare) {
-                errs.push(format!(
+            match var.split_once('.') {
+                // `vars.<shape>.<name>`: that shape must declare and bind it.
+                Some((shape, name)) => match requests.get(shape) {
+                    _ if !is_ident(shape) || !is_ident(name) => errs.push(format!(
+                        "{}: `when` var '{}' must be `vars.<name>` or `vars.<shape>.<name>`",
+                        what, var
+                    )),
+                    None => errs.push(format!(
+                        "{}: `when` names shape '{}', which is not a [requests] shape",
+                        what, shape
+                    )),
+                    Some(s) if !s.vars.contains_key(name) => errs.push(format!(
+                        "{}: `when` references var '{}', which [requests.{}] does not declare",
+                        what, name, shape
+                    )),
+                    Some(s) if !s.scope.iter().any(|k| k == name) => errs.push(format!(
+                        "{}: `when` gates on var '{}', which [requests.{}] does not bind; a deciding field must be bound (add it to scope)",
+                        what, name, shape
+                    )),
+                    Some(_) => {}
+                },
+                None if !declared.contains(var) => errs.push(format!(
                     "{}: `when` references var '{}', which no [requests] shape declares",
                     what, var
-                ));
-            } else if !bound.contains(bare) {
-                errs.push(format!(
+                )),
+                None if !bound.contains(var) => errs.push(format!(
                     "{}: `when` gates on var '{}', which is not in any shape's `scope`; a deciding field must be bound (add it to scope)",
                     what, var
-                ));
+                )),
+                None => {}
             }
         }
         if rule.body.is_some()

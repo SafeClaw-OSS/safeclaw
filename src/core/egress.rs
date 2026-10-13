@@ -24,7 +24,9 @@ use url::Host;
 /// SSRF cheat sheet deny-list (127.0.0.0/8, 0.0.0.0/8, ::1, RFC 1918,
 /// fc00::/7, fe80::/10, 224.0.0.0/4, ff00::/8, with 169.254.169.254 inside
 /// the 169.254.0.0/16 link-local range), plus the limited broadcast address,
-/// `::`, and every IPv4-mapped IPv6 address (`::ffff:0:0/96`).
+/// `::`, and every IPv4-mapped IPv6 address (`::ffff:0:0/96`). An IPv6
+/// address that carries an IPv4 one (IPv4-compatible `::a.b.c.d`, NAT64
+/// `64:ff9b::/96`, 6to4 `2002::/16`) is judged by that IPv4 address.
 pub fn ip_is_blocked(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => v4_is_blocked(v4),
@@ -49,6 +51,22 @@ fn v6_is_blocked(v6: Ipv6Addr) -> bool {
         || (first & 0xffc0) == 0xfe80 // fe80::/10 link-local
         || (first & 0xff00) == 0xff00 // ff00::/8 multicast
         || v6.to_ipv4_mapped().is_some() // ::ffff:0:0/96
+        || embedded_v4(v6).is_some_and(v4_is_blocked)
+}
+
+/// The IPv4 address an IPv6 address carries and a gateway or the host stack
+/// may deliver to: IPv4-compatible `::a.b.c.d` (RFC 4291), NAT64
+/// `64:ff9b::a.b.c.d` (RFC 6052) and 6to4 `2002:aabb:ccdd::/48` (RFC 3056).
+fn embedded_v4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
+    let s = v6.segments();
+    let v4 = |hi: u16, lo: u16| Ipv4Addr::new((hi >> 8) as u8, hi as u8, (lo >> 8) as u8, lo as u8);
+    if s[..6] == [0, 0, 0, 0, 0, 0] || s[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
+        return Some(v4(s[6], s[7]));
+    }
+    if s[0] == 0x2002 {
+        return Some(v4(s[1], s[2]));
+    }
+    None
 }
 
 /// True if `domain` (already parsed) is an RFC 6761 loopback name.
@@ -223,12 +241,30 @@ mod tests {
         ] {
             assert!(ip_is_blocked(ip.parse().unwrap()), "{ip} must be blocked");
         }
+        // IPv6 forms that carry an IPv4 address are judged by it.
+        for ip in [
+            "::127.0.0.1",
+            "::10.0.0.1",
+            "::169.254.169.254",
+            "64:ff9b::127.0.0.1",
+            "64:ff9b::a9fe:a9fe",
+            "64:ff9b::192.168.0.1",
+            "2002:7f00:1::",
+            "2002:a00:1::1",
+            "2002:c0a8:101::",
+        ] {
+            assert!(ip_is_blocked(ip.parse().unwrap()), "{ip} must be blocked");
+        }
         for ip in [
             "8.8.8.8",
             "1.1.1.1",
             "172.32.0.1",
+            "100.64.0.1",
             "2001:4860:4860::8888",
             "fec0::1",
+            "::8.8.8.8",
+            "64:ff9b::8.8.8.8",
+            "2002:808:808::1",
         ] {
             assert!(!ip_is_blocked(ip.parse().unwrap()), "{ip} is public");
         }
@@ -293,6 +329,9 @@ mod tests {
             "[::ffff:127.0.0.1]:80",
             "[fd00::1]",
             "[fe80::1]",
+            "[::127.0.0.1]",
+            "[64:ff9b::7f00:1]",
+            "[2002:a9fe:a9fe::]",
             "169.254.169.254",
             "134744072",
         ] {

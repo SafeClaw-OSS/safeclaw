@@ -1,14 +1,14 @@
 # CircleCI policy. The token never enters the agent and egress is host-anchored,
 # so routine reads (pipelines, jobs, workflows, insights, env-var listing) ride
-# the floor. The gate is spent on the two consequential ones: triggering a
-# pipeline runs arbitrary CI code (a supply-chain / code-execution surface), and
-# writing a project env var plants a value the build will read. Each rule is a
-# per-connection console toggle; loosen or tighten to taste.
+# the floor. The gate is spent where CI code runs or reads planted values:
+# triggering, continuing or rerunning a pipeline, scheduling one, and writing a
+# project or context env var the build will read. Each rule is a per-connection
+# console toggle; loosen or tighten to taste.
 #
-# Paths are relative to host circleci.com. The project slug is written either
-# as one URL-encoded segment (gh%2Forg%2Frepo) or as three literal ones
-# (gh/org/repo), so each rule lists both forms (`*` is one segment; `**` is
-# only allowed as the final segment).
+# Endpoints are CircleCI API v2 (https://circleci.com/api/v2/openapi.json). A
+# project slug is `vcs-slug/org-name/repo-name` and either `/` may be
+# URL-escaped, so a slug spans one, two or three path segments and each rule
+# lists all three forms (`*` is one segment; `**` is only allowed last).
 
 [default]
 read = "allow"
@@ -17,13 +17,40 @@ write = "allow"
 # ── Supply chain / code execution ────────────────────────────────────────────
 [[rule]]
 id = "trigger-pipeline"
-label = "Trigger a pipeline (runs arbitrary CI code)"
-match = ["POST /api/v2/project/*/pipeline", "POST /api/v2/project/*/*/*/pipeline"]
+label = "Trigger, continue or rerun a pipeline (runs CI code)"
+match = [
+  "POST /api/v2/project/*/pipeline",
+  "POST /api/v2/project/*/*/pipeline",
+  "POST /api/v2/project/*/*/*/pipeline",
+  "POST /api/v2/project/*/pipeline/run",
+  "POST /api/v2/project/*/*/pipeline/run",
+  "POST /api/v2/project/*/*/*/pipeline/run",
+  "POST /api/v2/pipeline/continue",
+  "POST /api/v2/workflow/*/rerun",
+]
+level = "ask"
+
+[[rule]]
+id = "schedule-pipeline"
+label = "Create or change a pipeline schedule or trigger"
+match = [
+  "POST /api/v2/project/*/schedule",
+  "POST /api/v2/project/*/*/schedule",
+  "POST /api/v2/project/*/*/*/schedule",
+  "PATCH /api/v2/schedule/*",
+  "POST /api/v2/projects/*/pipeline-definitions/*/triggers",
+  "PATCH /api/v2/projects/*/triggers/*",
+]
 level = "ask"
 
 # ── Plant a secret the build will read ───────────────────────────────────────
 [[rule]]
 id = "create-env-var"
-label = "Create or overwrite a project environment variable"
-match = ["POST /api/v2/project/*/envvar", "POST /api/v2/project/*/*/*/envvar"]
+label = "Create or overwrite a project or context environment variable"
+match = [
+  "POST /api/v2/project/*/envvar",
+  "POST /api/v2/project/*/*/envvar",
+  "POST /api/v2/project/*/*/*/envvar",
+  "PUT /api/v2/context/*/environment-variable/*",
+]
 level = "ask"
