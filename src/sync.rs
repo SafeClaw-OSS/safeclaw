@@ -3210,6 +3210,9 @@ enum LocalFix {
         id: String,
         row: pv_store::StoredItem,
     },
+    /// Drop our row at `id` iff it is still at version `expect` (a dirty row
+    /// this device cannot read, with no row of theirs to take).
+    Drop { id: String, expect: u64 },
     /// Keep `ours` as its conflict copy, a dirty record of its own name
     /// placed against the local store ([`PerItemVault::keep_conflict_copy`]).
     /// When no copy may be written, the fixes for the row `of` are not
@@ -3286,6 +3289,12 @@ fn apply_local_fixes(
                     out.content_changed = true;
                 }
             }
+            LocalFix::Drop { id, expect } => {
+                if pv.items.get(&id).is_some_and(|s| s.version == expect) {
+                    pv.items.remove(&id);
+                    out.changed = true;
+                }
+            }
             LocalFix::Mirror { id, row } => {
                 let take = pv.items.get(&id).is_none_or(|s| {
                     s.version < row.version && s.version <= s.synced_version
@@ -3354,13 +3363,11 @@ enum Resolved {
     NotReadable { fixes: Vec<LocalFix>, note: String },
 }
 
-/// What the user is told when THEIR row of `record` cannot be opened here
-/// ([`Resolved::NotReadable`]).
+/// What the user is told when a row of `record` cannot be opened here
+/// ([`Resolved::NotReadable`]): the same sentence a local write refused over
+/// such a row says ([`pv_store::unreadable_refusal`]).
 fn not_readable_note(record: &str) -> String {
-    format!(
-        "{}: this item was changed with a vault key this device does not have; your change to it was not applied: run `sc sync` after the vault owner's console finishes, then re-run it",
-        record
-    )
+    pv_store::unreadable_refusal(record)
 }
 
 /// Replace our dirty row with THEIR row (clean), guarded on our version.
@@ -3436,17 +3443,19 @@ fn open_conflict_pair(
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
     type S = sudp::primitives::StdPrimitives;
-    let ours = item_layer::open_wire_item::<S>(
+    let ours = match item_layer::open_wire_item::<S>(
         keys,
         vault_id,
         &ours_row.id,
         ours_row.version,
         &ours_row.ct,
-    )
-    .map_err(|e| {
-        tracing::warn!(vault = %vault_id, item = %ours_row.id, "per-item reconcile: can't open our row ({}); left dirty", e);
-        Resolved::LeaveDirty
-    })?;
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(vault = %vault_id, item = %ours_row.id, "per-item reconcile: can't open our row ({}); not sent, set aside", e);
+            return Err(unreadable_ours(keys, vault_id, ours_row, theirs_row));
+        }
+    };
     let theirs = match theirs_row {
         None => None,
         Some(r) if is_rollback(r.version, ours_row.synced_version) => {
@@ -3484,6 +3493,49 @@ fn open_conflict_pair(
         }
     };
     Ok((ours, theirs))
+}
+
+/// OUR dirty row cannot be opened here (sealed under a key this device no
+/// longer holds, or under a retired key that does not list it): it is never
+/// sent. THEIR row, when there is one, is taken as it is; with none, ours is
+/// dropped locally. Either way it stops being offered, and the user is told
+/// ([`not_readable_note`]). Their row older than what this device synced
+/// ([`is_rollback`]) is not taken: left dirty.
+fn unreadable_ours(
+    keys: item_layer::VaultKeys<'_>,
+    vault_id: &str,
+    ours_row: &DirtyRow,
+    theirs_row: Option<ItemRow>,
+) -> Resolved {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    type S = sudp::primitives::StdPrimitives;
+    let (fix, record) = match theirs_row {
+        Some(r) if is_rollback(r.version, ours_row.synced_version) => return Resolved::LeaveDirty,
+        Some(r) => {
+            let Ok(ct) = URL_SAFE_NO_PAD.decode(r.ct.as_bytes()) else {
+                return Resolved::LeaveDirty;
+            };
+            let theirs = item_layer::open_wire_item::<S>(keys, vault_id, &r.item_id, r.version, &ct).ok();
+            let tombstone = theirs.as_ref().is_some_and(|p| p.is_tombstone());
+            (
+                adopt_fix(ours_row, &r, ct, tombstone),
+                theirs.as_ref().map(conflict_record),
+            )
+        }
+        None => (
+            LocalFix::Drop {
+                id: ours_row.id.clone(),
+                expect: ours_row.version,
+            },
+            None,
+        ),
+    };
+    let record = record.unwrap_or_else(|| format!("item {}", ours_row.id));
+    Resolved::NotReadable {
+        fixes: vec![fix],
+        note: not_readable_note(&record),
+    }
 }
 
 /// Local fixes for a TERMINAL rejection of OUR dirty row
@@ -3959,6 +4011,34 @@ pub async fn push_items_best_effort(state: &Arc<AppState>, vault_id: &str) {
     let mut set_aside_rows: Vec<(String, String, bool)> = Vec::new();
     let mut refused_rows: Vec<(String, String)> = Vec::new();
     for row in &rows {
+        // A row this device cannot read is never sent (it would land where no
+        // member reads it): set aside instead, theirs taken if there is one.
+        if let Some(keys) = keys {
+            let opens = item_layer::open_wire_item::<sudp::primitives::StdPrimitives>(
+                keys,
+                vault_id,
+                &row.id,
+                row.version,
+                &row.ct,
+            )
+            .is_ok();
+            if !opens {
+                match load_conflict_pair(cloud, vault_id, &dk, keys, &mut their_rows, row, None)
+                    .await
+                {
+                    Err(Resolved::NotReadable { fixes: f, note }) => {
+                        fixes.extend(f);
+                        refused_rows.push((row.id.clone(), note));
+                    }
+                    Err(Resolved::EndpointMissing) => {
+                        endpoint_missing = true;
+                        break;
+                    }
+                    _ => left_dirty += 1,
+                }
+                continue;
+            }
+        }
         let base_version = push_base_version(row.synced_version);
         let ct_b64 = URL_SAFE_NO_PAD.encode(&row.ct);
         match push_item(
@@ -5826,6 +5906,86 @@ mod peritem_tests {
             assert_eq!((row.version, row.synced_version), (5, 5), "clean: no longer sent");
             assert_eq!(row.ct, their_ct, "theirs as it is");
             assert_eq!(pv.items.len(), 1, "ours is not kept");
+        }
+    }
+
+    /// OUR dirty row that this device cannot read (sealed under a key it no
+    /// longer holds, or under a retired key that does not list it) is never
+    /// sent and stops being offered: theirs is taken as it is when there is
+    /// one, else ours is dropped locally; the user is told.
+    #[test]
+    fn a_dirty_row_this_device_cannot_read_is_set_aside() {
+        use crate::storage::item::{self as il, ItemPayload};
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        let (k, gone) = ([0x42u8; 32], [0x43u8; 32]);
+        let vid = "v";
+        let keys = VaultKeys::single(&k);
+        let ours_keys = VaultKeys {
+            id_seed: &k,
+            content: &gone,
+            prev: &[],
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        for theirs_present in [true, false] {
+            let mut pv = empty_pv();
+            let ours = ItemPayload::secret_live("API", "mine");
+            let id = pv
+                .plant::<StdPrimitives>(ours_keys, vid, ItemNs::Secret, "API", 3, &ours)
+                .unwrap();
+            pv.items.get_mut(&id).unwrap().synced_version = 2;
+            let dirty = DirtyRow {
+                id: id.clone(),
+                version: 3,
+                synced_version: 2,
+                ct: pv.get_item(&id).unwrap().ct.clone(),
+                tombstone: false,
+                base: None,
+                upgrade: false,
+            };
+            let theirs = ItemPayload::secret_live("API", "theirs");
+            let their_ct = il::seal_wire_item::<StdPrimitives>(keys, vid, &id, 5, &theirs).unwrap();
+            let snapshot = if theirs_present {
+                vec![(
+                    id.clone(),
+                    ItemRow {
+                        item_id: id.clone(),
+                        version: 5,
+                        seq: 9,
+                        ct: URL_SAFE_NO_PAD.encode(&their_ct),
+                        sig: None,
+                        signer: None,
+                    },
+                )]
+            } else {
+                Vec::new()
+            };
+            let mut fetched = TheirRows::Fetched(snapshot.into_iter().collect());
+            let resolved = rt.block_on(load_conflict_pair(
+                "http://127.0.0.1:9",
+                vid,
+                "dk",
+                keys,
+                &mut fetched,
+                &dirty,
+                None,
+            ));
+            let Err(Resolved::NotReadable { fixes, note }) = resolved else {
+                panic!("set aside, not left dirty");
+            };
+            assert!(note.contains("this item was changed with a vault key this device does not have"), "{}", note);
+            apply_local_fixes(&mut pv, fixes, Some((keys, vid)));
+            if theirs_present {
+                assert!(note.starts_with("secret API: "), "{}", note);
+                let row = pv.get_item(&id).unwrap();
+                assert_eq!((row.version, row.synced_version, &row.ct), (5, 5, &their_ct));
+            } else {
+                assert!(note.starts_with(&format!("item {}: ", id)), "{}", note);
+                assert!(pv.get_item(&id).is_none(), "dropped: no longer offered");
+            }
         }
     }
 

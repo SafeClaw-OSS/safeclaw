@@ -1941,7 +1941,7 @@ refresh_token = "REFRESH_TOKEN"
         mine.native_secrets.insert("D".into(), b"d".to_vec());
         match persist_mutated_view(&state, vid, &base2, &mine, &material) {
             Err(crate::error::AppError::Conflict(m)) => {
-                assert!(m.starts_with("secret X: the stored record cannot be read"), "{}", m)
+                assert!(m.starts_with("secret X: this item was changed with a vault key this device does not have"), "{}", m)
             }
             other => panic!("a conflict, not {:?}", other.err()),
         }

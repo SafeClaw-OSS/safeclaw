@@ -1192,10 +1192,13 @@ pub struct Reconciled {
     pub refused: Vec<(String, String)>,
 }
 
-/// Why a change to `record` was not written over a row that cannot be read.
+/// Why a change to `record` was not applied over a row this device cannot
+/// read (sealed under a key it does not have, or under a retired key that
+/// row did not exist under): the row is never written over. The one sentence
+/// for every such case, local write or sync.
 pub fn unreadable_refusal(record: &str) -> String {
     format!(
-        "{}: the stored record cannot be read with this vault's key, so it was not written over and your change was not applied; run `sc sync`, then re-run it",
+        "{}: this item was changed with a vault key this device does not have; your change to it was not applied: run `sc sync` after the vault owner's console finishes, then re-run it",
         record
     )
 }
@@ -2010,7 +2013,7 @@ impl PerItemVault {
         };
         let raw = item_id_bytes::<S>(keys.id_seed, ns.as_str(), name)?;
         let ctx = ItemCtx::new(vault_id, raw, stored.version);
-        Ok(Some(unseal_item_keys::<S>(keys, &ctx, &stored.ct)?.0))
+        Ok(Some(unseal_item_keys::<S>(keys, &id, &ctx, &stored.ct)?.0))
     }
 
     /// Seed / re-seed this vault's item rows from a decrypted
@@ -2737,7 +2740,7 @@ impl PerItemVault {
                 // recomputes its HMAC (design/agent-authz-cleartext-cutover.md).
                 let raw = aad_id_from_wire::<S>(keys.id_seed, id_b64)?;
                 let ctx = ItemCtx::new(vault_id, raw, stored.version);
-                let (payload, _) = unseal_item_keys::<S>(keys, &ctx, &stored.ct)?;
+                let (payload, _) = unseal_item_keys::<S>(keys, id_b64, &ctx, &stored.ct)?;
                 // A record without a rule is not read: the retired `stores:` /
                 // `services:` / `members`, a legacy `aux:agent/<id>` (only
                 // native, UIK-signed agent rows authorize), an unknown `aux` or
@@ -2960,6 +2963,7 @@ impl PerItemVault {
                 let raw = item_id_bytes::<S>(keys.id_seed, ItemNs::Aux.as_str(), field)?;
                 let (payload, _) = unseal_item_keys::<S>(
                     keys,
+                    &wire,
                     &ItemCtx::new(vault_id, raw, stored.version),
                     &stored.ct,
                 )?;
@@ -3027,6 +3031,7 @@ impl PerItemVault {
         };
         let Ok((payload, _)) = unseal_item_keys::<S>(
             keys,
+            &wire,
             &ItemCtx::new(vault_id, raw, stored.version),
             &stored.ct,
         ) else {
@@ -3194,6 +3199,7 @@ impl PerItemVault {
             let raw = aad_id_from_wire::<S>(keys.id_seed, wire).ok()?;
             let (payload, _) = unseal_item_keys::<S>(
                 keys,
+                wire,
                 &ItemCtx::new(vault_id, raw, stored.version),
                 &stored.ct,
             )
@@ -3315,7 +3321,7 @@ impl PerItemVault {
                 // Cleartext agent wire ids recompute their HMAC AAD; blinded decode.
                 let raw = aad_id_from_wire::<S>(keys.id_seed, id_b64)?;
                 let ctx = ItemCtx::new(vault_id, raw, stored.version);
-                let (payload, _) = unseal_item_keys::<S>(keys, &ctx, &stored.ct)?;
+                let (payload, _) = unseal_item_keys::<S>(keys, id_b64, &ctx, &stored.ct)?;
                 if payload.ns == want && !payload.is_tombstone() {
                     out.push(payload.name);
                 }
@@ -4593,9 +4599,11 @@ pub(crate) mod tests {
     /// Re-keys the owner's console has not finished: rows still under a
     /// previous content key read through the previous keys the member's own
     /// keyset row carries (opened at unlock with the current key, newest
-    /// first). A row read that way is never written back under one: a
-    /// reconcile leaves it as it is, and a change to it is sealed under the
-    /// current key.
+    /// first), each only for the rows that existed when it was retired. A row
+    /// under a retired key that it does not list (sealed after it retired) is
+    /// not honored and never written over. A row read through a previous key
+    /// is never written back under it: a reconcile leaves it as it is, and a
+    /// change to it is sealed under the current key.
     #[test]
     fn rows_a_rekey_has_not_moved_read_through_the_previous_keys() {
         use crate::storage::item::{seal_prev_content_keys, vault_key_bundle};
@@ -4604,10 +4612,6 @@ pub(crate) mod tests {
         let vid = fx.vault;
         let c_older = [0x4du8; 32];
         let mut pv = fx.pv.clone();
-        pv.set_uik_prev_content_ct(
-            "cid-creator",
-            seal_prev_content_keys::<S>(&fx.c_new, vid, 1, &[&fx.c_old, &c_older]),
-        );
         let old = VaultKeys {
             id_seed: &fx.id_seed,
             content: &fx.c_old,
@@ -4625,14 +4629,31 @@ pub(crate) mod tests {
         let new_id = pv
             .plant::<S>(current, vid, ItemNs::Secret, "NEW", 1, &ItemPayload::secret_live("NEW", "n"))
             .unwrap();
-        pv.plant::<S>(older, vid, ItemNs::Secret, "OLDER", 2, &ItemPayload::secret_live("OLDER", "x"))
+        let older_id = pv
+            .plant::<S>(older, vid, ItemNs::Secret, "OLDER", 2, &ItemPayload::secret_live("OLDER", "x"))
+            .unwrap();
+        // Sealed under the retired key after it retired: listed nowhere.
+        let planted_id = pv
+            .plant::<S>(old, vid, ItemNs::Secret, "PLANTED", 5, &ItemPayload::secret_live("PLANTED", "p"))
             .unwrap();
         for s in pv.items.values_mut() {
             s.synced_version = s.version;
         }
+        pv.set_uik_prev_content_ct(
+            "cid-creator",
+            seal_prev_content_keys::<S>(
+                &fx.c_new,
+                vid,
+                1,
+                &[
+                    (&fx.c_old, &[(old_id.as_str(), 3)]),
+                    (&c_older, &[(older_id.as_str(), 2)]),
+                ],
+            ),
+        );
 
         // Unlock: the grant's root opens the bundle and, from the member's own
-        // row, the previous keys.
+        // row, the previous keys with their rows.
         let material = crate::server::handlers::metadata::acquire_k_from_keyset(
             &pv.keyset,
             &fx.root,
@@ -4640,12 +4661,13 @@ pub(crate) mod tests {
             vid,
         )
         .unwrap();
-        assert_eq!(material.len(), 128);
+        assert!(material.len() > 64);
         let keys = VaultKeys::from_material(&material);
         let view = pv.fold_view::<S>(keys, vid).unwrap();
         assert_eq!(view.native_secrets["OLD"], b"o");
         assert_eq!(view.native_secrets["OLDER"], b"x");
         assert_eq!(view.native_secrets["NEW"], b"n");
+        assert!(!view.native_secrets.contains_key("PLANTED"), "not honored");
         // Without them, only the current key reads.
         let view = pv.fold_view::<S>(current, vid).unwrap();
         assert!(!view.native_secrets.contains_key("OLD"));
@@ -4654,7 +4676,7 @@ pub(crate) mod tests {
         let mut stale = pv.clone();
         stale.set_uik_prev_content_ct(
             "cid-creator",
-            seal_prev_content_keys::<S>(&fx.c_new, vid, 2, &[&fx.c_old]),
+            seal_prev_content_keys::<S>(&fx.c_new, vid, 2, &[(&fx.c_old, &[(old_id.as_str(), 3)])]),
         );
         let m = crate::server::handlers::metadata::acquire_k_from_keyset(
             &stale.keyset,
@@ -4664,6 +4686,21 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert_eq!(m.len(), 64);
+
+        // The unlisted row is never written over: a change to it is refused
+        // with the note, the row left as it is.
+        let planted = pv.items[&planted_id].clone();
+        let view = pv.fold_view::<S>(keys, vid).unwrap();
+        let base = ViewBase::of(&view).unwrap();
+        let mut mine = pv.fold_view::<S>(keys, vid).unwrap();
+        mine.native_secrets.insert("PLANTED".into(), b"mine".to_vec());
+        let r = pv
+            .reconcile_from_view::<S>(keys, vid, &mine, ReconcileBase::Since(&base))
+            .unwrap();
+        assert!(r.changed.is_empty());
+        assert_eq!(r.refused.len(), 1);
+        assert!(r.refused[0].1.contains("changed with a vault key this device does not have"));
+        assert_eq!(pv.items[&planted_id].ct, planted.ct);
 
         // Nothing changed: nothing is written, the old row stays as it is.
         let before = pv.items[&old_id].clone();
@@ -6663,7 +6700,7 @@ pub(crate) mod tests {
         assert!(r
             .refused
             .iter()
-            .all(|(_, why)| why.contains("cannot be read with this vault's key")));
+            .all(|(_, why)| why.contains("changed with a vault key this device does not have")));
         for (wire, v) in [(&svc_wire, 3), (&b_wire, 2)] {
             let row = pv.get_item(wire).unwrap();
             assert_eq!((row.version, &row.ct), (v, &garbage), "left as it is");
