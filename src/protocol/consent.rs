@@ -39,8 +39,10 @@ pub struct ActConsent {
     pub explain: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub explain_zh: Option<String>,
-    /// "neutral" | "info" | "danger". Advisory upward-only: a client's
-    /// built-in danger floor for an act kind can never be downgraded.
+    /// "neutral" | "info" | "danger". Advisory styling AND the batch gate: a
+    /// danger act is confirmed alone, never batched; anything else is
+    /// batchable. Upward-only: a client's built-in danger floor for an act
+    /// kind can never be downgraded.
     #[serde(default = "default_tone")]
     pub tone: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -116,6 +118,33 @@ pub fn consent_for(op: &Operation) -> Option<RenderedConsent> {
         tone: desc.tone.clone(),
         facts,
     })
+}
+
+/// Stamp the act's descriptor tone into the signed scope at op creation
+/// (`scope.tone`), over anything the requester sent there: tone is the batch
+/// gate (a danger act is confirmed alone, never batched), so the console must
+/// read it from daemon-authored, signed material, never a requester field. An
+/// act without a descriptor gets none (a requester-supplied value is
+/// removed); clients keep their own upward-only danger floor for the acts
+/// they know.
+pub fn stamp_tone(op: &mut Operation) {
+    let tone = match &op.act.kind {
+        ActType::Custom(name) => act_catalog().get(name.as_str()).map(|d| d.tone.clone()),
+        _ => None,
+    };
+    if op.act.scope.is_null() && tone.is_some() {
+        op.act.scope = serde_json::json!({});
+    }
+    if let Some(o) = op.act.scope.as_object_mut() {
+        match tone {
+            Some(t) => {
+                o.insert("tone".into(), serde_json::Value::String(t));
+            }
+            None => {
+                o.remove("tone");
+            }
+        }
+    }
 }
 
 /// The generic floor for a table-less custom act: humanized slug + target
@@ -283,6 +312,81 @@ mod tests {
         .unwrap();
         assert!(c.facts.iter().all(|(l, _)| l != "Definition"), "{:?}", c.facts);
         assert!(c.facts.iter().any(|(l, v)| l == "Source" && v == "local folder mine"));
+    }
+
+    /// Tone is one knob for two things: advisory styling AND the batch gate
+    /// (danger = confirmed alone, never batched). Only vault-delete is
+    /// danger; routine install/remove acts are neutral, and the rendered
+    /// consent carries the tone so every surface reads the stamped material.
+    #[test]
+    fn only_vault_delete_is_danger() {
+        let acts = act_catalog();
+        let danger: Vec<&str> = acts
+            .iter()
+            .filter(|(_, a)| a.tone == "danger")
+            .map(|(name, _)| name.as_str())
+            .collect();
+        assert_eq!(danger, ["vault-delete"]);
+        for name in [
+            "widen-host",
+            "service-add",
+            "service-rm",
+            "secret-rm",
+            "connection-rm",
+        ] {
+            assert_eq!(acts[name].tone, "neutral", "{name}");
+        }
+        // The wire forms carry it: the catalog descriptor (registry `acts`)
+        // and the rendered consent.
+        let v = serde_json::to_value(&acts["vault-delete"]).unwrap();
+        assert_eq!(v["tone"], json!("danger"));
+        let v = serde_json::to_value(&acts["service-add"]).unwrap();
+        assert_eq!(v["tone"], json!("neutral"));
+        let c = consent_for(&op("vault-delete", "v1", json!({}))).unwrap();
+        assert_eq!(c.tone, "danger");
+        assert_eq!(serde_json::to_value(&c).unwrap()["tone"], json!("danger"));
+        let c = consent_for(&op(
+            "service-add",
+            "github:acme/tools",
+            json!({ "ids": ["a1"] }),
+        ))
+        .unwrap();
+        assert_eq!(c.tone, "neutral");
+    }
+
+    /// Op creation stamps the descriptor's tone into the signed scope, over
+    /// anything the requester sent; a table-less act (or a non-custom one)
+    /// carries none, whatever the requester claimed.
+    #[test]
+    fn op_creation_stamps_the_tone_into_the_signed_scope() {
+        let mut del = op("vault-delete", "v1", serde_json::Value::Null);
+        stamp_tone(&mut del);
+        assert_eq!(del.act.scope["tone"], json!("danger"));
+        let mut add = op(
+            "service-add",
+            "github:acme/tools",
+            json!({ "ids": ["a1"], "tone": "danger" }),
+        );
+        stamp_tone(&mut add);
+        assert_eq!(add.act.scope["tone"], json!("neutral"), "requester overwritten");
+        assert_eq!(add.act.scope["ids"], json!(["a1"]), "other fields kept");
+        let mut unknown = op("frobnicate", "x", json!({ "tone": "neutral" }));
+        stamp_tone(&mut unknown);
+        assert!(unknown.act.scope.get("tone").is_none(), "no descriptor, no tone");
+        let mut export = Operation {
+            act: Act {
+                kind: ActType::Export,
+                target: "K".into(),
+                scope: json!({ "tone": "neutral" }),
+            },
+            bind: Bind {
+                redeemer: "v1".into(),
+                recipient: None,
+            },
+            valid: Valid::single_use(0, Some(300)),
+        };
+        stamp_tone(&mut export);
+        assert!(export.act.scope.get("tone").is_none());
     }
 
     #[test]

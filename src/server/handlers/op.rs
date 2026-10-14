@@ -119,6 +119,9 @@ pub(crate) async fn create_op<A: crate::service::source::github::GitHubApi>(
         crate::server::handlers::service_ops::stamp_rm_at_mint(&state, &vault_id, &mut op)
             .map_err(AppError::BadRequest)?;
     }
+    // Every act's descriptor tone goes into the signed scope (the batch gate:
+    // danger = confirmed alone), over anything the requester sent there.
+    crate::protocol::consent::stamp_tone(&mut op);
     if op.valid.exp.is_none() {
         let now_unix = SystemTime::now()
             .duration_since(UNIX_EPOCH)

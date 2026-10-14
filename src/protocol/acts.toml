@@ -9,8 +9,12 @@
 #   and `{{vars.scope.<key>}}`. No surface may show requester-authored prose.
 # - P3 rule: an undefined/empty var renders empty; a fact row whose value
 #   renders empty (incl. `false`) is omitted. `true` renders as "yes".
-# - `tone` is advisory upward-only for clients: a client's built-in danger
-#   floor for an act kind can never be downgraded by this table.
+# - `tone` ("neutral" | "info" | "danger") is advisory styling AND the batch
+#   gate: a danger act is confirmed alone, never batched with others; anything
+#   else is batchable. Upward-only for clients: a client's built-in danger
+#   floor for an act kind can never be downgraded by this table. Routine acts
+#   stay neutral — the explain already carries the caution; danger is for the
+#   irreversible few (today: vault-delete only).
 # - Keep in lockstep with `DISPATCHED_CUSTOM_ACTS` (approve.rs) — the
 #   `dispatch_and_table_agree` test fails on drift in either direction.
 
@@ -50,7 +54,7 @@ action = "Permanently allow {{vars.scope.host}}"
 action_zh = "永久允许 {{vars.scope.host}}"
 explain = "Adds this host to the connection's allowed destinations forever. Every future brokered request may send its credential here without asking again. Grant only a host you trust."
 explain_zh = "将此主机永久添加到该连接的允许目标。今后每个代理请求都可能不再询问就把凭证发送到这里。仅授权你信任的主机。"
-tone = "danger"
+tone = "neutral"
 facts = [
   { label = "Connection", label_zh = "连接", value = "{{vars.scope.connection_id}}" },
   { label = "Host", label_zh = "主机", value = "{{vars.scope.host}}" },
@@ -72,7 +76,7 @@ action = "Install a third-party service"
 action_zh = "安装第三方服务"
 explain = "SafeClaw does not review third-party services. Connections that use one send credentials to the hosts it lists."
 explain_zh = "SafeClaw 不审查第三方服务。使用它的连接会把凭证发往它列出的主机。"
-tone = "danger"
+tone = "neutral"
 facts = [
   { label = "Services", label_zh = "服务", value = "{{vars.scope.ids}}" },
   { label = "Sends credentials to", label_zh = "凭证发往", value = "{{vars.scope.destinations}}" },
@@ -91,7 +95,7 @@ action = "Remove service definitions {{vars.target}}"
 action_zh = "移除服务定义 {{vars.target}}"
 explain = "Deletes these service definitions from your vault. Connections that use them are kept but stop working until a definition is added again."
 explain_zh = "从 vault 中删除这些服务定义。使用它们的连接会保留，但在重新添加定义之前无法工作。"
-tone = "danger"
+tone = "neutral"
 facts = [
   { label = "Services", label_zh = "服务", value = "{{vars.scope.ids}}" },
   { label = "Source", label_zh = "来源", value = "{{vars.scope.from}}" },
@@ -103,14 +107,14 @@ action = "Remove secret {{vars.target}}"
 action_zh = "移除密钥 {{vars.target}}"
 explain = "Deletes this secret's value from your vault. Connections referencing it stop working until the key is re-added."
 explain_zh = "从 vault 中删除该密钥的值。引用它的连接将无法工作，直到重新添加。"
-tone = "danger"
+tone = "neutral"
 
 [acts.connection-rm]
 action = "Remove connection {{vars.target}}"
 action_zh = "移除连接 {{vars.target}}"
 explain = "Removes this connection and the secrets it wrote that no other connection uses. Secrets that were already in the vault stay. Your agent loses access immediately."
 explain_zh = "移除此连接，及它写入且没有其他连接在用的密钥。原本就在 vault 里的密钥会保留。你的 agent 将立即失去访问。"
-tone = "danger"
+tone = "neutral"
 facts = [
   { label = "Secrets kept", label_zh = "保留密钥", value = "{{vars.scope.keep_secrets}}" },
 ]
