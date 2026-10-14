@@ -1575,11 +1575,17 @@ struct AuditEventWire {
     #[serde(skip_serializing_if = "Option::is_none")]
     target: Option<String>, // ceremony subject (key name / connection id)
     #[serde(skip_serializing_if = "Option::is_none")]
-    agent_id: Option<String>, // agent api-key PREFIX (= cloud api_keys.prefix)
+    agent_id: Option<String>, // requesting agent: its `ag_` id (legacy rows: api-key prefix)
     /// Why a denied request was refused: its ScCode wire name only, never
     /// the local free-text reason.
     #[serde(skip_serializing_if = "Option::is_none")]
     code: Option<String>,
+    /// Who approved: the passkey credential id (base64url) whose assertion
+    /// this daemon verified when it redeemed the grant. Only on an
+    /// `approved` row; the backend maps it to a vault member, never trusts a
+    /// name from here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    approver_cid: Option<String>,
 }
 
 fn event_from_row(row: &crate::audit::ApprovalRow) -> AuditEventWire {
@@ -1600,6 +1606,14 @@ fn event_from_row(row: &crate::audit::ApprovalRow) -> AuditEventWire {
         target: row.target.clone(),
         agent_id: row.agent_prefix.clone(),
         code: row.code.clone(),
+        // The local credential_id is written only by the approve path, after
+        // the grant's assertion verified; gate on the decision anyway so no
+        // other outcome can ever name an approver.
+        approver_cid: if row.status == crate::audit::STATUS_APPROVED {
+            row.credential_id.clone().filter(|c| !c.is_empty())
+        } else {
+            None
+        },
     }
 }
 
@@ -8208,6 +8222,44 @@ mod tests {
         assert_eq!(v["target"], "evil.example");
         assert_eq!(v["action"], "GET /repos");
         assert!(v.get("reason").is_none());
+        assert!(v.get("approver_cid").is_none());
+    }
+
+    /// An approved row names its approver by the credential whose assertion
+    /// the daemon verified, and keeps the requesting agent; no other outcome
+    /// ever carries an approver.
+    #[test]
+    fn an_approved_event_carries_the_verified_credential_and_the_agent() {
+        let mut row = crate::audit::ApprovalRow {
+            id: "op-2".into(),
+            created_at: 1,
+            decided_at: Some(2),
+            expires_at: 3,
+            status: crate::audit::STATUS_APPROVED.into(),
+            act_kind: "custom:vault-unlock".into(),
+            service: None,
+            method: None,
+            path: None,
+            target: None,
+            reason: None,
+            credential_id: Some("cid_AbC-_1".into()),
+            upstream_status: None,
+            agent_prefix: Some("ag_zpunp24l3lvmdesy7aiyhntxgzcc7ere".into()),
+            code: None,
+        };
+        let v = serde_json::to_value(event_from_row(&row)).unwrap();
+        assert_eq!(v["decision"], "approved");
+        assert_eq!(v["approver_cid"], "cid_AbC-_1");
+        assert_eq!(v["agent_id"], "ag_zpunp24l3lvmdesy7aiyhntxgzcc7ere");
+
+        row.status = crate::audit::STATUS_REJECTED.into();
+        let v = serde_json::to_value(event_from_row(&row)).unwrap();
+        assert!(v.get("approver_cid").is_none());
+
+        row.status = crate::audit::STATUS_APPROVED.into();
+        row.credential_id = Some(String::new());
+        let v = serde_json::to_value(event_from_row(&row)).unwrap();
+        assert!(v.get("approver_cid").is_none());
     }
 
     #[test]
