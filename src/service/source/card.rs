@@ -392,28 +392,20 @@ impl SourceCheck {
         .find(|c| c.as_str() == s)
     }
 
-    /// The card's source line (with its ref and commit): a fact only when
-    /// this device checked it, otherwise what the requester stated, said as
-    /// such.
+    /// The card's source line (with its ref and commit): "verified on this
+    /// device" only when this device checked it (the ref's head is at this
+    /// commit and the definitions match), otherwise "unverified" with the
+    /// reason where one helps.
     pub fn source_line(self, source: &ServiceSource) -> String {
         match self {
-            SourceCheck::Fetched => format!(
-                "{} (checked on your device: {} is at this commit and the definitions match)",
-                source.display(),
-                source.ref_label()
-            ),
-            SourceCheck::LocalFolder => format!(
-                "{}, as stated by the requester (a local folder cannot be checked)",
-                source.display()
-            ),
-            SourceCheck::NotReached => format!(
-                "{}, as stated by the requester (GitHub did not answer to check it)",
-                source.display()
-            ),
+            SourceCheck::Fetched => format!("{}, verified on this device", source.display()),
+            SourceCheck::LocalFolder => format!("{}, unverified", source.display()),
+            SourceCheck::NotReached => {
+                format!("{}, unverified (GitHub did not respond)", source.display())
+            }
             SourceCheck::NotBranchOrTag => format!(
-                "{}, as stated by the requester (only the head of one of the repository's branches or tags is checked, and {} is neither; pin a branch or tag to have it checked)",
-                source.display(),
-                source.ref_label()
+                "{}, unverified (pin a branch or tag to verify)",
+                source.display()
             ),
         }
     }

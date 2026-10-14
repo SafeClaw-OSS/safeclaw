@@ -867,7 +867,7 @@ client_id = "public"
         "each label beside what the rule matches"
     );
     assert!(c.from.contains(&"a".repeat(40)));
-    assert!(c.from.contains("checked on your device"));
+    assert!(c.from.contains("verified on this device"));
     assert!(c.oauth.is_empty(), "PKCE is on by default");
     assert!(c.new_destinations.is_empty() && c.loosens.is_empty());
     // Not checked here: the source is what the requester stated, said as such.
@@ -877,8 +877,8 @@ client_id = "public"
         SourceCheck::NotBranchOrTag,
     ] {
         let c = add_card(&snap, &src, check, false, &current, &reg).unwrap();
-        assert!(c.from.contains("as stated by the requester"), "{}", c.from);
-        assert!(!c.from.contains("checked on your device"));
+        assert!(c.from.contains(", unverified"), "{}", c.from);
+        assert!(!c.from.contains("verified on this device"));
         let mut scope = serde_json::json!({});
         c.stamp(&mut scope).unwrap();
         assert_eq!(scope["source_check"], check.as_str());
@@ -1555,16 +1555,16 @@ fn verify_requires_the_ref_head_to_be_the_pinned_commit() {
     };
     let from = card(&pinned(Some("v1.2.0"), 'b'), SourceCheck::Fetched);
     assert!(from.contains("github:acme/tools (v1.2.0) @ "), "{from}");
-    assert!(from.contains("'v1.2.0' is at this commit"), "{from}");
+    assert!(from.ends_with(", verified on this device"), "{from}");
     let from = card(&pinned(None, 'a'), SourceCheck::Fetched);
     assert!(
-        from.contains("(default branch)") && from.contains("the default branch is at this commit")
+        from.contains("(default branch)") && from.ends_with(", verified on this device")
     );
     let from = card(&pinned(Some("pull/1/head"), 'd'), SourceCheck::NotBranchOrTag);
     assert!(
-        from.contains("as stated by the requester")
+        from.contains(", unverified")
             && from.contains("(pull/1/head)")
-            && from.contains("'pull/1/head' is neither"),
+            && from.ends_with("(pin a branch or tag to verify)"),
         "{from}"
     );
 }

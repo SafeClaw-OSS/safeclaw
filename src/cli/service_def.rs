@@ -227,9 +227,9 @@ async fn listing(custodian: &str, vault: &str) -> Result<Vec<Listed>, String> {
 }
 
 /// The heading a stored source groups under: the source, then how it is
-/// known: `checked at <commit> (on this device)` when this device fetched
-/// that commit again and found this definition (its own record, never the
-/// vault's), else `as stated by the requester`. Definitions of one source
+/// known: `verified on this device` when this device fetched that commit
+/// again and found this definition (its own record, never the vault's), else
+/// `unverified`. Definitions of one source
 /// known differently head separate groups.
 fn group_of(l: &Listed) -> (String, String) {
     match &l.source {
@@ -249,17 +249,14 @@ fn group_of(l: &Listed) -> (String, String) {
                     if let Some(r) = git_ref {
                         h.push_str(&format!(" (ref {})", r));
                     }
+                    h.push_str(&format!(" @ {}", commit));
                     match &l.checked_on_this_device {
-                        Some(c) if c == commit => {
-                            h.push_str(&format!(": checked at {} (on this device)", commit))
-                        }
-                        _ => h.push_str(&format!(" @ {}: as stated by the requester", commit)),
+                        Some(c) if c == commit => h.push_str(": verified on this device"),
+                        _ => h.push_str(": unverified"),
                     }
                     h
                 }
-                ServiceSource::Local { name } => {
-                    format!("local folder {}: as stated by the requester", name)
-                }
+                ServiceSource::Local { name } => format!("local folder {}: unverified", name),
             };
             (format!("{}\n{}", s.identity(), head), head)
         }
@@ -816,9 +813,9 @@ mod tests {
         }
     }
 
-    /// `sc service ls` heads each source with how it is known: checked at its
-    /// commit on this device, or as the requester stated it. A stored record
-    /// saying it was checked is not read.
+    /// `sc service ls` heads each source with how it is known: verified at its
+    /// commit on this device, or unverified. A stored record saying it was
+    /// checked is not read.
     #[test]
     fn ls_heading_says_how_the_source_is_known() {
         let gh: ServiceSource = serde_json::from_value(serde_json::json!({
@@ -831,7 +828,7 @@ mod tests {
         assert_eq!(
             head,
             format!(
-                "github:acme/tools:svc (ref main) @ {}: as stated by the requester",
+                "github:acme/tools:svc (ref main) @ {}: unverified",
                 "a".repeat(40)
             )
         );
@@ -841,7 +838,7 @@ mod tests {
         assert_eq!(
             head,
             format!(
-                "github:acme/tools:svc (ref main): checked at {} (on this device)",
+                "github:acme/tools:svc (ref main) @ {}: verified on this device",
                 "a".repeat(40)
             )
         );
@@ -849,12 +846,12 @@ mod tests {
         // A check at another commit than the stored one says nothing.
         let mut other = listed("a3", Some(gh));
         other.checked_on_this_device = Some("b".repeat(40));
-        assert!(group_of(&other).1.ends_with("as stated by the requester"));
+        assert!(group_of(&other).1.ends_with(": unverified"));
         let local = ServiceSource::Local {
             name: "mine".into(),
         };
         let (_, head) = group_of(&listed("m1", Some(local)));
-        assert_eq!(head, "local folder mine: as stated by the requester");
+        assert_eq!(head, "local folder mine: unverified");
     }
 
     fn update_args(target: Option<&str>, all: bool) -> ServiceUpdateArgs {

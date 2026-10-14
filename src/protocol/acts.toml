@@ -68,15 +68,15 @@ facts = [
 ]
 
 [acts.service-add]
-action = "Add service definitions"
-action_zh = "添加服务定义"
-explain = "Stores these service definitions in your vault. Connections made with them send their credentials and sign-in data only to the hosts listed. The source line says whether it was checked on your device or only stated by the requester. Approve only a source you trust."
-explain_zh = "把这些服务定义存入你的 vault。用它们建立的连接只会把凭证和登录数据发往列出的主机。来源一行会说明它是在你的设备上核对过的，还是仅由请求方声称。只批准你信任的来源。"
+action = "Add services"
+action_zh = "添加服务"
+explain = "Connections that use these services send credentials only to the hosts listed. Approve only if you trust the source."
+explain_zh = "使用这些服务的连接只会把凭证发往列出的主机。只在你信任来源时批准。"
 tone = "danger"
 facts = [
-  { label = "Source", label_zh = "来源", value = "{{vars.scope.from}}" },
   { label = "Services", label_zh = "服务", value = "{{vars.scope.ids}}" },
   { label = "Sends credentials to", label_zh = "凭证发往", value = "{{vars.scope.destinations}}" },
+  { label = "Source", label_zh = "来源", value = "{{vars.scope.from}}" },
   { label = "OAuth", label_zh = "OAuth", value = "{{vars.scope.oauth}}" },
   { label = "New destinations", label_zh = "新增目标主机", value = "{{vars.scope.new_destinations}}" },
   { label = "Loosened or removed rules", label_zh = "放宽或删除的规则", value = "{{vars.scope.loosens}}" },

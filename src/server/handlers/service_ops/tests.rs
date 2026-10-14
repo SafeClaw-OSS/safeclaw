@@ -680,7 +680,7 @@ fn mint_checks_a_github_source_at_its_pinned_commit() {
     assert_eq!(signed["source_check"], json!("fetched"));
     let from = signed["from"].as_str().unwrap();
     assert!(
-        from.contains("checked on your device: the default branch is at this commit"),
+        from.ends_with(", verified on this device"),
         "{from}"
     );
     // A commit the default branch is not at (say, one pushed only to a fork,
@@ -710,7 +710,7 @@ fn mint_checks_a_github_source_at_its_pinned_commit() {
     assert!(signed["from"]
         .as_str()
         .unwrap()
-        .contains("as stated by the requester"));
+        .contains(", unverified"));
     // An answer from GitHub without the data (not found, refused, a server
     // error, too large or too slow) refuses the op.
     for answer in [404u16, 422, 403, 502] {
@@ -744,7 +744,7 @@ fn mint_checks_a_github_source_at_its_pinned_commit() {
     assert!(signed["from"]
         .as_str()
         .unwrap()
-        .starts_with("local folder mine, as stated by the requester"));
+        .starts_with("local folder mine, unverified"));
 }
 
 /// Whether a source was checked is this device's own fact, never the
