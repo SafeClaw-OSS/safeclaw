@@ -168,6 +168,14 @@ background `sc op wait <op_id>`, then act on its exit code:
 
 A destination host you have not used before takes the same one-time grant.
 
+Two pages approve. The `/grant/<op_id>` link needs no sign-in and approves that one
+request. The console's `/approvals` page (same host, signed in) lists every pending
+request; the user ticks several and approves them with one passkey tap, and the page
+marks any that need their own tap. The bell in the console's top bar counts what is
+waiting and opens that list. When a task needs several approvals, you may start them
+all and send the `/approvals` link once; for a single request, or a user who is not
+signed in on that device, send the `/grant` link.
+
 A call that returns `agent_not_authorized` means you are not turned on for this
 vault yet. Its message carries a link to the vault's Agent access page: give it to
 the user, then retry once they confirm.
