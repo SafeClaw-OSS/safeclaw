@@ -172,6 +172,72 @@ fn oauth2_claims_and_authorize_params_are_checked() {
     ));
 }
 
+/// The token-endpoint knobs: `token_auth` is post or basic; `token_params` /
+/// `refresh_params` are additions (reserved protocol keys refused), and the
+/// one placeholder allowed is `{state}` in token_params only.
+#[test]
+fn oauth2_token_knobs_are_checked() {
+    // token_auth: post or basic, nothing else.
+    ok(&format!("{ACME_OAUTH}token_auth = \"basic\"\n"));
+    ok(&format!("{ACME_OAUTH}token_auth = \"post\"\n"));
+    let e = rejected(&format!("{ACME_OAUTH}token_auth = \"header\"\n"));
+    assert!(mentions(&e, "token_auth 'header' is unknown"), "{e:?}");
+
+    // token_params: additions ok, {state} ok, reserved and other placeholders refused.
+    ok(&format!(
+        "{ACME_OAUTH}[auth.token_params]\necho_state = \"{{state}}\"\naudience = \"api\"\n"
+    ));
+    for reserved in [
+        "grant_type",
+        "code",
+        "code_verifier",
+        "client_id",
+        "client_secret",
+        "redirect_uri",
+    ] {
+        let e = rejected(&format!(
+            "{ACME_OAUTH}[auth.token_params]\n{reserved} = \"x\"\n"
+        ));
+        assert!(
+            mentions(&e, &format!("token_params may not set the reserved param '{reserved}'")),
+            "{e:?}"
+        );
+    }
+    let e = rejected(&format!(
+        "{ACME_OAUTH}[auth.token_params]\necho = \"{{code}}\"\n"
+    ));
+    assert!(
+        mentions(&e, "token_params 'echo' uses a placeholder other than {state}"),
+        "{e:?}"
+    );
+    let e = rejected(&format!(
+        "{ACME_OAUTH}[auth.token_params]\necho = \"{{state}} and {{more}}\"\n"
+    ));
+    assert!(mentions(&e, "placeholder other than {state}"), "{e:?}");
+
+    // refresh_params: additions ok, reserved refused, NO placeholders (there
+    // is no consent state at refresh time).
+    ok(&format!(
+        "{ACME_OAUTH}[auth.refresh_params]\naudience = \"api\"\n"
+    ));
+    for reserved in ["grant_type", "refresh_token", "client_id", "client_secret"] {
+        let e = rejected(&format!(
+            "{ACME_OAUTH}[auth.refresh_params]\n{reserved} = \"x\"\n"
+        ));
+        assert!(
+            mentions(&e, &format!("refresh_params may not set the reserved param '{reserved}'")),
+            "{e:?}"
+        );
+    }
+    let e = rejected(&format!(
+        "{ACME_OAUTH}[auth.refresh_params]\necho = \"{{state}}\"\n"
+    ));
+    assert!(
+        mentions(&e, "refresh_params 'echo' uses a placeholder; refresh values are static"),
+        "{e:?}"
+    );
+}
+
 #[test]
 fn rejects_tool_named_and_v3_sections() {
     let e = rejected(&format!("{}\n[git]\nhelper = \"x\"\n", GITHUB));

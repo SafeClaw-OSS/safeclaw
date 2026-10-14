@@ -39,7 +39,7 @@ use std::sync::Arc;
 use serde::{de::DeserializeOwned, Serialize};
 use sudp::state::ProtectedState;
 
-use crate::auth::oauth2::{ExchangedTokens, OAuthStyle};
+use crate::auth::oauth2::{ExchangedTokens, OAuthStyle, TokenAuth};
 use crate::state::AppState;
 use crate::storage::plaintext::{secret_key_for, suggested_secret_key, Connecting, Connection};
 use crate::storage::sealed_vault::{ReconcileBase, ViewBase};
@@ -52,6 +52,13 @@ pub struct ExchangeConfig {
     pub client_id: String,
     pub client_secret: Option<String>,
     pub style: OAuthStyle,
+    /// How the client authenticates at the token endpoint (`[auth]
+    /// token_auth`): in the body, or an `Authorization: Basic` header.
+    pub token_auth: TokenAuth,
+    /// The def's extra exchange-body params (`[auth.token_params]`), raw —
+    /// the `{state}` placeholder is substituted at exchange time from the
+    /// pending connect's consent state.
+    pub token_params: std::collections::HashMap<String, String>,
     /// The OAuth client's fixed redirect_uri (provider config), echoed at the
     /// token call so it matches the browser's consent request.
     pub redirect_uri: String,
@@ -107,6 +114,8 @@ pub fn resolve_exchange_config(
         client_id,
         client_secret: resolved.client_secret,
         style,
+        token_auth: services.token_auth(oauth),
+        token_params: oauth.token_params.clone(),
         redirect_uri: resolved.redirect_uri,
         secret_role,
         id_token_role: oauth.id_token.clone(),
@@ -665,6 +674,13 @@ pub(crate) async fn apply_pending_connects(
             if state.was_code_redeemed(&p.oauth2.code) {
                 return Err(ALREADY_REDEEMED.to_string());
             }
+            // The def's token_params, the `{state}` placeholder filled from
+            // THIS pending connect's consent state. A def that asks for it
+            // when the entry has none fails here, with why.
+            let extra = crate::auth::oauth2::render_extra_params(
+                &cfg.token_params,
+                p.oauth2.state.as_deref(),
+            )?;
             let out = crate::auth::oauth2::exchange_code(
                 &cfg.token_url,
                 &cfg.client_id,
@@ -673,6 +689,8 @@ pub(crate) async fn apply_pending_connects(
                 &p.oauth2.code_verifier,
                 &cfg.redirect_uri,
                 cfg.style,
+                cfg.token_auth,
+                &extra,
             )
             .await;
             if out.is_ok() {
@@ -1202,6 +1220,8 @@ mod tests {
             client_id: "client".into(),
             client_secret: None,
             style: OAuthStyle::Form,
+            token_auth: TokenAuth::Post,
+            token_params: Default::default(),
             redirect_uri: "http://127.0.0.1:8765/cb".into(),
             secret_role: role.to_string(),
             id_token_role: None,

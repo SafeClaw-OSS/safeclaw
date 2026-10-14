@@ -111,7 +111,7 @@ secrets = ["GITHUB_TOKEN"]
 
 That is a complete service. An optional top-level `setup = """…"""` string
 (sibling of `[service]`, not inside it) carries agent-facing setup notes. Add
-`[oauth2]` only if the service mints tokens.
+`[auth]` only if the service mints tokens.
 
 ### `hosts`
 
@@ -129,13 +129,13 @@ The only destinations this service's secrets may ever be sent to.
 ### `secrets`
 
 The durable stored keys a connection of this type holds. Keys are `[A-Z0-9_]`
-and are the same list for **every** service — an `[oauth2]` service lists its
-refresh-token key here too (whatever `[oauth2].refresh_token` names). Presence of
+and are the same list for **every** service — an OAuth2 service lists its
+refresh-token key here too (whatever `[auth].refresh_token` names). Presence of
 all of them is what makes a connection "connected".
 
 - **The injectable rule (uniform):** a connection's phantoms resolve to what its
   *production* PRODUCES. No section = pass-through: the products are the declared
-  `secrets` themselves. A production section (`[oauth2]`; future `[sigv4]`-class)
+  `secrets` themselves. A production section (`[auth]`; future `[sigv4]`-class)
   makes its OUTPUT the injectable and marks every secret its fields name (e.g.
   `refresh_token = "…"`) as a production INPUT — stored, never injectable
   (the proxy answers such a phantom with an explicit `403 refresh_forbidden`).
@@ -173,7 +173,7 @@ fetches a secret from it, and it never participates in routing or policy.
 Must be `http(s)` when present — it is rendered as a link, so the validator
 rejects non-web schemes.
 
-### `[oauth2]`
+### `[auth] type = "oauth2"`
 
 Declare only when the service authenticates with minted OAuth2 access tokens.
 
@@ -182,7 +182,8 @@ Declare only when the service authenticates with minted OAuth2 access tokens.
 # …
 secrets = ["GMAIL_REFRESH_TOKEN"]   # the refresh key is listed here too (uniform `secrets`)
 
-[oauth2]
+[auth]
+type = "oauth2"
 provider = "google"                 # display label only ("Connect with Google")
 scopes   = ["https://www.googleapis.com/auth/gmail.send"]
 refresh_token = "GMAIL_REFRESH_TOKEN"  # RFC 6749 field name → the vault secret KEY the
@@ -193,11 +194,37 @@ pkce              = true
 client_id         = "499410884315-…apps.googleusercontent.com"  # PUBLIC client, inline
 # client_secret only for a non-confidential PUBLIC client (by convention,
 # review-enforced; no client_type field). No provider-template layer; every
-# [oauth2] is inline-complete.
+# [auth] oauth2 section is inline-complete.
 # id_token = "GMAIL_ID_TOKEN"       # only when the provider returns a stored OIDC id token
 # exposes = ["account_id"]          # optional extra derived values →
                                     #   __sc__<conn>__account_id__
 ```
+
+Token-endpoint knobs, all optional:
+
+```toml
+[auth]
+# ...
+oauth_style = "form"               # /token body style: form (default) or json
+token_auth  = "post"               # client auth at /token: post (default: client_id
+                                   #   and client_secret in the body) or basic
+                                   #   (Authorization: Basic client_id:client_secret,
+                                   #   RFC 6749 2.3.1, and neither in the body)
+
+[auth.token_params]                # extra params merged into the code-exchange body
+echo_state = "{state}"             #   {state} = the consent state of this connect;
+                                   #   the ONLY placeholder (any other {...} is refused)
+
+[auth.refresh_params]              # extra params merged into the refresh body
+audience = "api"                   #   static values only (no placeholders: there is
+                                   #   no consent state at refresh time)
+```
+
+`token_params` / `refresh_params` are additions, never overrides: the protocol
+params (`grant_type`, `code`, `code_verifier`, `client_id`, `client_secret`,
+`redirect_uri`; for refresh `grant_type`, `refresh_token`, `client_id`,
+`client_secret`) are reserved and refused. Every token-endpoint call sends
+`Accept: application/json`.
 
 The phantom resolves to the minted access token. Token slots use RFC 6749
 response field names: `refresh_token` (required) maps the durable refresh token
@@ -231,7 +258,7 @@ Put the phantom where the pair goes:
 | query param | Gemini `?key=` | same |
 | token in URL path | telegram `/bot<token>/` | same |
 | Basic pair | github/gitlab git | same |
-| OAuth2 mint | gmail; openai-codex (`exposes`) | + `[oauth2]` |
+| OAuth2 mint | gmail; openai-codex (`exposes`) | + `[auth]` |
 
 ## Out of scope
 

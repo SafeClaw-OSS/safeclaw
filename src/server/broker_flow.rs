@@ -238,6 +238,11 @@ pub async fn resolve_auth_value(
         ))
     })?;
     let style = state.services.oauth_style(&oauth);
+    let token_auth = state.services.token_auth(&oauth);
+    // The def's refresh_params are static (the validator refused
+    // placeholders: there is no consent state at refresh time).
+    let extra = crate::auth::oauth2::render_extra_params(&oauth.refresh_params, None)
+        .map_err(AppError::Internal)?;
 
     let (access_token, expires_at, rotated_refresh) = crate::auth::oauth2::perform_refresh(
         token_url,
@@ -245,6 +250,8 @@ pub async fn resolve_auth_value(
         client_secret.as_deref(),
         refresh_token_str,
         style,
+        token_auth,
+        &extra,
     )
     .await
     .map_err(|e| {

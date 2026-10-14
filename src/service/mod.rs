@@ -359,6 +359,26 @@ pub struct OAuth2Def {
     /// by the validator — these are ADDITIONS, never overrides.
     #[serde(default)]
     pub authorize_params: HashMap<String, String>,
+    /// Extra params merged into the authorization_code exchange body (both
+    /// form and json styles). The one placeholder a value may use is the
+    /// literal `{state}`, replaced at exchange time with the consent `state`
+    /// of the pending connect (a provider that echoes the consent state in
+    /// the token body). Reserved protocol params (grant_type, code,
+    /// code_verifier, client_id, client_secret, redirect_uri) are rejected by
+    /// the validator — ADDITIONS, never overrides.
+    #[serde(default)]
+    pub token_params: HashMap<String, String>,
+    /// Extra params merged into the refresh body. Static values only (no
+    /// placeholders — there is no consent state at refresh time). Reserved:
+    /// grant_type, refresh_token, client_id, client_secret.
+    #[serde(default)]
+    pub refresh_params: HashMap<String, String>,
+    /// How the client authenticates at the token endpoint: `post` (default:
+    /// client_id and client_secret in the body) or `basic`
+    /// (`Authorization: Basic client_id:client_secret`, RFC 6749 §2.3.1, and
+    /// neither in the body — the style some providers require).
+    #[serde(default)]
+    pub token_auth: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -1141,6 +1161,15 @@ impl ServiceRegistry {
         }
     }
 
+    /// How the client authenticates at the token endpoint: `token_auth`,
+    /// defaulting to `post`.
+    pub fn token_auth(&self, oauth: &OAuth2Def) -> crate::auth::oauth2::TokenAuth {
+        match oauth.token_auth.as_deref() {
+            Some("basic") => crate::auth::oauth2::TokenAuth::Basic,
+            _ => crate::auth::oauth2::TokenAuth::Post,
+        }
+    }
+
     /// A service's `[oauth2]` client/endpoint config with the defaults applied
     /// (loopback redirect_uri). A missing field is `None` (caller decides
     /// whether it's fatal).
@@ -1791,6 +1820,9 @@ secrets = ["GITHUB_TOKEN"]
             redirect_uri: None,
             oauth_style: style.map(|s| s.to_string()),
             authorize_params: HashMap::new(),
+            token_params: HashMap::new(),
+            refresh_params: HashMap::new(),
+            token_auth: None,
         };
         assert!(matches!(r.oauth_style(&oauth(None)), OAuthStyle::Form));
         assert!(matches!(

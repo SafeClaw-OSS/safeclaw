@@ -53,6 +53,26 @@ const RESERVED_AUTHORIZE_PARAMS: &[&str] = &[
     "code_challenge_method",
 ];
 
+/// Exchange-body params the authorization_code flow itself controls; a
+/// `token_params` map may never set these.
+const RESERVED_TOKEN_PARAMS: &[&str] = &[
+    "grant_type",
+    "code",
+    "code_verifier",
+    "client_id",
+    "client_secret",
+    "redirect_uri",
+];
+
+/// Refresh-body params the flow itself controls; a `refresh_params` map may
+/// never set these.
+const RESERVED_REFRESH_PARAMS: &[&str] = &[
+    "grant_type",
+    "refresh_token",
+    "client_id",
+    "client_secret",
+];
+
 // ── Raw (untrusted) shapes: serde targets that only the gate reads ──────────
 
 /// service.toml as written. `deny_unknown_fields` rejects stale v3 sections
@@ -646,6 +666,14 @@ fn check_oauth2(
             ));
         }
     }
+    if let Some(auth) = &o.token_auth {
+        if auth != "post" && auth != "basic" {
+            errs.push(format!(
+                "[auth] token_auth '{}' is unknown (\"post\" or \"basic\")",
+                auth
+            ));
+        }
+    }
     check_count("[auth] scopes", o.scopes.len(), MAX_OAUTH_SCOPES, errs);
     if o.scopes.iter().any(|sc| sc.trim().is_empty()) {
         errs.push("[auth] scopes has an empty entry".into());
@@ -690,6 +718,26 @@ fn check_oauth2(
             ));
         }
     }
+    // token_params / refresh_params are ADDITIONS to the token-endpoint
+    // bodies, same discipline. The one placeholder a token_params value may
+    // use is the literal `{state}` (filled at exchange time from the pending
+    // connect); any other `{...}` is refused — predictable over clever. A
+    // refresh_params value is static: there is no consent state at refresh
+    // time.
+    check_extra_params(
+        "token_params",
+        &o.token_params,
+        RESERVED_TOKEN_PARAMS,
+        true,
+        errs,
+    );
+    check_extra_params(
+        "refresh_params",
+        &o.refresh_params,
+        RESERVED_REFRESH_PARAMS,
+        false,
+        errs,
+    );
     // Durable token slots use RFC 6749 field names; each is a valid env KEY
     // that is ALSO declared in the top-level `secrets` (the uniform
     // durable-credential contract, SERVICES.md §3).
@@ -732,6 +780,56 @@ fn check_oauth2(
                 "[auth] exposes entry '{}' collides with a secret role",
                 e
             ));
+        }
+    }
+}
+
+/// Check one extra-params map of the token endpoint (`[auth.token_params]` /
+/// `[auth.refresh_params]`): the count cap, the flow's `reserved` keys, and
+/// the placeholder rule — with `state_ok` a value may use the literal
+/// `{state}` (any number of times); everything else between braces, and any
+/// stray brace, is refused.
+fn check_extra_params(
+    which: &str,
+    params: &std::collections::HashMap<String, String>,
+    reserved: &[&str],
+    state_ok: bool,
+    errs: &mut Vec<String>,
+) {
+    let ok = check_count(
+        &format!("[auth.{}]", which),
+        params.len(),
+        MAX_AUTHORIZE_PARAMS,
+        errs,
+    );
+    let mut keys: Vec<&String> = params.keys().filter(|_| ok).collect();
+    keys.sort();
+    for k in keys {
+        if reserved.contains(&k.as_str()) {
+            errs.push(format!(
+                "[auth] {} may not set the reserved param '{}'",
+                which, k
+            ));
+            continue;
+        }
+        let v = &params[k];
+        let stripped = if state_ok {
+            v.replace(crate::auth::oauth2::STATE_PLACEHOLDER, "")
+        } else {
+            v.clone()
+        };
+        if stripped.contains('{') || stripped.contains('}') {
+            errs.push(if state_ok {
+                format!(
+                    "[auth] {} '{}' uses a placeholder other than {{state}}",
+                    which, k
+                )
+            } else {
+                format!(
+                    "[auth] {} '{}' uses a placeholder; refresh values are static",
+                    which, k
+                )
+            });
         }
     }
 }
