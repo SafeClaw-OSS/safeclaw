@@ -3569,22 +3569,29 @@ mod tests {
             AppError::BatchVerify(_)
         ));
 
-        // Lifecycle / high-consequence sibling — the consent boundary.
-        let custom_id = {
-            let mut s = state.approvals.lock().unwrap();
-            let mut op = use_op("v1", "/x");
-            op.act.kind = ActType::Custom("vault-delete".into());
-            s.create("v1".into(), op, b64r(9))
-        };
-        let g = batch_grant(
-            use_op("v1", "/r/0"),
-            &b64r(0),
-            vec![ids[0].clone(), custom_id],
-        );
-        assert!(matches!(
-            batch_expected_challenge(&state, &ids[0], "v1", &g).unwrap_err(),
-            AppError::BatchVerify(_)
-        ));
+        // Lifecycle / high-consequence siblings — the consent boundary. Every
+        // Custom act keeps the per-op ceremony: a batch carries only `use`
+        // and `export`, so the console must never plan these kinds into an
+        // envelope at ANY daemon version (there is no version with the arm).
+        for kind in ["vault-delete", "vault-unlock", "widen-host", "secret-rm"] {
+            let custom_id = {
+                let mut s = state.approvals.lock().unwrap();
+                let mut op = use_op("v1", "/x");
+                op.act.kind = ActType::Custom(kind.into());
+                s.create("v1".into(), op, b64r(9))
+            };
+            let g = batch_grant(
+                use_op("v1", "/r/0"),
+                &b64r(0),
+                vec![ids[0].clone(), custom_id],
+            );
+            match batch_expected_challenge(&state, &ids[0], "v1", &g).unwrap_err() {
+                AppError::BatchVerify(m) => {
+                    assert!(m.contains("only `use` and `export`"), "{kind}: {m}")
+                }
+                other => panic!("{kind}: {other}"),
+            }
+        }
 
         // Export joins the batch arm (design/approvals-inbox.md D2, behind E1).
         let export_id = {
