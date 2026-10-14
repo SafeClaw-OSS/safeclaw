@@ -415,6 +415,10 @@ pub(crate) async fn pull_items_now(state: &Arc<AppState>, vault_id: &str) -> Res
     let lock = StoreLock::Take(state);
     if pull_items(&state.config.state_dir, cloud, vault_id, &dk, key, lock).await? > 0 {
         refresh_after_item_pull(state, vault_id);
+    } else {
+        // Nothing adopted, but a request a racing pull adopted (or one whose
+        // op resolved here) may still be waiting: re-check on every sync.
+        crate::server::handlers::service_ops::requests::after_sync(state, vault_id);
     }
     Ok(())
 }
@@ -2569,6 +2573,11 @@ async fn pull_and_process(
     if keys_pulled {
         confirm_unreadable_after_refresh(state, vault).await;
     }
+    // The console's install requests ride the same wake, whatever the pull
+    // adopted (a wake for an already-adopted row, or for an op that just
+    // resolved, still has a request to claim, finish or remove): a console
+    // Install is picked up within the wake, not on the next periodic tick.
+    crate::server::handlers::service_ops::requests::after_sync(state, vault);
     crate::auth::connect::process_vault_connects(state, vault, None).await;
     tracing::debug!(vault = %vault, channel = channel, "cloud sync watch: wake processed");
     ok
@@ -4648,6 +4657,9 @@ pub async fn push_items_best_effort(state: &Arc<AppState>, vault_id: &str) {
     if content_changed {
         refresh_after_item_pull(state, vault_id);
     }
+    // A push completing is a sync completing: an install request whose op
+    // just applied (this push carried the definitions) is removed now.
+    crate::server::handlers::service_ops::requests::after_sync(state, vault_id);
     tracing::debug!(
         vault = %vault_id, left_dirty, endpoint_missing,
         "per-item push: dirty items pushed"
