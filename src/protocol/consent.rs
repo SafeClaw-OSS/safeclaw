@@ -115,7 +115,9 @@ pub fn consent_for(op: &Operation) -> Option<RenderedConsent> {
         .collect();
     Some(RenderedConsent {
         action: interpolate_op(&desc.action, op),
-        explain: desc.explain.clone(),
+        // The explain carries {{vars}} templates too (widen-host names the
+        // connection and host in its consequence sentence).
+        explain: interpolate_op(&desc.explain, op),
         tone: desc.tone.clone(),
         facts,
     })
@@ -438,6 +440,23 @@ mod tests {
         let mut widen = op("widen-host", "github", json!({ "host": "uploads.github.com" }));
         stamp_tone(&mut widen);
         assert_eq!(widen.act.scope["tone"], json!("warn"));
+    }
+
+    /// The consequence sentence interpolates over the signed op like the
+    /// action line: a templated explain never shows literal braces.
+    #[test]
+    fn explain_interpolates_over_the_signed_op() {
+        let c = consent_for(&op(
+            "widen-host",
+            "",
+            json!({ "connection_id": "github", "host": "uploads.github.com" }),
+        ))
+        .unwrap();
+        assert_eq!(
+            c.explain,
+            "github's credential can be sent to uploads.github.com from now on, without asking, until you remove it."
+        );
+        assert!(!c.explain.contains("{{"), "{}", c.explain);
     }
 
     #[test]
