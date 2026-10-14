@@ -57,11 +57,14 @@ pub fn is_hop_by_hop(name_lc: &str) -> bool {
 pub fn register_pending_use(
     state: &Arc<AppState>,
     vault_id: &str,
-    op: Operation,
+    mut op: Operation,
     policy_context: Option<crate::approval::PolicyContext>,
     ip: IpAddr,
     agent_prefix: Option<String>,
 ) -> Result<(String, String, u64)> {
+    // The consequence tier rides the signed op like every other mint (a
+    // time-window use is "warn", a one-shot one "neutral").
+    crate::protocol::consent::stamp_tone(&mut op);
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())

@@ -39,9 +39,10 @@ pub struct ActConsent {
     pub explain: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub explain_zh: Option<String>,
-    /// "neutral" | "info" | "danger". Advisory styling AND the batch gate: a
-    /// danger act is confirmed alone, never batched; anything else is
-    /// batchable. Upward-only: a client's built-in danger floor for an act
+    /// The consequence tier: "neutral" (one-shot or reversible) | "warn"
+    /// (persistent or irrevocable, amber, still batchable) | "danger"
+    /// (destruction, red, confirmed alone, never batched). Styling AND the
+    /// batch gate. Upward-only: a client's built-in danger floor for an act
     /// kind can never be downgraded.
     #[serde(default = "default_tone")]
     pub tone: String,
@@ -120,16 +121,31 @@ pub fn consent_for(op: &Operation) -> Option<RenderedConsent> {
     })
 }
 
-/// Stamp the act's descriptor tone into the signed scope at op creation
+/// Stamp the op's consequence tier into the signed scope at op creation
 /// (`scope.tone`), over anything the requester sent there: tone is the batch
 /// gate (a danger act is confirmed alone, never batched), so the console must
-/// read it from daemon-authored, signed material, never a requester field. An
-/// act without a descriptor gets none (a requester-supplied value is
-/// removed); clients keep their own upward-only danger floor for the acts
-/// they know.
+/// read it from daemon-authored, signed material, never a requester field.
+///
+/// A Custom act carries its descriptor's tone. The two built-ins carry their
+/// variant: a `use` scoped to a time window is "warn" (approving grants every
+/// asking request for that window, writes included) while a one-shot use is
+/// "neutral"; an `export` with no recipient binding is "warn" (a handover:
+/// the plaintext reaches the requester and cannot be taken back) while one
+/// sealed to a recipient is "neutral". Anything else gets none (a
+/// requester-supplied value is removed); clients keep their own upward-only
+/// danger floor for the acts they know.
 pub fn stamp_tone(op: &mut Operation) {
+    let variant = |warn: bool| Some(if warn { "warn" } else { "neutral" }.to_string());
     let tone = match &op.act.kind {
         ActType::Custom(name) => act_catalog().get(name.as_str()).map(|d| d.tone.clone()),
+        ActType::Use => variant(
+            op.act
+                .scope
+                .get("window_s")
+                .and_then(|v| v.as_u64())
+                .is_some_and(|w| w > 0),
+        ),
+        ActType::Export => variant(op.bind.recipient.is_none()),
         _ => None,
     };
     if op.act.scope.is_null() && tone.is_some() {
@@ -314,26 +330,31 @@ mod tests {
         assert!(c.facts.iter().any(|(l, v)| l == "Source" && v == "local folder mine"));
     }
 
-    /// Tone is one knob for two things: advisory styling AND the batch gate
-    /// (danger = confirmed alone, never batched). Only vault-delete is
-    /// danger; routine install/remove acts are neutral, and the rendered
-    /// consent carries the tone so every surface reads the stamped material.
+    /// Tone is the consequence tier: neutral (one-shot or reversible), warn
+    /// (persistent or irrevocable, batchable) or danger (destruction,
+    /// confirmed alone). Only vault-delete is danger, only widen-host is
+    /// warn (its grant is forever), installs and removals are routine, and
+    /// the rendered consent carries the tone so every surface reads the
+    /// stamped material.
     #[test]
     fn only_vault_delete_is_danger() {
         let acts = act_catalog();
-        let danger: Vec<&str> = acts
-            .iter()
-            .filter(|(_, a)| a.tone == "danger")
-            .map(|(name, _)| name.as_str())
-            .collect();
-        assert_eq!(danger, ["vault-delete"]);
-        for name in [
-            "widen-host",
-            "service-add",
-            "service-rm",
-            "secret-rm",
-            "connection-rm",
-        ] {
+        for (name, a) in acts.iter() {
+            assert!(
+                ["neutral", "warn", "danger"].contains(&a.tone.as_str()),
+                "{name}: {}",
+                a.tone
+            );
+        }
+        let of = |tone: &str| -> Vec<&str> {
+            acts.iter()
+                .filter(|(_, a)| a.tone == tone)
+                .map(|(name, _)| name.as_str())
+                .collect()
+        };
+        assert_eq!(of("danger"), ["vault-delete"]);
+        assert_eq!(of("warn"), ["widen-host"]);
+        for name in ["service-add", "service-rm", "secret-rm", "connection-rm"] {
             assert_eq!(acts[name].tone, "neutral", "{name}");
         }
         // The wire forms carry it: the catalog descriptor (registry `acts`)
@@ -354,9 +375,57 @@ mod tests {
         assert_eq!(c.tone, "neutral");
     }
 
+    /// The two built-ins stamp their variant: a use scoped to a time window
+    /// is warn, a one-shot use neutral; an export with no recipient binding
+    /// (a handover) is warn, one sealed to a recipient neutral.
+    #[test]
+    fn use_and_export_stamp_their_variant_tone() {
+        let built_in = |kind: ActType, scope: serde_json::Value, sealed: bool| {
+            let mut o = Operation {
+                act: Act {
+                    kind,
+                    target: "t".into(),
+                    scope,
+                },
+                bind: Bind {
+                    redeemer: "v1".into(),
+                    recipient: sealed.then(|| crate::protocol::RecipientPk {
+                        alg: "hpke-p256-sha256-aes128gcm".into(),
+                        bytes: "cGs".into(),
+                    }),
+                },
+                valid: Valid::single_use(0, Some(300)),
+            };
+            stamp_tone(&mut o);
+            o.act.scope.get("tone").cloned()
+        };
+        let windowed = json!({ "level": "ask", "reuse": "floor", "window_s": 900 });
+        assert_eq!(
+            built_in(ActType::Use, windowed, false),
+            Some(json!("warn")),
+            "a time-window use grants more than this one request"
+        );
+        let once = json!({ "level": "ask-always", "reuse": "none", "tone": "neutral" });
+        assert_eq!(
+            built_in(ActType::Use, once, false),
+            Some(json!("neutral")),
+            "a one-shot use lets exactly one request through"
+        );
+        assert_eq!(
+            built_in(ActType::Export, json!({}), false),
+            Some(json!("warn")),
+            "a handover cannot be taken back"
+        );
+        assert_eq!(
+            built_in(ActType::Export, json!({}), true),
+            Some(json!("neutral")),
+            "sealed to a recipient: no plaintext handover"
+        );
+    }
+
     /// Op creation stamps the descriptor's tone into the signed scope, over
-    /// anything the requester sent; a table-less act (or a non-custom one)
-    /// carries none, whatever the requester claimed.
+    /// anything the requester sent; a table-less act carries none, whatever
+    /// the requester claimed.
     #[test]
     fn op_creation_stamps_the_tone_into_the_signed_scope() {
         let mut del = op("vault-delete", "v1", serde_json::Value::Null);
@@ -373,20 +442,9 @@ mod tests {
         let mut unknown = op("frobnicate", "x", json!({ "tone": "neutral" }));
         stamp_tone(&mut unknown);
         assert!(unknown.act.scope.get("tone").is_none(), "no descriptor, no tone");
-        let mut export = Operation {
-            act: Act {
-                kind: ActType::Export,
-                target: "K".into(),
-                scope: json!({ "tone": "neutral" }),
-            },
-            bind: Bind {
-                redeemer: "v1".into(),
-                recipient: None,
-            },
-            valid: Valid::single_use(0, Some(300)),
-        };
-        stamp_tone(&mut export);
-        assert!(export.act.scope.get("tone").is_none());
+        let mut widen = op("widen-host", "github", json!({ "host": "uploads.github.com" }));
+        stamp_tone(&mut widen);
+        assert_eq!(widen.act.scope["tone"], json!("warn"));
     }
 
     #[test]
