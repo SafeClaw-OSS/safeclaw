@@ -355,67 +355,49 @@ fn loosened(id: &str, o: &DefSummary, n: &DefSummary, out: &mut Vec<String>) {
 
 // ── service-add ──────────────────────────────────────────────────────────────
 
-/// How the daemon established where a `service-add`'s definitions come from,
-/// stamped on the card (`source_check`) at op creation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SourceCheck {
-    /// On this device: the GitHub source's ref is at its pinned commit, and
-    /// that commit, fetched again, holds the request's definitions.
-    Fetched,
-    /// A local folder: only the requester read it.
-    LocalFolder,
-    /// GitHub did not answer to check it (no response arrived).
-    NotReached,
-    /// The ref is no branch or tag of the repository (a commit id, any other
-    /// ref): only the head of one of its own branches or tags is checked.
-    NotBranchOrTag,
-}
+/// The most definition text a `service-add` card carries
+/// ([`definitions_text`]).
+pub const MAX_CARD_DEFINITIONS_BYTES: usize = 64 * 1024;
 
-impl SourceCheck {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            SourceCheck::Fetched => "fetched",
-            SourceCheck::LocalFolder => "local",
-            SourceCheck::NotReached => "not-reached",
-            SourceCheck::NotBranchOrTag => "not-branch-or-tag",
+/// The line that ends definition text cut at [`MAX_CARD_DEFINITIONS_BYTES`].
+pub const TRUNCATED_LINE: &str = "… (truncated)";
+
+/// The definition text a `service-add` approves, as one string: for each
+/// service in id order `# <id> service.toml` and its text, then, when it has
+/// one, `# <id> policy.toml` and its text. Characters a terminal acts on are
+/// escaped ([`crate::util::terminal_safe`]); past
+/// [`MAX_CARD_DEFINITIONS_BYTES`] it is cut at a character boundary and ends
+/// with [`TRUNCATED_LINE`].
+pub fn definitions_text(defs: &BTreeMap<String, (String, Option<String>)>) -> String {
+    use crate::util::terminal_safe;
+    let mut out = String::new();
+    for (id, (svc, pol)) in defs {
+        let id = terminal_safe(id);
+        out.push_str(&format!("# {} service.toml\n{}\n", id, terminal_safe(svc)));
+        if let Some(p) = pol {
+            out.push_str(&format!("# {} policy.toml\n{}\n", id, terminal_safe(p)));
         }
     }
-
-    pub fn parse(s: &str) -> Option<Self> {
-        [
-            SourceCheck::Fetched,
-            SourceCheck::LocalFolder,
-            SourceCheck::NotReached,
-            SourceCheck::NotBranchOrTag,
-        ]
-        .into_iter()
-        .find(|c| c.as_str() == s)
+    if out.len() <= MAX_CARD_DEFINITIONS_BYTES {
+        return out;
     }
-
-    /// The card's source line (with its ref and commit): "verified on this
-    /// device" only when this device checked it (the ref's head is at this
-    /// commit and the definitions match), otherwise "unverified" with the
-    /// reason where one helps.
-    pub fn source_line(self, source: &ServiceSource) -> String {
-        match self {
-            SourceCheck::Fetched => format!("{}, verified on this device", source.display()),
-            SourceCheck::LocalFolder => format!("{}, unverified", source.display()),
-            SourceCheck::NotReached => {
-                format!("{}, unverified (GitHub did not respond)", source.display())
-            }
-            SourceCheck::NotBranchOrTag => format!(
-                "{}, unverified (pin a branch or tag to verify)",
-                source.display()
-            ),
-        }
+    let mut cut = MAX_CARD_DEFINITIONS_BYTES - TRUNCATED_LINE.len() - 2;
+    while !out.is_char_boundary(cut) {
+        cut -= 1;
     }
+    out.truncate(cut);
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(TRUNCATED_LINE);
+    out.push('\n');
+    out
 }
 
 /// The `service-add` card. Fields (all present, possibly empty):
 /// - `ids`: the services this approval stores, sorted.
-/// - `from`: the source and its pinned commit, as a fact when this device
-///   fetched it again, else as the requester stated it
-///   ([`SourceCheck::source_line`]); `source_check` says which.
+/// - `from`: the source ([`ServiceSource::display`]).
+/// - `definitions`: the definition text approved ([`definitions_text`]).
 /// - `destinations`: every host that receives their credentials or OAuth
 ///   artifacts.
 /// - `oauth`: OAuth flows without PKCE (`<id>: PKCE: off`).
@@ -432,7 +414,7 @@ impl SourceCheck {
 pub struct AddCard {
     pub ids: Vec<String>,
     pub from: String,
-    pub source_check: SourceCheck,
+    pub definitions: String,
     pub destinations: Vec<String>,
     pub oauth: Vec<String>,
     pub tightens: Vec<String>,
@@ -476,7 +458,7 @@ impl AddCard {
             o.insert((*k).into(), json!(v));
         }
         o.insert("from".into(), json!(self.from));
-        o.insert("source_check".into(), json!(self.source_check.as_str()));
+        o.insert("definitions".into(), json!(self.definitions));
         Ok(())
     }
 
@@ -490,8 +472,8 @@ impl AddCard {
         if scope.get("from") != Some(&json!(self.from)) {
             return Some("from");
         }
-        if scope.get("source_check") != Some(&json!(self.source_check.as_str())) {
-            return Some("source_check");
+        if scope.get("definitions") != Some(&json!(self.definitions)) {
+            return Some("definitions");
         }
         None
     }
@@ -511,15 +493,15 @@ pub fn stored_from<'a>(
         .collect()
 }
 
-/// The card for storing `snapshot` (service id → admitted definition) from
-/// `source` (established as `check` says) into a vault holding `current`, or
-/// why it cannot be stored: an id that is a built-in service, an id another
-/// source (or an entry added before sources) already holds, a source already
-/// added when this is not an update, or one not added when it is.
+/// The card for storing `snapshot` (service id → admitted definition, of
+/// the text `texts`) from `source` into a vault holding `current`, or why it
+/// cannot be stored: an id that is a built-in service, an id another source
+/// (or an entry added before sources) already holds, a source already added
+/// when this is not an update, or one not added when it is.
 pub fn add_card(
     snapshot: &BTreeMap<String, ServiceDef>,
+    texts: &BTreeMap<String, (String, Option<String>)>,
     source: &ServiceSource,
-    check: SourceCheck,
     update: bool,
     current: &BTreeMap<String, StoredService>,
     reg: &ServiceRegistry,
@@ -572,8 +554,8 @@ pub fn add_card(
         .collect();
     let mut card = AddCard {
         ids: snapshot.keys().cloned().collect(),
-        from: check.source_line(source),
-        source_check: check,
+        from: source.display(),
+        definitions: definitions_text(texts),
         destinations: Vec::new(),
         oauth: Vec::new(),
         tightens: Vec::new(),

@@ -1034,8 +1034,8 @@ pub fn canonical_rule_table() -> String {
 
 /// A body as compared and written, so the same content written by any client
 /// compares equal: a `service` entry in its object form `{service, policy?,
-/// source?}` (the plain-string form written before sources is `{service:
-/// <text>}`; a null `policy` / `source` is absent); an owner-config record
+/// source?, summary?}` (the plain-string form written before sources is
+/// `{service: <text>}`; a null `policy` / `source` / `summary` is absent); an owner-config record
 /// (`name` picks its type) as its typed value (an absent or null field and
 /// an unknown one are the same); a body that does not parse, and every other
 /// body, is itself.
@@ -1045,7 +1045,9 @@ pub fn normalized_body(ns: ItemNs, name: &str, body: &serde_json::Value) -> serd
             serde_json::Value::String(s) => serde_json::json!({ "service": s }),
             serde_json::Value::Object(o) => serde_json::Value::Object(
                 o.iter()
-                    .filter(|(k, v)| !(v.is_null() && matches!(k.as_str(), "policy" | "source")))
+                    .filter(|(k, v)| {
+                        !(v.is_null() && matches!(k.as_str(), "policy" | "source" | "summary"))
+                    })
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect(),
             ),

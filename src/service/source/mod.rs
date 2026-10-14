@@ -13,7 +13,6 @@
 //! gate for definition text. Nothing in this module trusts what it reads.
 
 pub mod card;
-pub mod checks;
 pub mod github;
 pub mod tar;
 
@@ -31,9 +30,10 @@ use crate::service::{gate, ServiceDef};
 /// Services in one source (36: the built-in catalog).
 pub const MAX_SOURCE_SERVICES: usize = 64;
 /// Definition text in one source, all files together. The op carrying it
-/// (JSON-escaped) must stay under the daemon's 256 KiB request limit (66 KB:
-/// the built-in catalog).
-pub const MAX_SOURCE_DEFINITION_BYTES: usize = 160 * 1024;
+/// and the card's copy of it (at most
+/// [`card::MAX_CARD_DEFINITIONS_BYTES`]), JSON-escaped, must stay under the
+/// daemon's 256 KiB request limit (66 KB: the built-in catalog).
+pub const MAX_SOURCE_DEFINITION_BYTES: usize = 112 * 1024;
 /// Compressed size of a GitHub tarball (1.7 MB: the core repository itself).
 pub const MAX_TARBALL_BYTES: usize = 16 * 1024 * 1024;
 /// Bytes a GitHub tarball may unpack to, read through and discarded except for
@@ -49,10 +49,8 @@ pub const MAX_TARBALL_ENTRIES: usize = 10_000;
 /// update` can re-fetch it. A local path is meaningless on another machine, so
 /// a local source keeps only the folder name.
 ///
-/// The stored record is data any member may write, so it carries no claim
-/// that the source was checked: that is a fact this device records for
-/// itself ([`checks`]). A `checked` field an older record carries is read and
-/// ignored.
+/// The stored record is data any member may write. A `checked` field an
+/// older record carries is read and ignored.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(
     tag = "kind",
@@ -67,8 +65,8 @@ pub enum ServiceSource {
         /// Sub-folder inside the repository, when the source is not its root.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         path: Option<String>,
-        /// The branch, tag or commit the user asked for; absent = the
-        /// repository's default branch at add time.
+        /// The branch or tag the user asked for; absent = the repository's
+        /// default branch at add time.
         #[serde(rename = "ref", default, skip_serializing_if = "Option::is_none")]
         git_ref: Option<String>,
         /// The full 40-hex commit the definitions were read at.
@@ -212,10 +210,13 @@ impl ServiceSource {
 }
 
 /// One `aux.services` value. Two stored shapes: the object
-/// `{ service, policy?, source? }` every new write uses, and the plain string
-/// written before sources existed, which reads as a service.toml with no
-/// policy and no source. The value is kept as written (so an entry nobody
-/// changes is never rewritten); [`StoredService::parts`] reads it.
+/// `{ service, policy?, source?, summary? }` every new write uses, and the
+/// plain string written before sources existed, which reads as a service.toml
+/// with no policy and no source. An entry with a source is *installed* (a
+/// third-party service, loaded only while the vault's owner allows them); one
+/// without (a console-authored definition, a plain string) is not. The value
+/// is kept as written (so an entry nobody changes is never rewritten);
+/// [`StoredService::parts`] reads it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct StoredService(serde_json::Value);
@@ -228,7 +229,46 @@ pub struct StoredParts {
     pub source: Option<ServiceSource>,
 }
 
+/// What an installed definition declares, as the gate admitted it at
+/// install: stored beside it for the console to display. Never read back by
+/// the daemon (an entry without one reads the same).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct InstallSummary {
+    pub name: String,
+    pub hosts: Vec<String>,
+    pub secrets: Vec<String>,
+    pub oauth: bool,
+}
+
+impl InstallSummary {
+    pub fn of(def: &ServiceDef) -> Self {
+        InstallSummary {
+            name: def.service.name.clone(),
+            hosts: def.service.hosts.clone(),
+            secrets: def.service.secrets.clone(),
+            oauth: def.oauth2().is_some(),
+        }
+    }
+}
+
 impl StoredService {
+    /// An installed entry: the object form with its source and the summary
+    /// of the admitted definition `def`.
+    pub fn installed(
+        service: String,
+        policy: Option<String>,
+        source: ServiceSource,
+        def: &ServiceDef,
+    ) -> Self {
+        let mut e = StoredService::new(service, policy, Some(source));
+        if let (serde_json::Value::Object(o), Ok(sum)) =
+            (&mut e.0, serde_json::to_value(InstallSummary::of(def)))
+        {
+            o.insert("summary".into(), sum);
+        }
+        e
+    }
+
     /// The object form every new write uses.
     pub fn new(service: String, policy: Option<String>, source: Option<ServiceSource>) -> Self {
         let mut o = serde_json::Map::new();
@@ -256,9 +296,10 @@ impl StoredService {
                 source: None,
             }),
             serde_json::Value::Object(o) => {
+                // `summary` is display data for the console, never read here.
                 if let Some(k) = o
                     .keys()
-                    .find(|k| !matches!(k.as_str(), "service" | "policy" | "source"))
+                    .find(|k| !matches!(k.as_str(), "service" | "policy" | "source" | "summary"))
                 {
                     return Err(format!(
                         "stored entry has an unknown field '{}'",
@@ -297,6 +338,14 @@ impl StoredService {
     /// The entry's source, when it has a readable one.
     pub fn source(&self) -> Option<ServiceSource> {
         self.parts().ok().and_then(|p| p.source)
+    }
+
+    /// An installed entry: stored with a source (one that does not read
+    /// counts: the entry is not trusted to be anything else).
+    pub fn is_installed(&self) -> bool {
+        self.0
+            .get("source")
+            .is_some_and(|v| !v.is_null())
     }
 
     /// Admit the stored entry through the gate under its storage key `id`.

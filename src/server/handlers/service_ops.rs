@@ -1,20 +1,22 @@
 //! The vault side of `sc service`: the `service-add` / `service-rm` acts and
 //! the `GET /v/{vid}/services` listing.
 //!
-//! `service-add` stores one source's definitions with one approval. The op
-//! carries `definitions` (`id → { service, policy? }`), the `source` record
-//! (with its pinned commit) and `update`; the daemon admits every definition
-//! through the gate, fetches a GitHub source again at its commit to check the
-//! definitions are what it holds, and stamps the card ([`card::AddCard`]:
-//! services, destinations, the rules that tighten, the source as checked or
-//! as stated, what an update replaces, removes, newly sends to or loosens)
-//! into the signed scope at op creation, and at apply re-admits, recomputes
-//! the card against the opened vault and refuses any difference.
+//! `service-add` installs one source's definitions with one approval. The op
+//! carries `defs` (`id → { service, policy? }`), the `source` record (with
+//! its pinned commit) and `update`; the daemon refuses it while the vault's
+//! owner has installed services off, admits every definition through the
+//! gate, fetches a GitHub source again at its commit (a branch or tag) and
+//! refuses unless the definitions are what it holds, and stamps the card
+//! ([`card::AddCard`]: services, destinations, the rules that tighten, the
+//! source, the definition text, what an update replaces, removes, newly sends
+//! to or loosens) into the signed scope at op creation, and at apply
+//! re-admits, recomputes the card against the opened vault and refuses any
+//! difference.
 //! `service-rm` removes one service or a whole source the same way
 //! ([`card::RmCard`]).
 //!
 //! Each definition is its own native `service` item (`ns = "service"`,
-//! `name` = the id, body `{ service, policy?, source? }`): a data record like
+//! `name` = the id, body `{ service, policy?, source?, summary? }`): a data record like
 //! a connection, sealed under `K`, unsigned, written by this process after the
 //! approved card on every vault ([`persist`]). The old single `services`
 //! record is owner-config, read only here; the fold takes
@@ -33,9 +35,7 @@ use axum::{
 use serde_json::{json, Value};
 
 use crate::error::{AppError, Result};
-use crate::service::source::card::SourceCheck;
 use crate::service::source::github::{self, GitHubApi};
-use crate::service::source::checks::{self, DeviceCheck, DeviceChecks};
 use crate::service::source::{
     card, ServiceSource, StoredService, MAX_SOURCE_DEFINITION_BYTES, MAX_SOURCE_SERVICES,
 };
@@ -58,9 +58,9 @@ pub(crate) struct AddRequest {
 /// untrusted text and the source names a repository.
 pub(crate) fn parse_add(scope: &Value) -> std::result::Result<AddRequest, String> {
     let defs_in = scope
-        .get("definitions")
+        .get("defs")
         .and_then(|v| v.as_object())
-        .ok_or("service-add scope.definitions (object) required")?;
+        .ok_or("service-add scope.defs (object) required")?;
     if defs_in.is_empty() || defs_in.len() > MAX_SOURCE_SERVICES {
         return Err(format!(
             "service-add carries 1 to {} definitions",
@@ -95,8 +95,7 @@ pub(crate) fn parse_add(scope: &Value) -> std::result::Result<AddRequest, String
             total, MAX_SOURCE_DEFINITION_BYTES
         ));
     }
-    // A `checked` claim in it is ignored: whether the source was checked is
-    // this daemon's own finding (the card's `source_check`).
+    // A `checked` claim in it is ignored.
     let source: ServiceSource = serde_json::from_value(
         scope
             .get("source")
@@ -159,16 +158,22 @@ pub(crate) fn connections_using<'a>(
     out
 }
 
-/// The unlocked session's stored entries and connection records.
-fn session(
-    state: &AppState,
-    vault_id: &str,
-) -> std::result::Result<(BTreeMap<String, StoredService>, HashMap<String, Connection>), String> {
+/// The unlocked session's stored entries and connection records, and the
+/// owner's switch for installed services.
+type Session = (
+    BTreeMap<String, StoredService>,
+    HashMap<String, Connection>,
+    bool,
+);
+
+fn session(state: &AppState, vault_id: &str) -> std::result::Result<Session, String> {
     let states = state.vault_states.lock().unwrap();
     match states.get(vault_id) {
-        Some(VaultState::Unlocked { cache, .. }) => {
-            Ok((cache.service_entries.clone(), cache.connections.clone()))
-        }
+        Some(VaultState::Unlocked { cache, .. }) => Ok((
+            cache.service_entries.clone(),
+            cache.connections.clone(),
+            cache.policy.allow_installed_services,
+        )),
         _ => Err(crate::error::VAULT_LOCKED_MSG.to_string()),
     }
 }
@@ -274,8 +279,7 @@ pub(crate) async fn migrate_legacy_after_unlock(state: Arc<AppState>, vault_id: 
 
 /// How long op creation waits for GitHub to check a source (the requester's
 /// own request times out at 15 s). Every GitHub read must be answered within
-/// it ([`source_check_api`]): no answer at all and the card says GitHub did
-/// not answer; an answer not read in full by then refuses the op.
+/// it ([`source_check_api`]), or the op is refused.
 const SOURCE_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// What the whole check may take beyond [`SOURCE_CHECK_TIMEOUT`] (reading
@@ -288,26 +292,31 @@ pub(crate) fn source_check_api() -> std::result::Result<github::GitHubHttp, Stri
     Ok(github::GitHubHttp::new()?.answering_by(tokio::time::Instant::now() + SOURCE_CHECK_TIMEOUT))
 }
 
-/// Op creation: admit the definitions, check where they come from (a GitHub
-/// source is fetched again through `api` at its pinned commit; definitions it
-/// does not hold refuse the op), compute the `service-add` card from the
-/// unlocked session and stamp it into the scope (over anything the requester
-/// sent in its fields).
+/// Op creation: refuse while the owner has installed services off, admit the
+/// definitions, check where they come from (a GitHub source is fetched again
+/// through `api` at its pinned commit; anything but the same definitions at
+/// the head of its branch or tag refuses the op), compute the `service-add`
+/// card from the unlocked session and stamp it into the scope (over anything
+/// the requester sent in its fields).
 pub(crate) async fn mint_add<A: GitHubApi>(
     state: &AppState,
     vault_id: &str,
     op: &mut crate::protocol::operation::Operation,
     api: &A,
 ) -> std::result::Result<(), String> {
+    let (_, _, allowed) = session(state, vault_id)?;
+    if !allowed {
+        return Err(crate::service::INSTALLED_OFF_MSG.to_string());
+    }
     let req = parse_add(&op.act.scope)?;
     let snapshot = admit_add(&req)?;
     // Collisions and the add/update rule first: nothing is fetched for a
     // request the vault refuses anyway.
-    let (entries, _) = session(state, vault_id)?;
+    let (entries, _, _) = session(state, vault_id)?;
     card::add_card(
         &snapshot,
+        &req.defs,
         &req.source,
-        SourceCheck::NotReached,
         req.update,
         &entries,
         &state.services,
@@ -315,7 +324,7 @@ pub(crate) async fn mint_add<A: GitHubApi>(
     // GitHub's reads carry their own deadline ([`source_check_api`]), so a
     // check still running past it has had answers: whether it would have
     // matched is unknown, and nothing unchecked is offered for approval.
-    let check = match tokio::time::timeout(
+    match tokio::time::timeout(
         SOURCE_CHECK_TIMEOUT + SOURCE_CHECK_GRACE,
         github::verify(api, &req.source, &req.defs),
     )
@@ -324,16 +333,19 @@ pub(crate) async fn mint_add<A: GitHubApi>(
         Ok(checked) => checked?,
         Err(_) => {
             return Err(format!(
-                "could not verify {}: too large or too slow; nothing was stored",
+                "could not check {}: too large or too slow; nothing was stored",
                 crate::util::terminal_safe(&req.source.display())
             ))
         }
     };
-    let (entries, _) = session(state, vault_id)?;
+    let (entries, _, allowed) = session(state, vault_id)?;
+    if !allowed {
+        return Err(crate::service::INSTALLED_OFF_MSG.to_string());
+    }
     let c = card::add_card(
         &snapshot,
+        &req.defs,
         &req.source,
-        check,
         req.update,
         &entries,
         &state.services,
@@ -356,7 +368,7 @@ pub(crate) fn stamp_rm_at_mint(
     if target.is_empty() {
         return Err("service-rm target (a service id or a source) required".into());
     }
-    let (entries, conns) = session(state, vault_id)?;
+    let (entries, conns, _) = session(state, vault_id)?;
     let c = card::rm_card(&target, &entries, |id| connections_using(conns.iter(), id))?;
     c.stamp(&mut op.act.scope)?;
     Ok(())
@@ -378,11 +390,13 @@ pub(crate) fn persist(
 }
 
 /// Apply a `service-add`: the stored definitions of the source become exactly
-/// `snapshot` (its other services are removed), each stored in the object
-/// form with the source. `Err` when the signed card differs from the card the
-/// opened vault gives now. The source check is the one stamped at op creation
-/// (made by this process over these exact definitions; an op is immutable once
-/// created, and approval compares the grant's op with the stored one).
+/// `snapshot` (its other services are removed), each installed in the object
+/// form with the source and the summary of its admitted definition. `Err`
+/// while the opened vault's owner has installed services off, or when the
+/// signed card differs from the card the opened vault gives now. The source
+/// was checked at op creation by this process over these exact definitions
+/// (an op is immutable once created, and approval compares the grant's op
+/// with the stored one).
 pub(crate) fn apply_add(
     view: &mut crate::storage::plaintext::VaultPlaintextView,
     req: AddRequest,
@@ -390,15 +404,13 @@ pub(crate) fn apply_add(
     signed_scope: &Value,
     reg: &ServiceRegistry,
 ) -> std::result::Result<card::AddCard, String> {
-    let check = signed_scope
-        .get("source_check")
-        .and_then(|v| v.as_str())
-        .and_then(SourceCheck::parse)
-        .ok_or_else(|| changed_since("source_check"))?;
+    if !view.aux.allows_installed_services() {
+        return Err(crate::service::INSTALLED_OFF_MSG.to_string());
+    }
     let c = card::add_card(
         snapshot,
+        &req.defs,
         &req.source,
-        check,
         req.update,
         &view.aux.services,
         reg,
@@ -410,58 +422,13 @@ pub(crate) fn apply_add(
         view.aux.services.remove(id);
     }
     for (id, (svc, pol)) in req.defs {
-        view.aux
-            .services
-            .insert(id, StoredService::new(svc, pol, Some(req.source.clone())));
+        let def = snapshot
+            .get(&id)
+            .ok_or_else(|| changed_since("ids"))?;
+        let entry = StoredService::installed(svc, pol, req.source.clone(), def);
+        view.aux.services.insert(id, entry);
     }
     Ok(c)
-}
-
-/// The facts a `service-add` lets this device record
-/// ([`crate::service::source::checks`]): every definition of the request,
-/// when the card this daemon stamped at op creation says it fetched the
-/// GitHub source again at its commit and found these definitions
-/// ([`SourceCheck::Fetched`]). Anything else: none.
-pub(crate) fn device_checks(req: &AddRequest, signed_scope: &Value) -> Vec<(String, DeviceCheck)> {
-    let fetched = signed_scope
-        .get("source_check")
-        .and_then(|v| v.as_str())
-        .and_then(SourceCheck::parse)
-        == Some(SourceCheck::Fetched);
-    if !fetched {
-        return Vec::new();
-    }
-    req.defs
-        .iter()
-        .filter_map(|(id, (svc, pol))| {
-            DeviceCheck::of(svc, pol.as_deref(), &req.source).map(|c| (id.clone(), c))
-        })
-        .collect()
-}
-
-/// Record `facts` for `vault_id` (after the definitions they name landed).
-/// A failure is logged: the sources then read as stated by the requester.
-pub(crate) fn record_device_checks(state: &AppState, vault_id: &str, facts: Vec<(String, DeviceCheck)>) {
-    if facts.is_empty() {
-        return;
-    }
-    let recorded = state
-        .vaults
-        .dir_for(vault_id)
-        .map_err(|e| e.to_string())
-        .and_then(|d| checks::record(&checks::path(&d), facts).map_err(|e| e.to_string()));
-    if let Err(e) = recorded {
-        tracing::warn!(vault = %vault_id, "the source check was not recorded: {}", e);
-    }
-}
-
-/// The facts this device recorded for `vault_id` (none when it has none).
-fn device_checks_of(state: &AppState, vault_id: &str) -> DeviceChecks {
-    state
-        .vaults
-        .dir_for(vault_id)
-        .map(|d| checks::load(&checks::path(&d)))
-        .unwrap_or_default()
 }
 
 /// Apply a `service-rm` of `target`; same card discipline as [`apply_add`].
@@ -491,16 +458,15 @@ fn changed_since(field: &str) -> String {
 }
 
 /// One `aux.services` entry as `sc service ls` shows it: its source, whether
-/// the daemon loads it (and if not, why), the connections that name it, what
-/// it applies (destinations, rules) when it loads, and the commit this device
-/// checked it at (`checked_on_this_device`: its recorded fact names this
-/// definition text and this source at this commit; else null, the source is
-/// as the requester stated it).
+/// the daemon loads it (and if not, why: the same reasons as
+/// [`crate::service::vault_custom_services`], `allow_installed` the owner's
+/// switch), the connections that name it, and what it applies (destinations,
+/// rules) when it loads.
 pub(crate) fn listing(
     entries: &BTreeMap<String, StoredService>,
     conns: &HashMap<String, Connection>,
     reg: &ServiceRegistry,
-    facts: &DeviceChecks,
+    allow_installed: bool,
 ) -> Vec<Value> {
     entries
         .iter()
@@ -510,9 +476,10 @@ pub(crate) fn listing(
                 crate::service::source::definition_digest(&p.service, p.policy.as_deref())
             });
             let source = parts.and_then(|p| p.source);
-            let checked = checks::checked_commit(facts, id, source.as_ref(), digest.as_deref());
             let (summary, problems) = if crate::storage::item::is_conflict_copy_name(id) {
                 (None, vec![crate::service::CONFLICT_COPY_REASON.to_string()])
+            } else if !allow_installed && e.is_installed() {
+                (None, vec![crate::service::INSTALLED_OFF_REASON.to_string()])
             } else if reg.get(id).is_some() {
                 (None, vec!["shadows a built-in id".to_string()])
             } else {
@@ -529,7 +496,6 @@ pub(crate) fn listing(
                 "connections": connections_using(conns.iter(), id),
                 "summary": summary,
                 "digest": digest,
-                "checked_on_this_device": checked,
             })
         })
         .collect()
@@ -543,10 +509,10 @@ pub async fn list(
     Path(vault_id): Path<String>,
 ) -> Result<Json<Value>> {
     crate::server::handlers::op::validate_vault_id(&vault_id)?;
-    let (entries, conns) = session(&state, &vault_id).map_err(|_| AppError::VaultLocked)?;
-    let facts = device_checks_of(&state, &vault_id);
+    let (entries, conns, allowed) =
+        session(&state, &vault_id).map_err(|_| AppError::VaultLocked)?;
     Ok(Json(json!({
-        "services": listing(&entries, &conns, &state.services, &facts),
+        "services": listing(&entries, &conns, &state.services, allowed),
     })))
 }
 

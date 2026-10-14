@@ -54,6 +54,10 @@ pub struct ActFact {
     pub label_zh: Option<String>,
     /// Value template over the op's signed fields.
     pub value: String,
+    /// Long text (a definition's source) a client shows on request, never
+    /// inline: left out of the one-line rendering ([`consent_for`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub detail: bool,
 }
 
 fn default_tone() -> String {
@@ -84,7 +88,8 @@ pub struct RenderedConsent {
     pub action: String,
     pub explain: String,
     pub tone: String,
-    /// `(label, value)` — rows whose value rendered empty are already omitted.
+    /// `(label, value)` — rows whose value rendered empty, and `detail`
+    /// rows, are already omitted.
     pub facts: Vec<(String, String)>,
 }
 
@@ -99,6 +104,7 @@ pub fn consent_for(op: &Operation) -> Option<RenderedConsent> {
     let facts = desc
         .facts
         .iter()
+        .filter(|f| !f.detail)
         .filter_map(|f| {
             let v = interpolate_op(&f.value, op);
             (!v.is_empty()).then(|| (f.label.clone(), v))
@@ -220,6 +226,63 @@ mod tests {
             },
             valid: Valid::single_use(0, Some(300)),
         }
+    }
+
+    /// A `detail` fact (the definition text of a `service-add`) is emitted
+    /// with `"detail": true` in the catalog the registry serves; other facts
+    /// carry no `detail`. The one-line rendering leaves it out.
+    #[test]
+    fn detail_facts_are_emitted_and_kept_out_of_one_line_renders() {
+        let add = &act_catalog()["service-add"];
+        let v = serde_json::to_value(add).unwrap();
+        let facts = v["facts"].as_array().unwrap();
+        let labels: Vec<&str> = facts.iter().map(|f| f["label"].as_str().unwrap()).collect();
+        assert_eq!(
+            labels,
+            [
+                "Services",
+                "Sends credentials to",
+                "Source",
+                "OAuth",
+                "New destinations",
+                "Loosened or removed rules",
+                "Rules applied",
+                "Replaces",
+                "Removes",
+                "Definition"
+            ]
+        );
+        assert_eq!(
+            facts.last().unwrap(),
+            &json!({
+                "label": "Definition",
+                "label_zh": "定义原文",
+                "value": "{{vars.scope.definitions}}",
+                "detail": true
+            })
+        );
+        assert!(facts[..facts.len() - 1].iter().all(|f| f.get("detail").is_none()));
+        assert_eq!(v["action"], json!("Install a third-party service"));
+        assert_eq!(v["action_zh"], json!("安装第三方服务"));
+        assert_eq!(
+            v["explain"],
+            json!("SafeClaw does not review third-party services. Connections that use one send credentials to the hosts it lists.")
+        );
+        assert_eq!(
+            v["explain_zh"],
+            json!("SafeClaw 不审查第三方服务。使用它的连接会把凭证发往它列出的主机。")
+        );
+        // The table round-trips with `detail` (a client parsing it back).
+        let back: ActConsent = serde_json::from_value(v.clone()).unwrap();
+        assert!(back.facts.last().unwrap().detail);
+        let c = consent_for(&op(
+            "service-add",
+            "github:acme/tools",
+            json!({ "ids": ["a1"], "from": "local folder mine", "definitions": "# a1 service.toml\n[service]\n" }),
+        ))
+        .unwrap();
+        assert!(c.facts.iter().all(|(l, _)| l != "Definition"), "{:?}", c.facts);
+        assert!(c.facts.iter().any(|(l, v)| l == "Source" && v == "local folder mine"));
     }
 
     #[test]

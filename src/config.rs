@@ -476,7 +476,7 @@ pub struct ServiceAddArgs {
     /// it collides with a built-in service or another source's).
     #[arg(long, value_name = "ID")]
     pub id: Option<String>,
-    /// Branch, tag or commit of a GitHub source (default: its default
+    /// Branch or tag of a GitHub source (default: its default
     /// branch). Resolved to a full commit and pinned.
     #[arg(long = "ref", value_name = "REF")]
     pub git_ref: Option<String>,
@@ -503,7 +503,7 @@ pub struct ServiceUpdateArgs {
     /// Skip the terminal confirmation (the passkey approval is still required).
     #[arg(long, short = 'y')]
     pub yes: bool,
-    /// Update a GitHub source to this branch, tag or commit instead of its
+    /// Update a GitHub source to this branch or tag instead of its
     /// default branch head.
     #[arg(long = "ref", value_name = "REF")]
     pub git_ref: Option<String>,
@@ -540,7 +540,7 @@ pub struct ServiceRmArgs {
 pub struct ServiceValidateArgs {
     /// `./path`, `/abs/path`, or `github:owner/repo[:sub/path]`.
     pub source: String,
-    /// Branch, tag or commit of a GitHub source.
+    /// Branch or tag of a GitHub source.
     #[arg(long = "ref", value_name = "REF")]
     pub git_ref: Option<String>,
 }

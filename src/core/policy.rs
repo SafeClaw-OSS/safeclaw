@@ -320,6 +320,10 @@ pub struct Policy {
     /// Per-connection user policy, keyed by `connection_id`.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub connections: HashMap<String, ConnectionPolicy>,
+    /// The owner's switch for installed services (definitions stored with a
+    /// source): off (absent) = the vault neither loads nor adds them.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_installed_services: bool,
 }
 
 impl Default for Policy {
@@ -349,6 +353,7 @@ impl Default for Policy {
             default: Some(allow_rw()),
             categories,
             connections: HashMap::new(),
+            allow_installed_services: false,
         }
     }
 }
@@ -370,6 +375,7 @@ impl Policy {
                 p.categories.insert(k.clone(), v.clone());
             }
             p.connections = u.connections.clone();
+            p.allow_installed_services = u.allow_installed_services;
         }
         p
     }

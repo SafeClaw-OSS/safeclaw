@@ -41,9 +41,13 @@ names the service registry, which is not open yet.
 
 How it works:
 
+- **Third-party.** A service added from a source is installed: SafeClaw does
+  not review it. A vault loads installed services only while its owner turns
+  them on (console: Settings → Services); while off, `add` and `update` are
+  refused, `sc service ls` shows them skipped, and connections that use them
+  fail.
 - **Pinned.** A GitHub source is resolved to a full commit (`--ref` takes a
-  branch, tag or commit; default: the default branch) and stored with it and
-  the ref.
+  branch or tag; default: the default branch) and stored with it and the ref.
 - **Read, never run.** Only `service.toml` and `policy.toml` at those paths
   are read, as regular files: symlinks, links and devices are not followed
   (a local folder is opened one component at a time without following a
@@ -56,22 +60,15 @@ How it works:
   its credentials or OAuth data (declared hosts, the token endpoint, the
   authorization page, a redirect that leaves your device), `PKCE: off` when
   the flow has no PKCE, the rules it applies (each label with what it
-  matches, and any approval window it sets), and the source with its ref and
-  commit. A GitHub source is checked on your device only at the head of one
-  of the repository's own branches or tags: the ref (or the default branch)
-  is resolved under `refs/heads/` or `refs/tags/` (an annotated tag to its
-  commit) and must be at that commit, and the commit, fetched again, must
-  hold the same definitions. A name that is both a branch and a tag at
-  different commits is refused (state `refs/heads/<name>` or
-  `refs/tags/<name>`). Any GitHub answer without the data (not found,
-  refused, a server error, a download too large or too slow), or a proxy
-  refusing the connection, refuses the request. A local folder, a ref that
-  is no branch or tag of the repository (a commit id, any other ref), or
-  GitHub not answering at all shows the source as stated by the requester.
-  `sc service ls` shows which: `checked at <commit> (on this device)` when
-  this device checked that definition at that commit itself (its own record,
-  not the vault's), else `as stated by the requester`.
-  Only the rules that tighten apply in a vault.
+  matches, and any approval window it sets), the source with its ref and
+  commit, and the definition text. The daemon fetches a GitHub source itself:
+  the ref (or the default branch) is resolved under `refs/heads/` or
+  `refs/tags/` (an annotated tag to its commit) and must be at that commit,
+  and the commit must hold the same definitions. A commit id, any other ref,
+  a name that is both a branch and a tag at different commits (state
+  `refs/heads/<name>` or `refs/tags/<name>`), a failed fetch, or no answer
+  from GitHub refuses the request. Only the rules that tighten apply in a
+  vault.
 - **Ids.** A definition is stored under its `[service] id`. It may not be a
   built-in id or one another source already holds; `--id` renames a
   single-service source.

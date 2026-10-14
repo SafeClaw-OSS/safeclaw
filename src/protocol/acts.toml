@@ -68,10 +68,10 @@ facts = [
 ]
 
 [acts.service-add]
-action = "Add services"
-action_zh = "添加服务"
-explain = "Connections that use these services send credentials only to the hosts listed. Approve only if you trust the source."
-explain_zh = "使用这些服务的连接只会把凭证发往列出的主机。只在你信任来源时批准。"
+action = "Install a third-party service"
+action_zh = "安装第三方服务"
+explain = "SafeClaw does not review third-party services. Connections that use one send credentials to the hosts it lists."
+explain_zh = "SafeClaw 不审查第三方服务。使用它的连接会把凭证发往它列出的主机。"
 tone = "danger"
 facts = [
   { label = "Services", label_zh = "服务", value = "{{vars.scope.ids}}" },
@@ -83,6 +83,7 @@ facts = [
   { label = "Rules applied", label_zh = "生效的规则", value = "{{vars.scope.tightens}}" },
   { label = "Replaces", label_zh = "替换", value = "{{vars.scope.replaces}}" },
   { label = "Removes", label_zh = "移除", value = "{{vars.scope.removes}}" },
+  { label = "Definition", label_zh = "定义原文", value = "{{vars.scope.definitions}}", detail = true },
 ]
 
 [acts.service-rm]

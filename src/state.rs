@@ -975,6 +975,22 @@ impl AppState {
         }
     }
 
+    /// True when `service_id` is an installed service of the unlocked vault
+    /// that is not loaded because its owner has installed services off.
+    pub fn installed_service_off(&self, vault_id: &str, service_id: &str) -> bool {
+        let states = self.vault_states.lock().unwrap();
+        match states.get(vault_id) {
+            Some(VaultState::Unlocked { cache, .. }) => {
+                !cache.policy.allow_installed_services
+                    && cache
+                        .service_entries
+                        .get(service_id)
+                        .is_some_and(|e| e.is_installed())
+            }
+            _ => false,
+        }
+    }
+
     /// Look up a cached auth value for `(vault, connection)`. Returns None if
     /// the vault is Locked, the connection isn't bootstrapped/cached, the
     /// vault has never been unlocked, OR the entry's `expires_at` is in
@@ -1357,6 +1373,7 @@ impl AppState {
                     default: cache.policy.default.clone(),
                     categories: cache.policy.categories.clone(),
                     connections: HashMap::new(),
+                    allow_installed_services: cache.policy.allow_installed_services,
                 },
                 cache
                     .custom_services
@@ -2873,7 +2890,7 @@ level = "allow"
         let mut aux = std::collections::BTreeMap::new();
         aux.insert("acme".to_string(), src.into());
         let state = test_state();
-        let (custom, skipped) = crate::service::vault_custom_services(&aux, &state.services);
+        let (custom, skipped) = crate::service::vault_custom_services(&aux, true, &state.services);
         assert!(skipped.is_empty(), "{skipped:?}");
         let unlock = |policy: Policy| {
             let cache = SecretsCache {

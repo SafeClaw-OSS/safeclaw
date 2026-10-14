@@ -721,6 +721,12 @@ pub fn scope_digest(bound: &[(String, String)]) -> String {
 
 /// Why a vault service entry named `"<id> (conflict copy)"` is not loaded:
 /// the sync kept a second version of `<id>` beside the first.
+/// Why an installed service is skipped while the vault's owner switch is off.
+pub const INSTALLED_OFF_REASON: &str = "installed services are off for this vault";
+
+/// Why `sc service add` / `update` is refused while the owner switch is off.
+pub const INSTALLED_OFF_MSG: &str = "Installed services are off for this vault. A vault owner can turn them on in the console: Settings → Services.";
+
 pub const CONFLICT_COPY_REASON: &str = "a conflict copy: the service was changed in two places at once and both versions were kept; keep the one you want in the console";
 
 /// A vault's own service definitions (`aux.services`, id → stored entry) as
@@ -728,12 +734,15 @@ pub const CONFLICT_COPY_REASON: &str = "a conflict copy: the service was changed
 /// (so the key is the declared id), with its stored policy.toml if any, and
 /// whose id is not a compiled one (a custom def never shadows a built-in),
 /// with its policy reduced to the parts that tighten
-/// ([`ServiceDef::for_vault`]). The skipped ids come back with the reason. The
-/// unlock bootstrap loads exactly this set, so every other reader of
-/// `aux.services` (the proxy, the console's registry view) agrees with what is
-/// enforced.
+/// ([`ServiceDef::for_vault`]). An installed entry (stored with a source)
+/// loads only while the owner allows installed services (`allow_installed`,
+/// [`crate::core::policy::Policy::allow_installed_services`]). The skipped ids
+/// come back with the reason. The unlock bootstrap loads exactly this set, so
+/// every other reader of `aux.services` (the proxy, the console's registry
+/// view) agrees with what is enforced.
 pub fn vault_custom_services(
     aux_services: &std::collections::BTreeMap<String, source::StoredService>,
+    allow_installed: bool,
     reg: &ServiceRegistry,
 ) -> (HashMap<String, ServiceDef>, Vec<(String, String)>) {
     let mut defs = HashMap::new();
@@ -741,6 +750,10 @@ pub fn vault_custom_services(
     for (id, entry) in aux_services {
         if crate::storage::item::is_conflict_copy_name(id) {
             skipped.push((id.clone(), CONFLICT_COPY_REASON.to_string()));
+            continue;
+        }
+        if !allow_installed && entry.is_installed() {
+            skipped.push((id.clone(), INSTALLED_OFF_REASON.to_string()));
             continue;
         }
         if reg.get(id).is_some() {
@@ -1357,7 +1370,7 @@ level = "allow"
         // The registry reader applies it, so the console shows what is enforced.
         let mut aux = std::collections::BTreeMap::new();
         aux.insert("acme".to_string(), VAULT_DEF.into());
-        let (defs, _) = vault_custom_services(&aux, &ServiceRegistry::compiled_only());
+        let (defs, _) = vault_custom_services(&aux, true, &ServiceRegistry::compiled_only());
         assert_eq!(defs["acme"].policy.as_ref().unwrap().rules.len(), 1);
         // Nothing that tightens: no policy at all.
         let loose = VAULT_DEF

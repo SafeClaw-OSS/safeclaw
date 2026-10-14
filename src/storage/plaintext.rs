@@ -255,12 +255,24 @@ impl VaultAux {
         reg: &crate::service::ServiceRegistry,
         exclude: &str,
     ) -> BTreeMap<String, Vec<String>> {
-        let (custom, _) = crate::service::vault_custom_services(&self.services, reg);
+        let (custom, _) = crate::service::vault_custom_services(
+            &self.services,
+            self.allows_installed_services(),
+            reg,
+        );
         let defs = crate::service::ServiceDefs {
             reg,
             custom: &custom,
         };
         connection_claims_in(&self.connections, &defs, exclude)
+    }
+
+    /// The owner's switch for installed services (`policy:`
+    /// `allow_installed_services`); off when the vault has no policy.
+    pub fn allows_installed_services(&self) -> bool {
+        self.policy
+            .as_ref()
+            .is_some_and(|p| p.allow_installed_services)
     }
 }
 
@@ -901,7 +913,7 @@ secrets = ["ACME_TOKEN"]
             claims.get("ACME_TOKEN_WORK").map(Vec::as_slice),
             Some(&["acme_work".to_string()][..])
         );
-        let (custom, skipped) = crate::service::vault_custom_services(&aux.services, &reg);
+        let (custom, skipped) = crate::service::vault_custom_services(&aux.services, true, &reg);
         assert!(skipped.is_empty(), "{skipped:?}");
         let defs = crate::service::ServiceDefs {
             reg: &reg,

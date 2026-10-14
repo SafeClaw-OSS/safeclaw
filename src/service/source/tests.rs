@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use super::card::{add_card, diff, rm_card, summarize, SourceCheck};
+use super::card::{add_card, diff, rm_card, summarize};
 use super::github::{self, FetchError, GitHubApi, GitObject};
 use super::tar::{read_tarball, read_tarball_with};
 use super::*;
@@ -148,7 +148,7 @@ fn old_string_entries_still_load() {
     }))
     .unwrap();
     let reg = crate::service::ServiceRegistry::compiled_only();
-    let (defs, skipped) = crate::service::vault_custom_services(&aux.services, &reg);
+    let (defs, skipped) = crate::service::vault_custom_services(&aux.services, true, &reg);
     assert!(skipped.is_empty(), "{skipped:?}");
     assert!(defs.contains_key("acme") && defs.contains_key("beta"));
     assert_eq!(defs["beta"].policy.as_ref().unwrap().rules.len(), 2);
@@ -190,6 +190,7 @@ fn stored_object_form_round_trips_and_rejects_unknowns() {
     );
     let (defs, skipped) = crate::service::vault_custom_services(
         &aux,
+        true,
         &crate::service::ServiceRegistry::compiled_only(),
     );
     assert!(defs.contains_key("acme"));
@@ -641,8 +642,6 @@ struct FakeGitHub {
     refs: BTreeMap<&'static str, GitObject>,
     /// Annotated tag objects → their target.
     tags: BTreeMap<String, GitObject>,
-    /// What GitHub resolves any other ref or commit id to.
-    commits: BTreeMap<&'static str, String>,
     tarball: Vec<u8>,
     asked: std::sync::Mutex<Vec<String>>,
 }
@@ -666,13 +665,6 @@ impl GitHubApi for FakeGitHub {
             .cloned()
             .ok_or_else(|| FetchError::Answered(format!("tag {} not found", sha)))
     }
-    async fn commit_of(&self, _o: &str, _r: &str, git_ref: &str) -> Result<String, FetchError> {
-        self.asked.lock().unwrap().push(format!("commits {}", git_ref));
-        self.commits
-            .get(git_ref)
-            .cloned()
-            .ok_or_else(|| FetchError::Answered(format!("ref '{}' not found", git_ref)))
-    }
     async fn tarball(&self, _o: &str, _r: &str, commit: &str) -> Result<Vec<u8>, FetchError> {
         self.asked
             .lock()
@@ -688,10 +680,9 @@ fn commit(c: char) -> GitObject {
 
 /// `main` (the default branch) at a; the annotated tag `v1.2.0` at b; a
 /// branch `cafe` (hex digits only) at e; a branch named like a full commit
-/// id at e; `dup` a branch at a and a tag at b. GitHub's commits endpoint
-/// resolves commit ids and a pull ref.
+/// id at e; `dup` a branch at a and a tag at b; a branch `short` GitHub
+/// reports at a short id; `V9` a branch at an uppercase id.
 fn fake() -> FakeGitHub {
-    let c40 = "c".repeat(40);
     FakeGitHub {
         default: "main",
         refs: [
@@ -701,17 +692,11 @@ fn fake() -> FakeGitHub {
             ("heads/1111111111111111111111111111111111111111", commit('e')),
             ("heads/dup", commit('a')),
             ("tags/dup", commit('b')),
+            ("heads/short", GitObject::Commit("abc".into())),
+            ("heads/V9", GitObject::Commit("C".repeat(40))),
         ]
         .into(),
         tags: [("7".repeat(40), commit('b'))].into(),
-        commits: [
-            ("cafe", "f".repeat(40)),
-            ("cccccccc", c40.clone()),
-            ("CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC", c40.to_ascii_uppercase()),
-            ("short", "abc".into()),
-            ("pull/1/head", "d".repeat(40)),
-        ]
-        .into(),
         tarball: tar_gz(&[("o-r-x/service.toml", b'0', ACME.as_bytes())]),
         asked: Default::default(),
     }
@@ -736,16 +721,14 @@ fn github_ref_branch_tag_and_commit_are_pinned() {
     let (_, s) = block_on(github::fetch(&api, &spec, None)).unwrap();
     assert_eq!(s, gh("acme/tools", 'a'));
     // A branch, an annotated tag (peeled), a full ref name, a hex-only branch
-    // name (a branch before a commit id), a commit id, another ref: each
-    // resolved to a full commit and pinned, the ref recorded as asked.
+    // name: each resolved to a full commit and pinned, the ref recorded as
+    // asked.
     for (r, want) in [
         ("main", 'a'),
         ("v1.2.0", 'b'),
         ("refs/heads/main", 'a'),
         ("refs/tags/v1.2.0", 'b'),
         ("cafe", 'e'),
-        ("cccccccc", 'c'),
-        ("pull/1/head", 'd'),
     ] {
         let (files, s) = block_on(github::fetch(&api, &spec, Some(r))).unwrap();
         assert!(files.single);
@@ -766,13 +749,36 @@ fn github_ref_branch_tag_and_commit_are_pinned() {
         .iter()
         .filter(|a| a.starts_with("tarball"))
         .all(|a| a.len() == "tarball ".len() + 40));
+    // A branch or tag only: a commit id (short or full), a pull ref, another
+    // refs/ name is refused with a plain message, and no tarball is fetched.
+    let fetched = |api: &FakeGitHub| {
+        api.asked
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|a| a.starts_with("tarball"))
+            .count()
+    };
+    let before = fetched(&api);
+    for r in [
+        "cccccccc".to_string(),
+        "c".repeat(40),
+        "pull/1/head".into(),
+        "refs/pull/1/head".into(),
+        "refs/remotes/origin/main".into(),
+    ] {
+        let e = block_on(github::fetch(&api, &spec, Some(&r))).unwrap_err();
+        assert_eq!(
+            e,
+            vec![format!(
+                "'{}' is not a branch or tag of github:acme/tools; a GitHub source is added from a branch or tag",
+                r
+            )]
+        );
+    }
+    assert_eq!(fetched(&api), before);
     // Uppercase hex is normalized; a short answer is refused.
-    let (_, s) = block_on(github::fetch(
-        &api,
-        &spec,
-        Some("CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"),
-    ))
-    .unwrap();
+    let (_, s) = block_on(github::fetch(&api, &spec, Some("V9"))).unwrap();
     assert!(matches!(s, ServiceSource::Github { commit, .. } if commit == "c".repeat(40)));
     assert!(block_on(github::fetch(&api, &spec, Some("short"))).is_err());
     // A name that is a branch and a tag at different commits is refused.
@@ -786,10 +792,6 @@ fn github_ref_branch_tag_and_commit_are_pinned() {
 
 #[test]
 fn github_urls_are_built_from_checked_names() {
-    assert_eq!(
-        github::commit_url("https://api.github.com", "acme", "tools", "release/1"),
-        "https://api.github.com/repos/acme/tools/commits/release/1"
-    );
     assert_eq!(
         github::tarball_url(
             "https://codeload.github.com",
@@ -846,7 +848,12 @@ client_id = "public"
     .into();
     let src = gh("acme/tools", 'a');
     let current = BTreeMap::new();
-    let c = add_card(&snap, &src, SourceCheck::Fetched, false, &current, &reg).unwrap();
+    let texts: BTreeMap<String, (String, Option<String>)> = [(
+        "acme".to_string(),
+        (oauth.to_string(), Some(ACME_POLICY.to_string())),
+    )]
+    .into();
+    let c = add_card(&snap, &texts, &src, false, &current, &reg).unwrap();
     assert_eq!(c.ids, ["acme"]);
     assert_eq!(
         c.destinations,
@@ -866,24 +873,28 @@ client_id = "public"
         ],
         "each label beside what the rule matches"
     );
-    assert!(c.from.contains(&"a".repeat(40)));
-    assert!(c.from.contains("verified on this device"));
+    // The source line is the source's display, nothing appended.
+    assert_eq!(c.from, src.display());
+    assert_eq!(
+        c.definitions,
+        format!(
+            "# acme service.toml\n{}\n# acme policy.toml\n{}\n",
+            oauth, ACME_POLICY
+        )
+    );
     assert!(c.oauth.is_empty(), "PKCE is on by default");
     assert!(c.new_destinations.is_empty() && c.loosens.is_empty());
-    // Not checked here: the source is what the requester stated, said as such.
-    for check in [
-        SourceCheck::LocalFolder,
-        SourceCheck::NotReached,
-        SourceCheck::NotBranchOrTag,
-    ] {
-        let c = add_card(&snap, &src, check, false, &current, &reg).unwrap();
-        assert!(c.from.contains(", unverified"), "{}", c.from);
-        assert!(!c.from.contains("verified on this device"));
-        let mut scope = serde_json::json!({});
-        c.stamp(&mut scope).unwrap();
-        assert_eq!(scope["source_check"], check.as_str());
-        assert_eq!(SourceCheck::parse(check.as_str()), Some(check));
-    }
+    let mut scope = serde_json::json!({});
+    c.stamp(&mut scope).unwrap();
+    assert_eq!(scope["definitions"], serde_json::json!(c.definitions));
+    assert_eq!(scope["from"], serde_json::json!(src.display()));
+    assert!(scope.get("source_check").is_none());
+    assert_eq!(c.first_difference(&scope), None);
+    let local = ServiceSource::Local {
+        name: "mine".into(),
+    };
+    let c = add_card(&snap, &texts, &local, false, &current, &reg).unwrap();
+    assert_eq!(c.from, "local folder mine");
 
     // A built-in id.
     let gh_def: BTreeMap<_, _> = [(
@@ -892,7 +903,7 @@ client_id = "public"
     )]
     .into();
     assert!(
-        add_card(&gh_def, &src, SourceCheck::Fetched, false, &current, &reg)
+        add_card(&gh_def, &BTreeMap::new(), &src, false, &current, &reg)
             .unwrap_err()
             .contains("built-in")
     );
@@ -902,14 +913,14 @@ client_id = "public"
         "acme".to_string(),
         StoredService::new(ACME.into(), None, Some(gh("other/repo", 'b'))),
     );
-    let e = add_card(&snap, &src, SourceCheck::Fetched, false, &current, &reg).unwrap_err();
+    let e = add_card(&snap, &BTreeMap::new(), &src, false, &current, &reg).unwrap_err();
     assert!(
         e.contains("already in this vault from github:other/repo"),
         "{e}"
     );
     current.insert("acme".to_string(), StoredService::from(ACME));
     assert!(
-        add_card(&snap, &src, SourceCheck::Fetched, false, &current, &reg)
+        add_card(&snap, &BTreeMap::new(), &src, false, &current, &reg)
             .unwrap_err()
             .contains("added before sources")
     );
@@ -919,15 +930,15 @@ client_id = "public"
         StoredService::new(ACME.into(), None, Some(gh("Acme/Tools", 'b'))),
     );
     assert!(
-        add_card(&snap, &src, SourceCheck::Fetched, false, &current, &reg)
+        add_card(&snap, &BTreeMap::new(), &src, false, &current, &reg)
             .unwrap_err()
             .contains("already added")
     );
-    assert!(add_card(&snap, &src, SourceCheck::Fetched, true, &current, &reg).is_ok());
+    assert!(add_card(&snap, &BTreeMap::new(), &src, true, &current, &reg).is_ok());
     assert!(add_card(
         &snap,
+        &BTreeMap::new(),
         &src,
-        SourceCheck::Fetched,
         true,
         &BTreeMap::new(),
         &reg
@@ -949,8 +960,8 @@ fn first_add_card_shows_match_patterns_and_stated_windows() {
     let snap: BTreeMap<_, _> = [("acme".to_string(), admitted("acme", ACME, Some(&policy)))].into();
     let c = add_card(
         &snap,
+        &BTreeMap::new(),
         &gh("acme/tools", 'a'),
-        SourceCheck::Fetched,
         false,
         &BTreeMap::new(),
         &reg,
@@ -974,8 +985,8 @@ fn first_add_card_shows_match_patterns_and_stated_windows() {
         [("acme".to_string(), admitted("acme", ACME, Some(body_only)))].into();
     let c = add_card(
         &snap,
+        &BTreeMap::new(),
         &gh("acme/tools", 'a'),
-        SourceCheck::Fetched,
         false,
         &BTreeMap::new(),
         &reg,
@@ -1008,8 +1019,8 @@ fn update_card_highlights_new_hosts_loosened_rules_and_removals() {
     let snap: BTreeMap<_, _> = [("a1".to_string(), admitted("a1", a1_new, Some(pol_new)))].into();
     let c = add_card(
         &snap,
+        &BTreeMap::new(),
         &gh("acme/tools", 'b'),
-        SourceCheck::Fetched,
         true,
         &current,
         &reg,
@@ -1119,8 +1130,8 @@ fn id_rename_collisions_are_refused() {
     // --id onto a built-in id.
     assert!(add_card(
         &snap("github"),
+        &BTreeMap::new(),
         &src,
-        SourceCheck::Fetched,
         false,
         &BTreeMap::new(),
         &reg
@@ -1135,8 +1146,8 @@ fn id_rename_collisions_are_refused() {
     );
     assert!(add_card(
         &snap("taken"),
+        &BTreeMap::new(),
         &src,
-        SourceCheck::Fetched,
         false,
         &current,
         &reg
@@ -1146,8 +1157,8 @@ fn id_rename_collisions_are_refused() {
     // A free id is stored under the new name.
     let c = add_card(
         &snap("acme_work"),
+        &BTreeMap::new(),
         &src,
-        SourceCheck::Fetched,
         false,
         &current,
         &reg,
@@ -1212,8 +1223,8 @@ fn card_lists_every_host_an_oauth_artifact_reaches_and_pkce_off() {
     let snap: BTreeMap<_, _> = [("acme".to_string(), def)].into();
     let c = add_card(
         &snap,
+        &BTreeMap::new(),
         &gh("acme/tools", 'a'),
-        SourceCheck::Fetched,
         false,
         &BTreeMap::new(),
         &reg,
@@ -1311,8 +1322,8 @@ fn update_flags_longer_approval_windows_unbound_scope_vars_and_pkce_off() {
     .into();
     let c = add_card(
         &snap,
+        &BTreeMap::new(),
         &gh("acme/tools", 'b'),
-        SourceCheck::Fetched,
         true,
         &current,
         &reg,
@@ -1356,9 +1367,6 @@ impl GitHubApi for OfflineGitHub {
     async fn tag_target(&self, _o: &str, _r: &str, _s: &str) -> Result<GitObject, FetchError> {
         Err(self.fail())
     }
-    async fn commit_of(&self, _o: &str, _r: &str, _g: &str) -> Result<String, FetchError> {
-        Err(self.fail())
-    }
     async fn tarball(&self, _o: &str, _r: &str, _c: &str) -> Result<Vec<u8>, FetchError> {
         Err(self.fail())
     }
@@ -1383,7 +1391,7 @@ fn verify_fetches_the_pinned_commit_and_compares_every_definition() {
     let ok = carried(&[("acme", ACME.to_string(), None)]);
     assert_eq!(
         block_on(github::verify(&api, &src, &ok)),
-        Ok(SourceCheck::Fetched)
+        Ok(())
     );
     assert!(api
         .asked
@@ -1398,7 +1406,7 @@ fn verify_fetches_the_pinned_commit_and_compares_every_definition() {
     )]);
     assert_eq!(
         block_on(github::verify(&api, &src, &renamed)),
-        Ok(SourceCheck::Fetched)
+        Ok(())
     );
     // Anything else than what the commit holds: refused.
     for bad in [
@@ -1439,16 +1447,13 @@ fn verify_fetches_the_pinned_commit_and_compares_every_definition() {
     ]);
     assert_eq!(
         block_on(github::verify(&coll, &src, &both)),
-        Ok(SourceCheck::Fetched)
+        Ok(())
     );
     let one = carried(&[("a1", svc("a1", "a.dev"), None)]);
     assert!(block_on(github::verify(&coll, &src, &one)).is_err());
-    // No answer at all (a transport error, none in time): said so on the
-    // card, not refused.
-    assert_eq!(
-        block_on(github::verify(&OfflineGitHub(None), &src, &ok)),
-        Ok(SourceCheck::NotReached)
-    );
+    // No answer at all (a transport error, none in time): refused.
+    let e = block_on(github::verify(&OfflineGitHub(None), &src, &ok)).unwrap_err();
+    assert!(e.contains("GitHub did not respond; nothing was stored"), "{e}");
     // Any answer without the data (not found, refused, a server or proxy
     // error): refused.
     for status in [404u16, 422, 401, 403, 429, 407, 408, 500, 503] {
@@ -1460,7 +1465,7 @@ fn verify_fetches_the_pinned_commit_and_compares_every_definition() {
     };
     assert_eq!(
         block_on(github::verify(&OfflineGitHub(None), &local, &ok)),
-        Ok(SourceCheck::LocalFolder)
+        Ok(())
     );
 }
 
@@ -1469,9 +1474,8 @@ fn verify_fetches_the_pinned_commit_and_compares_every_definition() {
 /// branch; an annotated tag peeled) must point at the pinned commit, else it
 /// is refused, naming the ref, before anything is fetched. A ref that is no
 /// branch or tag of the repository (a commit id, a pull ref, an unknown name)
-/// is not checked, and the card says the source is as the requester stated
-/// it. A hex-only or commit-shaped name that is a branch is checked as one.
-/// The card shows the ref.
+/// is refused too. A hex-only or commit-shaped name that is a branch is
+/// checked as one. The card shows the ref.
 #[test]
 fn verify_requires_the_ref_head_to_be_the_pinned_commit() {
     let ok: BTreeMap<String, (String, Option<String>)> =
@@ -1517,11 +1521,11 @@ fn verify_requires_the_ref_head_to_be_the_pinned_commit() {
     ] {
         assert_eq!(
             block_on(github::verify(&api, &pinned(r, c), &ok)),
-            Ok(SourceCheck::Fetched),
+            Ok(()),
             "{r:?}"
         );
     }
-    // No branch or tag of the repository: as stated, nothing fetched.
+    // No branch or tag of the repository: refused, nothing fetched.
     let api = fake();
     for (r, c) in [
         ("cccccccc", 'c'),
@@ -1530,43 +1534,82 @@ fn verify_requires_the_ref_head_to_be_the_pinned_commit() {
         ("refs/pull/1/head", 'd'),
         ("no-such-ref", 'c'),
     ] {
+        let e = block_on(github::verify(&api, &pinned(Some(r), c), &ok)).unwrap_err();
         assert_eq!(
-            block_on(github::verify(&api, &pinned(Some(r), c), &ok)),
-            Ok(SourceCheck::NotBranchOrTag),
-            "{r}"
+            e,
+            format!(
+                "'{}' is not a branch or tag of github:acme/tools; a GitHub source is added from a branch or tag; nothing was stored",
+                r
+            )
         );
     }
     assert!(!fetched(&api));
     // A `refs/` name outside heads and tags asks GitHub nothing.
     let before = api.asked.lock().unwrap().len();
-    assert_eq!(
-        block_on(github::verify(&api, &pinned(Some("refs/pull/7/head"), 'd'), &ok)),
-        Ok(SourceCheck::NotBranchOrTag)
-    );
+    assert!(block_on(github::verify(&api, &pinned(Some("refs/pull/7/head"), 'd'), &ok)).is_err());
     assert_eq!(api.asked.lock().unwrap().len(), before);
 
     // The card names the ref.
     let reg = crate::service::ServiceRegistry::compiled_only();
     let snap: BTreeMap<_, _> = [("acme".to_string(), admitted("acme", ACME, None))].into();
-    let card = |src: &ServiceSource, check| {
-        add_card(&snap, src, check, false, &BTreeMap::new(), &reg)
+    let card = |src: &ServiceSource| {
+        add_card(&snap, &BTreeMap::new(), src, false, &BTreeMap::new(), &reg)
             .unwrap()
             .from
     };
-    let from = card(&pinned(Some("v1.2.0"), 'b'), SourceCheck::Fetched);
-    assert!(from.contains("github:acme/tools (v1.2.0) @ "), "{from}");
-    assert!(from.ends_with(", verified on this device"), "{from}");
-    let from = card(&pinned(None, 'a'), SourceCheck::Fetched);
-    assert!(
-        from.contains("(default branch)") && from.ends_with(", verified on this device")
+    assert_eq!(
+        card(&pinned(Some("v1.2.0"), 'b')),
+        format!("github:acme/tools (v1.2.0) @ {}", "b".repeat(40))
     );
-    let from = card(&pinned(Some("pull/1/head"), 'd'), SourceCheck::NotBranchOrTag);
-    assert!(
-        from.contains(", unverified")
-            && from.contains("(pull/1/head)")
-            && from.ends_with("(pin a branch or tag to verify)"),
-        "{from}"
+    assert_eq!(
+        card(&pinned(None, 'a')),
+        format!("github:acme/tools (default branch) @ {}", "a".repeat(40))
     );
+}
+
+/// The card's definition text: each service in id order, its service.toml
+/// then its policy.toml when it has one; characters a terminal acts on are
+/// escaped; past 64 KiB it is cut and ends with a `… (truncated)` line.
+#[test]
+fn card_definitions_text_is_ordered_safe_and_capped() {
+    use super::card::{definitions_text, MAX_CARD_DEFINITIONS_BYTES, TRUNCATED_LINE};
+    let defs: BTreeMap<String, (String, Option<String>)> = [
+        ("b2".to_string(), ("[service]\nid = \"b2\"".to_string(), None)),
+        (
+            "a1".to_string(),
+            ("x = 1 # \u{1b}[31mred\u{202e}".to_string(), Some("[default]\r\n".to_string())),
+        ),
+    ]
+    .into();
+    let t = definitions_text(&defs);
+    assert_eq!(
+        t,
+        "# a1 service.toml\nx = 1 # \\u{1b}[31mred\\u{202e}\n# a1 policy.toml\n[default]\\u{d}\n\n# b2 service.toml\n[service]\nid = \"b2\"\n"
+    );
+    assert!(!t
+        .chars()
+        .any(|c| c != '\n' && c != '\t' && crate::util::is_unsafe_display_char(c)));
+    assert_eq!(definitions_text(&BTreeMap::new()), "");
+
+    // Over the cap: cut on a character boundary, the last line says so.
+    let big: BTreeMap<String, (String, Option<String>)> = [(
+        "big".to_string(),
+        ("é".repeat(MAX_CARD_DEFINITIONS_BYTES), Some("p".into())),
+    )]
+    .into();
+    let t = definitions_text(&big);
+    assert!(t.len() <= MAX_CARD_DEFINITIONS_BYTES, "{}", t.len());
+    assert!(t.ends_with(&format!("\n{}\n", TRUNCATED_LINE)));
+    assert!(t.starts_with("# big service.toml\néé"));
+    assert!(!t.contains("policy.toml"));
+    // Exactly at the cap: kept whole.
+    let header = "# x service.toml\n";
+    let fill = MAX_CARD_DEFINITIONS_BYTES - header.len() - 1;
+    let exact: BTreeMap<String, (String, Option<String>)> =
+        [("x".to_string(), ("a".repeat(fill), None))].into();
+    let t = definitions_text(&exact);
+    assert_eq!(t.len(), MAX_CARD_DEFINITIONS_BYTES);
+    assert!(!t.contains(TRUNCATED_LINE));
 }
 
 /// The definition digest takes each part length-prefixed and the policy

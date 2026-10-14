@@ -435,7 +435,11 @@ pub(crate) fn apply_connection_rm_to_view(
     let plan = if keep_secrets {
         crate::storage::plaintext::ConnectionRemoval::default()
     } else {
-        let (custom, _) = crate::service::vault_custom_services(&view.aux.services, reg);
+        let (custom, _) = crate::service::vault_custom_services(
+            &view.aux.services,
+            view.aux.allows_installed_services(),
+            reg,
+        );
         crate::storage::plaintext::connection_removal(
             id,
             &rec,
@@ -1434,6 +1438,7 @@ pub async fn approve_op(
                         let bound_service = (state.services.get(&conn).is_some()
                             || crate::service::vault_custom_services(
                                 &view.aux.services,
+                                view.aux.allows_installed_services(),
                                 &state.services,
                             )
                             .0
@@ -1573,7 +1578,8 @@ pub async fn approve_op(
                 let cached = Some(resp.to_string());
                 (resp, cached)
             }
-            // Store one source's service definitions (`aux.services`). The op
+            // Install one source's service definitions (`aux.services`), only
+            // while the vault's owner allows installed services. The op
             // carries the definitions and the source; the daemon re-admits each
             // through the gate (the one the unlock load uses), refuses a built-in
             // id or one another source holds, recomputes the signed card against
@@ -1596,13 +1602,6 @@ pub async fn approve_op(
                         existing_vault.as_ref(),
                     )?;
                 let base = crate::storage::sealed_vault::ViewBase::of(&view)?;
-                // What this device found checking the source (stamped by this
-                // daemon at op creation), kept as its own fact once the
-                // definitions land, never in the vault.
-                let facts = crate::server::handlers::service_ops::device_checks(
-                    &req,
-                    &validated.op.act.scope,
-                );
                 let card = crate::server::handlers::service_ops::apply_add(
                     &mut view,
                     req,
@@ -1612,7 +1611,6 @@ pub async fn approve_op(
                 )
                 .map_err(AppError::BadRequest)?;
                 crate::server::handlers::service_ops::persist(&state, &vault_id, &base, &view, &k)?;
-                crate::server::handlers::service_ops::record_device_checks(&state, &vault_id, facts);
                 {
                     let state = state.clone();
                     let vid = vault_id.clone();
@@ -1863,7 +1861,11 @@ pub async fn approve_op(
                 // the vault's valid custom defs (never shadowing a built-in
                 // id), else the compiled registry.
                 let (custom_defs, _) =
-                    crate::service::vault_custom_services(&view.aux.services, &state.services);
+                    crate::service::vault_custom_services(
+            &view.aux.services,
+            view.aux.allows_installed_services(),
+            &state.services,
+        );
                 let def: Option<crate::service::ServiceDef> = match &service {
                     None => None,
                     Some(svc) => Some(
@@ -2891,7 +2893,11 @@ pub(crate) fn bootstrap_cache_from_view(
     // broker (defense in depth — never trust the stored blob), never shadow a
     // built-in id, load only if valid. Wiped on lock with the rest of the cache.
     let (custom, skipped) =
-        crate::service::vault_custom_services(&view.aux.services, &state.services);
+        crate::service::vault_custom_services(
+            &view.aux.services,
+            view.aux.allows_installed_services(),
+            &state.services,
+        );
     for (service_id, reason) in skipped {
         tracing::warn!(service = %service_id, "custom service {} — skipped", reason);
     }

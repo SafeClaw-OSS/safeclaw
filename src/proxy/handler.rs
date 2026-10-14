@@ -482,9 +482,27 @@ impl BrokerHandler {
         // resolves and the resident default-connection credential — bootstrapped
         // into the cache under the service id — is reachable. Only a genuinely
         // unknown id fails closed.
+        // A service installed from a source loads only while the vault's
+        // owner allows installed services: a connection naming one while they
+        // are off is refused by name, not as unknown.
+        let installed_off = |s: &str| {
+            self.state.installed_service_off(&vault_id, s).then(|| {
+                err_response(
+                    ScCode::PolicyDenied,
+                    &format!(
+                        "'{}' is an installed service. {}",
+                        s,
+                        crate::service::INSTALLED_OFF_MSG
+                    ),
+                )
+            })
+        };
         let conn_rec = match self.state.connection_snapshot(&vault_id, &conn) {
             Some(rec) => rec,
             None => {
+                if let Some(r) = installed_off(&conn) {
+                    return r.into();
+                }
                 let known_service = self.state.services.get(&conn).is_some()
                     || self.state.custom_service(&vault_id, &conn).is_some();
                 if known_service {
@@ -516,6 +534,11 @@ impl BrokerHandler {
                 .custom_service(&vault_id, s)
                 .or_else(|| self.state.services.get(s).cloned())
         });
+        if def.is_none() {
+            if let Some(r) = conn_rec.service.as_deref().and_then(installed_off) {
+                return r.into();
+            }
+        }
         // Some(input KEY) ⇔ this connection's wire credential is MINTED (oauth2
         // access token, snaplii JWT). The key rides along so the resolver can
         // answer a phantom naming the mint's INPUT secret (refresh token /

@@ -7,22 +7,54 @@ use crate::storage::sealed_vault::PerItemVault;
 use crate::service::source::github::{FetchError, GitObject};
 
 /// GitHub as the tests see it: serves `tarball` (or answers its read with an
-/// error) at the commit `main`, the default branch, is at (`a` × 40), or is
+/// error) at the commit `main`, the default branch, is at (`head`), or is
 /// out of reach.
-struct Gh(std::result::Result<Vec<u8>, FetchError>);
+struct Gh {
+    tarball: std::result::Result<Vec<u8>, FetchError>,
+    head: String,
+}
 
 impl Gh {
     fn serving(tarball: Vec<u8>) -> Self {
-        Gh(Ok(tarball))
+        Gh {
+            tarball: Ok(tarball),
+            head: "a".repeat(40),
+        }
+    }
+    fn answering(e: FetchError) -> Self {
+        Gh {
+            tarball: Err(e),
+            head: "a".repeat(40),
+        }
     }
     fn offline() -> Self {
-        Gh(Err(FetchError::Unreachable("offline".into())))
+        Gh::answering(FetchError::Unreachable("offline".into()))
+    }
+    /// GitHub holding exactly the definitions `scope` requests, at the head
+    /// of the default branch, which is at the source's pinned commit.
+    fn holding(scope: &Value) -> Self {
+        let mut files: Vec<(String, String)> = Vec::new();
+        for (id, d) in scope["defs"].as_object().into_iter().flatten() {
+            let dir = format!("acme-tools-x/services/{}", id);
+            files.push((format!("{}/service.toml", dir), d["service"].as_str().unwrap().into()));
+            if let Some(p) = d.get("policy").and_then(|p| p.as_str()) {
+                files.push((format!("{}/policy.toml", dir), p.into()));
+            }
+        }
+        let entries: Vec<(&str, u8, &[u8])> = files
+            .iter()
+            .map(|(p, t)| (p.as_str(), b'0', t.as_bytes()))
+            .collect();
+        Gh {
+            tarball: Ok(tar_gz(&entries)),
+            head: scope["source"]["commit"].as_str().unwrap_or("").to_string(),
+        }
     }
 }
 
 impl Gh {
     fn reached(&self) -> std::result::Result<(), FetchError> {
-        match &self.0 {
+        match &self.tarball {
             Err(e @ FetchError::Unreachable(_)) => Err(e.clone()),
             _ => Ok(()),
         }
@@ -40,7 +72,7 @@ impl GitHubApi for Gh {
         path: &str,
     ) -> std::result::Result<Option<GitObject>, FetchError> {
         self.reached()?;
-        Ok((path == "heads/main").then(|| GitObject::Commit("a".repeat(40))))
+        Ok((path == "heads/main").then(|| GitObject::Commit(self.head.clone())))
     }
     async fn tag_target(
         &self,
@@ -50,25 +82,13 @@ impl GitHubApi for Gh {
     ) -> std::result::Result<GitObject, FetchError> {
         Err(FetchError::Answered(format!("tag {} not found", sha)))
     }
-    async fn commit_of(
-        &self,
-        _o: &str,
-        _r: &str,
-        g: &str,
-    ) -> std::result::Result<String, FetchError> {
-        self.reached()?;
-        match g {
-            "main" => Ok("a".repeat(40)),
-            _ => Err(FetchError::Answered(format!("ref '{}' not found", g))),
-        }
-    }
     async fn tarball(
         &self,
         _o: &str,
         _r: &str,
         _c: &str,
     ) -> std::result::Result<Vec<u8>, FetchError> {
-        self.0.clone()
+        self.tarball.clone()
     }
 }
 
@@ -97,17 +117,31 @@ fn gh(commit: char) -> ServiceSource {
 }
 
 fn scope(defs: &[(&str, &str)], source: &ServiceSource, update: bool) -> Value {
-    let definitions: serde_json::Map<String, Value> = defs
+    let defs: serde_json::Map<String, Value> = defs
         .iter()
         .map(|(id, host)| ((*id).to_string(), json!({ "service": svc(id, host) })))
         .collect();
-    json!({ "definitions": definitions, "source": source, "update": update })
+    json!({ "defs": defs, "source": source, "update": update })
 }
 
-fn empty_view() -> VaultPlaintextView {
+/// A vault whose owner switch for installed services is `on`.
+fn view_with_switch(on: bool) -> VaultPlaintextView {
     let mut m = sudp::state::ProtectedState::new();
-    m.aux = serde_json::to_value(VaultAux::initial()).unwrap();
+    let mut aux = VaultAux::initial();
+    aux.policy = Some(crate::core::policy::Policy {
+        timeout: None,
+        default: None,
+        categories: HashMap::new(),
+        connections: HashMap::new(),
+        allow_installed_services: on,
+    });
+    m.aux = serde_json::to_value(aux).unwrap();
     VaultPlaintextView::from_protected_state(&m).unwrap()
+}
+
+/// A vault that allows installed services.
+fn empty_view() -> VaultPlaintextView {
+    view_with_switch(true)
 }
 
 fn copy(v: &VaultPlaintextView) -> VaultPlaintextView {
@@ -150,12 +184,15 @@ fn mint_with(state: &AppState, scope: Value, gh: &Gh) -> std::result::Result<Val
     Ok(op.act.scope)
 }
 
+/// Mint with GitHub holding exactly what is requested.
 fn mint(state: &AppState, scope: Value) -> std::result::Result<Value, String> {
-    mint_with(state, scope, &Gh::offline())
+    let upstream = Gh::holding(&scope);
+    mint_with(state, scope, &upstream)
 }
 
 fn unlock_with(state: &AppState, view: &VaultPlaintextView) {
     let cache = crate::state::SecretsCache {
+        policy: crate::core::policy::Policy::effective(view.aux.policy.as_ref()),
         service_entries: view.aux.services.clone(),
         connections: view
             .aux
@@ -176,16 +213,16 @@ fn parse_add_checks_every_field() {
     assert!(!req.update);
     for bad in [
         json!({}),
-        json!({ "definitions": {}, "source": gh('a') }),
-        json!({ "definitions": { "a1": { "service": "x", "extra": 1 } }, "source": gh('a') }),
-        json!({ "definitions": { "a1": { "service": "x" } } }),
-        json!({ "definitions": { "a1": { "service": "x" } }, "source": { "kind": "github", "repo": "../x", "commit": "a".repeat(40) } }),
-        json!({ "definitions": { "a1": { "service": "x" } }, "source": gh('a'), "update": "yes" }),
+        json!({ "defs": {}, "source": gh('a') }),
+        json!({ "defs": { "a1": { "service": "x", "extra": 1 } }, "source": gh('a') }),
+        json!({ "defs": { "a1": { "service": "x" } } }),
+        json!({ "defs": { "a1": { "service": "x" } }, "source": { "kind": "github", "repo": "../x", "commit": "a".repeat(40) } }),
+        json!({ "defs": { "a1": { "service": "x" } }, "source": gh('a'), "update": "yes" }),
     ] {
         assert!(parse_add(&bad).is_err(), "{bad}");
     }
     let too_big = "#".repeat(MAX_SOURCE_DEFINITION_BYTES + 1);
-    let big = json!({ "definitions": { "a1": { "service": too_big } }, "source": gh('a') });
+    let big = json!({ "defs": { "a1": { "service": too_big } }, "source": gh('a') });
     assert!(parse_add(&big).unwrap_err().contains("limit"));
     // Admission is all or nothing, under each definition's key.
     let mixed = parse_add(&scope(
@@ -224,8 +261,13 @@ fn add_then_update_then_rm_through_the_signed_card() {
         stored["old"].is_string(),
         "an unchanged entry is not rewritten"
     );
+    // Each installed entry carries the summary of its admitted definition.
+    assert_eq!(
+        stored["a1"]["summary"],
+        json!({ "name": "a1", "hosts": ["a.dev"], "secrets": ["TOKEN"], "oauth": false })
+    );
     let (defs, skipped) =
-        crate::service::vault_custom_services(&view.aux.services, &state.services);
+        crate::service::vault_custom_services(&view.aux.services, true, &state.services);
     assert!(skipped.is_empty() && defs.len() == 3);
 
     // Adding the same source again is refused at mint.
@@ -236,7 +278,7 @@ fn add_then_update_then_rm_through_the_signed_card() {
 
     // Update: b2 vanished upstream, a1 now also sends to a new host.
     let mut up = scope(&[("a1", "a.dev")], &gh('b'), true);
-    up["definitions"]["a1"]["service"] = json!(
+    up["defs"]["a1"]["service"] = json!(
         "[service]\nid = \"a1\"\nname = \"a1\"\nhosts = [\"a.dev\", \"new.dev\"]\nsecrets = [\"TOKEN\"]\n"
     );
     let signed = mint(&state, up).unwrap();
@@ -250,18 +292,18 @@ fn add_then_update_then_rm_through_the_signed_card() {
     let snap = admit_add(&req).unwrap();
     let e = apply_add(&mut raced, req.clone(), &snap, &signed, &state.services).unwrap_err();
     assert!(e.contains("`removes` differs"), "{e}");
-    // The source check stamped at mint is part of the card.
-    let mut unchecked = signed.clone();
-    unchecked.as_object_mut().unwrap().remove("source_check");
+    // The definition text stamped at mint is part of the card.
+    let mut retexted = signed.clone();
+    retexted["definitions"] = json!("# a1 service.toml\n[service]\n");
     let e = apply_add(
         &mut copy(&view),
         req.clone(),
         &snap,
-        &unchecked,
+        &retexted,
         &state.services,
     )
     .unwrap_err();
-    assert!(e.contains("source_check"), "{e}");
+    assert!(e.contains("`definitions` differs"), "{e}");
     // A requester cannot pre-fill the card: mint overwrites it.
     let mut forged = signed.clone();
     forged["new_destinations"] = json!([]);
@@ -364,7 +406,7 @@ fn listing_shows_source_status_and_reason() {
             ..Connection::default()
         },
     );
-    let rows = listing(&entries, &conns, &state.services, &DeviceChecks::new());
+    let rows = listing(&entries, &conns, &state.services, true);
     let row = |id: &str| rows.iter().find(|r| r["id"] == id).unwrap().clone();
     assert_eq!(row("a1")["valid"], json!(true));
     assert_eq!(row("a1")["source"]["kind"], json!("github"));
@@ -440,6 +482,7 @@ fn state_with_store(
     let view = crate::server::handlers::metadata::decrypt_vault_view_peritem_with_key(k, pv, vault)
         .unwrap();
     let cache = crate::state::SecretsCache {
+        policy: crate::core::policy::Policy::effective(view.aux.policy.as_ref()),
         service_entries: view.aux.services.clone(),
         ..Default::default()
     };
@@ -465,7 +508,21 @@ fn services_are_data_records_on_a_vault_with_members() {
     let vault = "vault-team";
     let k = [0x5au8; 32];
     let keys = crate::storage::item::VaultKeys::single(&k);
-    let (_dir, state) = state_with_store(vault, &v2_vault(vault), &k);
+    // The owner's switch, signed by the owner: honored on a v2 keyset.
+    let mut pv = v2_vault(vault);
+    crate::storage::sealed_vault::tests::plant_signed(
+        &mut pv,
+        keys,
+        vault,
+        &UikRoot::from_root([0x11u8; 32]),
+        "policy",
+        &crate::storage::item::ItemPayload::live(
+            crate::storage::item::ItemNs::Policy,
+            "",
+            json!({ "allow_installed_services": true }),
+        ),
+    );
+    let (_dir, state) = state_with_store(vault, &pv, &k);
 
     // Mint: `path: null` is not kept.
     let mut sc = scope(&[("a1", "a.dev")], &gh('a'), false);
@@ -476,7 +533,8 @@ fn services_are_data_records_on_a_vault_with_members() {
         "valid": { "iat": 0, "multiplicity": 1 }
     }))
     .unwrap();
-    block_on(mint_add(&state, vault, &mut op, &Gh::offline())).unwrap();
+    let upstream = Gh::holding(&op.act.scope);
+    block_on(mint_add(&state, vault, &mut op, &upstream)).unwrap();
     let signed = op.act.scope.clone();
     assert_eq!(signed["source"], serde_json::to_value(gh('a')).unwrap());
     assert!(signed["source"].get("path").is_none());
@@ -659,9 +717,11 @@ fn legacy_services_move_only_after_a_pull() {
     );
 }
 
-/// The card's source is a fact only when this device fetched the pinned
-/// commit again and found the same definitions; other definitions refuse
-/// the op; when it cannot be checked the card says the requester stated it.
+/// A GitHub source is fetched by the daemon at the head of its branch or
+/// tag: only the same definitions at the pinned commit mint an op. A commit
+/// the ref is not at, other definitions, a ref that is no branch or tag, an
+/// answer without the data and no answer at all refuse it. The card's source
+/// line is the source's display, nothing appended.
 #[test]
 fn mint_checks_a_github_source_at_its_pinned_commit() {
     let state = test_state();
@@ -677,12 +737,8 @@ fn mint_checks_a_github_source_at_its_pinned_commit() {
         &Gh::serving(at_commit.clone()),
     )
     .unwrap();
-    assert_eq!(signed["source_check"], json!("fetched"));
-    let from = signed["from"].as_str().unwrap();
-    assert!(
-        from.ends_with(", verified on this device"),
-        "{from}"
-    );
+    assert_eq!(signed["from"], json!(gh('a').display()));
+    assert!(signed.get("source_check").is_none());
     // A commit the default branch is not at (say, one pushed only to a fork,
     // which GitHub serves through the parent repository's URLs): refused.
     let e = mint_with(
@@ -703,21 +759,39 @@ fn mint_checks_a_github_source_at_its_pinned_commit() {
     )
     .unwrap_err();
     assert!(e.contains("not what github:acme/tools"), "{e}");
-    // GitHub not answering (a transport error, no answer in time): stated,
-    // not checked.
-    let signed = mint(&state, scope(&[("a1", "a.dev")], &gh('a'), false)).unwrap();
-    assert_eq!(signed["source_check"], json!("not-reached"));
-    assert!(signed["from"]
-        .as_str()
-        .unwrap()
-        .contains(", unverified"));
+    // A commit id or another refs/ name as the ref: no branch or tag, refused.
+    for r in ["a".repeat(40), "refs/pull/1/head".to_string(), "v9".to_string()] {
+        let src = ServiceSource::Github {
+            repo: "acme/tools".into(),
+            path: None,
+            git_ref: Some(r.clone()),
+            commit: "a".repeat(40),
+        };
+        let e = mint_with(
+            &state,
+            scope(&[("a1", "a.dev")], &src, false),
+            &Gh::serving(at_commit.clone()),
+        )
+        .unwrap_err();
+        assert!(e.contains("is not a branch or tag"), "{r}: {e}");
+        assert!(e.contains("nothing was stored"), "{r}: {e}");
+    }
+    // GitHub not answering (a transport error, no answer in time): refused.
+    let e = mint_with(
+        &state,
+        scope(&[("a1", "a.dev")], &gh('a'), false),
+        &Gh::offline(),
+    )
+    .unwrap_err();
+    assert!(e.contains("GitHub did not respond"), "{e}");
+    assert!(e.contains("nothing was stored"), "{e}");
     // An answer from GitHub without the data (not found, refused, a server
     // error, too large or too slow) refuses the op.
     for answer in [404u16, 422, 403, 502] {
-        let gh_answer = Gh(Err(crate::service::source::github::status_problem(
+        let gh_answer = Gh::answering(crate::service::source::github::status_problem(
             answer,
             "github:acme/tools",
-        )));
+        ));
         let e = mint_with(
             &state,
             scope(&[("a1", "a.dev")], &gh('a'), false),
@@ -726,113 +800,135 @@ fn mint_checks_a_github_source_at_its_pinned_commit() {
         .unwrap_err();
         assert!(e.contains("nothing was stored"), "{answer}: {e}");
     }
-    let oversize = Gh(Err(FetchError::Answered(
+    let oversize = Gh::answering(FetchError::Answered(
         "the download is larger than 16 bytes".into(),
-    )));
+    ));
     assert!(mint_with(
         &state,
         scope(&[("a1", "a.dev")], &gh('a'), false),
         &oversize
     )
     .is_err());
-    // A local folder cannot be checked here.
+    // A local folder is read by the requester only; its line is its display.
     let local = ServiceSource::Local {
         name: "mine".into(),
     };
-    let signed = mint(&state, scope(&[("a1", "a.dev")], &local, false)).unwrap();
-    assert_eq!(signed["source_check"], json!("local"));
-    assert!(signed["from"]
-        .as_str()
-        .unwrap()
-        .starts_with("local folder mine, unverified"));
+    let signed = mint_with(
+        &state,
+        scope(&[("a1", "a.dev")], &local, false),
+        &Gh::offline(),
+    )
+    .unwrap();
+    assert_eq!(signed["from"], json!("local folder mine"));
 }
 
-/// Whether a source was checked is this device's own fact, never the
-/// vault's: it is recorded beside the store only when this daemon fetched
-/// the pinned commit again and the definitions matched, and a listing says
-/// `checked_on_this_device` only while the stored definition is the one it
-/// names. The stored record carries no claim; one an older or another client
-/// wrote (`checked: true`) is read and ignored.
+/// The owner switch: off (or no policy at all), `service-add` is refused at
+/// op creation and at apply with the one message, installed entries are not
+/// loaded and are listed skipped with the reason, and a connection using one
+/// is refused by name. On, they load. Entries without a source are not
+/// installed and load either way.
 #[test]
-fn the_source_check_is_this_devices_own_fact() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut st = test_state();
-    st.config.state_dir = dir.path().to_path_buf();
-    st.vaults = crate::storage::vault_dir::VaultDir::new(dir.path());
-    let state = st;
-    let at_commit = tar_gz(&[(
-        "acme-tools-x/services/a1/service.toml",
-        b'0',
-        svc("a1", "a.dev").as_bytes(),
-    )]);
-    let applied = |gh_api: &Gh, claimed: bool| {
-        let mut view = empty_view();
-        unlock_with(&state, &view);
-        let mut sc = scope(&[("a1", "a.dev")], &gh('a'), false);
-        if claimed {
-            sc["source"]["checked"] = json!(true);
-        }
-        let signed = mint_with(&state, sc, gh_api).unwrap();
-        let req = parse_add(&signed).unwrap();
-        let facts = device_checks(&req, &signed);
-        let snap = admit_add(&req).unwrap();
-        apply_add(&mut view, req, &snap, &signed, &state.services).unwrap();
-        (signed, view, facts)
-    };
-    let a = "a".repeat(40);
-    let listed = |view: &VaultPlaintextView| {
-        listing(
-            &view.aux.services,
-            &HashMap::new(),
-            &state.services,
-            &device_checks_of(&state, "v1"),
-        )
-    };
-
-    // Not reached, the requester claiming otherwise: no fact, as stated.
-    let (signed, view, facts) = applied(&Gh::offline(), true);
-    assert!(signed["source"].get("checked").is_none());
-    assert!(facts.is_empty());
-    record_device_checks(&state, "v1", facts);
-    assert_eq!(listed(&view)[0]["checked_on_this_device"], Value::Null);
-
-    // Fetched and matched: the stored record carries no claim; the fact is
-    // this device's, and the listing says the commit.
-    let (signed, view, facts) = applied(&Gh::serving(at_commit), false);
-    assert!(signed["source"].get("checked").is_none());
-    let stored = serde_json::to_value(&view.aux.services["a1"]).unwrap();
-    assert!(stored["source"].get("checked").is_none(), "{stored}");
-    assert_eq!(facts.len(), 1);
-    record_device_checks(&state, "v1", facts);
-    assert!(state.vaults.dir_for("v1").unwrap().join(crate::service::source::checks::FILE).exists());
-    assert_eq!(listed(&view)[0]["checked_on_this_device"], json!(a));
-
-    // The stored definition changed since (a member's write): as stated.
-    let mut changed = copy(&view);
-    changed.aux.services.insert(
-        "a1".into(),
-        StoredService::new(svc("a1", "evil.dev"), None, Some(gh('a'))),
-    );
-    assert_eq!(listed(&changed)[0]["checked_on_this_device"], Value::Null);
-    // A record claiming it was checked, with no fact here: as stated.
-    let mut claimed = copy(&view);
-    claimed.aux.services.insert(
-        "b2".into(),
-        serde_json::from_value(json!({
-            "service": svc("b2", "b.dev"),
-            "source": { "kind": "github", "repo": "acme/tools", "commit": a.clone(), "checked": true },
-        }))
-        .unwrap(),
-    );
-    let rows = listed(&claimed);
-    let b2 = rows.iter().find(|r| r["id"] == "b2").unwrap();
-    assert_eq!(b2["checked_on_this_device"], Value::Null);
-    assert!(b2["source"].get("checked").is_none());
+fn the_owner_switch_decides_whether_installed_services_exist() {
+    let state = test_state();
+    let off = view_with_switch(false);
+    unlock_with(&state, &off);
+    let e = mint(&state, scope(&[("a1", "a.dev")], &gh('a'), false)).unwrap_err();
+    assert_eq!(e, crate::service::INSTALLED_OFF_MSG);
     assert_eq!(
-        claimed.aux.services["b2"].source(),
-        Some(gh('a')),
-        "an older record with the claim still reads"
+        e,
+        "Installed services are off for this vault. A vault owner can turn them on in the console: Settings → Services."
     );
+    let mut no_policy = copy(&off);
+    no_policy.aux.policy = None;
+    unlock_with(&state, &no_policy);
+    assert_eq!(
+        mint(&state, scope(&[("a1", "a.dev")], &gh('a'), false)).unwrap_err(),
+        crate::service::INSTALLED_OFF_MSG
+    );
+
+    // Minted while on, applied after the owner turned it off: refused.
+    let on = empty_view();
+    unlock_with(&state, &on);
+    let signed = mint(&state, scope(&[("a1", "a.dev")], &gh('a'), false)).unwrap();
+    let req = parse_add(&signed).unwrap();
+    let snap = admit_add(&req).unwrap();
+    let mut turned_off = view_with_switch(false);
+    let e = apply_add(&mut turned_off, req.clone(), &snap, &signed, &state.services).unwrap_err();
+    assert_eq!(e, crate::service::INSTALLED_OFF_MSG);
+    assert!(turned_off.aux.services.is_empty());
+    let mut view = copy(&on);
+    apply_add(&mut view, req, &snap, &signed, &state.services).unwrap();
+    view.aux
+        .services
+        .insert("old".into(), StoredService::from(svc("old", "o.dev")));
+    view.aux.services.insert(
+        "console".into(),
+        StoredService::new(svc("console", "c.dev"), None, None),
+    );
+
+    // Loading: on, all three; off, the installed one is skipped by name.
+    let (defs, skipped) = crate::service::vault_custom_services(&view.aux.services, true, &state.services);
+    assert_eq!(defs.len(), 3, "{skipped:?}");
+    let (defs, skipped) = crate::service::vault_custom_services(&view.aux.services, false, &state.services);
+    assert!(defs.contains_key("old") && defs.contains_key("console"));
+    assert!(!defs.contains_key("a1"));
+    assert_eq!(
+        skipped,
+        vec![("a1".to_string(), "installed services are off for this vault".to_string())]
+    );
+    let mut off_view = copy(&view);
+    off_view.aux.policy = view_with_switch(false).aux.policy;
+    assert!(!off_view.aux.allows_installed_services());
+    assert!(view.aux.allows_installed_services());
+
+    // Listing: skipped with the reason while off.
+    let rows = listing(&view.aux.services, &HashMap::new(), &state.services, false);
+    let a1 = rows.iter().find(|r| r["id"] == "a1").unwrap();
+    assert_eq!(a1["valid"], json!(false));
+    assert_eq!(a1["problems"], json!(["installed services are off for this vault"]));
+    assert_eq!(a1["source"], json!(gh('a')));
+    for id in ["old", "console"] {
+        assert_eq!(rows.iter().find(|r| r["id"] == id).unwrap()["valid"], json!(true));
+    }
+    let rows = listing(&view.aux.services, &HashMap::new(), &state.services, true);
+    assert!(rows.iter().all(|r| r["valid"] == json!(true)), "{rows:?}");
+
+    // A connection naming it: refused by name while off, not while on.
+    unlock_with(&state, &off_view);
+    assert!(state.installed_service_off("v1", "a1"));
+    assert!(!state.installed_service_off("v1", "old"));
+    assert!(!state.installed_service_off("v1", "console"));
+    unlock_with(&state, &view);
+    assert!(!state.installed_service_off("v1", "a1"));
+}
+
+/// The stored record carries no claim about its source: one an older client
+/// wrote (`checked: true`) is read and ignored, and the summary beside an
+/// installed definition is display data the daemon never reads (an entry
+/// without one, or with any other content in it, reads the same).
+#[test]
+fn stored_records_carry_no_check_and_a_summary_that_is_not_read() {
+    let state = test_state();
+    let view = empty_view();
+    unlock_with(&state, &view);
+    let mut sc = scope(&[("a1", "a.dev")], &gh('a'), false);
+    sc["source"]["checked"] = json!(true);
+    let signed = mint(&state, sc).unwrap();
+    assert!(signed["source"].get("checked").is_none());
+    let a = "a".repeat(40);
+    let claimed: StoredService = serde_json::from_value(json!({
+        "service": svc("b2", "b.dev"),
+        "source": { "kind": "github", "repo": "acme/tools", "commit": a, "checked": true },
+        "summary": { "name": "anything", "hosts": ["elsewhere.example"], "secrets": [], "oauth": true },
+    }))
+    .unwrap();
+    assert_eq!(claimed.source(), Some(gh('a')));
+    assert!(claimed.is_installed());
+    let def = claimed.admit("b2").unwrap();
+    assert_eq!(def.service.hosts, ["b.dev"], "the summary is never read");
+    let plain: StoredService = serde_json::from_value(json!({ "service": svc("b2", "b.dev") })).unwrap();
+    assert!(!plain.is_installed());
+    assert!(!StoredService::from(svc("b2", "b.dev")).is_installed());
 }
 
 /// A conflict copy (`"<id> (conflict copy)"`, kept by the sync beside the
@@ -852,7 +948,7 @@ fn a_conflict_copy_is_listed_skipped_and_never_used() {
         copy.clone(),
         StoredService::new(svc("a1", "evil.dev"), None, Some(gh('a'))),
     );
-    let rows = listing(&entries, &HashMap::new(), &state.services, &DeviceChecks::new());
+    let rows = listing(&entries, &HashMap::new(), &state.services, true);
     let row = rows.iter().find(|r| r["id"] == copy.as_str()).unwrap();
     assert_eq!(row["valid"], json!(false));
     assert_eq!(
@@ -860,7 +956,7 @@ fn a_conflict_copy_is_listed_skipped_and_never_used() {
         json!([crate::service::CONFLICT_COPY_REASON])
     );
     assert!(crate::service::CONFLICT_COPY_REASON.contains("console"));
-    let (defs, skipped) = crate::service::vault_custom_services(&entries, &state.services);
+    let (defs, skipped) = crate::service::vault_custom_services(&entries, true, &state.services);
     assert!(defs.contains_key("a1") && !defs.contains_key(&copy));
     assert!(skipped.iter().any(|(id, _)| id == &copy));
     // Not part of its source.

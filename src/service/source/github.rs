@@ -206,21 +206,17 @@ pub trait GitHubApi {
     /// The object the annotated tag object `sha` points at.
     async fn tag_target(&self, owner: &str, repo: &str, sha: &str)
         -> Result<GitObject, FetchError>;
-    /// The full commit GitHub resolves any ref or commit id to (a fetch of a
-    /// ref that is no branch or tag of the repository).
-    async fn commit_of(&self, owner: &str, repo: &str, git_ref: &str)
-        -> Result<String, FetchError>;
     /// The `tar.gz` of the repository at `commit`, at most
     /// [`MAX_TARBALL_BYTES`].
     async fn tarball(&self, owner: &str, repo: &str, commit: &str) -> Result<Vec<u8>, FetchError>;
 }
 
-/// Fetch a GitHub source: resolve `git_ref` (absent: the default branch) to a
-/// full commit, fetch that commit's tarball and read the source out of it.
-/// A ref is resolved among the repository's own branches and tags first
-/// ([`ref_head`]); one that is neither (a commit id, another ref) is resolved
-/// as GitHub resolves it, and the daemon then shows that source as stated by
-/// the requester. Returns the files and the source record pinning the commit.
+/// Fetch a GitHub source: resolve `git_ref` (absent: the default branch)
+/// among the repository's own branches and tags ([`ref_head`]) to a full
+/// commit, fetch that commit's tarball and read the source out of it. A ref
+/// that is neither (a commit id, another `refs/` name) is refused
+/// ([`not_branch_or_tag`]). Returns the files and the source record pinning
+/// the commit.
 pub async fn fetch<A: GitHubApi>(
     api: &A,
     spec: &GitHubSpec,
@@ -235,16 +231,10 @@ pub async fn fetch<A: GitHubApi>(
     let commit = match git_ref {
         Some(r) => {
             check_ref(r).map_err(|e| vec![e])?;
-            match ref_head(api, owner, repo, r)
+            ref_head(api, owner, repo, r)
                 .await
                 .map_err(|e| vec![e.into()])?
-            {
-                Some(c) => c,
-                None => api
-                    .commit_of(owner, repo, r)
-                    .await
-                    .map_err(|e| vec![e.into()])?,
-            }
+                .ok_or_else(|| vec![not_branch_or_tag(r, owner, repo)])?
         }
         None => {
             let b = api
@@ -280,6 +270,16 @@ pub async fn fetch<A: GitHubApi>(
     ))
 }
 
+/// Why a ref that names no branch or tag of the repository is refused.
+pub fn not_branch_or_tag(git_ref: &str, owner: &str, repo: &str) -> String {
+    format!(
+        "'{}' is not a branch or tag of github:{}/{}; a GitHub source is added from a branch or tag",
+        crate::util::terminal_safe(git_ref),
+        owner,
+        repo
+    )
+}
+
 /// Check that `defs` (service id → service.toml, policy.toml), as a request
 /// carries them, are what `source` holds. A GitHub source is checked only at
 /// the head of one of the repository's own branches or tags: its stated ref
@@ -288,19 +288,15 @@ pub async fn fetch<A: GitHubApi>(
 /// must point at the pinned commit; that commit is fetched again and every
 /// definition's digest compared (a single service folder stored under
 /// another id through `--id` is compared after the same rename).
-/// `Ok(Fetched)` when all of it holds. `Err` when it does not, when the
-/// commit does not hold a source, or when GitHub answers without the data
-/// ([`FetchError::Answered`]). `Ok(NotReached)` only when no answer arrived
-/// ([`FetchError::Unreachable`]), `Ok(NotBranchOrTag)` for a ref that is no
-/// branch or tag of the repository (a commit id, any other ref), and
-/// `Ok(LocalFolder)` for a local folder: none is checked, and the card shows
-/// the source as the requester stated it.
+/// `Ok` when all of it holds. `Err` when it does not, when the commit does
+/// not hold a source, when the ref is no branch or tag of the repository (a
+/// commit id, any other ref), or when GitHub does not answer with the data.
+/// A local folder is only ever read by the requester: `Ok`.
 pub async fn verify<A: GitHubApi>(
     api: &A,
     source: &ServiceSource,
     defs: &std::collections::BTreeMap<String, (String, Option<String>)>,
-) -> Result<super::card::SourceCheck, String> {
-    use super::card::SourceCheck;
+) -> Result<(), String> {
     use super::definition_digest;
     let ServiceSource::Github {
         repo,
@@ -310,7 +306,7 @@ pub async fn verify<A: GitHubApi>(
         ..
     } = source
     else {
-        return Ok(SourceCheck::LocalFolder);
+        return Ok(());
     };
     let (owner, name) = repo
         .split_once('/')
@@ -322,6 +318,7 @@ pub async fn verify<A: GitHubApi>(
     }
     let shown = crate::util::terminal_safe(&source.display()).into_owned();
     let refused = |e: &str| format!("{}: {}; nothing was stored", shown, e);
+    let silent = || refused("GitHub did not respond");
     let mismatch = || {
         format!(
             "the definitions in this request are not what {} holds; nothing was stored",
@@ -341,15 +338,20 @@ pub async fn verify<A: GitHubApi>(
                     .map_err(|_| refused("GitHub returned an unusable default branch name"))?;
                 format!("refs/heads/{}", b)
             }
-            Err(FetchError::Unreachable(_)) => return Ok(SourceCheck::NotReached),
+            Err(FetchError::Unreachable(_)) => return Err(silent()),
             Err(FetchError::Answered(e)) => return Err(refused(&e)),
         },
     };
     let head = match ref_head(api, owner, name, &target).await {
         Ok(Some(h)) => h,
-        Ok(None) if git_ref.is_some() => return Ok(SourceCheck::NotBranchOrTag),
+        Ok(None) if git_ref.is_some() => {
+            return Err(format!(
+                "{}; nothing was stored",
+                not_branch_or_tag(&target, owner, name)
+            ))
+        }
         Ok(None) => return Err(refused("GitHub has no commit for the default branch")),
-        Err(FetchError::Unreachable(_)) => return Ok(SourceCheck::NotReached),
+        Err(FetchError::Unreachable(_)) => return Err(silent()),
         Err(FetchError::Answered(e)) => return Err(refused(&e)),
     };
     if !is_full_commit(&head) {
@@ -364,7 +366,7 @@ pub async fn verify<A: GitHubApi>(
     }
     let gz = match api.tarball(owner, name, commit).await {
         Ok(gz) => gz,
-        Err(FetchError::Unreachable(_)) => return Ok(SourceCheck::NotReached),
+        Err(FetchError::Unreachable(_)) => return Err(silent()),
         Err(FetchError::Answered(e)) => return Err(refused(&e)),
     };
     let files = tar::read_tarball(&gz, path.as_deref()).map_err(|_| mismatch())?;
@@ -388,7 +390,7 @@ pub async fn verify<A: GitHubApi>(
                 .all(|(key, held)| defs.get(key).is_some_and(|c| digest(c) == digest(held)))
     };
     if matches {
-        Ok(SourceCheck::Fetched)
+        Ok(())
     } else {
         Err(mismatch())
     }
@@ -485,9 +487,6 @@ impl GitHubHttp {
 /// The URLs a source fetch uses, built only from checked names.
 pub(crate) fn repo_url(api: &str, owner: &str, repo: &str) -> String {
     format!("{}/repos/{}/{}", api, owner, repo)
-}
-pub(crate) fn commit_url(api: &str, owner: &str, repo: &str, git_ref: &str) -> String {
-    format!("{}/repos/{}/{}/commits/{}", api, owner, repo, git_ref)
 }
 pub(crate) fn git_ref_url(api: &str, owner: &str, repo: &str, path: &str) -> String {
     format!("{}/repos/{}/{}/git/ref/{}", api, owner, repo, path)
@@ -678,23 +677,6 @@ impl GitHubApi for GitHubHttp {
         git_object(v.get("object"))
     }
 
-    async fn commit_of(
-        &self,
-        owner: &str,
-        repo: &str,
-        git_ref: &str,
-    ) -> Result<String, FetchError> {
-        let what = format!("ref '{}' in github:{}/{}", git_ref, owner, repo);
-        let req = self.get(
-            &commit_url(&self.api, owner, repo, git_ref),
-            "application/vnd.github.sha",
-        );
-        let resp = self.send(req, &what).await?;
-        let body = self.read(resp, 256, &what).await?;
-        String::from_utf8(body)
-            .map_err(|_| FetchError::Answered("GitHub returned an unreadable commit id".into()))
-    }
-
     async fn tarball(&self, owner: &str, repo: &str, commit: &str) -> Result<Vec<u8>, FetchError> {
         let what = format!("github:{}/{} at {}", owner, repo, commit);
         let req = self.get(
@@ -787,7 +769,7 @@ mod tests {
             // No answer at all: not reached.
             let silent = stand_in(Vec::new()).await;
             let e = reader(&silent, within)
-                .commit_of("acme", "tools", "main")
+                .default_branch("acme", "tools")
                 .await
                 .unwrap_err();
             assert!(matches!(e, FetchError::Unreachable(_)), "{e:?}");

@@ -82,7 +82,7 @@ fn key_must_equal_declared_id() {
         GITHUB.replace("\"github\"", "\"other\"").into(),
     );
     let reg = crate::service::ServiceRegistry::compiled_only();
-    let (defs, skipped) = crate::service::vault_custom_services(&aux, &reg);
+    let (defs, skipped) = crate::service::vault_custom_services(&aux, true, &reg);
     assert!(defs.is_empty());
     assert!(skipped[0].1.contains("declares id 'other'"), "{skipped:?}");
 }

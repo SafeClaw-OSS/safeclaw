@@ -1218,7 +1218,8 @@ pub fn unreadable_refusal(record: &str) -> String {
 }
 
 // ── Owner-config records ─────────────────────────────────────────────────────
-// Storage unit = edit unit: `policy:` = `{timeout, default}`,
+// Storage unit = edit unit: `policy:` = `{timeout, default,
+// allow_installed_services}`,
 // `policy:category:<tag>` = that tag's Levels, `policy:connection:<id>` =
 // that connection's ConnectionPolicy, `store:<id>` = one Store,
 // `store_order:` and `audit_retention_days:` one record each. The fold
@@ -1231,6 +1232,8 @@ struct PolicyRoot {
     timeout: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     default: Option<crate::core::policy::Levels>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    allow_installed_services: bool,
 }
 
 /// The owner-config kinds, each reassembled into its `VaultAux` field.
@@ -1256,6 +1259,7 @@ fn policy_items(p: &crate::core::policy::Policy) -> Result<Vec<Record>> {
     let root = PolicyRoot {
         timeout: p.timeout,
         default: p.default.clone(),
+        allow_installed_services: p.allow_installed_services,
     };
     let mut out = vec![((ItemNs::Policy, String::new()), to_json(&root)?)];
     for (tag, levels) in p.categories.iter().filter(|(k, _)| !k.is_empty()) {
@@ -1445,12 +1449,14 @@ impl OwnerConfigFold {
                         default: None,
                         categories: Default::default(),
                         connections: Default::default(),
+                        allow_installed_services: false,
                     };
                     for (name, v) in entries {
                         if name.is_empty() {
                             let root: PolicyRoot = parse_config("policy", v)?;
                             p.timeout = root.timeout;
                             p.default = root.default;
+                            p.allow_installed_services = root.allow_installed_services;
                         } else if let Some(tag) = name.strip_prefix(POLICY_CATEGORY) {
                             p.categories
                                 .insert(tag.to_string(), parse_config("policy category", v)?);
@@ -6497,6 +6503,7 @@ pub(crate) mod tests {
         );
         let (_, skipped) = crate::service::vault_custom_services(
             &services,
+            true,
             &crate::service::ServiceRegistry::load(),
         );
         assert!(skipped
@@ -6560,6 +6567,55 @@ pub(crate) mod tests {
             let services = pv.fold_view::<S>(keys, vault).unwrap().aux.services;
             assert_eq!(services.keys().collect::<Vec<_>>(), ["acme"], "{vault}");
         }
+    }
+
+    /// The owner's switch for installed services lives in the `policy:`
+    /// record: written only when on (absent = off), kept through the
+    /// normalized form every client compares, and reassembled by the fold.
+    #[test]
+    fn the_installed_services_switch_is_in_the_policy_record() {
+        type S = sudp::primitives::StdPrimitives;
+        let on = crate::core::policy::Policy {
+            allow_installed_services: true,
+            ..crate::core::policy::Policy::default()
+        };
+        let root = policy_items(&on).unwrap()[0].1.clone();
+        assert_eq!(root["allow_installed_services"], serde_json::json!(true));
+        assert_eq!(
+            owner_config_typed(ItemNs::Policy, "", &root).unwrap()["allow_installed_services"],
+            serde_json::json!(true)
+        );
+        let off = crate::core::policy::Policy {
+            allow_installed_services: false,
+            ..on.clone()
+        };
+        assert!(policy_items(&off).unwrap()[0].1.get("allow_installed_services").is_none());
+        assert!(!crate::core::policy::Policy::effective(None).allow_installed_services);
+        assert!(crate::core::policy::Policy::effective(Some(&on)).allow_installed_services);
+
+        let k = [0x5au8; 32];
+        let keys = VaultKeys::single(&k);
+        let vault = "vault-switch";
+        let mut pv = PerItemVault::build_initial(
+            b"c".to_vec(),
+            "x".into(),
+            "y".into(),
+            "Dev".into(),
+            vec![0u8; 32],
+            vec![0u8; 48],
+        )
+        .unwrap();
+        pv.plant::<S>(
+            keys,
+            vault,
+            ItemNs::Policy,
+            "",
+            1,
+            &ItemPayload::live(ItemNs::Policy, "", root),
+        )
+        .unwrap();
+        let aux = pv.fold_view::<S>(keys, vault).unwrap().aux;
+        assert!(aux.allows_installed_services());
     }
 
     /// Seal `payload` at `(ns, name)` version 1 and sign it as `signer`

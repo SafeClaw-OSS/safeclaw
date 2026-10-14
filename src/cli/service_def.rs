@@ -190,11 +190,6 @@ struct Listed {
     summary: Option<DefSummary>,
     #[serde(default)]
     digest: Option<String>,
-    /// The commit this device checked the definition at, when its recorded
-    /// fact still names this definition and source; else the source is as
-    /// the requester stated it.
-    #[serde(default)]
-    checked_on_this_device: Option<String>,
 }
 
 /// What `sc service ls` says of a locked vault.
@@ -226,38 +221,12 @@ async fn listing(custodian: &str, vault: &str) -> Result<Vec<Listed>, String> {
         .map_err(|e| format!("parse: {}", e))
 }
 
-/// The heading a stored source groups under: the source, then how it is
-/// known: `verified on this device` when this device fetched that commit
-/// again and found this definition (its own record, never the vault's), else
-/// `unverified`. Definitions of one source
-/// known differently head separate groups.
+/// The heading a stored source groups under: the source's display (one
+/// group per source and commit), or `added before sources`.
 fn group_of(l: &Listed) -> (String, String) {
     match &l.source {
         Some(s) => {
-            let head = match s {
-                ServiceSource::Github {
-                    repo,
-                    path,
-                    git_ref,
-                    commit,
-                } => {
-                    let mut h = format!("github:{}", repo);
-                    if let Some(p) = path {
-                        h.push(':');
-                        h.push_str(p);
-                    }
-                    if let Some(r) = git_ref {
-                        h.push_str(&format!(" (ref {})", r));
-                    }
-                    h.push_str(&format!(" @ {}", commit));
-                    match &l.checked_on_this_device {
-                        Some(c) if c == commit => h.push_str(": verified on this device"),
-                        _ => h.push_str(": unverified"),
-                    }
-                    h
-                }
-                ServiceSource::Local { name } => format!("local folder {}: unverified", name),
-            };
+            let head = s.display();
             (format!("{}\n{}", s.identity(), head), head)
         }
         None => (String::new(), "added before sources".into()),
@@ -282,7 +251,7 @@ async fn submit(
     update: bool,
     opts: &ApproveOpts,
 ) -> Result<Value, String> {
-    let definitions: serde_json::Map<String, Value> = loaded
+    let defs: serde_json::Map<String, Value> = loaded
         .admitted
         .iter()
         .map(|a| {
@@ -298,7 +267,7 @@ async fn submit(
         "act": {
             "type": { "custom": "service-add" },
             "target": identity,
-            "scope": { "definitions": definitions, "source": loaded.source, "update": update },
+            "scope": { "defs": defs, "source": loaded.source, "update": update },
         },
         "bind": { "redeemer": vault },
         "valid": { "iat": now_unix(), "multiplicity": 1 }
@@ -809,49 +778,31 @@ mod tests {
             connections: vec![],
             summary: None,
             digest: None,
-            checked_on_this_device: None,
         }
     }
 
-    /// `sc service ls` heads each source with how it is known: verified at its
-    /// commit on this device, or unverified. A stored record saying it was
-    /// checked is not read.
+    /// `sc service ls` heads each installed source with its display only; a
+    /// stored record saying it was checked is not read.
     #[test]
-    fn ls_heading_says_how_the_source_is_known() {
+    fn ls_heading_is_the_source_display() {
         let gh: ServiceSource = serde_json::from_value(serde_json::json!({
-            "kind": "github", "repo": "acme/tools", "path": "svc", "ref": "main",
+            "kind": "github", "repo": "acme/tools", "path": "svc", "ref": "v1.2.0",
             "commit": "a".repeat(40), "checked": true,
         }))
         .unwrap();
-        let stated = listed("a1", Some(gh.clone()));
-        let (stated_key, head) = group_of(&stated);
+        let (key, head) = group_of(&listed("a1", Some(gh.clone())));
         assert_eq!(
             head,
-            format!(
-                "github:acme/tools:svc (ref main) @ {}: unverified",
-                "a".repeat(40)
-            )
+            format!("github:acme/tools:svc (v1.2.0) @ {}", "a".repeat(40))
         );
-        let mut checked = listed("a2", Some(gh.clone()));
-        checked.checked_on_this_device = Some("a".repeat(40));
-        let (checked_key, head) = group_of(&checked);
-        assert_eq!(
-            head,
-            format!(
-                "github:acme/tools:svc (ref main) @ {}: verified on this device",
-                "a".repeat(40)
-            )
-        );
-        assert_ne!(stated_key, checked_key, "known differently: separate groups");
-        // A check at another commit than the stored one says nothing.
-        let mut other = listed("a3", Some(gh));
-        other.checked_on_this_device = Some("b".repeat(40));
-        assert!(group_of(&other).1.ends_with(": unverified"));
+        assert_eq!(head, gh.display());
+        assert_eq!(group_of(&listed("a2", Some(gh))).0, key, "one group");
         let local = ServiceSource::Local {
             name: "mine".into(),
         };
         let (_, head) = group_of(&listed("m1", Some(local)));
-        assert_eq!(head, "local folder mine: unverified");
+        assert_eq!(head, "local folder mine");
+        assert_eq!(group_of(&listed("old", None)).1, "added before sources");
     }
 
     fn update_args(target: Option<&str>, all: bool) -> ServiceUpdateArgs {
