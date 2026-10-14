@@ -210,9 +210,8 @@ pub enum Command {
     /// the only thing it ever prints.
     #[command(name = "git-credential", hide = true)]
     GitCredential(GitCredentialArgs),
-    /// Approval ops. `sc op wait <op_id>` blocks until the op resolves — the
-    /// waiter an agent backgrounds after a pending-approval reply; its exit
-    /// is the wake-up (0 approved, 5 rejected, 3 expired, 4 timeout).
+    /// Approval ops. `sc op wait <op_id>` blocks until the op resolves; its
+    /// exit code is the outcome (`sc op wait --help`).
     Op(OpArgs),
 }
 
@@ -378,6 +377,14 @@ pub struct OpArgs {
 #[derive(Debug, Subcommand)]
 pub enum OpSubcommand {
     /// Block until an approval op resolves; the exit code carries the outcome.
+    ///
+    /// Exit codes:
+    ///   0  approved: re-run the original command
+    ///   5  not approved: do not retry it unchanged
+    ///   6  withdrawn or replaced by a newer request: re-run to ask again
+    ///   3  expired or unknown: re-run for a fresh approval link
+    ///   4  stopped waiting (--timeout): the op may still be pending; wait again
+    #[command(verbatim_doc_comment)]
     Wait(OpWaitArgs),
 }
 
