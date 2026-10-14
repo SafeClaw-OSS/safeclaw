@@ -126,25 +126,18 @@ pub fn consent_for(op: &Operation) -> Option<RenderedConsent> {
 /// gate (a danger act is confirmed alone, never batched), so the console must
 /// read it from daemon-authored, signed material, never a requester field.
 ///
-/// A Custom act carries its descriptor's tone. The two built-ins carry their
-/// variant: a `use` scoped to a time window is "warn" (approving grants every
-/// asking request for that window, writes included) while a one-shot use is
-/// "neutral"; an `export` with no recipient binding is "warn" (a handover:
-/// the plaintext reaches the requester and cannot be taken back) while one
-/// sealed to a recipient is "neutral". Anything else gets none (a
-/// requester-supplied value is removed); clients keep their own upward-only
-/// danger floor for the acts they know.
+/// A Custom act carries its descriptor's tone. The built-ins: a `use` is
+/// always "neutral" (windowed or one-shot, it is the agent's most routine
+/// action; the window itself is on the card); an `export` with no recipient
+/// binding is "warn" (a handover: the plaintext reaches the requester and
+/// cannot be taken back) while one sealed to a recipient is "neutral".
+/// Anything else gets none (a requester-supplied value is removed); clients
+/// keep their own upward-only danger floor for the acts they know.
 pub fn stamp_tone(op: &mut Operation) {
     let variant = |warn: bool| Some(if warn { "warn" } else { "neutral" }.to_string());
     let tone = match &op.act.kind {
         ActType::Custom(name) => act_catalog().get(name.as_str()).map(|d| d.tone.clone()),
-        ActType::Use => variant(
-            op.act
-                .scope
-                .get("window_s")
-                .and_then(|v| v.as_u64())
-                .is_some_and(|w| w > 0),
-        ),
+        ActType::Use => variant(false),
         ActType::Export => variant(op.bind.recipient.is_none()),
         _ => None,
     };
@@ -375,9 +368,9 @@ mod tests {
         assert_eq!(c.tone, "neutral");
     }
 
-    /// The two built-ins stamp their variant: a use scoped to a time window
-    /// is warn, a one-shot use neutral; an export with no recipient binding
-    /// (a handover) is warn, one sealed to a recipient neutral.
+    /// The built-ins stamp their variant: a use is neutral whatever its
+    /// window (the agent's most routine action); an export with no recipient
+    /// binding (a handover) is warn, one sealed to a recipient neutral.
     #[test]
     fn use_and_export_stamp_their_variant_tone() {
         let built_in = |kind: ActType, scope: serde_json::Value, sealed: bool| {
@@ -402,14 +395,14 @@ mod tests {
         let windowed = json!({ "level": "ask", "reuse": "floor", "window_s": 900 });
         assert_eq!(
             built_in(ActType::Use, windowed, false),
-            Some(json!("warn")),
-            "a time-window use grants more than this one request"
+            Some(json!("neutral")),
+            "a windowed use is still the routine action"
         );
-        let once = json!({ "level": "ask-always", "reuse": "none", "tone": "neutral" });
+        let once = json!({ "level": "ask-always", "reuse": "none", "tone": "warn" });
         assert_eq!(
             built_in(ActType::Use, once, false),
             Some(json!("neutral")),
-            "a one-shot use lets exactly one request through"
+            "one-shot, and a requester-supplied tone is overwritten"
         );
         assert_eq!(
             built_in(ActType::Export, json!({}), false),
