@@ -48,14 +48,18 @@ How it works:
   fail.
 - **Pinned.** A GitHub source is resolved to a full commit (`--ref` takes a
   branch or tag; default: the default branch) and stored with it and the ref.
-- **Read, never run.** Only `service.toml` and `policy.toml` at those paths
-  are read, as regular files: symlinks, links and devices are not followed
+- **Read, never run.** Only `service.toml`, `policy.toml` and an optional
+  `icon.png` at those paths are read, as regular files: symlinks, links and devices are not followed
   (a local folder is opened one component at a time without following a
   link, macOS and Linux), a GitHub tarball is read in memory (never
   extracted), `..` or an absolute path refuses it, and sizes and entry counts
   are capped. A parse error gives its kind, line and column, never the text.
 - **All or nothing.** Every definition passes the same gate the daemon runs at
   unlock; one invalid definition refuses the whole source.
+- **Icons.** A service folder may ship an `icon.png` (a real PNG, at most
+  32 KiB; anything else refuses the source). Icons display from the public
+  catalog, not from installs: the vault stores TOML only, and nothing of the
+  icon reaches the approval card.
 - **One approval.** The card lists each service, every host that receives
   its credentials or OAuth data (declared hosts, the token endpoint, the
   authorization page, a redirect that leaves your device), `PKCE: off` when

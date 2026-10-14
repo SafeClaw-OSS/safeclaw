@@ -16,7 +16,7 @@
 use std::io::Read;
 
 use super::{
-    fixed_path, Layout, SourceFiles, MAX_TARBALL_BYTES, MAX_TARBALL_ENTRIES,
+    fixed_path, FileKind, Layout, SourceFiles, MAX_TARBALL_BYTES, MAX_TARBALL_ENTRIES,
     MAX_TARBALL_UNPACKED_BYTES,
 };
 use crate::service::limits::MAX_FILE_BYTES;
@@ -159,13 +159,13 @@ pub(crate) fn read_tarball_with(
         };
         seen_under_sub = true;
         note_layout(&rel, kind == b'5', &mut lay);
-        let Some((key, is_policy)) = fixed_path(rel.trim_end_matches('/')) else {
+        let Some((key, file_kind)) = fixed_path(rel.trim_end_matches('/')) else {
             if has_data {
                 skip(&mut rd, size).map_err(|e| vec![e])?;
             }
             continue;
         };
-        let label = shown_path(&key, is_policy);
+        let label = shown_path(&key, file_kind);
         if !regular {
             let what = match kind {
                 b'2' => "is a symbolic link",
@@ -194,22 +194,28 @@ pub(crate) fn read_tarball_with(
         let mut data = vec![0u8; size as usize];
         read_full(&mut rd, &mut data).map_err(|e| vec![e])?;
         skip_padding(&mut rd, size).map_err(|e| vec![e])?;
+        if file_kind == FileKind::Icon {
+            if key.is_empty() {
+                lay.root_icon = Some(data);
+            } else {
+                lay.folders.entry(key).or_default().icon = Some(data);
+            }
+            continue;
+        }
         let Ok(text) = String::from_utf8(data) else {
             lay.problems.push(format!("{} is not UTF-8", label));
             continue;
         };
         if key.is_empty() {
-            if is_policy {
-                lay.root_policy = Some(text);
-            } else {
-                lay.root_service = Some(text);
+            match file_kind {
+                FileKind::Policy => lay.root_policy = Some(text),
+                _ => lay.root_service = Some(text),
             }
         } else {
             let slot = lay.folders.entry(key).or_default();
-            if is_policy {
-                slot.1 = Some(text);
-            } else {
-                slot.0 = Some(text);
+            match file_kind {
+                FileKind::Policy => slot.policy = Some(text),
+                _ => slot.service = Some(text),
             }
         }
     }
@@ -244,12 +250,8 @@ fn note_layout(rel: &str, is_dir: bool, lay: &mut Layout) {
 }
 
 /// A fixed path as shown in a problem (the folder name is untrusted).
-fn shown_path(key: &str, is_policy: bool) -> String {
-    let file = if is_policy {
-        "policy.toml"
-    } else {
-        "service.toml"
-    };
+fn shown_path(key: &str, kind: FileKind) -> String {
+    let file = kind.file_name();
     if key.is_empty() {
         file.to_string()
     } else {

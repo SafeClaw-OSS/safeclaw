@@ -41,6 +41,28 @@ pub const MAX_TARBALL_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_TARBALL_UNPACKED_BYTES: u64 = 64 * 1024 * 1024;
 /// Archive entries in a GitHub tarball (336: the core repository).
 pub const MAX_TARBALL_ENTRIES: usize = 10_000;
+/// One `icon.png` (PNG only; SVG and every other format are refused — a
+/// vector format can carry script).
+pub const MAX_ICON_BYTES: usize = 32 * 1024;
+
+/// The PNG signature every `icon.png` must start with.
+const PNG_MAGIC: [u8; 8] = [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
+
+/// Why `bytes` is not an icon a source may ship, or `Ok`: a PNG (by its
+/// signature) of at most [`MAX_ICON_BYTES`].
+pub fn check_icon(bytes: &[u8]) -> Result<(), String> {
+    if bytes.len() < PNG_MAGIC.len() || bytes[..PNG_MAGIC.len()] != PNG_MAGIC {
+        return Err("is not a PNG (only PNG icons are read)".into());
+    }
+    if bytes.len() > MAX_ICON_BYTES {
+        return Err(format!(
+            "is {} bytes; the limit is {}",
+            bytes.len(),
+            MAX_ICON_BYTES
+        ));
+    }
+    Ok(())
+}
 
 // ── The stored form ──────────────────────────────────────────────────────────
 
@@ -553,18 +575,28 @@ impl SourceFiles {
 /// with one set of layout rules for both a local folder and a tarball.
 #[derive(Default)]
 pub(crate) struct Layout {
-    /// `service.toml` / `policy.toml` at the root.
+    /// `service.toml` / `policy.toml` / `icon.png` at the root.
     pub root_service: Option<String>,
     pub root_policy: Option<String>,
+    pub root_icon: Option<Vec<u8>>,
     /// Something exists at `service.toml` at the root (read or not).
     pub root_service_seen: bool,
     /// Something exists at `services/` (a folder, or any entry under it).
     pub services_seen: bool,
-    /// `services/<id>` folders seen, with what was read inside.
-    pub folders: BTreeMap<String, (Option<String>, Option<String>)>,
+    /// `services/<id>` folders seen, with what was read inside
+    /// (service.toml, policy.toml, icon.png).
+    pub folders: BTreeMap<String, FolderSlot>,
     /// Problems found while reading (a symlink at a fixed path, a file over
     /// the size limit, a file that is not UTF-8).
     pub problems: Vec<String>,
+}
+
+/// What was read inside one `services/<id>` folder.
+#[derive(Default)]
+pub(crate) struct FolderSlot {
+    pub service: Option<String>,
+    pub policy: Option<String>,
+    pub icon: Option<Vec<u8>>,
 }
 
 impl Layout {
@@ -578,8 +610,24 @@ impl Layout {
             return Err(problems);
         }
         let mut files = SourceFiles::default();
+        // An `icon.png` is a format allowance, not content: it is validated
+        // (PNG, size) so the convention stays disciplined, then dropped. It is
+        // never stored, never part of what is approved; icons display from
+        // the public catalog when it opens, not from installs.
+        let check_icon_at = |key: &str, icon: Option<Vec<u8>>, problems: &mut Vec<String>| {
+            let Some(bytes) = icon else { return };
+            let label = if key.is_empty() {
+                "icon.png".to_string()
+            } else {
+                format!("services/{}/icon.png", crate::util::terminal_safe(key))
+            };
+            if let Err(e) = check_icon(&bytes) {
+                problems.push(format!("{} {}", label, e));
+            }
+        };
         if self.root_service_seen {
             files.single = true;
+            check_icon_at("", self.root_icon, &mut problems);
             match self.root_service {
                 Some(s) => {
                     files.defs.insert(String::new(), (s, self.root_policy));
@@ -598,10 +646,11 @@ impl Layout {
                 ));
                 return Err(problems);
             }
-            for (key, (svc, pol)) in self.folders {
-                match svc {
+            for (key, slot) in self.folders {
+                check_icon_at(&key, slot.icon, &mut problems);
+                match slot.service {
                     Some(s) => {
-                        files.defs.insert(key, (s, pol));
+                        files.defs.insert(key, (s, slot.policy));
                     }
                     None => {
                         let label = format!("services/{}", crate::util::terminal_safe(&key));
@@ -625,25 +674,43 @@ impl Layout {
     }
 }
 
+/// The file kinds a source is read at ([`fixed_path`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FileKind {
+    Service,
+    Policy,
+    Icon,
+}
+
+impl FileKind {
+    pub(crate) fn file_name(self) -> &'static str {
+        match self {
+            FileKind::Service => "service.toml",
+            FileKind::Policy => "policy.toml",
+            FileKind::Icon => "icon.png",
+        }
+    }
+}
+
 /// The paths a source is read at, relative to its root: `Some((folder key,
-/// is_policy))` for the four fixed names, `None` for anything else. A folder
-/// key is empty at the root.
-pub(crate) fn fixed_path(rel: &str) -> Option<(String, bool)> {
-    match rel {
-        "service.toml" => return Some((String::new(), false)),
-        "policy.toml" => return Some((String::new(), true)),
-        _ => {}
+/// kind))` for the fixed names, `None` for anything else. A folder key is
+/// empty at the root.
+pub(crate) fn fixed_path(rel: &str) -> Option<(String, FileKind)> {
+    let kind = |file: &str| match file {
+        "service.toml" => Some(FileKind::Service),
+        "policy.toml" => Some(FileKind::Policy),
+        "icon.png" => Some(FileKind::Icon),
+        _ => None,
+    };
+    if let Some(k) = kind(rel) {
+        return Some((String::new(), k));
     }
     let rest = rel.strip_prefix("services/")?;
     let (key, file) = rest.split_once('/')?;
     if key.is_empty() || file.contains('/') {
         return None;
     }
-    match file {
-        "service.toml" => Some((key.to_string(), false)),
-        "policy.toml" => Some((key.to_string(), true)),
-        _ => None,
-    }
+    kind(file).map(|k| (key.to_string(), k))
 }
 
 // ── Local folders ────────────────────────────────────────────────────────────
@@ -668,6 +735,7 @@ pub fn read_local(root: &Path) -> Result<SourceFiles, Vec<String>> {
         lay.root_service_seen = true;
         lay.root_service = read_fixed(svc, "service.toml", &mut lay.problems);
         lay.root_policy = read_fixed(dir.file("policy.toml"), "policy.toml", &mut lay.problems);
+        lay.root_icon = read_fixed_bytes(dir.file("icon.png"), "icon.png", &mut lay.problems);
     }
     match dir.folder("services") {
         Opened::Absent => {}
@@ -734,18 +802,23 @@ fn read_local_collection(services: local::Opened<local::Folder>, lay: &mut Layou
             // A README or similar next to the service folders, or gone.
             Opened::Other | Opened::Absent => continue,
         };
-        let slot = (
-            read_fixed(
+        let slot = FolderSlot {
+            service: read_fixed(
                 folder.file("service.toml"),
                 &format!("{}/service.toml", label),
                 &mut lay.problems,
             ),
-            read_fixed(
+            policy: read_fixed(
                 folder.file("policy.toml"),
                 &format!("{}/policy.toml", label),
                 &mut lay.problems,
             ),
-        );
+            icon: read_fixed_bytes(
+                folder.file("icon.png"),
+                &format!("{}/icon.png", label),
+                &mut lay.problems,
+            ),
+        };
         lay.folders.insert(name, slot);
     }
 }
@@ -758,16 +831,34 @@ fn read_fixed(
     label: &str,
     problems: &mut Vec<String>,
 ) -> Option<String> {
+    let bytes = read_fixed_bytes(opened, label, problems)?;
+    match String::from_utf8(bytes) {
+        Ok(s) => Some(s),
+        Err(_) => {
+            problems.push(format!("{} is not UTF-8", label));
+            None
+        }
+    }
+}
+
+/// The bytes of one fixed-name file (the icon is binary), or `None` (absent,
+/// or a problem pushed under `label`).
+#[cfg(unix)]
+fn read_fixed_bytes(
+    opened: local::Opened<std::fs::File>,
+    label: &str,
+    problems: &mut Vec<String>,
+) -> Option<Vec<u8>> {
     use local::Opened;
-    let text = match opened {
+    let bytes = match opened {
         Opened::Absent => return None,
-        Opened::Found(f) => local::read_text(f),
+        Opened::Found(f) => local::read_bytes(f),
         Opened::Link => Err("is a symbolic link; only regular files are read".to_string()),
         Opened::Other => Err("is not a regular file".to_string()),
         Opened::Failed(e) => Err(format!("cannot be read: {}", e)),
     };
-    match text {
-        Ok(s) => Some(s),
+    match bytes {
+        Ok(b) => Some(b),
         Err(e) => {
             problems.push(format!("{} {}", label, e));
             None
@@ -906,7 +997,7 @@ pub(crate) mod local {
 
     /// Read an opened file: only a regular file (by `fstat` on the open file)
     /// within the size limit.
-    pub fn read_text(file: std::fs::File) -> Result<String, String> {
+    pub fn read_bytes(file: std::fs::File) -> Result<Vec<u8>, String> {
         let meta = file
             .metadata()
             .map_err(|e| format!("cannot be read: {}", e))?;
@@ -927,7 +1018,7 @@ pub(crate) mod local {
         if buf.len() > MAX_FILE_BYTES {
             return Err(format!("is larger than the {}-byte limit", MAX_FILE_BYTES));
         }
-        String::from_utf8(buf).map_err(|_| "is not UTF-8".to_string())
+        Ok(buf)
     }
 }
 

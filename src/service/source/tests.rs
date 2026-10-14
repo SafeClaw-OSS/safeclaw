@@ -450,6 +450,69 @@ fn pax_path(path: &str) -> Vec<u8> {
     format!("{}{}", len, body).into_bytes()
 }
 
+/// An optional `icon.png` may sit next to a service.toml, in a collection
+/// folder or at a single-service root, from a tarball or a local folder: a
+/// PNG (by signature) of at most 32 KiB is tolerated and dropped — never
+/// stored, never in the op or the admitted definitions — while anything else
+/// at that name refuses the source, so the convention stays disciplined for
+/// the public catalog that will serve icons. Built-in service dirs ship none
+/// and compile as before (the loaded registry tests cover them).
+#[test]
+fn icon_png_is_validated_and_dropped() {
+    let png = |pad: usize| {
+        let mut b = vec![0x89u8, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
+        b.extend(std::iter::repeat_n(0u8, pad));
+        b
+    };
+    let a1 = svc("a1", "a.dev");
+    // Valid, collection + root: read fine, and nothing of the icon reaches
+    // the admitted definitions or the op.
+    let ok = tar_gz(&[
+        ("o-r-x/services/a1/service.toml", b'0', a1.as_bytes()),
+        ("o-r-x/services/a1/icon.png", b'0', &png(64)),
+    ]);
+    let files = read_tarball(&ok, None).unwrap();
+    assert_eq!(files.defs["a1"], (a1.clone(), None));
+    let admitted = admit_files(&files, None).unwrap();
+    let op = super::add_op("v1", &gh("acme/tools", 'a'), &admitted, false, 0);
+    let def = op["act"]["scope"]["defs"]["a1"].as_object().unwrap();
+    assert_eq!(def.keys().collect::<Vec<_>>(), ["service"]);
+    let root = tar_gz(&[
+        ("o-r-x/service.toml", b'0', ACME.as_bytes()),
+        ("o-r-x/icon.png", b'0', &png(0)),
+    ]);
+    assert!(read_tarball(&root, None).unwrap().single);
+    // Not a PNG (an SVG, any text) at the icon name: the source is refused.
+    let fake = tar_gz(&[
+        ("o-r-x/services/a1/service.toml", b'0', a1.as_bytes()),
+        ("o-r-x/services/a1/icon.png", b'0', b"<svg onload=x></svg>"),
+    ]);
+    let e = read_tarball(&fake, None).unwrap_err();
+    assert!(
+        e.iter().any(|p| p.contains("services/a1/icon.png is not a PNG")),
+        "{e:?}"
+    );
+    // A PNG over 32 KiB: refused with the limit.
+    let big = tar_gz(&[
+        ("o-r-x/service.toml", b'0', ACME.as_bytes()),
+        ("o-r-x/icon.png", b'0', &png(super::MAX_ICON_BYTES)),
+    ]);
+    let e = read_tarball(&big, None).unwrap_err();
+    assert!(
+        e.iter()
+            .any(|p| p.starts_with("icon.png is") && p.contains("the limit is 32768")),
+        "{e:?}"
+    );
+    // The local reader shares the rule.
+    let d = tempfile::tempdir().unwrap();
+    write(&d.path().join("one/service.toml"), ACME);
+    std::fs::write(d.path().join("one/icon.png"), png(10)).unwrap();
+    assert!(read_local(&d.path().join("one")).unwrap().single);
+    std::fs::write(d.path().join("one/icon.png"), b"not a png").unwrap();
+    let e = read_local(&d.path().join("one")).unwrap_err();
+    assert!(e.iter().any(|p| p.contains("icon.png is not a PNG")), "{e:?}");
+}
+
 #[test]
 fn tarball_collection_and_sub_path() {
     let pol = ACME_POLICY.as_bytes();
@@ -1694,7 +1757,7 @@ fn local_walk_opens_each_component_without_following_links() {
         panic!()
     };
     assert_eq!(
-        super::local::read_text(dir_as_file).unwrap_err(),
+        super::local::read_bytes(dir_as_file).unwrap_err(),
         "is not a regular file"
     );
 }
