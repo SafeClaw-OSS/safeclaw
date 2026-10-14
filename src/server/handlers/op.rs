@@ -81,6 +81,19 @@ pub(crate) async fn create_op<A: crate::service::source::github::GitHubApi>(
     if !is_lifecycle_bypass && state.is_vault_locked(&vault_id) {
         return Err(AppError::VaultLocked);
     }
+    // Concurrent unlock requests for one vault on this device are one intent:
+    // while one is pending, a second `sc up` (another terminal, a retry after
+    // `sc upgrade`) gets the SAME op back — same op_id, same challenge, so
+    // the /grant link the user was already given stays valid and the one
+    // approval satisfies every waiter — instead of minting a successor that
+    // supersedes that link out from under them. This daemon's in-memory store
+    // only: device A's pending unlock never answers device B, and the
+    // ceremony key is per vault.
+    if matches!(&op.act.kind, ActType::Custom(name) if name == "vault-unlock") {
+        if let Some(pending) = pending_unlock_response(&state, &vault_id) {
+            return Ok(pending);
+        }
+    }
     // ONE approval window (SSOT, user decision 2026-07-14): ops that arrive
     // without an explicit Valid window — the CLI ceremonies (unlock / set /
     // connect) — inherit the vault's `aux.policy.timeout`, the SAME knob the
@@ -200,9 +213,11 @@ pub(crate) async fn create_op<A: crate::service::source::github::GitHubApi>(
 
     // Requester-side supersede: a lifecycle ceremony (unlock/lock) is a
     // singleton — at most one should be live per vault. When a new one is
-    // created (e.g. the user Ctrl-C'd `sc unlock` and retried), withdraw the
-    // stale prior op so the console stops showing "1 approval waiting". Only
-    // ceremonies supersede; Use/Export ops can legitimately be concurrent.
+    // created, withdraw the stale prior op so the console stops showing
+    // "1 approval waiting". A pending unlock is normally REUSED above, so
+    // this fires for lock, and for unlock only when the prior op went
+    // terminal or two creates raced past the reuse check. Only ceremonies
+    // supersede; Use/Export ops can legitimately be concurrent.
     if let ActType::Custom(name) = &op.act.kind {
         if name == "vault-unlock" || name == "vault-lock" {
             let prev = {
@@ -239,6 +254,31 @@ pub(crate) async fn create_op<A: crate::service::source::github::GitHubApi>(
         resp["waiter_secret"] = json!(secret);
     }
     Ok(resp)
+}
+
+/// The create-time response of `vault_id`'s still-pending unlock op on this
+/// device, when one is live: what `POST /v/{vid}/op` answered when that op
+/// was created (its op_id, its challenge, the stored op a local signer must
+/// sign), so a later `sc up` waits on the same approval. `None` when there is
+/// none, or it is terminal or expired: the caller mints fresh.
+fn pending_unlock_response(state: &AppState, vault_id: &str) -> Option<Value> {
+    let id = state
+        .live_ceremony_ops
+        .lock()
+        .unwrap()
+        .get(&(vault_id.to_string(), "vault-unlock".to_string()))
+        .cloned()?;
+    let store = state.approvals.lock().unwrap();
+    let rec = store.get(&id)?;
+    if !matches!(rec.status, crate::approval::store::ApprovalStatus::Pending) {
+        return None;
+    }
+    Some(json!({
+        "op_id": rec.id,
+        "r": rec.r,
+        "expires_at": rec.expires_at_unix,
+        "op": serde_json::to_value(&rec.op).ok()?,
+    }))
 }
 
 /// Requester attribution for an op created on this LOCAL API (the CLI
@@ -529,6 +569,49 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    /// Concurrent unlock requests for one vault on this device coalesce:
+    /// while one is pending, a second create gets the SAME op back (op_id,
+    /// challenge, stored op), so the /grant link already handed out stays
+    /// valid and the one approval satisfies every waiter polling that id.
+    /// Nothing crosses vaults, and a terminal op is never reused.
+    #[test]
+    fn a_second_unlock_request_reuses_the_pending_op() {
+        let state = test_state();
+        let unlock = |vault: &str| -> Operation {
+            serde_json::from_value(json!({
+                "act": { "type": { "custom": "vault-unlock" }, "target": vault, "scope": {} },
+                "bind": { "redeemer": vault },
+                "valid": { "iat": 0, "multiplicity": 1 }
+            }))
+            .unwrap()
+        };
+        // The first create's bookkeeping: the stored op and the per-vault
+        // ceremony singleton, exactly what `create_op` records.
+        let first_id = {
+            let mut s = state.approvals.lock().unwrap();
+            s.create("v1".into(), unlock("v1"), "r-one".into())
+        };
+        state
+            .live_ceremony_ops
+            .lock()
+            .unwrap()
+            .insert(("v1".into(), "vault-unlock".into()), first_id.clone());
+        let resp = pending_unlock_response(&state, "v1").expect("the pending op is reused");
+        assert_eq!(resp["op_id"], json!(first_id), "same /grant link");
+        assert_eq!(resp["r"], json!("r-one"), "same challenge");
+        assert_eq!(resp["op"]["bind"]["redeemer"], json!("v1"));
+        // Another vault has nothing to reuse: no cross-vault coalescing.
+        assert!(pending_unlock_response(&state, "v2").is_none());
+        // One approval flips the one record every waiter polls; a LATER
+        // request then mints fresh (a terminal op is never reused).
+        state.approvals.lock().unwrap().approve(&first_id, None);
+        assert!(matches!(
+            state.approvals.lock().unwrap().get_any(&first_id).unwrap().status,
+            crate::approval::store::ApprovalStatus::Approved
+        ));
+        assert!(pending_unlock_response(&state, "v1").is_none());
     }
 
     #[test]
