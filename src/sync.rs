@@ -4191,14 +4191,22 @@ fn own_record(keys: Option<item_layer::VaultKeys<'_>>, vault_id: &str, row: &Dir
     .unwrap_or_else(|| format!("item {}", row.id))
 }
 
-/// What the user is told about a change of `record` this device made under
-/// a vault key that has since changed, when this session does not hold the
-/// new key ([`Gen::NeedsUnlock`]): kept, sent after `sc unlock`.
-fn keyset_changed_note(record: &str) -> String {
-    format!(
-        "{}: the vault key changed since this change was made on this device; run `sc unlock`, and it is sent under the new key",
-        record
-    )
+/// What the user is told about a change of `record` this device made and
+/// this session cannot send ([`Gen::NeedsUnlock`]): kept, sent after
+/// `sc unlock`. `generation`: the keyset generation the change was sealed
+/// under. A change from before the generation was recorded (`None`) is
+/// not said to be under a changed key: that is not known.
+fn needs_unlock_note(record: &str, generation: Option<u64>) -> String {
+    match generation {
+        Some(_) => format!(
+            "{}: the vault key changed since this change was made on this device; run `sc unlock`, and it is sent under the new key",
+            record
+        ),
+        None => format!(
+            "{}: this change was made on this device before an update and is not sent yet; run `sc unlock`, and it is sent",
+            record
+        ),
+    }
 }
 
 /// Write ours over THEIR row that cannot be read ([`Overwrite`]), at their
@@ -4380,9 +4388,10 @@ pub async fn push_items_best_effort(state: &Arc<AppState>, vault_id: &str) {
             }
             Gen::NeedsUnlock => {
                 tally.left_dirty += 1;
-                tally
-                    .refused_rows
-                    .push((row.id.clone(), keyset_changed_note(&own_record(keys, vault_id, row))));
+                tally.refused_rows.push((
+                    row.id.clone(),
+                    needs_unlock_note(&own_record(keys, vault_id, row), row.generation),
+                ));
                 continue;
             }
             Gen::Unreadable => {
@@ -4459,7 +4468,7 @@ pub async fn push_items_best_effort(state: &Arc<AppState>, vault_id: &str) {
                         tally.left_dirty += 1;
                         tally.refused_rows.push((
                             row.id.clone(),
-                            keyset_changed_note(&own_record(keys, vault_id, row)),
+                            needs_unlock_note(&own_record(keys, vault_id, row), row.generation),
                         ));
                     }
                     Gen::Unreadable => {
@@ -6440,7 +6449,13 @@ mod peritem_tests {
             check_generation(&gens(Some(1), None), Some(stale_session), vid, &stale),
             Gen::NeedsUnlock
         ));
-        assert!(keyset_changed_note("secret A").contains("run `sc unlock`"));
+        assert!(matches!(check_generation(&gens(Some(1), None), None, vid, &row(old, None)), Gen::NeedsUnlock));
+        let changed = needs_unlock_note("secret A", Some(0));
+        assert!(changed.contains("the vault key changed") && changed.contains("run `sc unlock`"), "{changed}");
+        // A change from before the generation was recorded: not said to be
+        // under a changed key; sent after unlock.
+        let unrecorded = needs_unlock_note("secret A", None);
+        assert!(!unrecorded.contains("key changed") && unrecorded.contains("run `sc unlock`"), "{unrecorded}");
         // Under no key this device holds: never sent.
         let other = VaultKeys { content: &[0x99u8; 32], ..old };
         assert!(matches!(
