@@ -40,9 +40,10 @@ curl -s -o /dev/null --connect-timeout 1 "$SAFECLAW_BROKER_URL/health" || sc up
 - `sc secret ls` lists the names of secrets already in the vault. One can back a
   connection you propose with `sc connection add ... --from-secret`, so no value
   passes through you.
-- An API outside the catalog is a custom connection: its host and key. Installing
-  a service (`sc service --help`) adds named rules for an API; it comes from a third
-  party and the user approves it.
+- An API outside the catalog is a custom connection: its host and key. A service
+  (`sc service --help`) adds named rules for an API from a third-party source; an
+  owner must first allow third-party services in the vault's Settings, and the
+  user approves each install. The user can also install one from that page.
 - A vault is a security boundary, and each connection belongs to one. Target it
   with `--vault` to use its connections; resolve a name with `sc vault ls`, and ask
   when it is ambiguous.
