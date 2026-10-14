@@ -448,8 +448,8 @@ pub fn unwrap_k_from_keyset(
 ///   in this credential's per-row seal ([`crate::crypto::vault_key::UikRoot::open_k`]).
 ///
 /// On a re-keyed v2 vault the material also carries the vault's previous
-/// content keys from this member's own keyset row
-/// ([`crate::storage::item::material_with_prev`]).
+/// content keys from this member's own keyset entry, else from another
+/// entry's ([`crate::storage::item::material_with_prev`]).
 ///
 /// One seam so no read path can diverge on how a grant resolves `K` across the
 /// two keyset formats. The grant wire is identical in both cases (a 32-byte
@@ -492,13 +492,17 @@ pub fn acquire_k_from_keyset(
         .or_else(|| uik.creds.values().find(|c| c.user_id == us_id))
         .ok_or_else(|| AppError::Unauthorized("no UIK seal for this member".into()))?;
     let bundle = uik_root.open_k(vault_id, &entry.k_encapped, &entry.k_ct)?;
-    // A re-keyed vault: this member's own row may carry the previous content
-    // keys, kept with the bundle so rows a re-key has not moved yet still read.
+    // A re-keyed vault: the previous content keys ride the keyset entries,
+    // kept with the bundle so rows a re-key has not moved yet still read.
+    // This member's own entry's list first, else any other entry's: every
+    // list is sealed under the shared content key with the same AAD.
+    let lists = std::iter::once(entry.prev_content_ct.as_slice())
+        .chain(uik.creds.values().map(|c| c.prev_content_ct.as_slice()));
     Ok(crate::storage::item::material_with_prev::<StdPrimitives>(
         bundle,
         vault_id,
         uik.generation,
-        &entry.prev_content_ct,
+        lists,
     ))
 }
 

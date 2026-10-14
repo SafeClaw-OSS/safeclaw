@@ -420,33 +420,45 @@ pub fn seal_prev_content_keys<S: PrimitiveSuite>(
 }
 
 /// The key material a member keeps: the key `bundle` (`id_seed ‖ content`),
-/// followed by the vault's previous content keys and their rows when
-/// `sealed_prev` (this member's own keyset row's `uik_prev_content_ct`) opens
-/// under the bundle's content key for this vault at `generation`
-/// ([`VaultKeys::from_material`] splits it back). Anything else (none
-/// carried, a single key, a seal that does not open) is the bundle alone:
-/// only the current key reads.
-pub fn material_with_prev<S: PrimitiveSuite>(
+/// followed by the vault's previous content keys and their rows from the
+/// first of `sealed_lists` that opens under the bundle's content key for
+/// this vault at `generation` ([`VaultKeys::from_material`] splits it back).
+/// `sealed_lists` are keyset entries' `uik_prev_content_ct`, this member's
+/// own entry's first, then the other entries' (every entry's list is sealed
+/// under the shared content key with the same AAD); empty ones are skipped.
+/// Anything else (none carried, a single key, no list that opens) is the
+/// bundle alone: only the current key reads.
+pub fn material_with_prev<'l, S: PrimitiveSuite>(
     bundle: zeroize::Zeroizing<Vec<u8>>,
     vault_id: &str,
     generation: u64,
-    sealed_prev: &[u8],
+    sealed_lists: impl IntoIterator<Item = &'l [u8]>,
 ) -> zeroize::Zeroizing<Vec<u8>> {
-    if sealed_prev.is_empty() || bundle.len() != 2 * SINGLE_KEY_LEN {
+    if bundle.len() != 2 * SINGLE_KEY_LEN {
         return bundle;
     }
-    match open_prev_content_keys::<S>(&bundle[SINGLE_KEY_LEN..], vault_id, generation, sealed_prev) {
-        Ok(prev) => {
-            let mut out = zeroize::Zeroizing::new(Vec::with_capacity(bundle.len() + prev.len()));
-            out.extend_from_slice(&bundle);
-            out.extend_from_slice(&prev);
-            out
+    let mut tried: Vec<&[u8]> = Vec::new();
+    for sealed in sealed_lists {
+        if sealed.is_empty() || tried.contains(&sealed) {
+            continue;
         }
-        Err(e) => {
-            tracing::warn!(vault = %vault_id, generation, "this member's previous content keys do not open ({}); reading with the current key only", e);
-            bundle
+        tried.push(sealed);
+        match open_prev_content_keys::<S>(&bundle[SINGLE_KEY_LEN..], vault_id, generation, sealed) {
+            Ok(prev) => {
+                let mut out = zeroize::Zeroizing::new(Vec::with_capacity(bundle.len() + prev.len()));
+                out.extend_from_slice(&bundle);
+                out.extend_from_slice(&prev);
+                return out;
+            }
+            Err(e) => {
+                tracing::warn!(vault = %vault_id, generation, "a keyset entry's previous content keys do not open ({}); trying the next", e);
+            }
         }
     }
+    if !tried.is_empty() {
+        tracing::warn!(vault = %vault_id, generation, "no keyset entry's previous content keys open; reading with the current key only");
+    }
+    bundle
 }
 
 /// Concatenate a DP-S1 key bundle: `id_seed(32) ‖ content_key(32)` = 64 bytes,
@@ -2184,11 +2196,26 @@ mod tests {
         );
         // No seal, a seal for another generation: the bundle alone.
         for (gen, s) in [(2u64, &[][..]), (3, sealed.as_slice())] {
-            let m = material_with_prev::<StdPrimitives>(bundle.clone(), vault, gen, s);
+            let m = material_with_prev::<StdPrimitives>(bundle.clone(), vault, gen, [s]);
             assert_eq!(m.len(), 64);
             assert!(VaultKeys::from_material(&m).prev.is_empty());
         }
-        let m = material_with_prev::<StdPrimitives>(bundle.clone(), vault, 2, &sealed);
+        let m = material_with_prev::<StdPrimitives>(bundle.clone(), vault, 2, [sealed.as_slice()]);
+        // Own entry without a list, or with one that does not open: another
+        // entry's list is used, the same keys.
+        let other_key = seal_prev_content_keys::<StdPrimitives>(&[9u8; 32], vault, 2, &[(&old, &[])]);
+        for own in [&[][..], other_key.as_slice()] {
+            let from_other =
+                material_with_prev::<StdPrimitives>(bundle.clone(), vault, 2, [own, &[][..], sealed.as_slice()]);
+            assert_eq!(*from_other, *m);
+        }
+        // Own entry's list that opens comes first.
+        let own_list = seal_prev_content_keys::<StdPrimitives>(&new, vault, 2, &[(&old, &[])]);
+        let from_own = material_with_prev::<StdPrimitives>(bundle.clone(), vault, 2, [own_list.as_slice(), sealed.as_slice()]);
+        assert_eq!(VaultKeys::from_material(&from_own).prev_keys().count(), 1);
+        // No entry's list opens: the bundle alone.
+        let none = material_with_prev::<StdPrimitives>(bundle.clone(), vault, 2, [other_key.as_slice()]);
+        assert_eq!(*none, *bundle);
         let keys = VaultKeys::from_material(&m);
         assert_eq!((keys.id_seed, keys.content), (&seed[..], &new[..]));
         let ks: Vec<&[u8]> = keys.prev_keys().map(|k| k.key).collect();
