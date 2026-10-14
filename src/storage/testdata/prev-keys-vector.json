@@ -1,5 +1,5 @@
 {
-  "description": "uik_prev_content_ct / prev_content_ct: every earlier content key, newest first, each with the rows the vault held when it was retired ([wire id, version], sorted by wire id then version), sealed under the CURRENT content key with the item AEAD (sudp sealRecord, suite 1). Std base64. An earlier key opens only the rows listed under it. Open with unsealRecord(current_content_key, ctx, sealed) and parse the plaintext.",
+  "description": "uik_prev_content_ct / prev_content_ct: every earlier content key, newest first, each with the rows the vault held when it was retired as [wire id, version, std b64 SHA-256 of the row's decoded ct bytes], sorted by wire id then version, sealed under the CURRENT content key with the item AEAD (sudp sealRecord, suite 1). Std base64. An earlier key opens only a row whose wire id, version and ct digest are all listed under it. Open with unsealRecord(current_content_key, ctx, sealed) and parse the plaintext.",
   "vault_id": "vlt_prev_keys_vector",
   "generation": 3,
   "seal_ctx": {
@@ -16,15 +16,18 @@
       "items_as_given": [
         [
           "hBVW1yFYQ9aIxjcB-PeisTpr_EYtjQFXysiLCq7bN6k",
-          1
+          1,
+          "tJNXY6mYYViY2kQc0hAltAK9kfzqAur1Q2t4dQ/kZIM="
         ],
         [
           "25fAyYNRxgkF3WqLCKweefkv-JCd5UECrQP7LCgApiQ",
-          4
+          4,
+          "BDsecbHab2YlfSAGYKqIcMJTcYLhYEMIE6Y0N8gj8No="
         ],
         [
           "ag_abcdefghijklmnopqrstuvwxyz234567",
-          2
+          2,
+          "7Lp7Cjo+eyV4P16h1P/Rmt0bNeETpfjamf5co0DVyFY="
         ]
       ]
     },
@@ -33,11 +36,13 @@
       "items_as_given": [
         [
           "25fAyYNRxgkF3WqLCKweefkv-JCd5UECrQP7LCgApiQ",
-          3
+          3,
+          "SOzVq66OmQSu+YDlS96grNppQ0lAHWf1QRdWTL6IFoY="
         ],
         [
           "hBVW1yFYQ9aIxjcB-PeisTpr_EYtjQFXysiLCq7bN6k",
-          1
+          1,
+          "tJNXY6mYYViY2kQc0hAltAK9kfzqAur1Q2t4dQ/kZIM="
         ]
       ]
     },
@@ -46,12 +51,20 @@
       "items_as_given": [
         [
           "25fAyYNRxgkF3WqLCKweefkv-JCd5UECrQP7LCgApiQ",
-          2
+          2,
+          "iOUdwNvNOdWBlQIEiUfbKpFozgoSr7jU8PghDcUE3y4="
         ]
       ]
     }
   ],
-  "plaintext": "{\"v\":1,\"keys\":[{\"k\":\"Q0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0M=\",\"items\":[[\"25fAyYNRxgkF3WqLCKweefkv-JCd5UECrQP7LCgApiQ\",4],[\"ag_abcdefghijklmnopqrstuvwxyz234567\",2],[\"hBVW1yFYQ9aIxjcB-PeisTpr_EYtjQFXysiLCq7bN6k\",1]]},{\"k\":\"QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI=\",\"items\":[[\"25fAyYNRxgkF3WqLCKweefkv-JCd5UECrQP7LCgApiQ\",3],[\"hBVW1yFYQ9aIxjcB-PeisTpr_EYtjQFXysiLCq7bN6k\",1]]},{\"k\":\"QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE=\",\"items\":[[\"25fAyYNRxgkF3WqLCKweefkv-JCd5UECrQP7LCgApiQ\",2]]}]}",
-  "sealed_b64": "AUIjkUX7CNcWqVWeAkudyFsHk49QTlYAKakc+HN5QCVE8Qf17gFdmvDCRRVXCspGG99F54MHEudP+5RvoglwBPfuNQnxhWhSRTK5Cd3vqRTPL9W6MpYYGL+N2y34vDYSd3/uWwwPNIW1fy0fwMcfYWLe6dOy9hZlVkyW8iX/CLfKxHYHw66VcXUqtp8x+dlMBj9PoIxB0r4/KsFxKyPNQ8rqXWrowSmBuhes7W9m2kXPB8nMkJd6O79lKraN+2NgouEepuBWE519f1MFAZyJfpWnvM8D1m5d9SESHtegTaNm52hsSR0TWUUtpmnXQL530AbEWaY9mlVBTDODUFc576gqqPPJu/JbdsGkLK/zJ34lc5i7Z45vjO6fLEkN9tIBGxRgZLRmL3QIhAON8KUi3dnhIqQwar+tbP+mNe3/dZ2f3aE2Kmzb8VfFVYFsl4/MJ46Mowh61GHE3NJgc71vMOWt1I0HUWetqYozdhXwzfKw/hznA3K0OQt5jQ4jcpXpnJrKx02Qc837HHQeWstBdgON7Mhe8vpYsHrEoV1xbZdIeWZm1UwKfToEIhynRJ3W1CGLcg6Hvj09rvpDhu8G1rFJdIM2cHTdH0pTtyhA6HrTvjxuKaamjDwUh33LGrvnbH54b9X3dVE9gFDF2icegZWbHfFyKjBGhZhUAZAW/fUtSPcWbuE2Jg2L9vJkks2EfimeB0cZzKeCAA==",
+  "listed_row_cts_b64url": {
+    "hBVW1yFYQ9aIxjcB-PeisTpr_EYtjQFXysiLCq7bN6k@1": "Zml4ZWQtY3Q6aEJWVzF5RllROWFJeGpjQi1QZWlzVHByX0VZdGpRRlh5c2lMQ3E3Yk42azox",
+    "25fAyYNRxgkF3WqLCKweefkv-JCd5UECrQP7LCgApiQ@4": "Zml4ZWQtY3Q6MjVmQXlZTlJ4Z2tGM1dxTENLd2VlZmt2LUpDZDVVRUNyUVA3TENnQXBpUTo0",
+    "ag_abcdefghijklmnopqrstuvwxyz234567@2": "Zml4ZWQtY3Q6YWdfYWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXoyMzQ1Njc6Mg",
+    "25fAyYNRxgkF3WqLCKweefkv-JCd5UECrQP7LCgApiQ@3": "Zml4ZWQtY3Q6MjVmQXlZTlJ4Z2tGM1dxTENLd2VlZmt2LUpDZDVVRUNyUVA3TENnQXBpUToz",
+    "25fAyYNRxgkF3WqLCKweefkv-JCd5UECrQP7LCgApiQ@2": "Zml4ZWQtY3Q6MjVmQXlZTlJ4Z2tGM1dxTENLd2VlZmt2LUpDZDVVRUNyUVA3TENnQXBpUToy"
+  },
+  "plaintext": "{\"v\":1,\"keys\":[{\"k\":\"Q0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0M=\",\"items\":[[\"25fAyYNRxgkF3WqLCKweefkv-JCd5UECrQP7LCgApiQ\",4,\"BDsecbHab2YlfSAGYKqIcMJTcYLhYEMIE6Y0N8gj8No=\"],[\"ag_abcdefghijklmnopqrstuvwxyz234567\",2,\"7Lp7Cjo+eyV4P16h1P/Rmt0bNeETpfjamf5co0DVyFY=\"],[\"hBVW1yFYQ9aIxjcB-PeisTpr_EYtjQFXysiLCq7bN6k\",1,\"tJNXY6mYYViY2kQc0hAltAK9kfzqAur1Q2t4dQ/kZIM=\"]]},{\"k\":\"QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI=\",\"items\":[[\"25fAyYNRxgkF3WqLCKweefkv-JCd5UECrQP7LCgApiQ\",3,\"SOzVq66OmQSu+YDlS96grNppQ0lAHWf1QRdWTL6IFoY=\"],[\"hBVW1yFYQ9aIxjcB-PeisTpr_EYtjQFXysiLCq7bN6k\",1,\"tJNXY6mYYViY2kQc0hAltAK9kfzqAur1Q2t4dQ/kZIM=\"]]},{\"k\":\"QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE=\",\"items\":[[\"25fAyYNRxgkF3WqLCKweefkv-JCd5UECrQP7LCgApiQ\",2,\"iOUdwNvNOdWBlQIEiUfbKpFozgoSr7jU8PghDcUE3y4=\"]]}]}",
+  "sealed_b64": "AQmUNZpd2w52wfifuWOIIiuw43jrbzrT6l2TgxY4nAZ+TRAW44F3n2G2e7p12FpjSPMEHw3vkBdQ+gAqa6vdDBP1Iq4rkt+tHin9BhIc+hkcBZ1wFEdi3/KRpQ+fY+OwBu8q8GdlYF9ggHAsX1S0bGDcKYQ53Q02/zCzphWFMxOZzERwD1xg0BcBr4bycGzkKHvPY7YssG4LTXX9hu4MA8KNZ1Ai9qqy+7vddcSU+HuD1iWE1GBriHh1xVY94mhBcV+42lN6FRVs0R/JwXkVot74P6ZE9nj4OO1SXWUDaoEoFN85+1oj4ORek6QWNQyDbKeuTUjerktDmGIB7EyDSXS1p2WsVU+tfXKFNulwa/ff4Lg9++5laPq+DNua9FcNWddpzMbAZpUhMofvnt4pDQyw3u2UH8OrD6FsGUQZWeR0tltq0IRbmvxcaNEdEwA4tBjNl6Uq85zp/yR3VKIUUwBDpFlyZIgn1jCyY40XkwvPnGGJ5NyO2Fb01Rq5HTPVguP4Xz3E0oUkUIziRivHF7xg6oh7s1RAOTcC0Xw7yTmMqHZYmQhjSVRJjc7K55sBlm/cy/os7yI7WCB5IWi91f791H2Gd3POEDR+AKK3tj7D2kMkgVcWobUvFArrD63M6bMKUG44pp1zgr2thbn9/FE1CJZgTs0ItosOYYsd7G0uj05QVB0Pk1ISfQVwk9iy2h7L77vfjBhOnknt6yCmPlAEcDvGb7bIvvWtwRDzM6iOrArmum7wAXck5zXW1CZlQGDrHs8P2I6beGSGQcjv+aSyr8b0CnxvRe/dGBNO2dxtCerYy5whxRVUhQw2G+Ec9eotGcfzO536cwHBWtnLyGkkaG+sjghr9BOmv55m/ai2FXMx4zQjnl/MeB92nsXYteDYbz35DpyX+2S/6QEWJkb5LN9a7lxJrWd42hqBCxuculo8Yf1/j187q7ve/6FpADQTyKlYf0qLjWh4ikOajbgkos0Osg8VjNIeO/s7QblRmrm5z/kRREta3wfx//GIw/bRX2SwarJ4qr2GVY3m6w0lH0lOd2jCO0xHgL9cVXzDN1ZL6qokmV021ZGmRLaVIXHmXg==",
   "sealed_layout": "suite(1) || nonce(24) || ciphertext || tag(16)"
 }

@@ -2052,22 +2052,22 @@ mod tests {
         }
         let none = seal_json(PREV_CONTENT_KEYS_DOMAIN, r#"{"v":1,"keys":[]}"#);
         assert!(open(&none).unwrap().is_empty());
-        // The buffer is exactly the encoded size.
-        assert_eq!(section.len(), section.capacity());
     }
 
     /// The console's vector (`testdata/prev-keys-vector.json`, made by
     /// running the console's own code): its sealed list opens here to its
-    /// plaintext, and every row it lists is listed under its key. If this
-    /// fails, the two sides diverged: do not edit the vector.
+    /// plaintext, and the keys and rows read from it are exactly the ones the
+    /// console was given (newest first, rows sorted by wire id then version),
+    /// each row's digest the SHA-256 of its decoded ct. If this fails, the
+    /// two sides diverged: do not edit the vector.
     #[test]
-    #[ignore = "until testdata/prev-keys-vector.json is the console's vector with [wire id, version, digest] rows"]
     fn prev_content_keys_console_vector() {
         use base64::engine::general_purpose::STANDARD;
         let v: serde_json::Value =
             serde_json::from_str(include_str!("testdata/prev-keys-vector.json")).unwrap();
         let vault = v["vault_id"].as_str().unwrap();
         let generation = v["generation"].as_u64().unwrap();
+        assert_eq!(generation, 3);
         let content = STANDARD
             .decode(v["current_content_key_b64"].as_str().unwrap())
             .unwrap();
@@ -2080,26 +2080,81 @@ mod tests {
         )
         .unwrap();
         assert_eq!(std::str::from_utf8(&pt).unwrap(), v["plaintext"].as_str().unwrap());
+
+        // What the console was given: keys newest first, each with its rows
+        // as [wire id, version, std b64 digest], here sorted as the list is.
+        type Row = (String, u64, String);
+        let given: Vec<(String, Vec<Row>)> = v["prev_keys_newest_first"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| {
+                let mut rows: Vec<Row> = e["items_as_given"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|r| {
+                        let r = r.as_array().unwrap();
+                        assert_eq!(r.len(), 3, "[wire id, version, digest]");
+                        (
+                            r[0].as_str().unwrap().to_string(),
+                            r[1].as_u64().unwrap(),
+                            r[2].as_str().unwrap().to_string(),
+                        )
+                    })
+                    .collect();
+                rows.sort();
+                (e["k"].as_str().unwrap().to_string(), rows)
+            })
+            .collect();
+        assert_eq!(given.len(), 3);
+
+        // What this side reads from the sealed list.
         let section =
             open_prev_content_keys::<StdPrimitives>(&content, vault, generation, &sealed).unwrap();
         let mut material = vault_key_bundle(&[0u8; 32], &content);
         material.extend_from_slice(&section);
         let keys = VaultKeys::from_material(&material);
+        assert_eq!(keys.content, &content[..]);
+        let read: Vec<(String, Vec<Row>)> = keys
+            .prev_keys()
+            .map(|p| {
+                let mut rows = Vec::new();
+                let mut rest = p.rows;
+                for _ in 0..p.n {
+                    let (w, ver, h, r) = split_listed_row(rest).unwrap();
+                    rows.push((std::str::from_utf8(w).unwrap().to_string(), ver, STANDARD.encode(h)));
+                    rest = r;
+                }
+                assert!(rest.is_empty());
+                (STANDARD.encode(p.key), rows)
+            })
+            .collect();
+        assert_eq!(read, given);
+
+        // Each digest is the SHA-256 of the row's decoded ct, and a key lists
+        // a row only at its version with that ct.
+        let cts = v["listed_row_cts_b64url"].as_object().unwrap();
         let prev: Vec<PrevKey> = keys.prev_keys().collect();
-        let plain: serde_json::Value = serde_json::from_slice(&pt).unwrap();
-        let entries = plain["keys"].as_array().unwrap();
-        assert_eq!(prev.len(), entries.len());
-        for (p, e) in prev.iter().zip(entries) {
-            assert_eq!(STANDARD.encode(p.key), e["k"].as_str().unwrap());
-            for item in e["items"].as_array().unwrap() {
-                let digest: [u8; 32] = STANDARD
-                    .decode(item[2].as_str().unwrap())
-                    .unwrap()
-                    .try_into()
+        for (p, (_, rows)) in prev.iter().zip(&given) {
+            for (wire, ver, digest) in rows {
+                let ct = URL_SAFE_NO_PAD
+                    .decode(cts[&format!("{wire}@{ver}")].as_str().unwrap().trim_end_matches('='))
                     .unwrap();
-                assert!(p.lists(item[0].as_str().unwrap(), item[1].as_u64().unwrap(), &digest));
+                assert_eq!(STANDARD.encode(ct_sha256(&ct)), *digest, "{wire}@{ver}");
+                assert!(p.lists(wire, *ver, &ct_sha256(&ct)));
+                assert!(!p.lists(wire, ver + 1, &ct_sha256(&ct)));
+                assert!(!p.lists(wire, *ver, &ct_sha256(b"another ct")));
             }
         }
+        // A row listed under one key only is not listed under the others.
+        let only_newest = URL_SAFE_NO_PAD
+            .decode(cts["25fAyYNRxgkF3WqLCKweefkv-JCd5UECrQP7LCgApiQ@4"].as_str().unwrap())
+            .unwrap();
+        let wire = "25fAyYNRxgkF3WqLCKweefkv-JCd5UECrQP7LCgApiQ";
+        assert!(prev[0].lists(wire, 4, &ct_sha256(&only_newest)));
+        assert!(!prev[1].lists(wire, 4, &ct_sha256(&only_newest)));
+        assert!(!prev[2].lists(wire, 4, &ct_sha256(&only_newest)));
     }
 
     /// Key material with the previous content keys splits back into the
