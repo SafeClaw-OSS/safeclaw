@@ -47,7 +47,9 @@ machine-readable list that also carries each connection's `setup` hint:
 ]
 ```
 
-`sc status` shows whether the vault is locked and prints its console URL.
+`sc status` shows whether the vault is locked and prints its console URL. It also
+lists any vault change that was not applied, with the reason; tell the user what it
+says rather than retrying.
 `sc registry` prints the catalog of services SafeClaw supports.
 
 When the vault is locked, run `sc up`. It unlocks the vault and prints an approval
@@ -58,7 +60,7 @@ console. Give them the link (the console URL is in `sc status`) and let them fin
 there:
 
 ```
-Connect <service name>: open <console_url>#connections, add your credential,
+Connect <service name>: open <console_url>/connections, add your credential,
 approve with your passkey.
 ```
 
@@ -89,6 +91,25 @@ With `--service`, name the slot (`ROLE=KEY`); a raw connection's slot is the
 KEY itself. Nothing changes until the user approves with a passkey; the approval
 lists every key and every host the connection will send it to. Surface the link
 as for any approval.
+
+### A service that is not in the catalog
+
+A service missing from `sc registry` can be added to the vault as a service
+definition: a folder with a `service.toml` (and an optional `policy.toml`), local or
+in a GitHub repository.
+
+```
+sc service validate ./my-service        # the same checks, offline, no vault
+sc service add ./my-service
+sc service add github:owner/repo:services/my-service --ref v1.2.0
+```
+
+`add` takes one passkey approval. Its card lists every service, every host a
+credential may be sent to, the rules, and the source, so surface the link as for
+any approval. A GitHub source is pinned to a commit. `sc service ls` shows each
+definition and whether it is loaded or skipped, and why. A definition only names
+its secrets; the user still adds the credential as above. For a plain token API, a
+raw connection (`--host`) needs no definition.
 
 ### Which vault
 
@@ -136,8 +157,25 @@ Then re-run the same command.
 ```
 
 Give that link to the user on its own line. Their browser tap is the signal, so
-background `sc op wait <op_id>` (exit 0 means approved), then re-run the exact same
-command; the approval is cached. A destination host you have not used before takes
-the same one-time grant.
+background `sc op wait <op_id>`, then act on its exit code:
+
+- `0` approved: re-run the exact same command; the approval is cached.
+- `5` not approved: the user said no, or the message states a cause. Do not retry
+  unchanged.
+- `6` withdrawn or replaced by a newer request, not a refusal: re-run the command to
+  ask again.
+- `3` expired, `4` stopped waiting: re-run the command for a fresh link.
+
+A destination host you have not used before takes the same one-time grant.
+
+A call that returns `agent_not_authorized` means you are not turned on for this
+vault yet. Its message carries a link to the vault's Agent access page: give it to
+the user, then retry once they confirm.
 
 When `sc` is not on your PATH, ask the user to reply once they have tapped the link.
+
+## Updates
+
+When a command says SafeClaw needs an update, run `sc upgrade`, then retry. An
+upgrade restarts the daemon, which locks the vault until the user taps their
+passkey: tell the user first, then run `sc up` and give them the link.
