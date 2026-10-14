@@ -34,16 +34,18 @@ curl -s -o /dev/null --connect-timeout 1 "$SAFECLAW_BROKER_URL/health" || sc up
 - `sc status` shows whether the vault is locked, its console URL, and any vault
   change that was not applied, with the reason.
 - `sc registry` is the catalog of supported services.
-- Credentials come from the user: in the console (`<console_url>/connections`), or
-  at this machine's terminal (`sc set`); `sc connection ls` then shows them. Keep
-  any value you see out of your replies.
-- A secret already in the vault (`sc secret ls`) can back a connection you propose
-  with `sc connection add ... --from-secret`; no value passes through you.
+- The user adds connections, with their credentials, on the console's Connections
+  page (`<console_url>/connections`); a new one then appears in `sc connection ls`.
+  Keep any credential value you see out of your replies.
+- `sc secret ls` lists the names of secrets already in the vault. One can back a
+  connection you propose with `sc connection add ... --from-secret`, so no value
+  passes through you.
 - An API outside the catalog is a custom connection: its host and key. Installing
   a service (`sc service --help`) adds named rules for an API; it comes from a third
   party and the user approves it.
-- A vault is a security boundary: target one with `--vault`, resolve a name with
-  `sc vault ls`, and ask when it is ambiguous.
+- A vault is a security boundary, and each connection belongs to one. Target it
+  with `--vault` to use its connections; resolve a name with `sc vault ls`, and ask
+  when it is ambiguous.
 
 ## Using a connection
 
@@ -54,8 +56,7 @@ GITHUB_TOKEN=__sc__github__ sc run -- gh pr list
 ```
 
 - Two accounts of one service differ by phantom (`__sc__github__`,
-  `__sc__github_work__`). One request carries one connection's phantoms, and they
-  resolve only in that command's vault.
+  `__sc__github_work__`). One request carries one connection's phantoms.
 - A connection with a `setup` hint brokers a local tool: tell the user what you are
   configuring, then apply its steps.
 - On a 401 or 403, first check the command ran under `sc run --` with the exact
