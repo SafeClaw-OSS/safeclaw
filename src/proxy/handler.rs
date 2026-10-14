@@ -398,8 +398,8 @@ impl BrokerHandler {
                 // loop to supply the URL. Path segment matches the console's
                 // /vault/{id}/{tab} routing.
                 let hint = format!(
-                    "this agent isn't authorized on this vault yet — authorize it in the \
-                     SafeClaw console (Agents tab), then retry: {}/vault/{}/agents",
+                    "this agent is not turned on for this vault yet. Ask the user to turn it \
+                     on in the vault's Agent access page, then retry: {}/vault/{}/agents",
                     crate::passkey::webauthn::console_link_origin(&self.state.config.origin),
                     self.vid.as_deref().unwrap_or_default(),
                 );

@@ -213,10 +213,10 @@ async fn add(args: AgentAddArgs) -> Result<(), String> {
         args.name.clone()
     };
     eprintln!(
-        "\nAgent '{}' authorized — its SafeClaw env (two non-secret lines: the broker URL \
+        "\nAgent '{}' authorized. Its SafeClaw env (two non-secret lines: the broker URL \
          and its identity-file path) went to stdout. Append them to the env file your \
-         framework loads. It can reach any vault you toggle on for it in the console's \
-         Agents tab. Works on any paired device; revoke: `sc agent rm {}`.",
+         framework loads. It can reach any vault you turn it on for in that vault's \
+         Agent access page. Works on any paired device; revoke: `sc agent rm {}`.",
         args.name, rm_name
     );
     Ok(())

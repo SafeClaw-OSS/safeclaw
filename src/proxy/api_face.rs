@@ -223,8 +223,8 @@ async fn require_agent(
                 // key change (same fail-loudly posture as the proxy path).
                 Some(_) => Err(problem(
                     ScCode::AgentNotAuthorized,
-                    "this agent isn't authorized on any of your vaults yet — \
-                     authorize it in the SafeClaw console (Agents tab)",
+                    "this agent is not turned on for any vault yet. Ask the user to turn it \
+                     on in a vault's Agent access page in the SafeClaw console",
                 )),
                 // Not a valid/fresh PoP at all → generic 401 (no api-key fallback:
                 // a `scpop1…` string is never a hash-set member).
