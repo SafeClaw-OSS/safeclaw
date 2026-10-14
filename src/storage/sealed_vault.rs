@@ -2926,6 +2926,9 @@ impl PerItemVault {
                             })?;
                             aux.connecting.insert(name, c);
                         }
+                        ItemNs::ServiceRequest => {
+                            aux.service_requests.insert(name, payload.body);
+                        }
                         _ => {}
                     },
                     // T2 (design/agent-authz-cleartext-cutover.md): a native

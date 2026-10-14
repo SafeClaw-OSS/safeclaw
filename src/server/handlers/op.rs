@@ -30,6 +30,36 @@ pub async fn create(
     headers: HeaderMap,
     Json(op): Json<Operation>,
 ) -> Result<Json<Value>> {
+    let mut op = op;
+    // Requester attribution: verified from the agent's proof over this exact
+    // op, else none (see `attribute_agent`).
+    let agent = attribute_agent(&headers, &vault_id, &mut op, crate::util::now_unix());
+    create_op::<crate::service::source::github::GitHubHttp>(
+        &state,
+        vault_id,
+        op,
+        agent,
+        addr.ip(),
+        None,
+    )
+    .await
+    .map(Json)
+}
+
+/// Create a pending op as `POST /v/{vid}/op` does, for `agent` (the verified
+/// requesting agent, if any) from `ip`: the one path every op of this
+/// process takes (the CLI's through the handler, a console install request
+/// through [`crate::server::handlers::service_ops::requests`]). `api` reads
+/// GitHub for a `service-add` (`None`: GitHub itself).
+pub(crate) async fn create_op<A: crate::service::source::github::GitHubApi>(
+    state: &Arc<AppState>,
+    vault_id: String,
+    op: Operation,
+    agent: Option<String>,
+    ip: IpAddr,
+    api: Option<&A>,
+) -> Result<Value> {
+    let state = state.clone();
     validate_vault_id(&vault_id)?;
     reject_broker_kind(&op.act.kind)?;
     check_scope_shape(&op.act.scope)?;
@@ -58,9 +88,6 @@ pub async fn create(
     // and the op's own expiry can never disagree. A locked vault (the unlock
     // ceremony) can't read its policy and takes the 30-min default.
     let mut op = op;
-    // Requester attribution: verified from the agent's proof over this exact
-    // op, else none (see `attribute_agent`).
-    let agent = attribute_agent(&headers, &vault_id, &mut op, crate::util::now_unix());
     // connection-add: the approval card (bound keys per slot, written vs
     // referenced, destinations, sharing) is computed HERE from the unlocked
     // session state and stamped into the signed scope, overwriting anything
@@ -74,11 +101,19 @@ pub async fn create(
     // services, every destination host, the rules, the source as checked; see
     // `service_ops`), on every vault: each service is a data record.
     if matches!(&op.act.kind, ActType::Custom(name) if name == "service-add") {
-        let api =
-            crate::server::handlers::service_ops::source_check_api().map_err(AppError::Internal)?;
-        crate::server::handlers::service_ops::mint_add(&state, &vault_id, &mut op, &api)
-            .await
-            .map_err(AppError::BadRequest)?;
+        let minted = match api {
+            Some(api) => {
+                crate::server::handlers::service_ops::mint_add(&state, &vault_id, &mut op, api)
+                    .await
+            }
+            None => {
+                let api = crate::server::handlers::service_ops::source_check_api()
+                    .map_err(AppError::Internal)?;
+                crate::server::handlers::service_ops::mint_add(&state, &vault_id, &mut op, &api)
+                    .await
+            }
+        };
+        minted.map_err(AppError::BadRequest)?;
     }
     if matches!(&op.act.kind, ActType::Custom(name) if name == "service-rm") {
         crate::server::handlers::service_ops::stamp_rm_at_mint(&state, &vault_id, &mut op)
@@ -91,7 +126,6 @@ pub async fn create(
             .unwrap_or(0);
         op.valid.exp = Some(now_unix + state.policy_approval_hold(&vault_id));
     }
-    let ip: IpAddr = addr.ip();
     let r = {
         let mut store = state.challenges.lock().unwrap();
         store.issue(ip).ok_or(AppError::TooManyRequests)?
@@ -201,7 +235,7 @@ pub async fn create(
     if let Some(secret) = waiter_secret {
         resp["waiter_secret"] = json!(secret);
     }
-    Ok(Json(resp))
+    Ok(resp)
 }
 
 /// Requester attribution for an op created on this LOCAL API (the CLI

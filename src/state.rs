@@ -288,6 +288,9 @@ pub struct SecretsCache {
     /// sources): what `sc service ls` lists and what a `service-add` /
     /// `service-rm` card is computed against at op creation. Wiped on lock.
     pub service_entries: std::collections::BTreeMap<String, crate::service::source::StoredService>,
+    /// The names of the vault's console install requests
+    /// (`service_request:<id>`), handled on each sync. Wiped on lock.
+    pub service_requests: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -988,6 +991,15 @@ impl AppState {
                         .is_some_and(|e| e.is_installed())
             }
             _ => false,
+        }
+    }
+
+    /// The names of an unlocked vault's console install requests.
+    pub fn service_request_names(&self, vault_id: &str) -> Vec<String> {
+        let states = self.vault_states.lock().unwrap();
+        match states.get(vault_id) {
+            Some(VaultState::Unlocked { cache, .. }) => cache.service_requests.clone(),
+            _ => Vec::new(),
         }
     }
 

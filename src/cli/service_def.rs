@@ -33,22 +33,7 @@ fn safe(s: &str) -> String {
 
 /// Print a list of problems under a heading and turn them into the error.
 fn report(what: &str, problems: Vec<String>) -> String {
-    eprintln!(
-        "✗ {}: {} problem{}:",
-        safe(what),
-        problems.len(),
-        if problems.len() == 1 { "" } else { "s" }
-    );
-    for p in &problems {
-        let p = safe(p);
-        let mut lines = p.lines();
-        if let Some(first) = lines.next() {
-            eprintln!("  • {}", first);
-        }
-        for l in lines {
-            eprintln!("    {}", l);
-        }
-    }
+    eprintln!("{}", safe(&source::problems_text(what, &problems)));
     format!("{}: see the problems above", safe(what))
 }
 
@@ -251,27 +236,8 @@ async fn submit(
     update: bool,
     opts: &ApproveOpts,
 ) -> Result<Value, String> {
-    let defs: serde_json::Map<String, Value> = loaded
-        .admitted
-        .iter()
-        .map(|a| {
-            let mut d = json!({ "service": a.service });
-            if let Some(p) = &a.policy {
-                d["policy"] = json!(p);
-            }
-            (a.id.clone(), d)
-        })
-        .collect();
     let identity = loaded.source.identity();
-    let op = json!({
-        "act": {
-            "type": { "custom": "service-add" },
-            "target": identity,
-            "scope": { "defs": defs, "source": loaded.source, "update": update },
-        },
-        "bind": { "redeemer": vault },
-        "valid": { "iat": now_unix(), "multiplicity": 1 }
-    });
+    let op = source::add_op(vault, &loaded.source, &loaded.admitted, update, now_unix());
     let label = if update {
         format!("Update services from {}", identity)
     } else {

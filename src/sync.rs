@@ -257,7 +257,10 @@ pub async fn sync_vault_now(state: &Arc<AppState>, vault_id: &str) -> Result<Syn
                     tracing::info!(vault = %vault_id, adopted = n, "per-item pull: adopted rows");
                     refresh_after_item_pull(state, vault_id);
                 }
-                Ok(_) => state.record_cloud_contact(vault_id),
+                Ok(_) => {
+                    state.record_cloud_contact(vault_id);
+                    crate::server::handlers::service_ops::requests::after_sync(state, vault_id);
+                }
                 Err(e) => tracing::debug!(vault = %vault_id, "per-item pull failed: {}", e),
             }
             if keys_pulled {
@@ -449,6 +452,8 @@ pub(crate) fn refresh_after_item_pull(state: &Arc<AppState>, vault: &str) {
             let cache = crate::server::handlers::approve::bootstrap_cache_from_view(&view, state);
             state.unlock_vault(vault.to_string(), cache, k);
             tracing::info!(vault = %vault, "per-item pull: cache refreshed from item rows");
+            // The console's install requests, handled as `sc service add`.
+            crate::server::handlers::service_ops::requests::after_sync(state, vault);
         }
         Err(_) => {
             tracing::warn!(

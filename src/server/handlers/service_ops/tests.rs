@@ -966,3 +966,286 @@ fn a_conflict_copy_is_listed_skipped_and_never_used() {
         .unwrap_err()
         .contains("conflict copy"));
 }
+
+// ── console install requests ─────────────────────────────────────────────────
+
+mod install_requests {
+    use super::*;
+    use crate::server::handlers::service_ops::requests::{
+        self, op_state, step, ItemPush, OpState, Step, EXPIRED,
+    };
+    use crate::storage::item::{ItemNs, ItemPayload, VaultKeys};
+    use crate::sync::PushOutcome;
+
+    type S = sudp::primitives::StdPrimitives;
+    const VAULT: &str = "vault-req";
+    const ME: &str = "dev_me";
+    const K: [u8; 32] = [0x5au8; 32];
+
+    /// The cloud as a test sees it: takes every write, or refuses each with a
+    /// conflict (another writer got there first); remembers each push.
+    #[derive(Default)]
+    struct FakeCloud {
+        conflict: bool,
+        pushed: std::sync::Mutex<Vec<(Option<u64>, u64)>>,
+    }
+
+    impl ItemPush for FakeCloud {
+        async fn push(
+            &self,
+            _vault: &str,
+            _item_id: &str,
+            base: Option<u64>,
+            version: u64,
+            _ct: &str,
+            _generation: Option<u64>,
+        ) -> Option<std::result::Result<PushOutcome, String>> {
+            self.pushed.lock().unwrap().push((base, version));
+            Some(Ok(if self.conflict {
+                PushOutcome::Conflict {
+                    current_version: version,
+                }
+            } else {
+                PushOutcome::Ok { version, seq: 1 }
+            }))
+        }
+    }
+
+    /// A vault without a keyset, its owner switch `on`, holding `requests`
+    /// as the console wrote them (each on the cloud at version 1).
+    fn vault_with(on: bool, requests: &[(&str, Value)]) -> (tempfile::TempDir, Arc<AppState>) {
+        let keys = VaultKeys::single(&K);
+        let mut pv = PerItemVault::build_initial(
+            b"c".to_vec(),
+            "x".into(),
+            "y".into(),
+            "Dev".into(),
+            vec![0u8; 32],
+            vec![0u8; 48],
+        )
+        .unwrap();
+        pv.plant::<S>(
+            keys,
+            VAULT,
+            ItemNs::Policy,
+            "",
+            1,
+            &ItemPayload::live(ItemNs::Policy, "", json!({ "allow_installed_services": on })),
+        )
+        .unwrap();
+        for (name, body) in requests {
+            let id = pv
+                .plant::<S>(
+                    keys,
+                    VAULT,
+                    ItemNs::ServiceRequest,
+                    name,
+                    1,
+                    &ItemPayload::live(ItemNs::ServiceRequest, *name, body.clone()),
+                )
+                .unwrap();
+            pv.items.get_mut(&id).unwrap().synced_version = 1;
+        }
+        state_with_store(VAULT, &pv, &K)
+    }
+
+    /// The requests as the fold reads them now.
+    fn read(state: &AppState) -> BTreeMap<String, Value> {
+        crate::server::handlers::metadata::decrypt_vault_view_peritem_with_key(
+            &K,
+            &stored(state, VAULT),
+            VAULT,
+        )
+        .unwrap()
+        .aux
+        .service_requests
+    }
+
+    fn upstream() -> Gh {
+        Gh::serving(tar_gz(&[(
+            "acme-tools-x/services/a1/service.toml",
+            b'0',
+            svc("a1", "a.dev").as_bytes(),
+        )]))
+    }
+
+    fn run(state: &Arc<AppState>, gh: &Gh, cloud: &FakeCloud) {
+        let names: Vec<String> = read(state).into_keys().collect();
+        block_on(requests::process(
+            state,
+            VAULT,
+            names,
+            ME,
+            gh,
+            Some(gh),
+            cloud,
+        ));
+    }
+
+    fn asked() -> Value {
+        json!({ "source": "github:acme/tools", "requested_at": 1_760_000_000u64 })
+    }
+
+    /// Claimed with a compare-and-swap at the row's version, installed through
+    /// the op path `sc service add` takes (the same card, the request named,
+    /// no agent), the op id written back; the request is removed once the op
+    /// is resolved.
+    #[test]
+    fn a_request_is_claimed_installed_and_removed_when_its_op_resolves() {
+        let (_dir, state) = vault_with(true, &[("r1", asked())]);
+        let github = upstream();
+        let cloud = FakeCloud::default();
+        run(&state, &github, &cloud);
+        let r1 = read(&state)["r1"].clone();
+        assert_eq!(r1["claimed_by"], json!(ME));
+        assert!(r1.get("error").is_none(), "{r1}");
+        assert_eq!(r1["requested_at"], json!(1_760_000_000u64), "the console's fields kept");
+        let op_id = r1["op_id"].as_str().unwrap().to_string();
+        assert_eq!(
+            *cloud.pushed.lock().unwrap(),
+            [(Some(1), 2), (Some(2), 3)],
+            "the claim at the console's version, then the op id"
+        );
+        let op = state.approvals.lock().unwrap().get(&op_id).unwrap().op.clone();
+        assert_eq!(
+            op.act.kind,
+            crate::protocol::operation::ActType::Custom("service-add".into())
+        );
+        assert_eq!(op.act.scope["service_request"], json!("r1"));
+        assert_eq!(op.act.scope["ids"], json!(["a1"]));
+        assert_eq!(op.act.scope["from"], json!(gh('a').display()));
+        assert!(op.act.scope["definitions"]
+            .as_str()
+            .unwrap()
+            .starts_with("# a1 service.toml\n"));
+        assert!(op.act.scope.get("agent").is_none());
+        assert_eq!(op_state(&state, &op_id), OpState::Pending);
+
+        // Pending: left as it is.
+        run(&state, &github, &cloud);
+        assert_eq!(read(&state)["r1"], r1);
+        // Resolved (here rejected): removed.
+        state.approvals.lock().unwrap().reject(&op_id, "no");
+        assert_eq!(op_state(&state, &op_id), OpState::Resolved);
+        run(&state, &github, &cloud);
+        assert!(read(&state).is_empty());
+        let keys = VaultKeys::single(&K);
+        let id = crate::storage::item::wire_id_for::<S>(keys.id_seed, ItemNs::ServiceRequest, "r1")
+            .unwrap();
+        assert!(stored(&state, VAULT).items[&id].tombstone);
+    }
+
+    /// Another device's claim landed first (a 409): this one writes nothing
+    /// and creates no op.
+    #[test]
+    fn a_request_another_device_claimed_first_is_left() {
+        let (_dir, state) = vault_with(true, &[("r1", asked())]);
+        let cloud = FakeCloud {
+            conflict: true,
+            ..Default::default()
+        };
+        run(&state, &upstream(), &cloud);
+        assert_eq!(read(&state)["r1"], asked());
+        assert_eq!(cloud.pushed.lock().unwrap().len(), 1, "no install after a lost claim");
+    }
+
+    /// The owner switch off, a source that is not GitHub, a ref that is no
+    /// branch or tag, a definition the gate refuses: an `error` with what
+    /// `sc service add` prints, and no op.
+    #[test]
+    fn a_request_that_cannot_be_installed_gets_the_clis_message() {
+        let (_dir, state) = vault_with(false, &[("r1", asked())]);
+        run(&state, &upstream(), &FakeCloud::default());
+        let r1 = read(&state)["r1"].clone();
+        assert_eq!(r1["error"], json!(crate::service::INSTALLED_OFF_MSG));
+        assert_eq!(r1["claimed_by"], json!(ME));
+        assert!(r1.get("op_id").is_none());
+
+        let bad_gate = Gh::serving(tar_gz(&[(
+            "acme-tools-x/services/b2/service.toml",
+            b'0',
+            svc("b2", "10.0.0.1").as_bytes(),
+        )]));
+        let (_dir, state) = vault_with(
+            true,
+            &[
+                ("gate", asked()),
+                ("local", json!({ "source": "./mine", "requested_at": 1 })),
+                (
+                    "commit",
+                    json!({ "source": "github:acme/tools", "ref": "a".repeat(40), "requested_at": 1 }),
+                ),
+            ],
+        );
+        run(&state, &bad_gate, &FakeCloud::default());
+        let got = read(&state);
+        let e = got["gate"]["error"].as_str().unwrap();
+        assert!(e.starts_with("✗ github:acme/tools: "), "{e}");
+        assert!(e.contains("\n  • services/b2: "), "{e}");
+        assert!(got["local"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("is not a GitHub source"));
+        assert!(got["commit"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("is not a branch or tag of github:acme/tools"));
+        // A request with an error stays as it is for the console.
+        let before = read(&state);
+        run(&state, &upstream(), &FakeCloud::default());
+        assert_eq!(read(&state), before);
+    }
+
+    /// A request this device claimed whose op it no longer holds (it
+    /// restarted) gets the expiry error; another device's claim is left.
+    #[test]
+    fn a_claim_whose_op_is_gone_expires_and_others_claims_are_left() {
+        let mut gone = asked();
+        gone["claimed_by"] = json!(ME);
+        gone["op_id"] = json!("op_gone");
+        let mut half = asked();
+        half["claimed_by"] = json!(ME);
+        let mut theirs = asked();
+        theirs["claimed_by"] = json!("dev_other");
+        let (_dir, state) = vault_with(
+            true,
+            &[("gone", gone), ("half", half), ("theirs", theirs.clone())],
+        );
+        run(&state, &upstream(), &FakeCloud::default());
+        let got = read(&state);
+        assert_eq!(got["gone"]["error"], json!(EXPIRED));
+        assert_eq!(got["half"]["error"], json!(EXPIRED));
+        assert_eq!(got["theirs"], theirs);
+    }
+
+    #[test]
+    fn the_step_for_each_request_state() {
+        let op = |s: OpState| move |_: &str| s;
+        let mut b = asked();
+        assert_eq!(step(&b, ME, op(OpState::Gone)), Step::Claim);
+        b["claimed_by"] = json!("dev_other");
+        assert_eq!(step(&b, ME, op(OpState::Gone)), Step::Leave);
+        b["claimed_by"] = json!(ME);
+        assert_eq!(step(&b, ME, op(OpState::Pending)), Step::Expire);
+        b["op_id"] = json!("op_1");
+        assert_eq!(step(&b, ME, op(OpState::Pending)), Step::Leave);
+        assert_eq!(step(&b, ME, op(OpState::Resolved)), Step::Remove);
+        assert_eq!(step(&b, ME, op(OpState::Gone)), Step::Expire);
+        b["error"] = json!("x");
+        assert_eq!(step(&b, ME, op(OpState::Gone)), Step::Leave);
+    }
+
+    /// The rule row the console holds the same copy of.
+    #[test]
+    fn the_request_namespace_rule() {
+        let r = crate::storage::item::rule(ItemNs::ServiceRequest, "0123456789abcdef").unwrap();
+        assert_eq!(r.key(), "service_request:<id>");
+        assert!(crate::storage::item::canonical_rule_table().contains(
+            r#"{"key":"service_request:<id>","address":"blinded","writers":["member","device"],"signed":"none","conflict":"take_writer","read":"all"}"#
+        ));
+        assert_eq!(
+            serde_json::to_value(ItemNs::ServiceRequest).unwrap(),
+            json!("service_request")
+        );
+    }
+}

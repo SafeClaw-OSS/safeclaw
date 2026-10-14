@@ -538,6 +538,11 @@ pub struct VaultAux {
     /// [`Connecting`].
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub connecting: BTreeMap<String, Connecting>,
+    /// The console's install requests (`service_request:<id>` items), as
+    /// written. Read only by the daemon's request handling, which writes
+    /// them itself; never part of a view's reconcile.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub service_requests: BTreeMap<String, serde_json::Value>,
     /// Established connections, keyed by `connection_id`. Sparse. Status is
     /// derived (see [`Connection`]).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -587,6 +592,7 @@ impl VaultAux {
             store_order: vec![NATIVE_SECRETS_ID.to_string()],
             policy: None,
             connecting: BTreeMap::new(),
+            service_requests: BTreeMap::new(),
             connections: BTreeMap::new(),
             audit_retention_days: None,
             services: BTreeMap::new(),

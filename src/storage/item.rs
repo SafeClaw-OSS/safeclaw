@@ -561,6 +561,12 @@ pub enum ItemNs {
     /// with the legacy `services` record, a native item (or tombstone) winning
     /// for its id.
     Service,
+    /// A console's request that this device install a service from a source
+    /// (`name` = a random id): `body` = `{ source, ref?, requested_at }`,
+    /// then `claimed_by`, `op_id` or `error` as the daemon handles it
+    /// ([`crate::server::handlers::service_ops::requests`]). A data record.
+    #[serde(rename = "service_request")]
+    ServiceRequest,
     /// Owner-config, one record per edit unit, reassembled into the
     /// [`Policy`] tree by the fold: `policy:` (empty name) = `{timeout,
     /// default}`, `policy:category:<tag>` = that tag's `Levels`,
@@ -627,6 +633,7 @@ impl ItemNs {
             ItemNs::Aux => "aux",
             ItemNs::Agent => "agent",
             ItemNs::Service => "service",
+            ItemNs::ServiceRequest => "service_request",
             ItemNs::Policy => "policy",
             ItemNs::Store => "store",
             ItemNs::Stores => "stores",
@@ -831,7 +838,7 @@ const fn legacy_aux(field: &'static str) -> ItemRule {
 /// in this crate reads it: [`wire_id_for`], [`ItemNs::write_allowed`], what
 /// this process writes, the sync's conflict decision and the fold's read
 /// rules.
-pub const ITEM_RULES: [ItemRule; 18] = [
+pub const ITEM_RULES: [ItemRule; 19] = [
     data_record(ItemNs::Secret, "<KEY>", Conflict::KeepBoth),
     data_record(ItemNs::Connection, "<id>", Conflict::KeepBoth),
     data_record(ItemNs::Connecting, "<id>", Conflict::TakeWriter),
@@ -839,6 +846,7 @@ pub const ITEM_RULES: [ItemRule; 18] = [
         read: Read::DerivedIdOnlyUnionLegacy,
         ..data_record(ItemNs::Service, "<id>", Conflict::KeepBoth)
     },
+    data_record(ItemNs::ServiceRequest, "<id>", Conflict::TakeWriter),
     ItemRule {
         ns: ItemNs::Agent,
         name: Name::Any("<ag_id>"),
@@ -1605,7 +1613,7 @@ mod tests {
     /// both sides.
     #[test]
     fn rule_table_matches_the_canonical_text() {
-        const CANONICAL: &str = r#"[{"key":"agent:<ag_id>","address":"cleartext_wire_hmac_aad","writers":["owner","own_member"],"signed":"writer:agent","conflict":"take_writer","read":"signer_authorized_and_wire_id_matches"},{"key":"audit_retention_days:","address":"blinded","writers":["owner","device_without_keyset"],"signed":"owner_with_keyset","conflict":"owner_config","read":"owner_signed_with_keyset_native_wins"},{"key":"aux:audit_retention_days","address":"blinded","writers":["migration_tombstone_only"],"signed":"owner_with_keyset","conflict":"owner_config","read":"legacy_when_no_honored_native"},{"key":"aux:policy","address":"blinded","writers":["migration_tombstone_only"],"signed":"owner_with_keyset","conflict":"owner_config","read":"legacy_when_no_honored_native"},{"key":"aux:secret_order","address":"blinded","writers":["migration_tombstone_only"],"signed":"none","conflict":"take_writer","read":"legacy_when_no_honored_native"},{"key":"aux:services","address":"blinded","writers":["migration_tombstone_only"],"signed":"owner_with_keyset","conflict":"owner_config","read":"legacy_union_native_wins"},{"key":"aux:store_order","address":"blinded","writers":["migration_tombstone_only"],"signed":"owner_with_keyset","conflict":"owner_config","read":"legacy_when_no_honored_native"},{"key":"aux:stores","address":"blinded","writers":["migration_tombstone_only"],"signed":"owner_with_keyset","conflict":"owner_config","read":"legacy_when_no_honored_native"},{"key":"connecting:<id>","address":"blinded","writers":["member","device"],"signed":"none","conflict":"take_writer","read":"all"},{"key":"connection:<id>","address":"blinded","writers":["member","device"],"signed":"none","conflict":"keep_both","read":"all"},{"key":"policy:","address":"blinded","writers":["owner","device_without_keyset"],"signed":"owner_with_keyset","conflict":"owner_config","read":"owner_signed_with_keyset_native_wins"},{"key":"policy:category:<tag>","address":"blinded","writers":["owner","device_without_keyset"],"signed":"owner_with_keyset","conflict":"owner_config","read":"owner_signed_with_keyset_native_wins"},{"key":"policy:connection:<connection_id>","address":"blinded","writers":["owner","device_without_keyset"],"signed":"owner_with_keyset","conflict":"owner_config","read":"owner_signed_with_keyset_native_wins"},{"key":"secret:<KEY>","address":"blinded","writers":["member","device"],"signed":"none","conflict":"keep_both","read":"all"},{"key":"secret_order:","address":"blinded","writers":["member"],"signed":"none","conflict":"take_writer","read":"console_only"},{"key":"service:<id>","address":"blinded","writers":["member","device"],"signed":"none","conflict":"keep_both","read":"derived_id_only_union_legacy"},{"key":"store:<id>","address":"blinded","writers":["owner","device_without_keyset"],"signed":"owner_with_keyset","conflict":"owner_config","read":"owner_signed_with_keyset_native_wins"},{"key":"store_order:","address":"blinded","writers":["owner","device_without_keyset"],"signed":"owner_with_keyset","conflict":"owner_config","read":"owner_signed_with_keyset_native_wins"}]"#;
+        const CANONICAL: &str = r#"[{"key":"agent:<ag_id>","address":"cleartext_wire_hmac_aad","writers":["owner","own_member"],"signed":"writer:agent","conflict":"take_writer","read":"signer_authorized_and_wire_id_matches"},{"key":"audit_retention_days:","address":"blinded","writers":["owner","device_without_keyset"],"signed":"owner_with_keyset","conflict":"owner_config","read":"owner_signed_with_keyset_native_wins"},{"key":"aux:audit_retention_days","address":"blinded","writers":["migration_tombstone_only"],"signed":"owner_with_keyset","conflict":"owner_config","read":"legacy_when_no_honored_native"},{"key":"aux:policy","address":"blinded","writers":["migration_tombstone_only"],"signed":"owner_with_keyset","conflict":"owner_config","read":"legacy_when_no_honored_native"},{"key":"aux:secret_order","address":"blinded","writers":["migration_tombstone_only"],"signed":"none","conflict":"take_writer","read":"legacy_when_no_honored_native"},{"key":"aux:services","address":"blinded","writers":["migration_tombstone_only"],"signed":"owner_with_keyset","conflict":"owner_config","read":"legacy_union_native_wins"},{"key":"aux:store_order","address":"blinded","writers":["migration_tombstone_only"],"signed":"owner_with_keyset","conflict":"owner_config","read":"legacy_when_no_honored_native"},{"key":"aux:stores","address":"blinded","writers":["migration_tombstone_only"],"signed":"owner_with_keyset","conflict":"owner_config","read":"legacy_when_no_honored_native"},{"key":"connecting:<id>","address":"blinded","writers":["member","device"],"signed":"none","conflict":"take_writer","read":"all"},{"key":"connection:<id>","address":"blinded","writers":["member","device"],"signed":"none","conflict":"keep_both","read":"all"},{"key":"policy:","address":"blinded","writers":["owner","device_without_keyset"],"signed":"owner_with_keyset","conflict":"owner_config","read":"owner_signed_with_keyset_native_wins"},{"key":"policy:category:<tag>","address":"blinded","writers":["owner","device_without_keyset"],"signed":"owner_with_keyset","conflict":"owner_config","read":"owner_signed_with_keyset_native_wins"},{"key":"policy:connection:<connection_id>","address":"blinded","writers":["owner","device_without_keyset"],"signed":"owner_with_keyset","conflict":"owner_config","read":"owner_signed_with_keyset_native_wins"},{"key":"secret:<KEY>","address":"blinded","writers":["member","device"],"signed":"none","conflict":"keep_both","read":"all"},{"key":"secret_order:","address":"blinded","writers":["member"],"signed":"none","conflict":"take_writer","read":"console_only"},{"key":"service:<id>","address":"blinded","writers":["member","device"],"signed":"none","conflict":"keep_both","read":"derived_id_only_union_legacy"},{"key":"service_request:<id>","address":"blinded","writers":["member","device"],"signed":"none","conflict":"take_writer","read":"all"},{"key":"store:<id>","address":"blinded","writers":["owner","device_without_keyset"],"signed":"owner_with_keyset","conflict":"owner_config","read":"owner_signed_with_keyset_native_wins"},{"key":"store_order:","address":"blinded","writers":["owner","device_without_keyset"],"signed":"owner_with_keyset","conflict":"owner_config","read":"owner_signed_with_keyset_native_wins"}]"#;
         assert_eq!(canonical_rule_table(), CANONICAL);
     }
 

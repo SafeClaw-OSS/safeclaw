@@ -1017,6 +1017,58 @@ pub fn admit_files(
     Ok(out)
 }
 
+/// The `service-add` op for `admitted` from `source` into `vault`
+/// (`update`: `sc service update`): the request the daemon's op creation
+/// checks and stamps. One shape for every requester.
+pub fn add_op(
+    vault: &str,
+    source: &ServiceSource,
+    admitted: &[Admitted],
+    update: bool,
+    iat: u64,
+) -> serde_json::Value {
+    let defs: serde_json::Map<String, serde_json::Value> = admitted
+        .iter()
+        .map(|a| {
+            let mut d = serde_json::json!({ "service": a.service });
+            if let Some(p) = &a.policy {
+                d["policy"] = serde_json::json!(p);
+            }
+            (a.id.clone(), d)
+        })
+        .collect();
+    serde_json::json!({
+        "act": {
+            "type": { "custom": "service-add" },
+            "target": source.identity(),
+            "scope": { "defs": defs, "source": source, "update": update },
+        },
+        "bind": { "redeemer": vault },
+        "valid": { "iat": iat, "multiplicity": 1 }
+    })
+}
+
+/// Problems under a heading, as `sc service` prints them: `✗ <what>: <n>
+/// problem(s):` then one `  • ` line each (continuation lines indented).
+pub fn problems_text(what: &str, problems: &[String]) -> String {
+    let mut out = format!(
+        "✗ {}: {} problem{}:",
+        what,
+        problems.len(),
+        if problems.len() == 1 { "" } else { "s" }
+    );
+    for p in problems {
+        let mut lines = p.lines();
+        if let Some(first) = lines.next() {
+            out.push_str(&format!("\n  • {}", first));
+        }
+        for l in lines {
+            out.push_str(&format!("\n    {}", l));
+        }
+    }
+    out
+}
+
 /// Rewrite a service.toml's `[service] id`. The text is re-serialized from
 /// its parsed form (comments are not kept); the result is admitted again.
 pub fn rename_service(text: &str, new_id: &str) -> Result<String, String> {

@@ -2903,6 +2903,7 @@ pub(crate) fn bootstrap_cache_from_view(
     }
     cache.custom_services = custom;
     cache.service_entries = view.aux.services.clone();
+    cache.service_requests = view.aux.service_requests.keys().cloned().collect();
     cache
 }
 
