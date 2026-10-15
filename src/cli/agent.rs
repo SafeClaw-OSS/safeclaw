@@ -31,8 +31,7 @@ fn cloud_and_key() -> Result<(String, String), String> {
         .cloud_backend
         .filter(|s| !s.is_empty())
         .ok_or("this device isn't paired — run `sc login` first")?;
-    let key = crate::sync::device_key()
-        .ok_or("no device-key — run `sc login` first")?;
+    let key = crate::sync::device_key().ok_or("no device-key — run `sc login` first")?;
     Ok((cloud.trim_end_matches('/').to_string(), key))
 }
 
@@ -124,7 +123,10 @@ async fn add(args: AgentAddArgs) -> Result<(), String> {
     // no secret to guard: this output can be shown, and appended to the agent's env
     // file directly. The daemon still holds an account-roster row for this AIK.
     println!("SAFECLAW_BROKER_URL={}", broker_url);
-    println!("SAFECLAW_AGENT_IDENTITY={}", identity_path.display());
+    println!(
+        "SAFECLAW_AGENT_IDENTITY={}",
+        env_value(&identity_path.display().to_string())
+    );
 
     let rm_name = if args.name.contains(char::is_whitespace) {
         format!("'{}'", args.name)
@@ -208,4 +210,31 @@ async fn rm(args: AgentRmArgs) -> Result<(), String> {
     eprintln!("  {}", url);
     eprintln!("Every device stops serving it within two minutes of the removal.");
     Ok(())
+}
+
+/// A dotenv value that also survives `set -a; . file`: bare when it is only path-safe
+/// characters, else single-quoted (dotenv parsers strip the quotes). A home directory
+/// with a space is the usual case.
+fn env_value(v: &str) -> String {
+    if !v.is_empty()
+        && v.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | ':' | '+'))
+    {
+        v.to_string()
+    } else {
+        format!("'{}'", v.replace('\'', "'\\''"))
+    }
+}
+
+#[cfg(test)]
+mod env_value_tests {
+    #[test]
+    fn a_path_with_a_space_is_quoted_once() {
+        assert_eq!(
+            super::env_value("/home/a/.safeclaw/agents/claude/identity"),
+            "/home/a/.safeclaw/agents/claude/identity"
+        );
+        assert_eq!(super::env_value("/Users/Jo Lee/x"), "'/Users/Jo Lee/x'");
+        assert_eq!(super::env_value("/it's"), "'/it'\\''s'");
+    }
 }

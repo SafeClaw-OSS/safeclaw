@@ -136,23 +136,37 @@ pub async fn pair(client: &reqwest::Client, req: &PairRequest<'_>) -> Result<Pai
         if !resp.status().is_success() {
             let status = resp.status();
             let detail = resp.text().await.unwrap_or_default();
-            return Err(format!("could not start pairing ({})", http_detail(status, &detail)));
+            return Err(format!(
+                "could not start pairing ({})",
+                http_detail(status, &detail)
+            ));
         }
         eprintln!();
         eprintln!("Open this link in your browser and approve:");
         eprintln!("  {}", pairing::link(req.origin, &auth.nameplate, &secret));
-        eprintln!("Or open {}/pair and enter the code:", req.origin.trim_end_matches('/'));
+        eprintln!(
+            "Or open {}/pair and enter the code:",
+            req.origin.trim_end_matches('/')
+        );
         eprintln!("  {}", pairing::display_code(&auth.nameplate, &secret));
         eprintln!();
         eprintln!("Waiting for you to approve in the browser…");
         Some(session)
     };
-    let own_msg = session.as_ref().map(|s| s.msg().to_vec()).unwrap_or_default();
+    let own_msg = session
+        .as_ref()
+        .map(|s| s.msg().to_vec())
+        .unwrap_or_default();
     let mut k_owner: Option<zeroize::Zeroizing<[u8; 32]>> = None;
     let id_pub = req.signer.public_bytes();
     let sc_pk: &[u8] = req.sc_pk.as_ref().map(|k| &k[..]).unwrap_or(&[]);
 
     let interval = auth.interval.unwrap_or(5).clamp(1, 30);
+    // A dropped connection while the person reads the page is not a failed pairing:
+    // keep polling through about a minute of consecutive network errors (the code's
+    // own expiry still ends it with 410).
+    let max_net_errors = (60 / interval).max(3);
+    let mut net_errors = 0u64;
     let dead = |why: &str| {
         format!(
             "{} This code can't be used again: run `{}` for a new one.",
@@ -161,12 +175,24 @@ pub async fn pair(client: &reqwest::Client, req: &PairRequest<'_>) -> Result<Pai
     };
     loop {
         tokio::time::sleep(Duration::from_secs(interval)).await;
-        let presp = client
+        let presp = match client
             .post(format!("{}/api/pair/poll", cloud))
             .json(&json!({ "device_code": auth.device_code, "pop": pop }))
             .send()
             .await
-            .map_err(|e| crate::cli::neterr::reach_failed(cloud, &e))?;
+        {
+            Ok(r) => {
+                net_errors = 0;
+                r
+            }
+            Err(e) => {
+                net_errors += 1;
+                if net_errors >= max_net_errors {
+                    return Err(crate::cli::neterr::reach_failed(cloud, &e));
+                }
+                continue;
+            }
+        };
         let status = presp.status();
         if status.as_u16() == 410 {
             return Err(format!(
@@ -205,20 +231,38 @@ pub async fn pair(client: &reqwest::Client, req: &PairRequest<'_>) -> Result<Pai
                     &id_pub,
                     sc_pk,
                 );
-                let resp = client
-                    .post(format!("{}/api/pair/keys", cloud))
-                    .json(&json!({
-                        "device_code": auth.device_code,
-                        "pop": pop,
-                        "keys_mac": URL_SAFE_NO_PAD.encode(mac),
-                    }))
-                    .send()
-                    .await
-                    .map_err(|e| crate::cli::neterr::reach_failed(cloud, &e))?;
+                // Store-once on the server (the same keys_mac again is a no-op), so a
+                // send that failed on the wire is safe to repeat.
+                let body = json!({
+                    "device_code": auth.device_code,
+                    "pop": pop,
+                    "keys_mac": URL_SAFE_NO_PAD.encode(mac),
+                });
+                let mut tries = 0;
+                let resp = loop {
+                    match client
+                        .post(format!("{}/api/pair/keys", cloud))
+                        .json(&body)
+                        .send()
+                        .await
+                    {
+                        Ok(r) => break r,
+                        Err(e) => {
+                            tries += 1;
+                            if tries >= 5 {
+                                return Err(crate::cli::neterr::reach_failed(cloud, &e));
+                            }
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                        }
+                    }
+                };
                 if !resp.status().is_success() {
                     let st = resp.status();
                     let detail = resp.text().await.unwrap_or_default();
-                    return Err(dead(&format!("Pairing failed ({}).", http_detail(st, &detail))));
+                    return Err(dead(&format!(
+                        "Pairing failed ({}).",
+                        http_detail(st, &detail)
+                    )));
                 }
                 k_owner = Some(sub.k_owner);
             }
@@ -251,7 +295,12 @@ fn verify_approval(
     let uik_pub: [u8; 32] = body
         .get("account_uik_pub")
         .and_then(|v| v.as_str())
-        .and_then(|s| URL_SAFE_NO_PAD.decode(s).or_else(|_| STANDARD.decode(s)).ok())
+        .and_then(|s| {
+            URL_SAFE_NO_PAD
+                .decode(s)
+                .or_else(|_| STANDARD.decode(s))
+                .ok()
+        })
         .and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok())
         .ok_or("The approval carries no account key.")?;
     let uik_id = crate::identity::derive_id(crate::identity::IdKind::User, &uik_pub);
@@ -270,7 +319,9 @@ fn verify_approval(
     if !crate::crypto::binding::constant_time_eq(&mac, &want) {
         return Err("The approving account could not be verified (owner proof mismatch).".into());
     }
-    let admit = body.get("admit").ok_or("The approval carries no owner-signed admit.")?;
+    let admit = body
+        .get("admit")
+        .ok_or("The approval carries no owner-signed admit.")?;
     let owner =
         crate::principal_ledger::verify_pairing_admit(admit, &uik_pub, req.principal_id, sc_pk)?;
     debug_assert_eq!(owner, uik_id);
@@ -321,8 +372,14 @@ mod tests {
         let good = pairing::owner_mac(&k_owner, &acct, &owner.public_bytes());
         let p = verify_approval(body(good, &pk), &k_owner, &req, &pk).unwrap();
         assert_eq!(p.uik_id, acct);
-        assert!(verify_approval(body([0u8; 32], &pk), &k_owner, &req, &pk).is_err(), "owner_mac");
-        assert!(verify_approval(body(good, &[6u8; 32]), &k_owner, &req, &pk).is_err(), "sc_pk");
+        assert!(
+            verify_approval(body([0u8; 32], &pk), &k_owner, &req, &pk).is_err(),
+            "owner_mac"
+        );
+        assert!(
+            verify_approval(body(good, &[6u8; 32]), &k_owner, &req, &pk).is_err(),
+            "sc_pk"
+        );
         let mut b = body(good, &pk);
         b["account_uik_id"] = json!("us_someoneelse");
         assert!(verify_approval(b, &k_owner, &req, &pk).is_err(), "label");
