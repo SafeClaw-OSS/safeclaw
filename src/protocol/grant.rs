@@ -54,6 +54,15 @@ pub struct Grant {
     /// HPKE-sealed vault key ciphertext + tag (base64url-no-pad). Paired with `k_enc`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub k_ct: Option<String>,
+    /// Grant v3 (contract C3): the approver's identity (`us_…`). Paired with
+    /// `id_sig`. Required on every grant the daemon applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// Grant v3: Ed25519 signature by `id`'s UIK over
+    /// [`crate::identity::grant_id_input`] (this op's β, the raw credential id,
+    /// the K seal hash and the daemon's `sc_pk`), base64url-no-pad.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id_sig: Option<String>,
     /// The vault key opened from `k_enc`/`k_ct` by the approve handler. Never
     /// on the wire (not deserialized, not serialized).
     #[serde(skip)]
@@ -165,8 +174,8 @@ pub enum GrantKey<'a> {
     /// The approver's own unlock secret: `W_c` (v1 keyset) or their UIK root
     /// (v2 keyset). Opens `K` through the acting credential's keyset entry.
     Custody(&'a [u8]),
-    /// The vault key material itself (an admin's `k_*` grant): `K` or the
-    /// 64-byte bundle. Only a v2 (UIK) keyset accepts it.
+    /// The vault key material itself (a grant v3 `k_*` delivery): `K` or the
+    /// 64-byte bundle (v2 keyset), the 32-byte `K` (v1 keyset).
     VaultKey(&'a [u8]),
 }
 
@@ -491,6 +500,8 @@ mod tests {
             wk_ct: None,
             k_enc: None,
             k_ct: None,
+            id: None,
+            id_sig: None,
             vault_key: None,
             assertion: None,
             batch: Some(BatchProof {

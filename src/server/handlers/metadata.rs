@@ -150,19 +150,9 @@ pub async fn passkeys(
             });
         }
     }
-    // Pending-passkey deposits (Stage 1 done, awaiting Stage 2 Enroll).
-    // list() opportunistically GC-sweeps expired files — that's the only
-    // place we know the daemon is actively serving this vault. Failure to
-    // list isn't fatal: pending list just renders empty.
-    let pending: Vec<Value> = crate::storage::pending_passkey::list(&state.vaults, &vault_id)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|p| p.public_metadata())
-        .collect();
     Ok(Json(json!({
         "vault_exists": true,
         "passkeys": metas,
-        "pending_passkeys": pending,
     })))
 }
 
@@ -461,7 +451,8 @@ pub fn unwrap_k_from_keyset(
 /// the vault key itself, `k_enc`/`k_ct`) skips the member entry: the
 /// delivered material is the bundle a v2 open produces, kept with the
 /// vault's previous content keys from any keyset entry, the same as the root
-/// path. Only a v2 keyset accepts one.
+/// path. On a v1 keyset the delivered material is the 32-byte `K` itself
+/// (grant v3: every vault takes the vault key, never `W_c`).
 pub fn acquire_k_from_keyset(
     keyset: &crate::storage::sealed_vault::Keyset,
     key: GrantKey<'_>,
@@ -471,9 +462,15 @@ pub fn acquire_k_from_keyset(
     let secret = match key {
         GrantKey::Custody(secret) => secret,
         GrantKey::VaultKey(material) => {
-            let uik = keyset.uik.as_ref().ok_or_else(|| {
-                AppError::Unauthorized("a delivered vault key opens only a team vault".into())
-            })?;
+            let Some(uik) = keyset.uik.as_ref() else {
+                // v1 keyset (personal vault): the delivered material is `K` itself.
+                if material.len() != 32 {
+                    return Err(AppError::Unauthorized(
+                        "a delivered vault key for a personal vault must be 32 bytes".into(),
+                    ));
+                }
+                return Ok(zeroize::Zeroizing::new(material.to_vec()));
+            };
             if material.len() != 32 && material.len() != 64 {
                 return Err(AppError::Unauthorized(
                     "a delivered vault key must be 32 or 64 bytes".into(),
@@ -601,18 +598,20 @@ pub fn open_view_for_grant(
     // Whole-blob fallback — only vaults that still have a vault.dat (daemon-side
     // Enroll/Write) reach here; a web-enrolled per-item vault is served above.
     let vault = vault.ok_or_else(|| AppError::Conflict("vault not initialized".into()))?;
-    decrypt_vault_view(op, whole_blob_secret(key)?, credential_id_bytes, vault)
+    match key {
+        GrantKey::Custody(w_c) => decrypt_vault_view(op, w_c, credential_id_bytes, vault),
+        GrantKey::VaultKey(k) => decrypt_vault_view_with_key(whole_blob_k(k)?, vault),
+    }
 }
 
-/// The whole-blob open needs the passkey's own `W_c`: a delivered vault key
-/// (team vaults only, which have no whole blob) never opens one.
-fn whole_blob_secret(key: GrantKey<'_>) -> Result<&[u8]> {
-    match key {
-        GrantKey::Custody(secret) => Ok(secret),
-        GrantKey::VaultKey(_) => Err(AppError::Unauthorized(
-            "a delivered vault key opens only a team vault".into(),
-        )),
+/// A whole-blob vault (v1, personal) is sealed under the 32-byte `K`.
+fn whole_blob_k(k: &[u8]) -> Result<&[u8]> {
+    if k.len() != 32 {
+        return Err(AppError::Unauthorized(
+            "a delivered vault key for a personal vault must be 32 bytes".into(),
+        ));
     }
+    Ok(k)
 }
 
 /// Like [`open_view_for_grant`] but RETAINS `K` for the unlocked session — the
@@ -643,7 +642,14 @@ pub fn open_view_for_grant_keep_key(
     }
     // Whole-blob fallback — see open_view_for_grant.
     let vault = vault.ok_or_else(|| AppError::Conflict("vault not initialized".into()))?;
-    decrypt_vault_view_keep_key(op, whole_blob_secret(key)?, credential_id_bytes, vault)
+    match key {
+        GrantKey::Custody(w_c) => decrypt_vault_view_keep_key(op, w_c, credential_id_bytes, vault),
+        GrantKey::VaultKey(k) => {
+            let k = whole_blob_k(k)?;
+            let view = decrypt_vault_view_with_key(k, vault)?;
+            Ok((view, zeroize::Zeroizing::new(k.to_vec())))
+        }
+    }
 }
 
 /// Open the CURRENT vault view with the RETAINED state key `K` — no grant, no

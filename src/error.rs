@@ -55,6 +55,23 @@ pub enum ScCode {
     /// client re-registers it so the requester or an admin can still approve
     /// (the client switches on this code, never on message text).
     ApproverNotAuthorized,
+    /// A grant carrying an unlock secret (`wk_*` / `wrapping_key`) instead of
+    /// the vault key + identity signature (grant v3). The approver's root and
+    /// `W_c` never leave their browser, so the daemon refuses the form outright
+    /// (fail closed). RECOVERABLE: the op stays pending.
+    WkRefusedV2,
+    /// A grant v3 identity signature (`id` / `id_sig`) that is missing,
+    /// malformed, does not verify under `id`'s key, or names someone other
+    /// than the person the approving passkey belongs to. RECOVERABLE: the op
+    /// stays pending (a relay must not resolve an op with a forged signer).
+    GrantIdInvalid,
+    /// This device has no valid owner-signed admit over its `dev_ ‖ sc_pk`
+    /// (pairing did not complete, or the server served an admit that does
+    /// not verify). Fix: pair again with `sc login`.
+    DeviceNotAdmitted,
+    /// The account principal ledger does not hash to a validly owner-signed
+    /// head (a forged or truncated tail). The daemon keeps its prior decision.
+    LedgerHeadInvalid,
     BrokerBodyLimit,
     EgressUnreachable,
     ExposesUnsupported,
@@ -158,6 +175,34 @@ impl ScCode {
                 403,
                 "approver_not_authorized",
                 "Only the requester or a vault admin can approve this",
+                "none",
+                "auth",
+            ),
+            WkRefusedV2 => (
+                400,
+                "wk_refused_v2",
+                "Approval must deliver the vault key, not an unlock secret",
+                "none",
+                "request",
+            ),
+            GrantIdInvalid => (
+                403,
+                "grant_id_invalid",
+                "Approval signature could not be verified",
+                "none",
+                "auth",
+            ),
+            DeviceNotAdmitted => (
+                403,
+                "device_not_admitted",
+                "This device needs to be paired again",
+                "configure",
+                "auth",
+            ),
+            LedgerHeadInvalid => (
+                403,
+                "ledger_head_invalid",
+                "Device list signature could not be verified",
                 "none",
                 "auth",
             ),
@@ -301,6 +346,11 @@ impl ScCode {
 /// consistent state and relays one consistent fix.
 pub const VAULT_LOCKED_MSG: &str = "vault locked. Run `sc unlock`, then retry";
 
+/// The ONE remediation line for [`ScCode::DeviceNotAdmitted`] (the console
+/// says the same sentence).
+pub const DEVICE_NOT_ADMITTED_MSG: &str =
+    "This device needs to be paired again: run `sc login`.";
+
 /// The ONE remediation line for [`ScCode::AgentNotInAccount`], shared by every
 /// surface that raises it (proxy plane, API face, control plane).
 pub const AGENT_NOT_IN_ACCOUNT_MSG: &str = "This agent isn't registered to the SafeClaw account this machine is signed in to. Run `sc agent add` to set it up.";
@@ -346,6 +396,14 @@ pub enum AppError {
     /// The requesting agent isn't registered to this machine's account (see
     /// `ScCode::AgentNotInAccount`).
     AgentNotInAccount,
+    /// A grant delivered an unlock secret instead of the vault key (see
+    /// `ScCode::WkRefusedV2`). The op stays pending.
+    WkRefused(String),
+    /// A grant's identity signature failed (see `ScCode::GrantIdInvalid`).
+    /// The op stays pending.
+    GrantIdInvalid(String),
+    /// This device has no valid admit (see `ScCode::DeviceNotAdmitted`).
+    DeviceNotAdmitted,
 }
 
 impl AppError {
@@ -366,6 +424,12 @@ impl AppError {
             AppError::AgentNotInAccount => (
                 ScCode::AgentNotInAccount,
                 AGENT_NOT_IN_ACCOUNT_MSG.to_string(),
+            ),
+            AppError::WkRefused(msg) => (ScCode::WkRefusedV2, msg.clone()),
+            AppError::GrantIdInvalid(msg) => (ScCode::GrantIdInvalid, msg.clone()),
+            AppError::DeviceNotAdmitted => (
+                ScCode::DeviceNotAdmitted,
+                DEVICE_NOT_ADMITTED_MSG.to_string(),
             ),
             AppError::Internal(msg) => {
                 tracing::error!("internal error: {}", msg);
@@ -412,6 +476,9 @@ impl std::fmt::Display for AppError {
             AppError::BatchVerify(msg) => write!(f, "Batch verification failed: {}", msg),
             AppError::ApproverNotAuthorized(msg) => write!(f, "Approver not authorized: {}", msg),
             AppError::AgentNotInAccount => write!(f, "{}", AGENT_NOT_IN_ACCOUNT_MSG),
+            AppError::WkRefused(msg) => write!(f, "Grant refused: {}", msg),
+            AppError::GrantIdInvalid(msg) => write!(f, "Approval signature invalid: {}", msg),
+            AppError::DeviceNotAdmitted => write!(f, "{}", DEVICE_NOT_ADMITTED_MSG),
         }
     }
 }
@@ -465,6 +532,10 @@ mod tests {
             ApprovalRegister,
             BatchVerifyFailed,
             ApproverNotAuthorized,
+            WkRefusedV2,
+            GrantIdInvalid,
+            DeviceNotAdmitted,
+            LedgerHeadInvalid,
             BrokerBodyLimit,
             EgressUnreachable,
             ExposesUnsupported,
@@ -487,7 +558,8 @@ mod tests {
             let (status, code, title, action, cause) = c.row();
             assert!((400..=599).contains(&status), "{code}: status {status}");
             assert!(
-                code.chars().all(|ch| ch.is_ascii_lowercase() || ch == '_'),
+                code.chars()
+                    .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_'),
                 "{code}: not snake_case"
             );
             assert!(!title.is_empty());

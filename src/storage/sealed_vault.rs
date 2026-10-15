@@ -26,6 +26,7 @@ use sudp::state::{Registry, SealedCredential, SealedState, Version, CURRENT_VERS
 
 use crate::error::{AppError, Result};
 use crate::passkey::PasskeyEntry;
+#[cfg(test)]
 use crate::protocol::grant::GrantKey;
 use crate::protocol::operation::decode_credential_id;
 use crate::storage::item::{
@@ -949,8 +950,6 @@ fn fold_owner_config_record(
 /// Whether a grant's signer may approve an op ([`PerItemVault::approval_authority`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ApprovalAuthority {
-    /// No identities to check (a v1 keyset: a personal vault).
-    NotGated,
     /// The signer is the requester.
     Requester,
     /// The signer is an admin of the vault.
@@ -2722,72 +2721,47 @@ impl PerItemVault {
             .or_else(|| uik.approver_cids.get(cid_b64).cloned())
     }
 
-    /// The identity (`us_…`) that signed an approval grant on this v2 vault, for
-    /// approval AUTHORITY ([`Self::approval_authority`]). Two sources, the proven
-    /// one first:
-    /// - a delivered custody secret ([`GrantKey::Custody`]): on a v2 vault that is
-    ///   the approver's UIK ROOT, and only that person holds it, so
-    ///   `UikRoot(secret).user_id()` is who approved. Honored when it names an
-    ///   identity this vault knows (a keyset entry, the role fold, or the
-    ///   requester), so it covers a passkey whose own entry the keyset has not
-    ///   caught yet.
-    /// - else the signing credential's identity as the membership labels it
-    ///   ([`Self::credential_identity`]: the device's own entry, or an admin's
-    ///   approver credential). This is the only source for a delivered vault key
-    ///   ([`GrantKey::VaultKey`], which proves no identity), and for a caller that
-    ///   delivered `W_c`.
-    ///
-    /// `None` = no identity resolves (a v1 keyset, or an unknown credential).
-    pub(crate) fn approval_signer(
-        &self,
-        vault_id: &str,
-        requester: &std::collections::BTreeSet<String>,
-        cid_b64: &str,
-        delivered: GrantKey<'_>,
-    ) -> Option<String> {
+    /// The Ed25519 signing key of identity `id` as this vault knows it, for a
+    /// grant v3 `id_sig` check: a keyset entry seated for `id`, or the vault's
+    /// current (succession-resolved) root. Every candidate must SELF-CERTIFY
+    /// (`derive_id(User, pub) == id`), so the source does not matter: a key the
+    /// server mislabeled never derives to `id`. `None` = this vault holds no key
+    /// that is `id`'s.
+    pub(crate) fn identity_sig_pub(&self, vault_id: &str, id: &str) -> Option<[u8; 32]> {
         let uik = self.keyset.uik.as_ref()?;
-        if let GrantKey::Custody(secret) = delivered {
-            if let Ok(root) = <[u8; 32]>::try_from(secret) {
-                let root_id = crate::crypto::vault_key::UikRoot::from_root(root).user_id();
-                let known = requester.contains(&root_id)
-                    || uik.creds.values().any(|c| c.user_id == root_id)
-                    || self.fold_roles(vault_id).contains_key(&root_id);
-                if known {
-                    return Some(root_id);
-                }
-            }
-        }
-        self.credential_identity(cid_b64)
+        let certifies = |pub32: &[u8; 32]| {
+            crate::identity::derive_id(crate::identity::IdKind::User, pub32) == id
+        };
+        uik.creds
+            .values()
+            .filter(|c| c.user_id == id)
+            .filter_map(|c| <[u8; 32]>::try_from(c.sig_pub.as_slice()).ok())
+            .find(certifies)
+            .or_else(|| {
+                resolve_current_root(uik, vault_id)
+                    .map(|(root, _)| root)
+                    .filter(certifies)
+            })
     }
 
-    /// May this grant approve an op that `requester` (the member whose daemon
-    /// raised it) is waiting on? On a v2 (UIK) vault the approver must be the
-    /// requester THEMSELF or an ADMIN of the vault per the current role fold;
-    /// anyone else is refused (the op stays pending for someone who may approve).
-    /// A v1 keyset carries no identities (a personal vault) and is not gated here.
-    /// An untrusted fold (no confirmable admin) still lets the requester approve
-    /// their own op; it only refuses everyone else.
+    /// May `signer` (the approver's `us_…`, already proven by a verified grant v3
+    /// `id_sig`) approve an op that `requester` (the account whose daemon raised
+    /// it) is waiting on? The requester always may. Anyone else must be an ADMIN
+    /// of the vault per the current, VERIFIED role fold; a v1 keyset (a personal
+    /// vault) has no fold, so only the requester approves there. An untrusted
+    /// fold (no confirmable admin) still lets the requester approve their own op.
     pub(crate) fn approval_authority(
         &self,
         vault_id: &str,
         requester: &std::collections::BTreeSet<String>,
-        cid_b64: &str,
-        delivered: GrantKey<'_>,
+        signer: &str,
     ) -> ApprovalAuthority {
-        if self.keyset.uik.is_none() {
-            return ApprovalAuthority::NotGated;
-        }
-        let Some(signer) = self.approval_signer(vault_id, requester, cid_b64, delivered) else {
-            return ApprovalAuthority::Refused(
-                "the approving passkey belongs to no identity in this vault".into(),
-            );
-        };
-        if requester.contains(&signer) {
+        if requester.contains(signer) {
             return ApprovalAuthority::Requester;
         }
         match self.resolve_membership_trust(vault_id) {
             MembershipTrust::Verified(roles)
-                if roles.get(&signer).is_some_and(|r| r.is_admin()) =>
+                if roles.get(signer).is_some_and(|r| r.is_admin()) =>
             {
                 ApprovalAuthority::Admin
             }
@@ -8472,18 +8446,7 @@ pub(crate) mod tests {
     fn requester_can_approve_own_op() {
         let (vault, _a, b_id, _c, pv) = authority_fixture();
         assert_eq!(
-            pv.approval_authority(vault, &ids(&[&b_id]), "cid-b", GrantKey::Custody(&[0x22u8; 32])),
-            ApprovalAuthority::Requester
-        );
-        // A passkey the keyset has not caught yet (upgraded / just added): the
-        // delivered root still names B.
-        assert_eq!(
-            pv.approval_authority(vault, &ids(&[&b_id]), "cid-new", GrantKey::Custody(&[0x22u8; 32])),
-            ApprovalAuthority::Requester
-        );
-        // A caller that delivered W_c (not a root): resolved via the credential's entry.
-        assert_eq!(
-            pv.approval_authority(vault, &ids(&[&b_id]), "cid-b", GrantKey::Custody(&[0x99u8; 32])),
+            pv.approval_authority(vault, &ids(&[&b_id]), &b_id),
             ApprovalAuthority::Requester
         );
     }
@@ -8492,10 +8455,10 @@ pub(crate) mod tests {
     fn admin_can_approve_another_members_op() {
         use crate::crypto::vault_key::UikRoot;
         use crate::storage::plaintext::MemberRole;
-        let (vault, _a, b_id, c_id, mut pv) = authority_fixture();
+        let (vault, a_id, b_id, c_id, mut pv) = authority_fixture();
         // The creator (root admin) approves B's op.
         assert_eq!(
-            pv.approval_authority(vault, &ids(&[&b_id]), "cid-creator", GrantKey::Custody(&[0x11u8; 32])),
+            pv.approval_authority(vault, &ids(&[&b_id]), &a_id),
             ApprovalAuthority::Admin
         );
         // C promoted to admin by a LEGACY "owner" delegation event: approves B's op.
@@ -8515,116 +8478,90 @@ pub(crate) mod tests {
             sig: sig.to_vec(),
         });
         assert_eq!(
-            pv.approval_authority(vault, &ids(&[&b_id]), "cid-c", GrantKey::Custody(&[0x33u8; 32])),
+            pv.approval_authority(vault, &ids(&[&b_id]), &c_id),
             ApprovalAuthority::Admin
         );
     }
 
     #[test]
     fn other_member_is_refused() {
-        let (vault, _a, b_id, _c, pv) = authority_fixture();
-        // C (a plain member) approves B's op with C's own passkey + root.
+        let (vault, _a, b_id, c_id, pv) = authority_fixture();
         assert!(matches!(
-            pv.approval_authority(vault, &ids(&[&b_id]), "cid-c", GrantKey::Custody(&[0x33u8; 32])),
+            pv.approval_authority(vault, &ids(&[&b_id]), &c_id),
             ApprovalAuthority::Refused(_)
         ));
-        // The delivered root is the proof: C's root on the admin's credential id
-        // is still C.
         assert!(matches!(
-            pv.approval_authority(vault, &ids(&[&b_id]), "cid-creator", GrantKey::Custody(&[0x33u8; 32])),
-            ApprovalAuthority::Refused(_)
-        ));
-        // C's passkey without a root (W_c delivered): the credential's entry names C.
-        assert!(matches!(
-            pv.approval_authority(vault, &ids(&[&b_id]), "cid-c", GrantKey::Custody(&[0x99u8; 32])),
-            ApprovalAuthority::Refused(_)
-        ));
-        // Nothing resolves (unknown credential, not a known root): refused.
-        assert!(matches!(
-            pv.approval_authority(vault, &ids(&[&b_id]), "cid-nobody", GrantKey::Custody(&[0x99u8; 32])),
+            pv.approval_authority(vault, &ids(&[&b_id]), "us_nobody"),
             ApprovalAuthority::Refused(_)
         ));
     }
 
-    /// A delivered vault key (`k_*`) proves no identity: the signer is the
-    /// approving passkey's label (the device's own entry, or an admin's
-    /// approver credential the membership served), and it passes only as the
-    /// requester or as an admin in the VERIFIED fold. A label naming a member,
-    /// or an admin since demoted (the passkey still in the registry and the
-    /// approver map), is refused. 32 delivered bytes are never read as a root.
+    /// A promoted admin approves; demoted again, refused, whatever passkey
+    /// material is still on the daemon.
     #[test]
-    fn vault_key_grant_signer_is_the_label_authorized_by_the_fold() {
+    fn admin_authority_follows_the_fold() {
         use crate::crypto::vault_key::UikRoot;
         use crate::storage::plaintext::MemberRole;
-        let (vault, a_id, b_id, c_id, mut pv) = authority_fixture();
+        let (vault, _a, b_id, c_id, mut pv) = authority_fixture();
         let creator = UikRoot::from_root([0x11u8; 32]);
-        let k = GrantKey::VaultKey(&[0x42u8; 32]);
         let requester = ids(&[&b_id]);
-        // The admin's passkey, known only as approval material.
-        pv.set_approver_credential("YWRtaW4", &a_id, "x", "y").unwrap();
-        assert_eq!(
-            pv.approval_authority(vault, &requester, "YWRtaW4", k),
-            ApprovalAuthority::Admin
-        );
-        // The requester's own passkey delivering the vault key: the requester.
-        assert_eq!(
-            pv.approval_authority(vault, &requester, "cid-b", k),
-            ApprovalAuthority::Requester
-        );
-        // The admin's root bytes delivered as a vault key on C's passkey: still C.
-        assert!(matches!(
-            pv.approval_authority(vault, &requester, "cid-c", GrantKey::VaultKey(&[0x11u8; 32])),
-            ApprovalAuthority::Refused(_)
-        ));
-        // A member's passkey served as approver material: the label says C, the
-        // fold says member.
-        pv.set_approver_credential("Yy1j", &c_id, "x", "y").unwrap();
-        assert!(matches!(
-            pv.approval_authority(vault, &requester, "Yy1j", k),
-            ApprovalAuthority::Refused(_)
-        ));
-        // C promoted: approves. C demoted again: refused, though its passkey
-        // and label are still on this daemon.
         push_event(&mut pv, vault, &creator, "set", &c_id, MemberRole::Admin, 1, 0);
         assert_eq!(
-            pv.approval_authority(vault, &requester, "Yy1j", k),
+            pv.approval_authority(vault, &requester, &c_id),
             ApprovalAuthority::Admin
         );
         push_event(&mut pv, vault, &creator, "set", &c_id, MemberRole::Member, 2, 0);
-        assert!(find_pubkey_in_registry(&pv.keyset.registry, "Yy1j").is_some());
         assert!(matches!(
-            pv.approval_authority(vault, &requester, "Yy1j", k),
+            pv.approval_authority(vault, &requester, &c_id),
             ApprovalAuthority::Refused(_)
         ));
-        // No label at all: refused.
-        assert!(matches!(
-            pv.approval_authority(vault, &requester, "bm9ib2R5", k),
-            ApprovalAuthority::Refused(_)
-        ));
-        // Neither admin's approver credential counts as this device's own.
-        assert!(!pv.own_identities().contains(&a_id));
-        assert!(!pv.own_identities().contains(&c_id));
+    }
+
+    /// The signing key of an identity: a self-certifying keyset entry or the
+    /// vault root; a key labeled with someone else's id never resolves.
+    #[test]
+    fn identity_sig_pub_self_certifies() {
+        use crate::crypto::vault_key::UikRoot;
+        use crate::storage::plaintext::MemberRole;
+        let (vault, a_id, b_id, c_id, mut pv) = authority_fixture();
+        let b = UikRoot::from_root([0x22u8; 32]);
+        let creator = UikRoot::from_root([0x11u8; 32]);
+        assert_eq!(pv.identity_sig_pub(vault, &b_id), Some(b.signing().public_bytes()));
+        assert_eq!(pv.identity_sig_pub(vault, &a_id), Some(creator.signing().public_bytes()));
+        assert_eq!(pv.identity_sig_pub(vault, "us_nobody"), None);
+        // A poisoned entry: C's id with B's key. Never C's key.
+        pv.set_uik_cred(
+            "cid-c".into(),
+            c_id.clone(),
+            b.signing().public_bytes().to_vec(),
+            vec![9u8; 32],
+            vec![1u8; 40],
+            vec![2u8; 40],
+            MemberRole::Member,
+            Vec::new(),
+        );
+        assert_eq!(pv.identity_sig_pub(vault, &c_id), None);
     }
 
     /// No confirmable admin set (anchor stripped): the requester still approves
     /// their own op; nobody else does.
     #[test]
     fn untrusted_fold_keeps_requester_and_refuses_others() {
-        let (vault, _a, b_id, _c, mut pv) = authority_fixture();
+        let (vault, a_id, b_id, _c, mut pv) = authority_fixture();
         pv.keyset.uik.as_mut().unwrap().creator_sig_pub.clear();
         assert_eq!(
-            pv.approval_authority(vault, &ids(&[&b_id]), "cid-b", GrantKey::Custody(&[0x22u8; 32])),
+            pv.approval_authority(vault, &ids(&[&b_id]), &b_id),
             ApprovalAuthority::Requester
         );
         assert!(matches!(
-            pv.approval_authority(vault, &ids(&[&b_id]), "cid-creator", GrantKey::Custody(&[0x11u8; 32])),
+            pv.approval_authority(vault, &ids(&[&b_id]), &a_id),
             ApprovalAuthority::Refused(_)
         ));
     }
 
-    /// A v1 keyset (a personal vault: no identities) is not gated.
+    /// A v1 keyset (a personal vault) has no fold: only the requester approves.
     #[test]
-    fn v1_keyset_is_not_gated() {
+    fn v1_keyset_admits_only_the_requester() {
         let pv = PerItemVault::build_initial(
             b"c".to_vec(),
             "x".into(),
@@ -8635,9 +8572,14 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert_eq!(
-            pv.approval_authority("v", &ids(&[]), "Yw", GrantKey::Custody(&[0x44u8; 32])),
-            ApprovalAuthority::NotGated
+            pv.approval_authority("v", &ids(&["us_me"]), "us_me"),
+            ApprovalAuthority::Requester
         );
+        assert!(matches!(
+            pv.approval_authority("v", &ids(&["us_me"]), "us_other"),
+            ApprovalAuthority::Refused(_)
+        ));
+        assert_eq!(pv.identity_sig_pub("v", "us_me"), None);
     }
 
     /// The requester fallback: identities seated under a passkey this device

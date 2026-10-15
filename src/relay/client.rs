@@ -520,8 +520,10 @@ fn resolved_locally(state: &AppState, op_id: &str) -> bool {
 /// NEVER by matching message text (design/batch-approve.md §Daemon verify 7).
 struct ApplyFailure {
     batch_verify_failed: bool,
-    /// `approver_not_authorized`: the signer may not approve this op; it stays
-    /// pending (recovered like `batch_verify_failed`).
+    /// `approver_not_authorized` / `grant_id_invalid` / `wk_refused_v2`: the
+    /// signer may not (or could not be proven to) approve this op, or the grant
+    /// delivered an unlock secret; it stays pending (recovered like
+    /// `batch_verify_failed`).
     approver_not_authorized: bool,
     detail: String,
 }
@@ -562,7 +564,13 @@ async fn apply_grant(state: Arc<AppState>, op_id: &str, grant: Value) -> Result<
             .and_then(|v| v.get("code").and_then(|c| c.as_str()).map(String::from));
         Err(ApplyFailure {
             batch_verify_failed: code.as_deref() == Some("batch_verify_failed"),
-            approver_not_authorized: code.as_deref() == Some("approver_not_authorized"),
+            // Every refusal of WHO approved or HOW the key was delivered leaves
+            // the op pending (grant v3): a forged or mis-shaped grant must never
+            // resolve an op someone may still approve.
+            approver_not_authorized: matches!(
+                code.as_deref(),
+                Some("approver_not_authorized" | "grant_id_invalid" | "wk_refused_v2")
+            ),
             detail: format!("loopback approve HTTP {}: {}", status, body),
         })
     }

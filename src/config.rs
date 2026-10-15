@@ -609,9 +609,8 @@ pub enum PasskeySubcommand {
     /// credential id, device name, transports, timestamps). No vault
     /// unlock or passkey gesture required.
     Ls(CommonArgs),
-    /// Add a new passkey (cross-device or same-device). NOT YET
-    /// IMPLEMENTED, needs the daemon-side `/cli/auth?op=enroll-passkey`
-    /// page and the same crypto vendoring as `sc setup`.
+    /// Add a passkey: prints the SafeClaw console page where passkeys are
+    /// enrolled (in the browser, where the identity key lives).
     Add(CommonArgs),
     /// Remove an enrolled passkey by credential id. NOT YET IMPLEMENTED.
     Rm(PasskeyRemoveArgs),
@@ -650,10 +649,8 @@ pub enum VaultSubcommand {
     /// Remove a vault from the local known list (does NOT touch the
     /// daemon, for that use `sc vault rm`). Pass URL or index.
     Forget(VaultForgetArgs),
-    /// Create a new vault. Default = local (http://localhost:23293,
-    /// vault id "default"). Pass --remote <URL> to create on a remote
-    /// custodian (auto-generates a UUID). Saves to config and makes
-    /// the new vault active.
+    /// Create a new vault: prints the SafeClaw console page where vaults are
+    /// created. The new vault syncs to this machine on its own.
     Create(VaultCreateArgs),
     /// Irreversibly delete a vault's daemon-side state. Passkey-gated
     /// via the standard `/op/{op_id}` browser-callback ceremony.
@@ -687,24 +684,7 @@ pub struct VaultForgetArgs {
 }
 
 #[derive(Debug, Args)]
-pub struct VaultCreateArgs {
-    /// Create on a remote custodian (default is local). Pass the
-    /// custodian root URL like `https://custodian.dev.safeclaw.pro`.
-    #[arg(long)]
-    pub remote: Option<String>,
-    #[arg(long)]
-    pub no_browser: bool,
-    /// Fixed port for the localhost callback server (for SSH forwarding).
-    #[arg(long, env = "SAFECLAW_CB_PORT")]
-    pub cb_port: Option<u16>,
-    #[arg(long, default_value = "120")]
-    pub timeout: u64,
-    /// Reuse an existing registered passkey instead of registering a new one.
-    /// Skips the create() ceremony; uses get() PRF from an already-enrolled
-    /// vault. Saves a browser gesture when the hardware key is already set up.
-    #[arg(long)]
-    pub reuse_passkey: bool,
-}
+pub struct VaultCreateArgs {}
 
 #[derive(Debug, Args)]
 pub struct VaultDeleteArgs {

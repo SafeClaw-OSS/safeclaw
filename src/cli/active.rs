@@ -104,6 +104,13 @@ pub struct CliConfig {
     /// Absent on an older backend / pre-UIK account (the ledger loop then doesn't run).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_uik: Option<String>,
+    /// The account owner's UIK signing key (raw 32 bytes, base64url), pinned at
+    /// pairing from the signer of the VERIFIED owner-signed admit of this device
+    /// (grant-v3 C1), never from a server label. Verifies a grant's `id_sig`
+    /// when the approver is the paired account. Read only when it self-certifies
+    /// against `account_uik` ([`account_uik_pub`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_uik_pub: Option<String>,
     /// §15 principal-ledger enforcement switch: DEFAULT OFF — a verified revoke of
     /// THIS device only locks+wipes when this is "on". `SAFECLAW_PRINCIPAL_ENFORCE`
     /// overrides (and survives an old binary's config save). Flipped on at the P6
@@ -422,6 +429,9 @@ pub fn put_cloud_coords(
         account_id,
         account_uik,
     );
+    if uik != cfg.account_uik {
+        cfg.account_uik_pub = None; // a pinned key belongs to the previous account
+    }
     cfg.account_id = id;
     cfg.account_uik = uik;
     save(&cfg)
@@ -496,6 +506,30 @@ pub fn account_uik() -> Option<String> {
     load().ok()?.account_uik.filter(|s| !s.is_empty())
 }
 
+/// The paired account's UIK signing key ([`CliConfig::account_uik_pub`]), only
+/// when it self-certifies against the pinned [`account_uik`].
+pub fn account_uik_pub() -> Option<[u8; 32]> {
+    use base64::Engine as _;
+    let cfg = load().ok()?;
+    let id = cfg.account_uik.filter(|s| !s.is_empty())?;
+    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(cfg.account_uik_pub?.as_bytes())
+        .ok()?;
+    let pk = <[u8; 32]>::try_from(raw.as_slice()).ok()?;
+    (crate::identity::derive_id(crate::identity::IdKind::User, &pk) == id).then_some(pk)
+}
+
+/// Pin the account owner's UIK (`us_…` and its signing key) from a VERIFIED
+/// admit signer at pairing. The id is derived from the key, so the two can't
+/// disagree.
+pub fn put_account_uik_key(pk: &[u8; 32]) -> Result<PathBuf, String> {
+    use base64::Engine as _;
+    let mut cfg = load().unwrap_or_default();
+    cfg.account_uik = Some(crate::identity::derive_id(crate::identity::IdKind::User, pk));
+    cfg.account_uik_pub = Some(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(pk));
+    save(&cfg)
+}
+
 /// Clear the cloud pairing from config + the known-vaults catalog (the inverse of
 /// [`put_cloud_coords`]): drop daemon/vault/cloud_backend/frontend_origin/account_id
 /// + known_vaults, preserve user `settings`. Used by the §15 self-revoke wipe so it
@@ -508,6 +542,7 @@ pub fn clear_pairing() -> Result<(), String> {
     cfg.frontend_origin = None;
     cfg.account_id = None;
     cfg.account_uik = None;
+    cfg.account_uik_pub = None;
     cfg.vault_deleted_upstream = None;
     cfg.known_vaults.clear();
     save(&cfg)?;

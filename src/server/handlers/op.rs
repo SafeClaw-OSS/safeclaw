@@ -80,11 +80,10 @@ pub(crate) async fn create_op<A: crate::service::source::github::GitHubApi>(
         ));
     }
     // Locked-state gate (H3 / PROTOCOL.md §6.3): when the vault is Locked,
-    // only the unlock ceremony (and first-time Enroll, which auto-unlocks)
-    // is admissible. Everything else gets a canned 409 so the caller knows
+    // only the unlock ceremony is admissible. Everything else gets a canned 409 so the caller knows
     // to drive a `Custom("vault-unlock")` op first.
-    let is_lifecycle_bypass = matches!(&op.act.kind, ActType::Enroll)
-        || matches!(&op.act.kind, ActType::Custom(name) if name == "vault-unlock");
+    let is_lifecycle_bypass =
+        matches!(&op.act.kind, ActType::Custom(name) if name == "vault-unlock");
     if !is_lifecycle_bypass && state.is_vault_locked(&vault_id) {
         return Err(AppError::VaultLocked);
     }
@@ -536,6 +535,13 @@ fn reject_broker_kind(kind: &ActType) -> Result<()> {
             crate::server::handlers::approve::WHOLE_BLOB_WRITE_RETIRED.into(),
         ));
     }
+    // Daemon-side Enroll (vault create, add passkey) is retired: both happen in
+    // the console, where the identity key lives (approve refuses it too).
+    if matches!(kind, ActType::Enroll) {
+        return Err(AppError::BadRequest(
+            crate::server::handlers::approve::ENROLL_RETIRED.into(),
+        ));
+    }
     Ok(())
 }
 
@@ -631,8 +637,11 @@ mod tests {
 
     #[test]
     fn accept_control_plane_kinds() {
+        assert!(
+            reject_broker_kind(&ActType::Enroll).is_err(),
+            "daemon-side enroll is retired"
+        );
         for kind in [
-            ActType::Enroll,
             ActType::Export,
             ActType::Custom("vault-unlock".into()),
             ActType::Custom("vault-lock".into()),

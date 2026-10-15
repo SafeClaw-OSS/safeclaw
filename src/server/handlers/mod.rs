@@ -6,7 +6,6 @@ pub mod metadata;
 pub mod nudge;
 pub mod op;
 pub mod op_payload;
-pub mod pending_passkey;
 pub mod proxy;
 pub mod registry;
 pub mod secret_keys;

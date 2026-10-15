@@ -70,6 +70,7 @@ pub async fn run(args: LogoutArgs) -> Result<(), String> {
     cleared.frontend_origin = None;
     cleared.account_id = None;
     cleared.account_uik = None;
+    cleared.account_uik_pub = None;
     save(&cleared)?;
 
     if was_paired {

@@ -43,6 +43,10 @@ SafeClaw because it is the hop that observed them.
 | `approval_needed` | 401 | approve | policy | policy asks; body carries approve/poll URLs + op id |
 | `approval_register` | 503 | retry | internal | could not open the approval op |
 | `approver_not_authorized` | 403 | none | auth | the passkey that approved is neither the requester nor an admin of this shared vault; the request stays pending |
+| `wk_refused_v2` | 400 | none | request | an approval delivered an unlock secret instead of the vault key and the approver's signature; an approver's identity key never leaves their browser, so the daemon refuses it. The request stays pending; reload the approval page (it needs the current console) |
+| `grant_id_invalid` | 403 | none | auth | the approval's identity signature is missing, does not verify, or names someone other than the owner of the passkey that approved; the request stays pending |
+| `device_not_admitted` | 403 | configure | auth | this device has no valid owner-signed admit over its device and daemon keys, so no approval can be sealed to it. Fix: run `sc login` |
+| `ledger_head_invalid` | 403 | none | auth | the account's device list does not match its owner-signed head (a forged or truncated list); the daemon keeps its previous view |
 | `broker_body_limit` | 413 | configure | config | body exceeds the inspectable cap; raise `--body-cap` if legitimate |
 | `egress_unreachable` | 502 | configure | environment | forward hop failed to connect (NOT a credential problem) |
 | `exposes_unsupported` | 400 | fix_request | request | role not mintable yet |

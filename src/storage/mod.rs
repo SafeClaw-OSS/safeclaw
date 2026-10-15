@@ -7,7 +7,6 @@
 //! - `vault_dir`: state-dir layout helpers (vaults/<id>/vault.dat).
 
 pub mod item;
-pub mod pending_passkey;
 pub mod plaintext;
 pub mod sealed_vault;
 pub mod vault_dir;
