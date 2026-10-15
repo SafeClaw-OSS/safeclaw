@@ -1199,7 +1199,7 @@ mod install_requests {
         let (_dir, state) = vault_with(true, &[("r1", asked()), ("r2", newer)]);
         let github = upstream();
         // The newer one first: an older open request names the same source.
-        block_on(requests::process(&state, VAULT, vec!["r2".into()], ME, &github, &FakeCloud::default()));
+        block_on(requests::process(&state, VAULT, vec!["r2".into()], ME, Some(ACCOUNT), &github, &FakeCloud::default()));
         assert!(!read(&state).contains_key("r2"));
         run(&state, &github, &FakeCloud::default());
         let left = read(&state);
