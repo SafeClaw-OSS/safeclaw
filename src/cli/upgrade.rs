@@ -92,18 +92,91 @@ fn origin_host(origin: &str) -> &str {
         .unwrap_or(origin)
 }
 
+/// A release tag `vX.Y.Z[-pre]` in semver order: a release outranks its
+/// pre-releases, and pre-release identifiers compare numerically when both
+/// are numbers (`rc.11` > `rc.9`), else as text, numbers first. `None` for a
+/// tag that is not a version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Version {
+    core: (u64, u64, u64),
+    pre: Vec<PreIdent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum PreIdent {
+    Num(u64),
+    Text(String),
+}
+
+impl Version {
+    fn parse(tag: &str) -> Option<Self> {
+        let v = tag.strip_prefix('v').unwrap_or(tag);
+        let (core, pre) = match v.split_once('-') {
+            Some((c, p)) => (c, Some(p)),
+            None => (v, None),
+        };
+        let mut nums = core.split('.').map(|n| n.parse::<u64>().ok());
+        let core = (nums.next()??, nums.next()??, nums.next()??);
+        if nums.next().is_some() {
+            return None;
+        }
+        let pre = match pre {
+            None => Vec::new(),
+            Some(p) => p
+                .split('.')
+                .map(|i| match i.parse::<u64>() {
+                    Ok(n) => PreIdent::Num(n),
+                    Err(_) => PreIdent::Text(i.to_string()),
+                })
+                .collect(),
+        };
+        Some(Version { core, pre })
+    }
+}
+
+impl Ord for Version {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.core.cmp(&other.core).then_with(|| {
+            match (self.pre.is_empty(), other.pre.is_empty()) {
+                (true, true) => std::cmp::Ordering::Equal,
+                (true, false) => std::cmp::Ordering::Greater,
+                (false, true) => std::cmp::Ordering::Less,
+                (false, false) => self.pre.cmp(&other.pre),
+            }
+        })
+    }
+}
+
+impl PartialOrd for Version {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// The highest version among the published releases in `body` (a releases
+/// API page; drafts skipped). The API does not list newest first: it is
+/// ordered neither by version nor by date.
+fn newest_tag(body: &serde_json::Value) -> Option<String> {
+    body.as_array()?
+        .iter()
+        .filter(|r| r.get("draft").and_then(|d| d.as_bool()) != Some(true))
+        .filter_map(|r| r.get("tag_name")?.as_str())
+        .filter_map(|t| Version::parse(t).map(|v| (v, t)))
+        .max_by(|a, b| a.0.cmp(&b.0))
+        .map(|(_, t)| t.to_string())
+}
+
 /// Resolve the asset base URL for the chosen channel, plus a short label for
 /// user messaging. Stable → GitHub's `latest/download` (no API call).
-/// Pre-release → query the releases API for the newest release (index 0,
-/// newest-first, INCLUDING pre-releases) and point at its
-/// `releases/download/<tag>` assets.
+/// Pre-release → the highest version among the releases INCLUDING
+/// pre-releases ([`newest_tag`]) and its `releases/download/<tag>` assets.
 async fn resolve_base(client: &reqwest::Client, pre: bool) -> Result<(String, String), String> {
     if !pre {
         return Ok((LATEST_BASE.to_string(), "latest stable".to_string()));
     }
-    // GitHub requires a User-Agent; the API returns releases newest-first and,
-    // unauthenticated, includes pre-releases but not drafts (CI never drafts).
-    let url = format!("https://api.github.com/repos/{}/releases?per_page=1", REPO);
+    // GitHub requires a User-Agent; unauthenticated, the API includes
+    // pre-releases but not drafts (CI never drafts).
+    let url = format!("https://api.github.com/repos/{}/releases?per_page=100", REPO);
     let resp = client
         .get(&url)
         .header("User-Agent", "safeclaw-upgrade")
@@ -118,12 +191,7 @@ async fn resolve_base(client: &reqwest::Client, pre: bool) -> Result<(String, St
         .json()
         .await
         .map_err(|e| format!("parse releases: {}", e))?;
-    let tag = body
-        .as_array()
-        .and_then(|a| a.first())
-        .and_then(|r| r.get("tag_name"))
-        .and_then(|t| t.as_str())
-        .ok_or("no releases found (including pre-releases)")?;
+    let tag = newest_tag(&body).ok_or("no releases found (including pre-releases)")?;
     let base = format!("https://github.com/{}/releases/download/{}", REPO, tag);
     Ok((base, format!("pre-release {}", tag)))
 }
@@ -157,6 +225,27 @@ mod tests {
             prerelease: pre,
             stable,
         }
+    }
+
+    /// The order GitHub actually returned on 10-15: an older line first, then
+    /// rc.9 before rc.11. The highest version wins, numerically.
+    #[test]
+    fn the_newest_prerelease_is_the_highest_version_not_the_first_listed() {
+        let page = serde_json::json!([
+            { "tag_name": "v0.12.0-rc.1" },
+            { "tag_name": "v1.1.0-rc.9" },
+            { "tag_name": "v1.1.0-rc.11" },
+            { "tag_name": "v1.1.0-rc.12", "draft": true },
+            { "tag_name": "not-a-version" },
+        ]);
+        assert_eq!(newest_tag(&page).as_deref(), Some("v1.1.0-rc.11"));
+        let v = |t: &str| Version::parse(t).unwrap();
+        assert!(v("v1.1.0") > v("v1.1.0-rc.11"), "a release outranks its pre-releases");
+        assert!(v("v1.1.0-rc.11") > v("v1.1.0-rc.9"));
+        assert!(v("v1.1.0-rc.1") > v("v1.0.9"));
+        assert!(v("v1.1.0-rc.1") < v("v1.1.0-rc.1.1"));
+        assert!(Version::parse("v1.1").is_none());
+        assert_eq!(newest_tag(&serde_json::json!([])), None);
     }
 
     #[test]
