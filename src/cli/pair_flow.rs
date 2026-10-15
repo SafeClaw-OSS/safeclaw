@@ -202,7 +202,7 @@ pub async fn pair(client: &reqwest::Client, req: &PairRequest<'_>) -> Result<Pai
         let text = presp.text().await.unwrap_or_default();
         if !status.is_success() {
             if text.contains("pair_code_mismatch") {
-                return Err(dead("The code entered in the browser did not match."));
+                return Err(dead("The code was entered wrong, or entered again (for example after the page reloaded)."));
             }
             return Err(format!("pairing failed ({})", http_detail(status, &text)));
         }
@@ -270,7 +270,7 @@ pub async fn pair(client: &reqwest::Client, req: &PairRequest<'_>) -> Result<Pai
         match state {
             "pending" | "pake" | "" => continue,
             "denied" => return Err("pairing was declined in the browser.".into()),
-            "failed" => return Err(dead("The code entered in the browser did not match.")),
+            "failed" => return Err(dead("The code was entered wrong, or entered again (for example after the page reloaded).")),
             "approved" => {
                 let k_owner = k_owner.ok_or_else(|| {
                     dead("The server reported an approval without the code exchange.")
