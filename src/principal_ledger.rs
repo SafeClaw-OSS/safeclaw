@@ -53,6 +53,10 @@ struct PrincipalEventJson {
     anchor_uik: String,
     owner_id: String,
     sig: String, // base64 raw 64-byte Ed25519
+    /// Contract C1: the admitted device's raw 32-byte X25519 grant-seal key
+    /// (base64url; standard base64 tolerated). Absent for an agent and a revoke.
+    #[serde(default)]
+    sc_pk: Option<String>,
     #[serde(default)]
     #[allow(dead_code)]
     created_at: String,
@@ -153,7 +157,19 @@ fn decode_pub32(b64: &str) -> Option<[u8; 32]> {
 }
 
 fn decode_sig64(b64: &str) -> Option<[u8; 64]> {
-    <[u8; 64]>::try_from(STANDARD.decode(b64).ok()?.as_slice()).ok()
+    <[u8; 64]>::try_from(decode_b64_any(b64)?.as_slice()).ok()
+}
+
+/// Decode base64url-no-pad (the grant-v3 wire convention) or standard base64
+/// (the ledger's original encoding). The alphabets are unambiguous for a
+/// fixed-length key or signature, so accepting both is not a parsing hazard.
+fn decode_b64_any(s: &str) -> Option<Vec<u8>> {
+    use base64::engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD};
+    STANDARD
+        .decode(s)
+        .or_else(|_| URL_SAFE_NO_PAD.decode(s))
+        .or_else(|_| URL_SAFE.decode(s))
+        .ok()
 }
 
 // ── Pull ──────────────────────────────────────────────────────────────────
@@ -222,7 +238,18 @@ fn fold_verified(ledger: &LedgerJson, anchor_uik: &str) -> Option<Folded> {
             continue;
         };
         // anchor_uik is the first signed field (== anchor for a personal account).
-        let input = identity::principal_event_input(anchor_uik, &e.op, &e.principal_id, e.seq, &e.owner_id);
+        let sc_pk = match e.sc_pk.as_deref().filter(|s| !s.is_empty()) {
+            None => Vec::new(),
+            Some(b) => match decode_b64_any(b) {
+                Some(v) if v.len() == 32 => v,
+                _ => {
+                    tracing::warn!(seq = e.seq, "principal ledger: undecodable sc_pk; skipping");
+                    continue;
+                }
+            },
+        };
+        let input =
+            identity::principal_event_input(anchor_uik, &e.op, &e.principal_id, e.seq, &e.owner_id, &sc_pk);
         if !identity::verify(&anchor_pub, &input, &sig) {
             tracing::warn!(seq = e.seq, "principal ledger: signature does not verify; skipping");
             continue;
@@ -419,7 +446,7 @@ mod tests {
     }
 
     fn signed_event(owner: &SigningIdentity, anchor_uik: &str, op: &str, principal: &str, seq: u64) -> PrincipalEventJson {
-        let input = identity::principal_event_input(anchor_uik, op, principal, seq, anchor_uik);
+        let input = identity::principal_event_input(anchor_uik, op, principal, seq, anchor_uik, &[]);
         let sig = owner.sign(&input);
         PrincipalEventJson {
             seq,
@@ -429,6 +456,7 @@ mod tests {
             anchor_uik: anchor_uik.to_string(),
             owner_id: anchor_uik.to_string(),
             sig: STANDARD.encode(sig),
+            sc_pk: None,
             created_at: String::new(),
         }
     }

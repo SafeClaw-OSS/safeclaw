@@ -20,6 +20,8 @@ pub mod audit;
 pub mod auth;
 pub mod cli;
 pub mod config;
+#[cfg(test)]
+mod contract_vectors;
 pub mod core;
 pub mod crypto;
 pub mod device_auth;
