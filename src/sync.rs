@@ -1406,15 +1406,46 @@ async fn recover_after_conflict(
     true
 }
 
-/// Fetch the account-level agent-key hash-set (`/api/vault/agents/hashes`,
+/// The account's agent roster as served by `/api/vault/agents/hashes`: the
+/// broker-authorizing key hashes, plus (from a backend that serves them) the
+/// `ag_` ids of every agent registered to the account.
+struct AgentRoster {
+    hashes: std::collections::HashSet<String>,
+    /// `None` when the backend omits `agent_ids` (an older backend): the
+    /// account-ownership check stays off rather than refuse on missing data.
+    agent_ids: Option<std::collections::HashSet<String>>,
+}
+
+/// Parse the `/api/vault/agents/hashes` body. `None` if `keys` is missing.
+fn parse_agent_roster(body: &serde_json::Value) -> Option<AgentRoster> {
+    let keys = body.get("keys")?.as_array()?;
+    let hashes = keys
+        .iter()
+        .filter_map(|k| {
+            k.get("hash")
+                .and_then(|h| h.as_str())
+                .map(|s| s.to_string())
+        })
+        .collect();
+    let agent_ids = body.get("agent_ids").and_then(|v| v.as_array()).map(|ids| {
+        ids.iter()
+            .filter_map(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect()
+    });
+    Some(AgentRoster { hashes, agent_ids })
+}
+
+/// Fetch the account-level agent roster (`/api/vault/agents/hashes`,
 /// device-key authed). Returns None on any failure (caller keeps the prior
-/// set). The hashes are sha256(token) hex — the broker validates a presented
+/// state). The hashes are sha256(token) hex — the broker validates a presented
 /// key by re-hashing and checking membership; the cloud never sees plaintext.
-async fn fetch_agent_key_hashes(
+async fn fetch_agent_roster(
     client: &reqwest::Client,
     cloud: &str,
     device_key: &str,
-) -> Option<std::collections::HashSet<String>> {
+) -> Option<AgentRoster> {
     let url = format!("{}/api/vault/agents/hashes", cloud.trim_end_matches('/'));
     let resp = client
         .get(&url)
@@ -1427,16 +1458,7 @@ async fn fetch_agent_key_hashes(
         return None;
     }
     let body: serde_json::Value = resp.json().await.ok()?;
-    let keys = body.get("keys")?.as_array()?;
-    Some(
-        keys.iter()
-            .filter_map(|k| {
-                k.get("hash")
-                    .and_then(|h| h.as_str())
-                    .map(|s| s.to_string())
-            })
-            .collect(),
-    )
+    parse_agent_roster(&body)
 }
 
 /// One-shot refresh of the broker's agent-key hash-set. Best-effort + gated
@@ -1461,14 +1483,30 @@ async fn sync_agent_keys_with_timeout(state: &Arc<AppState>, timeout: Duration) 
         Ok(c) => c,
         Err(_) => return,
     };
-    if let Some(hashes) = fetch_agent_key_hashes(&client, cloud, &dk).await {
-        let n = hashes.len();
+    if let Some(roster) = fetch_agent_roster(&client, cloud, &dk).await {
+        let n = roster.hashes.len();
         // Log only when the set actually moved — this runs on a 30s loop, and
         // an unconditional line here is the daemon's loudest idle chatter.
-        if state.set_agent_key_hashes(hashes) {
+        if state.set_agent_key_hashes(roster.hashes) {
             tracing::info!(count = n, "agent-key hash-set updated");
         }
+        state.set_account_agent_ids(roster.agent_ids);
     }
+}
+
+/// Is the verified agent `agent_id` one this machine's paired account does
+/// NOT have (`agent_other_account`)? A machine is paired to exactly one account
+/// and its agents act as that account; an AIK set up under another account is
+/// refused here, before any vault-level check. Fails closed only on a positive
+/// answer from the account's own roster: when the roster is unknown it says
+/// `false`, and on a miss it first re-pulls the roster once (debounced, like a
+/// key miss) so an agent added to this account seconds ago is never refused.
+pub async fn agent_of_other_account(state: &Arc<AppState>, agent_id: &str) -> bool {
+    if !state.agent_outside_account(agent_id) {
+        return false;
+    }
+    refresh_agent_keys_on_miss(state).await;
+    state.agent_outside_account(agent_id)
 }
 
 /// One serialized refresh on an agent-key AUTH MISS. A key minted seconds ago
@@ -8265,6 +8303,66 @@ mod peritem_tests {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    /// The roster parse: hashes as before, plus the account's `ag_` ids when the
+    /// backend serves them. An older backend (no `agent_ids`) yields `None`, which
+    /// keeps the account-ownership check off.
+    #[test]
+    fn agent_roster_parses_ids_only_when_served() {
+        let r = parse_agent_roster(&serde_json::json!({
+            "keys": [{ "hash": "h1" }, { "hash": "h2" }],
+            "agent_ids": ["ag_a", "", 7, "ag_b"],
+        }))
+        .unwrap();
+        assert_eq!(r.hashes.len(), 2);
+        let ids = r.agent_ids.unwrap();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains("ag_a") && ids.contains("ag_b"));
+
+        let old = parse_agent_roster(&serde_json::json!({ "keys": [{ "hash": "h1" }] })).unwrap();
+        assert!(old.agent_ids.is_none());
+        // An empty roster is a KNOWN empty account, not "unknown".
+        let empty =
+            parse_agent_roster(&serde_json::json!({ "keys": [], "agent_ids": [] })).unwrap();
+        assert_eq!(empty.agent_ids.map(|s| s.len()), Some(0));
+        assert!(parse_agent_roster(&serde_json::json!({})).is_none());
+    }
+
+    /// `agent_other_account` fires only on a positive answer from the paired
+    /// account's roster: unknown roster → never; this account's agent → never;
+    /// an agent absent from the roster (after the debounced re-pull) → yes.
+    #[tokio::test]
+    async fn other_account_agent_needs_a_known_roster() {
+        let dir = tempdir().unwrap();
+        let cfg = crate::config::Config {
+            state_dir: dir.path().to_path_buf(),
+            port: 0,
+            proxy_port: 0,
+            listen: "127.0.0.1".into(),
+            origin: "http://localhost".into(),
+            relying_party: crate::passkey::webauthn::RelyingParty::exact(
+                "http://localhost",
+                "localhost",
+            ),
+            admin_key: None,
+            relay_url: None,
+            body_cap: crate::config::DEFAULT_BODY_CAP,
+        };
+        let state = Arc::new(AppState::new(cfg));
+        // Pre-debounce the on-miss re-pull: no network in tests.
+        *state.agent_key_resync.lock().await = Some(std::time::Instant::now());
+
+        assert!(
+            !agent_of_other_account(&state, "ag_x").await,
+            "unknown roster"
+        );
+        state.set_account_agent_ids(Some(["ag_mine".to_string()].into_iter().collect()));
+        assert!(!agent_of_other_account(&state, "ag_mine").await);
+        assert!(agent_of_other_account(&state, "ag_x").await);
+        // A backend that stops serving ids turns the check back off.
+        state.set_account_agent_ids(None);
+        assert!(!agent_of_other_account(&state, "ag_x").await);
+    }
 
     /// The format gate reads every format up to and including the one this
     /// build knows, and only a NEWER one trips the loud upgrade path.

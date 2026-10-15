@@ -209,13 +209,24 @@ async fn require_agent(
     if let Some(tok) = token.as_deref() {
         if tok.starts_with(&format!("{}.", crate::agent_pop::TOKEN_PREFIX)) {
             let target = crate::agent_pop::apiface_target(pq);
-            return match crate::agent_pop::verify_agent_proxy_pop(
+            let verified = crate::agent_pop::verify_agent_proxy_pop(
                 tok,
                 "",
                 &target,
                 crate::util::now_unix(),
                 crate::agent_pop::DEFAULT_MAX_SKEW_SECS,
-            ) {
+            );
+            // Verified AIK of ANOTHER account (checked before any vault-level
+            // check): the fix is `sc agent add` on this machine, not a toggle.
+            if let Some(ag) = verified.as_deref() {
+                if crate::sync::agent_of_other_account(state, ag).await {
+                    return Err(problem(
+                        ScCode::AgentOtherAccount,
+                        crate::error::AGENT_OTHER_ACCOUNT_MSG,
+                    ));
+                }
+            }
+            return match verified {
                 // Verified AIK, authorized on some unlocked vault → attribution.
                 Some(ag) if state.agent_is_authorized_any(&ag) => Ok(ag),
                 // Verified AIK but NOT authorized anywhere yet: distinct from a bad
@@ -382,5 +393,73 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         assert!(is_api_face(&loop_back, 23294));
+    }
+
+    /// An AIK agent set up under ANOTHER account gets `agent_other_account` at
+    /// its first api-face read, before any vault-level check; with the roster
+    /// unknown it falls through to the vault-level answer as before.
+    #[tokio::test]
+    async fn other_account_agent_is_named_before_vault_checks() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = crate::config::Config {
+            state_dir: dir.path().to_path_buf(),
+            port: 0,
+            proxy_port: 0,
+            listen: "127.0.0.1".into(),
+            origin: "http://localhost".into(),
+            relying_party: crate::passkey::webauthn::RelyingParty::exact(
+                "http://localhost",
+                "localhost",
+            ),
+            admin_key: None,
+            relay_url: None,
+            body_cap: crate::config::DEFAULT_BODY_CAP,
+        };
+        let state = Arc::new(AppState::new(cfg));
+        // Pre-debounce the on-miss roster re-pull: no network in tests.
+        *state.agent_key_resync.lock().await = Some(std::time::Instant::now());
+        let id = crate::identity::SigningIdentity::from_seed(&[9u8; 32]);
+        let ag = crate::identity::derive_id(crate::identity::IdKind::Agent, &id.public_bytes());
+        let signer = crate::agent_pop::AgentProxyPopSigner::new(id, ag.clone());
+        let headers = |pq: &str| {
+            let tok = signer.token(
+                "",
+                &crate::agent_pop::apiface_target(pq),
+                crate::util::now_unix(),
+            );
+            let mut h = HeaderMap::new();
+            h.insert(
+                header::AUTHORIZATION,
+                format!("Bearer {tok}").parse().unwrap(),
+            );
+            h
+        };
+        let code = |r: &Response<Body>| {
+            r.headers()
+                .get("x-safeclaw-error")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        };
+
+        state.set_account_agent_ids(Some(["ag_someone_else".to_string()].into_iter().collect()));
+        let r = require_agent(&state, &headers("/vaults"), "/vaults")
+            .await
+            .unwrap_err();
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
+        assert_eq!(code(&r).as_deref(), Some("agent_other_account"));
+
+        // Roster unknown → no account verdict; the vault-level answer stands.
+        state.set_account_agent_ids(None);
+        let r = require_agent(&state, &headers("/vaults"), "/vaults")
+            .await
+            .unwrap_err();
+        assert_eq!(code(&r).as_deref(), Some("agent_not_authorized"));
+
+        // This account's agent is never refused by the account check.
+        state.set_account_agent_ids(Some([ag].into_iter().collect()));
+        let r = require_agent(&state, &headers("/vaults"), "/vaults")
+            .await
+            .unwrap_err();
+        assert_eq!(code(&r).as_deref(), Some("agent_not_authorized"));
     }
 }

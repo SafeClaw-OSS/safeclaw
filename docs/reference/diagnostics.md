@@ -38,6 +38,7 @@ SafeClaw because it is the hop that observed them.
 | `internal` | 500 | retry | internal | daemon bug/failure |
 | `ca_unavailable` | 500 | retry | internal | resident CA unreadable |
 | `agent_key` | 407 | configure | auth | phantom-bearing request without a valid agent api key |
+| `agent_other_account` | 403 | configure | auth | the agent was set up (`sc agent add`) under a different SafeClaw account than the one this machine is signed in to; checked before any vault-level check. Fix: run `sc agent add` on this machine |
 | `ambiguous_phantom` | 400 | fix_request | request | bare phantom on a multi-secret connection; use a role phantom |
 | `approval_needed` | 401 | approve | policy | policy asks; body carries approve/poll URLs + op id |
 | `approval_register` | 503 | retry | internal | could not open the approval op |

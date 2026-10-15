@@ -384,6 +384,27 @@ pub async fn run(args: LoginArgs) -> Result<(), String> {
         device_flow_pair(&client, &custodian, &device_name, &dev_id, &dik_pub, &dik).await?
     };
 
+    // ── Pairing a DIFFERENT account switches this machine to it ──────────
+    // A machine's `sc` is paired to exactly one account. Nothing of the old one
+    // may carry over: stop the daemon (it holds the old account's unlocked keys
+    // and would write its state back), then drop the old account's local state
+    // exactly as `sc logout` does. The bring-up below starts the daemon clean on
+    // the new pairing; `put_cloud_coords` drops the old account id / pinned UIK.
+    // Re-pairing the same account skips all of this.
+    if crate::cli::active::paired_to_other_account(
+        Some(parsed.account_id.as_str()),
+        parsed.account_uik_id.as_deref(),
+    ) {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            if crate::cli::service::unit_installed() {
+                let _ = crate::cli::service::run_stop();
+            }
+        }
+        crate::cli::logout::wipe_local_account_state()
+            .map_err(|e| format!("clear the previous account's local state: {}", e))?;
+    }
+
     // ── Persist the device-key to ~/.safeclaw/device-key (0600) ──────────
     let key_path = device_key_path()?;
     write_device_key(&key_path, &parsed.device_key)?;

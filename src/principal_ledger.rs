@@ -244,7 +244,7 @@ fn fold_verified(ledger: &LedgerJson, anchor_uik: &str) -> Option<Folded> {
 
 // ── Floor persistence (rollback resistance) ─────────────────────────────────
 
-fn floor_path(state_dir: &Path) -> std::path::PathBuf {
+pub(crate) fn floor_path(state_dir: &Path) -> std::path::PathBuf {
     state_dir.join("principal_floor.json")
 }
 

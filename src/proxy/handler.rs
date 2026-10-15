@@ -380,6 +380,19 @@ impl BrokerHandler {
         // — a bad/missing key is an explicit 407, never a silent fallback. On a
         // miss with a key PRESENT, refresh the hash-set once (debounced): a key
         // minted seconds ago by `sc agent add` must not 407 for the 30s loop.
+        //
+        // First, before any vault-level check: a verified AIK that this machine's
+        // paired account doesn't have was set up under ANOTHER account. Say so
+        // (fix: `sc agent add` here), never "not turned on for this vault".
+        if let Some(ag) = self.agent_id.as_deref() {
+            if crate::sync::agent_of_other_account(&self.state, ag).await {
+                return err_response(
+                    ScCode::AgentOtherAccount,
+                    crate::error::AGENT_OTHER_ACCOUNT_MSG,
+                )
+                .into();
+            }
+        }
         if !self.key_is_valid() {
             // A cryptographically-VALID AIK PoP (agent_id resolved in
             // should_intercept) that isn't authorized on THIS vault is a distinct

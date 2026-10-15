@@ -33,6 +33,13 @@ pub enum ScCode {
     /// authorize (Agents tab), not a credential change, so it must NEVER read as
     /// "bad key" (that sends the user debugging the wrong thing).
     AgentNotAuthorized,
+    /// A cryptographically-valid agent AIK that this machine's paired account
+    /// does not have: the agent was set up (`sc agent add`) under a DIFFERENT
+    /// SafeClaw account than the one this machine is signed in to. Checked
+    /// before any vault-level check, so it never reads as `agent_not_authorized`
+    /// ("not turned on for this vault"), whose fix is a Console toggle; the fix
+    /// here is `sc agent add` on this machine.
+    AgentOtherAccount,
     AmbiguousPhantom,
     ApprovalNeeded,
     ApprovalRegister,
@@ -117,6 +124,13 @@ impl ScCode {
                 "agent_not_authorized",
                 "Agent not authorized on this vault",
                 "none",
+                "auth",
+            ),
+            AgentOtherAccount => (
+                403,
+                "agent_other_account",
+                "Agent set up for a different account",
+                "configure",
                 "auth",
             ),
             AmbiguousPhantom => (
@@ -287,6 +301,12 @@ impl ScCode {
 /// consistent state and relays one consistent fix.
 pub const VAULT_LOCKED_MSG: &str = "vault locked. Run `sc unlock`, then retry";
 
+/// The ONE remediation line for [`ScCode::AgentOtherAccount`], shared by every
+/// surface that raises it (proxy plane, API face, control plane).
+pub const AGENT_OTHER_ACCOUNT_MSG: &str = "This agent was set up for a different SafeClaw \
+     account than the one this machine is signed in to. Run `sc agent add` to set it up for \
+     this account.";
+
 /// RFC 9457 `application/problem+json` body for a code + detail message.
 /// Extension members: `code` / `action` / `cause` (see [`ScCode::row`]),
 /// plus legacy `error` / `message` dual-emitted for one transition window
@@ -325,6 +345,9 @@ pub enum AppError {
     /// The grant's signer may not approve this op (see
     /// `ScCode::ApproverNotAuthorized`). The op stays pending.
     ApproverNotAuthorized(String),
+    /// The requesting agent belongs to another account (see
+    /// `ScCode::AgentOtherAccount`).
+    AgentOtherAccount,
 }
 
 impl AppError {
@@ -342,6 +365,10 @@ impl AppError {
             AppError::TooManyRequests => (ScCode::RateLimited, "Rate limit exceeded".to_string()),
             AppError::BatchVerify(msg) => (ScCode::BatchVerifyFailed, msg.clone()),
             AppError::ApproverNotAuthorized(msg) => (ScCode::ApproverNotAuthorized, msg.clone()),
+            AppError::AgentOtherAccount => (
+                ScCode::AgentOtherAccount,
+                AGENT_OTHER_ACCOUNT_MSG.to_string(),
+            ),
             AppError::Internal(msg) => {
                 tracing::error!("internal error: {}", msg);
                 (ScCode::Internal, "Internal server error".to_string())
@@ -386,6 +413,7 @@ impl std::fmt::Display for AppError {
             AppError::Internal(msg) => write!(f, "Internal error: {}", msg),
             AppError::BatchVerify(msg) => write!(f, "Batch verification failed: {}", msg),
             AppError::ApproverNotAuthorized(msg) => write!(f, "Approver not authorized: {}", msg),
+            AppError::AgentOtherAccount => write!(f, "{}", AGENT_OTHER_ACCOUNT_MSG),
         }
     }
 }
@@ -433,6 +461,7 @@ mod tests {
             CaUnavailable,
             AgentKey,
             AgentNotAuthorized,
+            AgentOtherAccount,
             AmbiguousPhantom,
             ApprovalNeeded,
             ApprovalRegister,
@@ -491,6 +520,22 @@ mod tests {
                 "{code}: unknown cause {cause}"
             );
         }
+    }
+
+    /// The account-mismatch refusal is its own code with the `sc agent add` fix,
+    /// never the vault-level `agent_not_authorized`.
+    #[test]
+    fn agent_other_account_row() {
+        let (code, detail) = AppError::AgentOtherAccount.code();
+        assert_eq!(code.as_str(), "agent_other_account");
+        assert_eq!(code.status(), 403);
+        assert_eq!(code.row().3, "configure");
+        assert!(detail.contains("different SafeClaw account"));
+        assert!(detail.contains("`sc agent add`"));
+        assert!(
+            !detail.contains("  "),
+            "no doubled spaces from line continuation"
+        );
     }
 
     /// problem_body carries both the 9457 members and the legacy dual-emit.

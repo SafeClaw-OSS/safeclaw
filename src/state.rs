@@ -467,6 +467,16 @@ pub struct AppState {
     /// unpaired/local-only daemon has no broker plane to gate). See
     /// [[project_vault_agent_architecture_2026_06_25]].
     pub agent_key_hashes: Mutex<std::collections::HashSet<String>>,
+    /// The `ag_` ids of every agent registered to THIS machine's paired account
+    /// (`api_keys.identity_id`), synced alongside [`Self::agent_key_hashes`].
+    /// A machine is paired to exactly one account and its agents act as that
+    /// account, so a verified AIK outside this set was set up under another
+    /// account (`agent_other_account`). `None` = not known (unpaired, not yet
+    /// fetched, or a backend that doesn't serve the ids): the check is then
+    /// off, so it can never refuse an agent of the paired account on missing
+    /// data. A failed fetch keeps the prior set; a re-pair to another account
+    /// restarts the daemon, so the set never outlives its account.
+    pub account_agent_ids: Mutex<Option<std::collections::HashSet<String>>>,
     /// Serializer + debounce stamp for the on-auth-miss hash refresh
     /// (`sync::refresh_agent_keys_on_miss`): a key minted seconds ago
     /// (`sc agent add` → immediate use) must not wait out the 30s sync loop,
@@ -549,7 +559,7 @@ pub struct OpPayloadEntry {
     pub values: std::collections::BTreeMap<String, String>,
 }
 
-fn host_anchors_path(state_dir: &std::path::Path) -> std::path::PathBuf {
+pub(crate) fn host_anchors_path(state_dir: &std::path::Path) -> std::path::PathBuf {
     state_dir.join("host-anchors.json")
 }
 
@@ -631,6 +641,7 @@ impl AppState {
             vault_write_locks: Mutex::new(HashMap::new()),
             sse_semaphores: Mutex::new(HashMap::new()),
             agent_key_hashes: Mutex::new(std::collections::HashSet::new()),
+            account_agent_ids: Mutex::new(None),
             agent_key_resync: tokio::sync::Mutex::new(None),
             external_fill_lock: tokio::sync::Mutex::new(()),
             oauth_reauth_needed: Mutex::new(std::collections::HashSet::new()),
@@ -741,6 +752,22 @@ impl AppState {
         let changed = *cur != hashes;
         *cur = hashes;
         changed
+    }
+
+    /// Replace the synced set of the paired account's agent ids (see
+    /// [`Self::account_agent_ids`]). `None` turns the account check off.
+    pub fn set_account_agent_ids(&self, ids: Option<std::collections::HashSet<String>>) {
+        *self.account_agent_ids.lock().unwrap() = ids;
+    }
+
+    /// Is the verified agent `agent_id` known NOT to be one of the paired
+    /// account's agents? `false` whenever the account's list is unknown, so an
+    /// agent of this account is never refused for lack of data.
+    pub fn agent_outside_account(&self, agent_id: &str) -> bool {
+        matches!(
+            self.account_agent_ids.lock().unwrap().as_ref(),
+            Some(ids) if !ids.contains(agent_id)
+        )
     }
 
     /// TTL for the redeemed-code ledger. OAuth authorization codes expire

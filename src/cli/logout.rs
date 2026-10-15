@@ -48,16 +48,10 @@ pub async fn run(args: LogoutArgs) -> Result<(), String> {
         let _ = crate::cli::service::run_stop();
     }
 
-    // 2b. Wipe local sealed vault state (`<state_dir>/vaults/`). Unpair means this
-    //    machine is out; the sealed blobs are ciphertext (no leak), but leaving
-    //    them is untidy and a re-pair re-pulls them from the cloud. Best-effort —
-    //    a wipe failure must not block the unpair.
-    {
-        let vaults_dir = crate::config::default_state_dir().join("vaults");
-        if vaults_dir.exists() {
-            let _ = std::fs::remove_dir_all(&vaults_dir);
-        }
-    }
+    // 2b. Wipe the account's local state (sealed vaults, catalog, …). Unpair
+    //    means this machine is out; the sealed blobs are ciphertext (no leak), but
+    //    leaving them is untidy and a re-pair re-pulls them from the cloud.
+    wipe_local_account_state()?;
 
     // 3. Remove the device-key file (this host's identity to the cloud).
     if let Some(home) = dirs::home_dir() {
@@ -67,20 +61,16 @@ pub async fn run(args: LogoutArgs) -> Result<(), String> {
         }
     }
 
-    // 4. Clear the pairing from config.toml: active vault, cloud backend,
-    //    frontend origin, and the known-vaults catalog (its own file; incl. any
-    //    orphans). Preserve user `settings` (e.g. cb_port) — not pairing state.
+    // 4. Clear the pairing from config.toml: cloud backend, frontend origin and
+    //    the paired account (the active vault + catalog went in 2b). Preserve
+    //    user `settings` (e.g. cb_port) — not pairing state.
     let mut cleared = load().unwrap_or_default();
     cleared.daemon = None;
-    cleared.vault = None;
     cleared.cloud_backend = None;
     cleared.frontend_origin = None;
     cleared.account_id = None;
     cleared.account_uik = None;
-    cleared.vault_deleted_upstream = None;
-    cleared.known_vaults.clear();
     save(&cleared)?;
-    crate::cli::active::clear_known_vaults()?;
 
     if was_paired {
         eprintln!("Unpaired this machine — daemon stopped, local pairing cleared.");
@@ -93,6 +83,27 @@ pub async fn run(args: LogoutArgs) -> Result<(), String> {
     eprintln!("  valid account-wide (logout revokes only this DEVICE) — revoke unused ones");
     eprintln!("  with `sc agent rm`. Re-pair with `sc login`.");
     Ok(())
+}
+
+/// Drop everything local that belongs to the paired ACCOUNT rather than the
+/// machine: the sealed vaults (`<state_dir>/vaults/`, incl. each vault's audit
+/// db), the host anchors and principal-ledger floor learned under it, the active
+/// vault, and the known-vaults catalog. Kept: the device identity, the CA, the
+/// agent identity files and user `settings`. Stop the daemon first: it holds the
+/// unlocked vault keys in memory and would write some of this back. Shared by
+/// `sc logout` and by `sc login` switching this machine to another account.
+pub(crate) fn wipe_local_account_state() -> Result<(), String> {
+    let state_dir = crate::config::default_state_dir();
+    // Best-effort file removals: a missing file is the goal state.
+    let _ = std::fs::remove_dir_all(state_dir.join("vaults"));
+    let _ = std::fs::remove_file(crate::state::host_anchors_path(&state_dir));
+    let _ = std::fs::remove_file(crate::principal_ledger::floor_path(&state_dir));
+    let mut cfg = load().unwrap_or_default();
+    cfg.vault = None;
+    cfg.vault_deleted_upstream = None;
+    cfg.known_vaults.clear();
+    save(&cfg)?;
+    crate::cli::active::clear_known_vaults()
 }
 
 #[derive(Deserialize)]

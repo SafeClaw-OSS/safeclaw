@@ -34,6 +34,13 @@ pub async fn create(
     // Requester attribution: verified from the agent's proof over this exact
     // op, else none (see `attribute_agent`).
     let agent = attribute_agent(&headers, &vault_id, &mut op, crate::util::now_unix());
+    // An agent set up under another account than this machine's is refused
+    // before any vault-level check (and before the op reaches the relay).
+    if let Some(ag) = agent.as_deref() {
+        if crate::sync::agent_of_other_account(&state, ag).await {
+            return Err(AppError::AgentOtherAccount);
+        }
+    }
     create_op::<crate::service::source::github::GitHubHttp>(
         &state,
         vault_id,
@@ -850,6 +857,37 @@ mod tests {
         let (scope_agent, rec_agent) = attribution(&state, &body);
         assert_eq!(scope_agent.as_deref(), Some(s.agent_id()));
         assert_eq!(rec_agent.as_deref(), Some(s.agent_id()));
+    }
+
+    /// A ceremony from an agent set up under ANOTHER account than this machine's
+    /// is refused with `agent_other_account` before any op exists; the same
+    /// request from one of this account's agents goes through. The roster
+    /// re-pull on a miss is pre-debounced so the test makes no network call.
+    #[tokio::test]
+    async fn agent_of_another_account_is_refused_before_the_op() {
+        let state = Arc::new(test_state());
+        *state.agent_key_resync.lock().await = Some(std::time::Instant::now());
+        let s = agent_signer();
+        let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+        state.set_account_agent_ids(Some(["ag_someone_else".to_string()].into_iter().collect()));
+        let op = rm_op(Value::Null);
+        let tok = s.op_token("v1", &op, crate::util::now_unix()).unwrap();
+        let err = create(
+            State(state.clone()),
+            ConnectInfo(addr),
+            Path("v1".into()),
+            pop_headers(&tok),
+            Json(op),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code().0.as_str(), "agent_other_account");
+
+        state.set_account_agent_ids(Some([s.agent_id().to_string()].into_iter().collect()));
+        let op = rm_op(Value::Null);
+        let tok = s.op_token("v1", &op, crate::util::now_unix()).unwrap();
+        let body = create_with(&state, op, pop_headers(&tok)).await;
+        assert_eq!(attribution(&state, &body).0.as_deref(), Some(s.agent_id()));
     }
 
     /// No proof, a proof over a different op, a proof for another vault, or a
