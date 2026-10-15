@@ -474,7 +474,7 @@ fn icon_png_is_validated_and_dropped() {
     let files = read_tarball(&ok, None).unwrap();
     assert_eq!(files.defs["a1"], (a1.clone(), None));
     let admitted = admit_files(&files, None).unwrap();
-    let op = super::add_op("v1", &gh("acme/tools", 'a'), &admitted, false, 0);
+    let op = super::add_op("v1", &gh("acme/tools", 'a'), &admitted, 0);
     let def = op["act"]["scope"]["defs"]["a1"].as_object().unwrap();
     assert_eq!(def.keys().collect::<Vec<_>>(), ["service"]);
     let root = tar_gz(&[
@@ -916,7 +916,7 @@ client_id = "public"
         (oauth.to_string(), Some(ACME_POLICY.to_string())),
     )]
     .into();
-    let c = add_card(&snap, &texts, &src, false, &current, &reg).unwrap();
+    let c = add_card(&snap, &texts, &src, &current, &reg).unwrap();
     assert_eq!(c.ids, ["acme"]);
     assert_eq!(
         c.destinations,
@@ -956,7 +956,7 @@ client_id = "public"
     let local = ServiceSource::Local {
         name: "mine".into(),
     };
-    let c = add_card(&snap, &texts, &local, false, &current, &reg).unwrap();
+    let c = add_card(&snap, &texts, &local, &current, &reg).unwrap();
     assert_eq!(c.from, "local folder mine");
 
     // A built-in id.
@@ -966,7 +966,7 @@ client_id = "public"
     )]
     .into();
     assert!(
-        add_card(&gh_def, &BTreeMap::new(), &src, false, &current, &reg)
+        add_card(&gh_def, &BTreeMap::new(), &src, &current, &reg)
             .unwrap_err()
             .contains("built-in")
     );
@@ -976,38 +976,28 @@ client_id = "public"
         "acme".to_string(),
         StoredService::new(ACME.into(), None, Some(gh("other/repo", 'b'))),
     );
-    let e = add_card(&snap, &BTreeMap::new(), &src, false, &current, &reg).unwrap_err();
+    let e = add_card(&snap, &BTreeMap::new(), &src, &current, &reg).unwrap_err();
     assert!(
         e.contains("already in this vault from github:other/repo"),
         "{e}"
     );
     current.insert("acme".to_string(), StoredService::from(ACME));
     assert!(
-        add_card(&snap, &BTreeMap::new(), &src, false, &current, &reg)
+        add_card(&snap, &BTreeMap::new(), &src, &current, &reg)
             .unwrap_err()
             .contains("added before sources")
     );
-    // The same source again: add refuses, update requires it.
+    // The same source again is an update, observed from the vault.
     current.insert(
         "acme".to_string(),
         StoredService::new(ACME.into(), None, Some(gh("Acme/Tools", 'b'))),
     );
-    assert!(
-        add_card(&snap, &BTreeMap::new(), &src, false, &current, &reg)
-            .unwrap_err()
-            .contains("already added")
-    );
-    assert!(add_card(&snap, &BTreeMap::new(), &src, true, &current, &reg).is_ok());
-    assert!(add_card(
-        &snap,
-        &BTreeMap::new(),
-        &src,
-        true,
-        &BTreeMap::new(),
-        &reg
-    )
-    .unwrap_err()
-    .contains("not added"));
+    let c = add_card(&snap, &BTreeMap::new(), &src, &current, &reg).unwrap();
+    assert!(c.update);
+    assert_eq!(c.replaces, ["acme"]);
+    let c = add_card(&snap, &BTreeMap::new(), &src, &BTreeMap::new(), &reg).unwrap();
+    assert!(!c.update);
+    assert!(c.replaces.is_empty());
 }
 
 /// A first add's card shows what each rule matches beside its label, and
@@ -1025,7 +1015,6 @@ fn first_add_card_shows_match_patterns_and_stated_windows() {
         &snap,
         &BTreeMap::new(),
         &gh("acme/tools", 'a'),
-        false,
         &BTreeMap::new(),
         &reg,
     )
@@ -1050,7 +1039,6 @@ fn first_add_card_shows_match_patterns_and_stated_windows() {
         &snap,
         &BTreeMap::new(),
         &gh("acme/tools", 'a'),
-        false,
         &BTreeMap::new(),
         &reg,
     )
@@ -1084,7 +1072,6 @@ fn update_card_highlights_new_hosts_loosened_rules_and_removals() {
         &snap,
         &BTreeMap::new(),
         &gh("acme/tools", 'b'),
-        true,
         &current,
         &reg,
     )
@@ -1195,7 +1182,6 @@ fn id_rename_collisions_are_refused() {
         &snap("github"),
         &BTreeMap::new(),
         &src,
-        false,
         &BTreeMap::new(),
         &reg
     )
@@ -1211,7 +1197,6 @@ fn id_rename_collisions_are_refused() {
         &snap("taken"),
         &BTreeMap::new(),
         &src,
-        false,
         &current,
         &reg
     )
@@ -1222,7 +1207,6 @@ fn id_rename_collisions_are_refused() {
         &snap("acme_work"),
         &BTreeMap::new(),
         &src,
-        false,
         &current,
         &reg,
     )
@@ -1288,7 +1272,6 @@ fn card_lists_every_host_an_oauth_artifact_reaches_and_pkce_off() {
         &snap,
         &BTreeMap::new(),
         &gh("acme/tools", 'a'),
-        false,
         &BTreeMap::new(),
         &reg,
     )
@@ -1387,7 +1370,6 @@ fn update_flags_longer_approval_windows_unbound_scope_vars_and_pkce_off() {
         &snap,
         &BTreeMap::new(),
         &gh("acme/tools", 'b'),
-        true,
         &current,
         &reg,
     )
@@ -1616,7 +1598,7 @@ fn verify_requires_the_ref_head_to_be_the_pinned_commit() {
     let reg = crate::service::ServiceRegistry::compiled_only();
     let snap: BTreeMap<_, _> = [("acme".to_string(), admitted("acme", ACME, None))].into();
     let card = |src: &ServiceSource| {
-        add_card(&snap, &BTreeMap::new(), src, false, &BTreeMap::new(), &reg)
+        add_card(&snap, &BTreeMap::new(), src, &BTreeMap::new(), &reg)
             .unwrap()
             .from
     };

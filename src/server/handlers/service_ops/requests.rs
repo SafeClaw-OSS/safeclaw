@@ -1,16 +1,19 @@
 //! Console install requests: a `service_request:<id>` item asks this vault's
 //! daemons to install a service from a source, through the same path as
 //! `sc service add` (the daemon fetches the source, the gate admits it, op
-//! creation checks it again and stamps the card).
+//! creation checks it again and stamps the card). A source the vault already
+//! holds is updated to the source's current head, as `sc service update`
+//! does: the console's Update is the same request.
 //!
 //! The console writes `{ source, ref?, requested_at }`. On an unlocked sync
 //! one daemon claims a request (`claimed_by`, a compare-and-swap write at the
 //! row's version: another device's claim wins and this one leaves it), then
-//! writes `op_id` (the pending `service-add` op) or `error` (what `sc service
-//! add` would print). The request is removed once its op is resolved; a
-//! request claimed here whose op this process does not hold (it restarted)
-//! gets [`EXPIRED`]. A request with `error` stays for the console to show and
-//! clear.
+//! writes `op_id` (the pending `service-add` op), `up_to_date: true` (an
+//! update whose definitions match what the vault holds: nothing to approve)
+//! or `error` (what `sc service add` would print). The request is removed
+//! once its op is resolved; a request claimed here whose op this process does
+//! not hold (it restarted) gets [`EXPIRED`]. A request with `up_to_date` or
+//! `error` stays for the console to show and clear.
 
 use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr};
@@ -74,7 +77,9 @@ pub(crate) enum Step {
 /// The step for request `body` on the device `me`.
 pub(crate) fn step(body: &Value, me: &str, op: impl Fn(&str) -> OpState) -> Step {
     let text = |k: &str| body.get(k).and_then(|v| v.as_str());
-    if body.get("error").is_some_and(|v| !v.is_null()) {
+    if body.get("error").is_some_and(|v| !v.is_null())
+        || body.get("up_to_date") == Some(&json!(true))
+    {
         return Step::Leave;
     }
     match text("claimed_by") {
@@ -208,7 +213,9 @@ fn app_error_text(e: AppError) -> String {
 /// GitHub through `fetch_api` and admitted by the gate, then the op created
 /// through [`crate::server::handlers::op::create_op`] (`mint_api`: `None` =
 /// GitHub itself), naming the request in its scope (`service_request`) and
-/// no agent. `Ok(op_id)`, or the message `sc service add` would print.
+/// no agent. `Ok(Some(op_id))`, `Ok(None)` when the vault already holds
+/// exactly these definitions from the source (nothing to approve), or the
+/// message `sc service add` would print.
 pub(crate) async fn install<A: GitHubApi>(
     state: &Arc<AppState>,
     vault: &str,
@@ -216,8 +223,8 @@ pub(crate) async fn install<A: GitHubApi>(
     body: &Value,
     fetch_api: &A,
     mint_api: Option<&A>,
-) -> Result<String, String> {
-    let (_, _, allowed) = super::session(state, vault)?;
+) -> Result<Option<String>, String> {
+    let (entries, _, allowed) = super::session(state, vault)?;
     if !allowed {
         return Err(crate::service::INSTALLED_OFF_MSG.to_string());
     }
@@ -235,8 +242,30 @@ pub(crate) async fn install<A: GitHubApi>(
     let (files, stated) = github::fetch(fetch_api, &spec, git_ref)
         .await
         .map_err(|p| source::problems_text(src, &p))?;
+    // Installing a source the vault holds updates it; a single-service
+    // source keeps the id it is stored under, as `sc service update` does.
+    let mine = source::card::stored_from(&entries, &stated.identity());
+    let keep = match mine.keys().collect::<Vec<_>>().as_slice() {
+        [id] if files.single => Some(id.as_str()),
+        _ => None,
+    };
     let admitted =
-        source::admit_files(&files, None).map_err(|p| source::problems_text(src, &p))?;
+        source::admit_files(&files, keep).map_err(|p| source::problems_text(src, &p))?;
+    let digest = |svc: &str, pol: Option<&str>| source::definition_digest(svc, pol);
+    let unchanged = !mine.is_empty()
+        && mine.len() == admitted.len()
+        && admitted.iter().all(|a| {
+            mine.iter().any(|(id, e)| {
+                **id == a.id
+                    && e.parts().is_ok_and(|p| {
+                        digest(&p.service, p.policy.as_deref())
+                            == digest(&a.service, a.policy.as_deref())
+                    })
+            })
+        });
+    if unchanged {
+        return Ok(None);
+    }
     let built_in: Vec<String> = admitted
         .iter()
         .filter(|a| state.services.get(&a.id).is_some())
@@ -254,7 +283,6 @@ pub(crate) async fn install<A: GitHubApi>(
         vault,
         &stated,
         &admitted,
-        false,
         crate::util::now_unix(),
     ))
     .map_err(|e| e.to_string())?;
@@ -275,7 +303,7 @@ pub(crate) async fn install<A: GitHubApi>(
         .map(str::to_string)
         .ok_or_else(|| "the op was not created".to_string())?;
     created().lock().unwrap().insert(op_id.clone());
-    Ok(op_id)
+    Ok(Some(op_id))
 }
 
 /// Request `name` as this device's store holds it now (`None`: removed or
@@ -329,7 +357,8 @@ pub(crate) async fn process<A: GitHubApi, P: ItemPush>(
                     }
                 }
                 match install(state, vault, &name, &claimed, fetch_api, mint_api).await {
-                    Ok(op_id) => claimed["op_id"] = json!(op_id),
+                    Ok(Some(op_id)) => claimed["op_id"] = json!(op_id),
+                    Ok(None) => claimed["up_to_date"] = json!(true),
                     Err(e) => claimed["error"] = json!(e),
                 }
                 Some(claimed)

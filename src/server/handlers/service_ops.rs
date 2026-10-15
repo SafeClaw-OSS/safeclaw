@@ -1,17 +1,18 @@
 //! The vault side of `sc service`: the `service-add` / `service-rm` acts and
 //! the `GET /v/{vid}/services` listing.
 //!
-//! `service-add` installs one source's definitions with one approval. The op
-//! carries `defs` (`id → { service, policy? }`), the `source` record (with
-//! its pinned commit) and `update`; the daemon refuses it while the vault's
-//! owner has installed services off, admits every definition through the
-//! gate, fetches a GitHub source again at its commit (a branch or tag) and
-//! refuses unless the definitions are what it holds, and stamps the card
-//! ([`card::AddCard`]: services, destinations, the rules that tighten, the
-//! source, the definition text, what an update replaces, removes, newly sends
-//! to or loosens) into the signed scope at op creation, and at apply
-//! re-admits, recomputes the card against the opened vault and refuses any
-//! difference.
+//! `service-add` installs one source's definitions with one approval, or
+//! updates them when the vault already holds that source. The op carries
+//! `defs` (`id → { service, policy? }`) and the `source` record (with its
+//! pinned commit); the daemon refuses it while the vault's owner has
+//! installed services off, admits every definition through the gate, fetches
+//! a GitHub source again at its commit (a branch or tag) and refuses unless
+//! the definitions are what it holds, and stamps the card ([`card::AddCard`]:
+//! whether this updates a source the vault already holds, services,
+//! destinations, the rules that tighten, the source, the definition text,
+//! what an update replaces, removes, newly sends to or loosens) into the
+//! signed scope at op creation, and at apply re-admits, recomputes the card
+//! against the opened vault and refuses any difference.
 //! `service-rm` removes one service or a whole source the same way
 //! ([`card::RmCard`]).
 //!
@@ -49,9 +50,6 @@ pub(crate) struct AddRequest {
     /// Service id → (service.toml, policy.toml).
     pub defs: BTreeMap<String, (String, Option<String>)>,
     pub source: ServiceSource,
-    /// True for `sc service update` (the source must already be stored),
-    /// false for `sc service add` (it must not be).
-    pub update: bool,
 }
 
 /// Read a `service-add` scope. Every field is checked: the definitions are
@@ -104,16 +102,7 @@ pub(crate) fn parse_add(scope: &Value) -> std::result::Result<AddRequest, String
     )
     .map_err(|_| "service-add scope.source is not a source record".to_string())?;
     source.check()?;
-    let update = match scope.get("update") {
-        None | Some(Value::Null) => false,
-        Some(Value::Bool(b)) => *b,
-        Some(_) => return Err("service-add scope.update must be true or false".into()),
-    };
-    Ok(AddRequest {
-        defs,
-        source,
-        update,
-    })
+    Ok(AddRequest { defs, source })
 }
 
 /// Admit every requested definition through the gate under its id, all or
@@ -310,14 +299,13 @@ pub(crate) async fn mint_add<A: GitHubApi>(
     }
     let req = parse_add(&op.act.scope)?;
     let snapshot = admit_add(&req)?;
-    // Collisions and the add/update rule first: nothing is fetched for a
+    // Collisions first: nothing is fetched for a
     // request the vault refuses anyway.
     let (entries, _, _) = session(state, vault_id)?;
     card::add_card(
         &snapshot,
         &req.defs,
         &req.source,
-        req.update,
         &entries,
         &state.services,
     )?;
@@ -346,7 +334,6 @@ pub(crate) async fn mint_add<A: GitHubApi>(
         &snapshot,
         &req.defs,
         &req.source,
-        req.update,
         &entries,
         &state.services,
     )?;
@@ -411,7 +398,6 @@ pub(crate) fn apply_add(
         snapshot,
         &req.defs,
         &req.source,
-        req.update,
         &view.aux.services,
         reg,
     )?;

@@ -410,8 +410,12 @@ pub fn definitions_text(defs: &BTreeMap<String, (String, Option<String>)>) -> St
 ///   (empty on a first add).
 /// - `loosens`: what a replaced service now lets through more easily
 ///   ([`Diff::loosens`]).
+/// - `update`: the vault already holds services from this source, so the
+///   approval updates it rather than installing it. Observed by the daemon,
+///   never taken from the requester: the card's title says which.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AddCard {
+    pub update: bool,
     pub ids: Vec<String>,
     pub from: String,
     pub definitions: String,
@@ -459,11 +463,15 @@ impl AddCard {
         }
         o.insert("from".into(), json!(self.from));
         o.insert("definitions".into(), json!(self.definitions));
+        o.insert("update".into(), json!(self.update));
         Ok(())
     }
 
     /// The first field where the signed card in `scope` differs from `self`.
     pub fn first_difference(&self, scope: &Value) -> Option<&'static str> {
+        if scope.get("update") != Some(&json!(self.update)) {
+            return Some("update");
+        }
         for (k, v) in ADD_LISTS.iter().zip(self.lists()) {
             if scope.get(*k) != Some(&json!(v)) {
                 return Some(k);
@@ -495,14 +503,14 @@ pub fn stored_from<'a>(
 
 /// The card for storing `snapshot` (service id → admitted definition, of
 /// the text `texts`) from `source` into a vault holding `current`, or why it
-/// cannot be stored: an id that is a built-in service, an id another source
-/// (or an entry added before sources) already holds, a source already added
-/// when this is not an update, or one not added when it is.
+/// cannot be stored: an id that is a built-in service, or an id another
+/// source (or an entry added before sources) already holds. Installing a
+/// source the vault already holds updates it (`update`, with what it
+/// replaces and removes).
 pub fn add_card(
     snapshot: &BTreeMap<String, ServiceDef>,
     texts: &BTreeMap<String, (String, Option<String>)>,
     source: &ServiceSource,
-    update: bool,
     current: &BTreeMap<String, StoredService>,
     reg: &ServiceRegistry,
 ) -> Result<AddCard, String> {
@@ -531,19 +539,6 @@ pub fn add_card(
         }
     }
     let mine = stored_from(current, &identity);
-    let shown_source = crate::util::terminal_safe(&identity).into_owned();
-    if !update && !mine.is_empty() {
-        return Err(format!(
-            "{} is already added; run `sc service update {}`",
-            shown_source, shown_source
-        ));
-    }
-    if update && mine.is_empty() {
-        return Err(format!(
-            "{} is not added; run `sc service add` first",
-            shown_source
-        ));
-    }
     let old: BTreeMap<String, DefSummary> = mine
         .iter()
         .filter_map(|(id, e)| e.admit(id).ok().map(|d| ((*id).clone(), summarize(&d))))
@@ -553,6 +548,7 @@ pub fn add_card(
         .map(|(id, d)| (id.clone(), summarize(d)))
         .collect();
     let mut card = AddCard {
+        update: !mine.is_empty(),
         ids: snapshot.keys().cloned().collect(),
         from: source.display(),
         definitions: definitions_text(texts),

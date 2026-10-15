@@ -116,12 +116,12 @@ fn gh(commit: char) -> ServiceSource {
     }
 }
 
-fn scope(defs: &[(&str, &str)], source: &ServiceSource, update: bool) -> Value {
+fn scope(defs: &[(&str, &str)], source: &ServiceSource) -> Value {
     let defs: serde_json::Map<String, Value> = defs
         .iter()
         .map(|(id, host)| ((*id).to_string(), json!({ "service": svc(id, host) })))
         .collect();
-    json!({ "defs": defs, "source": source, "update": update })
+    json!({ "defs": defs, "source": source })
 }
 
 /// A vault whose owner switch for installed services is `on`.
@@ -207,17 +207,15 @@ fn unlock_with(state: &AppState, view: &VaultPlaintextView) {
 
 #[test]
 fn parse_add_checks_every_field() {
-    let ok = scope(&[("a1", "a.dev")], &gh('a'), false);
+    let ok = scope(&[("a1", "a.dev")], &gh('a'));
     let req = parse_add(&ok).unwrap();
     assert_eq!(req.defs.len(), 1);
-    assert!(!req.update);
     for bad in [
         json!({}),
         json!({ "defs": {}, "source": gh('a') }),
         json!({ "defs": { "a1": { "service": "x", "extra": 1 } }, "source": gh('a') }),
         json!({ "defs": { "a1": { "service": "x" } } }),
         json!({ "defs": { "a1": { "service": "x" } }, "source": { "kind": "github", "repo": "../x", "commit": "a".repeat(40) } }),
-        json!({ "defs": { "a1": { "service": "x" } }, "source": gh('a'), "update": "yes" }),
     ] {
         assert!(parse_add(&bad).is_err(), "{bad}");
     }
@@ -225,11 +223,7 @@ fn parse_add_checks_every_field() {
     let big = json!({ "defs": { "a1": { "service": too_big } }, "source": gh('a') });
     assert!(parse_add(&big).unwrap_err().contains("limit"));
     // Admission is all or nothing, under each definition's key.
-    let mixed = parse_add(&scope(
-        &[("a1", "a.dev"), ("b2", "10.0.0.1")],
-        &gh('a'),
-        false,
-    ))
+    let mixed = parse_add(&scope(&[("a1", "a.dev"), ("b2", "10.0.0.1")], &gh('a')))
     .unwrap();
     assert!(admit_add(&mixed).unwrap_err().contains("b2"));
 }
@@ -244,10 +238,14 @@ fn add_then_update_then_rm_through_the_signed_card() {
         .insert("old".into(), StoredService::from(svc("old", "o.dev")));
     unlock_with(&state, &view);
 
-    // Add: stamped at mint, applied against the same vault.
+    // Add: stamped at mint, applied against the same vault. Whether it
+    // updates is observed, never taken from the requester.
+    let mut first = scope(&[("a1", "a.dev"), ("b2", "b.dev")], &gh('a'));
+    first["update"] = json!(true);
+    assert_eq!(mint(&state, first).unwrap()["update"], json!(false));
     let signed = mint(
         &state,
-        scope(&[("a1", "a.dev"), ("b2", "b.dev")], &gh('a'), false),
+        scope(&[("a1", "a.dev"), ("b2", "b.dev")], &gh('a')),
     )
     .unwrap();
     assert_eq!(signed["ids"], json!(["a1", "b2"]));
@@ -270,18 +268,19 @@ fn add_then_update_then_rm_through_the_signed_card() {
         crate::service::vault_custom_services(&view.aux.services, true, &state.services);
     assert!(skipped.is_empty() && defs.len() == 3);
 
-    // Adding the same source again is refused at mint.
+    // Installing the same source again is an update.
     unlock_with(&state, &view);
-    assert!(mint(&state, scope(&[("a1", "a.dev")], &gh('b'), false))
-        .unwrap_err()
-        .contains("already added"));
+    let again = mint(&state, scope(&[("a1", "a.dev"), ("b2", "b.dev")], &gh('a'))).unwrap();
+    assert_eq!(again["update"], json!(true));
+    assert_eq!(again["replaces"], json!(["a1", "b2"]));
 
     // Update: b2 vanished upstream, a1 now also sends to a new host.
-    let mut up = scope(&[("a1", "a.dev")], &gh('b'), true);
+    let mut up = scope(&[("a1", "a.dev")], &gh('b'));
     up["defs"]["a1"]["service"] = json!(
         "[service]\nid = \"a1\"\nname = \"a1\"\nhosts = [\"a.dev\", \"new.dev\"]\nsecrets = [\"TOKEN\"]\n"
     );
     let signed = mint(&state, up).unwrap();
+    assert_eq!(signed["update"], json!(true));
     assert_eq!(signed["removes"], json!(["b2"]));
     assert_eq!(signed["new_destinations"], json!(["new.dev"]));
 
@@ -316,6 +315,17 @@ fn add_then_update_then_rm_through_the_signed_card() {
     )
     .unwrap_err();
     assert!(e.contains("new_destinations"), "{e}");
+    let mut forged = signed.clone();
+    forged["update"] = json!(false);
+    let e = apply_add(
+        &mut copy(&view),
+        req.clone(),
+        &snap,
+        &forged,
+        &state.services,
+    )
+    .unwrap_err();
+    assert!(e.contains("`update` differs"), "{e}");
     apply_add(&mut view, req, &snap, &signed, &state.services).unwrap();
     assert!(!view.aux.services.contains_key("b2"));
     assert_eq!(view.aux.services["a1"].source(), Some(gh('b')));
@@ -365,20 +375,20 @@ fn collisions_are_refused_at_mint() {
         ),
     );
     unlock_with(&state, &view);
-    let e = mint(&state, scope(&[("a1", "a.dev")], &gh('a'), false)).unwrap_err();
+    let e = mint(&state, scope(&[("a1", "a.dev")], &gh('a'))).unwrap_err();
     assert!(
         e.contains("already in this vault from local folder mine"),
         "{e}"
     );
     let e = mint(
         &state,
-        scope(&[("github", "api.github.com")], &gh('a'), false),
+        scope(&[("github", "api.github.com")], &gh('a')),
     )
     .unwrap_err();
     assert!(e.contains("built-in"), "{e}");
     // A locked vault: nothing to compare against, refused.
     state.lock_vault("v1");
-    assert!(mint(&state, scope(&[("z9", "z.dev")], &gh('a'), false)).is_err());
+    assert!(mint(&state, scope(&[("z9", "z.dev")], &gh('a'))).is_err());
 }
 
 #[test]
@@ -525,7 +535,7 @@ fn services_are_data_records_on_a_vault_with_members() {
     let (_dir, state) = state_with_store(vault, &pv, &k);
 
     // Mint: `path: null` is not kept.
-    let mut sc = scope(&[("a1", "a.dev")], &gh('a'), false);
+    let mut sc = scope(&[("a1", "a.dev")], &gh('a'));
     sc["source"]["path"] = Value::Null;
     let mut op: crate::protocol::operation::Operation = serde_json::from_value(json!({
         "act": { "type": { "custom": "service-add" }, "target": "github:acme/tools", "scope": sc },
@@ -733,7 +743,7 @@ fn mint_checks_a_github_source_at_its_pinned_commit() {
     )]);
     let signed = mint_with(
         &state,
-        scope(&[("a1", "a.dev")], &gh('a'), false),
+        scope(&[("a1", "a.dev")], &gh('a')),
         &Gh::serving(at_commit.clone()),
     )
     .unwrap();
@@ -743,7 +753,7 @@ fn mint_checks_a_github_source_at_its_pinned_commit() {
     // which GitHub serves through the parent repository's URLs): refused.
     let e = mint_with(
         &state,
-        scope(&[("a1", "a.dev")], &gh('b'), false),
+        scope(&[("a1", "a.dev")], &gh('b')),
         &Gh::serving(at_commit.clone()),
     )
     .unwrap_err();
@@ -754,7 +764,7 @@ fn mint_checks_a_github_source_at_its_pinned_commit() {
     // The requester's definitions differ from the commit's: refused.
     let e = mint_with(
         &state,
-        scope(&[("a1", "evil.example")], &gh('a'), false),
+        scope(&[("a1", "evil.example")], &gh('a')),
         &Gh::serving(at_commit.clone()),
     )
     .unwrap_err();
@@ -769,7 +779,7 @@ fn mint_checks_a_github_source_at_its_pinned_commit() {
         };
         let e = mint_with(
             &state,
-            scope(&[("a1", "a.dev")], &src, false),
+            scope(&[("a1", "a.dev")], &src),
             &Gh::serving(at_commit.clone()),
         )
         .unwrap_err();
@@ -779,7 +789,7 @@ fn mint_checks_a_github_source_at_its_pinned_commit() {
     // GitHub not answering (a transport error, no answer in time): refused.
     let e = mint_with(
         &state,
-        scope(&[("a1", "a.dev")], &gh('a'), false),
+        scope(&[("a1", "a.dev")], &gh('a')),
         &Gh::offline(),
     )
     .unwrap_err();
@@ -794,7 +804,7 @@ fn mint_checks_a_github_source_at_its_pinned_commit() {
         ));
         let e = mint_with(
             &state,
-            scope(&[("a1", "a.dev")], &gh('a'), false),
+            scope(&[("a1", "a.dev")], &gh('a')),
             &gh_answer,
         )
         .unwrap_err();
@@ -805,7 +815,7 @@ fn mint_checks_a_github_source_at_its_pinned_commit() {
     ));
     assert!(mint_with(
         &state,
-        scope(&[("a1", "a.dev")], &gh('a'), false),
+        scope(&[("a1", "a.dev")], &gh('a')),
         &oversize
     )
     .is_err());
@@ -815,7 +825,7 @@ fn mint_checks_a_github_source_at_its_pinned_commit() {
     };
     let signed = mint_with(
         &state,
-        scope(&[("a1", "a.dev")], &local, false),
+        scope(&[("a1", "a.dev")], &local),
         &Gh::offline(),
     )
     .unwrap();
@@ -832,7 +842,7 @@ fn the_owner_switch_decides_whether_installed_services_exist() {
     let state = test_state();
     let off = view_with_switch(false);
     unlock_with(&state, &off);
-    let e = mint(&state, scope(&[("a1", "a.dev")], &gh('a'), false)).unwrap_err();
+    let e = mint(&state, scope(&[("a1", "a.dev")], &gh('a'))).unwrap_err();
     assert_eq!(e, crate::service::INSTALLED_OFF_MSG);
     assert_eq!(
         e,
@@ -842,14 +852,14 @@ fn the_owner_switch_decides_whether_installed_services_exist() {
     no_policy.aux.policy = None;
     unlock_with(&state, &no_policy);
     assert_eq!(
-        mint(&state, scope(&[("a1", "a.dev")], &gh('a'), false)).unwrap_err(),
+        mint(&state, scope(&[("a1", "a.dev")], &gh('a'))).unwrap_err(),
         crate::service::INSTALLED_OFF_MSG
     );
 
     // Minted while on, applied after the owner turned it off: refused.
     let on = empty_view();
     unlock_with(&state, &on);
-    let signed = mint(&state, scope(&[("a1", "a.dev")], &gh('a'), false)).unwrap();
+    let signed = mint(&state, scope(&[("a1", "a.dev")], &gh('a'))).unwrap();
     let req = parse_add(&signed).unwrap();
     let snap = admit_add(&req).unwrap();
     let mut turned_off = view_with_switch(false);
@@ -911,7 +921,7 @@ fn stored_records_carry_no_check_and_a_summary_that_is_not_read() {
     let state = test_state();
     let view = empty_view();
     unlock_with(&state, &view);
-    let mut sc = scope(&[("a1", "a.dev")], &gh('a'), false);
+    let mut sc = scope(&[("a1", "a.dev")], &gh('a'));
     sc["source"]["checked"] = json!(true);
     let signed = mint(&state, sc).unwrap();
     assert!(signed["source"].get("checked").is_none());
@@ -1014,6 +1024,15 @@ mod install_requests {
     /// A vault without a keyset, its owner switch `on`, holding `requests`
     /// as the console wrote them (each on the cloud at version 1).
     fn vault_with(on: bool, requests: &[(&str, Value)]) -> (tempfile::TempDir, Arc<AppState>) {
+        vault_holding(on, requests, &[])
+    }
+
+    /// [`vault_with`], also holding `services` (id → stored record).
+    fn vault_holding(
+        on: bool,
+        requests: &[(&str, Value)],
+        services: &[(&str, StoredService)],
+    ) -> (tempfile::TempDir, Arc<AppState>) {
         let keys = VaultKeys::single(&K);
         let mut pv = PerItemVault::build_initial(
             b"c".to_vec(),
@@ -1033,6 +1052,17 @@ mod install_requests {
             &ItemPayload::live(ItemNs::Policy, "", json!({ "allow_installed_services": on })),
         )
         .unwrap();
+        for (id, entry) in services {
+            pv.plant::<S>(
+                keys,
+                VAULT,
+                ItemNs::Service,
+                id,
+                1,
+                &ItemPayload::live(ItemNs::Service, *id, serde_json::to_value(entry).unwrap()),
+            )
+            .unwrap();
+        }
         for (name, body) in requests {
             let id = pv
                 .plant::<S>(
@@ -1112,6 +1142,7 @@ mod install_requests {
             crate::protocol::operation::ActType::Custom("service-add".into())
         );
         assert_eq!(op.act.scope["service_request"], json!("r1"));
+        assert_eq!(op.act.scope["update"], json!(false));
         assert_eq!(op.act.scope["ids"], json!(["a1"]));
         assert_eq!(op.act.scope["from"], json!(gh('a').display()));
         assert!(op.act.scope["definitions"]
@@ -1133,6 +1164,30 @@ mod install_requests {
         let id = crate::storage::item::wire_id_for::<S>(keys.id_seed, ItemNs::ServiceRequest, "r1")
             .unwrap();
         assert!(stored(&state, VAULT).items[&id].tombstone);
+    }
+
+    /// The console's Update is the same request: a source the vault holds
+    /// with the same definitions is `up_to_date` (no op, left for the console
+    /// to clear); with changed ones, the op the daemon stamps as an update.
+    #[test]
+    fn a_request_for_a_held_source_updates_it_or_is_up_to_date() {
+        let held = |host: &str| StoredService::new(svc("a1", host), None, Some(gh('b')));
+        let (_dir, state) = vault_holding(true, &[("r1", asked())], &[("a1", held("a.dev"))]);
+        let github = upstream();
+        run(&state, &github, &FakeCloud::default());
+        let r1 = read(&state)["r1"].clone();
+        assert_eq!(r1["up_to_date"], json!(true), "{r1}");
+        assert!(r1.get("op_id").is_none() && r1.get("error").is_none(), "{r1}");
+        run(&state, &github, &FakeCloud::default());
+        assert_eq!(read(&state)["r1"], r1, "left for the console to clear");
+
+        let (_dir, state) = vault_holding(true, &[("r1", asked())], &[("a1", held("old.dev"))]);
+        run(&state, &github, &FakeCloud::default());
+        let op_id = read(&state)["r1"]["op_id"].as_str().unwrap().to_string();
+        let op = state.approvals.lock().unwrap().get(&op_id).unwrap().op.clone();
+        assert_eq!(op.act.scope["update"], json!(true));
+        assert_eq!(op.act.scope["replaces"], json!(["a1"]));
+        assert_eq!(op.act.scope["new_destinations"], json!(["a.dev"]));
     }
 
     /// Another device's claim landed first (a 409): this one writes nothing
@@ -1232,6 +1287,10 @@ mod install_requests {
         assert_eq!(step(&b, ME, op(OpState::Resolved)), Step::Remove);
         assert_eq!(step(&b, ME, op(OpState::Gone)), Step::Expire);
         b["error"] = json!("x");
+        assert_eq!(step(&b, ME, op(OpState::Gone)), Step::Leave);
+        let mut b = asked();
+        b["claimed_by"] = json!(ME);
+        b["up_to_date"] = json!(true);
         assert_eq!(step(&b, ME, op(OpState::Gone)), Step::Leave);
     }
 

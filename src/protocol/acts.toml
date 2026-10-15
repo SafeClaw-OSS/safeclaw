@@ -80,6 +80,9 @@ action_zh = "安装第三方服务"
 explain = "SafeClaw does not review third-party services. Connections that use one send credentials to the hosts it lists."
 explain_zh = "SafeClaw 不审查第三方服务。使用它的连接会把凭证发往它列出的主机。"
 tone = "neutral"
+variants = [
+  { when = "{{vars.scope.update}}", action = "Update a third-party service", action_zh = "更新第三方服务" },
+]
 facts = [
   { label = "Services", label_zh = "服务", value = "{{vars.scope.ids}}" },
   { label = "Sends credentials to", label_zh = "凭证发往", value = "{{vars.scope.destinations}}" },

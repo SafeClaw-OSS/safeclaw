@@ -46,8 +46,23 @@ pub struct ActConsent {
     /// kind can never be downgraded.
     #[serde(default = "default_tone")]
     pub tone: String,
+    /// Titles the signed op selects: the first variant whose `when` renders
+    /// non-empty replaces `action` / `action_zh` (a `service-add` the daemon
+    /// stamped `update` reads "Update …").
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub variants: Vec<ActVariant>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub facts: Vec<ActFact>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActVariant {
+    /// A template over the op's signed fields; the variant applies when it
+    /// renders non-empty.
+    pub when: String,
+    pub action: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_zh: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -113,8 +128,13 @@ pub fn consent_for(op: &Operation) -> Option<RenderedConsent> {
             (!v.is_empty()).then(|| (f.label.clone(), v))
         })
         .collect();
+    let action = desc
+        .variants
+        .iter()
+        .find(|v| !interpolate_op(&v.when, op).is_empty())
+        .map_or(&desc.action, |v| &v.action);
     Some(RenderedConsent {
-        action: interpolate_op(&desc.action, op),
+        action: interpolate_op(action, op),
         // The explain carries {{vars}} templates too (widen-host names the
         // connection and host in its consequence sentence).
         explain: interpolate_op(&desc.explain, op),
@@ -323,6 +343,26 @@ mod tests {
         .unwrap();
         assert!(c.facts.iter().all(|(l, _)| l != "Definition"), "{:?}", c.facts);
         assert!(c.facts.iter().any(|(l, v)| l == "Source" && v == "local folder mine"));
+    }
+
+    /// The daemon stamps `update` on a `service-add` of a source the vault
+    /// already holds; the title follows that signed field, not the requester.
+    #[test]
+    fn service_add_title_follows_the_stamped_update() {
+        let add = &act_catalog()["service-add"];
+        let v = serde_json::to_value(add).unwrap();
+        assert_eq!(
+            v["variants"],
+            json!([{
+                "when": "{{vars.scope.update}}",
+                "action": "Update a third-party service",
+                "action_zh": "更新第三方服务"
+            }])
+        );
+        let title = |scope: serde_json::Value| consent_for(&op("service-add", "github:acme/tools", scope)).unwrap().action;
+        assert_eq!(title(json!({ "update": true })), "Update a third-party service");
+        assert_eq!(title(json!({ "update": false })), "Install a third-party service");
+        assert_eq!(title(json!({})), "Install a third-party service");
     }
 
     /// Tone is the consequence tier: neutral (one-shot or reversible), warn

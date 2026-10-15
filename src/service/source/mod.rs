@@ -1108,14 +1108,14 @@ pub fn admit_files(
     Ok(out)
 }
 
-/// The `service-add` op for `admitted` from `source` into `vault`
-/// (`update`: `sc service update`): the request the daemon's op creation
-/// checks and stamps. One shape for every requester.
+/// The `service-add` op for `admitted` from `source` into `vault`, for
+/// `sc service add` and `sc service update` alike: the request the daemon's
+/// op creation checks and stamps (whether it updates is the daemon's to
+/// observe). One shape for every requester.
 pub fn add_op(
     vault: &str,
     source: &ServiceSource,
     admitted: &[Admitted],
-    update: bool,
     iat: u64,
 ) -> serde_json::Value {
     let defs: serde_json::Map<String, serde_json::Value> = admitted
@@ -1132,7 +1132,7 @@ pub fn add_op(
         "act": {
             "type": { "custom": "service-add" },
             "target": source.identity(),
-            "scope": { "defs": defs, "source": source, "update": update },
+            "scope": { "defs": defs, "source": source },
         },
         "bind": { "redeemer": vault },
         "valid": { "iat": iat, "multiplicity": 1 }

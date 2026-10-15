@@ -237,7 +237,7 @@ async fn submit(
     opts: &ApproveOpts,
 ) -> Result<Value, String> {
     let identity = loaded.source.identity();
-    let op = source::add_op(vault, &loaded.source, &loaded.admitted, update, now_unix());
+    let op = source::add_op(vault, &loaded.source, &loaded.admitted, now_unix());
     let label = if update {
         format!("Update services from {}", identity)
     } else {
@@ -269,6 +269,20 @@ pub async fn run_add(args: ServiceAddArgs) -> Result<(), String> {
         return Err(report(&args.source, clash));
     }
     let (custodian, vault) = resolve_active(None)?;
+    // Installing a source the vault holds would update it; `add` says so
+    // instead (the daemon's card would show the update either way).
+    let identity = loaded.source.identity();
+    let stored = listing(&custodian, &vault).await?;
+    if stored
+        .iter()
+        .any(|l| l.source.as_ref().is_some_and(|s| s.identity() == identity))
+    {
+        return Err(format!(
+            "{} is already added; run `sc service update {}`",
+            safe(&identity),
+            safe(&identity)
+        ));
+    }
     print_loaded(&loaded);
     let result = submit(
         &custodian,
