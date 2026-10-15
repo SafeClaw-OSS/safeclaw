@@ -19,6 +19,11 @@ daemon's endpoint for your requests) and `SAFECLAW_AGENT_IDENTITY`. If they are
 unset, load your agent env file (its path is in your always-loaded instructions).
 Don't run `sc agent add` again: each run registers another agent.
 
+This machine's `sc` is paired to one SafeClaw account, and you act as that
+account: your requests are its requests, approved by that person or a vault admin.
+Working for another account means the user re-pairs this machine; agree on it with
+them first.
+
 Before the first call:
 
 ```bash
@@ -42,7 +47,7 @@ curl -s -o /dev/null --connect-timeout 1 "$SAFECLAW_BROKER_URL/health" || sc up
   passes through you.
 - An API outside the catalog is a custom connection: its host and key. A service
   (`sc service --help`) adds named rules for an API from a third-party source; an
-  owner must first allow third-party services in the vault's Settings, and the
+  admin must first allow third-party services in the vault's Settings, and the
   user approves each install. The user can also install one from that page.
 - A vault is a security boundary, and each connection belongs to one. Target it
   with `--vault` to use its connections; resolve a name with `sc vault ls`, and ask
