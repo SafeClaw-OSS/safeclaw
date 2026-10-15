@@ -159,9 +159,8 @@ pub async fn passkeys(
 /// `GET /pubkey` — daemon HPKE outer-envelope public key (PROTOCOL.md §4.2.1 M1).
 ///
 /// Returns the daemon's static `sc_pk` plus the suite identifier so clients
-/// can pick the matching HPKE implementation. Currently used by the
-/// pending-passkey deposit flow (cross-device add-passkey); future use:
-/// `[HPKE: MUST]` grant submissions.
+/// can pick the matching HPKE implementation. Used by the local approve
+/// ceremony to seal the vault key it delivers (grant v3).
 ///
 /// `sc_pk_fingerprint` lets remote clients OOB-verify the key on first pin
 /// (per PROTOCOL.md §4.2.2 trust establishment).
@@ -181,6 +180,21 @@ pub async fn pubkey(State(state): State<Arc<AppState>>) -> Json<Value> {
         "sc_pk": URL_SAFE_NO_PAD.encode(&pk_bytes),
         "sc_pk_fingerprint": STANDARD.encode(fp),
     }))
+}
+
+/// `GET /v/{vid}/keyset` — this vault's per-item KEYSET (passkey wraps, UIK
+/// membership seals, registry; no items). Local control plane only: the local
+/// approve ceremony (`sc`, same machine) opens `K` in its own process from it,
+/// so neither `W_c` nor a root ever reaches the daemon. Every field is wrapped
+/// or sealed material the cloud already syncs.
+pub async fn keyset(
+    State(state): State<Arc<AppState>>,
+    Path(vault_id): Path<String>,
+) -> Result<Json<Value>> {
+    validate_vault_id(&vault_id)?;
+    let path = state.vaults.per_item_path(&vault_id)?;
+    let pv = crate::storage::sealed_vault::read_per_item(&path)?.ok_or(AppError::NotFound)?;
+    Ok(Json(json!({ "keyset": pv.keyset })))
 }
 
 /// `POST /v/{vid}/sync` — on-demand cloud pull + complete-pending-connect

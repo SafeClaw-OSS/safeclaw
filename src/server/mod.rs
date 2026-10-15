@@ -68,6 +68,7 @@ pub fn app_router(state: Arc<AppState>) -> Router {
         .route("/v/{vid}/secret", post(handlers::secret_set_local::create))
         .route("/v/{vid}/sync", post(handlers::metadata::sync_now))
         .route("/v/{vid}/passkeys", get(handlers::metadata::passkeys))
+        .route("/v/{vid}/keyset", get(handlers::metadata::keyset))
         // What this device has not applied (held pulled changes, a failed
         // pull at unlock, set-aside changes): `sc status`, `sc service ls`.
         .route("/v/{vid}/held", get(handlers::metadata::held))

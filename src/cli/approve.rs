@@ -8,18 +8,19 @@
 //!     different machine than this zero-inbound localhost daemon can reach.
 //!     The daemon registered the op with the cloud op-relay at create time
 //!     (`op.rs` → `relay::client::spawn_register_and_poll`); the browser
-//!     derives + HPKE-seals W_c and deposits the grant; the daemon polls the
+//!     opens K, HPKE-seals it with its identity signature and deposits the grant; the daemon polls the
 //!     relay and applies it. The CLI just surfaces the link and polls the
-//!     daemon for the op to resolve — no local gesture, no CLI-side W_c.
+//!     daemon for the op to resolve — no local gesture.
 //!
 //!   • **Local** (self-host, no cloud pairing): the on-box ceremony — the
 //!     daemon serves the WebAuthn page on localhost, the CLI spawns a
-//!     localhost callback, derives W_c from the PRF result, and submits the
-//!     grant. Only reachable when the user is on the daemon's machine.
+//!     localhost callback, derives W_c from the PRF result, opens K in its own
+//!     process and submits a grant v3 (sealed K + identity signature). Only
+//!     reachable when the user is on the daemon's machine.
 //!
 //! Both arms drive the SAME op through the SAME `/op/{id}/approve` endpoint;
-//! they differ only in WHERE the passkey gesture happens and how W_c reaches
-//! the daemon. This is the single path the design demands — `unlock`/`lock`
+//! they differ only in WHERE the passkey gesture happens. Neither delivers W_c
+//! or an identity root to the daemon. This is the single path the design demands — `unlock`/`lock`
 //! (and any future approval-only op) route through here so the link is correct
 //! everywhere by construction.
 
@@ -445,10 +446,12 @@ async fn remote_wait(
     }
 }
 
-/// Local arm: the on-box WebAuthn ceremony. CLI receives the PRF result over a
-/// localhost callback, derives W_c, and submits a plaintext-W_c grant (the
-/// transport never leaves the machine). For approval-only ops the daemon does
-/// all the work from this grant's W_c.
+/// Local arm: the on-box WebAuthn ceremony, grant v3 like the browser's. The
+/// CLI receives the PRF result over a localhost callback and, in THIS process,
+/// derives `W_c`, unwraps the identity root from the keyset's custody wrap,
+/// opens `K` from the identity's K-seal, seals `K` to the daemon's `sc_pk`
+/// and signs the grant identity (C3) with the root. Only `K` (sealed) and the
+/// signature reach the daemon; `W_c` and the root never leave this process.
 async fn local_ceremony(
     custodian: &str,
     op_id: &str,
@@ -460,6 +463,22 @@ async fn local_ceremony(
 ) -> Result<Value, String> {
     let r_bytes = STANDARD.decode(r).map_err(|e| format!("decode r: {}", e))?;
     let beta = compute_beta(&r_bytes, op)?;
+    let vault_id = op
+        .pointer("/bind/redeemer")
+        .and_then(|v| v.as_str())
+        .ok_or("op has no bind.redeemer")?
+        .to_string();
+    // Everything the CLI needs besides the gesture, fetched BEFORE the user
+    // taps, so an unsupported vault fails without a wasted gesture.
+    let keyset = fetch_keyset(custodian, &vault_id).await?;
+    if keyset.uik.is_none() {
+        return Err(
+            "this vault has no identity key on this machine, so it can't be approved here; \
+             approve it in the SafeClaw console (pair this machine with `sc login`)"
+                .into(),
+        );
+    }
+    let sc_pk = fetch_sc_pk(custodian).await?;
 
     eprintln!("safeclaw {} — touch passkey…", label.to_lowercase());
     let result = do_browser_gesture(
@@ -480,10 +499,12 @@ async fn local_ceremony(
         .prf_first
         .clone()
         .ok_or("gesture didn't return prf_first")?;
-    let prf_first_bytes = URL_SAFE_NO_PAD
-        .decode(&prf_first)
-        .map_err(|e| format!("decode prf_first: {}", e))?;
-    let user_key = prf_to_user_key(&prf_first_bytes)?;
+    let prf_first_bytes = zeroize::Zeroizing::new(
+        URL_SAFE_NO_PAD
+            .decode(&prf_first)
+            .map_err(|e| format!("decode prf_first: {}", e))?,
+    );
+    let user_key = zeroize::Zeroizing::new(prf_to_user_key(&prf_first_bytes)?);
     let cred_id_raw = URL_SAFE_NO_PAD
         .decode(&meta.credential_id)
         .map_err(|e| format!("decode cred_id: {}", e))?;
@@ -491,26 +512,33 @@ async fn local_ceremony(
         .decode(&meta.prf_salt)
         .or_else(|_| URL_SAFE_NO_PAD.decode(&meta.prf_salt))
         .map_err(|e| format!("decode prf_salt: {}", e))?;
-    let wrapping_key = crate::crypto::kdf::derive_wrapping_key(
-        &user_key,
-        &prf_salt_bytes,
+    let w_c = zeroize::Zeroizing::new(
+        crate::crypto::kdf::derive_wrapping_key(
+            &user_key,
+            &prf_salt_bytes,
+            &cred_id_raw,
+            crate::crypto::kdf::WRAP_VERSION,
+        )
+        .map_err(|e| format!("derive wrapping key: {}", e))?,
+    );
+    let grant = build_local_grant(
+        &keyset,
+        &w_c[..],
         &cred_id_raw,
-        crate::crypto::kdf::WRAP_VERSION,
-    )
-    .map_err(|e| format!("derive wrapping key: {}", e))?;
-
-    let grant = json!({
-        "o": op,
-        "r": r,
-        "credential_id": meta.credential_id,
-        "wrapping_key": STANDARD.encode(&wrapping_key),
-        "assertion": assertion_json(
+        &vault_id,
+        op_id,
+        op,
+        r,
+        &beta,
+        &sc_pk,
+        &meta.credential_id,
+        assertion_json(
             &result.credential_id,
             &result.authenticator_data,
             &result.client_data_json,
             &result.signature,
         ),
-    });
+    )?;
     let client = http_client()?;
     let resp = client
         .post(format!(
@@ -530,4 +558,193 @@ async fn local_ceremony(
         ));
     }
     Ok(resp.json().await.unwrap_or(Value::Null))
+}
+
+/// The grant v3 body of the local ceremony (pure; unit-tested): unwrap the
+/// identity root from this passkey's custody wrap under `w_c`, open `K`, seal
+/// it to `sc_pk` for `op_id`, and sign C3 with the root.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_local_grant(
+    keyset: &crate::storage::sealed_vault::Keyset,
+    w_c: &[u8],
+    cred_id_raw: &[u8],
+    vault_id: &str,
+    op_id: &str,
+    op: &Value,
+    r: &str,
+    beta: &[u8],
+    sc_pk: &[u8],
+    credential_id: &str,
+    assertion: Value,
+) -> Result<Value, String> {
+    let wrapped_root = keyset
+        .credentials
+        .iter()
+        .find(|c| c.credential_id == cred_id_raw)
+        .map(|c| c.wrapped_key.clone())
+        .ok_or(
+            "this passkey's identity key isn't held on this machine; approve in the SafeClaw \
+             console (pair this machine with `sc login`)",
+        )?;
+    let root = crate::crypto::vault_key::unwrap_uik_root(w_c, cred_id_raw, &wrapped_root)
+        .map_err(|e| format!("open your identity key: {}", e))?;
+    let uik = crate::crypto::vault_key::UikRoot::from_root(*root);
+    let k = crate::server::handlers::metadata::acquire_k_from_keyset(
+        keyset,
+        crate::protocol::grant::GrantKey::Custody(&root[..]),
+        cred_id_raw,
+        vault_id,
+    )
+    .map_err(|e| format!("open the vault key: {}", e))?;
+    // The delivered material is the bundle a v2 open produces, without the
+    // previous-generation keys the daemon re-attaches from its own keyset.
+    let material = &k[..k.len().min(64)];
+    let (k_enc, k_ct) = crate::crypto::envelope::seal_to(
+        sc_pk,
+        material,
+        &crate::crypto::envelope::grant_k_seal_info(op_id),
+        b"",
+    )
+    .map_err(|e| format!("seal the vault key: {}", e))?;
+    let id = uik.user_id();
+    let input = crate::identity::grant_id_input(
+        vault_id, op_id, beta, cred_id_raw, &k_enc, &k_ct, sc_pk, &id,
+    );
+    let id_sig = uik.signing().sign(&input);
+    Ok(json!({
+        "o": op,
+        "r": r,
+        "credential_id": credential_id,
+        "k_enc": URL_SAFE_NO_PAD.encode(&k_enc),
+        "k_ct": URL_SAFE_NO_PAD.encode(&k_ct),
+        "id": id,
+        "id_sig": URL_SAFE_NO_PAD.encode(id_sig),
+        "assertion": assertion,
+    }))
+}
+
+/// The vault's keyset from the local daemon (`GET /v/{vid}/keyset`).
+async fn fetch_keyset(
+    custodian: &str,
+    vault: &str,
+) -> Result<crate::storage::sealed_vault::Keyset, String> {
+    let url = format!(
+        "{}/v/{}/keyset",
+        custodian.trim_end_matches('/'),
+        urlencoding::encode(vault)
+    );
+    let resp = http_client()?
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("keyset: {}", e))?;
+    if !resp.status().is_success() {
+        return Err(format!(
+            "this vault's keys aren't on this machine (HTTP {}); approve it in the SafeClaw console",
+            resp.status()
+        ));
+    }
+    let mut body: Value = resp.json().await.map_err(|e| format!("keyset: {}", e))?;
+    serde_json::from_value(body["keyset"].take()).map_err(|e| format!("keyset: {}", e))
+}
+
+/// The local daemon's grant-seal key (`GET /pubkey`, raw 32 bytes).
+async fn fetch_sc_pk(custodian: &str) -> Result<Vec<u8>, String> {
+    let url = format!("{}/pubkey", custodian.trim_end_matches('/'));
+    let body: Value = http_client()?
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("pubkey: {}", e))?
+        .json()
+        .await
+        .map_err(|e| format!("pubkey: {}", e))?;
+    let pk = body["sc_pk"]
+        .as_str()
+        .and_then(|s| URL_SAFE_NO_PAD.decode(s).ok())
+        .filter(|v| v.len() == 32)
+        .ok_or("the daemon returned no sc_pk")?;
+    Ok(pk)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The local ceremony's grant carries only the sealed K and the identity
+    /// signature: K opens with the daemon's key, the signature verifies under
+    /// the identity the custody wrap holds, and neither W_c nor the root is in
+    /// the body.
+    #[test]
+    fn local_grant_delivers_k_and_signs_the_identity() {
+        use crate::crypto::vault_key::{seal_k_to_uik, wrap_uik_root, UikRoot};
+        use crate::storage::sealed_vault::PerItemVault;
+        let vid = "vault-local";
+        let root = [0x33u8; 32];
+        let uik = UikRoot::from_root(root);
+        let w_c = [0x55u8; 32];
+        let cid = b"cred-local".to_vec();
+        let mut pv = PerItemVault::build_initial(
+            cid.clone(),
+            "x".into(),
+            "y".into(),
+            "Dev".into(),
+            vec![0u8; 32],
+            wrap_uik_root(&w_c, &cid, &root).unwrap(),
+        )
+        .unwrap();
+        let k = [0x9au8; 32];
+        let enc_pub = uik.encryption_public().unwrap();
+        let (encapped, ct) = seal_k_to_uik(&enc_pub, vid, &k).unwrap();
+        pv.set_uik_cred(
+            URL_SAFE_NO_PAD.encode(&cid),
+            uik.user_id(),
+            uik.signing().public_bytes().to_vec(),
+            enc_pub,
+            encapped,
+            ct,
+            crate::storage::plaintext::MemberRole::Admin,
+            Vec::new(),
+        );
+        let sc = crate::crypto::envelope::ScKeyPair::load_or_generate().unwrap();
+        let sc_pk = sc.pk_bytes();
+        let op = json!({ "act": { "type": "export", "target": "FOO", "scope": {} } });
+        let r = STANDARD.encode([7u8; 16]);
+        let beta = compute_beta(&[7u8; 16], &op).unwrap();
+        let g = build_local_grant(
+            &pv.keyset,
+            &w_c,
+            &cid,
+            vid,
+            "op-1",
+            &op,
+            &r,
+            &beta,
+            &sc_pk,
+            &URL_SAFE_NO_PAD.encode(&cid),
+            json!({}),
+        )
+        .unwrap();
+        let text = g.to_string();
+        assert!(!text.contains(&STANDARD.encode(w_c)) && !text.contains(&URL_SAFE_NO_PAD.encode(w_c)));
+        assert!(!text.contains(&URL_SAFE_NO_PAD.encode(root)) && !text.contains(&STANDARD.encode(root)));
+        assert!(g.get("wrapping_key").is_none() && g.get("wk_enc").is_none());
+        let dec = |f: &str| URL_SAFE_NO_PAD.decode(g[f].as_str().unwrap()).unwrap();
+        let (k_enc, k_ct) = (dec("k_enc"), dec("k_ct"));
+        let opened = sc
+            .open(&k_enc, &k_ct, &crate::crypto::envelope::grant_k_seal_info("op-1"), b"")
+            .unwrap();
+        assert_eq!(opened, k);
+        assert_eq!(g["id"], uik.user_id());
+        let input = crate::identity::grant_id_input(
+            vid, "op-1", &beta, &cid, &k_enc, &k_ct, &sc_pk, &uik.user_id(),
+        );
+        let sig: [u8; 64] = dec("id_sig").try_into().unwrap();
+        assert!(crate::identity::verify(&uik.signing().public_bytes(), &input, &sig));
+        // A wrong W_c opens nothing.
+        assert!(build_local_grant(
+            &pv.keyset, &[0u8; 32], &cid, vid, "op-1", &op, &r, &beta, &sc_pk, "x", json!({})
+        )
+        .is_err());
+    }
 }
