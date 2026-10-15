@@ -62,12 +62,26 @@ struct PrincipalEventJson {
     created_at: String,
 }
 
+/// The owner-signed ledger head (contract C4): the owner's commitment to the
+/// whole event list, so a forged or truncated tail is detectable.
+#[derive(Debug, Deserialize)]
+struct HeadJson {
+    anchor: String,
+    max_seq: u64,
+    /// SHA256(lp(sig_1) ‖ … ‖ lp(sig_n)), base64url (standard tolerated).
+    events_hash: String,
+    /// Owner-UIK signature over `principal_head_input`, base64url (standard tolerated).
+    sig: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct LedgerJson {
     #[serde(default)]
     events: Vec<PrincipalEventJson>,
     #[serde(default)]
     anchor: Option<AnchorJson>,
+    #[serde(default)]
+    head: Option<HeadJson>,
     #[serde(default)]
     #[allow(dead_code)]
     cursor: u64,
@@ -153,7 +167,7 @@ pub fn require_signed_tombstone() -> bool {
 // ── base64 → fixed arrays ────────────────────────────────────────────────────
 
 fn decode_pub32(b64: &str) -> Option<[u8; 32]> {
-    <[u8; 32]>::try_from(STANDARD.decode(b64).ok()?.as_slice()).ok()
+    <[u8; 32]>::try_from(decode_b64_any(b64)?.as_slice()).ok()
 }
 
 fn decode_sig64(b64: &str) -> Option<[u8; 64]> {
@@ -216,6 +230,14 @@ fn fold_verified(ledger: &LedgerJson, anchor_uik: &str) -> Option<Folded> {
     let mut events: Vec<&PrincipalEventJson> = ledger.events.iter().collect();
     events.sort_by(|a, b| a.seq.cmp(&b.seq).then_with(|| a.sig.cmp(&b.sig)));
 
+    // C4: the served events must be exactly what the owner committed to in a
+    // validly signed head; otherwise the whole pull is refused (park, keep the
+    // prior decision). Closes a forged or truncated tail.
+    if let Err(why) = verify_head(ledger.head.as_ref(), &events, anchor_uik, &anchor_pub) {
+        tracing::warn!(code = "ledger_head_invalid", "principal ledger: {}; rejecting pull", why);
+        return None;
+    }
+
     let mut state: HashMap<String, (bool, u64)> = HashMap::new();
     let mut last_seq: Option<u64> = None;
     let mut max_seq: u64 = 0;
@@ -267,6 +289,43 @@ fn fold_verified(ledger: &LedgerJson, anchor_uik: &str) -> Option<Folded> {
         }
     }
     Some(Folded { state, max_seq })
+}
+
+/// Contract C4: `head` must be signed by the account owner over
+/// `principal_head_input(anchor, max_seq, SHA256(lp(sig_1) ‖ … ‖ lp(sig_n)))`, and
+/// the served `events` (in seq order) must hash to its `events_hash` and end at
+/// its `max_seq`. Every event signature counts, valid or not: the head commits to
+/// the list the owner wrote.
+fn verify_head(
+    head: Option<&HeadJson>,
+    events: &[&PrincipalEventJson],
+    anchor_uik: &str,
+    anchor_pub: &[u8; 32],
+) -> Result<(), String> {
+    let head = head.ok_or("no signed ledger head")?;
+    if head.anchor != anchor_uik {
+        return Err("ledger head names another account".into());
+    }
+    let sig = decode_sig64(&head.sig).ok_or("ledger head signature undecodable")?;
+    let claimed = decode_b64_any(&head.events_hash)
+        .filter(|h| h.len() == 32)
+        .ok_or("ledger head events_hash undecodable")?;
+    let input = identity::principal_head_input(anchor_uik, head.max_seq, &claimed);
+    if !identity::verify(anchor_pub, &input, &sig) {
+        return Err("ledger head signature does not verify".into());
+    }
+    let mut sigs = Vec::with_capacity(events.len());
+    for e in events {
+        sigs.push(decode_b64_any(&e.sig).ok_or("an event signature is undecodable")?);
+    }
+    if identity::principal_events_hash(&sigs).as_slice() != claimed.as_slice() {
+        return Err("the served events do not match the signed head".into());
+    }
+    let max = events.last().map(|e| e.seq).unwrap_or(0);
+    if max != head.max_seq {
+        return Err("the served events end at another seq than the signed head".into());
+    }
+    Ok(())
 }
 
 // ── Floor persistence (rollback resistance) ─────────────────────────────────
@@ -422,10 +481,10 @@ pub async fn principal_ledger_loop(state: Arc<AppState>, cloud: String, dk: Stri
                     // Agent revokes ride the existing /agents/hashes sync (backend drops
                     // the key); the ledger is the account-level record + daemon-verifiable
                     // authority the P6 cutover enforces directly.
-                    // KNOWN RESIDUAL (F1c): a revoke the daemon has NEVER observed (server
-                    // withholds it on every poll) can't latch — closing that needs an
-                    // owner-signed ledger head (max-seq/count) so tail omission is
-                    // detectable. Tracked for a P6 hardening; out of scope for the flag flip.
+                    // Tail omission is closed by the owner-signed head (C4, verified in
+                    // `fold_verified`). RESIDUAL: the server can still serve an OLDER but
+                    // consistent head + list (hiding a later revoke), bounded by re-key
+                    // on offboard (design approval-key-delivery §3).
                 }
             }
         }
@@ -462,13 +521,32 @@ mod tests {
     }
 
     fn ledger(owner: &SigningIdentity, events: Vec<PrincipalEventJson>) -> LedgerJson {
+        let head = Some(sign_head(owner, &events));
         LedgerJson {
             events,
             anchor: Some(AnchorJson {
                 uik_id: owner.user_id(),
                 uik_pub: STANDARD.encode(owner.public_bytes()),
             }),
+            head,
             cursor: 0,
+        }
+    }
+
+    /// The owner's signed head over `events` (C4), as the console writes it.
+    fn sign_head(owner: &SigningIdentity, events: &[PrincipalEventJson]) -> HeadJson {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let mut sorted: Vec<&PrincipalEventJson> = events.iter().collect();
+        sorted.sort_by(|a, b| a.seq.cmp(&b.seq).then_with(|| a.sig.cmp(&b.sig)));
+        let sigs: Vec<Vec<u8>> = sorted.iter().map(|e| STANDARD.decode(&e.sig).unwrap()).collect();
+        let hash = identity::principal_events_hash(&sigs);
+        let max_seq = sorted.last().map(|e| e.seq).unwrap_or(0);
+        let sig = owner.sign(&identity::principal_head_input(&owner.user_id(), max_seq, &hash));
+        HeadJson {
+            anchor: owner.user_id(),
+            max_seq,
+            events_hash: URL_SAFE_NO_PAD.encode(hash),
+            sig: URL_SAFE_NO_PAD.encode(sig),
         }
     }
 
@@ -535,6 +613,50 @@ mod tests {
         let l = ledger(&o, vec![ev]);
         let folded = fold_verified(&l, &acct).unwrap();
         assert!(folded.state.is_empty(), "foreign-owner event does not fold");
+    }
+
+    /// C4: a ledger without a head, with a dropped or added event, or whose
+    /// head another key signed is refused whole (park), never folded.
+    #[test]
+    fn a_ledger_not_matching_its_signed_head_is_refused() {
+        let o = owner();
+        let acct = o.user_id();
+        let events = || {
+            vec![
+                signed_event(&o, &acct, "admit", "dev_box", 1),
+                signed_event(&o, &acct, "revoke", "dev_box", 2),
+            ]
+        };
+        assert!(fold_verified(&ledger(&o, events()), &acct).is_some(), "honest ledger folds");
+
+        let mut l = ledger(&o, events());
+        l.head = None;
+        assert!(fold_verified(&l, &acct).is_none(), "no head");
+
+        // Truncated tail: the revoke dropped, the full head kept.
+        let mut l = ledger(&o, events());
+        l.events.pop();
+        assert!(fold_verified(&l, &acct).is_none(), "truncated tail");
+
+        // An extra (validly signed) event the head does not commit to.
+        let mut l = ledger(&o, events());
+        l.events.push(signed_event(&o, &acct, "admit", "dev_other", 3));
+        assert!(fold_verified(&l, &acct).is_none(), "extra event");
+
+        // A head signed by someone else over the same list.
+        let imposter = SigningIdentity::from_seed(&[9u8; 32]);
+        let mut l = ledger(&o, events());
+        let mut forged = sign_head(&imposter, &l.events);
+        forged.anchor = acct.clone();
+        l.head = Some(forged);
+        assert!(fold_verified(&l, &acct).is_none(), "foreign head signer");
+
+        // A head whose max_seq lies about the tail.
+        let mut l = ledger(&o, events());
+        let mut h = sign_head(&o, &l.events);
+        h.max_seq = 5;
+        l.head = Some(h);
+        assert!(fold_verified(&l, &acct).is_none(), "max_seq mismatch");
     }
 
     // F1 regression: the MONOTONE self-revoke latch (`apply_fold_to_floor`). Once a revoke
