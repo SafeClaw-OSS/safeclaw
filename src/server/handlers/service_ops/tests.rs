@@ -494,6 +494,8 @@ fn state_with_store(
     let cache = crate::state::SecretsCache {
         policy: crate::core::policy::Policy::effective(view.aux.policy.as_ref()),
         service_entries: view.aux.services.clone(),
+        // As an unlock fills it: the requests the daemon handles after a sync.
+        service_requests: view.aux.service_requests.keys().cloned().collect(),
         ..Default::default()
     };
     state.unlock_vault(vault.into(), cache, zeroize::Zeroizing::new(k.to_vec()));
@@ -982,7 +984,7 @@ fn a_conflict_copy_is_listed_skipped_and_never_used() {
 mod install_requests {
     use super::*;
     use crate::server::handlers::service_ops::requests::{
-        self, op_state, step, ItemPush, OpState, Step, EXPIRED,
+        self, duplicate_of_older, op_state, step, ItemPush, OpState, Step, EXPIRED,
     };
     use crate::storage::item::{ItemNs, ItemPayload, VaultKeys};
     use crate::sync::PushOutcome;
@@ -1188,6 +1190,56 @@ mod install_requests {
         assert_eq!(op.act.scope["update"], json!(true));
         assert_eq!(op.act.scope["replaces"], json!(["a1"]));
         assert_eq!(op.act.scope["new_destinations"], json!(["a.dev"]));
+    }
+
+    /// Two requests for one source (two tabs, two clicks): the newer is
+    /// removed unclaimed and only the older gets an approval.
+    #[test]
+    fn a_second_request_for_the_same_source_is_dropped() {
+        let mut newer = asked();
+        newer["requested_at"] = json!(1_760_000_100u64);
+        newer["source"] = json!("github:Acme/Tools");
+        let (_dir, state) = vault_with(true, &[("r1", asked()), ("r2", newer)]);
+        let github = upstream();
+        // The newer one first: an older open request names the same source.
+        block_on(requests::process(&state, VAULT, vec!["r2".into()], ME, &github, Some(&github), &FakeCloud::default()));
+        assert!(!read(&state).contains_key("r2"));
+        run(&state, &github, &FakeCloud::default());
+        let left = read(&state);
+        assert_eq!(left.len(), 1);
+        assert!(left["r1"]["op_id"].is_string(), "{left:?}");
+    }
+
+    /// Which older request makes a newer one a duplicate: only an open one
+    /// for the same source.
+    #[test]
+    fn only_an_older_open_request_for_the_same_source_supersedes() {
+        let op = |s: OpState| move |_: &str| s;
+        let req = |src: &str, at: u64| json!({ "source": src, "requested_at": at });
+        let me = req("github:acme/tools", 200);
+        let older = |b: Value| vec![("r0".to_string(), b)];
+        let dup = |others: Vec<(String, Value)>, s: OpState| {
+            duplicate_of_older("r9", &me, &others, ME, op(s))
+        };
+        assert!(dup(older(req("github:ACME/tools", 100)), OpState::Gone));
+        assert!(!dup(older(req("github:acme/tools", 300)), OpState::Gone), "newer");
+        assert!(!dup(older(req("github:acme/other", 100)), OpState::Gone), "other source");
+        assert!(!dup(older(req("github:acme/tools:sub", 100)), OpState::Gone), "other folder");
+        let mut failed = req("github:acme/tools", 100);
+        failed["error"] = json!("x");
+        assert!(!dup(older(failed), OpState::Gone));
+        let mut current = req("github:acme/tools", 100);
+        current["up_to_date"] = json!(true);
+        assert!(!dup(older(current), OpState::Gone));
+        let mut mine = req("github:acme/tools", 100);
+        mine["claimed_by"] = json!(ME);
+        mine["op_id"] = json!("op_1");
+        assert!(dup(older(mine.clone()), OpState::Pending));
+        assert!(!dup(older(mine), OpState::Resolved), "its op resolved");
+        let mut theirs = req("github:acme/tools", 100);
+        theirs["claimed_by"] = json!("dev_other");
+        theirs["op_id"] = json!("op_2");
+        assert!(dup(older(theirs), OpState::Gone), "another device holds it");
     }
 
     /// Another device's claim landed first (a 409): this one writes nothing

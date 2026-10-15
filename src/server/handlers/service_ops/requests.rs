@@ -14,6 +14,10 @@
 //! once its op is resolved; a request claimed here whose op this process does
 //! not hold (it restarted) gets [`EXPIRED`]. A request with `up_to_date` or
 //! `error` stays for the console to show and clear.
+//!
+//! One source has at most one open request (not failed, not up to date): a
+//! request for a source an older open request already names is removed
+//! unclaimed, so two tabs or devices asking at once get one approval.
 
 use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr};
@@ -319,6 +323,51 @@ fn current(state: &AppState, vault: &str, name: &str) -> Option<Value> {
     (!payload.is_tombstone()).then_some(payload.body)
 }
 
+/// The source identity a request names (`None`: not a GitHub source).
+fn request_identity(body: &Value) -> Option<String> {
+    match source::parse_source(body.get("source")?.as_str()?).ok()? {
+        SourceSpec::GitHub(g) => Some(g.identity()),
+        _ => None,
+    }
+}
+
+/// Whether request `body` (on the device `me`) is still open: not failed,
+/// not up to date, and its op (when this device holds it) not resolved. One
+/// another device claimed counts as open: that device resolves it.
+fn is_open(body: &Value, me: &str, op: impl Fn(&str) -> OpState) -> bool {
+    if body.get("error").is_some_and(|v| !v.is_null())
+        || body.get("up_to_date") == Some(&json!(true))
+    {
+        return false;
+    }
+    let mine = body.get("claimed_by").and_then(|v| v.as_str()) == Some(me);
+    match body.get("op_id").and_then(|v| v.as_str()) {
+        Some(id) if mine => op(id) == OpState::Pending,
+        _ => true,
+    }
+}
+
+/// Whether an older open request in `others` (name, body) names the same
+/// source as request `name` (`body`): then `name` is a duplicate.
+pub(crate) fn duplicate_of_older(
+    name: &str,
+    body: &Value,
+    others: &[(String, Value)],
+    me: &str,
+    op: impl Fn(&str) -> OpState + Copy,
+) -> bool {
+    let Some(want) = request_identity(body) else {
+        return false;
+    };
+    let at = |b: &Value| b.get("requested_at").and_then(|v| v.as_u64()).unwrap_or(0);
+    others.iter().any(|(n, b)| {
+        n != name
+            && (at(b), n.as_str()) < (at(body), name)
+            && request_identity(b).as_deref() == Some(want.as_str())
+            && is_open(b, me, op)
+    })
+}
+
 /// Handle the requests `names` of `vault` on the device `me`, one at a time,
 /// each as the store holds it now.
 pub(crate) async fn process<A: GitHubApi, P: ItemPush>(
@@ -346,6 +395,17 @@ pub(crate) async fn process<A: GitHubApi, P: ItemPush>(
                 Some(b)
             }
             Step::Claim => {
+                let others: Vec<(String, Value)> = state
+                    .service_request_names(vault)
+                    .into_iter()
+                    .filter_map(|n| current(state, vault, &n).map(|b| (n, b)))
+                    .collect();
+                if duplicate_of_older(&name, &body, &others, me, |id| op_state(state, id)) {
+                    if let Err(e) = write(state, vault, &name, None, push).await {
+                        log(&name, e);
+                    }
+                    continue;
+                }
                 let mut claimed = body.clone();
                 claimed["claimed_by"] = json!(me);
                 match write(state, vault, &name, Some(claimed.clone()), push).await {
