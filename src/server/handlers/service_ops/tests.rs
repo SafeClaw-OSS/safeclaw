@@ -984,7 +984,7 @@ fn a_conflict_copy_is_listed_skipped_and_never_used() {
 mod install_requests {
     use super::*;
     use crate::server::handlers::service_ops::requests::{
-        self, duplicate_of_older, op_state, step, ItemPush, OpState, Step, EXPIRED,
+        self, duplicate_of_older, step, ItemPush, Step, INTERRUPTED,
     };
     use crate::storage::item::{ItemNs, ItemPayload, VaultKeys};
     use crate::sync::PushOutcome;
@@ -1109,7 +1109,6 @@ mod install_requests {
             names,
             ME,
             gh,
-            Some(gh),
             cloud,
         ));
     }
@@ -1118,12 +1117,12 @@ mod install_requests {
         json!({ "source": "github:acme/tools", "requested_at": 1_760_000_000u64 })
     }
 
-    /// Claimed with a compare-and-swap at the row's version, installed through
-    /// the op path `sc service add` takes (the same card, the request named,
-    /// no agent), the op id written back; the request is removed once the op
-    /// is resolved.
+    /// Claimed with a compare-and-swap at the row's version, then prepared
+    /// as `sc service add` reads the source: the card the approval would
+    /// sign, the records to store, the ids to remove. No op: the console
+    /// confirms and writes. A prepared request is left for the console.
     #[test]
-    fn a_request_is_claimed_installed_and_removed_when_its_op_resolves() {
+    fn a_request_is_claimed_and_prepared_for_the_console() {
         let (_dir, state) = vault_with(true, &[("r1", asked())]);
         let github = upstream();
         let cloud = FakeCloud::default();
@@ -1132,45 +1131,37 @@ mod install_requests {
         assert_eq!(r1["claimed_by"], json!(ME));
         assert!(r1.get("error").is_none(), "{r1}");
         assert_eq!(r1["requested_at"], json!(1_760_000_000u64), "the console's fields kept");
-        let op_id = r1["op_id"].as_str().unwrap().to_string();
         assert_eq!(
             *cloud.pushed.lock().unwrap(),
             [(Some(1), 2), (Some(2), 3)],
-            "the claim at the console's version, then the op id"
+            "the claim at the console's version, then the prepared card"
         );
-        let op = state.approvals.lock().unwrap().get(&op_id).unwrap().op.clone();
-        assert_eq!(
-            op.act.kind,
-            crate::protocol::operation::ActType::Custom("service-add".into())
-        );
-        assert_eq!(op.act.scope["service_request"], json!("r1"));
-        assert_eq!(op.act.scope["update"], json!(false));
-        assert_eq!(op.act.scope["ids"], json!(["a1"]));
-        assert_eq!(op.act.scope["from"], json!(gh('a').display()));
-        assert!(op.act.scope["definitions"]
+        let p = &r1["prepared"];
+        assert_eq!(p["card"]["update"], json!(false));
+        assert_eq!(p["card"]["ids"], json!(["a1"]));
+        assert_eq!(p["card"]["destinations"], json!(["a.dev"]));
+        assert_eq!(p["card"]["from"], json!(gh('a').display()));
+        assert_eq!(p["card"]["source"]["commit"], json!("a".repeat(40)));
+        assert!(p["card"]["definitions"]
             .as_str()
             .unwrap()
             .starts_with("# a1 service.toml\n"));
-        assert!(op.act.scope.get("agent").is_none());
-        assert_eq!(op_state(&state, &op_id), OpState::Pending);
+        assert_eq!(p["store"]["a1"]["source"]["commit"], json!("a".repeat(40)));
+        assert_eq!(
+            p["store"]["a1"]["summary"],
+            json!({ "name": "a1", "hosts": ["a.dev"], "secrets": ["TOKEN"], "oauth": false })
+        );
+        assert_eq!(p["remove"], json!([]));
+        assert!(r1.get("op_id").is_none(), "no op");
 
-        // Pending: left as it is.
+        // Prepared: left as it is.
         run(&state, &github, &cloud);
         assert_eq!(read(&state)["r1"], r1);
-        // Resolved (here rejected): removed.
-        state.approvals.lock().unwrap().reject(&op_id, "no");
-        assert_eq!(op_state(&state, &op_id), OpState::Resolved);
-        run(&state, &github, &cloud);
-        assert!(read(&state).is_empty());
-        let keys = VaultKeys::single(&K);
-        let id = crate::storage::item::wire_id_for::<S>(keys.id_seed, ItemNs::ServiceRequest, "r1")
-            .unwrap();
-        assert!(stored(&state, VAULT).items[&id].tombstone);
     }
 
     /// The console's Update is the same request: a source the vault holds
-    /// with the same definitions is `up_to_date` (no op, left for the console
-    /// to clear); with changed ones, the op the daemon stamps as an update.
+    /// with the same definitions is `up_to_date` (left for the console to
+    /// clear); with changed ones, a card the daemon marks as an update.
     #[test]
     fn a_request_for_a_held_source_updates_it_or_is_up_to_date() {
         let held = |host: &str| StoredService::new(svc("a1", host), None, Some(gh('b')));
@@ -1179,21 +1170,20 @@ mod install_requests {
         run(&state, &github, &FakeCloud::default());
         let r1 = read(&state)["r1"].clone();
         assert_eq!(r1["up_to_date"], json!(true), "{r1}");
-        assert!(r1.get("op_id").is_none() && r1.get("error").is_none(), "{r1}");
+        assert!(r1.get("prepared").is_none() && r1.get("error").is_none(), "{r1}");
         run(&state, &github, &FakeCloud::default());
         assert_eq!(read(&state)["r1"], r1, "left for the console to clear");
 
         let (_dir, state) = vault_holding(true, &[("r1", asked())], &[("a1", held("old.dev"))]);
         run(&state, &github, &FakeCloud::default());
-        let op_id = read(&state)["r1"]["op_id"].as_str().unwrap().to_string();
-        let op = state.approvals.lock().unwrap().get(&op_id).unwrap().op.clone();
-        assert_eq!(op.act.scope["update"], json!(true));
-        assert_eq!(op.act.scope["replaces"], json!(["a1"]));
-        assert_eq!(op.act.scope["new_destinations"], json!(["a.dev"]));
+        let card = read(&state)["r1"]["prepared"]["card"].clone();
+        assert_eq!(card["update"], json!(true));
+        assert_eq!(card["replaces"], json!(["a1"]));
+        assert_eq!(card["new_destinations"], json!(["a.dev"]));
     }
 
     /// Two requests for one source (two tabs, two clicks): the newer is
-    /// removed unclaimed and only the older gets an approval.
+    /// removed unclaimed and only the older is prepared.
     #[test]
     fn a_second_request_for_the_same_source_is_dropped() {
         let mut newer = asked();
@@ -1202,48 +1192,40 @@ mod install_requests {
         let (_dir, state) = vault_with(true, &[("r1", asked()), ("r2", newer)]);
         let github = upstream();
         // The newer one first: an older open request names the same source.
-        block_on(requests::process(&state, VAULT, vec!["r2".into()], ME, &github, Some(&github), &FakeCloud::default()));
+        block_on(requests::process(&state, VAULT, vec!["r2".into()], ME, &github, &FakeCloud::default()));
         assert!(!read(&state).contains_key("r2"));
         run(&state, &github, &FakeCloud::default());
         let left = read(&state);
         assert_eq!(left.len(), 1);
-        assert!(left["r1"]["op_id"].is_string(), "{left:?}");
+        assert!(left["r1"]["prepared"].is_object(), "{left:?}");
     }
 
     /// Which older request makes a newer one a duplicate: only an open one
-    /// for the same source.
+    /// (waiting, or prepared and waiting for the console) for the same
+    /// source.
     #[test]
     fn only_an_older_open_request_for_the_same_source_supersedes() {
-        let op = |s: OpState| move |_: &str| s;
         let req = |src: &str, at: u64| json!({ "source": src, "requested_at": at });
         let me = req("github:acme/tools", 200);
-        let older = |b: Value| vec![("r0".to_string(), b)];
-        let dup = |others: Vec<(String, Value)>, s: OpState| {
-            duplicate_of_older("r9", &me, &others, ME, op(s))
-        };
-        assert!(dup(older(req("github:ACME/tools", 100)), OpState::Gone));
-        assert!(!dup(older(req("github:acme/tools", 300)), OpState::Gone), "newer");
-        assert!(!dup(older(req("github:acme/other", 100)), OpState::Gone), "other source");
-        assert!(!dup(older(req("github:acme/tools:sub", 100)), OpState::Gone), "other folder");
+        let dup = |b: Value| duplicate_of_older("r9", &me, &[("r0".to_string(), b)]);
+        assert!(dup(req("github:ACME/tools", 100)));
+        assert!(!dup(req("github:acme/tools", 300)), "newer");
+        assert!(!dup(req("github:acme/other", 100)), "other source");
+        assert!(!dup(req("github:acme/tools:sub", 100)), "other folder");
         let mut failed = req("github:acme/tools", 100);
         failed["error"] = json!("x");
-        assert!(!dup(older(failed), OpState::Gone));
+        assert!(!dup(failed));
         let mut current = req("github:acme/tools", 100);
         current["up_to_date"] = json!(true);
-        assert!(!dup(older(current), OpState::Gone));
-        let mut mine = req("github:acme/tools", 100);
-        mine["claimed_by"] = json!(ME);
-        mine["op_id"] = json!("op_1");
-        assert!(dup(older(mine.clone()), OpState::Pending));
-        assert!(!dup(older(mine), OpState::Resolved), "its op resolved");
-        let mut theirs = req("github:acme/tools", 100);
-        theirs["claimed_by"] = json!("dev_other");
-        theirs["op_id"] = json!("op_2");
-        assert!(dup(older(theirs), OpState::Gone), "another device holds it");
+        assert!(!dup(current));
+        let mut prepared = req("github:acme/tools", 100);
+        prepared["claimed_by"] = json!("dev_other");
+        prepared["prepared"] = json!({ "card": {} });
+        assert!(dup(prepared), "waiting for the console");
     }
 
     /// Another device's claim landed first (a 409): this one writes nothing
-    /// and creates no op.
+    /// and prepares nothing.
     #[test]
     fn a_request_another_device_claimed_first_is_left() {
         let (_dir, state) = vault_with(true, &[("r1", asked())]);
@@ -1258,7 +1240,7 @@ mod install_requests {
 
     /// The owner switch off, a source that is not GitHub, a ref that is no
     /// branch or tag, a definition the gate refuses: an `error` with what
-    /// `sc service add` prints, and no op.
+    /// `sc service add` prints, and nothing prepared.
     #[test]
     fn a_request_that_cannot_be_installed_gets_the_clis_message() {
         let (_dir, state) = vault_with(false, &[("r1", asked())]);
@@ -1266,7 +1248,7 @@ mod install_requests {
         let r1 = read(&state)["r1"].clone();
         assert_eq!(r1["error"], json!(crate::service::INSTALLED_OFF_MSG));
         assert_eq!(r1["claimed_by"], json!(ME));
-        assert!(r1.get("op_id").is_none());
+        assert!(r1.get("prepared").is_none());
 
         let bad_gate = Gh::serving(tar_gz(&[(
             "acme-tools-x/services/b2/service.toml",
@@ -1303,47 +1285,46 @@ mod install_requests {
         assert_eq!(read(&state), before);
     }
 
-    /// A request this device claimed whose op it no longer holds (it
-    /// restarted) gets the expiry error; another device's claim is left.
+    /// A request this device claimed that never got an answer (it stopped
+    /// midway; or an op id from before requests were prepared) is
+    /// interrupted; another device's claim is left.
     #[test]
-    fn a_claim_whose_op_is_gone_expires_and_others_claims_are_left() {
-        let mut gone = asked();
-        gone["claimed_by"] = json!(ME);
-        gone["op_id"] = json!("op_gone");
+    fn a_claim_without_an_answer_is_interrupted_and_others_claims_are_left() {
+        let mut legacy = asked();
+        legacy["claimed_by"] = json!(ME);
+        legacy["op_id"] = json!("op_gone");
         let mut half = asked();
         half["claimed_by"] = json!(ME);
         let mut theirs = asked();
         theirs["claimed_by"] = json!("dev_other");
         let (_dir, state) = vault_with(
             true,
-            &[("gone", gone), ("half", half), ("theirs", theirs.clone())],
+            &[("legacy", legacy), ("half", half), ("theirs", theirs.clone())],
         );
         run(&state, &upstream(), &FakeCloud::default());
         let got = read(&state);
-        assert_eq!(got["gone"]["error"], json!(EXPIRED));
-        assert_eq!(got["half"]["error"], json!(EXPIRED));
+        assert_eq!(got["legacy"]["error"], json!(INTERRUPTED));
+        assert_eq!(got["half"]["error"], json!(INTERRUPTED));
         assert_eq!(got["theirs"], theirs);
     }
 
     #[test]
     fn the_step_for_each_request_state() {
-        let op = |s: OpState| move |_: &str| s;
         let mut b = asked();
-        assert_eq!(step(&b, ME, op(OpState::Gone)), Step::Claim);
+        assert_eq!(step(&b, ME), Step::Claim);
         b["claimed_by"] = json!("dev_other");
-        assert_eq!(step(&b, ME, op(OpState::Gone)), Step::Leave);
+        assert_eq!(step(&b, ME), Step::Leave);
         b["claimed_by"] = json!(ME);
-        assert_eq!(step(&b, ME, op(OpState::Pending)), Step::Expire);
-        b["op_id"] = json!("op_1");
-        assert_eq!(step(&b, ME, op(OpState::Pending)), Step::Leave);
-        assert_eq!(step(&b, ME, op(OpState::Resolved)), Step::Remove);
-        assert_eq!(step(&b, ME, op(OpState::Gone)), Step::Expire);
-        b["error"] = json!("x");
-        assert_eq!(step(&b, ME, op(OpState::Gone)), Step::Leave);
-        let mut b = asked();
-        b["claimed_by"] = json!(ME);
-        b["up_to_date"] = json!(true);
-        assert_eq!(step(&b, ME, op(OpState::Gone)), Step::Leave);
+        assert_eq!(step(&b, ME), Step::Interrupt);
+        for (k, v) in [
+            ("prepared", json!({ "card": {} })),
+            ("up_to_date", json!(true)),
+            ("error", json!("x")),
+        ] {
+            let mut a = b.clone();
+            a[k] = v;
+            assert_eq!(step(&a, ME), Step::Leave, "{k}");
+        }
     }
 
     /// The rule row the console holds the same copy of.

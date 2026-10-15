@@ -1,102 +1,69 @@
 //! Console install requests: a `service_request:<id>` item asks this vault's
-//! daemons to install a service from a source, through the same path as
-//! `sc service add` (the daemon fetches the source, the gate admits it, op
-//! creation checks it again and stamps the card). A source the vault already
-//! holds is updated to the source's current head, as `sc service update`
-//! does: the console's Update is the same request.
+//! daemons to read a service source for the console, through the same path
+//! as `sc service add` (the daemon fetches the source and the gate admits
+//! it) but with no op: the person who asked is the person in the console,
+//! already holding the vault key, so the daemon only prepares the card and
+//! the console confirms and writes the definitions itself. A source the vault
+//! already holds is prepared as an update to the source's current head, as
+//! `sc service update` does: the console's Update is the same request.
 //!
 //! The console writes `{ source, ref?, requested_at }`. On an unlocked sync
 //! one daemon claims a request (`claimed_by`, a compare-and-swap write at the
 //! row's version: another device's claim wins and this one leaves it), then
-//! writes `op_id` (the pending `service-add` op), `up_to_date: true` (an
-//! update whose definitions match what the vault holds: nothing to approve)
-//! or `error` (what `sc service add` would print). The request is removed
-//! once its op is resolved; a request claimed here whose op this process does
-//! not hold (it restarted) gets [`EXPIRED`]. A request with `up_to_date` or
-//! `error` stays for the console to show and clear.
+//! writes `prepared` (the `service-add` card, the records to store and the
+//! ids to remove), `up_to_date: true` (the vault already holds these
+//! definitions) or `error` (what `sc service add` would print). A request
+//! claimed here that never got a result (this process stopped midway) gets
+//! [`INTERRUPTED`]. The console removes a request when it confirms or
+//! dismisses it. Whatever the console writes, the daemon admits each stored
+//! definition again when it loads it, and the owner switch still decides.
 //!
 //! One source has at most one open request (not failed, not up to date): a
 //! request for a source an older open request already names is removed
-//! unclaimed, so two tabs or devices asking at once get one approval.
+//! unclaimed, so two tabs or devices asking at once get one card.
 
-use std::collections::BTreeSet;
-use std::net::{IpAddr, Ipv4Addr};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use serde_json::{json, Value};
 
-use crate::approval::store::ApprovalStatus;
-use crate::error::AppError;
 use crate::service::source::github::{self, GitHubApi};
 use crate::service::source::{self, SourceSpec};
 use crate::state::AppState;
 use crate::storage::item::{wire_id_for, ItemNs, ItemPayload, VaultKeys};
 use crate::sync::PushOutcome;
 
-/// The error a request claimed here gets when its op is gone.
-pub(crate) const EXPIRED: &str = "the approval request expired; install again";
-
-/// Where a request's op stands in this process.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum OpState {
-    Pending,
-    /// Applied, rejected, expired or withdrawn.
-    Resolved,
-    /// Not held here (this process restarted since it was created).
-    Gone,
-}
-
-/// The ops this process created for requests (a resolved op may be dropped
-/// from the approval store; one created before a restart is not here).
-fn created() -> &'static Mutex<BTreeSet<String>> {
-    static CREATED: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
-    CREATED.get_or_init(Default::default)
-}
-
-pub(crate) fn op_state(state: &AppState, op_id: &str) -> OpState {
-    let store = state.approvals.lock().unwrap();
-    match store.get_any(op_id) {
-        Some(r) if matches!(r.status, ApprovalStatus::Pending) && !r.is_expired() => {
-            OpState::Pending
-        }
-        Some(_) => OpState::Resolved,
-        None if created().lock().unwrap().contains(op_id) => OpState::Resolved,
-        None => OpState::Gone,
-    }
-}
+/// The error a request claimed here gets when it never got a result.
+pub(crate) const INTERRUPTED: &str = "the request was interrupted; install again";
 
 /// What this device does with one request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Step {
     Claim,
-    /// Claimed here, and its op is gone: [`EXPIRED`].
-    Expire,
-    /// Its op is resolved: remove it.
-    Remove,
+    /// Claimed here and never answered: [`INTERRUPTED`].
+    Interrupt,
     Leave,
 }
 
+/// Whether request `body` carries its answer (`prepared`, `up_to_date` or
+/// `error`).
+fn answered(body: &Value) -> bool {
+    ["prepared", "up_to_date", "error"]
+        .iter()
+        .any(|k| body.get(*k).is_some_and(|v| !v.is_null() && *v != json!(false)))
+}
+
 /// The step for request `body` on the device `me`.
-pub(crate) fn step(body: &Value, me: &str, op: impl Fn(&str) -> OpState) -> Step {
-    let text = |k: &str| body.get(k).and_then(|v| v.as_str());
-    if body.get("error").is_some_and(|v| !v.is_null())
-        || body.get("up_to_date") == Some(&json!(true))
-    {
+pub(crate) fn step(body: &Value, me: &str) -> Step {
+    if answered(body) {
         return Step::Leave;
     }
-    match text("claimed_by") {
+    match body.get("claimed_by").and_then(|v| v.as_str()) {
         None => Step::Claim,
         Some(c) if c != me => Step::Leave,
-        Some(_) => match text("op_id") {
-            None => Step::Expire,
-            Some(id) => match op(id) {
-                OpState::Pending => Step::Leave,
-                OpState::Resolved => Step::Remove,
-                OpState::Gone => Step::Expire,
-            },
-        },
+        Some(_) => Step::Interrupt,
     }
 }
 
@@ -205,29 +172,20 @@ pub(crate) async fn write<P: ItemPush>(
     Ok(Written::Done)
 }
 
-fn app_error_text(e: AppError) -> String {
-    match e {
-        AppError::BadRequest(m) => m,
-        other => other.to_string(),
-    }
-}
-
-/// Install what request `name` (`body`) asks for, as `sc service add
-/// <source> [--ref <ref>]` does: the owner switch, the source read from
-/// GitHub through `fetch_api` and admitted by the gate, then the op created
-/// through [`crate::server::handlers::op::create_op`] (`mint_api`: `None` =
-/// GitHub itself), naming the request in its scope (`service_request`) and
-/// no agent. `Ok(Some(op_id))`, `Ok(None)` when the vault already holds
-/// exactly these definitions from the source (nothing to approve), or the
-/// message `sc service add` would print.
-pub(crate) async fn install<A: GitHubApi>(
+/// Prepare what request `body` asks for, as `sc service add <source>
+/// [--ref <ref>]` reads it: the owner switch, the source read from GitHub
+/// through `fetch_api` and admitted by the gate, then the card against the
+/// vault as this device holds it. `Ok(Some(prepared))` with
+/// `{ card, store, remove }` (the card is the `service-add` scope the
+/// approval would sign: whether it updates, what it sends where, what it
+/// replaces), `Ok(None)` when the vault already holds exactly these
+/// definitions from the source, or the message `sc service add` would print.
+pub(crate) async fn prepare<A: GitHubApi>(
     state: &Arc<AppState>,
     vault: &str,
-    name: &str,
     body: &Value,
     fetch_api: &A,
-    mint_api: Option<&A>,
-) -> Result<Option<String>, String> {
+) -> Result<Option<Value>, String> {
     let (entries, _, allowed) = super::session(state, vault)?;
     if !allowed {
         return Err(crate::service::INSTALLED_OFF_MSG.to_string());
@@ -283,31 +241,28 @@ pub(crate) async fn install<A: GitHubApi>(
     if !built_in.is_empty() {
         return Err(source::problems_text(src, &built_in));
     }
-    let mut op: crate::protocol::operation::Operation = serde_json::from_value(source::add_op(
-        vault,
-        &stated,
-        &admitted,
-        crate::util::now_unix(),
-    ))
-    .map_err(|e| e.to_string())?;
-    op.act.scope["service_request"] = json!(name);
-    let resp = crate::server::handlers::op::create_op(
-        state,
-        vault.to_string(),
-        op,
-        None,
-        IpAddr::V4(Ipv4Addr::LOCALHOST),
-        mint_api,
-    )
-    .await
-    .map_err(app_error_text)?;
-    let op_id = resp
-        .get("op_id")
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
-        .ok_or_else(|| "the op was not created".to_string())?;
-    created().lock().unwrap().insert(op_id.clone());
-    Ok(Some(op_id))
+    let snapshot: BTreeMap<String, crate::service::ServiceDef> =
+        admitted.iter().map(|a| (a.id.clone(), a.def.clone())).collect();
+    let texts: BTreeMap<String, (String, Option<String>)> = admitted
+        .iter()
+        .map(|a| (a.id.clone(), (a.service.clone(), a.policy.clone())))
+        .collect();
+    let c = source::card::add_card(&snapshot, &texts, &stated, &entries, &state.services)?;
+    let mut card = json!({ "source": stated });
+    c.stamp(&mut card)?;
+    let store: serde_json::Map<String, Value> = admitted
+        .iter()
+        .map(|a| {
+            let e = source::StoredService::installed(
+                a.service.clone(),
+                a.policy.clone(),
+                stated.clone(),
+                &a.def,
+            );
+            Ok((a.id.clone(), serde_json::to_value(e).map_err(|e| e.to_string())?))
+        })
+        .collect::<Result<_, String>>()?;
+    Ok(Some(json!({ "card": card, "store": store, "remove": c.removes })))
 }
 
 /// Request `name` as this device's store holds it now (`None`: removed or
@@ -331,31 +286,16 @@ fn request_identity(body: &Value) -> Option<String> {
     }
 }
 
-/// Whether request `body` (on the device `me`) is still open: not failed,
-/// not up to date, and its op (when this device holds it) not resolved. One
-/// another device claimed counts as open: that device resolves it.
-fn is_open(body: &Value, me: &str, op: impl Fn(&str) -> OpState) -> bool {
-    if body.get("error").is_some_and(|v| !v.is_null())
-        || body.get("up_to_date") == Some(&json!(true))
-    {
-        return false;
-    }
-    let mine = body.get("claimed_by").and_then(|v| v.as_str()) == Some(me);
-    match body.get("op_id").and_then(|v| v.as_str()) {
-        Some(id) if mine => op(id) == OpState::Pending,
-        _ => true,
-    }
+/// Whether request `body` is still open: not failed and not up to date
+/// (one waiting for a device, or prepared and waiting for the console).
+fn is_open(body: &Value) -> bool {
+    !(body.get("error").is_some_and(|v| !v.is_null())
+        || body.get("up_to_date") == Some(&json!(true)))
 }
 
 /// Whether an older open request in `others` (name, body) names the same
 /// source as request `name` (`body`): then `name` is a duplicate.
-pub(crate) fn duplicate_of_older(
-    name: &str,
-    body: &Value,
-    others: &[(String, Value)],
-    me: &str,
-    op: impl Fn(&str) -> OpState + Copy,
-) -> bool {
+pub(crate) fn duplicate_of_older(name: &str, body: &Value, others: &[(String, Value)]) -> bool {
     let Some(want) = request_identity(body) else {
         return false;
     };
@@ -364,7 +304,7 @@ pub(crate) fn duplicate_of_older(
         n != name
             && (at(b), n.as_str()) < (at(body), name)
             && request_identity(b).as_deref() == Some(want.as_str())
-            && is_open(b, me, op)
+            && is_open(b)
     })
 }
 
@@ -376,7 +316,6 @@ pub(crate) async fn process<A: GitHubApi, P: ItemPush>(
     names: Vec<String>,
     me: &str,
     fetch_api: &A,
-    mint_api: Option<&A>,
     push: &P,
 ) {
     let log = |name: &str, e: String| {
@@ -386,13 +325,12 @@ pub(crate) async fn process<A: GitHubApi, P: ItemPush>(
         let Some(body) = current(state, vault, &name) else {
             continue;
         };
-        let next = match step(&body, me, |id| op_state(state, id)) {
+        let next = match step(&body, me) {
             Step::Leave => continue,
-            Step::Remove => None,
-            Step::Expire => {
+            Step::Interrupt => {
                 let mut b = body.clone();
-                b["error"] = json!(EXPIRED);
-                Some(b)
+                b["error"] = json!(INTERRUPTED);
+                b
             }
             Step::Claim => {
                 let others: Vec<(String, Value)> = state
@@ -400,7 +338,7 @@ pub(crate) async fn process<A: GitHubApi, P: ItemPush>(
                     .into_iter()
                     .filter_map(|n| current(state, vault, &n).map(|b| (n, b)))
                     .collect();
-                if duplicate_of_older(&name, &body, &others, me, |id| op_state(state, id)) {
+                if duplicate_of_older(&name, &body, &others) {
                     if let Err(e) = write(state, vault, &name, None, push).await {
                         log(&name, e);
                     }
@@ -416,15 +354,15 @@ pub(crate) async fn process<A: GitHubApi, P: ItemPush>(
                         continue;
                     }
                 }
-                match install(state, vault, &name, &claimed, fetch_api, mint_api).await {
-                    Ok(Some(op_id)) => claimed["op_id"] = json!(op_id),
+                match prepare(state, vault, &claimed, fetch_api).await {
+                    Ok(Some(prepared)) => claimed["prepared"] = prepared,
                     Ok(None) => claimed["up_to_date"] = json!(true),
                     Err(e) => claimed["error"] = json!(e),
                 }
-                Some(claimed)
+                claimed
             }
         };
-        if let Err(e) = write(state, vault, &name, next, push).await {
+        if let Err(e) = write(state, vault, &name, Some(next), push).await {
             log(&name, e);
         }
     }
@@ -466,7 +404,6 @@ pub(crate) fn after_sync(state: &Arc<AppState>, vault: &str) {
                         vec![one],
                         &me,
                         &api,
-                        None,
                         &Cloud,
                     )
                     .await
