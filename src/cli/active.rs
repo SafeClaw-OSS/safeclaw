@@ -111,19 +111,6 @@ pub struct CliConfig {
     /// against `account_uik` ([`account_uik_pub`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_uik_pub: Option<String>,
-    /// §15 principal-ledger enforcement switch: DEFAULT OFF — a verified revoke of
-    /// THIS device only locks+wipes when this is "on". `SAFECLAW_PRINCIPAL_ENFORCE`
-    /// overrides (and survives an old binary's config save). Flipped on at the P6
-    /// cutover. See [`crate::principal_ledger::principal_enforce_enabled`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub principal_enforce: Option<String>,
-    /// §15 leg-A require-signed-tombstone switch: DEFAULT OFF — an unsigned
-    /// `status:"deleted"` still drops local state (legacy). When "on", the daemon drops
-    /// only on an owner-signed tombstone that verifies against the vault fold-owner set.
-    /// `SAFECLAW_REQUIRE_SIGNED_TOMBSTONE` overrides. Flipped on at the P6 cutover. See
-    /// [`crate::principal_ledger::require_signed_tombstone`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub require_signed_tombstone: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]

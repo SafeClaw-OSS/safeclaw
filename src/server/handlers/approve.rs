@@ -825,6 +825,12 @@ pub async fn approve_op(
     Path(op_id): Path<String>,
     Json(mut grant): Json<Grant>,
 ) -> Result<Json<Value>> {
+    // 0. §15: a device that is not admitted, past its lease, or revoked applies
+    // no grant (K was evicted; nothing may re-open it). The op stays pending.
+    if let Some(e) = state.ledger_refusal() {
+        return Err(e);
+    }
+
     // 1. Look up the pending op. A SUPERSEDED op is still `Pending` and still
     // approvable (design/approvals-inbox.md D1): supersede is display state,
     // and the grant verifies against this op's OWN stored (o, r).
@@ -3137,7 +3143,11 @@ mod tests {
             relay_url: None,
             body_cap: crate::config::DEFAULT_BODY_CAP,
         };
-        AppState::new(cfg)
+        {
+            let s = AppState::new(cfg);
+            s.open_ledger_for_tests(&[]);
+            s
+        }
     }
 
     fn empty_view() -> crate::storage::plaintext::VaultPlaintextView {

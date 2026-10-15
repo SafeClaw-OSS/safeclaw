@@ -361,11 +361,11 @@ async fn run_daemon(
     // team-edition §9.
     state.hydrate_shared_from_catalog();
 
-    // Agent-centric auth: sync the account-level agent-key hash-set once
-    // before serving (so account agent-keys are accepted from the start),
-    // then keep it fresh in the background (revokes/new agents land in ~30s).
-    crate::sync::sync_agent_keys_once(&state).await;
-    tokio::spawn(crate::sync::sync_agent_keys_loop(state.clone()));
+    // §15 principal ledger, enforced: load this device's persisted standing
+    // before serving (fail closed: park without an anchor, a DIK or an admit;
+    // lock past the lease). The ledger loop (spawned with the watchers) keeps it
+    // current and carries the admitted agents.
+    crate::principal_ledger::init_gate(&state);
 
     // Slice 3 realtime sync: one detached long-poll watcher PER synced vault
     // (active ∪ known_vaults — all vaults stay live, not just the active one).

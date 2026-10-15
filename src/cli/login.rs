@@ -257,6 +257,22 @@ pub async fn run(args: LoginArgs) -> Result<(), String> {
     .map_err(|e| format!("save active config: {}", e))?;
     crate::cli::active::put_account_uik_key(&paired.uik_pub)
         .map_err(|e| format!("save the account key: {}", e))?;
+    // §15 W2: the daemon serves only while the ledger admits this device. Write
+    // its standing fresh from the admit just verified (admitted at that seq, no
+    // revoke, lease from now), so it serves at once and an old revoke of this
+    // device never wipes the new pairing before the first pull.
+    let admit_seq = paired
+        .body
+        .get("admit")
+        .and_then(|a| a.get("seq"))
+        .and_then(|v| v.as_u64())
+        .ok_or("approved, but the admit carries no seq")?;
+    crate::principal_ledger::write_pairing_floor(
+        &crate::config::default_state_dir(),
+        admit_seq,
+        crate::util::now_unix(),
+    )
+    .map_err(|e| format!("save this device's standing: {}", e))?;
 
     eprintln!(
         "Paired to {}; your agent talks to {}.",

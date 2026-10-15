@@ -28,7 +28,7 @@ const POLL_FALLBACK: Duration = Duration::from_secs(2);
 /// ★ Storm floor: an event wake never polls sooner than this after the
 /// previous poll — events accelerate the poll, they don't replace its
 /// pacing (a buggy emitter must cost ≤1 poll/s, not RTT-speed; same rule
-/// as refresh_agent_keys_on_miss's debounce).
+/// as the ledger's on-miss re-pull debounce).
 const POLL_FLOOR: Duration = Duration::from_secs(1);
 /// Daemon-side safety cap so a never-approved op's task can't run forever
 /// (the relay also enforces a TTL). Derived per-op from the op's own expiry

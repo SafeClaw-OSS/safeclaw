@@ -168,7 +168,11 @@ fn test_state() -> AppState {
         relay_url: None,
         body_cap: crate::config::DEFAULT_BODY_CAP,
     };
-    AppState::new(cfg)
+    {
+        let s = AppState::new(cfg);
+        s.open_ledger_for_tests(&[]);
+        s
+    }
 }
 
 /// Mint (stamp) then apply, the way an approved op flows. GitHub is out of

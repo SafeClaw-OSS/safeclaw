@@ -24,7 +24,7 @@ use crate::cli::active;
 use crate::device_auth::DikRequestExt;
 use crate::state::AppState;
 use crate::storage::sealed_vault::{self, SealedVault};
-use crate::sync_stream::{Mode, StreamHealth, VaultStatus, WakeCell, Work};
+use crate::sync_stream::{Mode, StreamHealth, WakeCell, Work};
 
 /// How long an auth-rejected (401/403) sync path parks before retrying. The
 /// pre-parking behavior — `return`, killing sync for the daemon's lifetime —
@@ -717,6 +717,15 @@ pub fn spawn_watchers(state: Arc<AppState>) {
         tracing::debug!("cloud sync watch: no cloud_backend; not started (local-only daemon)");
         return;
     };
+    // §15 account principal ledger, enforced: pull (DIK proof of possession, no
+    // bearer: a revoked device whose key the backend dropped still gets its
+    // revoke), verify strictly, decide (serve / park / lock / wipe). Runs
+    // before the device-key gate below for that reason. No anchor = parked at
+    // startup ([`crate::principal_ledger::init_gate`]); the anchor is only
+    // learned at pairing, which restarts the daemon.
+    if active::account_uik().is_some() {
+        tokio::spawn(crate::principal_ledger::principal_ledger_loop(state.clone()));
+    }
     let Some(dk) = device_key() else {
         tracing::debug!("cloud sync watch: no device-key (unpaired); not started");
         return;
@@ -756,19 +765,6 @@ pub fn spawn_watchers(state: Arc<AppState>) {
     // with the vaults already watched above so it only spawns for NEW ones.
     let watched: std::collections::HashSet<String> =
         synced_vault_ids(&cfg).into_iter().collect();
-    // §15 account principal ledger: pull + verify + (flag-gated) enforce a VERIFIED
-    // self-revoke (lock + wipe all + logout). The anchor is the account's owner-UIK
-    // us_ pinned at login (NOT the account UUID) — self-certifying. Dormant until
-    // SAFECLAW_PRINCIPAL_ENFORCE is on (the P6 cutover flips the default). Uses clones
-    // so the discovery loop below still takes ownership.
-    if let Some(anchor_uik) = active::account_uik() {
-        tokio::spawn(crate::principal_ledger::principal_ledger_loop(
-            state.clone(),
-            cloud.clone(),
-            dk.clone(),
-            anchor_uik,
-        ));
-    }
     tokio::spawn(discovery_reconcile_loop(state, cloud, dk, watched));
 }
 
@@ -1148,13 +1144,9 @@ pub(crate) async fn drop_local_vault_locked(state: &Arc<AppState>, vault: &str) 
 /// (the caller stops this vault's watcher — a later pull would re-adopt the triple).
 /// SAFE: acts ONLY on a `Verified`, non-empty fold that EXCLUDES our `us_`
 /// ([`PerItemVault::verified_membership`] = `Some(false)`); an untrusted / rolled-back
-/// / bootstrap / personal-`NoUik` vault yields `None` → parks. Flag-gated (default OFF,
-/// P6 flips it). Recoverable if ever wrong: the discovery loop won't re-add a
+/// / bootstrap / personal-`NoUik` vault yields `None` → parks. Recoverable if ever wrong: the discovery loop won't re-add a
 /// non-member vault, and a re-invite + passkey re-unlock restores it.
 async fn enforce_membership_presence(state: &Arc<AppState>, vault: &str) -> bool {
-    if !crate::principal_ledger::principal_enforce_enabled() {
-        return false;
-    }
     let Some(us) = active::account_uik() else {
         return false;
     };
@@ -1173,39 +1165,69 @@ async fn enforce_membership_presence(state: &Arc<AppState>, vault: &str) -> bool
 }
 
 /// §15 leg A: decide whether a `status:"deleted"` tombstone should DROP local state.
-/// Dual-path: with the require-signed flag OFF (default) ANY tombstone drops — the
-/// legacy behavior, byte-for-byte unchanged. With it ON, drop ONLY on an owner-signed
-/// tombstone (`tombstone_sig`/`tombstone_signer` in the body) that verifies against the
-/// vault's fold-owner set; a server flipping `status` without a valid owner signature is
-/// then REJECTED (parked), not obeyed. NEVER acts on a bare 401 (that path parks
-/// upstream) — this only gates an explicit deleted-status body.
+/// Every vault with a keyset drops ONLY on an owner-signed tombstone
+/// (`tombstone_sig` / `tombstone_signer` in the body): on a shared (v2) keyset the
+/// signer must be an admin in the vault's verified fold; on a personal (v1)
+/// keyset, the paired account whose key was pinned at pairing. A server flipping
+/// `status` without a valid owner signature is refused (parked), never obeyed.
+/// A vault with no local keyset holds nothing to protect and drops. NEVER acts on
+/// a bare 401 (that path parks upstream): this only gates an explicit
+/// deleted-status body.
 fn tombstone_should_drop(state_dir: &Path, vault: &str, body: &serde_json::Value) -> bool {
-    if !crate::principal_ledger::require_signed_tombstone() {
-        return true; // legacy dual-path: unsigned deletes still drop until the P6 flip
-    }
-    // No per-item keyset at all (a pure legacy fmt1 vault, or one never synced here) → no
-    // fold-owner to verify against and no fmt2 K/blob to protect → keep the legacy drop
-    // (F3: require-signed must never STRAND a legacy delete, only harden fmt2).
     let Some(pv) = read_per_item_store(state_dir, vault) else {
         return true;
     };
-    if pv.is_legacy_nouik(vault) {
-        return true; // legacy NoUik vault: no signed owner set → legacy drop
-    }
-    // fmt2 vault: require a verified owner tombstone; an unsigned/forged delete parks.
+    tombstone_verified_for(&pv, vault, body, active::account_uik_pub())
+}
+
+/// [`tombstone_should_drop`] for a vault with a keyset (unit-testable).
+fn tombstone_verified_for(
+    pv: &sealed_vault::PerItemVault,
+    vault: &str,
+    body: &serde_json::Value,
+    account_pub: Option<[u8; 32]>,
+) -> bool {
     let (Some(sig), Some(signer)) = (
         body.get("tombstone_sig").and_then(|v| v.as_str()).filter(|s| !s.is_empty()),
         body.get("tombstone_signer").and_then(|v| v.as_str()).filter(|s| !s.is_empty()),
     ) else {
-        tracing::warn!(vault = %vault, "tombstone: require-signed ON but the delete carries no owner signature; NOT dropping");
+        tracing::warn!(vault = %vault, "tombstone: the delete carries no owner signature; NOT dropping");
         return false;
     };
-    if pv.tombstone_verified(vault, signer, sig) {
-        true
+    let verified = if pv.keyset.uik.is_some() {
+        pv.tombstone_verified(vault, signer, sig)
     } else {
+        personal_tombstone_verified(vault, signer, sig, account_pub)
+    };
+    if !verified {
         tracing::warn!(vault = %vault, signer = %signer, "tombstone: owner signature did NOT verify; NOT dropping (possible server-forged delete)");
-        false
     }
+    verified
+}
+
+/// A personal (v1 keyset) vault's tombstone: signed by the paired account
+/// (`signer` = the pinned `account_uik`, verified under its pinned key).
+fn personal_tombstone_verified(
+    vault: &str,
+    signer: &str,
+    sig_b64: &str,
+    account_pub: Option<[u8; 32]>,
+) -> bool {
+    use base64::Engine as _;
+    let Some(pk) = account_pub else {
+        return false;
+    };
+    if crate::identity::derive_id(crate::identity::IdKind::User, &pk) != signer {
+        return false;
+    }
+    let Some(sig) = base64::engine::general_purpose::STANDARD
+        .decode(sig_b64)
+        .ok()
+        .and_then(|v| <[u8; 64]>::try_from(v.as_slice()).ok())
+    else {
+        return false;
+    };
+    crate::identity::verify(&pk, &crate::identity::vault_tombstone_input(vault), &sig)
 }
 
 /// After a runtime pull wrote a new `vault.dat`, refresh the in-memory cache
@@ -1404,185 +1426,6 @@ async fn recover_after_conflict(
     // vault.dat and re-PUTs, so the fan-out is covered without the recursive edge.
     crate::auth::connect::apply_pending_connects(state, vault_id, None).await;
     true
-}
-
-/// The account's agent roster as served by `/api/vault/agents/hashes`: the
-/// broker-authorizing key hashes, plus (from a backend that serves them) the
-/// `ag_` ids of every agent registered to the account.
-struct AgentRoster {
-    hashes: std::collections::HashSet<String>,
-    /// `None` when the backend omits `agent_ids` (an older backend): the
-    /// account-ownership check stays off rather than refuse on missing data.
-    agent_ids: Option<std::collections::HashSet<String>>,
-}
-
-/// Parse the `/api/vault/agents/hashes` body. `None` if `keys` is missing.
-fn parse_agent_roster(body: &serde_json::Value) -> Option<AgentRoster> {
-    let keys = body.get("keys")?.as_array()?;
-    let hashes = keys
-        .iter()
-        .filter_map(|k| {
-            k.get("hash")
-                .and_then(|h| h.as_str())
-                .map(|s| s.to_string())
-        })
-        .collect();
-    let agent_ids = body.get("agent_ids").and_then(|v| v.as_array()).map(|ids| {
-        ids.iter()
-            .filter_map(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
-            .collect()
-    });
-    Some(AgentRoster { hashes, agent_ids })
-}
-
-/// Fetch the account-level agent roster (`/api/vault/agents/hashes`,
-/// device-key authed). Returns None on any failure (caller keeps the prior
-/// state). The hashes are sha256(token) hex — the broker validates a presented
-/// key by re-hashing and checking membership; the cloud never sees plaintext.
-async fn fetch_agent_roster(
-    client: &reqwest::Client,
-    cloud: &str,
-    device_key: &str,
-) -> Option<AgentRoster> {
-    let url = format!("{}/api/vault/agents/hashes", cloud.trim_end_matches('/'));
-    let resp = client
-        .get(&url)
-        .bearer_auth(device_key)
-        .dik_pop("GET", &url, &[])
-        .send()
-        .await
-        .ok()?;
-    if !resp.status().is_success() {
-        return None;
-    }
-    let body: serde_json::Value = resp.json().await.ok()?;
-    parse_agent_roster(&body)
-}
-
-/// One-shot refresh of the broker's agent-key hash-set. Best-effort + gated
-/// like the blob sync (no-op for a local-only/unpaired daemon). Call once
-/// before serving so the broker accepts account agent-keys from the start.
-pub async fn sync_agent_keys_once(state: &Arc<AppState>) {
-    sync_agent_keys_with_timeout(state, Duration::from_secs(15)).await;
-}
-
-async fn sync_agent_keys_with_timeout(state: &Arc<AppState>, timeout: Duration) {
-    let cfg = match active::load() {
-        Ok(c) => c,
-        Err(_) => return,
-    };
-    let Some(cloud) = cfg.cloud_backend.as_deref().filter(|s| !s.is_empty()) else {
-        return;
-    };
-    let Some(dk) = device_key() else {
-        return;
-    };
-    let client = match crate::cli::egress_proxy::client(timeout) {
-        Ok(c) => c,
-        Err(_) => return,
-    };
-    if let Some(roster) = fetch_agent_roster(&client, cloud, &dk).await {
-        let n = roster.hashes.len();
-        // Log only when the set actually moved — this runs on a 30s loop, and
-        // an unconditional line here is the daemon's loudest idle chatter.
-        if state.set_agent_key_hashes(roster.hashes) {
-            tracing::info!(count = n, "agent-key hash-set updated");
-        }
-        state.set_account_agent_ids(roster.agent_ids);
-    }
-}
-
-/// Is the verified agent `agent_id` one this machine's paired account does
-/// NOT have (`agent_not_in_account`)? A machine is paired to exactly one account
-/// and its agents act as that account; an AIK not registered to it (set up under
-/// another account, or removed) is refused here, before any vault-level check. Fails closed only on a positive
-/// answer from the account's own roster: when the roster is unknown it says
-/// `false`, and on a miss it first re-pulls the roster once (debounced, like a
-/// key miss) so an agent added to this account seconds ago is never refused.
-pub async fn agent_not_in_account(state: &Arc<AppState>, agent_id: &str) -> bool {
-    if !state.agent_outside_account(agent_id) {
-        return false;
-    }
-    refresh_agent_keys_on_miss(state).await;
-    state.agent_outside_account(agent_id)
-}
-
-/// One serialized refresh on an agent-key AUTH MISS. A key minted seconds ago
-/// (`sc agent add` prints the agent's env → the agent uses it immediately)
-/// would otherwise sit invalid for up to the 30s loop interval — the exact
-/// window the install flow now hits. The tokio Mutex is held ACROSS the fetch:
-/// a concurrent miss WAITS for the in-flight refresh (then sees the fresh
-/// stamp) instead of being bounced to a reject, and a bad-key flood is capped
-/// at one outstanding backend call per 2s window. The short 3s timeout bounds
-/// the reject path's latency when the backend is down. Always returns true =
-/// "the hash-set is now as fresh as it gets — re-check membership".
-pub async fn refresh_agent_keys_on_miss(state: &Arc<AppState>) -> bool {
-    const DEBOUNCE: Duration = Duration::from_secs(2);
-    let mut last = state.agent_key_resync.lock().await;
-    if matches!(*last, Some(t) if t.elapsed() < DEBOUNCE) {
-        return true;
-    }
-    *last = Some(std::time::Instant::now());
-    sync_agent_keys_with_timeout(state, Duration::from_secs(3)).await;
-    true
-}
-
-/// Agent-hash poll cadence while the SSE stream is healthy (v1.1): the
-/// stream's `agent_hashes` event plus the resync-on-reconnect fire are the
-/// propagation path, so this poll is pure belt-and-suspenders — 600s keeps
-/// the documented bound ("revocation: instant, worst case 10 min"; Railway's
-/// ≤15-min rotation forces the reconnect resync regardless). Add-key latency
-/// is independent of the cadence either way: `refresh_agent_keys_on_miss`
-/// refetches on first sight of an unknown key.
-const AGENT_KEYS_CADENCE_STREAMED: Duration = Duration::from_secs(600);
-/// Stream down or `sync_stream=off`: the pre-v1.1 30s — degraded
-/// environments keep the poll as their ONLY propagation path.
-const AGENT_KEYS_CADENCE_POLL: Duration = Duration::from_secs(30);
-
-/// Cadence selection, factored for the unit test. The relaxed cadence needs
-/// PROOF the events can reach us (`agent_hash_events_live()`: live stream
-/// AND the backend declared the cap in hello) — bare stream health would
-/// relax the poll against a v1-only backend that never emits the event.
-fn agent_keys_cadence(agent_hash_events_live: bool) -> Duration {
-    if agent_hash_events_live {
-        AGENT_KEYS_CADENCE_STREAMED
-    } else {
-        AGENT_KEYS_CADENCE_POLL
-    }
-}
-
-/// Periodically refresh the agent-key hash-set so a dashboard revoke / a newly
-/// added agent takes effect on this daemon. Detached, best-effort. v1.1:
-/// event-driven — the SSE dispatcher fires the agent-hash notify on an
-/// `agent_hashes` stream event AND after every reconnect hello, either of
-/// which resyncs immediately; the sleep is the fallback bound, mode-sized by
-/// stream health. Logging stays inside `sync_agent_keys_once` (only on a
-/// hash-set CHANGE), so neither wake source adds idle chatter.
-pub async fn sync_agent_keys_loop(state: Arc<AppState>) {
-    /// ★ Storm floor, mirroring `refresh_agent_keys_on_miss`'s 2s debounce:
-    /// a chatty/buggy stream costs ≤1 hash-set fetch per 2s, never
-    /// RTT-speed refetching (each fetch builds a fresh client = TLS).
-    const FETCH_FLOOR: Duration = Duration::from_secs(2);
-    loop {
-        sync_agent_keys_once(&state).await;
-        let fetched = tokio::time::Instant::now();
-        // Arm AFTER the fetch: `notify_one` parks a permit, so an event that
-        // fired mid-fetch completes this wait instantly (one redundant
-        // cursor-cheap refetch at worst, never a lost revoke).
-        loop {
-            tokio::select! {
-                _ = crate::sync_stream::agent_hashes_notified() => break,
-                _ = tokio::time::sleep(agent_keys_cadence(crate::sync_stream::agent_hash_events_live())) => break,
-                // A health flip mid-sleep re-sizes the wait: a 600s streamed
-                // sleep must not ride across an Up→Down flip — the 30s
-                // Down-mode promise is per-mode, not per-cycle.
-                _ = crate::sync_stream::stream_health_edge() => continue,
-            }
-        }
-        tokio::time::sleep_until(fetched + FETCH_FLOOR).await;
-    }
 }
 
 // ── Audit shipper (de-daemon, DE_DAEMON.md §4) ──────────────────────────────
@@ -1969,22 +1812,11 @@ pub async fn watch_loop(
             // lifecycle authority (design doc) — the same trust as the blob
             // channel's body (authenticated TLS to our own backend), and an
             // explicit "deleted" stays the ONLY local-state destroyer.
-            if let Some((version, status)) = work.vault {
-                if status == VaultStatus::Deleted {
-                    // §15 leg A: the SSE vault EVENT carries no tombstone signature, so
-                    // it can direct-drop only under the legacy (flag-OFF) path. With
-                    // require-signed ON, do NOT drop/stop here — fall through so the
-                    // reconcile blob probe re-fetches the SIGNED tombstone body, which
-                    // `handle_blob_wake_body` gates against the fold-owner set.
-                    if !crate::principal_ledger::require_signed_tombstone() {
-                        drop_local_vault_locked(&state, &vault).await;
-                        tracing::info!(vault = %vault, "cloud sync: vault deleted upstream; dropped local state");
-                        // Task exit drops the sole strong ref to the cell; the
-                        // dispatcher prunes this vid from `?vids` at its next
-                        // reconnect.
-                        return;
-                    }
-                }
+            if let Some((version, _status)) = work.vault {
+                // §15 leg A: the SSE vault EVENT carries no tombstone signature, so
+                // a `deleted` status never drops here: the blob probe below
+                // re-fetches the SIGNED tombstone body, which
+                // `handle_blob_wake_body` verifies before any drop.
                 // ★ Cursor re-read from disk at use time, never cached across
                 // parks — the loop-top discipline the long-poll shape gets
                 // for free.
@@ -5822,6 +5654,48 @@ mod peritem_tests {
     use crate::storage::sealed_vault::PerItemVault;
     use sudp::primitives::StdPrimitives;
 
+    /// §15 W1: a vault with a keyset drops only on a VERIFIED owner tombstone.
+    /// Unsigned or forged deletes never drop, on a personal (v1) keyset (signed
+    /// by the paired account's pinned key) or a shared (v2) one (an admin of
+    /// the verified fold).
+    #[test]
+    fn an_unsigned_tombstone_on_a_keyset_vault_never_drops() {
+        use base64::Engine as _;
+        let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+        let vid = "vault-tomb";
+        let me = crate::identity::SigningIdentity::from_seed(&[0x41u8; 32]);
+        let other = crate::identity::SigningIdentity::from_seed(&[0x42u8; 32]);
+        let input = crate::identity::vault_tombstone_input(vid);
+        let signed = |who: &crate::identity::SigningIdentity| {
+            serde_json::json!({
+                "status": "deleted",
+                "tombstone_sig": b64(&who.sign(&input)),
+                "tombstone_signer": who.user_id(),
+            })
+        };
+        let unsigned = serde_json::json!({ "status": "deleted" });
+
+        // Personal (v1 keyset): the paired account's key.
+        let pv = empty_pv();
+        let pin = Some(me.public_bytes());
+        assert!(!tombstone_verified_for(&pv, vid, &unsigned, pin), "unsigned");
+        assert!(tombstone_verified_for(&pv, vid, &signed(&me), pin), "the account");
+        assert!(!tombstone_verified_for(&pv, vid, &signed(&other), pin), "someone else");
+        assert!(!tombstone_verified_for(&pv, vid, &signed(&me), None), "no pinned key");
+        assert!(!tombstone_verified_for(&pv, "vault-other", &signed(&me), pin), "another vault");
+
+        // Shared (v2 keyset): an admin of the verified fold.
+        let (svid, creator, _b, _cid, _bid, spv) =
+            crate::storage::sealed_vault::tests::role_fixture_creator_cred();
+        let sinput = crate::identity::vault_tombstone_input(svid);
+        let admin = serde_json::json!({
+            "tombstone_sig": b64(&creator.signing().sign(&sinput)),
+            "tombstone_signer": creator.user_id(),
+        });
+        assert!(!tombstone_verified_for(&spv, svid, &unsigned, None), "unsigned");
+        assert!(tombstone_verified_for(&spv, svid, &admin, None), "the admin");
+    }
+
     fn empty_pv() -> PerItemVault {
         PerItemVault::build_initial(
             b"c".to_vec(),
@@ -8304,70 +8178,6 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    /// The roster parse: hashes as before, plus the account's `ag_` ids when the
-    /// backend serves them. An older backend (no `agent_ids`) yields `None`, which
-    /// keeps the account-ownership check off.
-    #[test]
-    fn agent_roster_parses_ids_only_when_served() {
-        let r = parse_agent_roster(&serde_json::json!({
-            "keys": [{ "hash": "h1" }, { "hash": "h2" }],
-            "agent_ids": ["ag_a", "", 7, "ag_b"],
-        }))
-        .unwrap();
-        assert_eq!(r.hashes.len(), 2);
-        let ids = r.agent_ids.unwrap();
-        assert_eq!(ids.len(), 2);
-        assert!(ids.contains("ag_a") && ids.contains("ag_b"));
-
-        let old = parse_agent_roster(&serde_json::json!({ "keys": [{ "hash": "h1" }] })).unwrap();
-        assert!(old.agent_ids.is_none());
-        // An empty roster is a KNOWN empty account, not "unknown".
-        let empty =
-            parse_agent_roster(&serde_json::json!({ "keys": [], "agent_ids": [] })).unwrap();
-        assert_eq!(empty.agent_ids.map(|s| s.len()), Some(0));
-        assert!(parse_agent_roster(&serde_json::json!({})).is_none());
-    }
-
-    /// `agent_not_in_account` fires only on a positive answer from the paired
-    /// account's roster: unknown roster → never; this account's agent → never;
-    /// an agent absent from the roster (after the debounced re-pull) → yes.
-    #[tokio::test]
-    async fn not_in_account_needs_a_known_roster() {
-        let dir = tempdir().unwrap();
-        let cfg = crate::config::Config {
-            state_dir: dir.path().to_path_buf(),
-            port: 0,
-            proxy_port: 0,
-            listen: "127.0.0.1".into(),
-            origin: "http://localhost".into(),
-            relying_party: crate::passkey::webauthn::RelyingParty::exact(
-                "http://localhost",
-                "localhost",
-            ),
-            admin_key: None,
-            relay_url: None,
-            body_cap: crate::config::DEFAULT_BODY_CAP,
-        };
-        let state = Arc::new(AppState::new(cfg));
-        // Pre-debounce the on-miss re-pull: no network in tests.
-        *state.agent_key_resync.lock().await = Some(std::time::Instant::now());
-
-        assert!(
-            !agent_not_in_account(&state, "ag_x").await,
-            "unknown roster"
-        );
-        state.set_account_agent_ids(Some(["ag_mine".to_string()].into_iter().collect()));
-        assert!(!agent_not_in_account(&state, "ag_mine").await);
-        assert!(agent_not_in_account(&state, "ag_x").await);
-        // A backend that stops serving ids turns the check back off.
-        state.set_account_agent_ids(None);
-        assert!(!agent_not_in_account(&state, "ag_x").await);
-    }
-
-    /// The format gate reads every format up to and including the one this
-    /// build knows, and only a NEWER one trips the loud upgrade path.
-    /// A refused request ships with why, as its code only: the destination
-    /// host as its target, never the local free-text reason.
     #[test]
     fn an_audit_event_carries_the_refusal_code_and_no_reason() {
         let row = crate::audit::ApprovalRow {
@@ -8439,15 +8249,6 @@ mod tests {
             assert!(!vault_format_too_new(f), "format {f} is readable");
         }
         assert!(vault_format_too_new(SUPPORTED_VAULT_FORMAT + 1));
-    }
-
-    /// v1.1 mode-dependent agent-hash cadence: 600s while the stream carries
-    /// the events (poll = belt-and-suspenders), the legacy 30s when the poll
-    /// is the only propagation path.
-    #[test]
-    fn agent_keys_cadence_is_mode_dependent() {
-        assert_eq!(agent_keys_cadence(true), Duration::from_secs(600));
-        assert_eq!(agent_keys_cadence(false), Duration::from_secs(30));
     }
 
     /// The browser assembles the blob client-side; this guards that the exact

@@ -2657,14 +2657,6 @@ impl PerItemVault {
         crate::identity::verify(&pub32, &crate::identity::vault_tombstone_input(vault_id), &sig)
     }
 
-    /// §15 leg A: is this a legacy fmt1 / NoUik vault (no signed owner set)? Such a vault
-    /// has no fold-owner to verify a tombstone against, so the require-signed gate cannot
-    /// apply — the caller keeps the legacy UNSIGNED drop for it (fmt1 is being retired; a
-    /// fmt2 vault's owner signs the tombstone). Never blocks a legacy delete from propagating.
-    pub(crate) fn is_legacy_nouik(&self, vault_id: &str) -> bool {
-        matches!(self.resolve_membership_trust(vault_id), MembershipTrust::NoUik)
-    }
-
     /// The `us_…` ids this keyset seats under one of THIS device's own passkeys:
     /// entries keyed by a credential id that has a WebAuthn pubkey in the registry
     /// (the membership triple keys only the caller's own member under its cids;
@@ -5655,7 +5647,7 @@ pub(crate) mod tests {
             vec![0u8; 48],
         )
         .unwrap();
-        assert!(pv.is_legacy_nouik(vid));
+        assert!(pv.keyset.uik.is_none(), "a v1 keyset");
         let native = "ag_abcdefghijklmnopqrstuvwxyz234567";
         let legacy_ag = "ag_765432zyxwvutsrqponmlkjihgfedcba";
         let body = serde_json::to_value(AgentEntry::default()).unwrap();

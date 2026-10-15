@@ -34,11 +34,11 @@ pub async fn create(
     // Requester attribution: verified from the agent's proof over this exact
     // op, else none (see `attribute_agent`).
     let agent = attribute_agent(&headers, &vault_id, &mut op, crate::util::now_unix());
-    // An agent not registered to this machine's account is refused
-    // before any vault-level check (and before the op reaches the relay).
+    // An agent the account ledger does not admit is refused before any
+    // vault-level check (and before the op reaches the relay).
     if let Some(ag) = agent.as_deref() {
-        if crate::sync::agent_not_in_account(&state, ag).await {
-            return Err(AppError::AgentNotInAccount);
+        if crate::principal_ledger::agent_not_admitted(&state, ag).await {
+            return Err(AppError::AgentNotAdmitted);
         }
     }
     create_op::<crate::service::source::github::GitHubHttp>(
@@ -67,6 +67,11 @@ pub(crate) async fn create_op<A: crate::service::source::github::GitHubApi>(
     api: Option<&A>,
 ) -> Result<Value> {
     let state = state.clone();
+    // §15: a device that is not admitted, past its lease, or revoked unlocks
+    // nothing and raises no op.
+    if let Some(e) = state.ledger_refusal() {
+        return Err(e);
+    }
     validate_vault_id(&vault_id)?;
     reject_broker_kind(&op.act.kind)?;
     check_scope_shape(&op.act.scope)?;
@@ -673,7 +678,11 @@ mod tests {
             relay_url: None,
             body_cap: crate::config::DEFAULT_BODY_CAP,
         };
-        AppState::new(cfg)
+        {
+            let s = AppState::new(cfg);
+            s.open_ledger_for_tests(&[]);
+            s
+        }
     }
 
     /// RED LINE (verified invariant — see the export/allow discussion): an
@@ -860,6 +869,7 @@ mod tests {
     async fn valid_op_pop_stamps_the_agent() {
         let state = Arc::new(test_state());
         let s = agent_signer();
+        state.open_ledger_for_tests(&[s.agent_id()]);
         let op = rm_op(Value::Null);
         let tok = s.op_token("v1", &op, crate::util::now_unix()).unwrap();
         let body = create_with(&state, op, pop_headers(&tok)).await;
@@ -868,17 +878,17 @@ mod tests {
         assert_eq!(rec_agent.as_deref(), Some(s.agent_id()));
     }
 
-    /// A ceremony from an agent not registered to this machine's account
-    /// is refused with `agent_not_in_account` before any op exists; the same
-    /// request from one of this account's agents goes through. The roster
-    /// re-pull on a miss is pre-debounced so the test makes no network call.
+    /// A ceremony from an agent the account ledger does not admit is refused
+    /// with `agent_not_admitted` before any op exists; the same request from
+    /// an admitted agent goes through. The on-miss re-pull is pre-debounced so
+    /// the test makes no network call.
     #[tokio::test]
-    async fn agent_not_in_account_is_refused_before_the_op() {
+    async fn an_agent_the_ledger_does_not_admit_is_refused_before_the_op() {
         let state = Arc::new(test_state());
-        *state.agent_key_resync.lock().await = Some(std::time::Instant::now());
+        *state.ledger_sync.lock().await = Some(std::time::Instant::now());
         let s = agent_signer();
         let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
-        state.set_account_agent_ids(Some(["ag_someone_else".to_string()].into_iter().collect()));
+        state.open_ledger_for_tests(&["ag_someone_else"]);
         let op = rm_op(Value::Null);
         let tok = s.op_token("v1", &op, crate::util::now_unix()).unwrap();
         let err = create(
@@ -890,13 +900,38 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert_eq!(err.code().0.as_str(), "agent_not_in_account");
+        assert_eq!(err.code().0.as_str(), "agent_not_admitted");
 
-        state.set_account_agent_ids(Some([s.agent_id().to_string()].into_iter().collect()));
+        state.open_ledger_for_tests(&[s.agent_id()]);
         let op = rm_op(Value::Null);
         let tok = s.op_token("v1", &op, crate::util::now_unix()).unwrap();
         let body = create_with(&state, op, pop_headers(&tok)).await;
         assert_eq!(attribution(&state, &body).0.as_deref(), Some(s.agent_id()));
+    }
+
+    /// §15: a device that is not admitted, or past its lease, raises no op
+    /// (so it can never be unlocked).
+    #[tokio::test]
+    async fn a_parked_or_stale_device_raises_no_op() {
+        use crate::principal_ledger::{DeviceGate, LedgerGate};
+        let state = Arc::new(test_state());
+        let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+        for (device, code) in [
+            (DeviceGate::NotAdmitted, "device_not_admitted"),
+            (DeviceGate::Stale, "ledger_stale"),
+        ] {
+            state.set_ledger(LedgerGate { device, agents: None });
+            let err = create(
+                State(state.clone()),
+                ConnectInfo(addr),
+                Path("v1".into()),
+                HeaderMap::new(),
+                Json(rm_op(Value::Null)),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.code().0.as_str(), code);
+        }
     }
 
     /// No proof, a proof over a different op, a proof for another vault, or a

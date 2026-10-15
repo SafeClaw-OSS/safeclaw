@@ -75,6 +75,12 @@ pub enum ScCode {
     /// The account owner revoked this device (a verified revoke in the
     /// head-checked ledger, contract C6/C5). The daemon latches it.
     LedgerDeviceRevoked,
+    /// A verified agent AIK whose `ag_` the account ledger does not admit (never
+    /// approved, or revoked): refused on every vault, whatever its table lists.
+    AgentNotAdmitted,
+    /// No verified ledger pull for 7 days (the lease): vaults are locked until
+    /// one succeeds. Data stays on disk.
+    LedgerStale,
     BrokerBodyLimit,
     EgressUnreachable,
     ExposesUnsupported,
@@ -215,6 +221,20 @@ impl ScCode {
                 "This device was removed from the account",
                 "configure",
                 "auth",
+            ),
+            AgentNotAdmitted => (
+                403,
+                "agent_not_admitted",
+                "Agent not admitted to this account",
+                "configure",
+                "auth",
+            ),
+            LedgerStale => (
+                423,
+                "ledger_stale",
+                "Locked: account unreachable for 7 days",
+                "retry",
+                "environment",
             ),
             ApprovalRegister => (
                 503,
@@ -361,8 +381,17 @@ pub const VAULT_LOCKED_MSG: &str = "vault locked. Run `sc unlock`, then retry";
 pub const DEVICE_NOT_ADMITTED_MSG: &str =
     "This device needs to be paired again: run `sc login`.";
 
-/// The ONE remediation line for [`ScCode::AgentNotInAccount`], shared by every
-/// surface that raises it (proxy plane, API face, control plane).
+/// The ONE remediation line for [`ScCode::AgentNotAdmitted`].
+pub const AGENT_NOT_ADMITTED_MSG: &str = "This agent isn't admitted to the SafeClaw account this machine is signed in to (never approved, or removed). Run `sc agent add` to set it up again.";
+
+/// The ONE remediation line for [`ScCode::LedgerStale`].
+pub const LEDGER_STALE_MSG: &str = "locked: SafeClaw could not reach your account for 7 days. Check this machine's network; vaults unlock again once it reconnects (`sc up`).";
+
+/// The ONE remediation line for [`ScCode::LedgerDeviceRevoked`].
+pub const LEDGER_DEVICE_REVOKED_MSG: &str = "This device was removed from your SafeClaw account. Run `sc login` to pair it again.";
+
+/// The remediation line for [`ScCode::AgentNotInAccount`] (raised by the cloud
+/// op relay; the daemon answers [`ScCode::AgentNotAdmitted`]).
 pub const AGENT_NOT_IN_ACCOUNT_MSG: &str = "This agent isn't registered to the SafeClaw account this machine is signed in to. Run `sc agent add` to set it up.";
 
 /// RFC 9457 `application/problem+json` body for a code + detail message.
@@ -403,9 +432,6 @@ pub enum AppError {
     /// The grant's signer may not approve this op (see
     /// `ScCode::ApproverNotAuthorized`). The op stays pending.
     ApproverNotAuthorized(String),
-    /// The requesting agent isn't registered to this machine's account (see
-    /// `ScCode::AgentNotInAccount`).
-    AgentNotInAccount,
     /// A grant delivered an unlock secret instead of the vault key (see
     /// `ScCode::WkRefusedV2`). The op stays pending.
     WkRefused(String),
@@ -414,6 +440,12 @@ pub enum AppError {
     GrantIdInvalid(String),
     /// This device has no valid admit (see `ScCode::DeviceNotAdmitted`).
     DeviceNotAdmitted,
+    /// The ledger lease ran out (see `ScCode::LedgerStale`).
+    LedgerStale,
+    /// This device was revoked (see `ScCode::LedgerDeviceRevoked`).
+    LedgerDeviceRevoked,
+    /// The agent is not admitted by the ledger (see `ScCode::AgentNotAdmitted`).
+    AgentNotAdmitted,
 }
 
 impl AppError {
@@ -431,15 +463,20 @@ impl AppError {
             AppError::TooManyRequests => (ScCode::RateLimited, "Rate limit exceeded".to_string()),
             AppError::BatchVerify(msg) => (ScCode::BatchVerifyFailed, msg.clone()),
             AppError::ApproverNotAuthorized(msg) => (ScCode::ApproverNotAuthorized, msg.clone()),
-            AppError::AgentNotInAccount => (
-                ScCode::AgentNotInAccount,
-                AGENT_NOT_IN_ACCOUNT_MSG.to_string(),
-            ),
             AppError::WkRefused(msg) => (ScCode::WkRefusedV2, msg.clone()),
             AppError::GrantIdInvalid(msg) => (ScCode::GrantIdInvalid, msg.clone()),
             AppError::DeviceNotAdmitted => (
                 ScCode::DeviceNotAdmitted,
                 DEVICE_NOT_ADMITTED_MSG.to_string(),
+            ),
+            AppError::LedgerStale => (ScCode::LedgerStale, LEDGER_STALE_MSG.to_string()),
+            AppError::LedgerDeviceRevoked => (
+                ScCode::LedgerDeviceRevoked,
+                LEDGER_DEVICE_REVOKED_MSG.to_string(),
+            ),
+            AppError::AgentNotAdmitted => (
+                ScCode::AgentNotAdmitted,
+                AGENT_NOT_ADMITTED_MSG.to_string(),
             ),
             AppError::Internal(msg) => {
                 tracing::error!("internal error: {}", msg);
@@ -485,10 +522,12 @@ impl std::fmt::Display for AppError {
             AppError::Internal(msg) => write!(f, "Internal error: {}", msg),
             AppError::BatchVerify(msg) => write!(f, "Batch verification failed: {}", msg),
             AppError::ApproverNotAuthorized(msg) => write!(f, "Approver not authorized: {}", msg),
-            AppError::AgentNotInAccount => write!(f, "{}", AGENT_NOT_IN_ACCOUNT_MSG),
             AppError::WkRefused(msg) => write!(f, "Grant refused: {}", msg),
             AppError::GrantIdInvalid(msg) => write!(f, "Approval signature invalid: {}", msg),
             AppError::DeviceNotAdmitted => write!(f, "{}", DEVICE_NOT_ADMITTED_MSG),
+            AppError::LedgerStale => write!(f, "{}", LEDGER_STALE_MSG),
+            AppError::LedgerDeviceRevoked => write!(f, "{}", LEDGER_DEVICE_REVOKED_MSG),
+            AppError::AgentNotAdmitted => write!(f, "{}", AGENT_NOT_ADMITTED_MSG),
         }
     }
 }
@@ -547,6 +586,8 @@ mod tests {
             DeviceNotAdmitted,
             LedgerHeadInvalid,
             LedgerDeviceRevoked,
+            AgentNotAdmitted,
+            LedgerStale,
             BrokerBodyLimit,
             EgressUnreachable,
             ExposesUnsupported,
@@ -603,24 +644,19 @@ mod tests {
         }
     }
 
-    /// The not-in-account refusal is its own code with the `sc agent add` fix,
+    /// The not-admitted refusal is its own code with the `sc agent add` fix,
     /// never the vault-level `agent_not_authorized`.
     #[test]
-    fn agent_not_in_account_row() {
-        let (code, detail) = AppError::AgentNotInAccount.code();
-        assert_eq!(code.as_str(), "agent_not_in_account");
+    fn agent_not_admitted_row() {
+        let (code, detail) = AppError::AgentNotAdmitted.code();
+        assert_eq!(code.as_str(), "agent_not_admitted");
         assert_eq!(code.status(), 403);
         assert_eq!(code.row().3, "configure");
-        assert!(detail.contains("isn't registered to the SafeClaw account"));
-        assert!(
-            !detail.contains('\n') && !detail.contains('\u{2014}'),
-            "one line, no em dash"
-        );
         assert!(detail.contains("`sc agent add`"));
-        assert!(
-            !detail.contains("  "),
-            "no doubled spaces from line continuation"
-        );
+        assert!(!detail.contains('\n') && !detail.contains('\u{2014}'), "one line, no em dash");
+        let (code, detail) = AppError::LedgerStale.code();
+        assert_eq!((code.as_str(), code.status()), ("ledger_stale", 423));
+        assert!(detail.starts_with("locked: SafeClaw could not reach your account for 7 days"));
     }
 
     /// problem_body carries both the 9457 members and the legacy dual-emit.

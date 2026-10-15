@@ -567,9 +567,8 @@ pub enum AgentSubcommand {
     Add(AgentAddArgs),
     /// List this account's agents (name, key prefix, last-used).
     Ls,
-    /// Revoke an agent by name (or key prefix / id). Propagates to every
-    /// device in under a second over the sync stream (one poll cycle when a
-    /// device is offline or unstreamed).
+    /// Remove an agent: prints the SafeClaw console page where the owner signs
+    /// the removal. Every device refuses the agent at its next ledger pull.
     Rm(AgentRmArgs),
 }
 
@@ -583,7 +582,7 @@ pub struct AgentAddArgs {
 
 #[derive(Debug, Args)]
 pub struct AgentRmArgs {
-    /// Agent name, key prefix, or id (see `sc agent ls`).
+    /// Agent name (see `sc agent ls`).
     pub name: String,
 }
 

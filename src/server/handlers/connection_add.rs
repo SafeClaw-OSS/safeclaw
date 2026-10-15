@@ -934,7 +934,11 @@ secrets = ["MIXED_KEY"]
             relay_url: None,
             body_cap: crate::config::DEFAULT_BODY_CAP,
         };
-        crate::state::AppState::new(cfg)
+        {
+            let s = crate::state::AppState::new(cfg);
+            s.open_ledger_for_tests(&[]);
+            s
+        }
     }
 
     fn unlock(state: &crate::state::AppState, conns: &[(&str, Connection)], native: &[&str]) {

@@ -129,9 +129,8 @@ pub fn app_router(state: Arc<AppState>) -> Router {
     router
 }
 
-/// The agent-key-gated broker sub-router. Split out so the gate is a layer on
-/// these broker routes only — the control routes in `app_router` keep their own
-/// (passkey / X-Admin-Key / auth-free-localhost) gating untouched.
+/// The agent-facing stub sub-router: `/export` answers that raw export is
+/// disabled (no secret ever leaves here, so it needs no agent credential).
 fn broker_router(state: Arc<AppState>) -> Router {
     use crate::proxy::env;
 
@@ -139,11 +138,6 @@ fn broker_router(state: Arc<AppState>) -> Router {
         // /export → disabled stub (raw-secret export off the agent surface; the
         // op-plane Export ceremony is the human path).
         .route("/v/{vid}/export/{key}", post(env::disabled))
-        // Agent-key gate — scoped to exactly this route.
-        .layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            crate::api_key::require_api_key,
-        ))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state)
 }

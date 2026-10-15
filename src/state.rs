@@ -460,30 +460,14 @@ pub struct AppState {
     /// OwnedSemaphorePermit is stored in each live stream; dropping the
     /// stream drops the permit, automatically releasing the slot.
     pub sse_semaphores: Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>,
-    /// Account-level set of broker-authorizing agent-key HASHES (sha256 hex),
-    /// synced from the cloud (`/api/vault/agents/hashes`). This is the SOLE
-    /// broker auth (agent ≡ api-key): a presented key is valid iff sha256(key)
-    /// is a member. Empty ⇒ reject (a paired daemon requires an agent key; an
-    /// unpaired/local-only daemon has no broker plane to gate). See
-    /// [[project_vault_agent_architecture_2026_06_25]].
-    pub agent_key_hashes: Mutex<std::collections::HashSet<String>>,
-    /// The `ag_` ids of every agent registered to THIS machine's paired account
-    /// (`api_keys.identity_id`), synced alongside [`Self::agent_key_hashes`].
-    /// A machine is paired to exactly one account and its agents act as that
-    /// account, so a verified AIK outside this set isn't registered to it
-    /// (`agent_not_in_account`). `None` = not known (unpaired, not yet
-    /// fetched, or a backend that doesn't serve the ids): the check is then
-    /// off, so it can never refuse an agent of the paired account on missing
-    /// data. A failed fetch keeps the prior set; a re-pair to another account
-    /// restarts the daemon, so the set never outlives its account.
-    pub account_agent_ids: Mutex<Option<std::collections::HashSet<String>>>,
-    /// Serializer + debounce stamp for the on-auth-miss hash refresh
-    /// (`sync::refresh_agent_keys_on_miss`): a key minted seconds ago
-    /// (`sc agent add` → immediate use) must not wait out the 30s sync loop,
-    /// but a bad-key flood must not hammer the backend either. tokio Mutex —
-    /// held ACROSS the refresh fetch so concurrent misses wait for the
-    /// in-flight result instead of being bounced to a reject.
-    pub agent_key_resync: tokio::sync::Mutex<Option<std::time::Instant>>,
+    /// This device's standing in the account principal ledger and the account's
+    /// admitted agents (DESIGN-principal-ledger-enforced W2/W3/W6). Fail closed:
+    /// nothing serves until a decision is loaded ([`crate::principal_ledger::init_gate`]).
+    pub ledger: Mutex<crate::principal_ledger::LedgerGate>,
+    /// Serializes ledger pulls (the loop and the on-miss re-pull) and stamps the
+    /// last one, so an agent miss re-pulls at most once per 2 s. tokio Mutex:
+    /// held across the fetch.
+    pub ledger_sync: tokio::sync::Mutex<Option<std::time::Instant>>,
     /// Single-flight for the allow-path external-store lazy fill
     /// (`lazy_fill_external`): a burst of first requests on a GCP-backed
     /// connection must resolve ONCE, not once per request. tokio Mutex —
@@ -640,9 +624,8 @@ impl AppState {
             sc,
             vault_write_locks: Mutex::new(HashMap::new()),
             sse_semaphores: Mutex::new(HashMap::new()),
-            agent_key_hashes: Mutex::new(std::collections::HashSet::new()),
-            account_agent_ids: Mutex::new(None),
-            agent_key_resync: tokio::sync::Mutex::new(None),
+            ledger: Mutex::new(crate::principal_ledger::LedgerGate::default()),
+            ledger_sync: tokio::sync::Mutex::new(None),
             external_fill_lock: tokio::sync::Mutex::new(()),
             oauth_reauth_needed: Mutex::new(std::collections::HashSet::new()),
             oauth_redeemed_codes: Mutex::new(HashMap::new()),
@@ -744,30 +727,49 @@ impl AppState {
         Some(entry.values)
     }
 
-    /// Replace the synced account-level agent-key hash-set (sha256 hex).
-    /// Returns whether the set actually changed, so the 30s refresh loop can
-    /// log only real updates instead of one line per tick.
-    pub fn set_agent_key_hashes(&self, hashes: std::collections::HashSet<String>) -> bool {
-        let mut cur = self.agent_key_hashes.lock().unwrap();
-        let changed = *cur != hashes;
-        *cur = hashes;
-        changed
+    /// Publish the ledger standing. Anything but `Open` evicts K from every
+    /// vault at once (park / lock / wipe); data stays on disk.
+    pub fn set_ledger(&self, gate: crate::principal_ledger::LedgerGate) {
+        let open = gate.device == crate::principal_ledger::DeviceGate::Open;
+        *self.ledger.lock().unwrap() = gate;
+        if !open {
+            let mut states = self.vault_states.lock().unwrap();
+            for st in states.values_mut() {
+                *st = VaultState::Locked;
+            }
+        }
     }
 
-    /// Replace the synced set of the paired account's agent ids (see
-    /// [`Self::account_agent_ids`]). `None` turns the account check off.
-    pub fn set_account_agent_ids(&self, ids: Option<std::collections::HashSet<String>>) {
-        *self.account_agent_ids.lock().unwrap() = ids;
+    /// Why this device may not unlock or broker right now (the ledger standing),
+    /// or `None` when it is admitted and within the lease.
+    pub fn ledger_refusal(&self) -> Option<crate::error::AppError> {
+        use crate::principal_ledger::DeviceGate;
+        match self.ledger.lock().unwrap().device {
+            DeviceGate::Open => None,
+            DeviceGate::NotAdmitted => Some(crate::error::AppError::DeviceNotAdmitted),
+            DeviceGate::Stale => Some(crate::error::AppError::LedgerStale),
+            DeviceGate::Revoked => Some(crate::error::AppError::LedgerDeviceRevoked),
+        }
     }
 
-    /// Is the verified agent `agent_id` known NOT to be one of the paired
-    /// account's agents? `false` whenever the account's list is unknown, so an
-    /// agent of this account is never refused for lack of data.
-    pub fn agent_outside_account(&self, agent_id: &str) -> bool {
-        matches!(
-            self.account_agent_ids.lock().unwrap().as_ref(),
-            Some(ids) if !ids.contains(agent_id)
-        )
+    /// Does the account ledger admit agent `agent_id` (latest event an admit)?
+    /// `false` with no verified decision (fail closed).
+    pub fn agent_admitted(&self, agent_id: &str) -> bool {
+        self.ledger
+            .lock()
+            .unwrap()
+            .agents
+            .as_ref()
+            .is_some_and(|a| a.contains(agent_id))
+    }
+
+    /// Tests: an admitted, in-lease device with these admitted agents.
+    #[cfg(test)]
+    pub fn open_ledger_for_tests(&self, agents: &[&str]) {
+        self.set_ledger(crate::principal_ledger::LedgerGate {
+            device: crate::principal_ledger::DeviceGate::Open,
+            agents: Some(agents.iter().map(|s| s.to_string()).collect()),
+        });
     }
 
     /// TTL for the redeemed-code ledger. OAuth authorization codes expire
@@ -2095,7 +2097,11 @@ mod tests {
             relay_url: None,
             body_cap: crate::config::DEFAULT_BODY_CAP,
         };
-        AppState::new(cfg)
+        {
+            let s = AppState::new(cfg);
+            s.open_ledger_for_tests(&[]);
+            s
+        }
     }
 
     #[test]

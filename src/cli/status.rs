@@ -213,6 +213,35 @@ pub async fn fetch_held(client: &reqwest::Client, custodian: &str, vault: &str) 
         .unwrap_or_default()
 }
 
+/// This device's standing in the account ledger (§15), from the decision the
+/// daemon persisted (`principal_floor.json`) and the pairing in config.
+fn ledger_line(cfg: &crate::cli::active::CliConfig) -> String {
+    use crate::principal_ledger as pl;
+    let floor = pl::load_floor(&crate::config::default_state_dir());
+    let now = crate::util::now_unix();
+    let has_anchor = cfg.account_uik.as_deref().is_some_and(|s| !s.is_empty());
+    let has_dik = crate::device_auth::device_signer().is_some();
+    ledger_text(pl::gate(&floor, now, has_anchor, has_dik), pl::lease_days_left(&floor, now))
+}
+
+/// The `device:` line for a standing (pure).
+fn ledger_text(gate: crate::principal_ledger::DeviceGate, days_left: Option<u64>) -> String {
+    use crate::principal_ledger::DeviceGate;
+    match gate {
+        DeviceGate::Open => match days_left {
+            Some(d) if d < 2 => format!(
+                "admitted; {} day{} left before SafeClaw locks unless it reaches your account",
+                d,
+                if d == 1 { "" } else { "s" }
+            ),
+            _ => "admitted".to_string(),
+        },
+        DeviceGate::NotAdmitted => "not admitted to your account: run `sc login`".to_string(),
+        DeviceGate::Stale => "locked: SafeClaw could not reach your account for 7 days".to_string(),
+        DeviceGate::Revoked => "removed from your account: run `sc login` to pair it again".to_string(),
+    }
+}
+
 pub async fn run(json: bool) -> Result<(), String> {
     let cfg = load_config()?;
     // ONE control root for the probe and every fetch below — derived env-first
@@ -294,6 +323,7 @@ pub async fn run(json: bool) -> Result<(), String> {
             let host = origin_host(&origin);
             println!("  state: logged in");
             println!("  cloud: {} ({})", host, env_label(host));
+            println!("  device: {}", ledger_line(&cfg));
         }
         None => println!("  state: not logged in — run `sc login`"),
     }
@@ -458,7 +488,7 @@ pub fn print_status(s: &VaultStatus) {
 
 #[cfg(test)]
 mod env_label_tests {
-    use super::env_label;
+    use super::{env_label, ledger_text};
 
     #[test]
     fn either_console_host_names_its_environment() {
@@ -466,5 +496,18 @@ mod env_label_tests {
         assert_eq!(env_label("app.dev.safeclaw.pro"), "dev");
         assert_eq!(env_label("app.safeclaw.pro"), "prod");
         assert_eq!(env_label("vault.example.com"), "self-host");
+    }
+
+    #[test]
+    fn ledger_lines() {
+        use crate::principal_ledger::DeviceGate;
+        assert_eq!(ledger_text(DeviceGate::Open, Some(5)), "admitted");
+        assert!(ledger_text(DeviceGate::Open, Some(1)).contains("1 day left"));
+        assert!(ledger_text(DeviceGate::Open, Some(0)).contains("0 days left"));
+        assert_eq!(
+            ledger_text(DeviceGate::Stale, None),
+            "locked: SafeClaw could not reach your account for 7 days"
+        );
+        assert!(ledger_text(DeviceGate::NotAdmitted, None).contains("`sc login`"));
     }
 }

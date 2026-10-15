@@ -1,24 +1,28 @@
-//! §15 account principal ledger — daemon-side sync + verify + enforce.
+//! §15 account principal ledger, enforced (DESIGN-principal-ledger-enforced.md).
 //!
-//! The cloud serves an append-only, owner-UIK-signed log of device/agent ADMIT +
-//! REVOKE events at `GET /api/vault/principals`. This module pulls it, verifies
-//! every event against the ACCOUNT ANCHOR (the owner UIK, self-certifying:
-//! `derive_id(User, uik_pub) == anchor_uik`), folds by monotone `seq`, and — behind
-//! a flag, DEFAULT OFF until the P6 cutover — ENFORCES a verified revoke of THIS
-//! device by locking + wiping every local vault + logging out.
+//! The cloud serves the account's append-only, owner-UIK-signed log of device and
+//! agent ADMIT / REVOKE events plus an owner-signed head (grant-v3 C1, C4) at
+//! `GET /api/vault/principals`, authenticated by this device's DIK proof of
+//! possession alone (no bearer: a revoked device whose key the backend already
+//! dropped still pulls its own revoke).
 //!
-//! Invariants (design §15):
-//! - Destructive action fires ONLY on a daemon-VERIFIED owner signature, NEVER on a
-//!   bare 401 (that class caused the transient-403 mass-outage incident; a fetch
-//!   failure just parks and keeps the prior decision).
-//! - The `anchor_uik`, trusted-on-pairing (TOFU), IS the anchor: a swapped anchor
-//!   pubkey fails the self-cert check and the whole pull is rejected. No separate
-//!   pin file is needed (the per-vault genesis-anchor trick, lifted to account scope).
-//! - Rollback-resistant: a verified self-revoke LATCHES to disk (`principal_floor.json`),
-//!   and a later pull whose max `seq` regresses below the recorded floor is ignored, so
-//!   a malicious server dropping the revoke event cannot un-revoke a device.
+//! The ledger is an ALLOWLIST (I1): this device serves only while the verified
+//! ledger's latest event for its `dev_` is an admit over its own `sc_pk`, and an
+//! agent is brokered only while the latest event for its `ag_` is an admit. Three
+//! outcomes, used exactly:
+//! - **hold**: a fetch failure or an invalid pull (one event that does not verify,
+//!   events that do not hash to a validly signed head, a regressed `max_seq`)
+//!   keeps the last persisted verified decision. Never wipes, never locks.
+//! - **park**: this device not admitted, no anchor, or no DIK: K is evicted and
+//!   unlock and broker are refused (`device_not_admitted`).
+//! - **lock**: no verified pull for 7 days (the lease): K is evicted and unlock
+//!   is refused until a fresh verified pull (`ledger_stale`). Data stays on disk.
+//!
+//! A VERIFIED revoke of this device (above the admit it was paired under) latches
+//! in `principal_floor.json` and wipes local state (`self_wipe_and_logout`). There
+//! are no flags: enforcement is the only branch.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,9 +30,15 @@ use std::time::Duration;
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::{Deserialize, Serialize};
 
-use crate::device_auth::DikRequestExt;
+use crate::device_auth::DeviceRequestSigner;
 use crate::identity::{self, IdKind};
 use crate::state::AppState;
+
+/// The lease (W6): a device that cannot pull a verified ledger for this long locks.
+pub const LEASE_SECS: u64 = 7 * 24 * 3600;
+
+/// Poll cadence: a revoke reaches an online device within one interval (I4).
+const INTERVAL: Duration = Duration::from_secs(120);
 
 // ── Wire shapes (GET /api/vault/principals) ─────────────────────────────────
 
@@ -36,8 +46,8 @@ use crate::state::AppState;
 struct AnchorJson {
     #[allow(dead_code)]
     uik_id: String,
-    /// base64 raw 32-byte Ed25519 owner-UIK signing pubkey (public — `derive_id`
-    /// is one-way, so serving it leaks nothing).
+    /// raw 32-byte Ed25519 owner-UIK signing pubkey (standard base64; base64url
+    /// tolerated).
     uik_pub: String,
 }
 
@@ -52,7 +62,7 @@ struct PrincipalEventJson {
     #[serde(default)]
     anchor_uik: String,
     owner_id: String,
-    sig: String, // base64 raw 64-byte Ed25519
+    sig: String, // raw 64-byte Ed25519 (standard base64; base64url tolerated)
     /// Contract C1: the admitted device's raw 32-byte X25519 grant-seal key
     /// (base64url; standard base64 tolerated). Absent for an agent and a revoke.
     #[serde(default)]
@@ -82,86 +92,6 @@ struct LedgerJson {
     anchor: Option<AnchorJson>,
     #[serde(default)]
     head: Option<HeadJson>,
-    #[serde(default)]
-    #[allow(dead_code)]
-    cursor: u64,
-}
-
-/// The folded outcome of a verified ledger.
-#[derive(Debug, Default)]
-struct Folded {
-    /// principal id → (final live-state, seq of its latest applied event). A principal
-    /// ABSENT from the map has NO verified event in this pull (e.g. the server omitted
-    /// it) — distinct from a present-but-revoked `(false, seq)`.
-    state: HashMap<String, (bool, u64)>,
-    /// highest `seq` among applied (verified) events.
-    max_seq: u64,
-}
-
-impl Folded {
-    /// The latest verified `(live, seq)` for a principal, or `None` if this pull carries
-    /// no verified event about it. `None` must NEVER clear a latched decision — omission
-    /// is not an owner action.
-    fn status(&self, id: &str) -> Option<(bool, u64)> {
-        self.state.get(id).copied()
-    }
-}
-
-/// Persisted, rollback-resistant decision floor (`<state_dir>/principal_floor.json`).
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
-struct LedgerFloor {
-    /// Monotone high-water of applied `seq` (never regresses).
-    #[serde(default)]
-    seq: u64,
-    /// MONOTONE self-revoke latch: set once THIS device's own revoke is VERIFIED, and
-    /// cleared ONLY by a verified LATER admit (`seq > self_revoke_seq`) — NEVER because a
-    /// pull merely omits the revoke event. So a compromised server that drops the revoke
-    /// cannot un-revoke the device (the wave's headline invariant).
-    #[serde(default)]
-    self_revoked: bool,
-    /// The `seq` at which `self_revoked` was latched (0 when not latched). A re-admit only
-    /// clears the latch if it is strictly newer than this.
-    #[serde(default)]
-    self_revoke_seq: u64,
-}
-
-// ── Flag ────────────────────────────────────────────────────────────────────
-
-/// Enforcement flag — DEFAULT OFF until the P6 cutover. A NEW destructive behavior
-/// opts IN (the inverse of the `sync_stream` kill switch, which opts out).
-/// `SAFECLAW_PRINCIPAL_ENFORCE` wins over the `principal_enforce` config key (the env
-/// var survives an old binary's config save, so it is the robust lever either way).
-pub fn principal_enforce_enabled() -> bool {
-    let v = std::env::var("SAFECLAW_PRINCIPAL_ENFORCE")
-        .ok()
-        .map(|s| s.trim().to_ascii_lowercase())
-        .filter(|s| !s.is_empty())
-        .or_else(|| {
-            crate::cli::active::load()
-                .ok()
-                .and_then(|c| c.principal_enforce)
-                .map(|s| s.trim().to_ascii_lowercase())
-        });
-    matches!(v.as_deref(), Some("on" | "1" | "true" | "yes" | "enabled"))
-}
-
-/// §15 leg-A require-signed-tombstone flag — DEFAULT OFF (an unsigned `status:"deleted"`
-/// still drops local state, the legacy behavior). `SAFECLAW_REQUIRE_SIGNED_TOMBSTONE`
-/// wins over `CliConfig.require_signed_tombstone`. Flipped on at the P6 cutover so a
-/// server can no longer force a local wipe by flipping `status` without a valid
-/// owner-signed tombstone (verified against the vault's fold-owner set).
-pub fn require_signed_tombstone() -> bool {
-    let v = std::env::var("SAFECLAW_REQUIRE_SIGNED_TOMBSTONE")
-        .ok()
-        .map(|s| s.trim().to_ascii_lowercase())
-        .filter(|s| !s.is_empty())
-        .or_else(|| {
-            crate::cli::active::load()
-                .ok()
-                .and_then(|c| c.require_signed_tombstone)
-                .map(|s| s.trim().to_ascii_lowercase())
-        });
-    matches!(v.as_deref(), Some("on" | "1" | "true" | "yes" | "enabled"))
 }
 
 // ── base64 → fixed arrays ────────────────────────────────────────────────────
@@ -188,107 +118,114 @@ fn decode_b64_any(s: &str) -> Option<Vec<u8>> {
 
 // ── Pull ──────────────────────────────────────────────────────────────────
 
-/// GET the account principal ledger with device-key bearer + DIK PoP (same auth
-/// shape as vault discovery). Best-effort: any failure returns `None` and the
-/// caller PARKS (keeps the prior decision) — a fetch failure is never a revoke.
-async fn fetch_ledger(cloud: &str, dk: &str) -> Option<LedgerJson> {
-    let cloud = cloud.trim_end_matches('/');
-    let url = format!("{}/api/vault/principals", cloud);
-    let client = crate::cli::egress_proxy::client(Duration::from_secs(15)).ok()?;
-    let resp = client
-        .get(&url)
-        .bearer_auth(dk)
-        .dik_pop("GET", &url, &[])
-        .send()
-        .await
-        .ok()?;
-    if !resp.status().is_success() {
-        // 404 = a backend that predates the ledger; anything else transient. Park.
-        tracing::debug!(status = %resp.status(), "principal ledger: non-success (old backend / transient)");
-        return None;
+/// GET the account ledger, authenticated by this device's DIK proof of
+/// possession ALONE (W4: no bearer, so a device whose key the backend dropped on
+/// revoke still receives its own revoke). Any failure is an `Err`, which the
+/// caller treats as hold (I3: a bare 401/403 is never acted on).
+async fn fetch_ledger(
+    client: &reqwest::Client,
+    cloud: &str,
+    anchor_uik: &str,
+    signer: &DeviceRequestSigner,
+) -> Result<LedgerJson, String> {
+    // `uik` names the pinned account explicitly (the backend would otherwise
+    // pick the account with the newest event naming this device).
+    let url = format!(
+        "{}/api/vault/principals?uik={}",
+        cloud.trim_end_matches('/'),
+        urlencoding::encode(anchor_uik)
+    );
+    let path = crate::device_auth::path_and_query(&url).ok_or("unparseable cloud URL")?;
+    let mut rb = client.get(&url);
+    for (k, v) in signer.headers("GET", &path, crate::util::now_unix(), &[]) {
+        rb = rb.header(k, v);
     }
-    resp.json().await.ok()
+    let resp = rb.send().await.map_err(|e| format!("fetch: {}", e))?;
+    if !resp.status().is_success() {
+        return Err(format!("HTTP {}", resp.status()));
+    }
+    resp.json().await.map_err(|e| format!("parse: {}", e))
 }
 
-// ── Verify + fold ────────────────────────────────────────────────────────────
+// ── Strict verify + fold ─────────────────────────────────────────────────────
 
-/// Verify every event against the account anchor and fold admit/revoke by monotone
-/// `seq`. Returns `None` (fail closed → park) iff the anchor is missing or does NOT
-/// self-certify against `anchor_uik` (a swapped anchor = untrusted source). An
-/// individually invalid event (bad sig, foreign owner, unknown op) is SKIPPED, not
-/// fatal — mirrors the per-vault `fold_roles`.
-fn fold_verified(ledger: &LedgerJson, anchor_uik: &str) -> Option<Folded> {
-    let anchor = ledger.anchor.as_ref()?;
-    let anchor_pub = decode_pub32(&anchor.uik_pub)?;
-    // Self-cert: the anchor pubkey MUST derive to the anchor_uik we pinned at pairing.
+/// The latest event about one principal in a verified ledger.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Latest {
+    admit: bool,
+    seq: u64,
+    /// The admitted `sc_pk` (empty for an agent admit and every revoke).
+    sc_pk: Vec<u8>,
+}
+
+/// A ledger that verified as a whole.
+#[derive(Debug, Default)]
+struct Folded {
+    max_seq: u64,
+    latest: HashMap<String, Latest>,
+}
+
+impl Folded {
+    /// The agents whose latest event is an admit, sorted.
+    fn admitted_agents(&self) -> Vec<String> {
+        let mut v: Vec<String> = self
+            .latest
+            .iter()
+            .filter(|(id, l)| id.starts_with("ag_") && l.admit)
+            .map(|(id, _)| id.clone())
+            .collect();
+        v.sort();
+        v
+    }
+}
+
+/// Verify a pulled ledger STRICTLY (W2, the console's `verifyEvents` rule): the
+/// anchor self-certifies against the pinned `anchor_uik`, the events carry seqs
+/// `1..=n` in order, they hash to a validly owner-signed head (C4), and EVERY
+/// event is an owner-signed admit / revoke by this account. Any failure refuses
+/// the whole pull (`ledger_head_invalid` → hold); nothing is skipped.
+fn verify_strict(ledger: &LedgerJson, anchor_uik: &str) -> Result<Folded, String> {
+    let anchor = ledger.anchor.as_ref().ok_or("no account anchor")?;
+    let anchor_pub = decode_pub32(&anchor.uik_pub).ok_or("anchor key undecodable")?;
     if identity::derive_id(IdKind::User, &anchor_pub) != anchor_uik {
-        tracing::warn!("principal ledger: anchor pubkey does not self-certify against anchor_uik; rejecting pull");
-        return None;
+        return Err("the anchor key does not belong to the paired account".into());
     }
-
-    // Deterministic total order; strictly-increasing seq (consumed-seq dup guard).
     let mut events: Vec<&PrincipalEventJson> = ledger.events.iter().collect();
-    events.sort_by(|a, b| a.seq.cmp(&b.seq).then_with(|| a.sig.cmp(&b.sig)));
-
-    // C4: the served events must be exactly what the owner committed to in a
-    // validly signed head; otherwise the whole pull is refused (park, keep the
-    // prior decision). Closes a forged or truncated tail.
-    if let Err(why) = verify_head(ledger.head.as_ref(), &events, anchor_uik, &anchor_pub) {
-        tracing::warn!(code = "ledger_head_invalid", "principal ledger: {}; rejecting pull", why);
-        return None;
+    events.sort_by_key(|e| e.seq);
+    for (i, e) in events.iter().enumerate() {
+        if e.seq != i as u64 + 1 {
+            return Err(format!("event seqs are not contiguous at {}", e.seq));
+        }
     }
-
-    let mut state: HashMap<String, (bool, u64)> = HashMap::new();
-    let mut last_seq: Option<u64> = None;
-    let mut max_seq: u64 = 0;
+    verify_head(ledger.head.as_ref(), &events, anchor_uik, &anchor_pub)?;
+    let mut folded = Folded::default();
     for e in events {
-        if matches!(last_seq, Some(ls) if e.seq <= ls) {
-            continue; // duplicate/backwards seq at the same position — keep the first
+        if e.owner_id != anchor_uik || (!e.anchor_uik.is_empty() && e.anchor_uik != anchor_uik) {
+            return Err(format!("event {} is not by the account owner", e.seq));
         }
-        // The signer must be the account owner (owner_id == the anchor id), and the
-        // event's own anchor_uik (when carried) must match too.
-        if e.owner_id != anchor_uik {
-            tracing::warn!(seq = e.seq, "principal ledger: event owner_id != account anchor; skipping");
-            continue;
-        }
-        if !e.anchor_uik.is_empty() && e.anchor_uik != anchor_uik {
-            tracing::warn!(seq = e.seq, "principal ledger: event anchor_uik mismatch; skipping");
-            continue;
-        }
-        let Some(sig) = decode_sig64(&e.sig) else {
-            tracing::warn!(seq = e.seq, "principal ledger: undecodable signature; skipping");
-            continue;
+        let admit = match e.op.as_str() {
+            "admit" => true,
+            "revoke" => false,
+            other => return Err(format!("event {} has an unknown op {}", e.seq, other)),
         };
-        // anchor_uik is the first signed field (== anchor for a personal account).
         let sc_pk = match e.sc_pk.as_deref().filter(|s| !s.is_empty()) {
             None => Vec::new(),
-            Some(b) => match decode_b64_any(b) {
-                Some(v) if v.len() == 32 => v,
-                _ => {
-                    tracing::warn!(seq = e.seq, "principal ledger: undecodable sc_pk; skipping");
-                    continue;
-                }
-            },
+            Some(b) => decode_b64_any(b)
+                .filter(|v| v.len() == 32)
+                .ok_or_else(|| format!("event {} has an undecodable sc_pk", e.seq))?,
         };
+        let sig = decode_sig64(&e.sig).ok_or_else(|| format!("event {} signature undecodable", e.seq))?;
         let input =
             identity::principal_event_input(anchor_uik, &e.op, &e.principal_id, e.seq, &e.owner_id, &sc_pk);
         if !identity::verify(&anchor_pub, &input, &sig) {
-            tracing::warn!(seq = e.seq, "principal ledger: signature does not verify; skipping");
-            continue;
+            return Err(format!("event {} signature does not verify", e.seq));
         }
-        last_seq = Some(e.seq);
-        max_seq = max_seq.max(e.seq);
-        match e.op.as_str() {
-            "admit" => {
-                state.insert(e.principal_id.clone(), (true, e.seq));
-            }
-            "revoke" => {
-                state.insert(e.principal_id.clone(), (false, e.seq));
-            }
-            other => tracing::warn!(op = %other, "principal ledger: unknown op; skipping"),
-        }
+        folded.max_seq = e.seq;
+        folded
+            .latest
+            .insert(e.principal_id.clone(), Latest { admit, seq: e.seq, sc_pk });
     }
-    Some(Folded { state, max_seq })
+    Ok(folded)
 }
 
 /// Contract C4: `head` must be signed by the account owner over
@@ -326,6 +263,174 @@ fn verify_head(
         return Err("the served events end at another seq than the signed head".into());
     }
     Ok(())
+}
+
+// ── The persisted decision (`principal_floor.json`) ──────────────────────────
+
+/// What the last verified pull decided, persisted so a restart within the lease
+/// serves without a successful pull (hold).
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LedgerFloor {
+    /// This device's latest verified admit (over its own `sc_pk`), or the admit
+    /// pairing just verified.
+    #[serde(default)]
+    pub admitted_seq: u64,
+    /// The latest verified event for this device is that admit.
+    #[serde(default)]
+    pub admitted: bool,
+    /// A verified revoke of this device. The latch is honored only while
+    /// `self_revoke_seq > admitted_seq`, so a re-paired device never wipes on
+    /// its old revoke.
+    #[serde(default)]
+    pub self_revoke_seq: u64,
+    /// Wall time of the last verified pull (the lease starts here).
+    #[serde(default)]
+    pub fresh_at: u64,
+    /// The highest `seq` of the last verified pull; a pull below it is a
+    /// rollback (hold).
+    #[serde(default)]
+    pub max_seq: u64,
+    /// The latest wall time seen since `fresh_at`: a clock moved backwards never
+    /// extends the lease.
+    #[serde(default)]
+    pub max_wall: u64,
+    /// The account's admitted agents (`ag_`), per the last verified pull.
+    #[serde(default)]
+    pub agents: Vec<String>,
+}
+
+pub(crate) fn floor_path(state_dir: &Path) -> std::path::PathBuf {
+    state_dir.join("principal_floor.json")
+}
+
+pub(crate) fn load_floor(state_dir: &Path) -> LedgerFloor {
+    std::fs::read_to_string(floor_path(state_dir))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn store_floor(state_dir: &Path, floor: &LedgerFloor) {
+    if let Ok(json) = serde_json::to_string(floor) {
+        if let Err(e) = std::fs::write(floor_path(state_dir), json) {
+            tracing::warn!("principal ledger: failed to persist the decision: {}", e);
+        }
+    }
+}
+
+/// Pairing success writes the decision fresh from the admit the CLI just
+/// verified (W2): admitted at that seq, no revoke, lease starting now.
+pub fn write_pairing_floor(state_dir: &Path, admit_seq: u64, now: u64) -> Result<(), String> {
+    let floor = LedgerFloor {
+        admitted_seq: admit_seq,
+        admitted: true,
+        self_revoke_seq: 0,
+        fresh_at: now,
+        max_seq: admit_seq,
+        max_wall: now,
+        agents: Vec::new(),
+    };
+    std::fs::create_dir_all(state_dir).map_err(|e| e.to_string())?;
+    let json = serde_json::to_string(&floor).map_err(|e| e.to_string())?;
+    std::fs::write(floor_path(state_dir), json).map_err(|e| e.to_string())
+}
+
+/// Fold a VERIFIED pull into the decision (pure). `Err` = hold (a pull whose
+/// `max_seq` regressed below the last verified one).
+fn apply_pull(
+    mut floor: LedgerFloor,
+    folded: &Folded,
+    my_dev: &str,
+    my_sc_pk: &[u8],
+    now: u64,
+) -> Result<LedgerFloor, String> {
+    if folded.max_seq < floor.max_seq {
+        return Err(format!(
+            "the ledger regressed to seq {} below the known {}",
+            folded.max_seq, floor.max_seq
+        ));
+    }
+    floor.max_seq = folded.max_seq;
+    // A verified pull proves contact now: the lease restarts from this clock.
+    floor.fresh_at = now;
+    floor.max_wall = now;
+    match folded.latest.get(my_dev) {
+        Some(l) if !l.admit => {
+            if l.seq > floor.admitted_seq {
+                floor.self_revoke_seq = floor.self_revoke_seq.max(l.seq);
+            }
+            floor.admitted = false;
+        }
+        Some(l) if l.sc_pk == my_sc_pk => {
+            floor.admitted = true;
+            floor.admitted_seq = l.seq;
+        }
+        // An admit of this dev_ over another daemon key, or no event at all.
+        _ => floor.admitted = false,
+    }
+    floor.agents = folded.admitted_agents();
+    Ok(floor)
+}
+
+/// This device's standing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceGate {
+    /// Admitted, within the lease: serve.
+    Open,
+    /// Park: not admitted (or no anchor / no DIK). Refuse unlock and broker.
+    NotAdmitted,
+    /// Lock: the lease ran out. Refuse unlock until a fresh verified pull.
+    Stale,
+    /// A verified revoke of this device: wipe.
+    Revoked,
+}
+
+/// The standing of this device given its persisted decision (pure). `now` is the
+/// wall clock; a clock earlier than `fresh_at`, or the latest wall time seen more
+/// than the lease past it, is stale.
+pub fn gate(floor: &LedgerFloor, now: u64, has_anchor: bool, has_dik: bool) -> DeviceGate {
+    if !has_anchor || !has_dik {
+        return DeviceGate::NotAdmitted;
+    }
+    if floor.self_revoke_seq > floor.admitted_seq {
+        return DeviceGate::Revoked;
+    }
+    if !floor.admitted {
+        return DeviceGate::NotAdmitted;
+    }
+    let seen = now.max(floor.max_wall);
+    if now < floor.fresh_at || seen.saturating_sub(floor.fresh_at) > LEASE_SECS {
+        return DeviceGate::Stale;
+    }
+    DeviceGate::Open
+}
+
+/// Whole days left on the lease (`sc status`), `None` when not admitted.
+pub fn lease_days_left(floor: &LedgerFloor, now: u64) -> Option<u64> {
+    if !floor.admitted {
+        return None;
+    }
+    let seen = now.max(floor.max_wall);
+    let used = seen.saturating_sub(floor.fresh_at);
+    Some(LEASE_SECS.saturating_sub(used) / 86_400)
+}
+
+/// The daemon's in-memory ledger standing ([`AppState::ledger`]).
+#[derive(Debug, Clone)]
+pub struct LedgerGate {
+    pub device: DeviceGate,
+    /// The account's admitted agents; `None` = no verified decision.
+    pub agents: Option<HashSet<String>>,
+}
+
+impl Default for LedgerGate {
+    /// Fail closed: nothing is admitted until a decision is loaded.
+    fn default() -> Self {
+        Self {
+            device: DeviceGate::NotAdmitted,
+            agents: None,
+        }
+    }
 }
 
 // ── Pairing: the owner-signed admit of THIS principal (C1) ─────────────────
@@ -366,61 +471,13 @@ pub fn verify_pairing_admit(
     Ok(owner)
 }
 
-// ── Floor persistence (rollback resistance) ─────────────────────────────────
-
-pub(crate) fn floor_path(state_dir: &Path) -> std::path::PathBuf {
-    state_dir.join("principal_floor.json")
-}
-
-fn load_floor(state_dir: &Path) -> LedgerFloor {
-    std::fs::read_to_string(floor_path(state_dir))
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
-}
-
-fn store_floor(state_dir: &Path, floor: &LedgerFloor) {
-    if let Ok(json) = serde_json::to_string(floor) {
-        if let Err(e) = std::fs::write(floor_path(state_dir), json) {
-            tracing::warn!("principal ledger: failed to persist floor: {}", e);
-        }
-    }
-}
-
-/// Fold a NON-REGRESSED pull into the decision floor — the F1 MONOTONE self-revoke latch,
-/// as a pure function so it is directly testable. `my_dev` is THIS device's id. Rules:
-/// - a verified self-`revoke` LATCHES `self_revoked` (raising `self_revoke_seq`);
-/// - a verified self-`admit` clears it ONLY if strictly newer (`seq > self_revoke_seq`);
-/// - the server OMITTING the revoke → `status(my_dev)` is `None` (or an OLDER admit) →
-///   the latch is left UNTOUCHED, so a compromised server can never un-revoke by dropping
-///   the event. `seq` only moves forward.
-fn apply_fold_to_floor(mut floor: LedgerFloor, folded: &Folded, my_dev: Option<&str>) -> LedgerFloor {
-    floor.seq = folded.max_seq.max(floor.seq);
-    if let Some(dev) = my_dev {
-        match folded.status(dev) {
-            Some((false, rseq)) => {
-                if !floor.self_revoked || rseq > floor.self_revoke_seq {
-                    floor.self_revoked = true;
-                    floor.self_revoke_seq = rseq;
-                }
-            }
-            Some((true, aseq)) => {
-                if floor.self_revoked && aseq > floor.self_revoke_seq {
-                    floor.self_revoked = false;
-                }
-            }
-            None => { /* omission is not an owner action — keep the latch */ }
-        }
-    }
-    floor
-}
-
 // ── Enforcement ──────────────────────────────────────────────────────────────
 
-/// Self-revoke enforcement: the owner revoked THIS device. Lock + wipe every local
+/// Self-revoke enforcement: the owner revoked THIS device (a VERIFIED revoke,
+/// latched in `principal_floor.json` before this runs). Lock + wipe every local
 /// vault (evict retained K + delete sealed blobs, in-process — no CLI), delete the
-/// device-key, clear the pairing config, then EXIT. "A revoked device can't use
-/// secrets" (design §15). Does not return.
+/// device-key, clear the pairing config, then EXIT. The DIK and `sc_sk.bin` stay,
+/// so a re-pair re-admits the same `dev_` and `sc_pk`. Does not return.
 async fn self_wipe_and_logout(state: &Arc<AppState>) -> ! {
     tracing::warn!(
         code = "ledger_device_revoked",
@@ -459,250 +516,540 @@ async fn self_wipe_and_logout(state: &Arc<AppState>) -> ! {
     std::process::exit(0);
 }
 
-// ── Loop ──────────────────────────────────────────────────────────────────
+// ── Runtime ──────────────────────────────────────────────────────────────────
 
-/// Periodic principal-ledger poll: pull → verify + fold → (flag-gated) enforce a
-/// verified self-revoke. Spawned once per paired daemon (like the vault-discovery
-/// reconcile loop). `anchor_uik` is the account's owner-UIK id (`us_…`) pinned at
-/// pairing — the self-certifying ledger anchor (NOT the Supabase account UUID).
-pub async fn principal_ledger_loop(state: Arc<AppState>, cloud: String, dk: String, anchor_uik: String) {
-    /// Poll cadence. A revoke propagates within one interval of the owner tapping
-    /// (or instantly on the next daemon start via the latched floor).
-    const INTERVAL: Duration = Duration::from_secs(120);
+/// What a pull needs: the cloud, the pinned anchor, this device's DIK and its
+/// daemon key. `None` (no pairing / anchor / DIK) parks the device.
+struct Ctx {
+    cloud: String,
+    anchor_uik: String,
+    signer: DeviceRequestSigner,
+    sc_pk: Vec<u8>,
+}
+
+fn context(state: &AppState) -> Option<Ctx> {
+    let cfg = crate::cli::active::load().ok()?;
+    let cloud = cfg.cloud_backend.filter(|s| !s.is_empty())?;
+    let anchor_uik = cfg.account_uik.filter(|s| !s.is_empty())?;
+    let signer = crate::device_auth::device_signer()?;
+    Some(Ctx {
+        cloud,
+        anchor_uik,
+        signer,
+        sc_pk: state.sc.pk_bytes(),
+    })
+}
+
+/// Publish a standing: not open evicts K from every vault (park / lock / wipe).
+fn publish(state: &AppState, device: DeviceGate, floor: &LedgerFloor) {
+    let agents = (device == DeviceGate::Open).then(|| floor.agents.iter().cloned().collect());
+    state.set_ledger(LedgerGate { device, agents });
+}
+
+/// The standing at startup, from the persisted decision alone (no network): a
+/// restart within the lease serves (hold); no anchor or no DIK parks.
+pub fn init_gate(state: &AppState) {
+    let floor = load_floor(&state.config.state_dir);
+    let cfg = crate::cli::active::load().unwrap_or_default();
+    let has_anchor = cfg.account_uik.as_deref().is_some_and(|s| !s.is_empty());
+    let has_dik = crate::device_auth::device_signer().is_some();
+    let g = gate(&floor, crate::util::now_unix(), has_anchor, has_dik);
+    if g != DeviceGate::Open {
+        tracing::warn!(standing = ?g, "principal ledger: this device is not serving until a verified pull admits it");
+    }
+    publish(state, g, &floor);
+}
+
+/// One pull → verify → decide → persist → publish, serialized by
+/// [`AppState::ledger_sync`] (the caller holds it). Returns the new standing.
+async fn pull_now(state: &AppState, timeout: Duration) -> DeviceGate {
     let state_dir = state.config.state_dir.clone();
-
-    // The self-revoke decision is a MONOTONE, on-disk LATCH (F1): once a verified revoke
-    // of THIS device is seen it stays latched — a later pull that merely OMITS the revoke
-    // can NEVER clear it (only a verified LATER admit does). Enforcement reads the LATCH,
-    // not the current pull, so a compromised server cannot un-revoke by dropping the event.
     let mut floor = load_floor(&state_dir);
-    let my_dev = crate::device_auth::device_signer().map(|s| s.device_id().to_string());
-
-    loop {
-        // Enforce the LATCHED decision every iteration, independent of the current pull.
-        // Covers a latch that survived a restart AND the enforce flag being flipped ON
-        // mid-run (it is read live, so no restart is needed to start biting).
-        if floor.self_revoked && principal_enforce_enabled() {
-            self_wipe_and_logout(&state).await; // does not return
-        }
-
-        // Work first (immediate on start), then wait — a fresh revoke enforces within one
-        // poll rather than after a full INTERVAL.
-        if let Some(ledger) = fetch_ledger(&cloud, &dk).await {
-            if let Some(folded) = fold_verified(&ledger, &anchor_uik) {
-                if folded.max_seq < floor.seq {
-                    // Wholesale regression (max seq below our high-water). Ignore the pull;
-                    // the monotone latch above already protects an already-observed revoke.
-                    tracing::warn!(
-                        max = folded.max_seq,
-                        floor = floor.seq,
-                        "principal ledger: pull regressed below the known seq (rollback?); ignoring"
-                    );
-                } else {
-                    let before = (floor.seq, floor.self_revoked, floor.self_revoke_seq);
-                    floor = apply_fold_to_floor(floor, &folded, my_dev.as_deref());
-                    if (floor.seq, floor.self_revoked, floor.self_revoke_seq) != before {
-                        store_floor(&state_dir, &floor);
-                    }
-                    // Enforce immediately after a fresh latch so a just-seen revoke wipes
-                    // this round rather than next.
-                    if floor.self_revoked {
-                        if principal_enforce_enabled() {
-                            self_wipe_and_logout(&state).await;
-                        } else {
-                            tracing::warn!(
-                                code = "ledger_device_revoked",
-                                device = ?my_dev,
-                                "principal ledger: THIS device is revoked (VERIFIED, latched) but enforcement \
-                                 is OFF (SAFECLAW_PRINCIPAL_ENFORCE); NOT wiping — the P6 cutover flips the default"
-                            );
-                        }
-                    }
-                    // Agent revokes ride the existing /agents/hashes sync (backend drops
-                    // the key); the ledger is the account-level record + daemon-verifiable
-                    // authority the P6 cutover enforces directly.
-                    // Tail omission is closed by the owner-signed head (C4, verified in
-                    // `fold_verified`). RESIDUAL: the server can still serve an OLDER but
-                    // consistent head + list (hiding a later revoke), bounded by re-key
-                    // on offboard (design approval-key-delivery §3).
+    let now = crate::util::now_unix();
+    let Some(ctx) = context(state) else {
+        publish(state, DeviceGate::NotAdmitted, &floor);
+        return DeviceGate::NotAdmitted;
+    };
+    let before = floor.clone();
+    floor.max_wall = floor.max_wall.max(now);
+    let pulled = match crate::cli::egress_proxy::client(timeout) {
+        Ok(client) => fetch_ledger(&client, &ctx.cloud, &ctx.anchor_uik, &ctx.signer).await,
+        Err(e) => Err(e.to_string()),
+    };
+    match pulled {
+        Err(e) => tracing::debug!("principal ledger: fetch failed ({}); holding", e),
+        Ok(ledger) => match verify_strict(&ledger, &ctx.anchor_uik) {
+            Err(why) => tracing::warn!(
+                code = "ledger_head_invalid",
+                "principal ledger: pull refused ({}); holding the last verified decision",
+                why
+            ),
+            Ok(folded) => {
+                match apply_pull(floor.clone(), &folded, ctx.signer.device_id(), &ctx.sc_pk, now) {
+                    Ok(f) => floor = f,
+                    Err(why) => tracing::warn!("principal ledger: {}; holding", why),
                 }
             }
+        },
+    }
+    if floor != before {
+        store_floor(&state_dir, &floor);
+    }
+    let g = gate(&floor, now, true, true);
+    publish(state, g, &floor);
+    g
+}
+
+/// Periodic pull (every [`INTERVAL`], and on a backend principals / agent-key
+/// stream event). A verified revoke of this device wipes (does not return).
+pub async fn principal_ledger_loop(state: Arc<AppState>) {
+    loop {
+        let g = {
+            let mut last = state.ledger_sync.lock().await;
+            *last = Some(std::time::Instant::now());
+            pull_now(&state, Duration::from_secs(15)).await
+        };
+        match g {
+            DeviceGate::Revoked => self_wipe_and_logout(&state).await,
+            DeviceGate::NotAdmitted => tracing::warn!(
+                code = "device_not_admitted",
+                "principal ledger: this device is not admitted to the account; run `sc login`"
+            ),
+            DeviceGate::Stale => tracing::warn!(
+                code = "ledger_stale",
+                "principal ledger: no verified pull for 7 days; vaults locked until one succeeds"
+            ),
+            DeviceGate::Open => {}
         }
-        tokio::time::sleep(INTERVAL).await;
+        tokio::select! {
+            _ = tokio::time::sleep(INTERVAL) => {}
+            _ = crate::sync_stream::agent_hashes_notified() => {}
+        }
     }
 }
+
+/// Is `agent_id` NOT admitted by the account ledger (W3)? On a miss, one
+/// debounced re-pull first, so an agent approved seconds ago is not refused
+/// for the poll interval. Fails closed: no verified decision = not admitted.
+pub async fn agent_not_admitted(state: &Arc<AppState>, agent_id: &str) -> bool {
+    if state.agent_admitted(agent_id) {
+        return false;
+    }
+    const DEBOUNCE: Duration = Duration::from_secs(2);
+    {
+        let mut last = state.ledger_sync.lock().await;
+        if !matches!(*last, Some(t) if t.elapsed() < DEBOUNCE) {
+            *last = Some(std::time::Instant::now());
+            if pull_now(state, Duration::from_secs(3)).await == DeviceGate::Revoked {
+                // The loop wipes on its next turn; refuse meanwhile.
+                return true;
+            }
+        }
+    }
+    !state.agent_admitted(agent_id)
+}
+
+/// Why an agent request is refused ([`authorize_agent`]).
+#[derive(Debug)]
+pub enum AgentRefusal {
+    /// This device itself may not serve (park / lock / revoked).
+    Device(crate::error::AppError),
+    /// No verified agent identity (no or invalid AIK proof): an api key alone is
+    /// no longer an agent credential (W3).
+    NoIdentity,
+    /// The ledger does not admit this `ag_`.
+    NotAdmitted,
+    /// Admitted to the account, but not turned on for this vault (or for any
+    /// vault, on an account-scoped read).
+    NotAuthorized,
+}
+
+/// The one agent admission rule (W3), shared by the proxy and the API face: this
+/// device serves, the agent proved its AIK, the account ledger admits its `ag_`
+/// (no later revoke), and the vault's authorized-agents table lists it (`vault`
+/// `None` = an account-scoped read: any unlocked vault). Returns the `ag_`.
+pub async fn authorize_agent(
+    state: &Arc<AppState>,
+    agent: Option<&str>,
+    vault: Option<&str>,
+) -> Result<String, AgentRefusal> {
+    if let Some(e) = state.ledger_refusal() {
+        return Err(AgentRefusal::Device(e));
+    }
+    let ag = agent.ok_or(AgentRefusal::NoIdentity)?;
+    if agent_not_admitted(state, ag).await {
+        return Err(AgentRefusal::NotAdmitted);
+    }
+    let listed = match vault {
+        Some(v) => state.agent_is_authorized(v, ag),
+        None => state.agent_is_authorized_any(ag),
+    };
+    if !listed {
+        return Err(AgentRefusal::NotAuthorized);
+    }
+    Ok(ag.to_string())
+}
+
+/// The refusal for a request with no verified agent identity.
+pub const NO_AGENT_IDENTITY_MSG: &str = "this request carries no SafeClaw agent identity. Run the \
+     agent through `sc run`, or set it up with `sc agent add`";
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::identity::SigningIdentity;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
-    // Deterministic owner UIK for the vectors below.
     const OWNER_SEED: [u8; 32] = [7u8; 32];
+    const MY_PK: [u8; 32] = [5u8; 32];
+    const MY_DEV: &str = "dev_me";
+    const T0: u64 = 1_800_000_000;
 
     fn owner() -> SigningIdentity {
         SigningIdentity::from_seed(&OWNER_SEED)
     }
 
-    fn signed_event(owner: &SigningIdentity, anchor_uik: &str, op: &str, principal: &str, seq: u64) -> PrincipalEventJson {
-        let input = identity::principal_event_input(anchor_uik, op, principal, seq, anchor_uik, &[]);
-        let sig = owner.sign(&input);
+    fn ev(o: &SigningIdentity, op: &str, principal: &str, seq: u64, sc_pk: &[u8]) -> PrincipalEventJson {
+        let acct = o.user_id();
+        let input = identity::principal_event_input(&acct, op, principal, seq, &acct, sc_pk);
         PrincipalEventJson {
             seq,
             op: op.to_string(),
             principal_id: principal.to_string(),
             principal_kind: if principal.starts_with("dev_") { "device" } else { "agent" }.to_string(),
-            anchor_uik: anchor_uik.to_string(),
-            owner_id: anchor_uik.to_string(),
-            sig: STANDARD.encode(sig),
-            sc_pk: None,
+            anchor_uik: acct.clone(),
+            owner_id: acct,
+            sig: STANDARD.encode(o.sign(&input)),
+            sc_pk: (!sc_pk.is_empty()).then(|| URL_SAFE_NO_PAD.encode(sc_pk)),
             created_at: String::new(),
         }
     }
 
-    fn ledger(owner: &SigningIdentity, events: Vec<PrincipalEventJson>) -> LedgerJson {
-        let head = Some(sign_head(owner, &events));
-        LedgerJson {
-            events,
-            anchor: Some(AnchorJson {
-                uik_id: owner.user_id(),
-                uik_pub: STANDARD.encode(owner.public_bytes()),
-            }),
-            head,
-            cursor: 0,
-        }
-    }
-
     /// The owner's signed head over `events` (C4), as the console writes it.
-    fn sign_head(owner: &SigningIdentity, events: &[PrincipalEventJson]) -> HeadJson {
-        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    fn sign_head(o: &SigningIdentity, events: &[PrincipalEventJson]) -> HeadJson {
         let mut sorted: Vec<&PrincipalEventJson> = events.iter().collect();
-        sorted.sort_by(|a, b| a.seq.cmp(&b.seq).then_with(|| a.sig.cmp(&b.sig)));
-        let sigs: Vec<Vec<u8>> = sorted.iter().map(|e| STANDARD.decode(&e.sig).unwrap()).collect();
+        sorted.sort_by_key(|e| e.seq);
+        let sigs: Vec<Vec<u8>> = sorted.iter().map(|e| decode_b64_any(&e.sig).unwrap()).collect();
         let hash = identity::principal_events_hash(&sigs);
         let max_seq = sorted.last().map(|e| e.seq).unwrap_or(0);
-        let sig = owner.sign(&identity::principal_head_input(&owner.user_id(), max_seq, &hash));
+        let sig = o.sign(&identity::principal_head_input(&o.user_id(), max_seq, &hash));
         HeadJson {
-            anchor: owner.user_id(),
+            anchor: o.user_id(),
             max_seq,
             events_hash: URL_SAFE_NO_PAD.encode(hash),
             sig: URL_SAFE_NO_PAD.encode(sig),
         }
     }
 
-    #[test]
-    fn admit_then_revoke_folds_to_revoked() {
-        let o = owner();
-        let acct = o.user_id();
-        let l = ledger(&o, vec![
-            signed_event(&o, &acct, "admit", "dev_box", 1),
-            signed_event(&o, &acct, "revoke", "dev_box", 2),
-        ]);
-        let folded = fold_verified(&l, &acct).expect("trusted anchor folds");
-        assert_eq!(folded.status("dev_box"), Some((false, 2)), "final state is revoked @ seq 2");
-        assert_eq!(folded.max_seq, 2);
+    fn ledger(o: &SigningIdentity, events: Vec<PrincipalEventJson>) -> LedgerJson {
+        let head = Some(sign_head(o, &events));
+        LedgerJson {
+            events,
+            anchor: Some(AnchorJson {
+                uik_id: o.user_id(),
+                uik_pub: STANDARD.encode(o.public_bytes()),
+            }),
+            head,
+        }
     }
 
-    #[test]
-    fn revoke_then_readmit_clears() {
-        let o = owner();
-        let acct = o.user_id();
-        let l = ledger(&o, vec![
-            signed_event(&o, &acct, "admit", "dev_box", 1),
-            signed_event(&o, &acct, "revoke", "dev_box", 2),
-            signed_event(&o, &acct, "admit", "dev_box", 3),
-        ]);
-        let folded = fold_verified(&l, &acct).unwrap();
-        assert_eq!(folded.status("dev_box"), Some((true, 3)), "a higher-seq re-admit un-revokes");
-        assert_eq!(folded.max_seq, 3);
+    /// One verified pull folded into `floor`.
+    fn pull(floor: LedgerFloor, l: &LedgerJson, now: u64) -> Result<LedgerFloor, String> {
+        let folded = verify_strict(l, &owner().user_id())?;
+        apply_pull(floor, &folded, MY_DEV, &MY_PK, now)
     }
 
-    #[test]
-    fn wrong_anchor_rejects_whole_pull() {
-        let o = owner();
-        let acct = o.user_id();
-        let mut l = ledger(&o, vec![signed_event(&o, &acct, "revoke", "dev_box", 1)]);
-        // Swap the anchor pubkey to a different key: self-cert (derive_id == anchor_uik) fails.
-        let imposter = SigningIdentity::from_seed(&[9u8; 32]);
-        l.anchor = Some(AnchorJson { uik_id: imposter.user_id(), uik_pub: STANDARD.encode(imposter.public_bytes()) });
-        assert!(fold_verified(&l, &acct).is_none(), "a swapped anchor is untrusted → park");
+    fn paired_at(seq: u64) -> LedgerFloor {
+        LedgerFloor {
+            admitted_seq: seq,
+            admitted: true,
+            fresh_at: T0,
+            max_seq: seq,
+            max_wall: T0,
+            ..Default::default()
+        }
     }
 
+    /// Revoked self → wipe: a verified revoke above the paired admit latches.
     #[test]
-    fn forged_signature_event_is_skipped_not_fatal() {
+    fn a_verified_revoke_of_this_device_wipes() {
         let o = owner();
-        let acct = o.user_id();
-        let mut forged = signed_event(&o, &acct, "revoke", "dev_box", 2);
-        // Corrupt the signature: this event must be skipped, the valid admit still applies.
-        forged.sig = STANDARD.encode([0u8; 64]);
-        let l = ledger(&o, vec![signed_event(&o, &acct, "admit", "ag_bot", 1), forged]);
-        let folded = fold_verified(&l, &acct).expect("valid anchor");
-        assert_eq!(folded.status("dev_box"), None, "forged revoke is skipped (no verified event about dev_box)");
-        assert_eq!(folded.status("ag_bot"), Some((true, 1)), "ag_bot was admitted, not revoked");
-        assert_eq!(folded.max_seq, 1, "only the verified admit counts");
+        let l = ledger(&o, vec![ev(&o, "admit", MY_DEV, 1, &MY_PK), ev(&o, "revoke", MY_DEV, 2, &[])]);
+        let f = pull(paired_at(1), &l, T0 + 60).unwrap();
+        assert_eq!(f.self_revoke_seq, 2);
+        assert_eq!(gate(&f, T0 + 60, true, true), DeviceGate::Revoked);
+        // Latched: a later pull that drops the revoke regresses (hold), so the
+        // persisted latch stands.
+        let dropped = ledger(&o, vec![ev(&o, "admit", MY_DEV, 1, &MY_PK)]);
+        assert!(pull(f.clone(), &dropped, T0 + 120).is_err());
+        assert_eq!(gate(&f, T0 + 120, true, true), DeviceGate::Revoked);
     }
 
+    /// Re-pair after a revoke: pairing writes the decision fresh at the new
+    /// admit, so the old revoke never wipes again; the first pull serves.
     #[test]
-    fn foreign_owner_event_is_skipped() {
+    fn re_pairing_after_a_revoke_serves_without_a_wipe_loop() {
         let o = owner();
-        let acct = o.user_id();
-        // An event whose owner_id is someone else, but signed by our owner (a confused
-        // or malicious re-attribution): owner_id != account anchor → skipped.
-        let mut ev = signed_event(&o, &acct, "revoke", "dev_box", 1);
-        ev.owner_id = "us_someone_else".to_string();
-        let l = ledger(&o, vec![ev]);
-        let folded = fold_verified(&l, &acct).unwrap();
-        assert!(folded.state.is_empty(), "foreign-owner event does not fold");
-    }
-
-    /// C4: a ledger without a head, with a dropped or added event, or whose
-    /// head another key signed is refused whole (park), never folded.
-    #[test]
-    fn a_ledger_not_matching_its_signed_head_is_refused() {
-        let o = owner();
-        let acct = o.user_id();
-        let events = || {
+        let dir = tempfile::tempdir().unwrap();
+        // The old decision carried a latched revoke at seq 2.
+        store_floor(dir.path(), &LedgerFloor { admitted_seq: 1, self_revoke_seq: 2, ..paired_at(1) });
+        // Re-pair: C6 writes revoke(old) at 3 then admit(new) at 4.
+        write_pairing_floor(dir.path(), 4, T0).unwrap();
+        let f = load_floor(dir.path());
+        assert_eq!(gate(&f, T0 + 1, true, true), DeviceGate::Open);
+        let l = ledger(
+            &o,
             vec![
-                signed_event(&o, &acct, "admit", "dev_box", 1),
-                signed_event(&o, &acct, "revoke", "dev_box", 2),
-            ]
-        };
-        assert!(fold_verified(&ledger(&o, events()), &acct).is_some(), "honest ledger folds");
+                ev(&o, "admit", MY_DEV, 1, &MY_PK),
+                ev(&o, "revoke", MY_DEV, 2, &[]),
+                ev(&o, "revoke", MY_DEV, 3, &[]),
+                ev(&o, "admit", MY_DEV, 4, &MY_PK),
+            ],
+        );
+        let f = pull(f, &l, T0 + 60).unwrap();
+        assert_eq!(gate(&f, T0 + 60, true, true), DeviceGate::Open);
+        assert_eq!(f.admitted_seq, 4);
+    }
 
-        let mut l = ledger(&o, events());
+    /// Restart within the lease with the backend down: the persisted decision
+    /// serves (hold).
+    #[test]
+    fn a_restart_within_the_lease_serves_without_a_pull() {
+        let dir = tempfile::tempdir().unwrap();
+        store_floor(dir.path(), &paired_at(3));
+        let f = load_floor(dir.path());
+        assert_eq!(gate(&f, T0 + 6 * 86_400, true, true), DeviceGate::Open);
+        assert_eq!(lease_days_left(&f, T0 + 6 * 86_400), Some(1));
+    }
+
+    /// Not admitted → park, never a wipe: no event for this device, or an
+    /// admit of its dev_ over another daemon key.
+    #[test]
+    fn a_device_without_its_admit_parks() {
+        let o = owner();
+        let none = ledger(&o, vec![ev(&o, "admit", "dev_other", 1, &[9u8; 32])]);
+        let f = pull(LedgerFloor::default(), &none, T0).unwrap();
+        assert_eq!(gate(&f, T0, true, true), DeviceGate::NotAdmitted);
+        let other_key = ledger(&o, vec![ev(&o, "admit", MY_DEV, 1, &[9u8; 32])]);
+        let f = pull(LedgerFloor::default(), &other_key, T0).unwrap();
+        assert_eq!(gate(&f, T0, true, true), DeviceGate::NotAdmitted);
+        assert_eq!(f.self_revoke_seq, 0, "no wipe");
+        // Never paired: nothing persisted.
+        assert_eq!(gate(&LedgerFloor::default(), T0, true, true), DeviceGate::NotAdmitted);
+    }
+
+    /// No anchor (or no DIK) → park, whatever was persisted.
+    #[test]
+    fn no_anchor_or_no_dik_parks() {
+        assert_eq!(gate(&paired_at(1), T0, false, true), DeviceGate::NotAdmitted);
+        assert_eq!(gate(&paired_at(1), T0, true, false), DeviceGate::NotAdmitted);
+    }
+
+    /// One bad event, a head mismatch, a foreign anchor, a gap: the whole pull
+    /// is refused (hold), nothing is folded, nothing wipes.
+    #[test]
+    fn one_bad_event_or_a_head_mismatch_holds() {
+        let o = owner();
+        let acct = o.user_id();
+        let good = || vec![ev(&o, "admit", MY_DEV, 1, &MY_PK), ev(&o, "revoke", MY_DEV, 2, &[])];
+        assert!(verify_strict(&ledger(&o, good()), &acct).is_ok());
+
+        // A forged revoke the head even commits to: still refused whole.
+        let mut events = good();
+        events[1].sig = STANDARD.encode([0u8; 64]);
+        assert!(verify_strict(&ledger(&o, events), &acct).is_err(), "bad event");
+
+        let mut l = ledger(&o, good());
         l.head = None;
-        assert!(fold_verified(&l, &acct).is_none(), "no head");
+        assert!(verify_strict(&l, &acct).is_err(), "no head");
 
-        // Truncated tail: the revoke dropped, the full head kept.
-        let mut l = ledger(&o, events());
+        let mut l = ledger(&o, good());
         l.events.pop();
-        assert!(fold_verified(&l, &acct).is_none(), "truncated tail");
+        assert!(verify_strict(&l, &acct).is_err(), "truncated tail");
 
-        // An extra (validly signed) event the head does not commit to.
-        let mut l = ledger(&o, events());
-        l.events.push(signed_event(&o, &acct, "admit", "dev_other", 3));
-        assert!(fold_verified(&l, &acct).is_none(), "extra event");
+        let mut l = ledger(&o, good());
+        l.events.push(ev(&o, "admit", "ag_x", 3, &[]));
+        assert!(verify_strict(&l, &acct).is_err(), "event outside the head");
 
-        // A head signed by someone else over the same list.
         let imposter = SigningIdentity::from_seed(&[9u8; 32]);
-        let mut l = ledger(&o, events());
-        let mut forged = sign_head(&imposter, &l.events);
-        forged.anchor = acct.clone();
-        l.head = Some(forged);
-        assert!(fold_verified(&l, &acct).is_none(), "foreign head signer");
+        let mut l = ledger(&o, good());
+        l.anchor = Some(AnchorJson { uik_id: imposter.user_id(), uik_pub: STANDARD.encode(imposter.public_bytes()) });
+        assert!(verify_strict(&l, &acct).is_err(), "swapped anchor");
 
-        // A head whose max_seq lies about the tail.
-        let mut l = ledger(&o, events());
-        let mut h = sign_head(&o, &l.events);
-        h.max_seq = 5;
+        let mut l = ledger(&o, good());
+        let mut h = sign_head(&imposter, &l.events);
+        h.anchor = acct.clone();
         l.head = Some(h);
-        assert!(fold_verified(&l, &acct).is_none(), "max_seq mismatch");
+        assert!(verify_strict(&l, &acct).is_err(), "head by another key");
+
+        let gap = ledger(&o, vec![ev(&o, "admit", MY_DEV, 1, &MY_PK), ev(&o, "admit", "ag_x", 3, &[])]);
+        assert!(verify_strict(&gap, &acct).is_err(), "seq gap");
+
+        let mut foreign = good();
+        foreign[0].owner_id = "us_someone_else".into();
+        assert!(verify_strict(&ledger(&o, foreign), &acct).is_err(), "foreign owner");
+
+        // The persisted decision is untouched by a refused pull: still serving.
+        assert_eq!(gate(&paired_at(1), T0 + 60, true, true), DeviceGate::Open);
+    }
+
+    /// The agent allowlist: the latest event per ag_ decides; a revoked agent
+    /// is out at the next fold.
+    #[test]
+    fn agents_are_admitted_only_while_their_latest_event_is_an_admit() {
+        let o = owner();
+        let l = ledger(
+            &o,
+            vec![
+                ev(&o, "admit", MY_DEV, 1, &MY_PK),
+                ev(&o, "admit", "ag_a", 2, &[]),
+                ev(&o, "admit", "ag_b", 3, &[]),
+                ev(&o, "revoke", "ag_b", 4, &[]),
+            ],
+        );
+        let f = pull(paired_at(1), &l, T0).unwrap();
+        assert_eq!(f.agents, vec!["ag_a".to_string()]);
+    }
+
+    /// Lease expiry → lock (never a wipe); a fresh verified pull reopens.
+    #[test]
+    fn the_lease_locks_after_seven_days_and_a_pull_reopens() {
+        let o = owner();
+        let f = paired_at(1);
+        assert_eq!(gate(&f, T0 + LEASE_SECS, true, true), DeviceGate::Open);
+        assert_eq!(gate(&f, T0 + LEASE_SECS + 1, true, true), DeviceGate::Stale);
+        let l = ledger(&o, vec![ev(&o, "admit", MY_DEV, 1, &MY_PK)]);
+        let later = T0 + LEASE_SECS + 10;
+        let f = pull(f, &l, later).unwrap();
+        assert_eq!(gate(&f, later, true, true), DeviceGate::Open);
+        assert_eq!(f.self_revoke_seq, 0);
+    }
+
+    /// A clock moved backwards never extends the lease: earlier than the last
+    /// verified pull is stale, and the latest wall time seen keeps counting.
+    #[test]
+    fn a_clock_rollback_does_not_extend_the_lease() {
+        let mut f = paired_at(1);
+        assert_eq!(gate(&f, T0 - 1, true, true), DeviceGate::Stale);
+        f.max_wall = T0 + LEASE_SECS + 5; // seen 7 days on, then the clock went back
+        assert_eq!(gate(&f, T0 + 3600, true, true), DeviceGate::Stale);
+    }
+
+    #[test]
+    fn floor_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = LedgerFloor { agents: vec!["ag_a".into()], ..paired_at(2) };
+        store_floor(dir.path(), &f);
+        assert_eq!(load_floor(dir.path()), f);
+    }
+
+    /// Lease expiry (or a park) locks: K is evicted from every vault at once,
+    /// nothing on disk is touched, and unlock is refused until a verified pull.
+    #[test]
+    fn a_stale_standing_locks_without_wiping() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = crate::config::Config {
+            state_dir: dir.path().to_path_buf(),
+            port: 0,
+            proxy_port: 0,
+            listen: "127.0.0.1".into(),
+            origin: "http://localhost".into(),
+            relying_party: crate::passkey::webauthn::RelyingParty::exact("http://localhost", "localhost"),
+            admin_key: None,
+            relay_url: None,
+            body_cap: crate::config::DEFAULT_BODY_CAP,
+        };
+        let state = AppState::new(cfg);
+        let blob = dir.path().join("vaults").join("v1");
+        std::fs::create_dir_all(&blob).unwrap();
+        std::fs::write(blob.join("vault.per-item.json"), b"{}").unwrap();
+        state.open_ledger_for_tests(&[]);
+        state.unlock_vault(
+            "v1".into(),
+            crate::state::SecretsCache::default(),
+            zeroize::Zeroizing::new(vec![0x42u8; 32]),
+        );
+        assert!(state.ledger_refusal().is_none());
+        let f = paired_at(1);
+        let g = gate(&f, T0 + LEASE_SECS + 1, true, true);
+        assert_eq!(g, DeviceGate::Stale);
+        publish(&state, g, &f);
+        assert!(state.is_vault_locked("v1"), "K evicted");
+        assert!(blob.join("vault.per-item.json").exists(), "data stays on disk");
+        assert_eq!(state.ledger_refusal().unwrap().code().0.as_str(), "ledger_stale");
+    }
+
+    /// The pull authenticates by DIK proof of possession alone, so a revoked
+    /// device whose bearer the backend already dropped still receives its own
+    /// revoke, and one pull decides the wipe.
+    #[tokio::test]
+    async fn a_revoked_device_without_a_bearer_still_pulls_its_revoke() {
+        use axum::{http::HeaderMap, routing::get, Json, Router};
+        let o = owner();
+        let dik = SigningIdentity::from_seed(&[3u8; 32]);
+        let dev = identity::derive_id(IdKind::Device, &dik.public_bytes());
+        let dik_pub = dik.public_bytes();
+        let events = vec![ev(&o, "admit", &dev, 1, &MY_PK), ev(&o, "revoke", &dev, 2, &[])];
+        let head = sign_head(&o, &events);
+        let body = serde_json::json!({
+            "anchor": { "uik_id": o.user_id(), "uik_pub": STANDARD.encode(o.public_bytes()) },
+            "events": events.iter().map(|e| serde_json::json!({
+                "seq": e.seq, "op": e.op, "principal_id": e.principal_id,
+                "anchor_uik": e.anchor_uik, "owner_id": e.owner_id, "sig": e.sig,
+                "sc_pk": e.sc_pk,
+            })).collect::<Vec<_>>(),
+            "head": { "anchor": head.anchor, "max_seq": head.max_seq,
+                      "events_hash": head.events_hash, "sig": head.sig },
+        });
+        let dev2 = dev.clone();
+        let uik_q = format!("/api/vault/principals?uik={}", o.user_id());
+        let app = Router::new().route(
+            "/api/vault/principals",
+            get(move |h: HeaderMap, uri: axum::http::Uri| {
+                let body = body.clone();
+                let dev = dev2.clone();
+                let uik_q = uik_q.clone();
+                async move {
+                    // The pinned account rides the query, and the PoP covers it.
+                    let pq = uri.path_and_query().map(|p| p.as_str().to_string()).unwrap_or_default();
+                    if pq != uik_q {
+                        return Err(axum::http::StatusCode::BAD_REQUEST);
+                    }
+                    // The backend dropped this device's key: any bearer is refused.
+                    if h.contains_key("authorization") {
+                        return Err(axum::http::StatusCode::UNAUTHORIZED);
+                    }
+                    let hv = |k: &str| h.get(k).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+                    let ts: u64 = hv(crate::device_auth::HDR_DEVICE_TS).parse().unwrap_or(0);
+                    let sig = STANDARD.decode(hv(crate::device_auth::HDR_DEVICE_SIG)).unwrap_or_default();
+                    let input = identity::device_request_signature_input("GET", &pq, ts, &[], &dev);
+                    let ok = hv(crate::device_auth::HDR_DEVICE_ID) == dev
+                        && <[u8; 64]>::try_from(sig.as_slice())
+                            .is_ok_and(|s| identity::verify(&dik_pub, &input, &s));
+                    if !ok {
+                        return Err(axum::http::StatusCode::UNAUTHORIZED);
+                    }
+                    Ok(Json(body))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let signer = DeviceRequestSigner::new(dik, dev.clone());
+        let client = reqwest::Client::new();
+        let l = fetch_ledger(&client, &format!("http://{}", addr), &o.user_id(), &signer)
+            .await
+            .unwrap();
+        let folded = verify_strict(&l, &o.user_id()).unwrap();
+        let f = apply_pull(paired_at(1), &folded, &dev, &MY_PK, T0 + 60).unwrap();
+        assert_eq!(gate(&f, T0 + 60, true, true), DeviceGate::Revoked);
     }
 
     /// The pairing admit proves the owner only over THIS machine's own keys.
     #[test]
     fn pairing_admit_binds_principal_key_and_owner() {
-        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         let o = owner();
         let acct = o.user_id();
         let pk = [5u8; 32];
@@ -727,39 +1074,5 @@ mod tests {
         let mut forged = admit("dev_me", &pk, 3);
         forged["seq"] = serde_json::json!(4);
         assert!(verify_pairing_admit(&forged, &me, "dev_me", &pk).is_err());
-    }
-
-    // F1 regression: the MONOTONE self-revoke latch (`apply_fold_to_floor`). Once a revoke
-    // of self is verified, a later pull that OMITS it — even while serving an OLDER admit
-    // and a NEWER unrelated event — must NOT un-revoke. Only a verified LATER admit clears it.
-    #[test]
-    fn monotone_latch_survives_omitted_revoke() {
-        let o = owner();
-        let acct = o.user_id();
-        let dev = "dev_me";
-
-        // Pull 1: dev_me revoked at seq 2 → latch {revoked, revoke_seq: 2, seq: 2}.
-        let p1 = ledger(&o, vec![
-            signed_event(&o, &acct, "admit", dev, 1),
-            signed_event(&o, &acct, "revoke", dev, 2),
-        ]);
-        let f1 = apply_fold_to_floor(LedgerFloor::default(), &fold_verified(&p1, &acct).unwrap(), Some(dev));
-        assert!(f1.self_revoked && f1.self_revoke_seq == 2 && f1.seq == 2);
-
-        // Pull 2 (malicious): revoke(2) OMITTED, admit(1) kept (dev_me looks "admitted" @1),
-        // plus a genuine NEWER unrelated event (admit dev_other @3) so max_seq advances. The
-        // OLDER admit (seq 1 <= revoke seq 2) must NOT clear the latch.
-        let p2 = ledger(&o, vec![
-            signed_event(&o, &acct, "admit", dev, 1),
-            signed_event(&o, &acct, "admit", "dev_other", 3),
-        ]);
-        let f2 = apply_fold_to_floor(f1, &fold_verified(&p2, &acct).unwrap(), Some(dev));
-        assert!(f2.self_revoked, "an omitted revoke (only an OLDER admit served) must NOT un-revoke");
-        assert_eq!(f2.seq, 3, "high-water still advances on the unrelated event");
-
-        // Pull 3: a genuine re-admit at seq > the revoke seq is the ONLY thing that clears it.
-        let p3 = ledger(&o, vec![signed_event(&o, &acct, "admit", dev, 4)]);
-        let f3 = apply_fold_to_floor(f2, &fold_verified(&p3, &acct).unwrap(), Some(dev));
-        assert!(!f3.self_revoked, "a verified LATER admit clears the latch");
     }
 }

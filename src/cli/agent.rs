@@ -196,46 +196,16 @@ async fn ls(json: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// `sc agent rm`: revoking an agent is an owner-signed ledger revoke, signed in
+/// the console (this machine holds no owner key). Print the page; every device
+/// refuses the agent at its next ledger pull.
 async fn rm(args: AgentRmArgs) -> Result<(), String> {
-    let (cloud, key) = cloud_and_key()?;
-    let agents = fetch_agents(&cloud, &key).await?;
-    let matches: Vec<&ListKey> = agents
-        .iter()
-        .filter(|k| {
-            k.label.as_deref() == Some(args.name.as_str())
-                || k.id == args.name
-                || k.prefix == args.name
-        })
-        .collect();
-    let id = match matches.as_slice() {
-        [k] => k.id.clone(),
-        [] => {
-            return Err(format!(
-                "no agent named '{}' (see `sc agent ls`)",
-                args.name
-            ))
-        }
-        _ => {
-            return Err(format!(
-                "'{}' matches multiple agents — remove by id or prefix (`sc agent ls`)",
-                args.name
-            ))
-        }
-    };
-    let url = format!("{}/api/vault/agents/{}", cloud, id);
-    let resp = client()?
-        .delete(&url)
-        .bearer_auth(&key)
-        .dik_pop("DELETE", &url, &[])
-        .send()
-        .await
-        .map_err(|e| crate::cli::neterr::reach_failed(&cloud, &e))?;
-    if !resp.status().is_success() {
-        return Err(format!("revoke failed: HTTP {}", resp.status()));
-    }
+    let url = crate::cli::vault::console_page("/account/access")?;
     eprintln!(
-        "Revoked agent '{}'. Streaming devices drop it within a second; an offline device drops it on its next sync.",
+        "Remove the agent '{}' in the SafeClaw console (it asks for your passkey):",
         args.name
     );
+    eprintln!("  {}", url);
+    eprintln!("Every device stops serving it within two minutes of the removal.");
     Ok(())
 }

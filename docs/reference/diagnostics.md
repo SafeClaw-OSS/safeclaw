@@ -37,8 +37,9 @@ SafeClaw because it is the hop that observed them.
 | `rate_limited` | 429 | retry | request | slow down |
 | `internal` | 500 | retry | internal | daemon bug/failure |
 | `ca_unavailable` | 500 | retry | internal | resident CA unreadable |
-| `agent_key` | 407 | configure | auth | phantom-bearing request without a valid agent api key |
-| `agent_not_in_account` | 403 | configure | auth | the agent isn't registered to the account this machine is signed in to (set up under another account, or removed from this one); checked before any vault-level check. Fix: run `sc agent add` on this machine |
+| `agent_key` | 407 | configure | auth | phantom-bearing request without a verified agent identity (run the agent through `sc run`; set it up with `sc agent add`) |
+| `agent_not_admitted` | 403 | configure | auth | the agent proved its identity, but the account's ledger does not admit it (never approved, or revoked); refused on every vault, whatever its Agent access page lists. Fix: run `sc agent add` |
+| `agent_not_in_account` | 403 | configure | auth | (cloud op relay) the agent isn't registered to the account this machine is signed in to. The daemon itself answers `agent_not_admitted`. Fix: run `sc agent add` on this machine |
 | `ambiguous_phantom` | 400 | fix_request | request | bare phantom on a multi-secret connection; use a role phantom |
 | `approval_needed` | 401 | approve | policy | policy asks; body carries approve/poll URLs + op id |
 | `approval_register` | 503 | retry | internal | could not open the approval op |
@@ -46,6 +47,7 @@ SafeClaw because it is the hop that observed them.
 | `wk_refused_v2` | 400 | none | request | an approval delivered an unlock secret instead of the vault key and the approver's signature; an approver's identity key never leaves their browser, so the daemon refuses it. The request stays pending; reload the approval page (it needs the current console) |
 | `grant_id_invalid` | 403 | none | auth | the approval's identity signature is missing, does not verify, or names someone other than the owner of the passkey that approved; the request stays pending |
 | `device_not_admitted` | 403 | configure | auth | this device has no valid owner-signed admit over its device and daemon keys, so no approval can be sealed to it. Fix: run `sc login` |
+| `ledger_stale` | 423 | retry | environment | SafeClaw could not pull a verified device list from your account for 7 days; vaults are locked (data stays) until it reconnects |
 | `ledger_device_revoked` | 403 | configure | auth | the account owner revoked this device (a verified revoke in the device list; a newer admit of a re-paired device follows its revoke). The daemon latches it. Fix: run `sc login` to pair again |
 | `ledger_head_invalid` | 403 | none | auth | the account's device list does not match its owner-signed head (a forged or truncated list); the daemon keeps its previous view |
 | `broker_body_limit` | 413 | configure | config | body exceeds the inspectable cap; raise `--body-cap` if legitimate |
