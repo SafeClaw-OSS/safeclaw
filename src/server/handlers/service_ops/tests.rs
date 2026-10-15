@@ -992,6 +992,8 @@ mod install_requests {
     type S = sudp::primitives::StdPrimitives;
     const VAULT: &str = "vault-req";
     const ME: &str = "dev_me";
+    /// The account this test daemon is paired to (the requester's identity).
+    const ACCOUNT: &str = "us_requester";
     const K: [u8; 32] = [0x5au8; 32];
 
     /// The cloud as a test sees it: takes every write, or refuses each with a
@@ -1108,13 +1110,14 @@ mod install_requests {
             VAULT,
             names,
             ME,
+            Some(ACCOUNT),
             gh,
             cloud,
         ));
     }
 
     fn asked() -> Value {
-        json!({ "source": "github:acme/tools", "requested_at": 1_760_000_000u64 })
+        json!({ "source": "github:acme/tools", "requested_at": 1_760_000_000u64, "requested_by": ACCOUNT })
     }
 
     /// Claimed with a compare-and-swap at the row's version, then prepared
@@ -1259,10 +1262,10 @@ mod install_requests {
             true,
             &[
                 ("gate", asked()),
-                ("local", json!({ "source": "./mine", "requested_at": 1 })),
+                ("local", json!({ "source": "./mine", "requested_at": 1, "requested_by": ACCOUNT })),
                 (
                     "commit",
-                    json!({ "source": "github:acme/tools", "ref": "a".repeat(40), "requested_at": 1 }),
+                    json!({ "source": "github:acme/tools", "ref": "a".repeat(40), "requested_at": 1, "requested_by": ACCOUNT }),
                 ),
             ],
         );
@@ -1311,11 +1314,11 @@ mod install_requests {
     #[test]
     fn the_step_for_each_request_state() {
         let mut b = asked();
-        assert_eq!(step(&b, ME), Step::Claim);
+        assert_eq!(step(&b, ME, Some(ACCOUNT)), Step::Claim);
         b["claimed_by"] = json!("dev_other");
-        assert_eq!(step(&b, ME), Step::Leave);
+        assert_eq!(step(&b, ME, Some(ACCOUNT)), Step::Leave);
         b["claimed_by"] = json!(ME);
-        assert_eq!(step(&b, ME), Step::Interrupt);
+        assert_eq!(step(&b, ME, Some(ACCOUNT)), Step::Interrupt);
         for (k, v) in [
             ("prepared", json!({ "card": {} })),
             ("up_to_date", json!(true)),
@@ -1323,8 +1326,22 @@ mod install_requests {
         ] {
             let mut a = b.clone();
             a[k] = v;
-            assert_eq!(step(&a, ME), Step::Leave, "{k}");
+            assert_eq!(step(&a, ME, Some(ACCOUNT)), Step::Leave, "{k}");
         }
+    }
+
+    #[test]
+    fn only_the_requesters_own_devices_claim_a_request() {
+        let mine = asked();
+        assert_eq!(step(&mine, ME, Some(ACCOUNT)), Step::Claim);
+        // Another member's request: their devices take it, not this one.
+        assert_eq!(step(&mine, ME, Some("us_someone_else")), Step::Leave);
+        // An unpaired daemon claims nothing new.
+        assert_eq!(step(&mine, ME, None), Step::Leave);
+        // A request naming no one belongs to no one.
+        let mut anon = asked();
+        anon.as_object_mut().unwrap().remove("requested_by");
+        assert_eq!(step(&anon, ME, Some(ACCOUNT)), Step::Leave);
     }
 
     /// The rule row the console holds the same copy of.

@@ -7,8 +7,12 @@
 //! already holds is prepared as an update to the source's current head, as
 //! `sc service update` does: the console's Update is the same request.
 //!
-//! The console writes `{ source, ref?, requested_at }`. On an unlocked sync
-//! one daemon claims a request (`claimed_by`, a compare-and-swap write at the
+//! The console writes `{ source, ref?, requested_at, requested_by }`, where
+//! `requested_by` is the requesting person's identity (`us_…`). A request
+//! belongs to that person: only a daemon paired to that same account claims
+//! it, so the card it prepares reaches the person who asked. A request
+//! naming no one, or someone else, is left alone. On an unlocked sync one of
+//! the requester's daemons claims a request (`claimed_by`, a compare-and-swap write at the
 //! row's version: another device's claim wins and this one leaves it), then
 //! writes `prepared` (the `service-add` card, the records to store and the
 //! ids to remove), `up_to_date: true` (the vault already holds these
@@ -55,13 +59,19 @@ fn answered(body: &Value) -> bool {
         .any(|k| body.get(*k).is_some_and(|v| !v.is_null() && *v != json!(false)))
 }
 
-/// The step for request `body` on the device `me`.
-pub(crate) fn step(body: &Value, me: &str) -> Step {
+/// The step for request `body` on the device `me`, paired to the account
+/// identity `account` (`None`: not paired, so it claims nothing new).
+pub(crate) fn step(body: &Value, me: &str, account: Option<&str>) -> Step {
     if answered(body) {
         return Step::Leave;
     }
-    match body.get("claimed_by").and_then(|v| v.as_str()) {
-        None => Step::Claim,
+    let text = |k: &str| body.get(k).and_then(|v| v.as_str());
+    match text("claimed_by") {
+        // Only the requester's own devices take a request on.
+        None => match (text("requested_by"), account) {
+            (Some(by), Some(acct)) if by == acct => Step::Claim,
+            _ => Step::Leave,
+        },
         Some(c) if c != me => Step::Leave,
         Some(_) => Step::Interrupt,
     }
@@ -315,6 +325,7 @@ pub(crate) async fn process<A: GitHubApi, P: ItemPush>(
     vault: &str,
     names: Vec<String>,
     me: &str,
+    account: Option<&str>,
     fetch_api: &A,
     push: &P,
 ) {
@@ -325,7 +336,7 @@ pub(crate) async fn process<A: GitHubApi, P: ItemPush>(
         let Some(body) = current(state, vault, &name) else {
             continue;
         };
-        let next = match step(&body, me) {
+        let next = match step(&body, me, account) {
             Step::Leave => continue,
             Step::Interrupt => {
                 let mut b = body.clone();
@@ -388,6 +399,7 @@ pub(crate) fn after_sync(state: &Arc<AppState>, vault: &str) {
     let Some(me) = crate::device_auth::device_signer().map(|s| s.device_id().to_string()) else {
         return;
     };
+    let account = crate::cli::active::account_uik();
     if !running().lock().unwrap().insert(vault.to_string()) {
         return;
     }
@@ -403,6 +415,7 @@ pub(crate) fn after_sync(state: &Arc<AppState>, vault: &str) {
                         &vault,
                         vec![one],
                         &me,
+                        account.as_deref(),
                         &api,
                         &Cloud,
                     )
