@@ -186,7 +186,7 @@ async fn fetch_ledger(cloud: &str, dk: &str) -> Option<LedgerJson> {
 /// `seq`. Returns `None` (fail closed → park) iff the anchor is missing or does NOT
 /// self-certify against `anchor_uik` (a swapped anchor = untrusted source). An
 /// individually invalid event (bad sig, foreign owner, unknown op) is SKIPPED, not
-/// fatal — mirrors the per-vault `fold_owner_set`.
+/// fatal — mirrors the per-vault `fold_roles`.
 fn fold_verified(ledger: &LedgerJson, anchor_uik: &str) -> Option<Folded> {
     let anchor = ledger.anchor.as_ref()?;
     let anchor_pub = decode_pub32(&anchor.uik_pub)?;

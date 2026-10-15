@@ -289,7 +289,8 @@ async fn run(
     //    the pre-event loop — only the wait between polls is event-aware.
     let poll_url = format!("{}/v/{}/op/relay/{}", base, vault_id, op_id);
     let deadline = tokio::time::Instant::now() + poll_budget(expires_at);
-    // Full-body hash of the last grant that failed BATCH verification: skip
+    // Full-body hash of the last grant refused RECOVERABLY (it failed BATCH
+    // verification, or its signer may not approve this op): skip
     // re-applying a byte-identical redelivery in the gap before our
     // re-register flips the relay row back to pending. Full body, not the
     // assertion: a same-set retry has the same root and a deterministic
@@ -347,7 +348,7 @@ async fn run(
                         tracing::info!(op = %op_id, "op resolved locally while its grant applied; poll ending");
                         return Ok(());
                     }
-                    if e.batch_verify_failed {
+                    if e.batch_verify_failed || e.approver_not_authorized {
                         // RECOVERABLE (design/batch-approve.md §Daemon verify
                         // 7): never reject a user-approved op over a failed
                         // BATCH rebuild (daemon restart, version skew,
@@ -357,8 +358,16 @@ async fn run(
                         // first-write-wins, so without this reset no retry
                         // could ever land) — and keep polling until the op's
                         // own expiry.
+                        // Same recovery for a grant whose signer is neither the
+                        // requester nor a vault admin: another member's tap must
+                        // never resolve (or burn) the op; reset it to pending so
+                        // the requester or an admin can still approve it.
                         last_batch_failed = Some(grant_hash);
-                        tracing::warn!(op = %op_id, "batch grant failed verification ({}); re-registering op so per-op approval works again", e.detail);
+                        if e.approver_not_authorized {
+                            tracing::warn!(op = %op_id, "grant refused, approver not authorized ({}); re-registering op so the requester or a vault admin can approve", e.detail);
+                        } else {
+                            tracing::warn!(op = %op_id, "batch grant failed verification ({}); re-registering op so per-op approval works again", e.detail);
+                        }
                         // Recovery re-register: `supersedes: []` (nothing was
                         // just marked), the op's CURRENT superseded_by.
                         let reg_body = register_body(&state, &base_body, op_id, &[]);
@@ -375,13 +384,13 @@ async fn run(
                             .await;
                         match rr {
                             Ok(r) if r.status().is_success() => {
-                                tracing::info!(op = %op_id, "op re-registered as pending after batch verify failure");
+                                tracing::info!(op = %op_id, "op re-registered as pending after a recoverable grant refusal");
                             }
                             Ok(r) => {
-                                tracing::warn!(op = %op_id, "re-register after batch failure: HTTP {}", r.status());
+                                tracing::warn!(op = %op_id, "re-register after a refused grant: HTTP {}", r.status());
                             }
                             Err(err) => {
-                                tracing::warn!(op = %op_id, "re-register after batch failure: {}", err);
+                                tracing::warn!(op = %op_id, "re-register after a refused grant: {}", err);
                             }
                         }
                         next_poll_due(&op_wait, vault_id, last_poll).await;
@@ -510,6 +519,9 @@ fn resolved_locally(state: &AppState, op_id: &str) -> bool {
 /// NEVER by matching message text (design/batch-approve.md §Daemon verify 7).
 struct ApplyFailure {
     batch_verify_failed: bool,
+    /// `approver_not_authorized`: the signer may not approve this op; it stays
+    /// pending (recovered like `batch_verify_failed`).
+    approver_not_authorized: bool,
     detail: String,
 }
 
@@ -517,6 +529,7 @@ impl ApplyFailure {
     fn transport(detail: String) -> Self {
         ApplyFailure {
             batch_verify_failed: false,
+            approver_not_authorized: false,
             detail,
         }
     }
@@ -548,6 +561,7 @@ async fn apply_grant(state: Arc<AppState>, op_id: &str, grant: Value) -> Result<
             .and_then(|v| v.get("code").and_then(|c| c.as_str()).map(String::from));
         Err(ApplyFailure {
             batch_verify_failed: code.as_deref() == Some("batch_verify_failed"),
+            approver_not_authorized: code.as_deref() == Some("approver_not_authorized"),
             detail: format!("loopback approve HTTP {}: {}", status, body),
         })
     }

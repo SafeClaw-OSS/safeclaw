@@ -42,6 +42,12 @@ pub enum ScCode {
     /// op instead of rejecting it, so this must stay a distinct code (the
     /// client switches on it, never on message text).
     BatchVerifyFailed,
+    /// A grant signed by a passkey that may not approve THIS op: on a shared
+    /// vault only the requester (the member whose daemon raised it) or a vault
+    /// admin may approve. RECOVERABLE: the op stays pending and the relay
+    /// client re-registers it so the requester or an admin can still approve
+    /// (the client switches on this code, never on message text).
+    ApproverNotAuthorized,
     BrokerBodyLimit,
     EgressUnreachable,
     ExposesUnsupported,
@@ -133,6 +139,13 @@ impl ScCode {
                 "Batch approval could not be verified",
                 "retry",
                 "request",
+            ),
+            ApproverNotAuthorized => (
+                403,
+                "approver_not_authorized",
+                "Only the requester or a vault admin can approve this",
+                "none",
+                "auth",
             ),
             ApprovalRegister => (
                 503,
@@ -309,6 +322,9 @@ pub enum AppError {
     /// Batch-approve verification failure (recoverable; see
     /// `ScCode::BatchVerifyFailed`). Never use for per-op apply failures.
     BatchVerify(String),
+    /// The grant's signer may not approve this op (see
+    /// `ScCode::ApproverNotAuthorized`). The op stays pending.
+    ApproverNotAuthorized(String),
 }
 
 impl AppError {
@@ -325,6 +341,7 @@ impl AppError {
             AppError::VaultLocked => (ScCode::VaultLocked, VAULT_LOCKED_MSG.to_string()),
             AppError::TooManyRequests => (ScCode::RateLimited, "Rate limit exceeded".to_string()),
             AppError::BatchVerify(msg) => (ScCode::BatchVerifyFailed, msg.clone()),
+            AppError::ApproverNotAuthorized(msg) => (ScCode::ApproverNotAuthorized, msg.clone()),
             AppError::Internal(msg) => {
                 tracing::error!("internal error: {}", msg);
                 (ScCode::Internal, "Internal server error".to_string())
@@ -368,6 +385,7 @@ impl std::fmt::Display for AppError {
             AppError::TooManyRequests => write!(f, "Rate limit exceeded"),
             AppError::Internal(msg) => write!(f, "Internal error: {}", msg),
             AppError::BatchVerify(msg) => write!(f, "Batch verification failed: {}", msg),
+            AppError::ApproverNotAuthorized(msg) => write!(f, "Approver not authorized: {}", msg),
         }
     }
 }
@@ -419,6 +437,7 @@ mod tests {
             ApprovalNeeded,
             ApprovalRegister,
             BatchVerifyFailed,
+            ApproverNotAuthorized,
             BrokerBodyLimit,
             EgressUnreachable,
             ExposesUnsupported,

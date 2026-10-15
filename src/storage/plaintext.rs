@@ -420,20 +420,49 @@ pub fn suggested_secret_key(conn_id: &str, service_id: &str, role: &str) -> Stri
 }
 
 /// Membership role inside a shared vault. Two tiers by design (team §7.1/§5.15):
-/// `Owner` = manage (config, members, reveal, kill switch); `Member` = edit
-/// (content). Multiple owners are the norm; the LAST owner can never be removed
-/// or demoted (§7.9).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+/// `Admin` = manage (config, members, reveal, approve anyone's request, kill
+/// switch); `Member` = edit (content). Several admins are the norm; the LAST
+/// admin can never be removed or demoted (§7.9). (The single billing "owner" of
+/// a team is a server-side product label held by one admin; it is not a role
+/// and never appears in signed data.)
+///
+/// Wire tokens: writers emit `"admin"` / `"member"`. Records signed before the
+/// rename carry `"owner"`, which reads as [`MemberRole::LegacyOwner`]: the SAME
+/// role as `Admin` (`==` treats them as equal, [`MemberRole::is_admin`] is
+/// true), but it keeps its spelling so a re-emitted record still carries the
+/// exact bytes its signature covers. Never construct `LegacyOwner` in new code.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum MemberRole {
-    Owner,
+    Admin,
     /// The least-privilege default: a cred that loads without an explicit role
-    /// (legacy row, serde default) is a `Member`, never an `Owner`. This is the
-    /// fail-closed choice for the owner-authority anchor — a missing role can
-    /// never silently confer owner powers.
+    /// (legacy row, serde default) is a `Member`, never an `Admin`. This is the
+    /// fail-closed choice for the admin-authority anchor — a missing role can
+    /// never silently confer admin powers.
     #[default]
     Member,
+    /// The pre-rename spelling of [`MemberRole::Admin`] (`"owner"`), read from
+    /// records signed before the rename. Equal to `Admin` in every comparison.
+    #[serde(rename = "owner")]
+    LegacyOwner,
 }
+
+impl MemberRole {
+    /// Does this role carry admin authority? (`Admin`, or its legacy `"owner"`
+    /// spelling.)
+    pub fn is_admin(self) -> bool {
+        matches!(self, MemberRole::Admin | MemberRole::LegacyOwner)
+    }
+}
+
+/// Roles compare by MEANING, not spelling: a legacy `"owner"` record is an admin.
+impl PartialEq for MemberRole {
+    fn eq(&self, other: &Self) -> bool {
+        self.is_admin() == other.is_admin()
+    }
+}
+
+impl Eq for MemberRole {}
 
 /// A single agent's reach mask — which connections of THIS vault the agent may
 /// use (design/team §8.1). The mask defaults OPEN and the console writes a

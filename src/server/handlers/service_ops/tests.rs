@@ -451,7 +451,7 @@ fn v2_vault(vault: &str) -> PerItemVault {
     )
     .unwrap();
     for (cid, who, role, role_str) in [
-        ("cid-creator", &creator, MemberRole::Owner, "owner"),
+        ("cid-creator", &creator, MemberRole::Admin, "owner"),
         ("cid-member", &member, MemberRole::Member, "member"),
     ] {
         let grant = creator.signing().sign(&crate::identity::role_grant_input(

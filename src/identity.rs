@@ -533,7 +533,8 @@ pub fn membership_commitment(sigs: &[&[u8]]) -> [u8; 32] {
 /// ```
 ///
 /// `role` is the lowercase serde token of [`crate::storage::plaintext::MemberRole`]
-/// (`"owner"` / `"member"`). The variable-length fields are length-prefixed (so a
+/// (`"admin"` / `"member"`; a grant signed before the admin rename carries `"owner"`,
+/// which still verifies as admin). The variable-length fields are length-prefixed (so a
 /// `(vault, user, role)` triple can't be spliced into another); the trailing epoch
 /// is appended as a fixed-width big-endian `u64`, EXACTLY as [`rekey_sig_input`]
 /// appends `generation`.
@@ -573,10 +574,10 @@ pub fn role_grant_input(vault_id: &str, user_id: &str, role: &str, role_epoch: u
 ///
 /// `op` ∈ {`"set"`, `"remove"`}: `set` inserts `subject_id → role` (add / promote /
 /// demote); `remove` drops `subject_id` (NON-CASCADE — touches only the subject).
-/// `role` is the lowercase [`crate::storage::plaintext::MemberRole`] token for `set`,
-/// empty for `remove`. `granter_id` is the signing owner's `us_…`; the event is
-/// honored by the fold iff `granter_id` is an OWNER in the owner-set folded up to
-/// this event (so a member can't grant, and issuance-time authority survives the
+/// `role` is the lowercase [`crate::storage::plaintext::MemberRole`] token for `set`
+/// (`"admin"` / `"member"`, legacy `"owner"` = admin), empty for `remove`.
+/// `granter_id` is the signing admin's `us_…`; the event is honored by the fold
+/// iff `granter_id` is an ADMIN in the role set folded up to this event (so a member can't grant, and issuance-time authority survives the
 /// granter's later removal). `seq` is monotone within `role_epoch` (rollback guard);
 /// `role_epoch` binds the event to the current checkpoint so a compaction that folds
 /// the log invalidates replays of pre-compaction events at the new epoch.

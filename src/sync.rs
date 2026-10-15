@@ -4740,9 +4740,9 @@ struct KeyRowData {
     /// HPKE ciphertext = `Seal(K)` to `uik_enc_pub`.
     #[serde(default)]
     uik_k_ct: Option<String>,
-    /// This member's role (`"owner"` / `"member"`), an owner-signed attribute on
-    /// the cred (design/identity-uik-aik.md §4.3). Absent on a legacy row ⇒
-    /// defaults to `Member` (least privilege) on adopt.
+    /// This member's role (`"admin"` / `"member"`; a legacy `"owner"` is an admin),
+    /// an admin-signed attribute on the cred (design/identity-uik-aik.md §4.3).
+    /// Absent on a legacy row ⇒ defaults to `Member` (least privilege) on adopt.
     #[serde(default)]
     uik_role: Option<crate::storage::plaintext::MemberRole>,
     /// The CREATOR's Ed25519 signature over
@@ -4780,7 +4780,7 @@ struct KeyRowData {
     /// since the last checkpoint) — keyset-LEVEL, carried REDUNDANTLY on every row like
     /// the anchor + generation. JSON array of `DelegationEvent` (sig as STANDARD b64).
     /// Adopted as an append-only UNION (`adopt_delegation_meta`); the authoritative
-    /// owner-set is re-derived from signatures in `fold_owner_set`. Absent on a
+    /// owner-set is re-derived from signatures in `fold_roles`. Absent on a
     /// gen-0 / no-delegation vault.
     #[serde(default)]
     uik_delegation_log: Option<serde_json::Value>,
@@ -5266,7 +5266,7 @@ fn adopt_creator_pin(
 /// copy and NEVER shrinks it, so a colluding server serving a stale/shorter set can't
 /// roll back the owner-set — rollback-safety BY CONSTRUCTION. Unlike `generation`
 /// (a stored scalar gating K selection, hence verify-before-ratchet), the owner-set is
-/// RE-DERIVED from signatures every fold ([`SealedVault::fold_owner_set`] /
+/// RE-DERIVED from signatures every fold ([`SealedVault::fold_roles`] /
 /// `resolve_current_root`), so a forged event/cert adopted here is simply INERT — the
 /// fold ignores it. Adopt only screens for well-formedness (32-byte pubkeys / 64-byte
 /// sigs) + de-duplicates, to keep a re-delivered row from growing the log unboundedly.
@@ -5328,24 +5328,7 @@ fn adopt_delegation_meta(
             {
                 continue;
             }
-            let Ok(sig) = <[u8; 64]>::try_from(e.sig.as_slice()) else {
-                continue;
-            };
-            let role_tok = if e.op == "remove" {
-                ""
-            } else {
-                crate::storage::sealed_vault::role_str(e.role)
-            };
-            let input = crate::identity::delegation_event_input(
-                vault_id,
-                &e.op,
-                &e.subject_id,
-                role_tok,
-                &e.granter_id,
-                e.seq,
-                e.role_epoch,
-            );
-            if !crate::identity::verify(&granter_pub, &input, &sig) {
+            if !e.signature_verifies(vault_id, &granter_pub) {
                 continue; // signature does not self-verify → junk, do not store
             }
             let dup = uik.delegation_log.iter().any(|x| {
@@ -5370,7 +5353,7 @@ fn adopt_delegation_meta(
 /// strictly-higher proposed generation `G` advances the local monotonic
 /// generation (and stores the proof) ONLY when the accompanying proof is present,
 /// is FOR `G`, and is signed by an OWNER in the current folded owner-set
-/// ([`PerItemVault::fold_owner_set`]) with a valid signature over
+/// ([`PerItemVault::fold_roles`]) with a valid signature over
 /// [`crate::identity::rekey_sig_input`]. Otherwise the higher generation is
 /// IGNORED (neither `generation` nor `rekey_proof` change) — this is what stops a
 /// current member forging `uik_generation: 999` with no valid owner proof from
@@ -5455,8 +5438,8 @@ fn adopt_rekey_meta(
     // the two-counter model, so the owner-set is folded at the current role_epoch
     // (checkpoint ∘ delegation_log), NOT re-derived at the proposed `generation`. A
     // member's self-signed proof fails here (a member is not an owner).
-    if pv.fold_owner_set(vault_id).get(&signer_id)
-        != Some(&crate::storage::plaintext::MemberRole::Owner)
+    if pv.fold_roles(vault_id).get(&signer_id)
+        != Some(&crate::storage::plaintext::MemberRole::Admin)
     {
         return Ok(());
     }
@@ -7382,7 +7365,7 @@ mod peritem_tests {
             vec![8u8; 32],         // enc_pub
             vec![1u8; 48],         // k_encapped
             vec![2u8; 48],         // k_ct
-            MemberRole::Owner,
+            MemberRole::Admin,
             grant.clone(), // role_sig (creator-signed @gen)
         );
         {
@@ -7487,7 +7470,7 @@ mod peritem_tests {
                 vec![9u8; 32],
                 vec![1u8; 40],
                 vec![2u8; 40],
-                MemberRole::Owner,
+                MemberRole::Admin,
                 grant,
             );
             pv.keyset.uik.as_mut().unwrap().creator_sig_pub = owner_sig_pub.clone();
@@ -7619,7 +7602,7 @@ mod peritem_tests {
             vec![9u8; 32],
             vec![1u8; 40],
             vec![2u8; 40],
-            MemberRole::Owner,
+            MemberRole::Admin,
             creator_grant,
         );
         let member_grant = creator
@@ -7781,7 +7764,7 @@ mod peritem_tests {
                 vec![9u8; 32],
                 vec![1u8; 40],
                 vec![2u8; 40],
-                MemberRole::Owner,
+                MemberRole::Admin,
                 cg,
             );
             for (cid, who, id) in [("cid-a", &a, &a_id), ("cid-b", &b, &b_id)] {
@@ -7812,7 +7795,7 @@ mod peritem_tests {
                         sealed_vault::DelegationEvent {
                             op: "set".into(),
                             subject_id: subj.clone(),
-                            role: MemberRole::Owner,
+                            role: MemberRole::Admin,
                             granter_id: gid,
                             granter_sig_pub: gpub,
                             seq,
@@ -7826,15 +7809,15 @@ mod peritem_tests {
         };
 
         let source = build(true);
-        let src_owners = source.fold_owner_set(vault);
+        let src_owners = source.fold_roles(vault);
         assert_eq!(
             src_owners.get(&a_id),
-            Some(&MemberRole::Owner),
+            Some(&MemberRole::Admin),
             "A owner @ source"
         );
         assert_eq!(
             src_owners.get(&b_id),
-            Some(&MemberRole::Owner),
+            Some(&MemberRole::Admin),
             "B owner @ source"
         );
 
@@ -7850,14 +7833,14 @@ mod peritem_tests {
         // A fresh device that adopted only the CREDS (no log) sees just the creator.
         let mut fresh = build(false);
         assert!(
-            !fresh.fold_owner_set(vault).contains_key(&a_id),
+            !fresh.fold_roles(vault).contains_key(&a_id),
             "no log adopted yet → A is not an owner on the fresh device",
         );
 
         // Adopt the carried log → the fresh device reconstructs the FULL owner-set.
         adopt_delegation_meta(&mut fresh, vault, &Some(log_json.clone()), &None).unwrap();
         assert_eq!(
-            fresh.fold_owner_set(vault),
+            fresh.fold_roles(vault),
             src_owners,
             "delegation log syncs: the fresh device folds the SAME owner-set",
         );
@@ -7905,7 +7888,7 @@ mod peritem_tests {
             vec![9u8; 32],
             vec![1u8; 40],
             vec![2u8; 40],
-            MemberRole::Owner,
+            MemberRole::Admin,
             cg.clone(),
         );
         for (cid, who, id) in [("cid-a", &a, &a_id), ("cid-b", &b, &b_id)] {
@@ -7939,7 +7922,7 @@ mod peritem_tests {
                 .push(sealed_vault::DelegationEvent {
                     op: "set".into(),
                     subject_id: subj.clone(),
-                    role: MemberRole::Owner,
+                    role: MemberRole::Admin,
                     granter_id: gid,
                     granter_sig_pub: gpub,
                     seq,
@@ -7947,9 +7930,9 @@ mod peritem_tests {
                     sig,
                 });
         }
-        let src_owners = source.fold_owner_set(vault);
-        assert_eq!(src_owners.get(&a_id), Some(&MemberRole::Owner));
-        assert_eq!(src_owners.get(&b_id), Some(&MemberRole::Owner));
+        let src_owners = source.fold_roles(vault);
+        assert_eq!(src_owners.get(&a_id), Some(&MemberRole::Admin));
+        assert_eq!(src_owners.get(&b_id), Some(&MemberRole::Admin));
 
         // Build the EQUIVALENT triple (a GET /v/{vid}/membership body) from the SAME data.
         let enc = |bytes: &[u8]| STANDARD.encode(bytes);
@@ -7990,7 +7973,7 @@ mod peritem_tests {
         let mut fresh = empty_keyset_store();
         adopt_membership_triple(&mut fresh, vault, &anchor_b64, &body).unwrap();
         assert_eq!(
-            fresh.fold_owner_set(vault),
+            fresh.fold_roles(vault),
             src_owners,
             "the membership TRIPLE folds to the SAME owner-set as the /keys wire",
         );
@@ -8039,8 +8022,8 @@ mod peritem_tests {
         let mut pv = empty_keyset_store();
         adopt_membership_triple(&mut pv, vault, &anchor_b64, &body).unwrap();
         assert_eq!(
-            pv.fold_owner_set(vault).get(&m_id),
-            Some(&MemberRole::Owner),
+            pv.fold_roles(vault).get(&m_id),
+            Some(&MemberRole::Admin),
             "a checkpoint owner with a valid role_sig folds as owner even with no enc_pub/K",
         );
     }
@@ -8080,7 +8063,7 @@ mod peritem_tests {
             vec![9u8; 32],
             vec![1u8; 40],
             vec![2u8; 40],
-            MemberRole::Owner,
+            MemberRole::Admin,
             cg,
         );
         let mg = creator
@@ -8096,13 +8079,13 @@ mod peritem_tests {
             vec![9u8; 32],
             vec![1u8; 40],
             vec![2u8; 40],
-            MemberRole::Owner,
+            MemberRole::Admin,
             mg,
         );
         pv.keyset.uik.as_mut().unwrap().creator_sig_pub = creator_pub.clone();
         assert_eq!(
-            pv.fold_owner_set(vault).get(&member_id),
-            Some(&MemberRole::Owner),
+            pv.fold_roles(vault).get(&member_id),
+            Some(&MemberRole::Admin),
             "member is an owner @epoch 0",
         );
 
@@ -8130,10 +8113,10 @@ mod peritem_tests {
         // A fresh device with the SAME creds but no succession → member still owner.
         // Adopt the carried compaction → derived epoch is 1, the stale grant drops.
         adopt_delegation_meta(&mut pv, vault, &None, &Some(succ_json.clone())).unwrap();
-        let os = pv.fold_owner_set(vault);
+        let os = pv.fold_roles(vault);
         assert_eq!(
             os.get(&creator_id),
-            Some(&MemberRole::Owner),
+            Some(&MemberRole::Admin),
             "the root stays an owner across compaction (genesis pin)",
         );
         assert!(

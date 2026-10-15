@@ -42,8 +42,9 @@ use crate::state::{AppState, ApprovalEvent, SecretsCache};
 use crate::storage::plaintext::{Category, VaultPlaintextView};
 use crate::storage::sealed_vault::{
     build_initial, find_pubkey, find_pubkey_in_registry, read as read_vault, read_per_item,
-    write_atomic,
+    write_atomic, ApprovalAuthority, PerItemVault,
 };
+use std::collections::BTreeSet;
 
 /// `GET /op/{op_id}` — JSON poll: status + cached value + render(o).
 ///
@@ -593,6 +594,54 @@ fn batch_expected_challenge(
     Ok(batch_challenge(&root))
 }
 
+/// Who raised the ops this daemon holds: the account it is paired to (its
+/// pinned account UIK), together with the identities the vault seats under
+/// this device's own passkeys (so a missing or stale pin never locks the
+/// requester out of their own request).
+fn requester_identities(pv: &PerItemVault) -> BTreeSet<String> {
+    let mut ids = pv.own_identities();
+    ids.extend(crate::cli::active::account_uik());
+    ids
+}
+
+/// The approval-authority gate of [`approve_op`] (step 3d): refuse a grant
+/// whose signer is neither the requester nor an admin of the vault
+/// ([`PerItemVault::approval_authority`]). First-time Enroll has no prior
+/// identity to check and is not gated.
+fn check_approval_authority(pv: &PerItemVault, vault_id: &str, grant: &Grant) -> Result<()> {
+    if grant.o.act.kind == ActType::Enroll && grant.o.act.target != "passkeys" {
+        return Ok(());
+    }
+    authorize_approver(pv, vault_id, &requester_identities(pv), grant)
+}
+
+/// [`check_approval_authority`] with the requester given (unit-testable).
+fn authorize_approver(
+    pv: &PerItemVault,
+    vault_id: &str,
+    requester: &BTreeSet<String>,
+    grant: &Grant,
+) -> Result<()> {
+    // The keyset keys a passkey's entry by its URL-safe unpadded id.
+    let cid = decode_credential_id(&grant.credential_id)
+        .map(|b| URL_SAFE_NO_PAD.encode(b))
+        .unwrap_or_else(|_| grant.credential_id.clone());
+    // On a v2 vault the delivered secret is the approver's UIK root.
+    let secret = zeroize::Zeroizing::new(
+        grant
+            .wrapping_key
+            .as_deref()
+            .and_then(|b| STANDARD.decode(b).ok())
+            .unwrap_or_default(),
+    );
+    match pv.approval_authority(vault_id, requester, &cid, &secret) {
+        ApprovalAuthority::Refused(reason) => Err(AppError::ApproverNotAuthorized(reason)),
+        ApprovalAuthority::NotGated | ApprovalAuthority::Requester | ApprovalAuthority::Admin => {
+            Ok(())
+        }
+    }
+}
+
 pub async fn approve_op(
     State(state): State<Arc<AppState>>,
     Path(op_id): Path<String>,
@@ -798,6 +847,18 @@ pub async fn approve_op(
             ));
         }
         grant.wrapping_key = Some(STANDARD.encode(&wk));
+    }
+
+    // 3d. Approval AUTHORITY: on a shared (v2) vault only the requester or a
+    // vault admin may approve. Checked BEFORE validation so a refused grant
+    // never consumes this op's single-use challenge and never counts toward
+    // auto-reject: the op stays pending for someone who may approve it. A batch
+    // grant lands here once per op row, so each op is judged on its own.
+    if let Some(pv) = existing_per_item.as_ref() {
+        if let Err(e) = check_approval_authority(pv, &vault_id, &grant) {
+            tracing::warn!(op = %op_id, vault = %vault_id, "approval refused: {}", e);
+            return Err(e);
+        }
     }
 
     let mut validated = {
@@ -5095,5 +5156,164 @@ mod tests {
         seed_per_item_store(&state, &vid, &vault, &view, &k);
         assert_eq!(std::fs::read(&path).unwrap(), b"not json");
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ── approval authority (requester or vault admin) ──────────────────────
+
+    /// The shared-vault fixture of the role tests: the creator (root 0x11) is
+    /// an admin; B (root 0x22, passkey "cid-b") and C (root 0x33, passkey
+    /// "cid-c") are members.
+    fn authority_vault() -> (&'static str, String, String, String, PerItemVault) {
+        use crate::crypto::vault_key::UikRoot;
+        use crate::storage::plaintext::MemberRole;
+        let (vault, creator, b, creator_id, b_id, mut pv) =
+            crate::storage::sealed_vault::tests::role_fixture_creator_cred();
+        let c = UikRoot::from_root([0x33u8; 32]);
+        let c_id = c.user_id();
+        for (cid, who) in [("cid-b", &b), ("cid-c", &c)] {
+            let g = creator.signing().sign(&crate::identity::role_grant_input(
+                vault,
+                &who.user_id(),
+                "member",
+                0,
+            ));
+            pv.set_uik_cred(
+                cid.into(),
+                who.user_id(),
+                who.signing().public_bytes().to_vec(),
+                vec![9u8; 32],
+                vec![1u8; 40],
+                vec![2u8; 40],
+                MemberRole::Member,
+                g.to_vec(),
+            );
+        }
+        (vault, creator_id, b_id, c_id, pv)
+    }
+
+    /// A grant row signed with passkey `cid` delivering UIK root `root`.
+    fn signed_by(mut g: Grant, cid: &str, root: u8) -> Grant {
+        g.credential_id = cid.into();
+        g.wrapping_key = Some(STANDARD.encode([root; 32]));
+        g
+    }
+
+    /// One gesture over several ops: every op row is judged on its own, so a
+    /// member's batch applies to the op they raised and is refused for the op
+    /// another member raised; an admin's batch applies to both.
+    #[test]
+    fn batch_refuses_only_the_foreign_op() {
+        let (vault, _admin, b_id, c_id, pv) = authority_vault();
+        let ops = [("op-b", b_id.clone()), ("op-c", c_id.clone())];
+        let ids: Vec<String> = ops.iter().map(|(id, _)| id.to_string()).collect();
+        let row = |i: usize, cid: &str, root: u8| {
+            signed_by(
+                batch_grant(use_op(vault, &format!("/{}", i)), &b64r(i as u8), ids.clone()),
+                cid,
+                root,
+            )
+        };
+        let requester = |who: &str| -> BTreeSet<String> { [who.to_string()].into() };
+
+        // B's batch: B's own op applies; C's op is foreign to B.
+        let verdicts: Vec<bool> = ops
+            .iter()
+            .enumerate()
+            .map(|(i, (_, who))| {
+                authorize_approver(&pv, vault, &requester(who), &row(i, "cid-b", 0x22)).is_ok()
+            })
+            .collect();
+        assert_eq!(verdicts, vec![true, false]);
+        let err = authorize_approver(&pv, vault, &requester(&c_id), &row(1, "cid-b", 0x22))
+            .unwrap_err();
+        assert!(matches!(err, AppError::ApproverNotAuthorized(_)), "{err}");
+        assert_eq!(err.code().0.as_str(), "approver_not_authorized");
+
+        // The admin's batch applies to every member's op.
+        for (i, (_, who)) in ops.iter().enumerate() {
+            authorize_approver(&pv, vault, &requester(who), &row(i, "cid-creator", 0x11)).unwrap();
+        }
+    }
+
+    /// End to end through `approve_op`: another member's grant is refused with
+    /// `approver_not_authorized` BEFORE validation, so the op stays pending, its
+    /// challenge stays live and the refusal never counts toward auto-reject.
+    /// The requester's own grant passes the gate (and goes on to validation).
+    #[tokio::test]
+    async fn approve_op_refuses_a_foreign_member_and_keeps_the_op_pending() {
+        use crate::crypto::vault_key::UikRoot;
+        use crate::protocol::operation::{Act, Bind, Operation, Valid};
+        use crate::storage::plaintext::MemberRole;
+        let state = Arc::new(test_state());
+        let (vault, _admin, b_id, _c, mut pv) = authority_vault();
+        // This daemon is B's: B's passkey (the store's registered "Yw") is on it.
+        let b = UikRoot::from_root([0x22u8; 32]);
+        pv.set_uik_cred(
+            "Yw".into(),
+            b_id.clone(),
+            b.signing().public_bytes().to_vec(),
+            vec![9u8; 32],
+            vec![1u8; 40],
+            vec![2u8; 40],
+            MemberRole::Member,
+            Vec::new(),
+        );
+        crate::storage::sealed_vault::write_per_item_atomic(
+            &state.vaults.per_item_path(vault).unwrap(),
+            &pv,
+        )
+        .unwrap();
+        let op = Operation {
+            act: Act {
+                kind: ActType::Custom("vault-lock".into()),
+                target: vault.into(),
+                scope: json!({}),
+            },
+            bind: Bind {
+                redeemer: vault.into(),
+                recipient: None,
+            },
+            valid: Valid::single_use(0, None),
+        };
+        let r = state
+            .challenges
+            .lock()
+            .unwrap()
+            .issue("127.0.0.1".parse().unwrap())
+            .unwrap();
+        let id = state
+            .approvals
+            .lock()
+            .unwrap()
+            .create(vault.into(), op.clone(), r.clone());
+
+        // C's root through the registered passkey id: refused at the gate.
+        let err = approve_op(
+            State(state.clone()),
+            Path(id.clone()),
+            Json(signed_by(plain_grant(op.clone(), &r), "Yw", 0x33)),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, AppError::ApproverNotAuthorized(_)), "{err}");
+        {
+            let store = state.approvals.lock().unwrap();
+            let rec = store.get(&id).unwrap();
+            assert!(matches!(rec.status, ApprovalStatus::Pending));
+            assert_eq!(rec.fail_count, 0, "a refusal never marches toward auto-reject");
+        }
+        assert!(state.challenges.lock().unwrap().peek(&r), "challenge not consumed");
+
+        // B (the requester) passes the gate; the dummy assertion then fails
+        // validation, which is not an authority refusal.
+        let err = approve_op(
+            State(state.clone()),
+            Path(id.clone()),
+            Json(signed_by(plain_grant(op, &r), "Yw", 0x22)),
+        )
+        .await
+        .unwrap_err();
+        assert!(!matches!(err, AppError::ApproverNotAuthorized(_)), "{err}");
+        let _ = std::fs::remove_dir_all(state.vaults.dir_for(vault).unwrap());
     }
 }

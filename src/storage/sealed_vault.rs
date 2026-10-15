@@ -523,6 +523,36 @@ pub struct DelegationEvent {
     pub sig: Vec<u8>,
 }
 
+impl DelegationEvent {
+    /// Does `sig` verify under `granter_pub` over this event's signing input
+    /// ([`crate::identity::delegation_event_input`])? A `remove` signs an empty
+    /// role; a `set` signs its role token, which a legacy admin event spells
+    /// `"owner"` and a new one `"admin"` (either verifies the admin role, never
+    /// another role). The one check both the adopt filter and the fold run.
+    pub(crate) fn signature_verifies(&self, vault_id: &str, granter_pub: &[u8; 32]) -> bool {
+        let Ok(sig) = <[u8; 64]>::try_from(self.sig.as_slice()) else {
+            return false;
+        };
+        let role_toks: &[&str] = if self.op == "remove" {
+            &[""]
+        } else {
+            role_sig_tokens(self.role)
+        };
+        role_toks.iter().any(|tok| {
+            let input = crate::identity::delegation_event_input(
+                vault_id,
+                &self.op,
+                &self.subject_id,
+                tok,
+                &self.granter_id,
+                self.seq,
+                self.role_epoch,
+            );
+            crate::identity::verify(granter_pub, &input, &sig)
+        })
+    }
+}
+
 /// A root-succession certificate — the CURRENT root signs the NEXT root's id +
 /// signing pubkey, letting the daemon follow a short chain from the TOFU-pinned
 /// GENESIS root to the current root (creator transfer / offboard;
@@ -612,13 +642,28 @@ pub fn rekey_commitment(content_key: &[u8]) -> [u8; 32] {
     h.finalize().into()
 }
 
-/// The lowercase serde token for a role (`"owner"` / `"member"`) — the EXACT
-/// bytes the creator signs in [`crate::identity::role_grant_input`]. Kept in one
-/// place so the signing input and the enum's serde spelling can never drift.
+/// The token a record of `role` is signed with: its own lowercase serde
+/// spelling (`"admin"` / `"member"`, or the legacy `"owner"` a pre-rename record
+/// carries), the first of [`role_sig_tokens`]. The daemon signs no roles; test
+/// signers use this.
+#[cfg(test)]
 pub(crate) fn role_str(role: crate::storage::plaintext::MemberRole) -> &'static str {
+    role_sig_tokens(role)[0]
+}
+
+/// Every token a signature over `role` may have been made with, the record's own
+/// spelling (its serde token, the EXACT bytes signed in
+/// [`crate::identity::role_grant_input`] / [`crate::identity::delegation_event_input`])
+/// first. An admin was signed as `"owner"` before the rename and as
+/// `"admin"` after; both mean the same role, so a signature over either verifies
+/// it (this also tolerates another implementation that re-spells a legacy record).
+/// No token ever verifies a DIFFERENT role: `"member"` is never tried for an admin.
+fn role_sig_tokens(role: crate::storage::plaintext::MemberRole) -> &'static [&'static str] {
+    use crate::storage::plaintext::MemberRole;
     match role {
-        crate::storage::plaintext::MemberRole::Owner => "owner",
-        crate::storage::plaintext::MemberRole::Member => "member",
+        MemberRole::Admin => &["admin", "owner"],
+        MemberRole::LegacyOwner => &["owner", "admin"],
+        MemberRole::Member => &["member"],
     }
 }
 
@@ -824,7 +869,7 @@ fn fold_agent_record(
                 .and_then(|v| v.as_str())
                 .unwrap_or_default();
             let is_owner =
-                membership.get(&sid) == Some(&crate::storage::plaintext::MemberRole::Owner);
+                membership.get(&sid) == Some(&crate::storage::plaintext::MemberRole::Admin);
             if is_owner || sid == owner {
                 Some(body)
             } else {
@@ -874,7 +919,7 @@ fn fold_owner_config_record(
         MembershipTrust::Untrusted => None,
         MembershipTrust::NoUik => Some(body),
         MembershipTrust::Verified(membership) => {
-            if membership.get(&sid) == Some(&crate::storage::plaintext::MemberRole::Owner) {
+            if membership.get(&sid) == Some(&crate::storage::plaintext::MemberRole::Admin) {
                 Some(body)
             } else {
                 None
@@ -891,6 +936,19 @@ fn fold_owner_config_record(
 /// STRIPPED looked identical to a legacy v1 vault and silently downgraded to
 /// integrity-only, letting a colluding member's signed owner-config be honored.
 /// The three states keep those cases distinct:
+/// Whether a grant's signer may approve an op ([`PerItemVault::approval_authority`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ApprovalAuthority {
+    /// No identities to check (a v1 keyset: a personal vault).
+    NotGated,
+    /// The signer is the requester.
+    Requester,
+    /// The signer is an admin of the vault.
+    Admin,
+    /// Anyone else; carries the reason.
+    Refused(String),
+}
+
 enum MembershipTrust {
     /// Legacy v1 keyset (`keyset.uik == None`) — no UIK layer, never re-keyable.
     /// Owner-config is honored on integrity alone (additive; pre-signing vaults).
@@ -945,7 +1003,7 @@ fn unwrap_verified_config(
             MembershipTrust::Verified(membership) => match signer {
                 Some(signer_id)
                     if membership.get(&signer_id)
-                        == Some(&crate::storage::plaintext::MemberRole::Owner) =>
+                        == Some(&crate::storage::plaintext::MemberRole::Admin) =>
                 {
                     Some(data)
                 }
@@ -1086,12 +1144,12 @@ fn verify_rekey_proof(
     let Some(signer_pub) = signer_pub else {
         return false;
     };
-    // The signer must be an OWNER in the verified owner-set (D).
-    let owner = matches!(
-        membership.get(&proof.signer_id),
-        Some(crate::storage::plaintext::MemberRole::Owner)
-    );
-    if !owner {
+    // The signer must be an ADMIN in the verified role set (D). (`is_admin`, not a
+    // pattern: a legacy `"owner"` grant reads as `LegacyOwner`, also an admin.)
+    let admin = membership
+        .get(&proof.signer_id)
+        .is_some_and(|r| r.is_admin());
+    if !admin {
         return false;
     }
     let input = crate::identity::rekey_sig_input(
@@ -1524,7 +1582,7 @@ fn owner_config_tombstone_honored(
                 signer,
             )
             .is_some_and(|sid| {
-                membership.get(&sid) == Some(&crate::storage::plaintext::MemberRole::Owner)
+                membership.get(&sid) == Some(&crate::storage::plaintext::MemberRole::Admin)
             })
         }
     }
@@ -2533,7 +2591,7 @@ impl PerItemVault {
         if !membership_prefix_ok(uik, vault_id) {
             return MembershipTrust::Untrusted;
         }
-        MembershipTrust::Verified(self.fold_owner_set(vault_id))
+        MembershipTrust::Verified(self.fold_roles(vault_id))
     }
 
     /// §15 leg-B: is `us_id` a VERIFIED member of this vault right now? Answers the
@@ -2563,7 +2621,7 @@ impl PerItemVault {
         use base64::{engine::general_purpose::STANDARD, Engine};
         use crate::storage::plaintext::MemberRole;
         // Authority: only an OWNER may tombstone the vault.
-        if self.fold_owner_set(vault_id).get(signer) != Some(&MemberRole::Owner) {
+        if self.fold_roles(vault_id).get(signer) != Some(&MemberRole::Admin) {
             return false;
         }
         // The signer's verifying key rides the keyset creds; self-certify it (its id
@@ -2598,7 +2656,96 @@ impl PerItemVault {
         matches!(self.resolve_membership_trust(vault_id), MembershipTrust::NoUik)
     }
 
-    /// Compute the current derived OWNER-SET (`user_id → role`) = the FOLD of the
+    /// The `us_…` ids this keyset seats under one of THIS device's own passkeys:
+    /// entries keyed by a credential id that has a WebAuthn pubkey in the registry
+    /// (the membership triple keys only the caller's own member under its cids and
+    /// serves only the caller's own pubkeys; other members sit under their `us_…`).
+    /// The fallback requester identity when the pairing carries no account UIK.
+    pub(crate) fn own_identities(&self) -> std::collections::BTreeSet<String> {
+        let Some(uik) = self.keyset.uik.as_ref() else {
+            return Default::default();
+        };
+        uik.creds
+            .iter()
+            .filter(|(cid, _)| find_pubkey_in_registry(&self.keyset.registry, cid).is_some())
+            .map(|(_, c)| c.user_id.clone())
+            .collect()
+    }
+
+    /// The identity (`us_…`) that signed an approval grant on this v2 vault, for
+    /// approval AUTHORITY ([`Self::approval_authority`]). Two sources, the proven
+    /// one first:
+    /// - the delivered `secret`: on a v2 vault the grant delivers the approver's
+    ///   UIK ROOT, and only that person holds it, so `UikRoot(secret).user_id()` is
+    ///   who approved. Honored when it names an identity this vault knows (a keyset
+    ///   entry, the role fold, or the requester), so it covers a passkey whose own
+    ///   entry the keyset has not caught yet.
+    /// - else the signing credential's keyset entry (`uik.creds[cid].user_id`, set
+    ///   from the `/keys` row or the membership triple's `credentials`), for a grant
+    ///   whose secret is not a root (a caller that delivered `W_c`).
+    ///
+    /// `None` = no identity resolves (a v1 keyset, or an unknown credential).
+    pub(crate) fn approval_signer(
+        &self,
+        vault_id: &str,
+        requester: &std::collections::BTreeSet<String>,
+        cid_b64: &str,
+        secret: &[u8],
+    ) -> Option<String> {
+        let uik = self.keyset.uik.as_ref()?;
+        if let Ok(root) = <[u8; 32]>::try_from(secret) {
+            let root_id = crate::crypto::vault_key::UikRoot::from_root(root).user_id();
+            let known = requester.contains(&root_id)
+                || uik.creds.values().any(|c| c.user_id == root_id)
+                || self.fold_roles(vault_id).contains_key(&root_id);
+            if known {
+                return Some(root_id);
+            }
+        }
+        uik.creds.get(cid_b64).map(|c| c.user_id.clone())
+    }
+
+    /// May this grant approve an op that `requester` (the member whose daemon
+    /// raised it) is waiting on? On a v2 (UIK) vault the approver must be the
+    /// requester THEMSELF or an ADMIN of the vault per the current role fold;
+    /// anyone else is refused (the op stays pending for someone who may approve).
+    /// A v1 keyset carries no identities (a personal vault) and is not gated here.
+    /// An untrusted fold (no confirmable admin) still lets the requester approve
+    /// their own op; it only refuses everyone else.
+    pub(crate) fn approval_authority(
+        &self,
+        vault_id: &str,
+        requester: &std::collections::BTreeSet<String>,
+        cid_b64: &str,
+        secret: &[u8],
+    ) -> ApprovalAuthority {
+        if self.keyset.uik.is_none() {
+            return ApprovalAuthority::NotGated;
+        }
+        let Some(signer) = self.approval_signer(vault_id, requester, cid_b64, secret) else {
+            return ApprovalAuthority::Refused(
+                "the approving passkey belongs to no identity in this vault".into(),
+            );
+        };
+        if requester.contains(&signer) {
+            return ApprovalAuthority::Requester;
+        }
+        match self.resolve_membership_trust(vault_id) {
+            MembershipTrust::Verified(roles)
+                if roles.get(&signer).is_some_and(|r| r.is_admin()) =>
+            {
+                ApprovalAuthority::Admin
+            }
+            _ => ApprovalAuthority::Refused(format!(
+                "{} is neither the requester nor an admin of this vault; \
+                 only the requester or a vault admin can approve this request",
+                signer
+            )),
+        }
+    }
+
+    /// Compute the current derived ROLE SET (`user_id → role`; its admins are the
+    /// vault's admin set) = the FOLD of the
     /// root-signed CHECKPOINT (each cred's `role_sig` @ the current `role_epoch`)
     /// followed by the append-only `delegation_log` (design/identity-uik-aik.md
     /// §4.3, delegation-log-impl-spec.md §0). The checkpoint is verified under the
@@ -2608,7 +2755,7 @@ impl PerItemVault {
     /// (NON-CASCADE). A last-owner removal/demote is ignored (defense in depth; also
     /// gated at write time). Returns an EMPTY map when there is no UIK layer or no
     /// resolvable root (no confirmable owner → callers fail closed).
-    pub(crate) fn fold_owner_set(
+    pub(crate) fn fold_roles(
         &self,
         vault_id: &str,
     ) -> BTreeMap<String, crate::storage::plaintext::MemberRole> {
@@ -2622,7 +2769,7 @@ impl PerItemVault {
         };
         let root_id = crate::identity::derive_id(crate::identity::IdKind::User, &root_pub);
         // Genesis: the current root is an owner (TOFU-pinned anchor + succession).
-        map.insert(root_id.clone(), MemberRole::Owner);
+        map.insert(root_id.clone(), MemberRole::Admin);
         // Checkpoint: root-signed grants @ the current (succession-derived) role_epoch
         // (depth-1 → a fresh daemon verifies with no history).
         for cred in uik.creds.values() {
@@ -2645,13 +2792,14 @@ impl PerItemVault {
             let Ok(sig) = <[u8; 64]>::try_from(cred.role_sig.as_slice()) else {
                 continue; // no / malformed grant → not in the checkpoint
             };
-            let input = crate::identity::role_grant_input(
-                vault_id,
-                &cred.user_id,
-                role_str(cred.role),
-                role_epoch,
-            );
-            if crate::identity::verify(&root_pub, &input, &sig) {
+            // A legacy admin grant was signed over `"owner"`, a new one over
+            // `"admin"`: either spelling of the cred's OWN role verifies it.
+            let granted = role_sig_tokens(cred.role).iter().any(|tok| {
+                let input =
+                    crate::identity::role_grant_input(vault_id, &cred.user_id, tok, role_epoch);
+                crate::identity::verify(&root_pub, &input, &sig)
+            });
+            if granted {
                 map.insert(cred.user_id.clone(), cred.role);
             }
         }
@@ -2677,7 +2825,7 @@ impl PerItemVault {
             // A junk / non-owner event must NOT consume the seq slot (else it could
             // suppress a legitimate same-seq event — the dup guard would then drop the
             // real one), so `last_seq` advances ONLY AFTER full validation below.
-            if map.get(&e.granter_id) != Some(&MemberRole::Owner) {
+            if map.get(&e.granter_id) != Some(&MemberRole::Admin) {
                 continue;
             }
             // The granter's verifying key rides INLINE and is SELF-CERTIFYING: it must
@@ -2692,24 +2840,7 @@ impl PerItemVault {
             {
                 continue;
             }
-            let role_tok = if e.op == "remove" {
-                ""
-            } else {
-                role_str(e.role)
-            };
-            let input = crate::identity::delegation_event_input(
-                vault_id,
-                &e.op,
-                &e.subject_id,
-                role_tok,
-                &e.granter_id,
-                e.seq,
-                e.role_epoch,
-            );
-            let Ok(sig) = <[u8; 64]>::try_from(e.sig.as_slice()) else {
-                continue;
-            };
-            if !crate::identity::verify(&granter_pub, &input, &sig) {
+            if !e.signature_verifies(vault_id, &granter_pub) {
                 continue;
             }
             // VALIDATED (owner + self-certifying key + signature): now consume the seq
@@ -2722,22 +2853,22 @@ impl PerItemVault {
             // owner-set is never EMPTIED — a remove/demote that would drop the LAST
             // owner is ignored (last-owner guard; also enforced at write time in the
             // console). This replaces the old "root is permanently immune" rule.
-            let owner_count = |m: &BTreeMap<String, MemberRole>| {
-                m.values().filter(|r| **r == MemberRole::Owner).count()
+            let admin_count = |m: &BTreeMap<String, MemberRole>| {
+                m.values().filter(|r| r.is_admin()).count()
             };
             match e.op.as_str() {
                 "remove" => {
-                    if map.get(&e.subject_id) == Some(&MemberRole::Owner) && owner_count(&map) <= 1
+                    if map.get(&e.subject_id) == Some(&MemberRole::Admin) && admin_count(&map) <= 1
                     {
-                        continue; // last-owner guard: never empty the owner-set
+                        continue; // last-admin guard: never empty the admin set
                     }
                     map.remove(&e.subject_id); // NON-CASCADE: only the subject
                 }
                 "set" => {
-                    // A demote (owner → member) of the last owner would empty it → skip.
-                    if e.role != MemberRole::Owner
-                        && map.get(&e.subject_id) == Some(&MemberRole::Owner)
-                        && owner_count(&map) <= 1
+                    // A demote (admin → member) of the last admin would empty it → skip.
+                    if !e.role.is_admin()
+                        && map.get(&e.subject_id) == Some(&MemberRole::Admin)
+                        && admin_count(&map) <= 1
                     {
                         continue;
                     }
@@ -4432,7 +4563,7 @@ pub(crate) mod tests {
             enc_pub.clone(),
             encapped,
             ct,
-            crate::storage::plaintext::MemberRole::Owner,
+            crate::storage::plaintext::MemberRole::Admin,
             Vec::new(),
         );
         assert!(pv.is_uik(), "seal promotes the keyset to v2");
@@ -4602,7 +4733,7 @@ pub(crate) mod tests {
         let uid = uik.user_id();
         // Signer is an OWNER in the owner-set → honored.
         let owner_set: std::collections::BTreeMap<String, MemberRole> =
-            [(uid.clone(), MemberRole::Owner)].into_iter().collect();
+            [(uid.clone(), MemberRole::Admin)].into_iter().collect();
         assert_eq!(
             unwrap_verified_config(
                 wrapper.clone(),
@@ -4643,7 +4774,7 @@ pub(crate) mod tests {
         // Unsigned legacy-raw body on a v2 (Verified) keyset → DROP: any K-holding
         // member could have written it (only NoUik honors raw config).
         let owner_set2: std::collections::BTreeMap<String, MemberRole> =
-            [(uid.clone(), MemberRole::Owner)].into_iter().collect();
+            [(uid.clone(), MemberRole::Admin)].into_iter().collect();
         assert_eq!(
             unwrap_verified_config(
                 data.clone(),
@@ -4955,7 +5086,7 @@ pub(crate) mod tests {
             vec![9u8; 32],
             vec![1u8; 40],
             vec![2u8; 40],
-            MemberRole::Owner,
+            MemberRole::Admin,
             Vec::new(),
         );
         {
@@ -4971,7 +5102,7 @@ pub(crate) mod tests {
             });
         }
         let owner_trust = MembershipTrust::Verified(
-            [(owner_id.clone(), MemberRole::Owner)]
+            [(owner_id.clone(), MemberRole::Admin)]
                 .into_iter()
                 .collect(),
         );
@@ -5086,7 +5217,7 @@ pub(crate) mod tests {
             enc_pub,
             k_encapped,
             k_ct,
-            MemberRole::Owner,
+            MemberRole::Admin,
             Vec::new(),
         );
         let commit = rekey_commitment(&c_new).to_vec();
@@ -5157,7 +5288,7 @@ pub(crate) mod tests {
             vec![9u8; 32],
             vec![1u8; 40],
             vec![2u8; 40],
-            MemberRole::Owner,
+            MemberRole::Admin,
             creator_grant.to_vec(),
         );
         // Pin the root anchor = the creator's signing pubkey.
@@ -5197,7 +5328,7 @@ pub(crate) mod tests {
         let MembershipTrust::Verified(owner_set) = pv.resolve_membership_trust(vault) else {
             panic!("pinned creator ⇒ MembershipTrust::Verified");
         };
-        assert_eq!(owner_set.get(&creator_id), Some(&MemberRole::Owner));
+        assert_eq!(owner_set.get(&creator_id), Some(&MemberRole::Admin));
         assert_eq!(owner_set.get(&member_id), Some(&MemberRole::Member));
         let trust = MembershipTrust::Verified(owner_set);
 
@@ -5558,7 +5689,7 @@ pub(crate) mod tests {
             vec![9u8; 32],
             vec![1u8; 40],
             vec![2u8; 40],
-            MemberRole::Owner,
+            MemberRole::Admin,
             self_grant.to_vec(),
         );
 
@@ -5569,7 +5700,7 @@ pub(crate) mod tests {
         };
         assert_eq!(
             owner_set.get(&creator_id),
-            Some(&MemberRole::Owner),
+            Some(&MemberRole::Admin),
             "creator remains owner"
         );
         assert!(
@@ -5686,7 +5817,7 @@ pub(crate) mod tests {
             vec![9u8; 32],
             vec![1u8; 40],
             vec![2u8; 40],
-            MemberRole::Owner,
+            MemberRole::Admin,
             grant0.to_vec(),
         );
 
@@ -5697,10 +5828,10 @@ pub(crate) mod tests {
 
         // Baseline: both the root creator and the granted member are owners @epoch 0.
         let os = owners(&pv);
-        assert_eq!(os.get(&creator_id), Some(&MemberRole::Owner));
+        assert_eq!(os.get(&creator_id), Some(&MemberRole::Admin));
         assert_eq!(
             os.get(&member_id),
-            Some(&MemberRole::Owner),
+            Some(&MemberRole::Admin),
             "member granted owner @role_epoch 0 is an owner",
         );
 
@@ -5709,7 +5840,7 @@ pub(crate) mod tests {
         let os = owners(&pv);
         assert_eq!(
             os.get(&member_id),
-            Some(&MemberRole::Owner),
+            Some(&MemberRole::Admin),
             "a generation (K-eviction) bump alone leaves the owner-set intact (⊥)",
         );
 
@@ -5725,7 +5856,7 @@ pub(crate) mod tests {
         );
         assert_eq!(
             os.get(&creator_id),
-            Some(&MemberRole::Owner),
+            Some(&MemberRole::Admin),
             "the root creator is an owner by the genesis pin, immune to grant replay",
         );
 
@@ -5744,7 +5875,7 @@ pub(crate) mod tests {
             .role_sig = grant1.to_vec();
         assert_eq!(
             owners(&pv).get(&member_id),
-            Some(&MemberRole::Owner),
+            Some(&MemberRole::Admin),
             "re-signing the grant @role_epoch 1 restores the owner",
         );
     }
@@ -5880,20 +6011,20 @@ pub(crate) mod tests {
             &creator,
             "set",
             &a_id,
-            MemberRole::Owner,
+            MemberRole::Admin,
             1,
             0,
         );
         assert_eq!(
             owner_set(&pv, vault).get(&a_id),
-            Some(&MemberRole::Owner),
+            Some(&MemberRole::Admin),
             "root grants A via event",
         );
         // seq 2: A (a NON-root owner) sets B → owner (egalitarian delegation).
-        push_event(&mut pv, vault, &a, "set", &b_id, MemberRole::Owner, 2, 0);
+        push_event(&mut pv, vault, &a, "set", &b_id, MemberRole::Admin, 2, 0);
         assert_eq!(
             owner_set(&pv, vault).get(&b_id),
-            Some(&MemberRole::Owner),
+            Some(&MemberRole::Admin),
             "a non-root owner can grant (delegation bit)",
         );
         // seq 3: root removes A → A dropped, B STAYS (non-cascade).
@@ -5911,7 +6042,7 @@ pub(crate) mod tests {
         assert!(!os.contains_key(&a_id), "A removed");
         assert_eq!(
             os.get(&b_id),
-            Some(&MemberRole::Owner),
+            Some(&MemberRole::Admin),
             "NON-CASCADE: removing A does not drop B (whom A added)",
         );
     }
@@ -5929,7 +6060,7 @@ pub(crate) mod tests {
             &member,
             "set",
             &member_id,
-            MemberRole::Owner,
+            MemberRole::Admin,
             1,
             0,
         );
@@ -5957,7 +6088,7 @@ pub(crate) mod tests {
             &creator,
             "set",
             &a_id,
-            MemberRole::Owner,
+            MemberRole::Admin,
             1,
             0,
         );
@@ -5968,7 +6099,7 @@ pub(crate) mod tests {
             &creator,
             "set",
             &b_id,
-            MemberRole::Owner,
+            MemberRole::Admin,
             1,
             0,
         );
@@ -5978,7 +6109,7 @@ pub(crate) mod tests {
         // dropped (the winner is server-independent — same on every implementation).
         assert_eq!(
             os.get(&a_id),
-            Some(&MemberRole::Owner),
+            Some(&MemberRole::Admin),
             "the (seq,sig)-first seq-1 event applies"
         );
         assert!(
@@ -6006,13 +6137,13 @@ pub(crate) mod tests {
             &creator,
             "set",
             &a_id,
-            MemberRole::Owner,
+            MemberRole::Admin,
             1,
             0,
         );
         assert_eq!(
             owner_set(&pv, vault).get(&a_id),
-            Some(&MemberRole::Owner),
+            Some(&MemberRole::Admin),
             "A granted @seq1",
         );
         // Junk @seq2: valid owner granter + self-certifying pubkey, but a ZERO signature
@@ -6026,7 +6157,7 @@ pub(crate) mod tests {
             .push(DelegationEvent {
                 op: "set".into(),
                 subject_id: "us_ghost".into(),
-                role: MemberRole::Owner,
+                role: MemberRole::Admin,
                 granter_id: creator.user_id(),
                 granter_sig_pub: creator.signing().public_bytes().to_vec(),
                 seq: 2,
@@ -6075,20 +6206,20 @@ pub(crate) mod tests {
             &creator,
             "set",
             &a_id,
-            MemberRole::Owner,
+            MemberRole::Admin,
             1,
             0,
         );
-        push_event(&mut pv, vault, &a, "set", &b_id, MemberRole::Owner, 2, 0);
+        push_event(&mut pv, vault, &a, "set", &b_id, MemberRole::Admin, 2, 0);
         let os = owner_set(&pv, vault);
         assert_eq!(
             os.get(&a_id),
-            Some(&MemberRole::Owner),
+            Some(&MemberRole::Admin),
             "A is an owner via the log with no cred row",
         );
         assert_eq!(
             os.get(&b_id),
-            Some(&MemberRole::Owner),
+            Some(&MemberRole::Admin),
             "A's grant of B verifies via A's INLINE key — non-cascade survives A having no cred row",
         );
     }
@@ -6142,13 +6273,13 @@ pub(crate) mod tests {
             vec![9u8; 32],
             vec![1u8; 40],
             vec![2u8; 40],
-            MemberRole::Owner,
+            MemberRole::Admin,
             nr_grant.to_vec(),
         );
         let os = owner_set(&pv, vault);
         assert_eq!(
             os.get(&newroot_id),
-            Some(&MemberRole::Owner),
+            Some(&MemberRole::Admin),
             "succession installs the new root as the owner authority",
         );
         assert!(
@@ -6193,7 +6324,7 @@ pub(crate) mod tests {
         let os = owner_set(&pv, vault);
         assert_eq!(
             os.get(&creator_id),
-            Some(&MemberRole::Owner),
+            Some(&MemberRole::Admin),
             "a forged succession is ignored; the creator stays root",
         );
         assert!(
@@ -6231,7 +6362,7 @@ pub(crate) mod tests {
         );
         assert_eq!(
             owner_set(&pv, vault).get(&creator_id),
-            Some(&MemberRole::Owner),
+            Some(&MemberRole::Admin),
             "the last owner (here the creator) can't be removed or demoted away",
         );
     }
@@ -6253,7 +6384,7 @@ pub(crate) mod tests {
             &creator,
             "set",
             &a_id,
-            MemberRole::Owner,
+            MemberRole::Admin,
             1,
             0,
         );
@@ -6274,7 +6405,7 @@ pub(crate) mod tests {
         );
         assert_eq!(
             os.get(&a_id),
-            Some(&MemberRole::Owner),
+            Some(&MemberRole::Admin),
             "the successor owner (added by the creator) stays after the creator leaves",
         );
     }
@@ -6311,7 +6442,7 @@ pub(crate) mod tests {
             .push(DelegationEvent {
                 op: "set".into(),
                 subject_id: a_id.clone(),
-                role: MemberRole::Owner,
+                role: MemberRole::Admin,
                 granter_id: creator_id.clone(),
                 granter_sig_pub: creator.signing().public_bytes().to_vec(),
                 seq: 1,
@@ -6349,7 +6480,7 @@ pub(crate) mod tests {
             matches!(pv.resolve_membership_trust(vault), MembershipTrust::Verified(_)),
             "matching log prefix → Verified",
         );
-        assert_eq!(owner_set(&pv, vault).get(&a_id), Some(&MemberRole::Owner));
+        assert_eq!(owner_set(&pv, vault).get(&a_id), Some(&MemberRole::Admin));
         // Rollback: the server drops the committed event → prefix mismatch → Untrusted
         // (the owner-set is NOT silently recomputed without it).
         pv.keyset.uik.as_mut().unwrap().delegation_log.clear();
@@ -8055,5 +8186,334 @@ pub(crate) mod tests {
             unreadable_confirmed: false,
         };
         assert!(!v1.keeps_honored_owner_config::<S>(keys, vid, &w, &t));
+    }
+
+    // ── admin role rename + approval authority ─────────────────────────────
+
+    /// A record signed before the rename carries `"owner"`: it folds as an ADMIN
+    /// (checkpoint grant and delegation event alike), and keeps its spelling so a
+    /// re-emitted record still carries the exact bytes its signature covers.
+    #[test]
+    fn legacy_owner_token_folds_as_admin_and_round_trips() {
+        use crate::crypto::vault_key::UikRoot;
+        use crate::storage::plaintext::MemberRole;
+        let (vault, creator, member, creator_id, member_id, mut pv) = role_fixture_creator_cred();
+
+        let legacy: MemberRole = serde_json::from_value(serde_json::json!("owner")).unwrap();
+        assert!(legacy.is_admin());
+        assert_eq!(legacy, MemberRole::Admin, "a legacy owner IS an admin");
+        assert_ne!(legacy, MemberRole::Member);
+
+        // Checkpoint grant: creator-signed over "owner", role read off the wire.
+        let grant = creator.signing().sign(&crate::identity::role_grant_input(
+            vault, &member_id, "owner", 0,
+        ));
+        pv.set_uik_cred(
+            "cid-member".into(),
+            member_id.clone(),
+            member.signing().public_bytes().to_vec(),
+            vec![9u8; 32],
+            vec![1u8; 40],
+            vec![2u8; 40],
+            legacy,
+            grant.to_vec(),
+        );
+        assert!(owner_set(&pv, vault).get(&member_id).is_some_and(|r| r.is_admin()));
+        assert_eq!(
+            serde_json::to_value(pv.uik_cred("cid-member").unwrap().role).unwrap(),
+            serde_json::json!("owner"),
+            "the legacy spelling survives re-emission",
+        );
+
+        // Delegation event as an old console wrote it: role "owner", signed over "owner".
+        let c = UikRoot::from_root([0x66u8; 32]);
+        let c_id = c.user_id();
+        cred_no_grant(&mut pv, "cid-c", &c, &c_id);
+        let sig = creator.signing().sign(&crate::identity::delegation_event_input(
+            vault, "set", &c_id, "owner", &creator_id, 1, 0,
+        ));
+        let wire = serde_json::json!({
+            "op": "set",
+            "subject_id": c_id,
+            "role": "owner",
+            "granter_id": creator_id,
+            "granter_sig_pub": STANDARD.encode(creator.signing().public_bytes()),
+            "seq": 1,
+            "role_epoch": 0,
+            "sig": STANDARD.encode(sig),
+        });
+        let ev: DelegationEvent = serde_json::from_value(wire.clone()).unwrap();
+        pv.keyset.uik.as_mut().unwrap().delegation_log.push(ev);
+        assert_eq!(owner_set(&pv, vault).get(&c_id), Some(&MemberRole::Admin));
+        assert_eq!(
+            serde_json::to_value(&pv.keyset.uik.as_ref().unwrap().delegation_log[0]).unwrap(),
+            wire,
+            "the legacy event re-emits byte-identical",
+        );
+    }
+
+    /// The rename never lets one role's signature stand for another: a grant
+    /// over "owner"/"admin" does not seat a cred claiming Member, and a grant over
+    /// "member" does not seat a cred claiming Admin (either spelling).
+    #[test]
+    fn role_spelling_never_crosses_roles() {
+        use crate::crypto::vault_key::UikRoot;
+        use crate::storage::plaintext::MemberRole;
+        let (vault, creator, _m, _cid, _mid, mut pv) = role_fixture_creator_cred();
+        let seat = |pv: &mut PerItemVault, cid: &str, who: &UikRoot, role: MemberRole, tok: &str| {
+            let g = creator.signing().sign(&crate::identity::role_grant_input(
+                vault,
+                &who.user_id(),
+                tok,
+                0,
+            ));
+            pv.set_uik_cred(
+                cid.into(),
+                who.user_id(),
+                who.signing().public_bytes().to_vec(),
+                vec![9u8; 32],
+                vec![1u8; 40],
+                vec![2u8; 40],
+                role,
+                g.to_vec(),
+            );
+        };
+        let (a, b, c) = (
+            UikRoot::from_root([0x71u8; 32]),
+            UikRoot::from_root([0x72u8; 32]),
+            UikRoot::from_root([0x73u8; 32]),
+        );
+        seat(&mut pv, "cid-a", &a, MemberRole::Member, "owner");
+        seat(&mut pv, "cid-b", &b, MemberRole::Member, "admin");
+        seat(&mut pv, "cid-c", &c, MemberRole::Admin, "member");
+        let set = owner_set(&pv, vault);
+        for who in [&a, &b, &c] {
+            assert!(!set.contains_key(&who.user_id()), "a role signature never seats another role");
+        }
+    }
+
+    /// The first signing token of every role IS its serde spelling, so the bytes
+    /// a record verifies against are the bytes it carries.
+    #[test]
+    fn role_signing_token_is_the_serde_spelling() {
+        use crate::storage::plaintext::MemberRole;
+        for r in [MemberRole::Admin, MemberRole::Member, MemberRole::LegacyOwner] {
+            assert_eq!(serde_json::to_value(r).unwrap(), serde_json::json!(role_str(r)));
+        }
+    }
+
+    /// New records are written and signed as "admin".
+    #[test]
+    fn new_role_records_emit_admin() {
+        use crate::crypto::vault_key::UikRoot;
+        use crate::storage::plaintext::MemberRole;
+        assert_eq!(serde_json::to_value(MemberRole::Admin).unwrap(), serde_json::json!("admin"));
+        assert_eq!(serde_json::to_value(MemberRole::Member).unwrap(), serde_json::json!("member"));
+        assert_eq!(role_str(MemberRole::Admin), "admin");
+
+        let (vault, creator, _m, creator_id, _mid, mut pv) = role_fixture_creator_cred();
+        // Checkpoint grant signed over "admin".
+        let b = UikRoot::from_root([0x81u8; 32]);
+        let b_id = b.user_id();
+        let g = creator.signing().sign(&crate::identity::role_grant_input(vault, &b_id, "admin", 0));
+        pv.set_uik_cred(
+            "cid-b".into(),
+            b_id.clone(),
+            b.signing().public_bytes().to_vec(),
+            vec![9u8; 32],
+            vec![1u8; 40],
+            vec![2u8; 40],
+            MemberRole::Admin,
+            g.to_vec(),
+        );
+        assert_eq!(owner_set(&pv, vault).get(&b_id), Some(&MemberRole::Admin));
+        assert_eq!(
+            serde_json::to_value(pv.uik_cred("cid-b").unwrap().role).unwrap(),
+            serde_json::json!("admin")
+        );
+
+        // Delegation event: signed over "admin", serialized as "admin".
+        let a = UikRoot::from_root([0x82u8; 32]);
+        let a_id = a.user_id();
+        cred_no_grant(&mut pv, "cid-a", &a, &a_id);
+        push_event(&mut pv, vault, &creator, "set", &a_id, MemberRole::Admin, 1, 0);
+        assert_eq!(owner_set(&pv, vault).get(&a_id), Some(&MemberRole::Admin));
+        let ev = &pv.keyset.uik.as_ref().unwrap().delegation_log[0];
+        assert_eq!(serde_json::to_value(ev).unwrap()["role"], serde_json::json!("admin"));
+        let sig: [u8; 64] = ev.sig.as_slice().try_into().unwrap();
+        assert!(crate::identity::verify(
+            &creator.signing().public_bytes(),
+            &crate::identity::delegation_event_input(vault, "set", &a_id, "admin", &creator_id, 1, 0),
+            &sig,
+        ));
+    }
+
+    /// Authority fixture: the creator (root) is an admin; B and C are members
+    /// (creator-signed member grants), each seated under its own passkey id.
+    /// Roots: creator 0x11, B 0x22, C 0x33.
+    fn authority_fixture() -> (&'static str, String, String, String, PerItemVault) {
+        use crate::crypto::vault_key::UikRoot;
+        use crate::storage::plaintext::MemberRole;
+        let (vault, creator, b, creator_id, b_id, mut pv) = role_fixture_creator_cred();
+        let c = UikRoot::from_root([0x33u8; 32]);
+        let c_id = c.user_id();
+        for (cid, who) in [("cid-b", &b), ("cid-c", &c)] {
+            let g = creator.signing().sign(&crate::identity::role_grant_input(
+                vault,
+                &who.user_id(),
+                "member",
+                0,
+            ));
+            pv.set_uik_cred(
+                cid.into(),
+                who.user_id(),
+                who.signing().public_bytes().to_vec(),
+                vec![9u8; 32],
+                vec![1u8; 40],
+                vec![2u8; 40],
+                MemberRole::Member,
+                g.to_vec(),
+            );
+        }
+        (vault, creator_id, b_id, c_id, pv)
+    }
+
+    fn ids(xs: &[&str]) -> std::collections::BTreeSet<String> {
+        xs.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn requester_can_approve_own_op() {
+        let (vault, _a, b_id, _c, pv) = authority_fixture();
+        assert_eq!(
+            pv.approval_authority(vault, &ids(&[&b_id]), "cid-b", &[0x22u8; 32]),
+            ApprovalAuthority::Requester
+        );
+        // A passkey the keyset has not caught yet (upgraded / just added): the
+        // delivered root still names B.
+        assert_eq!(
+            pv.approval_authority(vault, &ids(&[&b_id]), "cid-new", &[0x22u8; 32]),
+            ApprovalAuthority::Requester
+        );
+        // A caller that delivered W_c (not a root): resolved via the credential's entry.
+        assert_eq!(
+            pv.approval_authority(vault, &ids(&[&b_id]), "cid-b", &[0x99u8; 32]),
+            ApprovalAuthority::Requester
+        );
+    }
+
+    #[test]
+    fn admin_can_approve_another_members_op() {
+        use crate::crypto::vault_key::UikRoot;
+        use crate::storage::plaintext::MemberRole;
+        let (vault, _a, b_id, c_id, mut pv) = authority_fixture();
+        // The creator (root admin) approves B's op.
+        assert_eq!(
+            pv.approval_authority(vault, &ids(&[&b_id]), "cid-creator", &[0x11u8; 32]),
+            ApprovalAuthority::Admin
+        );
+        // C promoted to admin by a LEGACY "owner" delegation event: approves B's op.
+        let creator = UikRoot::from_root([0x11u8; 32]);
+        let creator_id = creator.user_id();
+        let sig = creator.signing().sign(&crate::identity::delegation_event_input(
+            vault, "set", &c_id, "owner", &creator_id, 1, 0,
+        ));
+        pv.keyset.uik.as_mut().unwrap().delegation_log.push(DelegationEvent {
+            op: "set".into(),
+            subject_id: c_id.clone(),
+            role: MemberRole::LegacyOwner,
+            granter_id: creator_id,
+            granter_sig_pub: creator.signing().public_bytes().to_vec(),
+            seq: 1,
+            role_epoch: 0,
+            sig: sig.to_vec(),
+        });
+        assert_eq!(
+            pv.approval_authority(vault, &ids(&[&b_id]), "cid-c", &[0x33u8; 32]),
+            ApprovalAuthority::Admin
+        );
+    }
+
+    #[test]
+    fn other_member_is_refused() {
+        let (vault, _a, b_id, _c, pv) = authority_fixture();
+        // C (a plain member) approves B's op with C's own passkey + root.
+        assert!(matches!(
+            pv.approval_authority(vault, &ids(&[&b_id]), "cid-c", &[0x33u8; 32]),
+            ApprovalAuthority::Refused(_)
+        ));
+        // The delivered root is the proof: C's root on the admin's credential id
+        // is still C.
+        assert!(matches!(
+            pv.approval_authority(vault, &ids(&[&b_id]), "cid-creator", &[0x33u8; 32]),
+            ApprovalAuthority::Refused(_)
+        ));
+        // C's passkey without a root (W_c delivered): the credential's entry names C.
+        assert!(matches!(
+            pv.approval_authority(vault, &ids(&[&b_id]), "cid-c", &[0x99u8; 32]),
+            ApprovalAuthority::Refused(_)
+        ));
+        // Nothing resolves (unknown credential, not a known root): refused.
+        assert!(matches!(
+            pv.approval_authority(vault, &ids(&[&b_id]), "cid-nobody", &[0x99u8; 32]),
+            ApprovalAuthority::Refused(_)
+        ));
+    }
+
+    /// No confirmable admin set (anchor stripped): the requester still approves
+    /// their own op; nobody else does.
+    #[test]
+    fn untrusted_fold_keeps_requester_and_refuses_others() {
+        let (vault, _a, b_id, _c, mut pv) = authority_fixture();
+        pv.keyset.uik.as_mut().unwrap().creator_sig_pub.clear();
+        assert_eq!(
+            pv.approval_authority(vault, &ids(&[&b_id]), "cid-b", &[0x22u8; 32]),
+            ApprovalAuthority::Requester
+        );
+        assert!(matches!(
+            pv.approval_authority(vault, &ids(&[&b_id]), "cid-creator", &[0x11u8; 32]),
+            ApprovalAuthority::Refused(_)
+        ));
+    }
+
+    /// A v1 keyset (a personal vault: no identities) is not gated.
+    #[test]
+    fn v1_keyset_is_not_gated() {
+        let pv = PerItemVault::build_initial(
+            b"c".to_vec(),
+            "x".into(),
+            "y".into(),
+            "Dev".into(),
+            vec![0u8; 32],
+            vec![0u8; 48],
+        )
+        .unwrap();
+        assert_eq!(
+            pv.approval_authority("v", &ids(&[]), "Yw", &[0x44u8; 32]),
+            ApprovalAuthority::NotGated
+        );
+    }
+
+    /// The requester fallback: identities seated under a passkey this device
+    /// holds (a registry pubkey), never another member's `us_…`-keyed entry.
+    #[test]
+    fn own_identities_are_the_registry_keyed_entries() {
+        use crate::crypto::vault_key::UikRoot;
+        use crate::storage::plaintext::MemberRole;
+        let (_vault, _a, b_id, _c, mut pv) = authority_fixture();
+        assert!(pv.own_identities().is_empty(), "no entry under a registered passkey");
+        let me = UikRoot::from_root([0x22u8; 32]);
+        // build_initial registered passkey b"c" (url-safe "Yw").
+        pv.set_uik_cred(
+            "Yw".into(),
+            b_id.clone(),
+            me.signing().public_bytes().to_vec(),
+            vec![9u8; 32],
+            vec![1u8; 40],
+            vec![2u8; 40],
+            MemberRole::Member,
+            Vec::new(),
+        );
+        assert_eq!(pv.own_identities(), ids(&[&b_id]));
     }
 }

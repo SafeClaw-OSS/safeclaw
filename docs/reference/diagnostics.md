@@ -41,6 +41,7 @@ SafeClaw because it is the hop that observed them.
 | `ambiguous_phantom` | 400 | fix_request | request | bare phantom on a multi-secret connection; use a role phantom |
 | `approval_needed` | 401 | approve | policy | policy asks; body carries approve/poll URLs + op id |
 | `approval_register` | 503 | retry | internal | could not open the approval op |
+| `approver_not_authorized` | 403 | none | auth | the passkey that approved is neither the requester nor an admin of this shared vault; the request stays pending |
 | `broker_body_limit` | 413 | configure | config | body exceeds the inspectable cap; raise `--body-cap` if legitimate |
 | `egress_unreachable` | 502 | configure | environment | forward hop failed to connect (NOT a credential problem) |
 | `exposes_unsupported` | 400 | fix_request | request | role not mintable yet |
