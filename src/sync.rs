@@ -1495,13 +1495,13 @@ async fn sync_agent_keys_with_timeout(state: &Arc<AppState>, timeout: Duration) 
 }
 
 /// Is the verified agent `agent_id` one this machine's paired account does
-/// NOT have (`agent_other_account`)? A machine is paired to exactly one account
-/// and its agents act as that account; an AIK set up under another account is
-/// refused here, before any vault-level check. Fails closed only on a positive
+/// NOT have (`agent_not_in_account`)? A machine is paired to exactly one account
+/// and its agents act as that account; an AIK not registered to it (set up under
+/// another account, or removed) is refused here, before any vault-level check. Fails closed only on a positive
 /// answer from the account's own roster: when the roster is unknown it says
 /// `false`, and on a miss it first re-pulls the roster once (debounced, like a
 /// key miss) so an agent added to this account seconds ago is never refused.
-pub async fn agent_of_other_account(state: &Arc<AppState>, agent_id: &str) -> bool {
+pub async fn agent_not_in_account(state: &Arc<AppState>, agent_id: &str) -> bool {
     if !state.agent_outside_account(agent_id) {
         return false;
     }
@@ -8328,11 +8328,11 @@ mod tests {
         assert!(parse_agent_roster(&serde_json::json!({})).is_none());
     }
 
-    /// `agent_other_account` fires only on a positive answer from the paired
+    /// `agent_not_in_account` fires only on a positive answer from the paired
     /// account's roster: unknown roster → never; this account's agent → never;
     /// an agent absent from the roster (after the debounced re-pull) → yes.
     #[tokio::test]
-    async fn other_account_agent_needs_a_known_roster() {
+    async fn not_in_account_needs_a_known_roster() {
         let dir = tempdir().unwrap();
         let cfg = crate::config::Config {
             state_dir: dir.path().to_path_buf(),
@@ -8353,15 +8353,15 @@ mod tests {
         *state.agent_key_resync.lock().await = Some(std::time::Instant::now());
 
         assert!(
-            !agent_of_other_account(&state, "ag_x").await,
+            !agent_not_in_account(&state, "ag_x").await,
             "unknown roster"
         );
         state.set_account_agent_ids(Some(["ag_mine".to_string()].into_iter().collect()));
-        assert!(!agent_of_other_account(&state, "ag_mine").await);
-        assert!(agent_of_other_account(&state, "ag_x").await);
+        assert!(!agent_not_in_account(&state, "ag_mine").await);
+        assert!(agent_not_in_account(&state, "ag_x").await);
         // A backend that stops serving ids turns the check back off.
         state.set_account_agent_ids(None);
-        assert!(!agent_of_other_account(&state, "ag_x").await);
+        assert!(!agent_not_in_account(&state, "ag_x").await);
     }
 
     /// The format gate reads every format up to and including the one this

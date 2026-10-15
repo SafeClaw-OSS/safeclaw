@@ -470,8 +470,8 @@ pub struct AppState {
     /// The `ag_` ids of every agent registered to THIS machine's paired account
     /// (`api_keys.identity_id`), synced alongside [`Self::agent_key_hashes`].
     /// A machine is paired to exactly one account and its agents act as that
-    /// account, so a verified AIK outside this set was set up under another
-    /// account (`agent_other_account`). `None` = not known (unpaired, not yet
+    /// account, so a verified AIK outside this set isn't registered to it
+    /// (`agent_not_in_account`). `None` = not known (unpaired, not yet
     /// fetched, or a backend that doesn't serve the ids): the check is then
     /// off, so it can never refuse an agent of the paired account on missing
     /// data. A failed fetch keeps the prior set; a re-pair to another account

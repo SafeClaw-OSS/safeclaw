@@ -382,13 +382,13 @@ impl BrokerHandler {
         // minted seconds ago by `sc agent add` must not 407 for the 30s loop.
         //
         // First, before any vault-level check: a verified AIK that this machine's
-        // paired account doesn't have was set up under ANOTHER account. Say so
-        // (fix: `sc agent add` here), never "not turned on for this vault".
+        // paired account doesn't have isn't registered to it. Say so (fix:
+        // `sc agent add` here), never "not turned on for this vault".
         if let Some(ag) = self.agent_id.as_deref() {
-            if crate::sync::agent_of_other_account(&self.state, ag).await {
+            if crate::sync::agent_not_in_account(&self.state, ag).await {
                 return err_response(
-                    ScCode::AgentOtherAccount,
-                    crate::error::AGENT_OTHER_ACCOUNT_MSG,
+                    ScCode::AgentNotInAccount,
+                    crate::error::AGENT_NOT_IN_ACCOUNT_MSG,
                 )
                 .into();
             }

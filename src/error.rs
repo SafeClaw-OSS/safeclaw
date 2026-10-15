@@ -34,12 +34,12 @@ pub enum ScCode {
     /// "bad key" (that sends the user debugging the wrong thing).
     AgentNotAuthorized,
     /// A cryptographically-valid agent AIK that this machine's paired account
-    /// does not have: the agent was set up (`sc agent add`) under a DIFFERENT
-    /// SafeClaw account than the one this machine is signed in to. Checked
+    /// does not have: set up (`sc agent add`) under another SafeClaw account,
+    /// or removed from this one (the daemon can't tell which). Checked
     /// before any vault-level check, so it never reads as `agent_not_authorized`
     /// ("not turned on for this vault"), whose fix is a Console toggle; the fix
     /// here is `sc agent add` on this machine.
-    AgentOtherAccount,
+    AgentNotInAccount,
     AmbiguousPhantom,
     ApprovalNeeded,
     ApprovalRegister,
@@ -126,10 +126,10 @@ impl ScCode {
                 "none",
                 "auth",
             ),
-            AgentOtherAccount => (
+            AgentNotInAccount => (
                 403,
-                "agent_other_account",
-                "Agent set up for a different account",
+                "agent_not_in_account",
+                "Agent not registered to this account",
                 "configure",
                 "auth",
             ),
@@ -301,11 +301,9 @@ impl ScCode {
 /// consistent state and relays one consistent fix.
 pub const VAULT_LOCKED_MSG: &str = "vault locked. Run `sc unlock`, then retry";
 
-/// The ONE remediation line for [`ScCode::AgentOtherAccount`], shared by every
+/// The ONE remediation line for [`ScCode::AgentNotInAccount`], shared by every
 /// surface that raises it (proxy plane, API face, control plane).
-pub const AGENT_OTHER_ACCOUNT_MSG: &str = "This agent was set up for a different SafeClaw \
-     account than the one this machine is signed in to. Run `sc agent add` to set it up for \
-     this account.";
+pub const AGENT_NOT_IN_ACCOUNT_MSG: &str = "This agent isn't registered to the SafeClaw account this machine is signed in to. Run `sc agent add` to set it up.";
 
 /// RFC 9457 `application/problem+json` body for a code + detail message.
 /// Extension members: `code` / `action` / `cause` (see [`ScCode::row`]),
@@ -345,9 +343,9 @@ pub enum AppError {
     /// The grant's signer may not approve this op (see
     /// `ScCode::ApproverNotAuthorized`). The op stays pending.
     ApproverNotAuthorized(String),
-    /// The requesting agent belongs to another account (see
-    /// `ScCode::AgentOtherAccount`).
-    AgentOtherAccount,
+    /// The requesting agent isn't registered to this machine's account (see
+    /// `ScCode::AgentNotInAccount`).
+    AgentNotInAccount,
 }
 
 impl AppError {
@@ -365,9 +363,9 @@ impl AppError {
             AppError::TooManyRequests => (ScCode::RateLimited, "Rate limit exceeded".to_string()),
             AppError::BatchVerify(msg) => (ScCode::BatchVerifyFailed, msg.clone()),
             AppError::ApproverNotAuthorized(msg) => (ScCode::ApproverNotAuthorized, msg.clone()),
-            AppError::AgentOtherAccount => (
-                ScCode::AgentOtherAccount,
-                AGENT_OTHER_ACCOUNT_MSG.to_string(),
+            AppError::AgentNotInAccount => (
+                ScCode::AgentNotInAccount,
+                AGENT_NOT_IN_ACCOUNT_MSG.to_string(),
             ),
             AppError::Internal(msg) => {
                 tracing::error!("internal error: {}", msg);
@@ -413,7 +411,7 @@ impl std::fmt::Display for AppError {
             AppError::Internal(msg) => write!(f, "Internal error: {}", msg),
             AppError::BatchVerify(msg) => write!(f, "Batch verification failed: {}", msg),
             AppError::ApproverNotAuthorized(msg) => write!(f, "Approver not authorized: {}", msg),
-            AppError::AgentOtherAccount => write!(f, "{}", AGENT_OTHER_ACCOUNT_MSG),
+            AppError::AgentNotInAccount => write!(f, "{}", AGENT_NOT_IN_ACCOUNT_MSG),
         }
     }
 }
@@ -461,7 +459,7 @@ mod tests {
             CaUnavailable,
             AgentKey,
             AgentNotAuthorized,
-            AgentOtherAccount,
+            AgentNotInAccount,
             AmbiguousPhantom,
             ApprovalNeeded,
             ApprovalRegister,
@@ -522,15 +520,19 @@ mod tests {
         }
     }
 
-    /// The account-mismatch refusal is its own code with the `sc agent add` fix,
+    /// The not-in-account refusal is its own code with the `sc agent add` fix,
     /// never the vault-level `agent_not_authorized`.
     #[test]
-    fn agent_other_account_row() {
-        let (code, detail) = AppError::AgentOtherAccount.code();
-        assert_eq!(code.as_str(), "agent_other_account");
+    fn agent_not_in_account_row() {
+        let (code, detail) = AppError::AgentNotInAccount.code();
+        assert_eq!(code.as_str(), "agent_not_in_account");
         assert_eq!(code.status(), 403);
         assert_eq!(code.row().3, "configure");
-        assert!(detail.contains("different SafeClaw account"));
+        assert!(detail.contains("isn't registered to the SafeClaw account"));
+        assert!(
+            !detail.contains('\n') && !detail.contains('\u{2014}'),
+            "one line, no em dash"
+        );
         assert!(detail.contains("`sc agent add`"));
         assert!(
             !detail.contains("  "),

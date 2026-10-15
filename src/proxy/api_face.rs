@@ -216,13 +216,13 @@ async fn require_agent(
                 crate::util::now_unix(),
                 crate::agent_pop::DEFAULT_MAX_SKEW_SECS,
             );
-            // Verified AIK of ANOTHER account (checked before any vault-level
-            // check): the fix is `sc agent add` on this machine, not a toggle.
+            // Verified AIK not registered to this account (checked before any
+            // vault-level check): the fix is `sc agent add` here, not a toggle.
             if let Some(ag) = verified.as_deref() {
-                if crate::sync::agent_of_other_account(state, ag).await {
+                if crate::sync::agent_not_in_account(state, ag).await {
                     return Err(problem(
-                        ScCode::AgentOtherAccount,
-                        crate::error::AGENT_OTHER_ACCOUNT_MSG,
+                        ScCode::AgentNotInAccount,
+                        crate::error::AGENT_NOT_IN_ACCOUNT_MSG,
                     ));
                 }
             }
@@ -395,11 +395,11 @@ mod tests {
         assert!(is_api_face(&loop_back, 23294));
     }
 
-    /// An AIK agent set up under ANOTHER account gets `agent_other_account` at
+    /// An AIK agent not registered to this account gets `agent_not_in_account` at
     /// its first api-face read, before any vault-level check; with the roster
     /// unknown it falls through to the vault-level answer as before.
     #[tokio::test]
-    async fn other_account_agent_is_named_before_vault_checks() {
+    async fn agent_not_in_account_is_named_before_vault_checks() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = crate::config::Config {
             state_dir: dir.path().to_path_buf(),
@@ -446,7 +446,7 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(r.status(), StatusCode::FORBIDDEN);
-        assert_eq!(code(&r).as_deref(), Some("agent_other_account"));
+        assert_eq!(code(&r).as_deref(), Some("agent_not_in_account"));
 
         // Roster unknown → no account verdict; the vault-level answer stands.
         state.set_account_agent_ids(None);
