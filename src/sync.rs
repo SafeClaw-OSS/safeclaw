@@ -1174,10 +1174,33 @@ async fn enforce_membership_presence(state: &Arc<AppState>, vault: &str) -> bool
 /// a bare 401 (that path parks upstream): this only gates an explicit
 /// deleted-status body.
 fn tombstone_should_drop(state_dir: &Path, vault: &str, body: &serde_json::Value) -> bool {
-    let Some(pv) = read_per_item_store(state_dir, vault) else {
-        return true;
-    };
-    tombstone_verified_for(&pv, vault, body, active::account_uik_pub())
+    let dir = state_dir.join("vaults").join(vault);
+    let per_item = dir.join("vault.per-item.json");
+    if per_item.exists() {
+        // A store that exists but can't be read fails CLOSED: never wipe on an
+        // unsigned delete because the local copy is damaged.
+        return match pv_store::read_per_item(&per_item) {
+            Ok(Some(pv)) => tombstone_verified_for(&pv, vault, body, active::account_uik_pub()),
+            _ => {
+                tracing::warn!(vault = %vault, "tombstone: the local store is unreadable; NOT dropping");
+                false
+            }
+        };
+    }
+    if dir.join("vault.dat").exists() {
+        // A whole-blob vault holds credentials too: only the paired account's
+        // signature drops it.
+        let (Some(sig), Some(signer)) = (
+            body.get("tombstone_sig").and_then(|v| v.as_str()).filter(|s| !s.is_empty()),
+            body.get("tombstone_signer").and_then(|v| v.as_str()).filter(|s| !s.is_empty()),
+        ) else {
+            tracing::warn!(vault = %vault, "tombstone: the delete carries no owner signature; NOT dropping");
+            return false;
+        };
+        return personal_tombstone_verified(vault, signer, sig, active::account_uik_pub());
+    }
+    // Nothing local to protect.
+    true
 }
 
 /// [`tombstone_should_drop`] for a vault with a keyset (unit-testable).
@@ -8177,6 +8200,24 @@ mod peritem_tests {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn an_unsigned_delete_never_drops_a_damaged_or_whole_blob_vault() {
+        let dir = tempdir().unwrap();
+        let deleted = serde_json::json!({ "status": "deleted" });
+        // Nothing local: nothing to protect.
+        assert!(tombstone_should_drop(dir.path(), "v0", &deleted));
+        // A per-item store that can't be read: fail closed.
+        let v1 = dir.path().join("vaults").join("v1");
+        std::fs::create_dir_all(&v1).unwrap();
+        std::fs::write(v1.join("vault.per-item.json"), b"{ not json").unwrap();
+        assert!(!tombstone_should_drop(dir.path(), "v1", &deleted));
+        // A whole-blob vault: only the paired account's signature drops it.
+        let v2 = dir.path().join("vaults").join("v2");
+        std::fs::create_dir_all(&v2).unwrap();
+        std::fs::write(v2.join("vault.dat"), b"sealed").unwrap();
+        assert!(!tombstone_should_drop(dir.path(), "v2", &deleted));
+    }
 
     #[test]
     fn an_audit_event_carries_the_refusal_code_and_no_reason() {

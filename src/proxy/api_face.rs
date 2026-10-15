@@ -398,10 +398,9 @@ mod tests {
         // The vault lists the agent.
         let mut cache = crate::state::SecretsCache::default();
         cache.agents.insert(ag.clone(), Default::default());
-        state.unlock_vault("v1".into(), cache, zeroize::Zeroizing::new(vec![0x42u8; 32]));
-
-        // Admitted by the ledger and listed: served.
+        // Admitted by the ledger (a parked device holds no K) and listed: served.
         state.open_ledger_for_tests(&[&ag]);
+        state.unlock_vault("v1".into(), cache, zeroize::Zeroizing::new(vec![0x42u8; 32]));
         assert_eq!(require_agent(&state, &headers("/vaults"), "/vaults").await.unwrap(), ag);
 
         // Revoked in the ledger (the latest fold no longer admits it): refused

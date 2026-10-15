@@ -1987,6 +1987,7 @@ refresh_token = "REFRESH_TOKEN"
         let material = fx.material();
         let keys = VaultKeys::from_material(&material);
         let (_dir, state) = temp_state();
+        state.open_ledger_for_tests(&[]);
         let mut pv = fx.pv.clone();
         let a = pv
             .seal_and_upsert::<S>(keys, vid, ItemNs::Secret, "A", 1, &ItemPayload::secret_live("A", "a"))
@@ -2069,6 +2070,7 @@ refresh_token = "REFRESH_TOKEN"
     #[test]
     fn a_rotated_token_not_stored_stays_in_use_and_pending() {
         let (_dir, state) = temp_state();
+        state.open_ledger_for_tests(&[]);
         let vid = "v-rotate";
         let mut cache = crate::state::SecretsCache::default();
         cache.entries.insert(

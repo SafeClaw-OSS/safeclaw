@@ -567,13 +567,28 @@ async fn apply_grant(state: Arc<AppState>, op_id: &str, grant: Value) -> Result<
             // Every refusal of WHO approved or HOW the key was delivered leaves
             // the op pending (grant v3): a forged or mis-shaped grant must never
             // resolve an op someone may still approve.
-            approver_not_authorized: matches!(
-                code.as_deref(),
-                Some("approver_not_authorized" | "grant_id_invalid" | "wk_refused_v2")
-            ),
+            approver_not_authorized: refusal_keeps_op_pending(code.as_deref()),
             detail: format!("loopback approve HTTP {}: {}", status, body),
         })
     }
+}
+
+/// Refusals that leave the op pending instead of failing it: who approved or
+/// how the key was delivered (a forged or mis-shaped grant must never resolve
+/// an op someone may still approve), and this device being unable to serve
+/// right now (parked, lease expired, revoked: the approval itself isn't wrong).
+fn refusal_keeps_op_pending(code: Option<&str>) -> bool {
+    matches!(
+        code,
+        Some(
+            "approver_not_authorized"
+                | "grant_id_invalid"
+                | "wk_refused_v2"
+                | "device_not_admitted"
+                | "ledger_stale"
+                | "ledger_device_revoked"
+        )
+    )
 }
 
 /// `reason: None` = a genuine user rejection (the endpoint's default). `Some` =
@@ -625,6 +640,16 @@ mod tests {
     fn poll_interval_is_mode_dependent() {
         assert_eq!(poll_interval(true), Duration::from_secs(15));
         assert_eq!(poll_interval(false), Duration::from_secs(2));
+    }
+
+    #[test]
+    fn a_device_that_cannot_serve_keeps_the_op_pending() {
+        for c in ["approver_not_authorized", "grant_id_invalid", "wk_refused_v2",
+                  "device_not_admitted", "ledger_stale", "ledger_device_revoked"] {
+            assert!(refusal_keeps_op_pending(Some(c)), "{c}");
+        }
+        assert!(!refusal_keeps_op_pending(Some("bad_request")));
+        assert!(!refusal_keeps_op_pending(None));
     }
 
     fn test_state() -> AppState {

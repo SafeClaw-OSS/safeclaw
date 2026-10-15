@@ -894,6 +894,12 @@ impl AppState {
         cache: SecretsCache,
         state_key: zeroize::Zeroizing<Vec<u8>>,
     ) {
+        // A parked or locked device holds no K (I3): a refresh or apply that
+        // cloned K before the park must not write it back.
+        if self.ledger.lock().unwrap().device != crate::principal_ledger::DeviceGate::Open {
+            tracing::warn!(vault = %vault_id, "unlock refused: this device is not admitted to serve");
+            return;
+        }
         // Team lease clock starts at unlock (a human was just present).
         self.record_cloud_contact(&vault_id);
         let unlocked_at = SystemTime::now()
@@ -2102,6 +2108,17 @@ mod tests {
             s.open_ledger_for_tests(&[]);
             s
         }
+    }
+
+    #[test]
+    fn a_parked_device_never_gets_k_back() {
+        let s = test_state();
+        s.set_ledger(crate::principal_ledger::LedgerGate::default()); // parked
+        s.unlock_vault("v".into(), SecretsCache::default(), zeroize::Zeroizing::new(vec![7u8; 32]));
+        assert!(s.is_vault_locked("v"), "a refresh that cloned K before the park must not reinstall it");
+        s.open_ledger_for_tests(&[]);
+        s.unlock_vault("v".into(), SecretsCache::default(), zeroize::Zeroizing::new(vec![7u8; 32]));
+        assert!(!s.is_vault_locked("v"));
     }
 
     #[test]
