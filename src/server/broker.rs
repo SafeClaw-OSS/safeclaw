@@ -16,7 +16,7 @@ use crate::storage::SealedVault;
 /// the agent's retried request can consume them.
 pub async fn resolve_use_primary(
     op: &Operation,
-    wrapping_key: &[u8],
+    key: crate::protocol::grant::GrantKey<'_>,
     credential_id_bytes: &[u8],
     vault: Option<&SealedVault>,
     state: &crate::state::AppState,
@@ -26,7 +26,7 @@ pub async fn resolve_use_primary(
         state,
         vault_id,
         op,
-        wrapping_key,
+        key,
         credential_id_bytes,
         vault,
     )?;

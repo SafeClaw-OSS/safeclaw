@@ -5002,8 +5002,16 @@ fn adopt_membership_triple(
     // seal under these cids so the grant's credential_id resolves at v2 unlock.
     let mut cids_by_member: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
+    // Other members' passkeys served as approval-verification material only
+    // (`approver: true`: a vault admin's cid, identity_id, x, y). Adopted after the
+    // members below, never as the caller's own.
+    let mut approvers: Vec<&serde_json::Value> = Vec::new();
     if let Some(creds) = body.get("credentials").and_then(|v| v.as_array()) {
         for c in creds {
+            if c.get("approver").and_then(|v| v.as_bool()) == Some(true) {
+                approvers.push(c);
+                continue;
+            }
             if let (Some(cid), Some(idid)) = (
                 c.get("cid").and_then(|v| v.as_str()),
                 c.get("identity_id").and_then(|v| v.as_str()),
@@ -5084,6 +5092,21 @@ fn adopt_membership_triple(
             .map_err(|e| format!("adopt uik seal {}: {}", id, e))?;
         }
         adopted += 1;
+    }
+
+    // An admin's passkey: its pubkey into the registry and its cid → identity label, so
+    // this daemon can verify the admin approving its op. Who is an admin stays the
+    // verified role fold; a malformed entry is skipped, never failing the pull.
+    for c in approvers {
+        let field = |k: &str| c.get(k).and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+        let (Some(cid), Some(idid), Some(x), Some(y)) =
+            (field("cid"), field("identity_id"), field("x"), field("y"))
+        else {
+            continue;
+        };
+        if let Err(e) = pv.set_approver_credential(cid, idid, x, y) {
+            tracing::warn!(vault = %vault_id, cid, "approver credential not adopted: {}", e);
+        }
     }
 
     // Keyset-level delegation state + re-key meta (reused helpers, SAME order as adopt_key_rows:
@@ -7315,6 +7338,61 @@ mod peritem_tests {
         adopt_membership_triple(&mut pv, "v", &enc(&[7; 32]), &body).unwrap();
         assert_eq!(pv.uik_cred("cid-a").unwrap().prev_content_ct, sealed);
         assert_eq!(pv.uik_cred("cid-b").unwrap().prev_content_ct, sealed);
+    }
+
+    /// An admin's passkey served as approval material (`approver: true`): its
+    /// pubkey lands in the registry and its cid maps to the admin, while the
+    /// admin's seat stays keyed under their `us_…` and never reads as one of
+    /// this device's own (requester) identities. A seat an earlier adoption
+    /// keyed under the admin's cid is dropped. A malformed entry is skipped.
+    #[test]
+    fn approver_credentials_verify_but_are_never_own() {
+        use base64::engine::general_purpose::STANDARD;
+        use base64::Engine;
+        let enc = |b: &[u8]| STANDARD.encode(b);
+        let body = serde_json::json!({
+            "anchor": enc(&[7; 32]),
+            "members": {
+                "us_me": { "role": "member", "k_encapped": enc(&[5; 32]), "k_ct": enc(&[6; 80]) },
+                "us_admin": { "role": "admin", "k_encapped": enc(&[5; 32]), "k_ct": enc(&[6; 80]) },
+            },
+            "identities": {
+                "us_me": { "sig_pub": enc(&[3; 32]), "enc_pub": enc(&[4; 32]) },
+                "us_admin": { "sig_pub": enc(&[8; 32]), "enc_pub": enc(&[9; 32]) },
+            },
+            "credentials": [
+                { "cid": "Yw", "identity_id": "us_me", "x": "mx", "y": "my" },
+                { "cid": "YWRtaW4", "identity_id": "us_admin", "x": "ax", "y": "ay", "approver": true },
+                { "cid": "YmFk", "identity_id": "us_admin", "approver": true },
+            ],
+        });
+        let mut pv = empty_keyset_store();
+        // A seat an older adoption keyed under the admin's cid.
+        pv.set_uik_cred(
+            "YWRtaW4".into(),
+            "us_admin".into(),
+            vec![8; 32],
+            vec![9; 32],
+            vec![5; 32],
+            vec![6; 80],
+            crate::storage::plaintext::MemberRole::Admin,
+            Vec::new(),
+        );
+        pv.set_registry_pubkey("YWRtaW4", "ax", "ay", "").unwrap();
+        assert!(pv.own_identities().contains("us_admin"), "the stale seat read as own");
+
+        adopt_membership_triple(&mut pv, "v", &enc(&[7; 32]), &body).unwrap();
+        let pk = crate::storage::sealed_vault::find_pubkey_in_registry(&pv.keyset.registry, "YWRtaW4")
+            .expect("the admin's pubkey verifies assertions");
+        assert_eq!((pk.x.as_str(), pk.y.as_str()), ("ax", "ay"));
+        assert_eq!(pv.credential_identity("YWRtaW4").as_deref(), Some("us_admin"));
+        assert!(pv.uik_cred("YWRtaW4").is_none(), "no seat under the admin's cid");
+        assert_eq!(pv.uik_cred("us_admin").unwrap().user_id, "us_admin");
+        assert_eq!(pv.uik_cred("Yw").unwrap().user_id, "us_me");
+        assert_eq!(pv.own_identities(), ["us_me".to_string()].into());
+        // No pubkey: nothing to verify with, not adopted.
+        assert!(pv.credential_identity("YmFk").is_none());
+        assert!(crate::storage::sealed_vault::find_pubkey_in_registry(&pv.keyset.registry, "YmFk").is_none());
     }
 
     /// DP-S1 wire plumbing (Part 1): a re-keyed vault's keyset-LEVEL `generation`

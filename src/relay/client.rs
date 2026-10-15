@@ -295,7 +295,8 @@ async fn run(
     // re-register flips the relay row back to pending. Full body, not the
     // assertion: a same-set retry has the same root and a deterministic
     // authenticator may repeat the assertion byte-for-byte — what guarantees
-    // an honest retry differs is the fresh HPKE ephemeral in wk_enc/wk_ct.
+    // an honest retry differs is the fresh HPKE ephemeral in wk_enc/wk_ct
+    // (or k_enc/k_ct, an admin's delivered vault key).
     let mut last_batch_failed: Option<[u8; 32]> = None;
     while tokio::time::Instant::now() < deadline {
         if now() > expires_at + 5 {

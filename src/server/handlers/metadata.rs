@@ -23,6 +23,7 @@ use sudp::passkey::WebAuthn;
 use sudp::primitives::StdPrimitives;
 
 use crate::error::{AppError, Result};
+use crate::protocol::grant::GrantKey;
 use crate::protocol::Operation;
 use crate::server::handlers::op::validate_vault_id;
 use crate::state::AppState;
@@ -455,12 +456,38 @@ pub fn unwrap_k_from_keyset(
 /// two keyset formats. The grant wire is identical in both cases (a 32-byte
 /// secret HPKE-sealed to the daemon's `sc_pk`); only its meaning differs, and
 /// the keyset shape (`uik.is_some()`) — not the wire — selects the branch.
+///
+/// A [`GrantKey::VaultKey`] (an admin approving another member's op delivers
+/// the vault key itself, `k_enc`/`k_ct`) skips the member entry: the
+/// delivered material is the bundle a v2 open produces, kept with the
+/// vault's previous content keys from any keyset entry, the same as the root
+/// path. Only a v2 keyset accepts one.
 pub fn acquire_k_from_keyset(
     keyset: &crate::storage::sealed_vault::Keyset,
-    secret: &[u8],
+    key: GrantKey<'_>,
     credential_id_bytes: &[u8],
     vault_id: &str,
 ) -> Result<zeroize::Zeroizing<Vec<u8>>> {
+    let secret = match key {
+        GrantKey::Custody(secret) => secret,
+        GrantKey::VaultKey(material) => {
+            let uik = keyset.uik.as_ref().ok_or_else(|| {
+                AppError::Unauthorized("a delivered vault key opens only a team vault".into())
+            })?;
+            if material.len() != 32 && material.len() != 64 {
+                return Err(AppError::Unauthorized(
+                    "a delivered vault key must be 32 or 64 bytes".into(),
+                ));
+            }
+            let lists = uik.creds.values().map(|c| c.prev_content_ct.as_slice());
+            return Ok(crate::storage::item::material_with_prev::<StdPrimitives>(
+                zeroize::Zeroizing::new(material.to_vec()),
+                vault_id,
+                uik.generation,
+                lists,
+            ));
+        }
+    };
     let Some(uik) = keyset.uik.as_ref() else {
         // v1: `secret` is W_c → unwrap K directly.
         return unwrap_k_from_keyset(keyset, secret, credential_id_bytes);
@@ -510,12 +537,12 @@ pub fn acquire_k_from_keyset(
 /// the grant, then fold all live item rows into a [`VaultPlaintextView`]. Used
 /// by the per-item Export path. Discards `K` after the fold (read-only).
 pub fn decrypt_vault_view_peritem(
-    wrapping_key: &[u8],
+    key: GrantKey<'_>,
     credential_id_bytes: &[u8],
     vault: &crate::storage::sealed_vault::PerItemVault,
     vault_id: &str,
 ) -> Result<VaultPlaintextView> {
-    let k = acquire_k_from_keyset(&vault.keyset, wrapping_key, credential_id_bytes, vault_id)?;
+    let k = acquire_k_from_keyset(&vault.keyset, key, credential_id_bytes, vault_id)?;
     vault.fold_view::<StdPrimitives>(VaultKeys::from_material(&k), vault_id)
 }
 
@@ -525,12 +552,12 @@ pub fn decrypt_vault_view_peritem(
 /// writes) without a second passkey. Used by the per-item unlock / write /
 /// enroll auto-unlock paths.
 pub fn decrypt_vault_view_peritem_keep_key(
-    wrapping_key: &[u8],
+    key: GrantKey<'_>,
     credential_id_bytes: &[u8],
     vault: &crate::storage::sealed_vault::PerItemVault,
     vault_id: &str,
 ) -> Result<(VaultPlaintextView, zeroize::Zeroizing<Vec<u8>>)> {
-    let k = acquire_k_from_keyset(&vault.keyset, wrapping_key, credential_id_bytes, vault_id)?;
+    let k = acquire_k_from_keyset(&vault.keyset, key, credential_id_bytes, vault_id)?;
     let view = vault.fold_view::<StdPrimitives>(VaultKeys::from_material(&k), vault_id)?;
     Ok((view, k))
 }
@@ -562,19 +589,30 @@ pub fn open_view_for_grant(
     state: &AppState,
     vault_id: &str,
     op: &Operation,
-    wrapping_key: &[u8],
+    key: GrantKey<'_>,
     credential_id_bytes: &[u8],
     vault: Option<&crate::storage::SealedVault>,
 ) -> Result<VaultPlaintextView> {
     if let Ok(path) = state.vaults.per_item_path(vault_id) {
         if let Ok(Some(pv)) = crate::storage::sealed_vault::read_per_item(&path) {
-            return decrypt_vault_view_peritem(wrapping_key, credential_id_bytes, &pv, vault_id);
+            return decrypt_vault_view_peritem(key, credential_id_bytes, &pv, vault_id);
         }
     }
     // Whole-blob fallback — only vaults that still have a vault.dat (daemon-side
     // Enroll/Write) reach here; a web-enrolled per-item vault is served above.
     let vault = vault.ok_or_else(|| AppError::Conflict("vault not initialized".into()))?;
-    decrypt_vault_view(op, wrapping_key, credential_id_bytes, vault)
+    decrypt_vault_view(op, whole_blob_secret(key)?, credential_id_bytes, vault)
+}
+
+/// The whole-blob open needs the passkey's own `W_c`: a delivered vault key
+/// (team vaults only, which have no whole blob) never opens one.
+fn whole_blob_secret(key: GrantKey<'_>) -> Result<&[u8]> {
+    match key {
+        GrantKey::Custody(secret) => Ok(secret),
+        GrantKey::VaultKey(_) => Err(AppError::Unauthorized(
+            "a delivered vault key opens only a team vault".into(),
+        )),
+    }
 }
 
 /// Like [`open_view_for_grant`] but RETAINS `K` for the unlocked session — the
@@ -583,14 +621,14 @@ pub fn open_view_for_grant_keep_key(
     state: &AppState,
     vault_id: &str,
     op: &Operation,
-    wrapping_key: &[u8],
+    key: GrantKey<'_>,
     credential_id_bytes: &[u8],
     vault: Option<&crate::storage::SealedVault>,
 ) -> Result<(VaultPlaintextView, zeroize::Zeroizing<Vec<u8>>)> {
     if let Ok(path) = state.vaults.per_item_path(vault_id) {
         if let Ok(Some(pv)) = crate::storage::sealed_vault::read_per_item(&path) {
             let (view, k) = decrypt_vault_view_peritem_keep_key(
-                wrapping_key,
+                key,
                 credential_id_bytes,
                 &pv,
                 vault_id,
@@ -605,7 +643,7 @@ pub fn open_view_for_grant_keep_key(
     }
     // Whole-blob fallback — see open_view_for_grant.
     let vault = vault.ok_or_else(|| AppError::Conflict("vault not initialized".into()))?;
-    decrypt_vault_view_keep_key(op, wrapping_key, credential_id_bytes, vault)
+    decrypt_vault_view_keep_key(op, whole_blob_secret(key)?, credential_id_bytes, vault)
 }
 
 /// Open the CURRENT vault view with the RETAINED state key `K` — no grant, no

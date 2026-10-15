@@ -41,6 +41,23 @@ pub struct Grant {
     /// HPKE-sealed `W*` ciphertext + tag (base64url-no-pad). Paired with `wk_enc`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wk_ct: Option<String>,
+    /// HPKE-sealed VAULT KEY encapped key (base64url-no-pad). Paired with `k_ct`.
+    /// An admin approving ANOTHER member's op on a team vault delivers the
+    /// vault's key (opened in the browser through the admin's own membership
+    /// entry), never their own UIK root: the root is the person's identity in
+    /// every vault, so it must not reach someone else's machine. Sealed to the
+    /// daemon's `sc_pk` with `info = grant_k_seal_info(op_id)`, aad empty.
+    /// Plaintext: the 32-byte `K` (generation 0) or the 64-byte key bundle
+    /// `id_seed ‖ content`. Mutually exclusive with `wrapping_key` / `wk_*`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub k_enc: Option<String>,
+    /// HPKE-sealed vault key ciphertext + tag (base64url-no-pad). Paired with `k_enc`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub k_ct: Option<String>,
+    /// The vault key opened from `k_enc`/`k_ct` by the approve handler. Never
+    /// on the wire (not deserialized, not serialized).
+    #[serde(skip)]
+    pub vault_key: Option<DeliveredVaultKey>,
     /// WebAuthn assertion. Present on every PLAIN grant (challenge = β).
     /// ABSENT on a batch grant — the shared proof rides in `batch` instead,
     /// and a batch grant carrying a top-level assertion is rejected outright
@@ -77,6 +94,89 @@ pub struct BatchProof {
     pub assertion: AssertionData,
 }
 
+/// The vault key material a `k_*` grant delivered (zeroized on drop; its
+/// bytes never print).
+#[derive(Clone)]
+pub struct DeliveredVaultKey(zeroize::Zeroizing<Vec<u8>>);
+
+impl DeliveredVaultKey {
+    /// Adopt opened key material: the 32-byte `K` or the 64-byte bundle.
+    pub fn new(material: Vec<u8>) -> Result<Self> {
+        let material = zeroize::Zeroizing::new(material);
+        if material.len() != 32 && material.len() != 64 {
+            return Err(AppError::BadRequest(
+                "a delivered vault key must be 32 or 64 bytes".into(),
+            ));
+        }
+        Ok(Self(material))
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for DeliveredVaultKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DeliveredVaultKey(..)")
+    }
+}
+
+/// How a grant delivers what opens the vault. A grant carries EXACTLY ONE.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryForm {
+    /// Plaintext `wrapping_key` (the legacy local op-page).
+    Plain,
+    /// `wk_enc`/`wk_ct`: the approver's own unlock secret, HPKE-sealed
+    /// (`W_c` on a v1 keyset, the approver's UIK root on a v2 keyset).
+    SealedSecret,
+    /// `k_enc`/`k_ct`: the vault key an admin delivers, HPKE-sealed.
+    SealedVaultKey,
+}
+
+/// The one delivery form `grant` carries, as it arrived on the wire (before
+/// the handler opens a seal). Exactly one of `wrapping_key`, the `wk_*` pair
+/// or the `k_*` pair (a half pair counts as its form, and is refused when
+/// opened); both or neither is malformed.
+pub fn delivery_form(grant: &Grant) -> Result<DeliveryForm> {
+    let forms = [
+        (grant.wrapping_key.is_some(), DeliveryForm::Plain),
+        (
+            grant.wk_enc.is_some() || grant.wk_ct.is_some(),
+            DeliveryForm::SealedSecret,
+        ),
+        (
+            grant.k_enc.is_some() || grant.k_ct.is_some(),
+            DeliveryForm::SealedVaultKey,
+        ),
+    ];
+    let mut present = forms.iter().filter(|(p, _)| *p).map(|(_, f)| *f);
+    match (present.next(), present.next()) {
+        (Some(f), None) => Ok(f),
+        _ => Err(AppError::BadRequest(
+            "a grant carries exactly one of wrapping_key, wk_enc/wk_ct or k_enc/k_ct".into(),
+        )),
+    }
+}
+
+/// What a validated grant delivered, as the read seams consume it.
+#[derive(Clone, Copy)]
+pub enum GrantKey<'a> {
+    /// The approver's own unlock secret: `W_c` (v1 keyset) or their UIK root
+    /// (v2 keyset). Opens `K` through the acting credential's keyset entry.
+    Custody(&'a [u8]),
+    /// The vault key material itself (an admin's `k_*` grant): `K` or the
+    /// 64-byte bundle. Only a v2 (UIK) keyset accepts it.
+    VaultKey(&'a [u8]),
+}
+
+/// Which [`GrantKey`] a [`ValidatedGrant`] carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Delivery {
+    Custody,
+    VaultKey,
+}
+
 /// Side payload for `Act::Enroll`. Carried out-of-band of the canonical op so
 /// that β = SHA-256(domain ‖ 0x00 ‖ r ‖ SHA-256(canonical(o))) can be
 /// pre-computed before the PRF-bearing WebAuthn `.get()` runs.
@@ -94,15 +194,42 @@ pub struct ValidatedGrant {
     pub op: Operation,
     /// Acting credential id (raw bytes).
     pub credential_id_bytes: Vec<u8>,
-    /// 32-byte wrapping key `W*` (zeroized on drop).
-    pub wrapping_key: Vec<u8>,
+    /// The delivered secret (zeroized on drop), read per `delivery`: the
+    /// 32-byte custody secret `W*` (W_c or UIK root), or the vault key
+    /// material (32 or 64 bytes) an admin delivered.
+    pub secret: Vec<u8>,
+    /// What `secret` is.
+    pub delivery: Delivery,
     /// `r` consumed (raw bytes).
     pub r_bytes: Vec<u8>,
 }
 
+impl ValidatedGrant {
+    /// The delivered secret as the read seams take it.
+    pub fn key(&self) -> GrantKey<'_> {
+        match self.delivery {
+            Delivery::Custody => GrantKey::Custody(&self.secret),
+            Delivery::VaultKey => GrantKey::VaultKey(&self.secret),
+        }
+    }
+
+    /// The approver's custody secret (`W_c` / UIK root), for the paths that
+    /// need the passkey's own secret (whole-blob open, add-passkey, KCV
+    /// backfill). A delivered vault key is not one: refused.
+    pub fn custody_secret(&self) -> Result<&[u8]> {
+        match self.delivery {
+            Delivery::Custody => Ok(&self.secret),
+            Delivery::VaultKey => Err(AppError::BadRequest(
+                "this act needs the approver's own passkey secret, not a delivered vault key"
+                    .into(),
+            )),
+        }
+    }
+}
+
 impl Drop for ValidatedGrant {
     fn drop(&mut self) {
-        self.wrapping_key.zeroize();
+        self.secret.zeroize();
     }
 }
 
@@ -270,30 +397,44 @@ fn validate_grant_core(
     }
     verify_assertion(assertion, &entry.x, &entry.y, rp, expected_challenge)?;
 
-    // 7. Decode wrapping_key + credential_id raw bytes.
+    // 7. Decode the delivered secret + credential_id raw bytes.
     //
-    // By this point W* must be present as plaintext base64 in `wrapping_key`:
-    // either the legacy local op-page shipped it directly, or the approve
-    // handler HPKE-opened `wk_enc`/`wk_ct` and populated this field. A grant
-    // with neither is malformed.
+    // Exactly one form, already opened by the approve handler: W* as
+    // plaintext base64 in `wrapping_key` (the legacy local op-page shipped it,
+    // or the handler HPKE-opened `wk_enc`/`wk_ct` into it), or the vault key
+    // an admin delivered (`k_enc`/`k_ct`, opened into `vault_key`). Both or
+    // neither is malformed.
     let credential_id_bytes = decode_credential_id(&grant.credential_id)?;
-    let wrapping_key_b64 = grant.wrapping_key.as_deref().ok_or_else(|| {
-        AppError::BadRequest("grant carries no wrapping_key (and no opened seal)".into())
-    })?;
-    let wrapping_key = STANDARD
-        .decode(wrapping_key_b64)
-        .map_err(|_| AppError::BadRequest("wrapping_key not base64".into()))?;
-    if wrapping_key.len() != 32 {
-        return Err(AppError::BadRequest("wrapping_key must be 32 bytes".into()));
-    }
-    // F-04: zeroize the source base64 String so W* doesn't linger on the heap.
-    // We can't mutate grant (it's `&Grant`) — clone a local copy, zeroize it,
-    // then drop it.
-    // SAFETY: zeroing valid UTF-8 bytes with 0x00; the String is immediately
-    // dropped after this block and never used as a &str again.
-    let mut wk_str = wrapping_key_b64.to_string();
-    unsafe { wk_str.as_bytes_mut().zeroize() };
-    drop(wk_str);
+    let (secret, delivery) = match (grant.wrapping_key.as_deref(), grant.vault_key.as_ref()) {
+        (Some(wrapping_key_b64), None) => {
+            let wrapping_key = STANDARD
+                .decode(wrapping_key_b64)
+                .map_err(|_| AppError::BadRequest("wrapping_key not base64".into()))?;
+            if wrapping_key.len() != 32 {
+                return Err(AppError::BadRequest("wrapping_key must be 32 bytes".into()));
+            }
+            // F-04: zeroize the source base64 String so W* doesn't linger on the heap.
+            // We can't mutate grant (it's `&Grant`) — clone a local copy, zeroize it,
+            // then drop it.
+            // SAFETY: zeroing valid UTF-8 bytes with 0x00; the String is immediately
+            // dropped after this block and never used as a &str again.
+            let mut wk_str = wrapping_key_b64.to_string();
+            unsafe { wk_str.as_bytes_mut().zeroize() };
+            drop(wk_str);
+            (wrapping_key, Delivery::Custody)
+        }
+        (None, Some(k)) => (k.as_bytes().to_vec(), Delivery::VaultKey),
+        (Some(_), Some(_)) => {
+            return Err(AppError::BadRequest(
+                "grant carries both a wrapping key and a vault key".into(),
+            ))
+        }
+        (None, None) => {
+            return Err(AppError::BadRequest(
+                "grant carries no wrapping_key or vault key (and no opened seal)".into(),
+            ))
+        }
+    };
 
     // 8. Grant fully validated (signature + all fields) — NOW consume the
     //    single-use challenge, so a valid grant can't be replayed and a bogus
@@ -303,7 +444,8 @@ fn validate_grant_core(
     Ok(ValidatedGrant {
         op: grant.o.clone(),
         credential_id_bytes,
-        wrapping_key,
+        secret,
+        delivery,
         r_bytes,
     })
 }
@@ -347,6 +489,9 @@ mod tests {
             wrapping_key: Some(B64.encode([9u8; 32])),
             wk_enc: None,
             wk_ct: None,
+            k_enc: None,
+            k_ct: None,
+            vault_key: None,
             assertion: None,
             batch: Some(BatchProof {
                 op_ids: vec!["a".into(), "b".into()],
@@ -397,6 +542,43 @@ mod tests {
             chs.peek(&r),
             "r must not be consumed by a failed batch verify"
         );
+    }
+
+    /// A grant delivers in exactly one form: the plaintext wrapping key, the
+    /// sealed secret (`wk_*`) or the sealed vault key (`k_*`). Both or neither
+    /// is malformed; a half pair counts as its form (and fails when opened).
+    #[test]
+    fn exactly_one_delivery_form() {
+        let mut g = batch_grant("r");
+        assert_eq!(delivery_form(&g).unwrap(), DeliveryForm::Plain);
+        g.wrapping_key = None;
+        assert!(delivery_form(&g).is_err(), "neither");
+        g.wk_enc = Some("e".into());
+        g.wk_ct = Some("c".into());
+        assert_eq!(delivery_form(&g).unwrap(), DeliveryForm::SealedSecret);
+        g.k_enc = Some("e".into());
+        g.k_ct = Some("c".into());
+        assert!(delivery_form(&g).is_err(), "wk_* and k_*");
+        g.wk_enc = None;
+        g.wk_ct = None;
+        assert_eq!(delivery_form(&g).unwrap(), DeliveryForm::SealedVaultKey);
+        g.k_ct = None;
+        assert_eq!(delivery_form(&g).unwrap(), DeliveryForm::SealedVaultKey);
+        g.wrapping_key = Some(B64.encode([9u8; 32]));
+        assert!(delivery_form(&g).is_err(), "wrapping_key and k_*");
+        // The opened vault key is never on the wire.
+        let mut g = batch_grant("r");
+        g.wrapping_key = None;
+        g.vault_key = Some(DeliveredVaultKey::new(vec![1u8; 32]).unwrap());
+        let wire = serde_json::to_value(&g).unwrap();
+        assert!(wire.get("vault_key").is_none());
+        let mut injected = wire.clone();
+        injected["vault_key"] = serde_json::json!("AAAA");
+        let back: Grant = serde_json::from_value(injected).unwrap();
+        assert!(back.vault_key.is_none());
+        assert!(!format!("{:?}", g).contains("[1, 1"));
+        assert!(DeliveredVaultKey::new(vec![1u8; 48]).is_err());
+        assert!(DeliveredVaultKey::new(vec![1u8; 64]).is_ok());
     }
 
     /// A batch-shaped grant on the PLAIN path fails closed.

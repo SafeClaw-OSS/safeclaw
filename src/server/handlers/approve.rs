@@ -36,6 +36,7 @@ use crate::passkey::PasskeyEntry;
 use crate::protocol::operation::{
     as_enroll_credential, as_export_path, decode_credential_id, discriminator, ActType,
 };
+use crate::protocol::grant::{delivery_form, DeliveredVaultKey, DeliveryForm, GrantKey};
 use crate::protocol::{render_operation, validate_batch_grant, validate_grant, Grant};
 use crate::server::handlers::metadata::decrypt_vault_view_keep_key;
 use crate::state::{AppState, ApprovalEvent, SecretsCache};
@@ -594,14 +595,41 @@ fn batch_expected_challenge(
     Ok(batch_challenge(&root))
 }
 
-/// Who raised the ops this daemon holds: the account it is paired to (its
-/// pinned account UIK), together with the identities the vault seats under
-/// this device's own passkeys (so a missing or stale pin never locks the
-/// requester out of their own request).
-fn requester_identities(pv: &PerItemVault) -> BTreeSet<String> {
-    let mut ids = pv.own_identities();
-    ids.extend(crate::cli::active::account_uik());
-    ids
+/// Who raised the ops this daemon holds: the account it is paired to, its
+/// pinned account UIK (`account`, from [`crate::cli::active::account_uik`]). The
+/// daemon acts for that one account, so that is the requester, whatever else
+/// the keyset seats. Membership data is not consulted when the pin exists: it
+/// is server-served, and since an admin's passkeys now ride the membership
+/// (`approver: true`, adopted into the registry, which is never pruned) a
+/// registry-derived set could name an admin, or a demoted one, as a requester.
+///
+/// Fallback for a daemon paired without an account UIK (an older backend):
+/// the identities the vault seats under this device's own passkeys
+/// ([`PerItemVault::own_identities`]), which excludes every credential the
+/// membership served as another member's approval material.
+fn requester_identities(pv: &PerItemVault, account: Option<String>) -> BTreeSet<String> {
+    match account {
+        Some(us) => [us].into(),
+        None => pv.own_identities(),
+    }
+}
+
+/// What a grant delivered, for the authority gate (before validation): the
+/// opened vault key of a `k_*` grant, else the custody secret (`W*` / UIK root;
+/// empty when absent or malformed: then no root resolves and the signer is
+/// the credential's label).
+fn with_delivered_key<T>(grant: &Grant, f: impl FnOnce(GrantKey<'_>) -> T) -> T {
+    if let Some(k) = grant.vault_key.as_ref() {
+        return f(GrantKey::VaultKey(k.as_bytes()));
+    }
+    let secret = zeroize::Zeroizing::new(
+        grant
+            .wrapping_key
+            .as_deref()
+            .and_then(|b| STANDARD.decode(b).ok())
+            .unwrap_or_default(),
+    );
+    f(GrantKey::Custody(&secret))
 }
 
 /// The approval-authority gate of [`approve_op`] (step 3d): refuse a grant
@@ -612,7 +640,17 @@ fn check_approval_authority(pv: &PerItemVault, vault_id: &str, grant: &Grant) ->
     if grant.o.act.kind == ActType::Enroll && grant.o.act.target != "passkeys" {
         return Ok(());
     }
-    authorize_approver(pv, vault_id, &requester_identities(pv), grant)
+    let requester = requester_identities(pv, paired_account());
+    authorize_approver(pv, vault_id, &requester, grant)
+}
+
+/// The paired account's UIK (`us_…`) this daemon acts for.
+fn paired_account() -> Option<String> {
+    #[cfg(test)]
+    if let Some(account) = tests::PAIRED_ACCOUNT.with(|a| a.borrow().clone()) {
+        return account;
+    }
+    crate::cli::active::account_uik()
 }
 
 /// [`check_approval_authority`] with the requester given (unit-testable).
@@ -626,17 +664,92 @@ fn authorize_approver(
     let cid = decode_credential_id(&grant.credential_id)
         .map(|b| URL_SAFE_NO_PAD.encode(b))
         .unwrap_or_else(|_| grant.credential_id.clone());
-    // On a v2 vault the delivered secret is the approver's UIK root.
-    let secret = zeroize::Zeroizing::new(
-        grant
-            .wrapping_key
-            .as_deref()
-            .and_then(|b| STANDARD.decode(b).ok())
-            .unwrap_or_default(),
-    );
-    match pv.approval_authority(vault_id, requester, &cid, &secret) {
+    let verdict =
+        with_delivered_key(grant, |key| pv.approval_authority(vault_id, requester, &cid, key));
+    match verdict {
         ApprovalAuthority::Refused(reason) => Err(AppError::ApproverNotAuthorized(reason)),
         ApprovalAuthority::NotGated | ApprovalAuthority::Requester | ApprovalAuthority::Admin => {
+            Ok(())
+        }
+    }
+}
+
+/// Open one HPKE grant seal (`enc`/`ct`, base64url-no-pad) addressed to this
+/// daemon's `sc_pk` under `info`. `name` is the wire pair's prefix (`wk` / `k`)
+/// for the error text. A half pair is malformed.
+fn open_grant_seal(
+    state: &AppState,
+    enc: Option<&str>,
+    ct: Option<&str>,
+    name: &str,
+    info: &[u8],
+) -> Result<zeroize::Zeroizing<Vec<u8>>> {
+    let (Some(enc_b64), Some(ct_b64)) = (enc, ct) else {
+        return Err(AppError::BadRequest(format!(
+            "a sealed grant needs both {name}_enc and {name}_ct"
+        )));
+    };
+    let enc = URL_SAFE_NO_PAD
+        .decode(enc_b64)
+        .map_err(|_| AppError::BadRequest(format!("{name}_enc not base64url")))?;
+    let ct = URL_SAFE_NO_PAD
+        .decode(ct_b64)
+        .map_err(|_| AppError::BadRequest(format!("{name}_ct not base64url")))?;
+    Ok(zeroize::Zeroizing::new(state.sc.open(&enc, &ct, info, b"")?))
+}
+
+/// Step 3c of [`approve_op`]: open what the grant delivers, in its one form
+/// ([`delivery_form`]), into the field validation reads — `wrapping_key` for
+/// the approver's own sealed secret (`wk_*`), `vault_key` for the vault key an
+/// admin delivers (`k_*`, accepted only on a team (v2) vault and never for an
+/// Enroll). Nothing is consumed: a malformed or mis-sealed delivery leaves the
+/// op pending with its challenge live.
+fn open_grant_delivery(
+    state: &AppState,
+    op_id: &str,
+    grant: &mut Grant,
+    pv: Option<&PerItemVault>,
+) -> Result<()> {
+    match delivery_form(grant)? {
+        // Legacy local op-page: plaintext `wrapping_key`, nothing to open.
+        DeliveryForm::Plain => Ok(()),
+        DeliveryForm::SealedSecret => {
+            let info = crate::crypto::envelope::grant_seal_info(op_id);
+            let wk = open_grant_seal(
+                state,
+                grant.wk_enc.as_deref(),
+                grant.wk_ct.as_deref(),
+                "wk",
+                &info,
+            )?;
+            if wk.len() != 32 {
+                return Err(AppError::BadRequest(
+                    "sealed wrapping_key must be 32 bytes".into(),
+                ));
+            }
+            grant.wrapping_key = Some(STANDARD.encode(&wk[..]));
+            Ok(())
+        }
+        DeliveryForm::SealedVaultKey => {
+            if grant.o.act.kind == ActType::Enroll {
+                return Err(AppError::BadRequest(
+                    "an enroll grant must deliver the approver's own passkey secret".into(),
+                ));
+            }
+            if !pv.is_some_and(|pv| pv.keyset.uik.is_some()) {
+                return Err(AppError::BadRequest(
+                    "a delivered vault key is accepted only on a team vault".into(),
+                ));
+            }
+            let info = crate::crypto::envelope::grant_k_seal_info(op_id);
+            let mut k = open_grant_seal(
+                state,
+                grant.k_enc.as_deref(),
+                grant.k_ct.as_deref(),
+                "k",
+                &info,
+            )?;
+            grant.vault_key = Some(DeliveredVaultKey::new(std::mem::take(&mut *k))?);
             Ok(())
         }
     }
@@ -784,6 +897,9 @@ pub async fn approve_op(
     // the daemon never re-pulled and `credential_lookup` misses it even though the
     // cloud offers it ("unknown credential"). Best-effort: a failed re-pull just
     // leaves the original miss to surface (now as a clear rejection, not a hang).
+    // On a team (v2) keyset the passkey must also resolve to an identity (the
+    // device's own entry or an admin's approver credential), else an admin's
+    // passkey adopted before its label would never re-pull.
     let cred_resolvable = existing_vault
         .as_ref()
         .and_then(|v| find_pubkey(v, &grant.credential_id))
@@ -792,7 +908,13 @@ pub async fn approve_op(
                 .as_ref()
                 .and_then(|pv| find_pubkey_in_registry(&pv.keyset.registry, &grant.credential_id))
         })
-        .is_some();
+        .is_some()
+        && existing_per_item.as_ref().is_none_or(|pv| {
+            pv.keyset.uik.is_none()
+                || decode_credential_id(&grant.credential_id)
+                    .map(|b| URL_SAFE_NO_PAD.encode(b))
+                    .is_ok_and(|cid| pv.credential_identity(&cid).is_some())
+        });
     if !cred_resolvable {
         match crate::sync::resync_membership_now(&state, &vault_id).await {
             Ok(n) => {
@@ -816,37 +938,19 @@ pub async fn approve_op(
                     .and_then(|pv| find_pubkey_in_registry(&pv.keyset.registry, cred_id_b64))
             })
     };
-    // 3c. HPKE-unseal W_c if the grant carries a sealed wrapping key (the web /
-    // op-relay path). The browser sealed W* to our `sc_pk` with
-    // `info = grant_seal_info(op_id)` so any cloud intermediary carrying the
-    // grant never saw W*. Populate `grant.wrapping_key` with the opened bytes
-    // so the rest of validation is identical to the legacy plaintext path.
-    // (Legacy local op-page ships plaintext `wrapping_key` and skips this.)
-    if grant.wk_enc.is_some() || grant.wk_ct.is_some() {
-        let enc_b64 = grant.wk_enc.as_deref().ok_or_else(|| {
-            AppError::BadRequest(
-                "sealed wrapping key needs both wk_enc and wk_ct (wk_enc missing)".into(),
-            )
-        })?;
-        let ct_b64 = grant.wk_ct.as_deref().ok_or_else(|| {
-            AppError::BadRequest(
-                "sealed wrapping key needs both wk_enc and wk_ct (wk_ct missing)".into(),
-            )
-        })?;
-        let enc = URL_SAFE_NO_PAD
-            .decode(enc_b64)
-            .map_err(|_| AppError::BadRequest("wk_enc not base64url".into()))?;
-        let ct = URL_SAFE_NO_PAD
-            .decode(ct_b64)
-            .map_err(|_| AppError::BadRequest("wk_ct not base64url".into()))?;
-        let info = crate::crypto::envelope::grant_seal_info(&op_id);
-        let wk = state.sc.open(&enc, &ct, &info, b"")?;
-        if wk.len() != 32 {
-            return Err(AppError::BadRequest(
-                "sealed wrapping_key must be 32 bytes".into(),
-            ));
-        }
-        grant.wrapping_key = Some(STANDARD.encode(&wk));
+    // 3c. Open what the grant delivers (exactly one form). The browser sealed it
+    // to our `sc_pk`, bound to this op id, so any cloud intermediary carrying
+    // the grant never saw it: the approver's own secret (`wk_*`, W* = W_c or
+    // the UIK root) is opened into `grant.wrapping_key`, so the rest of
+    // validation is identical to the legacy plaintext path; the vault key an
+    // admin delivers for another member's op (`k_*`) into `grant.vault_key`.
+    // Nothing is consumed on a failure here. A batch row's failure is
+    // recoverable (batch_verify_failed), like every other malformed batch row.
+    if let Err(e) = open_grant_delivery(&state, &op_id, &mut grant, existing_per_item.as_ref()) {
+        return Err(match e {
+            AppError::BadRequest(msg) if grant.batch.is_some() => AppError::BatchVerify(msg),
+            other => other,
+        });
     }
 
     // 3d. Approval AUTHORITY: on a shared (v2) vault only the requester or a
@@ -989,9 +1093,10 @@ pub async fn approve_op(
             let redeemed = sudp::grant::RedeemedGrant {
                 o: validated.op.clone(),
                 credential_id: validated.credential_id_bytes.clone(),
-                wrapping_key: sudp::grant::WrappingKey::from_bytes(std::mem::take(
-                    &mut validated.wrapping_key,
-                )),
+                wrapping_key: sudp::grant::WrappingKey::from_bytes({
+                    validated.custody_secret()?;
+                    std::mem::take(&mut validated.secret)
+                }),
                 opt: sudp::grant::GrantOpt::default(),
             };
             let opened = sudp::phases::consumption::open::<sudp::primitives::StdPrimitives>(
@@ -1097,7 +1202,7 @@ pub async fn approve_op(
             // unlock later) rather than failing the enroll.
             if let Ok((view, k)) = decrypt_vault_view_keep_key(
                 &validated.op,
-                &validated.wrapping_key,
+                validated.custody_secret()?,
                 &validated.credential_id_bytes,
                 &vault,
             ) {
@@ -1175,7 +1280,7 @@ pub async fn approve_op(
                 &state,
                 &vault_id,
                 &validated.op,
-                &validated.wrapping_key,
+                validated.key(),
                 &validated.credential_id_bytes,
                 existing_vault.as_ref(),
             )?;
@@ -1203,7 +1308,7 @@ pub async fn approve_op(
             // here (there is no buffered request on the op plane).
             let s_o = crate::server::broker::resolve_use_primary(
                 &validated.op,
-                &validated.wrapping_key,
+                validated.key(),
                 &validated.credential_id_bytes,
                 existing_vault.as_ref(),
                 &state,
@@ -1249,7 +1354,7 @@ pub async fn approve_op(
                         &state,
                         &vault_id,
                         &validated.op,
-                        &validated.wrapping_key,
+                        validated.key(),
                         &validated.credential_id_bytes,
                         existing_vault.as_ref(),
                     )?;
@@ -1309,12 +1414,15 @@ pub async fn approve_op(
                 // lets a later cross-device approval fail FAST in the browser
                 // (the KCV won't match a divergent W_c) instead of silently
                 // hanging on an unseal the daemon can't complete.
-                maybe_backfill_wc_check(
-                    &state,
-                    &vault_id,
-                    &validated.credential_id_bytes,
-                    &validated.wrapping_key,
-                );
+                // A delivered vault key is not the passkey's secret: nothing to backfill.
+                if let Ok(secret) = validated.custody_secret() {
+                    maybe_backfill_wc_check(
+                        &state,
+                        &vault_id,
+                        &validated.credential_id_bytes,
+                        secret,
+                    );
+                }
                 // On unlock, complete any pending OAuth connect: a
                 // browser "Connect" may have sealed `<conn>_oauth_pending`
                 // into the vault while it was locked (or before this device
@@ -1479,7 +1587,7 @@ pub async fn approve_op(
                         &state,
                         &vault_id,
                         &validated.op,
-                        &validated.wrapping_key,
+                        validated.key(),
                         &validated.credential_id_bytes,
                         existing_vault.as_ref(),
                     )?;
@@ -1568,7 +1676,7 @@ pub async fn approve_op(
                         &state,
                         &vault_id,
                         &validated.op,
-                        &validated.wrapping_key,
+                        validated.key(),
                         &validated.credential_id_bytes,
                         existing_vault.as_ref(),
                     )?;
@@ -1611,7 +1719,7 @@ pub async fn approve_op(
                         &state,
                         &vault_id,
                         &validated.op,
-                        &validated.wrapping_key,
+                        validated.key(),
                         &validated.credential_id_bytes,
                         existing_vault.as_ref(),
                     )?;
@@ -1658,7 +1766,7 @@ pub async fn approve_op(
                         &state,
                         &vault_id,
                         &validated.op,
-                        &validated.wrapping_key,
+                        validated.key(),
                         &validated.credential_id_bytes,
                         existing_vault.as_ref(),
                     )?;
@@ -1705,7 +1813,7 @@ pub async fn approve_op(
                         &state,
                         &vault_id,
                         &validated.op,
-                        &validated.wrapping_key,
+                        validated.key(),
                         &validated.credential_id_bytes,
                         existing_vault.as_ref(),
                     )?;
@@ -1775,7 +1883,7 @@ pub async fn approve_op(
                         &state,
                         &vault_id,
                         &validated.op,
-                        &validated.wrapping_key,
+                        validated.key(),
                         &validated.credential_id_bytes,
                         existing_vault.as_ref(),
                     )?;
@@ -1912,7 +2020,7 @@ pub async fn approve_op(
                         &state,
                         &vault_id,
                         &validated.op,
-                        &validated.wrapping_key,
+                        validated.key(),
                         &validated.credential_id_bytes,
                         existing_vault.as_ref(),
                     )?;
@@ -2102,7 +2210,7 @@ pub async fn approve_op(
                         &state,
                         &vault_id,
                         &validated.op,
-                        &validated.wrapping_key,
+                        validated.key(),
                         &validated.credential_id_bytes,
                         existing_vault.as_ref(),
                     )?;
@@ -3173,11 +3281,29 @@ mod tests {
     use crate::storage::plaintext::{Store, VaultAux};
     use std::collections::BTreeMap;
 
+    thread_local! {
+        /// The paired account a test pins for [`paired_account`] (`Some(None)`:
+        /// a daemon paired without one). Unset reads the machine's own pairing.
+        pub(super) static PAIRED_ACCOUNT: std::cell::RefCell<Option<Option<String>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    fn pin_account(account: Option<&str>) {
+        PAIRED_ACCOUNT.with(|a| *a.borrow_mut() = Some(account.map(str::to_string)));
+    }
+
     fn test_state() -> AppState {
+        test_state_in("")
+    }
+
+    /// [`test_state`] under its own state dir (`tag`), for a test that writes a
+    /// vault another test also uses.
+    fn test_state_in(tag: &str) -> AppState {
         let cfg = crate::config::Config {
             state_dir: std::path::PathBuf::from(format!(
-                "/tmp/safeclaw-test-approve-{}",
-                std::process::id()
+                "/tmp/safeclaw-test-approve-{}{}",
+                std::process::id(),
+                tag
             )),
             port: 0,
             proxy_port: 0,
@@ -3563,6 +3689,9 @@ mod tests {
             wrapping_key: None,
             wk_enc: None,
             wk_ct: None,
+            k_enc: None,
+            k_ct: None,
+            vault_key: None,
             assertion: None,
             batch: Some(crate::protocol::grant::BatchProof {
                 op_ids,
@@ -5245,6 +5374,9 @@ mod tests {
         use crate::protocol::operation::{Act, Bind, Operation, Valid};
         use crate::storage::plaintext::MemberRole;
         let state = Arc::new(test_state());
+        // A daemon paired without an account UIK: the requester is who the
+        // vault seats under this device's own passkeys.
+        pin_account(None);
         let (vault, _admin, b_id, _c, mut pv) = authority_vault();
         // This daemon is B's: B's passkey (the store's registered "Yw") is on it.
         let b = UikRoot::from_root([0x22u8; 32]);
@@ -5315,5 +5447,406 @@ mod tests {
         .unwrap_err();
         assert!(!matches!(err, AppError::ApproverNotAuthorized(_)), "{err}");
         let _ = std::fs::remove_dir_all(state.vaults.dir_for(vault).unwrap());
+    }
+
+    // ── an admin approves another member's op with the vault key (k_*) ─────
+
+    /// The admin's passkey id on B's daemon (url-safe base64 of `admin`).
+    const ADMIN_CID: &str = "YWRtaW4";
+    /// C's passkey id (url-safe base64 of `c-c`).
+    const C_CID: &str = "Yy1j";
+    /// The vault key (generation 0) the vault's items are sealed under.
+    const VAULT_K: [u8; 32] = [0x42u8; 32];
+
+    /// B's daemon on the shared vault, paired to B: B's own passkey ("Yw") is
+    /// seated; the membership served the creator's (an admin) passkey and C's
+    /// (a member) as approval material only. FOO and BAR are sealed under K.
+    struct BDaemon {
+        state: Arc<AppState>,
+        vault: &'static str,
+        admin: p256::ecdsa::SigningKey,
+        c: p256::ecdsa::SigningKey,
+    }
+
+    impl Drop for BDaemon {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.state.config.state_dir);
+        }
+    }
+
+    fn xy(key: &p256::ecdsa::SigningKey) -> (String, String) {
+        let point = key.verifying_key().to_encoded_point(false);
+        (
+            STANDARD.encode(point.x().unwrap()),
+            STANDARD.encode(point.y().unwrap()),
+        )
+    }
+
+    fn b_daemon(tag: &str) -> BDaemon {
+        use crate::crypto::vault_key::UikRoot;
+        use crate::storage::item::{ItemNs, ItemPayload, VaultKeys};
+        use crate::storage::plaintext::MemberRole;
+        type S = sudp::primitives::StdPrimitives;
+        let state = Arc::new(test_state_in(tag));
+        let (vault, admin_id, b_id, c_id, mut pv) = authority_vault();
+        let b = UikRoot::from_root([0x22u8; 32]);
+        pv.set_uik_cred(
+            "Yw".into(),
+            b_id.clone(),
+            b.signing().public_bytes().to_vec(),
+            vec![9u8; 32],
+            vec![1u8; 40],
+            vec![2u8; 40],
+            MemberRole::Member,
+            Vec::new(),
+        );
+        let admin = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let c = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let (ax, ay) = xy(&admin);
+        let (cx, cy) = xy(&c);
+        pv.set_approver_credential(ADMIN_CID, &admin_id, &ax, &ay).unwrap();
+        pv.set_approver_credential(C_CID, &c_id, &cx, &cy).unwrap();
+        let keys = VaultKeys::single(&VAULT_K);
+        for (name, value) in [("FOO", "foo-value"), ("BAR", "bar-value")] {
+            pv.plant::<S>(keys, vault, ItemNs::Secret, name, 1, &ItemPayload::secret_live(name, value))
+                .unwrap();
+        }
+        let path = state.vaults.per_item_path(vault).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        crate::storage::sealed_vault::write_per_item_atomic(&path, &pv).unwrap();
+        pin_account(Some(&b_id));
+        BDaemon { state, vault, admin, c }
+    }
+
+    fn team_export_op(vault: &str, name: &str) -> crate::protocol::operation::Operation {
+        use crate::protocol::operation::{Act, Bind, Operation, Valid};
+        Operation {
+            act: Act {
+                kind: ActType::Export,
+                target: name.into(),
+                scope: json!({}),
+            },
+            bind: Bind {
+                redeemer: vault.into(),
+                recipient: None,
+            },
+            valid: Valid::single_use(0, None),
+        }
+    }
+
+    impl BDaemon {
+        /// An op B's agent raised: (op, r, op id).
+        fn raise(&self, name: &str) -> (crate::protocol::operation::Operation, String, String) {
+            let op = team_export_op(self.vault, name);
+            let r = self
+                .state
+                .challenges
+                .lock()
+                .unwrap()
+                .issue("127.0.0.1".parse().unwrap())
+                .unwrap();
+            let id = self
+                .state
+                .approvals
+                .lock()
+                .unwrap()
+                .create(self.vault.into(), op.clone(), r.clone());
+            (op, r, id)
+        }
+
+        /// Seal `material` to this daemon's `sc_pk` under `info`.
+        fn seal(&self, material: &[u8], info: &[u8]) -> (String, String) {
+            let (enc, ct) =
+                crate::crypto::envelope::seal_to(&self.state.sc.pk_bytes(), material, info, b"")
+                    .unwrap();
+            (URL_SAFE_NO_PAD.encode(enc), URL_SAFE_NO_PAD.encode(ct))
+        }
+
+        /// A plain grant on (op, r) by passkey `cid` (`key` signs β), delivering
+        /// `material` as a vault key sealed for `seal_for`.
+        fn k_grant(
+            &self,
+            (op, r): (&crate::protocol::operation::Operation, &str),
+            cid: &str,
+            key: &p256::ecdsa::SigningKey,
+            material: &[u8],
+            seal_for: &str,
+        ) -> Grant {
+            let beta = crate::crypto::binding::binding_for_op(
+                crate::crypto::binding::DOMAIN_STANDARD,
+                &STANDARD.decode(r).unwrap(),
+                &serde_json::to_value(op).unwrap(),
+            )
+            .unwrap();
+            let mut g = plain_grant(op.clone(), r);
+            g.credential_id = cid.into();
+            g.assertion = Some(assertion_over(key, &beta));
+            let (enc, ct) =
+                self.seal(material, &crate::crypto::envelope::grant_k_seal_info(seal_for));
+            g.k_enc = Some(enc);
+            g.k_ct = Some(ct);
+            g
+        }
+
+        async fn approve(&self, id: &str, grant: Grant) -> Result<Value> {
+            approve_op(State(self.state.clone()), Path(id.into()), Json(grant))
+                .await
+                .map(|Json(v)| v)
+        }
+
+        /// The op is still pending, never counted toward auto-reject, and its
+        /// single-use challenge is still live.
+        fn assert_untouched(&self, id: &str, r: &str) {
+            let store = self.state.approvals.lock().unwrap();
+            let rec = store.get(id).unwrap();
+            assert!(matches!(rec.status, ApprovalStatus::Pending));
+            assert_eq!(rec.fail_count, 0);
+            drop(store);
+            assert!(self.state.challenges.lock().unwrap().peek(r), "challenge not consumed");
+        }
+    }
+
+    /// A real ES256 WebAuthn assertion over `challenge` for the test relying
+    /// party (`localhost`).
+    fn assertion_over(
+        key: &p256::ecdsa::SigningKey,
+        challenge: &[u8; 32],
+    ) -> crate::passkey::webauthn::AssertionData {
+        use p256::ecdsa::{signature::Signer, Signature};
+        use sha2::{Digest, Sha256};
+        let mut auth_data = Sha256::digest(b"localhost").to_vec();
+        auth_data.push(0x01); // user present
+        auth_data.extend_from_slice(&[0, 0, 0, 1]);
+        let client_data = serde_json::to_vec(&json!({
+            "type": "webauthn.get",
+            "challenge": URL_SAFE_NO_PAD.encode(challenge),
+            "origin": "http://localhost",
+        }))
+        .unwrap();
+        let mut signed = auth_data.clone();
+        signed.extend_from_slice(&Sha256::digest(&client_data));
+        let sig: Signature = key.sign(&signed);
+        crate::passkey::webauthn::AssertionData {
+            credential_id: None,
+            authenticator_data: STANDARD.encode(&auth_data),
+            client_data_json: STANDARD.encode(&client_data),
+            signature: STANDARD.encode(sig.to_der().as_bytes()),
+        }
+    }
+
+    /// An admin approves B's op by delivering the vault key, never a root:
+    /// B's daemon opens the vault with it and applies the op. The 32-byte `K`
+    /// and the 64-byte bundle (`id_seed ‖ content`) both work.
+    #[tokio::test]
+    async fn an_admins_vault_key_grant_applies_another_members_op() {
+        let d = b_daemon("-kadmin");
+        let (op, r, id) = d.raise("FOO");
+        let v = d
+            .approve(&id, d.k_grant((&op, &r), ADMIN_CID, &d.admin, &VAULT_K, &id))
+            .await
+            .unwrap();
+        assert_eq!(v["value"], "foo-value");
+        assert!(matches!(
+            d.state.approvals.lock().unwrap().get_any(&id).unwrap().status,
+            ApprovalStatus::Approved
+        ));
+        assert!(!d.state.challenges.lock().unwrap().peek(&r), "consumed once applied");
+
+        let bundle = [VAULT_K, VAULT_K].concat();
+        let (op, r, id) = d.raise("BAR");
+        let v = d
+            .approve(&id, d.k_grant((&op, &r), ADMIN_CID, &d.admin, &bundle, &id))
+            .await
+            .unwrap();
+        assert_eq!(v["value"], "bar-value");
+    }
+
+    /// The same vault-key grant from a member who is neither the requester nor
+    /// an admin (their passkey on B's daemon all the same) is refused with
+    /// `approver_not_authorized` before validation: the op stays pending for
+    /// the requester or an admin, who can still approve it.
+    #[tokio::test]
+    async fn a_members_vault_key_grant_for_anothers_op_is_refused() {
+        let d = b_daemon("-kmember");
+        let (op, r, id) = d.raise("FOO");
+        let err = d
+            .approve(&id, d.k_grant((&op, &r), C_CID, &d.c, &VAULT_K, &id))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::ApproverNotAuthorized(_)), "{err}");
+        assert_eq!(err.code().0.as_str(), "approver_not_authorized");
+        assert_eq!(err.code().0.status(), 403);
+        d.assert_untouched(&id, &r);
+        let v = d
+            .approve(&id, d.k_grant((&op, &r), ADMIN_CID, &d.admin, &VAULT_K, &id))
+            .await
+            .unwrap();
+        assert_eq!(v["value"], "foo-value");
+    }
+
+    /// A malformed or mis-sealed vault key (bound to another op, sealed under
+    /// the grant-secret domain, a half pair, not base64url, a wrong length) is
+    /// refused without consuming the op; the right grant then applies.
+    #[tokio::test]
+    async fn a_mis_sealed_vault_key_is_refused_without_consuming_the_op() {
+        let d = b_daemon("-kseal");
+        let (op, r, id) = d.raise("FOO");
+        let (other_op, other_r, other_id) = d.raise("BAR");
+        let good = || d.k_grant((&op, &r), ADMIN_CID, &d.admin, &VAULT_K, &id);
+        let mut bad: Vec<(&str, Grant)> = Vec::new();
+        bad.push((
+            "sealed for another op",
+            d.k_grant((&op, &r), ADMIN_CID, &d.admin, &VAULT_K, &other_id),
+        ));
+        let mut g = good();
+        let (enc, ct) = d.seal(&VAULT_K, &crate::crypto::envelope::grant_seal_info(&id));
+        (g.k_enc, g.k_ct) = (Some(enc), Some(ct));
+        bad.push(("sealed under the grant-secret domain", g));
+        let mut g = good();
+        g.k_ct = None;
+        bad.push(("half pair", g));
+        let mut g = good();
+        g.k_enc = Some("not base64url!".into());
+        bad.push(("not base64url", g));
+        let mut g = good();
+        let (enc, ct) = d.seal(&[0x42u8; 48], &crate::crypto::envelope::grant_k_seal_info(&id));
+        (g.k_enc, g.k_ct) = (Some(enc), Some(ct));
+        bad.push(("48 bytes", g));
+        for (why, grant) in bad {
+            let err = d.approve(&id, grant).await.unwrap_err();
+            assert!(matches!(err, AppError::BadRequest(_)), "{why}: {err}");
+            d.assert_untouched(&id, &r);
+        }
+        // A wrong vault key (well sealed) opens nothing: the apply fails, the
+        // value never leaves.
+        let err = d
+            .approve(&other_id, d.k_grant((&other_op, &other_r), ADMIN_CID, &d.admin, &[7u8; 32], &other_id))
+            .await;
+        assert!(err.is_err(), "a wrong vault key applies nothing");
+        let v = d.approve(&id, good()).await.unwrap();
+        assert_eq!(v["value"], "foo-value");
+    }
+
+    /// A grant delivers exactly one of the sealed secret (`wk_*`), the sealed
+    /// vault key (`k_*`) or the plaintext wrapping key: both, or neither, is
+    /// refused up front, the op untouched.
+    #[tokio::test]
+    async fn a_grant_with_both_or_neither_delivery_is_refused() {
+        let d = b_daemon("-kforms");
+        let (op, r, id) = d.raise("FOO");
+        let good = || d.k_grant((&op, &r), ADMIN_CID, &d.admin, &VAULT_K, &id);
+        let mut both = good();
+        let (enc, ct) = d.seal(&[0x11u8; 32], &crate::crypto::envelope::grant_seal_info(&id));
+        (both.wk_enc, both.wk_ct) = (Some(enc), Some(ct));
+        let mut plain_and_k = good();
+        plain_and_k.wrapping_key = Some(STANDARD.encode([0x11u8; 32]));
+        let mut neither = good();
+        (neither.k_enc, neither.k_ct) = (None, None);
+        for (why, grant) in [("wk_* and k_*", both), ("wrapping_key and k_*", plain_and_k), ("neither", neither)] {
+            let err = d.approve(&id, grant).await.unwrap_err();
+            assert!(matches!(err, AppError::BadRequest(_)), "{why}: {err}");
+            d.assert_untouched(&id, &r);
+        }
+        d.approve(&id, good()).await.unwrap();
+    }
+
+    /// The requester is the paired account (`account_uik`) alone: an admin's
+    /// passkey in the registry, or a seat an older adoption keyed under an
+    /// admin's passkey, never makes them a requester. Without a pinned account
+    /// the fallback is this device's own passkeys, minus every credential the
+    /// membership served as another member's approval material.
+    #[test]
+    fn the_requester_is_the_paired_account() {
+        use crate::crypto::vault_key::UikRoot;
+        use crate::storage::plaintext::MemberRole;
+        let (vault, admin_id, b_id, _c, mut pv) = authority_vault();
+        let b = UikRoot::from_root([0x22u8; 32]);
+        pv.set_uik_cred(
+            "Yw".into(),
+            b_id.clone(),
+            b.signing().public_bytes().to_vec(),
+            vec![9u8; 32],
+            vec![1u8; 40],
+            vec![2u8; 40],
+            MemberRole::Member,
+            Vec::new(),
+        );
+        // A stale seat: the admin keyed under their passkey, with its pubkey.
+        let admin = UikRoot::from_root([0x11u8; 32]);
+        pv.set_uik_cred(
+            ADMIN_CID.into(),
+            admin_id.clone(),
+            admin.signing().public_bytes().to_vec(),
+            vec![9u8; 32],
+            vec![1u8; 40],
+            vec![2u8; 40],
+            MemberRole::Admin,
+            Vec::new(),
+        );
+        pv.set_registry_pubkey(ADMIN_CID, "x", "y", "").unwrap();
+        let only = |id: &str| -> BTreeSet<String> { [id.to_string()].into() };
+        assert_eq!(requester_identities(&pv, Some(b_id.clone())), only(&b_id));
+        assert_eq!(requester_identities(&pv, Some("us_other".into())), only("us_other"));
+        // The approver label (as the membership serves it) takes the admin out
+        // of the fallback too.
+        pv.keyset
+            .uik
+            .as_mut()
+            .unwrap()
+            .approver_cids
+            .insert(ADMIN_CID.into(), admin_id.clone());
+        assert_eq!(requester_identities(&pv, None), only(&b_id));
+        // So the admin approving B's op is an admin, never "the requester",
+        // and a non-admin with the admin's label refused is covered by the fold.
+        let mut g = plain_grant(team_export_op(vault, "FOO"), &b64r(1));
+        g.credential_id = ADMIN_CID.into();
+        g.vault_key = Some(DeliveredVaultKey::new(VAULT_K.to_vec()).unwrap());
+        assert_eq!(
+            with_delivered_key(&g, |k| pv.approval_authority(
+                vault,
+                &requester_identities(&pv, Some(b_id.clone())),
+                ADMIN_CID,
+                k
+            )),
+            ApprovalAuthority::Admin
+        );
+    }
+
+    /// One admin gesture over two of B's ops, each row delivering the vault key
+    /// sealed for its own op: both apply. A row whose key is sealed for its
+    /// sibling is a recoverable `batch_verify_failed`, its op untouched.
+    #[tokio::test]
+    async fn an_admins_batch_delivers_the_vault_key_per_op() {
+        use crate::crypto::batch::{batch_challenge, batch_root};
+        let d = b_daemon("-kbatch");
+        let (op1, r1, id1) = d.raise("FOO");
+        let (op2, r2, id2) = d.raise("BAR");
+        let beta = |op: &crate::protocol::operation::Operation, r: &str| {
+            crate::crypto::binding::binding_for_op(
+                crate::crypto::binding::DOMAIN_STANDARD,
+                &STANDARD.decode(r).unwrap(),
+                &serde_json::to_value(op).unwrap(),
+            )
+            .unwrap()
+        };
+        let root = batch_root(&[beta(&op1, &r1), beta(&op2, &r2)]).unwrap();
+        let assertion = assertion_over(&d.admin, &batch_challenge(&root));
+        let ids = vec![id1.clone(), id2.clone()];
+        let row = |op: &crate::protocol::operation::Operation, r: &str, seal_for: &str| {
+            let mut g = batch_grant(op.clone(), r, ids.clone());
+            g.credential_id = ADMIN_CID.into();
+            g.batch.as_mut().unwrap().assertion = assertion.clone();
+            let (enc, ct) =
+                d.seal(&VAULT_K, &crate::crypto::envelope::grant_k_seal_info(seal_for));
+            (g.k_enc, g.k_ct) = (Some(enc), Some(ct));
+            g
+        };
+        let err = d.approve(&id2, row(&op2, &r2, &id1)).await.unwrap_err();
+        assert!(matches!(err, AppError::BatchVerify(_)), "{err}");
+        d.assert_untouched(&id2, &r2);
+
+        let v1 = d.approve(&id1, row(&op1, &r1, &id1)).await.unwrap();
+        let v2 = d.approve(&id2, row(&op2, &r2, &id2)).await.unwrap();
+        assert_eq!((v1["value"].as_str(), v2["value"].as_str()), (Some("foo-value"), Some("bar-value")));
     }
 }
