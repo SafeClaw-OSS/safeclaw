@@ -36,6 +36,8 @@ hostname = "0.4"
 # Authenticator). We keep p256 direct only for places sudp doesn't yet cover.
 sudp = { version = "0.3.0", features = ["std-primitives", "webauthn", "json-canonical"] }
 hmac = "0.12"
+hkdf = "0.12"
+spake2 = "=0.4.0"
 p256 = { version = "0.13", features = ["ecdh", "ecdsa", "jwk"] }
 sha2 = "0.10"
 rand = "0.8"

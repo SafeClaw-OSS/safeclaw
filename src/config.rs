@@ -135,7 +135,7 @@ pub enum Command {
     /// The DEVICE axis of the account plane: `sc device login/logout` are the
     /// canonical spellings of top-level `sc login`/`sc logout` (kept as
     /// shortcuts). Symmetric with `sc agent *` — both are account-level,
-    /// device-key/pair-token authed, cloud-backed.
+    /// device-key authed, cloud-backed.
     Device(DeviceArgs),
     /// Print `export` lines for the HUMAN's shell (`eval "$(sc env)"`):
     /// SAFECLAW_BROKER_URL projected from this device's config — never a key,
@@ -146,10 +146,9 @@ pub enum Command {
     /// verify its sha256, and replace the running binary in place. No-op when
     /// already current. This is also how the baked cloud domain changes ship.
     Upgrade(UpgradeArgs),
-    /// Pair this host to your vault: exchange a one-shot pair-token (from
-    /// safeclaw.pro's "Connect a new agent" modal) for this host's persistent
-    /// cloud-side daemon credential. Writes `~/.safeclaw/device-key` (0600) and
-    /// sets the active vault. Run once per host (re-run to repair/re-pair).
+    /// Pair this host to your SafeClaw account: prints a short code and an
+    /// approval link; you approve in the browser, then this host gets its
+    /// cloud-side daemon credential. Writes `~/.safeclaw/device-key` (0600). Run once per host (re-run to repair/re-pair).
     /// `sc login` then brings the daemon up and unlocks for you; `sc up` is the
     /// everyday "make sure it's running" afterwards.
     Login(LoginArgs),
@@ -898,12 +897,6 @@ pub struct UpgradeArgs {
 /// Args for `sc login`.
 #[derive(Debug, Args)]
 pub struct LoginArgs {
-    /// One-shot pair-token from safeclaw.pro → Connect-a-new-agent modal
-    /// (single-use, format `spt_...`). OMIT it to use Device Flow instead:
-    /// `sc login` with no token asks the cloud for a short code you approve in
-    /// your browser — nothing secret touches the prompt (design §12).
-    #[arg(long)]
-    pub pair_token: Option<String>,
     /// Friendly label shown for this host in the dashboard's device list.
     /// Defaults to the machine's hostname, else `agent-device`.
     #[arg(long)]
@@ -916,9 +909,9 @@ pub struct LoginArgs {
     #[arg(long)]
     pub profile: Option<String>,
     /// Test-only: allow a plaintext `http://` custodian URL. Without this,
-    /// `sc login` refuses non-HTTPS URLs to keep the pair-token off the wire
-    /// in cleartext (a malicious skill prompt could otherwise smuggle in an
-    /// attacker's device-key by suggesting an `http://` custodian).
+    /// `sc login` refuses non-HTTPS URLs (a malicious skill prompt could
+    /// otherwise smuggle in an attacker's device-key by suggesting an
+    /// `http://` custodian).
     /// `http://localhost:*` and `http://127.0.0.1:*` are exempt, that's the
     /// common dev-loopback case and is on-host plaintext.
     #[arg(long)]

@@ -263,7 +263,7 @@ pub async fn run_start_systemd(force: bool) -> Result<(), String> {
     }
     eprintln!("  broker:   requires an agent key (synced from your account); mint one with `sc agent add` or the dashboard's \"Connect a new agent\"");
     eprintln!();
-    eprintln!("  next: `sc login --pair-token <token>` to connect this daemon to your vault (token from the dashboard)");
+    eprintln!("  next: `sc login` to connect this machine to your SafeClaw account");
     eprintln!("        `sc log -f` to tail, `sc down` to stop, `sc restart` to reload");
     Ok(())
 }
@@ -378,7 +378,7 @@ pub async fn run_start_systemd(force: bool) -> Result<(), String> {
     }
     eprintln!("  logs:     {}", log_str);
     eprintln!();
-    eprintln!("  next: `sc login --pair-token <token>` to connect this daemon to your vault (token from the dashboard)");
+    eprintln!("  next: `sc login` to connect this machine to your SafeClaw account");
     eprintln!("        `sc log -f` to tail, `sc down` to stop, `sc restart` to reload");
     Ok(())
 }

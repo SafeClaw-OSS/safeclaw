@@ -24,6 +24,7 @@ pub mod login;
 pub mod logout;
 pub mod ls;
 pub mod neterr;
+pub mod pair_flow;
 pub mod op;
 pub mod passkey;
 pub mod proxy;

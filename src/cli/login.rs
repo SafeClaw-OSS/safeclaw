@@ -1,27 +1,22 @@
-//! `sc login --pair-token <X>` — exchange a one-shot pair-token (minted by
-//! safeclaw.pro's "Connect a new agent" modal) for this host's persistent
-//! cloud-side daemon credential.
+//! `sc login` — pair this machine to a SafeClaw account.
 //!
-//! The CLI POSTs the token to `<custodian>/api/pair-token/exchange`. The
-//! pro-backend validates+single-uses the token (10-min TTL) and returns
-//! `{ account_id, vault_id, device_key, pro_backend_url }`. We then:
+//! Pairing is the PAKE short-code ceremony (grant-v3 contract C2,
+//! `cli::pair_flow`): `sc` prints a code and a link it builds itself from the
+//! pinned console origin, the owner approves in the browser, and `sc` verifies
+//! the owner-signed admit of this device's own keys (`dev_…` ‖ `sc_pk`) before
+//! it pins that owner as `account_uik`. Then:
 //!
 //!   1. Persist `device_key` (a `sc_device_<rand>` token) to
-//!      `~/.safeclaw/device-key` (mode 0600). This is the daemon→cloud auth
-//!      token — Token 2 — distinct from `~/.safeclaw/api-key`, which is the
-//!      local agent→daemon broker key (Token 1). The agent never sees the
-//!      device-key.
-//!   2. Persist `(pro_backend_url, account_id)` as the active CLI vault via
-//!      `active::put_active(...)`. account_id doubles as the vault id under
-//!      the V1 §12.2 account-bound model.
+//!      `~/.safeclaw/device-key` (mode 0600): the daemon→cloud credential,
+//!      distinct from any agent credential. The agent never sees it.
+//!   2. Persist the cloud coordinates and the verified owner (`account_uik` +
+//!      its key) in config.
 //!
-//! Idempotent: re-running with a fresh token simply overwrites both files.
 //! `sc up` reads the credential at start time.
 
 use std::time::Duration;
 
 use serde::Deserialize;
-use serde_json::json;
 
 use crate::cli::active::put_cloud_coords;
 use crate::config::LoginArgs;
@@ -29,7 +24,7 @@ use crate::config::LoginArgs;
 /// Default daemon control-plane port (matches `ServeArgs` `SAFECLAW_PORT`).
 const DEFAULT_DAEMON_PORT: u16 = crate::config::CONTROL_PORT;
 
-/// Resolve which cloud the pair-token is exchanged against. Precedence:
+/// Resolve which cloud this machine pairs with. Precedence:
 ///   1. `SAFECLAW_CLOUD_URL` — runtime self-host escape hatch (any URL; HTTPS
 ///      enforced below). Undocumented; for people running their own custodian.
 ///   2. `--profile {prod,dev}` — the FIRST-PARTY selector the console's install
@@ -95,169 +90,17 @@ mod tests {
     }
 }
 
+/// What a completed pairing hands back (the approval body of `/api/pair/poll`).
 #[derive(Debug, Deserialize)]
 struct ExchangeResp {
+    #[serde(default)]
     account_id: String,
-    /// §15: the account's owner-UIK id (`us_…`) — the principal-ledger ANCHOR the
-    /// daemon pins here (NOT the `account_id` UUID). Optional: absent on an older
-    /// backend or a pre-UIK account, in which case the ledger loop simply doesn't run.
-    #[serde(default)]
-    account_uik_id: Option<String>,
-    /// The vault the pairing was scoped to, when the server sends one. Device
-    /// pairing is now account-level and vault-agnostic, so this is optional and
-    /// unused for selection — the daemon auto-discovers the account's vaults.
-    /// Kept for forward/back compat with a server that still returns it.
-    #[serde(default)]
-    #[allow(dead_code)]
-    vault_id: Option<String>,
     device_key: String,
-    pro_backend_url: String,
-    /// Cloud FRONTEND origin (web approval page host). Optional for forward-
-    /// compat with older backends; the daemon derives it from
-    /// `pro_backend_url` when absent.
-    #[serde(default)]
-    console_url: Option<String>,
-}
-
-/// Device Flow (RFC 8628) step 1 response — a short-lived code pair.
-#[derive(Debug, Deserialize)]
-struct AuthorizeResp {
-    device_code: String,
-    user_code: String,
-    verification_uri: String,
-    #[serde(default)]
-    verification_uri_complete: Option<String>,
-    #[serde(default)]
-    interval: Option<u64>,
-}
-
-/// Device Flow poll response. `status` ∈ { pending, denied, approved }; the
-/// credential fields are present only on `approved` (same shape as ExchangeResp).
-#[derive(Debug, Deserialize)]
-struct PollResp {
-    status: String,
-    #[serde(default)]
-    account_id: Option<String>,
-    #[serde(default)]
-    account_uik_id: Option<String>,
-    #[serde(default)]
-    vault_id: Option<String>,
-    #[serde(default)]
-    device_key: Option<String>,
-    #[serde(default)]
     pro_backend_url: Option<String>,
+    /// Cloud FRONTEND origin (web approval page host). Optional; the daemon
+    /// derives it from `pro_backend_url` when absent.
     #[serde(default)]
     console_url: Option<String>,
-}
-
-/// Device Flow (RFC 8628): `sc login` with no `--pair-token`. The daemon asks the
-/// cloud for a short user_code, shows it to the human, and polls until they
-/// approve it in their authenticated browser at `<console>/pair`. Nothing secret
-/// enters the prompt/transcript. Parallel to the token path; both converge on the
-/// same ExchangeResp + persistence tail. design/agent-device-identity-mtls.md §12.
-async fn device_flow_pair(
-    client: &reqwest::Client,
-    custodian: &str,
-    device_name: &str,
-    dev_id: &str,
-    dik_pub: &str,
-    dik: &crate::identity::SigningIdentity,
-) -> Result<ExchangeResp, String> {
-    // 1. authorize (unauthenticated) → device_code + user_code + verify URL.
-    let body = json!({
-        "device_name": device_name,
-        "device_id": dev_id,
-        "device_pubkey": dik_pub,
-    });
-    let resp = client
-        .post(format!("{}/api/pair/authorize", custodian))
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| crate::cli::neterr::reach_failed(custodian, &e))?;
-    if !resp.status().is_success() {
-        let code = resp.status().as_u16();
-        let detail = resp.text().await.unwrap_or_default();
-        // A 404 here usually means the server predates Device Flow OR this `sc`
-        // is talking to it wrong — either way, upgrading is the fix.
-        return Err(format!(
-            "could not start pairing (HTTP {}{}). Your `sc` may be too old for this \
-             server — run `sc upgrade` and try again.",
-            code,
-            if detail.trim().is_empty() { String::new() } else { format!(": {}", detail.trim()) }
-        ));
-    }
-    let auth: AuthorizeResp = resp
-        .json()
-        .await
-        .map_err(|e| format!("parse authorize response: {}", e))?;
-
-    // PoP: sign the (secret) device_code with the DIK private key so the server can
-    // prove — before it mints anything — that we hold the key whose pubkey we
-    // registered at authorize. Deterministic (Ed25519), so compute once. §12.3.
-    let pop = data_encoding::BASE64.encode(&dik.sign(auth.device_code.as_bytes()));
-
-    // 2. Show the human where to approve. Prefer the pre-filled URL if present.
-    let open_uri = auth
-        .verification_uri_complete
-        .as_deref()
-        .unwrap_or(&auth.verification_uri);
-    eprintln!();
-    eprintln!("To connect this machine, open this URL in your browser and approve it:");
-    eprintln!("  {}", open_uri);
-    eprintln!("Verification code: {}", auth.user_code);
-    eprintln!();
-    eprintln!("Waiting for you to approve in the browser…");
-
-    // 3. Poll until approved / denied / expired. Each poll is a single fast
-    //    round-trip; the wait between them is the human's approval time.
-    let interval = auth.interval.unwrap_or(5).clamp(1, 30);
-    loop {
-        tokio::time::sleep(Duration::from_secs(interval)).await;
-        let presp = client
-            .post(format!("{}/api/pair/poll", custodian))
-            .json(&json!({ "device_code": auth.device_code, "pop": pop }))
-            .send()
-            .await
-            .map_err(|e| crate::cli::neterr::reach_failed(custodian, &e))?;
-        let status = presp.status();
-        if status.as_u16() == 410 {
-            return Err("pairing code expired before you approved it; run `sc login` again.".to_string());
-        }
-        if !status.is_success() {
-            let detail = presp.text().await.unwrap_or_default();
-            return Err(format!(
-                "pairing failed (HTTP {}{})",
-                status.as_u16(),
-                if detail.trim().is_empty() { String::new() } else { format!(": {}", detail.trim()) }
-            ));
-        }
-        let poll: PollResp = presp
-            .json()
-            .await
-            .map_err(|e| format!("parse poll response: {}", e))?;
-        match poll.status.as_str() {
-            "pending" => continue,
-            "denied" => return Err("pairing was declined in the browser.".to_string()),
-            "approved" => {
-                return Ok(ExchangeResp {
-                    account_id: poll.account_id.unwrap_or_default(),
-                    account_uik_id: poll.account_uik_id,
-                    // Vault-agnostic pairing: a vault_id is no longer required to
-                    // finish. The daemon discovers the account's vaults on start.
-                    vault_id: poll.vault_id,
-                    device_key: poll
-                        .device_key
-                        .ok_or_else(|| "approved but the server returned no device_key".to_string())?,
-                    pro_backend_url: poll
-                        .pro_backend_url
-                        .unwrap_or_else(|| custodian.to_string()),
-                    console_url: poll.console_url,
-                });
-            }
-            other => return Err(format!("unexpected pairing status '{}'", other)),
-        }
-    }
 }
 
 pub async fn run(args: LoginArgs) -> Result<(), String> {
@@ -266,12 +109,10 @@ pub async fn run(args: LoginArgs) -> Result<(), String> {
     let custodian = custodian.trim_end_matches('/').to_string();
 
     // ── Enforce HTTPS for the custodian URL ──────────────────────────────
-    // The pair-token is single-use but high-value (POSTing it returns the
-    // device_key), and the response carries `pro_backend_url` +
-    // `device_key` which we persist and trust on subsequent runs. An
-    // `http://` custodian leaks the token on the wire AND lets an on-path
-    // attacker swap the response for an attacker-controlled daemon. Reject
-    // by default; the only legitimate cleartext case is dev-loopback.
+    // The response carries `pro_backend_url` + `device_key`, which we persist
+    // and trust on subsequent runs; an on-path attacker on `http://` could
+    // swap them. Reject by default; the only legitimate cleartext case is
+    // dev-loopback.
     if !args.insecure && !custodian.starts_with("https://") && !is_localhost_http(&custodian) {
         return Err(format!(
             "custodian URL must use HTTPS ({} is plaintext); \
@@ -297,9 +138,7 @@ pub async fn run(args: LoginArgs) -> Result<(), String> {
         .or_else(|| std::env::var("COMPUTERNAME").ok().filter(|s| !s.is_empty()))
         .unwrap_or_else(|| "agent-device".to_string());
 
-    // ── POST <custodian>/api/pair-token/exchange ─────────────────────────
-    // Dedicated 10s timeout; this is a single round-trip and we don't want
-    // it to inherit the longer browser-gesture timeouts other CLI calls use.
+    // Dedicated 10s timeout per request (each pairing call is one round-trip).
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
@@ -317,72 +156,39 @@ pub async fn run(args: LoginArgs) -> Result<(), String> {
         _ => crate::identity_file::mint(crate::identity::IdKind::Device),
     };
     let (dik, _) = crate::identity_file::resolve(crate::identity::IdKind::Device, &dik_seed);
-    let dik_pub = data_encoding::BASE64.encode(&dik.public_bytes());
 
-    let parsed: ExchangeResp = if let Some(pair_token) = args.pair_token.clone().filter(|t| !t.is_empty()) {
-        // ── Token exchange: the console "Connect a new agent" paste flow ─────
-        let body = json!({
-            "pair_token": pair_token,
-            "device_name": device_name,
-            // Additive: an older custodian ignores these; a current one records
-            // the pubkey for the authorized-devices set.
-            "device_id": dev_id,
-            "device_pubkey": dik_pub,
-        });
+    // ── The daemon's grant-seal key: the admit binds it (C1), so approvals can
+    // only ever be sealed to this exact key. Created now if this machine has none.
+    let sc = crate::crypto::envelope::ScKeyPair::load_or_generate()
+        .map_err(|e| format!("load this machine's daemon key: {}", e))?;
+    let sc_pk: [u8; 32] = sc
+        .pk_bytes()
+        .try_into()
+        .map_err(|_| "daemon key is not 32 bytes".to_string())?;
+    drop(sc);
 
-        let url = format!("{}/api/pair-token/exchange", custodian);
-        let resp = client
-            .post(&url)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| crate::cli::neterr::reach_failed(&custodian, &e))?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            let detail = resp.text().await.unwrap_or_default();
-            let detail_trimmed = detail.trim();
-            return Err(match status.as_u16() {
-                401 => format!(
-                    "pair-token invalid or unknown. Generate a new one at {}/dashboard (\"Connect a new agent\").",
-                    custodian
-                ),
-                // 409 = `no_vault`: the vault this token was pinned to is gone
-                // (deleted between mint and exchange), or the account has nothing
-                // sealed. The server message says which — surface it verbatim.
-                // (Historically 409 meant "already used"; that's 401 now.)
-                409 => {
-                    let msg = serde_json::from_str::<serde_json::Value>(detail_trimmed)
-                        .ok()
-                        .and_then(|v| v.get("message").and_then(|m| m.as_str()).map(str::to_string))
-                        .unwrap_or_else(|| "no vault to connect".to_string());
-                    format!(
-                        "{}. Generate a new install token at {}/dashboard (\"Connect a new agent\").",
-                        msg, custodian
-                    )
-                }
-                410 => format!(
-                    "pair-token expired. Generate a new one at {}/dashboard (\"Connect a new agent\").",
-                    custodian
-                ),
-                other => {
-                    if detail_trimmed.is_empty() {
-                        format!("custodian returned HTTP {}", other)
-                    } else {
-                        format!("custodian returned HTTP {}: {}", other, detail_trimmed)
-                    }
-                }
-            });
-        }
-
-        resp.json()
-            .await
-            .map_err(|e| format!("parse exchange response: {}", e))?
-    } else {
-        // ── Device Flow (RFC 8628): no token pasted — the daemon initiates and
-        //    the user approves in their browser. Nothing secret in the prompt.
-        device_flow_pair(&client, &custodian, &device_name, &dev_id, &dik_pub, &dik).await?
-    };
+    // ── Pair (PAKE short code). The link's origin is the console of the
+    // custodian resolved above (first-party allowlist / self-host env), never
+    // a URL the server returns.
+    let origin = crate::cli::active::console_origin_for_backend(&custodian);
+    let paired = crate::cli::pair_flow::pair(
+        &client,
+        &crate::cli::pair_flow::PairRequest {
+            principal: "device",
+            name: &device_name,
+            principal_id: &dev_id,
+            signer: &dik,
+            sc_pk: Some(sc_pk),
+            cloud: &custodian,
+            origin: &origin,
+            restart: "sc login",
+        },
+    )
+    .await?;
+    let parsed: ExchangeResp = serde_json::from_value(paired.body.clone())
+        .map_err(|e| format!("approved, but the server's response is incomplete: {}", e))?;
+    // The VERIFIED owner (admit signer, owner_mac), never the poll's label.
+    let account_uik = paired.uik_id.clone();
 
     // ── Pairing a DIFFERENT account switches this machine to it ──────────
     // A machine's `sc` is paired to exactly one account. Nothing of the old one
@@ -393,7 +199,7 @@ pub async fn run(args: LoginArgs) -> Result<(), String> {
     // Re-pairing the same account skips all of this.
     if crate::cli::active::paired_to_other_account(
         Some(parsed.account_id.as_str()),
-        parsed.account_uik_id.as_deref(),
+        Some(account_uik.as_str()),
     ) {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
@@ -428,7 +234,12 @@ pub async fn run(args: LoginArgs) -> Result<(), String> {
     // `cloud_backend` for the daemon's pull/push. Use the server-returned
     // pro_backend_url (source of truth) over the request custodian — they
     // normally match, but the server can canonicalize the host.
-    let pro_backend_url = parsed.pro_backend_url.trim_end_matches('/').to_string();
+    let pro_backend_url = parsed
+        .pro_backend_url
+        .as_deref()
+        .unwrap_or(&custodian)
+        .trim_end_matches('/')
+        .to_string();
     let daemon_port = std::env::var("SAFECLAW_PORT")
         .ok()
         .and_then(|s| s.parse::<u16>().ok())
@@ -441,9 +252,11 @@ pub async fn run(args: LoginArgs) -> Result<(), String> {
         // §15: persist the account UUID (for reference) AND the owner-UIK us_ (the
         // real principal-ledger anchor). Both pairing paths converge here.
         (!parsed.account_id.is_empty()).then_some(parsed.account_id.as_str()),
-        parsed.account_uik_id.as_deref(),
+        Some(account_uik.as_str()),
     )
     .map_err(|e| format!("save active config: {}", e))?;
+    crate::cli::active::put_account_uik_key(&paired.uik_pub)
+        .map_err(|e| format!("save the account key: {}", e))?;
 
     eprintln!(
         "Paired to {}; your agent talks to {}.",
@@ -451,9 +264,7 @@ pub async fn run(args: LoginArgs) -> Result<(), String> {
     );
     // Show the user's IDENTITY (the us_ UIK) as the account line; the Supabase UUID rides
     // as a secondary `id:` for support / console matching (debug only, never an anchor).
-    if let Some(uik) = parsed.account_uik_id.as_deref().filter(|s| !s.is_empty()) {
-        eprintln!("  account: {}", uik);
-    }
+    eprintln!("  account: {}", account_uik);
     if !parsed.account_id.is_empty() {
         eprintln!("  id:      {}", parsed.account_id);
     }

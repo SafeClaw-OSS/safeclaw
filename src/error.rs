@@ -72,6 +72,9 @@ pub enum ScCode {
     /// The account principal ledger does not hash to a validly owner-signed
     /// head (a forged or truncated tail). The daemon keeps its prior decision.
     LedgerHeadInvalid,
+    /// The account owner revoked this device (a verified revoke in the
+    /// head-checked ledger, contract C6/C5). The daemon latches it.
+    LedgerDeviceRevoked,
     BrokerBodyLimit,
     EgressUnreachable,
     ExposesUnsupported,
@@ -204,6 +207,13 @@ impl ScCode {
                 "ledger_head_invalid",
                 "Device list signature could not be verified",
                 "none",
+                "auth",
+            ),
+            LedgerDeviceRevoked => (
+                403,
+                "ledger_device_revoked",
+                "This device was removed from the account",
+                "configure",
                 "auth",
             ),
             ApprovalRegister => (
@@ -536,6 +546,7 @@ mod tests {
             GrantIdInvalid,
             DeviceNotAdmitted,
             LedgerHeadInvalid,
+            LedgerDeviceRevoked,
             BrokerBodyLimit,
             EgressUnreachable,
             ExposesUnsupported,

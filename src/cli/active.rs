@@ -51,7 +51,7 @@ pub struct CliConfig {
     pub cloud_backend: Option<String>,
     /// Cloud FRONTEND origin (where the human taps their passkey: the web
     /// approval page at `{frontend_origin}/grant/{op_id}`). Returned by the
-    /// pair-token exchange as `console_url`. Distinct from `cloud_backend`
+    /// pairing approval as `console_url`. Distinct from `cloud_backend`
     /// (the API host, typically `api.<frontend>`). Set by `sc login`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frontend_origin: Option<String>,
@@ -569,6 +569,14 @@ pub fn frontend_origin() -> Option<String> {
 /// passkey relying party).
 pub fn console_origin() -> Option<String> {
     frontend_origin().map(|o| crate::passkey::webauthn::console_link_origin(&o))
+}
+
+/// The console origin for a cloud backend URL, before any pairing is stored
+/// (`sc login`): the backend's frontend (`api.` dropped), at its console link
+/// host. The backend comes from the first-party allowlist / pinned config,
+/// never from a server response, so this is the origin `sc` pins for pairing.
+pub fn console_origin_for_backend(backend: &str) -> String {
+    crate::passkey::webauthn::console_link_origin(&derive_frontend_from_backend(backend))
 }
 
 /// Human web-approval link for an op. When the daemon is cloud-paired this is

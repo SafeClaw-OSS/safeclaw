@@ -30,9 +30,9 @@ fn cloud_and_key() -> Result<(String, String), String> {
     let cloud = cfg
         .cloud_backend
         .filter(|s| !s.is_empty())
-        .ok_or("this device isn't paired — run `sc login --pair-token <token>` first")?;
+        .ok_or("this device isn't paired — run `sc login` first")?;
     let key = crate::sync::device_key()
-        .ok_or("no device-key — run `sc login --pair-token <token>` first")?;
+        .ok_or("no device-key — run `sc login` first")?;
     Ok((cloud.trim_end_matches('/').to_string(), key))
 }
 
@@ -41,28 +41,6 @@ fn client() -> Result<reqwest::Client, String> {
         .timeout(Duration::from_secs(15))
         .build()
         .map_err(|e| format!("http client init: {}", e))
-}
-
-/// Device-Flow authorize response for the agent-admission ceremony (§14). Same
-/// shape as `sc login`'s AuthorizeResp — a short-lived code pair the human
-/// approves at `<console>/pair`.
-#[derive(Deserialize)]
-struct PairAuthorizeResp {
-    device_code: String,
-    user_code: String,
-    verification_uri: String,
-    #[serde(default)]
-    verification_uri_complete: Option<String>,
-    #[serde(default)]
-    interval: Option<u64>,
-}
-
-/// Poll response. `status` ∈ { pending, denied, approved }. Any credential the
-/// server returns is ignored — the agent authenticates by its AIK (proof-of-
-/// possession), so admission just needs the `approved` signal.
-#[derive(Deserialize)]
-struct PairPollResp {
-    status: String,
 }
 
 #[derive(Deserialize)]
@@ -101,97 +79,38 @@ async fn add(args: AgentAddArgs) -> Result<(), String> {
     // orphan identity file.
     let (seed, ag_id) = crate::identity_file::mint(crate::identity::IdKind::Agent);
     let (aik, _) = crate::identity_file::resolve(crate::identity::IdKind::Agent, &seed);
-    let aik_pub = data_encoding::BASE64.encode(&aik.public_bytes());
     let identity_path = crate::identity_file::agent_identity_path(&args.name)?;
 
-    // ── §14 agent-admission ceremony = the /pair browser confirm ─────────────
-    // Adding an agent to the account is an OWNER decision, symmetric to pairing a
-    // device: it goes through the same Device-Flow /pair page (ONE primitive),
-    // just with principal='agent'. The silent `POST /api/vault/agents` device-key
-    // path is retired — a new agent is now PENDING until the owner approves it in
-    // the browser (admission = session-auth, no passkey/K; vault access stays the
-    // separate K-signed Agents-tab toggle). No secret enters the prompt.
+    // ── §14 agent admission = the same /pair ceremony as a device (C2) ──────
+    // Adding an agent to the account is an OWNER decision: the PAKE short code,
+    // approved in the browser, with principal='agent'. The admit must be signed
+    // by the account this machine is paired to (its pinned owner UIK): an agent
+    // acts as that one account.
+    let pinned = crate::cli::active::account_uik_pub()
+        .ok_or("this machine's pairing predates verified pairing: run `sc login` first")?;
+    let origin = crate::cli::active::console_origin()
+        .ok_or("this machine isn't paired to SafeClaw yet: run `sc login` first")?;
     let client = client()?;
-    let auth_body = serde_json::json!({
-        "principal": "agent",
-        "device_name": args.name,   // the agent's name (reuses the shared column)
-        "device_id": ag_id,
-        "device_pubkey": aik_pub,
-    });
-    let auth_url = format!("{}/api/pair/authorize", cloud);
-    let resp = client
-        .post(&auth_url)
-        .json(&auth_body)
-        .send()
-        .await
-        .map_err(|e| crate::cli::neterr::reach_failed(&cloud, &e))?;
-    if !resp.status().is_success() {
-        let code = resp.status().as_u16();
-        let detail = resp.text().await.unwrap_or_default();
-        // A 404 here usually means the server predates agent admission via /pair,
-        // or `sc` is too old — upgrading is the fix either way.
+    let paired = crate::cli::pair_flow::pair(
+        &client,
+        &crate::cli::pair_flow::PairRequest {
+            principal: "agent",
+            name: &args.name,
+            principal_id: &ag_id,
+            signer: &aik,
+            sc_pk: None,
+            cloud: &cloud,
+            origin: &origin,
+            restart: "sc agent add",
+        },
+    )
+    .await?;
+    if paired.uik_pub != pinned {
         return Err(format!(
-            "could not start agent authorization (HTTP {}{}). Your `sc` or the \
-             server may be too old — run `sc upgrade` and try again.",
-            code,
-            if detail.trim().is_empty() { String::new() } else { format!(": {}", detail.trim()) }
+            "the agent was approved by another account ({}) than the one this machine is \
+             paired to; it was not set up. Approve it signed in as the paired account.",
+            paired.uik_id
         ));
-    }
-    let auth: PairAuthorizeResp = resp
-        .json()
-        .await
-        .map_err(|e| format!("parse authorize response: {}", e))?;
-
-    // PoP: sign the (secret) device_code with the AIK so the server proves — before
-    // it admits anything — that we hold the key whose pubkey we registered. §12.3.
-    let pop = data_encoding::BASE64.encode(&aik.sign(auth.device_code.as_bytes()));
-
-    let open_uri = auth
-        .verification_uri_complete
-        .as_deref()
-        .unwrap_or(&auth.verification_uri);
-    eprintln!();
-    eprintln!(
-        "To authorize the agent '{}' on your account, open this URL and approve it:",
-        args.name
-    );
-    eprintln!("  {}", open_uri);
-    eprintln!("Verification code: {}", auth.user_code);
-    eprintln!();
-    eprintln!("Waiting for you to approve in the browser…");
-
-    // Poll until approved / denied / expired. Same cadence as `sc login`.
-    let interval = auth.interval.unwrap_or(5).clamp(1, 30);
-    loop {
-        tokio::time::sleep(Duration::from_secs(interval)).await;
-        let presp = client
-            .post(format!("{}/api/pair/poll", cloud))
-            .json(&serde_json::json!({ "device_code": auth.device_code, "pop": pop }))
-            .send()
-            .await
-            .map_err(|e| crate::cli::neterr::reach_failed(&cloud, &e))?;
-        let status = presp.status();
-        if status.as_u16() == 410 {
-            return Err("authorization code expired before you approved it; run `sc agent add` again.".to_string());
-        }
-        if !status.is_success() {
-            let detail = presp.text().await.unwrap_or_default();
-            return Err(format!(
-                "agent authorization failed (HTTP {}{})",
-                status.as_u16(),
-                if detail.trim().is_empty() { String::new() } else { format!(": {}", detail.trim()) }
-            ));
-        }
-        let poll: PairPollResp = presp
-            .json()
-            .await
-            .map_err(|e| format!("parse poll response: {}", e))?;
-        match poll.status.as_str() {
-            "pending" => continue,
-            "denied" => return Err("agent authorization was declined in the browser.".to_string()),
-            "approved" => break,
-            other => return Err(format!("unexpected authorization status '{}'", other)),
-        }
     }
 
     // Admitted — NOW persist the AIK identity file (0600).

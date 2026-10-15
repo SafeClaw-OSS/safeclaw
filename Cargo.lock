@@ -640,6 +640,7 @@ dependencies = [
  "curve25519-dalek-derive",
  "digest",
  "fiat-crypto",
+ "rand_core 0.6.4",
  "rustc_version",
  "subtle",
  "zeroize",
@@ -2388,6 +2389,7 @@ dependencies = [
  "ed25519-dalek",
  "flate2",
  "futures-util",
+ "hkdf",
  "hmac",
  "hostname",
  "hpke",
@@ -2408,6 +2410,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "spake2",
  "subtle",
  "sudp",
  "tempfile",
@@ -2671,6 +2674,18 @@ checksum = "3a766e1110788c36f4fa1c2b71b387a7815aa65f88ce0229841826633d93723e"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "spake2"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c5482afe85a0b6ce956c945401598dbc527593c77ba51d0a87a586938b1b893a"
+dependencies = [
+ "curve25519-dalek",
+ "hkdf",
+ "rand_core 0.6.4",
+ "sha2",
 ]
 
 [[package]]

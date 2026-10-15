@@ -310,7 +310,7 @@ pub async fn run(json: bool) -> Result<(), String> {
             }
             None => report.push(
                 Mark::Warn,
-                "cloud backend: not paired — run `sc login --pair-token <token>`",
+                "cloud backend: not paired — run `sc login`",
             ),
         },
         // A config-load failure already surfaced as a `fail` row above.

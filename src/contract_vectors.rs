@@ -1,5 +1,6 @@
 //! Golden vectors for the grant-v3 cross-layer contract (C1 admit over device +
-//! daemon key, C3 grant identity signature, C4 signed ledger head). Core is the reference implementation: this test GENERATES the vector
+//! daemon key, C2 pairing by PAKE short code, C3 grant identity signature, C4
+//! signed ledger head). Core is the reference implementation: this test GENERATES the vector
 //! file from fixed seeds; the backend (Node) and console (TS) recompute every
 //! field and compare byte-for-byte.
 //!
@@ -104,6 +105,69 @@ fn c1_case(
     (case, sig)
 }
 
+/// C2: one full SPAKE2 run with both sides' RNGs seeded (rand 0.8
+/// `StdRng::from_seed`), the subkeys and both MACs.
+#[allow(clippy::too_many_arguments)]
+fn c2_case(
+    name: &str,
+    nameplate: &str,
+    secret: &str,
+    origin: &str,
+    principal: &str,
+    principal_id: &str,
+    id_pub: &[u8],
+    sc_pk: &[u8],
+    owner: &SigningIdentity,
+) -> Value {
+    use crate::pairing;
+    let (seed_sc, seed_b) = ([0x5c; 32], [0xb0; 32]);
+    let sc = pairing::PakeSession::start_with_rng(nameplate, secret, origin, StdRng::from_seed(seed_sc));
+    let b = pairing::PakeSession::start_with_rng(nameplate, secret, origin, StdRng::from_seed(seed_b));
+    let (msg_sc, msg_b) = (sc.msg().to_vec(), b.msg().to_vec());
+    let k = sc.finish(&msg_b).unwrap();
+    assert_eq!(&k[..], &b.finish(&msg_sc).unwrap()[..], "both sides agree");
+    let sub = pairing::subkeys(&k);
+    let keys_input = pairing::keys_mac_input(principal, principal_id, id_pub, sc_pk);
+    let keys_mac = pairing::keys_mac(&sub.k_keys[..], principal, principal_id, id_pub, sc_pk);
+    let uik_id = owner.user_id();
+    let owner_input = pairing::owner_mac_input(&uik_id, &owner.public_bytes());
+    let owner_mac = pairing::owner_mac(&sub.k_owner[..], &uik_id, &owner.public_bytes());
+    json!({
+        "name": name,
+        "nameplate": nameplate,
+        "secret": secret,
+        "code": pairing::display_code(nameplate, secret),
+        "link": pairing::link(origin, nameplate, secret),
+        "origin": origin,
+        "password": hex(&pairing::password(nameplate, secret)),
+        "identity": hex(&pairing::identity(origin)),
+        "rng": "rand 0.8 StdRng::from_seed (ChaCha12), one per side",
+        "rng_seed_sc": hex(&seed_sc),
+        "rng_seed_browser": hex(&seed_b),
+        "msg_sc": hex(&msg_sc),
+        "msg_b": hex(&msg_b),
+        "k": hex(&k),
+        "k_keys": hex(&sub.k_keys[..]),
+        "k_owner": hex(&sub.k_owner[..]),
+        "principal": principal,
+        "principal_id": principal_id,
+        "id_pub": hex(id_pub),
+        "sc_pk": hex(sc_pk),
+        "keys_mac_input": hex(&keys_input),
+        "keys_mac": hex(&keys_mac),
+        "uik_id": uik_id,
+        "uik_pub": hex(&owner.public_bytes()),
+        "owner_mac_input": hex(&owner_input),
+        "owner_mac": hex(&owner_mac),
+        "wire": {
+            "msg_sc": b64u(&msg_sc),
+            "msg_b": b64u(&msg_b),
+            "keys_mac": b64u(&keys_mac),
+            "owner_mac": b64u(&owner_mac),
+        },
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn c3_case(
     name: &str,
@@ -202,6 +266,16 @@ fn generate() -> Value {
     let (c1b, s2) = c1_case("agent_admit", &owner, "admit", "agent", &ag_id, 2, &[]);
     let (c1c, s3) = c1_case("device_revoke", &owner, "revoke", "device", &dev_id, 3, &[]);
 
+    // C2: a device on dev, an agent on prod.
+    let c2a = c2_case(
+        "device", "0421", "12345678", "https://app.dev.safeclaw.pro",
+        "device", &dev_id, &dik.public_bytes(), &pk, &owner,
+    );
+    let c2b = c2_case(
+        "agent", "9067", "00042517", "https://app.safeclaw.pro",
+        "agent", &ag_id, &aik_pub, &[], &owner,
+    );
+
     // C3: the requester approving their own op with the 32-byte K, and an admin
     // approving another member's op with the 64-byte K bundle (batch row shape).
     let op1 = json!({
@@ -271,6 +345,7 @@ fn generate() -> Value {
             "sc_pk": hex(&pk),
         },
         "c1": [c1a, c1b, c1c],
+        "c2": [c2a, c2b],
         "c3": [c3a, c3b],
         "c4": [c4a, c4b],
     })
@@ -289,5 +364,5 @@ fn contract_vectors_grant_v3() {
     // this digest. Do NOT update it to make the test pass without updating the
     // contract and regenerating the shared vectors file.
     let digest = hex(&Sha256::digest(text.as_bytes()));
-    assert_eq!(digest, "476be56b5a560153c23d5287bf254f16efaf625ecbf34db14d990958665d29e2");
+    assert_eq!(digest, "d8c4692546f150eed7c14845e3494ca34598663ac218b7d3b886caef36c84a9f");
 }

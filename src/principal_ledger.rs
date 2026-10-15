@@ -328,6 +328,44 @@ fn verify_head(
     Ok(())
 }
 
+// ── Pairing: the owner-signed admit of THIS principal (C1) ─────────────────
+
+/// Verify the owner-signed admit a pairing returned (contract C1) for THIS
+/// principal and return the owner's `us_…` it proves. The owner key `uik_pub`
+/// self-certifies the id; the admit must be an `admit` of exactly
+/// `principal_id`, by that owner as account anchor, over exactly `sc_pk`
+/// (empty for an agent), with a valid signature. The caller pins the returned
+/// id and key, never a server label.
+pub fn verify_pairing_admit(
+    admit: &serde_json::Value,
+    uik_pub: &[u8; 32],
+    principal_id: &str,
+    sc_pk: &[u8],
+) -> Result<String, String> {
+    let e: PrincipalEventJson = serde_json::from_value(admit.clone())
+        .map_err(|e| format!("the pairing returned a malformed admit: {}", e))?;
+    let owner = identity::derive_id(IdKind::User, uik_pub);
+    if e.op != "admit" || e.principal_id != principal_id {
+        return Err("the pairing's admit is not an admit of this machine".into());
+    }
+    if e.owner_id != owner || (!e.anchor_uik.is_empty() && e.anchor_uik != owner) {
+        return Err("the pairing's admit is not signed by the approving account".into());
+    }
+    let served_pk = match e.sc_pk.as_deref().filter(|s| !s.is_empty()) {
+        None => Vec::new(),
+        Some(b) => decode_b64_any(b).ok_or("the admit's sc_pk is undecodable")?,
+    };
+    if served_pk != sc_pk {
+        return Err("the pairing's admit binds another daemon key than this machine's".into());
+    }
+    let sig = decode_sig64(&e.sig).ok_or("the admit's signature is undecodable")?;
+    let input = identity::principal_event_input(&owner, "admit", principal_id, e.seq, &owner, sc_pk);
+    if !identity::verify(uik_pub, &input, &sig) {
+        return Err("the pairing's admit signature does not verify".into());
+    }
+    Ok(owner)
+}
+
 // ── Floor persistence (rollback resistance) ─────────────────────────────────
 
 pub(crate) fn floor_path(state_dir: &Path) -> std::path::PathBuf {
@@ -385,6 +423,7 @@ fn apply_fold_to_floor(mut floor: LedgerFloor, folded: &Folded, my_dev: Option<&
 /// secrets" (design §15). Does not return.
 async fn self_wipe_and_logout(state: &Arc<AppState>) -> ! {
     tracing::warn!(
+        code = "ledger_device_revoked",
         "principal ledger: THIS DEVICE was revoked by the account owner (VERIFIED signature) — \
          locking + wiping all local vaults and logging out"
     );
@@ -472,6 +511,7 @@ pub async fn principal_ledger_loop(state: Arc<AppState>, cloud: String, dk: Stri
                             self_wipe_and_logout(&state).await;
                         } else {
                             tracing::warn!(
+                                code = "ledger_device_revoked",
                                 device = ?my_dev,
                                 "principal ledger: THIS device is revoked (VERIFIED, latched) but enforcement \
                                  is OFF (SAFECLAW_PRINCIPAL_ENFORCE); NOT wiping — the P6 cutover flips the default"
@@ -657,6 +697,36 @@ mod tests {
         h.max_seq = 5;
         l.head = Some(h);
         assert!(fold_verified(&l, &acct).is_none(), "max_seq mismatch");
+    }
+
+    /// The pairing admit proves the owner only over THIS machine's own keys.
+    #[test]
+    fn pairing_admit_binds_principal_key_and_owner() {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let o = owner();
+        let acct = o.user_id();
+        let pk = [5u8; 32];
+        let admit = |principal: &str, sc_pk: &[u8], seq: u64| {
+            let input = identity::principal_event_input(&acct, "admit", principal, seq, &acct, sc_pk);
+            let mut v = serde_json::json!({
+                "seq": seq, "op": "admit", "principal_id": principal, "principal_kind": "device",
+                "anchor_uik": acct, "owner_id": acct, "sig": STANDARD.encode(o.sign(&input)),
+            });
+            if !sc_pk.is_empty() {
+                v["sc_pk"] = serde_json::json!(URL_SAFE_NO_PAD.encode(sc_pk));
+            }
+            v
+        };
+        let me = o.public_bytes();
+        assert_eq!(verify_pairing_admit(&admit("dev_me", &pk, 3), &me, "dev_me", &pk).unwrap(), acct);
+        assert_eq!(verify_pairing_admit(&admit("ag_me", &[], 4), &me, "ag_me", &[]).unwrap(), acct);
+        assert!(verify_pairing_admit(&admit("dev_other", &pk, 3), &me, "dev_me", &pk).is_err());
+        assert!(verify_pairing_admit(&admit("dev_me", &[6u8; 32], 3), &me, "dev_me", &pk).is_err());
+        let imposter = SigningIdentity::from_seed(&[9u8; 32]).public_bytes();
+        assert!(verify_pairing_admit(&admit("dev_me", &pk, 3), &imposter, "dev_me", &pk).is_err());
+        let mut forged = admit("dev_me", &pk, 3);
+        forged["seq"] = serde_json::json!(4);
+        assert!(verify_pairing_admit(&forged, &me, "dev_me", &pk).is_err());
     }
 
     // F1 regression: the MONOTONE self-revoke latch (`apply_fold_to_floor`). Once a revoke
