@@ -137,7 +137,6 @@ fn c2_case(
         "nameplate": nameplate,
         "secret": secret,
         "code": pairing::display_code(nameplate, secret),
-        "link": pairing::link(origin, nameplate, secret),
         "origin": origin,
         "password": hex(&pairing::password(nameplate, secret)),
         "identity": hex(&pairing::identity(origin)),
@@ -364,5 +363,5 @@ fn contract_vectors_grant_v3() {
     // this digest. Do NOT update it to make the test pass without updating the
     // contract and regenerating the shared vectors file.
     let digest = hex(&Sha256::digest(text.as_bytes()));
-    assert_eq!(digest, "d8c4692546f150eed7c14845e3494ca34598663ac218b7d3b886caef36c84a9f");
+    assert_eq!(digest, "6230a70ffa5e0b0f9c0d0c955a81593707bb1d67cc0ba9ccb6562a9cb1780c1b");
 }

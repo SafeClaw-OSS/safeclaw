@@ -55,18 +55,6 @@ pub fn display_code(nameplate: &str, secret: &str) -> String {
     format!("{}-{}-{}", nameplate, &secret[..4], &secret[4..])
 }
 
-/// The approval link `sc` builds itself from the pinned console origin
-/// (never a server-supplied URL): `<origin>/pair?n=NNNN#s=SSSSSSSS`. The
-/// secret rides the fragment, which browsers never send.
-pub fn link(origin: &str, nameplate: &str, secret: &str) -> String {
-    format!(
-        "{}/pair?n={}#s={}",
-        origin.trim_end_matches('/'),
-        nameplate,
-        secret
-    )
-}
-
 /// The two 32-byte subkeys of the SPAKE2 output `K`.
 pub struct Subkeys {
     pub k_keys: Zeroizing<[u8; 32]>,
@@ -237,12 +225,8 @@ mod tests {
     }
 
     #[test]
-    fn code_and_link_shapes() {
+    fn code_shape() {
         assert_eq!(display_code("0421", "12345678"), "0421-1234-5678");
-        assert_eq!(
-            link("https://app.safeclaw.pro/", "0421", "12345678"),
-            "https://app.safeclaw.pro/pair?n=0421#s=12345678"
-        );
         let s = gen_secret();
         assert_eq!(s.len(), 8);
         assert!(s.chars().all(|c| c.is_ascii_digit()));

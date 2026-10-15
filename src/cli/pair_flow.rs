@@ -5,8 +5,9 @@
 //!    `{nameplate, device_code, interval}`.
 //! 2. Generate the 8-digit secret, start SPAKE2 over `NNNN-SSSSSSSS` and the
 //!    pinned console origin, `POST /api/pair/start {device_code, pop, msg_sc}`.
-//! 3. Print the code `NNNN-SSSS-SSSS` and the link `sc` builds itself
-//!    (`<origin>/pair?n=NNNN#s=SSSSSSSS`), never a server-supplied URL.
+//! 3. Print the code `NNNN-SSSS-SSSS` and the pinned console's `/pair` address
+//!    (never a server-supplied URL). The code is only ever typed there: a link
+//!    carrying it would put someone else's code one click away (RFC 8628 §5.4).
 //! 4. Poll; when the browser's `msg_b` arrives, refuse a reflection, finish
 //!    SPAKE2 exactly once (any failure kills the code) and
 //!    `POST /api/pair/keys {device_code, pop, keys_mac}`.
@@ -142,10 +143,8 @@ pub async fn pair(client: &reqwest::Client, req: &PairRequest<'_>) -> Result<Pai
             ));
         }
         eprintln!();
-        eprintln!("Open this link in your browser and approve:");
-        eprintln!("  {}", pairing::link(req.origin, &auth.nameplate, &secret));
         eprintln!(
-            "Or open {}/pair and enter the code:",
+            "Open {}/pair and enter this code:",
             req.origin.trim_end_matches('/')
         );
         eprintln!("  {}", pairing::display_code(&auth.nameplate, &secret));
