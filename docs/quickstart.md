@@ -22,14 +22,14 @@ There is no password.
 
 ## 3. Pair this machine and your agent
 
-In the console, "Connect a new agent" mints a one-time pair token and an
-install prompt. Paste the prompt to your agent and it does the rest. What it
-runs:
+In the console, "Connect a new agent" gives you an install prompt. Paste it
+to your agent and it does the rest. What it runs:
 
 ```bash
 sc login                      # pair this machine; brings the daemon up and
                               # prints a passkey-approval link you open once
-sc agent add my-agent         # mint the agent's env file:
+sc agent add my-agent >> .env # register the agent the same way (one more link),
+                              # then append its env lines:
                               # SAFECLAW_BROKER_URL / SAFECLAW_AGENT_IDENTITY
 ```
 

@@ -68,11 +68,12 @@ Each release also carries a sigstore build-provenance attestation: `gh attestati
 
 **2. Create your vault** at [safeclaw.pro](https://safeclaw.pro): sign in and register a passkey. No password to invent, nothing to remember.
 
-**3. Connect your agent.** The console's "Connect a new agent" mints a one-time pair token and an install prompt you paste to your agent. Under the hood it runs:
+**3. Connect your agent.** The console's "Connect a new agent" gives you an install prompt to paste to your agent. Under the hood it runs:
 
 ```bash
-sc login --pair-token spt_…   # pair this machine; brings the daemon up + unlocks
-sc agent add my-agent         # mint the agent's env (BROKER_URL / VAULT_ID / API_KEY)
+sc login                        # pair this machine: prints a link + code you approve in the browser
+sc agent add my-agent >> .env   # register the agent the same way; appends its two env lines
+                                # (SAFECLAW_BROKER_URL / SAFECLAW_AGENT_IDENTITY, neither is a secret)
 ```
 
 **4. Add a credential.** In the console's Connections tab (values are encrypted in your browser before upload), or at your terminal:

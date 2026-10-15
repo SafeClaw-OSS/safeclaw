@@ -54,8 +54,8 @@ case ":${PATH}:" in
 esac
 echo
 echo "Next:"
-echo "  1. sc login --pair-token <token>     # pair this host to your vault"
-echo "  2. sc up                             # start SafeClaw + unlock (one passkey tap)"
+echo "  1. sc login                          # pair this host: prints a link + code to approve in your browser"
+echo "  2. sc agent add <name> >> <env file> # register your agent the same way"
 echo "  3. sc status                         # your connections, their phantoms, and 'routed'"
 echo
 echo "Then run a command through SafeClaw so a phantom (__sc__<name>__) resolves:"
