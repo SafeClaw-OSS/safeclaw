@@ -390,8 +390,8 @@ impl BrokerHandler {
                     // agent can relay a one-click fix (path matches the console's
                     // /vault/{id}/{tab} routing).
                     let hint = format!(
-                        "this agent is not turned on for this vault yet. Ask the user to turn it \
-                         on in the vault's Agent access page, then retry: {}/vault/{}/agents",
+                        "this agent is not turned on for this vault. Turn it on in the vault's \
+                         Agent access page, then retry: {}/vault/{}/agents",
                         crate::passkey::webauthn::console_link_origin(&self.state.config.origin),
                         self.vid.as_deref().unwrap_or_default(),
                     );
@@ -770,9 +770,9 @@ impl BrokerHandler {
                 Err(ResolveErr::RefreshForbidden) => {
                     return err_response(
                         ScCode::RefreshForbidden,
-                        "a refresh token never leaves the vault — this connection injects a \
-                     minted access token (use its default phantom). To reveal the stored \
-                     secret, the user runs `sc secret get` (passkey ceremony)",
+                        "a refresh token never leaves the vault. This connection injects a \
+                     minted access token; use its default phantom. To reveal the stored \
+                     secret, run `sc secret get` (needs a passkey)",
                     )
                     .into();
                 }

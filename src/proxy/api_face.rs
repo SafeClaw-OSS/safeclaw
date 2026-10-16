@@ -227,8 +227,8 @@ async fn require_agent(
         // bad credential — the fix is a Console authorize (Agent access page).
         Err(AgentRefusal::NotAuthorized) => Err(problem(
             ScCode::AgentNotAuthorized,
-            "this agent is not turned on for any vault yet. Ask the user to turn it \
-             on in a vault's Agent access page in the SafeClaw console",
+            "this agent is not turned on for any vault. Turn it on in a vault's \
+             Agent access page in the SafeClaw console",
         )),
     }
 }
