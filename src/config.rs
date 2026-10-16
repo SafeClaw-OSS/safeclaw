@@ -63,6 +63,11 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Set up this machine and one agent without prompting. Re-run the command
+    /// after completing each browser approval until it reports done.
+    Setup(SetupArgs),
+    /// Install or remove the SafeClaw agent skill.
+    Skill(SkillArgs),
     /// Print SafeClaw's status: the daemon (running? version) and the active
     /// vault (which one, locked/unlocked, key count).
     Status(StatusArgs),
@@ -584,6 +589,63 @@ pub struct AgentAddArgs {
 pub struct AgentRmArgs {
     /// Agent name (see `sc agent ls`).
     pub name: String,
+}
+
+/// `sc setup` is an agent-driven, re-runnable state machine. `name` stays
+/// optional at clap's boundary so the command can return its structured usage
+/// error instead of clap writing a different shape to stderr.
+#[derive(Debug, Args)]
+pub struct SetupArgs {
+    /// A short name identifying the agent being set up, such as claude-code.
+    #[arg(long)]
+    pub name: Option<String>,
+    /// First-party environment selector: prod (default) or dev.
+    #[arg(long)]
+    pub profile: Option<String>,
+    /// Wait briefly for an already-running setup worker.
+    #[arg(long)]
+    pub wait: bool,
+    /// Internal detached-worker entrypoint.
+    #[arg(long, hide = true)]
+    pub worker: bool,
+    /// Internal setup phase run by the detached worker.
+    #[arg(long, hide = true, value_enum)]
+    pub phase: Option<SetupPhase>,
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum SetupPhase {
+    Device,
+    Agent,
+    Unlock,
+}
+
+#[derive(Debug, Args)]
+pub struct SkillArgs {
+    #[command(subcommand)]
+    pub sub: SkillSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SkillSubcommand {
+    /// Install or update the SafeClaw skill for agents on this machine.
+    Install(SkillInstallArgs),
+    /// Remove the skill files previously written by SafeClaw.
+    Remove(SkillRemoveArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct SkillInstallArgs {
+    /// Replace a copy that was modified after SafeClaw installed it.
+    #[arg(long)]
+    pub force: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct SkillRemoveArgs {
+    /// Remove a copy that was modified after SafeClaw installed it.
+    #[arg(long)]
+    pub force: bool,
 }
 
 /// `sc device` — the device axis of the account plane.

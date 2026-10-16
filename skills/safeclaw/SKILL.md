@@ -40,10 +40,12 @@ what it prints, until it reports `done`:
 `~/.safeclaw/` and needs the network, so in a sandbox it may need to run outside
 it. Never ask the user to paste a key or a code into the chat.
 
-Each agent has its own identity, kept in `~/.safeclaw/agents/<name>/`. When this
-machine has only one agent, `sc` uses it automatically. With several, load your own
-env file, `~/.safeclaw/agents/<name>/agent.env` (it sets `SAFECLAW_BROKER_URL` and
-`SAFECLAW_AGENT_IDENTITY`; neither is a secret), before running `sc`.
+Each agent has its own identity, kept in `~/.safeclaw/agents/<name>/`. If
+`SAFECLAW_AGENT_IDENTITY` is unset, load your own env file before running `sc`:
+`set -a; . ~/.safeclaw/agents/<name>/agent.env; set +a` (it sets
+`SAFECLAW_BROKER_URL` and `SAFECLAW_AGENT_IDENTITY`; neither is a secret). With one
+directory there, that one is yours; with several, use the name you set up with.
+Without it, your requests are not attributed to you.
 
 This machine's `sc` is paired to one SafeClaw account, and you act as that
 account: your requests are its requests, approved by that person or a vault admin.

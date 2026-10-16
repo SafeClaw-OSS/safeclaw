@@ -59,6 +59,8 @@ struct AuthorizeResp {
     device_code: String,
     #[serde(default)]
     interval: Option<u64>,
+    #[serde(default)]
+    expires_in: Option<u64>,
 }
 
 fn http_detail(status: reqwest::StatusCode, body: &str) -> String {
@@ -142,14 +144,22 @@ pub async fn pair(client: &reqwest::Client, req: &PairRequest<'_>) -> Result<Pai
                 http_detail(status, &detail)
             ));
         }
+        let pair_url = format!("{}/pair", req.origin.trim_end_matches('/'));
+        let display_code = pairing::display_code(&auth.nameplate, &secret);
         eprintln!();
         eprintln!(
-            "Open {}/pair and enter this code:",
-            req.origin.trim_end_matches('/')
+            "Open {} and enter this code:",
+            pair_url
         );
-        eprintln!("  {}", pairing::display_code(&auth.nameplate, &secret));
+        eprintln!("  {}", display_code);
         eprintln!();
         eprintln!("Waiting for you to approve in the browser…");
+        crate::cli::human_action::report(
+            &pair_url,
+            Some(&display_code),
+            auth.expires_in
+                .map(|seconds| crate::util::now_unix().saturating_add(seconds)),
+        );
         Some(session)
     };
     let own_msg = session
@@ -222,6 +232,7 @@ pub async fn pair(client: &reqwest::Client, req: &PairRequest<'_>) -> Result<Pai
                 let k = s
                     .finish(&peer)
                     .map_err(|_| dead("The browser's pairing message was malformed."))?;
+                crate::cli::human_action::code_consumed();
                 let sub = pairing::subkeys(&k);
                 let mac = pairing::keys_mac(
                     &sub.k_keys[..],

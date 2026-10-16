@@ -40,7 +40,7 @@ const DEFAULT_DAEMON_PORT: u16 = crate::config::CONTROL_PORT;
 /// The resolved value is only the target at `sc login` time; once paired, the
 /// machine is pinned to the backend persisted in config.toml, so this never
 /// matters again for that machine.
-fn resolve_custodian(env_flag: Option<&str>) -> Result<String, String> {
+pub(crate) fn resolve_custodian(env_flag: Option<&str>) -> Result<String, String> {
     if let Ok(u) = std::env::var("SAFECLAW_CLOUD_URL") {
         if !u.is_empty() {
             return Ok(u);
@@ -60,7 +60,7 @@ fn resolve_custodian(env_flag: Option<&str>) -> Result<String, String> {
 /// The `--profile` allowlist. A SYMBOL → first-party URL only; anything else is a
 /// hard error. This is the gate that keeps a hostile install prompt from
 /// steering pairing off first-party domains; do not widen it to accept URLs.
-fn env_selector_to_url(env: &str) -> Result<String, String> {
+pub(crate) fn env_selector_to_url(env: &str) -> Result<String, String> {
     match env {
         "prod" => Ok("https://safeclaw.pro".to_string()),
         "dev" => Ok("https://dev.safeclaw.pro".to_string()),
@@ -69,6 +69,19 @@ fn env_selector_to_url(env: &str) -> Result<String, String> {
             other
         )),
     }
+}
+
+pub(crate) fn device_name(requested: Option<String>) -> String {
+    requested
+        .or_else(|| {
+            hostname::get()
+                .ok()
+                .and_then(|h| h.into_string().ok())
+                .filter(|s| !s.is_empty())
+        })
+        .or_else(|| std::env::var("HOSTNAME").ok().filter(|s| !s.is_empty()))
+        .or_else(|| std::env::var("COMPUTERNAME").ok().filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| "agent-device".to_string())
 }
 
 #[cfg(test)]
@@ -104,6 +117,24 @@ struct ExchangeResp {
 }
 
 pub async fn run(args: LoginArgs) -> Result<(), String> {
+    pair_and_persist(args, true).await?;
+    eprintln!("Starting SafeClaw…");
+    if let Err(e) = bring_up(true).await {
+        if let Some(e) = e.strip_prefix("auto-start: ") {
+            eprintln!("  couldn't auto-start the daemon ({e}); run `sc up` to finish.");
+        } else if let Some(e) = e.strip_prefix("auto-unlock: ") {
+            eprintln!("  couldn't auto-unlock ({e}); run `sc up` to finish.");
+        } else {
+            eprintln!("  couldn't finish bring-up ({e}); run `sc up` to finish.");
+        }
+    }
+    Ok(())
+}
+
+/// Run the existing device pairing ceremony and persist its result, but do not
+/// start or unlock the daemon. `sc setup --worker` uses this in-process so the
+/// PAKE session remains in one long-lived worker.
+pub async fn pair_and_persist(args: LoginArgs, allow_account_switch: bool) -> Result<(), String> {
     // ── Resolve cloud endpoint: env override > --profile selector > baked ─────
     let custodian = resolve_custodian(args.profile.as_deref())?;
     let custodian = custodian.trim_end_matches('/').to_string();
@@ -125,18 +156,7 @@ pub async fn run(args: LoginArgs) -> Result<(), String> {
     //    env > literal. The hostname syscall is the reliable source — the env
     //    vars are unset in most non-login / non-interactive shells, which is
     //    what used to strand a device on the "agent-device" fallback. ──
-    let device_name = args
-        .device_name
-        .clone()
-        .or_else(|| {
-            hostname::get()
-                .ok()
-                .and_then(|h| h.into_string().ok())
-                .filter(|s| !s.is_empty())
-        })
-        .or_else(|| std::env::var("HOSTNAME").ok().filter(|s| !s.is_empty()))
-        .or_else(|| std::env::var("COMPUTERNAME").ok().filter(|s| !s.is_empty()))
-        .unwrap_or_else(|| "agent-device".to_string());
+    let device_name = device_name(args.device_name.clone());
 
     // Dedicated 10s timeout per request (each pairing call is one round-trip).
     let client = reqwest::Client::builder()
@@ -201,6 +221,12 @@ pub async fn run(args: LoginArgs) -> Result<(), String> {
         Some(parsed.account_id.as_str()),
         Some(account_uik.as_str()),
     ) {
+        if !allow_account_switch {
+            return Err(
+                "the approval belongs to a different account than this machine's existing pairing"
+                    .to_string(),
+            );
+        }
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             if crate::cli::service::unit_installed() {
@@ -285,40 +311,34 @@ pub async fn run(args: LoginArgs) -> Result<(), String> {
         eprintln!("  id:      {}", parsed.account_id);
     }
 
-    // Bring SafeClaw to a ready state right after pairing: get the daemon
-    // running on the just-persisted pairing config, then unlock via the single
-    // chokepoint — so the agent never runs a separate up/unlock and the user
-    // just taps a passkey. `login` ⊃ `restart` ⊃ `unlock`: we reuse the same
-    // bring-up verbs rather than re-implementing them here.
-    // Best-effort: pairing already succeeded; if bring-up can't run (e.g. a
-    // non-Linux host with no service manager), point the user at `sc up`.
-    // Not "unlocking your vault" — a fresh multi-vault account has no active vault
-    // to unlock yet (that's a later, per-use choice), so a bring-up note must not
-    // promise an unlock that won't happen.
-    eprintln!("Starting SafeClaw…");
+    Ok(())
+}
+
+/// Bring up the daemon after pairing. With `unlock=false`, used only by the
+/// setup device worker, no approval operation is created.
+pub async fn bring_up(unlock: bool) -> Result<(), String> {
     if crate::cli::service::unit_installed() {
-        // Re-pair / post-upgrade: a daemon may already be running on the OLD
-        // pairing config. Bounce it so it reloads the just-persisted config,
-        // then unlock — exactly `sc restart`. Critical for the WebAuthn
-        // origin/rpId, which `from_serve_args` reads ONCE at startup: a stale
-        // daemon would validate grants against localhost and reject the
-        // web-gestured unlock. Routing through `restart` (not a unit rewrite)
-        // also avoids re-baking a stale `SAFECLAW_*` env into the unit.
-        if let Err(e) = crate::cli::up::restart().await {
-            eprintln!("  couldn't finish bring-up ({e}); run `sc up` to finish.");
+        if unlock {
+            return crate::cli::up::restart().await;
         }
+        crate::cli::service::restart_with_fallback().await?;
     } else {
-        // First pairing on this host: install + start the service (its fresh
-        // config is already correct, so no bounce needed), then unlock.
-        if let Err(e) = crate::cli::service::run_start_systemd(false).await {
-            eprintln!("  couldn't auto-start the daemon ({e}); run `sc up` to finish.");
-            return Ok(());
-        }
-        if let Err(e) = crate::cli::up::ensure_unlocked().await {
-            eprintln!("  couldn't auto-unlock ({e}); run `sc up` to finish.");
+        // Keep the ordinary terminal path exactly as before: attempt the
+        // platform service install first. Only a service-manager failure enters
+        // the detached fallback shared with `sc up`.
+        if let Err(manager) = crate::cli::service::run_start_systemd(false).await {
+            crate::cli::service::ensure_running_with_fallback()
+                .await
+                .map_err(|fallback| {
+                    format!("auto-start: {}; detached fallback: {}", manager, fallback)
+                })?;
         }
     }
-
+    if unlock {
+        crate::cli::up::ensure_unlocked()
+            .await
+            .map_err(|e| format!("auto-unlock: {}", e))?;
+    }
     Ok(())
 }
 

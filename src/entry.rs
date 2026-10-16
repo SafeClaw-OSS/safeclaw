@@ -55,6 +55,16 @@ pub async fn run_cli(hooks: Arc<dyn TeamHooks>) -> Result<(), Box<dyn std::error
         cli::logging::init_cli(verbose);
     }
     match cli.command {
+        Command::Setup(args) => match cli::setup::run(args, json).await {
+            Ok(()) => Ok(()),
+            Err(code) => std::process::exit(code),
+        },
+        Command::Skill(args) => {
+            cli::skill::run(args.sub).map_err(|e| -> Box<dyn std::error::Error> {
+                eprintln!("safeclaw skill: {}", e);
+                e.into()
+            })
+        }
         Command::Status(_args) => {
             // CLI commands log to stderr; don't initialise the tracing
             // subscriber here (it'd pollute the user-facing output of a

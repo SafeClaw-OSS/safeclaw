@@ -18,7 +18,7 @@ use crate::device_auth::DikRequestExt;
 
 pub async fn run(sub: AgentSubcommand, json: bool) -> Result<(), String> {
     match sub {
-        AgentSubcommand::Add(a) => add(a).await,
+        AgentSubcommand::Add(a) => add_cli(a).await,
         AgentSubcommand::Ls => ls(json).await,
         AgentSubcommand::Rm(a) => rm(a).await,
     }
@@ -55,7 +55,16 @@ struct ListKey {
     last_used_at: Option<String>,
 }
 
-async fn add(args: AgentAddArgs) -> Result<(), String> {
+pub struct AddedAgent {
+    pub identity_path: std::path::PathBuf,
+    pub broker_url: String,
+}
+
+/// Run the agent admission ceremony and persist the identity without printing
+/// its env projection. The `sc agent add` wrapper below retains the command's
+/// existing stdout and stderr exactly; setup workers consume this result
+/// directly.
+pub async fn add_and_persist(name: &str) -> Result<AddedAgent, String> {
     // Requires a paired device: the cloud backend to run the admission ceremony
     // against comes from `sc login`. (The ceremony's authorize/poll are
     // unauthenticated — the device_code + AIK PoP are the auth — so the
@@ -78,7 +87,7 @@ async fn add(args: AgentAddArgs) -> Result<(), String> {
     // orphan identity file.
     let (seed, ag_id) = crate::identity_file::mint(crate::identity::IdKind::Agent);
     let (aik, _) = crate::identity_file::resolve(crate::identity::IdKind::Agent, &seed);
-    let identity_path = crate::identity_file::agent_identity_path(&args.name)?;
+    let identity_path = crate::identity_file::agent_identity_path(name)?;
 
     // ── §14 agent admission = the same /pair ceremony as a device (C2) ──────
     // Adding an agent to the account is an OWNER decision: the PAKE short code,
@@ -94,7 +103,7 @@ async fn add(args: AgentAddArgs) -> Result<(), String> {
         &client,
         &crate::cli::pair_flow::PairRequest {
             principal: "agent",
-            name: &args.name,
+            name,
             principal_id: &ag_id,
             signer: &aik,
             sc_pk: None,
@@ -115,6 +124,15 @@ async fn add(args: AgentAddArgs) -> Result<(), String> {
     // Admitted — NOW persist the AIK identity file (0600).
     crate::identity_file::write(&identity_path, crate::identity::IdKind::Agent, &seed)?;
 
+    Ok(AddedAgent {
+        identity_path,
+        broker_url,
+    })
+}
+
+async fn add_cli(args: AgentAddArgs) -> Result<(), String> {
+    let added = add_and_persist(&args.name).await?;
+
     // ── Mint-time projection (CREDENTIAL_BROKER.md §14): this IS the minter ─
     // The agent's env is now just TWO non-secret lines: the daemon's API face and
     // the AIK identity PATH (a path, not a secret). Auth is the AIK's per-CONNECT
@@ -122,10 +140,10 @@ async fn add(args: AgentAddArgs) -> Result<(), String> {
     // emitted (it was legacy dual-auth cruft the shim stripped anyway). So there's
     // no secret to guard: this output can be shown, and appended to the agent's env
     // file directly. The daemon still holds an account-roster row for this AIK.
-    println!("SAFECLAW_BROKER_URL={}", broker_url);
+    println!("SAFECLAW_BROKER_URL={}", added.broker_url);
     println!(
         "SAFECLAW_AGENT_IDENTITY={}",
-        env_value(&identity_path.display().to_string())
+        env_value(&added.identity_path.display().to_string())
     );
 
     let rm_name = if args.name.contains(char::is_whitespace) {
@@ -202,20 +220,73 @@ async fn ls(json: bool) -> Result<(), String> {
 /// the console (this machine holds no owner key). Print the page; every device
 /// refuses the agent at its next ledger pull.
 async fn rm(args: AgentRmArgs) -> Result<(), String> {
+    let (cloud, key) = cloud_and_key()?;
+    let agents = fetch_agents(&cloud, &key).await?;
+    let matches: Vec<&ListKey> = agents
+        .iter()
+        .filter(|agent| {
+            agent.label.as_deref() == Some(args.name.as_str())
+                || agent.id == args.name
+                || agent.prefix == args.name
+        })
+        .collect();
+    if matches.len() > 1 {
+        return Err(format!(
+            "'{}' matches multiple agents; remove it by id or prefix from `sc agent ls`",
+            args.name
+        ));
+    }
+    let remote_id = matches.first().map(|agent| agent.id.clone());
+    let local_name = matches
+        .first()
+        .and_then(|agent| agent.label.clone())
+        .unwrap_or_else(|| args.name.clone());
     let url = crate::cli::vault::console_page("/account/access")?;
-    eprintln!(
-        "Remove the agent '{}' in the SafeClaw console (it asks for your passkey):",
-        args.name
-    );
-    eprintln!("  {}", url);
-    eprintln!("Every device stops serving it within two minutes of the removal.");
+    if remote_id.is_some() {
+        eprintln!(
+            "Remove the agent '{}' in the SafeClaw console (it asks for your passkey):",
+            args.name
+        );
+        eprintln!("  {}", url);
+        eprintln!("Waiting for the cloud removal to finish...");
+    }
+
+    // Agent removal is owner-signed in the browser, so the CLI cannot perform
+    // it with the device key. Observe the cloud list until that signed removal
+    // lands, and only then delete the local private identity directory.
+    if let Some(remote_id) = remote_id {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15 * 60);
+        loop {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let remaining = fetch_agents(&cloud, &key).await?;
+            if !remaining.iter().any(|agent| agent.id == remote_id) {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "the cloud removal is not finished; complete it at {} and re-run `sc agent rm {}`",
+                    url, args.name
+                ));
+            }
+        }
+    }
+
+    let identity = crate::identity_file::agent_identity_path(&local_name)?;
+    if let Some(dir) = identity.parent() {
+        if dir.exists() {
+            std::fs::remove_dir_all(dir)
+                .map_err(|e| format!("remove local agent directory {}: {}", dir.display(), e))?;
+            eprintln!("Removed local agent identity at {}.", dir.display());
+        }
+    }
+    eprintln!("Every device stops serving the removed agent after it receives the signed update.");
     Ok(())
 }
 
 /// A dotenv value that also survives `set -a; . file`: bare when it is only path-safe
 /// characters, else single-quoted (dotenv parsers strip the quotes). A home directory
 /// with a space is the usual case.
-fn env_value(v: &str) -> String {
+pub(crate) fn env_value(v: &str) -> String {
     if !v.is_empty()
         && v.chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | ':' | '+'))

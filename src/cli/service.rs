@@ -21,7 +21,10 @@
 //! and not touch these commands.
 
 use crate::config::LogArgs;
-use std::process::Command as ProcCommand;
+use std::fs::{self, OpenOptions};
+use std::io::Write as _;
+use std::path::PathBuf;
+use std::process::{Command as ProcCommand, Stdio};
 
 const UNIT_BASENAME: &str = "safeclaw.service";
 /// First line of every unit we generate. The idempotency guard refuses to
@@ -183,7 +186,10 @@ pub async fn run_start_systemd(force: bool) -> Result<(), String> {
         // env — the daemon reads its api-key from the FILE `~/.safeclaw/api-key`
         // (provisioned below), and a stray/foreign value in the operator's
         // shell must not be adopted as the broker key.
-        if k.starts_with("SAFECLAW_") && k != "SAFECLAW_API_KEY" {
+        if k.starts_with("SAFECLAW_")
+            && k != "SAFECLAW_API_KEY"
+            && k != crate::cli::human_action::STATUS_ENV
+        {
             // systemd unit syntax: quote the value to allow spaces/=.
             // Escape any " inside.
             let v_escaped = v.replace('"', "\\\"");
@@ -279,7 +285,10 @@ pub async fn run_start_systemd(force: bool) -> Result<(), String> {
     // sticks across restarts), EXCEPT the agent-facing SAFECLAW_API_KEY.
     let mut env_entries = Vec::new();
     for (k, v) in std::env::vars() {
-        if k.starts_with("SAFECLAW_") && k != "SAFECLAW_API_KEY" {
+        if k.starts_with("SAFECLAW_")
+            && k != "SAFECLAW_API_KEY"
+            && k != crate::cli::human_action::STATUS_ENV
+        {
             env_entries.push(format!(
                 "    <key>{}</key><string>{}</string>",
                 xml_escape(&k),
@@ -594,6 +603,186 @@ pub fn unit_installed() -> bool {
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         false
+    }
+}
+
+fn detached_pid_path() -> Result<PathBuf, String> {
+    let home = dirs::home_dir().ok_or("cannot locate home dir")?;
+    Ok(home.join(".safeclaw").join("daemon.pid"))
+}
+
+fn detached_log_path() -> Result<PathBuf, String> {
+    let home = dirs::home_dir().ok_or("cannot locate home dir")?;
+    Ok(home.join(".safeclaw").join("daemon.log"))
+}
+
+fn read_detached_pid() -> Option<u32> {
+    let path = detached_pid_path().ok()?;
+    fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+fn write_detached_pid(pid: u32) -> Result<(), String> {
+    let path = detached_pid_path()?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("create {}: {}", parent.display(), e))?;
+    }
+    let tmp = path.with_extension(format!("pid.tmp.{}", std::process::id()));
+    let mut options = OpenOptions::new();
+    options.create(true).truncate(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&tmp)
+        .map_err(|e| format!("create {}: {}", tmp.display(), e))?;
+    writeln!(file, "{}", pid).map_err(|e| format!("write {}: {}", tmp.display(), e))?;
+    fs::rename(&tmp, &path)
+        .map_err(|e| format!("rename {} to {}: {}", tmp.display(), path.display(), e))?;
+    Ok(())
+}
+
+async fn wait_for_daemon() -> bool {
+    let cfg = crate::cli::active::load().unwrap_or_default();
+    let control = crate::cli::active::control_root(&cfg);
+    for _ in 0..80 {
+        if crate::cli::status::probe_local_daemon(&control).await.up {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    false
+}
+
+async fn start_detached() -> Result<(), String> {
+    let cfg = crate::cli::active::load().unwrap_or_default();
+    let control = crate::cli::active::control_root(&cfg);
+    if crate::cli::status::probe_local_daemon(&control).await.up {
+        return Ok(());
+    }
+    let pid_path = detached_pid_path()?;
+    if let Some(pid) = read_detached_pid() {
+        if crate::cli::human_action::pid_is_live(pid) {
+            if wait_for_daemon().await {
+                return Ok(());
+            }
+            return Err(format!(
+                "detached daemon process {} is live but its control port is not answering; see {}",
+                pid,
+                detached_log_path()?.display()
+            ));
+        }
+        let _ = fs::remove_file(&pid_path);
+    }
+
+    let log_path = detached_log_path()?;
+    if let Some(parent) = log_path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("create {}: {}", parent.display(), e))?;
+    }
+    let stdout = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .map_err(|e| format!("open {}: {}", log_path.display(), e))?;
+    let stderr = stdout
+        .try_clone()
+        .map_err(|e| format!("open {} for stderr: {}", log_path.display(), e))?;
+    let binary = std::env::current_exe().map_err(|e| format!("locate current binary: {}", e))?;
+    let mut command = ProcCommand::new(binary);
+    command
+        .arg("serve")
+        .env_remove(crate::cli::human_action::STATUS_ENV)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr));
+    crate::cli::human_action::detach_session(&mut command);
+    let mut child = command
+        .spawn()
+        .map_err(|e| format!("start detached daemon: {}", e))?;
+    if let Err(e) = write_detached_pid(child.id()) {
+        let _ = child.kill();
+        return Err(e);
+    }
+    if wait_for_daemon().await {
+        eprintln!("✓ daemon running in a detached process (log: {})", log_path.display());
+        Ok(())
+    } else {
+        Err(format!(
+            "detached daemon did not answer on its control port; see {}",
+            log_path.display()
+        ))
+    }
+}
+
+fn stop_detached() -> Result<(), String> {
+    let path = detached_pid_path()?;
+    let Some(pid) = read_detached_pid() else {
+        return Ok(());
+    };
+    if crate::cli::human_action::pid_is_live(pid) {
+        let status = ProcCommand::new("kill")
+            .arg(pid.to_string())
+            .status()
+            .map_err(|e| format!("stop detached daemon {}: {}", pid, e))?;
+        if !status.success() {
+            return Err(format!("could not stop detached daemon {}", pid));
+        }
+    }
+    let _ = fs::remove_file(path);
+    Ok(())
+}
+
+/// Start the normal user service when it is usable, otherwise run `sc serve`
+/// in a setsid-detached process. This is shared by `sc up` and `sc setup`.
+pub async fn ensure_running_with_fallback() -> Result<(), String> {
+    let cfg = crate::cli::active::load().unwrap_or_default();
+    let control = crate::cli::active::control_root(&cfg);
+    if crate::cli::status::probe_local_daemon(&control).await.up {
+        return Ok(());
+    }
+    let managed = if unit_installed() {
+        let _ = reconcile_unit_execstart();
+        run_ensure_running()
+    } else {
+        run_start_systemd(false).await
+    };
+    match managed {
+        Ok(()) => {
+            if wait_for_daemon().await {
+                Ok(())
+            } else {
+                Err("the user service started but its control port is not answering".to_string())
+            }
+        }
+        Err(manager) => start_detached()
+            .await
+            .map_err(|fallback| format!("{}; detached fallback failed: {}", manager, fallback)),
+    }
+}
+
+/// Restart after pairing while retaining the no-service-manager fallback.
+pub async fn restart_with_fallback() -> Result<(), String> {
+    let managed = if unit_installed() {
+        let _ = reconcile_unit_execstart();
+        run_restart()
+    } else {
+        Err("no user service is installed".to_string())
+    };
+    match managed {
+        Ok(()) => {
+            if wait_for_daemon().await {
+                Ok(())
+            } else {
+                Err("the user service restarted but its control port is not answering".to_string())
+            }
+        }
+        Err(manager) => {
+            let _ = stop_detached();
+            start_detached().await.map_err(|fallback| {
+                format!("{}; detached fallback failed: {}", manager, fallback)
+            })
+        }
     }
 }
 

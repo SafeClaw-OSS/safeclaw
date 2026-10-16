@@ -404,6 +404,28 @@ pub async fn run(args: UpgradeArgs) -> Result<(), String> {
         ),
         None => eprintln!("Upgraded {} ({}).", current.display(), &actual[..12]),
     }
+    // The replacement binary embeds the replacement skill. If this machine
+    // previously opted into skill installation, refresh it with the NEW binary;
+    // a skill problem must never roll back an otherwise verified upgrade.
+    if crate::cli::skill::manifest_path()
+        .map(|path| path.exists())
+        .unwrap_or(false)
+    {
+        match std::process::Command::new(&current)
+            .args(["skill", "install"])
+            .status()
+        {
+            Ok(status) if status.success() => {}
+            Ok(status) => eprintln!(
+                "warning: the upgraded binary could not refresh the agent skill (status {})",
+                status
+            ),
+            Err(e) => eprintln!(
+                "warning: the upgraded binary could not refresh the agent skill ({})",
+                e
+            ),
+        }
+    }
     // Take effect now: restart the daemon onto the new binary and re-unlock.
     // Hand the whole convergence to the NEW binary via exec — this process is
     // still the old build, and driving a new daemon from an old client is a

@@ -320,6 +320,7 @@ async fn remote_approve(
     eprintln!("  {}", url);
     eprintln!();
     eprintln!("Waiting for approval…");
+    crate::cli::human_action::report(&url, None, None);
 
     let outcome = tokio::select! {
         r = remote_wait(custodian, op_id, waiter) => r,

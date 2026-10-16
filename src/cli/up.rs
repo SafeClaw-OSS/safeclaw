@@ -18,15 +18,7 @@ use crate::config::UnlockArgs;
 /// `sc up`: get SafeClaw ready — install the daemon service on first run (so
 /// there's no separate setup step), make sure it's running, then unlock.
 pub async fn run() -> Result<(), String> {
-    if service::unit_installed() {
-        // Migrate a unit installed by an older build (ExecStart=… custodian run)
-        // to `serve` before starting it — `custodian` no longer exists.
-        let _ = service::reconcile_unit_execstart();
-        service::run_ensure_running()?;
-    } else {
-        // First `sc up` on this host: install + enable + start the user service.
-        service::run_start_systemd(false).await?;
-    }
+    service::ensure_running_with_fallback().await?;
     ensure_unlocked().await
 }
 
@@ -40,8 +32,7 @@ pub async fn run() -> Result<(), String> {
 /// forward, `sc login`) reuse this so they can't silently leave you locked
 /// onto a freshly-started daemon either.
 pub async fn restart() -> Result<(), String> {
-    let _ = service::reconcile_unit_execstart();
-    service::run_restart()?;
+    service::restart_with_fallback().await?;
     ensure_unlocked().await?;
     warn_if_stale_after_restart().await;
     Ok(())
