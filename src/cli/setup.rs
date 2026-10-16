@@ -846,7 +846,7 @@ fn shell_word(value: &str) -> String {
     if !value.is_empty()
         && value
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'))
     {
         value.to_string()
     } else {
@@ -1064,6 +1064,16 @@ mod setup_tests {
         );
         assert_eq!(expiry_phrase(Some(59)).as_deref(), Some("expires soon"));
         assert_eq!(expiry_phrase(None), None);
+    }
+
+    #[test]
+    fn shell_word_quotes_only_when_needed() {
+        assert_eq!(
+            shell_word("/home/me/.safeclaw/agents/codex/agent.env"),
+            "/home/me/.safeclaw/agents/codex/agent.env"
+        );
+        assert_eq!(shell_word("/Users/Mia Li/agent.env"), "'/Users/Mia Li/agent.env'");
+        assert_eq!(shell_word("it's"), "'it'\\''s'");
     }
 
     #[test]
